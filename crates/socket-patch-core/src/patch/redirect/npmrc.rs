@@ -282,6 +282,9 @@ pub struct OuterAllowRemote {
     /// `replace-registry-host` in the same outer layers (see
     /// [`effective_replace_registry_host`]).
     pub replace_registry_host: OuterSetting,
+    /// `omit-lockfile-registry-resolved` in the same outer layers (see
+    /// [`effective_omit_lockfile_registry_resolved`]).
+    pub omit_lockfile_registry_resolved: OuterSetting,
     /// The process facts the layers were resolved with: npm env-replaces
     /// a value against them (see [`NpmConfigEnv::config_value`]),
     /// whichever layer sets it, the project `.npmrc` included.
@@ -528,6 +531,10 @@ pub fn resolve_outer_allow_remote(
             env: env.npm_config(REPLACE_REGISTRY_HOST, "npmjs"),
             file: outer_file_value(&layers, REPLACE_REGISTRY_HOST),
         },
+        omit_lockfile_registry_resolved: OuterSetting {
+            env: env.npm_config(OMIT_LOCKFILE_REGISTRY_RESOLVED, "false"),
+            file: outer_file_value(&layers, OMIT_LOCKFILE_REGISTRY_RESOLVED),
+        },
         config_env: env.clone(),
     }
 }
@@ -631,7 +638,15 @@ fn outer_file_value(layers: &[OuterLayer], key: &str) -> Option<OuterFileValue> 
 /// rewritten that way is fetched from the registry, which 404s.
 pub const REPLACE_REGISTRY_HOST: &str = "replace-registry-host";
 
-/// Where the effective `replace-registry-host` value comes from.
+/// npm's (>= 8) `omit-lockfile-registry-resolved` config key (Boolean).
+/// When true, `@npmcli/arborist` drops `resolved` from every
+/// registry-spec dependency each time it saves the lock
+/// (`shrinkwrap.js` → `overrideResolves()`), whatever the URL's host,
+/// while keeping `integrity`. A hosted pin then keeps the patched
+/// integrity but fetches the registry tarball: EINTEGRITY.
+pub const OMIT_LOCKFILE_REGISTRY_RESOLVED: &str = "omit-lockfile-registry-resolved";
+
+/// Where an effective npm config value comes from.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SettingSource {
     /// An `npm_config_*` environment variable (named).
@@ -645,8 +660,8 @@ pub enum SettingSource {
     },
 }
 
-/// The effective `replace-registry-host` setting: where it is set, the
-/// value as written there, and the value npm uses.
+/// An effective npm config setting: where it is set, the value as written
+/// there, and the value npm uses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EffectiveSetting {
     /// The value npm uses: [`raw`](Self::raw) trimmed and env-replaced.
@@ -656,21 +671,20 @@ pub struct EffectiveSetting {
     pub source: SettingSource,
 }
 
-/// The `replace-registry-host` value npm would use, following its layer
-/// order (env > project > user > global > builtin), or `None` when no
-/// layer sets it (npm's default `npmjs`). npm env-replaces the value in
-/// every layer (#1233), so `${RRH}` reads as what `RRH` holds; an unset
-/// `${RRH}` stays literal, as it does for npm.
-pub fn effective_replace_registry_host(
+/// The value npm would use for `key`, following its layer order (env >
+/// project > user > global > builtin), or `None` when no layer sets it
+/// (npm's default applies). npm env-replaces the value in every layer
+/// (#1233), so `${RRH}` reads as what `RRH` holds; an unset `${RRH}`
+/// stays literal, as it does for npm.
+fn effective_setting(
     project: Option<&str>,
-    outer: &OuterAllowRemote,
+    key: &str,
+    setting: &OuterSetting,
+    config_env: &NpmConfigEnv,
 ) -> Option<EffectiveSetting> {
-    let setting = &outer.replace_registry_host;
     let (raw, source) = if let Some((var, value)) = &setting.env {
         (value.clone(), SettingSource::Env(var.clone()))
-    } else if let Some(value) =
-        project.and_then(|t| npmrc_top_level_value(t, REPLACE_REGISTRY_HOST))
-    {
+    } else if let Some(value) = project.and_then(|t| npmrc_top_level_value(t, key)) {
         (value, SettingSource::Project)
     } else {
         let f = setting.file.as_ref()?;
@@ -683,10 +697,83 @@ pub fn effective_replace_registry_host(
         )
     };
     Some(EffectiveSetting {
-        value: outer.config_env.config_value(&raw),
+        value: config_env.config_value(&raw),
         raw,
         source,
     })
+}
+
+/// The `replace-registry-host` value npm would use (see
+/// [`effective_setting`]), or `None` for npm's default `npmjs`.
+pub fn effective_replace_registry_host(
+    project: Option<&str>,
+    outer: &OuterAllowRemote,
+) -> Option<EffectiveSetting> {
+    effective_setting(
+        project,
+        REPLACE_REGISTRY_HOST,
+        &outer.replace_registry_host,
+        &outer.config_env,
+    )
+}
+
+/// The `omit-lockfile-registry-resolved` setting npm would use (see
+/// [`effective_setting`]) when npm reads it as TRUE ([`npm_config_bool`]);
+/// `None` when it is unset (npm's default `false`) or false.
+pub fn effective_omit_lockfile_registry_resolved(
+    project: Option<&str>,
+    outer: &OuterAllowRemote,
+) -> Option<EffectiveSetting> {
+    effective_setting(
+        project,
+        OMIT_LOCKFILE_REGISTRY_RESOLVED,
+        &outer.omit_lockfile_registry_resolved,
+        &outer.config_env,
+    )
+    .filter(npm_config_bool)
+}
+
+/// A Boolean npm config setting as npm reads it (`@npmcli/config`
+/// `parseField`, then nopt's Boolean validation; measured on npm 10.9.4).
+/// On the value as written (trimmed, before env replacement): empty is
+/// TRUE (like a bare `--flag`), `true` true, `false` / `null` /
+/// `undefined` false. Otherwise the env-replaced value is false when it is
+/// a numeric zero (or empty) and TRUE for any other string, so `False`,
+/// `no` and `undefined` reached through `${VAR}` are all true to npm.
+pub fn npm_config_bool(setting: &EffectiveSetting) -> bool {
+    match js_trim(&setting.raw) {
+        "" | "true" => true,
+        "false" | "null" | "undefined" => false,
+        _ => {
+            !matches!(setting.value.as_str(), "false" | "null") && !js_numeric_zero(&setting.value)
+        }
+    }
+}
+
+/// Whether JavaScript's `Number(s)` is zero: blank, or an optionally
+/// signed decimal zero (`0`, `-0.0`, `.0e5`), or an unsigned `0x0` /
+/// `0o0` / `0b0`.
+fn js_numeric_zero(s: &str) -> bool {
+    let t = js_trim(s);
+    if let Some(digits) = ["0x", "0X", "0o", "0O", "0b", "0B"]
+        .iter()
+        .find_map(|p| t.strip_prefix(p))
+    {
+        return !digits.is_empty() && digits.bytes().all(|b| b == b'0');
+    }
+    if t.is_empty() {
+        return true;
+    }
+    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
+    let (mantissa, exponent) = t.split_once(['e', 'E']).unwrap_or((t, "0"));
+    let exponent = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let zeros = |d: &str| d.bytes().all(|b| b == b'0');
+    !(int.is_empty() && frac.is_empty())
+        && zeros(int)
+        && zeros(frac)
+        && !exponent.is_empty()
+        && exponent.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Whether npm's `replace-registry-host=<value>` rewrites a `resolved` URL
@@ -1455,6 +1542,159 @@ mod tests {
         assert!(!replace_registry_host_rewrites("PATCH.SOCKET.DEV", host));
         assert!(replace_registry_host_rewrites("[::1]", "[::1]:80"));
         assert!(replace_registry_host_rewrites("[::1]", "[::1]"));
+    }
+
+    /// #1871: `omit-lockfile-registry-resolved` is read from every npm
+    /// config layer in npm's order (env > project > user > global >
+    /// builtin) and reported only when npm reads it as true.
+    #[test]
+    fn omit_lockfile_registry_resolved_layers() {
+        fn effective(
+            project: Option<&str>,
+            outer: &OuterAllowRemote,
+        ) -> Option<(String, SettingSource)> {
+            effective_omit_lockfile_registry_resolved(project, outer).map(|s| (s.value, s.source))
+        }
+        use std::collections::HashMap;
+        use std::path::{Path, PathBuf};
+        let files: HashMap<PathBuf, &str> = HashMap::from([
+            (
+                PathBuf::from("/home/u/.npmrc"),
+                "omit-lockfile-registry-resolved=true\n",
+            ),
+            (
+                PathBuf::from("/opt/node/etc/npmrc"),
+                "omit-lockfile-registry-resolved=false\n",
+            ),
+        ]);
+        let read = |p: &Path| files.get(p).map(|s| s.to_string());
+
+        // Unset anywhere: npm's default (`false`).
+        let outer = resolve_outer_allow_remote(&cfg_env(&[]), |_| None);
+        assert_eq!(effective(None, &outer), None);
+        // The project file alone; a bare key is `true` to ini.
+        for text in [
+            "omit-lockfile-registry-resolved=true\n",
+            "omit-lockfile-registry-resolved\n",
+            "omit-lockfile-registry-resolved = true\r\n",
+        ] {
+            assert_eq!(
+                effective(Some(text), &outer),
+                Some(("true".into(), SettingSource::Project)),
+                "{text:?}"
+            );
+        }
+        // Scoped under a section it is not a top-level setting.
+        assert_eq!(
+            effective(Some("[x]\nomit-lockfile-registry-resolved=true\n"), &outer),
+            None
+        );
+
+        // The user file beats the global one...
+        let outer = resolve_outer_allow_remote(&cfg_env(&[]), read);
+        assert_eq!(
+            effective(Some("fund=false\n"), &outer),
+            Some((
+                "true".into(),
+                SettingSource::File {
+                    layer: "user",
+                    path: "/home/u/.npmrc".into()
+                }
+            ))
+        );
+        // ...a project `false` beats both...
+        assert_eq!(
+            effective(Some("omit-lockfile-registry-resolved=false\n"), &outer),
+            None
+        );
+        // ...and the env beats every file, in any spelling npm normalizes.
+        for var in [
+            "npm_config_omit_lockfile_registry_resolved",
+            "NPM_CONFIG_OMIT_LOCKFILE_REGISTRY_RESOLVED",
+        ] {
+            let outer = resolve_outer_allow_remote(&cfg_env(&[(var, "true")]), read);
+            assert_eq!(
+                effective(Some("omit-lockfile-registry-resolved=false\n"), &outer),
+                Some(("true".into(), SettingSource::Env(var.into())))
+            );
+            let outer = resolve_outer_allow_remote(&cfg_env(&[(var, "false")]), read);
+            assert_eq!(effective(None, &outer), None);
+        }
+        // Env-replaced like every npm value.
+        let outer = resolve_outer_allow_remote(&cfg_env(&[("OMIT", "true")]), |_| None);
+        let got = effective_omit_lockfile_registry_resolved(
+            Some("omit-lockfile-registry-resolved=${OMIT}\n"),
+            &outer,
+        )
+        .unwrap();
+        assert_eq!((got.raw.as_str(), got.value.as_str()), ("${OMIT}", "true"));
+        // The other keys' resolution is unaffected by the new key.
+        assert_eq!((outer.env, outer.file), (None, None));
+        assert_eq!(outer.replace_registry_host, OuterSetting::default());
+    }
+
+    /// npm's Boolean reading, as measured on npm 10.9.4 (`c.flat` after
+    /// `validate()`): keywords and blank on the written value, then nopt
+    /// on the env-replaced one.
+    #[test]
+    fn npm_config_bool_matches_npm() {
+        let bool_of = |raw: &str, value: &str| {
+            npm_config_bool(&EffectiveSetting {
+                value: value.into(),
+                raw: raw.into(),
+                source: SettingSource::Project,
+            })
+        };
+        for v in [
+            "",
+            " ",
+            "true",
+            "1",
+            "-1",
+            "yes",
+            "False",
+            "FALSE",
+            "no",
+            "off",
+            "0x1",
+            "1e0",
+            "Infinity",
+            "-Infinity",
+            "[a, b]",
+            "0x",
+            "-0x0",
+            ".",
+            "-",
+            "e5",
+            "0e",
+            "${UNSET}",
+        ] {
+            assert!(bool_of(v, js_trim(v)), "{v:?}");
+        }
+        for v in [
+            "false",
+            "null",
+            "undefined",
+            "0",
+            "-0",
+            "+0",
+            "0.0",
+            ".0",
+            "0.",
+            "0e5",
+            "0E-1",
+            "0x0",
+            "0b00",
+            "0o0",
+        ] {
+            assert!(!bool_of(v, v), "{v:?}");
+        }
+        // Keywords count only as written: `${V}` expanding to `false` /
+        // `null` is false (nopt), to `undefined` true, to blank false.
+        assert!(!bool_of("${V}", "false"));
+        assert!(!bool_of("${V}", "null"));
+        assert!(bool_of("${V}", "undefined"));
+        assert!(!bool_of("${V}", ""));
     }
 
     /// #1233: npm env-replaces every config value (`@npmcli/config`
