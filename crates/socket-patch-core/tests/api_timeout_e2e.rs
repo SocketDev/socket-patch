@@ -12,9 +12,7 @@
 use std::time::{Duration, Instant};
 
 use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiError, BinaryBody};
-use socket_patch_core::api::retry::{
-    ApiRetryPolicy, ApiTimeouts, RetryHooks, API_CONNECT_TIMEOUT, API_READ_TIMEOUT,
-};
+use socket_patch_core::api::retry::{ApiRetryPolicy, ApiTimeouts, RetryHooks};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
@@ -321,10 +319,12 @@ async fn a_body_that_keeps_streaming_past_the_bound_still_arrives() {
 }
 
 #[test]
-fn default_bounds_are_the_named_constants() {
-    let t = ApiTimeouts::default();
-    assert_eq!(t.connect, API_CONNECT_TIMEOUT);
-    assert_eq!(t.read, API_READ_TIMEOUT);
-    assert_eq!(API_CONNECT_TIMEOUT, Duration::from_secs(10));
-    assert_eq!(API_READ_TIMEOUT, Duration::from_secs(60));
+fn default_bounds_are_10s_connect_60s_read() {
+    assert_eq!(
+        ApiTimeouts::default(),
+        ApiTimeouts {
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(60),
+        }
+    );
 }
