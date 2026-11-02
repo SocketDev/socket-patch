@@ -645,11 +645,13 @@ pub async fn preflight_packages(
     }
 }
 
-/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in a
-/// pnpm, yarn classic or yarn berry project — each package's `(code,
-/// detail)` when its backend refuses it on the project's lock and manifest
-/// text alone, `None` otherwise (and for every package of any other
-/// flavor, or a project the flavor probe refuses).
+/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in an
+/// npm package-lock, pnpm, yarn classic or yarn berry project — each
+/// package's `(code, detail)` when its backend refuses it on the project's
+/// lock and manifest text alone, `None` otherwise (and for every package of
+/// any other flavor, or a project the flavor probe refuses). Package-lock
+/// joined in #1976: its per-entry refusals (a URL / git spec copy, a
+/// workspace member) were otherwise found only after the view fetch.
 ///
 /// Those backends evaluate every such gate — the coordinates, the lock and
 /// manifest reads, override conflicts, the entry present and rewritable —
@@ -669,7 +671,10 @@ pub async fn lock_text_refusals(
     };
     if !matches!(
         flavor,
-        NpmLockFlavor::Pnpm | NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry
+        NpmLockFlavor::PackageLock
+            | NpmLockFlavor::Pnpm
+            | NpmLockFlavor::YarnClassic
+            | NpmLockFlavor::YarnBerry
     ) {
         return vec![None; packages.len()];
     }
@@ -1004,20 +1009,103 @@ mod lock_text_refusal_tests {
         }
     }
 
-    /// Only the pnpm / yarn classic / yarn berry gates answer: a
-    /// package-lock project refuses nothing here, whatever its backend does.
+    /// A package-lock project whose lock pins `left-pad@1.3.0` with
+    /// `entry` (under `key`) beside a plain registry `is-number@7.0.0`.
+    fn package_lock_project(root: &Path, spec: &str, key: &str, entry: serde_json::Value) {
+        let manifest = serde_json::json!({
+            "name": "t", "version": "0.0.0",
+            "dependencies": { "left-pad": spec, "is-number": "7.0.0" },
+        });
+        std::fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+        let lock = serde_json::json!({
+            "name": "t", "version": "0.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+                "": { "name": "t", "version": "0.0.0",
+                      "dependencies": { "left-pad": spec, "is-number": "7.0.0" } },
+                key: entry,
+                "node_modules/is-number": {
+                    "version": "7.0.0",
+                    "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+                    "integrity": "sha512-AAAA=="
+                }
+            }
+        });
+        std::fs::write(root.join("package-lock.json"), lock.to_string()).unwrap();
+    }
+
+    /// #1976: the package-lock backend's per-entry refusals (an entry
+    /// installed from a URL or git spec, a workspace member) are answered
+    /// here too, in the backend's own words, while the registry copy beside
+    /// it is wireable. The vendored preview, rollout planning and download
+    /// phase all ask this, so such a package no longer previews as
+    /// vendorable, takes a `--max-new-patches` slot or has its view fetched.
     #[tokio::test]
-    async fn other_flavors_refuse_nothing_early() {
+    async fn package_lock_entry_refusals_are_the_backends_own_words() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let shapes = [
+            (
+                url,
+                "node_modules/left-pad",
+                serde_json::json!({ "version": "1.3.0", "resolved": url, "integrity": "sha512-orig==" }),
+                "vendor_lock_entry_not_rewritable",
+            ),
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "node_modules/left-pad",
+                serde_json::json!({ "version": "1.3.0", "resolved": git }),
+                "vendor_lock_entry_not_rewritable",
+            ),
+            (
+                "1.3.0",
+                "packages/left-pad",
+                serde_json::json!({ "name": "left-pad", "version": "1.3.0" }),
+                "vendor_workspace_member",
+            ),
+        ];
+        for (spec, key, entry, code) in shapes {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            package_lock_project(root, spec, key, entry);
+            let rec = record();
+            let purls = ["pkg:npm/left-pad@1.3.0", "pkg:npm/is-number@7.0.0"];
+            let packages: Vec<(&str, &PatchRecord)> = purls.iter().map(|p| (*p, &rec)).collect();
+            let refusals = lock_text_refusals(root, &packages).await;
+            assert_eq!(refusals[1], None, "{spec}: is-number is wireable");
+            let nowhere = root.join("not-installed");
+            let sources = PatchSources {
+                blobs_path: &nowhere,
+                mem_blobs: None,
+            };
+            let backend = crate::vendor::test_support::vendor_npm_any(
+                purls[0],
+                nowhere.as_path(),
+                root,
+                &rec,
+                &sources,
+                "t",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code: got, detail } = backend else {
+                panic!("{spec}: the backend must refuse left-pad");
+            };
+            assert_eq!(got, code, "{spec}");
+            assert_eq!(refusals[0], Some((got, detail)), "{spec}");
+        }
+    }
+
+    /// A project with no npm lock refuses nothing here: the flavor probe
+    /// decides first, and the run-level refusals are not lock-text gates.
+    #[tokio::test]
+    async fn a_lockless_project_refuses_nothing_early() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(
             root.join("package.json"),
             r#"{"name":"t","version":"0.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("package-lock.json"),
-            r#"{"name":"t","version":"0.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t","version":"0.0.0"}}}"#,
         )
         .unwrap();
         let rec = record();
