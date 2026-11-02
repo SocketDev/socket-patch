@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -106,5 +106,10 @@ _Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
   - Prove less than they claim: 8 of 9 docker agent chains serve a zero `beforeHash` and `apply --force`, so only the force path runs {{T62}}; 49 `vendor`/`repair --offline` calls in 16 suites run online because `prepare_command` strips the flag {{T61}}; `binary_shared_bundled_record_hosted_pin_is_managed` skips on the CLI output it tests; pypi `uv_tool…_full_apply_chain` never applies; the vendor_maven TAMPER probe only logs on Maven ≥ 3.9.2.
   - Can't fail: `npm_test_infrastructure_smoke` asserts its own wiremock; deno/pypi/sbt script tests assert their own generated strings; `contract_paid_required` greps the source for a variant; e2e_cargo's `!a && !a` duplicate operand.
   - Weak oracles: gem's `"applied": 1` grep matches 10 (executed) {{T60}}; `assert_vex_attested_from_host` ×4 checks only `(vendored)` beside `assert_attested` {{T63}}.
-  - Scaffolding: docker harness copied ×8-11 with 7 ungated image skips {{T60}}; `copy_tree` ~20+, scan-proxy ×4, `hosted_pin_count` ×8 {{T64}}.
+  - Scaffolding: docker harness copied ×8-11 with 7 ungated image skips {{T60}}; `copy_tree` ×38 (20 identical), scan-proxy ×4, `hosted_pin_count` ×8 {{T64}}.
+- **Tally for `e2e_embedded_vex`, `e2e_gem`, `e2e_golang*` (5), `e2e_gradle_{agent,discovery}_build`, `e2e_hosted_production`, `e2e_maven`, `e2e_npm`, `e2e_nuget*` (14 files, 14.8K lines, audit-cli-tests 2026-11-02 09:41Z): about 57 fake or weak tests.**
+  - Pass without the behavior they name: both Gradle `--global-prefix` tests, since the harness always sets `GRADLE_USER_HOME` (executed) {{T67}}; hosted-production golang and deno legs crawl nothing pinned {{T66}}; workspace `assert_ne!(code, -1)`; hosted_state asserts on a ledger v5 never writes {{T69}}.
+  - Weak oracles: nuget's unterminated `scannedPackages: {n}` substring passes 10–19 for 1; `!a && !a` ×5 {{T69}}; ~40 sentence `.contains` on `--json` stdout (C32); Go drift and refusal tests assert only a non-zero exit.
+  - Silent or never-run: `e2e_npm` (7) and `e2e_gem` (3) are `#[ignore]`d live tests, never in CI, that skip without a REQUIRED gate {{T50}}; the go<1.22 sub-gate skips without a line.
+  - Scaffolding: Go harness copied across 5 suites {{T65}}; no Go `Extra` in `hermetic` and process-wide `set_var` {{T66}}; hosted/vendored production near-fork {{T68}}; Gradle world setup ×4 and victim helpers ×2.
 - **Coverage gaps:** a lockfile-only calm skip and a genuine miss serialize identically (`skipped`/`package_not_installed`), and an apply no-matching-variant miss emits no event, so the JSON tests can't check either (executed; C13); no offline round-trip test of the cargo matrix's `Cargo.lock` codec.
