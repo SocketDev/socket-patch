@@ -66,6 +66,8 @@ pub mod gem;
 pub mod go_build_list;
 pub mod go_consumer_sync;
 pub mod go_mod_edit;
+mod go_native_vendor;
+pub(crate) mod go_sum_backup;
 pub mod go_sum_edit;
 pub mod go_workspace;
 pub mod golang;
