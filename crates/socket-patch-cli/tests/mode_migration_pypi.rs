@@ -912,7 +912,12 @@ const PATCHED_B: &[u8] = b"# six\nVERSION = '1.16.0'\nSOCKET_PATCHED = 2\n";
 /// A (`pipenv sync` after the first vendor): its files are A's patched
 /// bytes, not the pristine release patch B is diffed against.
 fn venv_installed_from_patch_a(venv: &Path) {
-    let site = venv.join("lib/python3.11/site-packages");
+    // The crawler looks for `Lib\site-packages` in a Windows venv.
+    let site = venv.join(if cfg!(windows) {
+        "Lib/site-packages"
+    } else {
+        "lib/python3.11/site-packages"
+    });
     let dist = site.join("six-1.16.0.dist-info");
     std::fs::create_dir_all(&dist).unwrap();
     std::fs::write(site.join("six.py"), PATCHED).unwrap();
