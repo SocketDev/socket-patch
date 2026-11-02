@@ -288,6 +288,15 @@ pub(crate) fn strip_comment(text: &str) -> &str {
     split_comment(text).0
 }
 
+/// Whether pip's [`expand_env_vars`] would substitute anything in `code`.
+/// pip expands every line, not only `-r` / `-c` targets, so `six==${SIXV}`
+/// pins whatever `SIXV` holds where pip runs: a Docker `ARG`, a CI step,
+/// none of which this process sees. Such a line pins no knowable release
+/// (#1873).
+pub(crate) fn has_env_reference(code: &str) -> bool {
+    code.contains("${") && expand_env_vars(code, |_| Some("_".to_string())) != code
+}
+
 /// pip's `expand_env_variables`: each `${NAME}` whose `NAME` is
 /// `[A-Z0-9_]+` is replaced by `lookup(NAME)`; an unset or empty variable
 /// leaves the reference as written. pip expands after stripping comments
