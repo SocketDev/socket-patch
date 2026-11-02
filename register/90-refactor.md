@@ -25,7 +25,7 @@ _Last updated 2026-11-02T01:20Z · main @ cbbbdb9_
 | #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; CI (82 checks) and Bugbot green |
 | #1948 | sweep | `cli/src/commands/{vex_consumed,vex_sources}.rs` (+ 2 tests moved to `ecosystem_dispatch.rs`) | ready; CI (ci-ok) and Bugbot green |
 | #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; CI (82 checks) and Bugbot green |
-| #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; CI/Bugbot pending |
+| #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; CI (82 checks) and Bugbot green |
 
 #### Merged
 _None._
