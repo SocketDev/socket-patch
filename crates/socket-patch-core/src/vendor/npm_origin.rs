@@ -1141,4 +1141,162 @@ mod tests {
         assert_eq!(split_selector("@s/pad"), ("@s/pad", None));
         assert_eq!(split_selector("@s/pad@^2"), ("@s/pad", Some("^2")));
     }
+
+    /// The #1965 lock: `foo` (a `file:` tarball) depends on left-pad by a
+    /// registry range, and the lock records a registry-looking `resolved`
+    /// for it whatever the root overrides it to.
+    fn overridden_range_lock(left_pad_resolved: &str) -> Value {
+        lock(json!({
+            "": { "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+            "node_modules/foo": {
+                "version": "1.0.0",
+                "resolved": "file:foo-1.0.0.tgz",
+                "dependencies": { "left-pad": "^1.3.0" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": left_pad_resolved,
+                "integrity": "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
+            }
+        }))
+    }
+
+    fn range_manifest(overrides: Value) -> NpmOverrides {
+        NpmOverrides::from_manifest(&json!({
+            "name": "app",
+            "dependencies": {
+                "foo": "file:foo-1.0.0.tgz",
+                "url-pad": REGISTRY_TGZ,
+                "reg-pad": "1.3.0"
+            },
+            "overrides": overrides
+        }))
+    }
+
+    #[test]
+    fn issue_1965_an_override_of_a_registry_edge_to_a_url_is_non_registry() {
+        // Fresh lock, after a hosted redirect, and after a vendored rewire:
+        // npm installs the override spec, never the lock's `resolved`.
+        for resolved in [
+            REGISTRY_TGZ,
+            "https://patch.socket.dev/npm/left-pad/-/left-pad-1.3.0.tgz",
+            "file:.socket/vendor/npm/0123/left-pad-1.3.0.tgz",
+        ] {
+            let lock = overridden_range_lock(resolved);
+            for overrides in [
+                json!({ "left-pad": REGISTRY_TGZ }),
+                json!({ "left-pad": "http://example.test/left-pad-1.3.0.tgz" }),
+                json!({ "left-pad": { ".": REGISTRY_TGZ } }),
+                json!({ "left-pad": "$url-pad" }),
+                json!({ "foo": { "left-pad": REGISTRY_TGZ } }),
+                json!({ "foo@1.0.0": { "left-pad": REGISTRY_TGZ } }),
+                json!({ "left-pad@^1.3.0": REGISTRY_TGZ }),
+                json!({ "left-pad": "github:someone/left-pad" }),
+                json!({ "left-pad": "git+https://example.test/left-pad.git" }),
+                json!({ "left-pad": "file:../left-pad" }),
+                json!({ "left-pad": "./vendor/left-pad-1.3.0.tgz" }),
+                json!({ "left-pad": "npm:other@https://example.test/x.tgz" }),
+            ] {
+                let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+                let reason = found.get("node_modules/left-pad");
+                assert!(reason.is_some(), "{overrides} / {resolved}: {found:?}");
+                assert!(
+                    reason.unwrap().contains("override"),
+                    "{overrides}: {reason:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_1965_registry_and_no_op_overrides_of_a_registry_edge_stay_registry() {
+        let lock = overridden_range_lock(REGISTRY_TGZ);
+        for overrides in [
+            json!({}),
+            json!({ "left-pad": "1.3.0" }),
+            json!({ "left-pad": "^1.3.0" }),
+            json!({ "left-pad": "latest" }),
+            json!({ "left-pad": "npm:left-pad@1.3.0" }),
+            json!({ "left-pad": "$reg-pad" }),
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "" }),
+            json!({ "left-pad": { "nested": REGISTRY_TGZ } }),
+            // Rules that don't apply to the edge.
+            json!({ "right-pad": REGISTRY_TGZ }),
+            json!({ "other": { "left-pad": REGISTRY_TGZ } }),
+            json!({ "foo@2.0.0": { "left-pad": REGISTRY_TGZ } }),
+            // A closer no-op shadows a farther URL rule, as in npm.
+            json!({ "left-pad": REGISTRY_TGZ, "foo": { "left-pad": "*" } }),
+            json!({ "left-pad": REGISTRY_TGZ, "foo": { "left-pad": "1.3.0" } }),
+            // A selector for a different spec, with only registry values
+            // anywhere for the package.
+            json!({ "left-pad@1.2.0": "1.3.0" }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+            // The `file:` dependent itself always counts.
+            assert!(found.contains_key("node_modules/foo"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn issue_1965_an_unclear_override_that_may_swap_in_a_url_keeps_the_edge() {
+        // npm's choice isn't modelled exactly here, and one candidate is a
+        // URL, so the copy is left unpatched and reported, never attested.
+        let lock = overridden_range_lock(REGISTRY_TGZ);
+        for overrides in [
+            // A target selector other than the edge's own spec.
+            json!({ "left-pad@^1": REGISTRY_TGZ }),
+            json!({ "left-pad@>=1.0.0": "github:someone/left-pad" }),
+            // A range selector on the dependent around a URL rule.
+            json!({ "foo@^1": { "left-pad": REGISTRY_TGZ } }),
+            // Two equally close rules that disagree.
+            json!({
+                "foo": { "left-pad": "1.3.0" },
+                "foo@1.0.0": { "left-pad": REGISTRY_TGZ }
+            }),
+            // An unresolvable `$` reference beside a URL rule.
+            json!({ "left-pad": "$missing", "left-pad@^1": REGISTRY_TGZ }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_url_override_of_a_nested_registry_edge_names_its_copy() {
+        // The overridden copy is nested under its dependent; only that copy
+        // is marked, not a hoisted registry copy of the same package.
+        let lock = lock(json!({
+            "": { "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": REGISTRY_TGZ,
+                "dependencies": { "left-pad": "^1.0.0" }
+            },
+            "node_modules/a/node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REGISTRY_TGZ
+            },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": REGISTRY_TGZ }
+        }));
+        let found = npm_non_registry_entries(
+            &lock,
+            &NpmOverrides::from_manifest(&json!({
+                "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" },
+                "overrides": { "a": { "left-pad": REGISTRY_TGZ } }
+            })),
+        );
+        assert!(
+            found.contains_key("node_modules/a/node_modules/left-pad"),
+            "{found:?}"
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+    }
 }
