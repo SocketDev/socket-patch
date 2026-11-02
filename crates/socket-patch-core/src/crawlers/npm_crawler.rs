@@ -8,7 +8,6 @@ use serde::Deserialize;
 use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
-use crate::formats::text::strip_bom;
 use crate::formats::yarn::classic_rc;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
