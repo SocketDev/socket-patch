@@ -7,25 +7,25 @@ _Last updated 2026-11-02T01:20Z · main @ cbbbdb9_
 | #1842 | sweep | `cli/src/args.rs` (+ the Deno guard moved into `lib.rs`) | ready |
 | #1855 | sweep | `cli/src/commands/{bun_preflight,composer_hints,context,fetch_stage}.rs` | ready; Bugbot clean; CI lost Depot runners twice (0 steps), needs a fresh run |
 | #1849 | structural | A01 #1832: `utils/cargo_build_cache.rs` | ready; CI and Bugbot green |
-| #1864 | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI (82 checks) and Bugbot green |
-| #1870 | structural | A27 #1869: `api/client.rs`, one serve GET and one vendor retry loop | ready; CI (82 checks) and Bugbot green |
-| #1875 | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI (82 checks) and Bugbot green |
-| #1884 | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 #1859; tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI (82 checks) and Bugbot green |
-| #1892 | sweep | `cli/src/commands/scan/gc.rs` | ready; CI (82 checks) and Bugbot green |
+| #1864 | sweep | `cli/src/commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ dead branch in `rollback.rs`) | ready; CI and Bugbot green |
+| #1870 | structural | A27 #1869: `api/client.rs`, one serve GET and one vendor retry loop | ready; CI and Bugbot green |
+| #1875 | sweep | `cli/src/commands/{remove,repair}.rs` | ready; CI and Bugbot green |
+| #1884 | sweep | `cli/src/commands/scan/discovery.rs` (+ T18 #1859; tests moved to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; CI and Bugbot green |
+| #1892 | sweep | `cli/src/commands/scan/gc.rs` | ready; CI and Bugbot green |
 | #1897 | sweep | `cli/src/commands/scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; 13 guidance tests moved to core `hosted/guidance.rs`, 2 to `formats/pnpm/mod.rs`) | ready; CI and Bugbot green |
-| #1903 | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI (82 checks) and Bugbot green |
-| #1907 | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI (82 checks) and Bugbot green |
-| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI (82 checks) and Bugbot green |
-| #1920 | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; CI (82 checks) and Bugbot green |
-| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI (82 checks) and Bugbot green |
-| #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI (82 checks) and Bugbot green |
-| #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI (82 checks) and Bugbot green |
-| #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI (82 checks) and Bugbot green |
+| #1903 | sweep | `cli/src/commands/scan/hosted/{nuget,takeover}.rs` | ready; CI and Bugbot green |
+| #1907 | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; CI and Bugbot green |
+| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; CI and Bugbot green |
+| #1920 | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; CI and Bugbot green |
+| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; CI and Bugbot green |
+| #1929 | sweep | `cli/src/commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; CI and Bugbot green |
+| #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; CI and Bugbot green |
+| #1939 | sweep | `cli/src/commands/vendored_backend/{mod,repair}.rs` | ready; CI and Bugbot green |
 | #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; Bugbot clean, 80/82 green; `hosted-e2e` red on a live patch.socket.dev 403 (minimist tgz), not this diff; re-run once |
-| #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; CI (82 checks) and Bugbot green |
+| #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; CI and Bugbot green |
 | #1948 | sweep | `cli/src/commands/{vex_consumed,vex_sources}.rs` (+ 2 tests moved to `ecosystem_dispatch.rs`) | ready; CI (ci-ok) and Bugbot green |
-| #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; CI (82 checks) and Bugbot green |
-| #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; CI (82 checks) and Bugbot green |
+| #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; CI and Bugbot green |
+| #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; CI and Bugbot green |
 
 #### Merged
 _None._
