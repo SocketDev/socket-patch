@@ -224,7 +224,9 @@ mod tests {
         let s = scope(&["packages/*"]);
         // `packages/*` matches the ancestor `packages/foo`, scoping its tree…
         assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
-        // …but `src/*.js` must not match `deep/file.js` across a `/`.
+        // A bare `*` matches the first component, so it scopes everything.
+        assert!(scope(&["*"]).matches(&cwd(), Path::new("/proj/anything")));
+        // `src/*.js` must not match `deep/file.js` across a `/`.
         let s3 = scope(&["src/*.js"]);
         assert!(!s3.matches(&cwd(), Path::new("/proj/src/deep/file.js")));
     }
