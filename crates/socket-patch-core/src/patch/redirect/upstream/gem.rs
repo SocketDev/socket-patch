@@ -47,7 +47,8 @@
 //!   rewriter could not have written in place (a blank line before it —
 //!   the in-place match swallows every blank line before the declaration,
 //!   and the append always writes one; it goes with the block) that
-//!   another locked spec depends on. Otherwise the gem is kept as a
+//!   another locked spec depends on (a spec sub-line, or a Bundler 4.1
+//!   `OVERRIDES` `with:` target, #1989). Otherwise the gem is kept as a
 //!   direct pin: a stray exact pin installs the same bytes, while dropping
 //!   a real declaration would stop `Bundler.require` loading the gem.
 //! * a `CHECKSUMS` entry the rewriter ADDED is only recognizable next to
@@ -190,7 +191,11 @@ fn override_targets<'l>(lines: &'l [&'l str]) -> impl Iterator<Item = &'l str> +
     let range = named_section(lines, "OVERRIDES").unwrap_or((0, 0));
     lines[range.0..range.1].iter().filter_map(|l| {
         let entry = indented(l, 2)?.trim_end();
-        // Gem names hold no `"` or `,`, so each `, ` starts a new argument.
+        // Bundler writes `"<target>", with: "<gem>", in: "<parent>"`
+        // (`Override#to_lock`: `inspect`ed values joined by `, `). A
+        // `version:` value may itself hold `, `, so splitting on it can
+        // break that value apart, but never the `with:` one: a gem name
+        // holds no `"`, `,` or space.
         entry.split(", ").find_map(|arg| {
             arg.strip_prefix("with: \"")?
                 .strip_suffix('"')
