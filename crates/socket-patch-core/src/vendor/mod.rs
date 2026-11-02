@@ -926,8 +926,9 @@ pub async fn service_preflight(
 
 /// The lock-text refusals among `candidates` (purls with the uuid of the
 /// patch to vendor): each purl its backend refuses on the project's lock
-/// and manifest text alone, with the backend's `(code, detail)` — the pnpm,
-/// yarn classic and yarn berry gates ([`npm_flavor::lock_text_refusals`])
+/// and manifest text alone, with the backend's `(code, detail)` — the npm
+/// package-lock, pnpm, yarn classic and yarn berry gates
+/// ([`npm_flavor::lock_text_refusals`])
 /// and cargo's locked-version gate ([`cargo::lock_text_refusal`]). None of
 /// them reads the patch, so the answer needs no view: a vendored run asks
 /// before it fetches views and pristine sources, and a package that will

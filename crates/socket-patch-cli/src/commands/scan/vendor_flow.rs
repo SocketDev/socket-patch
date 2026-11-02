@@ -201,22 +201,27 @@ impl VendorPreview {
 /// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
 /// before any download, or whose hosted pnpm pin the takeover would fail
 /// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
-/// refusal, #853), and would-refuse for PyPI purls the PyPI backend's
-/// wiring guards refuse ([`pypi_refusals`], #891), plus the gem
-/// hosted→vendored takeover refusals
+/// refusal, #853), or whose lock entry the backend refuses on the lock
+/// text alone ([`lock_text_refusals`]: a package-lock entry installed from
+/// a URL or git spec, a workspace member, #1976), and would-refuse for
+/// PyPI purls the PyPI backend's wiring guards refuse ([`pypi_refusals`],
+/// #891), plus the gem hosted→vendored takeover refusals
 /// ([`crate::commands::vendor::gem_takeover_preview_refusals`]). The preview stays a ledger
 /// classification otherwise (engine refusals outside the preflights are
 /// not predicted), and a would-refuse never flips the run's status or exit
 /// code. The preflights (the only disk access besides the ledger; the PyPI
 /// one may also probe `pipenv --version` and list Hatch environments, as
-/// the wet run's guards do) run only when the selection holds an npm or
-/// PyPI purl.
+/// the wet run's guards do; the lock-text gates read the lock, the
+/// manifest and, for a refused package the lock does not resolve to a
+/// registry source, the installed tree) run only when the selection holds
+/// an npm, PyPI or cargo purl.
 ///
 /// The one answer to "which selected patches would the wet run refuse?":
 /// the dry-run rows and the rollout planning pass
 /// ([`VendorPreview::refused_purls`]) both read it, so a patch the dry run
-/// shows as would-refuse never takes a `--max-new-patches` slot (#1908). Resolves the run's `--patch-server-url` origins and the
-/// gem takeover refusals itself.
+/// shows as would-refuse never takes a `--max-new-patches` slot (#1908,
+/// #1976). Resolves the run's `--patch-server-url` origins and the gem
+/// takeover refusals itself.
 pub(crate) async fn preview_vendor(
     common: &GlobalArgs,
     selected: &[PatchSearchResult],
@@ -250,6 +255,8 @@ async fn preview_vendor_with(
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
+    let lock_text_refusals =
+        lock_text_refusals(cwd, selected, origins, &state, npm_lock_refusal.is_some()).await;
     let pypi_refusals = pypi_refusals(cwd, selected, origins, takeover_refusals).await;
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
@@ -275,6 +282,10 @@ async fn preview_vendor_with(
                 }
                 _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
                     let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
+                    refuse(code, detail)
+                }
+                _ if lock_text_refusals.contains_key(&p.purl) => {
+                    let (code, detail) = &lock_text_refusals[&p.purl];
                     refuse(code, detail)
                 }
                 _ if takeover_refusals.contains_key(&p.purl) => {
@@ -396,6 +407,48 @@ async fn npm_lock_refusal(
         return None;
     }
     socket_patch_core::vendor::npm_lock_vendor_preflight(cwd).await
+}
+
+/// The purls of `selected` the vendor backend refuses on the project's
+/// lock and manifest text alone, with the backend's `(code, detail)`: the
+/// npm package-lock, pnpm, yarn classic and yarn berry per-entry gates and
+/// cargo's locked-version gate. These are the refusals the wet run's
+/// download phase raises before it fetches a view, read through the same
+/// [`crate::commands::agent_download::unclaimed_lock_text_refusals`] (same
+/// hosted-pin, ledger and reaches-the-backend scope), so the preview and
+/// the rollout plan name them too (#1976): an npm package installed from a
+/// URL or git spec, or a workspace member, otherwise previews as vendorable
+/// and takes a `--max-new-patches` slot on every run. npm purls are not
+/// asked when `npm_lock_refused` (the project-level package-lock refusal
+/// already refuses every one of them).
+async fn lock_text_refusals(
+    cwd: &Path,
+    selected: &[PatchSearchResult],
+    origins: &[String],
+    state: &VendorState,
+    npm_lock_refused: bool,
+) -> HashMap<String, (&'static str, String)> {
+    let gated: Vec<&PatchSearchResult> = selected
+        .iter()
+        .filter(|p| {
+            (p.purl.starts_with("pkg:npm/") && !npm_lock_refused)
+                || p.purl.starts_with("pkg:cargo/")
+        })
+        .collect();
+    if gated.is_empty() {
+        return HashMap::new();
+    }
+    let claimed =
+        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
+    let options = socket_patch_core::crawlers::CrawlerOptions {
+        cwd: cwd.to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    crate::commands::agent_download::unclaimed_lock_text_refusals(
+        cwd, &gated, &claimed, state, options, None,
+    )
+    .await
 }
 
 /// The lock-text refusals a hosted → vendored takeover of `selected` meets
@@ -2126,5 +2179,202 @@ mod merge_tests {
         merge_vendor_envelope(&mut env, venv);
         assert_eq!(env.status, Status::PartialFailure);
         assert!(env.error.is_none());
+    }
+}
+
+/// #1976: the npm package-lock backend's per-entry refusals reach the
+/// dry-run preview and the rollout planning pass.
+#[cfg(test)]
+mod npm_lock_entry_refusal_tests {
+    use super::*;
+    use std::path::Path;
+
+    const UUID: &str = "22222222-2222-4222-8222-222222222222";
+    const LEFT_PAD: &str = "pkg:npm/left-pad@1.3.0";
+    const IS_NUMBER: &str = "pkg:npm/is-number@7.0.0";
+    const URL: &str = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+
+    fn sel(purl: &str) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: UUID.into(),
+            purl: purl.into(),
+            published_at: "2024-01-01T00:00:00Z".into(),
+            description: String::new(),
+            license: "MIT".into(),
+            tier: "free".into(),
+            vulnerabilities: HashMap::new(),
+        }
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn installed(root: &Path, dir: &str, name: &str, version: &str) {
+        write(
+            &root.join(dir).join("package.json"),
+            &serde_json::json!({ "name": name, "version": version }).to_string(),
+        );
+    }
+
+    /// The issue's three shapes: left-pad installed from a URL spec, from
+    /// a git spec, or as a workspace member, beside a registry is-number.
+    /// Returns the code the wet run refuses left-pad with.
+    fn project(root: &Path, shape: &str) -> &'static str {
+        let is_number = serde_json::json!({
+            "version": "7.0.0",
+            "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+            "integrity": "sha512-AAAA=="
+        });
+        let (spec, extra, workspaces, code) = match shape {
+            "url" => (
+                URL,
+                serde_json::json!({ "node_modules/left-pad": {
+                    "version": "1.3.0", "resolved": URL, "integrity": "sha512-orig==" } }),
+                None,
+                "vendor_lock_entry_not_rewritable",
+            ),
+            "git" => (
+                "github:stevemao/left-pad#v1.3.0",
+                serde_json::json!({ "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba" } }),
+                None,
+                "vendor_lock_entry_not_rewritable",
+            ),
+            "workspace" => (
+                "1.3.0",
+                serde_json::json!({
+                    "packages/left-pad": { "name": "left-pad", "version": "1.3.0" },
+                    "node_modules/left-pad": { "resolved": "packages/left-pad", "link": true },
+                }),
+                Some(serde_json::json!(["packages/*"])),
+                "vendor_workspace_member",
+            ),
+            other => panic!("unknown shape {other}"),
+        };
+        let mut root_entry = serde_json::json!({
+            "name": "app", "version": "1.0.0",
+            "dependencies": { "is-number": "7.0.0" },
+        });
+        if workspaces.is_none() {
+            root_entry["dependencies"]["left-pad"] = spec.into();
+        }
+        let mut manifest = root_entry.clone();
+        if let Some(ws) = &workspaces {
+            root_entry["workspaces"] = ws.clone();
+            manifest["workspaces"] = ws.clone();
+        }
+        let mut packages =
+            serde_json::json!({ "": root_entry, "node_modules/is-number": is_number });
+        for (k, v) in extra.as_object().unwrap() {
+            packages[k] = v.clone();
+        }
+        let lock = serde_json::json!({
+            "name": "app", "version": "1.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": packages,
+        });
+        write(&root.join("package.json"), &manifest.to_string());
+        write(&root.join("package-lock.json"), &lock.to_string());
+        installed(root, "node_modules/is-number", "is-number", "7.0.0");
+        if workspaces.is_some() {
+            installed(root, "packages/left-pad", "left-pad", "1.3.0");
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("../packages/left-pad", root.join("node_modules/left-pad"))
+                .unwrap();
+            #[cfg(not(unix))]
+            installed(root, "node_modules/left-pad", "left-pad", "1.3.0");
+        } else {
+            installed(root, "node_modules/left-pad", "left-pad", "1.3.0");
+        }
+        code
+    }
+
+    /// The dry-run preview names left-pad `would_refuse` with the wet
+    /// run's code, and keeps the registry is-number `would_vendor`.
+    #[tokio::test]
+    async fn preview_refuses_a_package_lock_entry_the_backend_refuses() {
+        for shape in ["url", "git", "workspace"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            let code = project(root, shape);
+            let preview =
+                preview_vendor_with(root, &[sel(LEFT_PAD), sel(IS_NUMBER)], &[], &HashMap::new())
+                    .await;
+            let verdict = |purl: &str| {
+                &preview
+                    .rows
+                    .iter()
+                    .find(|r| r.purl == purl)
+                    .unwrap_or_else(|| panic!("{shape}: no row for {purl}"))
+                    .verdict
+            };
+            match verdict(LEFT_PAD) {
+                PreviewVerdict::WouldRefuse { code: got, detail } => {
+                    assert_eq!(got, code, "{shape}: {detail}");
+                }
+                other => panic!("{shape}: left-pad must preview would_refuse, got {other:?}"),
+            }
+            assert!(
+                matches!(verdict(IS_NUMBER), PreviewVerdict::WouldVendor),
+                "{shape}: is-number stays vendorable"
+            );
+            assert_eq!(preview.refused_count(), 1, "{shape}");
+        }
+    }
+
+    /// The ledger's scope is the download phase's: only a detached entry
+    /// carrying its record settles a purl, so a same-uuid entry `vendor`
+    /// wrote (not detached) is still asked, and the preview agrees with the
+    /// wet run's refusal instead of saying `already_vendored`.
+    #[tokio::test]
+    async fn preview_asks_a_same_uuid_entry_the_wet_run_still_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let code = project(root, "url");
+        write(
+            &root.join(".socket/vendor/state.json"),
+            &serde_json::json!({
+                "version": 1,
+                "entries": { LEFT_PAD: {
+                    "ecosystem": "npm", "basePurl": LEFT_PAD, "uuid": UUID,
+                    "artifact": { "path": format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz") },
+                    "wiring": [],
+                }}
+            })
+            .to_string(),
+        );
+        let state = load_state(root).await.expect("the seeded ledger parses");
+        let entry = lookup_entry(&state.entries, LEFT_PAD).expect("seeded entry");
+        assert!(entry.uuid == UUID && !entry.detached);
+        let preview = preview_vendor_with(root, &[sel(LEFT_PAD)], &[], &HashMap::new()).await;
+        match &preview.rows[0].verdict {
+            PreviewVerdict::WouldRefuse { code: got, .. } => assert_eq!(got, code),
+            other => panic!("left-pad must preview would_refuse, got {other:?}"),
+        }
+    }
+
+    /// The rollout planning pass: the refused left-pad holds no
+    /// `--max-new-patches` slot, so the vendorable is-number gets it.
+    #[tokio::test]
+    async fn planning_drops_a_package_lock_entry_the_backend_refuses() {
+        for shape in ["url", "git", "workspace"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            project(root, shape);
+            let common = GlobalArgs {
+                cwd: root.to_path_buf(),
+                ..GlobalArgs::default()
+            };
+            let refused = preview_vendor(&common, &[sel(LEFT_PAD), sel(IS_NUMBER)])
+                .await
+                .refused_purls();
+            assert_eq!(
+                refused,
+                HashSet::from([LEFT_PAD.to_string()]),
+                "{shape}: only left-pad is refused"
+            );
+        }
     }
 }
