@@ -58,15 +58,20 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
 
 /// The value of the last top-level `key` in a YAML settings file
 /// (pnpm-workspace.yaml, .yarnrc.yml, a YAML `.modules.yaml`), decoded by
-/// [`yaml_scalar`]. An empty or block value is `Some("")`; callers that
-/// read empty as unset use [`yaml_top_level_value`]. [`top_level_key`]
+/// [`yaml_scalar`]. An empty value or a nested block is `Some("")`
+/// (callers that read empty as unset use [`yaml_top_level_value`]); a
+/// block scalar (`key: |`) is `None`, unread. [`top_level_key`]
 /// skips the first line's BOM. Every pnpm settings reader goes through
 /// this one function so a quoted value reads the same everywhere (#1918).
 pub(crate) fn top_level_scalar(text: &str, key: &str) -> Option<String> {
     text.lines()
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
-        .map(|(_, value)| yaml_scalar(value))
+        .and_then(|(_, value)| {
+            // A block scalar (`|`, `>-`) continues on the next lines; its
+            // value is not on this one, so it is not read here.
+            (!value.starts_with(['|', '>'])).then(|| yaml_scalar(value))
+        })
 }
 
 /// [`top_level_scalar`], with an empty value read as unset.
@@ -332,8 +337,13 @@ fn is_marker(line: &str, marker: &str) -> bool {
 pub(crate) fn strip_comment(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut quote = None;
+    let mut escaped = false;
     for (i, &b) in bytes.iter().enumerate() {
         match quote {
+            // Inside double quotes a backslash escapes the next byte, so
+            // `\"` does not close the scalar (#1918).
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if b == b'\\' => escaped = true,
             Some(q) if b == q => quote = None,
             Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
@@ -347,7 +357,17 @@ pub(crate) fn strip_comment(text: &str) -> &str {
 }
 
 /// A double-quoted scalar at the start of `s`: its value and byte length.
+/// Escapes decode as YAML 1.2 (and js-yaml) does, `\uD83D\uDE00`
+/// surrogate pairs included; a malformed escape is `None`, as the file
+/// does not parse.
 fn double_quoted(s: &str) -> Option<(String, usize)> {
+    /// `n` hex digits as a code point (`None` when short or not hex).
+    fn hex(chars: &mut impl Iterator<Item = (usize, char)>, n: usize) -> Option<u32> {
+        let digits: String = (0..n).map_while(|_| chars.next().map(|(_, h)| h)).collect();
+        (digits.len() == n && digits.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(&digits, 16).ok())
+            .flatten()
+    }
     let mut out = String::new();
     let mut chars = s.char_indices().skip(1);
     while let Some((i, c)) = chars.next() {
@@ -355,27 +375,42 @@ fn double_quoted(s: &str) -> Option<(String, usize)> {
             '"' => return Some((out, i + 1)),
             '\\' => {
                 let (_, esc) = chars.next()?;
-                match esc {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    'r' => out.push('\r'),
+                let decoded = match esc {
+                    '0' => '\0',
+                    'a' => '\u{7}',
+                    'b' => '\u{8}',
+                    't' | '\t' => '\t',
+                    'n' => '\n',
+                    'v' => '\u{b}',
+                    'f' => '\u{c}',
+                    'r' => '\r',
+                    'e' => '\u{1b}',
+                    'N' => '\u{85}',
+                    '_' => '\u{a0}',
+                    'L' => '\u{2028}',
+                    'P' => '\u{2029}',
+                    '"' | '\\' | '/' | ' ' => esc,
+                    'x' => char::from_u32(hex(&mut chars, 2)?)?,
+                    'U' => char::from_u32(hex(&mut chars, 8)?)?,
                     'u' => {
-                        let hex: String = (0..4)
-                            .filter_map(|_| chars.next().map(|(_, h)| h))
-                            .collect();
-                        let code = u32::from_str_radix(&hex, 16)
-                            .ok()
-                            .filter(|_| hex.len() == 4);
-                        out.push(code.and_then(char::from_u32)?);
+                        let unit = hex(&mut chars, 4)?;
+                        if (0xD800..0xDC00).contains(&unit) {
+                            // A high surrogate pairs with a following `\uDCxx`.
+                            if chars.next()?.1 != '\\' || chars.next()?.1 != 'u' {
+                                return None;
+                            }
+                            let low = hex(&mut chars, 4)?;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return None;
+                            }
+                            char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))?
+                        } else {
+                            char::from_u32(unit)?
+                        }
                     }
-                    '"' | '\\' | '/' | ' ' => out.push(esc),
-                    // Any other escape decodes to text no pnpm key uses;
-                    // keep it visibly distinct rather than guessing.
-                    other => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                }
+                    _ => return None,
+                };
+                out.push(decoded);
             }
             c => out.push(c),
         }
@@ -424,6 +459,15 @@ mod tests {
             ("k: 'a' b\n", Some("'a' b")),
             ("\u{feff}k: x\n", Some("x")),
             ("k: a\r\nk: 'b'\r\n", Some("b")),
+            // Review on #1973: escapes the old JSON decoder read, an escaped
+            // quote before ` #`, a malformed escape, and a block scalar.
+            ("k: \"/p/a\\\" #b/.pnpm\"\n", Some("/p/a\" #b/.pnpm")),
+            ("k: \"nm-\\ud83d\\ude00\"\n", Some("nm-\u{1f600}")),
+            ("k: \"a\\bb\\x41\\U0001F600\"\n", Some("a\u{8}bA\u{1f600}")),
+            ("k: \"\\u+041\"\n", Some("\"\\u+041\"")),
+            ("k: \"\\ud83d\"\n", Some("\"\\ud83d\"")),
+            ("k: >-\n  long value\n", None),
+            ("k: |\n  text\n", None),
             ("  k: nested\n", None),
             ("other: x\n", None),
         ] {

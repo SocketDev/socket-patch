@@ -98,18 +98,15 @@ fn version_bounds(spec: &str) -> Option<(Release, Release)> {
     })
 }
 
-/// The `packageManager` value of a `.modules.yaml`.
-fn modules_yaml_package_manager(text: &str) -> Option<String> {
-    super::modules_yaml::field(text, "packageManager")
-}
-
 /// Every pnpm version pin the project's files carry, as `(where, spec)`.
 fn pnpm_pins(
     package_json: Option<&str>,
     modules_yaml: Option<&str>,
 ) -> Vec<(&'static str, String)> {
     let mut pins = Vec::new();
-    if let Some(spec) = modules_yaml.and_then(modules_yaml_package_manager) {
+    if let Some(spec) =
+        modules_yaml.and_then(|text| super::modules_yaml::field(text, "packageManager"))
+    {
         if let Some(version) = pinned_version(&spec, "pnpm") {
             pins.push(("node_modules/.modules.yaml", version.to_string()));
         }
@@ -201,20 +198,13 @@ mod tests {
     /// #1918: a YAML `.modules.yaml` is read like every other pnpm settings
     /// file: the last top-level key wins, comments are not part of the value.
     #[test]
-    fn modules_yaml_package_manager_reads_the_last_key() {
+    fn modules_yaml_pin_reads_the_last_key() {
+        let pins = |text: &str| pnpm_pins(None, Some(text));
         let text = "packageManager: pnpm@9.0.0\npackageManager: pnpm@11.0.0 # newer\n";
-        assert_eq!(
-            modules_yaml_package_manager(text).as_deref(),
-            Some("pnpm@11.0.0")
-        );
-        assert_eq!(
-            modules_yaml_package_manager("packageManager: 'pnpm@8.6.0'\n").as_deref(),
-            Some("pnpm@8.6.0")
-        );
-        assert_eq!(
-            modules_yaml_package_manager("{\"packageManager\":\"pnpm@10.1.0\"}").as_deref(),
-            Some("pnpm@10.1.0")
-        );
+        let want = vec![("node_modules/.modules.yaml", "11.0.0".to_string())];
+        assert_eq!(pins(text), want);
+        assert_eq!(pins("packageManager: 'pnpm@11.0.0'\n"), want);
+        assert_eq!(pins("{\"packageManager\":\"pnpm@11.0.0\"}"), want);
     }
 
     #[test]

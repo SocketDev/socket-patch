@@ -559,7 +559,7 @@ fn yaml_path_in(lines: &[String], path: &[&str]) -> Result<Option<String>, Strin
         return Ok(None);
     }
     if rest.is_empty() {
-        let value = value.trim_matches(['"', '\'']).to_string();
+        let value = crate::formats::pnpm::workspace::yaml_scalar(&value);
         return Ok((!value.is_empty()).then_some(value));
     }
     if !value.is_empty() {
@@ -1314,7 +1314,7 @@ fn yaml_block_value(text: &str, section: &str, key: &str) -> Option<String> {
         })
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
-        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
+        .map(|(_, value)| crate::formats::pnpm::workspace::yaml_scalar(value))
         .filter(|value| !value.is_empty())
 }
 
@@ -1549,10 +1549,7 @@ fn pnpm_lock_tarball_evidence(
 /// (`.modules.yaml`'s `packageManager`, package.json's corepack pin,
 /// `+sha…` suffix allowed).
 fn pnpm_spec_version(spec: &str) -> Option<PnpmVersion> {
-    let version = spec
-        .trim()
-        .trim_matches(['"', '\''])
-        .strip_prefix("pnpm@")?;
+    let version = spec.trim().strip_prefix("pnpm@")?;
     pnpm_version(version)
 }
 
@@ -4457,6 +4454,30 @@ mod tests {
         assert_eq!(
             pnpm_settings_prefix(&mut view, sub).await,
             "common/config/subspaces/x/"
+        );
+    }
+
+    /// #1918: nested pnpm/yarn settings values decode YAML quoting through
+    /// the same decoder as the top-level reader.
+    #[test]
+    fn nested_settings_values_decode_yaml_quoting() {
+        assert_eq!(
+            super::yaml_block_value(
+                "registries:\n  default: 'https://r/it''s/'\n",
+                "registries",
+                "default"
+            )
+            .as_deref(),
+            Some("https://r/it's/")
+        );
+        assert_eq!(
+            super::yaml_path_value(
+                "npmScopes:\n  s:\n    npmRegistryServer: \"https://r/\\u0041\"\n",
+                &["npmScopes", "s", "npmRegistryServer"]
+            )
+            .unwrap()
+            .as_deref(),
+            Some("https://r/A")
         );
     }
 }
