@@ -1,12 +1,14 @@
 //! Environment-variable readers shared by the CLI and core, plus the
 //! accepted `SOCKET_CLI_*` peer aliases.
 
-/// Check if debug mode is enabled via `SOCKET_DEBUG`.
+/// Whether `name` is exactly `1` or `true`.
+fn env_flag(name: &str) -> bool {
+    matches!(std::env::var(name).as_deref(), Ok("1" | "true"))
+}
+
+/// Whether `SOCKET_DEBUG` turns debug output on.
 pub fn is_debug_enabled() -> bool {
-    matches!(
-        std::env::var("SOCKET_DEBUG").unwrap_or_default().as_str(),
-        "1" | "true"
-    )
+    env_flag("SOCKET_DEBUG")
 }
 
 /// `message` made safe for a `SOCKET_DEBUG` line (every URL in it through
@@ -26,17 +28,13 @@ pub fn debug_log(channel: &str, message: &str) {
     }
 }
 
-/// Strict-airgap gate: `SOCKET_OFFLINE` is `"1"` or `"true"`. It lives
-/// here as the single definition of the vocabulary shared by every offline
-/// gate (telemetry kill-switch, API-client advisory and org-slug
-/// auto-resolution). The CLI mirrors `--offline` (whose clap-side
-/// bool parse accepts a wider vocabulary) into `SOCKET_OFFLINE=1` before
-/// any of those gates run, so the env read alone is authoritative.
+/// Strict-airgap gate shared by every offline check (telemetry kill-switch,
+/// API-client advisory, org-slug auto-resolution). The CLI mirrors
+/// `--offline` (whose clap parse accepts a wider vocabulary) into
+/// `SOCKET_OFFLINE=1` before any of them run, so the env read alone is
+/// authoritative.
 pub(crate) fn is_offline_env() -> bool {
-    matches!(
-        std::env::var("SOCKET_OFFLINE").unwrap_or_default().as_str(),
-        "1" | "true"
-    )
+    env_flag("SOCKET_OFFLINE")
 }
 
 /// The public patch-API proxy base URL: `SOCKET_PROXY_URL`, defaulting to
@@ -55,8 +53,8 @@ pub(crate) fn proxy_url_from_env() -> String {
 /// First entry is the canonical `SOCKET_*` name (what clap and core read);
 /// second is the accepted `SOCKET_CLI_*` peer name. These are **not**
 /// deprecated — promotion is silent and the canonical name simply wins
-/// when both are set. The list is deliberately tight: `SOCKET_CLI_CONFIG` (ephemeral JSON override),
-/// `SOCKET_CLI_API_PROXY` (an HTTP forward proxy — reqwest already honors
+/// when both are set. The list is deliberately tight: `SOCKET_CLI_CONFIG`
+/// (ephemeral JSON override), `SOCKET_CLI_API_PROXY` (an HTTP forward proxy — reqwest already honors
 /// `HTTP_PROXY`/`HTTPS_PROXY`), and `SOCKET_CLI_DEBUG` are intentionally
 /// not mirrored.
 pub const PEER_ENV_ALIASES: &[(&str, &str)] = &[
