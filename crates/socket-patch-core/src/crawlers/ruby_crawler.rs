@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
-use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::process::{env_key, CommandRunner, EnvKey, SystemCommandRunner};
 use crate::utils::relpath::normalize_lexically;
 use crate::vendor::lock_inventory::ProjectView;
 
@@ -1013,11 +1013,11 @@ impl RubyCrawler {
     async fn gem_env_homes() -> GemEnvHomes {
         static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
             once_cell::sync::Lazy::new(Default::default);
-        let key = gem_env_key();
+        let key = env_key();
         let cell = gem_env_cell(&MEMO, key.clone());
         memoize_gem_env_homes(&cell, || async move {
             let homes = tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
-            let env_unchanged = gem_env_key() == key;
+            let env_unchanged = env_key() == key;
             (homes, env_unchanged)
         })
         .await
@@ -1625,26 +1625,14 @@ pub fn parse_gem_env_output(stdout: &str) -> Option<String> {
 /// `(gemdir, gempath)` as [`parse_gem_env_output`] reads each `gem env` answer.
 type GemEnvHomes = (Option<String>, Option<String>);
 
-/// What a `gem env` subprocess inherits: the (sorted) environment and the
-/// working directory.
-type GemEnvKey = (
-    Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    Option<PathBuf>,
-);
-
+/// One single-flight cell per inherited environment ([`EnvKey`]).
 type GemEnvMemo =
-    std::sync::Mutex<HashMap<GemEnvKey, std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>>>>;
-
-fn gem_env_key() -> GemEnvKey {
-    let mut vars: Vec<_> = std::env::vars_os().collect();
-    vars.sort();
-    (vars, std::env::current_dir().ok())
-}
+    std::sync::Mutex<HashMap<EnvKey, std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>>>>;
 
 /// The memo cell for `key`, created empty on first sight.
 fn gem_env_cell(
     memo: &GemEnvMemo,
-    key: GemEnvKey,
+    key: EnvKey,
 ) -> std::sync::Arc<tokio::sync::OnceCell<GemEnvHomes>> {
     let mut memo = memo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     std::sync::Arc::clone(memo.entry(key).or_default())
@@ -5755,7 +5743,7 @@ mod tests {
     #[test]
     fn gem_env_cells_are_keyed_on_the_inherited_environment() {
         let memo = GemEnvMemo::default();
-        let key = |path: &str| -> GemEnvKey {
+        let key = |path: &str| -> EnvKey {
             (
                 vec![("PATH".into(), path.into())],
                 Some(PathBuf::from("/work")),
@@ -5766,9 +5754,6 @@ mod tests {
         let swapped = gem_env_cell(&memo, key("/tmp/fake-bin"));
         assert!(std::sync::Arc::ptr_eq(&a, &again));
         assert!(!std::sync::Arc::ptr_eq(&a, &swapped));
-        let (vars, cwd) = gem_env_key();
-        assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
-        assert_eq!(cwd, std::env::current_dir().ok());
     }
 
     // ── gem env gempath splitting (OS path separator) ─────────────
