@@ -130,8 +130,9 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     };
     // `.mvn/maven.config`'s `-D` user properties win over the pom's own
     // when Maven interpolates a coordinate.
-    let user_properties = match ctx.read_text(MVN_CONFIG, out).await {
-        Some(config) => maven_config_properties(&config),
+    let config = ctx.read_text(MVN_CONFIG, out).await;
+    let user_properties = match &config {
+        Some(config) => maven_config_properties(config),
         None => BTreeMap::new(),
     };
     let pom = match parse_pom_with(&raw, &user_properties) {
@@ -161,7 +162,11 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
 
     let gas = group_by_ga(&pom.deps);
-    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw);
+    let reactor = crate::vendor::jvm::maven_reactor::declares_modules(&raw)
+        || (crate::vendor::jvm::maven_reactor::may_discover_subprojects(&raw, config.as_deref())
+            && !crate::vendor::jvm::maven_reactor::implicit_subprojects_in(&ctx.view)
+                .await
+                .is_empty());
     extract_hosted(ctx, &pom, &gas, &hosted, reactor, out).await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &pom.deps, &gas, &vendored, out).await;
@@ -288,7 +293,8 @@ async fn extract_hosted(
                         uuid,
                         POM,
                         format!(
-                            "{POM} declares <modules>/<subprojects>, and a module's own \
+                            "{POM} heads a multi-module reactor (<modules>/<subprojects>, or \
+                             Maven 4 subproject discovery), and a module's own \
                              <version> of {ga} overrides this root pin; hosted mode reads only \
                              the root pom (re-patch the reactor with `scan --mode vendored`)"
                         ),
@@ -951,6 +957,60 @@ mod tests {
         let out = run(&p).await;
         assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root listing no
+    /// subprojects builds every direct subdirectory holding a `pom.xml`,
+    /// so its hosted pin is a reactor root's: kept as a ref, never
+    /// attested. A 4.0.0 model, no such subdirectory, or discovery turned
+    /// off in `.mvn/maven.config` leaves it a single pom, attested.
+    #[tokio::test]
+    async fn hosted_pin_in_a_maven_4_implicit_reactor_root_is_not_attested() {
+        let body = format!(
+            "<packaging>pom</packaging>\n<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n<repositories>\n{}</repositories>\n",
+            dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+            hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+        );
+        let model_4_1 = pom(&body)
+            .replace("POM/4.0.0", "POM/4.1.0")
+            .replace("<modelVersion>4.0.0", "<modelVersion>4.1.0");
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n<modelVersion>4.1.0</modelVersion>\n<parent/>\n<artifactId>child</artifactId>\n</project>\n";
+        let off = "-Dmaven.project.discoverSubprojects=false\n";
+        for (case, root, files, attested) in [
+            (
+                "implicit reactor",
+                &model_4_1,
+                &[("child/pom.xml", child)][..],
+                false,
+            ),
+            ("no subproject", &model_4_1, &[][..], true),
+            (
+                "model 4.0.0",
+                &pom(&body),
+                &[("child/pom.xml", child)][..],
+                true,
+            ),
+            (
+                "discovery off",
+                &model_4_1,
+                &[("child/pom.xml", child), (".mvn/maven.config", off)][..],
+                true,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("pom.xml", root.clone());
+            for (rel, text) in files {
+                p.write(rel, text.to_string());
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            if attested {
+                assert!(out.unattested.is_empty(), "{case}: {:?}", out.unattested);
+            } else {
+                assert_eq!(out.unattested.len(), 1, "{case}: {:?}", out.unattested);
+                assert_eq!(out.unattested[0].kind, UnattestedKind::MavenReactorRoot);
+            }
+        }
     }
 
     /// A classifier copy is its own coordinate: the classifier-less pin
