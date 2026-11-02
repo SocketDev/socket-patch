@@ -1240,24 +1240,12 @@ async fn lock_elsewhere(project: &Path, base: &Path, dir: &str) -> Option<PathBu
 }
 
 /// The top-level `lockfileDir:` scalar of a `pnpm-workspace.yaml`, read
-/// through the workspace splices' own key grammar
-/// ([`top_level_key`](crate::formats::pnpm::workspace::top_level_key):
-/// every key spelling, a trailing comment, a leading UTF-8 BOM). The last
-/// assignment wins, as in the `.npmrc` reader.
+/// through the shared pnpm settings reader
+/// ([`yaml_top_level_value`](crate::formats::pnpm::workspace::yaml_top_level_value):
+/// every key spelling, a trailing comment, a leading UTF-8 BOM, YAML
+/// quoting). The last assignment wins, as in the `.npmrc` reader.
 fn workspace_lockfile_dir(yaml: &str) -> Option<String> {
-    yaml.lines()
-        .filter_map(crate::formats::pnpm::workspace::top_level_key)
-        .rfind(|(key, _)| key == "lockfileDir")
-        .map(|(_, value)| unquote_scalar(value).to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// A YAML scalar value without its surrounding quotes.
-fn unquote_scalar(value: &str) -> &str {
-    match value.as_bytes() {
-        [q @ (b'"' | b'\''), .., last] if last == q => &value[1..value.len() - 1],
-        _ => value,
-    }
+    crate::formats::pnpm::workspace::yaml_top_level_value(yaml, "lockfileDir")
 }
 
 #[cfg(test)]
@@ -3561,5 +3549,14 @@ mod tests {
         );
         assert_eq!(workspace_lockfile_dir("lockfileDir: \"\"\n"), None);
         assert_eq!(workspace_lockfile_dir("# lockfileDir: ..\n"), None);
+        // #1918: the shared YAML scalar decoder, not a one-pair strip.
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir: '../it''s'\n").as_deref(),
+            Some("../it's")
+        );
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir: \"..\\\\x\"\n").as_deref(),
+            Some("..\\x")
+        );
     }
 }

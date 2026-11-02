@@ -145,31 +145,15 @@ fn setting_from(workspace_yaml: Option<&str>, npmrc: Option<&str>) -> Option<Str
         .filter(|value| !value.is_empty())
 }
 
-/// The last top-level `modulesDir:` of a `pnpm-workspace.yaml`.
+/// The last top-level `modulesDir:` of a `pnpm-workspace.yaml`. An empty
+/// value is kept: it still beats `.npmrc`.
 fn workspace_modules_dir(yaml: &str) -> Option<String> {
-    crate::formats::text::strip_bom(yaml)
-        .lines()
-        .filter_map(crate::formats::pnpm::workspace::top_level_key)
-        .rfind(|(key, _)| key == "modulesDir")
-        .map(|(_, value)| unquote_yaml_scalar(value))
+    crate::formats::pnpm::workspace::top_level_scalar(yaml, "modulesDir")
 }
 
 /// The top-level `modules-dir` of an `.npmrc`.
 fn npmrc_modules_dir(npmrc: &str) -> Option<String> {
     crate::patch::redirect::npmrc::npmrc_top_level_value(npmrc, "modules-dir")
-}
-
-/// A YAML flow scalar's value: quotes removed (`''` is a literal quote
-/// inside single quotes), a plain scalar as is.
-fn unquote_yaml_scalar(raw: &str) -> String {
-    if raw.starts_with('"') {
-        if let Ok(value) = serde_json::from_str::<String>(raw) {
-            return value;
-        }
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        return inner.replace("''", "'");
-    }
-    raw.to_string()
 }
 
 #[cfg(test)]

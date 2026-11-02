@@ -57,14 +57,41 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
 }
 
 /// The value of the last top-level `key` in a YAML settings file
-/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed. [`top_level_key`]
-/// skips the first line's BOM.
-pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+/// (pnpm-workspace.yaml, .yarnrc.yml, a YAML `.modules.yaml`), decoded by
+/// [`yaml_scalar`]. An empty value or a nested block is `Some("")`
+/// (callers that read empty as unset use [`yaml_top_level_value`]); a
+/// block scalar (`key: |`) is `None`, unread. [`top_level_key`]
+/// skips the first line's BOM. Every pnpm settings reader goes through
+/// this one function so a quoted value reads the same everywhere (#1918).
+pub(crate) fn top_level_scalar(text: &str, key: &str) -> Option<String> {
     text.lines()
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
-        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
+        .and_then(|(_, value)| {
+            // A block scalar (`|`, `>-`) continues on the next lines; its
+            // value is not on this one, so it is not read here.
+            (!value.starts_with(['|', '>'])).then(|| yaml_scalar(value))
+        })
+}
+
+/// [`top_level_scalar`], with an empty value read as unset.
+pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    top_level_scalar(text, key).filter(|value| !value.is_empty())
+}
+
+/// A YAML flow scalar's value: a whole single-quoted (`''` is one quote)
+/// or double-quoted (escapes decoded) scalar is unquoted; anything else,
+/// an unpaired or trailing quote included, is a plain scalar kept as is.
+pub(crate) fn yaml_scalar(raw: &str) -> String {
+    let quoted = match raw.as_bytes().first() {
+        Some(b'"') => double_quoted(raw),
+        Some(b'\'') => single_quoted(raw),
+        _ => None,
+    };
+    match quoted {
+        Some((value, len)) if len == raw.len() => value,
+        _ => raw.to_string(),
+    }
 }
 
 /// The line index a new top-level key is inserted at: after the document's
@@ -324,8 +351,13 @@ fn is_marker(line: &str, marker: &str) -> bool {
 pub(crate) fn strip_comment(text: &str) -> &str {
     let bytes = text.as_bytes();
     let mut quote = None;
+    let mut escaped = false;
     for (i, &b) in bytes.iter().enumerate() {
         match quote {
+            // Inside double quotes a backslash escapes the next byte, so
+            // `\"` does not close the scalar (#1918).
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if b == b'\\' => escaped = true,
             Some(q) if b == q => quote = None,
             Some(_) => {}
             None if b == b'\'' || b == b'"' => quote = Some(b),
@@ -339,7 +371,17 @@ pub(crate) fn strip_comment(text: &str) -> &str {
 }
 
 /// A double-quoted scalar at the start of `s`: its value and byte length.
+/// Escapes decode as YAML 1.2 (and js-yaml) does, `\uD83D\uDE00`
+/// surrogate pairs included; a malformed escape is `None`, as the file
+/// does not parse.
 fn double_quoted(s: &str) -> Option<(String, usize)> {
+    /// `n` hex digits as a code point (`None` when short or not hex).
+    fn hex(chars: &mut impl Iterator<Item = (usize, char)>, n: usize) -> Option<u32> {
+        let digits: String = (0..n).map_while(|_| chars.next().map(|(_, h)| h)).collect();
+        (digits.len() == n && digits.chars().all(|c| c.is_ascii_hexdigit()))
+            .then(|| u32::from_str_radix(&digits, 16).ok())
+            .flatten()
+    }
     let mut out = String::new();
     let mut chars = s.char_indices().skip(1);
     while let Some((i, c)) = chars.next() {
@@ -347,17 +389,42 @@ fn double_quoted(s: &str) -> Option<(String, usize)> {
             '"' => return Some((out, i + 1)),
             '\\' => {
                 let (_, esc) = chars.next()?;
-                match esc {
-                    'n' => out.push('\n'),
-                    't' => out.push('\t'),
-                    '"' | '\\' | '/' | ' ' => out.push(esc),
-                    // Any other escape decodes to text no pnpm key uses;
-                    // keep it visibly distinct rather than guessing.
-                    other => {
-                        out.push('\\');
-                        out.push(other);
+                let decoded = match esc {
+                    '0' => '\0',
+                    'a' => '\u{7}',
+                    'b' => '\u{8}',
+                    't' | '\t' => '\t',
+                    'n' => '\n',
+                    'v' => '\u{b}',
+                    'f' => '\u{c}',
+                    'r' => '\r',
+                    'e' => '\u{1b}',
+                    'N' => '\u{85}',
+                    '_' => '\u{a0}',
+                    'L' => '\u{2028}',
+                    'P' => '\u{2029}',
+                    '"' | '\\' | '/' | ' ' => esc,
+                    'x' => char::from_u32(hex(&mut chars, 2)?)?,
+                    'U' => char::from_u32(hex(&mut chars, 8)?)?,
+                    'u' => {
+                        let unit = hex(&mut chars, 4)?;
+                        if (0xD800..0xDC00).contains(&unit) {
+                            // A high surrogate pairs with a following `\uDCxx`.
+                            if chars.next()?.1 != '\\' || chars.next()?.1 != 'u' {
+                                return None;
+                            }
+                            let low = hex(&mut chars, 4)?;
+                            if !(0xDC00..0xE000).contains(&low) {
+                                return None;
+                            }
+                            char::from_u32(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00))?
+                        } else {
+                            char::from_u32(unit)?
+                        }
                     }
-                }
+                    _ => return None,
+                };
+                out.push(decoded);
             }
             c => out.push(c),
         }
@@ -389,6 +456,55 @@ fn single_quoted(s: &str) -> Option<(String, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1918: the one pnpm settings scalar reader every caller uses.
+    #[test]
+    fn top_level_scalar_table() {
+        for (text, want) in [
+            ("k: plain\n", Some("plain")),
+            ("k: plain # comment\n", Some("plain")),
+            ("k: \"a\\\"b\\n\\u0041\"\n", Some("a\"b\nA")),
+            ("k: \"a # not a comment\"\n", Some("a # not a comment")),
+            ("k: 'it''s'\n", Some("it's")),
+            ("k: ''\n", Some("")),
+            ("k:\n", Some("")),
+            ("k: \"a'\n", Some("\"a'")),
+            ("k: 'a\"\n", Some("'a\"")),
+            ("k: 'a' b\n", Some("'a' b")),
+            ("\u{feff}k: x\n", Some("x")),
+            ("k: a\r\nk: 'b'\r\n", Some("b")),
+            // Review on #1973: escapes the old JSON decoder read, an escaped
+            // quote before ` #`, a malformed escape, and a block scalar.
+            ("k: \"/p/a\\\" #b/.pnpm\"\n", Some("/p/a\" #b/.pnpm")),
+            ("k: \"nm-\\ud83d\\ude00\"\n", Some("nm-\u{1f600}")),
+            ("k: \"a\\bb\\x41\\U0001F600\"\n", Some("a\u{8}bA\u{1f600}")),
+            ("k: \"\\u+041\"\n", Some("\"\\u+041\"")),
+            ("k: \"\\ud83d\"\n", Some("\"\\ud83d\"")),
+            ("k: >-\n  long value\n", None),
+            ("k: |\n  text\n", None),
+            ("  k: nested\n", None),
+            ("other: x\n", None),
+        ] {
+            assert_eq!(top_level_scalar(text, "k").as_deref(), want, "{text:?}");
+        }
+    }
+
+    /// #1918: a settings scalar is decoded the way pnpm's YAML parser reads
+    /// it: `''` inside single quotes is one quote, an unpaired quote is not
+    /// stripped, and an empty value stays unset for this non-empty reader.
+    #[test]
+    fn yaml_top_level_value_decodes_yaml_quoting() {
+        let read = |text: &str| yaml_top_level_value(text, "k");
+        assert_eq!(read("k: 'it''s'\n").as_deref(), Some("it's"));
+        assert_eq!(read("k: \"a'\n").as_deref(), Some("\"a'"));
+        assert_eq!(read("k: ''a''\n").as_deref(), Some("''a''"));
+        assert_eq!(
+            read("k: \"say \\\"hi\\\"\"\n").as_deref(),
+            Some("say \"hi\"")
+        );
+        assert_eq!(read("k: ''\n"), None);
+        assert_eq!(read("k:\n"), None);
+    }
 
     fn lines(text: &str) -> Vec<String> {
         text.split('\n').map(str::to_string).collect()

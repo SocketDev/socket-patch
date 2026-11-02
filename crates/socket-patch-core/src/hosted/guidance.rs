@@ -377,7 +377,7 @@ pub const TRUST_SCAFFOLD_LINES: [&str; 3] = [
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
 /// remove exactly what was added.
 pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
-    use crate::formats::pnpm::workspace::{block_insert_point, top_level_key};
+    use crate::formats::pnpm::workspace::{block_insert_point, top_level_key, yaml_scalar};
     let Some(text) = existing else {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
@@ -401,17 +401,18 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
     // Top-level key only (every spelling pnpm reads: quoted, `key :`, a
     // trailing comment): an indented `trustLockfile:` under some other
     // mapping is not the setting pnpm reads.
-    for line in &lines {
-        if let Some((key, value)) = top_level_key(line) {
-            if key != "trustLockfile" {
-                continue;
-            }
-            let value = value.trim_matches(|c| c == '\'' || c == '"');
-            if value == "true" {
-                return TrustPlan::AlreadyTrue;
-            }
-            return TrustPlan::UserSet(value.to_string());
+    // The last assignment is the one pnpm reads, decoded by the shared pnpm
+    // settings reader (#1918).
+    let existing = lines
+        .iter()
+        .filter_map(|line| top_level_key(line))
+        .rfind(|(key, _)| key == "trustLockfile");
+    if let Some((_, value)) = existing {
+        let value = yaml_scalar(value);
+        if value == "true" {
+            return TrustPlan::AlreadyTrue;
         }
+        return TrustPlan::UserSet(value);
     }
     // After the document's last non-empty line (no blank separator; before a
     // `...` end marker): a revert removes exactly one line and the file's
@@ -660,6 +661,24 @@ mod tests {
         let merged = pnpm_trust_configured_detail("patch.test", false, false);
         assert!(!merged.contains("pnpm add -w"), "{merged}");
         assert!(!merged.contains("packageManager"), "{merged}");
+    }
+
+    /// #1918: the last `trustLockfile:` is the one pnpm reads, decoded by
+    /// the shared pnpm settings reader (an unpaired quote is not `true`).
+    #[test]
+    fn workspace_trust_plan_reads_the_last_key_as_yaml() {
+        assert!(matches!(
+            plan_workspace_trust(Some("trustLockfile: false\ntrustLockfile: true\n")),
+            TrustPlan::AlreadyTrue
+        ));
+        match plan_workspace_trust(Some("trustLockfile: \"true'\n")) {
+            TrustPlan::UserSet(value) => assert_eq!(value, "\"true'"),
+            _ => panic!("expected UserSet"),
+        }
+        assert!(matches!(
+            plan_workspace_trust(Some("trustLockfile: 'true'\n")),
+            TrustPlan::AlreadyTrue
+        ));
     }
 
     /// #904 (hosted): a BOM-prefixed `trustLockfile:` first line is the
