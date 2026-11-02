@@ -47,7 +47,7 @@ pub(crate) fn tag_event_mode(events: &mut [crate::json_envelope::PatchEvent], mo
 pub(crate) struct VendoredBackend<'a> {
     /// The run's args re-rooted at the manifest's project
     /// ([`GlobalArgs::at_project_root`]): the ledger, its artifacts and the
-    /// lockfile wiring they record always belong to one project (#745).
+    /// lockfile wiring they record always belong to one project.
     pub(crate) common: std::borrow::Cow<'a, GlobalArgs>,
     pub(crate) service: Option<&'a VendorServiceConfig>,
 }
@@ -143,52 +143,66 @@ impl<'a> VendoredBackend<'a> {
     ) -> Vec<RevertedEntry> {
         let mut out = Vec::with_capacity(keys.len());
         for key in keys {
-            // Captured before a clean revert drops the entry.
-            let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
-            let wiring_files: Vec<String> = state
-                .entries
-                .get(key)
-                .map(|e| e.wiring.iter().map(|w| w.file.clone()).collect())
-                .unwrap_or_default();
-            let gem = state
-                .entries
-                .get(key)
-                .map(|e| (e.ecosystem.clone(), e.base_purl.clone()));
-            let mut result = revert_vendor_entry(&self.common.cwd, key, state, opts).await;
+            let Some(entry) = state.entries.get(key).cloned() else {
+                out.push(RevertedEntry {
+                    key: key.clone(),
+                    flavor: None,
+                    warnings: Vec::new(),
+                    step: VendorRevertStep::Missing,
+                });
+                continue;
+            };
+            let flavor = entry.flavor.clone();
+            let wiring_files: Vec<String> = entry.wiring.iter().map(|w| w.file.clone()).collect();
+            let root = &self.common.cwd;
+            let outcome = dispatch_revert_one_opts(&entry, root, opts).await;
+            let step = if !outcome.success {
+                VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
+            } else if outcome.kept_artifact {
+                VendorRevertStep::Kept(if outcome.kept_for_residual_reference() {
+                    KeepCause::Reference
+                } else {
+                    KeepCause::Drift
+                })
+            } else if opts.dry_run {
+                VendorRevertStep::WouldRevert
+            } else if opts.keep_artifact {
+                VendorRevertStep::Preserved
+            } else {
+                state.entries.remove(key);
+                match save_state(root, state).await {
+                    Ok(()) => VendorRevertStep::Reverted,
+                    Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
+                }
+            };
+            let mut warnings = outcome.warnings;
             let hard_failure = matches!(
-                result.step,
+                step,
                 VendorRevertStep::Failed(_) | VendorRevertStep::LedgerWriteFailed(_)
             );
+            let dry = matches!(step, VendorRevertStep::WouldRevert);
             // The wiring is back on the registry while the installed tree
-            // may still hold the vendored build, which pip, PDM, uv and Pipenv
-            // keep through a plain sync (#477): name the reinstall.
-            let unwired = matches!(
-                result.step,
-                VendorRevertStep::WouldRevert
-                    | VendorRevertStep::Reverted
-                    | VendorRevertStep::Preserved
-                    | VendorRevertStep::LedgerWriteFailed(_)
-            );
-            if unwired {
+            // may still hold the vendored build, which pip, PDM, uv and
+            // Pipenv keep through a plain sync: name the reinstall.
+            if dry || step.unwired() {
                 crate::commands::pypi_reinstall::push_vendor_advisory(
-                    &self.common.cwd,
+                    root,
                     key,
                     flavor.as_deref(),
                     &wiring_files,
-                    &mut result.warnings,
+                    &mut warnings,
                 )
                 .await;
                 // A dry run reads the still-vendored lock, whose bare
                 // CHECKSUMS entry can't judge the archive: the wet run
                 // names it.
-                let dry = matches!(result.step, VendorRevertStep::WouldRevert);
-                if let Some((ecosystem, purl)) = gem.as_ref().filter(|_| !dry) {
+                if !dry {
                     push_gem_stale_cache(
-                        &self.common.cwd,
-                        ecosystem,
-                        purl,
+                        root,
+                        &entry.ecosystem,
+                        &entry.base_purl,
                         self.common.offline,
-                        &mut result.warnings,
+                        &mut warnings,
                     )
                     .await;
                 }
@@ -196,8 +210,8 @@ impl<'a> VendoredBackend<'a> {
             out.push(RevertedEntry {
                 key: key.clone(),
                 flavor,
-                warnings: result.warnings,
-                step: result.step,
+                warnings,
+                step,
             });
             if stop_on_failure && hard_failure {
                 break;
@@ -208,7 +222,7 @@ impl<'a> VendoredBackend<'a> {
 
     /// Dropping a vendored Go `replace` leaves a committed
     /// vendor/modules.txt still recording it, which breaks every default
-    /// build until `go mod vendor` runs (#343, #1777). The undo commands
+    /// build until `go mod vendor` runs. The undo commands
     /// call this after [`Self::revert`]: it audits the Go consumer state
     /// once and returns the issues of the Go modules `reverted` unwired,
     /// each keyed by the ledger key of its entry. Not part of `revert`
@@ -220,14 +234,7 @@ impl<'a> VendoredBackend<'a> {
     ) -> Vec<(String, VendorWarning)> {
         let unwired: Vec<(&str, String)> = reverted
             .iter()
-            .filter(|e| {
-                matches!(
-                    e.step,
-                    VendorRevertStep::Reverted
-                        | VendorRevertStep::Preserved
-                        | VendorRevertStep::LedgerWriteFailed(_)
-                )
-            })
+            .filter(|e| e.step.unwired())
             .filter_map(|e| {
                 socket_patch_core::utils::purl::parse_golang_purl(&e.key)
                     .map(|(module, _)| (e.key.as_str(), module.into_owned()))
@@ -251,11 +258,10 @@ impl<'a> VendoredBackend<'a> {
 }
 
 /// Name a patched `<name>-<version>.gem` left in Bundler's cache dir once
-/// the vendored ledger entry of `ecosystem` for `base_purl` is unwired
-/// (#1594): a `bundle cache` taken while a hosted pin was live keeps it
-/// there through the takeover, and bundler installs from it again once the
-/// lock is back on upstream. The hosted unwind raises the same warning
-/// (#1260).
+/// the vendored ledger entry of `ecosystem` for `base_purl` is unwired: a
+/// `bundle cache` taken while a hosted pin was live keeps it there through
+/// the takeover, and bundler installs from it again once the lock is back
+/// on upstream. The hosted unwind raises the same warning.
 pub(crate) async fn push_gem_stale_cache(
     root: &Path,
     ecosystem: &str,
@@ -316,6 +322,18 @@ pub(crate) enum VendorRevertStep {
     LedgerWriteFailed(String),
 }
 
+impl VendorRevertStep {
+    /// The wiring is back on the registry (a dry run's `WouldRevert` is not).
+    fn unwired(&self) -> bool {
+        matches!(
+            self,
+            VendorRevertStep::Reverted
+                | VendorRevertStep::Preserved
+                | VendorRevertStep::LedgerWriteFailed(_)
+        )
+    }
+}
+
 /// Why a vendored revert kept the artifact and ledger entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum KeepCause {
@@ -324,7 +342,7 @@ pub(crate) enum KeepCause {
     Drift,
     /// The recorded wiring was restored, but another project file (an
     /// exported requirements file) still installs from the artifact
-    /// (`vendor_revert_residual_reference`, #1184). Nothing drifted: the
+    /// (`vendor_revert_residual_reference`). Nothing drifted: the
     /// way out is to point that file back at the registry release.
     Reference,
 }
@@ -353,51 +371,6 @@ impl KeepCause {
                  registry release (or re-export it from the restored lock), then {then}"
             ),
         }
-    }
-}
-
-pub(crate) struct VendorRevertResult {
-    pub(crate) warnings: Vec<VendorWarning>,
-    pub(crate) step: VendorRevertStep,
-}
-
-/// Revert the vendored ledger entry `key` (see [`VendorRevertStep`]) of
-/// the project at `root` (its ledger, artifacts and lockfile wiring).
-pub(crate) async fn revert_vendor_entry(
-    root: &Path,
-    key: &str,
-    state: &mut VendorState,
-    opts: RevertOpts,
-) -> VendorRevertResult {
-    let Some(entry) = state.entries.get(key).cloned() else {
-        return VendorRevertResult {
-            warnings: Vec::new(),
-            step: VendorRevertStep::Missing,
-        };
-    };
-    let outcome = dispatch_revert_one_opts(&entry, root, opts).await;
-    let step = if !outcome.success {
-        VendorRevertStep::Failed(outcome.error.unwrap_or_else(|| "unknown error".into()))
-    } else if outcome.kept_artifact {
-        VendorRevertStep::Kept(if outcome.kept_for_residual_reference() {
-            KeepCause::Reference
-        } else {
-            KeepCause::Drift
-        })
-    } else if opts.dry_run {
-        VendorRevertStep::WouldRevert
-    } else if opts.keep_artifact {
-        VendorRevertStep::Preserved
-    } else {
-        state.entries.remove(key);
-        match save_state(root, state).await {
-            Ok(()) => VendorRevertStep::Reverted,
-            Err(e) => VendorRevertStep::LedgerWriteFailed(e.to_string()),
-        }
-    };
-    VendorRevertResult {
-        warnings: outcome.warnings,
-        step,
     }
 }
 
