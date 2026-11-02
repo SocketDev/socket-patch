@@ -61,7 +61,7 @@ _Last updated 2026-11-01T22:02Z · main @ cbbbdb9 · owner: audit-cli-tests_
 | T56 | 3 | Parse-suite env scrub 4 ways: `EnvScrub` byte-identical ×4 + hand lists + 91 `#[serial]`, scan `with_clean_env`, global_args own guard, none in list/remove/main (`SOCKET_JSON=true` fails 3, executed); `hermetic::try_parse` used by 2. Hand `Snap` mirrors ×4 miss 1-9 fields (executed). | #1956 | filed #1956 |
 | T57 | 3 | The `cli_parse_<cmd>` suites re-pin flattened `GlobalArgs` one test per flag (~85 tests) beside `cli_global_args`' every-flag × every-subcommand matrix; their field lists drift (apply/rollback `bool_flags` lack 5). Follows T56. |  | to verify |
 | T58 | 3 | 21 `tests/common` selftests run in each of ~104 includers (~2K redundant runs; 14 binaries include `cache_env` twice); the "no `cfg(test)` in integration crates" comment ×3 is false (executed). | #1957 | filed #1957 |
-| T59 | 3 | `hermetic::command` leaves `CLICOLOR_FORCE`/`NO_COLOR`/`COLUMNS`/`CI` ambient (`CLICOLOR_FORCE=1` fails a list test, executed); `HOSTILE_SEEDS` seed then remove the same list (can't catch anything); HOME pin only on `common::run`. | #1958 | filed #1958 |
+| T59 | 3 | `hermetic::command` leaves `CLICOLOR_FORCE`/`NO_COLOR`/`COLUMNS`/`CI` ambient (`CLICOLOR_FORCE=1` fails a list test, executed); `HOSTILE_SEEDS` seed then remove the same list (can't catch anything); HOME pin only on `common::run`. | #1958, #1964 | in PR #1964 |
 #### Handed off
 _None._
 
