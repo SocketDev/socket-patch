@@ -4591,7 +4591,7 @@ fn rewrite_yarn_classic_with(
         .zip(&heads)
         .map(|(b, (patterns, _))| {
             let version = classic_field(&b.lines, "version")?;
-            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+            let (name, source) = crate::formats::yarn::copy::classic_copy_name(
                 patterns,
                 classic_field(&b.lines, "resolved"),
                 version,
@@ -13769,6 +13769,90 @@ mod tests {
             let r = run(copy, manifest);
             assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
             assert!(r.bundled_skipped_uuids.is_empty(), "{case}");
+        }
+    }
+
+    /// #1951: the hosted rewriter reads which package a yarn classic
+    /// `file:` / url copy holds through the same reader vendored and VEX use
+    /// ([`crate::formats::yarn::copy::classic_copy_ref`] and
+    /// [`crate::formats::yarn::copy::CopyRef::identity`]), so the modes
+    /// identify the same copies. (A copy no reader identifies is a separate
+    /// rule: vendored keeps it as a possible copy, #1516.) yarn 1 installs
+    /// `file:../ext/lpdir` from outside the root as readily as from inside
+    /// it, so that copy is read and named; an absolute `file:` path is never
+    /// read (a lock is untrusted input, #1516); a codeload tarball names no
+    /// registry package.
+    #[test]
+    fn issue_1951_yarn_classic_copy_named_as_vendored_reads_it() {
+        use crate::formats::yarn::copy::classic_copy_ref;
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        let manifests = BTreeMap::from([
+            (
+                "../ext/lpdir/package.json".to_string(),
+                left_pad.to_string(),
+            ),
+            ("/abs/lpdir/package.json".to_string(), left_pad.to_string()),
+            ("lpdir/package.json".to_string(), left_pad.to_string()),
+        ]);
+        let codeload = "https://codeload.github.com/stevemao/left-pad/tar.gz/abc";
+        for (case, patterns, resolved, named) in [
+            ("in-root directory", "lp2@file:./lpdir", None, true),
+            ("out-of-root directory", "lp2@file:../ext/lpdir", None, true),
+            ("absolute directory", "lp2@file:/abs/lpdir", None, false),
+            (
+                "codeload tarball",
+                "lp2@stevemao/left-pad#v1.3.0",
+                Some(codeload),
+                false,
+            ),
+        ] {
+            // The package vendored and VEX identify this copy as.
+            let pats = vec![patterns.to_string()];
+            let vendored = classic_copy_ref(&pats, resolved).and_then(|copy| {
+                let bytes = copy
+                    .read_path()
+                    .and_then(|rel| manifests.get(&rel))
+                    .map(|t| t.as_bytes());
+                copy.identity("1.3.0", bytes)
+            });
+            assert_eq!(
+                vendored.is_some(),
+                named,
+                "{case}: vendored reads {vendored:?}"
+            );
+
+            let mut block = format!("\"{patterns}\":\n  version \"1.3.0\"\n");
+            if let Some(url) = resolved {
+                block.push_str(&format!("  resolved \"{url}\"\n"));
+            }
+            let mut files = manifests.clone();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{block}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{case}: the registry block is still pinned: {:?}",
+                r.warnings
+            );
+            let hosted = r.warnings.iter().any(|w| w.detail.contains("lp2@"));
+            assert_eq!(hosted, named, "{case}: {:?}", r.warnings);
+            assert_eq!(
+                r.bundled_skipped_uuids.contains(&ovr.patch_uuid),
+                named,
+                "{case}"
+            );
         }
     }
 

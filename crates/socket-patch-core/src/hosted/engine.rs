@@ -693,26 +693,25 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, NPMRC_REL).await;
         // A `file:` directory copy is locked under the DEPENDENCY name, so
         // the classic rewriter reads which package it is from the
-        // directory's `package.json` (#1236). Advisory: never rewritten,
-        // and an unreadable one only leaves that copy unnamed.
-        let dirs: BTreeSet<String> = out
+        // directory's `package.json` (#1236), at the path vendored and VEX
+        // read it from (#1951): outside the root too, never at an absolute
+        // path. Advisory: never rewritten, and an unreadable one only
+        // leaves that copy unnamed.
+        let manifests: BTreeSet<String> = out
             .files
             .get("yarn.lock")
             .map(|lock| {
+                use crate::formats::yarn::copy::{classic_copy_ref, CopyRef};
                 crate::vendor::lock_inventory::yarn::classic_entries(lock)
                     .iter()
-                    .filter_map(|e| {
-                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    .filter_map(|e| match classic_copy_ref(&e.patterns, None)? {
+                        copy @ CopyRef::Directory(_) => copy.read_path(),
+                        _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
-        for dir in dirs {
-            let rel = if dir.is_empty() {
-                "package.json".to_string()
-            } else {
-                format!("{dir}/package.json")
-            };
+        for rel in manifests {
             if out.files.contains_key(&rel) {
                 continue;
             }
@@ -4327,6 +4326,57 @@ mod tests {
         )
         .await;
         (read, done)
+    }
+
+    /// #1951: the hosted run reads a yarn classic `file:` directory copy's
+    /// `package.json` where vendored and VEX read it
+    /// ([`crate::formats::yarn::copy::CopyRef::read_path`]): from outside
+    /// the root too, since yarn 1 installs `file:../ext/lpdir` all the same,
+    /// but never at an absolute path a lock names (#1516).
+    #[tokio::test]
+    async fn issue_1951_yarn_classic_copy_manifests_read_as_vendored_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for dir in ["app/lpdir", "ext/lpdir", "abs/lpdir"] {
+            let dir = tmp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), manifest).unwrap();
+        }
+        let abs = tmp.path().join("abs/lpdir");
+        let abs = abs.to_str().unwrap().replace('\\', "/");
+        std::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "# yarn lockfile v1\n\n\n\
+                 left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n\n\
+                 \"lp2@file:./lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp3@file:../ext/lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp4@file:{abs}\":\n  version \"1.3.0\"\n"
+            ),
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(&root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("lpdir/package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            read.files
+                .get("../ext/lpdir/package.json")
+                .map(String::as_str),
+            Some(manifest),
+            "{:?}",
+            read.files.keys()
+        );
+        assert!(
+            !read.files.keys().any(|k| k.contains("abs/lpdir")),
+            "{:?}",
+            read.files.keys()
+        );
     }
 
     #[tokio::test]
