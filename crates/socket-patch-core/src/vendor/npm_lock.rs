@@ -14,7 +14,7 @@
 //! bytes — no error, no patch. Every rewrite therefore carries the packed
 //! tarball's own hash, never an inherited one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::Value;
@@ -816,20 +816,31 @@ pub async fn revert_npm_opts(
         // revert then drift-keeps as before #1155.
         if !upgrades_trusted {
             for rec in entry.wiring.iter().filter(|r| r.file == lock_name) {
-                if let Some(key) = rec.key.as_deref() {
-                    let key = match rec.kind.as_str() {
-                        KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
-                        _ => Some(key.to_string()),
-                    };
-                    if let Some(key) = key {
-                        non_registry.insert(key, "project config can redirect it".to_string());
-                    }
+                if let Some(key) = record_packages_key(rec) {
+                    non_registry.insert(key, "project config can redirect it".to_string());
                 }
             }
         }
+        let records: Vec<&WiringRecord> = entry
+            .wiring
+            .iter()
+            .rev()
+            .filter(|r| r.file == lock_name)
+            .collect();
+        // A v2 lock's `packages` entry and its legacy `dependencies` mirror
+        // node describe ONE install (npm 7+ reads the first, npm 6 the
+        // second). When either is drift-kept, restoring the other leaves a
+        // lock that disagrees with itself (npm 6 then fails EINTEGRITY,
+        // #1937), so a package's records are restored together or not at
+        // all. A dry pass on a copy finds the drift-kept packages first.
+        let gate = TwinGate::of(&lock, &records, &non_registry, &entry.uuid);
         let mut changed = false;
         // Reverse application order, like every backend's revert.
-        for rec in entry.wiring.iter().rev().filter(|r| r.file == lock_name) {
+        for rec in records {
+            if let Some(drifted_key) = gate.kept_by_twin(rec) {
+                warnings_for_kept_twin(rec, drifted_key, &mut outcome.warnings);
+                continue;
+            }
             revert_one_record(
                 &mut lock,
                 rec,
@@ -1149,6 +1160,13 @@ fn entry_points_into_vendor(live: &serde_json::Map<String, Value>) -> bool {
         .is_some_and(|p| p.eco == "npm")
 }
 
+/// A legacy mirror node with no `resolved` and the vendored `integrity`:
+/// what npm 7-12 leave of a vendored mirror node on every re-save (#879).
+fn legacy_node_lost_our_resolved(live: &serde_json::Map<String, Value>, integrity: &str) -> bool {
+    !live.contains_key("resolved")
+        && live.get("integrity").and_then(Value::as_str) == Some(integrity)
+}
+
 /// Replace the lock entry's dependency-manifest mirror fields with the
 /// patched package.json's (absent in the manifest ⇒ removed from the entry,
 /// matching what npm would regenerate).
@@ -1305,6 +1323,101 @@ fn split_http_scheme(url: &str) -> Option<(&str, &str)> {
         .find_map(|scheme| Some((scheme, url.strip_prefix(scheme)?.strip_prefix("://")?)))
 }
 
+/// The `packages` key a wiring record describes: its own key, or for a
+/// legacy mirror pointer the `packages` entry it mirrors.
+fn record_packages_key(rec: &WiringRecord) -> Option<String> {
+    let key = rec.key.as_deref()?;
+    match rec.kind.as_str() {
+        KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
+        _ => Some(key.to_string()),
+    }
+}
+
+/// Which records a v2 lock's revert leaves alone because the other half of
+/// their package (a `packages` entry or its legacy mirror node) is
+/// drift-kept.
+#[derive(Default)]
+struct TwinGate {
+    /// `packages` key → the keys of that package's drift-kept records.
+    drifted: BTreeMap<String, Vec<String>>,
+    /// Keys of the records the revert would rewrite.
+    restores: BTreeSet<String>,
+}
+
+impl TwinGate {
+    /// Dry-run [`revert_one_record`] over `records` on a copy of `lock`.
+    /// Without a legacy mirror record no package has two halves, so the
+    /// copy is skipped.
+    fn of(
+        lock: &Value,
+        records: &[&WiringRecord],
+        non_registry: &BTreeMap<String, String>,
+        entry_uuid: &str,
+    ) -> TwinGate {
+        let mut gate = TwinGate::default();
+        if !records.iter().any(|r| r.kind == KIND_LOCK_LEGACY_ENTRY) {
+            return gate;
+        }
+        let mut trial = lock.clone();
+        for rec in records {
+            let (Some(packages_key), Some(key)) = (record_packages_key(rec), rec.key.as_ref())
+            else {
+                continue;
+            };
+            let mut warnings = Vec::new();
+            let mut restored = false;
+            revert_one_record(
+                &mut trial,
+                rec,
+                non_registry,
+                entry_uuid,
+                &mut restored,
+                &mut warnings,
+            );
+            // The code `RevertOutcome::drift_skipped` keeps state on.
+            if warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted")
+            {
+                gate.drifted
+                    .entry(packages_key)
+                    .or_default()
+                    .push(key.clone());
+            } else if restored {
+                gate.restores.insert(key.clone());
+            }
+        }
+        gate
+    }
+
+    /// The drift-kept twin that keeps `rec` from being restored: `None`
+    /// unless `rec` would itself be rewritten and another record of its
+    /// package is drift-kept.
+    fn kept_by_twin(&self, rec: &WiringRecord) -> Option<&str> {
+        let key = rec.key.as_ref().filter(|k| self.restores.contains(*k))?;
+        let drifted = self.drifted.get(&record_packages_key(rec)?)?;
+        drifted.iter().find(|d| *d != key).map(String::as_str)
+    }
+}
+
+/// Say why a record whose own fragment is still ours is left alone: the
+/// other half of its package (`drifted_key`) was drift-kept.
+fn warnings_for_kept_twin(
+    rec: &WiringRecord,
+    drifted_key: &str,
+    warnings: &mut Vec<VendorWarning>,
+) {
+    let key = rec.key.as_deref().unwrap_or_default();
+    warnings.push(VendorWarning::new(
+        "vendor_lock_entry_drifted",
+        format!(
+            "lock entry `{key}` left alone: `{drifted_key}` describes the same install and was \
+             left alone, and restoring only one of them would leave the lock disagreeing \
+             with itself"
+        ),
+    ));
+}
+
 /// Apply one wiring record in reverse: restore `original` iff the live
 /// fragment is still ours (drift = third party re-resolved it; leave theirs
 /// alone, with a warning).
@@ -1355,19 +1468,31 @@ fn revert_one_record(
     }
 
     // Ours iff resolved is exactly what we wrote, or still points into OUR
-    // uuid dir (a re-serialized but unmoved entry).
+    // uuid dir (a re-serialized but unmoved entry). A legacy mirror node
+    // with NO `resolved` but the vendored `integrity` is ours too (#1937,
+    // the #879 rule `vex` and `vendor --check` use): npm 7-12 never write
+    // `resolved` for a `file:` resolution in the mirror, so every plain
+    // `npm install` on a vendored v2 lock leaves exactly that shape.
     let live_resolved = live.get("resolved").and_then(Value::as_str);
-    let new_resolved = rec
-        .new
-        .as_ref()
-        .and_then(|n| n.get("resolved"))
-        .and_then(Value::as_str);
+    let new_field = |field: &str| {
+        rec.new
+            .as_ref()
+            .and_then(|n| n.get(field))
+            .and_then(Value::as_str)
+    };
+    let new_resolved = new_field("resolved");
     let ours = match live_resolved {
         Some(r) => {
             Some(r) == new_resolved
                 || parse_vendor_path(r).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid)
         }
-        None => false,
+        None => {
+            rec.kind == KIND_LOCK_LEGACY_ENTRY
+                && new_field("integrity").is_some_and(|new_integrity| {
+                    live.as_object()
+                        .is_some_and(|obj| legacy_node_lost_our_resolved(obj, new_integrity))
+                })
+        }
     };
     if !ours {
         // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `npm install
@@ -1376,11 +1501,8 @@ fn revert_one_record(
         // after `npm uninstall`. Nothing to restore; the caller keeps the
         // artifact only while a lock still resolves through it. A
         // same-version re-resolution stays drift: re-vendoring can undo it.
-        let packages_key = match rec.kind.as_str() {
-            KIND_LOCK_LEGACY_ENTRY => legacy_pointer_packages_key(key),
-            _ => Some(key.to_string()),
-        };
-        let registry_install = packages_key.is_some_and(|k| !non_registry.contains_key(&k));
+        let registry_install =
+            record_packages_key(rec).is_some_and(|k| !non_registry.contains_key(&k));
         if let Some(live_version) = version_moved_off(rec, live).filter(|_| registry_install) {
             warnings.push(VendorWarning::new(
                 super::LOCK_ENTRY_REMOVED_CODE,
@@ -1579,7 +1701,12 @@ impl LockRewire<'_> {
                 if entry_in_sync(obj, self.resolved, self.integrity) {
                     continue;
                 }
-                let was_vendored = entry_points_into_vendor(obj);
+                // npm 7-12 drop a mirror node's `file:` `resolved` on every
+                // re-save and keep our integrity (#879): still our wiring,
+                // so its pre-vendor original is the prior record's, which
+                // `carry_forward_wiring` fills in (#1937).
+                let was_vendored = entry_points_into_vendor(obj)
+                    || legacy_node_lost_our_resolved(obj, self.integrity);
                 let original = Value::Object(obj.clone());
                 obj.insert(
                     "resolved".to_string(),
@@ -3494,6 +3621,193 @@ mod tests {
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
             fx.lock_bytes
+        );
+    }
+
+    /// A v2 lock with one direct left-pad: a `packages` entry and its legacy
+    /// `dependencies` mirror node.
+    fn v2_direct_lock() -> Value {
+        json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 2,
+            "requires": true,
+            "packages": {
+                "": {
+                    "name": "fixture",
+                    "version": "1.0.0",
+                    "dependencies": { "left-pad": "1.3.0" }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            },
+            "dependencies": {
+                "left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REG_RESOLVED,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        })
+    }
+
+    /// Vendor `v2_direct_lock`, then let `edit` change the mirror node the
+    /// way a later install would.
+    async fn vendored_v2_with_mirror(edit: impl FnOnce(&mut Value)) -> (Fixture, VendorEntry) {
+        let fx = fixture_with("left-pad", "1.3.0", v2_direct_lock()).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let mut live = fx.read_lock().await;
+        edit(&mut live["dependencies"]["left-pad"]);
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        (fx, entry)
+    }
+
+    /// #1937: npm 7-12 never write `resolved` for a `file:` resolution in
+    /// the v2 legacy mirror, so a plain `npm install` on a vendored v2 lock
+    /// leaves the mirror node with only `version` and the patched
+    /// `integrity`. That node is still ours (the #879 rule `vex` and
+    /// `vendor --check` use): rollback / remove / `vendor --revert` restore
+    /// the whole lock and delete the artifact.
+    #[tokio::test]
+    async fn v2_revert_restores_a_resolved_less_mirror_node_with_our_integrity() {
+        let (fx, entry) = vendored_v2_with_mirror(|node| {
+            node.as_object_mut().unwrap().remove("resolved");
+        })
+        .await;
+        assert_ne!(
+            fx.read_lock().await["dependencies"]["left-pad"]["integrity"],
+            json!("sha512-orig=="),
+            "the mirror node keeps the vendored integrity"
+        );
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes,
+            "both the packages entry and its mirror are restored"
+        );
+        assert!(!fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// #1937: a resolved-less mirror node whose integrity is NOT the
+    /// vendored one is not provably ours, so it is drift-kept, and so is the
+    /// `packages` entry it mirrors: restoring one half of a package leaves a
+    /// lock that disagrees with itself (npm 6 then fails EINTEGRITY).
+    #[tokio::test]
+    async fn v2_revert_keeps_the_packages_twin_of_a_drifted_mirror_node() {
+        let (fx, entry) = vendored_v2_with_mirror(|node| {
+            let node = node.as_object_mut().unwrap();
+            node.remove("resolved");
+            node.insert("integrity".into(), json!("sha512-someone-else=="));
+        })
+        .await;
+        let before = tokio::fs::read(fx.lock_path()).await.unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        assert_eq!(
+            String::from_utf8(tokio::fs::read(fx.lock_path()).await.unwrap()).unwrap(),
+            String::from_utf8(before).unwrap(),
+            "neither half of the package is rewritten"
+        );
+        assert!(fx
+            .root()
+            .join(format!(".socket/vendor/npm/{UUID}"))
+            .exists());
+    }
+
+    /// #1937: re-vendoring after `npm install` dropped the mirror node's
+    /// `resolved` must not record that patched node as the pre-vendor
+    /// original (a later revert would "restore" the patched integrity).
+    /// The node counts as already vendored, so its original comes from the
+    /// prior record (`carry_forward_wiring`).
+    #[tokio::test]
+    async fn v2_revendor_of_a_resolved_less_mirror_node_records_no_original() {
+        let (fx, _) = vendored_v2_with_mirror(|node| {
+            node.as_object_mut().unwrap().remove("resolved");
+        })
+        .await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success);
+        let entry = entry.unwrap();
+        let mirror = entry
+            .wiring
+            .iter()
+            .find(|r| r.kind == KIND_LOCK_LEGACY_ENTRY)
+            .expect("the mirror node is rewired");
+        assert_eq!(mirror.original, None, "{mirror:?}");
+    }
+
+    /// #1937: the twin gate only holds back a record the revert would
+    /// rewrite. A `packages` entry the user already restored by hand is
+    /// converged, so it gets no "left alone" warning when its mirror node
+    /// drifted.
+    #[tokio::test]
+    async fn v2_revert_does_not_blame_a_converged_packages_twin() {
+        let (fx, entry) = vendored_v2_with_mirror(|node| {
+            let node = node.as_object_mut().unwrap();
+            node.remove("resolved");
+            node.insert("integrity".into(), json!("sha512-someone-else=="));
+        })
+        .await;
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"] =
+            v2_direct_lock()["packages"]["node_modules/left-pad"].clone();
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let drifted: Vec<&str> = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .map(|w| w.detail.as_str())
+            .collect();
+        assert_eq!(drifted.len(), 1, "{drifted:?}");
+        assert!(
+            drifted[0].contains("`/dependencies/left-pad`"),
+            "{drifted:?}"
+        );
+    }
+
+    /// #1937, the other direction: a mirror node re-resolved to a third
+    /// party's tarball keeps its still-wired `packages` twin wired too.
+    #[tokio::test]
+    async fn v2_revert_keeps_the_packages_twin_of_a_re_resolved_mirror_node() {
+        let (fx, entry) = vendored_v2_with_mirror(|node| {
+            let node = node.as_object_mut().unwrap();
+            node.insert(
+                "resolved".into(),
+                json!("https://mirror.example/left-pad-1.3.0.tgz"),
+            );
+            node.insert("integrity".into(), json!("sha512-mirror=="));
+        })
+        .await;
+        let wired = fx.read_lock().await["packages"]["node_modules/left-pad"].clone();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.drift_skipped(), "{:?}", outcome.warnings);
+        let after = fx.read_lock().await;
+        assert_eq!(after["packages"]["node_modules/left-pad"], wired);
+        assert_eq!(
+            after["dependencies"]["left-pad"]["resolved"],
+            json!("https://mirror.example/left-pad-1.3.0.tgz")
         );
     }
 
