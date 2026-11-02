@@ -173,20 +173,16 @@ pub fn bin_dirs_with(
             dirs.push(p);
         }
     };
-    let gopaths: Vec<PathBuf> = match go_env("GOPATH").filter(|v| !v.is_empty()) {
-        Some(gopath) => std::env::split_paths(&gopath)
-            .filter(|p| !p.as_os_str().is_empty())
-            .collect(),
-        None => home.map(|h| h.join("go")).into_iter().collect(),
-    };
-    // go's own default: GOMODCACHE, else the first GOPATH's pkg/mod.
-    let user_cache = go_env("GOMODCACHE")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| gopaths.first().map(|g| g.join("pkg").join("mod")));
+    // An empty setting counts as unset, as `go_env` already reports it.
+    let go_env = &|k: &str| go_env(k).filter(|v| !v.is_empty());
+    let user_cache = crate::utils::go_env::gomodcache(go_env, home.as_deref());
+    let gopaths: Vec<PathBuf> = crate::utils::go_env::gopath_entries(go_env, home.as_deref())
+        .into_iter()
+        .filter(|p| !p.as_os_str().is_empty())
+        .collect();
     let in_user_cache = |d: &Path| user_cache.as_ref().is_some_and(|c| d.starts_with(c));
     if module_dirs.iter().any(|d| in_user_cache(d)) {
-        match go_env("GOBIN").filter(|v| !v.is_empty()) {
+        match go_env("GOBIN") {
             Some(gobin) => push(PathBuf::from(gobin)),
             None => gopaths.iter().for_each(|g| push(g.join("bin"))),
         }
@@ -547,6 +543,23 @@ mod tests {
                 home.clone()
             )
             .dirs,
+            vec![PathBuf::from("/home/u/go/bin")]
+        );
+        // An empty first GOPATH entry leaves go no module cache, so a
+        // copy under a later entry is not in the user's cache: no GOBIN
+        // (#1834).
+        assert_eq!(
+            bin_dirs_with(
+                &[Path::new("/b/pkg/mod/x@v1.0.0")],
+                &env(vec![("GOPATH", ":/b"), ("GOBIN", "/gobin")]),
+                home.clone()
+            )
+            .dirs,
+            vec![PathBuf::from("/b/bin")]
+        );
+        // An empty GOBIN counts as unset.
+        assert_eq!(
+            bin_dirs_with(&[user], &env(vec![("GOBIN", "")]), home.clone()).dirs,
             vec![PathBuf::from("/home/u/go/bin")]
         );
         // A --global-prefix tree: never the user's own tools.
