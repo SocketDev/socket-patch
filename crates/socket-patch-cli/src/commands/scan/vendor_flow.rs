@@ -1518,7 +1518,8 @@ mod preview_tests {
     async fn preview_headline_leaves_out_already_vendored() {
         let tmp = tempfile::tempdir().unwrap();
         seed_entry(tmp.path(), NPM, UUID);
-        let in_sync = preview_vendor(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        let in_sync =
+            preview_vendor_with(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(in_sync.in_sync_count(), 1);
         assert_eq!(
             in_sync.dry_run_line(),
@@ -1527,7 +1528,7 @@ mod preview_tests {
         );
 
         let other = "pkg:npm/preview-new@1.0.0";
-        let mixed = preview_vendor(
+        let mixed = preview_vendor_with(
             tmp.path(),
             &[sel(UUID, NPM), sel(UUID, other), sel(UUID, PYPI)],
             &[],
@@ -1545,7 +1546,8 @@ mod preview_tests {
 
         // Nothing in sync: the plain headline.
         let fresh = tempfile::tempdir().unwrap();
-        let plain = preview_vendor(fresh.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        let plain =
+            preview_vendor_with(fresh.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
         assert_eq!(plain.in_sync_count(), 0);
         assert_eq!(
             plain.dry_run_line(),
