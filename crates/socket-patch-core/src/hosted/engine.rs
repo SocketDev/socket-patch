@@ -2990,13 +2990,8 @@ fn read_advisory_text(view: &ProjectView<'_>, rel: &str) -> Option<String> {
 /// root: with a keyless pnpm-workspace.yaml that marks a pnpm <= 10.4
 /// install (see [`crate::formats::pnpm::workspace::lock_has_member_importers`]).
 fn lock_lists_members(view: &ProjectView<'_>) -> bool {
-    read_advisory_text(view, "pnpm-lock.yaml").is_some_and(|text| {
-        let doc =
-            crate::formats::pnpm::grammar::main_document(crate::formats::text::strip_bom(&text));
-        crate::formats::pnpm::workspace::lock_has_member_importers(
-            &crate::formats::pnpm::lines::split_lines(doc),
-        )
-    })
+    read_advisory_text(view, "pnpm-lock.yaml")
+        .is_some_and(|text| crate::formats::pnpm::workspace::lock_text_has_member_importers(&text))
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
