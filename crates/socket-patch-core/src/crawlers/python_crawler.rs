@@ -1044,8 +1044,9 @@ async fn uv_project_environment_site_packages(
 }
 
 /// Whether a manager other than uv records or locks the project at `cwd`:
-/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
-/// PDM project.
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`, read
+/// by [`declares_tool_poetry`], so a plugin table such as
+/// `[tool.poetry-dynamic-versioning]` does not count) or PDM project.
 async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
@@ -1061,7 +1062,7 @@ async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"))
+            .is_ok_and(|text| declares_tool_poetry(&text))
 }
 
 /// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
@@ -5112,6 +5113,52 @@ mod tests {
         let found = pdm_global_site_packages_with(Some(&home), &env_of(&pairs)).await;
         assert!(found.contains(&project_site), "{found:?}");
         assert!(found.contains(&managed_site), "{found:?}");
+    }
+
+    /// #1916: "is this lockless project Poetry's" reads the parsed
+    /// `[tool.poetry]` table, the same rule as Poetry env discovery. A
+    /// Poetry plugin table such as `[tool.poetry-dynamic-versioning]`
+    /// (common with non-Poetry backends) or a commented-out header does
+    /// not hand a lockless uv project to Poetry, so its
+    /// `UV_PROJECT_ENVIRONMENT` is still crawled.
+    #[tokio::test]
+    async fn poetry_plugin_table_does_not_claim_a_lockless_uv_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let site = fake_venv(&project, "env");
+        let stray = fake_venv(&project, ".venv");
+        let env = env_of(&[("UV_PROJECT_ENVIRONMENT", "env".to_string())]);
+
+        for pyproject in [
+            "[project]\nname = \"app\"\ndynamic = [\"version\"]\n\
+             [tool.poetry-dynamic-versioning]\nenable = true\n",
+            "[project]\nname = \"app\"\n# [tool.poetry]\n",
+            "[project]\nname = \"app\"\n[tool.poetry_bumpversion]\nfile = \"x\"\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![site.clone()],
+                "{pyproject}"
+            );
+        }
+
+        // A real `[tool.poetry]` table, or only a subtable of it, is still
+        // Poetry's.
+        for pyproject in [
+            "[tool.poetry]\nname = \"app\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry.dependencies]\npython = \"^3.12\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry-dynamic-versioning]\n\
+             enable = true\n[tool.poetry]\npackage-mode = false\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![stray.clone()],
+                "{pyproject}"
+            );
+        }
     }
 
     /// #525: uv syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
