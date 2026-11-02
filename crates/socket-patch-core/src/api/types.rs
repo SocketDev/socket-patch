@@ -190,162 +190,8 @@ pub struct PackageVendorArtifact {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_patch_response_camel_case() {
-        let pr = PatchResponse {
-            uuid: "u1".into(),
-            purl: "pkg:npm/x@1".into(),
-            published_at: "2024-01-01".into(),
-            files: HashMap::new(),
-            vulnerabilities: HashMap::new(),
-            description: "desc".into(),
-            license: "MIT".into(),
-            tier: "free".into(),
-        };
-        let json = serde_json::to_string(&pr).unwrap();
-        assert!(json.contains("publishedAt"));
-        assert!(!json.contains("published_at"));
-    }
-
-    #[test]
-    fn test_patch_response_deserialize() {
-        let json = r#"{
-            "uuid": "u1",
-            "purl": "pkg:npm/x@1",
-            "publishedAt": "2024-01-01",
-            "files": {},
-            "vulnerabilities": {},
-            "description": "A patch",
-            "license": "MIT",
-            "tier": "free"
-        }"#;
-        let pr: PatchResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(pr.uuid, "u1");
-        assert_eq!(pr.published_at, "2024-01-01");
-    }
-
-    #[test]
-    fn test_patch_file_response_optional_fields() {
-        let pfr = PatchFileResponse {
-            before_hash: None,
-            after_hash: None,
-            socket_blob: None,
-            blob_content: None,
-            before_blob_content: None,
-        };
-        let json = serde_json::to_string(&pfr).unwrap();
-        let back: PatchFileResponse = serde_json::from_str(&json).unwrap();
-        assert!(back.before_hash.is_none());
-        assert!(back.after_hash.is_none());
-        assert!(back.socket_blob.is_none());
-        assert!(back.blob_content.is_none());
-        assert!(back.before_blob_content.is_none());
-        // Verify camelCase field names
-        assert!(json.contains("beforeHash"));
-        assert!(json.contains("afterHash"));
-        assert!(json.contains("socketBlob"));
-        assert!(json.contains("blobContent"));
-        assert!(json.contains("beforeBlobContent"));
-    }
-
-    #[test]
-    fn test_search_response_camel_case() {
-        let sr = SearchResponse {
-            patches: Vec::new(),
-            can_access_paid_patches: true,
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        assert!(json.contains("canAccessPaidPatches"));
-        assert!(!json.contains("can_access_paid_patches"));
-    }
-
-    #[test]
-    fn test_batch_search_response_roundtrip() {
-        let bsr = BatchSearchResponse {
-            packages: vec![BatchPackagePatches {
-                purl: "pkg:npm/x@1".into(),
-                patches: vec![BatchPatchInfo {
-                    uuid: "u1".into(),
-                    purl: "pkg:npm/x@1".into(),
-                    tier: "free".into(),
-                    cve_ids: vec!["CVE-2024-0001".into()],
-                    ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
-                    severity: Some("high".into()),
-                    title: "Test".into(),
-                    published_at: None,
-                }],
-            }],
-            can_access_paid_patches: false,
-        };
-        let json = serde_json::to_string(&bsr).unwrap();
-        let back: BatchSearchResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.packages.len(), 1);
-        assert_eq!(back.packages[0].patches.len(), 1);
-        assert!(!back.can_access_paid_patches);
-    }
-
-    #[test]
-    fn test_batch_patch_info_camel_case() {
-        let bpi = BatchPatchInfo {
-            uuid: "u1".into(),
-            purl: "pkg:npm/x@1".into(),
-            tier: "free".into(),
-            cve_ids: vec!["CVE-2024-0001".into()],
-            ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
-            severity: Some("high".into()),
-            title: "Test".into(),
-            published_at: None,
-        };
-        let json = serde_json::to_string(&bpi).unwrap();
-        assert!(json.contains("cveIds"));
-        assert!(json.contains("ghsaIds"));
-        assert!(!json.contains("cve_ids"));
-        assert!(!json.contains("ghsa_ids"));
-    }
-
-    #[test]
-    fn test_vulnerability_response_no_rename() {
-        // VulnerabilityResponse does NOT have rename_all, so fields are snake_case
-        let vr = VulnerabilityResponse {
-            cves: vec!["CVE-2024-0001".into()],
-            summary: "Test".into(),
-            severity: "high".into(),
-            description: "A vulnerability".into(),
-        };
-        let json = serde_json::to_string(&vr).unwrap();
-        // Without rename_all, field names stay as-is (already lowercase single-word)
-        assert!(json.contains("\"cves\""));
-        assert!(json.contains("\"summary\""));
-        assert!(json.contains("\"severity\""));
-        assert!(json.contains("\"description\""));
-    }
-
-    #[test]
-    fn test_patch_search_result_roundtrip() {
-        let psr = PatchSearchResult {
-            uuid: "u1".into(),
-            purl: "pkg:npm/test@1.0.0".into(),
-            published_at: "2024-06-15".into(),
-            description: "A test patch".into(),
-            license: "MIT".into(),
-            tier: "free".into(),
-            vulnerabilities: HashMap::new(),
-        };
-        let json = serde_json::to_string(&psr).unwrap();
-        let back: PatchSearchResult = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.uuid, "u1");
-        assert_eq!(back.published_at, "2024-06-15");
-        assert!(json.contains("publishedAt"));
-    }
-
-    // ── Regression: deserialize from realistic, server-shaped payloads ──
-    //
-    // The structs above are pure serde DTOs, so the only thing that can
-    // break is the JSON field-name contract with the Socket API. The tests
-    // below pin that contract by deserializing payloads in the *exact*
-    // camelCase shape the live endpoints emit (mirroring the integration
-    // fixtures under crates/socket-patch-cli/tests). A dropped or mistyped
-    // `rename_all` / field rename would fail these.
+    // The structs are serde DTOs: these pin the JSON field-name contract by
+    // deserializing payloads in the exact shape the live endpoints emit.
 
     #[test]
     fn test_patch_response_full_view_payload_deserialize() {
@@ -404,10 +250,7 @@ mod tests {
 
     #[test]
     fn test_patch_file_response_absent_optional_keys_are_none() {
-        // serde treats absent Option fields as None. The existing optional-
-        // fields test only round-trips explicit `null`s; this pins the
-        // (distinct) absent-key path the server actually uses when a blob
-        // isn't inlined.
+        // The server omits the keys when a blob isn't inlined.
         let pfr: PatchFileResponse = serde_json::from_str("{}").unwrap();
         assert!(pfr.before_hash.is_none());
         assert!(pfr.after_hash.is_none());
@@ -455,6 +298,40 @@ mod tests {
         assert_eq!(patches[0].severity.as_deref(), Some("high"));
         assert!(patches[1].severity.is_none());
         assert!(patches[1].cve_ids.is_empty());
+    }
+
+    /// `scan --json` serializes the batch packages verbatim, so their
+    /// serialized keys are output.
+    #[test]
+    fn batch_packages_serialize_with_the_wire_keys() {
+        let package = BatchPackagePatches {
+            purl: "pkg:npm/x@1.0.0".into(),
+            patches: vec![BatchPatchInfo {
+                uuid: "u1".into(),
+                purl: "pkg:npm/x@1.0.0".into(),
+                tier: "free".into(),
+                cve_ids: vec!["CVE-2024-0001".into()],
+                ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
+                severity: None,
+                title: "Patch one".into(),
+                published_at: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&package).unwrap(),
+            serde_json::json!({
+                "purl": "pkg:npm/x@1.0.0",
+                "patches": [{
+                    "uuid": "u1",
+                    "purl": "pkg:npm/x@1.0.0",
+                    "tier": "free",
+                    "cveIds": ["CVE-2024-0001"],
+                    "ghsaIds": ["GHSA-1111-2222-3333"],
+                    "severity": null,
+                    "title": "Patch one"
+                }]
+            })
+        );
     }
 
     #[test]
@@ -513,30 +390,8 @@ mod tests {
     }
 
     #[test]
-    fn test_batch_package_patches_field_names() {
-        // BatchPackagePatches deliberately has no rename_all (both fields are
-        // single lowercase words). Pin the on-the-wire key names in both
-        // directions so an accidental rename can't silently break the
-        // batch-endpoint contract.
-        let bpp = BatchPackagePatches {
-            purl: "pkg:npm/x@1.0.0".into(),
-            patches: Vec::new(),
-        };
-        let json = serde_json::to_string(&bpp).unwrap();
-        assert!(json.contains("\"purl\""));
-        assert!(json.contains("\"patches\""));
-
-        let back: BatchPackagePatches =
-            serde_json::from_str(r#"{"purl":"pkg:npm/y@2","patches":[]}"#).unwrap();
-        assert_eq!(back.purl, "pkg:npm/y@2");
-        assert!(back.patches.is_empty());
-    }
-
-    #[test]
     fn test_vulnerability_response_deserialize_standalone() {
-        // VulnerabilityResponse has no rename_all; confirm it deserializes
-        // from the snake/lowercase keys the API emits (the existing test only
-        // exercised the serialize direction in isolation).
+        // VulnerabilityResponse has no rename_all.
         let json = r#"{
             "cves": ["CVE-2024-0001", "CVE-2024-0002"],
             "summary": "Prototype pollution",
@@ -548,31 +403,6 @@ mod tests {
         assert_eq!(vr.summary, "Prototype pollution");
         assert_eq!(vr.severity, "critical");
         assert_eq!(vr.description, "A prototype pollution vulnerability");
-    }
-
-    #[test]
-    fn test_search_response_populated_roundtrip() {
-        // The existing camelCase test round-trips an *empty* patches vec; this
-        // pins a populated PatchSearchResult survives a full serialize ->
-        // deserialize cycle inside its SearchResponse envelope.
-        let sr = SearchResponse {
-            patches: vec![PatchSearchResult {
-                uuid: "u1".into(),
-                purl: "pkg:npm/test@1.0.0".into(),
-                published_at: "2024-06-15T00:00:00Z".into(),
-                description: "A test patch".into(),
-                license: "MIT".into(),
-                tier: "free".into(),
-                vulnerabilities: HashMap::new(),
-            }],
-            can_access_paid_patches: true,
-        };
-        let json = serde_json::to_string(&sr).unwrap();
-        let back: SearchResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.patches.len(), 1);
-        assert_eq!(back.patches[0].uuid, "u1");
-        assert_eq!(back.patches[0].published_at, "2024-06-15T00:00:00Z");
-        assert!(back.can_access_paid_patches);
     }
 
     #[test]
@@ -597,17 +427,11 @@ mod tests {
     }
 
     #[test]
-    fn published_at_is_per_patch_not_per_package() {
+    fn deserializes_a_live_by_package_payload() {
         // Verbatim production payload for
         // `GET /patch/by-package/pkg%3Anpm%2Faxios%401.6.0`, captured
-        // 2026-08-04 (description/summary bodies elided).
-        //
-        // The point: ONE package version, TWO patches, TWO different
-        // `publishedAt` values. That is only possible if the field
-        // describes the patch. If it ever described the package release
-        // (axios@1.6.0 shipped 2023-10-26) both entries would carry the
-        // same date, and `api::ranking`'s recency rung would silently
-        // collapse into the UUID tiebreak.
+        // 2026-08-04 (description/summary bodies elided): RFC 2822 dates
+        // and uppercase severities.
         let json = r#"{
             "canAccessPaidPatches": false,
             "patches": [
@@ -643,18 +467,8 @@ mod tests {
         }"#;
         let sr: SearchResponse = serde_json::from_str(json).unwrap();
         assert_eq!(sr.patches.len(), 2);
-        assert_eq!(
-            sr.patches[0].purl, sr.patches[1].purl,
-            "fixture must be two patches for the SAME package version"
-        );
-        assert_ne!(
-            sr.patches[0].published_at, sr.patches[1].published_at,
-            "publishedAt must vary per patch, not per package"
-        );
         assert_eq!(sr.patches[0].published_at, "Fri, 27 Mar 2026 19:12:42 GMT");
         assert_eq!(sr.patches[1].published_at, "Mon, 03 Aug 2026 20:23:06 GMT");
-        // Production spells severity in uppercase; every ladder in the
-        // workspace lowercases before matching.
         assert_eq!(
             sr.patches[0].vulnerabilities["GHSA-4hjh-wcwx-xvwj"].severity,
             "HIGH"

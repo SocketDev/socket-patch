@@ -16,12 +16,12 @@
 //! So instead of a throwaway container filesystem, every stage runs with the
 //! same host tempdir bind-mounted at `/workspace`. The socket-patch binary
 //! itself is the one BAKED INTO the image at `/usr/local/bin/socket-patch`
-//! by `tests/docker/Dockerfile.base` (optionally shadowed by the
-//! coverage-instrumented binary via `cov_docker_args`, same hook as the
-//! other docker suites).
+//! by `tests/docker/Dockerfile.base` (optionally shadowed via
+//! `docker_common::cov_docker_args`).
 //!
 //! Each test file pulls this in with
-//! `#[path = "docker_vendor_common/mod.rs"] mod docker_vendor_common;`.
+//! `#[path = "docker_vendor_common/mod.rs"] mod docker_vendor_common;`,
+//! beside `docker_common`, which it builds on.
 //!
 //! `#![allow(dead_code)]`: each suite uses a different subset.
 
@@ -36,65 +36,6 @@ use std::process::Stdio;
 use std::path::Path;
 use std::process::{Command, Output};
 
-/// Coverage instrumentation hook — identical contract to
-/// `docker_e2e_pypi.rs::cov_docker_args`. The CI coverage-docker job sets
-/// `SOCKET_PATCH_COV_BIN` (host path to an llvm-cov-instrumented
-/// socket-patch) + `SOCKET_PATCH_COV_PROFRAW_DIR` (host dir for in-container
-/// *.profraw output); locally both are unset and this is empty.
-pub fn cov_docker_args() -> Vec<String> {
-    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
-        return Vec::new();
-    };
-    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
-
-/// Returns `true` when the test should skip: `docker` missing from PATH or
-/// the per-ecosystem image not built. Prints a skip notice — Rust
-/// integration tests have no native "skipped" outcome, so the test then
-/// reports `ok`. Build locally with
-/// `docker build -f tests/docker/Dockerfile.<eco> -t <image> .`
-/// (after `Dockerfile.base` → `socket-patch-test-base:latest`).
-///
-/// With `SOCKET_PATCH_DOCKER_E2E_REQUIRED=1` (a CI job that built the image
-/// itself) a missing docker or image fails the test instead, so a tag
-/// mismatch cannot pass the job with zero assertions.
-#[must_use]
-pub fn skip_if_no_image(image: &str) -> bool {
-    skip_or_require_image(
-        image,
-        std::env::var("SOCKET_PATCH_DOCKER_E2E_REQUIRED").is_ok_and(|v| v == "1"),
-    )
-}
-
-/// [`skip_if_no_image`] with the required switch passed in.
-#[must_use]
-pub fn skip_or_require_image(image: &str, required: bool) -> bool {
-    let reason = match Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()
-    {
-        Err(_) => "`docker` not on PATH".to_string(),
-        Ok(out) if !out.status.success() => format!("docker image `{image}` not present"),
-        Ok(_) => return false,
-    };
-    assert!(
-        !required,
-        "{reason}; SOCKET_PATCH_DOCKER_E2E_REQUIRED=1 forbids skipping"
-    );
-    eprintln!("skipping: {reason}");
-    true
-}
-
 fn docker_command(image: &str, host_dir: &Path, script: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("docker");
     cmd.args(["run", "--rm", "-i"]);
@@ -105,7 +46,7 @@ fn docker_command(image: &str, host_dir: &Path, script: &str, extra: &[&str]) ->
         "-w",
         "/workspace",
     ]);
-    cmd.args(cov_docker_args());
+    cmd.args(crate::docker_common::cov_docker_args());
     cmd.args([image, "bash", "-c", script]);
     cmd
 }
@@ -197,14 +138,7 @@ pub fn run_with_service(image: &str, host_dir: &Path, script: &str, uri: &str) -
     )
 }
 
-/// Run `script` (bash) inside `image` with `host_dir` bind-mounted at
-/// `/workspace` (the working dir). Network is the docker default — use this
-/// for fixture-install stages that need the real registry.
-pub fn run_in_image(image: &str, host_dir: &Path, script: &str) -> Output {
-    docker_run(image, host_dir, script, &[])
-}
-
-/// `run_in_image` + `--network none`: the cold-cache fresh-checkout install
+/// A `--network none` run: the cold-cache fresh-checkout install
 /// stage. Any code path that still wants the registry fails loudly in here.
 pub fn run_in_image_network_none(image: &str, host_dir: &Path, script: &str) -> Output {
     docker_run(image, host_dir, script, &["--network", "none"])

@@ -155,7 +155,7 @@ pub(super) async fn fetch_dists_on<R: Into<ProjectRegistry>>(
                 if let Some((base, why)) = fell_back {
                     // The detail is printed and persisted in `--json`
                     // output (CI logs): never the URL's credentials.
-                    let clean = crate::vex::product::strip_url_userinfo(&base);
+                    let clean = crate::utils::redact::strip_url_userinfo(&base);
                     let why = why.replace(base.trim_end_matches('/'), &clean);
                     let base = clean;
                     result.warnings.push((

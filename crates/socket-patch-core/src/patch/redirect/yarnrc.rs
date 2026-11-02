@@ -667,7 +667,7 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
     }
     let Some(patterns) = read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
         .filter(|patterns| !patterns.is_empty())
     else {
         return Vec::new();

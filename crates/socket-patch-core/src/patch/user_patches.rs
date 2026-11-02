@@ -11,6 +11,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::formats::package_json::Workspaces;
 use crate::formats::text::strip_bom;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
@@ -90,17 +91,9 @@ impl UserPatchIndex {
                         }
                     }
                 }
-                let workspaces = value["workspaces"]
-                    .as_array()
-                    .or_else(|| value["workspaces"]["packages"].as_array());
-                if let Some(workspaces) = workspaces {
-                    globs.extend(
-                        workspaces
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned),
-                    );
-                }
+                // A malformed field still names its string items (#1900):
+                // walking them can only find more patches.
+                globs.extend(Workspaces::of(&value).into_listed().into_iter().flatten());
                 index.patch_package(&dir, &value).await;
             } else {
                 index.patch_directory(&dir.join("patches"), false).await;
@@ -1147,6 +1140,35 @@ mod tests {
         std::fs::remove_file(tmp.path().join("packages/a/src/fixtures/bad/package.json")).unwrap();
         let index = UserPatchIndex::discover(tmp.path()).await;
         assert!(index.conflicts("pkg:npm/x@1.0.0").is_empty(), "{index:?}");
+    }
+
+    /// #1900: a `workspaces` list with a non-string item is read through
+    /// the shared package.json reader, which keeps its string patterns,
+    /// so the members they name are still searched for patches, and
+    /// unrelated npm packages are not marked as user-patched.
+    #[tokio::test]
+    async fn malformed_workspaces_still_walk_their_string_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"workspaces":["packages/*", 1]}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/patches/one+1.0.0.patch",
+            "user diff",
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/one@1.0.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
     }
 
     #[tokio::test]

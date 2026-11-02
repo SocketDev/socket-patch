@@ -64,8 +64,8 @@ fn stage(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
     (gomodcache, cache_dir)
 }
 
-/// Run the CLI binary through the shared hermetic runner. Its hostile seeds
-/// cover the vars verified to break this suite when inherited:
+/// Run the CLI binary through the shared hermetic runner. Its scrub
+/// covers the vars verified to break this suite when inherited:
 /// `SOCKET_GLOBAL` / `SOCKET_GLOBAL_PREFIX` take the redirect backend out of
 /// local scope (apply patches the fake module cache IN PLACE and `--check`
 /// exits 0 having checked nothing), `SOCKET_DRY_RUN` makes every apply a

@@ -808,7 +808,7 @@ pub fn find_repo_root_with_warnings(cwd: &Path) -> (PathBuf, Vec<PolicyWarning>)
             code: SOCKET_YML_REPO_UNTRUSTED,
             detail: format!(
                 "{} is owned by another user; using {} as the repository root",
-                repo.dot_git().display(),
+                repo.root.join(".git").display(),
                 cwd.display()
             ),
         }),

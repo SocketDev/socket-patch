@@ -5,15 +5,13 @@ use std::io::{self, BufRead, IsTerminal, Write};
 
 use crate::args::GlobalArgs;
 
-/// The one note printed (unless `--silent`) when a prompt is answered
-/// automatically because stdin is not a terminal.
-pub(crate) const NON_INTERACTIVE_PROCEED: &str =
-    "Non-interactive mode detected, proceeding automatically.";
-/// Same, for a prompt whose automatic answer is "no".
-pub(crate) const NON_INTERACTIVE_DECLINE: &str =
-    "Non-interactive mode detected, declining by default.";
+/// Printed (unless `--silent`) when a prompt is answered automatically
+/// because stdin is not a terminal.
+const NON_INTERACTIVE_PROCEED: &str = "Non-interactive mode detected, proceeding automatically.";
+/// Same, for a prompt whose default is "no".
+const NON_INTERACTIVE_DECLINE: &str = "Non-interactive mode detected, declining by default.";
 /// Same, for [`select_one`], which takes the first option.
-pub(crate) const NON_INTERACTIVE_SELECT_FIRST: &str =
+const NON_INTERACTIVE_SELECT_FIRST: &str =
     "Non-interactive mode detected, selecting the first option.";
 
 /// Ask a yes/no question on stderr. Returns the answer.
@@ -29,42 +27,27 @@ pub(crate) fn confirm(prompt: &str, default_yes: bool, common: &GlobalArgs) -> b
     if common.yes || common.json {
         return default_yes;
     }
-    ask(
-        prompt,
-        Ask {
-            default_yes,
-            non_interactive_answer: default_yes,
-            // The same question [`confirm_waits`] answers — asked through
-            // it, so the two cannot drift.
-            interactive: confirm_waits(common),
-            silent: common.silent,
-        },
-    )
-}
-
-/// Whether [`confirm`] would stop and wait for a person to answer.
-pub(crate) fn confirm_waits(common: &GlobalArgs) -> bool {
-    !(common.yes || common.json) && io::stdin().is_terminal()
-}
-
-/// How a yes/no question is answered (see [`confirm_with`]).
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Ask {
-    /// The answer to an empty line; also picks the `[Y/n]`/`[y/N]` hint.
-    pub default_yes: bool,
-    /// The answer when nobody can be asked (`interactive == false`).
-    pub non_interactive_answer: bool,
-    /// Whether stdin is a terminal a person is typing into.
-    pub interactive: bool,
-    /// `--silent`: suppress the non-interactive note.
-    pub silent: bool,
-}
-
-fn ask(prompt: &str, ask: Ask) -> bool {
+    let ask = Ask {
+        default_yes,
+        interactive: io::stdin().is_terminal(),
+        silent: common.silent,
+    };
     if ask.interactive {
         discard_typeahead();
     }
     confirm_with(&mut io::stdin().lock(), &mut io::stderr(), prompt, ask)
+}
+
+/// How a yes/no question is answered (see [`confirm_with`]).
+#[derive(Clone, Copy, Debug)]
+struct Ask {
+    /// The answer to an empty line or when nobody can be asked; also
+    /// picks the `[Y/n]`/`[y/N]` hint.
+    default_yes: bool,
+    /// Whether stdin is a terminal a person is typing into.
+    interactive: bool,
+    /// `--silent`: suppress the non-interactive note.
+    silent: bool,
 }
 
 /// Drop keystrokes typed before the prompt appeared, so an Enter pressed
@@ -90,36 +73,21 @@ fn discard_typeahead() {
 
 /// The testable core of [`confirm`]: reads one line from `input`, writes
 /// the prompt (and any note) to `out`.
-pub(crate) fn confirm_with(
-    input: &mut impl BufRead,
-    out: &mut impl Write,
-    prompt: &str,
-    ask: Ask,
-) -> bool {
+fn confirm_with(input: &mut impl BufRead, out: &mut impl Write, prompt: &str, ask: Ask) -> bool {
     if !ask.interactive {
         if !ask.silent {
-            let note = if ask.non_interactive_answer {
+            let note = if ask.default_yes {
                 NON_INTERACTIVE_PROCEED
             } else {
                 NON_INTERACTIVE_DECLINE
             };
             let _ = writeln!(out, "{note}");
         }
-        return ask.non_interactive_answer;
+        return ask.default_yes;
     }
     let hint = if ask.default_yes { "[Y/n]" } else { "[y/N]" };
     let _ = write!(out, "{prompt} {hint} ");
     let _ = out.flush();
-    read_answer(input, out).unwrap_or(ask.default_yes)
-}
-
-/// The answer-reading core of [`confirm_with`]: reads one line from
-/// `input` and maps it to `Some(true)` for `y`/`yes` (any case, whitespace
-/// ignored), `None` for an empty line (the caller's default), and
-/// `Some(false)` for any other answer, end of input (Ctrl-D) or unreadable
-/// input (non-UTF-8, an I/O error). Ends the prompt line on `out` when the
-/// terminal did not echo a newline.
-fn read_answer(input: &mut impl BufRead, out: &mut impl Write) -> Option<bool> {
     // Read raw bytes: `read_line` rolls its buffer back on invalid UTF-8,
     // which would hide the newline the terminal already echoed.
     let mut buf = Vec::new();
@@ -129,24 +97,17 @@ fn read_answer(input: &mut impl BufRead, out: &mut impl Write) -> Option<bool> {
     if !buf.ends_with(b"\n") {
         let _ = writeln!(out);
     }
-    match read {
-        // EOF: the user hit Ctrl-D (or input is gone). Never take that as yes.
-        Ok(0) => Some(false),
-        Ok(_) => match String::from_utf8(buf) {
-            Ok(line) => {
-                let answer = line.trim().to_lowercase();
-                if answer.is_empty() {
-                    None
-                } else {
-                    Some(answer == "y" || answer == "yes")
-                }
-            }
-            // Non-UTF-8 bytes (a Latin-1 paste): decline.
-            Err(_) => Some(false),
-        },
-        // An I/O error: decline.
-        Err(_) => Some(false),
+    // End of input (Ctrl-D), an I/O error and non-UTF-8 bytes (a Latin-1
+    // paste) all decline, even when the default is yes.
+    let Ok(1..) = read else { return false };
+    let Ok(line) = String::from_utf8(buf) else {
+        return false;
+    };
+    let answer = line.trim().to_lowercase();
+    if answer.is_empty() {
+        return ask.default_yes;
     }
+    answer == "y" || answer == "yes"
 }
 
 /// Error type for interactive selection.
@@ -315,22 +276,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn non_interactive_notes_share_one_wording() {
-        assert_eq!(
-            NON_INTERACTIVE_PROCEED,
-            "Non-interactive mode detected, proceeding automatically."
-        );
-        assert_eq!(
-            NON_INTERACTIVE_DECLINE,
-            "Non-interactive mode detected, declining by default."
-        );
-        assert_eq!(
-            NON_INTERACTIVE_SELECT_FIRST,
-            "Non-interactive mode detected, selecting the first option."
-        );
-    }
-
-    #[test]
     fn fit_menu_keeps_every_row_on_one_terminal_line() {
         let prompt = "Multiple patches available for pkg:npm/ws@7.4.5. Select one:";
         let options = vec![
@@ -358,7 +303,6 @@ mod tests {
     fn at_tty(default_yes: bool) -> Ask {
         Ask {
             default_yes,
-            non_interactive_answer: default_yes,
             interactive: true,
             silent: false,
         }
@@ -426,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_returns_the_non_interactive_answer_with_note() {
+    fn non_interactive_answers_the_default_with_note() {
         let ask = Ask {
             interactive: false,
             ..at_tty(true)
@@ -455,47 +399,6 @@ mod tests {
     }
 
     #[test]
-    fn setup_style_default_no_but_proceed_when_non_interactive() {
-        let setup = Ask {
-            default_yes: false,
-            non_interactive_answer: true,
-            interactive: true,
-            silent: false,
-        };
-        let (answer, _) = run(
-            b"",
-            Ask {
-                interactive: false,
-                ..setup
-            },
-        );
-        assert!(answer, "nobody to ask: proceed");
-        assert_eq!(
-            run(b"\n", setup),
-            (false, "Apply 1 patch? [y/N] ".into()),
-            "at a terminal an empty answer means no"
-        );
-    }
-
-    #[test]
-    fn read_answer_maps_empty_to_none_and_eof_to_decline() {
-        let read = |input: &[u8]| {
-            let mut out = Vec::new();
-            let answer = read_answer(&mut &input[..], &mut out);
-            (answer, String::from_utf8(out).unwrap())
-        };
-        assert_eq!(read(b"\n"), (None, String::new()));
-        assert_eq!(read(b"  \n"), (None, String::new()));
-        assert_eq!(read(b"Yes\n"), (Some(true), String::new()));
-        assert_eq!(read(b" y \n"), (Some(true), String::new()));
-        assert_eq!(read(b"no\n"), (Some(false), String::new()));
-        assert_eq!(read(b"\xE9\n"), (Some(false), String::new()));
-        // EOF declines (never `None`, which a default-yes caller would
-        // turn into yes) and ends the prompt line.
-        assert_eq!(read(b""), (Some(false), "\n".into()));
-    }
-
-    #[test]
     fn select_one_json_mode_requires_explicit_selection() {
         let json = GlobalArgs {
             json: true,
@@ -521,22 +424,14 @@ mod tests {
         ));
     }
 
-    /// `confirm_waits` must never say "no wait" for a case `confirm` would
-    /// stop on. Over
-    /// the whole `{yes, json}` cube with this process's stdin (a pipe
-    /// under the test harness, so never a terminal), it says no wait —
-    /// and `confirm` indeed answers from its default without reading a
-    /// byte, whatever is on stdin.
     #[test]
-    fn confirm_waits_agrees_with_confirm_over_the_flag_cube() {
-        for (yes, json) in [(false, false), (true, false), (false, true), (true, true)] {
+    fn yes_or_json_answers_the_default() {
+        for (yes, json) in [(true, false), (false, true), (true, true)] {
             let common = GlobalArgs {
                 yes,
                 json,
-                silent: true,
                 ..GlobalArgs::default()
             };
-            assert!(!confirm_waits(&common), "yes={yes} json={json}");
             for default_yes in [true, false] {
                 assert_eq!(
                     confirm("go?", default_yes, &common),
@@ -545,26 +440,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// The other half of the same contract, on the one input `confirm`
-    /// takes that a test can vary: when nobody is waiting, the answer is
-    /// the caller's default, never whatever happens to be on stdin.
-    #[test]
-    fn a_prompt_nobody_waits_on_never_reads_the_answer() {
-        let mut out = Vec::new();
-        let answered = confirm_with(
-            &mut &b"n\n"[..],
-            &mut out,
-            "go?",
-            Ask {
-                default_yes: true,
-                non_interactive_answer: true,
-                interactive: false,
-                silent: true,
-            },
-        );
-        assert!(answered);
-        assert!(out.is_empty(), "{}", String::from_utf8_lossy(&out));
     }
 }
