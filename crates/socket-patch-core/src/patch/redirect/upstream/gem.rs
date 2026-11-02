@@ -1902,6 +1902,10 @@ mod tests {
         };
         assert!(has("  \"other\", with: \"rails\", in: \"puma\"\n"));
         assert!(has("  \"other\", in: \"puma\", with: \"rails\"\n"));
+        // A replacement version requirement, as Bundler 4.1 locks it.
+        assert!(has(
+            "  \"other\", with: \"rails\", in: \"puma\", version: \">= 7, < 8\"\n"
+        ));
         assert!(has(
             "  \"x\", with: \"y\", in: \"z\"\n  \"other\", with: \"rails\", in: \"puma\"\n"
         ));
@@ -1910,6 +1914,8 @@ mod tests {
         assert!(!has("  \"rails\", with: \"other\", in: \"puma\"\n"));
         assert!(!has("  \"other\", with: \"x\", in: \"rails\"\n"));
         assert!(!has("  \"other\", with: \"rails-html\", in: \"puma\"\n"));
+        // `with: nil` drops the dependency: no target.
+        assert!(!has("  \"rails\", with: nil, in: \"puma\"\n"));
         assert!(!has(""));
         // A `with:` entry outside the OVERRIDES section is not read.
         let lines = ["DEPENDENCIES", "  \"other\", with: \"rails\", in: \"puma\""];
