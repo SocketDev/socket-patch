@@ -156,16 +156,16 @@ crates/socket-patch-cli/tests/e2e_maven.rs	331	audit-cli-tests	cbbbdb9 2026-11-0
 crates/socket-patch-cli/tests/e2e_npm.rs	762	audit-cli-tests	cbbbdb9 2026-11-02	-	delete has_command L42, git_sha256_file L53, assert_run_ok L87, write_package_json L113, npm_run L96 (T55); dead assert L416-420; merge save_only L510 into dry_run L250; stale comments L73, L586-587 (default refuses, not warn-overwrite); 7 #[ignore] live tests never in CI, silent skips; has_cve L201 ignores id (gem L529 drift); ci.yml L1498 dead e2e_npm gate
 crates/socket-patch-cli/tests/e2e_nuget.rs	297	audit-cli-tests	cbbbdb9 2026-11-02	-	L148-151 contains(scannedPackages: {n}) unterminated: 10-19 pass n=1 (T69) -> parse JSON; identical-operand && L226, L285; inline parse_found_count L79; drop always-project_dir cwd param of assert_json_scanned; legacy test L268 aliases NUGET_PACKAGES to packages/ -> empty dir; start_proxy/assert_proxy (T64); ~15 comment lines
 crates/socket-patch-cli/tests/e2e_nuget_dotnet_build.rs	1217	audit-cli-tests	cbbbdb9 2026-11-02	-	delete copy_tree L320 (= prebuilt_common L722, T64); local assert_omitted L407 -> vex_e2e_common; stale --vendor-source build docs L18-22, L904 (code passes service); module doc overclaims VEX L1-2; Backend Option always Some; patched-fixture preamble x4 -> helper; 5 env.to_string().contains(code) -> codes_in; solution test re-implements fresh_checkout L1192; DOTNET_SPAWN narration L94-107
-crates/socket-patch-cli/tests/e2e_pypi.rs	895	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_pypi_bytecode.rs	221	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_pypi_multi_copy.rs	290	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_bun_build.rs	1917	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_cargo_build.rs	1066	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_cargo_shapes.rs	1559	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_composer_build.rs	1009	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_gem_build.rs	4771	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_gem_stale_install.rs	1881	audit-cli-tests	-	-	
-crates/socket-patch-cli/tests/e2e_redirect_gradle_build.rs	2288	audit-cli-tests	-	-	
+crates/socket-patch-cli/tests/e2e_pypi.rs	895	audit-cli-tests	fd86ff2 2026-11-02	-	delete local git_sha256_file/assert_run_ok (T55); has_python3 skip has no REQUIRED gate (T50); fold 5 `nontrivial` blocks + hash loops into 2 helpers; merge dry_run and save_only (same flow); save_only counter counts unchecked files; global scan: assert the pydantic-ai purl in packages[]; drop macOS re-checks; ~30 comment lines (v3-v5 history, stale _ssrf.py)
+crates/socket-patch-cli/tests/e2e_pypi_bytecode.rs	221	audit-cli-tests	fd86ff2 2026-11-02	-	inline python_on_path, stage_patch; share the dupkit fixture with e2e_pypi_multi_copy (T73); `let Some(py) else return` skip needs a REQUIRED gate (T50); PYTHON_VARS overlaps multi_copy by 7 names: one hermetic Extra::Python; ~4 comment lines
+crates/socket-patch-cli/tests/e2e_pypi_multi_copy.rs	290	audit-cli-tests	fd86ff2 2026-11-02	-	local envelope -> common::envelope; re-apply asserts only the exit code: assert 0 applied events; rollback --json is never parsed: assert a rolled-back event per copy; share dupkit with e2e_pypi_bytecode (T73); ~6 "Apply used to" history lines
+crates/socket-patch-cli/tests/e2e_redirect_bun_build.rs	1917	audit-cli-tests	fd86ff2 2026-11-02	-	bun toolchain block -> shared module (T70); inline 6 single-caller fns; drop wrappers bun/run_socket/bun_hosted_project; v1 leg final proj/bun.lock assert and L1396 precondition cannot fail; 3 asserts redundant before assert_eq; npmrc warning by substring (C32); tamper oracle accepts any "hash"; split 440-line bun_hosted_project_with; stale ledger docs; ~70 comment lines; T55 T64 T72
+crates/socket-patch-cli/tests/e2e_redirect_cargo_build.rs	1066	audit-cli-tests	fd86ff2 2026-11-02	-	move cargo/sparse_index_rel/find_registry_crate/build_patched_crate/stage_fixture to cargo_e2e_matrix, locked_version/package_block -> parse_lock (T71); sha256_hex -> common (T55); ledger asserts -> assert_no_hosted_ledger; drop no-op strip_manifest/strip_ledgers; fix (1)/(2) labels; 4b `if let Some(pristine)` makes the check optional; ~40 comment lines
+crates/socket-patch-cli/tests/e2e_redirect_cargo_shapes.rs	1559	audit-cli-tests	fd86ff2 2026-11-02	-	inline 8 single-caller fns (build_crate, router, urlencoding_decode, contest_after_scan, ...); Shape::default (15 literals, ~120 lines); split 365-line run_shape; unwind accepts a trailing newline for every shape, scope it to config-unterminated; contest VEX ignores exit code and greps; vex argv x2; stale ledger doc; ~40 comment lines ("Bug B/H/F/K"); T64 T71
+crates/socket-patch-cli/tests/e2e_redirect_composer_build.rs	1009	audit-cli-tests	fd86ff2 2026-11-02	-	inline setup_vtag_project, locked_version, zip_top, composer_release (drifted copy of composer_major, unwrap_or(0) picks a branch silently); one composer.lock reader (x3 here + e2e_vendor_composer_build); 2 tamper assert_ne!(patched) cannot fail: assert absent; GetUuid arm checks no status/applied; fix step comments; no-ledger assert x3; ~15 comment lines; T72
+crates/socket-patch-cli/tests/e2e_redirect_gem_build.rs	4861	audit-cli-tests	fd86ff2 2026-11-02	-	16 refusal tests end in assert!(fx.is_none()) that cannot fire: one table test over an enum result; inline 8 single-caller fns; drop run_socket/bundle wrappers; sha256_hex -> common (T55); split 787-line redirect_scanned_project, 28-arm argv match -> `_`; ~8 in-file copies; hand-rolled vex -> run_vex; ~120 history comment lines; C32 T64 T69 T73
+crates/socket-patch-cli/tests/e2e_redirect_gem_stale_install.rs	1881	audit-cli-tests	fd86ff2 2026-11-02	-	grow hosted_scan_json, drop 11 hand-copied scan argv lists (~200 lines); 9 `if let Ok(doc)` VEX checks pass when no file is written; attestation by doc.contains -> assert_attested; one test drops exit code; force/redownload check only greps both words; hosted_pinned -> hosted_pins (T64); converged_lock dup; header lists 7 of 22 tests; ~35 comment lines
+crates/socket-patch-cli/tests/e2e_redirect_gradle_build.rs	2288	audit-cli-tests	fd86ff2 2026-11-02	-	codes()/snippet_code() iterate json["warnings"] twice; inline 5 single-caller fns + wrappers mount_api/stage_manifest/codes/sfx; Cell::vex ignores exit code, missing doc = 0 statements; assert_fails_loud ~only checks !ok; dead locking() match; `let _ = stderr`; takeover test drops scan code; mount_grants forks hosted_maven_common::mount_api (T72); jar fixtures (T73)
 crates/socket-patch-cli/tests/e2e_redirect_maven_build.rs	521	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/e2e_redirect_npm_build.rs	1418	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/e2e_redirect_pnpm_build.rs	2224	audit-cli-tests	-	-	
@@ -263,6 +263,7 @@ crates/socket-patch-cli/tests/get/global_packages_e2e.rs	611	audit-cli-tests	-	-
 crates/socket-patch-cli/tests/get/main.rs	33	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/global_scope_project_state.rs	1442	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/golang_e2e_matrix/mod.rs	406	audit-cli-tests	-	-	
+crates/socket-patch-cli/tests/golang_production/mod.rs	224	audit-cli-tests	fd86ff2 2026-11-02	-	drop #[path] re-mounts of cache_env/hermetic/oracle (parents mount common); narrow #![allow(dead_code)]; `action == "redirected"` is not an envelope action and mode is unchecked: assert applied + details.mode; copy_tree (T64); helper for go-run-compare x6; parent comments still call golang unsupported (T68)
 crates/socket-patch-cli/tests/gradle_agent_cli.rs	1363	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/gradle_build_common/mod.rs	791	audit-cli-tests	-	-	
 crates/socket-patch-cli/tests/help_text_hygiene.rs	337	audit-cli-tests	-	-	
@@ -766,6 +767,8 @@ crates/socket-patch-core/src/vendor/gem.rs	9222	audit-core	-	-
 crates/socket-patch-core/src/vendor/go_build_list.rs	387	audit-core	-	-	
 crates/socket-patch-core/src/vendor/go_consumer_sync.rs	1240	audit-core	-	-	
 crates/socket-patch-core/src/vendor/go_mod_edit.rs	2637	audit-core	-	-	
+crates/socket-patch-core/src/vendor/go_native_vendor.rs	1049	audit-core	-	-	
+crates/socket-patch-core/src/vendor/go_sum_backup.rs	409	audit-core	-	-	
 crates/socket-patch-core/src/vendor/go_sum_edit.rs	884	audit-core	-	-	
 crates/socket-patch-core/src/vendor/go_workspace.rs	2022	audit-core	-	-	
 crates/socket-patch-core/src/vendor/golang.rs	2934	audit-core	-	-	

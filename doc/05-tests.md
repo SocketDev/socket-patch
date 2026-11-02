@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
+_Last checked against main @ fd86ff2 on 2026-11-02 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -113,4 +113,9 @@ _Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
   - Weak oracles: nuget's unterminated `scannedPackages: {n}` substring passes 10–19 for 1; `!a && !a` ×5 {{T69}}; ~40 sentence `.contains` on `--json` stdout (C32); Go drift and refusal tests assert only a non-zero exit.
   - Silent or never-run: `e2e_npm` (7) and `e2e_gem` (3) are `#[ignore]`d live tests, never in CI, that skip without a REQUIRED gate {{T50}}; the go<1.22 sub-gate skips without a line.
   - Scaffolding: Go harness copied across 5 suites {{T65}}; no Go `Extra` in `hermetic` and process-wide `set_var` {{T66}}; hosted/vendored production near-fork {{T68}}; Gradle world setup ×4 and victim helpers ×2.
+- **Tally for `e2e_pypi*` (3), `e2e_redirect_{bun,cargo,cargo_shapes,composer,gem,gem_stale_install,gradle}_build`, `golang_production` (11 files, 16.2K lines, audit-cli-tests 2026-11-02 16:20Z): about 53 fake or weak tests.**
+  - Can't fail: gem's 16 refusal tests end in `assert!(fx.is_none())` after a fixture that returns `None` or panics; bun's v1 leg re-reads a `bun.lock` nothing touched since the fixture checked it; composer's two tamper `assert_ne!(patched)` where the server never serves the patched bytes; `golang_production` accepts `action == "redirected"`, which no event carries.
+  - Pass when the output is missing: 9 gem stale-install VEX checks (`if let Ok(doc)`), cargo-shapes contest and gradle `Cell::vex` (missing doc = 0 statements, exit code ignored); gradle `assert_fails_loud` checks little beyond `!ok`.
+  - Weak oracles: gradle `codes()` reads `warnings` twice; cargo-shapes unwind accepts a trailing newline for every shape; ~15 more sentence or raw-JSON `.contains` (C32).
+  - Scaffolding: bun toolchain ×3 {{T70}}; cargo fixture helpers ×3-4 beside `cargo_e2e_matrix` {{T71}}; hosted API mocks hand-mounted in ~120 files {{T72}}; two-suite fixture copies {{T73}}; `golang_production` re-mounts `common` modules under `#[path]`.
 - **Coverage gaps:** a lockfile-only calm skip and a genuine miss serialize identically (`skipped`/`package_not_installed`), and an apply no-matching-variant miss emits no event, so the JSON tests can't check either (executed; C13); no offline round-trip test of the cargo matrix's `Cargo.lock` codec.
