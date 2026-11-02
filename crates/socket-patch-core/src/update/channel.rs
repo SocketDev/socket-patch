@@ -386,16 +386,10 @@ fn read_package_json(dir: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(crate::formats::text::strip_bom(&text)).ok()
 }
 
-/// Whether a `package.json` declares workspaces: a non-empty array, or the
-/// `{ "packages": [...] }` form with a non-empty `packages`.
+/// Whether a `package.json` declares workspaces: its `workspaces` field
+/// names at least one pattern ([`Workspaces::lists_any`](crate::formats::package_json::Workspaces::lists_any)).
 fn declares_workspaces(pkg: &serde_json::Value) -> bool {
-    let globs = match pkg.get("workspaces") {
-        Some(serde_json::Value::Object(obj)) => obj.get("packages"),
-        other => other,
-    };
-    globs
-        .and_then(|g| g.as_array())
-        .is_some_and(|g| !g.is_empty())
+    crate::formats::package_json::Workspaces::of(pkg).lists_any()
 }
 
 /// Whether a `package.json` itself declares socket-patch in any dependency
@@ -575,6 +569,24 @@ mod tests {
     /// [`upgrade_hint_for`] with no yarn `global-folder` configured.
     fn hint(channel: InstallChannel, exe: &Path) -> &'static str {
         upgrade_hint_for(channel, exe, &ChannelEnv::default())
+    }
+
+    /// #1900: `workspaces` is read through the shared package.json
+    /// reader, so a field that names no pattern string declares none.
+    #[test]
+    fn declares_workspaces_reads_the_shared_field_rule() {
+        for (text, want) in [
+            (r#"{"workspaces":["a"]}"#, true),
+            (r#"{"workspaces":{"packages":["a"]}}"#, true),
+            (r#"{"workspaces":["a",1]}"#, true),
+            (r#"{"workspaces":[1]}"#, false),
+            (r#"{"workspaces":[]}"#, false),
+            (r#"{"workspaces":null}"#, false),
+            (r#"{"name":"x"}"#, false),
+        ] {
+            let pkg: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(declares_workspaces(&pkg), want, "{text}");
+        }
     }
 
     /// [`channel_label_for`] with no yarn `global-folder` configured.

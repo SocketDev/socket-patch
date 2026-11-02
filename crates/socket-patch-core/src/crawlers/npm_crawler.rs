@@ -124,7 +124,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
     else {
         return Vec::new();
     };
@@ -946,20 +946,17 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(_) => return None,
     };
-    let text = strip_bom(&text);
-    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
-    let patterns = match doc.get("workspaces") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(list)) => list.clone(),
-        Some(serde_json::Value::Object(map)) => match map.get("packages") {
-            None => Vec::new(),
-            Some(packages) => packages.as_array()?.clone(),
-        },
-        Some(_) => return None,
+    use crate::formats::package_json::Workspaces;
+
+    // Bun refuses to install from a malformed field (#1900), so it names
+    // no member set.
+    let patterns = match Workspaces::parse(&text)? {
+        Workspaces::None => Vec::new(),
+        Workspaces::Patterns(patterns) => patterns,
+        Workspaces::Malformed(_) => return None,
     };
     let mut members = Vec::new();
     for pattern in &patterns {
-        let pattern = pattern.as_str()?;
         if pattern.starts_with('!') {
             continue;
         }
@@ -8158,6 +8155,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bun_workspace_pattern_members_sync(dir.path()), None);
+
+        // #1900: Bun refuses to install from a `null` or non-string
+        // `workspaces`, so the patterns cannot name the member set.
+        for manifest in [r#"{"workspaces":null}"#, r#"{"workspaces":["a",1]}"#] {
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+            assert_eq!(
+                bun_workspace_pattern_members_sync(dir.path()),
+                None,
+                "{manifest}"
+            );
+        }
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(bun_workspace_pattern_members_sync(dir.path()), Some(vec![]));
     }
 
     /// `.yarnrc` `--modules-folder` parsing: bare and quoted keys and
