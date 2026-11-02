@@ -873,8 +873,9 @@ async fn dry_run_previews_report_would_refuse_on_refused_bun_project() {
     }
 }
 
-/// The human dry-run keeps its count line and additionally names what the
-/// wet run would refuse — under `--silent` it prints nothing at all.
+/// The human dry-run's count line leaves out what the wet run would refuse
+/// (scan's shared headline, #1850) and names it — under `--silent` it
+/// prints nothing at all.
 #[tokio::test]
 async fn dry_run_human_names_would_refuse_records() {
     let mock = MockServer::start().await;
@@ -885,7 +886,10 @@ async fn dry_run_human_names_would_refuse_records() {
     let (exit, stdout, stderr) = get_vendored(tmp.path(), &mock.uri(), PURL, &["--dry-run"]);
     assert_eq!(exit, 0, "stdout={stdout}\nstderr={stderr}");
     assert!(
-        stdout.contains("[dry-run] Would download and vendor 1 patch. No changes made."),
+        stdout.contains(
+            "[dry-run] Would download and vendor 0 of 1 patch (1 would be refused). \
+             No changes made."
+        ),
         "{stdout}"
     );
     assert!(
