@@ -118,19 +118,75 @@ impl NpmOverrides {
         dep_name: &str,
         spec: &str,
     ) -> Option<String> {
+        let search = self.search(packages, from, dep_name, spec)?;
+        if search.unclear {
+            return None;
+        }
+        let best = search.best.filter(|b| !b.contested)?;
+        effective(best.value)
+    }
+
+    /// For an edge whose own `spec` is a registry spec: the non-registry
+    /// spec (url, git, path) an override may make npm install instead, or
+    /// `None` when npm installs a registry release (#1965).
+    ///
+    /// This leans the other way from [`Self::replacement`]: when the
+    /// winning rule can't be decided exactly, any rule for `dep_name` with
+    /// a non-registry value counts, so the copy is left unpatched and
+    /// reported rather than rewired and attested.
+    fn non_registry_replacement(
+        &self,
+        packages: &Map<String, Value>,
+        from: &str,
+        dep_name: &str,
+        spec: &str,
+    ) -> Option<String> {
+        let search = self.search(packages, from, dep_name, spec)?;
+        let decided = match &search.best {
+            Some(best) => !search.unclear && !best.contested,
+            None => !search.unclear,
+        };
+        if decided {
+            return search
+                .best
+                .and_then(|best| effective(best.value))
+                .filter(|value| !npm_spec_is_registry(value));
+        }
+        self.any_non_registry_rule(&self.rules, dep_name)
+    }
+
+    /// The rules found for the edge, or `None` when there are no rules.
+    fn search(
+        &self,
+        packages: &Map<String, Value>,
+        from: &str,
+        dep_name: &str,
+        spec: &str,
+    ) -> Option<RuleSearch> {
         if self.rules.is_empty() {
             return None;
         }
         let chain = dependent_chain(packages, from);
         let mut search = RuleSearch::default();
         self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut search);
-        if search.unclear {
-            return None;
-        }
-        let best = search.best.filter(|b| !b.contested)?;
-        // npm ignores a `*` (or empty) replacement: the raw spec stays.
-        let value = best.value.trim();
-        (!value.is_empty() && value != "*").then_some(best.value)
+        Some(search)
+    }
+
+    /// The first non-registry value of a rule keyed by `dep_name`, at any
+    /// depth of `rules`, whatever its selectors.
+    fn any_non_registry_rule(&self, rules: &Map<String, Value>, dep_name: &str) -> Option<String> {
+        rules.iter().find_map(|(key, value)| {
+            let own = (key != "." && split_selector(key).0 == dep_name)
+                .then(|| self.rule_value(value))
+                .flatten()
+                .and_then(effective)
+                .filter(|value| !npm_spec_is_registry(value));
+            own.or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|children| self.any_non_registry_rule(children, dep_name))
+            })
+        })
     }
 
     /// Search `rules` (nested `depth` levels deep; the enclosing rules
@@ -222,6 +278,13 @@ impl NpmOverrides {
             None => Some(raw.to_string()),
         }
     }
+}
+
+/// The spec a rule's value makes npm install: `None` for a `*` (or empty)
+/// value, which npm ignores, leaving the dependent's own spec in effect.
+fn effective(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && trimmed != "*").then_some(value)
 }
 
 /// What [`NpmOverrides::visit`] has found for one edge.
@@ -382,30 +445,46 @@ pub(crate) fn npm_non_registry_entries(
                 let Some(spec) = spec.as_str() else {
                     continue;
                 };
-                if npm_spec_is_registry(spec) {
-                    continue;
-                }
-                // An override that swaps the spec for a registry one makes
-                // npm install the registry release instead (#490).
-                if overrides
-                    .replacement(packages, from, dep_name, spec)
-                    .is_some_and(|replacement| npm_spec_is_registry(&replacement))
-                {
-                    continue;
-                }
+                let dependent = || {
+                    if from.is_empty() {
+                        "the project".to_string()
+                    } else {
+                        format!("`{from}`")
+                    }
+                };
+                let reason = if npm_spec_is_registry(spec) {
+                    // An override that swaps a registry spec for a url, git
+                    // or path one makes npm install from that spec, though
+                    // the lock's `resolved` still looks like the registry's
+                    // (#1965).
+                    let Some(replacement) =
+                        overrides.non_registry_replacement(packages, from, dep_name, spec)
+                    else {
+                        continue;
+                    };
+                    format!(
+                        "{} depends on it as {spec:?}, which the root package.json's \
+                         overrides replace with {replacement:?}, and npm installs from that spec",
+                        dependent()
+                    )
+                } else {
+                    // An override that swaps the spec for a registry one
+                    // makes npm install the registry release instead (#490).
+                    if overrides
+                        .replacement(packages, from, dep_name, spec)
+                        .is_some_and(|replacement| npm_spec_is_registry(&replacement))
+                    {
+                        continue;
+                    }
+                    format!(
+                        "{} depends on it as {spec:?}, which npm installs from that spec",
+                        dependent()
+                    )
+                };
                 let Some(target) = resolve_edge(packages, from, dep_name) else {
                     continue;
                 };
-                let dependent = if from.is_empty() {
-                    "the project".to_string()
-                } else {
-                    format!("`{from}`")
-                };
-                out.entry(target).or_insert_with(|| {
-                    format!(
-                        "{dependent} depends on it as {spec:?}, which npm installs from that spec"
-                    )
-                });
+                out.entry(target).or_insert(reason);
             }
         }
     }
