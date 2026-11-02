@@ -20,6 +20,7 @@
 //! directory (its ancestors), so it only runs over the disk; an in-memory
 //! project is the host's whole file set and has no ancestors.
 
+use crate::formats::package_json::Workspaces;
 use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
@@ -1202,25 +1203,13 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
     })
 }
 
-/// The `workspaces` patterns of a `package.json`: the array form (npm,
-/// yarn, Bun) or the object form's `packages` array (yarn classic's
-/// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
+/// The `workspaces` patterns of a `package.json` as a widening reader
+/// takes them ([`Workspaces::into_listed`]): a root whose field is
+/// malformed still governs the members its string items name, so the
+/// refusal errs toward naming the root. `None` when no field is declared
 /// or the manifest does not parse.
 pub(crate) fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
-    let text = strip_bom(package_json);
-    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
-    let field = doc.get("workspaces")?;
-    let list = match field {
-        serde_json::Value::Array(list) => list,
-        serde_json::Value::Object(map) => map.get("packages")?.as_array()?,
-        _ => return None,
-    };
-    Some(
-        list.iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect(),
-    )
+    Workspaces::parse(package_json)?.into_listed()
 }
 
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {

@@ -4,6 +4,7 @@
 //! yet, and need not touch the same file as the Socket fix. Never execute hooks
 //! or fetch patch URLs to establish ownership.
 
+use crate::formats::package_json::Workspaces;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -90,17 +91,13 @@ impl UserPatchIndex {
                         }
                     }
                 }
-                let workspaces = value["workspaces"]
-                    .as_array()
-                    .or_else(|| value["workspaces"]["packages"].as_array());
-                if let Some(workspaces) = workspaces {
-                    globs.extend(
-                        workspaces
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned),
-                    );
+                let workspaces = Workspaces::of(&value);
+                if matches!(workspaces, Workspaces::Malformed(_)) {
+                    // #1900: the package managers refuse this field, so
+                    // which members install (and patch) cannot be told.
+                    index.unknown("npm", &dir.join("package.json"), "malformed workspaces");
                 }
+                globs.extend(workspaces.into_listed().into_iter().flatten());
                 index.patch_package(&dir, &value).await;
             } else {
                 index.patch_directory(&dir.join("patches"), false).await;
@@ -1207,6 +1204,10 @@ mod tests {
             r#"{"scripts":{"postinstall":"patch-package --patch-dir $PATCH_DIR"}}"#,
             r#"{"scripts":{"postinstall":"patch-package --patch-dir missing"}}"#,
             "{broken json",
+            // #1900: npm, yarn and Bun all refuse a `workspaces` list with
+            // a non-string item, and npm and Bun refuse `null`.
+            r#"{"workspaces": ["a", 1]}"#,
+            r#"{"workspaces": null}"#,
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write(tmp.path(), "package.json", text);
