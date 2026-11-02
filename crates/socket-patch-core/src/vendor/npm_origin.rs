@@ -141,6 +141,10 @@ impl NpmOverrides {
         dep_name: &str,
         spec: &str,
     ) -> Option<String> {
+        // Nearly every edge is a registry edge, so settle the common case
+        // (no rule for the package can name a non-registry spec) without
+        // walking the dependent's chain.
+        let candidate = self.any_non_registry_rule(&self.rules, dep_name)?;
         let search = self.search(packages, from, dep_name, spec)?;
         let decided = match &search.best {
             Some(best) => !search.unclear && !best.contested,
@@ -152,7 +156,7 @@ impl NpmOverrides {
                 .and_then(|best| effective(best.value))
                 .filter(|value| !npm_spec_is_registry(value));
         }
-        self.any_non_registry_rule(&self.rules, dep_name)
+        Some(candidate)
     }
 
     /// The rules found for the edge, or `None` when there are no rules.
