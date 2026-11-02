@@ -27,6 +27,7 @@
 pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
+pub(crate) mod modules_yaml;
 mod version;
 pub(crate) mod workspace;
 
@@ -369,8 +370,13 @@ pub(crate) fn check_v9_lock_version(text: &str) -> Result<(), String> {
 /// One pnpm lock, parsed once (see the module docs).
 pub struct PnpmLock<'t> {
     text: &'t str,
+    /// The project document ([`grammar::main_document`]): pnpm 11+ writes
+    /// its env lockfile (`configDependencies`, `packageManagerDependencies`)
+    /// as a first document whose packages the install never links (#1949).
+    doc: &'t str,
+    /// Entries of the project document only, with offsets into `text`.
     packages: Vec<PnpmPackage<'t>>,
-    /// [`vendored_npm_uuids`] of the text.
+    /// [`vendored_npm_uuids`] of the project document.
     vendored: HashSet<String>,
 }
 
@@ -386,10 +392,18 @@ pub(crate) struct PnpmTarballRef<'p> {
 impl<'t> PnpmLock<'t> {
     /// Parse a lock text (any content: a non-pnpm text has no entries).
     pub fn parse(text: &'t str) -> Self {
+        let doc = grammar::main_document(strip_bom(text));
+        // `doc` is a suffix of `text`: parse the whole text so offsets stay
+        // relative to it, and keep the entries that start in `doc`.
+        let doc_start = text.len() - doc.len();
         PnpmLock {
             text,
-            packages: pnpm_packages(text),
-            vendored: vendored_npm_uuids(text),
+            doc,
+            packages: pnpm_packages(text)
+                .into_iter()
+                .filter(|p| p.entry.offset >= doc_start)
+                .collect(),
+            vendored: vendored_npm_uuids(doc),
         }
     }
 
@@ -408,7 +422,7 @@ impl<'t> PnpmLock<'t> {
     }
 
     fn has_packages_section(&self) -> bool {
-        self.text
+        self.doc
             .lines()
             .any(|l| l.trim_end_matches('\r') == "packages:")
     }
@@ -754,6 +768,51 @@ mod tests {
         assert!(!PnpmLock::parse(importers).resolves("left-pad", "1.3.0"));
     }
 
+    /// #1949: a pnpm 11+ lock's env document (config dependencies the
+    /// install never links) is not part of the inventory: `entries()`,
+    /// `resolves()`, the vendored uuids and `InstalledPackages` all read
+    /// the project document alone, and agree with each other.
+    #[test]
+    fn env_document_is_not_in_the_inventory() {
+        let env = format!(
+            "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {{integrity: sha512-c}}\n\n  b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz}}\n    version: 1.0.0\n\n"
+        );
+        let project = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n";
+        for text in [
+            format!("{env}{project}"),
+            format!("\u{feff}{env}{project}"),
+            format!("{env}{project}").replace('\n', "\r\n"),
+        ] {
+            let lock = PnpmLock::parse(&text);
+            let names: Vec<_> = lock
+                .entries()
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.version))
+                .collect();
+            assert_eq!(
+                names,
+                [("left-pad".to_string(), "1.3.0".to_string())],
+                "{text:?}"
+            );
+            assert!(lock.resolves("left-pad", "1.3.0"));
+            assert!(!lock.resolves("cfg-dep", "2.0.0"));
+            assert!(!lock.vendored_in_use(UUID));
+            assert!(lock.packages().iter().all(|p| p.entry.offset >= env.len()));
+            let installed = InstalledPackages::from_lock_text(&text).unwrap();
+            assert!(installed.contains("left-pad", "1.3.0"));
+            assert!(!installed.contains("cfg-dep", "2.0.0"));
+        }
+        // Offsets still index the whole text.
+        let text = format!("{env}{project}");
+        let lock = PnpmLock::parse(&text);
+        let entry = &lock.packages()[0].entry;
+        assert_eq!(
+            &text[entry.offset..entry.offset + entry.body.len()],
+            entry.body
+        );
+    }
+
     #[test]
     fn vendored_in_use_reads_v9_and_legacy_keys_and_crlf() {
         let v9 = format!(
@@ -858,5 +917,53 @@ mod tests {
         assert!(!is_pnpm_lock_text(
             "\u{feff}\u{feff}lockfileVersion: '9.0'\n"
         ));
+    }
+
+    /// Lock-head version sniff against real pnpm 7/8/9-12 heads: quoted `'9.0'` and `'6.0'`,
+    /// unquoted `5.4`; a headless/garbled lock yields `None` (hands-off).
+    #[test]
+    fn lock_version_major_sniffs_real_lock_heads() {
+        assert_eq!(
+            lock_version_major("lockfileVersion: '9.0'\n\nsettings:\n"),
+            Some(9),
+            "pnpm 9-12 emit a quoted '9.0'"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: '6.0'\n\nsettings:\n"),
+            Some(6),
+            "pnpm 8 emits a quoted '6.0'"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: 5.4\n\nspecifiers:\n"),
+            Some(5),
+            "pnpm 7 emits an unquoted 5.4"
+        );
+        // Not necessarily the first line (a comment/BOM-damaged head).
+        assert_eq!(
+            lock_version_major("# managed\nlockfileVersion: \"9.0\"\n"),
+            Some(9)
+        );
+        assert_eq!(
+            lock_version_major("importers:\n  .:\n"),
+            None,
+            "no version line → None, callers stay hands-off"
+        );
+        assert_eq!(
+            lock_version_major("lockfileVersion: banana\n"),
+            None,
+            "unparseable version → None, never a guess"
+        );
+    }
+
+    #[test]
+    fn may_need_store_flag_only_for_pnpm_one_to_four_locks() {
+        assert!(may_need_store_flag("shrinkwrapVersion: 3\n"));
+        assert!(may_need_store_flag("lockfileVersion: 5.1\n"));
+        assert!(may_need_store_flag("lockfileVersion: '5.2'\n"));
+        assert!(!may_need_store_flag("lockfileVersion: 5.3\n"));
+        assert!(!may_need_store_flag("lockfileVersion: 5.4\n"));
+        assert!(!may_need_store_flag("lockfileVersion: '6.0'\n"));
+        assert!(!may_need_store_flag("lockfileVersion: '9.0'\n"));
+        assert!(!may_need_store_flag("packages: {}\n"));
     }
 }

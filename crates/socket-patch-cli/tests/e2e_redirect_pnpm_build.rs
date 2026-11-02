@@ -70,6 +70,10 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "common/cache_env.rs"]
 mod cache_env;
 #[path = "common/hermetic.rs"]
@@ -307,19 +311,6 @@ fn warning_codes(env: &serde_json::Value) -> Vec<String> {
 fn sha512_sri_b64(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::STANDARD.encode(Sha512::digest(bytes))
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
 }
 
 fn hosted_url_for(base: &str) -> String {
@@ -853,7 +844,7 @@ fn fresh_checkout_install_env(
     }
     // v5 hosted mode writes nothing under `.socket/`; carry it when present.
     if fx.proj.join(".socket").is_dir() {
-        copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+        fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
     // Dead registry: the only reachable artifact URL is the wiremock hosted
     // tarball, so a successful install can only have come from it. The retry
@@ -2204,7 +2195,7 @@ async fn pnpm_pinned_matrix_workspace_peer_instances() {
     // Manifest-less VEX over the fresh workspace: both peer instances are
     // hash-verified, from the ledger and then from the lockfile alone.
     if proj.join(".socket").is_dir() {
-        copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+        fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     assert_manifestless_hosted_vex(
         &fresh,

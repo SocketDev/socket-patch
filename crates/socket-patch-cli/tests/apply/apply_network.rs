@@ -12,66 +12,16 @@
 
 use std::path::Path;
 
+use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+use super::apply_fixture::{
+    install_npm_pkg, one_file, patch_record, stage_blob, write_manifest, write_root_package_json,
+};
 use crate::common::{binary, git_sha256, hermetic};
 
 const ORG_SLUG: &str = "test-org";
-
-fn write_npm_package(root: &Path, name: &str, version: &str, file_path: &str, file_content: &[u8]) {
-    let pkg_dir = root.join("node_modules").join(name);
-    std::fs::create_dir_all(&pkg_dir).expect("create pkg dir");
-    std::fs::write(
-        pkg_dir.join("package.json"),
-        format!(r#"{{ "name": "{name}", "version": "{version}" }}"#),
-    )
-    .expect("write pkg json");
-    let full = pkg_dir.join(file_path);
-    if let Some(parent) = full.parent() {
-        std::fs::create_dir_all(parent).expect("create file parent");
-    }
-    std::fs::write(&full, file_content).expect("write package file");
-}
-
-fn write_root_package_json(root: &Path) {
-    std::fs::write(
-        root.join("package.json"),
-        r#"{ "name": "apply-test-root", "version": "0.0.0" }"#,
-    )
-    .expect("write root package.json");
-}
-
-fn write_manifest_with_patch(
-    socket: &Path,
-    purl: &str,
-    uuid: &str,
-    before_hash: &str,
-    after_hash: &str,
-) {
-    std::fs::create_dir_all(socket).expect("create .socket");
-    let body = format!(
-        r#"{{
-  "patches": {{
-    "{purl}": {{
-      "uuid": "{uuid}",
-      "exportedAt": "2024-01-01T00:00:00Z",
-      "files": {{
-        "package/index.js": {{
-          "beforeHash": "{before_hash}",
-          "afterHash":  "{after_hash}"
-        }}
-      }},
-      "vulnerabilities": {{}},
-      "description": "Apply network test patch",
-      "license": "MIT",
-      "tier": "free"
-    }}
-  }}
-}}"#
-    );
-    std::fs::write(socket.join("manifest.json"), body).expect("write manifest");
-}
 
 fn run_apply(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String) {
     // Pass the API URL/token/org via env vars (equivalent to the global
@@ -101,7 +51,6 @@ fn run_apply(cwd: &Path, api_url: &str, extra: &[&str]) -> (i32, String, String)
 async fn apply_online_fetches_missing_blob_and_patches_file() {
     let before = b"before\n";
     let after = b"after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     let mock = MockServer::start().await;
@@ -120,15 +69,12 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(
-        tmp.path(),
-        "apply-network-test",
-        "1.0.0",
-        "index.js",
-        before,
-    );
+    install_npm_pkg(tmp.path(), "apply-network-test", "1.0.0", Some(before));
     let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
+    write_manifest(
+        tmp.path(),
+        json!({ purl: patch_record(uuid, one_file("package/index.js", before, after)) }),
+    );
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &[]);
     assert_eq!(
@@ -220,8 +166,6 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
 async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
     let before = b"before\n";
     let after = b"after\n";
-    let before_hash = git_sha256(before);
-    let after_hash = git_sha256(after);
 
     let mock = MockServer::start().await;
     let purl = "pkg:npm/skipped@1.0.0";
@@ -229,9 +173,11 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "skipped", "1.0.0", "index.js", before);
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
+    install_npm_pkg(tmp.path(), "skipped", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({ purl: patch_record(uuid, one_file("package/index.js", before, after)) }),
+    );
 
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--ecosystems", "pypi"]);
     // Filtering out npm leaves nothing in scope: there is genuinely no
@@ -301,25 +247,18 @@ async fn apply_with_ecosystem_filter_excluding_npm_skips_all_npm_patches() {
 async fn apply_dry_run_emits_verified_event_without_writing() {
     let before = b"before\n";
     let after = b"after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "dryrun-target", "1.0.0", "index.js", before);
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/dryrun-target@1.0.0",
-        "11111111-1111-4111-8111-111111111111",
-        &before_hash,
-        &after_hash,
+    install_npm_pkg(tmp.path(), "dryrun-target", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/dryrun-target@1.0.0": patch_record("11111111-1111-4111-8111-111111111111", one_file("package/index.js", before, after)) }),
     );
     // Pre-stage the after blob so we don't need to mock the network
     // path; we just want to verify dry-run reports the action correctly.
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), after).unwrap();
+    stage_blob(tmp.path(), &after_hash, after);
 
     // No mock needed — apply finds everything locally.
     let out = hermetic::command(&binary())
@@ -375,29 +314,16 @@ async fn apply_with_force_overrides_hash_mismatch() {
     let after_hash = git_sha256(after);
     let expected_before = b"expected-before\n";
     let actual_before = b"DIFFERENT-CONTENT\n"; // wrong before content
-    let expected_before_hash = git_sha256(expected_before);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(
+    install_npm_pkg(tmp.path(), "force-target", "1.0.0", Some(actual_before));
+    write_manifest(
         tmp.path(),
-        "force-target",
-        "1.0.0",
-        "index.js",
-        actual_before,
-    );
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/force-target@1.0.0",
-        "11111111-1111-4111-8111-111111111111",
-        &expected_before_hash,
-        &after_hash,
+        json!({ "pkg:npm/force-target@1.0.0": patch_record("11111111-1111-4111-8111-111111111111", one_file("package/index.js", expected_before, after)) }),
     );
     // Pre-stage the after blob so we don't need the network.
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), after).unwrap();
+    stage_blob(tmp.path(), &after_hash, after);
 
     // Without --force apply should fail (hash mismatch). With --force it
     // should bypass the verification and write the patched content.
@@ -441,23 +367,16 @@ async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
     let after_hash = git_sha256(after);
     let expected_before = b"expected-before\n";
     let actual_before = b"DIFFERENT-CONTENT\n";
-    let expected_before_hash = git_sha256(expected_before);
 
     let fixture = || {
         let tmp = tempfile::tempdir().expect("tempdir");
         write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "mismatch", "1.0.0", "index.js", actual_before);
-        let socket = tmp.path().join(".socket");
-        write_manifest_with_patch(
-            &socket,
-            "pkg:npm/mismatch@1.0.0",
-            "11111111-1111-4111-8111-111111111111",
-            &expected_before_hash,
-            &after_hash,
+        install_npm_pkg(tmp.path(), "mismatch", "1.0.0", Some(actual_before));
+        write_manifest(
+            tmp.path(),
+            json!({ "pkg:npm/mismatch@1.0.0": patch_record("11111111-1111-4111-8111-111111111111", one_file("package/index.js", expected_before, after)) }),
         );
-        let blobs = socket.join("blobs");
-        std::fs::create_dir_all(&blobs).unwrap();
-        std::fs::write(blobs.join(&after_hash), after).unwrap();
+        stage_blob(tmp.path(), &after_hash, after);
         tmp
     };
 
@@ -542,7 +461,6 @@ async fn apply_hash_mismatch_opt_in_warns_and_applies_strict_fails() {
 async fn apply_pypi_package_uses_python_crawler() {
     let before = b"def hello():\n    return 'before'\n";
     let after = b"def hello():\n    return 'after'\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -576,17 +494,11 @@ async fn apply_pypi_package_uses_python_crawler() {
     )
     .unwrap();
 
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:pypi/pypi_target@1.0.0",
-        "11111111-1111-4111-8111-111111111111",
-        &before_hash,
-        &after_hash,
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:pypi/pypi_target@1.0.0": patch_record("11111111-1111-4111-8111-111111111111", one_file("package/index.js", before, after)) }),
     );
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), after).unwrap();
+    stage_blob(tmp.path(), &after_hash, after);
 
     // Run apply restricted to pypi. With the venv staged on disk and the
     // after-blob pre-cached, this must locate the package via the python
@@ -633,23 +545,17 @@ async fn apply_pypi_package_uses_python_crawler() {
 async fn apply_uses_locally_cached_blob_without_fetching() {
     let before = b"before\n";
     let after = b"after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "cached", "1.0.0", "index.js", before);
+    install_npm_pkg(tmp.path(), "cached", "1.0.0", Some(before));
     let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/cached@1.0.0",
-        "22222222-2222-4222-8222-222222222222",
-        &before_hash,
-        &after_hash,
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/cached@1.0.0": patch_record("22222222-2222-4222-8222-222222222222", one_file("package/index.js", before, after)) }),
     );
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).unwrap();
-    std::fs::write(blobs.join(&after_hash), after).unwrap();
+    stage_blob(tmp.path(), &after_hash, after);
 
     // No mock server. If apply tries to hit the network, the test will
     // fail (connection refused) — proving the local-blob fast path is
@@ -683,7 +589,7 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
     // `.socket/blobs/` must still contain the cached blob (apply is
     // read-only against the persistent cache).
     assert!(
-        blobs.join(&after_hash).exists(),
+        socket.join("blobs").join(&after_hash).exists(),
         "cached blob must survive apply"
     );
 }
@@ -699,7 +605,6 @@ async fn apply_uses_locally_cached_blob_without_fetching() {
 async fn apply_mismatch_redownloads_full_blob_and_applies() {
     let after = b"after\n";
     let after_hash = git_sha256(after);
-    let expected_before_hash = git_sha256(b"expected-before\n");
 
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -713,20 +618,19 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
     let uuid = "11111111-1111-4111-8111-111111111111";
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(
+    install_npm_pkg(
         tmp.path(),
         "mismatch",
         "1.0.0",
-        "index.js",
-        b"DIFFERENT-CONTENT\n",
+        Some(b"DIFFERENT-CONTENT\n"),
     );
     let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/mismatch@1.0.0",
-        uuid,
-        &expected_before_hash,
-        &after_hash,
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/mismatch@1.0.0": patch_record(
+            uuid,
+            one_file("package/index.js", b"expected-before\n", after),
+        )}),
     );
     // A leftover LOCAL package archive exists, but nothing reads it: only
     // the blob can produce the patched bytes, and no blob is cached.
@@ -795,7 +699,6 @@ async fn apply_mismatch_redownloads_full_blob_and_applies() {
 async fn offline_apply_with_token_makes_zero_network_requests() {
     let before = b"offline airgap before\n";
     let after = b"offline airgap after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     // No mocks mounted: every request is a violation, and all are recorded.
@@ -803,18 +706,12 @@ async fn offline_apply_with_token_makes_zero_network_requests() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "airgap-test", "1.0.0", "index.js", before);
-    let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/airgap-test@1.0.0",
-        "33333333-3333-4333-8333-333333333333",
-        &before_hash,
-        &after_hash,
+    install_npm_pkg(tmp.path(), "airgap-test", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/airgap-test@1.0.0": patch_record("33333333-3333-4333-8333-333333333333", one_file("package/index.js", before, after)) }),
     );
-    let blobs = socket.join("blobs");
-    std::fs::create_dir_all(&blobs).expect("create blobs");
-    std::fs::write(blobs.join(&after_hash), after).expect("stage blob");
+    stage_blob(tmp.path(), &after_hash, after);
 
     let mut cmd = hermetic::command(&binary());
     cmd.args(["apply", "--json", "--offline"])
@@ -894,7 +791,6 @@ fn write_package_archive(packages: &Path, uuid: &str, entries: &[(&str, &[u8])])
 async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
     let before = b"pkgcache before\n";
     let after = b"pkgcache after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
     let uuid = "44444444-4444-4444-8444-444444444444";
 
@@ -904,14 +800,11 @@ async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     write_root_package_json(tmp.path());
-    write_npm_package(tmp.path(), "pkgcache", "1.0.0", "index.js", before);
+    install_npm_pkg(tmp.path(), "pkgcache", "1.0.0", Some(before));
     let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(
-        &socket,
-        "pkg:npm/pkgcache@1.0.0",
-        uuid,
-        &before_hash,
-        &after_hash,
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/pkgcache@1.0.0": patch_record(uuid, one_file("package/index.js", before, after)) }),
     );
     write_package_archive(
         &socket.join("packages"),
@@ -956,7 +849,6 @@ async fn apply_online_ignores_legacy_package_archive_when_downloads_fail() {
 async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
     let before = b"before\n";
     let after = b"after\n";
-    let before_hash = git_sha256(before);
     let after_hash = git_sha256(after);
 
     let mock = MockServer::start().await;
@@ -974,20 +866,22 @@ async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
     write_root_package_json(tmp.path());
     // Root copy: already patched (afterHash bytes) — the probe finds no
     // mismatch here.
-    write_npm_package(tmp.path(), "dupcopy", "1.0.0", "index.js", after);
+    install_npm_pkg(tmp.path(), "dupcopy", "1.0.0", Some(after));
     // Nested duplicate under a real intermediate package: locally modified,
     // matching neither hash.
-    write_npm_package(tmp.path(), "parent", "1.0.0", "index.js", b"parent\n");
-    write_npm_package(
+    install_npm_pkg(tmp.path(), "parent", "1.0.0", Some(b"parent\n"));
+    install_npm_pkg(
         &tmp.path().join("node_modules").join("parent"),
         "dupcopy",
         "1.0.0",
-        "index.js",
-        b"locally modified\n",
+        Some(b"locally modified\n"),
     );
 
     let socket = tmp.path().join(".socket");
-    write_manifest_with_patch(&socket, purl, uuid, &before_hash, &after_hash);
+    write_manifest(
+        tmp.path(),
+        json!({ purl: patch_record(uuid, one_file("package/index.js", before, after)) }),
+    );
     let (code, stdout, stderr) = run_apply(tmp.path(), &mock.uri(), &["--allow-patch-conflicts"]);
     let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
     assert_eq!(

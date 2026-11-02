@@ -10,104 +10,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, PtySize};
-
-/// Spawn the socket-patch binary inside a PTY, send `input`, and
-/// collect all output until the child exits. Returns `(exit_code,
-/// output)`. The timeout is enforced via a watchdog thread that
-/// kills the child if it doesn't exit in time.
-///
-/// Three pieces compose:
-///   * **Reader thread**: `read_to_end` on the master side.
-///     Blocks until EOF, which the kernel sends once both the
-///     slave fd (dropped here) and the child's last open fd are
-///     closed.
-///   * **Watchdog thread**: sleeps `timeout` then sends SIGKILL
-///     via a cloned ChildKiller. Detaches; no join needed since
-///     the killer is idempotent and the child either exits
-///     normally first (kill is a no-op) or is killed (we proceed).
-///   * **Main thread**: writes input, closes the writer (sends
-///     EOF on the child's stdin), blocks on `child.wait()`, then
-///     joins the reader.
-///
-/// No polling loops, no mpsc channels, no fixed-duration sleeps
-/// before sending input — the PTY buffers the input until the
-/// child reads it, so timing-coupling isn't needed.
-fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-    run_in_pty_bytes(args, cwd, input.as_bytes(), timeout)
-}
-
-/// Byte-level variant of [`run_in_pty`] for input that is not valid
-/// UTF-8 (e.g. a Latin-1 paste at an interactive prompt).
-fn run_in_pty_bytes(args: &[&str], cwd: &Path, input: &[u8], timeout: Duration) -> (i32, String) {
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-
-    // The hermetic environment (`tests/common/hermetic.rs`): an ambient
-    // SOCKET_YES=true would skip the very confirm prompts this file exists
-    // to drive, and SOCKET_SILENT=true would suppress the output the
-    // oracles match. It also forces the update notifier off: this suite
-    // hands the child a REAL terminal, so the stderr-TTY guard does not
-    // protect it.
-    let mut cmd = crate::common::hermetic::pty_binary_command();
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.cwd(cwd);
-
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .expect("spawn socket-patch in PTY");
-    // Drop the slave so the master sees EOF once the child closes its
-    // own copy of the slave fd on exit.
-    drop(pair.slave);
-
-    // Reader: a single `read_to_end` is sufficient — it blocks until
-    // EOF, which arrives when (a) the master is dropped (we do that
-    // below) or (b) the child has exited and its end of the slave is
-    // closed. The previous design used a chunked read+mpsc loop
-    // because it interleaved with a try_wait poll; the simplified
-    // design serializes wait → drop master → read_to_end joins.
-    let reader_handle =
-        crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-    // Watchdog: detach a thread that kills the child after `timeout`.
-    // The cloned ChildKiller is independent of the main `child`
-    // handle, so the watchdog can fire without coordinating with the
-    // main thread. If the child exits naturally first, the kill is a
-    // no-op against a dead pid.
-    let mut killer = child.clone_killer();
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        let _ = killer.kill();
-    });
-
-    // Writer: send input once a prompt is on screen, then close.
-    // `ui::confirm` discards typeahead right before it prompts, so input
-    // written any earlier would be thrown away (see
-    // `pty_io::send_when_prompted`).
-    let mut writer = pair.master.take_writer().expect("take writer");
-    crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input);
-    drop(writer);
-
-    // Block until the child exits (watchdog enforces the timeout).
-    let status = child.wait().expect("child.wait");
-    // Drop the master so the reader's `read_to_end` sees EOF and
-    // returns.
-    drop(pair.master);
-
-    let output = reader_handle.finish();
-    let code = status.exit_code() as i32;
-    (code, String::from_utf8_lossy(&output).to_string())
-}
+use crate::pty_io;
 
 // ---------------------------------------------------------------------------
 // `remove` interactive confirmation
@@ -138,7 +41,7 @@ fn remove_interactive_y_proceeds() {
     let tmp = tempfile::tempdir().unwrap();
     write_remove_manifest(tmp.path());
 
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &[
             "remove",
             "pkg:npm/__interactive_remove__@1.0.0",
@@ -186,7 +89,7 @@ fn remove_interactive_n_cancels() {
     let tmp = tempfile::tempdir().unwrap();
     write_remove_manifest(tmp.path());
 
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &[
             "remove",
             "pkg:npm/__interactive_remove__@1.0.0",
@@ -247,14 +150,16 @@ fn remove_interactive_non_utf8_answer_declines_without_panic() {
     // InvalidData error. Regression: `confirm()` unwrapped that error
     // and panicked (exit 101) instead of treating the garbage like any
     // other unrecognized answer (decline).
-    let (code, output) = run_in_pty_bytes(
+    let pty_io::PtyRun { code, output, .. } = pty_io::run_command(
+        crate::common::hermetic::pty_binary_command(),
         &[
             "remove",
             "pkg:npm/__interactive_remove__@1.0.0",
             "--skip-rollback",
         ],
         tmp.path(),
-        b"\xE9\n",
+        &[],
+        &[b"\xE9\n"],
         Duration::from_secs(15),
     );
     assert!(
@@ -329,7 +234,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
     let tmp = tempfile::tempdir().unwrap();
     write_detached_vendor_state(tmp.path(), purl, uuid);
 
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &["remove", purl, "--silent"],
         tmp.path(),
         "n\n",
@@ -365,7 +270,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
     // fix that deleted the message instead of gating it.
     let tmp2 = tempfile::tempdir().unwrap();
     write_detached_vendor_state(tmp2.path(), purl, uuid);
-    let (loud_code, loud_output) = run_in_pty(
+    let (loud_code, loud_output) = pty_io::run(
         &["remove", purl],
         tmp2.path(),
         "n\n",
@@ -393,7 +298,7 @@ fn remove_detached_interactive_n_cancel_message_respects_silent() {
 #[test]
 fn apply_in_pty_with_no_manifest_prints_friendly_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let (code, output) = run_in_pty(&["apply"], tmp.path(), "", Duration::from_secs(15));
+    let (code, output) = pty_io::run(&["apply"], tmp.path(), "", Duration::from_secs(15));
     assert_eq!(code, 0);
     // Assert the full message, not either half of it. The wording names the
     // missing manifest, not the `.socket/` folder (hosted/vendored projects

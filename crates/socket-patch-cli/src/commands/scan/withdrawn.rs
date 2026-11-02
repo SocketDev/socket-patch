@@ -26,8 +26,7 @@
 //!
 //! The settled answers are kept ([`WithdrawnSweep::take_references`]): on
 //! a rescan the redirect selects the same uuids the lockfiles pin, and asks
-//! the endpoint only about the ones the sweep has no answer for (#1606,
-//! #1607).
+//! the endpoint only about the ones the sweep has no answer for.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
@@ -39,7 +38,7 @@ use socket_patch_core::utils::purl_key::PurlKey;
 
 use crate::args::GlobalArgs;
 use crate::commands::agent_download::tag_mode;
-use crate::json_envelope::{Envelope, PatchAction, PatchEvent};
+use crate::json_envelope::{Envelope, PatchAction, PatchEvent, RunWarning};
 
 /// `reason` code on the `rolledBack` event of a pin the sweep restored.
 pub(super) const PATCH_WITHDRAWN: &str = "patch_withdrawn";
@@ -54,6 +53,8 @@ pub(super) const REDIRECT_WITHDRAWN_RESTORE_FAILED: &str = "redirect_withdrawn_r
 pub(super) const REDIRECT_WITHDRAWN_CHECK_FAILED: &str = "redirect_withdrawn_check_failed";
 
 /// Whether a reference `status` means the pinned patch is gone for good.
+/// `build_failed` keeps the pin (the vendor fetch reads it as unavailable):
+/// a failed build can be rebuilt.
 fn is_gone(status: &str) -> bool {
     matches!(status, "withdrawn" | "not_found")
 }
@@ -64,8 +65,7 @@ fn is_gone(status: &str) -> bool {
 pub(super) struct WithdrawnSweep {
     /// `rolledBack` (`verified` on a dry run) per restored pin.
     events: Vec<PatchEvent>,
-    /// `(code, detail)` run-level warnings.
-    warnings: Vec<(String, String)>,
+    warnings: Vec<RunWarning>,
     /// The reference endpoint's answers, when the lookup succeeded.
     references: Option<KnownReferences>,
 }
@@ -118,9 +118,7 @@ impl WithdrawnSweep {
         for event in self.events {
             env.record(event);
         }
-        for (code, detail) in self.warnings {
-            env.warn(code, detail);
-        }
+        env.warnings.extend(self.warnings);
     }
 
     fn warn(&mut self, common: &GlobalArgs, code: &str, detail: String) {
@@ -129,7 +127,7 @@ impl WithdrawnSweep {
         if !common.json {
             eprintln!("Warning: {detail}");
         }
-        self.warnings.push((code.to_string(), detail));
+        self.warnings.push(RunWarning::new(code, detail));
     }
 }
 
@@ -264,8 +262,8 @@ pub(super) async fn sweep(
     }
     // `run_hosted_leg` already printed each failure to stderr.
     for (purl, why) in leg.failed {
-        out.warnings.push((
-            REDIRECT_WITHDRAWN_RESTORE_FAILED.to_string(),
+        out.warnings.push(RunWarning::new(
+            REDIRECT_WITHDRAWN_RESTORE_FAILED,
             format!("{purl}: {why}"),
         ));
     }
@@ -273,7 +271,7 @@ pub(super) async fn sweep(
         if !common.json && !common.silent {
             eprintln!("Warning: {detail}");
         }
-        out.warnings.push((code, detail));
+        out.warnings.push(RunWarning::new(code, detail));
     }
     out
 }

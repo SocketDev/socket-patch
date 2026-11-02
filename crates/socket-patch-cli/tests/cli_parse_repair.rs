@@ -6,206 +6,51 @@
 //!
 //! See `crates/socket-patch-cli/CLI_CONTRACT.md` for the full repair table.
 //!
-//! ## Hermeticity
-//!
-//! Every flag and default below is also wired to an `#[arg(env = "SOCKET_*")]`
-//! source. clap reads those env vars during `try_parse_from`, so an ambient
-//! `SOCKET_*` variable in the developer's shell or in CI would silently
-//! satisfy these assertions even if the corresponding CLI default
-//! (`default_value`/`default_value_t`) regressed or a flag's action broke —
-//! the env value would mask the bug and the test would pass for the wrong
-//! reason (e.g. an exported `SOCKET_DOWNLOAD_ONLY=true` keeps a flag
-//! assertion green even if the flag's action broke).
-//! To make the assertions test *argv parsing* rather than the ambient
-//! environment, every parse runs with the full set of `SOCKET_*` vars scrubbed
-//! (see [`EnvScrub`]). Because the environment is process-global, every test is
-//! `#[serial_test::serial]` so the scrub/restore dance can't race a concurrent
-//! parse. This mirrors the hardening in `cli_parse_get.rs`.
+//! Two tests set `SOCKET_DOWNLOAD_ONLY`, and clap reads it during every parse,
+//! so every test that parses is `#[serial]`.
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use socket_patch_cli::commands::repair::RepairArgs;
-use socket_patch_cli::{Cli, Commands};
+use socket_patch_cli::Commands;
 
-/// Every `SOCKET_*` env var that clap consults while parsing `repair` (its own
-/// `--download-only` flag plus the flattened `GlobalArgs`). If any leaks in
-/// from the ambient environment it can mask a broken default or a regressed
-/// flag, so the parse helpers below remove them for the duration of the parse.
-const SOCKET_ENV_VARS: &[&str] = &[
-    // GlobalArgs
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_VENDOR_SOURCE",
-    "SOCKET_VENDOR_URL",
-    "SOCKET_PATCH_SERVER_URL",
-    "SOCKET_OFFLINE",
-    "SOCKET_STRICT",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
-    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
-    "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    // RepairArgs-specific
-    "SOCKET_DOWNLOAD_ONLY",
-];
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
-/// RAII guard that removes every [`SOCKET_ENV_VARS`] entry on construction and
-/// restores the prior value on drop. Holding one of these around a clap parse
-/// guarantees the parse sees only what's on the argv, not the developer's
-/// shell. Pair with `#[serial_test::serial]` so the global env mutation never
-/// races another test.
-struct EnvScrub(Vec<(&'static str, Option<String>)>);
-
-impl EnvScrub {
-    fn new() -> Self {
-        let saved = SOCKET_ENV_VARS
-            .iter()
-            .map(|&k| {
-                let prev = std::env::var(k).ok();
-                std::env::remove_var(k);
-                (k, prev)
-            })
-            .collect();
-        EnvScrub(saved)
-    }
-}
-
-impl Drop for EnvScrub {
-    fn drop(&mut self) {
-        for (k, v) in &self.0 {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
+use clap_parse::{try_parse_with_env, Globals};
+use hermetic::try_parse;
 
 fn parse_repair(extra: &[&str]) -> RepairArgs {
-    let _scrub = EnvScrub::new();
     let mut argv = vec!["socket-patch", "repair"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Repair(a) => a,
         _ => panic!("expected Repair"),
     }
 }
 
-/// Owned, comparable snapshot of *every* parsed field in `RepairArgs` — its own
-/// `download_only` flag plus every field of the flattened `GlobalArgs`.
-/// `RepairArgs`/`GlobalArgs` are production types we may not touch and don't
-/// derive `PartialEq`, so this mirror exists purely so a single `assert_eq!`
-/// can police the entire parsed surface at once.
-///
-/// This is what makes the defaults/alias tests honest. A field-at-a-time
-/// assertion only proves the one field it inspects; it says nothing about
-/// whether some *other* default silently regressed to a non-default value, or
-/// whether a flag flipped an unrelated field (a clap-derive copy/paste bug).
-/// Comparing the whole snapshot against the independently-declared defaults
-/// fails loudly the instant any field moves.
+/// Every parsed field of `RepairArgs`. The tests compare the whole snapshot,
+/// so a flag wired to a second field fails too.
 #[derive(Debug, Clone, PartialEq)]
 struct Snap {
-    cwd: PathBuf,
-    manifest_path: String,
-    api_url: Option<String>,
-    api_token: Option<String>,
-    org: Option<String>,
-    proxy_url: Option<String>,
-    ecosystems: Option<Vec<String>>,
-    vendor_source: String,
-    vendor_url: Option<String>,
-    patch_server_url: Option<String>,
-    offline: bool,
-    strict: bool,
-    allow_patch_conflicts: bool,
-    global: bool,
-    global_prefix: Option<PathBuf>,
-    json: bool,
-    verbose: bool,
-    silent: bool,
-    dry_run: bool,
-    yes: bool,
-    lock_timeout: Option<u64>,
-    debug: bool,
-    no_telemetry: bool,
+    common: Globals,
     download_only: bool,
 }
 
 fn snapshot(a: &RepairArgs) -> Snap {
     Snap {
-        cwd: a.common.cwd.clone(),
-        manifest_path: a.common.manifest_path.clone(),
-        api_url: a.common.api_url.clone(),
-        api_token: a.common.api_token.clone(),
-        org: a.common.org.clone(),
-        proxy_url: a.common.proxy_url.clone(),
-        ecosystems: a.common.ecosystems.clone(),
-        vendor_source: a.common.vendor_source.clone(),
-        vendor_url: a.common.vendor_url.clone(),
-        patch_server_url: a.common.patch_server_url.clone(),
-        offline: a.common.offline,
-        strict: a.common.strict,
-        allow_patch_conflicts: a.common.allow_patch_conflicts,
-        global: a.common.global,
-        global_prefix: a.common.global_prefix.clone(),
-        json: a.common.json,
-        verbose: a.common.verbose,
-        silent: a.common.silent,
-        dry_run: a.common.dry_run,
-        yes: a.common.yes,
-        lock_timeout: a.common.lock_timeout,
-        debug: a.common.debug,
-        no_telemetry: a.common.no_telemetry,
+        common: Globals(a.common.clone()),
         download_only: a.download_only,
     }
 }
 
-/// Independent oracle: the snapshot a correct parse of bare `repair` (no flags)
-/// must produce. The values are transcribed BY HAND from the
-/// `default_value`/`default_value_t` declarations on `RepairArgs`/`GlobalArgs`
-/// and the `DEFAULT_*` constants in `socket-patch-core` — NOT read back from a
-/// live parse — so this can actually disagree with the implementation if a
-/// default regresses.
+/// The snapshot of bare `repair`, written by hand.
 fn expected_defaults() -> Snap {
     Snap {
-        cwd: PathBuf::from("."),
-        manifest_path: ".socket/manifest.json".to_string(),
-        api_url: None, // no clap default — resolved in core
-        api_token: None,
-        org: None,
-        proxy_url: None, // no clap default — resolved in core
-        ecosystems: None,
-        vendor_source: "service".to_string(),
-        vendor_url: None,
-        patch_server_url: None,
-        offline: false,
-        strict: false,
-        allow_patch_conflicts: false,
-        global: false,
-        global_prefix: None,
-        json: false,
-        verbose: false,
-        silent: false,
-        dry_run: false,
-        yes: false,
-        lock_timeout: None,
-        debug: false,
-        no_telemetry: false,
+        common: clap_parse::global_defaults(),
         download_only: false,
     }
 }
@@ -214,13 +59,6 @@ fn expected_defaults() -> Snap {
 #[serial_test::serial]
 fn repair_defaults_match_contract() {
     let args = parse_repair(&[]);
-
-    // Pin the *entire* default surface in one shot against the independent
-    // oracle. The previous version only checked cwd,
-    // manifest_path, dry_run, offline, download_only and json — leaving
-    // api_url, proxy_url, verbose, silent, yes, lock_timeout,
-    // debug, no_telemetry, global, global_prefix, ecosystems, api_token and
-    // org free to regress unnoticed.
     assert_eq!(snapshot(&args), expected_defaults());
 }
 
@@ -231,7 +69,7 @@ fn repair_dry_run_long_flag() {
     // The flag flips dry_run and *nothing else* — anything but this exact
     // one-field delta from the defaults is a regression.
     let mut expected = expected_defaults();
-    expected.dry_run = true;
+    expected.common.dry_run = true;
     assert_eq!(snapshot(&args), expected);
 }
 
@@ -240,7 +78,7 @@ fn repair_dry_run_long_flag() {
 fn repair_manifest_path_long_flag() {
     let args = parse_repair(&["--manifest-path", "custom.json"]);
     let mut expected = expected_defaults();
-    expected.manifest_path = "custom.json".to_string();
+    expected.common.manifest_path = "custom.json".to_string();
     assert_eq!(snapshot(&args), expected);
 }
 
@@ -249,7 +87,7 @@ fn repair_manifest_path_long_flag() {
 fn repair_cwd_flag() {
     let args = parse_repair(&["--cwd", "/tmp/x"]);
     let mut expected = expected_defaults();
-    expected.cwd = PathBuf::from("/tmp/x");
+    expected.common.cwd = PathBuf::from("/tmp/x");
     assert_eq!(snapshot(&args), expected);
 }
 
@@ -258,7 +96,7 @@ fn repair_cwd_flag() {
 fn repair_offline_flag() {
     let args = parse_repair(&["--offline"]);
     let mut expected = expected_defaults();
-    expected.offline = true;
+    expected.common.offline = true;
     assert_eq!(snapshot(&args), expected);
 }
 
@@ -276,7 +114,7 @@ fn repair_download_only_flag() {
 fn repair_json_flag() {
     let args = parse_repair(&["--json"]);
     let mut expected = expected_defaults();
-    expected.json = true;
+    expected.common.json = true;
     assert_eq!(snapshot(&args), expected);
 }
 
@@ -284,7 +122,7 @@ fn repair_json_flag() {
 #[test]
 #[serial_test::serial]
 fn repair_download_mode_flag_is_removed() {
-    match Cli::try_parse_from(["socket-patch", "repair", "--download-mode", "file"]) {
+    match try_parse(&["socket-patch", "repair", "--download-mode", "file"]) {
         Ok(_) => panic!("--download-mode must be rejected"),
         Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
     }
@@ -298,14 +136,11 @@ fn repair_download_mode_flag_is_removed() {
 /// `--download-only` env binding must match. (`main`'s empty-var scrub also
 /// removes a blank `SOCKET_DOWNLOAD_ONLY` via `LOCAL_ARG_ENV_VARS`, but the
 /// parser itself must not depend on it — library callers of `Cli::parse`
-/// never run the scrub, as this test's direct `try_parse_from` shows.)
+/// never run the scrub, and neither does this test's parse.)
 #[test]
 #[serial_test::serial]
 fn empty_download_only_env_var_parses_as_false_not_crash() {
-    let _scrub = EnvScrub::new();
-    std::env::set_var("SOCKET_DOWNLOAD_ONLY", "");
-    let parsed = Cli::try_parse_from(["socket-patch", "repair"]);
-    std::env::remove_var("SOCKET_DOWNLOAD_ONLY");
+    let parsed = try_parse_with_env(&[("SOCKET_DOWNLOAD_ONLY", "")], &["socket-patch", "repair"]);
     let cli = parsed.expect("empty SOCKET_DOWNLOAD_ONLY must not abort the parse");
     match cli.command {
         Commands::Repair(a) => assert!(
@@ -321,10 +156,10 @@ fn empty_download_only_env_var_parses_as_false_not_crash() {
 #[test]
 #[serial_test::serial]
 fn truthy_download_only_env_var_sets_flag() {
-    let _scrub = EnvScrub::new();
-    std::env::set_var("SOCKET_DOWNLOAD_ONLY", "1");
-    let parsed = Cli::try_parse_from(["socket-patch", "repair"]);
-    std::env::remove_var("SOCKET_DOWNLOAD_ONLY");
+    let parsed = try_parse_with_env(
+        &[("SOCKET_DOWNLOAD_ONLY", "1")],
+        &["socket-patch", "repair"],
+    );
     let cli = parsed.expect("SOCKET_DOWNLOAD_ONLY=1 must parse");
     match cli.command {
         Commands::Repair(a) => assert!(a.download_only),
@@ -332,53 +167,10 @@ fn truthy_download_only_env_var_sets_flag() {
     }
 }
 
-// --- Hermeticity of the scrub itself -------------------------------------------
-
-#[test]
-#[serial_test::serial]
-fn scrub_covers_every_global_env_var_clap_consults() {
-    // [`SOCKET_ENV_VARS`] claims to list "every SOCKET_* env var that clap
-    // consults while parsing `repair`". `GlobalArgs` is flattened in whole,
-    // so the production `GLOBAL_ARG_ENV_VARS` list is the oracle — a flag
-    // added to `GlobalArgs` with an env binding is consulted here the moment
-    // it lands, and if the scrub list lags behind, an ambient value either
-    // aborts every parse in this file (validated flags: bools, ints,
-    // `--ecosystems`, `--vendor-source`) or silently leaks into the parsed
-    // args (string flags), voiding the hermeticity the module doc promises.
-    // `garbage` is rejected by every validating parser and visibly
-    // non-default for every string/path/option flag, so a missing scrub
-    // entry fails loudly either way. Mirrors `cli_parse_get.rs`.
-    for &var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        let prev = std::env::var(var).ok();
-        std::env::set_var(var, "garbage");
-        let parsed = {
-            let _scrub = EnvScrub::new();
-            Cli::try_parse_from(["socket-patch", "repair"])
-        };
-        match prev {
-            Some(v) => std::env::set_var(var, v),
-            None => std::env::remove_var(var),
-        }
-        let a = match parsed {
-            Ok(cli) => match cli.command {
-                Commands::Repair(a) => a,
-                _ => panic!("expected Repair"),
-            },
-            Err(e) => panic!("ambient {var}=garbage aborted the scrubbed parse: {e}"),
-        };
-        assert_eq!(
-            snapshot(&a),
-            expected_defaults(),
-            "ambient {var}=garbage leaked into the scrubbed parse",
-        );
-    }
-}
-
 #[test]
 #[serial_test::serial]
 fn repair_unknown_flag_is_unknown_argument_error() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "repair", "--nope"]) {
+    let err = match try_parse(&["socket-patch", "repair", "--nope"]) {
         Ok(_) => panic!("unknown flag should fail to parse"),
         Err(e) => e,
     };
@@ -392,8 +184,7 @@ fn repair_unknown_flag_is_unknown_argument_error() {
 // clean up without an apply pass. v5 removed its `gc` alias.
 
 fn top_level_help() -> String {
-    let _scrub = EnvScrub::new();
-    match Cli::try_parse_from(["socket-patch", "--help"]) {
+    match try_parse(&["socket-patch", "--help"]) {
         Ok(_) => panic!("--help should return a clap error (DisplayHelp)"),
         Err(e) => format!("{e}"),
     }
@@ -416,8 +207,7 @@ fn repair_appears_in_top_level_help() {
 fn removed_gc_alias_is_a_usage_error() {
     let help = top_level_help();
     assert!(!help.contains("[aliases: gc]"), "{help}");
-    let _scrub = EnvScrub::new();
-    match Cli::try_parse_from(["socket-patch", "gc"]) {
+    match try_parse(&["socket-patch", "gc"]) {
         Ok(_) => panic!("`gc` should no longer parse"),
         Err(e) => assert_eq!(e.kind(), clap::error::ErrorKind::InvalidSubcommand),
     }
@@ -426,10 +216,10 @@ fn removed_gc_alias_is_a_usage_error() {
 #[test]
 #[serial_test::serial]
 fn no_vlt_install_cleanup_is_accepted_silently_by_repair() {
-    assert!(!parse_repair(&[]).common.no_vlt_install_cleanup);
-    assert!(
-        parse_repair(&["--no-vlt-install-cleanup"])
-            .common
-            .no_vlt_install_cleanup
+    let mut expected = expected_defaults();
+    expected.common.no_vlt_install_cleanup = true;
+    assert_eq!(
+        snapshot(&parse_repair(&["--no-vlt-install-cleanup"])),
+        expected
     );
 }

@@ -3,9 +3,7 @@
 //! One composer release reaches the CLI under several spellings. Lockfiles
 //! and `installed.json` carry the pretty tag (`v3.0.2`, `3.0.2`), while a
 //! patch's base purl may carry the padded `version_normalized` form
-//! (`3.0.2.0`) that Socket's SBOM ingestion stores. Comparing them as strings
-//! made a patch for `@3.0.2.0` "not found" in a project that locks `3.0.2`,
-//! and made `scan --prune` delete it.
+//! (`3.0.2.0`) that Socket's SBOM ingestion stores.
 //!
 //! [`composer_version_normalize`] is a port of composer/semver 3.4
 //! `VersionParser::normalize`, the function Composer and Packagist key a
@@ -19,11 +17,9 @@
 //! parts too, since that padding erases whether the lock said `X`, `X.0` or
 //! `X.0.0`. Any other spelling Composer rejects keys as itself minus one
 //! leading `v`, and is equivalent only to other rejected spellings with the
-//! same key. [`composer_version_identity_key`] keeps that space apart with a
-//! `\u{1}` sentinel; [`composer_version_key`] (what `PurlKey` uses, so its
-//! string stays printable in reports) relies instead on every accepted key
-//! being accepted itself, bare and behind a `v`, which
-//! `sentinel_free_key_keeps_rejected_spellings_apart` pins over the vectors.
+//! same key. That needs no separate key space because every accepted key is
+//! accepted itself, bare and behind a `v`, which
+//! `key_equality_is_equivalence_over_every_vector_pair` pins over the vectors.
 //!
 //! Only comparisons go through this module, and purl comparisons reach it
 //! only through [`crate::utils::purl_key::PurlKey`]. Stored spellings
@@ -251,20 +247,12 @@ pub fn composer_version_key(version: &str) -> String {
     identity_normalize(version).unwrap_or_else(|| strip_leading_v(version).to_string())
 }
 
-/// A key two spellings share exactly when [`composer_versions_equivalent`]
-/// holds, for map and set lookups: [`identity_normalize`], else the spelling
-/// minus one leading `v` behind a `\u{1}` so that versions Composer rejects
-/// get their own key space (depscan's `composerVersionIdentityKey`).
-pub fn composer_version_identity_key(version: &str) -> String {
-    identity_normalize(version).unwrap_or_else(|| format!("\u{1}{}", strip_leading_v(version)))
-}
-
 /// Whether two composer version spellings name the same release
 /// (`3.0.2` ≡ `v3.0.2` ≡ `3.0.2.0`, `8.1.0-RC1` ≡ `v8.1.0-rc.1`). A spelling
 /// Composer rejects matches only another rejected spelling with the same
 /// `v`-stripped text.
 pub fn composer_versions_equivalent(a: &str, b: &str) -> bool {
-    composer_version_identity_key(a) == composer_version_identity_key(b)
+    composer_version_key(a) == composer_version_key(b)
 }
 
 #[cfg(test)]
@@ -325,44 +313,14 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
+    /// [`composer_versions_equivalent`] (one key, no separate space for
+    /// spellings Composer rejects) against the spec: two accepted spellings
+    /// are equivalent when they normalize alike, two rejected ones when their
+    /// `v`-stripped text is equal, and never one of each. Sound only while
+    /// every accepted key `N` is itself accepted, bare and behind a `v` (the
+    /// only text a rejected spelling `N` / `vN` would key as).
     #[test]
-    fn identity_key_equality_is_equivalence_over_every_vector_pair() {
-        let v = vectors();
-        let mut inputs: Vec<&str> = v["vectors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|case| case["input"].as_str().unwrap())
-            .collect();
-        for case in v["equivalence"].as_array().unwrap() {
-            inputs.push(case["left"].as_str().unwrap());
-            inputs.push(case["right"].as_str().unwrap());
-        }
-        let mut failures = Vec::new();
-        for a in &inputs {
-            for b in &inputs {
-                let keyed = composer_version_identity_key(a) == composer_version_identity_key(b);
-                let rejected = |x: &str| identity_normalize(x).is_none();
-                let spec = match (rejected(a), rejected(b)) {
-                    (false, false) => composer_version_key(a) == composer_version_key(b),
-                    (true, true) => strip_leading_v(a) == strip_leading_v(b),
-                    _ => false,
-                };
-                if keyed != spec || keyed != composer_versions_equivalent(a, b) {
-                    failures.push(format!("{a:?} vs {b:?}: key {keyed}, spec {spec}"));
-                }
-            }
-        }
-        assert!(failures.is_empty(), "{}", failures.join("\n"));
-    }
-
-    /// [`PurlKey`](crate::utils::purl_key::PurlKey) keys on the sentinel-free
-    /// [`composer_version_key`], which is only sound while a rejected
-    /// spelling's key can never equal an accepted one's: every accepted key
-    /// `N` must itself be accepted, bare and behind a `v` (the only text a
-    /// rejected spelling `N` / `vN` would key as; a `v` only before a digit).
-    #[test]
-    fn sentinel_free_key_keeps_rejected_spellings_apart() {
+    fn key_equality_is_equivalence_over_every_vector_pair() {
         let v = vectors();
         let mut inputs: Vec<&str> = v["vectors"]
             .as_array()
@@ -392,11 +350,16 @@ mod tests {
                 }
             }
         }
+        let rejected = |x: &str| identity_normalize(x).is_none();
         for a in &inputs {
             for b in &inputs {
-                let plain = composer_version_key(a) == composer_version_key(b);
-                if plain != composer_versions_equivalent(a, b) {
-                    failures.push(format!("{a:?} vs {b:?}: plain key {plain}"));
+                let spec = match (rejected(a), rejected(b)) {
+                    (false, false) => identity_normalize(a) == identity_normalize(b),
+                    (true, true) => strip_leading_v(a) == strip_leading_v(b),
+                    _ => false,
+                };
+                if composer_versions_equivalent(a, b) != spec {
+                    failures.push(format!("{a:?} vs {b:?}: spec {spec}"));
                 }
             }
         }

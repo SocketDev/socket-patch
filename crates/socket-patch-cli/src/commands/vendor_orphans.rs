@@ -1,7 +1,7 @@
 //! The orphan sweep `vendor --revert`, `scan --prune`, `rollback` and
 //! `remove` share: uuid dirs under `.socket/vendor/<eco>/` that no ledger
 //! entry owns (a hand-edited state file, an interrupted run, the losing
-//! side of a git merge of two vendor runs, #1610).
+//! side of a git merge of two vendor runs).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -24,10 +24,9 @@ pub(crate) struct OrphanSweep {
     pub(crate) failed: Vec<(vendor::path::SweptVendorDir, String)>,
 }
 
-/// Uuid dirs under `.socket/vendor/<eco>/` with no owning `(eco, uuid)`
-/// ledger entry (a hand-edited state file, or artifacts left by an
-/// interrupted run). Unparseable dirs are never returned (and never
-/// deleted). Returns the orphans so callers can emit events / counts.
+/// Sweep the uuid dirs under `.socket/vendor/<eco>/` with no owning
+/// `(eco, uuid)` ledger entry. Unparseable dirs are never returned (and
+/// never deleted).
 ///
 /// A missing ledger entry does NOT prove missing wiring: lockfiles can
 /// still point into `.socket/vendor/` after a deleted state.json or a
@@ -44,7 +43,7 @@ pub(crate) async fn sweep_orphan_vendor_dirs(
 }
 
 /// [`sweep_orphan_vendor_dirs`] limited to the orphans `select` accepts:
-/// `rollback` and `remove` sweep only the ones in their scope (#1610).
+/// `rollback` and `remove` sweep only the ones in their scope.
 pub(crate) async fn sweep_orphan_vendor_dirs_where(
     cwd: &Path,
     state: &VendorState,
@@ -69,12 +68,11 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     if candidates.is_empty() {
         return out;
     }
-    let wired: HashSet<(String, String)> =
-        crate::commands::vendored_backend::repair::scan_vendor_references(cwd)
-            .await
-            .into_iter()
-            .map(|(eco, uuid, _path)| (eco, uuid))
-            .collect();
+    let references = crate::commands::vendored_backend::repair::scan_vendor_references(cwd).await;
+    let wired: HashSet<(&str, &str)> = references
+        .iter()
+        .map(|(eco, uuid, _path)| (eco.as_str(), uuid.as_str()))
+        .collect();
     // Each removal also prunes the `<eco>/` and `vendor/` levels it
     // emptied (never `.socket/` — the lock guard owns that level): the
     // sweep runs AFTER the per-entry reverts and their ledger saves, so it
@@ -82,7 +80,7 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     // `.socket/vendor/<eco>/` husks.
     let stop_dir = cwd.join(SOCKET_DIR);
     for unit in candidates {
-        if wired.contains(&(unit.eco.clone(), unit.uuid.clone())) {
+        if wired.contains(&(unit.eco.as_str(), unit.uuid.as_str())) {
             out.still_wired.push(unit);
             continue;
         }
@@ -183,7 +181,7 @@ mod tests {
     /// `rollback <target>` / `remove <target>` scope their orphan sweep
     /// with [`orphan_in_target`]: a package target matches by the leaves'
     /// purls, a uuid target by the dir's own uuid, even when no leaf
-    /// parses (#1610).
+    /// parses.
     #[test]
     fn orphan_in_target_matches_package_and_uuid_targets() {
         let uuid = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
@@ -216,8 +214,7 @@ mod tests {
 
     /// A kept, still-wired orphan points the user at a remedy that works
     /// in v5: `repair` no longer rebuilds ledger entries from lockfiles,
-    /// so the advisory names the ledger restore (and the merge case,
-    /// #991) or the lockfile restore instead.
+    /// so the advisory names the ledger restore (and the merge case).
     #[test]
     fn orphan_still_wired_names_a_working_remedy() {
         let unit = vendor::path::SweptVendorDir {
@@ -228,15 +225,15 @@ mod tests {
         };
         let warning = orphan_still_wired(&unit);
         assert_eq!(warning.code, "vendor_orphan_still_wired");
-        let detail = &warning.detail;
-        assert!(
-            detail.contains(".socket/vendor/npm/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"),
-            "{detail}"
+        // The advisory follows a revert that rewrote the lockfile, so it
+        // names no lockfile checkout: that would re-wire what it removed.
+        assert_eq!(
+            warning.detail,
+            "a project lockfile still points at \
+             .socket/vendor/npm/aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa, which no ledger \
+             entry owns; the artifacts were kept (restore the missing entries in \
+             .socket/vendor/state.json from version control (if a git merge kept one \
+             side of state.json, merge both sides' `entries`), then revert again)"
         );
-        assert!(!detail.contains("socket-patch repair"), "{detail}");
-        assert!(detail.contains("entries"), "{detail}");
-        // The advisory follows a revert that rewrote the lockfile:
-        // checking the lockfile out again would re-wire what it removed.
-        assert!(!detail.contains("git checkout"), "{detail}");
     }
 }

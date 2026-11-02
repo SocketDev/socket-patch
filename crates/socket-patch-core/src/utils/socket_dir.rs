@@ -105,6 +105,14 @@ fn guard_root(stop_dir: &Path) -> &Path {
     stop_dir.parent().unwrap_or(stop_dir)
 }
 
+/// The nearest ancestor of `path` (inclusive) literally named `.socket`.
+fn nearest_socket_dir(path: &Path) -> Option<&Path> {
+    path.ancestors().find(|a| {
+        a.file_name()
+            .is_some_and(|n| n == crate::constants::SOCKET_DIR)
+    })
+}
+
 /// Persist a committed JSON ledger: pretty-printed with a trailing newline
 /// (deterministic bytes), parent directory created on demand, staged +
 /// fsync'd + renamed via [`atomic_write_bytes`]. A ledger already holding
@@ -128,7 +136,7 @@ fn guard_root(stop_dir: &Path) -> &Path {
 /// never creates one there, so its target belongs to another project or
 /// lies outside this one (#887).
 pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
-    if let Some(root) = containment::socket_project_root(path) {
+    if let Some(root) = nearest_socket_dir(path).and_then(Path::parent) {
         containment::ensure_unlinked(root, path, "write")?;
     }
     let mut bytes = serde_json::to_vec_pretty(value).map_err(std::io::Error::other)?;
@@ -145,7 +153,7 @@ pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> s
         Ok(()) => Ok(()),
         Err(e) => {
             if created_parent {
-                if let Some(stop) = containment::nearest_socket_dir(parent) {
+                if let Some(stop) = nearest_socket_dir(parent) {
                     prune_empty_dirs(parent, stop).await;
                 }
             }
@@ -157,6 +165,17 @@ pub(crate) async fn write_json_ledger<T: Serialize>(path: &Path, value: &T) -> s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_socket_dir_is_the_innermost_dot_socket_ancestor() {
+        let p = Path::new("/a/b/.socket/vendor/state.json");
+        assert_eq!(nearest_socket_dir(p), Some(Path::new("/a/b/.socket")));
+        assert_eq!(
+            nearest_socket_dir(Path::new("/a/.socket/b/.socket")),
+            Some(Path::new("/a/.socket/b/.socket"))
+        );
+        assert_eq!(nearest_socket_dir(Path::new("/a/b/state.json")), None);
+    }
 
     /// The climb removes every empty level below `stop_dir`, never
     /// `stop_dir` itself, and continues past a level that is already gone.

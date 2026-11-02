@@ -93,6 +93,8 @@ mod platform_wheel_tests;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod pypi_no_lockfile_tests;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
@@ -757,6 +759,7 @@ fn rewriter_groups<'a>(
             rewrite_hatch(files, overrides, result);
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
+            warn_no_pypi_wiring(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
@@ -1020,6 +1023,86 @@ fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Opti
         merge_group_delta(&mut result, delta);
     }
     Some(result)
+}
+
+/// #638: the PyPI twin of `redirect_npm_no_lockfile` /
+/// `redirect_composer_no_lockfile`. A pypi patch reached the PyPI lane, but
+/// the project has no file any PyPI rewriter reads (a root
+/// `requirements.txt`, a tool lock, a PEP 751 / PEP 723 lock, or a Hatch
+/// configuration), so nothing can pin it. Said once per run, naming what
+/// was looked for; the per-patch `redirect_unconfirmed` row still follows.
+/// A file that IS present owns its deps' diagnostics instead.
+fn warn_no_pypi_wiring(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !overrides.iter().any(|dep| dep.ecosystem == "pypi") {
+        return;
+    }
+    let wired = files.keys().any(|key| {
+        key == crate::formats::governing_locks::PYPI_REQUIREMENTS
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&key.as_str())
+            || crate::utils::python_lock::is_python_lock_name(key)
+    });
+    if wired || crate::utils::hatch::is_hatch(files) {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_pypi_no_lockfile".into(),
+        detail: format!(
+            "no readable requirements.txt, uv.lock, poetry.lock, pdm.lock, \
+             Pipfile.lock, pylock.toml / pylock.<name>.toml, PEP 723 script lock \
+             (<script>.py.lock) or Hatch configuration at the project root (hosted \
+             mode does not read other requirements files such as \
+             requirements-dev.txt); {}",
+            pypi_no_lockfile_remedy(files)
+        ),
+    });
+}
+
+/// What the project's own Python tooling suggests doing about
+/// `redirect_pypi_no_lockfile`: a Pipfile asks for `pipenv lock`; a
+/// pyproject naming its lock tool (a `[tool.<tool>]` table or its build
+/// backend) asks for that tool's lock; any other pyproject may be a plain
+/// pip project or a tool that writes no table of its own (`uv init`), so
+/// both remedies are offered.
+fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
+    const PIN: &str = "pin the package in a root requirements.txt";
+    if files.contains_key("Pipfile") {
+        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    }
+    let Some(pyproject) = files.get("pyproject.toml") else {
+        return format!("{PIN} or commit the project's lock, then re-run");
+    };
+    let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
+    let backend = document
+        .as_ref()
+        .and_then(|doc| doc.get("build-system"))
+        .and_then(|build| build.get("build-backend"))
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    let names = |tool: &str| {
+        document
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .is_some_and(|table| table.get(tool).is_some())
+            || backend.starts_with(&format!("{tool}."))
+            || backend.starts_with(&format!("{tool}_"))
+    };
+    for (tool, command) in [
+        ("uv", "uv lock"),
+        ("poetry", "poetry lock"),
+        ("pdm", "pdm lock"),
+    ] {
+        if names(tool) {
+            return format!("run `{command}` and commit its lock, then re-run");
+        }
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
 }
 
 fn rewrite_hatch(
@@ -4591,7 +4674,7 @@ fn rewrite_yarn_classic_with(
         .zip(&heads)
         .map(|(b, (patterns, _))| {
             let version = classic_field(&b.lines, "version")?;
-            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+            let (name, source) = crate::formats::yarn::copy::classic_copy_name(
                 patterns,
                 classic_field(&b.lines, "resolved"),
                 version,
@@ -13769,6 +13852,90 @@ mod tests {
             let r = run(copy, manifest);
             assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
             assert!(r.bundled_skipped_uuids.is_empty(), "{case}");
+        }
+    }
+
+    /// #1951: the hosted rewriter reads which package a yarn classic
+    /// `file:` / url copy holds through the same reader vendored and VEX use
+    /// ([`crate::formats::yarn::copy::classic_copy_ref`] and
+    /// [`crate::formats::yarn::copy::CopyRef::identity`]), so the modes
+    /// identify the same copies. (A copy no reader identifies is a separate
+    /// rule: vendored keeps it as a possible copy, #1516.) yarn 1 installs
+    /// `file:../ext/lpdir` from outside the root as readily as from inside
+    /// it, so that copy is read and named; an absolute `file:` path is never
+    /// read (a lock is untrusted input, #1516); a codeload tarball names no
+    /// registry package.
+    #[test]
+    fn issue_1951_yarn_classic_copy_named_as_vendored_reads_it() {
+        use crate::formats::yarn::copy::classic_copy_ref;
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        let manifests = BTreeMap::from([
+            (
+                "../ext/lpdir/package.json".to_string(),
+                left_pad.to_string(),
+            ),
+            ("/abs/lpdir/package.json".to_string(), left_pad.to_string()),
+            ("lpdir/package.json".to_string(), left_pad.to_string()),
+        ]);
+        let codeload = "https://codeload.github.com/stevemao/left-pad/tar.gz/abc";
+        for (case, patterns, resolved, named) in [
+            ("in-root directory", "lp2@file:./lpdir", None, true),
+            ("out-of-root directory", "lp2@file:../ext/lpdir", None, true),
+            ("absolute directory", "lp2@file:/abs/lpdir", None, false),
+            (
+                "codeload tarball",
+                "lp2@stevemao/left-pad#v1.3.0",
+                Some(codeload),
+                false,
+            ),
+        ] {
+            // The package vendored and VEX identify this copy as.
+            let pats = vec![patterns.to_string()];
+            let vendored = classic_copy_ref(&pats, resolved).and_then(|copy| {
+                let bytes = copy
+                    .read_path()
+                    .and_then(|rel| manifests.get(&rel))
+                    .map(|t| t.as_bytes());
+                copy.identity("1.3.0", bytes)
+            });
+            assert_eq!(
+                vendored.is_some(),
+                named,
+                "{case}: vendored reads {vendored:?}"
+            );
+
+            let mut block = format!("\"{patterns}\":\n  version \"1.3.0\"\n");
+            if let Some(url) = resolved {
+                block.push_str(&format!("  resolved \"{url}\"\n"));
+            }
+            let mut files = manifests.clone();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{block}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{case}: the registry block is still pinned: {:?}",
+                r.warnings
+            );
+            let hosted = r.warnings.iter().any(|w| w.detail.contains("lp2@"));
+            assert_eq!(hosted, named, "{case}: {:?}", r.warnings);
+            assert_eq!(
+                r.bundled_skipped_uuids.contains(&ovr.patch_uuid),
+                named,
+                "{case}"
+            );
         }
     }
 

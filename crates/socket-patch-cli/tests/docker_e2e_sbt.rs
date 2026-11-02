@@ -43,7 +43,10 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 use common::git_sha256;
+use docker_common::{cov_docker_args, skip_if_no_image};
 
 use std::io::{Read as _, Write as _};
 use std::process::Command;
@@ -437,53 +440,9 @@ echo "===E2E PASS==="
     )
 }
 
-fn required() -> bool {
-    std::env::var("SOCKET_PATCH_DOCKER_E2E_REQUIRED").is_ok_and(|v| v == "1")
-}
-
-/// `true` when the cell should be skipped (no docker / no image).
-#[must_use]
-fn skip_if_no_image() -> bool {
-    let reason = match Command::new("docker")
-        .args(["image", "inspect", &image()])
-        .output()
-    {
-        Err(_) => "`docker` not on PATH",
-        Ok(out) if !out.status.success() => "the sbt docker image is not present",
-        Ok(_) => return false,
-    };
-    assert!(
-        !required(),
-        "SOCKET_PATCH_DOCKER_E2E_REQUIRED=1 but {reason}"
-    );
-    eprintln!("skipping: {reason}");
-    true
-}
-
-/// The binary mounts: a local Linux build, or the coverage hook.
-fn binary_mounts() -> Vec<String> {
-    if let Ok(bin) = std::env::var("SOCKET_PATCH_DOCKER_BIN") {
-        return vec!["-v".into(), format!("{bin}:/usr/local/bin/socket-patch:ro")];
-    }
-    let (Ok(bin), Ok(dir)) = (
-        std::env::var("SOCKET_PATCH_COV_BIN"),
-        std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR"),
-    ) else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
-
 /// Run one cell in a fresh container and assert its markers.
 async fn run_cell(tool: Tool) {
-    if skip_if_no_image() {
+    if skip_if_no_image(&image()) {
         return;
     }
     let (pristine, patched) = jars().await;
@@ -499,7 +458,7 @@ async fn run_cell(tool: Tool) {
                 "2g",
                 "--add-host=host.docker.internal:host-gateway",
             ])
-            .args(binary_mounts())
+            .args(cov_docker_args())
             .args(["-e", &format!("SOCKET_PATCH_JDK={}", sbt_jdk("1.13.0"))])
             .args([image().as_str(), "bash", "-c", &script])
             .output()

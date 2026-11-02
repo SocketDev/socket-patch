@@ -19,15 +19,16 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 use common::git_sha256;
-
-use std::process::Command;
+use docker_common::{assert_vex_agent_attested, run_container, skip_if_no_image};
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const IMAGE: &str = "socket-patch-test-pypi:latest";
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:pypi/six@1.16.0";
 const UUID: &str = "12121212-1212-4121-8121-121212121212";
@@ -41,42 +42,6 @@ const GHSA: &str = "GHSA-agent-pypi-real";
 const PATCHED_PY: &[u8] = b"# SOCKET-PATCH-E2E-MARKER\n\
                             # six.py replaced by socket-patch e2e fixture\n\
                             __version__ = \"1.16.0-patched\"\n";
-
-/// Coverage instrumentation hook. The CI coverage-docker job sets
-/// SOCKET_PATCH_COV_BIN (host path to an llvm-cov-instrumented
-/// socket-patch binary) and SOCKET_PATCH_COV_PROFRAW_DIR (host dir
-/// for in-container *.profraw output). When both are set, the docker
-/// run mounts the instrumented binary over the image's baked-in
-/// /usr/local/bin/socket-patch and points LLVM_PROFILE_FILE into a
-/// host-visible volume so in-container code paths contribute to the
-/// host's lcov merge. Empty Vec when unset.
-fn cov_docker_args() -> Vec<String> {
-    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
-        return Vec::new();
-    };
-    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
-
-/// Plain SHA256 (NOT git-blob) of the content — used as an independent
-/// oracle for the on-disk file after apply. The marker grep alone only
-/// proves the marker is *somewhere* in the file; comparing the full
-/// sha256 against the exact bytes we served proves apply wrote the whole
-/// blob faithfully, catching a partial/garbled/truncated write.
-fn sha256_hex(content: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content);
-    hex::encode(hasher.finalize())
-}
 
 /// Assert the wiremock saw the real scan→sync API path: a batch search
 /// for metadata AND a content fetch via the inline-blob view endpoint.
@@ -749,90 +714,16 @@ fn uv_tool_script_pins_scans_to_the_mock_api() {
     );
 }
 
-/// Returns `true` when the test should skip (docker missing, image
-/// missing). Prints a skip notice to stderr — the test still reports as
-/// `ok` because Rust integration tests have no native "skipped" outcome.
-#[must_use]
-fn skip_if_no_image() -> bool {
-    let Ok(out) = Command::new("docker")
-        .args(["image", "inspect", "socket-patch-test-pypi:latest"])
-        .output()
-    else {
-        eprintln!("skipping: `docker` not on PATH");
-        return true;
-    };
-    if !out.status.success() {
-        eprintln!("skipping: docker image `socket-patch-test-pypi:latest` not present");
-        return true;
-    }
-    false
-}
-
-/// Host-side oracle over the VEX document the container emitted between the
-/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
-/// the workspace inside the container with no bind mount, so the doc is parsed
-/// from captured stdout). Asserts exactly one statement attesting the agent
-/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
-/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
-/// marker — the marker's absence is what distinguishes agent provenance.
-fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
-    const BEGIN: &str = "===VEX DOC BEGIN===";
-    const END: &str = "===VEX DOC END===";
-    let start = stdout
-        .find(BEGIN)
-        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
-        + BEGIN.len();
-    let stop = stdout[start..]
-        .find(END)
-        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
-        + start;
-    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
-        .expect("emitted VEX document must be valid JSON");
-    let stmts = doc["statements"]
-        .as_array()
-        .expect("VEX document must have a statements array");
-    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
-    let st = &stmts[0];
-    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
-    assert_eq!(st["status"], "not_affected");
-    assert_eq!(
-        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
-        "subcomponent must be the patched package purl"
-    );
-    let impact = st["impact_statement"]
-        .as_str()
-        .expect("statement must carry an impact_statement");
-    assert!(
-        impact.contains("Patched via Socket patch")
-            && !impact.contains("(vendored)")
-            && !impact.contains("(redirected)"),
-        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
-    );
-}
-
-fn run_container(_api_url: &str, script: &str) -> std::process::Output {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "--add-host=host.docker.internal:host-gateway",
-        "-i",
-    ])
-    .args(cov_docker_args())
-    .args(["socket-patch-test-pypi:latest", "bash", "-c", script]);
-    cmd.output().expect("docker run")
-}
-
 #[tokio::test]
 async fn pypi_local_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
-    let expected_sha = sha256_hex(PATCHED_PY);
-    let out = run_container(&api_url, &local_script(&api_url, &expected_sha));
+    let expected_sha = common::sha256_hex(PATCHED_PY);
+    let out = run_container(IMAGE, &local_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -850,7 +741,7 @@ async fn pypi_local_install_full_apply_chain() {
         stderr.contains("===VEX VERIFIED==="),
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
     );
-    assert_vex_agent_attested(&stdout, PURL);
+    assert_vex_agent_attested(&stdout, PURL, GHSA);
     assert_api_path_exercised(&server).await;
 }
 
@@ -859,11 +750,11 @@ async fn pypi_global_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
-    let expected_sha = sha256_hex(PATCHED_PY);
-    let out = run_container(&api_url, &global_script(&api_url, &expected_sha));
+    let expected_sha = common::sha256_hex(PATCHED_PY);
+    let out = run_container(IMAGE, &global_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -884,11 +775,11 @@ async fn pypi_uv_venv_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
-    let expected_sha = sha256_hex(PATCHED_PY);
-    let out = run_container(&api_url, &uv_venv_script(&api_url, &expected_sha));
+    let expected_sha = common::sha256_hex(PATCHED_PY);
+    let out = run_container(IMAGE, &uv_venv_script(&api_url, &expected_sha));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -912,11 +803,11 @@ async fn pypi_uv_tool_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_PY);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let marker = "uv-tool-discovery-ok";
-    let out = run_container(&api_url, &uv_tool_script(&api_url, marker));
+    let out = run_container(IMAGE, &uv_tool_script(&api_url, marker));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(

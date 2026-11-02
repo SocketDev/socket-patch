@@ -18,6 +18,10 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "../common/hermetic.rs"]
 mod hermetic;
 #[path = "../prebuilt_common/mod.rs"]
@@ -72,19 +76,6 @@ pub fn uuid_dir(root: &Path, uuid: &str) -> PathBuf {
 /// The file DepID of `rel` in a `lockfileVersion: 1` lock.
 pub fn file_id_v1(rel: &str) -> String {
     format!("file~{}", rel.replace('_', "__").replace('/', "+"))
-}
-
-pub fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
 }
 
 /// Every file under `dir` (relative, forward-slashed) with its bytes.
@@ -338,7 +329,7 @@ pub fn dep_ids(lock: &str, name: &str, version: &str) -> Vec<String> {
 /// A capture's project copied to `root`, the target installed in vlt's
 /// store (every instance) and its patch staged at [`FIXTURE_UUID`].
 pub fn capture_project(root: &Path, case: &Case) {
-    copy_dir(&case.project_dir(), root);
+    fs_tree::copy_tree(&case.project_dir(), root);
     let lock = std::fs::read_to_string(root.join(VLT_LOCK)).unwrap();
     let (name, version) = case.coords();
     for id in dep_ids(&lock, &name, &version) {

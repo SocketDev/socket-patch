@@ -568,8 +568,16 @@ jobs:
           TEST_SHARD: ${{ matrix.shard }}
         # This leg's share of `cargo test --workspace --no-fail-fast`; the
         # shards together run exactly that selection (test_ci_test_shard.py).
+        # A failing test's panic becomes an annotation, as in `coverage`
+        # (scripts/ci-test-failures.py).
         run: |
-          python3 scripts/ci-test-shard.py "$TEST_SHARD" 2
+          set -o pipefail
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" 2 \
+            2>&1 | tee "$RUNNER_TEMP/tests.log" || {
+            status=$?
+            python3 scripts/ci-test-failures.py "$RUNNER_TEMP/tests.log" || true
+            exit "$status"
+          }
 
   test-release:
     # Each PR and main push runs the complete release-mode suite. The merge
@@ -620,7 +628,15 @@ jobs:
         env:
           TEST_SHARD: ${{ matrix.shard }}
           TEST_SHARD_COUNT: ${{ strategy.job-total }}
-        run: python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release
+        # Failing tests' panics become annotations, as in `test`.
+        run: |
+          set -o pipefail
+          python3 scripts/ci-test-shard.py "$TEST_SHARD" "$TEST_SHARD_COUNT" --locked --profile ci-release \
+            2>&1 | tee "$RUNNER_TEMP/tests.log" || {
+            status=$?
+            python3 scripts/ci-test-failures.py "$RUNNER_TEMP/tests.log" || true
+            exit "$status"
+          }
 
   coverage:
     if: ((github.event.pull_request.draft != true) && needs.release-readiness.outputs.pr_unchanged != 'true') && (inputs.os != 'windows' && inputs.os != 'macos')

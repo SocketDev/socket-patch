@@ -201,9 +201,6 @@ impl std::fmt::Display for ReadCappedError {
 /// an over-large declared `Content-Length` and an actual stream that
 /// exceeds the cap mid-flight. `what` names the payload in error messages
 /// ("vendor package", "release archive", …).
-///
-/// Hoisted from `api/client.rs` so the self-update downloader shares the
-/// exact cap semantics the vendor/artifact fetches already have.
 pub(crate) async fn read_capped(
     resp: reqwest::Response,
     max: u64,
@@ -246,12 +243,31 @@ pub(crate) async fn read_capped_typed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    async fn get(server: &MockServer, route: &str) -> reqwest::Response {
-        reqwest::Client::new()
-            .get(format!("{}{route}", server.uri()))
+    /// Serve one raw HTTP/1.1 response on loopback and return a response
+    /// whose body is still unread.
+    async fn respond_raw(raw: &'static [u8]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                match tcp.read(&mut chunk).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                }
+            }
+            let _ = tcp.write_all(raw).await;
+            let _ = tcp.shutdown().await;
+        });
+        reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/"))
             .send()
             .await
             .unwrap()
@@ -259,27 +275,54 @@ mod tests {
 
     #[tokio::test]
     async fn declared_content_length_over_cap_is_refused() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/big"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![0u8; 64]))
-            .mount(&server)
-            .await;
-        let resp = get(&server, "/big").await;
-        let err = read_capped(resp, 16, "test payload").await.unwrap_err();
-        assert!(err.contains("too large"), "{err}");
-        assert!(err.contains("test payload"), "{err}");
+        let resp =
+            respond_raw(b"HTTP/1.1 200 OK\r\ncontent-length: 64\r\nconnection: close\r\n\r\n")
+                .await;
+        assert_eq!(
+            read_capped_typed(resp, 16, "test payload").await,
+            Err(ReadCappedError::CapExceeded(
+                "test payload too large: declared 64 bytes > 16 cap".into()
+            ))
+        );
+    }
+
+    /// A chunked body declares no length, so only the streamed count
+    /// catches it.
+    #[tokio::test]
+    async fn streamed_body_over_cap_is_refused_mid_stream() {
+        let resp = respond_raw(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n\
+              a\r\n0123456789\r\na\r\n0123456789\r\n0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(resp.content_length(), None);
+        assert_eq!(
+            read_capped_typed(resp, 16, "test payload").await,
+            Err(ReadCappedError::CapExceeded(
+                "test payload exceeded 16-byte cap mid-stream".into()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn body_cut_short_of_its_content_length_is_truncated() {
+        let resp =
+            respond_raw(b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\nhello")
+                .await;
+        let err = read_capped_typed(resp, 16, "test payload")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ReadCappedError::Truncated(m) if m.starts_with("error reading test payload body: ")),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]
     async fn body_within_cap_reads_fully() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/ok"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"hello".to_vec()))
-            .mount(&server)
-            .await;
-        let resp = get(&server, "/ok").await;
+        let resp =
+            respond_raw(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                .await;
         assert_eq!(
             read_capped(resp, 16, "test payload").await.unwrap(),
             b"hello"
@@ -288,21 +331,20 @@ mod tests {
 
     #[tokio::test]
     async fn exact_cap_boundary_is_allowed() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/edge"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![7u8; 16]))
-            .mount(&server)
-            .await;
-        let resp = get(&server, "/edge").await;
-        assert_eq!(
-            read_capped(resp, 16, "test payload").await.unwrap().len(),
-            16
-        );
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\ncontent-length: 16\r\nconnection: close\r\n\r\n\
+               0123456789abcdef"[..],
+            &b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n\
+               10\r\n0123456789abcdef\r\n0\r\n\r\n"[..],
+        ] {
+            let resp = respond_raw(raw).await;
+            assert_eq!(
+                read_capped_typed(resp, 16, "test payload").await.unwrap(),
+                b"0123456789abcdef"
+            );
+        }
     }
 
-    // ── Trust roots (#1107) ───────────────────────────────────────────
-    //
     // `tests/tls-ca/` holds a private CA (`ca.pem`) and a leaf for
     // 127.0.0.1 it signed (`leaf.pem` + `leaf.key`, P-256, valid for a
     // century): the shape of a TLS-inspecting proxy's re-signed traffic.
@@ -480,11 +522,10 @@ mod tests {
         assert_eq!(resp.status(), 200, "the usable root still verifies");
     }
 
-    /// The production builder accepts the shared rustls config (reqwest
-    /// refuses a config from a different rustls build at `build()`), and
-    /// building clients never reads the platform store.
+    /// reqwest refuses a rustls config from a different rustls build at
+    /// `build()`, so this fails if the shared config stops matching.
     #[test]
-    fn production_builder_builds() {
+    fn production_builder_accepts_the_shared_tls_config() {
         client_builder().build().unwrap();
         client_builder().build().unwrap();
     }

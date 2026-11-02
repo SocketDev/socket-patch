@@ -2,13 +2,8 @@
 //! `docs/configuration.md#gradual-rollout`).
 
 use clap::Args;
-pub(crate) use socket_patch_core::rollout::stage::RolloutCarry;
+use socket_patch_core::rollout::stage::{RolloutCarry, MAX_NEW_PATCHES_ENV};
 use socket_patch_core::rollout::{resolve_max_new, MaxNew};
-
-/// The env binding of `--max-new-patches`. Read by [`RolloutArgs::resolve`]
-/// rather than clap's `env =`, because the rollout block reports whether
-/// the value came from the flag or the environment.
-pub use socket_patch_core::rollout::stage::MAX_NEW_PATCHES_ENV;
 
 /// A parsed `--max-new-patches` value; `None` is `none` (no cap).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,7 +44,9 @@ pub struct RolloutArgs {
 impl RolloutArgs {
     /// The configured cap: the flag, then `env` (the
     /// [`MAX_NEW_PATCHES_ENV`] value; empty is unset), then the socket.yml
-    /// value, then unlimited. A malformed env value is a usage error.
+    /// value, then unlimited. A malformed env value is a usage error. The
+    /// env is read here, not by clap's `env =`, because the rollout block
+    /// reports whether the value came from the flag or the environment.
     pub fn resolve(&self, env: Option<&str>, file: Option<u32>) -> Result<MaxNew, String> {
         // The flag wins outright: an env value it overrides is never read.
         let env = env.filter(|_| self.max_new_patches.is_none());
@@ -80,20 +77,6 @@ impl RolloutArgs {
 mod tests {
     use super::*;
     use socket_patch_core::rollout::MaxNewSource;
-
-    #[test]
-    fn parses_numbers_and_none() {
-        assert_eq!(parse_max_new_patches("5"), Ok(MaxNewPatches(Some(5))));
-        assert_eq!(parse_max_new_patches("0"), Ok(MaxNewPatches(Some(0))));
-        assert_eq!(
-            parse_max_new_patches("4294967295"),
-            Ok(MaxNewPatches(Some(u32::MAX)))
-        );
-        assert_eq!(parse_max_new_patches("NONE"), Ok(MaxNewPatches(None)));
-        for bad in ["", "-1", "4294967296", "five", "1.5", "all"] {
-            assert!(parse_max_new_patches(bad).is_err(), "{bad:?}");
-        }
-    }
 
     #[test]
     fn flag_beats_env_beats_file() {

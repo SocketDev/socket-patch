@@ -305,19 +305,6 @@ fn sri(bytes: &[u8]) -> String {
     format!("sha512-{}", b64(&Sha512::digest(bytes)))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// A gzipped npm tarball from `(entry name under package/, bytes, mode)`
 /// triples, built with the tar crate so the suite has no system-`tar`
 /// dependency (Windows runners included).
@@ -826,7 +813,7 @@ fn fresh_checkout(fx: &BunProject, name: &str) -> PathBuf {
     if fx.proj.join("bunfig.toml").is_file() {
         std::fs::copy(fx.proj.join("bunfig.toml"), fresh.join("bunfig.toml")).unwrap();
     }
-    copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     fresh
 }
 
