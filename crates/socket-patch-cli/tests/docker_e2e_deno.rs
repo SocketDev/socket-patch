@@ -31,14 +31,16 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 use common::git_sha256;
-
-use std::process::Command;
+use docker_common::{run_container, skip_if_no_image};
 
 use base64::Engine;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const IMAGE: &str = "socket-patch-test-deno:latest";
 const ORG: &str = "test-org";
 const NPM_PURL: &str = "pkg:npm/minimist@1.2.2";
 const NPM_UUID: &str = "13131313-1313-4131-8131-131313131313";
@@ -47,27 +49,6 @@ const NPM_UUID: &str = "13131313-1313-4131-8131-131313131313";
 /// post-apply that the file has been overwritten.
 const PATCHED_BYTES: &[u8] =
     b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
-
-/// Coverage instrumentation hook — same shape as every other docker
-/// e2e test file. When `SOCKET_PATCH_COV_BIN` is set, mounts the
-/// instrumented socket-patch binary into the container and pipes
-/// profraw output back to a host-visible directory.
-fn cov_docker_args() -> Vec<String> {
-    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
-        return Vec::new();
-    };
-    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
 
 /// Build the wiremock for the npm-via-deno-install variant. Same
 /// minimist fixture as `docker_e2e_npm.rs`; we duplicate it here to
@@ -487,65 +468,16 @@ fn deno_jsr_script_pins_scan_to_the_mock_api() {
     );
 }
 
-/// Returns `true` when the test must skip because the docker image is
-/// absent. Rust integration tests have no native "skipped" outcome, so a
-/// missing image silently makes the whole test vacuous — that is itself a
-/// loophole. To make the skip auditable, set `SOCKET_PATCH_REQUIRE_DOCKER=1`
-/// (CI does this): the helper then PANICS instead of skipping, so a green
-/// run proves the assertions actually executed rather than no-op'd.
-#[must_use]
-fn skip_if_no_image() -> bool {
-    let require = std::env::var("SOCKET_PATCH_REQUIRE_DOCKER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    let out = Command::new("docker")
-        .args(["image", "inspect", "socket-patch-test-deno:latest"])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => false,
-        Ok(_) => {
-            assert!(
-                !require,
-                "SOCKET_PATCH_REQUIRE_DOCKER=1 but image \
-                 `socket-patch-test-deno:latest` is not present"
-            );
-            eprintln!("skipping: docker image `socket-patch-test-deno:latest` not present");
-            true
-        }
-        Err(_) => {
-            assert!(
-                !require,
-                "SOCKET_PATCH_REQUIRE_DOCKER=1 but `docker` is not on PATH"
-            );
-            eprintln!("skipping: `docker` not on PATH");
-            true
-        }
-    }
-}
-
-fn run_container(script: &str) -> std::process::Output {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "--add-host=host.docker.internal:host-gateway",
-        "-i",
-    ])
-    .args(cov_docker_args())
-    .args(["socket-patch-test-deno:latest", "bash", "-c", script]);
-    cmd.output().expect("docker run")
-}
-
 #[tokio::test]
 async fn deno_install_node_modules_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_BYTES);
     let server = make_npm_mock_server(&after_hash).await;
     let api_url = api_url_for_container(&server);
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let blob_b64 = base64::engine::general_purpose::STANDARD.encode(PATCHED_BYTES);
-    let out = run_container(&deno_node_modules_script(&api_url, &blob_b64));
+    let out = run_container(IMAGE, &deno_node_modules_script(&api_url, &blob_b64));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -582,10 +514,10 @@ async fn deno_install_node_modules_full_apply_chain() {
 async fn deno_jsr_synthetic_layout_scan_verifies_discovery() {
     let server = make_empty_batch_mock_server().await;
     let api_url = api_url_for_container(&server);
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
-    let out = run_container(&deno_jsr_script(&api_url));
+    let out = run_container(IMAGE, &deno_jsr_script(&api_url));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
