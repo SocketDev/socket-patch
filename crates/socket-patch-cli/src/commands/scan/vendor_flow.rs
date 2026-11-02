@@ -186,8 +186,10 @@ impl VendorPreview {
 /// not predicted), and a would-refuse never flips the run's status or exit
 /// code. The preflights (the only disk access besides the ledger; the PyPI
 /// one may also probe `pipenv --version` and list Hatch environments, as
-/// the wet run's guards do) run only when the selection holds an npm or
-/// PyPI purl.
+/// the wet run's guards do; the lock-text gates read the lock, the
+/// manifest and, for a refused package the lock does not resolve to a
+/// registry source, the installed tree) run only when the selection holds
+/// an npm, PyPI or cargo purl.
 /// `takeover_refusals` adds the hosted→vendored takeover refusals the
 /// caller resolved (the gem gates of
 /// [`crate::commands::vendor::gem_takeover_preview_refusals`]), keyed by
@@ -209,7 +211,8 @@ pub(crate) async fn preview_vendor(
     let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
-    let lock_text_refusals = lock_text_refusals(cwd, selected, origins, &state).await;
+    let lock_text_refusals =
+        lock_text_refusals(cwd, selected, origins, &state, npm_lock_refusal.is_some()).await;
     let pypi_refusals = pypi_refusals(cwd, selected, origins, takeover_refusals).await;
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
@@ -369,7 +372,8 @@ pub(super) async fn preflight_refused_purls(
     let origins = crate::commands::hosted_unwind::patch_server_origins(common);
     let state = state.unwrap_or_default();
     let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, &origins, &state).await;
-    let lock_text_refusals = lock_text_refusals(cwd, selected, &origins, &state).await;
+    let lock_text_refusals =
+        lock_text_refusals(cwd, selected, &origins, &state, npm_lock_refusal.is_some()).await;
     let gem_refusals = crate::commands::vendor::gem_takeover_preview_refusals(
         common,
         selected.iter().map(|p| p.purl.as_str()),
@@ -406,54 +410,41 @@ async fn npm_lock_refusal(
 /// The purls of `selected` the vendor backend refuses on the project's
 /// lock and manifest text alone, with the backend's `(code, detail)`: the
 /// npm package-lock, pnpm, yarn classic and yarn berry per-entry gates and
-/// cargo's locked-version gate
-/// ([`socket_patch_core::vendor::lock_text_refusals`]). These are the
-/// refusals the wet run's download phase raises before it fetches a view
-/// ([`crate::commands::agent_download::lock_text_refusals_for`]), so the
-/// preview and the rollout plan must name them too (#1976): an npm package
-/// installed from a URL or git spec, or a workspace member, otherwise
-/// previews as vendorable and takes a `--max-new-patches` slot on every
-/// run. As in the download phase, a purl the lockfiles pin hosted is left
-/// to its takeover (which restores the upstream entry first, see
-/// [`hosted_pnpm_refusals`]), a purl the ledger already holds at this uuid
-/// is not asked, and only a package the vendor loop would hand to its
-/// backend is kept ([`crate::commands::vendor::lock_refusals_reaching_backend`]).
+/// cargo's locked-version gate. These are the refusals the wet run's
+/// download phase raises before it fetches a view, read through the same
+/// [`crate::commands::agent_download::unclaimed_lock_text_refusals`] (same
+/// hosted-pin, ledger and reaches-the-backend scope), so the preview and
+/// the rollout plan name them too (#1976): an npm package installed from a
+/// URL or git spec, or a workspace member, otherwise previews as vendorable
+/// and takes a `--max-new-patches` slot on every run. npm purls are not
+/// asked when `npm_lock_refused` (the project-level package-lock refusal
+/// already refuses every one of them).
 async fn lock_text_refusals(
     cwd: &Path,
     selected: &[PatchSearchResult],
     origins: &[String],
     state: &VendorState,
+    npm_lock_refused: bool,
 ) -> HashMap<String, (&'static str, String)> {
-    let gated =
-        |p: &&PatchSearchResult| p.purl.starts_with("pkg:npm/") || p.purl.starts_with("pkg:cargo/");
-    if !selected.iter().any(|p| gated(&p)) {
+    let gated: Vec<&PatchSearchResult> = selected
+        .iter()
+        .filter(|p| {
+            (p.purl.starts_with("pkg:npm/") && !npm_lock_refused)
+                || p.purl.starts_with("pkg:cargo/")
+        })
+        .collect();
+    if gated.is_empty() {
         return HashMap::new();
     }
     let claimed =
         crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
-    let candidates: Vec<(&str, &str)> = selected
-        .iter()
-        .filter(gated)
-        .filter(|p| !claimed.contains(&PurlKey::new(&p.purl)))
-        .filter(|p| lookup_entry(&state.entries, &p.purl).is_none_or(|e| e.uuid != p.uuid))
-        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
-        .collect();
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-    let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
     let options = socket_patch_core::crawlers::CrawlerOptions {
         cwd: cwd.to_path_buf(),
         global: false,
         global_prefix: None,
     };
-    crate::commands::vendor::lock_refusals_reaching_backend(
-        cwd,
-        refused,
-        &state.entries,
-        |purls| async move {
-            crate::commands::vendor::installed_purls(&options, &purls, None).await
-        },
+    crate::commands::agent_download::unclaimed_lock_text_refusals(
+        cwd, &gated, &claimed, state, options, None,
     )
     .await
 }
@@ -2302,6 +2293,37 @@ mod npm_lock_entry_refusal_tests {
                 "{shape}: is-number stays vendorable"
             );
             assert_eq!(preview.refused_count(), 1, "{shape}");
+        }
+    }
+
+    /// The ledger's scope is the download phase's: only a detached entry
+    /// carrying its record settles a purl, so a same-uuid entry `vendor`
+    /// wrote (not detached) is still asked, and the preview agrees with the
+    /// wet run's refusal instead of saying `already_vendored`.
+    #[tokio::test]
+    async fn preview_asks_a_same_uuid_entry_the_wet_run_still_gates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let code = project(root, "url");
+        write(
+            &root.join(".socket/vendor/state.json"),
+            &serde_json::json!({
+                "version": 1,
+                "entries": { LEFT_PAD: {
+                    "ecosystem": "npm", "basePurl": LEFT_PAD, "uuid": UUID,
+                    "artifact": { "path": format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz") },
+                    "wiring": [],
+                }}
+            })
+            .to_string(),
+        );
+        let state = load_state(root).await.expect("the seeded ledger parses");
+        let entry = lookup_entry(&state.entries, LEFT_PAD).expect("seeded entry");
+        assert!(entry.uuid == UUID && !entry.detached);
+        let preview = preview_vendor(root, &[sel(LEFT_PAD)], &[], &HashMap::new()).await;
+        match &preview.rows[0].verdict {
+            PreviewVerdict::WouldRefuse { code: got, .. } => assert_eq!(got, code),
+            other => panic!("left-pad must preview would_refuse, got {other:?}"),
         }
     }
 
