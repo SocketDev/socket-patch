@@ -518,6 +518,21 @@ fn is_prefix_global_install(path: &Path) -> bool {
     }
 }
 
+impl InstallChannel {
+    /// A stable machine name for telemetry, unlike the human-facing
+    /// [`channel_label`] (`cargo install`, `the RubyGems launcher`).
+    pub fn id(self) -> &'static str {
+        match self {
+            InstallChannel::Standalone => "standalone",
+            InstallChannel::Npm => "npm",
+            InstallChannel::Pypi => "pypi",
+            InstallChannel::Cargo => "cargo",
+            InstallChannel::LauncherCache => "launcher_cache",
+            InstallChannel::Homebrew => "homebrew",
+        }
+    }
+}
+
 /// Short human label for refusal messages ("managed by npm"); see
 /// [`channel_label_for`] for the npm-family manager of a given path.
 pub fn channel_label(channel: InstallChannel) -> &'static str {
@@ -851,6 +866,20 @@ mod tests {
             detect_channel(cached, &ChannelEnv::default()),
             InstallChannel::Standalone
         );
+    }
+
+    #[test]
+    fn channel_ids_are_the_telemetry_names() {
+        for (channel, id) in [
+            (InstallChannel::Standalone, "standalone"),
+            (InstallChannel::Npm, "npm"),
+            (InstallChannel::Pypi, "pypi"),
+            (InstallChannel::Cargo, "cargo"),
+            (InstallChannel::LauncherCache, "launcher_cache"),
+            (InstallChannel::Homebrew, "homebrew"),
+        ] {
+            assert_eq!(channel.id(), id);
+        }
     }
 
     #[test]
