@@ -679,7 +679,7 @@ async fn run_pnpm_capstone(pm: &str, driver: VendorDriver) {
     if ws_created {
         std::fs::copy(&ws_path, fresh.join("pnpm-workspace.yaml")).unwrap();
     }
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_store = tmp.path().join("fresh-pnpm-store");
     let mut ci = corepack(
@@ -1756,7 +1756,7 @@ fn run_two_document_capstone(
     for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
         std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
     }
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     let fresh_store = tmp.path().join("fresh-store");
     let ci = corepack(
         &fresh,
@@ -1910,8 +1910,8 @@ fn pnpm_vendor_names_a_file_copy_of_the_vendored_release() {
     // Fresh checkout, empty store, frozen: a gets the vendored bytes, b
     // keeps the fork, exactly as the warning says.
     let fresh = tmp.path().join("fresh");
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join("forks"), &fresh.join("forks"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join("forks"), &fresh.join("forks"));
     for file in [
         "package.json",
         "pnpm-lock.yaml",
@@ -2232,7 +2232,7 @@ fn run_legacy_capstone_for(pm: &str, lock_head: &str, proj_dir: &str, dep: &str,
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("pnpm-lock.yaml")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     std::fs::write(fresh.join(".npmrc"), "registry=http://127.0.0.1:1/\n").unwrap();
 
     let fresh_store = tmp.path().join("store-fresh");
@@ -2512,7 +2512,7 @@ fn pnpm_vendor_keeps_user_workspace_overrides_authoritative() {
     for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
         std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
     }
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     let fresh_store = tmp.path().join("fresh-pnpm-store");
     let ci = corepack(
         &fresh,
@@ -2854,7 +2854,7 @@ async fn run_build_approval_capstone(pm: &str, approval: &str, carried: bool) {
     for file in ["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"] {
         std::fs::copy(proj.join(file), fresh.join(file)).unwrap();
     }
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     std::fs::write(fresh.join(".npmrc"), "registry=http://127.0.0.1:1/\n").unwrap();
     let fresh_store = tmp.path().join("fresh-pnpm-store");
     let ci = corepack(

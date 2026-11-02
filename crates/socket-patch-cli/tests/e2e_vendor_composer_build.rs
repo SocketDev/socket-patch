@@ -467,7 +467,7 @@ fn assert_manifestless_vendored_vex(
     std::fs::create_dir_all(&reverted).unwrap();
     std::fs::copy(fresh.join("composer.json"), reverted.join("composer.json")).unwrap();
     std::fs::write(reverted.join("composer.lock"), registry_lock).unwrap();
-    common::copy_tree(&fresh.join(".socket"), &reverted.join(".socket"));
+    common::fs_tree::copy_tree(&fresh.join(".socket"), &reverted.join(".socket"));
     let install = composer(
         &reverted,
         &["install"],

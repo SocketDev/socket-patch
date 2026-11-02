@@ -1136,7 +1136,7 @@ fn fresh_checkout(fx: &BunRedirectFixture, name: &str) -> PathBuf {
         std::fs::copy(fx.proj.join("bunfig.toml"), fresh.join("bunfig.toml")).unwrap();
     }
     if fx.proj.join(".socket").is_dir() {
-        common::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
     fresh
 }

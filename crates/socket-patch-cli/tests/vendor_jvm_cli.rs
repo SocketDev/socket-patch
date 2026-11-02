@@ -1423,7 +1423,7 @@ fn gradle_vendor_428_repair_from_subproject_refuses() {
     fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
     std::fs::create_dir_all(root.join("proj/.git")).unwrap();
     ok(root, &["vendor"]);
-    common::copy_tree(&root.join("proj/.socket"), &root.join("proj/app/.socket"));
+    common::fs_tree::copy_tree(&root.join("proj/.socket"), &root.join("proj/app/.socket"));
     std::fs::remove_file(
         root.join("proj/app/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"),
     )

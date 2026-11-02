@@ -544,7 +544,7 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
     std::fs::copy(proj.join(".yarnrc.yml"), fresh.join(".yarnrc.yml")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_global = tmp.path().join("fresh-yarn-global");
     let ci = corepack(

@@ -583,7 +583,7 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str, berry: bool) -> PathBuf {
     if berry {
         std::fs::copy(proj.join(".yarnrc.yml"), fresh.join(".yarnrc.yml")).unwrap();
     }
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     fresh
 }
 

@@ -337,7 +337,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let dev = corepack(
@@ -679,7 +679,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     //     entry is no longer wired.
     let api = patch_api(&purl, &patched);
     let drift = tmp.path().join("drift-vex");
-    common::copy_tree(&proj, &drift);
+    common::fs_tree::copy_tree(&proj, &drift);
     vex_e2e_common::strip_manifest(&drift);
     let out = vex_e2e_common::run_vex(
         &vex_e2e_common::binary(),
@@ -735,7 +735,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     // 5b. The recovered (re-wired, re-installed) state attests again with no
     //     manifest and no ledger — lockfile + kept tarball + patch API.
     let recovered = tmp.path().join("recovered-vex");
-    common::copy_tree(&proj, &recovered);
+    common::fs_tree::copy_tree(&proj, &recovered);
     vex_e2e_common::strip_manifest(&recovered);
     vex_e2e_common::strip_ledgers(&recovered);
     let out = vex_e2e_common::run_vex(

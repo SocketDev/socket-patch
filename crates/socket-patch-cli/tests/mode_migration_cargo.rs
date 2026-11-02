@@ -210,7 +210,7 @@ fn build_patched_crate(
 ) -> Vec<u8> {
     let leaf = format!("{DEP}-{version}");
     let pkg_dir = stage_root.join(&leaf);
-    common::copy_tree(crate_dir, &pkg_dir);
+    common::fs_tree::copy_tree(crate_dir, &pkg_dir);
     let _ = std::fs::remove_file(pkg_dir.join(".cargo-checksum.json"));
     std::fs::write(pkg_dir.join("src/lib.rs"), patched).unwrap();
     let mut bytes = Vec::new();
@@ -626,11 +626,11 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
     if proj.join(".cargo").exists() {
-        common::copy_tree(&proj.join(".cargo"), &fresh.join(".cargo"));
+        common::fs_tree::copy_tree(&proj.join(".cargo"), &fresh.join(".cargo"));
     }
-    common::copy_tree(&proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&proj.join("src"), &fresh.join("src"));
     if proj.join(".socket").exists() {
-        common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     let home = tmp.join(format!("fresh-home-{tag}"));
     std::fs::create_dir_all(&home).unwrap();

@@ -234,7 +234,7 @@ fn stage_patch(proj: &Path, purl: &str, before: &[u8], after: &[u8]) {
 /// from the installed dep directory.
 fn build_patched_tgz(installed_dir: &Path, patched_index: &[u8], out_tgz: &Path) {
     let stage = out_tgz.parent().unwrap().join("tarstage");
-    common::copy_tree(installed_dir, &stage.join("package"));
+    common::fs_tree::copy_tree(installed_dir, &stage.join("package"));
     std::fs::write(stage.join("package").join("index.js"), patched_index).unwrap();
     let tar = Command::new("tar")
         .args(["-czf", out_tgz.to_str().unwrap(), "package"])
@@ -358,7 +358,7 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
     std::fs::write(fresh.join(".yarnrc.yml"), yarnrc).unwrap();
     // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
     if proj.join(".socket").is_dir() {
-        common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     let fresh_global = tmp.join("fresh-yarn-global");
     let ci = corepack(

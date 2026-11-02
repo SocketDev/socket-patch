@@ -758,9 +758,9 @@ fn copy_project(from: &Path, to: &Path) {
     std::fs::copy(from.join("package.json"), to.join("package.json")).unwrap();
     std::fs::copy(from.join("bun.lock"), to.join("bun.lock")).unwrap();
     if from.join(".socket").is_dir() {
-        common::copy_tree(&from.join(".socket"), &to.join(".socket"));
+        common::fs_tree::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
-    common::copy_tree(&from.join("node_modules"), &to.join("node_modules"));
+    common::fs_tree::copy_tree(&from.join("node_modules"), &to.join("node_modules"));
 }
 
 /// ONLY the committable files (package.json, bun.lock, `.socket/` when it
@@ -770,7 +770,7 @@ fn fresh_checkout(from: &Path, to: &Path) {
     std::fs::copy(from.join("package.json"), to.join("package.json")).unwrap();
     std::fs::copy(from.join("bun.lock"), to.join("bun.lock")).unwrap();
     if from.join(".socket").is_dir() {
-        common::copy_tree(&from.join(".socket"), &to.join(".socket"));
+        common::fs_tree::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
 }
 

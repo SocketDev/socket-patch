@@ -813,7 +813,7 @@ fn fresh_checkout(fx: &BunProject, name: &str) -> PathBuf {
     if fx.proj.join("bunfig.toml").is_file() {
         std::fs::copy(fx.proj.join("bunfig.toml"), fresh.join("bunfig.toml")).unwrap();
     }
-    common::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     fresh
 }
 

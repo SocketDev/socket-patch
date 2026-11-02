@@ -452,7 +452,7 @@ fn assert_fresh_checkout_frozen_offline(
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("pyproject.toml"), fresh.join("pyproject.toml")).unwrap();
     std::fs::copy(proj.join("uv.lock"), fresh.join("uv.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.join("fresh-uv-cache");
     let mut fresh_env: Vec<(&str, &str)> = vec![("UV_CACHE_DIR", fresh_cache.to_str().unwrap())];
@@ -1671,7 +1671,7 @@ fn pip_requirements_vendor_fresh_checkout_no_index_and_revert() {
         fresh.join("requirements.txt"),
     )
     .unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_venv = fresh.join(".venv");
     let mkvenv = tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]);
@@ -1818,7 +1818,7 @@ fn pip_requirements_revert_after_the_vendor_comment_is_edited() {
     let requirements_before = std::fs::read(proj.join("requirements.txt")).unwrap();
     let blobs = proj.join(".socket/blobs");
     let blobs_before = tmp.path().join("blobs");
-    common::copy_tree(&blobs, &blobs_before);
+    common::fs_tree::copy_tree(&blobs, &blobs_before);
 
     let edits: [(&str, fn(&str) -> String); 3] = [
         ("respaced", |l| {
@@ -1834,7 +1834,7 @@ fn pip_requirements_revert_after_the_vendor_comment_is_edited() {
     ];
     for (edit, apply_edit) in edits {
         if !blobs.exists() {
-            common::copy_tree(&blobs_before, &blobs);
+            common::fs_tree::copy_tree(&blobs_before, &blobs);
         }
         let (code, stdout, stderr) = run_vendored(&VendorDriver::VendorOffline, &proj);
         assert_eq!(
@@ -1938,7 +1938,7 @@ fn pip_vendored_requirements_evaluate_environment_markers() {
             fresh.join("requirements.txt"),
         )
         .unwrap();
-        common::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
         assert_tool_ok(
             &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
             "create fresh venv",
@@ -2060,7 +2060,7 @@ fn pip_vendored_requirements_marker_split_across_includes() {
         for file in ["requirements.txt", "base.txt"] {
             std::fs::copy(project.join(file), fresh.join(file)).unwrap();
         }
-        common::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
         assert_tool_ok(
             &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
             "create fresh venv",
@@ -2168,7 +2168,7 @@ fn pip_vendored_requirements_marker_split_rewrites_matching_branch() {
         fresh.join("requirements.txt"),
     )
     .unwrap();
-    common::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&project.join(".socket"), &fresh.join(".socket"));
     assert_tool_ok(
         &tool(Path::new(python), &fresh, &["-m", "venv", ".venv"], &[]),
         "create fresh venv",

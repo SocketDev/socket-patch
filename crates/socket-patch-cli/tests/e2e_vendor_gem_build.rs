@@ -328,8 +328,8 @@ fn vendored_manifestless_vex_matrix(v: &Vendored<'_>) {
     std::fs::create_dir_all(&copy).unwrap();
     std::fs::copy(fresh.join("Gemfile"), copy.join("Gemfile")).unwrap();
     std::fs::write(copy.join(lock_name), v.pristine_lock).unwrap();
-    common::copy_tree(&fresh.join(".socket"), &copy.join(".socket"));
-    common::copy_tree(v.committed_bundle, &copy.join(".bundle"));
+    common::fs_tree::copy_tree(&fresh.join(".socket"), &copy.join(".socket"));
+    common::fs_tree::copy_tree(v.committed_bundle, &copy.join(".bundle"));
     for f in std::fs::read_dir(&saved).unwrap() {
         let f = f.unwrap();
         std::fs::copy(f.path(), copy.join(".socket/vendor").join(f.file_name())).unwrap();
@@ -350,7 +350,7 @@ fn vendored_manifestless_vex_matrix(v: &Vendored<'_>) {
     // Bundler <= 2.0 persisted `BUNDLE_FROZEN: "true"` into the copy's
     // `.bundle/config` on that frozen attempt; a developer's unfrozen
     // install runs from the committed config.
-    common::copy_tree(v.committed_bundle, &copy.join(".bundle"));
+    common::fs_tree::copy_tree(v.committed_bundle, &copy.join(".bundle"));
     let install = bundle(&copy, &["install"], false);
     assert!(
         install.status.success(),
@@ -599,8 +599,8 @@ fn gem_vendor_fresh_checkout_bundle_install_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
     assert!(
         !fresh.join("vendor").exists(),
         "fresh checkout must not carry an installed tree (test bug)"
@@ -900,8 +900,8 @@ fn gem_vendor_transitive_dep_fresh_checkout_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
     assert!(
         !fresh.join("vendor").exists(),
         "fresh checkout must not carry an installed tree (test bug)"
@@ -1293,8 +1293,8 @@ async fn gem_get_uuid_vendored_fresh_checkout_bundle_install() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
     assert!(
         !fresh.join("vendor").exists(),
         "fresh checkout must not carry an installed tree (test bug)"
@@ -1755,8 +1755,8 @@ fn gem_vendor_second_gem_section_fresh_checkout_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
     let lock_wired = std::fs::read(&lock_path).unwrap();
     let ci = bundle(&fresh, &["install"], true);
     assert!(
@@ -2200,7 +2200,7 @@ fn gem_vendor_crlf_lock_fresh_checkout_and_revert() {
     std::fs::create_dir_all(&pristine).unwrap();
     std::fs::copy(&gemfile_path, pristine.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, pristine.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".bundle"), &pristine.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &pristine.join(".bundle"));
     let frozen_crlf_ok = bundle(&pristine, &["install"], true).status.success();
     let cwd = proj.to_str().unwrap();
     let vendor = |extra: &[&str]| {
@@ -2249,8 +2249,8 @@ fn gem_vendor_crlf_lock_fresh_checkout_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(&gemfile_path, fresh.join("Gemfile")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Gemfile.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
-    common::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".bundle"), &fresh.join(".bundle"));
     let ci = bundle(&fresh, &["install"], frozen_crlf_ok);
     assert!(
         ci.status.success(),

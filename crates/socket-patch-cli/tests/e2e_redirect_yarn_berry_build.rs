@@ -163,7 +163,7 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
 /// from the installed dep directory.
 fn build_patched_tgz(installed_dir: &Path, patched_index: &[u8], out_tgz: &Path) {
     let stage = out_tgz.parent().unwrap().join("tarstage");
-    common::copy_tree(installed_dir, &stage.join("package"));
+    common::fs_tree::copy_tree(installed_dir, &stage.join("package"));
     std::fs::write(stage.join("package").join("index.js"), patched_index).unwrap();
     let tar = Command::new("tar")
         .args(["-czf", out_tgz.to_str().unwrap(), "package"])
@@ -645,7 +645,7 @@ fn fresh_checkout_yarn_install(fx: &BerryRedirectFixture) -> (PathBuf, Output) {
     std::fs::write(fresh.join(".yarnrc.yml"), fresh_yarnrc(fx)).unwrap();
     // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
     if fx.proj.join(".socket").is_dir() {
-        common::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
     let fresh_global = fx.tmp.path().join("fresh-yarn-global");
     let ci = corepack(

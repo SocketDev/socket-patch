@@ -378,7 +378,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
@@ -440,7 +440,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     // 7. MANIFEST-LESS VEX over the really-installed fresh checkout (a copy,
     //    so the idempotency/revert legs below still see the vendored proj).
     let vex_dir = tmp.path().join("fresh-vex");
-    common::copy_tree(&fresh, &vex_dir);
+    common::fs_tree::copy_tree(&fresh, &vex_dir);
     let api = vex_e2e_common::PatchApi::start(vec![(
         UUID.to_string(),
         vex_e2e_common::patch_view(
@@ -745,7 +745,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
         &fresh,

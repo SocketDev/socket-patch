@@ -53,7 +53,8 @@ pub use oracle::{binary, git_sha256};
 /// `#[path = "../common/fs_tree.rs"] mod fs_tree;`.
 pub mod fs_tree;
 
-pub use fs_tree::copy_tree;
+/// The mock public proxy the hermetic `scan` suites answer with.
+pub mod scan_proxy;
 
 // ── Binary discovery + invocation ─────────────────────────────────────
 

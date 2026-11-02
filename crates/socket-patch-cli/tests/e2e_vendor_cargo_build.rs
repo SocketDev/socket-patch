@@ -538,8 +538,8 @@ impl ManifestlessVendored {
             strip_patch_table(&std::fs::read_to_string(fresh.join("Cargo.toml")).unwrap()),
         )
         .unwrap();
-        common::copy_tree(&fresh.join("src"), &revert.join("src"));
-        common::copy_tree(&fresh.join(".socket"), &revert.join(".socket"));
+        common::fs_tree::copy_tree(&fresh.join("src"), &revert.join("src"));
+        common::fs_tree::copy_tree(&fresh.join(".socket"), &revert.join(".socket"));
         std::fs::write(
             revert.join("src/main.rs"),
             "fn main() { println!(\"baseline\"); }\n",
@@ -760,8 +760,8 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Cargo.lock")).unwrap();
-    common::copy_tree(&proj.join("src"), &fresh.join("src"));
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_home = tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -1217,8 +1217,8 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    common::copy_tree(&proj.join("src"), &fresh.join("src"));
-    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_home = tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -1329,7 +1329,7 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     }
     for dir in ["src", ".socket", ".cargo"] {
         if proj.join(dir).exists() {
-            common::copy_tree(&proj.join(dir), &fresh.join(dir));
+            common::fs_tree::copy_tree(&proj.join(dir), &fresh.join(dir));
         }
     }
     let home = tmp.join(format!("fresh-home-{tag}"));
@@ -2616,7 +2616,7 @@ fn cargo_url_spelled_crates_io_patch_table_is_refused() {
         return;
     };
     // A user's same-version fork of cfg-if under the URL spelling.
-    common::copy_tree(&crate_dir, &proj.join("fork-cfg-if"));
+    common::fs_tree::copy_tree(&crate_dir, &proj.join("fork-cfg-if"));
     let manifest = format!(
         "{}\n[patch.\"https://github.com/rust-lang/crates.io-index\"]\n{DEP} = {{ path = \"fork-cfg-if\" }}\n",
         std::fs::read_to_string(proj.join("Cargo.toml")).unwrap()
@@ -2700,7 +2700,7 @@ fn cargo_ancestor_config_patch_cannot_silently_shadow_the_vendored_copy() {
     // A monorepo-level config adds the user's same-version, unpatched fork
     // under the bare crate name.
     let fork = tmp.path().join(format!("forks/{DEP}-{version}"));
-    common::copy_tree(&crate_dir, &fork);
+    common::fs_tree::copy_tree(&crate_dir, &fork);
     std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
     std::fs::write(
         tmp.path().join(".cargo/config.toml"),

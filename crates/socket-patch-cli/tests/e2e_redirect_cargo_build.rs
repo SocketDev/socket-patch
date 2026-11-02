@@ -212,7 +212,7 @@ fn build_patched_crate(
 ) -> Vec<u8> {
     let leaf = format!("{DEP}-{version}");
     let pkg_dir = stage_root.join(&leaf);
-    common::copy_tree(crate_dir, &pkg_dir);
+    common::fs_tree::copy_tree(crate_dir, &pkg_dir);
     let _ = std::fs::remove_file(pkg_dir.join(".cargo-checksum.json"));
     std::fs::write(pkg_dir.join("src/lib.rs"), patched).unwrap();
 
@@ -657,11 +657,11 @@ fn fresh_checkout_cargo_fetch(fx: &RedirectFixture) -> (PathBuf, PathBuf, Output
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(fx.proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    common::copy_tree(&fx.proj.join(".cargo"), &fresh.join(".cargo"));
-    common::copy_tree(&fx.proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&fx.proj.join(".cargo"), &fresh.join(".cargo"));
+    common::fs_tree::copy_tree(&fx.proj.join("src"), &fresh.join("src"));
     // v5 hosted mode writes nothing under `.socket/`; carry it when present.
     if fx.proj.join(".socket").is_dir() {
-        common::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
 
     let fresh_home = fx.tmp.path().join("fresh-cargo-home");
@@ -829,7 +829,7 @@ impl ManifestlessHosted {
         std::fs::create_dir_all(&revert_home).unwrap();
         std::fs::write(revert.join("Cargo.toml"), &self.baseline_toml).unwrap();
         std::fs::write(revert.join("Cargo.lock"), &self.baseline_lock).unwrap();
-        common::copy_tree(&fresh.join("src"), &revert.join("src"));
+        common::fs_tree::copy_tree(&fresh.join("src"), &revert.join("src"));
         let fetch = cargo(&revert, &["fetch", "--locked"], &revert_home);
         assert!(
             fetch.status.success(),

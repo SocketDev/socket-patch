@@ -227,7 +227,7 @@ async fn mount_crates_index_mirror(pristine_lock: &str, patches: &[Patch]) -> Mo
 
 fn build_crate(stage: &Path, crate_dir: &Path, leaf: &str, patched: &[u8]) -> Vec<u8> {
     let pkg = stage.join(leaf);
-    common::copy_tree(crate_dir, &pkg);
+    common::fs_tree::copy_tree(crate_dir, &pkg);
     let _ = std::fs::remove_file(pkg.join(".cargo-checksum.json"));
     std::fs::write(pkg.join("src/lib.rs"), patched).unwrap();
     let mut bytes = Vec::new();
@@ -627,7 +627,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
         std::fs::copy(proj.join(&rel), to).unwrap();
     }
     if proj.join(".socket").is_dir() {
-        common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+        common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     let fresh_home = tmp.path().join("fresh-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -721,7 +721,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
         ("SOCKET_PATCH_SERVER_URL", uri.as_str()),
     ];
     let post_scan = tmp.path().join("post-scan");
-    common::copy_tree(&proj, &post_scan);
+    common::fs_tree::copy_tree(&proj, &post_scan);
     let mut orders = vec![shape.patches.clone()];
     if shape.patches.len() > 1 {
         orders.push(shape.patches.iter().rev().copied().collect());
@@ -729,7 +729,7 @@ async fn run_shape(shape: Shape) -> Option<()> {
     for (n, order) in orders.iter().enumerate() {
         if n > 0 {
             std::fs::remove_dir_all(&proj).unwrap();
-            common::copy_tree(&post_scan, &proj);
+            common::fs_tree::copy_tree(&post_scan, &proj);
         }
         for patch in order {
             let purl = patch.purl();
