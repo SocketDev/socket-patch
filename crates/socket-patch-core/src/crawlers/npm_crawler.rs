@@ -616,6 +616,64 @@ fn pnpm_shaped_store_layout(name: &str) -> Option<StoreLayout> {
         .map(|(_, layout)| *layout)
 }
 
+/// Which package-manager store a `node_modules` child is. The resolver
+/// (`find_by_purls`) and the scan (`crawl_all`) both classify a child
+/// through [`StoreKind::classify`], so they agree on which children are
+/// stores and on the store-entry rule below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoreKind {
+    /// pnpm's `.pnpm`, Bun's `.bun` or Deno's `.deno` (see
+    /// [`PNPM_SHAPED_STORES`]).
+    PnpmShaped(StoreLayout),
+    /// vlt's `.vlt` store.
+    Vlt,
+    /// npm's `install-strategy=linked` `.store`.
+    NpmLinked,
+    /// pnpm's `.modules.yaml`: it names a store relocated by
+    /// `virtualStoreDir`, or else the global virtual store's entries are
+    /// reached through it.
+    PnpmModulesYaml,
+    /// A pnpm <=3 `.<registry-host>` store (see
+    /// [`is_legacy_pnpm_store_dir_name`]).
+    LegacyPnpm,
+}
+
+impl StoreKind {
+    /// The store a `node_modules` child named `name` of type `file_type`
+    /// is, or `None` for anything else.
+    ///
+    /// Inside a store entry's own `node_modules` (`in_store_entry`) no
+    /// child is a store: a store entry holds packages and links to sibling
+    /// entries, never a nested store, so a hidden child there is skipped
+    /// like any other hidden entry. A store name with the wrong file type
+    /// (a `.pnpm` file, a `.modules.yaml` dir) is not a store either; every
+    /// store name is hidden, so callers skip it too.
+    fn classify(name: &str, file_type: Option<FileType>, in_store_entry: bool) -> Option<Self> {
+        if in_store_entry {
+            return None;
+        }
+        let kind = if let Some(layout) = pnpm_shaped_store_layout(name) {
+            StoreKind::PnpmShaped(layout)
+        } else if name == VLT_STORE_NAME {
+            StoreKind::Vlt
+        } else if name == NPM_LINKED_STORE_NAME {
+            StoreKind::NpmLinked
+        } else if name == PNPM_MODULES_YAML {
+            StoreKind::PnpmModulesYaml
+        } else if is_legacy_pnpm_store_dir_name(name) {
+            StoreKind::LegacyPnpm
+        } else {
+            return None;
+        };
+        let file_type = file_type?;
+        let shaped = match kind {
+            StoreKind::PnpmModulesYaml => file_type.is_file(),
+            _ => file_type.is_dir(),
+        };
+        shaped.then_some(kind)
+    }
+}
+
 /// Decode a `.bun` store entry name (`<name>@<version>`, a peer set
 /// appended as `+<hash>`, scoped `@scope+leaf@…`). The pnpm decoder reads
 /// the name exactly, but would keep a `+<hash>` tail as part of the
@@ -3029,7 +3087,7 @@ impl NpmCrawler {
             matched.extend(aliases);
         }
         let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
-        let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
+        let mut nested = Self::collect_nested_node_modules(&nm_path, listing, store_entry);
         if store_entry {
             nested.extend(own_package_nested_node_modules_sync(&nm_path));
         }
@@ -3138,90 +3196,32 @@ impl NpmCrawler {
     ///
     /// Entries are examined in parallel; their contributions keep listing
     /// order.
-    fn collect_nested_node_modules(nm_path: &Path, listing: Listing) -> Vec<NestedNodeModules> {
+    fn collect_nested_node_modules(
+        nm_path: &Path,
+        listing: Listing,
+        store_entry: bool,
+    ) -> Vec<NestedNodeModules> {
         let found: Vec<Vec<NestedNodeModules>> = par_map(listing.entries, |entry| {
-            Self::nested_node_modules_of(nm_path, entry)
+            Self::nested_node_modules_of(nm_path, entry, store_entry)
         });
         found.into_iter().flatten().collect()
     }
 
     /// What one listing entry of `nm_path` contributes to the resolver's
-    /// next level (see [`Self::collect_nested_node_modules`]).
-    fn nested_node_modules_of(nm_path: &Path, entry: ListedEntry) -> Vec<NestedNodeModules> {
+    /// next level (see [`Self::collect_nested_node_modules`]). `store_entry`
+    /// says `nm_path` is a store entry's own `node_modules`, whose children
+    /// are never stores (see [`StoreKind::classify`]), as in the scan.
+    fn nested_node_modules_of(
+        nm_path: &Path,
+        entry: ListedEntry,
+        store_entry: bool,
+    ) -> Vec<NestedNodeModules> {
         let name_str = entry.name_str.as_str();
-        // pnpm's virtual store. Under the isolated linker the store is
-        // the ONLY physical home of transitive dependencies: the
-        // importer's node_modules holds symlinks for direct deps only,
-        // so a transitive-only target (installed at
-        // `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is
-        // unreachable through the symlink-free walk above — invisible
-        // to apply despite being importable. Probe REAL store entries'
-        // `node_modules`; the name+version match in `find_by_purls`
-        // keeps aliases and multi-version store entries distinct, and
-        // BFS order guarantees a root-linked install has already been
-        // probed (and removed from `pending`) before these are
-        // dequeued, so a package is never resolved twice.
-        // Bun's `.bun` and Deno's `.deno` stores share the shape and the
-        // property (see `PNPM_SHAPED_STORES`).
-        if let Some(layout) = pnpm_shaped_store_layout(name_str) {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let store = nm_path.join(&entry.name);
-            let entries = StoreEntry::from_dirs(Self::list_pnpm_shaped_store_entries_sync(
-                &store, layout, false, false,
-            ));
-            return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // vlt's store has the same transitive-only-home property: every
-        // package lives at `.vlt/<DepID>/node_modules/<name>` and the
-        // importer holds only links into it.
-        if name_str == VLT_STORE_NAME {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = Self::list_vlt_store_entries_sync(&nm_path.join(&entry.name));
-            return vec![NestedNodeModules::StoreEntries(StoreEntry::vlt(entries))];
-        }
-        // npm's `install-strategy=linked` store: the same transitive-only
-        // home, at `.store/<name>@<version>-<hash>/node_modules/<name>`.
-        if name_str == NPM_LINKED_STORE_NAME {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = StoreEntry::from_dirs(Self::list_npm_store_entries_sync(
-                &nm_path.join(&entry.name),
-                false,
-            ));
-            return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // A pnpm virtual store relocated by `virtualStoreDir`, found
-        // through the `.modules.yaml` pnpm writes next to it. It may sit
-        // outside this `node_modules` or under a hidden name the skip
-        // below would swallow.
-        if name_str == PNPM_MODULES_YAML {
-            if !entry.file_type.is_some_and(|ft| ft.is_file()) {
-                return Vec::new();
-            }
-            let Some(store) = relocated_pnpm_virtual_store_sync(nm_path) else {
-                let entries = reachable_pnpm_global_virtual_store_entries_sync(nm_path);
-                return vec![NestedNodeModules::StoreEntries(entries)];
-            };
-            let entries = StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false));
-            return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
-        // (there is no `.pnpm` at all) with the same
-        // transitive-only-deps property, so it gets the same probing.
-        // Must run before the generic hidden-entry skip below, which
-        // would otherwise swallow it — leaving every transitive-only
-        // install unpatchable on those layouts.
-        if is_legacy_pnpm_store_dir_name(name_str) {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = Self::collect_nested_store_entries_sync(&nm_path.join(&entry.name));
-            return vec![NestedNodeModules::StoreEntries(StoreEntry::pnpm(entries))];
+        if let Some(kind) = StoreKind::classify(name_str, entry.file_type, store_entry) {
+            return Self::resolver_store_entries(nm_path, &entry.name, kind)
+                .map(NestedNodeModules::StoreEntries)
+                .into_iter()
+                .collect();
         }
         if name_str.starts_with('.') || name_str == "node_modules" {
             return Vec::new();
@@ -3251,6 +3251,51 @@ impl NpmCrawler {
                 Vec::new()
             }
         }
+    }
+
+    /// The entries of the store `kind` that `nm_path`'s child `name` is,
+    /// for the resolver to probe; `None` when there are none.
+    ///
+    /// Under the isolated linkers a store is the ONLY physical home of
+    /// transitive dependencies: the importer's `node_modules` holds links
+    /// for direct deps only, so a transitive-only target (installed at
+    /// `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is unreachable
+    /// through the link-free walk, and its REAL store entries are probed
+    /// instead. The name+version match in `find_by_purls` keeps aliases and
+    /// multi-version store entries distinct, and BFS order guarantees a
+    /// root-linked install has already been probed (and removed from
+    /// `pending`) before these are dequeued, so a package is never
+    /// resolved twice. pnpm's, Bun's and Deno's stores, vlt's
+    /// `.vlt/<DepID>/node_modules/<name>`, npm's linked
+    /// `.store/<name>@<version>-<hash>/node_modules/<name>`, a pnpm store
+    /// relocated by `virtualStoreDir` (found through `.modules.yaml`, it may
+    /// sit outside this `node_modules`) and pnpm <=3's hidden
+    /// `.<registry-host>` store all have this property.
+    fn resolver_store_entries(
+        nm_path: &Path,
+        name: &OsStr,
+        kind: StoreKind,
+    ) -> Option<Vec<StoreEntry>> {
+        let store = nm_path.join(name);
+        let entries = match kind {
+            StoreKind::PnpmShaped(layout) => StoreEntry::from_dirs(
+                Self::list_pnpm_shaped_store_entries_sync(&store, layout, false, false),
+            ),
+            StoreKind::Vlt => StoreEntry::vlt(Self::list_vlt_store_entries_sync(&store)),
+            StoreKind::NpmLinked => {
+                StoreEntry::from_dirs(Self::list_npm_store_entries_sync(&store, false))
+            }
+            StoreKind::PnpmModulesYaml => match relocated_pnpm_virtual_store_sync(nm_path) {
+                Some(store) => {
+                    StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false))
+                }
+                None => reachable_pnpm_global_virtual_store_entries_sync(nm_path),
+            },
+            StoreKind::LegacyPnpm => {
+                StoreEntry::pnpm(Self::collect_nested_store_entries_sync(&store))
+            }
+        };
+        (!entries.is_empty()).then_some(entries)
     }
 
     /// Whether a virtual-store entry can still hold a pending target.
@@ -3561,64 +3606,30 @@ impl NpmCrawler {
         for entry in listing.entries {
             let name_str = entry.name_str;
 
-            // pnpm's virtual store: under the isolated linker it is the
-            // ONLY physical home of transitive dependencies (the
-            // importer's node_modules symlinks direct deps only), so
-            // skipping it as just-another-hidden-dir leaves every
-            // transitive-only install invisible to scan. Deferred until
-            // after this loop so root-level entries are inventoried
-            // first and win the `seen` name@version dedup at their
-            // importer-root paths. (A store entry's own children never
-            // include a nested `.pnpm`; under the store-entry policy the
-            // name falls through to the hidden-entry skip below.)
-            // Bun's `.bun` and Deno's `.deno` share both the shape and
-            // the property (see `PNPM_SHAPED_STORES`).
-            if let Some(layout) = pnpm_shaped_store_layout(&name_str).filter(|_| !store_entry) {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    pnpm_shaped_stores.push((node_modules_path.join(&name_str), layout));
-                }
-                continue;
-            }
-
-            // vlt's store, deferred for the same reason: importer links
-            // win the `seen` dedup at their importer-root paths.
-            if !store_entry && name_str == VLT_STORE_NAME {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    vlt_store = Some(node_modules_path.join(&name_str));
-                }
-                continue;
-            }
-
-            // npm's linked-strategy store, deferred for the same reason.
-            if !store_entry && name_str == NPM_LINKED_STORE_NAME {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    npm_store = Some(node_modules_path.join(&name_str));
-                }
-                continue;
-            }
-
-            // A pnpm virtual store relocated by `virtualStoreDir` (see
-            // `relocated_pnpm_virtual_store_sync`), deferred like `.pnpm`.
-            if !store_entry && name_str == PNPM_MODULES_YAML {
-                if entry.file_type.is_some_and(|ft| ft.is_file()) {
-                    relocated_pnpm_store = relocated_pnpm_virtual_store_sync(node_modules_path);
-                    if relocated_pnpm_store.is_none() {
-                        global_store_entries =
-                            reachable_pnpm_global_virtual_store_entries_sync(node_modules_path);
+            // A store: under the isolated linkers it is the ONLY physical
+            // home of transitive dependencies (the importer's node_modules
+            // links direct deps only), so skipping it as
+            // just-another-hidden-dir would leave every transitive-only
+            // install invisible to scan. Every store is deferred until
+            // after this loop so root-level entries are inventoried first
+            // and win the `seen` name@version dedup at their importer-root
+            // paths. A store entry's own children are never stores (see
+            // `StoreKind::classify`), so under the store-entry policy the
+            // names fall through to the hidden-entry skip below.
+            if let Some(kind) = StoreKind::classify(&name_str, entry.file_type, store_entry) {
+                let store = node_modules_path.join(&name_str);
+                match kind {
+                    StoreKind::PnpmShaped(layout) => pnpm_shaped_stores.push((store, layout)),
+                    StoreKind::Vlt => vlt_store = Some(store),
+                    StoreKind::NpmLinked => npm_store = Some(store),
+                    StoreKind::PnpmModulesYaml => {
+                        relocated_pnpm_store = relocated_pnpm_virtual_store_sync(node_modules_path);
+                        if relocated_pnpm_store.is_none() {
+                            global_store_entries =
+                                reachable_pnpm_global_virtual_store_entries_sync(node_modules_path);
+                        }
                     }
-                }
-                continue;
-            }
-
-            // pnpm <=3 virtual store (a hidden `.<registry-host>` dir;
-            // no `.pnpm` exists on those layouts): same
-            // transitive-only-home property, same deferred scan so
-            // root-level entries win the `seen` dedup. Must run before
-            // the hidden-entry skip below, which would otherwise leave
-            // every transitive-only install invisible to scan.
-            if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    legacy_stores.push(node_modules_path.join(&name_str));
+                    StoreKind::LegacyPnpm => legacy_stores.push(store),
                 }
                 continue;
             }
@@ -6672,6 +6683,56 @@ mod tests {
     /// `node_modules/.modules.yaml` records where (relative to
     /// `node_modules`: JSON on pnpm 10+, YAML before). A relocated store
     /// inside the project is walked like `.pnpm`, wherever it sits.
+    /// #1899: a store entry's own `node_modules` holds packages and links
+    /// to sibling entries, never a nested store. Scan always skipped a
+    /// store-named child there as a hidden entry, but the resolver walked
+    /// it as a store, so `apply` could patch a copy `scan` never reported.
+    /// Both now classify through `StoreKind::classify` and agree: such a
+    /// copy is neither reported nor resolved, for every store name.
+    #[tokio::test]
+    async fn test_store_named_child_of_a_store_entry_is_not_a_store() {
+        for (store_name, nested_entry) in [
+            (".pnpm", "hidden@1.0.0/node_modules/hidden"),
+            (".bun", "hidden@1.0.0/node_modules/hidden"),
+            (".deno", "hidden@1.0.0/node_modules/hidden"),
+            (".store", "hidden@1.0.0-abcdef/node_modules/hidden"),
+            (".registry.npmjs.org", "hidden/1.0.0/node_modules/hidden"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let nm = root.join("node_modules");
+            let entry_nm = nm.join(".pnpm/outer@1.0.0/node_modules");
+            let outer = entry_nm.join("outer");
+            write_pkg(&outer, "outer", "1.0.0");
+            link_dir(&outer, &nm.join("outer"));
+            let hidden = entry_nm.join(store_name).join(nested_entry);
+            write_pkg(&hidden, "hidden", "1.0.0");
+
+            let scanned = scan_paths(&root).await;
+            assert!(
+                scanned
+                    .iter()
+                    .any(|(purl, _)| purl == "pkg:npm/outer@1.0.0"),
+                "{store_name}: {scanned:?}"
+            );
+            assert!(
+                !scanned
+                    .iter()
+                    .any(|(purl, _)| purl == "pkg:npm/hidden@1.0.0"),
+                "{store_name}: scan reported a nested store's copy: {scanned:?}"
+            );
+
+            let found = NpmCrawler::new()
+                .find_by_purls(&nm, &["pkg:npm/hidden@1.0.0".to_string()])
+                .await
+                .unwrap();
+            assert!(
+                found.is_empty(),
+                "{store_name}: resolver walked a nested store: {found:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_pnpm_relocated_virtual_store_dir_is_walked() {
         for (modules_yaml, store_rel) in [
