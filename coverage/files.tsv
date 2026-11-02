@@ -633,16 +633,16 @@ crates/socket-patch-core/src/formats/yarn/patterns.rs	350	audit-core	cbbbdb9 202
 crates/socket-patch-core/src/formats/yarn/rc.rs	855	audit-core	cbbbdb9 2026-11-01	-	delete raw_list_setting (no prod caller); list_setting, ListSetting, parse_dotenv, DEFAULT_ENV_FILES private; empty `if !root_is_mapping {}` L168: invert; inline line_scan; rewrap L352; pkg_managers re-composes raw_setting+expand_env and the rc walk x3 (A52)
 crates/socket-patch-core/src/formats/yarn/source.rs	350	audit-core	cbbbdb9 2026-11-01	-	inline is_codeload_tarball; classic_block_is_git, yarn_classic_range_is_git private; classic_file_directory uses cargo_workspace::normalize_rel: use utils::relpath; classic_copy_real_name/classic_file_directory duplicate copy.rs (A66, #1951)
 crates/socket-patch-core/src/formats/yarn/stanzas.rs	293	audit-core	cbbbdb9 2026-11-01	-	inline entries_sorted, reposition; merge_same_resolution re-renders berry_field(&stanza_lines(s)) per stanza per index: use blocks::berry_stanza_field; stanza_lines, on_disk one-line wrappers; stale header L3-4
-crates/socket-patch-core/src/golden.rs	210	audit-core	-	-	
-crates/socket-patch-core/src/gradle/dsl.rs	819	audit-core	-	-	
-crates/socket-patch-core/src/gradle/graph.rs	2852	audit-core	-	-	
-crates/socket-patch-core/src/gradle/home.rs	590	audit-core	-	-	
-crates/socket-patch-core/src/gradle/locks.rs	445	audit-core	-	-	
-crates/socket-patch-core/src/gradle/mod.rs	235	audit-core	-	-	
-crates/socket-patch-core/src/gradle/selector.rs	605	audit-core	-	-	
-crates/socket-patch-core/src/hash/git_sha256.rs	453	audit-core	-	-	
-crates/socket-patch-core/src/hash/mod.rs	1	audit-core	-	-	
-crates/socket-patch-core/src/hosted/engine.rs	7041	audit-core	-	-	
+crates/socket-patch-core/src/golden.rs	210	audit-core	cbbbdb9 2026-11-02	-	doc says "the oracles are gone" but 7 crawlers/*/oracle.rs remain (A29): correct it; drop #257 history (~3 lines); `digest` → private; `Sweep::with` exists only to pass a chunked Golden: give Sweep a `chunked()` instead
+crates/socket-patch-core/src/gradle/dsl.rs	819	audit-core	cbbbdb9 2026-11-02	-	delete test-only `literal_strings_in_call` (misnamed: returns CallSites, not strings); one read strips the BOM 4× (adapter, `decode`, `lex` split_bom, graph `read_capped`/`collect`): keep the adapter's; `closure_details`-style 3 near-identical arms; otherwise clean
+crates/socket-patch-core/src/gradle/graph.rs	2852	audit-core	cbbbdb9 2026-11-02	-	`wrapper_version` → A72; test-only `build_scripts`, `settings_includes`; forwarder chain redirect::gradle::lockfile_paths→ScriptGraph::lockfile_paths→locks::lockfile_paths_in; caps+BOM+well_formed+dsl_of ×3 (read_capped, collect init loop, subproject_owner); Unresolved built 5 ways; settings lexed twice; every query re-lexes; 4 `#NNN` test banners
+crates/socket-patch-core/src/gradle/home.rs	590	audit-core	cbbbdb9 2026-11-02	-	inline `files21_of_user_home`, `wrapper_dists_dir` (1 caller each); `init_scripts_with` is a 1-line wrapper; `init_dirs` and the `distribution_url` narrowing are test-only (prod re-does it in gradle_cache::dist_init_dirs, A35); `split_opts` → private; `VecEnv` test double duplicates the slice `Env` impl (first- vs last-wins)
+crates/socket-patch-core/src/gradle/locks.rs	445	audit-core	cbbbdb9 2026-11-02	-	`lockfile_paths` inventory walk + PRUNED/MAX_DEPTH/MAX_DIRS (~45 lines) has no production caller although its doc says discovery uses it: delete with its test; `LOCKFILE_NAMES`/`LEGACY_LOCK_DIR` → private; legacy `*.lockfile` listing ×2; `split_eol` beside utils::line_endings (A04)
+crates/socket-patch-core/src/gradle/mod.rs	235	audit-core	cbbbdb9 2026-11-02	-	clean; `resolve_rel` wraps utils::relpath with the absolute/URL/`~` refusals (keep); `test_fs::MemFs` is a 5th in-memory tree helper candidate for A51's test-support module
+crates/socket-patch-core/src/gradle/selector.rs	605	audit-core	cbbbdb9 2026-11-02	-	`version_parts`, `CURRENT_MAJOR` → private; `admits_for`/`gradle_version_cmp_for` and ~200 lines of GOLDEN_* tables are pub production items only for the CLI e2e: move behind a `testing` module; `(Some(s),None)` arms = `s.cmp(&0)`
+crates/socket-patch-core/src/hash/git_sha256.rs	453	audit-core	cbbbdb9 2026-11-02	-	async and std reader loops are byte-identical twins (~35 lines; 2 async callers); vendor/common::zip_bytes_match_after_hashes open-codes `zip_member_git_sha256`; fake: test_hello_world, test_known_vector recompute with sha2, test_empty_content self-compares — delete (known-answer vectors cover); see hash/mod.rs
+crates/socket-patch-core/src/hash/mod.rs	1	audit-core	cbbbdb9 2026-11-02	-	a directory holding one module: move git_sha256 to hash.rs or utils/digest.rs (the digest home)
+crates/socket-patch-core/src/hosted/engine.rs	7041	audit-core	partial@L960	-	read_candidate_files is ~360 lines (L588-950) of per-ecosystem phases with `any(|c| c.dep.ecosystem == "npm")` ×6; memory entry→text decode ×2 (CandidateFiles::read, read_advisory); `<dir>/package.json` key ×2; reference.status strings (#1912); 3 refusal builders with one message; synthetic keys A73
 crates/socket-patch-core/src/hosted/governing_root.rs	3580	audit-core	-	-	
 crates/socket-patch-core/src/hosted/guidance.rs	685	audit-core	-	-	
 crates/socket-patch-core/src/hosted/memory/discover.rs	589	audit-core	-	-	

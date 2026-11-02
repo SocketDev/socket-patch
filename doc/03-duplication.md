@@ -1,6 +1,6 @@
 ## Part 3
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
 
  Duplicated business logic:One bullet per rule that has more than one implementation: the copies (permalinks), whether they have drifted, the register token, and the target home. Rules carried over from the first thread stay in the carried registers until reconciled.
 
@@ -87,3 +87,6 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **XML attributes:** `xml::attr` vs NuGet's quote-aware tokenizer; `decode_entities` and the attribute encoder live in NuGet/redirect (executed) {{A65}}.
 - **Yarn copies and lines:** classic `file:`/url identity ×2 (executed) {{A66}}; berry dependency-line and `patch:` parsers ×2 {{A68}}; grammar decided by head-only or substring reads {{A69}}; yarn-1 tokenizer ×4 (extends #1901, {{A42}}).
 - **sbt declarations:** Rust preflight and the generated Scala verifier disagree on `%` name suffixes {{A70}}; Maven dependency versions skip `interpolate` (executed, on #1887) {{A30}}.
+- **Gradle wrapper version:** `gradle-wrapper.properties` is read by 3 parsers; the hosted and vendored "6.8 or newer" gates disagree on `distributionUrl = …` and a BOM, and only one honours a later duplicate key (executed). {{A72}}
+- **Gradle init-script list:** `GradleHome::init_scripts_for` (pure, its `distribution_url` narrowing test-only) vs `gradle_cache::init_scripts_for_build` + `dist_init_dirs`. {{A35}}
+- **Git blob hash loop:** async and blocking readers in `hash/git_sha256.rs` are byte-identical twins; `vendor/common` open-codes `zip_member_git_sha256`. Local notes.

@@ -1,6 +1,6 @@
 ## Part 4
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
 
  Structure, abstraction and placement:Needless layers (one-impl traits, forwarding modules, invariant-free newtypes), tiny-function clusters, unclear control flow (mode flags, giant functions, accumulate-then-decide), and misplaced code (with its destination). Per-directory tallies of single-caller functions, wrappers and deletable comment lines go here as the audit covers each directory.
 
@@ -92,3 +92,5 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-core._
 - **Global probe cwd:** the `gem env` probe runs in the project directory under `--global` {{A63}}.
 - **`formats` → `vendor` imports:** `formats/nuget/lock.rs` (`normalize_nuget_version`), `formats/pipenv.rs` (`parse_pipfile_lock`), `formats/yarn/copy.rs` (`vlt_lock_text` validators) {{A08}}. `formats::sbt::{Ga,JvmResolution,gate}` serve scala-cli too: target `formats::jvm` {{A35}}.
 - **`formats/*` tally (audit-core, 2026-11-01 19:03Z, 33 files, 15.8K lines):** ~55 single-caller fns, ~30 wrappers, ~95 deletable comment lines; dead: `PnpmLock::text`, `registry::PNPM_MARKER`, `GateWarning::MetaBuildOnly`, `rc::raw_list_setting`, `ResolutionDoc::from_json`.
+- **Rewriter context through the file map:** 8 synthetic `<socket-patch:…>` keys in `files: BTreeMap<String, String>` carry JSON or tab-separated side data (go workspace, NuGet locks and sources, uv ancestor config, sbt resolution, gemspecs) that the rewriters parse back with `.ok()`. Target: a typed rewrite context. {{A73}}
+- **`golden.rs`, `gradle/*`, `hash/*` tally (audit-core, 2026-11-02, 9 files, 6.2K lines):** ~10 single-caller fns, ~9 wrappers or forwarders (`redirect::gradle::lockfile_paths` → `ScriptGraph::lockfile_paths` → `locks::lockfile_paths_in`), ~15 deletable comment lines; production-dead: `locks::lockfile_paths` (an inventory walk its doc says discovery uses), `dsl::literal_strings_in_call`, `GradleHome::init_dirs`, `ScriptGraph::{build_scripts, settings_includes}`. `hosted/engine.rs` (read to L960): `read_candidate_files` is ~360 lines of per-ecosystem phases.
