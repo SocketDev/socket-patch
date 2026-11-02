@@ -117,19 +117,6 @@ fn run_socket_env(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, Stri
     )
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// Write `.socket/manifest.json` + the after-hash blob so `vendor --offline`
 /// runs fully offline (npm-family file keys carry the `package/` prefix).
 fn stage_patch(proj: &Path, before: &[u8], after: &[u8]) {
@@ -596,7 +583,7 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str, berry: bool) -> PathBuf {
     if berry {
         std::fs::copy(proj.join(".yarnrc.yml"), fresh.join(".yarnrc.yml")).unwrap();
     }
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     fresh
 }
 

@@ -155,19 +155,6 @@ fn stage_patch(proj: &Path, purl: &str, before: &[u8], after: &[u8]) {
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 fn locked_version(lock_text: &str, name: &str) -> Option<String> {
     let needle = format!("name = \"{name}\"");
     let mut lines = lock_text.lines();
@@ -223,7 +210,7 @@ fn build_patched_crate(
 ) -> Vec<u8> {
     let leaf = format!("{DEP}-{version}");
     let pkg_dir = stage_root.join(&leaf);
-    copy_dir_recursive(crate_dir, &pkg_dir);
+    common::copy_tree(crate_dir, &pkg_dir);
     let _ = std::fs::remove_file(pkg_dir.join(".cargo-checksum.json"));
     std::fs::write(pkg_dir.join("src/lib.rs"), patched).unwrap();
     let mut bytes = Vec::new();
@@ -639,11 +626,11 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
     if proj.join(".cargo").exists() {
-        copy_dir_recursive(&proj.join(".cargo"), &fresh.join(".cargo"));
+        common::copy_tree(&proj.join(".cargo"), &fresh.join(".cargo"));
     }
-    copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
+    common::copy_tree(&proj.join("src"), &fresh.join("src"));
     if proj.join(".socket").exists() {
-        copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+        common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     let home = tmp.join(format!("fresh-home-{tag}"));
     std::fs::create_dir_all(&home).unwrap();

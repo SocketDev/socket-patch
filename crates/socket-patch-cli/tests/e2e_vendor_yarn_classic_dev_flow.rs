@@ -182,19 +182,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// The contiguous lockfile block (header line through the following blank
 /// line) whose header starts with `"<name>@`. Yarn classic writes one block
 /// per resolution with headers like `resolve@^1.20.0:` or
@@ -350,7 +337,7 @@ fn yarn_classic_vendored_lock_survives_dev_install_resave() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let dev = corepack(
@@ -692,7 +679,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     //     entry is no longer wired.
     let api = patch_api(&purl, &patched);
     let drift = tmp.path().join("drift-vex");
-    copy_dir_recursive(&proj, &drift);
+    common::copy_tree(&proj, &drift);
     vex_e2e_common::strip_manifest(&drift);
     let out = vex_e2e_common::run_vex(
         &vex_e2e_common::binary(),
@@ -748,7 +735,7 @@ fn yarn_classic_drift_skipped_revert_keeps_artifacts_and_recovers() {
     // 5b. The recovered (re-wired, re-installed) state attests again with no
     //     manifest and no ledger — lockfile + kept tarball + patch API.
     let recovered = tmp.path().join("recovered-vex");
-    copy_dir_recursive(&proj, &recovered);
+    common::copy_tree(&proj, &recovered);
     vex_e2e_common::strip_manifest(&recovered);
     vex_e2e_common::strip_ledgers(&recovered);
     let out = vex_e2e_common::run_vex(

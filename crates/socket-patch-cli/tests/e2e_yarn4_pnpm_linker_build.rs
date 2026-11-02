@@ -150,19 +150,6 @@ fn run_socket(cwd: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// The pnpm-linker layout invariant: `node_modules/<dep>` is a symlink and
 /// the backing store entry lives under `node_modules/.store/<dep>-…`. This
 /// is the assertion that makes these capstones about the LAYOUT rather than
@@ -243,11 +230,11 @@ fn stage_patch(proj: &Path, purl: &str, before: &[u8], after: &[u8]) {
 
 /// Build a patched npm tarball (`package/` prefix, marker-prepended index.js)
 /// from the installed dep directory (read through the store symlink —
-/// copy_dir_recursive reads file contents, so the layout is flattened into a
+/// copy_tree reads file contents, so the layout is flattened into a
 /// regular `package/` tree exactly as a registry tarball would carry it).
 fn build_patched_tgz(installed_dir: &Path, patched_index: &[u8], out_tgz: &Path) {
     let stage = out_tgz.parent().unwrap().join("tarstage");
-    copy_dir_recursive(installed_dir, &stage.join("package"));
+    common::copy_tree(installed_dir, &stage.join("package"));
     std::fs::write(stage.join("package").join("index.js"), patched_index).unwrap();
     let tar = Command::new("tar")
         .args(["-czf", out_tgz.to_str().unwrap(), "package"])
@@ -363,7 +350,7 @@ fn fresh_checkout_install(tmp: &Path, proj: &Path, yarnrc: &str) -> (PathBuf, Ou
     std::fs::write(fresh.join(".yarnrc.yml"), yarnrc).unwrap();
     // v5 hosted mode may leave no `.socket/` at all (no ledger, no manifest).
     if proj.join(".socket").is_dir() {
-        copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+        common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     }
     let fresh_global = tmp.join("fresh-yarn-global");
     let ci = corepack(
@@ -998,7 +985,7 @@ fn yarn4_pnpm_linker_agent_apply_patches_bundled_copy_inside_store_package() {
         "module.exports = require.resolve('is-number');\n",
     )
     .unwrap();
-    copy_dir_recursive(
+    common::copy_tree(
         &registry_copy,
         &stage.join("node_modules").join("is-number"),
     );

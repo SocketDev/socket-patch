@@ -220,19 +220,6 @@ fn parse_envelope(stdout: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("vendor --json output is not JSON: {e}\nstdout:\n{stdout}"))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -557,7 +544,7 @@ async fn run_berry_capstone(driver: VendorDriver, yarnrc_extra: &str) {
     std::fs::copy(&pkg_path, fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
     std::fs::copy(proj.join(".yarnrc.yml"), fresh.join(".yarnrc.yml")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_global = tmp.path().join("fresh-yarn-global");
     let ci = corepack(

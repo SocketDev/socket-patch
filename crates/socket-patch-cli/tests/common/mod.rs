@@ -48,6 +48,13 @@ pub mod oracle;
 
 pub use oracle::{binary, git_sha256};
 
+/// Recursive fixture copy. Shared modules whose includers don't all
+/// declare `mod common` pull it in with
+/// `#[path = "../common/fs_tree.rs"] mod fs_tree;`.
+pub mod fs_tree;
+
+pub use fs_tree::copy_tree;
+
 // ── Binary discovery + invocation ─────────────────────────────────────
 
 /// Quick check whether `cmd` is on PATH. Used to soft-skip

@@ -136,19 +136,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// The locked version of `name` in Cargo.lock (first `[[package]]` match).
 fn locked_version(lock_text: &str, name: &str) -> Option<String> {
     let needle = format!("name = \"{name}\"");
@@ -225,7 +212,7 @@ fn build_patched_crate(
 ) -> Vec<u8> {
     let leaf = format!("{DEP}-{version}");
     let pkg_dir = stage_root.join(&leaf);
-    copy_dir_recursive(crate_dir, &pkg_dir);
+    common::copy_tree(crate_dir, &pkg_dir);
     let _ = std::fs::remove_file(pkg_dir.join(".cargo-checksum.json"));
     std::fs::write(pkg_dir.join("src/lib.rs"), patched).unwrap();
 
@@ -670,11 +657,11 @@ fn fresh_checkout_cargo_fetch(fx: &RedirectFixture) -> (PathBuf, PathBuf, Output
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(fx.proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(fx.proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&fx.proj.join(".cargo"), &fresh.join(".cargo"));
-    copy_dir_recursive(&fx.proj.join("src"), &fresh.join("src"));
+    common::copy_tree(&fx.proj.join(".cargo"), &fresh.join(".cargo"));
+    common::copy_tree(&fx.proj.join("src"), &fresh.join("src"));
     // v5 hosted mode writes nothing under `.socket/`; carry it when present.
     if fx.proj.join(".socket").is_dir() {
-        copy_dir_recursive(&fx.proj.join(".socket"), &fresh.join(".socket"));
+        common::copy_tree(&fx.proj.join(".socket"), &fresh.join(".socket"));
     }
 
     let fresh_home = fx.tmp.path().join("fresh-cargo-home");
@@ -842,7 +829,7 @@ impl ManifestlessHosted {
         std::fs::create_dir_all(&revert_home).unwrap();
         std::fs::write(revert.join("Cargo.toml"), &self.baseline_toml).unwrap();
         std::fs::write(revert.join("Cargo.lock"), &self.baseline_lock).unwrap();
-        copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
+        common::copy_tree(&fresh.join("src"), &revert.join("src"));
         let fetch = cargo(&revert, &["fetch", "--locked"], &revert_home);
         assert!(
             fetch.status.success(),

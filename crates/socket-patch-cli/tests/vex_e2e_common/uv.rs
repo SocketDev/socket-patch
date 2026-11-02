@@ -71,6 +71,10 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
 
@@ -496,23 +500,6 @@ impl Report<'_> {
 }
 
 // ── filesystem ─────────────────────────────────────────────────────────
-
-/// Copy `src` recursively to `dst`; a missing `src` copies nothing (a
-/// hosted flow commits no `.socket/` in v5).
-pub fn copy_tree(src: &Path, dst: &Path) {
-    if !src.is_dir() {
-        return;
-    }
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap().flatten() {
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
 
 /// `<venv>/lib/python3.X/site-packages` (or `Lib/site-packages`).
 pub fn site_packages(venv: &Path) -> Option<PathBuf> {
@@ -1449,7 +1436,9 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
     let fresh = tmp.path().join("fresh");
     std::fs::create_dir_all(&fresh).unwrap();
     restore(&fresh, &wired);
-    copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    if proj.join(".socket").is_dir() {
+        fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
+    }
     let _ = std::fs::remove_dir_all(fresh.join(".socket/blobs"));
     let _ = std::fs::remove_file(fresh.join("embedded.vex.json"));
     strip_manifest(&fresh);
@@ -1857,7 +1846,9 @@ fn script_sibling_revert(uv: &Uv, report: &Report<'_>, proj: &Path, tmp: &Path) 
     for f in [SCRIPT, "tool.py.lock"] {
         std::fs::copy(proj.join(f), dir.join(f)).unwrap();
     }
-    copy_tree(&proj.join(".socket"), &dir.join(".socket"));
+    if proj.join(".socket").is_dir() {
+        fs_tree::copy_tree(&proj.join(".socket"), &dir.join(".socket"));
+    }
     let cache = tmp.join("sibling-cache");
     let out = uv.run_py(&dir, &["add", "--script", SCRIPT, "idna==3.7"], &cache);
     if !ok(&out) {
@@ -2224,7 +2215,9 @@ pub fn production_manifestless(p: &Production<'_>) {
     for f in ["pyproject.toml", "uv.lock"] {
         std::fs::copy(p.proj.join(f), fresh.join(f)).unwrap();
     }
-    copy_tree(&p.proj.join(".socket"), &fresh.join(".socket"));
+    if p.proj.join(".socket").is_dir() {
+        fs_tree::copy_tree(&p.proj.join(".socket"), &fresh.join(".socket"));
+    }
     strip_manifest(&fresh);
     let sync = |dir: &Path, cache: &Path, offline: bool| {
         let mut cmd = Command::new(p.uv);

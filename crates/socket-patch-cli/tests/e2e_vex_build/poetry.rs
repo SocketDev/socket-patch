@@ -53,7 +53,7 @@
 //! shares one HTTP-cache lock under the home directory and wedges parallel
 //! runs) and an in-project `.venv`.
 
-use crate::vex_e2e_common;
+use crate::{fs_tree, vex_e2e_common};
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -277,19 +277,7 @@ fn fresh_checkout(from: &Path, to: &Path) {
         std::fs::copy(from.join(file), to.join(file)).unwrap();
     }
     if from.join(".socket").is_dir() {
-        copy_dir(&from.join(".socket"), &to.join(".socket"));
-    }
-}
-
-fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap().flatten() {
-        let target = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), &target).unwrap();
-        }
+        fs_tree::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
 }
 

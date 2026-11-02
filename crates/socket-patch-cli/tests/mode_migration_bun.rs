@@ -483,19 +483,6 @@ fn read_json(proj: &Path, rel: &str) -> Value {
     serde_json::from_str(&text).unwrap_or_else(|e| panic!("{rel} is not JSON: {e}\n{text}"))
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// Every regular file under `root` (relative `/`-joined path → bytes),
 /// `node_modules` excluded — the write-free oracle for the dry-run legs.
 /// `.socket/apply.lock` is deliberately NOT excluded: every run removes its
@@ -771,9 +758,9 @@ fn copy_project(from: &Path, to: &Path) {
     std::fs::copy(from.join("package.json"), to.join("package.json")).unwrap();
     std::fs::copy(from.join("bun.lock"), to.join("bun.lock")).unwrap();
     if from.join(".socket").is_dir() {
-        copy_dir_recursive(&from.join(".socket"), &to.join(".socket"));
+        common::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
-    copy_dir_recursive(&from.join("node_modules"), &to.join("node_modules"));
+    common::copy_tree(&from.join("node_modules"), &to.join("node_modules"));
 }
 
 /// ONLY the committable files (package.json, bun.lock, `.socket/` when it
@@ -783,7 +770,7 @@ fn fresh_checkout(from: &Path, to: &Path) {
     std::fs::copy(from.join("package.json"), to.join("package.json")).unwrap();
     std::fs::copy(from.join("bun.lock"), to.join("bun.lock")).unwrap();
     if from.join(".socket").is_dir() {
-        copy_dir_recursive(&from.join(".socket"), &to.join(".socket"));
+        common::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
 }
 
