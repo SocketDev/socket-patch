@@ -3,29 +3,11 @@
 //! `scan` keeps up to 32 patch-API requests in flight, so a throttling
 //! server (or a proxy / WAF in front of it) answering `429 Too Many
 //! Requests` or `503 Service Unavailable` is expected, not exotic. Each
-//! such answer is retried a bounded number of times before it becomes the
-//! request's error:
-//!
-//! - at most [`ApiRetryPolicy::max_retries`] retries per request (3 by
-//!   default, [`API_MAX_RETRIES_ENV`] overrides, `0` disables);
-//! - the wait honors the server's `Retry-After` (delta-seconds or an
-//!   HTTP-date). One longer than [`ApiRetryPolicy::max_retry_after`]
-//!   (30 s) is not waited out at all: the answer is final at once (retrying
-//!   early would only be refused again). One shorter than the jittered
-//!   first backoff step (`Retry-After: 0`, a date already past) waits that
-//!   step instead, so a server saying "now" is not hammered;
-//! - without a `Retry-After` the wait is exponential from
-//!   [`ApiRetryPolicy::base_delay`] (500 ms, 1 s, 2 s, ... capped at
-//!   [`ApiRetryPolicy::max_backoff`]) with "equal jitter" — each wait lands
-//!   in `[d/2, d)`, the sample derived deterministically from a seed, the
-//!   request and the retry number;
-//! - all retries share one run-wide WALL-CLOCK window
-//!   ([`ApiRetryPolicy::retry_window`], 60 s) that opens with the run's
-//!   first retry: a retry whose wait would end after the window closes is
-//!   refused and the answer is final. Concurrent requests wait in parallel,
-//!   so 32 throttled requests each still get their retries (their waits
-//!   overlap rather than add up), while a throttled run as a whole adds at
-//!   most about the window's length of waiting.
+//! such answer is retried under [`ApiRetryPolicy`]: the server's
+//! `Retry-After` is honored up to a cap, otherwise the wait is a jittered
+//! exponential backoff. All retries share one run-wide wall-clock window,
+//! so concurrent requests wait in parallel while a throttled run as a whole
+//! adds at most about the window's length of waiting.
 //!
 //! A connection the peer drops while it is being established (reset,
 //! aborted, or closed mid-TLS-handshake — [`is_retryable_transport`]) is
@@ -36,7 +18,7 @@
 //! Nothing else is retried here: other 4xx (401/403 keep driving the proxy
 //! fallback), other 5xx and every other transport error (refused, timed
 //! out, DNS, TLS certificate, or a failure after the request went out)
-//! surface on the first answer, exactly as before. Retries happen inside
+//! surface on the first answer. Retries happen inside
 //! each request's future, so the callers' ordered folds
 //! (`ordered_concurrent`) see the same sequence of results a clean run
 //! produces.
@@ -50,12 +32,11 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::StatusCode;
 
 /// Env override for [`ApiRetryPolicy::max_retries`]: a non-negative
-/// integer, clamped to [`MAX_RETRIES_CEILING`]; `0` turns retries off. An
-/// unset, empty or unparsable value keeps the default.
+/// integer, clamped to 10; `0` turns retries off. An unset, empty or
+/// unparsable value keeps the default.
 pub const API_MAX_RETRIES_ENV: &str = "SOCKET_API_MAX_RETRIES";
 
-/// The most retries [`API_MAX_RETRIES_ENV`] can ask for per request.
-pub const MAX_RETRIES_CEILING: u32 = 10;
+const MAX_RETRIES_CEILING: u32 = 10;
 
 /// Retry policy for the patch API's JSON calls (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,8 +68,7 @@ impl Default for ApiRetryPolicy {
 }
 
 impl ApiRetryPolicy {
-    /// No retries: every 429 / 503 is final on the first answer (the
-    /// behavior before retries existed).
+    /// No retries: every 429 / 503 is final on the first answer.
     pub fn none() -> Self {
         Self {
             max_retries: 0,
@@ -135,13 +115,6 @@ impl ApiRetryPolicy {
     }
 }
 
-/// Default [`ApiTimeouts::connect`]: TCP connect plus the TLS handshake.
-pub const API_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Default [`ApiTimeouts::read`]: the longest silence on an open
-/// connection (waiting for the response headers, or between body chunks).
-pub const API_READ_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Transport bounds for every patch-API request: the JSON calls, the
 /// blob/diff downloads and the vendoring service, on both of
 /// [`crate::api::client::ApiClient`]'s HTTP clients.
@@ -155,17 +128,18 @@ pub const API_READ_TIMEOUT: Duration = Duration::from_secs(60);
 /// on top.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiTimeouts {
-    /// Bound on establishing a connection.
+    /// Bound on TCP connect plus the TLS handshake.
     pub connect: Duration,
-    /// Bound on one read waiting for data.
+    /// The longest silence on an open connection (waiting for the response
+    /// headers, or between body chunks).
     pub read: Duration,
 }
 
 impl Default for ApiTimeouts {
     fn default() -> Self {
         Self {
-            connect: API_CONNECT_TIMEOUT,
-            read: API_READ_TIMEOUT,
+            connect: Duration::from_secs(10),
+            read: Duration::from_secs(60),
         }
     }
 }
@@ -187,7 +161,7 @@ fn max_retries_override(raw: Option<&str>) -> Option<u32> {
 }
 
 /// Is this answer one the retry loop may repeat? (429 and 503 only.)
-pub fn is_retryable_status(status: StatusCode) -> bool {
+pub(crate) fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status,
         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
@@ -203,7 +177,7 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
 /// failing fast), a connect or read timeout (a stall is not repeated, see
 /// [`ApiTimeouts`]), DNS and certificate errors, and any failure after the
 /// request went out.
-pub fn is_retryable_transport(error: &reqwest::Error) -> bool {
+pub(crate) fn is_retryable_transport(error: &reqwest::Error) -> bool {
     error.is_connect() && !error.is_timeout() && is_dropped_connection(error)
 }
 
@@ -239,7 +213,7 @@ fn is_dropped_connection(error: &(dyn std::error::Error + 'static)) -> bool {
 /// (`Retry-After: 7`) or an HTTP-date (`Retry-After: Fri, 27 Mar 2026
 /// 19:12:42 GMT`; a date already past waits zero). `None` when absent or
 /// unreadable — the caller then backs off exponentially.
-pub fn parse_retry_after(headers: &HeaderMap, now_unix_secs: u64) -> Option<Duration> {
+pub(crate) fn parse_retry_after(headers: &HeaderMap, now_unix_secs: u64) -> Option<Duration> {
     let raw = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     if raw.bytes().all(|b| b.is_ascii_digit()) {
         return raw.parse::<u64>().ok().map(Duration::from_secs);

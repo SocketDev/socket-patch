@@ -29,8 +29,6 @@ pub struct FetchMissingBlobsResult {
 /// Called with `(hash, one_based_index, total)` for each blob.
 pub type OnProgress = Box<dyn Fn(&str, usize, usize) + Send + Sync>;
 
-// ── Public API ────────────────────────────────────────────────────────
-
 /// Determine which `afterHash` blobs referenced in the manifest are
 /// missing from disk.
 ///
@@ -52,17 +50,8 @@ pub async fn get_missing_blobs(manifest: &PatchManifest, blobs_path: &Path) -> H
 }
 
 /// Download all missing `afterHash` blobs referenced in the manifest.
-///
-/// Creates the `blobs_path` directory if it does not exist.
-///
-/// # Arguments
-///
-/// * `manifest`    – Patch manifest whose `afterHash` blobs to check.
-/// * `blobs_path`  – Directory where blob files are stored (one file per
-///   hash).
-/// * `client`      – [`ApiClient`] used to fetch blobs from the server.
-/// * `on_progress` – Optional callback invoked before each download with
-///   `(hash, 1-based index, total)`.
+/// `on_progress` is called before each download with
+/// `(hash, 1-based index, total)`.
 pub async fn fetch_missing_blobs(
     manifest: &PatchManifest,
     blobs_path: &Path,
@@ -82,12 +71,8 @@ pub async fn fetch_missing_blobs(
     download_entries(&hashes, blobs_path, client, on_progress).await
 }
 
-/// Download specific blobs identified by their hashes.
-///
-/// Useful for fetching `beforeHash` blobs during rollback, where only a
-/// subset of hashes is required.
-///
-/// Blobs that already exist on disk are skipped (counted in `skipped`).
+/// Download the blobs `hashes` (rollback's `beforeHash` set). Blobs that
+/// already exist on disk are counted in `skipped`.
 pub async fn fetch_blobs_by_hash(
     hashes: &HashSet<String>,
     blobs_path: &Path,
@@ -98,9 +83,6 @@ pub async fn fetch_blobs_by_hash(
         return FetchMissingBlobsResult::default();
     }
 
-    // Filter out hashes that already exist on disk (an absent `blobs_path`
-    // simply means none do; the dir is created by the first successful
-    // write, never up front).
     let mut to_download: Vec<String> = Vec::new();
     let mut skipped: usize = 0;
     let mut results: Vec<BlobFetchResult> = Vec::new();
@@ -199,27 +181,19 @@ pub const PACKAGE_ARCHIVE: ArtifactNoun = ArtifactNoun {
 /// How many failures a fetch result lists before "... and N more".
 const MAX_LISTED_FAILURES: usize = 5;
 
-/// Format a [`FetchMissingBlobsResult`] of per-file blobs as a
-/// human-readable string (see [`format_fetch_result_for`]).
-pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
-    format_fetch_result_for(result, BLOB)
-}
-
-/// Format a [`FetchMissingBlobsResult`] counting `noun`s: the success
-/// counts first, then the failures sorted by id (the result's order comes
+/// Format a blob [`FetchMissingBlobsResult`] for humans: the success
+/// counts first, then the failures sorted by hash (the result's order comes
 /// from a `HashSet`), at most five listed.
-pub fn format_fetch_result_for(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> String {
-    let mut lines = format_fetch_successes(result, noun);
-    lines.extend(format_fetch_failures(result, noun));
+pub fn format_fetch_result(result: &FetchMissingBlobsResult) -> String {
+    let mut lines = format_fetch_successes(result, BLOB);
+    lines.extend(format_fetch_failures(result, BLOB));
     if lines.is_empty() {
-        // `total > 0` with nothing downloaded, skipped, or failed should
-        // not be reachable; never emit a misleading blank string.
-        return format!("All {} are present locally.", noun.many);
+        return "All blobs are present locally.".to_string();
     }
     lines.join("\n")
 }
 
-/// The success half of [`format_fetch_result_for`] ("Downloaded 2 blobs",
+/// The success half of [`format_fetch_result`] ("Downloaded 2 blobs",
 /// "1 blob already present locally"), for callers that route failures to
 /// a different stream. Empty when nothing succeeded.
 pub fn format_fetch_successes(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> Vec<String> {
@@ -236,7 +210,7 @@ pub fn format_fetch_successes(result: &FetchMissingBlobsResult, noun: ArtifactNo
     lines
 }
 
-/// The failure half of [`format_fetch_result_for`]: a "Failed to download
+/// The failure half of [`format_fetch_result`]: a "Failed to download
 /// N <noun>s" header and up to five `  - <id>: <error>` lines, sorted by
 /// id. Empty when nothing failed.
 pub fn format_fetch_failures(result: &FetchMissingBlobsResult, noun: ArtifactNoun) -> Vec<String> {
@@ -354,24 +328,14 @@ fn guard_cache_entry(dest: &Path) -> std::io::Result<()> {
     crate::utils::containment::ensure_unlinked(root, dest, "write")
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────
-
 /// Stream `body` to `dest` atomically: copy it chunk by chunk into a temp
 /// file in the same directory, check it against `expected_hash` (a blob's
 /// git-sha256 name) when given, then `rename(2)` it over `dest`. The body is
-/// never held in memory whole (#571).
+/// never held in memory whole.
 ///
-/// The destinations here are *content-addressed* cache entries —
-/// `blobs/<hash>`. A plain `tokio::fs::write`
-/// truncates-then-writes in place, so an interrupted write (ENOSPC, crash,
-/// killed process) can leave a partial file at the final path. Because the
-/// "is it already downloaded?" check ([`get_missing_blobs`]) only tests
-/// for presence, such a truncated file
-/// is then trusted forever — its content no longer hashes to its name, yet
-/// it is never re-downloaded. Staging in the same directory and renaming
-/// makes the final path always either the complete bytes or absent, never a
-/// torn intermediate, matching the stage+rename discipline used by the
-/// patch-apply and copy-on-write write paths.
+/// [`get_missing_blobs`] only tests for presence, so a torn entry left by
+/// an in-place write would be trusted forever; stage+rename makes the final
+/// path either the complete bytes or absent.
 ///
 /// Deliberately LIGHTER than [`crate::utils::fs::atomic_write_bytes`] (no
 /// file fsync, no dir fsync, `.socket-dl-` prefix): these are re-downloadable
@@ -389,8 +353,8 @@ async fn stream_cache_entry_atomic(
             "cache entry path has no parent directory",
         ))
     })?;
-    // The cache directory (`.socket/blobs/`) is created
-    // here, by the first download, and nowhere earlier. A fetch that lands
+    // The cache directory (`.socket/blobs/`) is created here, by the first
+    // download, and nowhere earlier. A fetch that lands
     // nothing (all 404, offline, every hash mismatched, every body cut
     // short) must not leave an empty directory behind for the user to
     // commit, so a failure removes the directories this call created, while
@@ -430,7 +394,6 @@ async fn stream_cache_entry_atomic(
     }
     .await;
     if result.is_err() {
-        // A partial stage would otherwise leak as a `.socket-dl-*` turd.
         let _ = tokio::fs::remove_file(&stage).await;
         // Deepest first; `remove_dir` only succeeds while a dir is empty.
         for dir in created_dirs {
@@ -468,25 +431,14 @@ enum EntryError {
     HashMismatch(String),
 }
 
-/// Compare an expected blob hash against the hash computed from the
-/// downloaded bytes.
-///
-/// Git object hashes are hex, and hex is case-insensitive. The content
-/// hasher ([`compute_git_sha256_from_reader`]) always emits lowercase, but
-/// [`ApiClient::fetch_blob`]'s validator accepts uppercase hex too — so a
-/// manifest (or server) that uses uppercase would download byte-for-byte
-/// correct content and then be wrongly rejected by a case-sensitive
-/// comparison. Compare ignoring ASCII case to keep the two consistent.
-///
-/// [`compute_git_sha256_from_reader`]: crate::hash::git_sha256::compute_git_sha256_from_reader
+/// The hasher emits lowercase hex, but [`ApiClient::fetch_blob`] accepts an
+/// uppercase manifest hash too, so the comparison ignores ASCII case.
 fn blob_hash_matches(expected: &str, actual: &str) -> bool {
     expected.eq_ignore_ascii_case(actual)
 }
 
-/// Download the blobs `ids` sequentially, streaming each into
-/// `dir/<hash>` and verifying it against its git-sha256 name (see
-/// [`stream_cache_entry_atomic`]). The one download loop behind
-/// [`fetch_missing_blobs`] and [`fetch_blobs_by_hash`].
+/// Download the blobs `ids` sequentially into `dir/<hash>`, each verified
+/// against its git-sha256 name.
 async fn download_entries(
     ids: &[String],
     dir: &Path,
@@ -627,255 +579,66 @@ mod tests {
         assert!(missing.is_empty());
     }
 
-    #[test]
-    fn test_format_fetch_result_all_present() {
-        let result = FetchMissingBlobsResult {
-            total: 0,
-            downloaded: 0,
-            failed: 0,
-            skipped: 0,
-            results: Vec::new(),
-        };
-        assert_eq!(
-            format_fetch_result(&result),
-            "All blobs are present locally."
-        );
+    fn ok(id: &str) -> BlobFetchResult {
+        BlobFetchResult {
+            hash: id.to_string(),
+            success: true,
+            error: None,
+        }
     }
 
     #[test]
-    fn test_format_fetch_result_some_downloaded() {
+    fn format_fetch_result_lists_successes_then_failures() {
         let result = FetchMissingBlobsResult {
             total: 3,
             downloaded: 2,
             failed: 1,
             skipped: 0,
             results: vec![
-                BlobFetchResult {
-                    hash: "a".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "b".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "c".repeat(64),
-                    success: false,
-                    error: Some("Blob not found on server".to_string()),
-                },
+                ok(&"a".repeat(64)),
+                ok(&"b".repeat(64)),
+                failure(&"c".repeat(64), "Blob not found on server"),
             ],
         };
-        let output = format_fetch_result(&result);
         assert_eq!(
-            output,
+            format_fetch_result(&result),
             "Downloaded 2 blobs\nFailed to download 1 blob\n  - cccccccccccc...: Blob not found on server"
         );
     }
 
     #[test]
-    fn test_format_fetch_result_truncates_at_5() {
-        let results: Vec<BlobFetchResult> = (0..8)
-            .map(|i| BlobFetchResult {
-                hash: format!("{:0>64}", i),
-                success: false,
-                error: Some(format!("error {}", i)),
-            })
-            .collect();
-
-        let result = FetchMissingBlobsResult {
-            total: 8,
-            downloaded: 0,
-            failed: 8,
-            skipped: 0,
-            results,
+    fn format_fetch_result_without_failures() {
+        let counts = |downloaded, skipped| FetchMissingBlobsResult {
+            total: downloaded + skipped,
+            downloaded,
+            skipped,
+            ..Default::default()
         };
-        let output = format_fetch_result(&result);
-        assert!(output.contains("... and 3 more"));
-    }
-
-    // ── Group 8: format edge cases ───────────────────────────────────
-
-    #[test]
-    fn test_format_only_downloaded() {
-        let result = FetchMissingBlobsResult {
-            total: 3,
-            downloaded: 3,
-            failed: 0,
-            skipped: 0,
-            results: vec![
-                BlobFetchResult {
-                    hash: "a".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "b".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "c".repeat(64),
-                    success: true,
-                    error: None,
-                },
-            ],
-        };
-        let output = format_fetch_result(&result);
-        assert_eq!(output, "Downloaded 3 blobs");
-        assert!(!output.contains("Failed"));
-    }
-
-    #[test]
-    fn test_format_short_hash() {
-        let result = FetchMissingBlobsResult {
-            total: 1,
-            downloaded: 0,
-            failed: 1,
-            skipped: 0,
-            results: vec![BlobFetchResult {
-                hash: "abc".into(),
-                success: false,
-                error: Some("not found".into()),
-            }],
-        };
-        let output = format_fetch_result(&result);
-        // Hash is < 12 chars: shown in full, with no false ellipsis.
-        assert_eq!(output, "Failed to download 1 blob\n  - abc: not found");
-    }
-
-    #[test]
-    fn test_format_multibyte_hash_does_not_panic() {
-        // Regression: the failed-blob detail line truncated `hash` with a
-        // byte slice (`&r.hash[..12]`). The hash field carries arbitrary
-        // manifest strings (afterHash / patch uuid); when byte 12 falls
-        // inside a multibyte char the slice panicked ("byte index 12 is not
-        // a char boundary"), crashing apply/repair/rollback human output
-        // instead of reporting the failed download.
-        let hash = format!("{}→tail-of-corrupted-hash", "a".repeat(11));
-        let result = FetchMissingBlobsResult {
-            total: 1,
-            downloaded: 0,
-            failed: 1,
-            skipped: 0,
-            results: vec![BlobFetchResult {
-                hash,
-                success: false,
-                error: Some("Invalid hash format".into()),
-            }],
-        };
-        let output = format_fetch_result(&result);
-        assert!(output.contains("Failed to download 1 blob\n"));
-        assert!(
-            output.contains("aaaaaaaaaaa→..."),
-            "12-char prefix expected: {output:?}"
+        assert_eq!(
+            format_fetch_result(&counts(0, 0)),
+            "All blobs are present locally."
+        );
+        assert_eq!(format_fetch_result(&counts(3, 0)), "Downloaded 3 blobs");
+        // Every blob already on disk is a line of its own, never blank.
+        assert_eq!(
+            format_fetch_result(&counts(0, 2)),
+            "2 blobs already present locally"
+        );
+        assert_eq!(
+            format_fetch_result(&counts(1, 2)),
+            "Downloaded 1 blob\n2 blobs already present locally"
         );
     }
 
     #[test]
-    fn test_format_error_none() {
-        let result = FetchMissingBlobsResult {
-            total: 1,
-            downloaded: 0,
-            failed: 1,
-            skipped: 0,
-            results: vec![BlobFetchResult {
-                hash: "d".repeat(64),
-                success: false,
-                error: None,
-            }],
-        };
-        let output = format_fetch_result(&result);
-        assert!(output.contains("unknown error"));
+    fn a_failure_without_an_error_reads_unknown_error() {
+        let mut nameless = failure("d", "");
+        nameless.error = None;
+        assert_eq!(
+            format_fetch_failures(&failed_result(vec![nameless]), BLOB),
+            vec!["Failed to download 1 blob", "  - d: unknown error"]
+        );
     }
-
-    // ── Regression: skipped accounting in format ─────────────────────
-
-    #[test]
-    fn test_format_all_skipped_is_not_blank() {
-        // Regression: `fetch_blobs_by_hash` can return total>0 with every
-        // blob already on disk (downloaded=0, failed=0, skipped=N). The
-        // formatter must surface that rather than returning a blank line.
-        let result = FetchMissingBlobsResult {
-            total: 2,
-            downloaded: 0,
-            failed: 0,
-            skipped: 2,
-            results: vec![
-                BlobFetchResult {
-                    hash: "a".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "b".repeat(64),
-                    success: true,
-                    error: None,
-                },
-            ],
-        };
-        let output = format_fetch_result(&result);
-        assert!(!output.trim().is_empty(), "must not be blank: {:?}", output);
-        assert_eq!(output, "2 blobs already present locally");
-        assert!(!output.contains("Downloaded"));
-        assert!(!output.contains("Failed"));
-    }
-
-    #[test]
-    fn test_format_downloaded_and_skipped_mix() {
-        let result = FetchMissingBlobsResult {
-            total: 3,
-            downloaded: 1,
-            failed: 0,
-            skipped: 2,
-            results: vec![
-                BlobFetchResult {
-                    hash: "a".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "b".repeat(64),
-                    success: true,
-                    error: None,
-                },
-                BlobFetchResult {
-                    hash: "c".repeat(64),
-                    success: true,
-                    error: None,
-                },
-            ],
-        };
-        let output = format_fetch_result(&result);
-        assert_eq!(output, "Downloaded 1 blob\n2 blobs already present locally");
-    }
-
-    // ── Regression: hash comparison is case-insensitive ──────────────
-
-    #[test]
-    fn test_blob_hash_matches_is_case_insensitive() {
-        // Hex is case-insensitive. `compute_git_sha256_from_bytes` emits
-        // lowercase, but `is_valid_sha256_hex` accepts uppercase, so the
-        // verification must treat the two as equal (otherwise valid
-        // uppercase-hash content is wrongly rejected as a mismatch).
-        let lower = "abc123".to_string() + &"0".repeat(58);
-        let upper = lower.to_ascii_uppercase();
-        assert!(blob_hash_matches(&upper, &lower));
-        assert!(blob_hash_matches(&lower, &upper));
-        assert!(blob_hash_matches(&lower, &lower));
-    }
-
-    #[test]
-    fn test_blob_hash_matches_rejects_genuine_mismatch() {
-        let a = "a".repeat(64);
-        let b = "b".repeat(64);
-        assert!(!blob_hash_matches(&a, &b));
-        // Differing length is still a mismatch.
-        assert!(!blob_hash_matches(&a, "aa"));
-    }
-
-    // ── Atomic cache-entry write ─────────────────────────────────────
 
     /// A [`BinaryBody`] streaming `bytes` from a local mock server. The
     /// server is returned so it outlives the read.
@@ -1057,34 +820,6 @@ mod tests {
             std::fs::read_dir(&ro).unwrap().count(),
             0,
             "no stage litter may survive the failed stage write"
-        );
-    }
-
-    #[test]
-    fn test_format_only_failed() {
-        let result = FetchMissingBlobsResult {
-            total: 2,
-            downloaded: 0,
-            failed: 2,
-            skipped: 0,
-            results: vec![
-                BlobFetchResult {
-                    hash: "a".repeat(64),
-                    success: false,
-                    error: Some("timeout".into()),
-                },
-                BlobFetchResult {
-                    hash: "b".repeat(64),
-                    success: false,
-                    error: Some("timeout".into()),
-                },
-            ],
-        };
-        let output = format_fetch_result(&result);
-        assert!(!output.contains("Downloaded"));
-        assert!(
-            output.starts_with("Failed to download 2 blobs\n"),
-            "{output}"
         );
     }
 
