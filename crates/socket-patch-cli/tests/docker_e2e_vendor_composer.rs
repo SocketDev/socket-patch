@@ -46,6 +46,9 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 #[path = "composer_e2e_common/mod.rs"]
@@ -440,7 +443,7 @@ fn assert_manifestless_vex_from_host(host_dir: &std::path::Path) {
     let purl = format!("pkg:composer/psr/log@{psr_ver}");
     let copy = tempfile::tempdir().expect("tempdir");
     let fresh = copy.path().join("fresh");
-    composer_e2e_common::copy_dir_recursive(&host_dir.join("fresh"), &fresh);
+    fs_tree::copy_tree(&host_dir.join("fresh"), &fresh);
     let patched = std::fs::read(fresh.join("vendor/psr/log/src/LoggerInterface.php"))
         .expect("the container-installed patched file");
     let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-66666"])];

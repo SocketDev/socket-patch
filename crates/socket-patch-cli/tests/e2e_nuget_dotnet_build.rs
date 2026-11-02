@@ -51,6 +51,10 @@
 //! done
 //! ```
 
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -308,25 +312,12 @@ fn fresh_checkout(from: &Path, to: &Path) {
     }
     // v5 hosted mode writes no `.socket/`: the lock pins are its whole state.
     if from.join(".socket").is_dir() {
-        copy_tree(&from.join(".socket"), &to.join(".socket"));
+        fs_tree::copy_tree(&from.join(".socket"), &to.join(".socket"));
     }
     strip_manifest(to);
     let blobs = to.join(".socket/blobs");
     if blobs.exists() {
         std::fs::remove_dir_all(blobs).unwrap();
-    }
-}
-
-fn copy_tree(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap() {
-        let entry = entry.unwrap();
-        let dst = to.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_tree(&entry.path(), &dst);
-        } else {
-            std::fs::copy(entry.path(), dst).unwrap();
-        }
     }
 }
 
@@ -1190,7 +1181,7 @@ fn nuget_vendored_solution_member_and_named_locks_restore() {
     // Fresh checkout of the committable files, cold cache, each project.
     let checkout = sb.dir("solution-checkout");
     std::fs::copy(root.join("nuget.config"), checkout.join("nuget.config")).unwrap();
-    copy_tree(&root.join(".socket"), &checkout.join(".socket"));
+    fs_tree::copy_tree(&root.join(".socket"), &checkout.join(".socket"));
     strip_manifest(&checkout);
     let blobs = checkout.join(".socket/blobs");
     if blobs.exists() {

@@ -30,6 +30,10 @@ use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
+
 #[path = "common/hermetic.rs"]
 mod hermetic;
 #[path = "vex_e2e_common/mod.rs"]
@@ -303,7 +307,9 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     let copy = tmp.path();
     write_project(copy, &read(&root.join("pdm.lock")));
     std::fs::copy(root.join("pyproject.toml"), copy.join("pyproject.toml")).unwrap();
-    copy_dir(&root.join(".socket"), &copy.join(".socket"));
+    if root.join(".socket").is_dir() {
+        fs_tree::copy_tree(&root.join(".socket"), &copy.join(".socket"));
+    }
     strip_manifest(copy);
     assert_no_ledger(copy);
 
@@ -345,7 +351,9 @@ fn manifestless_vex_steps(root: &Path, pristine_lock: &str) {
     let reverted = tmp2.path();
     write_project(reverted, pristine_lock);
     std::fs::copy(root.join("pyproject.toml"), reverted.join("pyproject.toml")).unwrap();
-    copy_dir(&copy.join(".socket"), &reverted.join(".socket"));
+    if copy.join(".socket").is_dir() {
+        fs_tree::copy_tree(&copy.join(".socket"), &reverted.join(".socket"));
+    }
     strip_manifest(reverted);
     for no_verify in [false, true] {
         let out = run_vex(
@@ -377,21 +385,6 @@ fn legacy_record(view: &serde_json::Value) -> serde_json::Value {
     obj.entry("tier")
         .or_insert_with(|| serde_json::json!("free"));
     record
-}
-
-fn copy_dir(from: &Path, to: &Path) {
-    if !from.is_dir() {
-        return;
-    }
-    std::fs::create_dir_all(to).unwrap();
-    for entry in std::fs::read_dir(from).unwrap().flatten() {
-        let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_dir(&entry.path(), &target);
-        } else {
-            std::fs::copy(entry.path(), target).unwrap();
-        }
-    }
 }
 
 /// Lock-only hosted redirect regression: before the `pdm.lock` inventory

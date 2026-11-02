@@ -51,6 +51,10 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -320,19 +324,6 @@ pub fn installed_packages(proj: &Path) -> Vec<serde_json::Value> {
         .clone()
 }
 
-pub fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// A fresh checkout of `proj` at `dst`: ONLY the committable files
 /// (composer.json, composer.lock, `.socket/`) — never `vendor/`.
 pub fn fresh_checkout(proj: &Path, dst: &Path) {
@@ -340,7 +331,7 @@ pub fn fresh_checkout(proj: &Path, dst: &Path) {
     std::fs::copy(proj.join("composer.json"), dst.join("composer.json")).unwrap();
     std::fs::copy(proj.join("composer.lock"), dst.join("composer.lock")).unwrap();
     if proj.join(".socket").is_dir() {
-        copy_dir_recursive(&proj.join(".socket"), &dst.join(".socket"));
+        fs_tree::copy_tree(&proj.join(".socket"), &dst.join(".socket"));
     }
     assert!(
         !dst.join("vendor").exists(),
