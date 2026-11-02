@@ -144,9 +144,24 @@ fn rollback_refuses_binary_hosted_pin_then_checkout(
 ) {
     let hosted_lock = fixture.lock();
     let uri = server.uri();
+    // `--api-url`: the agent leg downloads before-blobs through the patch
+    // API, which `--patch-server-url` does not redirect; without it the
+    // run reached the live public proxy and the outcome depended on
+    // whether that served minimist's original `index.js` blob.
     let (code, env) = cli_code(
         &fixture.project,
-        &["rollback", "--yes", "--patch-server-url", &uri],
+        &[
+            "rollback",
+            "--yes",
+            "--api-url",
+            &uri,
+            "--api-token",
+            "fake",
+            "--org",
+            ORG,
+            "--patch-server-url",
+            &uri,
+        ],
     );
     assert_eq!(code, 1, "a binary hosted pin cannot be restored: {env}");
     // The refused pin counts as a failure (#1066). After a takeover a
@@ -871,6 +886,21 @@ async fn mock_api_patch(server: &MockServer, fixture: &Fixture, uuid: &str, patc
                 "blobContent":base64::engine::general_purpose::STANDARD.encode(patched)}},
             "vulnerabilities":{GHSA:{"cves":[CVE],"summary":"binary lock vuln","severity":"high","description":"d"}},
             "description":"binary lock patch","license":"MIT","tier":"free"})),
+        )
+        .mount(server)
+        .await;
+    // The original `index.js` blob. `rollback`'s missing-blob gate
+    // downloads it when an installed copy matches neither patch hash (the
+    // `bundled` shape's untouched nested minimist); see
+    // `rollback_refuses_binary_hosted_pin_then_checkout`.
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG}/patches/blob/{}",
+            compute_git_sha256_from_bytes(&fixture.original)
+        )))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_raw(fixture.original.clone(), "application/octet-stream"),
         )
         .mount(server)
         .await;
