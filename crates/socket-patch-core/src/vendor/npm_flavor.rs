@@ -355,7 +355,26 @@ async fn sniff_yarn_lock(view: &ProjectView<'_>) -> Result<NpmLockFlavor, (&'sta
 /// as it is once `yarn install` writes `.pnp.cjs`, instead of being wired
 /// once and refused on every re-run. Read-only consumers (`vendor
 /// --check`, `--revert`, VEX, the lock inventory) keep the plain probe.
+///
+/// A `vendor_lockfile_missing` refusal in a project installed from a lock
+/// in another directory names that directory ([`lock_elsewhere_detail`],
+/// #1904). Callers that keep only the code use
+/// [`detect_vendorable_npm_flavor_code`], which skips that lookup.
 pub(crate) async fn detect_vendorable_npm_flavor(
+    project_root: &Path,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    match detect_vendorable_npm_flavor_code(project_root).await {
+        Err(("vendor_lockfile_missing", detail)) => Err((
+            "vendor_lockfile_missing",
+            lock_elsewhere_detail(project_root).await.unwrap_or(detail),
+        )),
+        found => found,
+    }
+}
+
+/// [`detect_vendorable_npm_flavor`] for callers that keep only the
+/// refusal code: the detail is the probe's own.
+async fn detect_vendorable_npm_flavor_code(
     project_root: &Path,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     detect_vendorable_npm_flavor_with(project_root, || {
@@ -398,6 +417,39 @@ async fn detect_vendorable_npm_flavor_with(
              `yarn patch <pkg>` instead"
         ),
     ))
+}
+
+/// #1904: the `vendor_lockfile_missing` detail for a project with no lock
+/// of its own that its package manager installs from a lock in another
+/// directory (a workspace member, or a pnpm `lockfile-dir`). Running
+/// install in the project only updates that other lock, so the generic
+/// "run install first" remedy would loop: a workspace member is told to
+/// vendor from the workspace root, a `lockfile-dir` project that vendor
+/// cannot wire it. `None` when no other directory governs the project.
+/// Hosted's `redirect_*_lockfile_elsewhere` refusal reads the same lookup.
+async fn lock_elsewhere_detail(project_root: &Path) -> Option<String> {
+    // The member's own path, not the default `--cwd` `.`.
+    let shown = tokio::fs::canonicalize(project_root)
+        .await
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let elsewhere = crate::hosted::governing_root::npm_lock_elsewhere(&shown).await?;
+    Some(if elsewhere.vendorable_dir {
+        format!(
+            "{}, so there is no lockfile here for vendoring to rewire; vendor from {} (the {})",
+            elsewhere.detail,
+            elsewhere.dir.display(),
+            elsewhere.dir_kind
+        )
+    } else {
+        format!(
+            "{}; vendor does not rewire a pnpm lock kept in another directory \
+             (`lockfile-dir`): use `socket-patch scan --mode hosted` from {} (the {}), or \
+             remove `lockfile-dir` and run `pnpm install` to write a lock here",
+            elsewhere.detail,
+            elsewhere.dir.display(),
+            elsewhere.dir_kind
+        )
+    })
 }
 
 /// A workspace member whose own lock its package manager never reads
@@ -624,7 +676,7 @@ pub async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    let flavor = match detect_vendorable_npm_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor_code(project_root).await {
         Ok((flavor, _probe_warnings)) => flavor,
         Err((code, _detail)) => return vec![Err(code); packages.len()],
     };
@@ -665,7 +717,7 @@ pub async fn lock_text_refusals(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Option<(&'static str, String)>> {
-    let flavor = match detect_vendorable_npm_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor_code(project_root).await {
         Ok((flavor, _)) => flavor,
         Err(_) => return vec![None; packages.len()],
     };
@@ -1162,6 +1214,97 @@ mod tests {
 
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
+    }
+
+    /// #1904: a workspace member with no lock of its own is installed from
+    /// the workspace root's lock. The vendored refusal keeps its code but
+    /// names that root, as hosted's refusal and the stray-lock refusal
+    /// (#1094) do, instead of a "run install first" remedy that loops.
+    #[tokio::test]
+    async fn lockless_workspace_member_refusal_names_the_workspace_root() {
+        for lock in ["package-lock.json", "yarn.lock", "bun.lock"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            touch(
+                root,
+                "package.json",
+                r#"{"name":"app","private":true,"workspaces":["packages/*"]}"#,
+            )
+            .await;
+            touch(root, lock, "").await;
+            let member = root.join("packages/a");
+            tokio::fs::create_dir_all(&member).await.unwrap();
+            touch(&member, "package.json", r#"{"name":"a"}"#).await;
+
+            let (code, detail) = detect_vendorable_npm_flavor(&member).await.unwrap_err();
+            assert_eq!(code, "vendor_lockfile_missing", "{lock}");
+            let canonical = tokio::fs::canonicalize(root).await.unwrap();
+            assert!(
+                detail.contains(&format!("vendor from {}", canonical.display()))
+                    && detail.contains("(the workspace root)")
+                    && detail.contains(&canonical.join(lock).display().to_string())
+                    && detail.contains("workspace member"),
+                "{lock}: {detail}"
+            );
+            assert!(!detail.contains("install first"), "{lock}: {detail}");
+        }
+    }
+
+    /// #1904, pnpm: a pnpm workspace member is installed from the root's
+    /// pnpm-lock.yaml; the refusal names the directory holding it.
+    #[tokio::test]
+    async fn lockless_pnpm_member_refusal_names_the_lock_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n").await;
+        touch(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        let member = root.join("packages/a");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        touch(&member, "package.json", r#"{"name":"a"}"#).await;
+
+        let (code, detail) = detect_vendorable_npm_flavor(&member).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        let canonical = tokio::fs::canonicalize(root).await.unwrap();
+        assert!(
+            detail.contains(&format!("vendor from {}", canonical.display()))
+                && detail.contains("pnpm-lock.yaml"),
+            "{detail}"
+        );
+    }
+
+    /// #1904, pnpm `lockfile-dir` outside a pnpm workspace: the lock's
+    /// directory holds no project, so the refusal names the setting and
+    /// hosted mode instead of telling the user to vendor from there.
+    #[tokio::test]
+    async fn lockfile_dir_project_refusal_names_the_setting_not_a_dead_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        let proj = root.join("proj");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        touch(&proj, "package.json", r#"{"name":"p"}"#).await;
+        touch(&proj, ".npmrc", "lockfile-dir=..\n").await;
+
+        let (code, detail) = detect_vendorable_npm_flavor(&proj).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains("lockfile-dir") && detail.contains("scan --mode hosted"),
+            "{detail}"
+        );
+        assert!(!detail.contains("vendor from"), "{detail}");
+        assert!(!detail.contains("install first"), "{detail}");
+    }
+
+    /// A lockless project that no workspace governs keeps the generic
+    /// "run your package manager's install first" refusal.
+    #[tokio::test]
+    async fn lockless_standalone_project_keeps_the_install_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "package.json", r#"{"name":"solo"}"#).await;
+        let (code, detail) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(detail.contains("install first"), "{detail}");
+        assert!(!detail.contains("vendor from"), "{detail}");
     }
 
     const YARN_V1: &str = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\

@@ -119,55 +119,6 @@ pub async fn refusal(
     None
 }
 
-/// The directory whose npm-family lock installs `root` when `root` is a
-/// workspace member with no lock of its own (or only locks its manager
-/// never reads): a pnpm workspace or `lockfile-dir`, an npm, yarn or Bun
-/// `package.json` workspace, or a vlt workspace, the nearer root winning.
-/// Returns that root with hosted mode's refusal for it. Vendored commands
-/// that read only `root` (`vendor`, `vendor --revert`, `vendor --check`)
-/// use the root to refuse instead of reporting nothing to do (#1921).
-pub async fn npm_family_governing_root(root: &Path) -> Option<(PathBuf, Refusal)> {
-    let workspace = if has_own_npm_family_lock(root) {
-        member_stray_lock_refusal(root).await
-    } else {
-        nearer_root(
-            package_json_workspace_refusal(root).await,
-            vlt_workspace_refusal(root).await,
-        )
-    };
-    if let Some(lock) = pnpm_lock_elsewhere(root).await {
-        let dir = lock.parent().unwrap_or(&lock);
-        // Canonical, like the other branches' roots: a relative
-        // `lockfile-dir` (`../..`) would otherwise name a `..` path.
-        let pnpm_dir = tokio::fs::canonicalize(dir)
-            .await
-            .unwrap_or_else(|_| dir.to_path_buf());
-        // A `package.json` workspace root nested inside the pnpm lock's
-        // directory is nearer the member and owns its lock (Bugbot on
-        // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
-        if let Some((ws_root, refusal)) = workspace {
-            if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
-                return Some((ws_root, refusal));
-            }
-        }
-        return Some((
-            pnpm_dir,
-            Refusal {
-                code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
-                message: format!(
-                    "{} has no lockfile of its own: pnpm installs it from {}, which a \
-                 hosted run here cannot see; run socket-patch from {} (the directory \
-                 holding pnpm-lock.yaml); nothing was written",
-                    root.display(),
-                    lock.display(),
-                    dir.display()
-                ),
-            },
-        ));
-    }
-    workspace
-}
-
 /// A pnpm v9 project lock (the one the trust auto-config serves) in a
 /// workspace member (listed by the `packages:` globs of the nearest
 /// ancestor `pnpm-workspace.yaml`, #1006) whose settings come from that
@@ -218,6 +169,108 @@ async fn cargo_member_refusal(root: &Path) -> Option<Refusal> {
     Some(Refusal {
         code: NOT_WORKSPACE_ROOT.to_string(),
         message: detail,
+    })
+}
+
+/// The directory whose npm-family lock installs `root` when `root` is a
+/// workspace member with no lock of its own (or only locks its manager
+/// never reads): a pnpm workspace or `lockfile-dir`, an npm, yarn or Bun
+/// `package.json` workspace, or a vlt workspace, the nearer root winning
+/// ([`npm_lock_elsewhere`]). Returns that root with hosted mode's refusal
+/// for it. Vendored commands that read only `root` (`vendor`, `vendor
+/// --revert`, `vendor --check`) use the root to refuse instead of
+/// reporting nothing to do (#1921).
+pub async fn npm_family_governing_root(root: &Path) -> Option<(PathBuf, Refusal)> {
+    if has_own_npm_family_lock(root) {
+        return member_stray_lock_refusal(root).await;
+    }
+    let elsewhere = npm_lock_elsewhere(root).await?;
+    let refusal = elsewhere.hosted_refusal();
+    Some((elsewhere.dir, refusal))
+}
+
+/// A project directory with no npm-family lock of its own that its
+/// package manager installs from a lock in another directory: a member of
+/// a `package.json` or vlt workspace, or a directory pnpm installs from an
+/// ancestor workspace's (or `lockfile-dir`'s) `pnpm-lock.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LockElsewhere {
+    /// The hosted refusal code.
+    code: &'static str,
+    /// The directory to run from, canonical like the other roots.
+    pub(crate) dir: PathBuf,
+    /// [`Self::dir`] as hosted's refusal has always named it.
+    shown_dir: PathBuf,
+    /// What [`Self::dir`] is, for the "run from" hint (`workspace root`;
+    /// worded like [`MemberStrayLock::root_kind`]).
+    pub(crate) dir_kind: &'static str,
+    /// Whether a vendored run from [`Self::dir`] would wire the project:
+    /// `true` for a workspace root, which installs its members, and
+    /// `false` for a pnpm `lockfile-dir` outside any pnpm workspace, which
+    /// holds only the lock.
+    pub(crate) vendorable_dir: bool,
+    /// Which lock installs the project, without a remedy.
+    pub(crate) detail: String,
+}
+
+impl LockElsewhere {
+    /// The hosted refusal: a hosted run here would pin a lock nothing reads.
+    fn hosted_refusal(&self) -> Refusal {
+        Refusal {
+            code: self.code.to_string(),
+            message: format!(
+                "{}, which a hosted run here cannot see; run socket-patch from {} (the {}); \
+                 nothing was written",
+                self.detail,
+                self.shown_dir.display(),
+                self.dir_kind
+            ),
+        }
+    }
+}
+
+/// `Some` when `root` holds no npm-family lock of its own and its package
+/// manager installs it from a lock in another directory (see
+/// [`LockElsewhere`]). Shared by the hosted refusal and the vendored
+/// `vendor_lockfile_missing` refusal (#1904), so both name the directory
+/// to run from. Of a `package.json` or vlt workspace root and a pnpm lock
+/// directory, the nearer one governs; a tie goes to pnpm.
+pub(crate) async fn npm_lock_elsewhere(root: &Path) -> Option<LockElsewhere> {
+    if has_own_npm_family_lock(root) {
+        return None;
+    }
+    let workspace = nearer_root(
+        package_json_workspace_elsewhere(root).await,
+        vlt_workspace_elsewhere(root).await,
+    );
+    let Some(lock) = pnpm_lock_elsewhere(root).await else {
+        return workspace;
+    };
+    let shown_dir = lock.parent().unwrap_or(&lock).to_path_buf();
+    // Canonical, like the other branches' roots: a relative `lockfile-dir`
+    // (`../..`) would otherwise name a `..` path.
+    let dir = tokio::fs::canonicalize(&shown_dir)
+        .await
+        .unwrap_or_else(|_| shown_dir.clone());
+    // A `package.json` workspace root nested inside the pnpm lock's
+    // directory is nearer the member and owns its lock (Bugbot on #901);
+    // otherwise pnpm's workspace or `lockfile-dir` governs.
+    if let Some(ws) = workspace {
+        if ws.dir != dir && ws.dir.starts_with(&dir) {
+            return Some(ws);
+        }
+    }
+    Some(LockElsewhere {
+        code: PNPM_LOCKFILE_ELSEWHERE,
+        detail: format!(
+            "{} has no lockfile of its own: pnpm installs it from {}",
+            root.display(),
+            lock.display()
+        ),
+        vendorable_dir: dir.join(PNPM_WORKSPACE).is_file(),
+        dir,
+        shown_dir,
+        dir_kind: "directory holding pnpm-lock.yaml",
     })
 }
 
@@ -306,26 +359,25 @@ const WORKSPACE_ROOT_FAMILIES: [NpmLockFamily; 3] =
 /// lock may itself be a member of an outer workspace (yarn berry's nested
 /// worktrees), so the walk goes on with that root as the member and
 /// refuses at the first root that holds an npm, yarn or Bun lock; a chain
-/// that ends without one (never installed), or at a Rush root, refuses
-/// nothing. Returns the
-/// governing root with the refusal, so [`refusal`] can weigh it against
-/// the pnpm check (the nearer root wins; a tie goes to pnpm's message).
-async fn package_json_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+/// that ends without one (never installed), or at a Rush root, finds
+/// nothing. [`npm_lock_elsewhere`] weighs the root against the pnpm check
+/// (the nearer root wins; a tie goes to pnpm).
+async fn package_json_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> {
     let (ancestor, locks) = package_json_workspace_root(root).await?;
-    let refusal = Refusal {
-        code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
-        message: format!(
+    Some(LockElsewhere {
+        code: WORKSPACE_LOCKFILE_ELSEWHERE,
+        detail: format!(
             "{} is a workspace member with no lockfile of its own: the workspace \
-             root {} lists it under \"workspaces\" and installs it from {}, which a \
-             hosted run here cannot see; run socket-patch from {} (the workspace \
-             root); nothing was written",
+             root {} lists it under \"workspaces\" and installs it from {}",
             root.display(),
             ancestor.display(),
             join_paths(&ancestor, &locks),
-            ancestor.display()
         ),
-    };
-    Some((ancestor, refusal))
+        shown_dir: ancestor.clone(),
+        dir: ancestor,
+        dir_kind: "workspace root",
+        vendorable_dir: true,
+    })
 }
 
 /// A workspace member's own locks that its package manager never reads
@@ -737,7 +789,7 @@ fn join_paths(dir: &Path, names: &[&str]) -> String {
 }
 
 /// The governing `package.json` workspace root of a member and the
-/// workspace locks it holds (see [`package_json_workspace_refusal`]).
+/// workspace locks it holds (see [`package_json_workspace_elsewhere`]).
 async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'static str>)> {
     let canonical = tokio::fs::canonicalize(root)
         .await
@@ -950,25 +1002,24 @@ async fn read_head(path: &Path) -> String {
 /// would find the member's copy, pin nothing and report success. The
 /// nearest ancestor whose patterns match is the root; one without a lock
 /// (never installed) refuses nothing.
-async fn vlt_workspace_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
+async fn vlt_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> {
     let (ancestor, source) = vlt_workspace_root(root).await?;
-    let lock = ancestor.join(VLT_LOCK);
-    let refusal = Refusal {
-        code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
-        message: format!(
+    Some(LockElsewhere {
+        code: WORKSPACE_LOCKFILE_ELSEWHERE,
+        detail: format!(
             "{} is a workspace member with no lockfile of its own: the workspace \
-             root {} lists it under \"{}\" in {} and installs it from {}, \
-             which a hosted run here cannot see; run socket-patch from {} (the \
-             workspace root); nothing was written",
+             root {} lists it under \"{}\" in {} and installs it from {}",
             root.display(),
             ancestor.display(),
             source.field(),
             ancestor.join(source.file()).display(),
-            lock.display(),
-            ancestor.display()
+            ancestor.join(VLT_LOCK).display(),
         ),
-    };
-    Some((ancestor, refusal))
+        shown_dir: ancestor.clone(),
+        dir: ancestor,
+        dir_kind: "workspace root",
+        vendorable_dir: true,
+    })
 }
 
 /// The file a vlt workspace root lists its members in.
@@ -999,7 +1050,7 @@ impl VltWorkspaceSource {
 
 /// The nearest ancestor whose vlt workspace patterns ([`vlt_workspace_groups`])
 /// match the project directory, when it holds `vlt-lock.json` (see
-/// [`vlt_workspace_refusal`]), with the file that lists the member.
+/// [`vlt_workspace_elsewhere`]), with the file that lists the member.
 async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)> {
     let canonical = tokio::fs::canonicalize(root)
         .await
@@ -1177,13 +1228,10 @@ async fn vlt_json_declares_workspaces(dir: &Path) -> bool {
         .is_some()
 }
 
-/// The refusal of the nearer (deeper) of two governing roots.
-fn nearer_root(
-    a: Option<(PathBuf, Refusal)>,
-    b: Option<(PathBuf, Refusal)>,
-) -> Option<(PathBuf, Refusal)> {
+/// The nearer (deeper) of two governing roots; a tie goes to `a`.
+fn nearer_root(a: Option<LockElsewhere>, b: Option<LockElsewhere>) -> Option<LockElsewhere> {
     match (a, b) {
-        (Some(a), Some(b)) => Some(if b.0.starts_with(&a.0) && b.0 != a.0 {
+        (Some(a), Some(b)) => Some(if b.dir.starts_with(&a.dir) && b.dir != a.dir {
             b
         } else {
             a

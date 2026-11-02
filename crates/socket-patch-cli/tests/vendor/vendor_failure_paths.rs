@@ -176,6 +176,52 @@ fn missing_package_with_no_lock_and_no_ledger_fails_before_any_fetch() {
     );
 }
 
+/// #1904: run from an npm workspace member with no lock of its own, the
+/// vendored refusal keeps `vendor_lockfile_missing` but names the
+/// workspace root to vendor from, instead of the "run your package
+/// manager's install first" remedy (an install in the member only
+/// updates the root lock, so that advice loops). Nothing is written.
+#[test]
+fn lockless_workspace_member_refusal_names_the_workspace_root() {
+    let fx = npm_fixture();
+    let root = fx.root();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    for entry in ["node_modules", ".socket", "package.json"] {
+        std::fs::rename(root.join(entry), member.join(entry)).unwrap();
+    }
+    std::fs::write(
+        root.join("package.json"),
+        br#"{"name":"app","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+
+    let (code, env) = vendor_cli(&member, &["--offline"]);
+    assert_eq!(code, 1, "the member run must fail closed: {env:#}");
+    let failed = find_event(&env, "failed", Some("vendor_lockfile_missing"));
+    assert_eq!(failed["purl"], PURL);
+    let detail = failed["error"].as_str().unwrap_or_default();
+    let canonical = std::fs::canonicalize(root).unwrap();
+    assert!(
+        detail.contains(&format!("vendor from {}", canonical.display()))
+            && detail.contains("workspace member"),
+        "the refusal names the workspace root: {env:#}"
+    );
+    assert!(
+        !detail.contains("install first"),
+        "no looping install remedy: {env:#}"
+    );
+    assert_eq!(
+        fx.lock_bytes(),
+        fx.original_lock,
+        "the root lock is untouched"
+    );
+    assert!(
+        !member.join(".socket/vendor").exists(),
+        "nothing is vendored into the member"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 3. hosted-pin takeover guard (v5: lockfile pins, no redirect ledger)
 // ─────────────────────────────────────────────────────────────────────
