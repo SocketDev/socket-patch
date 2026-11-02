@@ -176,17 +176,17 @@ pub(crate) struct PlanNote {
 }
 
 /// A lockfile wires the package to different patches (`wiring_conflict`).
-pub(crate) const NOTE_WIRING_CONFLICT: &str = "vex_wiring_conflict";
+const NOTE_WIRING_CONFLICT: &str = "vex_wiring_conflict";
 /// A recorded patch is superseded by the lockfile-wired one.
-pub(crate) const NOTE_RECORD_SUPERSEDED: &str = "vex_record_superseded";
+const NOTE_RECORD_SUPERSEDED: &str = "vex_record_superseded";
 /// A ledger claim died although the lockfiles still mention the patch.
-pub(crate) const NOTE_CLAIM_UNWIRED: &str = "vex_claim_unwired";
+const NOTE_CLAIM_UNWIRED: &str = "vex_claim_unwired";
 /// `--offline` forbids fetching the records the plan needs.
-pub(crate) const NOTE_RECORD_OFFLINE: &str = "vex_record_offline";
+const NOTE_RECORD_OFFLINE: &str = "vex_record_offline";
 /// The patch API has no such patch.
-pub(crate) const NOTE_RECORD_NOT_FOUND: &str = "vex_record_not_found";
+const NOTE_RECORD_NOT_FOUND: &str = "vex_record_not_found";
 /// A record fetch failed (transport, server, paid-only, ...).
-pub(crate) const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
+const NOTE_RECORD_FETCH_FAILED: &str = "vex_record_fetch_failed";
 /// The public proxy served free patches only: the authenticated API refused
 /// the credentials (`get` / `scan`'s fallback), or a token was set but its
 /// org could not be resolved, so the run's client is on the proxy.
@@ -211,15 +211,27 @@ pub(crate) fn api_auth_fallback_warning(
 /// Omission tag and note: a hosted Gradle pin is wired, but a lock file
 /// records a release above its base, which that build resolves instead
 /// (`vex::Unattested`).
-pub(crate) const NOTE_LOCK_ABOVE_BASE: &str = "vex_gradle_lock_above_base";
+const NOTE_LOCK_ABOVE_BASE: &str = "vex_gradle_lock_above_base";
 /// Omission tag and note: an npm pin is wired, but its pnpm lock names a
 /// package that bundles a copy of it, which no wiring reaches
 /// (`vex::Unattested`, `UnattestedKind::BundledCopy`).
-pub(crate) const NOTE_PNPM_BUNDLED_COPY: &str = "vex_pnpm_bundled_copy";
+const NOTE_PNPM_BUNDLED_COPY: &str = "vex_pnpm_bundled_copy";
 /// Omission tag and note: an npm pin is wired, but `deno.lock` locks the
 /// same version, which `deno install` installs without the wiring
 /// (`vex::Unattested`, `UnattestedKind::DenoLock`).
-pub(crate) const NOTE_DENO_LOCK_COPY: &str = "vex_deno_lock_copy";
+const NOTE_DENO_LOCK_COPY: &str = "vex_deno_lock_copy";
+
+/// Omission tag and note: the patch is wired only in a root
+/// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
+/// never reads (`vex::Unattested`).
+const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
+/// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
+/// module's own `<version>` may override it (`vex::Unattested`).
+const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
+/// Omission tag and note: a hosted Maven pin's GA also has an executable
+/// classifier copy at another version, which the pin does not reach
+/// (`vex::Unattested`).
+const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -257,22 +269,6 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              wiring itself is intact, so re-running `scan` does not change this",
         ),
     }
-}
-
-/// Omission tag and note: the patch is wired only in a root
-/// `npm-shrinkwrap.json` with no `package-lock.json` twin, which npm >= 12
-/// never reads (`vex::Unattested`, #899).
-pub(crate) const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
-/// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
-/// module's own `<version>` may override it (`vex::Unattested`, #261).
-pub(crate) const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
-/// Omission tag and note: a hosted Maven pin's GA also has an executable
-/// classifier copy at another version, which the pin does not reach
-/// (`vex::Unattested`).
-pub(crate) const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
-
-fn note(code: &'static str, detail: String) -> PlanNote {
-    PlanNote { code, detail }
 }
 
 /// One hosted-basis view purl's wiring (see [`Plan::hosted`]).
@@ -356,7 +352,7 @@ pub(crate) async fn plan(
     assume_live: &[String],
     api_client: &RunApiClient,
 ) -> Plan {
-    // The ledgers' project (#745): liveness and JVM wiring are judged where
+    // The ledgers' project: liveness and JVM wiring are judged where
     // the ledger and the discovery that gates it were read.
     let root_buf = common.project_root();
     let root = root_buf.as_path();
@@ -408,14 +404,14 @@ pub(crate) async fn plan(
             for key in keys {
                 gated.push(failed(&key, WIRING_CONFLICT));
             }
-            notes.push(note(
-                NOTE_WIRING_CONFLICT,
-                format!(
+            notes.push(PlanNote {
+                code: NOTE_WIRING_CONFLICT,
+                detail: format!(
                     "{pkg}: the lockfiles wire it to different patches ({wiring}); which one the \
                      build installs cannot be told from the files, so none is attested — make \
                      the lockfiles agree (re-run `socket-patch scan` or delete the stale lock)"
                 ),
-            ));
+            });
         }
     }
     let superseded = attach_discovered(&mut cands, &discovery, &vendor, &conflicts);
@@ -436,26 +432,25 @@ pub(crate) async fn plan(
         };
         let (code, remedy) = unattested_note(u.kind);
         gated.push(failed(&c.key, code));
-        notes.push(note(
+        notes.push(PlanNote {
             code,
-            format!(
+            detail: format!(
                 "{}: patch {} is wired, but {}; {remedy}",
                 c.key, c.uuid, u.detail
             ),
-        ));
+        });
         false
     });
     for (key, old_uuid, wired) in &superseded {
-        notes.push(note(
-            NOTE_RECORD_SUPERSEDED,
-            format!(
+        notes.push(PlanNote {
+            code: NOTE_RECORD_SUPERSEDED,
+            detail: format!(
                 "{key}: the recorded patch {old_uuid} is superseded by the lockfile-wired patch \
                  {wired}; attesting only what the lockfile wires"
             ),
-        ));
+        });
     }
 
-    // ── bases + liveness ────────────────────────────────────────────────
     let mut liveness = LedgerLiveness::new(root, &discovery, redirect.as_ref());
     let mut based: Vec<(Cand, Basis)> = Vec::new();
     for mut cand in cands {
@@ -469,10 +464,10 @@ pub(crate) async fn plan(
             {
                 const CODE: &str = "vendor_jvm_shape_unsupported";
                 gated.push(failed(&cand.key, CODE));
-                notes.push(note(
-                    CODE,
-                    format!("{}: cannot establish JVM wiring: {detail}", cand.key),
-                ));
+                notes.push(PlanNote {
+                    code: CODE,
+                    detail: format!("{}: cannot establish JVM wiring: {detail}", cand.key),
+                });
                 continue;
             }
         }
@@ -550,7 +545,6 @@ pub(crate) async fn plan(
         based.push((cand, basis));
     }
 
-    // ── record resolution ───────────────────────────────────────────────
     let mut need_api: Vec<usize> = Vec::new();
     for (i, (cand, _)) in based.iter_mut().enumerate() {
         if cand.record.is_some() {
@@ -596,7 +590,6 @@ pub(crate) async fn plan(
         }
     }
 
-    // ── assemble ────────────────────────────────────────────────────────
     let mut plan = Plan {
         view: PatchManifest {
             patches: HashMap::new(),
@@ -892,52 +885,41 @@ fn vendored_entry_for(cand: &Cand, vref: &PatchedRef) -> VendorEntry {
     }
 }
 
-/// [`recognized_dead_note`] for each dead `(uuid, mode, ledger)` claim of
-/// one candidate.
+/// One `vex_claim_unwired` note per dead `(uuid, mode, ledger)` claim of one
+/// candidate that discovery's authority killed although the lockfiles still
+/// MENTION the patch (rule 11): which files, and the extractor's own reason
+/// when it gave one (a diagnostic from one of those files naming the uuid).
+/// A claim whose uuid discovery does not recognize died on the ledger's own
+/// evidence; its skip reason says all there is, so it gets no note.
 fn dead_claim_notes(
     discovery: &Discovery,
     key: &str,
     claims: &[(&str, WiringMode, &str)],
 ) -> Vec<PlanNote> {
-    claims
-        .iter()
-        .filter_map(|(uuid, mode, ledger)| {
-            recognized_dead_note(discovery, key, uuid, *mode, ledger)
-        })
-        .map(|detail| note(NOTE_CLAIM_UNWIRED, detail))
-        .collect()
-}
-
-/// The human note for a ledger claim discovery's authority killed although
-/// the lockfiles still MENTION the patch (rule 11): which files, and the
-/// extractor's own reason when it gave one (a diagnostic from one of those
-/// files naming the uuid). `None` when discovery does not recognize the
-/// uuid — the claim then died on the ledger's own evidence, and the skip
-/// reason says all there is.
-fn recognized_dead_note(
-    discovery: &Discovery,
-    key: &str,
-    uuid: &str,
-    mode: WiringMode,
-    ledger: &str,
-) -> Option<String> {
-    let files = discovery.recognized_files(uuid, mode);
-    if files.is_empty() {
-        return None;
+    let mut notes = Vec::new();
+    for &(uuid, mode, ledger) in claims {
+        let files = discovery.recognized_files(uuid, mode);
+        if files.is_empty() {
+            continue;
+        }
+        let reason = discovery
+            .diagnostics
+            .iter()
+            .find(|d| files.contains(&d.file.as_path()) && d.detail.contains(uuid))
+            .map(|d| format!(" ({}: {})", d.code, d.detail))
+            .unwrap_or_default();
+        let names: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
+        notes.push(PlanNote {
+            code: NOTE_CLAIM_UNWIRED,
+            detail: format!(
+                "{key}: the {ledger} records patch {uuid}, and {} still mention{} it, but not as \
+                 wiring the package manager consumes for this package{reason}; not attested",
+                names.join(", "),
+                if names.len() == 1 { "s" } else { "" },
+            ),
+        });
     }
-    let reason = discovery
-        .diagnostics
-        .iter()
-        .find(|d| files.contains(&d.file.as_path()) && d.detail.contains(uuid))
-        .map(|d| format!(" ({}: {})", d.code, d.detail))
-        .unwrap_or_default();
-    let names: Vec<String> = files.iter().map(|f| f.display().to_string()).collect();
-    Some(format!(
-        "{key}: the {ledger} records patch {uuid}, and {} still mention{} it, but not as \
-         wiring the package manager consumes for this package{reason}; not attested",
-        names.join(", "),
-        if names.len() == 1 { "s" } else { "" },
-    ))
+    notes
 }
 
 /// A local record for `uuid` (manifest, then redirect ledger, then vendor
@@ -989,15 +971,15 @@ async fn fetch_records(
     }
     if common.offline {
         let n = uuids.len();
-        notes.push(note(
-            NOTE_RECORD_OFFLINE,
-            format!(
+        notes.push(PlanNote {
+            code: NOTE_RECORD_OFFLINE,
+            detail: format!(
                 "{} no local record (manifest or .socket/vendor ledgers), and --offline forbids \
                  fetching {} from the patch API",
                 plural(n, "lockfile-wired patch has", "lockfile-wired patches have"),
                 if n == 1 { "it" } else { "them" },
             ),
-        ));
+        });
         return out;
     }
     let overrides = common.api_client_overrides();
@@ -1013,7 +995,10 @@ async fn fetch_records(
     // reports this itself).
     if built_here && common.json {
         if let Some(reason) = client.org_unresolved() {
-            notes.push(note(NOTE_API_AUTH_FALLBACK, reason.to_string()));
+            notes.push(PlanNote {
+                code: NOTE_API_AUTH_FALLBACK,
+                detail: reason.to_string(),
+            });
         }
     }
     let mut use_public_proxy = client.uses_public_proxy();
@@ -1058,18 +1043,18 @@ async fn fetch_records(
                             socket_patch_core::manifest::records::record_from_patch_response(&view),
                         );
                     }
-                    Ok(None) => notes.push(note(
-                        NOTE_RECORD_NOT_FOUND,
-                        format!("Patch {uuid} was not found by the patch API"),
-                    )),
+                    Ok(None) => notes.push(PlanNote {
+                        code: NOTE_RECORD_NOT_FOUND,
+                        detail: format!("Patch {uuid} was not found by the patch API"),
+                    }),
                     Err(e) if !use_public_proxy && is_fallback_candidate(&e) => {
                         auth_error.get_or_insert_with(|| e.to_string());
                         auth_refused.push(uuid)
                     }
-                    Err(e) => notes.push(note(
-                        NOTE_RECORD_FETCH_FAILED,
-                        format!("Could not fetch patch {uuid}: {e}"),
-                    )),
+                    Err(e) => notes.push(PlanNote {
+                        code: NOTE_RECORD_FETCH_FAILED,
+                        detail: format!("Could not fetch patch {uuid}: {e}"),
+                    }),
                 }
             }
         }
@@ -1078,14 +1063,14 @@ async fn fetch_records(
         }
         // Same stale-credential recovery (and warning text) as `get` /
         // `scan`: free patches are still served by the public proxy.
-        notes.push(note(
-            NOTE_API_AUTH_FALLBACK,
-            format!(
+        notes.push(PlanNote {
+            code: NOTE_API_AUTH_FALLBACK,
+            detail: format!(
                 "authenticated API returned {}; falling back to public patch API proxy (free \
                  patches only).",
                 auth_error.unwrap_or_default()
             ),
-        ));
+        });
         client = build_proxy_fallback_client(&overrides);
         use_public_proxy = true;
         // The refused views are fetched again: not done yet.

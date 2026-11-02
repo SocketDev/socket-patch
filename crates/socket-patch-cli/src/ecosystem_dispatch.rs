@@ -2036,16 +2036,12 @@ mod tests {
     // temp `node_modules`, so a regression in the macro plumbing (wrong
     // crawler/path method, dropped result, swapped merge) is caught.
 
-    use std::io::Write as _;
-
     /// Lay down `node_modules/<name>/package.json` under `root` with the
     /// given version, returning the package directory the crawler should
     /// resolve the PURL to.
     fn write_npm_package(root: &std::path::Path, name: &str, version: &str) -> PathBuf {
         let pkg_dir = root.join("node_modules").join(name);
-        std::fs::create_dir_all(&pkg_dir).unwrap();
-        let mut f = std::fs::File::create(pkg_dir.join("package.json")).unwrap();
-        write!(f, r#"{{"name":"{name}","version":"{version}"}}"#).unwrap();
+        write_package_json(&pkg_dir, name, version);
         pkg_dir
     }
 
@@ -2258,6 +2254,128 @@ mod tests {
         // contract) keeps the first store's copy.
         let single = find_packages_for_purls(&partitioned, &opts, true).await;
         assert_eq!(single.get(&purl), Some(&scoped_copy));
+    }
+
+    fn npm_scope(root: &std::path::Path) -> crate::args::GlobalArgs {
+        crate::args::GlobalArgs {
+            cwd: root.to_path_buf(),
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..crate::args::GlobalArgs::default()
+        }
+    }
+
+    fn sorted(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+        paths.sort();
+        paths
+    }
+
+    fn write_package_json(dir: &std::path::Path, name: &str, version: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"{version}"}}"#),
+        )
+        .unwrap();
+    }
+
+    /// The every-copy lookup `vex` judges hosted npm purls by takes alias
+    /// installs as copies beside the own-name one: scoped keys, nested trees
+    /// and scoped targets count; hidden dirs, other versions and symlinks do
+    /// not. No second alias walk backs this lookup up.
+    #[tokio::test]
+    async fn manifest_copies_take_npm_alias_installs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let nm = root.join("node_modules");
+        write_package_json(&nm.join("minimist"), "minimist", "1.2.2");
+        write_package_json(&nm.join("mm"), "minimist", "1.2.2");
+        write_package_json(&nm.join("@me/mm"), "minimist", "1.2.2");
+        write_package_json(&nm.join("dep/node_modules/deep"), "minimist", "1.2.2");
+        write_package_json(&nm.join("old"), "minimist", "1.2.8");
+        write_package_json(
+            &nm.join(".pnpm/minimist@1.2.2/node_modules/x"),
+            "minimist",
+            "1.2.2",
+        );
+        write_package_json(&nm.join("sc"), "@scope/pkg", "1.0.0");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(nm.join("mm"), nm.join("linked")).unwrap();
+
+        let purls = vec![
+            "pkg:npm/minimist@1.2.2".to_string(),
+            "pkg:npm/%40scope/pkg@1.0.0".to_string(),
+        ];
+        let found =
+            find_manifest_package_copies_reusing(&purls, &npm_scope(root), true, None).await;
+        assert_eq!(
+            sorted(found["pkg:npm/minimist@1.2.2"].clone()),
+            sorted(vec![
+                nm.join("@me/mm"),
+                nm.join("dep/node_modules/deep"),
+                nm.join("minimist"),
+                nm.join("mm"),
+            ])
+        );
+        assert_eq!(found["pkg:npm/%40scope/pkg@1.0.0"], vec![nm.join("sc")]);
+    }
+
+    /// A workspace member's alias install is a consumed copy even when the
+    /// root holds the package under its own name: every importer tree the
+    /// crawler enumerates is searched, and `--global-prefix` searches the
+    /// prefix.
+    #[tokio::test]
+    async fn manifest_copies_walk_every_npm_workspace_members_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_package_json(&root.join("node_modules/left-pad"), "left-pad", "1.3.0");
+        write_package_json(
+            &root.join("packages/a/node_modules/lp"),
+            "left-pad",
+            "1.3.0",
+        );
+        write_package_json(
+            &root.join("packages/a/node_modules/dep/node_modules/deep"),
+            "left-pad",
+            "1.3.0",
+        );
+        write_package_json(
+            &root.join("apps/web/node_modules/@me/lp"),
+            "left-pad",
+            "1.3.0",
+        );
+        write_package_json(
+            &root.join("apps/web/node_modules/left-pad"),
+            "left-pad",
+            "1.3.0",
+        );
+
+        let purl = "pkg:npm/left-pad@1.3.0";
+        let got =
+            find_manifest_package_copies_reusing(&[purl.to_string()], &npm_scope(root), true, None)
+                .await;
+        assert_eq!(
+            sorted(got[purl].clone()),
+            sorted(vec![
+                root.join("apps/web/node_modules/@me/lp"),
+                root.join("apps/web/node_modules/left-pad"),
+                root.join("node_modules/left-pad"),
+                root.join("packages/a/node_modules/dep/node_modules/deep"),
+                root.join("packages/a/node_modules/lp"),
+            ])
+        );
+
+        let prefix = root.join("packages/a/node_modules");
+        let under_prefix = crate::args::GlobalArgs {
+            global_prefix: Some(prefix.clone()),
+            ..npm_scope(root)
+        };
+        let got =
+            find_manifest_package_copies_reusing(&[purl.to_string()], &under_prefix, true, None)
+                .await;
+        assert_eq!(
+            sorted(got[purl].clone()),
+            vec![prefix.join("dep/node_modules/deep"), prefix.join("lp")]
+        );
     }
 
     #[tokio::test]
