@@ -408,8 +408,9 @@ fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Op
 }
 
 /// The `(name, version)` of the workspace member at lock key `member`: its
-/// `name` field, else the name of the root link entry that points at it
-/// (npm omits `name` when it matches), else its folder name.
+/// `name` field, else the name of the root-level link entry that points at
+/// it (npm omits `name` when it matches; a nested link may be an alias),
+/// else its folder name, keeping an `@scope/` parent as npm does.
 fn workspace_member(packages: &Map<String, Value>, member: &str) -> (String, Option<String>) {
     let entry = packages.get(member);
     let version = entry
@@ -422,15 +423,14 @@ fn workspace_member(packages: &Map<String, Value>, member: &str) -> (String, Opt
         .map(str::to_string)
         .or_else(|| {
             packages.iter().find_map(|(key, link)| {
+                let name = key.strip_prefix("node_modules/")?;
+                let root_level = !name.contains("/node_modules/");
                 let linked = link.get("link").and_then(Value::as_bool) == Some(true)
                     && link.get("resolved").and_then(Value::as_str) == Some(member);
-                linked
-                    .then(|| key.rsplit_once("node_modules/").map(|(_, name)| name))
-                    .flatten()
-                    .map(str::to_string)
+                (root_level && linked).then(|| name.to_string())
             })
         })
-        .unwrap_or_else(|| member.rsplit('/').next().unwrap_or(member).to_string());
+        .unwrap_or_else(|| name_from_folder(member));
     (name, version)
 }
 
@@ -583,16 +583,20 @@ pub(crate) fn npm_link_source_identity(lock: &Value, link: &Value) -> Option<(St
     let version = source.get("version")?.as_str()?;
     let name = match source.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
-        None => {
-            let mut segments = resolved.rsplit('/');
-            let base = segments.next().unwrap_or(resolved);
-            match segments.next() {
-                Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
-                _ => base.to_string(),
-            }
-        }
+        None => name_from_folder(resolved),
     };
     Some((name, version.to_string()))
+}
+
+/// A package's name from its folder path, as npm's `nameFromFolder` reads
+/// it: the last segment, keeping an `@scope/` parent.
+fn name_from_folder(path: &str) -> String {
+    let mut segments = path.rsplit('/');
+    let base = segments.next().unwrap_or(path);
+    match segments.next() {
+        Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
+        _ => base.to_string(),
+    }
 }
 
 /// Every `packages` key installed beneath a package that ships its own
@@ -1478,6 +1482,56 @@ mod tests {
                 // `other`'s hoisted copy is outside the member's subtree.
                 assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
             }
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_workspace_member_is_named_as_npm_names_it() {
+        // The second Bugbot probe: a scoped member without a `name` field
+        // keeps its `@scope/` folder, and the root workspace link names it
+        // even when a nested alias link to the same folder sorts first.
+        let left_pad = json!({ "version": "1.3.0", "resolved": REGISTRY_TGZ });
+        let deps = json!({ "left-pad": "^1.3.0" });
+        let scoped = lock(json!({
+            "": { "workspaces": ["packages/*"] },
+            "packages/@s/app": { "version": "1.0.0", "dependencies": deps },
+            "packages/@s/app/node_modules/left-pad": left_pad,
+        }));
+        let aliased = lock(json!({
+            "": { "workspaces": ["packages/*"] },
+            "node_modules/a/node_modules/alias": { "resolved": "packages/app", "link": true },
+            "node_modules/app": { "resolved": "packages/app", "link": true },
+            "packages/app": { "version": "1.0.0", "dependencies": deps },
+            "packages/app/node_modules/left-pad": left_pad,
+        }));
+        for (lock, key, scope, flagged) in [
+            (
+                &scoped,
+                "packages/@s/app/node_modules/left-pad",
+                "@s/app",
+                true,
+            ),
+            (
+                &scoped,
+                "packages/@s/app/node_modules/left-pad",
+                "app",
+                false,
+            ),
+            (&aliased, "packages/app/node_modules/left-pad", "app", true),
+            (
+                &aliased,
+                "packages/app/node_modules/left-pad",
+                "alias",
+                false,
+            ),
+        ] {
+            let found = npm_non_registry_entries(
+                lock,
+                &NpmOverrides::from_manifest(&json!({
+                    "overrides": { scope: { "left-pad": REGISTRY_TGZ } }
+                })),
+            );
+            assert_eq!(found.contains_key(key), flagged, "{scope}: {found:?}");
         }
     }
 
