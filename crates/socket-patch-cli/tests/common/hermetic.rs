@@ -54,13 +54,12 @@ pub const FORCED_OPT_OUTS: &[(&str, &str)] = &[
     ("SOCKET_TELEMETRY_DISABLED", "1"),
 ];
 
-/// A `Command` for `bin` with the hermetic `SOCKET_*` environment: every
-/// flag-bound `SOCKET_*` and every other ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
-/// public proxy), and the three opt-outs (config layer, update notifier,
-/// telemetry) forced on, and [`COLOR_ENV`] removed. Callers add args, cwd
-/// and their own env
-/// afterwards; caller env lands last, so explicit injections survive the
-/// scrub.
+/// A `Command` for `bin` with the hermetic environment: every flag-bound
+/// and every other ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN`
+/// also forces the public proxy), [`COLOR_ENV`] removed, and the three
+/// opt-outs (config layer, update notifier, telemetry) forced on. Callers
+/// add args, cwd and their own env afterwards; caller env lands last, so
+/// explicit injections survive the scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
     for k in COLOR_ENV {
@@ -77,6 +76,9 @@ pub fn command(bin: &Path) -> Command {
         cmd.env_remove(k);
     }
     cmd.env_remove("SOCKET_API_TOKEN");
+    // Not flag-bound; removed by name for the same reason.
+    cmd.env_remove("SOCKET_UPDATE_BASE_URL");
+    cmd.env_remove("SOCKET_UPDATE_STATE_DIR");
     // The `SOCKET_CLI_*` peer names too: the binary promotes each onto its
     // canonical `SOCKET_*` name, so a peer token set mid-run would put the
     // child on the authenticated path.

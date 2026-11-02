@@ -239,38 +239,34 @@ fn workflow_env_copies_carry_every_opt_out() {
     );
 }
 
-/// The highest-risk ambient values: each flips a mode, a target or the
-/// output a test asserts on. Set in this process, so a dropped scrub fails.
-const HOSTILE_AMBIENT: &[(&str, &str)] = &[
-    ("SOCKET_CWD", "/nonexistent"),
-    ("SOCKET_GLOBAL", "true"),
-    ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
-    ("SOCKET_DRY_RUN", "true"),
-    ("SOCKET_SAVE_ONLY", "true"),
-    ("SOCKET_YES", "true"),
-    ("SOCKET_ECOSYSTEMS", "cargo"),
-    ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
-    ("SOCKET_JSON", "true"),
-    ("SOCKET_SILENT", "true"),
-    ("SOCKET_VERBOSE", "true"),
-    ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
-    ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
-    ("SOCKET_API_TOKEN", "ambient-token"),
-    ("SOCKET_API_URL", "http://127.0.0.1:1/hostile"),
-    ("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile"),
-    ("SOCKET_OFFLINE", "true"),
-    ("NO_COLOR", "1"),
-    ("CLICOLOR", "1"),
-    ("CLICOLOR_FORCE", "1"),
-    ("COLUMNS", "20"),
-];
+/// Every flag-bound var but the forced opt-outs, plus the other high-risk
+/// `SOCKET_*` values and the color env, set in this process so a dropped
+/// scrub fails.
+fn hostile_ambient() -> Vec<(&'static str, &'static str)> {
+    let args = socket_patch_cli::args::GLOBAL_ARG_ENV_VARS
+        .iter()
+        .chain(socket_patch_cli::args::LOCAL_ARG_ENV_VARS)
+        .filter(|k| !hermetic::FORCED_OPT_OUTS.iter().any(|(f, _)| f == *k))
+        .map(|k| (*k, "true"));
+    let other = [
+        ("SOCKET_API_TOKEN", "ambient-token"),
+        ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
+        ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
+        ("NO_COLOR", "1"),
+        ("CLICOLOR", "1"),
+        ("CLICOLOR_FORCE", "1"),
+        ("COLUMNS", "20"),
+    ];
+    args.chain(other).collect()
+}
 
 #[test]
 #[serial]
 fn command_scrubs_hostile_ambient_env() {
-    with_ambient(HOSTILE_AMBIENT, || {
+    let hostile = hostile_ambient();
+    with_ambient(&hostile, || {
         let env = effective_env(&hermetic::command(Path::new("socket-patch")));
-        for (key, _) in HOSTILE_AMBIENT {
+        for (key, _) in &hostile {
             assert_eq!(get(&env, key), None, "ambient {key} must be scrubbed");
         }
     });
@@ -363,17 +359,16 @@ fn pty_command_carries_the_same_env_as_command() {
 #[test]
 #[serial]
 fn pty_command_scrubs_hostile_ambient_env_and_keeps_caller_env() {
-    let mut cmd = None;
-    with_ambient(HOSTILE_AMBIENT, || {
-        cmd = Some(hermetic::pty_binary_command());
+    let hostile = hostile_ambient();
+    with_ambient(&hostile, || {
+        let mut cmd = hermetic::pty_binary_command();
+        let env = pty_env(&cmd);
+        for (key, _) in &hostile {
+            assert_eq!(env.get(*key), None, "ambient {key} must be scrubbed");
+        }
+        cmd.env("SOCKET_NO_UPDATE_CHECK", "0");
+        assert_eq!(cmd.get_env("SOCKET_NO_UPDATE_CHECK"), Some("0".as_ref()));
     });
-    let mut cmd = cmd.unwrap();
-    let env = pty_env(&cmd);
-    for (key, _) in HOSTILE_AMBIENT {
-        assert_eq!(env.get(*key), None, "ambient {key} must be scrubbed");
-    }
-    cmd.env("SOCKET_NO_UPDATE_CHECK", "0");
-    assert_eq!(cmd.get_env("SOCKET_NO_UPDATE_CHECK"), Some("0".as_ref()));
 }
 
 #[test]

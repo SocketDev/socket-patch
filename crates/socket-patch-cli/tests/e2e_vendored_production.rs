@@ -87,8 +87,8 @@
 //! No API token is used or needed — the suite deliberately runs against the
 //! **free public proxy** with `SOCKET_NO_CONFIG=true` so a developer's
 //! socket-cli login cannot move the run onto the org catalog. Every ambient
-//! `SOCKET_*` var is scrubbed and hostile seeds are planted so a dropped scrub
-//! turns the suite red immediately.
+//! `SOCKET_*` var is scrubbed; `spawn_env_hygiene` turns red if a scrub is
+//! dropped.
 //!
 //! # Running
 //!
@@ -324,9 +324,9 @@ fn has_corepack_pm(pm: &str) -> bool {
 /// would silently point the run at staging; an ambient `SOCKET_API_TOKEN` (or a
 /// socket-cli login on disk) would move it off the free public proxy this suite
 /// exists to cover. The shared builder (`hermetic::binary_command`) removes
-/// every ambient `SOCKET_*`, seeds those three with hostile values and removes
-/// them (so a dropped scrub reddens the suite instead of leaking a developer's
-/// shell), and forces `SOCKET_NO_CONFIG=1` to block the socket-cli
+/// every ambient `SOCKET_*` (`spawn_env_hygiene` seeds those three in the
+/// test process and fails if one reaches the child), and forces
+/// `SOCKET_NO_CONFIG=1` to block the socket-cli
 /// config.json. The crawler's own ambient inputs are scrubbed too
 /// (`hermetic::CRAWLER_EXTRAS`: an activated venv, `BUNDLE_*`, `COMPOSER_*`),
 /// so an ambient BUNDLE_PATH can't move the gem leg's crawl off
