@@ -422,9 +422,50 @@ pub(crate) fn npm_non_registry_entries(
     lock: &Value,
     overrides: &NpmOverrides,
 ) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
+    non_registry_entries(lock, overrides)
+        .into_iter()
+        .map(|(key, found)| (key, found.reason))
+        .collect()
+}
+
+/// The [`npm_non_registry_entries`] keys whose only evidence is an
+/// `overrides` rule that swaps a registry spec for a url, git or path one
+/// (#1965). Their `resolved` is a registry-style tarball url, so a Socket
+/// rewriter from before #1965 may have wired them: unlike the other
+/// non-registry entries, a Socket ref there is the rewriters' own output,
+/// which rollback and remove must still unwind.
+pub(crate) fn npm_override_only_entries(
+    lock: &Value,
+    overrides: &NpmOverrides,
+) -> std::collections::BTreeSet<String> {
+    non_registry_entries(lock, overrides)
+        .into_iter()
+        .filter(|(_, found)| found.override_only)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Why one `packages` entry is a non-registry install.
+struct NonRegistry {
+    /// The first reason found (for the skip warnings).
+    reason: String,
+    /// Every piece of evidence is a registry spec that `overrides` swap
+    /// for a non-registry one.
+    override_only: bool,
+}
+
+fn non_registry_entries(lock: &Value, overrides: &NpmOverrides) -> BTreeMap<String, NonRegistry> {
+    let mut out: BTreeMap<String, NonRegistry> = BTreeMap::new();
+    let mut note = |key: String, reason: String, override_only: bool| {
+        out.entry(key)
+            .and_modify(|found| found.override_only &= override_only)
+            .or_insert(NonRegistry {
+                reason,
+                override_only,
+            });
+    };
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
-        return out;
+        return BTreeMap::new();
     };
     for (key, entry) in packages {
         if !key.contains("node_modules/") {
@@ -432,7 +473,7 @@ pub(crate) fn npm_non_registry_entries(
         }
         if let Some(resolved) = entry.get("resolved").and_then(Value::as_str) {
             if resolved_is_non_registry(resolved) {
-                out.insert(key.clone(), format!("it resolves to {resolved:?}"));
+                note(key.clone(), format!("it resolves to {resolved:?}"), false);
             }
         }
     }
@@ -452,7 +493,8 @@ pub(crate) fn npm_non_registry_entries(
                         format!("`{from}`")
                     }
                 };
-                let reason = if npm_spec_is_registry(spec) {
+                let override_only = npm_spec_is_registry(spec);
+                let reason = if override_only {
                     // An override that swaps a registry spec for a url, git
                     // or path one makes npm install from that spec, though
                     // the lock's `resolved` still looks like the registry's
@@ -484,7 +526,7 @@ pub(crate) fn npm_non_registry_entries(
                 let Some(target) = resolve_edge(packages, from, dep_name) else {
                     continue;
                 };
-                out.entry(target).or_insert(reason);
+                note(target, reason, override_only);
             }
         }
     }

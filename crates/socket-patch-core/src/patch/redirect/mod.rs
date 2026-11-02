@@ -20871,6 +20871,87 @@ mod tests {
         assert!(!r.files.contains_key("package.json"));
     }
 
+    /// #1965: `foo` depends on left-pad by a registry range and the root
+    /// `overrides` swap it for a remote tarball url, so npm installs that
+    /// url whatever the lock's (registry-looking) `resolved` says. The
+    /// rewriter must skip the entry loudly and keep it out of the VEX.
+    #[test]
+    fn issue_1965_a_registry_edge_overridden_to_a_url_is_unredirected() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+                "node_modules/foo": {
+                    "version": "1.0.0",
+                    "resolved": "file:foo-1.0.0.tgz",
+                    "dependencies": { "left-pad": "^1.3.0" }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let files_with = |manifest_overrides: Value| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({
+                    "name": "app",
+                    "dependencies": { "foo": "file:foo-1.0.0.tgz" },
+                    "overrides": manifest_overrides
+                })
+                .to_string(),
+            );
+            files
+        };
+        for manifest_overrides in [
+            json!({ "left-pad": url }),
+            json!({ "foo": { "left-pad": url } }),
+            json!({ "left-pad": "github:someone/left-pad" }),
+        ] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            let skipped = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_npm_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{manifest_overrides}: {:?}", r.warnings));
+            assert!(
+                skipped.detail.contains("overrides"),
+                "the warning names the override: {}",
+                skipped.detail
+            );
+            assert!(
+                r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                "{manifest_overrides}: the skipped copy keeps the patch out of the in-run VEX"
+            );
+        }
+        // Control: a registry override (or none) still redirects.
+        for manifest_overrides in [json!({}), json!({ "left-pad": "1.3.0" })] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+            assert_eq!(
+                rewritten["packages"]["node_modules/left-pad"]["resolved"],
+                "http://patch.test/lp.tgz",
+                "{manifest_overrides}"
+            );
+        }
+    }
+
     #[test]
     fn npm_non_registry_entries_are_skipped_with_loud_warning() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
