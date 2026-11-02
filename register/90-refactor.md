@@ -57,7 +57,7 @@ Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884
 - Left from #1936: `vendor/gem.rs` `plan_gemfile_edit`, `vex/discover/gem.rs` (~L252), `redirect/upstream/gem.rs` (~L661) hand-scan `=begin`: use `manifest::code_lines`. Its heredoc heuristic misreads `x <<FLAG` and indented `<<ID` terminators.
 - Left from #1939: `remove.rs` L1327 doc still names the deleted `revert_vendor_entry` (#1875); `commands/repair.rs` ~L429 copies the build-once client (use `vendored_backend::repair::ensure_client`, #1875); `ApplyRequest.manifest` → `&HashMap` (drop `records_manifest`) and `stop_on_failure` wait on #1698/#1864/#1875; split `repair()`'s phases.
 - Keep a single-caller fn that is a constant's only test seam or names a phase of a long fn (`fetch_concurrency`, `build_candidates`).
-- Left from #1955: PTY watchdog SIGHUPs, fixed 10 s prompt waits.
+- Left from #1955: PTY watchdog SIGHUPs, 10 s prompt waits.
 - Left from #1967: core `UpdateTimeouts::from_env` and the notifier both parse `SOCKET_UPDATE_TIMEOUT_MS`; core caps `connect` at 10 s, the notifier doesn't (A09/C19).
 - Left from #1964: `CI`/`GITHUB_ACTIONS` still reach test children; a HOME pin in `hermetic::command` hits ~150 suites. Test a scrub with a parent-env canary.
 - Left from #1975: `blob_fetcher` `on_progress`/`OnProgress` (callers in `fetch_stage.rs` #1855, `repair.rs` #1875, `rollback.rs` #1864) and `BlobFetchResult.success` (literals in #1855's tests); `concise_fetch_error` re-parses the client's text; `store_verified_blob` vs `stream_cache_entry_atomic` drift. `scan --json` serializes `BatchPackagePatches`: keep a serialize test.
