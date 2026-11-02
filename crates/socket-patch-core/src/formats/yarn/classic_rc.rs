@@ -158,12 +158,21 @@ fn lockfile_grammar(text: &str) -> Option<HashMap<String, RcScalar>> {
     Some(out)
 }
 
+/// How deep [`parse_block`] nests before it calls the file unreadable.
+/// The `.yarnrc` comes from the (untrusted) project, and the parser
+/// recurses once per nested block, so a hostile nesting depth must not
+/// overflow the stack. No yarn setting nests more than a level or two.
+const MAX_BLOCK_DEPTH: usize = 64;
+
 fn parse_block(
     tokens: &[Token],
     pos: &mut usize,
     indent: usize,
     mut out: Option<&mut HashMap<String, RcScalar>>,
 ) -> Option<()> {
+    if indent > MAX_BLOCK_DEPTH {
+        return None;
+    }
     let at = |pos: usize| tokens.get(pos).unwrap_or(&Token::Eof);
     loop {
         match at(*pos) {
@@ -469,6 +478,31 @@ mod tests {
         );
         assert_eq!(v("# c\r--modules-folder deps\r"), None);
         assert_eq!(v("--modules-folder, \"\" deps\n"), None);
+    }
+
+    /// Nesting past [`MAX_BLOCK_DEPTH`] makes the file unreadable instead
+    /// of recursing without bound (a repository `.yarnrc` is untrusted).
+    #[test]
+    fn deep_nesting_is_unreadable_not_a_stack_overflow() {
+        let nested = |levels: usize| {
+            let mut rc = String::from("--modules-folder deps\n");
+            for level in 0..levels {
+                rc.push_str(&"  ".repeat(level));
+                rc.push_str("x:\n");
+            }
+            rc
+        };
+        assert_eq!(v(&nested(3)).as_deref(), Some("deps"));
+        assert_eq!(lockfile_grammar(&nested(MAX_BLOCK_DEPTH + 10)), None);
+        // Run the deep case on a small stack: it must return, not overflow.
+        let rc = nested(2_000);
+        let found = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || lockfile_grammar(&rc))
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(found, None);
     }
 
     /// A key holding a nested block is not a scalar setting.
