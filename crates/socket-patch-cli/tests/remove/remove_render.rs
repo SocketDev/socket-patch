@@ -461,59 +461,11 @@ fn remove_detached_drift_keep_human_prints_keep_lines() {
 
 /// Hosted-only interactive decline, PTY-driven: the non-TTY confirm
 /// auto-proceeds, so only a real terminal reaches the cancel branch.
-/// Runner copied from interactive_prompts_e2e.rs.
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, PtySize};
-    use std::path::Path;
+    use crate::pty_io;
     use std::time::Duration;
-
-    /// Spawn the binary inside a PTY, send `input`, collect all output
-    /// until exit (watchdog-killed after `timeout`).
-    fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // The hermetic environment: SOCKET_YES would skip the very prompt
-        // this test drives.
-        let mut cmd = common::hermetic::pty_binary_command();
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.cwd(cwd);
-
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
-        drop(pair.slave);
-
-        let reader_handle =
-            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-        let mut killer = child.clone_killer();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            let _ = killer.kill();
-        });
-
-        let mut writer = pair.master.take_writer().expect("take writer");
-        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
-        drop(writer);
-
-        let status = child.wait().expect("child.wait");
-        drop(pair.master);
-        let output = reader_handle.finish();
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
-    }
 
     /// Declining the hosted-only confirm prompt must cancel cleanly (exit
     /// 0, "Cancelled; no changes made.") with the lock byte-identical and no
@@ -525,7 +477,7 @@ mod pty {
         std::fs::write(&lock_path, redirected_lock_text()).unwrap();
         let lock_before = read_bytes(&lock_path);
 
-        let (code, output) = run_in_pty(
+        let (code, output) = pty_io::run(
             &["remove", NPM_PURL],
             tmp.path(),
             "n\n",

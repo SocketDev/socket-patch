@@ -35,6 +35,13 @@ fn number(digits: &str) -> String {
     if trimmed.is_empty() { "0" } else { trimmed }.to_owned()
 }
 
+/// Drop trailing `0` release segments, keeping at least one.
+fn trim_trailing_zeros(release: &mut Vec<String>) {
+    while release.len() > 1 && release.last().is_some_and(|segment| segment == "0") {
+        release.pop();
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum LocalPart {
     Number(String),
@@ -107,13 +114,8 @@ pub(crate) fn versions_equal(a: &str, b: &str) -> bool {
     match (parse(a), parse(b)) {
         (Some(mut a), Some(mut b)) => {
             // Equality ignores trailing `.0` release segments.
-            for version in [&mut a, &mut b] {
-                while version.release.len() > 1
-                    && version.release.last().is_some_and(|segment| segment == "0")
-                {
-                    version.release.pop();
-                }
-            }
+            trim_trailing_zeros(&mut a.release);
+            trim_trailing_zeros(&mut b.release);
             a == b
         }
         _ => false,
@@ -192,9 +194,7 @@ pub(crate) fn equivalent_release_spellings(version: &str) -> Vec<String> {
     }
     let segments: Vec<String> = version.split('.').map(number).collect();
     let mut trimmed = segments.clone();
-    while trimmed.len() > 1 && trimmed.last().is_some_and(|segment| segment == "0") {
-        trimmed.pop();
-    }
+    trim_trailing_zeros(&mut trimmed);
     let mut out = Vec::new();
     for len in trimmed.len()..=segments.len().max(3) {
         let mut release = trimmed.clone();
@@ -286,7 +286,7 @@ mod tests {
     }
 
     /// What `str(packaging.version.Version(v))` prints, which is what
-    /// uv.lock, wheel METADATA and PyPI record (#1589).
+    /// uv.lock, wheel METADATA and PyPI record.
     #[test]
     fn normalize_matches_packaging() {
         for (raw, normalized) in [

@@ -49,12 +49,15 @@
 
 #![cfg(feature = "docker-e2e")]
 
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
 
+use docker_common::skip_if_no_image;
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
-    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
+    run_with_fixture, run_with_service, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-gem:latest";

@@ -34,6 +34,7 @@ pub mod governing_locks;
 pub(crate) mod json;
 pub(crate) mod maven;
 pub(crate) mod nuget;
+pub(crate) mod package_json;
 pub(crate) mod pipenv;
 pub mod pnpm;
 pub mod registry;

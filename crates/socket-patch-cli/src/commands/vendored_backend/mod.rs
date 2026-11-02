@@ -153,6 +153,7 @@ impl<'a> VendoredBackend<'a> {
                 continue;
             };
             let flavor = entry.flavor.clone();
+            let wiring_files: Vec<String> = entry.wiring.iter().map(|w| w.file.clone()).collect();
             let root = &self.common.cwd;
             let outcome = dispatch_revert_one_opts(&entry, root, opts).await;
             let step = if !outcome.success {
@@ -181,13 +182,14 @@ impl<'a> VendoredBackend<'a> {
             );
             let dry = matches!(step, VendorRevertStep::WouldRevert);
             // The wiring is back on the registry while the installed tree
-            // may still hold the vendored build, which PDM, uv and Pipenv
-            // keep through a plain sync: name the reinstall.
+            // may still hold the vendored build, which pip, PDM, uv and
+            // Pipenv keep through a plain sync: name the reinstall.
             if dry || step.unwired() {
                 crate::commands::pypi_reinstall::push_vendor_advisory(
                     root,
                     key,
                     flavor.as_deref(),
+                    &wiring_files,
                     &mut warnings,
                 )
                 .await;

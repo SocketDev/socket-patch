@@ -1131,9 +1131,21 @@ fn stage_skip_dir_member_workspace(
     root: &Path,
     member: &str,
 ) -> (PathBuf, PathBuf, Vec<u8>, String, String) {
+    stage_member_workspace(root, r#"["packages/*"]"#, &format!("packages/{member}"))
+}
+
+/// [`stage_skip_dir_member_workspace`] with the root's `workspaces` value
+/// and the second member's path (`/`-separated, below the root) given.
+fn stage_member_workspace(
+    root: &Path,
+    workspaces: &str,
+    member: &str,
+) -> (PathBuf, PathBuf, Vec<u8>, String, String) {
     std::fs::write(
         root.join("package.json"),
-        r#"{"name":"root","version":"1.0.0","private":true,"workspaces":["packages/*"],"dependencies":{"ms":"2.1.3"}}"#,
+        format!(
+            r#"{{"name":"root","version":"1.0.0","private":true,"workspaces":{workspaces},"dependencies":{{"ms":"2.1.3"}}}}"#
+        ),
     )
     .unwrap();
     let stage_ms = |nm: PathBuf, version: &str| {
@@ -1153,8 +1165,9 @@ fn stage_skip_dir_member_workspace(
     };
     stage_ms(root.join("node_modules"), "2.1.3");
     let mut copies = Vec::new();
-    for name in ["app", member] {
-        let dir = root.join("packages").join(name);
+    for rel in ["packages/app", member] {
+        let dir = root.join(rel);
+        let name = rel.rsplit('/').next().unwrap();
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("package.json"),
@@ -1248,6 +1261,77 @@ async fn apply_check_and_vex_see_unpatched_member_named_like_a_build_dir() {
         !doc.contains("not_affected"),
         "VEX must not attest not_affected while packages/build's copy is unpatched \
          (exit {code}):\n{doc}"
+    );
+    // The control: with both copies patched, the same run attests it.
+    std::fs::write(&member_copy, &patched).unwrap();
+    let (code, doc) = vex().await;
+    assert_eq!(code, 0, "{doc}");
+    assert!(doc.contains("not_affected"), "{doc}");
+}
+
+/// #1827: agent-mode apply patches the nested copy of a declared workspace
+/// member inside a hidden directory (`.github/actions/x` through a glob,
+/// `.config/tool` listed literally), not just the other member's copy.
+#[tokio::test]
+#[serial]
+async fn apply_patches_workspace_member_in_a_hidden_dir() {
+    for (workspaces, member) in [
+        (r#"["packages/*",".github/actions/*"]"#, ".github/actions/x"),
+        (r#"["packages/*",".config/tool"]"#, ".config/tool"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app_copy, member_copy, patched, before_hash, after_hash) =
+            stage_member_workspace(tmp.path(), workspaces, member);
+
+        let code = apply_run(default_apply(tmp.path())).await;
+        assert_eq!(code, 0, "apply (member {member})");
+        assert_patched(&app_copy, &patched, &before_hash, &after_hash);
+        assert_patched(&member_copy, &patched, &before_hash, &after_hash);
+    }
+}
+
+/// #1827: with only the other member's copy patched, `apply --check`
+/// reports the `.github/actions/x` copy as drift (exit 1), and `vex`
+/// attests nothing as `not_affected` until that copy is patched too.
+#[tokio::test]
+#[serial]
+async fn apply_check_and_vex_see_unpatched_member_in_a_hidden_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (app_copy, member_copy, patched, _, _) = stage_member_workspace(
+        tmp.path(),
+        r#"["packages/*",".github/actions/*"]"#,
+        ".github/actions/x",
+    );
+    std::fs::write(&app_copy, &patched).unwrap();
+    assert_ne!(std::fs::read(&member_copy).unwrap(), patched);
+
+    let mut args = default_apply(tmp.path());
+    args.check = true;
+    let code = apply_run(args).await;
+    assert_eq!(
+        code, 1,
+        "apply --check must report the unpatched hidden member copy"
+    );
+
+    let vex_path = tmp.path().join("vex.json");
+    let vex = || async {
+        let _ = std::fs::remove_file(&vex_path);
+        let code = socket_patch_cli::commands::vex::run(socket_patch_cli::commands::vex::VexArgs {
+            common: default_apply(tmp.path()).common,
+            output: Some(vex_path.clone()),
+            product: Some("pkg:npm/root@1.0.0".to_string()),
+            no_verify: false,
+            doc_id: None,
+            compact: false,
+        })
+        .await;
+        (code, std::fs::read_to_string(&vex_path).unwrap_or_default())
+    };
+    let (code, doc) = vex().await;
+    assert!(
+        !doc.contains("not_affected"),
+        "VEX must not attest not_affected while .github/actions/x's copy is \
+         unpatched (exit {code}):\n{doc}"
     );
     // The control: with both copies patched, the same run attests it.
     std::fs::write(&member_copy, &patched).unwrap();

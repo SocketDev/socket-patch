@@ -2096,9 +2096,8 @@ mod tests {
     mod equivalence {
         use super::super::oracle::LegacyNuGetCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{
-            map_rows, mkdir, rows, symlink, write, PermGuard, Rng,
-        };
+        use crate::crawlers::oracle_support::{map_rows, mkdir, rows, symlink, write, PermGuard};
+        use crate::test_rng::Rng;
 
         const IDS: &[&str] = &["Newtonsoft.Json", "xunit", "System.Text.Json", "Dup", "dup"];
         const VERSIONS: &[&str] = &["13.0.3", "2.0.0-RC1", "8.0.0", "1.0.0"];

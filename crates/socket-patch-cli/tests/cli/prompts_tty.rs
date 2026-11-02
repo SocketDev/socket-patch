@@ -14,12 +14,9 @@
 
 #![cfg(unix)]
 
-use crate::common::binary;
-
 use std::path::Path;
 use std::time::Duration;
 
-use portable_pty::{native_pty_system, PtySize};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -27,143 +24,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // the "patch has no applicable files" guardrail with a real blob
 // hash). Read-only reuse of the shared helper module.
 use crate::common;
+use crate::pty_io;
 
 const ORG_SLUG: &str = "test-org";
 const UUID_A: &str = "11111111-1111-4111-8111-111111111111";
 const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
-
-/// Spawn the socket-patch binary inside a PTY, send `input`, and collect
-/// all output until the child exits. Returns `(exit_code, output)`.
-///
-/// Same choreography as the sibling `interactive_prompts_e2e.rs` harness
-/// (reader thread on the master, detached SIGKILL watchdog, input written
-/// once a prompt is on screen via `pty_io::send_when_prompted` — `confirm`
-/// discards earlier typeahead — then EOF on the writer) — plus a
-/// pinned `TERM` because the `dialoguer`/`console` menu these tests drive
-/// derives key handling and rendering from the terminal type, which the
-/// ambient environment (some CI shells) may not set at all.
-fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-    let (code, _signal, output) = run_in_pty_raw(Sigint::Default, args, cwd, input, timeout);
-    (code, output)
-}
-
-/// [`run_in_pty`] with a second answer: `then` is written once the y/n
-/// confirm (`[Y/n] `) is on screen, after `input` answered the first
-/// prompt (the dialoguer menu).
-fn run_in_pty_then(
-    args: &[&str],
-    cwd: &Path,
-    input: &str,
-    then: &str,
-    timeout: Duration,
-) -> (i32, String) {
-    let (code, _signal, output) =
-        run_in_pty_inner(Sigint::Default, args, cwd, input, Some(then), timeout);
-    (code, output)
-}
-
-/// The SIGINT disposition the binary starts with under [`run_in_pty_raw`].
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Sigint {
-    /// Inherited default: Ctrl-C kills the process.
-    Default,
-    /// Ignored (as `nohup` and some launchers do), via
-    /// `sh -c 'trap "" INT; exec ...'`.
-    Ignored,
-}
-
-/// [`run_in_pty`], also returning the name of the signal that ended the
-/// child (`None` for a normal exit), with the binary started under the
-/// given [`Sigint`] disposition.
-fn run_in_pty_raw(
-    sigint: Sigint,
-    args: &[&str],
-    cwd: &Path,
-    input: &str,
-    timeout: Duration,
-) -> (i32, Option<String>, String) {
-    run_in_pty_inner(sigint, args, cwd, input, None, timeout)
-}
-
-fn run_in_pty_inner(
-    sigint: Sigint,
-    args: &[&str],
-    cwd: &Path,
-    input: &str,
-    then: Option<&str>,
-    timeout: Duration,
-) -> (i32, Option<String>, String) {
-    let input = input.as_bytes();
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-
-    // The hermetic environment (`tests/common/hermetic.rs`): an ambient
-    // SOCKET_YES=true would skip the confirm prompt the bare-Enter test
-    // drives, and SOCKET_JSON=true flips select_one onto its
-    // JsonModeNeedsExplicit branch before the dialoguer menu renders. The
-    // `sh` wrapper `exec`s the binary, which inherits the same environment.
-    let mut cmd = if sigint == Sigint::Ignored {
-        let mut cmd = common::hermetic::pty_command("/bin/sh");
-        cmd.arg("-c");
-        cmd.arg("trap '' INT; exec \"$0\" \"$@\"");
-        cmd.arg(binary());
-        cmd
-    } else {
-        common::hermetic::pty_binary_command()
-    };
-    for a in args {
-        cmd.arg(a);
-    }
-    cmd.cwd(cwd);
-    // `dialoguer`/`console` key handling needs a terminal type; pin one so
-    // an unset ambient TERM (bare CI shells) can't skew rendering.
-    cmd.env("TERM", "xterm-256color");
-
-    let mut child = pair
-        .slave
-        .spawn_command(cmd)
-        .expect("spawn socket-patch in PTY");
-    drop(pair.slave);
-
-    let reader_handle =
-        crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-    // Watchdog: detached kill after `timeout`; a no-op if the child exits
-    // naturally first.
-    let mut killer = child.clone_killer();
-    std::thread::spawn(move || {
-        std::thread::sleep(timeout);
-        let _ = killer.kill();
-    });
-
-    let mut writer = pair.master.take_writer().expect("take writer");
-    crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input);
-    if let Some(then) = then {
-        use std::io::Write;
-        reader_handle.wait_for_count("[Y/n] ", 1, Duration::from_secs(10));
-        let _ = writer.write_all(then.as_bytes());
-        let _ = writer.flush();
-    }
-    drop(writer);
-
-    let status = child.wait().expect("child.wait");
-    drop(pair.master);
-
-    let output = reader_handle.finish();
-    let code = status.exit_code() as i32;
-    (
-        code,
-        status.signal().map(str::to_string),
-        String::from_utf8_lossy(&output).to_string(),
-    )
-}
 
 const HIDE_CURSOR: &str = "\x1b[?25l";
 const SHOW_CURSOR: &str = "\x1b[?25h";
@@ -214,7 +79,7 @@ fn remove_interactive_bare_enter_proceeds_with_default_yes() {
     let tmp = tempfile::tempdir().unwrap();
     write_remove_manifest(tmp.path());
 
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &[
             "remove",
             "pkg:npm/__prompts_tty_remove__@1.0.0",
@@ -371,7 +236,8 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
     // No `--yes`: it answers the menu with its default without showing it.
     // "\r" (Enter at a raw-mode terminal) accepts the menu's default, then
     // "\n" answers the "Download 1 patch?" confirm that follows.
-    let (code, output) = run_in_pty_then(
+    let pty_io::PtyRun { code, output, .. } = pty_io::run_command(
+        common::hermetic::pty_binary_command(),
         &[
             "get",
             purl,
@@ -384,8 +250,8 @@ fn get_interactive_dialoguer_enter_accepts_first_ranked_option() {
             ORG_SLUG,
         ],
         tmp.path(),
-        "\r",
-        "\n",
+        &[],
+        &[b"\r", b"\n"],
         Duration::from_secs(20),
     );
     assert_eq!(
@@ -453,7 +319,7 @@ fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
     let uri = mock.uri();
 
     let tmp = tempfile::tempdir().unwrap();
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &[
             "get",
             purl,
@@ -480,7 +346,7 @@ fn get_yes_answers_the_menu_with_its_default_without_showing_it() {
     let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(manifest["patches"][purl]["uuid"], UUID_A, "{body}");
     // The listing showed two patches; the pick is named before saving.
-    let screen = crate::pty_io::render(output.as_bytes()).join("\n");
+    let screen = pty_io::render(output.as_bytes()).join("\n");
     assert!(
         screen.contains("Selected:\n  pkg:npm/prompt-multi-yes@1.0.0 [FREE] 11111111"),
         "{screen}"
@@ -512,7 +378,7 @@ fn get_interactive_dialoguer_quit_cancels_with_exit_zero() {
     let uri = mock.uri();
 
     let tmp = tempfile::tempdir().unwrap();
-    let (code, output) = run_in_pty(
+    let (code, output) = pty_io::run(
         &[
             "get",
             purl,
@@ -589,8 +455,12 @@ fn get_interactive_dialoguer_ctrl_c_restores_cursor_and_dies_by_sigint() {
     let uri = mock.uri();
 
     let tmp = tempfile::tempdir().unwrap();
-    let (code, signal, output) = run_in_pty_raw(
-        Sigint::Default,
+    let pty_io::PtyRun {
+        code,
+        signal,
+        output,
+    } = pty_io::run_command(
+        common::hermetic::pty_binary_command(),
         &[
             "get",
             purl,
@@ -603,7 +473,8 @@ fn get_interactive_dialoguer_ctrl_c_restores_cursor_and_dies_by_sigint() {
             ORG_SLUG,
         ],
         tmp.path(),
-        "\x03",
+        &[],
+        &[b"\x03"],
         Duration::from_secs(20),
     );
     assert!(
@@ -642,8 +513,18 @@ fn get_interactive_dialoguer_ctrl_c_with_sigint_ignored_cancels_cleanly() {
     let uri = mock.uri();
 
     let tmp = tempfile::tempdir().unwrap();
-    let (code, signal, output) = run_in_pty_raw(
-        Sigint::Ignored,
+    // `sh` starts the binary with SIGINT ignored (as `nohup` and some
+    // launchers do); `exec` keeps the hermetic environment.
+    let mut sh = common::hermetic::pty_command("/bin/sh");
+    sh.arg("-c");
+    sh.arg("trap '' INT; exec \"$0\" \"$@\"");
+    sh.arg(common::binary());
+    let pty_io::PtyRun {
+        code,
+        signal,
+        output,
+    } = pty_io::run_command(
+        sh,
         &[
             "get",
             purl,
@@ -656,7 +537,8 @@ fn get_interactive_dialoguer_ctrl_c_with_sigint_ignored_cancels_cleanly() {
             ORG_SLUG,
         ],
         tmp.path(),
-        "\x03",
+        &[],
+        &[b"\x03"],
         Duration::from_secs(20),
     );
     assert!(

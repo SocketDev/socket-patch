@@ -11,7 +11,7 @@
 //! [`CopyRef`], and so cannot disagree on which package it is.
 
 use super::patterns::split_classic_pattern;
-use super::source::{is_tarball_path, registry_tarball_name};
+use super::source::{classic_copy_source, is_tarball_path, registry_tarball_name, CopySource};
 
 /// Where a yarn lock entry's copy comes from, read for the package it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +163,36 @@ pub(crate) fn classic_copy_ref(patterns: &[String], resolved: Option<&str>) -> O
                 .then(|| CopyRef::Url(url.to_string()))
         }
     }
+}
+
+/// The package a classic `file:` directory or url copy really installs,
+/// whatever dependency name its key carries (#1236), with where yarn 1
+/// installs it from: read through [`classic_copy_ref`] and
+/// [`CopyRef::identity`], the reader vendored and VEX use, so the hosted
+/// rewriter makes the same decision for every copy (#1951). `read_text`
+/// gets [`CopyRef::read_path`] (root-relative, possibly climbing above the
+/// root; never absolute). `None` for any other block, a `file:` tarball
+/// (whose bytes a text reader can't open), a url naming no registry
+/// package, or an unreadable or nameless manifest.
+pub(crate) fn classic_copy_name(
+    patterns: &[String],
+    resolved: Option<&str>,
+    version: &str,
+    read_text: impl Fn(&str) -> Option<String>,
+) -> Option<(String, CopySource)> {
+    let source = classic_copy_source(patterns, resolved);
+    let copy = classic_copy_ref(patterns, resolved)?;
+    match (source, &copy) {
+        (CopySource::Directory, CopyRef::Directory(_))
+        | (CopySource::RemoteTarball, CopyRef::Url(_)) => {}
+        _ => return None,
+    }
+    let text = match copy.read_path() {
+        Some(rel) => Some(read_text(&rel)?),
+        None => None,
+    };
+    let (name, _) = copy.identity(version, text.as_deref().map(str::as_bytes))?;
+    Some((name, source))
 }
 
 /// The copy a berry locator `reference` installs from: a `file:` tarball or

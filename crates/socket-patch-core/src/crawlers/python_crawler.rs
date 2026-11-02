@@ -6,7 +6,7 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::{
     is_dir, is_dir_sync, read_regular_to_string, read_regular_to_string_sync, run_blocking,
 };
-use crate::utils::process::{CommandRunner, SystemCommandRunner};
+use crate::utils::process::{CommandRunner, EnvKeyedMemo, SystemCommandRunner};
 
 #[cfg(test)]
 mod oracle;
@@ -1044,8 +1044,9 @@ async fn uv_project_environment_site_packages(
 }
 
 /// Whether a manager other than uv records or locks the project at `cwd`:
-/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`) or
-/// PDM project.
+/// Poetry, PDM or Pipenv files, or a lockless Poetry (`[tool.poetry]`, read
+/// by [`declares_tool_poetry`], so a plugin table such as
+/// `[tool.poetry-dynamic-versioning]` does not count) or PDM project.
 async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
     let other_lock = [
         "poetry.lock",
@@ -1061,7 +1062,7 @@ async fn claimed_by_non_uv_manager(cwd: &Path) -> bool {
         || is_pdm_project(cwd).await
         || read_regular_to_string(&cwd.join("pyproject.toml"))
             .await
-            .is_ok_and(|text| text.contains("[tool.poetry"))
+            .is_ok_and(|text| declares_tool_poetry(&text))
 }
 
 /// Whether only uv installs for `cwd`, so its env is only ever uv's own: a
@@ -2762,59 +2763,14 @@ fn pipenv_workon_home_venvs(
     found
 }
 
-/// What the interpreter query below depends on besides the interpreter
-/// itself: the whole process environment (`PATH` picks the interpreter;
-/// `HOME`, `PYTHONUSERBASE`, `PYTHONHOME`, … shape its answer) and the
-/// working directory.
-type SiteQueryKey = (
-    Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    Option<PathBuf>,
-);
-
-fn site_query_key() -> SiteQueryKey {
-    let mut env: Vec<_> = std::env::vars_os().collect();
-    env.sort();
-    (env, std::env::current_dir().ok())
-}
-
-/// The last successful `(key, answer)` of an expensive query, re-run
-/// whenever the key differs. A failed query (`None`) is never stored, so the
-/// next ask runs it again exactly as an unmemoized caller would: a transient
-/// spawn failure during the crawl cannot blank the vendor phase's answer.
-struct KeyedMemo<K, V> {
-    slot: std::sync::Mutex<Option<(K, V)>>,
-}
-
-impl<K: PartialEq, V: Clone> KeyedMemo<K, V> {
-    const fn new() -> Self {
-        Self {
-            slot: std::sync::Mutex::new(None),
-        }
-    }
-
-    fn get_or_run(&self, key: K, run: impl FnOnce() -> Option<V>) -> Option<V> {
-        let lock = || {
-            self.slot
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-        };
-        if let Some((cached, value)) = lock().as_ref() {
-            if *cached == key {
-                return Some(value.clone());
-            }
-        }
-        let value = run()?;
-        *lock() = Some((key, value.clone()));
-        Some(value)
-    }
-}
-
 /// The interpreter's site-packages answer (the `find_python_command` probe
-/// plus the `site` query — two process spawns), per [`SiteQueryKey`]: a
+/// plus the `site` query — two process spawns), per environment (`PATH`
+/// picks the interpreter; `HOME`, `PYTHONUSERBASE`, `PYTHONHOME`, … shape
+/// its answer; see [`EnvKeyedMemo`]): a
 /// scan asks it once for its crawl and again when it vendors, in the same
 /// environment, so the second ask re-spawned both processes for the same
-/// output. Only a successful answer is kept (see [`KeyedMemo`]).
-static SITE_QUERY_MEMO: KeyedMemo<SiteQueryKey, String> = KeyedMemo::new();
+/// output.
+static SITE_QUERY_MEMO: EnvKeyedMemo<String> = EnvKeyedMemo::new();
 
 /// The unmemoized interpreter query: probe for a python and ask it for its
 /// site-packages. [`SITE_QUERY_MEMO`] wraps this; tests call it directly as
@@ -2853,8 +2809,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
-    let site_output =
-        run_blocking(|| SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query)).await;
+    let site_output = run_blocking(|| SITE_QUERY_MEMO.get_or_run(run_site_query)).await;
     if let Some(stdout) = site_output {
         for p in parse_python_site_packages_output(&stdout) {
             add_path(p, &mut seen, &mut results);
@@ -5112,6 +5067,52 @@ mod tests {
         let found = pdm_global_site_packages_with(Some(&home), &env_of(&pairs)).await;
         assert!(found.contains(&project_site), "{found:?}");
         assert!(found.contains(&managed_site), "{found:?}");
+    }
+
+    /// #1916: "is this lockless project Poetry's" reads the parsed
+    /// `[tool.poetry]` table, the same rule as Poetry env discovery. A
+    /// Poetry plugin table such as `[tool.poetry-dynamic-versioning]`
+    /// (common with non-Poetry backends) or a commented-out header does
+    /// not hand a lockless uv project to Poetry, so its
+    /// `UV_PROJECT_ENVIRONMENT` is still crawled.
+    #[tokio::test]
+    async fn poetry_plugin_table_does_not_claim_a_lockless_uv_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let site = fake_venv(&project, "env");
+        let stray = fake_venv(&project, ".venv");
+        let env = env_of(&[("UV_PROJECT_ENVIRONMENT", "env".to_string())]);
+
+        for pyproject in [
+            "[project]\nname = \"app\"\ndynamic = [\"version\"]\n\
+             [tool.poetry-dynamic-versioning]\nenable = true\n",
+            "[project]\nname = \"app\"\n# [tool.poetry]\n",
+            "[project]\nname = \"app\"\n[tool.poetry_bumpversion]\nfile = \"x\"\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![site.clone()],
+                "{pyproject}"
+            );
+        }
+
+        // A real `[tool.poetry]` table, or only a subtable of it, is still
+        // Poetry's.
+        for pyproject in [
+            "[tool.poetry]\nname = \"app\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry.dependencies]\npython = \"^3.12\"\n",
+            "[project]\nname = \"app\"\n[tool.poetry-dynamic-versioning]\n\
+             enable = true\n[tool.poetry]\npackage-mode = false\n",
+        ] {
+            std::fs::write(project.join("pyproject.toml"), pyproject).unwrap();
+            assert_eq!(
+                find_local_venv_site_packages_with(&project, &env).await,
+                vec![stray.clone()],
+                "{pyproject}"
+            );
+        }
     }
 
     /// #525: uv syncs a project into `UV_PROJECT_ENVIRONMENT` (absolute, or
@@ -7946,8 +7947,9 @@ G=
         use super::super::oracle::{self, LegacyPythonCrawler};
         use super::*;
         use crate::crawlers::oracle_support::{
-            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard, Rng,
+            fifo, map_rows, mkdir, rows, symlink, write, write_bytes, PermGuard,
         };
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &["requests", "Flask_Cors", "zope.interface", "dup", "Dup"];
         const VERSIONS: &[&str] = &["1.0", "2.31.0", "1.0+local", "3.0a1"];
@@ -8048,52 +8050,6 @@ G=
         }
     }
 
-    /// DC-6: the interpreter query memo answers from its slot only for the
-    /// exact key it was filled under, re-runs on any other key (a changed
-    /// environment or working directory), and never keeps a failed query's
-    /// `None`: the next ask with the same key runs the query again, as an
-    /// unmemoized caller would.
-    #[test]
-    fn keyed_memo_reruns_only_on_a_different_key() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let memo: KeyedMemo<(u32, &str), String> = KeyedMemo::new();
-        let runs = AtomicUsize::new(0);
-        let run = |out: Option<&str>| {
-            runs.fetch_add(1, Ordering::SeqCst);
-            out.map(str::to_string)
-        };
-        assert_eq!(
-            memo.get_or_run((1, "a"), || run(Some("x"))),
-            Some("x".into())
-        );
-        assert_eq!(
-            memo.get_or_run((1, "a"), || run(Some("stale"))),
-            Some("x".into())
-        );
-        assert_eq!(runs.load(Ordering::SeqCst), 1);
-        // A failure is returned but not stored: the same key re-runs.
-        assert_eq!(memo.get_or_run((2, "a"), || run(None)), None);
-        assert_eq!(runs.load(Ordering::SeqCst), 2);
-        assert_eq!(
-            memo.get_or_run((2, "a"), || run(Some("y"))),
-            Some("y".into())
-        );
-        assert_eq!(runs.load(Ordering::SeqCst), 3);
-        assert_eq!(
-            memo.get_or_run((2, "a"), || run(Some("stale"))),
-            Some("y".into())
-        );
-        assert_eq!(runs.load(Ordering::SeqCst), 3);
-        // A failure under a new key leaves nothing cached for the old one
-        // to be served from, and the old key re-runs.
-        assert_eq!(memo.get_or_run((3, "a"), || run(None)), None);
-        assert_eq!(
-            memo.get_or_run((1, "a"), || run(Some("z"))),
-            Some("z".into())
-        );
-        assert_eq!(runs.load(Ordering::SeqCst), 5);
-    }
-
     /// DC-6: the memoized site query is wired to the whole environment.
     /// Under two different `PYTHONUSERBASE` values (the interpreter's
     /// `getusersitepackages` follows it) the memoized answer equals the
@@ -8123,7 +8079,7 @@ G=
                 }
             }
         }
-        let memoized = || SITE_QUERY_MEMO.get_or_run(site_query_key(), run_site_query);
+        let memoized = || SITE_QUERY_MEMO.get_or_run(run_site_query);
 
         let base_a = tempfile::tempdir().unwrap();
         let base_b = tempfile::tempdir().unwrap();

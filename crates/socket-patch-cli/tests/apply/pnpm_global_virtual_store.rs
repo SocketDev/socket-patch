@@ -11,31 +11,14 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::json;
 
-use crate::common;
-
-use common::{git_sha256, parse_json_envelope, run_with_env};
+use super::apply_fixture::{link_dir, one_file, patch_record, stage_blob, write_manifest};
+use crate::common::envelope::event_for;
+use crate::common::{git_sha256, parse_json_envelope, run_with_env};
 
 const BEFORE: &[u8] = b"module.exports = 'pristine';\n";
 const AFTER: &[u8] = b"module.exports = 'patched';\n";
-
-fn link_dir(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    {
-        let link: PathBuf = link.components().collect();
-        let target: PathBuf = target.components().collect();
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mklink /J failed");
-    }
-}
 
 fn write_pkg(dir: &Path, name: &str, version: &str) {
     std::fs::create_dir_all(dir).unwrap();
@@ -90,36 +73,15 @@ fn stage(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
     (proj, number, left_pad)
 }
 
-fn write_manifest(root: &Path, purl: &str) {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
-    std::fs::write(socket.join("blobs").join(git_sha256(AFTER)), AFTER).unwrap();
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_vec_pretty(&json!({ "patches": { purl: {
-            "uuid": "36236236-0000-4000-8000-000000000001",
-            "exportedAt": "2024-01-01T00:00:00Z",
-            "files": { "package/index.js": {
-                "beforeHash": git_sha256(BEFORE),
-                "afterHash": git_sha256(AFTER),
-            }},
-            "vulnerabilities": {},
-            "description": "pnpm global virtual store fixture",
-            "license": "MIT",
-            "tier": "free"
-        }}}))
-        .unwrap(),
-    )
-    .unwrap();
-}
-
-fn event<'a>(v: &'a Value, purl: &str) -> &'a Value {
-    v["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .find(|e| e["purl"] == purl)
-        .unwrap_or_else(|| panic!("no event for {purl}: {v}"))
+fn write_patch(root: &Path, purl: &str) {
+    write_manifest(
+        root,
+        json!({ purl: patch_record(
+            "36236236-0000-4000-8000-000000000001",
+            one_file("package/index.js", BEFORE, AFTER),
+        )}),
+    );
+    stage_blob(root, &git_sha256(AFTER), AFTER);
 }
 
 /// #362: the transitive `is-number` is refused as shared, like a direct
@@ -129,20 +91,16 @@ fn event<'a>(v: &'a Value, purl: &str) -> &'a Value {
 fn transitive_global_virtual_store_dep_is_refused_not_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, number, _) = stage(tmp.path());
-    write_manifest(&proj, "pkg:npm/is-number@6.0.0");
+    write_patch(&proj, "pkg:npm/is-number@6.0.0");
 
-    let (code, stdout, stderr) = run_with_env(
-        &proj,
-        &["apply", "--offline", "--json"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) = run_with_env(&proj, &["apply", "--offline", "--json"], &[]);
     let v = parse_json_envelope(&stdout);
     assert_ne!(
         code, 0,
         "a shared-store refusal fails the run; {v}\n{stderr}"
     );
     assert_eq!(v["status"], "partialFailure", "{v}");
-    let ev = event(&v, "pkg:npm/is-number@6.0.0");
+    let ev = event_for(&v, "pkg:npm/is-number@6.0.0");
     assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
     assert!(
         ev.to_string().contains("shared by other projects")
@@ -158,16 +116,12 @@ fn transitive_global_virtual_store_dep_is_refused_not_skipped() {
 fn other_projects_global_virtual_store_entries_stay_invisible() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, _, left_pad) = stage(tmp.path());
-    write_manifest(&proj, "pkg:npm/left-pad@1.3.0");
+    write_patch(&proj, "pkg:npm/left-pad@1.3.0");
 
-    let (code, stdout, stderr) = run_with_env(
-        &proj,
-        &["apply", "--offline", "--json"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) = run_with_env(&proj, &["apply", "--offline", "--json"], &[]);
     let v = parse_json_envelope(&stdout);
     assert_ne!(code, 0, "{v}\n{stderr}");
-    let ev = event(&v, "pkg:npm/left-pad@1.3.0");
+    let ev = event_for(&v, "pkg:npm/left-pad@1.3.0");
     assert_eq!(ev["errorCode"], "package_not_installed", "{ev}");
     assert_eq!(std::fs::read(left_pad.join("index.js")).unwrap(), BEFORE);
 }
@@ -202,16 +156,12 @@ fn workspace_member_transitive_global_virtual_store_dep_is_refused() {
     )
     .unwrap();
     link_dir(&odd, &member_nm.join("is-odd"));
-    write_manifest(&proj, "pkg:npm/is-number@6.0.0");
+    write_patch(&proj, "pkg:npm/is-number@6.0.0");
 
-    let (code, stdout, stderr) = run_with_env(
-        &proj,
-        &["apply", "--offline", "--json"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) = run_with_env(&proj, &["apply", "--offline", "--json"], &[]);
     let v = parse_json_envelope(&stdout);
     assert_ne!(code, 0, "{v}\n{stderr}");
-    let ev = event(&v, "pkg:npm/is-number@6.0.0");
+    let ev = event_for(&v, "pkg:npm/is-number@6.0.0");
     assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
     assert!(ev.to_string().contains("enableGlobalVirtualStore"), "{ev}");
     assert_eq!(std::fs::read(number.join("index.js")).unwrap(), BEFORE);
@@ -245,16 +195,16 @@ fn workspace_member_refusal_holds_when_run_from_the_member() {
     )
     .unwrap();
     link_dir(&odd, &member_nm.join("is-odd"));
-    write_manifest(&member, "pkg:npm/is-number@6.0.0");
+    write_patch(&member, "pkg:npm/is-number@6.0.0");
 
     let (code, stdout, stderr) = run_with_env(
         &member,
         &["apply", "--offline", "--json", "--cwd", "."],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
+        &[],
     );
     let v = parse_json_envelope(&stdout);
     assert_ne!(code, 0, "{v}\n{stderr}");
-    let ev = event(&v, "pkg:npm/is-number@6.0.0");
+    let ev = event_for(&v, "pkg:npm/is-number@6.0.0");
     assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
     assert!(ev.to_string().contains("enableGlobalVirtualStore"), "{ev}");
     assert_eq!(std::fs::read(number.join("index.js")).unwrap(), BEFORE);

@@ -50,10 +50,9 @@
 //!   a full sparse-registry install proof until 2026-09-01: production's free
 //!   cargo tier emptied on 2026-08-28, so the leg was demoted to the canary
 //!   (`docs/testing/hosted-production-e2e.md` says how to re-promote it).
-//! * **golang** — hosted mode is supported for free-tier references carrying
-//!   a `goproxy` override (`docs/ecosystems.md#go-directory-replaces-and-gosum`), but production
-//!   publishes no golang hosted modules yet. Covered as a shape guard that
-//!   holds in both worlds.
+//! * **golang** — pgx/v5 v5.7.0 must deliver the function-call decoder fix
+//!   through a hosted `/v5` module with both go.sum pins, including a fresh
+//!   checkout. Missing hosted metadata is a failure.
 //! * **deno** — hosted mode is not supported. Covered as a negative assertion.
 //!
 //! # Prerequisites
@@ -707,17 +706,72 @@ fn gem_lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
 }
 
 /// The patch UUID the gem rewriter wired into `Gemfile`'s per-dep Socket
-/// source block. The block's URL shape is
+/// source block for `name`. The block's URL shape is
 /// `https://<PATCH_HOST>/patch-registry/gem/<grant>/<patch-uuid>/`; the grant
 /// token is itself UUID-shaped, so this takes the SECOND path segment rather
 /// than scanning for "something UUID-like".
-fn wired_gem_registry_uuid(gemfile: &str) -> Option<String> {
-    let marker = format!("https://{PATCH_HOST}/patch-registry/gem/");
-    let rest = &gemfile[gemfile.find(&marker)? + marker.len()..];
-    let path = &rest[..rest.find('"')?];
-    let mut segments = path.split('/').filter(|s| !s.is_empty());
-    let _grant = segments.next()?;
-    segments.next().map(str::to_string)
+///
+/// The rewriter writes one block per redirected gem, and production also
+/// publishes patches for `activestorage`'s own dependencies (`actionpack`,
+/// `activesupport`), so the Gemfile can hold several blocks in any order.
+/// Only the block whose body declares `gem "<name>"` counts: reading the
+/// first block would attribute a transitive gem's patch to `name`.
+fn wired_gem_registry_uuid(gemfile: &str, name: &str) -> Option<String> {
+    let marker = format!("source \"https://{PATCH_HOST}/patch-registry/gem/");
+    let decl = format!("gem \"{name}\"");
+    let mut text = gemfile;
+    while let Some(at) = text.find(&marker) {
+        let rest = &text[at + marker.len()..];
+        let path = &rest[..rest.find('"')?];
+        // The block body runs from the opener's line to its `end` line.
+        let body_start = rest.find('\n').map_or(rest.len(), |i| i + 1);
+        let body = &rest[body_start..];
+        let body = &body[..body.find("\nend").map_or(body.len(), |i| i + 1)];
+        if body.lines().any(|l| l.trim_start().starts_with(&decl)) {
+            let mut segments = path.split('/').filter(|s| !s.is_empty());
+            let _grant = segments.next()?;
+            return segments.next().map(str::to_string);
+        }
+        text = rest;
+    }
+    None
+}
+
+#[test]
+fn wired_gem_registry_uuid_reads_the_named_gems_block() {
+    let block = |grant: &str, uuid: &str, gem: &str| {
+        format!(
+            "source \"https://{PATCH_HOST}/patch-registry/gem/{grant}/{uuid}/\" do\n  \
+             gem \"{gem}\", \"6.0.3\"\nend\n"
+        )
+    };
+    let transitive_first = format!(
+        "source \"https://rubygems.org\"\n\n{}\n{}\n{}",
+        block("g1", "u-actionpack", "actionpack"),
+        block("g2", "u-activestorage", "activestorage"),
+        block("g3", "u-activesupport", "activesupport"),
+    );
+    assert_eq!(
+        wired_gem_registry_uuid(&transitive_first, "activestorage").as_deref(),
+        Some("u-activestorage")
+    );
+    assert_eq!(
+        wired_gem_registry_uuid(&transitive_first, "actionpack").as_deref(),
+        Some("u-actionpack")
+    );
+    // `activestorage` left unwired beside wired transitive gems: no block
+    // for it, never a neighbour's UUID (the 2026-11-01 hosted-e2e shape).
+    let unwired = format!(
+        "source \"https://rubygems.org\"\ngem \"activestorage\", \"6.0.3\"\n\n{}\n{}",
+        block("g1", "u-actionpack", "actionpack"),
+        block("g3", "u-activesupport", "activesupport"),
+    );
+    assert_eq!(wired_gem_registry_uuid(&unwired, "activestorage"), None);
+    // A prefix of another gem's name is not a match.
+    assert_eq!(
+        wired_gem_registry_uuid(&block("g", "u", "activestorage-x"), "activestorage"),
+        None
+    );
 }
 
 /// Locate the bundler-installed `gems/<name>-<version>` directory under a
@@ -2193,10 +2247,11 @@ async fn gem_bundler_hosted_install_proof() {
     // pinned any-of set and then content-verifies against the one bundler
     // was actually given.
     let gemfile = read(&proj.join("Gemfile"));
-    let wired_uuid = wired_gem_registry_uuid(&gemfile).unwrap_or_else(|| {
+    let wired_uuid = wired_gem_registry_uuid(&gemfile, GEM_NAME).unwrap_or_else(|| {
         panic!(
-            "{LEG}: Gemfile carries no per-dep Socket source block \
-             (`source \"https://{PATCH_HOST}/patch-registry/gem/<grant>/<uuid>/\" do`):\n{gemfile}"
+            "{LEG}: Gemfile carries no per-dep Socket source block declaring \
+             `gem \"{GEM_NAME}\"` (`source \"https://{PATCH_HOST}/patch-registry/gem/<grant>/<uuid>/\" do`) \
+             — the hosted scan did not redirect {GEM_NAME} itself:\n{gemfile}"
         )
     });
     assert!(
@@ -2447,55 +2502,16 @@ fn statements_for_opt(doc: Option<&serde_json::Value>, purl: &str) -> usize {
 // Documented negative cases
 // ===========================================================================
 
-/// Go hosted mode: supported for free-tier references that carry a `goproxy`
-/// override (`docs/ecosystems.md#go-directory-replaces-and-gosum`); refused with
-/// `redirect_golang_unsupported` otherwise (`golang-hosted-no-go.md`, the
-/// paid-tier analysis).
-///
-/// Production publishes no golang hosted modules today, so this guards BOTH
-/// worlds without edits: while prod ships no `goproxy` overrides, nothing may
-/// be redirected (an empty-project scan must not invent a redirect); the day
-/// prod starts shipping them, any redirect this scan performs must be the
-/// documented shape — a socket-namespace replace in go.mod plus go.sum lines.
-#[test]
-#[ignore = "live production API. Run with --ignored."]
-fn golang_hosted_redirects_only_via_goproxy_override() {
-    const LEG: &str = "golang_hosted_redirects_only_via_goproxy_override";
-    if !has_command("go") {
-        soft_skip!(LEG, "`go` not on PATH");
-    }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).expect("mkdir proj");
-    std::fs::write(
-        proj.join("go.mod"),
-        "module example.com/hosted-e2e\n\ngo 1.21\n",
-    )
-    .expect("write go.mod");
+#[path = "golang_production/mod.rs"]
+mod golang_production;
 
-    let env_json = scan_hosted(&proj, &["--ecosystems", "golang"]);
-    let redirected = hosted_pin_count(&env_json);
-    if redirected == 0 {
-        println!(
-            "{LEG}: production publishes no golang hosted modules (or none \
-             matched an empty project); nothing redirected, as documented."
-        );
-    } else {
-        // The moment prod ships goproxy overrides, every golang redirect must
-        // be the committable fork-replace shape.
-        let go_mod = std::fs::read_to_string(proj.join("go.mod")).expect("read go.mod");
-        assert!(
-            go_mod.contains("patch.socket.dev/gopatch/"),
-            "{LEG}: {redirected} golang redirect(s) reported but go.mod has no \
-             socket-namespace replace:\n{go_mod}\n{env_json:#}"
-        );
-        assert!(
-            proj.join("go.sum").is_file(),
-            "{LEG}: golang redirect without a go.sum pin bricks -mod=readonly \
-             builds:\n{env_json:#}"
-        );
-        println!("{LEG}: production now serves golang hosted modules; shape verified.");
+#[test]
+#[ignore = "live production API + real Go >= 1.21. Run with --ignored."]
+fn golang_hosted_pgx_delivery() {
+    if !has_command("go") {
+        soft_skip!("golang_hosted", "go not on PATH");
     }
+    golang_production::delivery("hosted");
 }
 
 /// Deno hosted mode is not supported. Same shape as the golang guard.

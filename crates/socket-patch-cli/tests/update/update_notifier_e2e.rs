@@ -594,66 +594,7 @@ async fn update_command_never_notifies() {
 #[cfg(unix)]
 mod pty {
     use super::*;
-    use portable_pty::{native_pty_system, PtySize};
-    use std::io::Read;
-
-    /// Minimal PTY runner (same shape as `interactive_prompts_e2e.rs`):
-    /// reader thread to EOF, detached SIGKILL watchdog, no input. This
-    /// bypasses `run_installed`, so the update kit is applied by hand on
-    /// top of `hermetic::pty_command`.
-    fn run_in_pty(
-        bin: &Path,
-        cwd: &Path,
-        env: &[(&str, &str)],
-        timeout: Duration,
-    ) -> (i32, String) {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // The hermetic environment, then the caller's kit, which lands last
-        // (its `SOCKET_NO_UPDATE_CHECK=0` turns the notifier back on).
-        let mut cmd = common::hermetic::pty_command(bin);
-        cmd.arg("apply");
-        cmd.cwd(cwd);
-        for (k, v) in env {
-            cmd.env(k, v);
-        }
-
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
-        drop(pair.slave);
-
-        let mut reader = pair.master.try_clone_reader().expect("clone reader");
-        let reader_handle = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
-        });
-
-        let mut killer = child.clone_killer();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            let _ = killer.kill();
-        });
-
-        // No prompt to answer: close the writer immediately so the child's
-        // stdin sees EOF if anything ever reads it.
-        drop(pair.master.take_writer().expect("take writer"));
-
-        let status = child.wait().expect("child.wait");
-        drop(pair.master);
-        let output = reader_handle.join().expect("reader join");
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
-    }
+    use crate::pty_io;
 
     #[tokio::test]
     async fn real_tty_shows_notice_pty() {
@@ -675,10 +616,12 @@ mod pty {
             // `eligible_kit_await_fetch`).
             ("SOCKET_UPDATE_GRACE_MS", "30000"),
         ];
-        let (code, output) = run_in_pty(
-            &install.bin,
+        let pty_io::PtyRun { code, output, .. } = pty_io::run_command(
+            common::hermetic::pty_command(&install.bin),
+            &["apply"],
             &install.workdir,
             &kit,
+            &[],
             Duration::from_secs(30),
         );
         assert_eq!(code, 0, "carrier must succeed in a PTY; got: {output}");

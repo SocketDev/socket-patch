@@ -9,6 +9,8 @@ mod rollback_json;
 mod bun_vex;
 #[path = "../common/mod.rs"]
 mod common;
+#[path = "../docker_common/mod.rs"]
+mod docker_common;
 #[path = "../docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
 
