@@ -1,8 +1,9 @@
 //! Unified JSON output envelope shared across every subcommand.
 //!
 //! Every command's `--json` output uses this top-level shape (`vex` only
-//! with `--json --output`). A command's own payload (scan's `packages`, rollback's `hosted`, …) rides beside the
-//! shared keys through [`Envelope::extra`]:
+//! with `--json --output`; the hidden `hosted-bundle` prints its own). A
+//! command's own payload (scan's `packages`, rollback's `hosted`, …) rides
+//! beside the shared keys through [`Envelope::extra`]:
 //!
 //! ```json
 //! {

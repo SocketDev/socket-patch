@@ -13,10 +13,10 @@
 //! Only an uncatchable kill (SIGKILL, power loss) can still leave the file,
 //! and the next lock-taking command reclaims and removes it.
 //!
-//! On Unix, [`install`] also restores SIGPIPE's default disposition, so a
-//! pipe consumer that closes stdout ends the process quietly instead of a
-//! panic on EPIPE. Network writes still suppress SIGPIPE through
-//! std/socket2.
+//! On Unix, [`install`] also resets SIGPIPE to its default disposition
+//! (unconditionally, unlike the signals above), so a pipe consumer that
+//! closes stdout ends the process quietly instead of a panic on EPIPE.
+//! Network writes still suppress SIGPIPE through std/socket2.
 
 use socket_patch_core::patch::apply_lock::cleanup_held_lock_on_interrupt;
 

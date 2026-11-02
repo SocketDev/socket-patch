@@ -245,7 +245,7 @@ fn format_notice(
     )
 }
 
-/// A millisecond test knob's value (`SOCKET_UPDATE_TIMEOUT_MS`,
+/// A millisecond env knob's value (`SOCKET_UPDATE_TIMEOUT_MS`,
 /// `SOCKET_UPDATE_GRACE_MS`): `default` when unset, empty or not a number.
 fn millis_or(raw: Option<&str>, default: u64) -> Duration {
     Duration::from_millis(raw.and_then(|v| v.parse().ok()).unwrap_or(default))
