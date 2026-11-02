@@ -2597,7 +2597,8 @@ mod tests {
 
     #[tokio::test]
     async fn judge_installed_record_matches_verify_and_evidence_scan() {
-        use crate::crawlers::oracle_support::{fifo, mkdir, write, Rng};
+        use crate::crawlers::oracle_support::{fifo, mkdir, write};
+        use crate::test_rng::Rng;
 
         let patched = compute_git_sha256_from_bytes(b"patched");
         let upstream = compute_git_sha256_from_bytes(b"upstream");

@@ -30,16 +30,17 @@ pub(crate) fn npm_range_admits(range: &str, version: &str) -> Option<bool> {
     Some(admits)
 }
 
+fn is_operator(c: char) -> bool {
+    matches!(c, '^' | '~' | '>' | '<' | '=')
+}
+
 /// The comparators of one npm range alternative, an operator npm allows
 /// to stand apart (`>= 1.2.0`) joined to its version.
 fn glue_operators(alternative: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut pending = String::new();
     for token in alternative.split_whitespace() {
-        if token
-            .chars()
-            .all(|c| matches!(c, '^' | '~' | '>' | '<' | '='))
-        {
+        if token.chars().all(is_operator) {
             pending.push_str(token);
         } else {
             out.push(format!("{}{token}", std::mem::take(&mut pending)));
@@ -53,7 +54,7 @@ fn glue_operators(alternative: &str) -> Vec<String> {
 /// crate reads both as caret ranges.
 fn npm_comparator(comparator: &str) -> Option<String> {
     let op_len = comparator
-        .find(|c: char| !matches!(c, '^' | '~' | '>' | '<' | '='))
+        .find(|c: char| !is_operator(c))
         .unwrap_or(comparator.len());
     let (op, version) = comparator.split_at(op_len);
     let version = version.strip_prefix('v').unwrap_or(version);

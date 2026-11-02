@@ -106,40 +106,7 @@ pub async fn refusal(
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        let workspace = if has_own_npm_family_lock(root) {
-            member_stray_lock_refusal(root).await
-        } else {
-            nearer_root(
-                package_json_workspace_refusal(root).await,
-                vlt_workspace_refusal(root).await,
-            )
-        };
-        if let Some(lock) = pnpm_lock_elsewhere(root).await {
-            let dir = lock.parent().unwrap_or(&lock);
-            // A `package.json` workspace root nested inside the pnpm lock's
-            // directory is nearer the member and owns its lock (Bugbot on
-            // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
-            if let Some((ws_root, refusal)) = workspace {
-                let pnpm_dir = tokio::fs::canonicalize(dir)
-                    .await
-                    .unwrap_or_else(|_| dir.to_path_buf());
-                if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
-                    return Some(refusal);
-                }
-            }
-            return Some(Refusal {
-                code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
-                message: format!(
-                    "{} has no lockfile of its own: pnpm installs it from {}, which a \
-                     hosted run here cannot see; run socket-patch from {} (the directory \
-                     holding pnpm-lock.yaml); nothing was written",
-                    root.display(),
-                    lock.display(),
-                    dir.display()
-                ),
-            });
-        }
-        if let Some((_, refusal)) = workspace {
+        if let Some((_, refusal)) = npm_family_governing_root(root).await {
             return Some(refusal);
         }
         if trust_lockfile_config {
@@ -149,6 +116,55 @@ pub async fn refusal(
         }
     }
     None
+}
+
+/// The directory whose npm-family lock installs `root` when `root` is a
+/// workspace member with no lock of its own (or only locks its manager
+/// never reads): a pnpm workspace or `lockfile-dir`, an npm, yarn or Bun
+/// `package.json` workspace, or a vlt workspace, the nearer root winning.
+/// Returns that root with hosted mode's refusal for it. Vendored commands
+/// that read only `root` (`vendor`, `vendor --revert`, `vendor --check`)
+/// use the root to refuse instead of reporting nothing to do (#1921).
+pub async fn npm_family_governing_root(root: &Path) -> Option<(PathBuf, Refusal)> {
+    let workspace = if has_own_npm_family_lock(root) {
+        member_stray_lock_refusal(root).await
+    } else {
+        nearer_root(
+            package_json_workspace_refusal(root).await,
+            vlt_workspace_refusal(root).await,
+        )
+    };
+    if let Some(lock) = pnpm_lock_elsewhere(root).await {
+        let dir = lock.parent().unwrap_or(&lock);
+        // Canonical, like the other branches' roots: a relative
+        // `lockfile-dir` (`../..`) would otherwise name a `..` path.
+        let pnpm_dir = tokio::fs::canonicalize(dir)
+            .await
+            .unwrap_or_else(|_| dir.to_path_buf());
+        // A `package.json` workspace root nested inside the pnpm lock's
+        // directory is nearer the member and owns its lock (Bugbot on
+        // #901); otherwise pnpm's workspace or `lockfile-dir` governs.
+        if let Some((ws_root, refusal)) = workspace {
+            if ws_root != pnpm_dir && ws_root.starts_with(&pnpm_dir) {
+                return Some((ws_root, refusal));
+            }
+        }
+        return Some((
+            pnpm_dir,
+            Refusal {
+                code: PNPM_LOCKFILE_ELSEWHERE.to_string(),
+                message: format!(
+                    "{} has no lockfile of its own: pnpm installs it from {}, which a \
+                 hosted run here cannot see; run socket-patch from {} (the directory \
+                 holding pnpm-lock.yaml); nothing was written",
+                    root.display(),
+                    lock.display(),
+                    dir.display()
+                ),
+            },
+        ));
+    }
+    workspace
 }
 
 /// A pnpm v9 project lock (the one the trust auto-config serves) in a

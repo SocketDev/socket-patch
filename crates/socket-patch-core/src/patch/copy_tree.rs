@@ -198,6 +198,7 @@ pub async fn remove_tree(dir: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_rng::Rng;
     use std::fs;
 
     #[cfg(unix)]
@@ -232,23 +233,6 @@ mod tests {
                 }
             })
             .collect()
-    }
-
-    /// Deterministic xorshift64* — no `rand` dev-dependency.
-    struct Rng(u64);
-
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            let mut x = self.0;
-            x ^= x >> 12;
-            x ^= x << 25;
-            x ^= x >> 27;
-            self.0 = x;
-            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
     }
 
     const SKIP: &str = ".cargo-checksum.json";

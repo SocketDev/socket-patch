@@ -1542,9 +1542,10 @@ async fn classic_file_directory_copy_under_another_name_is_named_and_not_atteste
 /// #1516: the #1236 copy, but from a directory OUTSIDE the project root
 /// (`"lp2": "file:../ext/lpdir"`, shared code in a non-workspace
 /// monorepo). yarn 1 installs it into `node_modules/lp2` all the same, so
-/// it stays unpatched. `scan --mode hosted` must name the copy
-/// (`redirect_copy_unpatched`), and neither its in-run VEX nor a lock-only
-/// `vex` may attest left-pad not_affected.
+/// it stays unpatched. `scan --mode hosted` must name the copy exactly as
+/// it names an in-root one (`redirect_yarn_classic_directory_skipped`,
+/// read through the reader vendored and VEX use, #1951), once, and neither
+/// its in-run VEX nor a lock-only `vex` may attest left-pad not_affected.
 #[tokio::test(flavor = "multi_thread")]
 #[serial_test::serial]
 async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested() {
@@ -1635,11 +1636,22 @@ async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested(
         lock.contains(&format!("{UUID}/{DEP}-{DEP_VERSION}.tgz")),
         "the registry left-pad block must still be pinned:\n{lock}"
     );
-    assert!(
-        env.to_string().contains("redirect_copy_unpatched"),
-        "the outside-root copy must be named: {env}"
+    let naming: Vec<&str> = env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| {
+            w["detail"]
+                .as_str()
+                .is_some_and(|d| d.contains("lp2@file:../ext/lpdir"))
+        })
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert_eq!(
+        naming,
+        ["redirect_yarn_classic_directory_skipped"],
+        "the outside-root copy must be named once, as an in-root one is: {env}"
     );
-    assert!(env.to_string().contains("lp2@file:../ext/lpdir"), "{env}");
     let vex = std::fs::read_to_string(proj.join("out.vex.json")).unwrap_or_default();
     assert!(
         !vex.contains("not_affected"),
