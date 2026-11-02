@@ -27,7 +27,7 @@ _Last updated 2026-11-02T05:10Z · main @ cbbbdb9_
 | #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; CI and Bugbot green |
 | #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; CI and Bugbot green |
 | #1967 | sweep | `cli/src/{json_envelope,update_notifier,main,interrupt,path_scope}.rs` (path_scope tests only, #1864) | ready; CI and Bugbot green |
-| #1972 | structural | T60 #1968 slice 1: `tests/docker_common` + 15 `docker_e2e_*` suites (test-only, +260/−1,113) | ready; CI and Bugbot pending |
+| #1972 | structural | T60 #1968 slice 1: `tests/docker_common` + 15 `docker_e2e_*` suites (test-only, +260/−1,113) | ready; CI and Bugbot green |
 
 #### Merged
 _None._
