@@ -2004,7 +2004,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // Reuse the takeover's read-only backend preview over the restored
     // lockfile text. A manifest's presence must not change whether a dry
     // run catches an unsupported lock entry (for example a pnpm catalog).
-    let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
+    let uninstalled = common.cwd.join(UNINSTALLED_REL);
     let blobs = common.socket_dir().join("blobs");
     let sources = PatchSources {
         blobs_path: &blobs,
@@ -2853,32 +2853,37 @@ fn superseded_install(
         && matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Pypi)))
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn plan_service_downloads(
-    cwd: &Path,
-    force: bool,
-    all_packages: &[(String, StagedSource)],
+/// The stand-in source of a superseded install (see [`superseded_install`]),
+/// relative to the project root: a path that never exists, so the backend
+/// takes the pristine artifact from the lock, the registry or the service
+/// instead of the installed copy.
+const UNINSTALLED_REL: &str = ".socket/vendor/.uninstalled";
+
+/// One package of the vendor loop and the records it is judged for.
+struct CandidateGroup<'p> {
+    /// The package's position in the loop order (for progress lines).
+    index: usize,
+    staged: &'p StagedSource,
+    /// A release-variant ecosystem (pypi `?artifact_id=`, gem
+    /// `?platform=`, maven): the candidates are the qualified records of
+    /// one base purl.
+    is_variant_eco: bool,
+    candidates: Vec<String>,
+}
+
+/// The vendor loop's packages in order, each with its candidate records:
+/// a release-variant base purl fans out to every qualified record of its
+/// group, once per base; any other purl is its own candidate.
+fn candidate_groups<'p>(
+    all_packages: &'p [(String, StagedSource)],
     variant_groups: &HashMap<String, Vec<String>>,
-    records: &HashMap<String, PatchRecord>,
-    ledger: &VendorState,
-    refused: &HashSet<String>,
-    bun_refusal: Option<&crate::commands::bun_preflight::BunVendorRefusal>,
-    takeover_blocked: &dyn Fn(&str) -> bool,
-    (pipenv_version, installed_sites): (
-        &tokio::sync::OnceCell<Option<u32>>,
-        &vendor::pypi::InstalledSiteListings,
-    ),
-) -> Vec<socket_patch_core::api::client::PlannedDownload> {
-    // The loop's stand-in for a superseded install (see there).
-    let uninstalled = cwd.join(".socket/vendor/.uninstalled");
-    // Each loop candidate that reaches its backend, in loop order.
-    let mut reaching: Vec<(&str, &PatchRecord, &Path)> = Vec::new();
+) -> Vec<CandidateGroup<'p>> {
     let mut handled_bases: HashSet<String> = HashSet::new();
-    for (purl, staged) in all_packages {
-        let source = staged.as_source();
+    let mut groups = Vec::new();
+    for (index, (purl, staged)) in all_packages.iter().enumerate() {
         let is_variant_eco =
             Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
-        let candidates: Vec<String> = if is_variant_eco {
+        let candidates = if is_variant_eco {
             let base = strip_purl_qualifiers(purl).to_string();
             if !handled_bases.insert(base.clone()) {
                 continue;
@@ -2890,53 +2895,181 @@ async fn plan_service_downloads(
         } else {
             vec![purl.clone()]
         };
-        for candidate in &candidates {
-            let Some((candidate, record)) = records.get_key_value(candidate) else {
+        groups.push(CandidateGroup {
+            index,
+            staged,
+            is_variant_eco,
+            candidates,
+        });
+    }
+    groups
+}
+
+/// What the vendor loop does with one candidate before any takeover or
+/// backend call.
+enum CandidateVerdict<'a> {
+    /// Not this run's: no record, refused earlier, a variant the installed
+    /// copy is not, or a sibling variant the ledger records covers it.
+    Skip,
+    /// Several variants match a package with nothing installed to probe
+    /// and none recorded: `vendor_variant_ambiguous`.
+    Ambiguous,
+    /// A Bun, vlt or linked-vendor-dir refusal, with the engine's code and
+    /// detail. Raised before the takeover, so a live hosted pin stays.
+    Refuse { code: &'static str, detail: String },
+    /// The candidate reaches its takeover and backend. `superseded`: its
+    /// source is the [`UNINSTALLED_REL`] stand-in, not the installed copy.
+    Vendor {
+        purl: &'a str,
+        record: &'a PatchRecord,
+        superseded: bool,
+    },
+}
+
+/// The per-run inputs every candidate is judged against. The download
+/// plan and the vendor loop both judge through [`CandidateGates::judge`],
+/// so a package the loop refuses is never granted a download.
+struct CandidateGates<'a> {
+    cwd: &'a Path,
+    force: bool,
+    records: &'a HashMap<String, PatchRecord>,
+    /// Purls already failed this run (`vendor_ledger_entry_missing`); a
+    /// sibling variant's group must not bring them back.
+    refused: &'a HashSet<String>,
+    bun_refusal: Option<&'a crate::commands::bun_preflight::BunVendorRefusal>,
+    vlt_refusals: &'a [(String, crate::commands::vlt_preflight::VltVendorRefusal)],
+    /// Whether the lockfiles still pin the purl hosted.
+    hosted_pinned: &'a dyn Fn(&str) -> bool,
+}
+
+impl<'a> CandidateGates<'a> {
+    /// Judge `candidate` of `group` against `ledger` (the loop's current
+    /// copy, which its per-package persists update).
+    async fn judge(
+        &self,
+        ledger: &VendorState,
+        group: &CandidateGroup<'_>,
+        candidate: &str,
+    ) -> CandidateVerdict<'a> {
+        let Some((purl, record)) = self.records.get_key_value(candidate) else {
+            return CandidateVerdict::Skip;
+        };
+        if self.refused.contains(candidate) {
+            return CandidateVerdict::Skip;
+        }
+        // Variant probe: only the installed distribution's variant is
+        // vendored (mirrors apply / select_installed_variants). It hashes a
+        // representative patch-target file against the installed package
+        // dir, so it only works when those files are EXTRACTED on disk.
+        // Maven's patch targets live INSIDE the un-extracted jar and its
+        // vendor takes the single main jar regardless, so it is skipped.
+        let probe_applicable = group.is_variant_eco
+            && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
+        // A deferred source was deferred because the ledger covers the
+        // purl at this record's uuid: the variant the ledger vendored is
+        // the installed one's by construction, so it answers the probe
+        // without downloading the pristine tree just to read one file.
+        let ledger_answers_probe =
+            lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
+        let mut superseded = false;
+        if probe_applicable && !self.force && !ledger_answers_probe {
+            if let StagedSource::Installed(dir) = group.staged {
+                if let Some((file, info)) = representative_file(&record.files) {
+                    if !variant_matches_installed(Some(
+                        &verify_file_patch(dir, file, info).await.status,
+                    )) {
+                        if !superseded_install(
+                            ledger,
+                            candidate,
+                            record,
+                            group.candidates.len() == 1,
+                            (self.hosted_pinned)(candidate),
+                        ) {
+                            return CandidateVerdict::Skip;
+                        }
+                        superseded = true;
+                    }
+                }
+            } else if group.candidates.len() > 1
+                && lookup_entry(&ledger.entries, candidate).is_none()
+            {
+                // Nothing installed to probe: a variant the ledger records
+                // (at any uuid) is the wired distribution, so its siblings
+                // are left out and accounted for by it.
+                if group
+                    .candidates
+                    .iter()
+                    .any(|c| lookup_entry(&ledger.entries, c).is_some())
+                {
+                    return CandidateVerdict::Skip;
+                }
+                return CandidateVerdict::Ambiguous;
+            }
+        }
+        if let Some(refusal) = self.bun_refusal.filter(|r| r.applies_to(candidate)) {
+            return CandidateVerdict::Refuse {
+                code: refusal.code,
+                detail: refusal.detail.clone(),
+            };
+        }
+        if let Some(refusal) = vlt_refusal_for(self.vlt_refusals, candidate) {
+            return CandidateVerdict::Refuse {
+                code: refusal.code,
+                detail: refusal.detail.clone(),
+            };
+        }
+        // A linked vendor dir (#664) is refused before the takeover can
+        // restore a live hosted pin's upstream entry: the refusal must
+        // leave the hosted patch wired.
+        if let Some(detail) = linked_vendor_dir_refusal(self.cwd, candidate, &record.uuid) {
+            return CandidateVerdict::Refuse {
+                code: "vendor_dir_symlink_unsupported",
+                detail,
+            };
+        }
+        CandidateVerdict::Vendor {
+            purl,
+            record,
+            superseded,
+        }
+    }
+}
+
+/// The service downloads the vendor loop will ask for, in loop order: each
+/// candidate [`CandidateGates::judge`] sends to its backend, less the ones
+/// the loop answers without the service (a hosted takeover, an npm
+/// artifact the ledger anchors, an in-sync re-run) and the ones the
+/// backend's own preflight refuses.
+async fn plan_service_downloads(
+    gates: &CandidateGates<'_>,
+    ledger: &VendorState,
+    all_packages: &[(String, StagedSource)],
+    variant_groups: &HashMap<String, Vec<String>>,
+    (pipenv_version, installed_sites): (
+        &tokio::sync::OnceCell<Option<u32>>,
+        &vendor::pypi::InstalledSiteListings,
+    ),
+) -> Vec<socket_patch_core::api::client::PlannedDownload> {
+    let cwd = gates.cwd;
+    let uninstalled = cwd.join(UNINSTALLED_REL);
+    // Each loop candidate that reaches its backend, in loop order.
+    let mut reaching: Vec<(&str, &PatchRecord, &Path)> = Vec::new();
+    for group in candidate_groups(all_packages, variant_groups) {
+        for candidate in &group.candidates {
+            let CandidateVerdict::Vendor {
+                purl: candidate,
+                record,
+                superseded,
+            } = gates.judge(ledger, &group, candidate).await
+            else {
                 continue;
             };
-            if refused.contains(candidate) {
-                continue;
-            }
-            // The loop's installed-variant probe (see there).
-            let probe_applicable = is_variant_eco
-                && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
-            let ledger_answers_probe =
-                lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
-            let mut source_path = source.path();
-            if probe_applicable && !force && !ledger_answers_probe {
-                if matches!(staged, StagedSource::Installed(_)) {
-                    if let Some((file, info)) = representative_file(&record.files) {
-                        let dir = source.path();
-                        if !variant_matches_installed(Some(
-                            &verify_file_patch(dir, file, info).await.status,
-                        )) {
-                            if !superseded_install(
-                                ledger,
-                                candidate,
-                                record,
-                                candidates.len() == 1,
-                                takeover_blocked(candidate),
-                            ) {
-                                continue;
-                            }
-                            source_path = &uninstalled;
-                        }
-                    }
-                } else if candidates.len() > 1 && lookup_entry(&ledger.entries, candidate).is_none()
-                {
-                    // The loop leaves this variant to a sibling the ledger
-                    // records, or refuses it as ambiguous (see there).
-                    continue;
-                }
-            }
-            if bun_refusal.is_some_and(|r| r.applies_to(candidate)) {
-                continue;
-            }
-            // The loop refuses a linked vendor dir; no grant on its behalf.
-            if linked_vendor_dir_refusal(cwd, candidate, &record.uuid).is_some() {
-                continue;
-            }
-            if takeover_blocked(candidate) {
+            let source_path = if superseded {
+                uninstalled.as_path()
+            } else {
+                group.staged.as_source().path()
+            };
+            if (gates.hosted_pinned)(candidate) {
                 continue;
             }
             // The npm backends re-wire a committed artifact the ledger
@@ -2957,7 +3090,7 @@ async fn plan_service_downloads(
             if lookup_entry(&ledger.entries, candidate).is_some_and(|e| e.uuid == record.uuid) {
                 continue;
             }
-            reaching.push((candidate.as_str(), record, source_path));
+            reaching.push((candidate, record, source_path));
         }
     }
 
@@ -3218,9 +3351,9 @@ pub(crate) async fn vendor_records_reusing(
             all_packages.remove(purl);
             continue;
         }
-        all_packages.entry(purl.clone()).or_insert_with(|| {
-            StagedSource::Missing(common.cwd.join(".socket/vendor/.uninstalled"))
-        });
+        all_packages
+            .entry(purl.clone())
+            .or_insert_with(|| StagedSource::Missing(common.cwd.join(UNINSTALLED_REL)));
     }
 
     let vendored_at = now_rfc3339();
@@ -3258,7 +3391,6 @@ pub(crate) async fn vendor_records_reusing(
     }
 
     let mut matched: HashSet<String> = HashSet::new();
-    let mut handled_bases: HashSet<String> = HashSet::new();
 
     // The lockfiles' hosted pins, for cross-mode takeovers: vendoring a purl
     // the lockfiles still pin hosted must restore its upstream registry
@@ -3320,6 +3452,20 @@ pub(crate) async fn vendor_records_reusing(
             .collect(),
     });
 
+    let hosted_pinned = |purl: &str| hosted_pin_of(purl).is_some();
+    let gates = CandidateGates {
+        cwd: &common.cwd,
+        force,
+        records,
+        refused: &fetch_failed,
+        bun_refusal: bun_refusal.as_ref(),
+        vlt_refusals: &vlt_refusals,
+        hosted_pinned: &hosted_pinned,
+    };
+    // Candidates the loop refuses as `vendor_variant_ambiguous`, joined to
+    // `fetch_failed` once the loop is done.
+    let mut ambiguous: Vec<String> = Vec::new();
+
     // Service downloads, fetched ahead of this serial loop (the wiring and
     // every write stay here, in order). The plan is EXACT — only the
     // records the loop will ask the service for (see
@@ -3329,17 +3475,11 @@ pub(crate) async fn vendor_records_reusing(
     // is still decided at the loop's own call (see `VendorPrefetch`).
     let service_prefetch = match service.filter(|cfg| !common.dry_run && cfg.wants_prefetch()) {
         Some(cfg) => {
-            let takeover_blocked = |purl: &str| hosted_pin_of(purl).is_some();
             let planned = plan_service_downloads(
-                &common.cwd,
-                force,
+                &gates,
+                &state,
                 &all_packages,
                 &variant_groups,
-                records,
-                &state,
-                &fetch_failed,
-                bun_refusal.as_ref(),
-                &takeover_blocked,
                 (&pipenv_version, &installed_sites),
             )
             .await;
@@ -3370,125 +3510,47 @@ pub(crate) async fn vendor_records_reusing(
     });
     let mut stale_artifacts: Vec<StaleArtifact> = Vec::new();
     // The source of a superseded install (see [`superseded_install`]).
-    let uninstalled = common.cwd.join(".socket/vendor/.uninstalled");
-    for (index, (purl, staged)) in all_packages.iter().enumerate() {
-        let pkg_source = staged.as_source();
-        let is_variant_eco =
-            Ecosystem::from_purl(purl).is_some_and(|e| e.supports_release_variants());
-        let candidates: Vec<String> = if is_variant_eco {
-            let base = strip_purl_qualifiers(purl).to_string();
-            if !handled_bases.insert(base.clone()) {
-                continue;
-            }
-            variant_groups
-                .get(&base)
-                .cloned()
-                .unwrap_or_else(|| vec![base])
-        } else {
-            vec![purl.clone()]
-        };
-
-        for candidate in &candidates {
-            let Some(record) = records.get(candidate) else {
-                continue;
-            };
-            // Refused above (`vendor_ledger_entry_missing`); a sibling
-            // variant's group must not bring it back.
-            if fetch_failed.contains(candidate) {
-                continue;
-            }
-
-            // Variant probe: only the installed distribution's variant is
-            // vendored (mirrors apply / select_installed_variants). It hashes a
-            // representative patch-target file against the installed package
-            // dir, so it only works when those files are EXTRACTED on disk.
-            // Maven's patch targets live INSIDE the un-extracted jar and its
-            // vendor takes the single main jar regardless, so it is skipped.
-            let probe_applicable = is_variant_eco
-                && !matches!(Ecosystem::from_purl(candidate), Some(Ecosystem::Maven));
-            // A deferred source was deferred because the ledger covers the
-            // purl at this record's uuid: the variant the ledger vendored is
-            // the installed one's by construction, so it answers the probe
-            // without downloading the pristine tree just to read one file.
-            let ledger_answers_probe =
-                lookup_entry(&state.entries, candidate).is_some_and(|e| e.uuid == record.uuid);
-            let mut candidate_source = pkg_source;
-            if probe_applicable && !force && !ledger_answers_probe {
-                if matches!(staged, StagedSource::Installed(_)) {
-                    if let Some((file, info)) = representative_file(&record.files) {
-                        if !variant_matches_installed(Some(
-                            &verify_file_patch(pkg_source.path(), file, info)
-                                .await
-                                .status,
-                        )) {
-                            if !superseded_install(
-                                &state,
-                                candidate,
-                                record,
-                                candidates.len() == 1,
-                                hosted_pin_of(candidate).is_some(),
-                            ) {
-                                continue;
-                            }
-                            candidate_source = PackageSource::Installed(&uninstalled);
-                        }
-                    }
-                } else if candidates.len() > 1 && lookup_entry(&state.entries, candidate).is_none()
-                {
-                    // Nothing installed to probe: a variant the ledger
-                    // records (at any uuid) is the wired distribution, so
-                    // its siblings are left out and accounted for by it.
-                    if candidates
-                        .iter()
-                        .any(|c| lookup_entry(&state.entries, c).is_some())
-                    {
-                        continue;
-                    }
+    let uninstalled = common.cwd.join(UNINSTALLED_REL);
+    for package in candidate_groups(&all_packages, &variant_groups) {
+        let index = package.index;
+        let pkg_source = package.staged.as_source();
+        for candidate in &package.candidates {
+            let (record, superseded) = match gates.judge(&state, &package, candidate).await {
+                CandidateVerdict::Skip => continue,
+                CandidateVerdict::Ambiguous => {
                     let detail = "multiple patch variants match an uninstalled package; select one release variant";
                     env.record(
                         PatchEvent::new(PatchAction::Failed, candidate.clone())
                             .with_error("vendor_variant_ambiguous", detail),
                     );
                     report_vendor_failure(common, candidate, detail);
-                    fetch_failed.insert(candidate.clone());
+                    ambiguous.push(candidate.clone());
                     continue;
                 }
-            }
+                // The Bun/vlt preflight verdicts (computed once above) and
+                // a linked vendor dir: refused HERE, with the engine's own
+                // code and detail, before the takeover block below can
+                // revert a live hosted redirect.
+                CandidateVerdict::Refuse { code, detail } => {
+                    matched.insert(candidate.clone());
+                    has_errors = true;
+                    env.record(
+                        PatchEvent::new(PatchAction::Failed, candidate.clone())
+                            .with_error(code, detail.clone()),
+                    );
+                    report_vendor_failure(common, candidate, &detail);
+                    continue;
+                }
+                CandidateVerdict::Vendor {
+                    record, superseded, ..
+                } => (record, superseded),
+            };
             matched.insert(candidate.clone());
-
-            // The Bun/vlt preflight verdicts (computed once above): refuse
-            // HERE, with the engine's own code and detail, before the
-            // takeover block below can revert a live hosted redirect.
-            if let Some(refusal) = bun_refusal.as_ref().filter(|r| r.applies_to(candidate)) {
-                has_errors = true;
-                env.record(
-                    PatchEvent::new(PatchAction::Failed, candidate.clone())
-                        .with_error(refusal.code, refusal.detail.clone()),
-                );
-                report_vendor_failure(common, candidate, &refusal.detail);
-                continue;
-            }
-            if let Some(refusal) = vlt_refusal_for(&vlt_refusals, candidate) {
-                has_errors = true;
-                env.record(
-                    PatchEvent::new(PatchAction::Failed, candidate.clone())
-                        .with_error(refusal.code, refusal.detail.clone()),
-                );
-                report_vendor_failure(common, candidate, &refusal.detail);
-                continue;
-            }
-            // A linked vendor dir (#664) is refused before the takeover
-            // below can restore a live hosted pin's upstream entry: the
-            // refusal must leave the hosted patch wired.
-            if let Some(detail) = linked_vendor_dir_refusal(&common.cwd, candidate, &record.uuid) {
-                has_errors = true;
-                env.record(
-                    PatchEvent::new(PatchAction::Failed, candidate.clone())
-                        .with_error("vendor_dir_symlink_unsupported", detail.clone()),
-                );
-                report_vendor_failure(common, candidate, &detail);
-                continue;
-            }
+            let candidate_source = if superseded {
+                PackageSource::Installed(&uninstalled)
+            } else {
+                pkg_source
+            };
 
             // Cross-mode takeover: vendoring over a LIVE hosted pin must
             // first restore the upstream registry entry (v5 keeps no hosted
@@ -4175,6 +4237,7 @@ pub(crate) async fn vendor_records_reusing(
         }
     }
 
+    fetch_failed.extend(ambiguous);
     // Manifest entries that targeted in-scope ecosystems but had no
     // installed package on disk (and could not be auto-fetched).
     let mut unmatched: Vec<String> = vendorable
@@ -5321,6 +5384,23 @@ mod plan_gate_tests {
         ));
     }
 
+    /// Gates with no preflight refusals, no hosted pins and no `--force`.
+    pub(super) fn gates<'a>(
+        root: &'a Path,
+        records: &'a HashMap<String, PatchRecord>,
+        refused: &'a HashSet<String>,
+    ) -> CandidateGates<'a> {
+        CandidateGates {
+            cwd: root,
+            force: false,
+            records,
+            refused,
+            bun_refusal: None,
+            vlt_refusals: &[],
+            hosted_pinned: &|_| false,
+        }
+    }
+
     /// The download plan runs every record through its backend's own gate:
     /// a package the backend refuses before its first service call is
     /// never planned, wherever it sits in the loop order. Here the refused
@@ -5369,15 +5449,10 @@ mod plan_gate_tests {
             records.insert(purl.to_string(), record(uuid));
         }
         let planned = plan_service_downloads(
-            root,
-            false,
+            &gates(root, &records, &HashSet::new()),
+            &VendorState::default(),
             &all_packages,
             &HashMap::new(),
-            &records,
-            &VendorState::default(),
-            &HashSet::new(),
-            None,
-            &|_| false,
             (
                 &tokio::sync::OnceCell::new(),
                 &vendor::pypi::InstalledSiteListings::default(),
@@ -5439,15 +5514,10 @@ mod plan_gate_tests {
         std::os::unix::fs::symlink(&other, eco_dir.join(UUID_B)).unwrap();
 
         let planned = plan_service_downloads(
-            root,
-            false,
+            &gates(root, &records, &HashSet::new()),
+            &VendorState::default(),
             &all_packages,
             &HashMap::new(),
-            &records,
-            &VendorState::default(),
-            &HashSet::new(),
-            None,
-            &|_| false,
             (
                 &tokio::sync::OnceCell::new(),
                 &vendor::pypi::InstalledSiteListings::default(),
@@ -5459,6 +5529,83 @@ mod plan_gate_tests {
             uuids,
             vec![UUID_A, UUID_C],
             "the linked package is never planned"
+        );
+    }
+
+    /// A vlt project whose installed store copy declares
+    /// `bundleDependencies` passes the lock-level backend preflight, but
+    /// the vlt preflight refuses it and so does the loop (#1909). The plan
+    /// must leave it out: a grant can start a server-side build and counts
+    /// against quota.
+    #[tokio::test]
+    async fn the_plan_leaves_out_a_package_the_vlt_preflight_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        std::fs::write(
+            root.join("vlt-lock.json"),
+            "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \
+             \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-REG==\"]\n  },\n  \
+             \"edges\": {\n    \"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\"\n  }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        let store = root.join("node_modules/.vlt/~npm~left-pad@1.3.0/node_modules/left-pad");
+        std::fs::create_dir_all(&store).unwrap();
+        let all_packages = vec![(purl.to_string(), StagedSource::Installed(store.clone()))];
+        let records = HashMap::from([(purl.to_string(), record(UUID_A))]);
+        let pairs = [(purl, UUID_A)];
+        let none = HashSet::new();
+        let plan = |vlt_refusals: Vec<_>| {
+            let none = &none;
+            let all_packages = &all_packages;
+            let records = &records;
+            async move {
+                let gates = CandidateGates {
+                    vlt_refusals: &vlt_refusals,
+                    ..gates(root, records, none)
+                };
+                plan_service_downloads(
+                    &gates,
+                    &VendorState::default(),
+                    all_packages,
+                    &HashMap::new(),
+                    (
+                        &tokio::sync::OnceCell::new(),
+                        &vendor::pypi::InstalledSiteListings::default(),
+                    ),
+                )
+                .await
+                .into_iter()
+                .map(|d| d.uuid)
+                .collect::<Vec<_>>()
+            }
+        };
+        let empty = HashMap::new();
+
+        std::fs::write(store.join("package.json"), r#"{"name":"left-pad"}"#).unwrap();
+        let vlt =
+            crate::commands::vlt_preflight::vlt_vendor_preflight_pairs(root, &pairs, Ok(&empty))
+                .await;
+        assert!(vlt.is_empty(), "{vlt:?}");
+        assert_eq!(plan(vlt).await, vec![UUID_A.to_string()]);
+
+        std::fs::write(
+            store.join("package.json"),
+            r#"{"name":"left-pad","bundleDependencies":["x"]}"#,
+        )
+        .unwrap();
+        let vlt =
+            crate::commands::vlt_preflight::vlt_vendor_preflight_pairs(root, &pairs, Ok(&empty))
+                .await;
+        assert_eq!(vlt[0].1.code, "vendor_bundled_deps_unsupported");
+        assert!(
+            plan(vlt).await.is_empty(),
+            "the vlt-refused package is never planned"
         );
     }
 }
@@ -5983,7 +6130,7 @@ mod variant_probe_tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("requirements.txt"), "foo==1.0.0\n").unwrap();
-        let missing = || StagedSource::Missing(root.join(".socket/vendor/.uninstalled"));
+        let missing = || StagedSource::Missing(root.join(UNINSTALLED_REL));
         let both = vec![
             (WHEEL.to_string(), missing()),
             (SDIST.to_string(), missing()),
@@ -6005,15 +6152,10 @@ mod variant_probe_tests {
         ];
         for (all_packages, ledger, refused, expected) in cases {
             let planned = plan_service_downloads(
-                root,
-                false,
+                &super::plan_gate_tests::gates(root, &records, &refused),
+                &ledger,
                 all_packages,
                 &variant_groups,
-                &records,
-                &ledger,
-                &refused,
-                None,
-                &|_| false,
                 (
                     &tokio::sync::OnceCell::new(),
                     &vendor::pypi::InstalledSiteListings::default(),
