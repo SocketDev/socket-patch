@@ -3801,14 +3801,21 @@ async fn mount_pypi_json(server: &MockServer) {
 /// restored lock still pins (they reinstall a same-version package only
 /// when the LOCKED candidate is a differing URL or file), so after an
 /// unwind a plain `pdm sync` / `uv sync` / `pipenv sync` keeps the patched
-/// build. Every unwind — hosted and vendored `rollback` and `remove`, and
+/// build. #1953: so does `pip install -r requirements.txt`. Every unwind — hosted and vendored `rollback` and `remove`, and
 /// `vendor --revert` — must name the reinstall that restores the upstream
 /// bytes, and rollback's generic note must defer to it.
 #[tokio::test]
 async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
     type Stage = fn(&Path) -> &'static [&'static str];
-    let tools: [(&str, Stage, Stage, &str); 3] = [
+    let tools: [(&str, Stage, Stage, &str); 4] = [
         ("pdm", stage_pdm, stage_pdm, "`pdm sync --reinstall`"),
+        // #1953: `pip install -r` keeps a same-version install too.
+        (
+            "pip",
+            stage_requirements,
+            stage_requirements,
+            "`pip install -r requirements.txt`",
+        ),
         (
             "pipenv",
             stage_pipenv,

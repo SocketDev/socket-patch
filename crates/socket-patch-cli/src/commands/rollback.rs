@@ -6511,7 +6511,7 @@ mod tests {
     fn reinstall_note_defers_to_the_pypi_advisory() {
         let note = format_reinstall_note(1, false, false, true);
         assert!(
-            note.contains("(PDM, uv and Pipenv keep a same-version install")
+            note.contains("(pip, PDM, uv and Pipenv keep a same-version install through a plain install or sync")
                 && note.contains("pypi_reinstall_required"),
             "{note}"
         );

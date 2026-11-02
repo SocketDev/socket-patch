@@ -810,6 +810,12 @@ enum Format {
     Unsupported,
 }
 
+/// Whether the hosted restore reads the root-relative wiring file `rel` as
+/// a pip requirements file (the format a plain `pip install -r` installs).
+pub fn is_requirements_file(rel: &str) -> bool {
+    format_of(rel) == Format::Requirements
+}
+
 fn format_of(rel: &str) -> Format {
     let leaf = rel.rsplit('/').next().unwrap_or(rel);
     match leaf {

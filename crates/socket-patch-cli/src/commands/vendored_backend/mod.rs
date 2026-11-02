@@ -145,6 +145,11 @@ impl<'a> VendoredBackend<'a> {
         for key in keys {
             // Captured before a clean revert drops the entry.
             let flavor = state.entries.get(key).and_then(|e| e.flavor.clone());
+            let wiring_files: Vec<String> = state
+                .entries
+                .get(key)
+                .map(|e| e.wiring.iter().map(|w| w.file.clone()).collect())
+                .unwrap_or_default();
             let gem = state
                 .entries
                 .get(key)
@@ -155,7 +160,7 @@ impl<'a> VendoredBackend<'a> {
                 VendorRevertStep::Failed(_) | VendorRevertStep::LedgerWriteFailed(_)
             );
             // The wiring is back on the registry while the installed tree
-            // may still hold the vendored build, which PDM, uv and Pipenv
+            // may still hold the vendored build, which pip, PDM, uv and Pipenv
             // keep through a plain sync (#477): name the reinstall.
             let unwired = matches!(
                 result.step,
@@ -169,6 +174,7 @@ impl<'a> VendoredBackend<'a> {
                     &self.common.cwd,
                     key,
                     flavor.as_deref(),
+                    &wiring_files,
                     &mut result.warnings,
                 )
                 .await;
