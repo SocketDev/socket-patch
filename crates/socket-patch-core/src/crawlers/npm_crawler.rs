@@ -616,22 +616,26 @@ fn pnpm_shaped_store_layout(name: &str) -> Option<StoreLayout> {
         .map(|(_, layout)| *layout)
 }
 
-/// Whether `dir` is a named store's entry's own `node_modules`
-/// (`<store>/<entry>/node_modules`, `<store>` one of the pnpm-shaped
-/// stores, `.vlt` or `.store`), whose children are never stores (see
-/// [`StoreKind::classify`]).
-fn is_store_entry_node_modules(dir: &Path) -> bool {
-    dir.file_name() == Some(OsStr::new("node_modules"))
-        && dir
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            .and_then(OsStr::to_str)
-            .is_some_and(|store| {
-                pnpm_shaped_store_layout(store).is_some()
-                    || store == VLT_STORE_NAME
-                    || store == NPM_LINKED_STORE_NAME
+/// Whether `store` sits inside another store: below one of `stores`, or
+/// below a dir whose name makes it a store (pnpm-shaped, `.vlt`, pnpm
+/// <=3's `.registry.*`, npm's `.store` in a `node_modules`). Such a
+/// "store" lives in a store entry's own `node_modules`, which never holds
+/// a store (see [`StoreKind::classify`]), so the peer fan-out skips it as
+/// the scan and the resolver do. Scoped and legacy entries nest deeper
+/// than `<store>/<entry>/node_modules`, and a store relocated by
+/// `virtualStoreDir` has no fixed name, hence the walk up every ancestor.
+fn is_inside_another_store(store: &Path, stores: &[(StoreLayout, PathBuf)]) -> bool {
+    store.ancestors().skip(1).any(|dir| {
+        stores.iter().any(|(_, other)| other == dir)
+            || dir.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+                pnpm_shaped_store_layout(name).is_some()
+                    || name == VLT_STORE_NAME
+                    || is_legacy_pnpm_store_dir_name(name)
+                    || (name == NPM_LINKED_STORE_NAME
+                        && dir.parent().and_then(Path::file_name)
+                            == Some(OsStr::new("node_modules")))
             })
+    })
 }
 
 /// Which package-manager store a `node_modules` child is. The resolver
@@ -4523,9 +4527,7 @@ async fn find_store_peer_variant_copies_reusing(
                         stores.push((StoreLayout::NpmLinked, dir.to_path_buf()));
                     }
                 }
-                // A store entry's own `node_modules` never holds a store
-                // (see `StoreKind::classify`), so only other ones are probed.
-                Some("node_modules") if !is_store_entry_node_modules(dir) => {
+                Some("node_modules") => {
                     let others = [
                         (VLT_STORE_NAME, StoreLayout::Vlt),
                         (NPM_LINKED_STORE_NAME, StoreLayout::NpmLinked),
@@ -4609,6 +4611,9 @@ async fn find_store_peer_variant_copies_reusing(
             }
         }
     }
+    // A store nested in another store's entry is not a store (#1899).
+    let all_stores = stores.clone();
+    stores.retain(|(_, store)| !is_inside_another_store(store, &all_stores));
     if stores.is_empty() {
         return Vec::new();
     }
@@ -6761,6 +6766,49 @@ mod tests {
                     .await
                     .contains(&nested_twin),
                 "{store_name}: peer fan-out walked a nested store"
+            );
+        }
+    }
+
+    /// #1899: apply's peer fan-out skips a store nested in a store entry's
+    /// own `node_modules`, whatever shape the outer entry has: a pnpm
+    /// entry, a scoped npm `.store` entry, a pnpm <=3 `.registry.*` entry
+    /// (both nest deeper than `<store>/<entry>/node_modules`) or an entry
+    /// of a store relocated by `virtualStoreDir`.
+    #[tokio::test]
+    async fn test_peer_fan_out_skips_a_store_nested_in_any_store_entry() {
+        for (outer_entry_nm, modules_yaml) in [
+            ("node_modules/.pnpm/@s+outer@1.0.0/node_modules", None),
+            (
+                "node_modules/.store/@s+outer@1.0.0-abcdef/node_modules",
+                None,
+            ),
+            (
+                "node_modules/.registry.npmjs.org/@s/outer/1.0.0/node_modules",
+                None,
+            ),
+            (
+                ".vs/@s+outer@1.0.0/node_modules",
+                Some("layoutVersion: 5\nvirtualStoreDir: '../.vs'\n"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let entry_nm = root.join(outer_entry_nm);
+            let outer = entry_nm.join("@s/outer");
+            write_pkg(&outer, "@s/outer", "1.0.0");
+            if let Some(yaml) = modules_yaml {
+                std::fs::create_dir_all(root.join("node_modules")).unwrap();
+                std::fs::write(root.join("node_modules/.modules.yaml"), yaml).unwrap();
+            }
+            let nested_twin =
+                entry_nm.join(".pnpm/@s+outer@1.0.0(react@18.2.0)/node_modules/@s/outer");
+            write_pkg(&nested_twin, "@s/outer", "1.0.0");
+
+            let copies = find_store_peer_variant_copies(&outer).await;
+            assert!(
+                !copies.contains(&nested_twin),
+                "{outer_entry_nm}: peer fan-out walked a nested store: {copies:?}"
             );
         }
     }
