@@ -1,37 +1,38 @@
 ### Refactor routine
-_Last updated 2026-11-02T13:35Z · main @ cbbbdb9_
+_Last updated 2026-11-02T15:45Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
 |---|---|---|---|
-| #1842 | sweep | `cli/src/args.rs` (+ the Deno guard moved into `lib.rs`) | ready |
+| #1842 | sweep | `cli/src/args.rs` | ready |
 | #1855 | sweep | `commands/{bun_preflight,composer_hints,context,fetch_stage}.rs` | ready; CI needs a re-run (Depot) |
 | #1849 | structural | A01 #1832: `utils/cargo_build_cache.rs` | ready; green |
-| #1864 | sweep | `commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` (+ `rollback.rs` dead branch) | ready; green |
+| #1864 | sweep | `commands/{hosted_bundle,hosted_unwind,list,lock_cli,mod,pypi_reinstall}.rs` | ready; green |
 | #1870 | structural | A27 #1869: `api/client.rs`, one serve GET and one vendor retry loop | ready; green |
 | #1875 | sweep | `commands/{remove,repair}.rs` | ready; green |
-| #1884 | sweep | `scan/discovery.rs` (+ T18 #1859; tests to core `ranking.rs`, `lock_inventory/tests.rs`, `ui/text.rs`) | ready; green |
+| #1884 | sweep | `scan/discovery.rs` (+ T18 #1859; tests moved to core) | ready; green |
 | #1892 | sweep | `scan/gc.rs` | ready; green |
-| #1897 | sweep | `scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24; tests to core `hosted/guidance.rs`, `formats/pnpm/mod.rs`) | ready; green |
+| #1897 | sweep | `scan/hosted.rs` (all but `run_redirect_selected_untracked`, T24) | ready; green |
 | #1903 | sweep | `scan/hosted/{nuget,takeover}.rs` | ready; green |
-| #1907 | sweep | core `constants.rs`, `utils/{cargo_home,composer_version,concurrent,containment,digest,durability,env_compat,failpoint}.rs` (+ `socket_dir.rs`, `purl_key.rs` tests) | ready; green |
-| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` (`line_endings.rs` clean) | ready; green |
+| #1907 | sweep | core `constants.rs`, 8 `utils/` files (`cargo_home`…`failpoint`) | ready; green |
+| #1914 | sweep | core `utils/{http,mod,hatch_workspace,hatch}.rs` | ready; green |
 | #1920 | sweep | core `utils/{notice,npm_range,package_manager,pep440,pipenv,purl}.rs` (+ `target.rs` callers) | ready; green |
-| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` (+ `vex/product.rs`, `redirect/upstream/npm.rs`, advisory lint moved to `vendor/service_fetch.rs`) | ready; green |
-| #1929 | sweep | `commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` (+ `InstallChannel::id` in core `update/channel.rs`) | ready; green |
+| #1923 | sweep + A20 #1848 | core `utils/{redact,repo_root,serde,toml_edit_ext,uri,uv_workspace}.rs` | ready; green |
+| #1929 | sweep | `commands/{update,user_patches,vendor_orphans,vlt_heal}.rs` | ready; green |
 | #1936 | structural | A54 #1932: `formats/gem/{gemspec,manifest}.rs`, `vex/product.rs` (`for_each_code_line` → `code_lines`) | ready; green |
 | #1939 | sweep | `commands/vendored_backend/{mod,repair}.rs` | ready; green |
 | #1944 | structural | T51 #1941: 11 `tests/apply` suites + `common/envelope.rs` onto `apply_fixture` (test-only, −635 net) | ready; `hosted-e2e` red on a live 403, not this diff |
 | #1955 | structural | T52 #1942: 7 PTY runners → `common/pty_io::{run,run_command}` (test-only, +172/−567) | ready; green |
-| #1948 | sweep | `commands/{vex_consumed,vex_sources}.rs` (+ 2 tests moved to `ecosystem_dispatch.rs`) | ready; green |
+| #1948 | sweep | `commands/{vex_consumed,vex_sources}.rs` | ready; green |
 | #1961 | sweep | `cli/src/ui/{mod,prompt,status}.rs` (`test_support.rs` clean) | ready; green |
 | #1964 | structural | T59 #1958: `tests/common/hermetic.rs` color scrub; seeds → parent-env canary (test-only, +69/−82) | ready; green |
 | #1967 | sweep | `cli/src/{json_envelope,update_notifier,main,interrupt,path_scope}.rs` (path_scope tests only, #1864) | ready; green |
 | #1972 | structural | T60 #1968 slice 1: `tests/docker_common` + 15 `docker_e2e_*` suites (test-only, +260/−1,113) | ready; green |
 | #1975 | sweep | core `api/{blob_fetcher,date,retry,types}.rs` | ready; green |
 | #1978 | structural | T56 #1956: 9 `cli_parse_*`/`cli_global_args` suites onto `hermetic::try_parse` + new `common/clap_parse.rs` (test-only, +418/−1,471) | ready; green |
-| #1985 | sweep | `scan/{rollout,rollout_args,withdrawn}.rs` (+ `Stage::may_admit` and 11 tests moved to core `rollout/stage.rs`) | ready; green |
+| #1985 | sweep | `scan/{rollout,rollout_args,withdrawn}.rs` (+ core `rollout/stage.rs`) | ready; green |
 | #1988 | structural | T64 #1979 slice 1: `tests/common/{fs_tree,scan_proxy}.rs`; 28 copiers + 4 proxy copies deleted (test-only, +218/−589) | ready; green |
+| #1990 | sweep | core `utils/{python_lock,python_script}.rs` (+ `hosted/engine.rs` wheel gate, `vendor/pypi_uv.rs`, 2 lines of `redirect/mod.rs`) | ready; green |
 
 #### Merged
 _None._
@@ -40,7 +41,7 @@ _None._
 Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 2026-10-29, so most candidates ≥6 stay blocked: A30 #1887 (~8.7, #1886), T09 #1858 (~7, #1864/#1698), A41 #1899 (~6, #1891/#1829/#1906), A43 #1900 (~6, #1863/#1698), T01 #1835 / T25 #1877 (#1698), A53 #1931 / A57 #1935 (`ruby_crawler.rs`, #1882/#1895/#1943), A55 #1933 (`redirect/mod.rs`). Free test-only: T64 #1979 rest (copies held by 9 PRs; then a `shared_helper_copies` guard), T60 #1968 rest (~7, after #1972: CI REQUIRED export, `assert_api_exercised`, `GIT_SHA256_FN` ×3, bash summary greps), T61 #1969 (~6; `e2e_bun_lockb.rs` held by #1905), T50 #1940 (~7; land the suites not held by #1698/#1843/#1893/#1894), T55 #1959 (~7, ~35 files; `tests/apply` is #1944), T58 #1957 (~6).
 A26 #1867, A46 #1917, A44 #1918 score ~4.
 
-Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/vendor_prefetch.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `socket_yml_args.rs` `min_severity` → `Option<u8>` + injected env (held by #1978/#1864), `cli_parse_scan` env subset test + `"1.5"` reject row (#1978), rollout `offer`/`manifest` fixtures in CLI+core → `test-fixtures` (#1985); `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (#1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (rollback L1814 loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967).
+Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `api/vendor_prefetch.rs`, crawler rows (`fuzzy_match`, `listing`, `jvm_cache`, `ivy_cache`, `coursier_cache`, `gradle_cache`, `sbt_evidence`, `hatch_env` are free); `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `socket_yml_args.rs` `min_severity` → `Option<u8>` + injected env (held by #1978/#1864), `cli_parse_scan` env subset test + `"1.5"` reject row (#1978), rollout `offer`/`manifest` fixtures in CLI+core → `test-fixtures` (#1985); `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (#1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (rollback L1814 loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967); `check_python_lock_source_scope` is test-only (its caller in `redirect/mod.rs`, held by 7 PRs), `artifact_filename` ×4 (`pypi_locks::basename` also splits `\\`), `ancestor_uv_config_files` → `relpath` (A19), `PythonLockSession::plan`'s `text` arg → keep the rendering in the session (#1990).
 
 #### Notes
 - Want issues (output-changing, found in sweeps): `ui::shell_word` misses `"`/`%VAR%` on cmd; `scan/gc.rs` `has_ledger` probes `--cwd` but `run_vendor_gc` reads `project_root()` (C43); gem stale probe dedups by purl and drops the platform suffix; `hatch::require_pip_installer_documents` ignores the `envs` override; `npm_range_admits(">=", v)` admits all; npm `upstream_registry_fallback` leaks `?token=` (use `redact_urls_in`); `vlt_heal` swallows `load_state`/lock read errors; `strip_url_userinfo`'s scp branch keeps `u:p@`.
