@@ -4590,7 +4590,7 @@ fn rewrite_yarn_classic_with(
         .zip(&heads)
         .map(|(b, (patterns, _))| {
             let version = classic_field(&b.lines, "version")?;
-            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+            let (name, source) = crate::formats::yarn::copy::classic_copy_name(
                 patterns,
                 classic_field(&b.lines, "resolved"),
                 version,
@@ -13773,7 +13773,10 @@ mod tests {
              integrity sha512-UPSTREAMupstream==\n";
         let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
         let manifests = BTreeMap::from([
-            ("../ext/lpdir/package.json".to_string(), left_pad.to_string()),
+            (
+                "../ext/lpdir/package.json".to_string(),
+                left_pad.to_string(),
+            ),
             ("/abs/lpdir/package.json".to_string(), left_pad.to_string()),
             ("lpdir/package.json".to_string(), left_pad.to_string()),
         ]);

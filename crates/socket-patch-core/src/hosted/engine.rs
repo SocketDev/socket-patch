@@ -693,26 +693,25 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, NPMRC_REL).await;
         // A `file:` directory copy is locked under the DEPENDENCY name, so
         // the classic rewriter reads which package it is from the
-        // directory's `package.json` (#1236). Advisory: never rewritten,
-        // and an unreadable one only leaves that copy unnamed.
-        let dirs: BTreeSet<String> = out
+        // directory's `package.json` (#1236), at the path vendored and VEX
+        // read it from (#1951): outside the root too, never at an absolute
+        // path. Advisory: never rewritten, and an unreadable one only
+        // leaves that copy unnamed.
+        let manifests: BTreeSet<String> = out
             .files
             .get("yarn.lock")
             .map(|lock| {
+                use crate::formats::yarn::copy::{classic_copy_ref, CopyRef};
                 crate::vendor::lock_inventory::yarn::classic_entries(lock)
                     .iter()
-                    .filter_map(|e| {
-                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    .filter_map(|e| match classic_copy_ref(&e.patterns, None)? {
+                        copy @ CopyRef::Directory(_) => copy.read_path(),
+                        _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
-        for dir in dirs {
-            let rel = if dir.is_empty() {
-                "package.json".to_string()
-            } else {
-                format!("{dir}/package.json")
-            };
+        for rel in manifests {
             if out.files.contains_key(&rel) {
                 continue;
             }
@@ -4366,7 +4365,9 @@ mod tests {
             Some(manifest)
         );
         assert_eq!(
-            read.files.get("../ext/lpdir/package.json").map(String::as_str),
+            read.files
+                .get("../ext/lpdir/package.json")
+                .map(String::as_str),
             Some(manifest),
             "{:?}",
             read.files.keys()
