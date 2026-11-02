@@ -11,6 +11,8 @@
 //!
 //! [`command`] (and [`binary_command`] for the built binary) is the only way
 //! a test spawns `socket-patch`; `common::run_bin_with_env` is built on it.
+//! `command` does not move `HOME`: only `run_bin_with_env` (and suites that
+//! call `jvm_env::isolate_cli` themselves) point the child at a stand-in.
 //! PTY suites use [`pty_command`] / [`pty_binary_command`], which carry the
 //! same environment onto a `portable_pty::CommandBuilder`.
 //! Package-manager children the same tests spawn get [`scrub_socket_vars`]
@@ -31,34 +33,11 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The highest-risk `SOCKET_*` vars. [`command`] seeds each with a hostile
-/// value and then removes it: `env_remove` clears the seed too, so the child
-/// never sees it, but if a scrub line is ever dropped the seed (rather than a
-/// developer's ambient shell, which the suites can't rely on) turns the tests
-/// red immediately.
-pub const HOSTILE_SEEDS: &[(&str, &str)] = &[
-    ("SOCKET_CWD", "/nonexistent"),
-    ("SOCKET_GLOBAL", "true"),
-    ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
-    ("SOCKET_DRY_RUN", "true"),
-    ("SOCKET_SAVE_ONLY", "true"),
-    // Skips every confirm prompt the PTY suites exist to drive.
-    ("SOCKET_YES", "true"),
-    ("SOCKET_ECOSYSTEMS", "cargo"),
-    ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
-    ("SOCKET_JSON", "true"),
-    ("SOCKET_SILENT", "true"),
-    ("SOCKET_VERBOSE", "true"),
-    ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
-    ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
-    // An ambient token or API/proxy URL would move a child off the public
-    // proxy, or point the production suites at staging while every
-    // assertion still passed.
-    ("SOCKET_API_TOKEN", "hostile-seed-must-be-scrubbed"),
-    ("SOCKET_API_URL", "http://127.0.0.1:1/hostile"),
-    ("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile"),
-    ("SOCKET_OFFLINE", "true"),
-];
+/// The env the CLI's color and width policy reads (`ui::color_enabled`,
+/// `ui::width_of`) besides `TERM`. An ambient `CLICOLOR_FORCE=1` puts ANSI
+/// codes into every captured stdout. `TERM` is left alone: the PTY suites
+/// hand the binary a real terminal and pick their own.
+pub const COLOR_ENV: &[&str] = &["NO_COLOR", "CLICOLOR", "CLICOLOR_FORCE", "COLUMNS"];
 
 /// The opt-outs [`command`] forces on in every child: the config layer
 /// (a developer's real `socket login` must never authenticate a test
@@ -75,19 +54,16 @@ pub const FORCED_OPT_OUTS: &[(&str, &str)] = &[
     ("SOCKET_TELEMETRY_DISABLED", "1"),
 ];
 
-/// A `Command` for `bin` with the hermetic `SOCKET_*` environment: the
-/// hostile seeds scrubbed, every flag-bound `SOCKET_*` and every other
-/// ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
+/// A `Command` for `bin` with the hermetic `SOCKET_*` environment: every
+/// flag-bound `SOCKET_*` and every other ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN` also forces the
 /// public proxy), and the three opt-outs (config layer, update notifier,
-/// telemetry) forced on. Callers add args, cwd and their own env
+/// telemetry) forced on, and [`COLOR_ENV`] removed. Callers add args, cwd
+/// and their own env
 /// afterwards; caller env lands last, so explicit injections survive the
 /// scrub.
 pub fn command(bin: &Path) -> Command {
     let mut cmd = Command::new(bin);
-    for (k, v) in HOSTILE_SEEDS {
-        cmd.env(k, v);
-    }
-    for (k, _) in HOSTILE_SEEDS {
+    for k in COLOR_ENV {
         cmd.env_remove(k);
     }
     // The flag-bound vars are removed by name, not only when the sweep below
@@ -229,14 +205,13 @@ pub enum Extra {
     Venv,
     /// Every `YARN_*` var. Yarn berry lets any `.yarnrc.yml` setting be
     /// overridden by env, so an ambient `YARN_NODE_LINKER=pnp` would build a
-    /// PnP tree and void the node_modules probes. Seeded with that value and
-    /// then scrubbed.
+    /// PnP tree and void the node_modules probes.
     Yarn,
     /// Every `PNPM_*` and `npm_config_*` var (any case). pnpm lets any
     /// `.npmrc` setting be overridden by an `npm_config_*` env var (env
     /// outranks the project npmrc), so an ambient
     /// `npm_config_node_linker=pnp` makes pnpm emit a `.pnp.cjs` that
-    /// `vendor` refuses. Seeded with that value and then scrubbed.
+    /// `vendor` refuses.
     Pnpm,
     /// Yarn 1's ambient config: the cache folder in any spelling
     /// (`YARN_CACHE_FOLDER`, `yarn_cache_folder`, `npm_config_cache_folder`;
@@ -256,8 +231,8 @@ pub enum Extra {
     /// lib dir, which pin every child ruby to the outer Gemfile and bundler.
     /// `GEM_HOME`/`GEM_PATH` are kept on purpose: rvm/chruby
     /// export them and `bundle` itself resolves through them (see
-    /// `cache_env.rs`). Seeded with a bogus `BUNDLE_APP_CONFIG` and then
-    /// scrubbed; run it before the suite sets its own `BUNDLE_*` values.
+    /// `cache_env.rs`). Run it before the suite sets its own `BUNDLE_*`
+    /// values.
     Bundle,
     /// Every `PDM_*` var plus `UV_PROJECT_ENVIRONMENT`: PDM reads any
     /// setting from `PDM_<NAME>`, and its uv backend follows
@@ -309,16 +284,13 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                 cmd.env_remove("VIRTUAL_ENV");
             }
             Extra::Yarn => {
-                cmd.env("YARN_NODE_LINKER", "pnp");
                 for (key, _) in std::env::vars_os() {
                     if key.to_string_lossy().starts_with("YARN_") {
                         cmd.env_remove(&key);
                     }
                 }
-                cmd.env_remove("YARN_NODE_LINKER");
             }
             Extra::Pnpm => {
-                cmd.env("npm_config_node_linker", "pnp");
                 for (key, _) in std::env::vars_os() {
                     let name = key.to_string_lossy();
                     if name.starts_with("PNPM_")
@@ -327,7 +299,6 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                         cmd.env_remove(&key);
                     }
                 }
-                cmd.env_remove("npm_config_node_linker");
             }
             Extra::YarnClassic => {
                 cmd.env_remove("YARN_CACHE_FOLDER");
@@ -345,13 +316,11 @@ pub fn scrub_extra(cmd: &mut Command, extras: &[Extra]) {
                 cmd.env_remove("PREFIX");
             }
             Extra::Bundle => {
-                cmd.env("BUNDLE_APP_CONFIG", "/nonexistent/.bundle");
                 for (key, _) in std::env::vars_os() {
                     if key.to_string_lossy().starts_with("BUNDLE_") {
                         cmd.env_remove(&key);
                     }
                 }
-                cmd.env_remove("BUNDLE_APP_CONFIG");
                 cmd.env_remove("RUBYOPT");
                 cmd.env_remove("RUBYLIB");
             }

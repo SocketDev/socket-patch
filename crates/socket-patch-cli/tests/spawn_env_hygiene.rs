@@ -239,13 +239,41 @@ fn workflow_env_copies_carry_every_opt_out() {
     );
 }
 
+/// The highest-risk ambient values: each flips a mode, a target or the
+/// output a test asserts on. Set in this process, so a dropped scrub fails.
+const HOSTILE_AMBIENT: &[(&str, &str)] = &[
+    ("SOCKET_CWD", "/nonexistent"),
+    ("SOCKET_GLOBAL", "true"),
+    ("SOCKET_GLOBAL_PREFIX", "/nonexistent"),
+    ("SOCKET_DRY_RUN", "true"),
+    ("SOCKET_SAVE_ONLY", "true"),
+    ("SOCKET_YES", "true"),
+    ("SOCKET_ECOSYSTEMS", "cargo"),
+    ("SOCKET_MANIFEST_PATH", "/nonexistent/manifest.json"),
+    ("SOCKET_JSON", "true"),
+    ("SOCKET_SILENT", "true"),
+    ("SOCKET_VERBOSE", "true"),
+    ("SOCKET_UPDATE_BASE_URL", "http://127.0.0.1:1"),
+    ("SOCKET_UPDATE_STATE_DIR", "/nonexistent"),
+    ("SOCKET_API_TOKEN", "ambient-token"),
+    ("SOCKET_API_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_PROXY_URL", "http://127.0.0.1:1/hostile"),
+    ("SOCKET_OFFLINE", "true"),
+    ("NO_COLOR", "1"),
+    ("CLICOLOR", "1"),
+    ("CLICOLOR_FORCE", "1"),
+    ("COLUMNS", "20"),
+];
+
 #[test]
 #[serial]
-fn command_never_leaks_its_hostile_seeds() {
-    let env = effective_env(&hermetic::command(Path::new("socket-patch")));
-    for (key, _) in hermetic::HOSTILE_SEEDS {
-        assert_eq!(get(&env, key), None, "{key} seed must be scrubbed");
-    }
+fn command_scrubs_hostile_ambient_env() {
+    with_ambient(HOSTILE_AMBIENT, || {
+        let env = effective_env(&hermetic::command(Path::new("socket-patch")));
+        for (key, _) in HOSTILE_AMBIENT {
+            assert_eq!(get(&env, key), None, "ambient {key} must be scrubbed");
+        }
+    });
 }
 
 /// In-process tests set flag-bound vars in the test binary's own
@@ -334,11 +362,15 @@ fn pty_command_carries_the_same_env_as_command() {
 
 #[test]
 #[serial]
-fn pty_command_never_leaks_its_hostile_seeds_and_keeps_caller_env() {
-    let mut cmd = hermetic::pty_binary_command();
+fn pty_command_scrubs_hostile_ambient_env_and_keeps_caller_env() {
+    let mut cmd = None;
+    with_ambient(HOSTILE_AMBIENT, || {
+        cmd = Some(hermetic::pty_binary_command());
+    });
+    let mut cmd = cmd.unwrap();
     let env = pty_env(&cmd);
-    for (key, _) in hermetic::HOSTILE_SEEDS {
-        assert_eq!(env.get(*key), None, "{key} seed must be scrubbed");
+    for (key, _) in HOSTILE_AMBIENT {
+        assert_eq!(env.get(*key), None, "ambient {key} must be scrubbed");
     }
     cmd.env("SOCKET_NO_UPDATE_CHECK", "0");
     assert_eq!(cmd.get_env("SOCKET_NO_UPDATE_CHECK"), Some("0".as_ref()));
@@ -514,17 +546,6 @@ fn composer_extra_sweeps_overrides_and_pins_an_empty_home() {
             );
         },
     );
-}
-
-#[test]
-#[serial]
-fn extra_seeds_are_scrubbed_whatever_the_ambient_value() {
-    let mut cmd = Command::new("tool");
-    hermetic::scrub_extra(&mut cmd, &[Extra::Yarn, Extra::Pnpm, Extra::Bundle]);
-    let env = effective_env(&cmd);
-    assert_eq!(get(&env, "YARN_NODE_LINKER"), None);
-    assert_eq!(get(&env, "npm_config_node_linker"), None);
-    assert_eq!(get(&env, "BUNDLE_APP_CONFIG"), None);
 }
 
 /// Every `.rs` file under `tests/`, as `/`-separated paths relative to it.
