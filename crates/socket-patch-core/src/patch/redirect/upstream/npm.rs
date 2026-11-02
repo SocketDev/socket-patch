@@ -1602,14 +1602,7 @@ pub(crate) fn modules_yaml_pnpm_major(text: &str) -> Option<u32> {
 
 /// [`modules_yaml_pnpm_major`] with the minor.
 fn modules_yaml_pnpm_version(text: &str) -> Option<PnpmVersion> {
-    let text = crate::formats::text::strip_bom(text);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return value
-            .get("packageManager")
-            .and_then(|v| v.as_str())
-            .and_then(pnpm_spec_version);
-    }
-    yaml_top_level_value(text, "packageManager")
+    crate::formats::pnpm::modules_yaml::field(text, "packageManager")
         .as_deref()
         .and_then(pnpm_spec_version)
 }

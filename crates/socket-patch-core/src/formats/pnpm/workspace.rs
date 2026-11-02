@@ -57,14 +57,36 @@ pub(crate) fn top_level_key(line: &str) -> Option<(String, &str)> {
 }
 
 /// The value of the last top-level `key` in a YAML settings file
-/// (pnpm-workspace.yaml, .yarnrc.yml), quotes removed. [`top_level_key`]
-/// skips the first line's BOM.
-pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+/// (pnpm-workspace.yaml, .yarnrc.yml, a YAML `.modules.yaml`), decoded by
+/// [`yaml_scalar`]. An empty or block value is `Some("")`; callers that
+/// read empty as unset use [`yaml_top_level_value`]. [`top_level_key`]
+/// skips the first line's BOM. Every pnpm settings reader goes through
+/// this one function so a quoted value reads the same everywhere (#1918).
+pub(crate) fn top_level_scalar(text: &str, key: &str) -> Option<String> {
     text.lines()
         .filter_map(top_level_key)
         .rfind(|(k, _)| k == key)
-        .map(|(_, value)| value.trim_matches(['"', '\'']).to_string())
-        .filter(|value| !value.is_empty())
+        .map(|(_, value)| yaml_scalar(value))
+}
+
+/// [`top_level_scalar`], with an empty value read as unset.
+pub(crate) fn yaml_top_level_value(text: &str, key: &str) -> Option<String> {
+    top_level_scalar(text, key).filter(|value| !value.is_empty())
+}
+
+/// A YAML flow scalar's value: a whole single-quoted (`''` is one quote)
+/// or double-quoted (escapes decoded) scalar is unquoted; anything else,
+/// an unpaired or trailing quote included, is a plain scalar kept as is.
+pub(crate) fn yaml_scalar(raw: &str) -> String {
+    let quoted = match raw.as_bytes().first() {
+        Some(b'"') => double_quoted(raw),
+        Some(b'\'') => single_quoted(raw),
+        _ => None,
+    };
+    match quoted {
+        Some((value, len)) if len == raw.len() => value,
+        _ => raw.to_string(),
+    }
 }
 
 /// The line index a new top-level key is inserted at: after the document's
@@ -336,6 +358,16 @@ fn double_quoted(s: &str) -> Option<(String, usize)> {
                 match esc {
                     'n' => out.push('\n'),
                     't' => out.push('\t'),
+                    'r' => out.push('\r'),
+                    'u' => {
+                        let hex: String = (0..4)
+                            .filter_map(|_| chars.next().map(|(_, h)| h))
+                            .collect();
+                        let code = u32::from_str_radix(&hex, 16)
+                            .ok()
+                            .filter(|_| hex.len() == 4);
+                        out.push(code.and_then(char::from_u32)?);
+                    }
                     '"' | '\\' | '/' | ' ' => out.push(esc),
                     // Any other escape decodes to text no pnpm key uses;
                     // keep it visibly distinct rather than guessing.
@@ -376,6 +408,29 @@ fn single_quoted(s: &str) -> Option<(String, usize)> {
 mod tests {
     use super::*;
 
+    /// #1918: the one pnpm settings scalar reader every caller uses.
+    #[test]
+    fn top_level_scalar_table() {
+        for (text, want) in [
+            ("k: plain\n", Some("plain")),
+            ("k: plain # comment\n", Some("plain")),
+            ("k: \"a\\\"b\\n\\u0041\"\n", Some("a\"b\nA")),
+            ("k: \"a # not a comment\"\n", Some("a # not a comment")),
+            ("k: 'it''s'\n", Some("it's")),
+            ("k: ''\n", Some("")),
+            ("k:\n", Some("")),
+            ("k: \"a'\n", Some("\"a'")),
+            ("k: 'a\"\n", Some("'a\"")),
+            ("k: 'a' b\n", Some("'a' b")),
+            ("\u{feff}k: x\n", Some("x")),
+            ("k: a\r\nk: 'b'\r\n", Some("b")),
+            ("  k: nested\n", None),
+            ("other: x\n", None),
+        ] {
+            assert_eq!(top_level_scalar(text, "k").as_deref(), want, "{text:?}");
+        }
+    }
+
     /// #1918: a settings scalar is decoded the way pnpm's YAML parser reads
     /// it: `''` inside single quotes is one quote, an unpaired quote is not
     /// stripped, and an empty value stays unset for this non-empty reader.
@@ -385,7 +440,10 @@ mod tests {
         assert_eq!(read("k: 'it''s'\n").as_deref(), Some("it's"));
         assert_eq!(read("k: \"a'\n").as_deref(), Some("\"a'"));
         assert_eq!(read("k: ''a''\n").as_deref(), Some("''a''"));
-        assert_eq!(read("k: \"say \\\"hi\\\"\"\n").as_deref(), Some("say \"hi\""));
+        assert_eq!(
+            read("k: \"say \\\"hi\\\"\"\n").as_deref(),
+            Some("say \"hi\"")
+        );
         assert_eq!(read("k: ''\n"), None);
         assert_eq!(read("k:\n"), None);
     }

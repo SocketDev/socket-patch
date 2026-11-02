@@ -98,17 +98,9 @@ fn version_bounds(spec: &str) -> Option<(Release, Release)> {
     })
 }
 
-/// The `packageManager` value of a `.modules.yaml`: JSON on pnpm 10+,
-/// YAML before (a top-level scalar, maybe quoted).
+/// The `packageManager` value of a `.modules.yaml`.
 fn modules_yaml_package_manager(text: &str) -> Option<String> {
-    let text = strip_bom(text);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return value.get("packageManager")?.as_str().map(str::to_string);
-    }
-    text.split('\n').find_map(|line| {
-        let (key, value) = super::workspace::top_level_key(line)?;
-        (key == "packageManager").then(|| value.trim_matches(|c| c == '\'' || c == '"').to_string())
-    })
+    super::modules_yaml::field(text, "packageManager")
 }
 
 /// Every pnpm version pin the project's files carry, as `(where, spec)`.

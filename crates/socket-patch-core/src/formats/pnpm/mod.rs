@@ -27,6 +27,7 @@
 pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
+pub(crate) mod modules_yaml;
 mod version;
 pub(crate) mod workspace;
 

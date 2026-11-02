@@ -1421,29 +1421,9 @@ fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     Some((key[..at].to_string(), version.to_string()))
 }
 
-/// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
-/// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
+/// The non-empty `virtualStoreDir` value of a `.modules.yaml`.
 fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
-    let text = crate::formats::text::strip_bom(text);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return value
-            .get("virtualStoreDir")?
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-    }
-    let raw = text
-        .lines()
-        .find_map(|line| line.strip_prefix("virtualStoreDir:"))?
-        .trim();
-    let value = if raw.starts_with('"') {
-        serde_json::from_str::<String>(raw).ok()?
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        inner.replace("''", "'")
-    } else {
-        raw.to_string()
-    };
-    (!value.is_empty()).then_some(value)
+    crate::formats::pnpm::modules_yaml::field(text, "virtualStoreDir").filter(|s| !s.is_empty())
 }
 
 /// `store` relative to `importer`, when it names a directory strictly
@@ -4834,10 +4814,7 @@ mod tests {
             read("virtualStoreDir: a\nvirtualStoreDir: 'b''c'\n").as_deref(),
             Some("b'c")
         );
-        assert_eq!(
-            read("\"virtualStoreDir\": \"x\"\n").as_deref(),
-            Some("x")
-        );
+        assert_eq!(read("\"virtualStoreDir\": \"x\"\n").as_deref(), Some("x"));
         assert_eq!(read("virtualStoreDir: ''\n"), None);
         assert_eq!(
             read("{\"virtualStoreDir\":\"/abs/.pnpm\"}").as_deref(),
