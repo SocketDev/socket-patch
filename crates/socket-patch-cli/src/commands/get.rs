@@ -2284,18 +2284,7 @@ async fn run_get_vendored(
     // Dry run: ledger-classification preview only (scan's posture) — no
     // download, no vendor step, no writes.
     if args.common.dry_run {
-        let takeover = super::vendor::gem_takeover_preview_refusals(
-            &args.common,
-            selected.iter().map(|p| p.purl.as_str()),
-        )
-        .await;
-        let preview = super::scan::preview_vendor(
-            &args.common.cwd,
-            selected,
-            &super::hosted_unwind::patch_server_origins(&args.common),
-            &takeover,
-        )
-        .await;
+        let preview = super::scan::preview_vendor(&args.common, selected).await;
         if args.common.json {
             preview.record_into(&mut env);
             emit(&env);
