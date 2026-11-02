@@ -1546,6 +1546,28 @@ mod tests {
         }
     }
 
+    /// A brace group without a top-level comma or `..` stays literal, also
+    /// around a nested set, as pnpm 10.28.0 reads it:
+    /// `packages/{app-{web,api}}` lists only `packages/{app-web}`, never
+    /// `packages/app-web`, and `packages/{a}` lists `packages/{a}`.
+    #[test]
+    fn member_dirs_keep_a_commaless_brace_group_literal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["app-web", "app-api", "{app-web}", "a", "{a}"] {
+            std::fs::create_dir_all(root.join("packages").join(dir)).unwrap();
+        }
+        let globs = |g: &str| vec![g.to_string()];
+        assert_eq!(
+            member_dirs(&DiskTree(root), &globs("packages/{app-{web,api}}")),
+            Ok(vec!["packages/{app-web}".to_string()])
+        );
+        assert_eq!(
+            member_dirs(&DiskTree(root), &globs("packages/{a}")),
+            Ok(vec!["packages/{a}".to_string()])
+        );
+    }
+
     #[test]
     fn member_dirs_refuse_a_glob_the_bounded_walk_cannot_finish() {
         // More directories below `packages/` than the walk visits: the
