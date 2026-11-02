@@ -12,6 +12,8 @@ pub mod fs;
 pub(crate) mod go_env;
 pub mod go_installed_tools;
 pub mod group_commit;
+pub mod hatch;
+pub(crate) mod hatch_workspace;
 pub(crate) mod http;
 pub(crate) mod line_endings;
 pub mod lock_fragments;
@@ -40,6 +42,3 @@ pub(crate) mod toml_edit_ext;
 pub mod uri;
 pub(crate) mod uv_workspace;
 pub(crate) mod workspace_globs;
-
-pub mod hatch;
-pub mod hatch_workspace;

@@ -119,6 +119,9 @@ fn configured_modules_dirs_in(view: &ProjectView<'_>) -> Vec<String> {
 /// [`crate::utils::fs::read_regular_to_string_sync`]: the files belong to
 /// the (untrusted) project.
 fn modules_dir_setting(project: &Path) -> Option<String> {
+    // Walk the absolute spelling: the default `--cwd .` has no lexical
+    // parents, so a workspace root's settings would never be read (#1902).
+    let project = &crate::utils::relpath::absolute_lexically(project);
     let read = |path: PathBuf| crate::utils::fs::read_regular_to_string_sync(&path).ok();
     project
         .ancestors()

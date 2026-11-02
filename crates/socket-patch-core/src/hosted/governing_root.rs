@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
+use crate::formats::package_json::Workspaces;
 use crate::formats::pnpm::workspace::read_package_globs;
 use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
@@ -106,12 +107,8 @@ pub async fn refusal(
         }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        if has_own_npm_family_lock(root) {
-            if let Some(refusal) = member_stray_lock_refusal(root).await {
-                return Some(refusal);
-            }
-        } else if let Some(elsewhere) = npm_lock_elsewhere(root).await {
-            return Some(elsewhere.hosted_refusal());
+        if let Some((_, refusal)) = npm_family_governing_root(root).await {
+            return Some(refusal);
         }
         if trust_lockfile_config {
             if let Some(refusal) = pnpm_settings_elsewhere(root) {
@@ -175,6 +172,23 @@ async fn cargo_member_refusal(root: &Path) -> Option<Refusal> {
     })
 }
 
+/// The directory whose npm-family lock installs `root` when `root` is a
+/// workspace member with no lock of its own (or only locks its manager
+/// never reads): a pnpm workspace or `lockfile-dir`, an npm, yarn or Bun
+/// `package.json` workspace, or a vlt workspace, the nearer root winning
+/// ([`npm_lock_elsewhere`]). Returns that root with hosted mode's refusal
+/// for it. Vendored commands that read only `root` (`vendor`, `vendor
+/// --revert`, `vendor --check`) use the root to refuse instead of
+/// reporting nothing to do (#1921).
+pub async fn npm_family_governing_root(root: &Path) -> Option<(PathBuf, Refusal)> {
+    if has_own_npm_family_lock(root) {
+        return member_stray_lock_refusal(root).await;
+    }
+    let elsewhere = npm_lock_elsewhere(root).await?;
+    let refusal = elsewhere.hosted_refusal();
+    Some((elsewhere.dir, refusal))
+}
+
 /// A project directory with no npm-family lock of its own that its
 /// package manager installs from a lock in another directory: a member of
 /// a `package.json` or vlt workspace, or a directory pnpm installs from an
@@ -183,8 +197,10 @@ async fn cargo_member_refusal(root: &Path) -> Option<Refusal> {
 pub(crate) struct LockElsewhere {
     /// The hosted refusal code.
     code: &'static str,
-    /// The directory to run from.
+    /// The directory to run from, canonical like the other roots.
     pub(crate) dir: PathBuf,
+    /// [`Self::dir`] as hosted's refusal has always named it.
+    shown_dir: PathBuf,
     /// What [`Self::dir`] is, for the "run from" hint (`workspace root`;
     /// worded like [`MemberStrayLock::root_kind`]).
     pub(crate) dir_kind: &'static str,
@@ -206,7 +222,7 @@ impl LockElsewhere {
                 "{}, which a hosted run here cannot see; run socket-patch from {} (the {}); \
                  nothing was written",
                 self.detail,
-                self.dir.display(),
+                self.shown_dir.display(),
                 self.dir_kind
             ),
         }
@@ -230,15 +246,17 @@ pub(crate) async fn npm_lock_elsewhere(root: &Path) -> Option<LockElsewhere> {
     let Some(lock) = pnpm_lock_elsewhere(root).await else {
         return workspace;
     };
-    let dir = lock.parent().unwrap_or(&lock).to_path_buf();
+    let shown_dir = lock.parent().unwrap_or(&lock).to_path_buf();
+    // Canonical, like the other branches' roots: a relative `lockfile-dir`
+    // (`../..`) would otherwise name a `..` path.
+    let dir = tokio::fs::canonicalize(&shown_dir)
+        .await
+        .unwrap_or_else(|_| shown_dir.clone());
     // A `package.json` workspace root nested inside the pnpm lock's
     // directory is nearer the member and owns its lock (Bugbot on #901);
     // otherwise pnpm's workspace or `lockfile-dir` governs.
     if let Some(ws) = workspace {
-        let pnpm_dir = tokio::fs::canonicalize(&dir)
-            .await
-            .unwrap_or_else(|_| dir.clone());
-        if ws.dir != pnpm_dir && ws.dir.starts_with(&pnpm_dir) {
+        if ws.dir != dir && ws.dir.starts_with(&dir) {
             return Some(ws);
         }
     }
@@ -251,6 +269,7 @@ pub(crate) async fn npm_lock_elsewhere(root: &Path) -> Option<LockElsewhere> {
         ),
         vendorable_dir: dir.join(PNPM_WORKSPACE).is_file(),
         dir,
+        shown_dir,
         dir_kind: "directory holding pnpm-lock.yaml",
     })
 }
@@ -354,6 +373,7 @@ async fn package_json_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> 
             ancestor.display(),
             join_paths(&ancestor, &locks),
         ),
+        shown_dir: ancestor.clone(),
         dir: ancestor,
         dir_kind: "workspace root",
         vendorable_dir: true,
@@ -698,7 +718,7 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
         let listed = ancestor.join("rush.json").exists()
             || package_json
                 .ok()
-                .and_then(|text| workspace_patterns(&text))
+                .and_then(|text| Workspaces::listed_patterns(&text))
                 .is_some_and(|patterns| lists(&patterns, &rel))
             || read_regular_to_string(&ancestor.join(VLT_JSON))
                 .await
@@ -746,9 +766,9 @@ fn pnpm_lists_unmodeled(globs: &[String], rel: &[String]) -> bool {
 }
 
 /// The hosted refusal for [`member_stray_lock`].
-async fn member_stray_lock_refusal(root: &Path) -> Option<Refusal> {
+async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
     let stray = member_stray_lock(root).await?;
-    Some(Refusal {
+    let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
             "{}; run socket-patch from {} (the {}); nothing was written",
@@ -756,7 +776,8 @@ async fn member_stray_lock_refusal(root: &Path) -> Option<Refusal> {
             stray.root.display(),
             stray.root_kind
         ),
-    })
+    };
+    Some((stray.root, refusal))
 }
 
 fn join_paths(dir: &Path, names: &[&str]) -> String {
@@ -778,7 +799,7 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
             continue;
         };
-        let Some(patterns) = workspace_patterns(&text) else {
+        let Some(patterns) = Workspaces::listed_patterns(&text) else {
             continue;
         };
         let Ok(rel) = member.strip_prefix(ancestor) else {
@@ -994,6 +1015,7 @@ async fn vlt_workspace_elsewhere(root: &Path) -> Option<LockElsewhere> {
             ancestor.join(source.file()).display(),
             ancestor.join(VLT_LOCK).display(),
         ),
+        shown_dir: ancestor.clone(),
         dir: ancestor,
         dir_kind: "workspace root",
         vendorable_dir: true,
@@ -1243,27 +1265,6 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
         serde_json::Value::Object(groups) => groups.values().map(group).collect(),
         other => vec![group(other)],
     })
-}
-
-/// The `workspaces` patterns of a `package.json`: the array form (npm,
-/// yarn, Bun) or the object form's `packages` array (yarn classic's
-/// `nohoist` shape, Bun's catalogs shape). `None` when the field is absent
-/// or the manifest does not parse.
-pub(crate) fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
-    let text = strip_bom(package_json);
-    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
-    let field = doc.get("workspaces")?;
-    let list = match field {
-        serde_json::Value::Array(list) => list,
-        serde_json::Value::Object(map) => map.get("packages")?.as_array()?,
-        _ => return None,
-    };
-    Some(
-        list.iter()
-            .filter_map(|v| v.as_str())
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
@@ -2596,11 +2597,14 @@ mod tests {
                 vlt_workspace_patterns(&text),
                 Some(vec![vec!["a/*".to_string()]])
             );
-            assert_eq!(workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+            assert_eq!(
+                Workspaces::listed_patterns(&text),
+                Some(vec!["a/*".to_string()])
+            );
         }
         let text = format!("\u{feff}\u{feff}{json}");
         assert_eq!(vlt_workspace_patterns(&text), None);
-        assert_eq!(workspace_patterns(&text), None);
+        assert_eq!(Workspaces::listed_patterns(&text), None);
     }
 
     /// #942: vlt's `workspaces` in `vlt.json` is a string, an array or an
@@ -3534,20 +3538,6 @@ mod tests {
         .await
         .expect("refused");
         assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
-    }
-
-    #[test]
-    fn workspace_patterns_reads_both_field_shapes() {
-        assert_eq!(
-            workspace_patterns(r#"{"workspaces":["a/*","b"]}"#),
-            Some(vec!["a/*".to_string(), "b".to_string()])
-        );
-        assert_eq!(
-            workspace_patterns("\u{feff}{\"workspaces\":{\"packages\":[\"a/*\"]}}"),
-            Some(vec!["a/*".to_string()])
-        );
-        assert_eq!(workspace_patterns(r#"{"name":"x"}"#), None);
-        assert_eq!(workspace_patterns("not json"), None);
     }
 
     /// #417: a cargo workspace member is refused with the vendored code; the

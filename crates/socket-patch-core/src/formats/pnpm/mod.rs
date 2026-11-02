@@ -369,8 +369,13 @@ pub(crate) fn check_v9_lock_version(text: &str) -> Result<(), String> {
 /// One pnpm lock, parsed once (see the module docs).
 pub struct PnpmLock<'t> {
     text: &'t str,
+    /// The project document ([`grammar::main_document`]): pnpm 11+ writes
+    /// its env lockfile (`configDependencies`, `packageManagerDependencies`)
+    /// as a first document whose packages the install never links (#1949).
+    doc: &'t str,
+    /// Entries of the project document only, with offsets into `text`.
     packages: Vec<PnpmPackage<'t>>,
-    /// [`vendored_npm_uuids`] of the text.
+    /// [`vendored_npm_uuids`] of the project document.
     vendored: HashSet<String>,
 }
 
@@ -386,10 +391,18 @@ pub(crate) struct PnpmTarballRef<'p> {
 impl<'t> PnpmLock<'t> {
     /// Parse a lock text (any content: a non-pnpm text has no entries).
     pub fn parse(text: &'t str) -> Self {
+        let doc = grammar::main_document(strip_bom(text));
+        // `doc` is a suffix of `text`: parse the whole text so offsets stay
+        // relative to it, and keep the entries that start in `doc`.
+        let doc_start = text.len() - doc.len();
         PnpmLock {
             text,
-            packages: pnpm_packages(text),
-            vendored: vendored_npm_uuids(text),
+            doc,
+            packages: pnpm_packages(text)
+                .into_iter()
+                .filter(|p| p.entry.offset >= doc_start)
+                .collect(),
+            vendored: vendored_npm_uuids(doc),
         }
     }
 
@@ -408,7 +421,7 @@ impl<'t> PnpmLock<'t> {
     }
 
     fn has_packages_section(&self) -> bool {
-        self.text
+        self.doc
             .lines()
             .any(|l| l.trim_end_matches('\r') == "packages:")
     }
@@ -752,6 +765,51 @@ mod tests {
         // Keys outside `packages:` (importers, overrides) resolve nothing.
         let importers = "lockfileVersion: '9.0'\n\nimporters:\n\n  left-pad@1.3.0:\n    x: y\n";
         assert!(!PnpmLock::parse(importers).resolves("left-pad", "1.3.0"));
+    }
+
+    /// #1949: a pnpm 11+ lock's env document (config dependencies the
+    /// install never links) is not part of the inventory: `entries()`,
+    /// `resolves()`, the vendored uuids and `InstalledPackages` all read
+    /// the project document alone, and agree with each other.
+    #[test]
+    fn env_document_is_not_in_the_inventory() {
+        let env = format!(
+            "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {{integrity: sha512-c}}\n\n  b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz}}\n    version: 1.0.0\n\n"
+        );
+        let project = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n";
+        for text in [
+            format!("{env}{project}"),
+            format!("\u{feff}{env}{project}"),
+            format!("{env}{project}").replace('\n', "\r\n"),
+        ] {
+            let lock = PnpmLock::parse(&text);
+            let names: Vec<_> = lock
+                .entries()
+                .unwrap()
+                .into_iter()
+                .map(|e| (e.name, e.version))
+                .collect();
+            assert_eq!(
+                names,
+                [("left-pad".to_string(), "1.3.0".to_string())],
+                "{text:?}"
+            );
+            assert!(lock.resolves("left-pad", "1.3.0"));
+            assert!(!lock.resolves("cfg-dep", "2.0.0"));
+            assert!(!lock.vendored_in_use(UUID));
+            assert!(lock.packages().iter().all(|p| p.entry.offset >= env.len()));
+            let installed = InstalledPackages::from_lock_text(&text).unwrap();
+            assert!(installed.contains("left-pad", "1.3.0"));
+            assert!(!installed.contains("cfg-dep", "2.0.0"));
+        }
+        // Offsets still index the whole text.
+        let text = format!("{env}{project}");
+        let lock = PnpmLock::parse(&text);
+        let entry = &lock.packages()[0].entry;
+        assert_eq!(
+            &text[entry.offset..entry.offset + entry.body.len()],
+            entry.body
+        );
     }
 
     #[test]

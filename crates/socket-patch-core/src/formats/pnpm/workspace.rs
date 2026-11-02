@@ -151,14 +151,20 @@ pub(crate) fn is_keyless(text: &str) -> bool {
 /// nested package on pnpm 8–10.4 (`packages` defaults to `['.', '**']`) but
 /// as the root alone on pnpm >= 10.5, so a lock made from one with member
 /// importers comes from pnpm <= 10.4, and the root-only
-/// [`PACKAGES_SCAFFOLD`] would drop those members.
-pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
+/// [`PACKAGES_SCAFFOLD`] would drop those members. The same answer marks a
+/// root lock as a SHARED workspace lock (`utils::pnpm_workspace`). Comment
+/// lines are neither keys nor section ends (#1952).
+pub(crate) fn lock_has_member_importers<S: AsRef<str>>(lines: &[S]) -> bool {
     // CRLF-blind: a Windows checkout's lock reads like its LF twin.
     let mut in_importers = false;
     for line in lines {
+        let line = line.as_ref();
         let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.is_empty() && !line.starts_with(' ') {
-            in_importers = line == "importers:";
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        if !line.is_empty() && !line.starts_with([' ', '\t']) {
+            in_importers = line.trim_end() == "importers:";
         } else if in_importers
             && super::lines::parse_key_line(line, 2).is_some_and(|(key, _, _)| key != ".")
         {
@@ -166,6 +172,14 @@ pub(crate) fn lock_has_member_importers(lines: &[String]) -> bool {
         }
     }
     false
+}
+
+/// [`lock_has_member_importers`] of a whole `pnpm-lock.yaml` text: its
+/// project document alone ([`super::grammar::main_document`]), so importers
+/// of a pnpm 11+ env document never count.
+pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
+    let doc = super::grammar::main_document(strip_bom(text));
+    lock_has_member_importers(&doc.split('\n').collect::<Vec<_>>())
 }
 
 /// `text` with the contiguous run of lines `block` removed, when that
@@ -504,6 +518,36 @@ mod tests {
                 .map(|l| format!("{l}\r"))
                 .collect();
         assert!(lock_has_member_importers(&crlf));
+    }
+
+    /// #1952: a commented-out importer is not a member, a column-0 comment
+    /// does not end `importers:`, and the env document's importers never
+    /// count; the line and text forms agree.
+    #[test]
+    fn member_importers_skip_comments_and_the_env_document() {
+        let head = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies: {}\n";
+        for (body, members) in [
+            ("  # sub:\n  #   dependencies: {}\n", false),
+            ("# a note\n  sub:\n    dependencies: {}\n", true),
+            ("    # nested: comment\n", false),
+        ] {
+            let text = format!("{head}{body}\npackages: {{}}\n");
+            assert_eq!(lock_text_has_member_importers(&text), members, "{text:?}");
+            assert_eq!(
+                lock_has_member_importers(&lines(&text)),
+                members,
+                "{text:?}"
+            );
+        }
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  tooling:\n    configDependencies: {}\n\n";
+        let project = format!("---\n{head}\npackages: {{}}\n");
+        assert!(!lock_text_has_member_importers(&format!("{env}{project}")));
+        assert!(!lock_text_has_member_importers(&format!(
+            "\u{feff}{env}{project}"
+        )));
+        assert!(lock_text_has_member_importers(&format!(
+            "{env}---\n{head}  sub:\n    dependencies: {{}}\n"
+        )));
     }
 
     #[test]

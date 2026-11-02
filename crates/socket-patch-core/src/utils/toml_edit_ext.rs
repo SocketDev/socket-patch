@@ -1,5 +1,4 @@
-//! Small structured-TOML helpers shared by every module that edits or sniffs
-//! TOML (`vendor::cargo_config`, `vendor::pypi`, `vendor::pypi_uv`).
+//! Small structured-TOML helpers for `vendor::pypi` and `vendor::pypi_uv`.
 
 use toml_edit::{Item, Table};
 

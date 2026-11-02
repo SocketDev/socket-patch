@@ -4900,16 +4900,6 @@ __metadata:
 
     #[test]
     fn helper_grammar() {
-        // encodeURIComponent semantics, incl. a scoped workspace name.
-        assert_eq!(
-            encode_uri_component("vendor-spike@workspace:."),
-            "vendor-spike%40workspace%3A."
-        );
-        assert_eq!(
-            encode_uri_component("@acme/root@workspace:."),
-            "%40acme%2Froot%40workspace%3A."
-        );
-
         // Root workspace name extraction + berry field reads.
         let blocks = scan_blocks(B3_BEFORE_LOCK);
         assert_eq!(

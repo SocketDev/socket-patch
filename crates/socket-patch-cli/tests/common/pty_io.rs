@@ -1,4 +1,6 @@
-//! PTY I/O shared by the interactive suites.
+//! The PTY runner shared by the interactive suites: [`run`] and
+//! [`run_command`] spawn a hermetic child on a real terminal, answer its
+//! prompts and collect what it printed.
 //!
 //! `confirm()` discards terminal typeahead right before it shows a y/n
 //! prompt (so an Enter pressed during a long scan cannot answer it). Input
@@ -6,12 +8,14 @@
 //! away, exactly as a real user's early keystrokes are. These helpers send
 //! the scripted answer only once a prompt is on screen.
 //!
-//! Pull in with `#[path = "common/pty_io.rs"] mod pty_io;` and use it via
-//! `crate::pty_io::...`.
+//! Pull in with `#[path = "common/pty_io.rs"] mod pty_io;` next to the
+//! crate's `mod common` (the runner spawns through `common::hermetic`), and
+//! use it via `crate::pty_io::...`.
 
 #![allow(dead_code)]
 
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -90,6 +94,103 @@ pub fn send_when_prompted(out: &PtyOutput, writer: &mut dyn Write, input: &[u8])
     }
     let _ = writer.write_all(input);
     let _ = writer.flush();
+}
+
+/// How a [`run_command`] child ended, and everything it printed.
+pub struct PtyRun {
+    pub code: i32,
+    /// The signal that ended the child; `None` for a normal exit.
+    pub signal: Option<String>,
+    pub output: String,
+}
+
+/// Run the built binary with `args` in `cwd` on a PTY, answer the first
+/// prompt with `input`, and return `(exit_code, output)`.
+pub fn run(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
+    let run = run_command(
+        crate::common::hermetic::pty_binary_command(),
+        args,
+        cwd,
+        &[],
+        &[input.as_bytes()],
+        timeout,
+    );
+    (run.code, run.output)
+}
+
+/// Run `cmd` (a `hermetic::pty_command`) with `args` in `cwd` on a
+/// 24x80 PTY, `env` applied last so it survives the scrub. `answers[0]`
+/// is written once any prompt is on screen; `answers[i]` once the `[Y/n] `
+/// confirm hint has appeared `i` times (so only `answers[0]` may answer a
+/// menu, and the rest answer `[Y/n]` confirms in order). Then the writer is
+/// dropped, which portable_pty does by sending a newline and EOF. A child
+/// still running after `timeout` gets SIGHUP (`ChildKiller::kill`).
+///
+/// `TERM` is pinned: `console`/`dialoguer` derive key handling and
+/// rendering from it, and bare CI shells leave it unset or `dumb`.
+pub fn run_command(
+    mut cmd: portable_pty::CommandBuilder,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+    answers: &[&[u8]],
+    timeout: Duration,
+) -> PtyRun {
+    let pair = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+
+    for a in args {
+        cmd.arg(a);
+    }
+    cmd.cwd(cwd);
+    cmd.env("TERM", "xterm-256color");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+
+    let mut child = pair.slave.spawn_command(cmd).expect("spawn in PTY");
+    // The master sees EOF only once every slave fd is closed: ours now,
+    // the child's when it exits.
+    drop(pair.slave);
+
+    let output = PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
+
+    // Cancelled once the child is reaped, so it never signals a reused pid.
+    let (reaped, watchdog) = std::sync::mpsc::channel::<()>();
+    let mut killer = child.clone_killer();
+    std::thread::spawn(move || {
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = watchdog.recv_timeout(timeout) {
+            let _ = killer.kill();
+        }
+    });
+
+    let mut writer = pair.master.take_writer().expect("take writer");
+    for (i, answer) in answers.iter().enumerate() {
+        if i == 0 {
+            send_when_prompted(&output, &mut writer, answer);
+        } else {
+            output.wait_for_count("[Y/n] ", i, Duration::from_secs(10));
+            let _ = writer.write_all(answer);
+            let _ = writer.flush();
+        }
+    }
+    drop(writer);
+
+    let status = child.wait().expect("child.wait");
+    drop(reaped);
+    drop(pair.master);
+    let output = output.finish();
+    PtyRun {
+        code: status.exit_code() as i32,
+        signal: status.signal().map(str::to_string),
+        output: String::from_utf8_lossy(&output).into_owned(),
+    }
 }
 
 /// The lib's terminal emulator (`ui::test_support::render`), included

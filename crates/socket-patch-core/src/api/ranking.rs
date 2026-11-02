@@ -983,4 +983,36 @@ mod tests {
         assert_eq!(ids(&first), ids(&second));
         assert_eq!(ids(&first), ["u0", "u1", "u2", "u3"]);
     }
+
+    #[test]
+    fn batch_supersedes_on_advisory_count_at_equal_severity() {
+        // No dates: only the severity and advisory-count rungs can decide.
+        let single = batch("a_single", "free", None, Some("high"));
+        let merged = batch_multi("z_merged", "free", None, Some("high"), 2);
+        let larger = batch_multi("z_larger", "free", None, Some("high"), 3);
+        assert!(batch_supersedes(&merged, &single));
+        assert!(!batch_supersedes(&single, &merged));
+        assert!(batch_supersedes(&larger, &merged));
+        assert!(!batch_supersedes(&merged, &larger));
+    }
+
+    #[test]
+    fn batch_supersedes_on_severity_before_advisory_count() {
+        let merged = batch_multi("a_merged", "free", None, Some("low"), 2);
+        let critical = batch("z_critical", "free", None, Some("critical"));
+        assert!(batch_supersedes(&critical, &merged));
+        assert!(!batch_supersedes(&merged, &critical));
+    }
+
+    #[test]
+    fn batch_supersedes_ignores_cve_aliases_beside_a_ghsa() {
+        // Both sides name one GHSA, so their CVE lists are aliases: neither
+        // is merged, and without two real dates neither supersedes.
+        let mut candidate = batch("a_cand", "free", None, Some("high"));
+        candidate.cve_ids = vec!["CVE-1".into(), "CVE-2".into()];
+        let mut applied = batch("z_appl", "free", None, Some("high"));
+        applied.cve_ids = vec!["CVE-3".into()];
+        assert!(!batch_supersedes(&candidate, &applied));
+        assert!(!batch_supersedes(&applied, &candidate));
+    }
 }
