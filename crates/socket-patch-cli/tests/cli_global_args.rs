@@ -503,7 +503,6 @@ fn env_vars_populate_global_args() {
 /// Bool env vars accept "1"/"yes" (the conventional truthy strings), not
 /// just clap's strict "true"/"false": `SOCKET_OFFLINE=1` (or
 /// `SOCKET_DEBUG=1`) must not fail with `invalid value '1' for '--offline'`.
-///
 #[test]
 #[serial_test::serial]
 fn bool_env_vars_accept_one_and_yes() {
@@ -557,34 +556,27 @@ fn bool_env_vars_reject_zero_and_falsey() {
         ("SOCKET_JSON", |c| c.json),
     ];
 
-    let parse_list = || {
-        let cli = hermetic::try_parse(&["socket-patch", "list"]);
-        cli.map(|cli| match cli.command {
-            socket_patch_cli::Commands::List(args) => args.common,
-            _ => panic!("expected List"),
-        })
+    let parse_list = |var: &str, value: &str| {
+        let cli = clap_parse::try_parse_with_env(&[(var, value)], &["socket-patch", "list"])
+            .unwrap_or_else(|e| panic!("{var}={value} should parse, got: {e}"));
+        common_of(&cli).clone()
     };
 
-    hermetic::scrub_process_socket_env();
     for &(var, get) in fields {
         // Liveness proof: a truthy value MUST flip the field to true. If this
         // fails, the env binding is dead and the falsey checks below would be
         // vacuous.
-        std::env::set_var(var, "1");
-        let common = parse_list().unwrap_or_else(|e| panic!("{var}=1 should parse: {e}"));
         assert!(
-            get(&common),
+            get(&parse_list(var, "1")),
             "{var}=1 must engage the bool (proves binding is live)"
         );
-        std::env::remove_var(var);
 
         // Each falsey idiom must resolve to false — not true, not a parse error.
         for falsey in ["0", "false", "no", "off"] {
-            std::env::set_var(var, falsey);
-            let common =
-                parse_list().unwrap_or_else(|e| panic!("{var}={falsey} should parse, got: {e}"));
-            assert!(!get(&common), "{var}={falsey} must NOT engage the bool");
-            std::env::remove_var(var);
+            assert!(
+                !get(&parse_list(var, falsey)),
+                "{var}={falsey} must NOT engage the bool"
+            );
         }
     }
 }
@@ -707,15 +699,17 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
 #[test]
 #[serial_test::serial]
 fn cli_arg_overrides_env_var() {
-    hermetic::scrub_process_socket_env();
+    let api_url_env = [("SOCKET_API_URL", "https://env-api.example.com")];
     // String field: env set, CLI overrides.
-    std::env::set_var("SOCKET_API_URL", "https://env-api.example.com");
-    let cli = hermetic::try_parse(&[
-        "socket-patch",
-        "list",
-        "--api-url",
-        "https://cli-api.example.com",
-    ])
+    let cli = clap_parse::try_parse_with_env(
+        &api_url_env,
+        &[
+            "socket-patch",
+            "list",
+            "--api-url",
+            "https://cli-api.example.com",
+        ],
+    )
     .expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
@@ -727,7 +721,8 @@ fn cli_arg_overrides_env_var() {
     );
 
     // Sanity: with the CLI flag absent, the env value resolves through.
-    let cli = hermetic::try_parse(&["socket-patch", "list"]).expect("parse");
+    let cli =
+        clap_parse::try_parse_with_env(&api_url_env, &["socket-patch", "list"]).expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
     };
@@ -738,8 +733,11 @@ fn cli_arg_overrides_env_var() {
     );
 
     // Bool field: CLI `--offline` wins over a falsey env value.
-    std::env::set_var("SOCKET_OFFLINE", "0");
-    let cli = hermetic::try_parse(&["socket-patch", "list", "--offline"]).expect("parse");
+    let cli = clap_parse::try_parse_with_env(
+        &[("SOCKET_OFFLINE", "0")],
+        &["socket-patch", "list", "--offline"],
+    )
+    .expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
     };
@@ -747,8 +745,6 @@ fn cli_arg_overrides_env_var() {
         args.common.offline,
         "CLI --offline must win over SOCKET_OFFLINE=0"
     );
-    std::env::remove_var("SOCKET_API_URL");
-    std::env::remove_var("SOCKET_OFFLINE");
 }
 
 /// Regression: with neither CLI flags nor env vars set, clap must populate the

@@ -19,8 +19,9 @@ use socket_patch_cli::commands::list::{run, ListArgs};
 mod clap_parse;
 #[path = "common/mod.rs"]
 mod common;
+use clap_parse::try_parse_keeping_opt_outs as try_parse;
 use common::hermetic;
-use hermetic::{binary_command, try_parse};
+use hermetic::binary_command;
 use socket_patch_cli::Commands;
 use socket_patch_core::manifest::schema::{
     PatchFileInfo, PatchManifest, PatchRecord, VulnerabilityInfo,
@@ -46,11 +47,12 @@ fn parse_list(extra: &[&str]) -> ListArgs {
 
 #[test]
 fn defaults_match_contract() {
+    // The `run()` tests below need the forced opt-outs, so parses here see
+    // `SOCKET_TELEMETRY_DISABLED=1`.
     let args = parse_list(&[]);
-    assert_eq!(
-        clap_parse::Globals(args.common),
-        clap_parse::global_defaults()
-    );
+    let mut want = clap_parse::global_defaults();
+    want.no_telemetry = true;
+    assert_eq!(clap_parse::Globals(args.common), want);
 }
 
 #[test]

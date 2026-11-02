@@ -53,22 +53,16 @@ fn defaults_match_contract() {
     );
 
     // All other defaults from the scan table.
-    assert_eq!(args.common.cwd, std::path::PathBuf::from("."));
-    assert_eq!(args.common.org, None);
-    assert!(!args.common.json);
-    assert!(!args.common.yes);
-    assert!(!args.common.global);
-    assert_eq!(args.common.global_prefix, None);
-    assert_eq!(args.common.api_url, None); // default applied in core resolver
-    assert_eq!(args.common.api_token, None);
-    assert_eq!(args.common.ecosystems, None);
+    assert_eq!(
+        clap_parse::Globals(args.common.clone()),
+        clap_parse::global_defaults()
+    );
     assert!(
         !args.prune,
         "--prune default is false (GC is opt-in in v3.0)"
     );
     assert!(!args.sync, "--sync default is false");
     assert_eq!(args.mode, None, "--mode default is None (no mode selector)");
-    assert!(!args.common.dry_run, "--dry-run default is false");
     assert!(
         !args.all_releases,
         "--all-releases default is false (narrow — installed-dist variant only)"

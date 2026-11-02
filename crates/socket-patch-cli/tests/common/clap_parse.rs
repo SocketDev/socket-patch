@@ -21,6 +21,30 @@ pub fn try_parse_with_env(env: &[(&str, &str)], argv: &[&str]) -> Result<Cli, cl
     parsed
 }
 
+/// `Cli::try_parse_from` for binaries that also call a command's `run()`
+/// in-process, which reads the process env. Once per process, removes every
+/// `SOCKET_*` var except the `hermetic::FORCED_OPT_OUTS`, and forces those
+/// on, so `run()` reads no developer config and sends no telemetry. An
+/// opt-out is never removed, so a concurrent `run()` can't see it missing.
+/// `SOCKET_TELEMETRY_DISABLED` binds `--no-telemetry`, so every parse here
+/// yields `no_telemetry: true`.
+pub fn try_parse_keeping_opt_outs(argv: &[&str]) -> Result<Cli, clap::Error> {
+    use crate::hermetic::FORCED_OPT_OUTS;
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        for (key, _) in std::env::vars_os() {
+            let name = key.to_string_lossy();
+            if name.starts_with("SOCKET_") && !FORCED_OPT_OUTS.iter().any(|(k, _)| *k == name) {
+                std::env::remove_var(&key);
+            }
+        }
+        for (k, v) in FORCED_OPT_OUTS {
+            std::env::set_var(k, v);
+        }
+    });
+    <Cli as clap::Parser>::try_parse_from(argv)
+}
+
 /// The `GlobalArgs` a parse with no global flag must yield, written out by
 /// hand so it can disagree with the `default_value`s. A struct literal: a new
 /// global field fails to compile here until its default is added.

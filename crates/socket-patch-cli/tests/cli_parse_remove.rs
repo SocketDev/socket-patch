@@ -16,8 +16,8 @@ mod clap_parse;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
+use clap_parse::try_parse_keeping_opt_outs as try_parse;
 use clap_parse::{global_defaults, Globals};
-use hermetic::try_parse;
 
 fn parse_remove(extra: &[&str]) -> RemoveArgs {
     let mut argv = vec!["socket-patch", "remove"];
@@ -29,6 +29,14 @@ fn parse_remove(extra: &[&str]) -> RemoveArgs {
     }
 }
 
+/// The `run()` tests below need the forced opt-outs, so parses here see
+/// `SOCKET_TELEMETRY_DISABLED=1`.
+fn opt_out_defaults() -> Globals {
+    let mut want = global_defaults();
+    want.no_telemetry = true;
+    want
+}
+
 // ---------------------------------------------------------------------------
 // Defaults
 // ---------------------------------------------------------------------------
@@ -38,7 +46,7 @@ fn defaults_with_purl_positional() {
     let args = parse_remove(&["pkg:npm/foo@1"]);
     assert_eq!(args.identifier, "pkg:npm/foo@1");
     assert!(!args.skip_rollback);
-    assert_eq!(Globals(args.common), global_defaults());
+    assert_eq!(Globals(args.common), opt_out_defaults());
 }
 
 #[test]
@@ -49,7 +57,7 @@ fn positional_uuid_stored_in_identifier() {
     // identifier shape at parse time; the runtime branch on `pkg:` happens
     // inside `run()`.
     assert!(!args.skip_rollback);
-    assert_eq!(Globals(args.common), global_defaults());
+    assert_eq!(Globals(args.common), opt_out_defaults());
 }
 
 // ---------------------------------------------------------------------------
