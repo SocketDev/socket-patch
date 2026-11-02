@@ -60,10 +60,7 @@
 //!   loop including the fresh-dir `bundle install` delivery proof. The server
 //!   must provide a valid `gem-stub-gemspec` with summary and authors; invalid
 //!   stubs fail closed without constructing a local replacement.
-//! * **golang** — vendored mode *works* (directory `replace`), but production
-//!   publishes no free golang patches, so there is nothing to vendor.
-//!   [`golang_vendored_finds_no_free_patches`] asserts exactly that (zero
-//!   applied) and would light up the moment a golang patch is published.
+//! * **golang** — pgx/v5 v5.7.0 exercises directory replacements and cold-cache delivery.
 //! * **cargo / maven / nuget / composer** — vendored mode is implemented, but
 //!   production publishes **zero** free-tier patches for them.
 //!   [`canary_unpublished_vendored_ecosystems`] probes production every run and
@@ -2504,50 +2501,16 @@ fn gem_manifestless_vex(
 // Documented gaps — golang (nothing to vendor), deno (unsupported), canary
 // ===========================================================================
 
-/// Golang vendored mode WORKS (directory `replace`), but production publishes
-/// no free golang patches, so there is nothing to vendor. This asserts exactly
-/// that — a clean run that vendors zero packages — and would light up the
-/// moment a free golang patch is published.
-#[test]
-#[ignore = "live production API. Run with --ignored."]
-fn golang_vendored_finds_no_free_patches() {
-    const LEG: &str = "golang_vendored_finds_no_free_patches";
-    if !has_command("go") {
-        soft_skip!(LEG, "`go` not on PATH");
-    }
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let proj = tmp.path().join("proj");
-    std::fs::create_dir_all(&proj).expect("mkdir proj");
-    std::fs::write(
-        proj.join("go.mod"),
-        "module example.com/vendored-e2e\n\ngo 1.21\n",
-    )
-    .expect("write go.mod");
+#[path = "golang_production/mod.rs"]
+mod golang_production;
 
-    let env_json = scan_vendored(&proj, &["--ecosystems", "golang"]);
-    let applied = env_json["summary"]["applied"].as_u64().unwrap_or(0);
-    assert_eq!(
-        applied, 0,
-        "{LEG}: golang vendored something, but production publishes no free golang patches. \
-         Either production changed (extend this suite with a real golang delivery proof) or \
-         this is a bug.\nenvelope:\n{env_json:#}"
-    );
-    let patches = env_json["events"]
-        .as_array()
-        .map(|a| a.iter().filter(|e| e["action"] == "downloaded").count())
-        .unwrap_or(0);
-    if patches > 0 {
-        println!(
-            "{LEG}: production now publishes free golang patches — extend this suite with a \
-             real `go mod` vendored delivery proof."
-        );
-    } else {
-        println!("{LEG}: no free golang patches published; vendored mode correctly found nothing.");
+#[test]
+#[ignore = "live production API + real Go >= 1.21. Run with --ignored."]
+fn golang_vendored_pgx_delivery() {
+    if !has_command("go") {
+        soft_skip!("golang_vendored", "go not on PATH");
     }
-    assert!(
-        !proj.join(".socket/vendor").exists(),
-        "{LEG}: nothing was vendored, so no .socket/vendor tree should exist:\n{env_json:#}"
-    );
+    golang_production::delivery("vendored");
 }
 
 /// Deno vendored mode is not supported. Same shape as the golang guard.
@@ -2708,4 +2671,14 @@ async fn vlt_pinned_matrix_production_vendored_install_proof() {
         "vlt vendored production",
     );
     leg.ran();
+}
+
+#[test]
+#[ignore = "live production API + real Go >= 1.21. Run with --ignored."]
+fn golang_agent_pgx_delivery_and_cold_cache() {
+    if !has_command("go") {
+        soft_skip!("golang_agent", "go not on PATH");
+    }
+    golang_production::delivery("agent");
+    golang_production::cold_agent();
 }
