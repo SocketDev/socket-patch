@@ -199,7 +199,7 @@ fn go_build_links_patch_via_replace_redirect() {
     // this suite fails deterministically if the leak returns. `GOTOOLCHAIN`
     // must lose to go_env's `local` pin (or every `go` command chases a
     // nonexistent toolchain through the file proxy). `SOCKET_DRY_RUN` needs
-    // no guard here: `hermetic::command` seeds and scrubs it itself.
+    // no guard here: `spawn_env_hygiene` pins `hermetic::command`'s scrub.
     std::env::set_var("GOTOOLCHAIN", "go1.99.99");
     let tmp = tempfile::tempdir().unwrap();
     let (consumer, modcache, proxy_url) = stage(tmp.path());
