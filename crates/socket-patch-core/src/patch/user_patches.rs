@@ -4,7 +4,6 @@
 //! yet, and need not touch the same file as the Socket fix. Never execute hooks
 //! or fetch patch URLs to establish ownership.
 
-use crate::formats::package_json::Workspaces;
 use std::collections::{BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -12,6 +11,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use serde_json::Value;
 
+use crate::formats::package_json::Workspaces;
 use crate::formats::text::strip_bom;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
@@ -91,13 +91,9 @@ impl UserPatchIndex {
                         }
                     }
                 }
-                let workspaces = Workspaces::of(&value);
-                if matches!(workspaces, Workspaces::Malformed(_)) {
-                    // #1900: the package managers refuse this field, so
-                    // which members install (and patch) cannot be told.
-                    index.unknown("npm", &dir.join("package.json"), "malformed workspaces");
-                }
-                globs.extend(workspaces.into_listed().into_iter().flatten());
+                // A malformed field still names its string items (#1900):
+                // walking them can only find more patches.
+                globs.extend(Workspaces::of(&value).into_listed().into_iter().flatten());
                 index.patch_package(&dir, &value).await;
             } else {
                 index.patch_directory(&dir.join("patches"), false).await;
@@ -1146,6 +1142,35 @@ mod tests {
         assert!(index.conflicts("pkg:npm/x@1.0.0").is_empty(), "{index:?}");
     }
 
+    /// #1900: a `workspaces` list with a non-string item is read through
+    /// the shared package.json reader, which keeps its string patterns,
+    /// so the members they name are still searched for patches, and
+    /// unrelated npm packages are not marked as user-patched.
+    #[tokio::test]
+    async fn malformed_workspaces_still_walk_their_string_patterns() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"workspaces":["packages/*", 1]}"#,
+        );
+        write(tmp.path(), "packages/a/package.json", "{}");
+        write(
+            tmp.path(),
+            "packages/a/patches/one+1.0.0.patch",
+            "user diff",
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/one@1.0.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
     #[tokio::test]
     async fn dot_dot_workspace_globs_resolve_lexically() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1204,10 +1229,6 @@ mod tests {
             r#"{"scripts":{"postinstall":"patch-package --patch-dir $PATCH_DIR"}}"#,
             r#"{"scripts":{"postinstall":"patch-package --patch-dir missing"}}"#,
             "{broken json",
-            // #1900: npm, yarn and Bun all refuse a `workspaces` list with
-            // a non-string item, and npm and Bun refuse `null`.
-            r#"{"workspaces": ["a", 1]}"#,
-            r#"{"workspaces": null}"#,
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write(tmp.path(), "package.json", text);

@@ -15,9 +15,16 @@
 //! | `{"nohoist": []}`         | fails  | no workspaces | no workspaces |
 //!
 //! A list with a non-string item fails every install, so it is
-//! [`Workspaces::Malformed`], as are the other shapes npm and Bun refuse.
-//! The object form without `packages` installs under the two package
-//! managers that write it, so it declares no patterns.
+//! [`Workspaces::Malformed`], as are the other shapes npm and Bun refuse
+//! (yarn 1 installs those as if no field were set). The object form
+//! without `packages` installs under the two package managers that write
+//! it, so it declares no patterns.
+//!
+//! Readers that only widen (a governing-root refusal, an extra crawl
+//! root, a warning, a patch search) take a malformed field's string items
+//! through [`Workspaces::into_listed`]. A reader that must name an exact
+//! member set (the Bun member walk) treats a malformed field as
+//! unreadable.
 
 use serde_json::Value;
 
@@ -78,6 +85,12 @@ impl Workspaces {
             Workspaces::None => None,
             Workspaces::Patterns(list) | Workspaces::Malformed(list) => Some(list),
         }
+    }
+
+    /// [`Self::parse`] then [`Self::into_listed`]: the patterns a widening
+    /// reader takes from a `package.json` text.
+    pub(crate) fn listed_patterns(package_json: &str) -> Option<Vec<String>> {
+        Self::parse(package_json)?.into_listed()
     }
 
     /// Whether the field names at least one pattern ([`Self::into_listed`]

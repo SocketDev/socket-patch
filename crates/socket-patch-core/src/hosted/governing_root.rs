@@ -20,11 +20,11 @@
 //! directory (its ancestors), so it only runs over the disk; an in-memory
 //! project is the host's whole file set and has no ancestors.
 
-use crate::formats::package_json::Workspaces;
 use std::path::{Path, PathBuf};
 
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, VLT_LOCK};
 use crate::formats::governing_locks::{npm_lock_files, NpmLockFamily};
+use crate::formats::package_json::Workspaces;
 use crate::formats::pnpm::workspace::read_package_globs;
 use crate::formats::text::strip_bom;
 use crate::formats::yarn::berry_gates::YARN_LOCK;
@@ -650,7 +650,7 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
         let listed = ancestor.join("rush.json").exists()
             || package_json
                 .ok()
-                .and_then(|text| workspace_patterns(&text))
+                .and_then(|text| Workspaces::listed_patterns(&text))
                 .is_some_and(|patterns| lists(&patterns, &rel))
             || read_regular_to_string(&ancestor.join(VLT_JSON))
                 .await
@@ -731,7 +731,7 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
             continue;
         };
-        let Some(patterns) = workspace_patterns(&text) else {
+        let Some(patterns) = Workspaces::listed_patterns(&text) else {
             continue;
         };
         let Ok(rel) = member.strip_prefix(ancestor) else {
@@ -1201,15 +1201,6 @@ fn vlt_workspace_patterns(vlt_json: &str) -> Option<Vec<Vec<String>>> {
         serde_json::Value::Object(groups) => groups.values().map(group).collect(),
         other => vec![group(other)],
     })
-}
-
-/// The `workspaces` patterns of a `package.json` as a widening reader
-/// takes them ([`Workspaces::into_listed`]): a root whose field is
-/// malformed still governs the members its string items name, so the
-/// refusal errs toward naming the root. `None` when no field is declared
-/// or the manifest does not parse.
-pub(crate) fn workspace_patterns(package_json: &str) -> Option<Vec<String>> {
-    Workspaces::parse(package_json)?.into_listed()
 }
 
 async fn npmrc_lockfile_dir(root: &Path) -> Option<String> {
@@ -2542,11 +2533,14 @@ mod tests {
                 vlt_workspace_patterns(&text),
                 Some(vec![vec!["a/*".to_string()]])
             );
-            assert_eq!(workspace_patterns(&text), Some(vec!["a/*".to_string()]));
+            assert_eq!(
+                Workspaces::listed_patterns(&text),
+                Some(vec!["a/*".to_string()])
+            );
         }
         let text = format!("\u{feff}\u{feff}{json}");
         assert_eq!(vlt_workspace_patterns(&text), None);
-        assert_eq!(workspace_patterns(&text), None);
+        assert_eq!(Workspaces::listed_patterns(&text), None);
     }
 
     /// #942: vlt's `workspaces` in `vlt.json` is a string, an array or an
@@ -3480,20 +3474,6 @@ mod tests {
         .await
         .expect("refused");
         assert!(refusal.message.contains(VLT_LOCK), "{}", refusal.message);
-    }
-
-    #[test]
-    fn workspace_patterns_reads_both_field_shapes() {
-        assert_eq!(
-            workspace_patterns(r#"{"workspaces":["a/*","b"]}"#),
-            Some(vec!["a/*".to_string(), "b".to_string()])
-        );
-        assert_eq!(
-            workspace_patterns("\u{feff}{\"workspaces\":{\"packages\":[\"a/*\"]}}"),
-            Some(vec!["a/*".to_string()])
-        );
-        assert_eq!(workspace_patterns(r#"{"name":"x"}"#), None);
-        assert_eq!(workspace_patterns("not json"), None);
     }
 
     /// #417: a cargo workspace member is refused with the vendored code; the

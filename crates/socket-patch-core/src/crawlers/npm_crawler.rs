@@ -111,7 +111,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
     else {
         return Vec::new();
     };
@@ -915,12 +915,14 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(_) => return None,
     };
+    use crate::formats::package_json::Workspaces;
+
     // Bun refuses to install from a malformed field (#1900), so it names
     // no member set.
-    let patterns = match crate::formats::package_json::Workspaces::parse(&text)? {
-        crate::formats::package_json::Workspaces::None => Vec::new(),
-        crate::formats::package_json::Workspaces::Patterns(patterns) => patterns,
-        crate::formats::package_json::Workspaces::Malformed(_) => return None,
+    let patterns = match Workspaces::parse(&text)? {
+        Workspaces::None => Vec::new(),
+        Workspaces::Patterns(patterns) => patterns,
+        Workspaces::Malformed(_) => return None,
     };
     let mut members = Vec::new();
     for pattern in &patterns {
