@@ -301,6 +301,9 @@ pub(super) fn merge_configured_install_roots(
 /// the (untrusted) project, and a FIFO planted there would wedge a plain
 /// read forever.
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
+    // Walk the absolute spelling: the default `--cwd .` has no lexical
+    // parents, so a parent `.yarnrc` would never be read (#1902).
+    let start_path = &crate::utils::relpath::absolute_lexically(start_path);
     let mut general: Option<(&Path, String)> = None;
     let mut install: Option<(&Path, String)> = None;
     for dir in start_path.ancestors() {
@@ -1570,14 +1573,13 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
-    let project = nm
-        .parent()?
-        .ancestors()
-        .find(|dir| dir.join("yarn.lock").is_file())?;
-    let store = super::pkg_managers::active_yarn_pnpm_store(project)?;
-    let (Ok(real_store), Ok(real_project)) =
-        (std::fs::canonicalize(store), std::fs::canonicalize(project))
-    else {
+    let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
+        .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
+    let (Ok(real_store), Ok(real_project)) = (
+        std::fs::canonicalize(store),
+        std::fs::canonicalize(&abs_project),
+    ) else {
         return None;
     };
     let below = path_below(&real_project, &real_store)?;
@@ -1586,7 +1588,7 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    let mut dir = project.to_path_buf();
+    let mut dir = project;
     for component in below.components() {
         dir.push(component);
         if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
