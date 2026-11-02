@@ -688,11 +688,12 @@ pub(super) async fn run_redirect(
         &pairs,
         scan_result,
         npm_prior,
-        Some(
-            super::rollout::Gate::new(stage, rows)
-                .with_prior(prior)
-                .with_references(references),
-        ),
+        Some(super::rollout::Gate {
+            stage,
+            rows,
+            prior,
+            references,
+        }),
         "scan",
     )
     .await
@@ -1057,7 +1058,8 @@ async fn run_redirect_selected_untracked(
     let may_write = rollout.as_ref().is_none_or(|gate| {
         let new = gate.new_keys();
         candidates.iter().any(|c| {
-            !new.contains(&(sel_purl(c), c.dep.patch_uuid.clone())) || gate.may_admit(&sel_purl(c))
+            !new.contains(&(sel_purl(c), c.dep.patch_uuid.clone()))
+                || gate.stage.may_admit(&sel_purl(c))
         })
     });
     let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {

@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub(crate) use socket_patch_core::rollout::stage::*;
-use socket_patch_core::rollout::{severity_label, MaxNew, MaxNewSource, Recorded, RolloutPlan};
+use socket_patch_core::rollout::{severity_label, MaxNewSource, Recorded};
 use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::discovery::UpdateInfo;
@@ -73,32 +73,7 @@ impl<'a> Prior<'a> {
     }
 }
 
-impl<'a> Gate<'a> {
-    pub(crate) fn new(stage: &'a mut Stage, rows: Vec<Row>) -> Self {
-        Gate {
-            stage,
-            rows,
-            prior: None,
-            references: None,
-        }
-    }
-
-    /// This gate carrying scan's pre-redirect discovery (see [`Self::prior`]).
-    pub(crate) fn with_prior(mut self, prior: Option<Prior<'a>>) -> Self {
-        self.prior = prior;
-        self
-    }
-
-    /// This gate carrying the sweep's reference answers (see
-    /// [`Self::references`]).
-    pub(crate) fn with_references(
-        mut self,
-        references: Option<super::withdrawn::KnownReferences>,
-    ) -> Self {
-        self.references = references;
-        self
-    }
-
+impl Gate<'_> {
     /// `(purl, uuid)` of every NEW row, for O(1) [`Self::is_new`] checks.
     pub(crate) fn new_keys(&self) -> HashSet<(String, String)> {
         self.rows
@@ -106,17 +81,6 @@ impl<'a> Gate<'a> {
             .filter(|r| r.candidate.recorded.is_new())
             .map(|r| (r.writer.purl.clone(), r.writer.uuid.clone()))
             .collect()
-    }
-
-    /// Whether a NEW `(purl, uuid)` row could be admitted: budget left, or
-    /// its package already admitted by an earlier directory.
-    pub(crate) fn may_admit(&self, purl: &str) -> bool {
-        self.stage.may_admit_new()
-            || (!(self.stage.capped() && self.stage.incomplete)
-                && self
-                    .stage
-                    .already_admitted
-                    .contains(&PurlKey::new(purl).into_string()))
     }
 }
 
@@ -151,45 +115,15 @@ pub(crate) fn human(stage: &Stage, dry_run: bool) -> (Option<String>, Vec<String
     let Some(plan) = stage.plan.as_ref() else {
         return (None, Vec::new());
     };
-    let ctx = HumanContext {
-        dry_run,
-        incomplete: stage.incomplete && stage.capped(),
-        shared: stage.carry.is_some(),
-    };
-    human_lines(&stage.configured, plan, ctx)
-}
-
-/// `pkg:npm/@scope/x@1.0.0` → `@scope/x@1.0.0`.
-fn short_name(base_purl: &str) -> &str {
-    base_purl
-        .strip_prefix("pkg:")
-        .and_then(|rest| rest.split_once('/'))
-        .map_or(base_purl, |(_, name)| name)
-}
-
-/// How [`human_lines`] words a run.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct HumanContext {
-    pub(crate) dry_run: bool,
-    /// A lookup failed, so no new patch could be admitted.
-    pub(crate) incomplete: bool,
-    /// The budget is shared with other project directories of this run.
-    pub(crate) shared: bool,
-}
-
-pub(crate) fn human_lines(
-    configured: &MaxNew,
-    plan: &RolloutPlan,
-    ctx: HumanContext,
-) -> (Option<String>, Vec<String>) {
+    let configured = &stage.configured;
     let c = plan.counts;
     let line = configured.value.map(|cap| {
-        let verb = if ctx.dry_run {
+        let verb = if dry_run {
             "would be applied"
         } else {
             "applied"
         };
-        let shared = match (ctx.shared, plan.remaining) {
+        let shared = match (stage.carry.is_some(), plan.remaining) {
             (true, Some(left)) => format!(", shared by this run's directories, {left} left"),
             _ => String::new(),
         };
@@ -207,13 +141,13 @@ pub(crate) fn human_lines(
         return (line, Vec::new());
     }
     let deferred = crate::ui::plural(groups.len(), "new patch", "new patches");
-    let deferred = if ctx.dry_run {
+    let deferred = if dry_run {
         format!("{deferred} would be deferred")
     } else {
         format!("{deferred} deferred")
     };
     let first = match configured.value {
-        _ if ctx.incomplete => format!(
+        _ if stage.incomplete && stage.capped() => format!(
             "{deferred}: a patch lookup failed, so no new patch was added this run; run scan \
              again once the patch API answers."
         ),
@@ -226,7 +160,7 @@ pub(crate) fn human_lines(
                 MaxNewSource::Cap | MaxNewSource::Default => "raise the cap",
             }
         ),
-        Some(cap) if ctx.dry_run => format!(
+        Some(cap) if dry_run => format!(
             "{deferred}; the wet run adds the top {}, and each later committed scan the next ones.",
             (cap as usize).min(c.new as usize + groups.len())
         ),
@@ -242,7 +176,10 @@ pub(crate) fn human_lines(
         .map(|g| {
             format!(
                 "{} ({})",
-                short_name(&g.base_purl),
+                g.base_purl
+                    .strip_prefix("pkg:")
+                    .and_then(|rest| rest.split_once('/'))
+                    .map_or(g.base_purl.as_str(), |(_, name)| name),
                 severity_label(g.severity_order)
             )
         })
@@ -307,6 +244,7 @@ mod tests {
     use socket_patch_core::api::types::VulnerabilityResponse;
     use socket_patch_core::manifest::schema::PatchManifest;
     use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::rollout::MaxNew;
     use std::collections::HashMap;
     use std::path::Path;
 

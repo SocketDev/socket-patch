@@ -361,6 +361,16 @@ impl Stage {
         !(self.capped() && self.incomplete) && self.budget.value != Some(0)
     }
 
+    /// Whether a NEW row of `purl` could be admitted: budget left, or its
+    /// package already admitted by an earlier directory.
+    pub fn may_admit(&self, purl: &str) -> bool {
+        self.may_admit_new()
+            || (!(self.capped() && self.incomplete)
+                && self
+                    .already_admitted
+                    .contains(&PurlKey::new(purl).into_string()))
+    }
+
     /// Plan `rows` with `eligible` deciding each NEW row, record the plan
     /// and hand the remaining budget to the next directory.
     pub fn plan(&mut self, rows: &[Row], eligible: impl Fn(&Row) -> bool) -> &RolloutPlan {
