@@ -65,6 +65,15 @@ pub fn find_event<'a>(envelope: &'a Value, action: &str, error_code: Option<&str
         })
 }
 
+/// The first event for `purl`; panics with the envelope when there is
+/// none.
+pub fn event_for<'a>(envelope: &'a Value, purl: &str) -> &'a Value {
+    events(envelope)
+        .iter()
+        .find(|e| e["purl"] == purl)
+        .unwrap_or_else(|| panic!("no event for {purl} in:\n{envelope:#}"))
+}
+
 /// Each event as `(purl, action, errorCode)`, absent fields as `""`.
 pub fn event_triples(envelope: &Value) -> Vec<(String, String, String)> {
     events(envelope)

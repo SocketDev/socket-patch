@@ -10,6 +10,12 @@ use socket_patch_core::crawlers::maven_crawler::parse_pom_group_artifact_version
 use socket_patch_core::crawlers::types::CrawlerOptions;
 use socket_patch_core::crawlers::MavenCrawler;
 
+/// The variables the crawler reads a user home from. Maven's `user.home`
+/// prefers `USERPROFILE` on Windows and `HOME` elsewhere, while the
+/// Coursier / Ivy lookups prefer `HOME` everywhere, so a test that points
+/// the home at a temp dir must set both.
+const HOME_VARS: [&str; 2] = ["HOME", "USERPROFILE"];
+
 fn options_at(root: &Path) -> CrawlerOptions {
     CrawlerOptions {
         cwd: root.to_path_buf(),
@@ -269,10 +275,12 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
 
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = HOME_VARS.map(std::env::var_os);
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path());
+    for key in HOME_VARS {
+        std::env::set_var(key, tmp.path());
+    }
 
     let crawler = MavenCrawler;
     let paths = crawler
@@ -286,10 +294,11 @@ async fn get_maven_repo_paths_home_dot_m2_fallback() {
     if let Some(v) = prev_m2 {
         std::env::set_var("M2_HOME", v);
     }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
+    for (key, value) in HOME_VARS.into_iter().zip(prev_home) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     // Production returns exactly the single resolved repo path — assert the
@@ -340,10 +349,13 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
     let tmp = tempfile::tempdir().unwrap();
     let prev_local = std::env::var("MAVEN_REPO_LOCAL").ok();
     let prev_m2 = std::env::var("M2_HOME").ok();
-    let prev_home = std::env::var("HOME").ok();
+    let prev_home = HOME_VARS.map(std::env::var_os);
     std::env::remove_var("MAVEN_REPO_LOCAL");
     std::env::remove_var("M2_HOME");
-    std::env::set_var("HOME", tmp.path()); // No .m2/ inside
+    // No .m2/ inside.
+    for key in HOME_VARS {
+        std::env::set_var(key, tmp.path());
+    }
 
     let crawler = MavenCrawler;
     let opts = CrawlerOptions {
@@ -359,10 +371,11 @@ async fn get_maven_repo_paths_global_mode_no_m2_returns_empty() {
     if let Some(v) = prev_m2 {
         std::env::set_var("M2_HOME", v);
     }
-    if let Some(v) = prev_home {
-        std::env::set_var("HOME", v);
-    } else {
-        std::env::remove_var("HOME");
+    for (key, value) in HOME_VARS.into_iter().zip(prev_home) {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 
     assert!(

@@ -367,10 +367,6 @@ mod tests {
             "pkg:composer/psr/log@dev-Feature",
             "pkg:composer/psr/log@dev-feature"
         ));
-        // Rejected versions key without the internal sentinel.
-        assert!(!PurlKey::new("pkg:composer/psr/log@not-a-version")
-            .as_str()
-            .contains('\u{1}'));
         // Only composer and NuGet get release identity; other types stay
         // version-exact.
         assert!(!PurlKey::same("pkg:npm/x@1.0", "pkg:npm/x@1.0.0.0"));
@@ -593,8 +589,7 @@ mod tests {
 
     /// The composer half of [`PurlKey`] is exactly composer release
     /// equivalence, over the whole shared vector file (pairs of accepted
-    /// AND rejected spellings), even though the key drops the internal
-    /// rejected-version sentinel.
+    /// AND rejected spellings).
     #[test]
     fn composer_key_equality_is_release_equivalence_over_every_vector_pair() {
         let v: serde_json::Value = serde_json::from_str(include_str!(

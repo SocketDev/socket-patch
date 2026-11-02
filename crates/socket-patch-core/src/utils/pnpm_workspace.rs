@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::formats::pnpm::workspace::{lock_text_has_member_importers, read_package_globs};
+use crate::formats::pnpm::workspace::read_package_globs;
 use crate::utils::cargo_workspace::{
     expand_glob_bounded, DirTree, DiskTree, MemoryTree, MAX_MANIFESTS,
 };
@@ -620,9 +620,12 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         return Members::Shared;
     }
     let root_lock = view.read_text(PNPM_LOCK).await.ok();
+    // A root lock whose importers name a project other than `.` is a
+    // SHARED workspace lock: pnpm installs every member from it, whatever
+    // the settings say now, so member locks beside it are stale leftovers.
     if root_lock
         .as_deref()
-        .is_some_and(lock_text_has_member_importers)
+        .is_some_and(crate::formats::pnpm::workspace::lock_text_has_member_importers)
     {
         return Members::Shared;
     }
@@ -1363,6 +1366,25 @@ mod tests {
                 None => assert_eq!(found, None, "{pm:?} {vars:?}"),
             }
         }
+    }
+
+    #[test]
+    fn a_root_lock_listing_member_importers_is_shared() {
+        use crate::formats::pnpm::workspace::lock_text_has_member_importers;
+        let root_only = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n";
+        assert!(!lock_text_has_member_importers(root_only));
+        assert!(!lock_text_has_member_importers(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"
+        ));
+        assert!(!lock_text_has_member_importers(
+            "lockfileVersion: 5.4\n\ndependencies:\n  a: 1.0.0\n"
+        ));
+        assert!(lock_text_has_member_importers(
+            "lockfileVersion: '9.0'\r\n\r\nimporters:\r\n\r\n  .: {}\r\n\r\n  packages/a:\r\n    dependencies: {}\r\n"
+        ));
+        assert!(lock_text_has_member_importers(
+            "lockfileVersion: '6.0'\nimporters:\n  '.': {}\n  'packages/a': {}\n"
+        ));
     }
 
     #[test]

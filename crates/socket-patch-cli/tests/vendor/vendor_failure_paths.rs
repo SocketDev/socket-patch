@@ -1289,3 +1289,180 @@ async fn pdm_relock_rescan_under_outage_rewires_the_committed_wheel() {
         "rollback restores the relocked bytes"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// workspace member directories (#1921)
+// ─────────────────────────────────────────────────────────────────────
+
+/// Turn the fixture into an npm workspace whose root lock installs the
+/// member `packages/a`, which has no lock, manifest or ledger of its own.
+/// Returns the member directory.
+fn make_workspace_member(fx: &NpmFixture) -> PathBuf {
+    std::fs::write(
+        fx.root().join("package.json"),
+        br#"{"name":"fixture","version":"1.0.0","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let member = fx.root().join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("package.json"),
+        br#"{"name":"a","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+    )
+    .unwrap();
+    member
+}
+
+/// The refusal a vendor form gives from a workspace member: exit 1,
+/// `vendor_lockfile_missing`, naming the workspace root to run from.
+fn assert_member_refusal(code: i32, env: &Value, root: &Path) {
+    assert_eq!(code, 1, "a member run must not pass: {env:#}");
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert_eq!(env["error"]["code"], "vendor_lockfile_missing", "{env:#}");
+    let root = std::fs::canonicalize(root).unwrap();
+    let message = env["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&format!("run socket-patch from {}", root.display())),
+        "the refusal names the workspace root: {message}"
+    );
+}
+
+/// #1921: `vendor --check` from a member directory verified the member's
+/// empty ledger and exited 0, even with the root's committed artifact
+/// tampered. It now refuses and names the root, whose check fails.
+#[test]
+fn vendor_check_from_workspace_member_refuses_and_names_root() {
+    let fx = npm_fixture();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let member = make_workspace_member(&fx);
+    let tgz = std::fs::read_dir(fx.vendor_dir().join("npm"))
+        .unwrap()
+        .flat_map(|uuid| std::fs::read_dir(uuid.unwrap().path()).unwrap())
+        .map(|f| f.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "tgz"))
+        .expect("the vendored tarball");
+    let mut bytes = std::fs::read(&tgz).unwrap();
+    bytes.push(b'x');
+    std::fs::write(&tgz, bytes).unwrap();
+
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 1, "the root sees the tamper: {env:#}");
+
+    let (code, env) = vendor_cli(&member, &["--check"]);
+    assert_member_refusal(code, &env, fx.root());
+
+    // The issue's other spelling: `--cwd packages/a` from the root.
+    let (code, stdout, stderr) = run_cli(
+        fx.root(),
+        &["vendor", "--check", "--json", "--cwd", "packages/a"],
+        &[],
+    );
+    let env: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{e}: {stderr}"));
+    assert_member_refusal(code, &env, fx.root());
+
+    // Human mode prints the code-tagged error and exits 1.
+    let cwd = member.to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(&member, &["vendor", "--check", "--cwd", cwd], &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("Error (vendor_lockfile_missing)"),
+        "{stderr}"
+    );
+}
+
+/// #1921: the hosted → vendored eject from a member directory said "No
+/// manifest found, nothing to vendor." and exited 0 while the root lock
+/// held the hosted pin. It now refuses, names the root, and writes nothing.
+#[test]
+fn vendor_eject_from_workspace_member_refuses_and_names_root() {
+    let fx = npm_fixture_with_purls(&[]);
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    let hosted_lock = pin_hosted(&fx);
+    let member = make_workspace_member(&fx);
+
+    let (code, env) = vendor_cli(&member, &[]);
+    assert_member_refusal(code, &env, fx.root());
+    assert_eq!(fx.lock_bytes(), hosted_lock, "the root lock is untouched");
+    assert!(!member.join(".socket").exists(), "nothing is written");
+
+    let cwd = member.to_str().unwrap();
+    let (code, stdout, stderr) = run_cli(&member, &["vendor", "--yes", "--cwd", cwd], &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        !stdout.contains("nothing to vendor"),
+        "no calm success line: {stdout}"
+    );
+    assert!(
+        stderr.contains("Error (vendor_lockfile_missing)"),
+        "{stderr}"
+    );
+}
+
+/// #1921's revert twin: `vendor --revert` from a member reverted the
+/// member's empty ledger and exited 0 while the root stayed vendored.
+#[test]
+fn vendor_revert_from_workspace_member_refuses_and_names_root() {
+    let fx = npm_fixture();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    let vendored_lock = fx.lock_bytes();
+    let member = make_workspace_member(&fx);
+
+    let (code, env) = vendor_cli(&member, &["--revert"]);
+    assert_member_refusal(code, &env, fx.root());
+    assert_eq!(fx.lock_bytes(), vendored_lock, "the root stays vendored");
+}
+
+/// The guard asks only when the directory has nothing of its own: a
+/// standalone project with no manifest keeps the calm `noManifest` exit 0.
+#[test]
+fn vendor_outside_a_workspace_keeps_the_no_manifest_exit() {
+    let fx = npm_fixture_with_purls(&[]);
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    let (code, env) = vendor_cli(fx.root(), &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(env["status"], "noManifest", "{env:#}");
+    let (code, env) = vendor_cli(fx.root(), &["--check"]);
+    assert_eq!(code, 0, "{env:#}");
+}
+
+/// A non-npm project nested in a pnpm workspace (a Python service beside
+/// the JS packages) is its own project, not a member: its `vendor` forms
+/// keep their exit 0.
+#[test]
+fn vendor_in_a_non_npm_dir_under_a_pnpm_workspace_is_not_refused() {
+    let fx = npm_fixture_with_purls(&[]);
+    std::fs::remove_file(fx.manifest_path()).unwrap();
+    std::fs::write(
+        fx.root().join("pnpm-workspace.yaml"),
+        "packages:\n  - 'packages/*'\n",
+    )
+    .unwrap();
+    std::fs::write(fx.root().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+    let service = fx.root().join("services/api");
+    std::fs::create_dir_all(&service).unwrap();
+    std::fs::write(
+        service.join("pyproject.toml"),
+        "[project]\nname = \"api\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+
+    for extra in [&[][..], &["--check"][..], &["--revert"][..]] {
+        let (code, env) = vendor_cli(&service, extra);
+        assert_eq!(code, 0, "{extra:?}: {env:#}");
+    }
+}
+
+/// `--revert` in a member that keeps its own manifest (apply mode) is the
+/// documented clean no-op, not the member refusal.
+#[test]
+fn vendor_revert_in_a_member_with_its_own_manifest_is_not_refused() {
+    let fx = npm_fixture_with_purls(&[]);
+    let member = make_workspace_member(&fx);
+    std::fs::create_dir_all(member.join(".socket")).unwrap();
+    std::fs::write(member.join(".socket/manifest.json"), b"{\"patches\":{}}\n").unwrap();
+
+    let (code, env) = vendor_cli(&member, &["--revert"]);
+    assert_eq!(code, 0, "{env:#}");
+}

@@ -50,14 +50,20 @@
 mod cache_env;
 #[path = "composer_e2e_common/mod.rs"]
 mod composer_e2e_common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
+use docker_common::skip_if_no_image;
 use docker_vendor_common::{
     assert_stage_markers, bash_prelude, json_assert_fns, run_in_image_network_none,
-    run_with_fixture, run_with_service, skip_if_no_image, stage_patch_fn,
+    run_with_fixture, run_with_service, stage_patch_fn,
 };
 
 const IMAGE: &str = "socket-patch-test-composer:latest";
@@ -437,7 +443,7 @@ fn assert_manifestless_vex_from_host(host_dir: &std::path::Path) {
     let purl = format!("pkg:composer/psr/log@{psr_ver}");
     let copy = tempfile::tempdir().expect("tempdir");
     let fresh = copy.path().join("fresh");
-    composer_e2e_common::copy_dir_recursive(&host_dir.join("fresh"), &fresh);
+    fs_tree::copy_tree(&host_dir.join("fresh"), &fresh);
     let patched = std::fs::read(fresh.join("vendor/psr/log/src/LoggerInterface.php"))
         .expect("the container-installed patched file");
     let vulns: &[(&str, &[&str])] = &[(GHSA, &["CVE-2024-66666"])];

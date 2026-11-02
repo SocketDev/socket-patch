@@ -66,6 +66,8 @@ pub mod gem;
 pub mod go_build_list;
 pub mod go_consumer_sync;
 pub mod go_mod_edit;
+mod go_native_vendor;
+pub(crate) mod go_sum_backup;
 pub mod go_sum_edit;
 pub mod go_workspace;
 pub mod golang;
@@ -232,15 +234,7 @@ pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorW
         return None;
     }
     let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
-    let workspaces = manifest.get("workspaces")?;
-    let globs = workspaces.as_array().or_else(|| {
-        workspaces
-            .get("packages")
-            .and_then(serde_json::Value::as_array)
-    })?;
-    if globs.is_empty() {
+    if !crate::formats::package_json::Workspaces::parse(&manifest)?.lists_any() {
         return None;
     }
     Some(VendorWarning::new(
@@ -2167,7 +2161,12 @@ mod berry_migration_risk_tests {
     /// 1.10.1 and 1.22.22; no relative spelling installs from both.
     #[test]
     fn issue_691_wired_classic_workspaces_warn_about_member_dir_installs() {
-        for workspaces in [r#"["a","b"]"#, r#"{"packages":["packages/*"]}"#] {
+        // #1900: a malformed list still warns for the patterns it names.
+        for workspaces in [
+            r#"["a","b"]"#,
+            r#"{"packages":["packages/*"]}"#,
+            r#"["a",1]"#,
+        ] {
             let pkg = format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#);
             let tmp = project(Some(WIRED_V1), Some(&pkg));
             let w = yarn_classic_workspace_member_risk(tmp.path()).expect("must warn");
@@ -2189,6 +2188,8 @@ mod berry_migration_risk_tests {
                 Some(r#"{"name":"x","workspaces":{"packages":[]}}"#),
             ),
             (Some(WIRED_V1), None),
+            // #1900: a field naming no pattern string lists no member.
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[1]}"#)),
             (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
             (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),
         ] {

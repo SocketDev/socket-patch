@@ -1394,7 +1394,8 @@ version = "fake"
     mod equivalence {
         use super::super::oracle::LegacyCargoCrawler;
         use super::*;
-        use crate::crawlers::oracle_support::{mkdir, rows, symlink, write, PermGuard, Rng};
+        use crate::crawlers::oracle_support::{mkdir, rows, symlink, write, PermGuard};
+        use crate::test_rng::Rng;
 
         const NAMES: &[&str] = &["serde", "serde-json", "sha-1", "tokio", "dup", "a_b"];
         const VERSIONS: &[&str] = &["1.0.0", "1.0.0-rc.1", "0.2.3", "5", "1.0.0+build"];

@@ -518,7 +518,7 @@ const MAX_BRACE_EXPANSIONS: usize = 4096;
 /// the first `{...}` group holding a top-level `,` or a `x..y[..step]`
 /// sequence is replaced by each alternative, recursively. A group with
 /// neither, and an unbalanced `{`, stay literal.
-fn expand_braces(pattern: &str) -> Vec<String> {
+pub(crate) fn expand_braces(pattern: &str) -> Vec<String> {
     let mut out = Vec::new();
     expand_braces_into(pattern, &mut out);
     out

@@ -9,173 +9,46 @@
 //! `vendor`. Changing any assertion here is a breaking change to the CLI
 //! surface — see `crates/socket-patch-cli/CLI_CONTRACT.md`.
 //!
-//! ## Hermeticity
-//!
-//! Every flag and default below is also wired to an `#[arg(env = "SOCKET_*")]`
-//! source. clap reads those env vars during `try_parse_from`, so an ambient
-//! `SOCKET_*` variable in the developer's shell or in CI would silently
-//! satisfy these assertions even if the corresponding CLI default
-//! (`default_value`/`default_value_t`) regressed or a flag's action broke —
-//! the env value would mask the bug and the test would pass for the wrong
-//! reason. To make the assertions test *argv parsing* rather than the
-//! ambient environment, every parse runs with the full set of `SOCKET_*`
-//! vars scrubbed (see [`EnvScrub`]). Because the environment is process-
-//! global, every test is `#[serial_test::serial]` so the scrub/restore
-//! dance can't race a concurrent parse. This mirrors `cli_parse_get.rs` /
-//! `cli_parse_repair.rs`.
+//! The env-wiring tests set `SOCKET_*` vars, and clap reads them during every
+//! parse, so every test that parses is `#[serial]`.
 
-use clap::Parser;
 use socket_patch_cli::commands::vendor::VendorArgs;
 use socket_patch_cli::{parse_argv_with_shortcuts, Cli, Commands};
 use std::path::PathBuf;
 
-/// Every `SOCKET_*` env var that clap consults while parsing `vendor` (its
-/// own flags, the flattened `GlobalArgs`, and the flattened `VexEmbedArgs`).
-/// If any of these leaks in from the ambient environment it can mask a
-/// broken default or a regressed flag, so the parse helpers below remove
-/// them for the duration of the parse.
-const SOCKET_ENV_VARS: &[&str] = &[
-    // GlobalArgs
-    "SOCKET_CWD",
-    "SOCKET_MANIFEST_PATH",
-    "SOCKET_API_URL",
-    "SOCKET_API_TOKEN",
-    "SOCKET_ORG_SLUG",
-    "SOCKET_PROXY_URL",
-    "SOCKET_ECOSYSTEMS",
-    "SOCKET_VENDOR_SOURCE",
-    "SOCKET_VENDOR_URL",
-    "SOCKET_PATCH_SERVER_URL",
-    "SOCKET_OFFLINE",
-    "SOCKET_STRICT",
-    "SOCKET_GLOBAL",
-    "SOCKET_GLOBAL_PREFIX",
-    "SOCKET_JSON",
-    "SOCKET_VERBOSE",
-    "SOCKET_SILENT",
-    "SOCKET_DRY_RUN",
-    "SOCKET_YES",
-    "SOCKET_LOCK_TIMEOUT",
-    "SOCKET_DEBUG",
-    "SOCKET_TELEMETRY_DISABLED",
-    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
-    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
-    "SOCKET_NO_VLT_INSTALL_CLEANUP",
-    // VendorArgs-specific (`SOCKET_FORCE` is retired but still scrubbed so a
-    // stale export can't leak into the "is ignored" test)
-    "SOCKET_FORCE",
-    "SOCKET_VENDOR_REVERT",
-    // VexEmbedArgs (flattened embedded-VEX passthrough)
-    "SOCKET_VEX",
-    "SOCKET_VEX_PRODUCT",
-    "SOCKET_VEX_NO_VERIFY",
-    "SOCKET_VEX_DOC_ID",
-    "SOCKET_VEX_COMPACT",
-];
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
+#[path = "common/hermetic.rs"]
+mod hermetic;
 
-/// RAII guard that removes every [`SOCKET_ENV_VARS`] entry on construction and
-/// restores the prior value on drop. Holding one of these around a clap parse
-/// guarantees the parse sees only what's on the argv, not the developer's
-/// shell. Pair with `#[serial_test::serial]` so the global env mutation never
-/// races another test.
-struct EnvScrub(Vec<(&'static str, Option<String>)>);
+use clap_parse::Globals;
+use hermetic::try_parse;
 
-impl EnvScrub {
-    fn new() -> Self {
-        let saved = SOCKET_ENV_VARS
-            .iter()
-            .map(|&k| {
-                let prev = std::env::var(k).ok();
-                std::env::remove_var(k);
-                (k, prev)
-            })
-            .collect();
-        EnvScrub(saved)
-    }
-}
-
-impl Drop for EnvScrub {
-    fn drop(&mut self) {
-        for (k, v) in &self.0 {
-            match v {
-                Some(val) => std::env::set_var(k, val),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
-}
-
-/// Parse `socket-patch vendor <extra...>` and return the `VendorArgs`, with
-/// the ambient `SOCKET_*` environment scrubbed so the result reflects only
-/// the argv. The scrub guard is held across the parse and dropped before the
-/// caller's assertions run (which only inspect the returned struct).
 fn parse_vendor(extra: &[&str]) -> VendorArgs {
-    let _scrub = EnvScrub::new();
     let mut argv = vec!["socket-patch", "vendor"];
     argv.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(&argv).expect("parse");
+    let cli = try_parse(&argv).expect("parse");
     match cli.command {
         Commands::Vendor(a) => a,
         _ => panic!("expected Vendor"),
     }
 }
 
-/// Parse `socket-patch vendor <extra...>` with `env` injected into an
-/// otherwise fully-scrubbed `SOCKET_*` environment. Returns the raw clap
-/// result so env-wiring tests can assert both the success and the failure
-/// shapes. The injected vars are removed before the scrub guard restores
-/// the ambient values.
 fn parse_vendor_with_env(env: &[(&str, &str)], extra: &[&str]) -> Result<VendorArgs, clap::Error> {
-    let _scrub = EnvScrub::new();
-    for (k, v) in env {
-        std::env::set_var(k, v);
-    }
     let mut argv = vec!["socket-patch", "vendor"];
     argv.extend_from_slice(extra);
-    let result = Cli::try_parse_from(&argv);
-    for (k, _) in env {
-        std::env::remove_var(k);
-    }
-    result.map(|cli| match cli.command {
+    clap_parse::try_parse_with_env(env, &argv).map(|cli| match cli.command {
         Commands::Vendor(a) => a,
         _ => panic!("expected Vendor"),
     })
 }
 
-/// Owned, comparable snapshot of *every* parsed field in `VendorArgs` — its
-/// own flags (`force`, `revert`), every field of the flattened `GlobalArgs`,
-/// and every field of the flattened `VexEmbedArgs`. `VendorArgs` is
-/// production code that doesn't derive `PartialEq`, so this mirror exists
-/// purely so a single `assert_eq!` can police the entire parsed surface at
-/// once.
-///
-/// This is what makes the per-flag tests honest. A field-at-a-time assertion
-/// (`assert!(a.force)`) only proves the flag set *its* field; it says nothing
-/// about whether the same flag also flipped an unrelated one. A clap-derive
-/// copy/paste regression (e.g. `--revert` accidentally wired to `force`)
-/// would set both and still pass a single-field check. Comparing the whole
-/// snapshot against the independently-declared defaults — with only the
-/// field under test mutated — fails loudly the instant any other field moves.
+/// Every parsed field of `VendorArgs`, including the flattened `GlobalArgs`
+/// and `VexEmbedArgs`. The per-flag tests compare the whole snapshot, so a
+/// flag wired to a second field fails too.
 #[derive(Debug, Clone, PartialEq)]
 struct Snap {
-    cwd: PathBuf,
-    manifest_path: String,
-    api_url: Option<String>,
-    api_token: Option<String>,
-    org: Option<String>,
-    proxy_url: Option<String>,
-    ecosystems: Option<Vec<String>>,
-    offline: bool,
-    global: bool,
-    global_prefix: Option<PathBuf>,
-    json: bool,
-    verbose: bool,
-    silent: bool,
-    dry_run: bool,
-    yes: bool,
-    lock_timeout: Option<u64>,
-    debug: bool,
-    no_telemetry: bool,
+    common: Globals,
     force: bool,
     revert: bool,
     vex: Option<PathBuf>,
@@ -187,24 +60,7 @@ struct Snap {
 
 fn snapshot(a: &VendorArgs) -> Snap {
     Snap {
-        cwd: a.common.cwd.clone(),
-        manifest_path: a.common.manifest_path.clone(),
-        api_url: a.common.api_url.clone(),
-        api_token: a.common.api_token.clone(),
-        org: a.common.org.clone(),
-        proxy_url: a.common.proxy_url.clone(),
-        ecosystems: a.common.ecosystems.clone(),
-        offline: a.common.offline,
-        global: a.common.global,
-        global_prefix: a.common.global_prefix.clone(),
-        json: a.common.json,
-        verbose: a.common.verbose,
-        silent: a.common.silent,
-        dry_run: a.common.dry_run,
-        yes: a.common.yes,
-        lock_timeout: a.common.lock_timeout,
-        debug: a.common.debug,
-        no_telemetry: a.common.no_telemetry,
+        common: Globals(a.common.clone()),
         force: a.force,
         revert: a.revert,
         vex: a.vex.vex.clone(),
@@ -215,34 +71,10 @@ fn snapshot(a: &VendorArgs) -> Snap {
     }
 }
 
-/// Independent oracle: the snapshot a correct parse of bare `vendor` (no
-/// flags) must produce. The values are transcribed BY HAND from the
-/// `default_value`/`default_value_t` declarations on `VendorArgs` /
-/// `GlobalArgs` / `VexEmbedArgs` and the `DEFAULT_*` constants in
-/// `socket-patch-core` — NOT read back from a live parse — so this can
-/// actually disagree with the implementation if a default regresses. Every
-/// per-flag test starts from this and mutates exactly the one field the flag
-/// is supposed to touch.
+/// The snapshot of bare `vendor`, written by hand.
 fn expected_defaults() -> Snap {
     Snap {
-        cwd: PathBuf::from("."),
-        manifest_path: ".socket/manifest.json".to_string(),
-        api_url: None, // no clap default — resolved in core
-        api_token: None,
-        org: None,
-        proxy_url: None, // no clap default — resolved in core
-        ecosystems: None,
-        offline: false,
-        global: false,
-        global_prefix: None,
-        json: false,
-        verbose: false,
-        silent: false,
-        dry_run: false,
-        yes: false,
-        lock_timeout: None,
-        debug: false,
-        no_telemetry: false,
+        common: clap_parse::global_defaults(),
         force: false,
         revert: false,
         vex: None,
@@ -355,7 +187,7 @@ fn vex_passthrough_knobs_each_set_their_field() {
 fn json_long_sets_json() {
     let a = parse_vendor(&["--json"]);
     let mut want = expected_defaults();
-    want.json = true;
+    want.common.json = true;
     assert_eq!(snapshot(&a), want);
 }
 
@@ -364,7 +196,7 @@ fn json_long_sets_json() {
 fn json_short_sets_json() {
     let a = parse_vendor(&["-j"]);
     let mut want = expected_defaults();
-    want.json = true;
+    want.common.json = true;
     assert_eq!(snapshot(&a), want);
 }
 
@@ -373,7 +205,7 @@ fn json_short_sets_json() {
 fn dry_run_sets_dry_run() {
     let a = parse_vendor(&["--dry-run"]);
     let mut want = expected_defaults();
-    want.dry_run = true;
+    want.common.dry_run = true;
     // `--dry-run` is the preview contract ("verifies and writes nothing");
     // it must NOT be cross-wired into `--force` or `--revert`.
     assert_eq!(snapshot(&a), want);
@@ -384,7 +216,7 @@ fn dry_run_sets_dry_run() {
 fn cwd_flag_sets_cwd() {
     let a = parse_vendor(&["--cwd", "/tmp/project"]);
     let mut want = expected_defaults();
-    want.cwd = PathBuf::from("/tmp/project");
+    want.common.cwd = PathBuf::from("/tmp/project");
     assert_eq!(snapshot(&a), want);
 }
 
@@ -393,7 +225,7 @@ fn cwd_flag_sets_cwd() {
 fn manifest_path_flag_sets_manifest_path() {
     let a = parse_vendor(&["--manifest-path", "custom.json"]);
     let mut want = expected_defaults();
-    want.manifest_path = "custom.json".to_string();
+    want.common.manifest_path = "custom.json".to_string();
     assert_eq!(snapshot(&a), want);
 }
 
@@ -402,7 +234,7 @@ fn manifest_path_flag_sets_manifest_path() {
 fn offline_flag_sets_offline() {
     let a = parse_vendor(&["--offline"]);
     let mut want = expected_defaults();
-    want.offline = true;
+    want.common.offline = true;
     assert_eq!(snapshot(&a), want);
 }
 
@@ -411,7 +243,7 @@ fn offline_flag_sets_offline() {
 fn lock_timeout_flag_sets_lock_timeout() {
     let a = parse_vendor(&["--lock-timeout", "30"]);
     let mut want = expected_defaults();
-    want.lock_timeout = Some(30);
+    want.common.lock_timeout = Some(30);
     assert_eq!(snapshot(&a), want);
 }
 
@@ -420,7 +252,7 @@ fn lock_timeout_flag_sets_lock_timeout() {
 fn ecosystems_csv_splits_into_vec() {
     let a = parse_vendor(&["--ecosystems", "npm,cargo"]);
     let mut want = expected_defaults();
-    want.ecosystems = Some(vec!["npm".to_string(), "cargo".to_string()]);
+    want.common.ecosystems = Some(vec!["npm".to_string(), "cargo".to_string()]);
     assert_eq!(snapshot(&a), want);
 }
 
@@ -432,7 +264,7 @@ fn ecosystems_csv_splits_into_vec() {
 
 /// v5 retired `SOCKET_FORCE` (#615): `--force` is flag-only, so a stale
 /// export leaves `force` at its default instead of bypassing the variant
-/// probe. The var stays in the scrub list so this test controls it.
+/// probe.
 #[test]
 #[serial_test::serial]
 fn env_socket_force_is_ignored() {
@@ -513,9 +345,7 @@ fn env_socket_vex_sets_embedded_vex_path() {
 // --- Subcommand routing ----------------------------------------------------------
 
 #[test]
-#[serial_test::serial]
 fn vendor_appears_in_subcommand_list() {
-    let _scrub = EnvScrub::new();
     use clap::CommandFactory;
     let cmd = Cli::command();
     assert!(
@@ -530,8 +360,7 @@ fn vendor_appears_in_subcommand_list() {
 #[test]
 #[serial_test::serial]
 fn vendor_appears_in_top_level_help() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "--help"]) {
+    let err = match try_parse(&["socket-patch", "--help"]) {
         Ok(_) => panic!("--help should return a clap error (DisplayHelp)"),
         Err(e) => e,
     };
@@ -550,7 +379,7 @@ fn vendor_appears_in_top_level_help() {
 #[test]
 #[serial_test::serial]
 fn bare_uuid_fallback_still_routes_to_get_not_vendor() {
-    let _scrub = EnvScrub::new();
+    hermetic::scrub_process_socket_env();
     const UUID: &str = "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
     let cli = parse_argv_with_shortcuts(vec!["socket-patch".to_string(), UUID.to_string()])
         .expect("bare uuid must parse via the get fallback");
@@ -561,32 +390,12 @@ fn bare_uuid_fallback_still_routes_to_get_not_vendor() {
     }
 }
 
-// --- Harness invariants --------------------------------------------------------
-
-/// Drift guard: [`EnvScrub`] must cover every env var `GlobalArgs` binds —
-/// the production `GLOBAL_ARG_ENV_VARS` list is the source of truth. A
-/// `GlobalArgs` flag whose env var is missing from [`SOCKET_ENV_VARS`]
-/// escapes the scrub, so an ambient value in the developer's shell or CI
-/// (e.g. `SOCKET_STRICT=garbage`) aborts every parse in this file —
-/// exactly the wrong-reason failure mode the hermeticity contract at the
-/// top of this file promises away.
-#[test]
-fn env_scrub_covers_every_global_arg_env_var() {
-    for var in socket_patch_cli::args::GLOBAL_ARG_ENV_VARS {
-        assert!(
-            SOCKET_ENV_VARS.contains(var),
-            "{var} is bound by GlobalArgs but missing from SOCKET_ENV_VARS — EnvScrub won't scrub it",
-        );
-    }
-}
-
 // --- Error paths -------------------------------------------------------------
 
 #[test]
 #[serial_test::serial]
 fn unknown_flag_errors() {
-    let _scrub = EnvScrub::new();
-    let err = match Cli::try_parse_from(["socket-patch", "vendor", "--bogus"]) {
+    let err = match try_parse(&["socket-patch", "vendor", "--bogus"]) {
         Err(e) => e,
         Ok(_) => panic!("expected parse error for unknown flag"),
     };
@@ -599,8 +408,7 @@ fn unknown_flag_errors() {
 #[test]
 #[serial_test::serial]
 fn bare_force_does_not_consume_next_token() {
-    let _scrub = EnvScrub::new();
-    match Cli::try_parse_from(["socket-patch", "vendor", "--force", "stray"]) {
+    match try_parse(&["socket-patch", "vendor", "--force", "stray"]) {
         Ok(_) => panic!("`vendor --force stray` must reject the stray positional"),
         Err(err) => assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument),
     }
@@ -609,12 +417,10 @@ fn bare_force_does_not_consume_next_token() {
 #[test]
 #[serial_test::serial]
 fn no_vlt_install_cleanup_is_accepted_silently_by_vendor() {
-    assert!(
-        parse_vendor(&["--no-vlt-install-cleanup"])
-            .common
-            .no_vlt_install_cleanup
-    );
+    let mut want = expected_defaults();
+    want.common.no_vlt_install_cleanup = true;
+    assert_eq!(snapshot(&parse_vendor(&["--no-vlt-install-cleanup"])), want);
     let from_env =
         parse_vendor_with_env(&[("SOCKET_NO_VLT_INSTALL_CLEANUP", "true")], &[]).expect("parse");
-    assert!(from_env.common.no_vlt_install_cleanup);
+    assert_eq!(snapshot(&from_env), want);
 }
