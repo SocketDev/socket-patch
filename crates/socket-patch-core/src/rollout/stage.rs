@@ -815,6 +815,25 @@ mod tests {
     }
 
     #[test]
+    fn a_spent_budget_admits_only_packages_an_earlier_directory_admitted() {
+        let zero = MaxNew {
+            value: Some(0),
+            source: MaxNewSource::Flag,
+        };
+        let mut stage = Stage::new(zero, None, Path::new("/repo"));
+        stage
+            .already_admitted
+            .insert(PurlKey::new("pkg:npm/a@1").into_string());
+        assert!(stage.may_admit("pkg:npm/a@1"));
+        assert!(!stage.may_admit("pkg:npm/b@1"));
+        stage.incomplete = true;
+        assert!(
+            !stage.may_admit("pkg:npm/a@1"),
+            "a failed lookup admits nothing"
+        );
+    }
+
+    #[test]
     fn incomplete_lookups_warn_only_when_they_deferred_something() {
         let results = vec![offer("pkg:npm/a@1", "ua", "", &["critical"])];
         let offers = offers_from_results(&results, true);
