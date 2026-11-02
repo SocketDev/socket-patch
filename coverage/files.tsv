@@ -658,21 +658,21 @@ crates/socket-patch-core/src/hosted/render.rs	81	audit-core	cbbbdb9 2026-11-02	-
 crates/socket-patch-core/src/hosted/sbt_reads.rs	242	audit-core	cbbbdb9 2026-11-02	-	hosted_repo_dirs is a vex consumed-copy helper: move to vex; Disk|Snapshot dispatch (A75)
 crates/socket-patch-core/src/hosted/takeover.rs	113	audit-core	cbbbdb9 2026-11-02	-	inline any_takeover_ecosystem (1-line wrapper); gradle file-suffix test x4 with engine is_gradle_*; clean otherwise
 crates/socket-patch-core/src/hosted/vlt.rs	219	audit-core	cbbbdb9 2026-11-02	-	WITHHELD_REASON alias of ARTIFACT_UNVERIFIABLE: drop; install_state_present/bun_lockb_present hand view dispatch (A75); plan clones deps into Vec<DepOverride>; no unit tests in file
-crates/socket-patch-core/src/ledgers.rs	732	audit-core	-	-	
-crates/socket-patch-core/src/manifest/cleanup_blobs.rs	924	audit-core	-	-	
-crates/socket-patch-core/src/manifest/mod.rs	4	audit-core	-	-	
-crates/socket-patch-core/src/manifest/operations.rs	633	audit-core	-	-	
-crates/socket-patch-core/src/manifest/records.rs	87	audit-core	-	-	
-crates/socket-patch-core/src/manifest/schema.rs	697	audit-core	-	-	
-crates/socket-patch-core/src/patch/apply.rs	4428	audit-core	-	-	
-crates/socket-patch-core/src/patch/apply_lock.rs	1612	audit-core	-	-	
-crates/socket-patch-core/src/patch/copy_tree.rs	707	audit-core	-	-	
-crates/socket-patch-core/src/patch/file_hash.rs	214	audit-core	-	-	
-crates/socket-patch-core/src/patch/jvm_jar.rs	1323	audit-core	-	-	
-crates/socket-patch-core/src/patch/mod.rs	15	audit-core	-	-	
-crates/socket-patch-core/src/patch/npm_bin.rs	739	audit-core	-	-	
-crates/socket-patch-core/src/patch/package.rs	839	audit-core	-	-	
-crates/socket-patch-core/src/patch/path_safety.rs	210	audit-core	-	-	
+crates/socket-patch-core/src/ledgers.rs	732	audit-core	cbbbdb9 2026-11-02	-	drop test-only pub Ledgers::vendor_claimed; uuid_only_record private; inline primary/claims (1 caller each) and test wrapper record(); owned() re-runs claimant per vendored key after claims(); hosted pins are (String,String) in merge_ledger_records_for_updates but HostedPin in hosted_pins_matching
+crates/socket-patch-core/src/manifest/cleanup_blobs.rs	924	audit-core	cbbbdb9 2026-11-02	-	move format_cleanup_result_for/format_all_in_use/format_bytes (CLI-only callers) to cli ui; after_removal re-writes retain's non-empty beforeHash filter; CleanupResult blobs_* fields also count diff/package archives; test sweep_blobs re-implements sweep's closure; test_cleanup_keeps_after_hash_removes_orphan duplicated by L454 and the table test
+crates/socket-patch-core/src/manifest/mod.rs	4	audit-core	cbbbdb9 2026-11-02	-	clean
+crates/socket-patch-core/src/manifest/operations.rs	633	audit-core	cbbbdb9 2026-11-02	-	manifest_exists is a 1-line try_exists wrapper with a 9-line doc; test_write_manifest_failure_preserves_existing writes a different path, passes with a non-atomic writer (see entry); dup tests: write_and_read (L555), blob_extractors_cross (L449), parse_missing_fields, read_invalid_schema; mkfifo copy (A51); ~6 history comment lines
+crates/socket-patch-core/src/manifest/records.rs	87	audit-core	cbbbdb9 2026-11-02	-	build_patch_record's files param: every caller passes files_for_manifest(patch), stale 'caller owns' doc; fold into record_from_patch_response; vulnerabilities_for_manifest pub, 1 internal caller: inline; files_for_manifest tests live in cli get.rs L3728, move here
+crates/socket-patch-core/src/manifest/schema.rs	697	audit-core	cbbbdb9 2026-11-02	-	PatchManifest::new = Default; PatchRecord literal x4 in tests (use a fixture); test_empty_manifest_roundtrip asserts len 0 only; camel_case tests (L181,L194) covered by snake_case rejection + roundtrip; ~25 banner/narration comment lines
+crates/socket-patch-core/src/patch/apply.rs	4428	audit-core	cbbbdb9 2026-11-02	-	inline chown_blocking; select_installed_variants = _any([p]) twice; drop one-variant AppliedVia+as_tag (+CLI mirror); is_socket_content any-length hex vs is_valid_blob_hash; verify_file_patch builds VerifyResult x7; npm source_hash computed twice; 336-line apply_package_patch_at; pycache cleanup+DirWriteGuard out; fix hash_mismatch_blocks test (fails on bad blob hash); ~70 comment lines; A76
+crates/socket-patch-core/src/patch/apply_lock.rs	1612	audit-core	cbbbdb9 2026-11-02	-	delete-pending explained 3x, identity check 4x (~60 comment lines); SOCKET_DIR_NAME dup of constants; EINVAL=22 -> libc; .socket gate x2 (L263,L351); eprintln! in core (L203,L600); LockError::Io says 'lock file' for socket dir/journal; group-commit recovery belongs in group_commit; tautological contended_sentinel test; 3 subsumed tests
+crates/socket-patch-core/src/patch/copy_tree.rs	707	audit-core	cbbbdb9 2026-11-02	-	fresh_copy skip_file_name is None at every prod caller: drop param, skipped_dir_depth (L53-81), cfg(test) oracle copy_tree_blocking_reference and 4-5 skip tests; stale registry_fetch docs about 'the skip a vendor stage asks for'; inline copy_tree_blocking/make_owner_writable; test Rng (A29); ~20 comment lines
+crates/socket-patch-core/src/patch/file_hash.rs	214	audit-core	cbbbdb9 2026-11-02	-	merge into hash::git_sha256; sync twin has 1 caller (vex/verify) and no test; test_compute_file_git_sha256_rejects_directory compares error text to a hash (can't fail); assert ErrorKind::InvalidInput; ~12 doc lines repeat open_regular_file
+crates/socket-patch-core/src/patch/jvm_jar.rs	1323	audit-core	cbbbdb9 2026-11-02	-	restore loop L536 `let _ = write_jar` records 'rolled back' even if restore fails; dead derived_copies, DerivedVerdict::clean; 6 pub fns file-local; sha256_hex/sha1_hex wrappers (A06); String errors+&str codes; .ok() at L656 hides network errors as 'no upstream matches'; daemon SidecarRecord x2; 2 expect in prod; 12 single-caller fns
+crates/socket-patch-core/src/patch/mod.rs	15	audit-core	cbbbdb9 2026-11-02	-	clean
+crates/socket-patch-core/src/patch/npm_bin.rs	739	audit-core	cbbbdb9 2026-11-02	-	fix_bin/unfix_bin/is_linked_bin/has_lf_shebang/fixed_for_write pub(crate) but file-local; form_for_write doc ends mid-sentence; bare #1756/#1791/#1804 refs; clean_path = relpath::fold_str (A19); 'Hash verification failed before patch' string x2 with apply.rs L513; sentence .contains test L476; no test of form_for_write matrix
+crates/socket-patch-core/src/patch/package.rs	839	audit-core	cbbbdb9 2026-11-02	-	tar reader misnamed/misplaced (A77); bool strict+strip_package_prefix drive 3 forwarders -> Layout enum; FIFO-safe open L96-111 copies utils::fs::open_regular_file_sync; canonical_member_key serves the zip decoder; 9 unit tests duplicate tests/package_e2e.rs; bomb test accepts any Err; ambiguous-root drop untested
+crates/socket-patch-core/src/patch/path_safety.rs	210	audit-core	cbbbdb9 2026-11-02	-	is_safe_name_version 1-line && wrapper; uuid check (A15); purl_builders test belongs to utils::purl; ~6 history comment lines
 crates/socket-patch-core/src/patch/redirect/bun_binary.rs	322	audit-core	-	-	
 crates/socket-patch-core/src/patch/redirect/cargo_lock_equivalence_tests.rs	222	audit-core	-	-	
 crates/socket-patch-core/src/patch/redirect/composer_equivalence_tests.rs	284	audit-core	-	-	

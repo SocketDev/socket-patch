@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -20,6 +20,7 @@ _Last checked against main @ cbbbdb9 on 2026-11-02 by audit-cli-tests._
   - Sentence matching where a typed error exists: `http` cap tests.
   - Only `is_err()` asserted: `pdm_lock` unsafe-sources test.
 - **Root-skip tests** pass silently under root (`group_commit` ×2, `fs` ×3).
+- **`ledgers.rs`, `manifest/*`, first `patch/*` (audit-core, 2026-11-02, 15 files): about 25 fake, duplicate or weak tests.** All 23 `manifest::operations` tests pass with `write_manifest` replaced by a torn non-atomic write (executed), so `test_write_manifest_failure_preserves_existing` (writes a different path) and `leaves_no_stage_litter` cannot catch a lost atomic write; `apply` `test_apply_package_patch_hash_mismatch_blocks` fails on an invalid blob hash, not the mismatch; `file_hash` compares an error message to a hash; `apply_lock` `contended_sentinel_is_classified_as_contention` restates its one-line predicate; `package.rs` repeats 9 `tests/package_e2e.rs` cases; ~10 subsumed duplicates.
 - **Coverage gaps:**
   - `http` mid-stream cap and `Truncated`;
   - `cargo_build_cache` warning text;
