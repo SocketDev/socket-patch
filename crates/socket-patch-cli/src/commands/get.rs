@@ -908,7 +908,8 @@ async fn filter_to_installed_purls(
         }
     }
 
-    let warnings = super::scan::unsupported_layout_warnings(&pnp_diags);
+    let warnings =
+        socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings(&pnp_diags);
     let pnp_yarn = pnp_diags
         .iter()
         .any(|d| d.code == "vendor_yarn_berry_unsupported");

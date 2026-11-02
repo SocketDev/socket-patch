@@ -12,11 +12,13 @@ use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
     is_fallback_candidate, ApiClient, ApiError,
 };
+use socket_patch_core::api::ranking::severity_order;
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry, TelemetryAuth,
@@ -24,6 +26,7 @@ use socket_patch_core::telemetry::{
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
+use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -62,15 +65,13 @@ mod withdrawn;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
-    merge_ledger_records_for_updates, preverify_vendor_baselines, severity_order,
-    vendored_ledger_supplement, LockfileSupplement,
+    preverify_vendor_baselines, vendored_ledger_supplement, LockfileSupplement,
 };
-// Shared with `get --mode hosted|vendored` (commands::get): the advisory-
-// pinned entry into the hosted engine, the vendor step + its dry-run
-// preview, and the PnP layout-refusal warning mapping. `pub(crate)`
-// re-exports because the submodules themselves stay private to scan.
+// Shared with `get --mode hosted|vendored` (commands::get): the lockfile
+// and vendored-ledger crawl supplements. `pub(crate)` re-exports because
+// the submodules themselves stay private to scan.
 pub(crate) use self::discovery::{
-    lockfile_supplement as project_lockfile_supplement, unsupported_layout_warnings,
+    lockfile_supplement as project_lockfile_supplement,
     vendored_ledger_supplement as project_vendored_supplement,
 };
 use self::gc::gc_into;
@@ -3152,7 +3153,7 @@ async fn run_scan(
                 .patches
                 .iter()
                 .filter_map(|p| p.severity.as_deref())
-                .min_by_key(|s| severity_order(s))
+                .min_by_key(|s| severity_order(Some(s)))
                 .unwrap_or("unknown");
 
             // Collect vuln IDs (deterministic; see collect_vuln_ids).
