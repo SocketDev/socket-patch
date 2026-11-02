@@ -1,5 +1,5 @@
 ### Refactor routine
-_Last updated 2026-11-02T09:20Z · main @ cbbbdb9_
+_Last updated 2026-11-02T11:35Z · main @ cbbbdb9_
 
 #### In flight
 | PR | Kind | Scope | State |
@@ -30,6 +30,7 @@ _Last updated 2026-11-02T09:20Z · main @ cbbbdb9_
 | #1972 | structural | T60 #1968 slice 1: `tests/docker_common` + 15 `docker_e2e_*` suites (test-only, +260/−1,113) | ready; green |
 | #1975 | sweep | core `api/{blob_fetcher,date,retry,types}.rs` | ready; green |
 | #1978 | structural | T56 #1956: 9 `cli_parse_*`/`cli_global_args` suites onto `hermetic::try_parse` + new `common/clap_parse.rs` (test-only, +418/−1,471) | ready; green |
+| #1985 | sweep | `scan/{rollout,rollout_args,withdrawn}.rs` (+ `Stage::may_admit` and 11 tests moved to core `rollout/stage.rs`) | ready; green |
 
 #### Merged
 _None._
@@ -38,25 +39,25 @@ _None._
 Structural, scored `3·B + 2·U + 2·D + 2·C − risk`. Nothing merged since 2026-10-29, so most candidates ≥6 stay blocked: A30 #1887 (~8.7, #1886), T09 #1858 (~7, #1864/#1698), A41 #1899 (~6, #1891/#1829/#1906), A43 #1900 (~6, #1863/#1698), T01 #1835 / T25 #1877 (#1698), A53 #1931 / A57 #1935 (`ruby_crawler.rs`, #1882/#1895/#1943), A55 #1933 (`redirect/mod.rs`). Free test-only: T60 #1968 rest (~7, after #1972: CI REQUIRED export, `assert_api_exercised`, `GIT_SHA256_FN` ×3, bash summary greps), T61 #1969 (~6; `e2e_bun_lockb.rs` held by #1905), T50 #1940 (~7; land the suites not held by #1698/#1843/#1893/#1894), T55 #1959 (~7, ~35 files; `tests/apply` is #1944), T58 #1957 (~6).
 A26 #1867, A46 #1917, A44 #1918 score ~4.
 
-Next sweep files, in order: `scan/{rollout,rollout_args,socket_yml_args,withdrawn}.rs` (free); `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/vendor_prefetch.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (callers in `vendor.rs`/`apply.rs`/`vex.rs`, #1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (1 caller, rollback L1814, in a loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967).
+Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884; `python_lock.rs` (2,283), `python_script.rs` (1,768), `api/vendor_prefetch.rs`, crawler rows; `group_commit.rs` (2,163, region); `tests/apply/*` rows not covered by #1944 (their notes list fake tests). Held: `vlt_preflight.rs`, `agent_download.rs`, `apply.rs`, `get.rs`, `vendor.rs` (#1698); `rollback.rs` (#1864); `utils/fs.rs`, core `lib.rs` (#1891); `lock_fragments.rs`/`pdm_lock.rs` (#1898); `poetry_lock.rs` (#1865/#1898); `pnpm_workspace.rs` (#1863); `process.rs` (#1895); `go_env.rs` (#1876); `cargo_workspace.rs` (#1866). Leftovers from merged-pending sweeps: `socket_yml_args.rs` `min_severity` → `Option<u8>` + injected env (held by #1978/#1864), `cli_parse_scan` env subset test (#1978), rollout `offer`/`manifest` fixtures in CLI+core → `test-fixtures` (#1985); `ui/text.rs` sweep and the text-shaping move out of `ui/mod.rs` (#1884), `StatusLine::stderr(json, silent)` → one `report` bool (scan/mod.rs, lock_cli.rs) (#1961); `toml_edit_ext` deletion and `uv_workspace` fold (#1923); 7 `build_*_purl` wrappers + `parse_jsr_purl`, purl's PurlKey asserts → `purl_key.rs`, pipenv `installed_major`'s `_root` (#1920); String `read_capped` wrapper, `lock_fragments`/`pdm_lock` `pub mod` → `pub(crate)` (#1914); `CargoCrawler::cargo_home`, `vendor/jvm` digest copies, async `fs::is_symlink` (#1907); `api_auth_fallback_warning` → `json_envelope` and `PlanNote` → `RunWarning` (callers in `vendor.rs`/`apply.rs`/`vex.rs`, #1698), `store_variants` test → core `npm_crawler.rs` (#1829/#1891/#1906/#1915) (#1948); `PathScope::matches` (1 caller, rollback L1814, in a loop) → `bind` once, plus `BoundScope::matching_pattern_indices` for rollback's `raw()` re-parse with `expect` (#1864); `AppliedVia` one-variant mirror + `from_core` (apply.rs, #1698) (#1967).
 
 #### Notes
 - Want issues (output-changing, found in sweeps): `ui::shell_word` misses `"`/`%VAR%` on cmd; `scan/gc.rs` `has_ledger` probes `--cwd` but `run_vendor_gc` reads `project_root()` (C43); gem stale probe dedups by purl and drops the platform suffix; `hatch::require_pip_installer_documents` ignores the `envs` override; `npm_range_admits(">=", v)` admits all; npm `upstream_registry_fallback` leaks `?token=` (use `redact_urls_in`); `vlt_heal` swallows `load_state`/lock read errors; `strip_url_userinfo`'s scp branch keeps `u:p@`.
-- Check every "redundant filter" note against all consumers and derived `GlobalArgs` (the `args.rs` proxy filter, `select_one`'s `quiet()`).
+- Check "redundant filter" notes against all consumers and derived `GlobalArgs`.
 - Clap field doc comments are `--help` output: leave them.
 - `--cwd` defaults to `.`: absolutize before walking `ancestors()`; test via chdir under `#[serial]`.
 - `vendor/cargo_config.rs` (~L165-L190) has a third `.cargo/config` pick: fold into `config_layer_paths` when swept.
 - Build with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0` (disk). CI's clippy has no `--tests`.
 - Root-sandbox failures that pass in CI: 2 chmod tests in `tests/repair`, and core `copy_tree` symlinked-root, `vlt_heal` unremovable-lock, `pypi_poetry`/`pypi_requirements` wire-failure tests.; `in_process_redirect`'s 3 chmod tests
-- The proxy refuses branch deletions: name branches right first time (`sweep-scan-gc-policy` is stale).
+- The proxy refuses branch deletions: name branches right first time.
 - `run_redirect_selected` still takes `Option<Envelope>` keyed on `common.json`; making it a value touches `get.rs` (#1698) and T24.
 - Making a `pub` core item private can leave rustdoc links to it; unlink in the same commit.
 - Test runners that pin `--cwd` must not also set the child's cwd to the project, or a crawler reading the process cwd passes (found by /code-review on #1944).
 - Left from #1929: `UpdateArgs.pin_version` as `semver::Version` waits on `lib.rs` (#1842); `sweep_orphan_vendor_dirs` forwarder on `vendor.rs` (#1698).
-- Left from #1936: `vendor/gem.rs` `plan_gemfile_edit`, `vex/discover/gem.rs` (~L252) and `redirect/upstream/gem.rs` (~L661) still hand-scan `=begin`; route them through `manifest::code_lines` (the pin writer refuses a Gemfile whose duplicate `gem` line sits in `=begin`). `code_lines`'s heredoc heuristic reads `x <<FLAG` (a shift) as a heredoc and closes a plain `<<ID` at an indented terminator.
+- Left from #1936: `vendor/gem.rs` `plan_gemfile_edit`, `vex/discover/gem.rs` (~L252), `redirect/upstream/gem.rs` (~L661) hand-scan `=begin`: use `manifest::code_lines`. Its heredoc heuristic misreads `x <<FLAG` and indented `<<ID` terminators.
 - Left from #1939: `remove.rs` L1327 doc still names the deleted `revert_vendor_entry` (#1875); `commands/repair.rs` ~L429 copies the build-once client (use `vendored_backend::repair::ensure_client`, #1875); `ApplyRequest.manifest` → `&HashMap` (drop `records_manifest`) and `stop_on_failure` wait on #1698/#1864/#1875; split `repair()`'s phases.
 - Keep a single-caller fn that is a constant's only test seam or names a phase of a long fn (`fetch_concurrency`, `build_candidates`).
-- Left from #1955: PTY watchdog SIGHUPs; fixed 10 s prompt waits.
+- Left from #1955: PTY watchdog SIGHUPs, fixed 10 s prompt waits.
 - Left from #1967: core `UpdateTimeouts::from_env` and the notifier both parse `SOCKET_UPDATE_TIMEOUT_MS`; core caps `connect` at 10 s, the notifier doesn't (A09/C19).
 - Left from #1964: `CI`/`GITHUB_ACTIONS` still reach test children; a HOME pin in `hermetic::command` hits ~150 suites. Test a scrub with a parent-env canary.
 - Left from #1975: `blob_fetcher` `on_progress`/`OnProgress` (callers in `fetch_stage.rs` #1855, `repair.rs` #1875, `rollback.rs` #1864) and `BlobFetchResult.success` (literals in #1855's tests); `concise_fetch_error` re-parses the client's text; `store_verified_blob` vs `stream_cache_entry_atomic` drift. `scan --json` serializes `BatchPackagePatches`: keep a serialize test.
