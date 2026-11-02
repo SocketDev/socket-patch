@@ -267,7 +267,7 @@ impl LegacyNpmCrawler {
                 .map(|t| t.dir_key.as_str())
                 .collect();
             let filter = filter_store_entries.then_some(&unmatched_names);
-            Self::collect_nested_node_modules(&nm_path, filter, &mut queue).await;
+            Self::collect_nested_node_modules(&nm_path, store_entry, filter, &mut queue).await;
         }
         // Only the targets with zero copies remain "pending" for pass 2.
         pending.retain(|t| !result.contains_key(&t.purl));
@@ -337,9 +337,11 @@ impl LegacyNpmCrawler {
     /// store (see below); `pending_names` — `Some(the still-unresolved
     /// targets' full package names)` — bounds which store entries get
     /// enqueued, while `None` (the pass-2 fallback of `find_by_purls`)
-    /// enqueues every store entry.
+    /// enqueues every store entry. Inside a store entry's own
+    /// `node_modules` (`store_entry`) no child is a store (#1899).
     async fn collect_nested_node_modules(
         nm_path: &Path,
+        store_entry: bool,
         pending_names: Option<&HashSet<&str>>,
         queue: &mut VecDeque<(PathBuf, bool)>,
     ) {
@@ -358,7 +360,7 @@ impl LegacyNpmCrawler {
             // BFS order guarantees a root-linked install has already been
             // probed (and removed from `pending`) before these are
             // dequeued, so a package is never resolved twice.
-            if name_str == ".pnpm" {
+            if !store_entry && name_str == ".pnpm" {
                 let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
                     continue;
                 };
@@ -377,7 +379,7 @@ impl LegacyNpmCrawler {
             // vlt's store has the same transitive-only-home property: every
             // package lives at `.vlt/<DepID>/node_modules/<name>` and the
             // importer holds only links into it.
-            if name_str == VLT_STORE_NAME {
+            if !store_entry && name_str == VLT_STORE_NAME {
                 let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
                     continue;
                 };
@@ -394,7 +396,7 @@ impl LegacyNpmCrawler {
             // Must run before the generic hidden-entry skip below, which
             // would otherwise swallow it — leaving every transitive-only
             // install unpatchable on those layouts.
-            if is_legacy_pnpm_store_dir_name(&name_str) {
+            if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
                 let Some(file_type) = crate::utils::fs::entry_file_type(&entry).await else {
                     continue;
                 };
