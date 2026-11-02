@@ -300,6 +300,40 @@ mod tests {
         assert!(patches[1].cve_ids.is_empty());
     }
 
+    /// `scan --json` serializes the batch packages verbatim, so their
+    /// serialized keys are output.
+    #[test]
+    fn batch_packages_serialize_with_the_wire_keys() {
+        let package = BatchPackagePatches {
+            purl: "pkg:npm/x@1.0.0".into(),
+            patches: vec![BatchPatchInfo {
+                uuid: "u1".into(),
+                purl: "pkg:npm/x@1.0.0".into(),
+                tier: "free".into(),
+                cve_ids: vec!["CVE-2024-0001".into()],
+                ghsa_ids: vec!["GHSA-1111-2222-3333".into()],
+                severity: None,
+                title: "Patch one".into(),
+                published_at: None,
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&package).unwrap(),
+            serde_json::json!({
+                "purl": "pkg:npm/x@1.0.0",
+                "patches": [{
+                    "uuid": "u1",
+                    "purl": "pkg:npm/x@1.0.0",
+                    "tier": "free",
+                    "cveIds": ["CVE-2024-0001"],
+                    "ghsaIds": ["GHSA-1111-2222-3333"],
+                    "severity": null,
+                    "title": "Patch one"
+                }]
+            })
+        );
+    }
+
     #[test]
     fn test_organizations_response_deserialize() {
         // Mirrors GET /v0/organizations: an object keyed by org id. `name`

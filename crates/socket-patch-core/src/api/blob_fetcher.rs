@@ -632,8 +632,11 @@ mod tests {
 
     #[test]
     fn a_failure_without_an_error_reads_unknown_error() {
-        let mut nameless = failure("d", "");
-        nameless.error = None;
+        let nameless = BlobFetchResult {
+            hash: "d".into(),
+            success: false,
+            error: None,
+        };
         assert_eq!(
             format_fetch_failures(&failed_result(vec![nameless]), BLOB),
             vec!["Failed to download 1 blob", "  - d: unknown error"]

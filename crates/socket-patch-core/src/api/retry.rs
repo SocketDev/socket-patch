@@ -10,7 +10,7 @@
 //! adds at most about the window's length of waiting.
 //!
 //! A connection the peer drops while it is being established (reset,
-//! aborted, or closed mid-TLS-handshake — [`is_retryable_transport`]) is
+//! aborted, or closed mid-TLS-handshake — `is_retryable_transport`) is
 //! retried under the same budget and window, with the exponential backoff:
 //! the request was never sent, and a load balancer or proxy resetting a
 //! fresh connection is a transient blip, not an answer.
@@ -463,10 +463,8 @@ mod tests {
         assert_eq!(max_retries_override(Some("-1")), None);
         assert_eq!(max_retries_override(Some("0")), Some(0));
         assert_eq!(max_retries_override(Some(" 5 ")), Some(5));
-        assert_eq!(
-            max_retries_override(Some("1000")),
-            Some(MAX_RETRIES_CEILING)
-        );
+        // The ceiling `API_MAX_RETRIES_ENV`'s doc promises.
+        assert_eq!(max_retries_override(Some("1000")), Some(10));
     }
 
     /// A hand-driven monotonic clock (milliseconds).
