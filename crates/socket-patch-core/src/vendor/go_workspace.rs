@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::utils::fs::read_regular_to_string;
 
-use super::go_build_list::Selection;
+use super::go_build_list::{ModuleGraph, Selection};
 use super::go_mod_edit::{self, ReplaceEntry};
 use super::go_sum_edit::{go_semver_cmp, go_sum_lines};
 
@@ -500,6 +500,30 @@ fn selected_versions(
         }
     }
     selected
+}
+
+/// The module graph of the main module at `dir` (module mode, go.mod text
+/// `go_mod`), read as [`GoWorkspace::read_graph_from`] reads a one-member
+/// workspace's: what MVS selects for each module, and whether every go.mod
+/// it needed was read.
+pub async fn module_graph(dir: &Path, go_mod: &str, cache: Option<&Path>) -> ModuleGraph {
+    let mut ws = GoWorkspace {
+        work_file: dir.join("go.work"),
+        work: String::new(),
+        work_sum: None,
+        members: vec![Member {
+            dir: dir.to_path_buf(),
+            go_mod: Some(go_mod_edit::normalize_for_read(go_mod)),
+            go_sum: None,
+        }],
+        graph: None,
+    };
+    ws.read_graph_from(cache).await;
+    let graph = ws.graph.unwrap_or_default();
+    ModuleGraph {
+        complete: graph.values().all(Option::is_some),
+        selected: selected_versions(&ws.members, &graph),
+    }
 }
 
 impl GoWorkspace {
@@ -1306,6 +1330,35 @@ mod tests {
             &format!("cache/download/{path}/@v/{version}.mod"),
             &format!("module {path}\n\ngo {go}\n{requires}"),
         );
+    }
+
+    /// #1840: a go 1.16 module's graph reaches a fork only a dependency
+    /// requires, which the root go.mod never lists.
+    #[tokio::test]
+    async fn module_graph_reaches_a_fork_only_a_dependency_requires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (root, cache) = (tmp.path().join("app"), tmp.path().join("cache"));
+        let go_mod = "module example.com/app\n\ngo 1.16\n\nrequire example.com/mid v1.0.0\n\n\
+                      replace other.com/fork => example.com/upstream v1.0.0\n";
+        cached(
+            &cache,
+            "example.com/mid",
+            "v1.0.0",
+            "1.16",
+            "\nrequire other.com/fork v1.0.0\n",
+        );
+        cached(&cache, "example.com/upstream", "v1.0.0", "1.16", "");
+        let graph = module_graph(&root, go_mod, Some(&cache)).await;
+        assert!(graph.complete, "{graph:?}");
+        assert_eq!(
+            graph.selected.get("other.com/fork").map(String::as_str),
+            Some("v1.0.0")
+        );
+        // Without the dependency's go.mod the graph is incomplete.
+        let empty = tmp.path().join("empty");
+        let graph = module_graph(&root, go_mod, Some(&empty)).await;
+        assert!(!graph.complete);
+        assert!(!graph.selected.contains_key("other.com/fork"));
     }
 
     #[tokio::test]

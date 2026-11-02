@@ -124,7 +124,7 @@ use super::{
 };
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::go_env::{go_env, goflags_modfile, GoflagsModfile};
-use crate::vendor::go_build_list::{self, Selection};
+use crate::vendor::go_build_list::{self, ModuleGraph, Selection};
 use crate::vendor::go_mod_edit::{
     self, block_structure_error, hosted_module_uuid, normalize_for_read, ReplaceEntry,
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
@@ -283,7 +283,21 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         .iter()
         .flat_map(|(_, entries)| entries)
         .any(|e| e.owner == Some(ReplaceOwner::Hosted));
-    let graph = Graph::new(go_mod.as_deref(), workspace.as_ref().map(|ws| &ws.model));
+    // Module mode: whether a module-to-module replace is in effect can turn
+    // on modules only the dependencies require (#1840).
+    let mut module_graph = None;
+    if let (Some(text), None) = (&go_mod, &workspace) {
+        if go_build_list::may_need_module_graph(text) {
+            if let Some(root) = ctx.disk_root_reading(go_build_list::module_graph_reads(text)) {
+                module_graph = Some(go_build_list::module_graph(root, text).await);
+            }
+        }
+    }
+    let graph = Graph::new(
+        go_mod.as_deref(),
+        workspace.as_ref().map(|ws| &ws.model),
+        module_graph.as_ref(),
+    );
     let mut sums = SumPins::default();
     if any_hosted {
         let sum_files = match &workspace {
@@ -304,10 +318,16 @@ struct Graph<'a> {
     required: HashMap<String, String>,
     root: Option<&'a str>,
     workspace: Option<&'a GoWorkspace>,
+    /// The root module's unpruned graph from the module cache, when read.
+    module_graph: Option<&'a ModuleGraph>,
 }
 
 impl<'a> Graph<'a> {
-    fn new(go_mod: Option<&'a str>, workspace: Option<&'a GoWorkspace>) -> Self {
+    fn new(
+        go_mod: Option<&'a str>,
+        workspace: Option<&'a GoWorkspace>,
+        module_graph: Option<&'a ModuleGraph>,
+    ) -> Self {
         let required = match workspace {
             Some(ws) => {
                 let mut max: HashMap<String, String> = HashMap::new();
@@ -331,6 +351,7 @@ impl<'a> Graph<'a> {
             required,
             root: go_mod,
             workspace,
+            module_graph,
         }
     }
 
@@ -342,8 +363,9 @@ impl<'a> Graph<'a> {
             Some(ws) => ws.selection(module, version),
             None => {
                 let root = self.root.unwrap_or_default();
-                go_build_list::select(
+                go_build_list::select_in(
                     root,
+                    self.module_graph,
                     module,
                     self.required.get(module).map(String::as_str),
                     zips,
@@ -2105,7 +2127,7 @@ mod tests {
                 .collect(),
             ),
         };
-        let graph = Graph::new(None, Some(&ws));
+        let graph = Graph::new(None, Some(&ws), None);
         let entry = |version: &str| ReplaceEntry {
             module: MODULE.to_string(),
             version: Some(version.to_string()),
@@ -2128,7 +2150,7 @@ mod tests {
         assert!(out.diagnostics[0].detail.contains("is inert"));
         // Without the graph nothing proves the raise.
         let ws = GoWorkspace { graph: None, ..ws };
-        let graph = Graph::new(None, Some(&ws));
+        let graph = Graph::new(None, Some(&ws), None);
         let mut out = Discovery::default();
         assert_eq!(
             replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
