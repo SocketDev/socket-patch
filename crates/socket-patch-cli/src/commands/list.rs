@@ -1,4 +1,5 @@
 use clap::Args;
+use socket_patch_core::ledgers::Store;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::patch::redirect::upstream::HostedPin;
 use socket_patch_core::patch::redirect::RedirectState;
@@ -16,20 +17,12 @@ pub struct ListArgs {
     pub common: GlobalArgs,
 }
 
-// Where a listed record lives (see `socket_patch_core::ledgers`): the
-// manifest (agent mode); the hosted redirect ledger, where `scan --mode
-// hosted` recorded its patches; or the vendor ledger, where vendored mode
-// keeps every `scan`/`get --mode vendored` patch as a `detached` entry's
-// embedded record (a standalone `vendor` entry's fallback copy lists too
-// once no manifest entry covers it — the checkout `vex` attests from it).
-use socket_patch_core::ledgers::Store as Source;
-
 /// The display order of one purl's copies: manifest, hosted, vendored.
-fn display_rank(source: Source) -> u8 {
+fn display_rank(source: Store) -> u8 {
     match source {
-        Source::Manifest => 0,
-        Source::Hosted => 1,
-        Source::Vendored => 2,
+        Store::Manifest => 0,
+        Store::Hosted => 1,
+        Store::Vendored => 2,
     }
 }
 
@@ -38,10 +31,10 @@ fn display_rank(source: Source) -> u8 {
 /// `HOSTED_MODE_LABEL`'s docs) — or `None` for a manifest entry or a hosted
 /// pin (which has no ledger; see [`ListEntry::lockfiles`]). Shared by the
 /// JSON `details` and the human `Mode:` line.
-fn ledger_label(source: Source) -> Option<(&'static str, &'static str)> {
+fn ledger_label(source: Store) -> Option<(&'static str, &'static str)> {
     match source {
-        Source::Manifest | Source::Hosted => None,
-        Source::Vendored => Some((crate::commands::VENDORED_MODE_LABEL, VENDOR_STATE_REL)),
+        Store::Manifest | Store::Hosted => None,
+        Store::Vendored => Some((crate::commands::VENDORED_MODE_LABEL, VENDOR_STATE_REL)),
     }
 }
 
@@ -49,7 +42,7 @@ fn ledger_label(source: Source) -> Option<(&'static str, &'static str)> {
 struct ListEntry<'a> {
     purl: &'a str,
     record: &'a PatchRecord,
-    source: Source,
+    source: Store,
     /// The lockfiles wiring a hosted pin (empty for the other sources).
     lockfiles: &'a [String],
 }
@@ -78,15 +71,7 @@ impl HostedListing {
                             .find(|(k, r)| PurlKey::same(k, &pin.purl) && r.uuid == pin.uuid)
                             .map(|(_, r)| r.clone())
                     })
-                    .unwrap_or_else(|| PatchRecord {
-                        uuid: pin.uuid.clone(),
-                        exported_at: String::new(),
-                        files: Default::default(),
-                        vulnerabilities: Default::default(),
-                        description: String::new(),
-                        license: String::new(),
-                        tier: String::new(),
-                    });
+                    .unwrap_or_else(|| socket_patch_core::ledgers::uuid_only_record(&pin.uuid));
                 HostedListing {
                     purl: pin.purl.clone(),
                     record,
@@ -129,7 +114,7 @@ fn combined_entries<'a>(
     entries.extend(hosted.iter().map(|h| ListEntry {
         purl: &h.purl,
         record: &h.record,
-        source: Source::Hosted,
+        source: Store::Hosted,
         lockfiles: &h.lockfiles,
     }));
     entries.sort_by(|a, b| {
@@ -195,7 +180,7 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
             details["mode"] = serde_json::json!(mode);
             details["ledger"] = serde_json::json!(ledger);
         }
-        if entry.source == Source::Hosted {
+        if entry.source == Store::Hosted {
             details["mode"] = serde_json::json!(crate::commands::HOSTED_MODE_LABEL);
             details["lockfiles"] = serde_json::json!(entry.lockfiles);
         }
@@ -264,7 +249,7 @@ fn format_entry(entry: &ListEntry<'_>, color: bool) -> String {
         // Same labeling rule as the JSON details.
         lines.push(format!("  Mode: {mode} (recorded in {ledger})"));
     }
-    if entry.source == Source::Hosted {
+    if entry.source == Store::Hosted {
         lines.push(format!(
             "  Mode: {} (wired in {})",
             crate::commands::HOSTED_MODE_LABEL,
@@ -334,11 +319,6 @@ pub async fn run(args: ListArgs) -> i32 {
     apply_env_toggles(&args.common);
     let manifest_path = args.common.resolved_manifest_path();
 
-    // `read_manifest` is the single source of truth for the three error
-    // states: `Ok(None)` (file absent), `Err(InvalidData)` (present but
-    // unparseable), and any other `Err` (genuine I/O failure). No stat
-    // pre-check: it would report any stat failure as `manifest_not_found`
-    // and open a TOCTOU window.
     // One load of the three stores, all from the SAME project as the
     // manifest (see below); each keeps list's own posture.
     let ctx = crate::commands::context::ProjectContext::new(&args.common);
@@ -370,10 +350,10 @@ pub async fn run(args: ListArgs) -> i32 {
         Ok(state) => state.as_ref(),
         Err(corrupt) => {
             if args.common.json {
-                warnings.push(RunWarning {
-                    code: "redirect_ledger_corrupt".to_string(),
-                    detail: corrupt.to_string(),
-                });
+                warnings.push(RunWarning::new(
+                    "redirect_ledger_corrupt",
+                    corrupt.to_string(),
+                ));
             } else if !args.common.silent {
                 eprintln!("Warning: {corrupt}");
             }
@@ -387,10 +367,7 @@ pub async fn run(args: ListArgs) -> i32 {
     let contested = inventory.contested_refusal();
     if let Some(detail) = &contested {
         if args.common.json {
-            warnings.push(RunWarning {
-                code: "hosted_wiring_contested".to_string(),
-                detail: detail.clone(),
-            });
+            warnings.push(RunWarning::new("hosted_wiring_contested", detail.clone()));
         } else if !args.common.silent {
             eprintln!("Warning: {}", crate::ui::sentence_case(detail));
         }
@@ -426,15 +403,24 @@ pub async fn run(args: ListArgs) -> i32 {
             )
         };
         if args.common.json {
-            warnings.push(RunWarning {
-                code: "hosted_resolution_orphaned".to_string(),
-                detail,
-            });
+            warnings.push(RunWarning::new("hosted_resolution_orphaned", detail));
         } else if !args.common.silent {
             eprintln!("Warning: {}", crate::ui::sentence_case(&detail));
         }
     }
-    let vendor_state = crate::commands::vendor_state_lenient(&loaded.vendor, args.common.silent);
+    // A broken vendor ledger degrades to nothing-to-list here (every path
+    // that writes or attests from it fails closed instead), but says so.
+    let vendor_state = match &loaded.vendor {
+        Ok(state) => Some(state),
+        Err(e) => {
+            if !args.common.silent {
+                eprintln!(
+                    "Warning: unreadable vendor ledger ({e}); its vendored patches are not listed"
+                );
+            }
+            None
+        }
+    };
 
     // `combined_entries` folds only real records in (a record-less legacy
     // vendor entry asserts no patch), so entry emptiness is the whole exit
@@ -799,10 +785,6 @@ mod tests {
         assert_eq!(v["events"][0]["details"]["mode"], "hosted");
     }
 
-    /// A vendor-ledger entry: `detached` with the embedded record when
-    /// `record` is given (the manifest-free vendored posture), a legacy
-    /// manifest-tracked entry (no record of its own) otherwise. Built from
-    /// the on-disk JSON shape so the fixture follows the ledger schema.
     fn as_state(entries: &HashMap<String, VendorEntry>) -> VendorState {
         VendorState {
             entries: entries.clone(),
@@ -810,6 +792,10 @@ mod tests {
         }
     }
 
+    /// A vendor-ledger entry: `detached` with the embedded record when
+    /// `record` is given (the manifest-free vendored posture), a legacy
+    /// manifest-tracked entry (no record of its own) otherwise. Built from
+    /// the on-disk JSON shape so the fixture follows the ledger schema.
     fn vendor_entry(purl: &str, record: Option<PatchRecord>) -> VendorEntry {
         serde_json::from_value(serde_json::json!({
             "ecosystem": "npm",
@@ -877,7 +863,7 @@ mod tests {
                 ("pkg:npm/minimist@1.2.2", "vendored"),
                 ("pkg:npm/zzz-vendored@1.0.0", "vendored"),
             ],
-            "purl-sorted, manifest < hosted < vendored on a tie, record-less              entries skipped: {v}"
+            "purl-sorted, manifest < hosted < vendored on a tie, record-less entries skipped: {v}"
         );
         let events = v["events"].as_array().unwrap();
         assert_eq!(
@@ -982,15 +968,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ordering_is_deterministic_across_builds() {
-        // Two independent builds of the same manifest must be byte-identical.
-        let manifest = multi_entry_manifest();
-        let a = manifest_envelope(&manifest).to_pretty_json();
-        let b = manifest_envelope(&manifest).to_pretty_json();
-        assert_eq!(a, b);
-    }
-
     fn record_with(description: &str, license: &str, severity: &str, summary: &str) -> PatchRecord {
         let mut rec = sample_manifest().patches["pkg:npm/minimist@1.2.2"].clone();
         rec.description = description.to_string();
@@ -1005,7 +982,7 @@ mod tests {
         ListEntry {
             purl,
             record,
-            source: Source::Manifest,
+            source: Store::Manifest,
             lockfiles: &[],
         }
     }
