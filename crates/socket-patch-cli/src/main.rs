@@ -2,27 +2,11 @@ use socket_patch_cli::{commands, parse_argv_with_shortcuts, Commands};
 use socket_patch_core::utils::env_compat::promote_peer_env_vars;
 use socket_patch_core::utils::socket_cli_config;
 
-/// Exit quietly when a pipe consumer closes stdout, instead of panicking on EPIPE.
-/// Network writes still suppress SIGPIPE through std/socket2.
-#[cfg(unix)]
-fn restore_default_sigpipe() {
-    // SAFETY: SIG_DFL is a valid disposition for SIGPIPE.
-    unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
-    }
-}
-
-#[cfg(not(unix))]
-fn restore_default_sigpipe() {}
-
 #[tokio::main]
 async fn main() {
     // Must precede any output: clap help writes to a possibly-already-closed
-    // pipe.
-    restore_default_sigpipe();
-
-    // Ctrl-C / SIGTERM / SIGHUP remove a held `.socket/apply.lock` before
-    // the signal ends the process (see `interrupt`).
+    // pipe. Ctrl-C / SIGTERM / SIGHUP remove a held `.socket/apply.lock`
+    // before the signal ends the process (see `interrupt`).
     socket_patch_cli::interrupt::install();
 
     // Accept the JS socket-cli's SOCKET_CLI_* peer names (silently —

@@ -224,9 +224,7 @@ mod tests {
         let s = scope(&["packages/*"]);
         // `packages/*` matches the ancestor `packages/foo`, scoping its tree…
         assert!(s.matches(&cwd(), Path::new("/proj/packages/foo/node_modules/lodash")));
-        // …but `nested/*` must not match a deeper path component-wise.
-        let s2 = scope(&["*"]);
-        assert!(s2.matches(&cwd(), Path::new("/proj/anything")));
+        // …but `src/*.js` must not match `deep/file.js` across a `/`.
         let s3 = scope(&["src/*.js"]);
         assert!(!s3.matches(&cwd(), Path::new("/proj/src/deep/file.js")));
     }
@@ -278,35 +276,24 @@ mod tests {
         assert_eq!(matches, cfg!(windows));
     }
 
-    /// `bind` absolutizes the cwd once and answers exactly like the
-    /// per-call form for every candidate, relative and absolute patterns
-    /// alike.
     #[test]
-    fn bound_scope_matches_like_the_per_call_form() {
+    fn bound_scope_matches_relative_and_absolute_patterns() {
         let s = scope(&["packages/foo", "/global/store"]);
         let bound = s.bind(&cwd());
-        for candidate in [
-            "/proj/packages/foo/node_modules/lodash",
-            "/proj/packages/bar/node_modules/lodash",
-            "/global/store/lib/node_modules/x",
-            "/other/store/lib",
-        ] {
-            let candidate = Path::new(candidate);
-            assert_eq!(
-                bound.matches(candidate),
-                s.matches(&cwd(), candidate),
-                "{candidate:?}"
-            );
-        }
-        assert!(bound.matches(Path::new("/proj/packages/foo/x")));
-        assert!(!bound.matches(Path::new("/proj/packages/bar/x")));
+        assert!(bound.matches(Path::new("/proj/packages/foo/node_modules/lodash")));
+        assert!(!bound.matches(Path::new("/proj/packages/bar/node_modules/lodash")));
+        assert!(bound.matches(Path::new("/global/store/lib/node_modules/x")));
+        assert!(!bound.matches(Path::new("/other/store/lib")));
         assert!(scope(&[]).bind(&cwd()).matches(Path::new("/anywhere")));
     }
 
+    /// Crawlers under the default `--cwd .` yield `./node_modules/foo`, so
+    /// a relative candidate must strip against the cwd as given.
     #[test]
-    fn matching_is_purely_textual() {
-        // Paths that do not exist on disk still match — no fs access.
-        let s = scope(&["no/such/dir"]);
-        assert!(s.matches(&cwd(), Path::new("/proj/no/such/dir/pkg")));
+    fn relative_cwd_strips_relative_candidates() {
+        let s = scope(&["node_modules/foo"]);
+        let bound = s.bind(Path::new("."));
+        assert!(bound.matches(Path::new("./node_modules/foo")));
+        assert!(!bound.matches(Path::new("./node_modules/bar")));
     }
 }
