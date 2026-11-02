@@ -13751,10 +13751,12 @@ mod tests {
         }
     }
 
-    /// #1951: the hosted rewriter names a yarn classic `file:` / url copy
-    /// through the same reader vendored and VEX use
-    /// ([`crate::formats::yarn::copy::classic_copy_ref`]), so the modes
-    /// make the same decision for every copy. yarn 1 installs
+    /// #1951: the hosted rewriter reads which package a yarn classic
+    /// `file:` / url copy holds through the same reader vendored and VEX use
+    /// ([`crate::formats::yarn::copy::classic_copy_ref`] and
+    /// [`crate::formats::yarn::copy::CopyRef::identity`]), so the modes
+    /// identify the same copies. (A copy no reader identifies is a separate
+    /// rule: vendored keeps it as a possible copy, #1516.) yarn 1 installs
     /// `file:../ext/lpdir` from outside the root as readily as from inside
     /// it, so that copy is read and named; an absolute `file:` path is never
     /// read (a lock is untrusted input, #1516); a codeload tarball names no
@@ -13792,7 +13794,7 @@ mod tests {
                 false,
             ),
         ] {
-            // What vendored and VEX decide for this copy.
+            // The package vendored and VEX identify this copy as.
             let pats = vec![patterns.to_string()];
             let vendored = classic_copy_ref(&pats, resolved).and_then(|copy| {
                 let bytes = copy
