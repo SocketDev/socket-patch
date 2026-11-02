@@ -305,7 +305,7 @@ fn outside_root_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         return;
     }
     let Some((name, location)) = requirement_location(code) else {
-        registry_pin(file, code, out);
+        registry_line(file, code, out);
         return;
     };
     if matches!(classify(ctx, location, url_form(location)), Ok(None)) {
@@ -342,18 +342,7 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         return;
     }
     let Some((name, location)) = requirement_location(code) else {
-        if requirements::has_env_reference(code) {
-            // pip expands `${NAME}` where it runs, so a registry line
-            // carrying one may install any release of the package it
-            // names: evidence against every wiring of it (#1873).
-            if let Some(name) = requirements::requirement_name(code) {
-                out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
-            }
-            return;
-        }
-        // A registry requirement; a pin that can only install one release
-        // is evidence against another lock's wiring of that release.
-        registry_pin(file, code, out);
+        registry_line(file, code, out);
         return;
     };
     let tag = comment.and_then(vendor_tag);
@@ -371,6 +360,21 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
         integrity_of(location, hash_options(code)),
         out,
     );
+}
+
+/// A registry requirement line, in-root or in an out-of-root include. pip
+/// expands `${NAME}` where it runs, so a line carrying one may install any
+/// release of the package it names: evidence against every wiring of it
+/// (#1873). Otherwise a pin that can only install one release is evidence
+/// against another lock's wiring of that release ([`registry_pin`]).
+fn registry_line(file: &str, code: &str, out: &mut Discovery) {
+    if requirements::has_env_reference(code) {
+        if let Some(name) = requirements::requirement_name(code) {
+            out.resolved_elsewhere_any_version(file, pypi_name_purl(name));
+        }
+        return;
+    }
+    registry_pin(file, code, out);
 }
 
 /// Record a registry requirement that can only install one release as
