@@ -433,7 +433,7 @@ mod tests {
         }"#;
         let sr: SearchResponse = serde_json::from_str(json).unwrap();
         assert_eq!(sr.patches.len(), 2);
-        assert_eq(sr.patches[0].published_at, "Fri, 27 Mar 2026 19:12:42 GMT");
+        assert_eq!(sr.patches[0].published_at, "Fri, 27 Mar 2026 19:12:42 GMT");
         assert_eq!(sr.patches[1].published_at, "Mon, 03 Aug 2026 20:23:06 GMT");
         assert_eq!(
             sr.patches[0].vulnerabilities["GHSA-4hjh-wcwx-xvwj"].severity,
