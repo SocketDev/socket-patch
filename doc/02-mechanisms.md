@@ -1,6 +1,6 @@
 ## Part 2
 
-_Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
 
  Common mechanisms:For each cross-cutting concern: the **canonical mechanism** (the one way the code should do it, with a permalink to its home), the **deviations** found (file, what it does instead, its register token), and a count. Concerns: error types and context; error codes and exit codes; swallowed errors and panics in non-test code; stdout/stderr and the `ui` layer; the JSON envelope; human text, color and progress; logging; env and config reading; paths and containment; file I/O (atomic writes, BOM/CRLF); HTTP clients, timeouts and retries; process spawning and deadlines; concurrency.
 
@@ -31,3 +31,5 @@ _Last checked against main @ cbbbdb9 on 2026-11-01 by audit-cli-tests._
 - **API auth fallback** (proposed canonical: the proxy fallback inside `ApiClient`, C09). The 401/403 → proxy text is copied in vex_sources, scan and get; vex reports it in `warnings[]`, scan and get print it to stderr under `--json`. The `api_auth_fallback` warning helper lives in `vex_sources.rs` and is used by repair, vendor and apply.
 - **Windows verbatim-prefix strip** (proposed canonical: one `utils` helper, from `pnpm_workspace::without_verbatim_prefix`): 6 copies, drifted on UNC and `\\?\Volume{…}`. {{A49}}
 - **Evidence read failures** (proposed canonical: a typed read error carried to the gate): sbt `discover` and scala `discover` collapse cap breaches and unreadable files to `None`, so the user is told to run `sbt update`/`scala-cli compile`. {{A60}}
+- **Project file reads** (canonical: `vendor::lock_inventory::ProjectView` methods). 21 hand `Disk | Snapshot` arms (17 `disk_root().expect("a disk view has a root")`, 7 in `hosted/engine.rs`) re-read the raw disk with their own rules (sync vs async, follows links or not) and would skip a Snapshot overlay. {{A75}}
+- **Bounded concurrency** (canonical: `utils::concurrent::ordered_concurrent`). `hosted/memory/discover.rs` hand-writes `join_bounded` with the same semantics (local note).

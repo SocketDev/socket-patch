@@ -642,22 +642,22 @@ crates/socket-patch-core/src/gradle/mod.rs	235	audit-core	cbbbdb9 2026-11-02	-	c
 crates/socket-patch-core/src/gradle/selector.rs	605	audit-core	cbbbdb9 2026-11-02	-	`version_parts`, `CURRENT_MAJOR` → private; `admits_for`/`gradle_version_cmp_for` and ~200 lines of GOLDEN_* tables are pub production items only for the CLI e2e: move behind a `testing` module; `(Some(s),None)` arms = `s.cmp(&0)`
 crates/socket-patch-core/src/hash/git_sha256.rs	453	audit-core	cbbbdb9 2026-11-02	-	async and std reader loops are byte-identical twins (~35 lines; 2 async callers); vendor/common::zip_bytes_match_after_hashes open-codes `zip_member_git_sha256`; fake: test_hello_world, test_known_vector recompute with sha2, test_empty_content self-compares — delete (known-answer vectors cover); see hash/mod.rs
 crates/socket-patch-core/src/hash/mod.rs	1	audit-core	cbbbdb9 2026-11-02	-	a directory holding one module: move git_sha256 to hash.rs or utils/digest.rs (the digest home)
-crates/socket-patch-core/src/hosted/engine.rs	7041	audit-core	partial@L960	-	read_candidate_files is ~360 lines (L588-950) of per-ecosystem phases with `any(|c| c.dep.ecosystem == "npm")` ×6; memory entry→text decode ×2 (CandidateFiles::read, read_advisory); `<dir>/package.json` key ×2; reference.status strings (#1912); 3 refusal builders with one message; synthetic keys A73
-crates/socket-patch-core/src/hosted/governing_root.rs	3580	audit-core	-	-	
-crates/socket-patch-core/src/hosted/guidance.rs	685	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/discover.rs	589	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/limits.rs	460	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/mod.rs	1978	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/roots.rs	404	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/select.rs	765	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/stages.rs	434	audit-core	-	-	
-crates/socket-patch-core/src/hosted/memory/types.rs	549	audit-core	-	-	
-crates/socket-patch-core/src/hosted/mod.rs	27	audit-core	-	-	
-crates/socket-patch-core/src/hosted/npm_manifest.rs	181	audit-core	-	-	
-crates/socket-patch-core/src/hosted/render.rs	81	audit-core	-	-	
-crates/socket-patch-core/src/hosted/sbt_reads.rs	242	audit-core	-	-	
-crates/socket-patch-core/src/hosted/takeover.rs	113	audit-core	-	-	
-crates/socket-patch-core/src/hosted/vlt.rs	219	audit-core	-	-	
+crates/socket-patch-core/src/hosted/engine.rs	7041	audit-core	cbbbdb9 2026-11-02	-	7 Disk|Snapshot view dispatches (A75); 3 near-copy SkippedPatch builders (wheel/npm_manifest/npm_tarball); host-naming block x2 (pnpm_trust, npm_allow_remote); inline refuse_git_branch_locks, reusable_prior(+its test), pipenv_lock_targets clone; is_gradle_file vs is_gradle_owned_file drifted; RewriteOptions literal x9 in tests -> helper; pnpm_trust 280 lines, 4-tuple out
+crates/socket-patch-core/src/hosted/governing_root.rs	3580	audit-core	cbbbdb9 2026-11-02	-	npm workspace model belongs outside hosted (A74 #1974); nearer_root vs vlt_lock_root deeper-wins x2; rel components->Vec<String> x3 (L644,L739,L997); /-split normalize x2 (L842,L1142); canonicalize-or-self x5 beside canonical_or_absolute; unquote_scalar (A44); workspace_patterns (A43); read_head 4K sniff (A69)
+crates/socket-patch-core/src/hosted/guidance.rs	685	audit-core	cbbbdb9 2026-11-02	-	pub use formats::pnpm::{..} as pnpm_* rename shim: import directly; Create scaffold literal L382 duplicates TRUST_SCAFFOLD_LINES; 'Do NOT follow pnpm's advice to rebuild...' sentence x4 -> const; 4 more pnpm_trust_*_detail fns live in engine.rs, move here; value.trim_matches quote strip (A44); untested: Unsupported/Scaffold plans, npm_replace_registry_host_detail
+crates/socket-patch-core/src/hosted/memory/discover.rs	589	audit-core	cbbbdb9 2026-11-02	-	delete join_bounded+its test: use utils::concurrent::ordered_concurrent (same order/bound/cancel); 5 fetch_* fns repeat ordered->futures->join->zip, one helper; module doc says roots select here (stale: select_with_policy is in mod.rs); test selection_filters_paid... tests rollout::stage::offers_from_results, move to stage.rs
+crates/socket-patch-core/src/hosted/memory/limits.rs	460	audit-core	cbbbdb9 2026-11-02	-	mostly option resolution + SessionBuilder: rename session.rs; limit checks/messages duplicated in mod.rs validate_input; test classifies_finished_files asserts only unterminated_file (name claims more), duplicates setup of finished_input_keeps_every_kind: merge
+crates/socket-patch-core/src/hosted/memory/mod.rs	1978	audit-core	cbbbdb9 2026-11-02	-	engine() 735 lines (L612-1347): split per phase; RootState 14-field accumulator; root_markers+admits_root(Root{..}) x3; ProjectResult literal x3; stages::rewrite+RewriteRefused handling x2 (L1138,L1225); ecosystem filter x4; refuse_governed_pnpm_members re-derives governing_root::pnpm_settings_elsewhere (T24); tier filter T15
+crates/socket-patch-core/src/hosted/memory/roots.rs	404	audit-core	cbbbdb9 2026-11-02	-	nearest-ancestor pnpm-workspace walk x3 (here L216, mod.rs L380, select.rs L469); allowed() x4 with mod.rs; rush internal dirs hard-coded beside RUSH_* consts; clean otherwise
+crates/socket-patch-core/src/hosted/memory/select.rs	765	audit-core	cbbbdb9 2026-11-02	-	safe_repo_path never normalizes (returns input clone): make it -> bool, mod.rs compares it to itself; per-root ancestor loop L419 hand-writes strict_ancestors; UNSUPPORTED marker pick L481-505 copies mod.rs unrooted_unsupported_warnings filters; selection_policy_fs vs mod.rs memory_policy_fs; candidate_files hand list can drift from classify; test asserts BTreeSet output sorted (tautology)
+crates/socket-patch-core/src/hosted/memory/stages.rs	434	audit-core	cbbbdb9 2026-11-02	-	3 near-identical fetch-result loops (wheels/npm_manifests/npm_classic) -> one; npm manifests stored in python_metadata map (misnamed); vendored_entries copies vendor::state parse_state_raw legacy {mode} rule (x3 total), call it; cargo_vendored_wiring copies vendor::cargo::socket_wiring_present (legacy config pick A01)
+crates/socket-patch-core/src/hosted/memory/types.rs	549	audit-core	cbbbdb9 2026-11-02	-	ECOSYSTEMS duplicates crawlers::Ecosystem cli names; EngineError::Internal never constructed; deleted_files always empty (contract field: decide or drop); PresentKind::parse returns MarkKind: move to MarkKind
+crates/socket-patch-core/src/hosted/mod.rs	27	audit-core	cbbbdb9 2026-11-02	-	clean
+crates/socket-patch-core/src/hosted/npm_manifest.rs	181	audit-core	cbbbdb9 2026-11-02	-	fetch_hosted_* are thin disk twins of memory/discover closures (same messages; T24); otherwise clean
+crates/socket-patch-core/src/hosted/render.rs	81	audit-core	cbbbdb9 2026-11-02	-	skipped_json single caller-ish; rewrite_warnings_json hand-builds json! for a Serialize type; clean otherwise
+crates/socket-patch-core/src/hosted/sbt_reads.rs	242	audit-core	cbbbdb9 2026-11-02	-	hosted_repo_dirs is a vex consumed-copy helper: move to vex; Disk|Snapshot dispatch (A75)
+crates/socket-patch-core/src/hosted/takeover.rs	113	audit-core	cbbbdb9 2026-11-02	-	inline any_takeover_ecosystem (1-line wrapper); gradle file-suffix test x4 with engine is_gradle_*; clean otherwise
+crates/socket-patch-core/src/hosted/vlt.rs	219	audit-core	cbbbdb9 2026-11-02	-	WITHHELD_REASON alias of ARTIFACT_UNVERIFIABLE: drop; install_state_present/bun_lockb_present hand view dispatch (A75); plan clones deps into Vec<DepOverride>; no unit tests in file
 crates/socket-patch-core/src/ledgers.rs	732	audit-core	-	-	
 crates/socket-patch-core/src/manifest/cleanup_blobs.rs	924	audit-core	-	-	
 crates/socket-patch-core/src/manifest/mod.rs	4	audit-core	-	-	

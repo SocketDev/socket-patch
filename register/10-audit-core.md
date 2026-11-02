@@ -1,5 +1,5 @@
 ### Core audit (A rows)
-_Last updated 2026-11-02T00:48Z · main @ cbbbdb9 · owner: audit-core_
+_Last updated 2026-11-02T06:48Z · main @ cbbbdb9 · owner: audit-core_
 
 | ID | P | Problem | Issues | Status |
 |---|---|---|---|---|
@@ -16,8 +16,8 @@ _Last updated 2026-11-02T00:48Z · main @ cbbbdb9 · owner: audit-core_
 | A11 | 3 | The tool `--version` probe is written twice: `utils/pipenv.rs` runs it in `temp_dir` with `PIPENV_DONT_LOAD_ENV`, while `vendor/pypi_hatch.rs:202` runs it in the project root. Suspected hardening drift. |  | to verify |
 | A12 | 3 | Prune-empty-dirs ×3 (inclusive/exclusive/sync), "remove, NotFound ok, sync parent" ×3, `group_commit::sync_dir` duplicates `fs.rs`. |  | to verify |
 | A13 | 3 | The yarn major is parsed from `packageManager` twice: `update/channel.rs:361` (no trim) and `vendor/mod.rs:274` (after `package_manager::pinned_version`). |  | to verify |
-| A14 | 2 | `pkg:` purls split by hand ~12×; `purl.rs` has 3 splitters that disagree on empty parts; composer purl ×4. Parsing half of #748. | #748 | filed #748; copies listed in a comment |
-| A15 | 3 | Uuid shape is checked 4 ways (`target::is_uuid_shaped`, `redact`'s private twin, `path_safety::is_canonical_uuid`, `Uuid::parse_str` in `python_script` L99, which also accepts braced/urn/simple forms). | #705, #1845 | filed #705; #1845 closed as its duplicate |
+| A14 | 2 | `pkg:` purls split by hand ~12×; `purl.rs` has 3 splitters that disagree on empty parts; composer purl ×4. Parsing half of #748. | #748 | filed #748; copies in a comment |
+| A15 | 3 | Uuid shape is checked 4 ways (`target`, `redact`, `path_safety`, `python_script`'s `Uuid::parse_str`, which accepts braced/urn/simple forms). | #705, #1845 | filed #705; #1845 closed as dup |
 | A16 | 3 | Committed JSON ledgers written 3 ways (`socket_dir::write_json_ledger`, `write_manifest` no newline, two state markers). Changes manifest bytes. |  | to verify |
 | A17 | 3 | pnpm `packages:` membership refuses `{}[]` globs the shared matcher reads; hosted keeps a second reader. | #1846 | in PR #1863 |
 | A18 | 3 | "poetry.lock written before 1.4" ×2 while `poetry_lock::lock_writer_version` is dead. | #1847 | in PR #1865 |
@@ -37,16 +37,16 @@ _Last updated 2026-11-02T00:48Z · main @ cbbbdb9 · owner: audit-core_
 | A32 | 3 | Env-keyed subprocess memo ×3 (composer `EnvKeyedMemo`, python `KeyedMemo`, ruby `GemEnvMemo`) with byte-identical keys; python caches answers computed under a changed env. | #1888 | in PR #1895 |
 | A33 | 3 | "Is this a Coursier root" ×2 (`maven_crawler::coursier_spelled` vs `JvmCacheLayout::classify`). Unexecuted. |  | to verify |
 | A34 | 3 | Go coordinate gate ×4 (`go_crawler`, `golang_local`, `purl::golang_purl`, `vendor/path.rs`; identical today) and Go module-cache layout (`encode_module_path`, `cache/download` paths, `get_gomodcache`) in the crawler but used by vendor and redirect. Extends E37, A03. | #748 | to verify |
-| A35 | 3 | JVM cache plumbing split: `JvmEnv`/`M2Gate` in `maven_crawler`; gradle roots ×2, hash-dir listing ×3, wrapper init.d ×2 (`home::init_scripts_for` vs `gradle_cache::init_scripts_for_build`), `-D` parsing ×2, Maven2 root climb ×2; `formats::sbt::{Ga,JvmResolution,gate}` serve scala-cli too (target `formats::jvm`). |  | to verify |
+| A35 | 3 | JVM cache plumbing split: `JvmEnv`/`M2Gate` in `maven_crawler`; gradle roots ×2, hash-dir listing ×3, init.d ×2, `-D` parsing ×2, Maven2 root climb ×2; `formats::sbt` types serve scala-cli too (target `formats::jvm`). |  | to verify |
 | A36 | 3 | platformdirs-style user dirs ×8 (coursier, deno, poetry, hatch, pdm, uv, pipx, pipenv), absolute-XDG filter ×6; drifted on Windows and macOS `XDG_*`. Extends A10. |  | to verify |
 | A37 | 3 | `EnvGuard` test helper ×11 plus `with_env`/`with_home_env`. | #1889 | in PR #1891 |
 | A38 | 3 | All 8 crawlers are stateless unit structs with `new()` + `Default`; free functions would do. |  | to verify |
-| A39 | 3 | Hatch legacy `<name>-<id>` env layout is checked only for the first project id, and macOS lists the casefolded id first, so Hatch 1.0–1.2 envs under raw ids are missed ([hatch_env.rs L128-L178](https://github.com/SocketDev/socket-patch/blob/5ca5623863eee274851df4a941a86ba36f284dc3/crates/socket-patch-core/src/crawlers/hatch_env.rs#L128-L178)). Unexecuted. |  | to verify |
+| A39 | 3 | Hatch legacy `<name>-<id>` env layout is checked only for the first project id (macOS lists the casefolded one first), so Hatch 1.0–1.2 envs under raw ids are missed (`hatch_env.rs` L128-L178). Unexecuted. |  | to verify |
 | A40 | 3 | The effective-POM walk ×2 (`maven_scope::Walk`, `maven_reactor`); drifted: scope matches a local parent on artifactId only and has no BOM-import seen-set. `maven_scope` imports `vendor::jvm`. Extends E83, A30. |  | to verify |
 | A41 | 2 | `npm_crawler` classifies `node_modules` store children 3× (resolver, scan, peer finder), drifted on nested stores. | #1899 | filed #1899 |
 | A42 | 3 | Yarn-classic `.yarnrc` tokenized ×2 (npm_crawler, redirect/yarnrc), drifted on quotes. | #1901 | in PR #1915 |
-| A43 | 3 | package.json `workspaces` is read 5× (`governing_root::workspace_patterns`, `npm_crawler` Bun walk, `update::channel`, `vendor/mod.rs`, `user_patches`); they disagree on non-string items, `null` and `!` patterns. | #1900 | filed #1900 |
-| A44 | 3 | `.modules.yaml` parsed 3× (npm_crawler, `formats/pnpm/version.rs`, upstream npm; first vs last key, executed) + YAML scalar unquote ×4. | #1918 | filed #1918 |
+| A43 | 3 | package.json `workspaces` is read 5× (`governing_root::workspace_patterns`, `npm_crawler` Bun walk, `update::channel`, `vendor/mod.rs`, `user_patches`); they disagree on non-string items, `null` and `!` patterns. | #1900 | in PR #1971 |
+| A44 | 3 | `.modules.yaml` parsed 3× (npm_crawler, `formats/pnpm/version.rs`, upstream npm; first vs last key, executed) + YAML scalar unquote ×4. | #1918 | in PR #1973 |
 | A45 | 1 | Default `--cwd .` hides a parent `.yarnrc`/yarn store from the npm crawler (executed): `crawler_options()` never absolutizes `cwd`. | #1902 | in PR #1906 |
 | A46 | 3 | NuGet project-tree walk ×2 (`nuget_crawler::restore_walk`, `vendor::nuget_config::project_files`/`governed_locks_in`) and project-file test ×2 (case-sensitive crawler copy vs `formats::nuget::lock::is_project_file`); drifted on case and non-UTF-8 names. | #1917 | filed #1917 |
 | A47 | 2 | "Declares `[tool.poetry]`" ×3 (`declares_tool_poetry` TOML parse, `claimed_by_non_uv_manager` substring, `toml_edit_ext::has_table`). Executed: a lockless uv project with `[tool.poetry-dynamic-versioning]` loses its `UV_PROJECT_ENVIRONMENT` site-packages. | #1916 | filed #1916 |
@@ -62,8 +62,8 @@ _Last updated 2026-11-02T00:48Z · main @ cbbbdb9 · owner: audit-core_
 | A57 | 3 | ~1.26K lines of Bundler settings in `ruby_crawler`, imported by `formats/gem`; `.bundle/config` key reader ×2 drifted; manifest-name list ×2. Extends E20. | #1935 | filed #1935 |
 | A58 | 3 | Gemfile.lock read beside its model: `BUNDLED WITH` ×2, CHECKSUMS ×5, FIRST vs LAST `DEPENDENCIES` (upstream vs model). Extends E19. |  | to verify |
 | A59 | 3 | Ruby string literal ×4 (`gemspec::literal`, `manifest::plain_literal`, `vex/product`, `vendor/gem`) + 6 quote loops, drifted on `%q`, escapes, `#{`. Target `formats/gem/ruby.rs`. |  | to verify |
-| A60 | 3 | sbt evidence path table ×2 (`sbt_evidence` PATTERNS, `formats::sbt::evidence::classify_path`); vex `evidence_blocker` re-implements `sbt::gate::check_new` and loses `read_error`; scala_evidence drops its reason too. |  | to verify |
-| A61 | 3 | Streaming file sha256 ×2 (`sbt_evidence` refuses symlinks, 256 MiB; `vendor/verify::file_sha256_hex` follows, 512 MiB). Target `utils::digest`. |  | to verify |
+| A60 | 3 | sbt evidence path table ×2 (`sbt_evidence`, `formats::sbt::evidence`); vex `evidence_blocker` re-implements `sbt::gate::check_new` and loses `read_error`; scala_evidence too. |  | to verify |
+| A61 | 3 | Streaming file sha256 ×2 (`sbt_evidence`: no symlinks, 256 MiB; `vendor/verify`: follows, 512 MiB). Target `utils::digest`. |  | to verify |
 | A62 | 3 | JSON text scanners ×5 (composer hosted/source, vlt, bun, `formats::pipenv`; drifted on escapes/removal); BOM-tolerant JSON parse ×8; bun.lock line split ×3. Target `formats/json.rs`. |  | to verify |
 | A63 | 3 | `gem env` probe runs in the project cwd under `--global` (npm/composer use `GlobalProbeRunner`) and bypasses `CommandRunner`. Unexecuted. |  | to verify |
 | A64 | 2 | `PnpmLock::parse` inventories a pnpm 11 env-lockfile document; `InstalledPackages` and upstream evidence drop it (executed). | #1949 | in PR #1960 |
@@ -74,8 +74,10 @@ _Last updated 2026-11-02T00:48Z · main @ cbbbdb9 · owner: audit-core_
 | A69 | 3 | Yarn lock grammar decided on head-only (4 KiB: `update/channel`, `governing_root`) or substring reads (`vendor/mod.rs` L198/L231) beside `formats::yarn::grammar`. Unexecuted. |  | to verify |
 | A70 | 3 | sbt preflight `DepLiteral::declares` (exact `%` name) vs generated Scala `@ID@Verify` (`startsWith(name+"_")`) disagree. Unexecuted. |  | to verify |
 | A71 | 3 | pnpm `lockfileVersion` head sniff ×5 (two scan windows, three trims) and remedy ladder ×2 in `formats/pnpm`; lock filename consts repeated (`PACKAGES_LOCK` ×3, `YARN_LOCK` ×4, pnpm names ×4). |  | to verify |
-| A72 | 2 | `gradle-wrapper.properties` read 3 ways (`graph::wrapper_version` first-prefix line, `vendor::jvm::wrapper_version` exact `distributionUrl=`, `gradle_cache::parse_properties`): hosted refuses a 6.7 wrapper written `distributionUrl = …` that vendored lets through (executed). | #1963 | filed #1963 |
-| A73 | 3 | Rewriter context rides 8 synthetic `<socket-patch:…>` keys in the `files` text map (go workspace JSON, NuGet tab-separated `lock`/`unresolved`/`error` lines, uv ancestor config, sbt resolution, gemspecs), each serialized by `hosted/engine.rs` and parsed back with `.ok()`. Target: a typed rewrite context. Unexecuted. |  | to verify |
+| A72 | 2 | `gradle-wrapper.properties` read 3 ways (`graph`, `vendor::jvm`, `gradle_cache`): hosted refuses a 6.7 wrapper written `distributionUrl = …` that vendored lets through (executed). | #1963 | filed #1963 |
+| A73 | 3 | Rewriter context rides 8 synthetic `<socket-patch:…>` keys in the `files` text map (go workspace, NuGet, uv, sbt, gemspecs), serialized by `hosted/engine.rs` and parsed back with `.ok()`. Target: a typed rewrite context. |  | to verify |
+| A74 | 3 | npm-family workspace model (`member_stray_lock`, `nested_npm_project`, package.json/vlt/Bun root walks; ~1.25K prod lines) lives in `hosted/governing_root` but vendor, vex, the crawler, redirect/yarnrc and CLI scan import it; #1928 adds more. Extends A08, A43. | #1974 | filed #1974 |
+| A75 | 3 | `ProjectView` bypassed: 21 hand `Disk \| Snapshot` arms (17 `disk_root().expect`; engine 7, vlt 2, utils, lock_inventory) re-read raw disk under their own rules (sync, follows links or not), skipping a Snapshot overlay; unreachable in the engine today (only Disk/Memory reach it). |  | to verify |
 
 #### Handed off
 _None._
