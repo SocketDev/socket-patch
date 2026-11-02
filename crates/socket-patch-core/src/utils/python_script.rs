@@ -62,6 +62,28 @@ fn dependency_name(specifier: &str) -> String {
     canonicalize_pypi_name(pep508_name(specifier))
 }
 
+/// The document's `[tool.uv]` table.
+fn tool_uv(doc: &DocumentMut) -> Option<&dyn TableLike> {
+    doc.get("tool")
+        .and_then(Item::as_table_like)
+        .and_then(|tool| tool.get("uv"))
+        .and_then(Item::as_table_like)
+}
+
+/// Whether the metadata declares `name` (canonical) directly: a PEP 723
+/// block's `dependencies` when `script`, else a pyproject dependency array
+/// or the legacy `[tool.uv] dev-dependencies` (uv records those under
+/// `requires-dev`, so an override for them is redundant).
+fn declares_directly(doc: &DocumentMut, script: bool, name: &str) -> bool {
+    if script {
+        return contains_dependency(doc.get("dependencies"), name);
+    }
+    pyproject_dependency_specs(doc)
+        .into_iter()
+        .any(|(_, spec)| dependency_name(spec) == name)
+        || tool_uv(doc).is_some_and(|uv| contains_dependency(uv.get("dev-dependencies"), name))
+}
+
 /// Whether `previous` is socket-patch's own earlier hosted source for this
 /// package that `current` may replace: a rotated grant token on the same
 /// artifact path, or (the shared PyPI recognizer) a superseding patch uuid
@@ -103,31 +125,18 @@ pub(crate) fn same_hosted_artifact(
 
 /// How a freshly created `[tool.uv.sources]` is laid out.
 ///
-/// A PEP 723 script block is reverted by DOCUMENT restore
-/// (`vendor::pypi_lock::restore_document`), which can only converge on the
-/// exact pre-vendor bytes after an out-of-order multi-package revert of
-/// DIRECT dependencies (one `sources.<name>` key each) when the tables we
-/// created vanish once empty. Only DOTTED keys do that after a parse round
-/// trip (dotted-ness is syntax; `implicit` is not), so the script block
-/// keeps `tool.uv.sources.x = { … }` right after `dependencies`, where
-/// placement was never a problem. TRANSITIVE pairs are different: they share
-/// one `override-dependencies` array, and `restore_value`'s array branch
-/// flags drift as soon as the entries stop lining up, so their revert stays
-/// order-dependent whatever the layout.
+/// A PEP 723 script block is reverted by document restore
+/// (`vendor::pypi_lock::restore_document`), which converges on the original
+/// bytes after an out-of-order multi-package revert only when the tables we
+/// created vanish once empty. Only dotted keys do that after a parse round
+/// trip (dotted-ness is syntax; `implicit` is not), so scripts use `Dotted`.
 ///
-/// A `pyproject.toml` is reverted by exact text replay of the recorded
-/// original, so it can use uv's own layout: header-less `[tool]` / `[tool.uv]`
-/// parents and a real `[tool.uv.sources]` table. Where that header lands is
-/// toml_edit's choice, not ours: a new table is rendered right after the
-/// last PRE-EXISTING table visited before it in depth-first key order —
-/// directly after an existing `[tool.uv]`, after `[tool.ruff]` when that is
-/// the only `[tool.*]` table (even when that puts it BEFORE `[project]`),
-/// and at the very end of the document — after a trailing `[build-system]` —
-/// when there is no `[tool]` block yet. (Dotted keys would instead render as
-/// `tool.uv.sources.x = …` in the ROOT body — i.e. ABOVE `[project]` —
-/// whenever the pyproject had no `[tool]` header yet; an older CLI wrote
-/// exactly that, and `rewrite_sources` keeps extending such a dotted table
-/// rather than adding a second, conflicting header.)
+/// A `pyproject.toml` is reverted by text replay of the recorded original,
+/// so it uses uv's own layout (`Tables`): header-less `[tool]` / `[tool.uv]`
+/// parents and a real `[tool.uv.sources]` table, placed by toml_edit after
+/// the last pre-existing table before it in key order (or at the end of the
+/// document). A dotted root table an older CLI wrote is extended in place
+/// rather than given a second, conflicting header.
 #[derive(Clone, Copy)]
 enum SourcesLayout {
     Dotted,
@@ -228,7 +237,20 @@ fn rewrite_sources(
                 ));
             }
         } else if hosted {
-            push_hosted_override(overrides, specifier);
+            // On its own line under the mark; removing the element (its
+            // decor goes with it) restores the array's original bytes.
+            const INDENT: &str = "    ";
+            let created = overrides.is_empty();
+            let mut value = Value::from(specifier);
+            value
+                .decor_mut()
+                .set_prefix(format!("\n{INDENT}{HOSTED_OVERRIDE_MARK}\n{INDENT}"));
+            value.decor_mut().set_suffix("");
+            overrides.push_formatted(value);
+            if created {
+                overrides.set_trailing_comma(true);
+                overrides.set_trailing("\n");
+            }
         } else {
             overrides.push(specifier);
         }
@@ -240,7 +262,7 @@ fn rewrite_sources(
 /// direct reference (`six @ https://…`, `six @ git+…`): that is the user's
 /// own source, the `[project]` spelling of a `[tool.uv.sources]` entry, and
 /// a source added beside it would silently replace it (hosted) or leave a
-/// lock uv rejects (vendored) (#767).
+/// lock uv rejects (vendored).
 fn refuse_direct_reference<'a>(
     file: &str,
     name: &str,
@@ -262,13 +284,13 @@ fn refuse_direct_reference<'a>(
 /// `override-dependencies` entry it adds. v5 hosted mode keeps no ledger,
 /// so this comment is the only evidence the upstream restore has that the
 /// entry is socket-patch's to remove: an entry without it, even one spelled
-/// exactly `<name>==<version>`, is the user's own pin and is kept (#411).
+/// exactly `<name>==<version>`, is the user's own pin and is kept.
 pub(crate) const HOSTED_OVERRIDE_MARK: &str =
     "# socket-patch hosted: pins a patched transitive dependency; rollback removes it";
 
 /// Whether an `override-dependencies` element carries
 /// [`HOSTED_OVERRIDE_MARK`] (the hosted rewrite added it).
-pub(crate) fn is_hosted_override(value: &Value) -> bool {
+fn is_hosted_override(value: &Value) -> bool {
     value
         .decor()
         .prefix()
@@ -294,36 +316,14 @@ pub(crate) struct HostedOverridePin {
 /// its `dependencies`). The rewrite adds an override only for a transitive
 /// dependency, so a marked entry for a direct one is not its own. Hosted
 /// mode keeps no ledger: these are the only overrides socket-patch may
-/// remove (#411), and the only ones a relock can leave behind as Socket's
-/// own wiring (#1445).
+/// remove, and the only ones a relock can leave behind as Socket's
+/// own wiring.
 pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<HostedOverridePin> {
-    let uv = doc
-        .get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|t| t.get("uv"))
-        .and_then(Item::as_table_like);
-    let Some(overrides) = uv
-        .and_then(|u| u.get("override-dependencies"))
+    let Some(overrides) = tool_uv(doc)
+        .and_then(|uv| uv.get("override-dependencies"))
         .and_then(Item::as_array)
     else {
         return Vec::new();
-    };
-    let strings = |item: Option<&Item>| -> Vec<String> {
-        item.and_then(Item::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .map(|spec| canonicalize_pypi_name(pep508_name(spec)))
-            .collect()
-    };
-    let direct: Vec<String> = if script {
-        strings(doc.get("dependencies"))
-    } else {
-        pyproject_dependency_specs(doc)
-            .iter()
-            .map(|(_, spec)| canonicalize_pypi_name(pep508_name(spec)))
-            .chain(strings(uv.and_then(|u| u.get("dev-dependencies"))))
-            .collect()
     };
     overrides
         .iter()
@@ -342,10 +342,12 @@ pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<Hoste
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '!' | '-' | '_'));
             let name = canonicalize_pypi_name(raw);
-            (exact && !raw.is_empty() && !direct.contains(&name)).then(|| HostedOverridePin {
-                index,
-                name,
-                version: version.to_string(),
+            (exact && !raw.is_empty() && !declares_directly(doc, script, &name)).then(|| {
+                HostedOverridePin {
+                    index,
+                    name,
+                    version: version.to_string(),
+                }
             })
         })
         .collect()
@@ -356,7 +358,7 @@ pub(crate) fn hosted_override_pins(doc: &DocumentMut, script: bool) -> Vec<Hoste
 /// override-dependencies` entry names it (the hosted rewrite's marked one or
 /// the user's own, which the rewrite reuses) and no dependency array
 /// declares it, so `[tool.uv.sources]` reaches it only through the
-/// override. uv before 0.5.5 ignores sources there (#1569). Unparseable
+/// override. uv before 0.5.5 ignores sources there. Unparseable
 /// metadata wires nothing.
 pub(crate) fn wires_through_override(metadata: &str, script: bool, name: &str) -> bool {
     let toml = if script {
@@ -371,24 +373,10 @@ pub(crate) fn wires_through_override(metadata: &str, script: bool, name: &str) -
         return false;
     };
     let name = canonicalize_pypi_name(name);
-    let uv = doc
-        .get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|tool| tool.get("uv"))
-        .and_then(Item::as_table_like);
-    if !contains_dependency(uv.and_then(|uv| uv.get("override-dependencies")), &name) {
-        return false;
-    }
-    // The same "direct" reading the rewrites use to decide on an override.
-    let direct = if script {
-        contains_dependency(doc.get("dependencies"), &name)
-    } else {
-        pyproject_dependency_specs(&doc)
-            .into_iter()
-            .any(|(_, spec)| dependency_name(spec) == name)
-            || uv.is_some_and(|uv| contains_dependency(uv.get("dev-dependencies"), &name))
-    };
-    !direct
+    contains_dependency(
+        tool_uv(&doc).and_then(|uv| uv.get("override-dependencies")),
+        &name,
+    ) && !declares_directly(&doc, script, &name)
 }
 
 /// The advisory for [`wires_through_override`] wiring, shared by hosted
@@ -419,26 +407,6 @@ pub(crate) fn uv_constraints_advisory(name: &str, wheel: &str) -> String {
     )
 }
 
-/// Append `specifier` to `overrides` on its own line, under
-/// [`HOSTED_OVERRIDE_MARK`]. An array the rewrite just created (empty) is
-/// laid out multi-line with a trailing comma; an existing array keeps its
-/// other elements as they were. Removing the element again (its decor goes
-/// with it) restores the array's original bytes.
-fn push_hosted_override(overrides: &mut Array, specifier: String) {
-    const INDENT: &str = "    ";
-    let created = overrides.is_empty();
-    let mut value = Value::from(specifier);
-    value
-        .decor_mut()
-        .set_prefix(format!("\n{INDENT}{HOSTED_OVERRIDE_MARK}\n{INDENT}"));
-    value.decor_mut().set_suffix("");
-    overrides.push_formatted(value);
-    if created {
-        overrides.set_trailing_comma(true);
-        overrides.set_trailing("\n");
-    }
-}
-
 fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
     item.and_then(Item::as_array).is_some_and(|dependencies| {
         dependencies
@@ -453,7 +421,7 @@ fn contains_dependency(item: Option<&Item>, name: &str) -> bool {
 pub const UV_TOML: &str = "uv.toml";
 
 /// A uv settings file above the scanned root that uv applies to a PEP 723
-/// script (#1501) or a project (#1545) there, found by
+/// script or a project there, found by
 /// [`find_ancestor_uv_config`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UvConfig {
@@ -548,7 +516,7 @@ const UV_PROJECT_ONLY_KEYS: &[&str] = &[
 ];
 
 /// Refuse to wire a project whose `pyproject` would shadow the uv settings
-/// it inherits from `ancestor` (#1545).
+/// it inherits from `ancestor`.
 ///
 /// uv reads a project's settings from the nearest directory at or above it
 /// that holds a `uv.toml` or a `pyproject.toml` with `[tool.uv]`, the same
@@ -680,7 +648,7 @@ fn project_settings<'a>(
 /// The governing project settings for a PEP 723 script in a root whose own
 /// `pyproject` and `uv_toml` may not govern it: when neither sets uv's
 /// settings, `ancestor` (the [`find_ancestor_uv_config`] above the root)
-/// does (#1501).
+/// does.
 fn script_project_settings<'a>(
     pyproject: Option<&'a str>,
     uv_toml: Option<&'a str>,
@@ -696,13 +664,12 @@ fn script_project_settings<'a>(
 }
 
 /// Refuse to wire a `[tool.uv.sources]` entry for `name` that uv would
-/// ignore (#564).
+/// ignore.
 ///
 /// Under `no-sources = true`, or a `no-sources-package` list naming the
 /// package, uv drops the source, so a wired entry fails `uv sync --locked`,
 /// and a plain `uv sync` relocks the package to the registry and installs
-/// the unpatched wheel. `script` is the PEP 723 script being wired (`None`
-/// for a project), and `pyproject` and `uv_toml` are the project's files,
+/// the unpatched wheel. `pyproject` and `uv_toml` are the project's files,
 /// when present. Each file's settings are uv's (checked against uv 0.11): a
 /// `uv.toml` replaces pyproject's `[tool.uv]` outright; a script's own
 /// `no-sources` wins over the project's, while the two `no-sources-package`
@@ -711,14 +678,13 @@ fn script_project_settings<'a>(
 /// the rewriters report a metadata file they cannot edit.
 pub fn refuse_uv_no_sources(
     name: &str,
-    script: Option<&str>,
     pyproject: Option<&str>,
     uv_toml: Option<&str>,
 ) -> Result<(), String> {
     refuse_package_setting(
         &NO_SOURCES,
         name,
-        script,
+        None,
         project_settings(pyproject, uv_toml),
     )
 }
@@ -726,7 +692,7 @@ pub fn refuse_uv_no_sources(
 /// [`refuse_uv_no_sources`] for a PEP 723 script in a root whose own
 /// `pyproject` and `uv_toml` may not govern it: when neither sets uv's
 /// settings, `ancestor` (the [`find_ancestor_uv_config`] above the root)
-/// does (#1501).
+/// does.
 pub fn refuse_uv_script_no_sources(
     name: &str,
     script: &str,
@@ -742,8 +708,7 @@ pub fn refuse_uv_script_no_sources(
     )
 }
 
-/// Refuse to wire a patched wheel for `name` that uv may not install
-/// (#1603).
+/// Refuse to wire a patched wheel for `name` that uv may not install.
 ///
 /// Under `no-binary = true`, or a `no-binary-package` list naming the
 /// package, uv installs the package only from an sdist, and every Socket
@@ -754,16 +719,10 @@ pub fn refuse_uv_script_no_sources(
 /// two lists add up, and `no-binary = false` disables the list.
 pub fn refuse_uv_no_binary(
     name: &str,
-    script: Option<&str>,
     pyproject: Option<&str>,
     uv_toml: Option<&str>,
 ) -> Result<(), String> {
-    refuse_package_setting(
-        &NO_BINARY,
-        name,
-        script,
-        project_settings(pyproject, uv_toml),
-    )
+    refuse_package_setting(&NO_BINARY, name, None, project_settings(pyproject, uv_toml))
 }
 
 /// [`refuse_uv_no_binary`] for a PEP 723 script, with the project settings
@@ -869,11 +828,7 @@ pub fn rewrite_project_metadata(
     {
         return Err("pyproject.toml has no project table".to_string());
     }
-    let tool_uv = document
-        .get("tool")
-        .and_then(Item::as_table_like)
-        .and_then(|tool| tool.get("uv"))
-        .and_then(Item::as_table_like);
+    let tool_uv = tool_uv(&document);
     let legacy_dev = tool_uv
         .and_then(|uv| uv.get("dev-dependencies"))
         .and_then(Item::as_array)
@@ -888,16 +843,7 @@ pub fn rewrite_project_metadata(
             .map(|(_, spec)| spec)
             .chain(legacy_dev),
     )?;
-    let direct = pyproject_dependency_specs(&document)
-        .into_iter()
-        .any(|(_, spec)| dependency_name(spec) == name)
-        // The legacy `[tool.uv] dev-dependencies` array (still honoured by uv
-        // with a deprecation warning) is a direct declaration too: uv records
-        // it under `[package.metadata.requires-dev]`, so an override here
-        // would be redundant — and ignored by uv < 0.5.6, which does not
-        // apply `[tool.uv.sources]` to `override-dependencies`.
-        || tool_uv
-            .is_some_and(|uv| contains_dependency(uv.get("dev-dependencies"), &name));
+    let direct = declares_directly(&document, false, &name);
     if tool_uv.is_some_and(|uv| uv.contains_key("workspace")) {
         return Err(
             "hosted sources for uv workspaces require a package-scoped source mapping".to_string(),
@@ -936,7 +882,7 @@ pub fn rewrite_script_metadata(
             .flatten()
             .filter_map(Value::as_str),
     )?;
-    let direct = contains_dependency(document.get("dependencies"), &name);
+    let direct = declares_directly(&document, true, &name);
     rewrite_sources(
         &mut document,
         &name,
@@ -953,7 +899,7 @@ pub fn rewrite_script_metadata(
 mod tests {
     use super::*;
 
-    /// #815: the re-commented block takes the script's majority line
+    /// The re-commented block takes the script's majority line
     /// ending; one stray CRLF line no longer turns it CRLF.
     #[test]
     fn replaced_metadata_takes_the_majority_line_ending() {
@@ -966,7 +912,7 @@ mod tests {
         assert!(out.contains("# dependencies = [\"a\"]\r\n# ///"), "{out:?}");
     }
 
-    /// #767: a PEP 508 direct reference to the patched package, wherever
+    /// A PEP 508 direct reference to the patched package, wherever
     /// the project or script declares it, is the user's own source: the
     /// rewrite refuses instead of adding a `[tool.uv.sources]` entry beside it.
     #[test]
@@ -1077,7 +1023,7 @@ mod tests {
     const OWN_A: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/11111111-1111-4111-8111-111111111111/aaaaaaaa-0000-4000-8000-000000000001/six-1.16.0-py2.py3-none-any.whl";
     const OWN_B: &str = "https://patch.socket.dev/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/aaaaaaaa-0000-4000-8000-000000000004/six-1.16.0-py2.py3-none-any.whl";
 
-    /// #742: a superseding patch (a new patch uuid for the same package and
+    /// A superseding patch (a new patch uuid for the same package and
     /// version) re-pins socket-patch's OWN earlier hosted source in both a
     /// uv project and a PEP 723 script, instead of refusing it as a
     /// user-authored source.
@@ -1588,7 +1534,7 @@ mod ancestor_config_tests {
     const SCRIPT: &str = "# /// script\n# dependencies = [\"six==1.16.0\"]\n# ///\n";
     const PYPROJECT: &str = "[project]\nname = \"root\"\nversion = \"0\"\n";
 
-    /// #1501: uv takes a script's settings from the nearest directory above
+    /// uv takes a script's settings from the nearest directory above
     /// it that holds a uv.toml, or a pyproject.toml with `[tool.uv]`; uv.toml
     /// first in each directory, and a pyproject without `[tool.uv]` skipped.
     #[test]
@@ -1693,7 +1639,7 @@ mod ancestor_config_tests {
         );
     }
 
-    /// #1545: a project whose root sets no uv settings takes a parent's
+    /// A project whose root sets no uv settings takes a parent's
     /// `uv.toml` / `[tool.uv]`, and the `[tool.uv]` table a patch adds
     /// would make uv read the project's pyproject instead and drop them.
     #[test]
@@ -1763,6 +1709,44 @@ mod ancestor_config_tests {
                 Some(&ancestor("../uv.toml", "resolution =\n"))
             ),
             Ok(())
+        );
+    }
+
+    /// `no-binary` follows uv's combine rules: a `uv.toml` replaces
+    /// pyproject's `[tool.uv]`, a script's own bool wins over the project's
+    /// list, and the lists name packages by their canonical name.
+    #[test]
+    fn no_binary_refuses_by_uvs_combine_rules() {
+        let listed = format!("{PYPROJECT}[tool.uv]\nno-binary-package = [\"Six\"]\n");
+        let error = refuse_uv_no_binary("six", Some(&listed), None).unwrap_err();
+        assert!(
+            error.starts_with("pyproject.toml [tool.uv] sets no-binary-package naming six,"),
+            "{error}"
+        );
+        let other = listed.replace("Six", "other");
+        assert_eq!(refuse_uv_no_binary("six", Some(&other), None), Ok(()));
+        // uv.toml replaces [tool.uv] outright, in both directions.
+        assert_eq!(refuse_uv_no_binary("six", Some(&listed), Some("")), Ok(()));
+        let error =
+            refuse_uv_no_binary("six", Some(&other), Some("no-binary = true\n")).unwrap_err();
+        assert!(
+            error.starts_with("uv.toml sets no-binary = true,"),
+            "{error}"
+        );
+        // A script's own `no-binary = false` disables the project's list...
+        let script_false =
+            SCRIPT.replace("# ///\n", "#\n# [tool.uv]\n# no-binary = false\n# ///\n");
+        assert_eq!(
+            refuse_uv_script_no_binary("six", &script_false, Some(&listed), None, None),
+            Ok(())
+        );
+        // ...and its `no-binary = true` refuses under a silent project.
+        let script_true = script_false.replace("false", "true");
+        let error = refuse_uv_script_no_binary("six", &script_true, Some(PYPROJECT), None, None)
+            .unwrap_err();
+        assert!(
+            error.starts_with("the script's [tool.uv] sets no-binary = true,"),
+            "{error}"
         );
     }
 }

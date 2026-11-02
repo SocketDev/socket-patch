@@ -6492,14 +6492,12 @@ fn plan_python_metadata_with(
     } else {
         crate::utils::python_script::refuse_uv_no_sources(
             &dep.name,
-            None,
             Some(&original),
             project_file(crate::utils::python_script::UV_TOML),
         )
         .and_then(|()| {
             crate::utils::python_script::refuse_uv_no_binary(
                 &dep.name,
-                None,
                 Some(&original),
                 project_file(crate::utils::python_script::UV_TOML),
             )
