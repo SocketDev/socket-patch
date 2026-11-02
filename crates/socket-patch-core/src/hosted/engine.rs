@@ -1345,8 +1345,8 @@ pub fn wheel_targets<'a>(
     candidates: &'a [Candidate],
     files: &BTreeMap<String, String>,
 ) -> Vec<(&'a DepOverride, &'a str)> {
-    use crate::utils::python_lock::{ArtifactSource, PythonLockProbe};
-    let mut probes: Option<Vec<PythonLockProbe>> = None;
+    use crate::utils::python_lock::{ArtifactSource, PythonLockSession};
+    let mut probes: Option<Vec<(&str, PythonLockSession)>> = None;
     let mut out = Vec::new();
     for dep in candidates
         .iter()
@@ -1371,15 +1371,19 @@ pub fn wheel_targets<'a>(
                     .filter(|(path, _)| {
                         *path == "uv.lock" || crate::utils::python_lock::is_script_lock_name(path)
                     })
-                    .map(|(_, text)| PythonLockProbe::new(text))
+                    .map(|(_, text)| (text.as_str(), PythonLockSession::new(text)))
                     .collect()
             })
             .iter()
-            .any(|probe| {
-                probe.rewrites(
-                    &dep.name,
-                    &dep.version,
-                    ArtifactSource::Url(&dep.artifact_url),
+            .any(|(text, session)| {
+                matches!(
+                    session.plan(
+                        text,
+                        &dep.name,
+                        &dep.version,
+                        ArtifactSource::Url(&dep.artifact_url),
+                    ),
+                    Ok(Some(_))
                 )
             });
         if native_target {
