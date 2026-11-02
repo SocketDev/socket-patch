@@ -832,27 +832,7 @@ mod tests {
 
     const PURL: &str = "pkg:maven/com.example/lib@1.0";
 
-    /// Save/restore guard for env-var tests; every user is
-    /// `#[serial_test::serial]`.
-    struct EnvGuard {
-        key: &'static str,
-        prev: Option<String>,
-    }
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, prev }
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var(self.key, v),
-                None => std::env::remove_var(self.key),
-            }
-        }
-    }
+    use crate::test_env::EnvGuard;
 
     fn record() -> HashMap<String, PatchFileInfo> {
         HashMap::from([(
@@ -1146,7 +1126,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(original.clone()))
             .mount(&server)
             .await;
-        let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", &server.uri());
+        let _registry = EnvGuard::set("SOCKET_MAVEN_REGISTRY", server.uri());
         restore.offline = false;
         let out = rollback_jar_swap(&restore, &[hash_dir.clone()]).await;
         assert!(out[0].success, "{:?}", out[0].error);
