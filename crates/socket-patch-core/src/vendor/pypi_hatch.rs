@@ -149,7 +149,7 @@ async fn require_no_raw_workspace(
     files: &BTreeMap<String, String>,
     name: &str,
 ) -> Result<(), Failure> {
-    let Some(pyproject) = files.get(hatch::HATCH_FILES[0]).cloned() else {
+    let Some(pyproject) = files.get(hatch::PYPROJECT).cloned() else {
         return Ok(());
     };
     let vendored = pyproject.contains("{root:uri}/.socket/vendor/");
@@ -418,7 +418,7 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
 /// recorded before them.
 fn permission_held_by_live_references(files: &BTreeMap<String, String>) -> bool {
     files
-        .get(hatch::HATCH_FILES[0])
+        .get(hatch::PYPROJECT)
         .and_then(|text| crate::formats::text::strip_bom(text).parse().ok())
         .is_some_and(|document: toml_edit::DocumentMut| {
             crate::vendor::common::pyproject_dependency_specs(&document)
@@ -437,7 +437,7 @@ fn permission_held_by_live_references(files: &BTreeMap<String, String>) -> bool 
 fn drop_owned_permission(text: &str, file: &str) -> Option<String> {
     let (bom, body) = crate::formats::text::split_bom(text);
     let mut document = body.parse::<toml_edit::DocumentMut>().ok()?;
-    let keys = hatch::permission_keys(file == hatch::HATCH_FILES[1]);
+    let keys = hatch::permission_keys(file == hatch::HATCH_TOML);
     hatch::drop_direct_reference_permission(&mut document, keys)
         .then(|| crate::utils::python_lock::preserve_line_endings(text, format!("{bom}{document}")))
 }

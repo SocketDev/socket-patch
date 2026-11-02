@@ -28,6 +28,24 @@ fn options_at(root: &Path) -> CrawlerOptions {
     }
 }
 
+/// Moves into `dir` and restores the working directory however the test
+/// ends. Tests using it are `#[serial]`: the cwd is process-wide.
+struct CwdGuard(PathBuf);
+
+impl CwdGuard {
+    fn enter(dir: &Path) -> Self {
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir).unwrap();
+        Self(prev)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        let _ = std::env::set_current_dir(&self.0);
+    }
+}
+
 /// Stage a package inside node_modules. `name` may include a `@scope/`
 /// prefix.
 async fn stage_npm_pkg(node_modules: &Path, name: &str, version: &str) {
@@ -1014,6 +1032,99 @@ async fn crawl_all_finds_declared_members_with_skip_dir_names() {
         expected.sort();
         assert_eq!(got, expected, "workspaces {workspaces}");
     }
+}
+
+/// #1827: a declared `workspaces` member inside a hidden directory (a
+/// JavaScript GitHub Action kept at `.github/actions/<name>`, an explicit
+/// `.config/tool`) is crawled too, though the walk prunes hidden dirs:
+/// npm, yarn and Bun install its unhoistable deps into
+/// `<member>/node_modules` from the root lock.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_finds_declared_members_in_hidden_dirs() {
+    for (workspaces, members) in [
+        (r#"[".github/actions/*"]"#, &[".github/actions/x"][..]),
+        (
+            r#"["packages/*",".github/actions/*"]"#,
+            &["packages/y", ".github/actions/x"][..],
+        ),
+        (r#"[".config/tool"]"#, &[".config/tool"][..]),
+        (r#"{"packages":[".github/**"]}"#, &[".github/actions/x"][..]),
+        (
+            r#"["{.github/actions,tools}/*"]"#,
+            &[".github/actions/x"][..],
+        ),
+        (
+            r#"["{.github,packages}/**"]"#,
+            &[".github/actions/x", "packages/build"][..],
+        ),
+        // A dot the glob part spells, below a skip-named dir, and a
+        // skip-named member below a hidden one.
+        (
+            r#"["build/.*",".tools/*"]"#,
+            &["build/.x", ".tools/dist"][..],
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("package.json"),
+            format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#),
+        )
+        .await
+        .unwrap();
+        stage_npm_pkg(&root.join("node_modules"), "ms", "2.1.3").await;
+        let mut expected = vec![root.join("node_modules").join("ms")];
+        for member in members {
+            expected.push(stage_member(root, member).await);
+        }
+
+        let result = NpmCrawler.crawl_all(&options_at(root)).await;
+        let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+        got.sort();
+        expected.sort();
+        assert_eq!(got, expected, "workspaces {workspaces}");
+    }
+}
+
+/// #1827 control: a hidden dir no `workspaces` pattern declares, one
+/// declared but without a `package.json`, and one a wildcard reaches but
+/// no pattern spells (build output such as Nuxt's `.output/server`)
+/// stay pruned.
+#[tokio::test]
+#[serial_test::parallel]
+async fn crawl_all_still_skips_undeclared_hidden_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    tokio::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*",".github/actions/*","apps/**","{.github,tools}/**"]}"#,
+    )
+    .await
+    .unwrap();
+    // Reached only through a wildcard.
+    stage_member(root, "packages/.hidden").await;
+    stage_member(root, "apps/site/.output/server").await;
+    // A brace alternative that spells a dot reaches only the dir it
+    // names, not every hidden dir.
+    stage_member(root, ".git/build").await;
+    stage_member(root, "tools/.cache/build").await;
+    // Undeclared: `.cache/tool` at the root and `packages/x/.out` below a
+    // member, each a would-be member with its own `package.json`.
+    stage_member(root, ".cache/tool").await;
+    let member = stage_member(root, "packages/x").await;
+    stage_member(root, "packages/x/.out").await;
+    // Declared by `.github/actions/*` but no package.json.
+    stage_npm_pkg(
+        &root.join(".github/actions/bare/node_modules"),
+        "not-a-member",
+        "1.0",
+    )
+    .await;
+
+    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
+    assert_eq!(got, vec![member]);
 }
 
 /// #1627: the members of a workspace nested below the scan root (found by
@@ -5006,15 +5117,7 @@ async fn relative_deno_npm_dir_prefix_expands() {
     let registry = npm.join("registry.npmjs.org");
     stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
 
-    /// Restores the working directory however the test ends.
-    struct CwdGuard(PathBuf);
-    impl Drop for CwdGuard {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.0);
-        }
-    }
-    let _guard = CwdGuard(std::env::current_dir().unwrap());
-    std::env::set_current_dir(&npm).unwrap();
+    let _guard = CwdGuard::enter(&npm);
     let opts = CrawlerOptions {
         cwd: npm.clone(),
         global: false,
@@ -5023,4 +5126,134 @@ async fn relative_deno_npm_dir_prefix_expands() {
     let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
     assert_eq!(roots.len(), 1, "{roots:?}");
     assert!(roots[0].ends_with("registry.npmjs.org"), "{roots:?}");
+}
+
+fn sorted_purls(pkgs: &[socket_patch_core::crawlers::types::CrawledPackage]) -> Vec<String> {
+    let mut purls: Vec<String> = pkgs.iter().map(|p| p.purl.clone()).collect();
+    purls.sort();
+    purls.dedup();
+    purls
+}
+
+/// REGRESSION (#1902): under the default `--cwd .` the start path is the
+/// relative `.`, whose lexical ancestors are only `.` and `""`, so a
+/// parent `.yarnrc`'s `--modules-folder` was never read and the packages
+/// installed there went unreported. Scanning with `.` must find what
+/// scanning with the absolute path finds, spelled relative to `.`.
+#[tokio::test]
+#[serial_test::serial]
+async fn parent_yarnrc_modules_folder_is_read_from_a_relative_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = std::fs::canonicalize(tmp.path()).unwrap();
+    let project = repo.join("project");
+    stage_npm_pkg(&project.join("deps"), "foo", "1.0.0").await;
+    std::fs::write(repo.join(".yarnrc"), "--modules-folder project/deps\n").unwrap();
+    let want = vec!["pkg:npm/foo@1.0.0".to_string()];
+
+    // Control: the absolute spelling has always worked.
+    let crawler = NpmCrawler::new();
+    assert_eq!(
+        sorted_purls(&crawler.crawl_all(&options_at(&project)).await),
+        want
+    );
+
+    let _cwd = CwdGuard::enter(&project);
+    let relative = options_at(Path::new("."));
+    let roots = crawler.get_node_modules_paths(&relative).await.unwrap();
+    assert_eq!(roots, vec![Path::new(".").join("deps")]);
+    let pkgs = crawler.crawl_all(&relative).await;
+    assert_eq!(sorted_purls(&pkgs), want);
+    assert_eq!(pkgs[0].path, Path::new(".").join("deps").join("foo"));
+}
+
+/// REGRESSION (#1902): pnpm's `modulesDir` set in the workspace root's
+/// `pnpm-workspace.yaml` applies to every member, but scanned from a
+/// member under the default `--cwd .` the root file was never read.
+#[tokio::test]
+#[serial_test::serial]
+async fn parent_pnpm_modules_dir_is_read_from_a_relative_member_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::write(
+        root.join("pnpm-workspace.yaml"),
+        "packages:\n  - packages/*\nmodulesDir: deps\n",
+    )
+    .unwrap();
+    let member = root.join("packages").join("a");
+    stage_npm_pkg(&member.join("deps"), "left-pad", "1.3.0").await;
+    let want = vec!["pkg:npm/left-pad@1.3.0".to_string()];
+
+    // Control: the absolute spelling has always worked.
+    let crawler = NpmCrawler::new();
+    assert_eq!(
+        sorted_purls(&crawler.crawl_all(&options_at(&member)).await),
+        want
+    );
+
+    let _cwd = CwdGuard::enter(&member);
+    let pkgs = crawler.crawl_all(&options_at(Path::new("."))).await;
+    assert_eq!(sorted_purls(&pkgs), want);
+    assert_eq!(pkgs[0].path, Path::new(".").join("deps").join("left-pad"));
+}
+
+/// REGRESSION (#1902): scanned from a yarn workspace member under the
+/// default `--cwd .`, the member's `node_modules` is the relative
+/// `node_modules`, whose lexical ancestors never reach the root's
+/// `yarn.lock`. So Yarn's pnpm-linker store, relocated by
+/// `pnpmStoreFolder` and the only home of the transitive packages, was
+/// never walked. It is found, spelled relative to the cwd. (Unix only:
+/// the store's self-links are symlinks; the unit tests cover the Windows
+/// junction layout.)
+#[cfg(unix)]
+#[tokio::test]
+#[serial_test::serial]
+async fn parent_yarn_pnpm_store_is_found_from_a_relative_member_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(tmp.path()).unwrap();
+    std::fs::write(root.join("yarn.lock"), "").unwrap();
+    std::fs::write(
+        root.join(".yarnrc.yml"),
+        "nodeLinker: pnpm\npnpmStoreFolder: store\n",
+    )
+    .unwrap();
+    let entry = root.join("store").join("is-number-npm-6.0.0-9f8e7d6c5b");
+    let pkg = entry.join("package");
+    tokio::fs::create_dir_all(&pkg).await.unwrap();
+    tokio::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"is-number","version":"6.0.0"}"#,
+    )
+    .await
+    .unwrap();
+    // Yarn 4 links each entry's own package into the entry's
+    // `node_modules`, which is how the store walk recognizes an entry.
+    tokio::fs::create_dir_all(entry.join("node_modules"))
+        .await
+        .unwrap();
+    std::os::unix::fs::symlink("../package", entry.join("node_modules/is-number")).unwrap();
+    let member = root.join("packages").join("a");
+    stage_npm_pkg(&member.join("node_modules"), "is-odd", "3.0.1").await;
+    let want = vec![
+        "pkg:npm/is-number@6.0.0".to_string(),
+        "pkg:npm/is-odd@3.0.1".to_string(),
+    ];
+
+    // Control: the absolute spelling has always worked.
+    let crawler = NpmCrawler::new();
+    assert_eq!(
+        sorted_purls(&crawler.crawl_all(&options_at(&member)).await),
+        want
+    );
+
+    let _cwd = CwdGuard::enter(&member);
+    let pkgs = crawler.crawl_all(&options_at(Path::new("."))).await;
+    assert_eq!(sorted_purls(&pkgs), want);
+    let number = pkgs.iter().find(|p| p.name == "is-number").unwrap();
+    assert_eq!(
+        number.path,
+        Path::new("./../..")
+            .join("store")
+            .join("is-number-npm-6.0.0-9f8e7d6c5b")
+            .join("package")
+    );
 }

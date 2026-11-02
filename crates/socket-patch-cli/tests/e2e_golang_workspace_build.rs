@@ -115,6 +115,42 @@ fn run_members(dir: &Path, machine: &Machine, env: &[(&str, &str)], want: &str, 
     }
 }
 
+/// Reinstall both members, then synchronize their requirements. Regenerating
+/// native workspace vendoring must also retain the patched runtime bytes.
+fn reinstall_workspace(root: &Path, machine: &Machine, env: &[(&str, &str)]) {
+    run_members(root, machine, env, "PATCHED", "before cache removal");
+    for args in [
+        vec!["clean", "-modcache", "-cache"],
+        vec!["mod", "download"],
+        vec!["work", "sync"],
+    ] {
+        let out = go(root, machine, &args, env);
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    run_members(
+        root,
+        machine,
+        env,
+        "PATCHED",
+        "after reinstall and go work sync",
+    );
+    if golang_e2e_matrix::go_minor() >= 22 {
+        let out = go(root, machine, &["work", "vendor"], env);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        run_members(root, machine, env, "PATCHED", "after go work vendor");
+        // Later VEX tails deliberately inspect the module replacement itself.
+        std::fs::remove_dir_all(root.join("vendor")).unwrap();
+    }
+}
+
 /// Go extracts modules read-only; restore write bits so the tempdir drops.
 struct ChmodGuard(PathBuf);
 impl Drop for ChmodGuard {
@@ -484,6 +520,13 @@ fn go_work_vendored_members_build_patched_and_attest_without_manifest() {
         "vendored, go.work replace",
     );
 
+    reinstall_workspace(
+        root,
+        &Machine::new(tmp.path(), "vendored-reinstall"),
+        // Older Go work sync loads each member's original module metadata.
+        &day2(&ws.proxy),
+    );
+
     tail(&Tail {
         tmp: tmp.path(),
         ws: &ws,
@@ -697,6 +740,12 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
         &day2(&ws.proxy),
         "PATCHED",
         "hosted, go.work replace + go.work.sum",
+    );
+
+    reinstall_workspace(
+        root,
+        &Machine::new(tmp.path(), "hosted-reinstall"),
+        &day2(&ws.proxy),
     );
 
     tail(&Tail {
@@ -1405,8 +1454,17 @@ fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let _guard = ChmodGuard(tmp.path().to_path_buf());
-    let w = stage_members(tmp.path(), UVER, UVER);
-    let m = Machine::new(tmp.path(), "sibling");
+    // go takes its working directory with symlinks resolved, so a GOWORK
+    // under an unresolved temp path (macOS's /var -> /private/var) holds
+    // no member go runs in. (Windows keeps the path: canonicalize would
+    // give a \\?\ path go can't use.)
+    let base = if cfg!(windows) {
+        tmp.path().to_path_buf()
+    } else {
+        tmp.path().canonicalize().unwrap()
+    };
+    let w = stage_members(&base, UVER, UVER);
+    let m = Machine::new(&base, "sibling");
     download(&w.root, &m, &w.proxy);
     write_local_patch(&w.root, VENDOR_UUID);
     let ci = w.root.join("ci.work");
@@ -1477,7 +1535,7 @@ fn apply_never_writes_go_work_when_gowork_names_a_sibling_file() {
     assert_eq!(read(&w.root.join("go.work")), work, "go.work untouched");
     assert_eq!(read(&ci), work, "ci.work untouched");
     for dir in ["a", "b"] {
-        let (stdout, stderr) = run_member(tmp.path(), &w.root, dir, &w.proxy, &gowork);
+        let (stdout, stderr) = run_member(&base, &w.root, dir, &w.proxy, &gowork);
         assert!(
             stdout.contains(&format!("{}: PATCHED", dir.to_uppercase())),
             "{dir}: {stdout}\n{stderr}"

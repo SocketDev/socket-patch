@@ -50,7 +50,6 @@ pub(crate) fn sha1_hex(s: &str) -> Option<String> {
     is_hex(s, 40).then(|| s.to_ascii_lowercase())
 }
 
-// ── computations ──────────────────────────────────────────────────────────
 // The `_of` suffix keeps a computation from sharing a name with the
 // validators above: `sha256_hex(&str)` checks a pin, `sha256_hex_of(&[u8])`
 // makes one.
@@ -98,8 +97,7 @@ mod tests {
         assert!(is_sri_pin("sha512-abc") && !is_sri_pin("sha512-") && !is_sri_pin("md5-x"));
     }
 
-    /// Known vectors (FIPS 180 / RFC 3174 test strings `""` and `"abc"`) for
-    /// every computation, so each former inline copy's output is pinned.
+    /// Known vectors (FIPS 180 / RFC 3174 test strings `""` and `"abc"`).
     #[test]
     fn computations_match_known_vectors() {
         assert_eq!(
@@ -130,10 +128,8 @@ mod tests {
         }
     }
 
-    /// Production files that still compute a digest inline, waiting on
-    /// #706 slice 2 (they are changed by open PRs). Drop a file from the list
-    /// when you move it onto the helpers above; the test fails on a stale
-    /// entry as well as on a new inline copy.
+    /// Production files that still compute a digest inline. Drop a file
+    /// when you move it onto the helpers above.
     const PENDING_INLINE_DIGESTS: &[&str] = &[
         "utils/group_commit.rs",
         "vendor/jvm/mod.rs",

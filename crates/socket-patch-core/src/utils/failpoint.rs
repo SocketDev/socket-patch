@@ -49,7 +49,10 @@ pub fn hit(name: &str) {
                 Some((p, n)) => (p, n.parse::<usize>().unwrap_or(1)),
                 None => (point, 1),
             };
-            if point == name && at == count && pause {
+            if point != name || at != count {
+                continue;
+            }
+            if pause {
                 drop(hits);
                 eprintln!("socket-patch: failpoint `{name}` #{count} paused");
                 if let Some(ready) = std::env::var_os("SOCKET_PATCH_FAILPOINT_READY") {
@@ -59,10 +62,8 @@ pub fn hit(name: &str) {
                     std::thread::sleep(std::time::Duration::from_secs(3600));
                 }
             }
-            if point == name && at == count {
-                eprintln!("socket-patch: failpoint `{name}` #{count} hit; exiting");
-                std::process::exit(86);
-            }
+            eprintln!("socket-patch: failpoint `{name}` #{count} hit; exiting");
+            std::process::exit(86);
         }
     }
     #[cfg(not(any(debug_assertions, feature = "failpoints")))]

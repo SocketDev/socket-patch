@@ -1598,19 +1598,27 @@ jobs:
           # Bundler-era legs pin their own Ruby (`ruby:`): bundler <= 2.2
           # needs Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`).
           ruby-version: ${{ matrix.ruby || '3.2.10' }}
-          # The legs pin their bundler (`bundler:`) so a capstone never rides
-          # whatever bundler the runner's Ruby ships; bundler 1.x is not
-          # installable through setup-ruby, see the next steps. e2e_gem keeps
-          # the 2.5 floor.
-          bundler: ${{ startsWith(matrix.bundler, '1.') && 'none' || matrix.bundler || '2.5' }}
+          # Bundler comes from the next step, which retries rubygems.org
+          # blips; setup-ruby's own install is a single bare `gem install`
+          # (and cannot install bundler 1.x at all).
+          bundler: 'none'
           bundler-cache: false
 
-      - name: Install Bundler 1.x
-        if: startsWith(matrix.bundler, '1.')
+      # The legs pin their bundler (`bundler:`) so a capstone never rides
+      # whatever bundler the runner's Ruby ships; e2e_gem keeps the 2.5
+      # floor. A two-part version gets the `~> X.Y.0` requirement setup-ruby's
+      # `bundler:` input used for it; a three-part one stays exact.
+      - name: Install Bundler
+        if: matrix.suite == 'e2e_gem' || matrix.bundler != ''
         shell: bash
         env:
-          BUNDLER_TEST_VERSION: ${{ matrix.bundler }}
-        run: scripts/gem-install-retry.sh bundler -v "$BUNDLER_TEST_VERSION" --no-document
+          BUNDLER_TEST_VERSION: ${{ matrix.bundler || '2.5' }}
+        run: |
+          case "$BUNDLER_TEST_VERSION" in
+            *.*.*) requirement="$BUNDLER_TEST_VERSION" ;;
+            *) requirement="~> $BUNDLER_TEST_VERSION.0" ;;
+          esac
+          scripts/gem-install-retry.sh bundler -v "$requirement" --no-document
 
       # Installing a bundler does not make `bundle` run it: with no lockfile
       # to read, RubyGems' binstub activates the HIGHEST installed bundler,

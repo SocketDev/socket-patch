@@ -492,8 +492,11 @@ itself (packages are read from it, not searched for workspaces), or
 directories named `dist`, `build`, `coverage`, `tmp`, `temp`, `__pycache__`
 or `vendor`, except that a workspace member the root `package.json`
 `workspaces` field declares (a directory holding a `package.json` that any
-of npm, yarn or Bun reads the patterns as listing, such as `packages/build`
-or `vendor/lib`) still has its own `node_modules` crawled. npm, yarn and
+of npm, yarn or Bun reads the patterns as listing, such as `packages/build`,
+`vendor/lib`, or a GitHub Action kept at `.github/actions/<name>`) still has
+its own `node_modules` crawled. A hidden directory counts only where a
+pattern spells its dot (`.github/actions/*`, `.config/tool`); a wildcard
+alone never reaches one. npm, yarn and
 Bun install a member's unhoistable dependencies there from the root lock.
 It also prunes every directory that carries a
 [Cache Directory Tagging](https://bford.info/cachedir/) `CACHEDIR.TAG` file
@@ -1439,6 +1442,25 @@ development works), and it means the committed patched tree itself is the protec
 commit it, and review it like any other vendored code. The wiring survives
 `go mod tidy`, and `apply --check` gives CI a read-only audit that the committed
 redirects still match the manifest.
+
+Reinstalling the same module version (`go clean -modcache`, `go mod download`,
+`go get module@version`, and `go mod tidy`) preserves the local replacement.
+Agent reapplication can reuse the committed copy after cache removal, but only
+after verifying its patch hashes and replacement wiring. Changing the required
+module version needs a matching patch for that version; the old version-pinned
+replacement does not patch a different release.
+
+Local modes keep the replaced module's original checksum lines in
+`.upstream-go.sum` beside the patched module tree. Commit that file with `.socket/`:
+rollback restores those lines offline even after `go mod tidy` removes them from
+`go.sum`. A conflicting checksum fails rollback without removing the replacement.
+Projects patched by older releases without this backup may still need
+`go mod download <module>@<version>` after rollback.
+
+When native Go vendoring is active, VEX and the audit commands also verify
+`vendor/`, including the workspace vendor tree. A pristine or modified runtime
+file there fails verification even when the `.socket` copy remains intact.
+Regenerate it with `go mod vendor` or `go work vendor`.
 
 Hosted mode uses a fork-style module replacement and two committed checksums:
 
