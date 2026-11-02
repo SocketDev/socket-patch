@@ -1264,7 +1264,13 @@ wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha
                 SHA256,
             )
             .unwrap();
-            assert!(rewritten.is_some_and(|text| text.contains(URL)), "{ours}");
+            // The fixture's old digest `aa` gives way to the artifact's.
+            assert!(
+                rewritten.is_some_and(|text| text.contains(SHA256)
+                    && !text.contains("\"aa\"")
+                    && !text.contains("sha256:aa")),
+                "{ours}"
+            );
         }
     }
 

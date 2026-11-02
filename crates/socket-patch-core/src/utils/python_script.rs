@@ -130,6 +130,9 @@ pub(crate) fn same_hosted_artifact(
 /// bytes after an out-of-order multi-package revert only when the tables we
 /// created vanish once empty. Only dotted keys do that after a parse round
 /// trip (dotted-ness is syntax; `implicit` is not), so scripts use `Dotted`.
+/// Transitive pairs share one `override-dependencies` array, whose restore
+/// flags drift once entries stop lining up, so their out-of-order revert
+/// stays order-dependent whatever the layout.
 ///
 /// A `pyproject.toml` is reverted by text replay of the recorded original,
 /// so it uses uv's own layout (`Tables`): header-less `[tool]` / `[tool.uv]`
@@ -828,8 +831,8 @@ pub fn rewrite_project_metadata(
     {
         return Err("pyproject.toml has no project table".to_string());
     }
-    let tool_uv = tool_uv(&document);
-    let legacy_dev = tool_uv
+    let uv = tool_uv(&document);
+    let legacy_dev = uv
         .and_then(|uv| uv.get("dev-dependencies"))
         .and_then(Item::as_array)
         .into_iter()
@@ -844,7 +847,7 @@ pub fn rewrite_project_metadata(
             .chain(legacy_dev),
     )?;
     let direct = declares_directly(&document, false, &name);
-    if tool_uv.is_some_and(|uv| uv.contains_key("workspace")) {
+    if uv.is_some_and(|uv| uv.contains_key("workspace")) {
         return Err(
             "hosted sources for uv workspaces require a package-scoped source mapping".to_string(),
         );
