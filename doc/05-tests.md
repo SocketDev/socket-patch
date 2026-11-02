@@ -1,6 +1,6 @@
 ## Part 5
 
-_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
+_Last checked against main @ cbbbdb9 on 2026-11-02 by audit-cli-tests._
 
  Tests:Fake tests (asserting on their own mocks, recomputing expected values with the code under test, unable to fail, claiming more than they check), mock overuse where a tempdir or a real install is cheap, sentence-matching assertions, duplicate tests, and real coverage gaps. Per-directory tallies and the fixes that landed.
 
@@ -101,4 +101,9 @@ _Last checked against main @ cbbbdb9 on 2026-11-02 by audit-core._
   - Can't fail: `save_and_clear_covers_every_bound_global_env_var` iterates the list it checks; `hermetic::HOSTILE_SEEDS` seed and remove the same list {{T59}}; the redirect test's "forbidden" mock in `cli_scan_silent` is outranked by the prebuilt mount (executed).
   - Duplicates: ~85 per-subcommand `GlobalArgs` flag tests beside `cli_global_args` {{T57}}; `cli_parse_remove`'s 5 binary tests copy `remove/remove_invariants`; 7 exit-code-only `run()` tests in `cli_parse_list`.
   - Scaffolding: dead `stderr_chatter` filter ×11 and `has_command`/`sha256_hex` copies {{T55}}; 21 `common` selftests re-run in ~104 binaries {{T58}}.
+- **Tally for `tests/docker_*`, `composer_e2e_common`, `contract_*`, `crawl_fd_limit_e2e`, `e2e_bun_lockb`, `e2e_cargo`, `e2e_composer*` (25 files, 14.7K lines, audit-cli-tests 2026-11-02 05:00Z): about 45 fake or weak tests.**
+  - Prove less than they claim: 8 of 9 docker agent chains serve a zero `beforeHash` and `apply --force`, so only the force path runs {{T62}}; 49 `vendor`/`repair --offline` calls in 16 suites run online because `prepare_command` strips the flag {{T61}}; `binary_shared_bundled_record_hosted_pin_is_managed` skips on the CLI output it tests; pypi `uv_tool…_full_apply_chain` never applies; the vendor_maven TAMPER probe only logs on Maven ≥ 3.9.2.
+  - Can't fail: `npm_test_infrastructure_smoke` asserts its own wiremock; deno/pypi/sbt script tests assert their own generated strings; `contract_paid_required` greps the source for a variant; e2e_cargo's `!a && !a` duplicate operand.
+  - Weak oracles: gem's `"applied": 1` grep matches 10 (executed) {{T60}}; `assert_vex_attested_from_host` ×4 checks only `(vendored)` beside `assert_attested` {{T63}}.
+  - Scaffolding: docker harness copied ×8-11 with 7 ungated image skips {{T60}}; `copy_tree` ~20+, scan-proxy ×4, `hosted_pin_count` ×8 {{T64}}.
 - **Coverage gaps:** a lockfile-only calm skip and a genuine miss serialize identically (`skipped`/`package_not_installed`), and an apply no-matching-variant miss emits no event, so the JSON tests can't check either (executed; C13); no offline round-trip test of the cargo matrix's `Cargo.lock` codec.
