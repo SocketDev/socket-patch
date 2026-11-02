@@ -63,5 +63,5 @@ Next sweep files, in order: `scan/policy.rs`, `scan/render.rs` after #1856/#1884
 - Left from #1964: `CI`/`GITHUB_ACTIONS` still reach test children; test a scrub with a parent-env canary.
 - Left from #1975: `blob_fetcher` `on_progress` (#1855/#1875/#1864) and `BlobFetchResult.success` (#1855); `concise_fetch_error` re-parses the client's text; `store_verified_blob` vs `stream_cache_entry_atomic` drift. `scan --json` serializes `BatchPackagePatches`: keep a serialize test.
 - Left from #1978: T57 can use `clap_parse::global_defaults()`; `derive(PartialEq)` on `GlobalArgs` (after #1842) retires `Globals`. Set vars via `try_parse_with_env` (the scrub is `Once`).
-- Left from #1988: `assert_proxy_served_scans` counts 404s too (wrong mount path stays green, executed). A `#[path]` in a non-`mod.rs` file resolves under its stem dir: declare in `main.rs`.
+- Left from #1988: `assert_proxy_served_scans` counts 404s too (a wrong mount path stays green). A `#[path]` in a non-`mod.rs` file resolves under its stem dir: declare in `main.rs`.
 - Left from #1972: `run_container` takes no extra args (3 callers still build `docker run`); `host.docker.internal` ×15. No Docker here: build with `--features docker-e2e`.
