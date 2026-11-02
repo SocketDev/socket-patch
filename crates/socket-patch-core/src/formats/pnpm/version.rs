@@ -206,6 +206,25 @@ pub fn matches_file_id_build_keys(
 mod tests {
     use super::*;
 
+    /// #1918: a YAML `.modules.yaml` is read like every other pnpm settings
+    /// file: the last top-level key wins, comments are not part of the value.
+    #[test]
+    fn modules_yaml_package_manager_reads_the_last_key() {
+        let text = "packageManager: pnpm@9.0.0\npackageManager: pnpm@11.0.0 # newer\n";
+        assert_eq!(
+            modules_yaml_package_manager(text).as_deref(),
+            Some("pnpm@11.0.0")
+        );
+        assert_eq!(
+            modules_yaml_package_manager("packageManager: 'pnpm@8.6.0'\n").as_deref(),
+            Some("pnpm@8.6.0")
+        );
+        assert_eq!(
+            modules_yaml_package_manager("{\"packageManager\":\"pnpm@10.1.0\"}").as_deref(),
+            Some("pnpm@10.1.0")
+        );
+    }
+
     #[test]
     fn file_id_build_keys_start_at_10_34_2_and_11_5_3() {
         let pm = |spec: &str| format!("{{\"packageManager\":\"pnpm@{spec}\"}}");

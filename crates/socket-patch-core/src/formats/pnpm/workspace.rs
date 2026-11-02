@@ -376,6 +376,20 @@ fn single_quoted(s: &str) -> Option<(String, usize)> {
 mod tests {
     use super::*;
 
+    /// #1918: a settings scalar is decoded the way pnpm's YAML parser reads
+    /// it: `''` inside single quotes is one quote, an unpaired quote is not
+    /// stripped, and an empty value stays unset for this non-empty reader.
+    #[test]
+    fn yaml_top_level_value_decodes_yaml_quoting() {
+        let read = |text: &str| yaml_top_level_value(text, "k");
+        assert_eq!(read("k: 'it''s'\n").as_deref(), Some("it's"));
+        assert_eq!(read("k: \"a'\n").as_deref(), Some("\"a'"));
+        assert_eq!(read("k: ''a''\n").as_deref(), Some("''a''"));
+        assert_eq!(read("k: \"say \\\"hi\\\"\"\n").as_deref(), Some("say \"hi\""));
+        assert_eq!(read("k: ''\n"), None);
+        assert_eq!(read("k:\n"), None);
+    }
+
     fn lines(text: &str) -> Vec<String> {
         text.split('\n').map(str::to_string).collect()
     }

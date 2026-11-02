@@ -3576,5 +3576,14 @@ mod tests {
         );
         assert_eq!(workspace_lockfile_dir("lockfileDir: \"\"\n"), None);
         assert_eq!(workspace_lockfile_dir("# lockfileDir: ..\n"), None);
+        // #1918: the shared YAML scalar decoder, not a one-pair strip.
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir: '../it''s'\n").as_deref(),
+            Some("../it's")
+        );
+        assert_eq!(
+            workspace_lockfile_dir("lockfileDir: \"..\\\\x\"\n").as_deref(),
+            Some("..\\x")
+        );
     }
 }

@@ -4820,6 +4820,31 @@ fn is_safe_npm_component(component: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// #1918: `.modules.yaml`'s `virtualStoreDir` is read through the shared
+    /// pnpm settings reader: every key spelling, the last key, no comment.
+    #[test]
+    fn modules_yaml_virtual_store_dir_uses_the_shared_reader() {
+        let read = parse_modules_yaml_virtual_store_dir;
+        assert_eq!(read("virtualStoreDir: .pnpm\n").as_deref(), Some(".pnpm"));
+        assert_eq!(
+            read("virtualStoreDir: .pnpm # default\n").as_deref(),
+            Some(".pnpm")
+        );
+        assert_eq!(
+            read("virtualStoreDir: a\nvirtualStoreDir: 'b''c'\n").as_deref(),
+            Some("b'c")
+        );
+        assert_eq!(
+            read("\"virtualStoreDir\": \"x\"\n").as_deref(),
+            Some("x")
+        );
+        assert_eq!(read("virtualStoreDir: ''\n"), None);
+        assert_eq!(
+            read("{\"virtualStoreDir\":\"/abs/.pnpm\"}").as_deref(),
+            Some("/abs/.pnpm")
+        );
+    }
+
     tokio::task_local! {
         pub(super) static VARIANT_STORE_SCANS: std::cell::RefCell<Vec<PathBuf>>;
     }
