@@ -7,9 +7,9 @@ use std::collections::HashMap;
 
 use socket_patch_core::api::types::{PatchSearchResult, VulnerabilityResponse};
 
-use super::discovery::severity_order;
 use crate::args::GlobalArgs;
 use crate::ui::{self, plural, Align};
+use socket_patch_core::api::ranking::severity_order;
 
 /// Visible widths of the table's PATCHES and SEVERITY columns.
 pub(super) const PATCHES_COL: usize = 8;
@@ -373,8 +373,8 @@ fn sorted_vulns(
 ) -> Vec<(&String, &VulnerabilityResponse)> {
     let mut v: Vec<_> = vulns.iter().collect();
     v.sort_by(|a, b| {
-        severity_order(&a.1.severity)
-            .cmp(&severity_order(&b.1.severity))
+        severity_order(Some(&a.1.severity))
+            .cmp(&severity_order(Some(&b.1.severity)))
             .then_with(|| vuln_label(a.0, a.1).cmp(&vuln_label(b.0, b.1)))
     });
     v
@@ -398,7 +398,7 @@ pub(super) fn highest_severity(patch: &PatchSearchResult) -> Option<&str> {
         .vulnerabilities
         .values()
         .map(|v| v.severity.as_str())
-        .min_by_key(|s| severity_order(s))
+        .min_by_key(|s| severity_order(Some(s)))
 }
 
 /// The warning for a replacement that leaves some of the recorded patch's

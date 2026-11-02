@@ -1,18 +1,10 @@
-//! The uv workspace that governs a member directory from above (#1138).
+//! The uv workspace that governs a member directory from above.
 //!
 //! In a uv workspace, `uv.lock` lives at the workspace root and governs
 //! every member listed by the root `pyproject.toml`'s
 //! `[tool.uv.workspace] members` globs (minus its `exclude` globs). A run
-//! whose project directory is such a member reads only the member: its
-//! Python flavor routing never sees the ancestor lock, and a member with
-//! any Hatch configuration (the hatchling build backend `uv init --package`
-//! scaffolds before uv 0.8, a `hatch.toml`, a `[tool.hatch.*]` table) was
-//! rewritten as a lockless Hatch project. The root `uv.lock` then went
-//! stale, `uv sync --frozen` installed the unpatched release, and vendored
-//! VEX attested it `not_affected`.
-//!
-//! Both modes refuse the layout instead (hosted through the governing-root
-//! pre-check, vendored in the PyPI flavor routing), the way they already
+//! from a member reads only the member, so rewriting it would leave the
+//! root `uv.lock` stale; both modes refuse the layout instead, as they
 //! refuse a run from the workspace root itself.
 
 use std::path::{Path, PathBuf};

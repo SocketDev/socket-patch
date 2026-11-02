@@ -33,7 +33,7 @@ use std::fmt;
 
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::policy::package_spec_matches;
-use crate::utils::purl::{is_purl, purl_matches_identifier, strip_purl_qualifiers};
+use crate::utils::purl::{purl_matches_identifier, strip_purl_qualifiers};
 use crate::utils::purl_key::{canonical_base_purl, PurlKey};
 
 /// What a target token names.
@@ -90,7 +90,7 @@ impl Target {
             TargetKind::Cve
         } else if is_ghsa_id(token) {
             TargetKind::Ghsa
-        } else if is_purl(token) {
+        } else if token.starts_with("pkg:") {
             TargetKind::Purl
         } else {
             TargetKind::Name
@@ -367,7 +367,7 @@ pub fn is_ghsa_id(s: &str) -> bool {
 /// `@scope/name` is a name, not a path. Only `rollback` has path targets;
 /// every other verb treats these tokens as names.
 pub fn is_path_shaped(token: &str) -> bool {
-    if is_purl(token) || is_npm_scoped_name(token) {
+    if token.starts_with("pkg:") || is_npm_scoped_name(token) {
         return false;
     }
     token.contains('/')

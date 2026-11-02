@@ -68,6 +68,10 @@
 
 #![allow(dead_code)]
 
+#[allow(clippy::duplicate_mod)]
+#[path = "../common/fs_tree.rs"]
+mod fs_tree;
+
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -519,7 +523,7 @@ impl<'a> BerryVexFlow<'a> {
         }
         std::fs::write(fresh.join(".yarnrc.yml"), self.yarnrc).unwrap();
         if socket && self.proj.join(".socket").is_dir() {
-            copy_dir(&self.proj.join(".socket"), &fresh.join(".socket"));
+            fs_tree::copy_tree(&self.proj.join(".socket"), &fresh.join(".socket"));
         }
         fresh
     }
@@ -593,20 +597,6 @@ impl<'a> BerryVexFlow<'a> {
                 );
                 assert!(out.doc.is_none(), "{ctx}: no document: {out}");
             }
-        }
-    }
-}
-
-/// Recursive copy (files and dirs; symlinks are followed).
-pub fn copy_dir(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_dir(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
         }
     }
 }
@@ -873,7 +863,7 @@ pub fn run_manifestless_vex_matrix(flow: &BerryVexFlow<'_>) -> Vec<String> {
         std::fs::write(reverted.join(rel), bytes).unwrap();
     }
     if flow.registry_cache.is_dir() {
-        copy_dir(&flow.registry_cache, &reverted.join(".yarn/cache"));
+        fs_tree::copy_tree(&flow.registry_cache, &reverted.join(".yarn/cache"));
     }
     flow.install(&reverted, &["install", "--immutable"], "reverted install");
     assert_eq!(

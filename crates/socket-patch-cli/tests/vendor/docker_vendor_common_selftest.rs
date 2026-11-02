@@ -17,7 +17,8 @@ use std::process::{Command, Output, Stdio};
 
 use crate::docker_vendor_common;
 
-use docker_vendor_common::{bash_prelude, skip_or_require_image, stage_patch_fn};
+use crate::docker_common::skip_or_require_image;
+use docker_vendor_common::{bash_prelude, stage_patch_fn};
 
 /// The docker images always have coreutils `sha256sum`; macOS dev hosts may
 /// only have perl `shasum`, so shim it for these local runs.

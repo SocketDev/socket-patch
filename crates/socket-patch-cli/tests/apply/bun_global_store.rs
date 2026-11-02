@@ -10,31 +10,14 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
-use crate::common;
-
-use common::{git_sha256, parse_json_envelope, run_with_env};
+use super::apply_fixture::{index_js_patches, link_dir, stage_blob, write_manifest};
+use crate::common::envelope::event_for;
+use crate::common::{git_sha256, parse_json_envelope, run_with_env};
 
 const BEFORE: &[u8] = b"module.exports = 'pristine';\n";
 const AFTER: &[u8] = b"module.exports = 'patched';\n";
-
-fn link_dir(target: &Path, link: &Path) {
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(target, link).unwrap();
-    #[cfg(windows)]
-    {
-        let link: PathBuf = link.components().collect();
-        let target: PathBuf = target.components().collect();
-        let status = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&link)
-            .arg(&target)
-            .status()
-            .unwrap();
-        assert!(status.success(), "mklink /J failed");
-    }
-}
 
 /// The layout Bun 1.3.14 writes with `linker = "isolated"` and
 /// `globalStore = true`: `proj/node_modules/{left-pad,is-odd}` link to
@@ -87,55 +70,15 @@ fn stage(tmp: &Path, bytes: &[u8]) -> (PathBuf, PathBuf, PathBuf) {
     (proj, left_pad, number)
 }
 
-fn write_manifest(root: &Path, purls: &[&str]) {
-    let socket = root.join(".socket");
-    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+fn write_patches(root: &Path, purls: &[&str]) {
+    write_manifest(root, index_js_patches(purls, "63563563", BEFORE, AFTER));
     for bytes in [BEFORE, AFTER] {
-        std::fs::write(socket.join("blobs").join(git_sha256(bytes)), bytes).unwrap();
+        stage_blob(root, &git_sha256(bytes), bytes);
     }
-    let patches: serde_json::Map<String, Value> = purls
-        .iter()
-        .enumerate()
-        .map(|(i, purl)| {
-            let patch = json!({
-                "uuid": format!("63563563-0000-4000-8000-00000000000{i}"),
-                "exportedAt": "2024-01-01T00:00:00Z",
-                "files": { "package/index.js": {
-                    "beforeHash": git_sha256(BEFORE),
-                    "afterHash": git_sha256(AFTER),
-                }},
-                "vulnerabilities": {},
-                "description": "bun global store fixture",
-                "license": "MIT",
-                "tier": "free"
-            });
-            (purl.to_string(), patch)
-        })
-        .collect();
-    std::fs::write(
-        socket.join("manifest.json"),
-        serde_json::to_vec_pretty(&json!({ "patches": patches })).unwrap(),
-    )
-    .unwrap();
-}
-
-/// `purl`'s entry in an apply envelope's `events` or a rollback
-/// envelope's `results`.
-fn event<'a>(v: &'a Value, purl: &str) -> &'a Value {
-    v["events"]
-        .as_array()
-        .expect("events array")
-        .iter()
-        .find(|e| e["purl"] == purl)
-        .unwrap_or_else(|| panic!("no event for {purl}: {v}"))
 }
 
 fn run(proj: &Path, command: &str) -> Value {
-    let (code, stdout, stderr) = run_with_env(
-        proj,
-        &[command, "--offline", "--json"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, stdout, stderr) = run_with_env(proj, &[command, "--offline", "--json"], &[]);
     let v = parse_json_envelope(&stdout);
     assert_ne!(
         code, 0,
@@ -145,7 +88,7 @@ fn run(proj: &Path, command: &str) -> Value {
 }
 
 fn assert_refused(v: &Value, purl: &str) {
-    let ev = event(v, purl);
+    let ev = event_for(v, purl);
     assert_ne!(ev["errorCode"], "package_not_installed", "{ev}");
     let text = ev.to_string();
     assert!(
@@ -161,7 +104,7 @@ fn assert_refused(v: &Value, purl: &str) {
 fn apply_refuses_bun_global_store_packages() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, left_pad, number) = stage(tmp.path(), BEFORE);
-    write_manifest(
+    write_patches(
         &proj,
         &["pkg:npm/left-pad@1.3.0", "pkg:npm/is-number@6.0.0"],
     );
@@ -181,7 +124,7 @@ fn apply_refuses_bun_global_store_packages() {
 fn rollback_refuses_bun_global_store_packages() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, left_pad, number) = stage(tmp.path(), AFTER);
-    write_manifest(
+    write_patches(
         &proj,
         &["pkg:npm/left-pad@1.3.0", "pkg:npm/is-number@6.0.0"],
     );
@@ -205,13 +148,9 @@ fn apply_note_names_the_bun_global_store() {
     let tmp = tempfile::tempdir().unwrap();
     let (proj, left_pad, _) = stage(tmp.path(), BEFORE);
     std::fs::write(proj.join("bun.lock"), "{}\n").unwrap();
-    write_manifest(&proj, &["pkg:npm/left-pad@1.3.0"]);
+    write_patches(&proj, &["pkg:npm/left-pad@1.3.0"]);
 
-    let (code, _stdout, stderr) = run_with_env(
-        &proj,
-        &["apply", "--offline"],
-        &[("SOCKET_TELEMETRY_DISABLED", "1")],
-    );
+    let (code, _stdout, stderr) = run_with_env(&proj, &["apply", "--offline"], &[]);
     assert_ne!(
         code, 0,
         "the shared-store refusal fails the apply; {stderr}"

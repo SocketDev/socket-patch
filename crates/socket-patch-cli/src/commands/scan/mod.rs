@@ -12,11 +12,13 @@ use socket_patch_core::api::client::{
     build_proxy_fallback_client, get_api_client_with_overrides, hold_back_debug,
     is_fallback_candidate, ApiClient, ApiError,
 };
+use socket_patch_core::api::ranking::severity_order;
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
 use socket_patch_core::crawlers::Ecosystem;
+use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{
     spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry, TelemetryAuth,
@@ -24,6 +26,7 @@ use socket_patch_core::telemetry::{
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
+use socket_patch_core::vendor::lock_inventory::unsupported_layout_warnings;
 use socket_patch_core::vendor::{purl_keys_cover, VendorState};
 use socket_patch_core::vex::discover::{LedgerLiveness, WiringMode};
 use std::collections::{HashMap, HashSet};
@@ -62,15 +65,13 @@ mod withdrawn;
 
 use self::discovery::{
     collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
-    merge_ledger_records_for_updates, preverify_vendor_baselines, severity_order,
-    vendored_ledger_supplement, LockfileSupplement,
+    preverify_vendor_baselines, vendored_ledger_supplement, LockfileSupplement,
 };
-// Shared with `get --mode hosted|vendored` (commands::get): the advisory-
-// pinned entry into the hosted engine, the vendor step + its dry-run
-// preview, and the PnP layout-refusal warning mapping. `pub(crate)`
-// re-exports because the submodules themselves stay private to scan.
+// Shared with `get --mode hosted|vendored` (commands::get): the lockfile
+// and vendored-ledger crawl supplements. `pub(crate)` re-exports because
+// the submodules themselves stay private to scan.
 pub(crate) use self::discovery::{
-    lockfile_supplement as project_lockfile_supplement, unsupported_layout_warnings,
+    lockfile_supplement as project_lockfile_supplement,
     vendored_ledger_supplement as project_vendored_supplement,
 };
 use self::gc::gc_into;
@@ -1676,7 +1677,7 @@ async fn run_project_dirs(
         Err(message) => return usage("invalid_env", &message),
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
-    let carry = rollout_args::RolloutCarry::new(configured, root);
+    let carry = rollout::RolloutCarry::new(configured, root);
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
@@ -2777,7 +2778,7 @@ async fn run_scan(
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &policy,
-                Some(env),
+                env,
                 telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
@@ -3152,7 +3153,7 @@ async fn run_scan(
                 .patches
                 .iter()
                 .filter_map(|p| p.severity.as_deref())
-                .min_by_key(|s| severity_order(s))
+                .min_by_key(|s| severity_order(Some(s)))
                 .unwrap_or("unknown");
 
             // Collect vuln IDs (deterministic; see collect_vuln_ids).
@@ -3258,11 +3259,12 @@ async fn run_scan(
             &pairs,
             None,
             npm_crawl.as_ref(),
-            Some(
-                rollout::Gate::new(&mut stage, rows)
-                    .with_prior(prior_discovery)
-                    .with_references(sweep_references),
-            ),
+            Some(rollout::Gate {
+                stage: &mut stage,
+                rows,
+                prior: prior_discovery,
+                references: sweep_references,
+            }),
             "scan",
         )
         .await;
@@ -3297,13 +3299,17 @@ async fn run_scan(
     };
 
     // The rollout plan (§5.2): deferred NEW rows leave the selection here.
-    // Vendored eligibility is the wet run's Bun / vlt / npm-lock / gem
-    // takeover preflight; the agent partition above already removed what
-    // cannot land in place.
+    // Vendored eligibility is the dry-run preview's would-refuse verdicts
+    // (the wet run's preflights and takeover gates), computed once and
+    // reused by the dry-run rendering below; the agent partition above
+    // already removed what cannot land in place.
+    let mut vendor_preview = None;
     let selected = if report_only {
         selected
     } else if vendor {
-        let refused = vendor_flow::preflight_refused_purls(&args.common, &selected).await;
+        let preview = preview_vendor(&args.common, &selected).await;
+        let refused = preview.refused_purls();
+        vendor_preview = Some(preview);
         stage.plan(&rows, |r| !refused.contains(&r.writer.purl));
         let deferred = stage.deferred_keys();
         selected
@@ -3422,20 +3428,13 @@ async fn run_scan(
             // rendered as `[would-refuse]` lines so a preview never
             // advertises vendoring the wet run would refuse.
             let preview = if vendor {
-                let takeover = crate::commands::vendor::gem_takeover_preview_refusals(
-                    &args.common,
-                    selected.iter().map(|p| p.purl.as_str()),
-                )
-                .await;
-                Some(
-                    preview_vendor(
-                        &args.common.cwd,
-                        &selected,
-                        &crate::commands::hosted_unwind::patch_server_origins(&args.common),
-                        &takeover,
-                    )
-                    .await,
-                )
+                // `vendor` is never report-only, so the planning pass
+                // above always computed it.
+                let mut preview = vendor_preview
+                    .take()
+                    .expect("the vendored planning pass computed the preview");
+                preview.retain_selected(&selected);
+                Some(preview)
             } else {
                 None
             };

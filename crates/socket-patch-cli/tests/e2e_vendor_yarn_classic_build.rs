@@ -164,19 +164,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 // ── the capstone ──────────────────────────────────────────────────────
 
 #[test]
@@ -391,7 +378,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(&lock_path, fresh.join("yarn.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
@@ -453,7 +440,7 @@ fn yarn_classic_vendor_fresh_checkout_frozen_offline_install_and_revert() {
     // 7. MANIFEST-LESS VEX over the really-installed fresh checkout (a copy,
     //    so the idempotency/revert legs below still see the vendored proj).
     let vex_dir = tmp.path().join("fresh-vex");
-    copy_dir_recursive(&fresh, &vex_dir);
+    common::fs_tree::copy_tree(&fresh, &vex_dir);
     let api = vex_e2e_common::PatchApi::start(vec![(
         UUID.to_string(),
         vex_e2e_common::patch_view(
@@ -758,7 +745,7 @@ fn yarn_classic_detached_scan_vendored_fresh_checkout_manifestless_vex() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("package.json"), fresh.join("package.json")).unwrap();
     std::fs::copy(proj.join("yarn.lock"), fresh.join("yarn.lock")).unwrap();
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
     let fresh_cache = tmp.path().join("fresh-yarn-cache");
     let ci = corepack(
         &fresh,

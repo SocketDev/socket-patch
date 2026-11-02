@@ -33,6 +33,16 @@ pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
     }
 }
 
+/// The project-patch sources protecting `purl`, if its ecosystem is selected
+/// and it has any.
+fn protecting(common: &GlobalArgs, index: &UserPatchIndex, purl: &str) -> Option<Vec<String>> {
+    if !common.purl_ecosystem_selected(purl) {
+        return None;
+    }
+    let sources = index.conflicts(purl);
+    (!sources.is_empty()).then_some(sources)
+}
+
 pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool) -> String {
     let sources = sources.join(", ");
     if allowed {
@@ -76,13 +86,9 @@ pub(crate) async fn partition(
     let mut conflicts = Vec::new();
     for purl in &purls {
         let purl = purl.as_str();
-        if !common.purl_ecosystem_selected(purl) {
+        let Some(sources) = protecting(common, &index, purl) else {
             continue;
-        }
-        let sources = index.conflicts(purl);
-        if sources.is_empty() {
-            continue;
-        }
+        };
         let message = detail(purl, &sources, common.allow_patch_conflicts);
         if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));
@@ -106,11 +112,7 @@ pub(crate) async fn evidence(
     }
     let index = inspect(common).await;
     for &purl in purls {
-        if !common.purl_ecosystem_selected(purl) {
-            continue;
-        }
-        let sources = index.conflicts(purl);
-        if !sources.is_empty() {
+        if let Some(sources) = protecting(common, &index, purl) {
             found.insert(purl.to_string(), sources);
         }
     }
@@ -149,13 +151,9 @@ pub(crate) async fn skip_protected(
     }
     let index = inspect(common).await;
     patches.retain(|purl, record| {
-        if !common.purl_ecosystem_selected(purl) {
+        let Some(sources) = protecting(common, &index, purl) else {
             return true;
-        }
-        let sources = index.conflicts(purl);
-        if sources.is_empty() {
-            return true;
-        }
+        };
         let message = detail(purl, &sources, common.allow_patch_conflicts);
         if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));

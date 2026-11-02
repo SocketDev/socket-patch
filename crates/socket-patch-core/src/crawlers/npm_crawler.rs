@@ -66,8 +66,9 @@ pub(super) fn configured_install_roots(start_path: &Path) -> Vec<PathBuf> {
 }
 
 /// The `node_modules` dirs of declared workspace members that the
-/// workspace walk prunes by name (#1627): members whose path crosses a
-/// [`SKIP_DIRS`] name (`packages/build`, `vendor/lib`). npm, yarn and Bun
+/// workspace walk prunes by name: members whose path crosses a
+/// [`SKIP_DIRS`] name (`packages/build`, `vendor/lib`, #1627) or a hidden
+/// one (`.github/actions/x`, `.config/tool`, #1827). npm, yarn and Bun
 /// install a member's unhoistable deps into `<member>/node_modules` from
 /// the root lock, so such a copy is as live as any other member's. The
 /// workspace roots are `start_path` and the project of every `walked`
@@ -95,6 +96,13 @@ pub(super) fn skipped_workspace_member_roots(
     roots
 }
 
+/// Whether the workspace walk prunes a dir by its name alone: a hidden dir
+/// or a well-known build dir ([`SKIP_DIRS`]). Declared workspace members
+/// under such a name are added back by [`skipped_workspace_member_roots`].
+fn walk_prunes_name(name: &str) -> bool {
+    name.starts_with('.') || SKIP_DIRS.contains(&name)
+}
+
 /// [`skipped_workspace_member_roots`] for the one workspace root `root`. A
 /// member is a dir the root `package.json` `workspaces` patterns list in
 /// any package manager's reading ([`WorkspacesDialect::ALL`]: an extra root
@@ -102,104 +110,124 @@ pub(super) fn skipped_workspace_member_roots(
 /// pattern is walked from its literal prefix to the depth its segments
 /// allow (any depth for `**`, within [`WORKSPACE_GLOB_DIR_BUDGET`] dirs per
 /// pattern), with the walk's own rules: real dirs only (never a symlink),
-/// never a hidden dir, a `node_modules` or a tagged cache dir below the
-/// root, literal prefix included. Names are
-/// read from the listings, so the [`SKIP_DIRS`] test sees each dir as the
-/// walk does even when a pattern spells it in another case.
+/// never a `node_modules` or a tagged cache dir below the root, literal
+/// prefix included. A hidden dir counts only where the pattern spells the
+/// dot (`.github/actions/*`, `.config/tool`): the glob part descends into
+/// one only when it names a dot, and a path through one is read with no
+/// wildcard matching a dot component, as pnpm, Bun and vlt read it. So a
+/// `**` never spends its budget on `.git` or `.next`, and build output
+/// such as `.output/server` never becomes a member. Names are read from
+/// the listings, so the pruned-name test sees each dir as the walk does
+/// even when a pattern spells it in another case.
 fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
-    use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+    use crate::utils::workspace_globs::{expand_braces, workspaces_include_as, WorkspacesDialect};
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
     else {
         return Vec::new();
     };
     let walkable = |entry: &ListedEntry| {
-        entry.file_type.is_some_and(|ft| ft.is_dir())
-            && entry.name_str != "node_modules"
-            && !entry.name_str.starts_with('.')
+        entry.file_type.is_some_and(|ft| ft.is_dir()) && entry.name_str != "node_modules"
     };
     let mut roots = Vec::new();
     // A leading `!` is a negation in some readings and part of an extglob
     // or a literal name in others; the dirs it can reach are walked either
-    // way, and `workspaces_include_as` decides.
+    // way, and `workspaces_include_as` decides. Braces are expanded first,
+    // so each alternative walks from its own literal prefix and only an
+    // alternative that spells a dot descends into hidden dirs; the
+    // alternatives of one pattern share its dir budget.
     for pattern in &patterns {
-        let segments: Vec<&str> = pattern
-            .trim_start_matches('!')
-            .split(['/', '\\'])
-            .filter(|s| !s.is_empty() && *s != ".")
-            .collect();
-        let is_glob = |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
-        let literal = segments.iter().take_while(|s| !is_glob(s)).count();
-        // The literal prefix, each component as its parent lists it (an
-        // exact name first, else the ASCII-case-insensitive match a
-        // case-insensitive filesystem resolves). A prefix that climbs out
-        // (`..`) or is not walkable names nothing here.
-        let mut dir = root.to_path_buf();
-        let mut rel: Vec<String> = Vec::new();
-        let mut reachable = true;
-        for segment in &segments[..literal] {
-            let entries: Vec<ListedEntry> = list_dir_sync(&dir)
-                .entries
-                .into_iter()
-                .filter(|e| walkable(e))
-                .collect();
-            let found = entries.iter().find(|e| e.name_str == *segment).or_else(|| {
-                entries
-                    .iter()
-                    .find(|e| e.name_str.eq_ignore_ascii_case(segment))
-            });
-            let Some(entry) = found else {
-                reachable = false;
-                break;
-            };
-            dir.push(&entry.name);
-            rel.push(entry.name_str.clone());
-            if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
-                reachable = false;
-                break;
-            }
-        }
-        if !reachable {
-            continue;
-        }
-        let rest = &segments[literal..];
-        let max_depth = if rest.contains(&"**") {
-            usize::MAX
-        } else {
-            rest.len()
-        };
         let mut budget = WORKSPACE_GLOB_DIR_BUDGET;
-        let mut stack = vec![(dir, rel, 0usize)];
-        while let Some((dir, rel, depth)) = stack.pop() {
-            let listing = list_dir_sync(&dir);
-            // The workspace root itself is exempt, as the walk always
-            // crawls the scan root (and never reaches a nested project
-            // inside a tagged dir).
-            if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
-                continue;
-            }
-            if rel.iter().any(|seg| SKIP_DIRS.contains(&seg.as_str()))
-                && WorkspacesDialect::ALL
-                    .iter()
-                    .any(|&dialect| workspaces_include_as(&patterns, &rel, dialect))
-                && dir.join("package.json").is_file()
-                && has_node_modules_dir(&dir, &listing)
-            {
-                roots.push(dir.join("node_modules"));
-            }
-            if depth >= max_depth {
-                continue;
-            }
-            for entry in listing.entries.into_iter().filter(|e| walkable(e)) {
-                let Some(left) = budget.checked_sub(1) else {
+        for alternative in expand_braces(pattern.trim_start_matches('!')) {
+            let segments: Vec<&str> = alternative
+                .split(['/', '\\'])
+                .filter(|s| !s.is_empty() && *s != ".")
+                .collect();
+            let is_glob =
+                |s: &str| s.contains(['*', '?', '[', ']', '{', '}', '(', ')', '!', '+', '@']);
+            let literal = segments.iter().take_while(|s| !is_glob(s)).count();
+            // The literal prefix, each component as its parent lists it (an
+            // exact name first, else the ASCII-case-insensitive match a
+            // case-insensitive filesystem resolves). A prefix that climbs out
+            // (`..`) or is not walkable names nothing here.
+            let mut dir = root.to_path_buf();
+            let mut rel: Vec<String> = Vec::new();
+            let mut reachable = true;
+            for segment in &segments[..literal] {
+                let entries: Vec<ListedEntry> = list_dir_sync(&dir)
+                    .entries
+                    .into_iter()
+                    .filter(|e| walkable(e))
+                    .collect();
+                let found = entries.iter().find(|e| e.name_str == *segment).or_else(|| {
+                    entries
+                        .iter()
+                        .find(|e| e.name_str.eq_ignore_ascii_case(segment))
+                });
+                let Some(entry) = found else {
+                    reachable = false;
                     break;
                 };
-                budget = left;
-                let mut child_rel = rel.clone();
-                child_rel.push(entry.name_str.clone());
-                stack.push((dir.join(&entry.name), child_rel, depth + 1));
+                dir.push(&entry.name);
+                rel.push(entry.name_str.clone());
+                if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
+                    reachable = false;
+                    break;
+                }
+            }
+            if !reachable {
+                continue;
+            }
+            let rest = &segments[literal..];
+            let rest_names_dot = rest
+                .iter()
+                .any(|s| s.starts_with('.') || s.contains("(.") || s.contains("|."));
+            let max_depth = if rest.contains(&"**") {
+                usize::MAX
+            } else {
+                rest.len()
+            };
+            let mut stack = vec![(dir, rel, 0usize)];
+            while let Some((dir, rel, depth)) = stack.pop() {
+                let listing = list_dir_sync(&dir);
+                // The workspace root itself is exempt, as the walk always
+                // crawls the scan root (and never reaches a nested project
+                // inside a tagged dir).
+                if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
+                    continue;
+                }
+                let hidden = rel.iter().any(|seg| seg.starts_with('.'));
+                if rel.iter().any(|seg| walk_prunes_name(seg))
+                    && has_node_modules_dir(&dir, &listing)
+                    && dir.join("package.json").is_file()
+                    && WorkspacesDialect::ALL.iter().any(|&dialect| {
+                        let dialect = WorkspacesDialect {
+                            dot: dialect.dot && !hidden,
+                            ..dialect
+                        };
+                        workspaces_include_as(&patterns, &rel, dialect)
+                    })
+                {
+                    roots.push(dir.join("node_modules"));
+                }
+                if depth >= max_depth {
+                    continue;
+                }
+                for entry in listing
+                    .entries
+                    .into_iter()
+                    .filter(|e| walkable(e) && (rest_names_dot || !e.name_str.starts_with('.')))
+                {
+                    let Some(left) = budget.checked_sub(1) else {
+                        break;
+                    };
+                    budget = left;
+                    let mut child_rel = rel.clone();
+                    child_rel.push(entry.name_str.clone());
+                    stack.push((dir.join(&entry.name), child_rel, depth + 1));
+                }
             }
         }
     }
@@ -273,6 +301,9 @@ pub(super) fn merge_configured_install_roots(
 /// the (untrusted) project, and a FIFO planted there would wedge a plain
 /// read forever.
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
+    // Walk the absolute spelling: the default `--cwd .` has no lexical
+    // parents, so a parent `.yarnrc` would never be read (#1902).
+    let start_path = &crate::utils::relpath::absolute_lexically(start_path);
     let mut general: Option<(&Path, String)> = None;
     let mut install: Option<(&Path, String)> = None;
     for dir in start_path.ancestors() {
@@ -915,20 +946,17 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(_) => return None,
     };
-    let text = strip_bom(&text);
-    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
-    let patterns = match doc.get("workspaces") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(list)) => list.clone(),
-        Some(serde_json::Value::Object(map)) => match map.get("packages") {
-            None => Vec::new(),
-            Some(packages) => packages.as_array()?.clone(),
-        },
-        Some(_) => return None,
+    use crate::formats::package_json::Workspaces;
+
+    // Bun refuses to install from a malformed field (#1900), so it names
+    // no member set.
+    let patterns = match Workspaces::parse(&text)? {
+        Workspaces::None => Vec::new(),
+        Workspaces::Patterns(patterns) => patterns,
+        Workspaces::Malformed(_) => return None,
     };
     let mut members = Vec::new();
     for pattern in &patterns {
-        let pattern = pattern.as_str()?;
         if pattern.starts_with('!') {
             continue;
         }
@@ -1421,29 +1449,9 @@ fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     Some((key[..at].to_string(), version.to_string()))
 }
 
-/// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
-/// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
+/// The non-empty `virtualStoreDir` value of a `.modules.yaml`.
 fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
-    let text = crate::formats::text::strip_bom(text);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return value
-            .get("virtualStoreDir")?
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-    }
-    let raw = text
-        .lines()
-        .find_map(|line| line.strip_prefix("virtualStoreDir:"))?
-        .trim();
-    let value = if raw.starts_with('"') {
-        serde_json::from_str::<String>(raw).ok()?
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        inner.replace("''", "'")
-    } else {
-        raw.to_string()
-    };
-    (!value.is_empty()).then_some(value)
+    crate::formats::pnpm::modules_yaml::field(text, "virtualStoreDir").filter(|s| !s.is_empty())
 }
 
 /// `store` relative to `importer`, when it names a directory strictly
@@ -1542,14 +1550,13 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
-    let project = nm
-        .parent()?
-        .ancestors()
-        .find(|dir| dir.join("yarn.lock").is_file())?;
-    let store = super::pkg_managers::active_yarn_pnpm_store(project)?;
-    let (Ok(real_store), Ok(real_project)) =
-        (std::fs::canonicalize(store), std::fs::canonicalize(project))
-    else {
+    let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
+        .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
+    let (Ok(real_store), Ok(real_project)) = (
+        std::fs::canonicalize(store),
+        std::fs::canonicalize(&abs_project),
+    ) else {
         return None;
     };
     let below = path_below(&real_project, &real_store)?;
@@ -1558,7 +1565,7 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    let mut dir = project.to_path_buf();
+    let mut dir = project;
     for component in below.components() {
         dir.push(component);
         if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
@@ -3412,7 +3419,7 @@ impl NpmCrawler {
 
         // Recursively search for workspace node_modules
         results.extend(Self::find_workspace_node_modules(start_path, listing));
-        // Plus the declared members the walk prunes by name (#1627).
+        // Plus the declared members the walk prunes by name (#1627, #1827).
         let members = skipped_workspace_member_roots(start_path, &results);
         results.extend(members);
 
@@ -3507,9 +3514,7 @@ impl NpmCrawler {
             .into_iter()
             .filter(|entry| {
                 entry.file_type.is_some_and(|ft| ft.is_dir())
-                    && !(entry.name_str == "node_modules"
-                        || entry.name_str.starts_with('.')
-                        || SKIP_DIRS.contains(&entry.name_str.as_str()))
+                    && !(entry.name_str == "node_modules" || walk_prunes_name(&entry.name_str))
             })
             .map(|entry| dir.join(&entry.name))
             .collect()
@@ -4819,6 +4824,28 @@ fn is_safe_npm_component(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1918: `.modules.yaml`'s `virtualStoreDir` is read through the shared
+    /// pnpm settings reader: every key spelling, the last key, no comment.
+    #[test]
+    fn modules_yaml_virtual_store_dir_uses_the_shared_reader() {
+        let read = parse_modules_yaml_virtual_store_dir;
+        assert_eq!(read("virtualStoreDir: .pnpm\n").as_deref(), Some(".pnpm"));
+        assert_eq!(
+            read("virtualStoreDir: .pnpm # default\n").as_deref(),
+            Some(".pnpm")
+        );
+        assert_eq!(
+            read("virtualStoreDir: a\nvirtualStoreDir: 'b''c'\n").as_deref(),
+            Some("b'c")
+        );
+        assert_eq!(read("\"virtualStoreDir\": \"x\"\n").as_deref(), Some("x"));
+        assert_eq!(read("virtualStoreDir: ''\n"), None);
+        assert_eq!(
+            read("{\"virtualStoreDir\":\"/abs/.pnpm\"}").as_deref(),
+            Some("/abs/.pnpm")
+        );
+    }
 
     tokio::task_local! {
         pub(super) static VARIANT_STORE_SCANS: std::cell::RefCell<Vec<PathBuf>>;
@@ -8130,6 +8157,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bun_workspace_pattern_members_sync(dir.path()), None);
+
+        // #1900: Bun refuses to install from a `null` or non-string
+        // `workspaces`, so the patterns cannot name the member set.
+        for manifest in [r#"{"workspaces":null}"#, r#"{"workspaces":["a",1]}"#] {
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+            assert_eq!(
+                bun_workspace_pattern_members_sync(dir.path()),
+                None,
+                "{manifest}"
+            );
+        }
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(bun_workspace_pattern_members_sync(dir.path()), Some(vec![]));
     }
 
     /// `.yarnrc` `--modules-folder` parsing: bare and quoted keys and

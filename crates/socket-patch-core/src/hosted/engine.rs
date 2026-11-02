@@ -30,8 +30,9 @@ use crate::constants::npm_family::{
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
-    effective_replace_registry_host, plan_npmrc_allow_remote_with, replace_registry_host_rewrites,
-    NpmrcPlan, OuterAllowRemote, NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
+    effective_omit_lockfile_registry_resolved, effective_replace_registry_host,
+    plan_npmrc_allow_remote_with, replace_registry_host_rewrites, NpmrcPlan, OuterAllowRemote,
+    NPMRC_ALLOW_REMOTE_EDIT_KIND, NPMRC_REL,
 };
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
@@ -48,15 +49,17 @@ use super::guidance::{
     npm_allow_remote_already_detail, npm_allow_remote_configured_detail,
     npm_allow_remote_env_set_detail, npm_allow_remote_manual_detail,
     npm_allow_remote_outer_set_detail, npm_allow_remote_unreadable_detail,
-    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_replace_registry_host_detail,
-    plan_workspace_trust, pnpm_heal_root, pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag,
-    pnpm_lock_version_major, pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
+    npm_allow_remote_user_set_detail, npm_lock_url_needles, npm_omit_lockfile_resolved_detail,
+    npm_replace_registry_host_detail, plan_workspace_trust, pnpm_heal_root,
+    pnpm_is_shrinkwrap_lock, pnpm_lock_may_need_store_flag, pnpm_lock_version_major,
+    pnpm_root_only_workspace_breaks_add, pnpm_trust_configured_detail,
     pnpm_trust_keyless_members_detail, pnpm_trust_legacy_detail, pnpm_trust_manual_guidance,
     pnpm_trust_not_needed_detail, pnpm_trust_policy_preamble, pnpm_trust_rush_detail,
     pnpm_trust_scaffolded_detail, pnpm_trust_workspace_unreadable_detail,
     pnpm_trust_workspace_unsupported_detail, read_npmrc_for_allow_remote, read_workspace_for_trust,
-    TrustPlan, NPM_LOCKS, NPM_REPLACE_REGISTRY_HOST_CODE, PNPM_TRUST_RUSH_MIXED_NOTE,
-    PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL, REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
+    TrustPlan, NPM_LOCKS, NPM_OMIT_LOCKFILE_RESOLVED_CODE, NPM_REPLACE_REGISTRY_HOST_CODE,
+    PNPM_TRUST_RUSH_MIXED_NOTE, PNPM_TRUST_TRADEOFF_AND_CAUTION, PNPM_WORKSPACE_REL,
+    REDIRECT_PNPM_WORKSPACE_TRUST_EDIT_KIND,
 };
 use super::vlt::bun_lockb_present;
 
@@ -693,26 +696,25 @@ pub async fn read_candidate_files(
         out.read(view, unreadable, NPMRC_REL).await;
         // A `file:` directory copy is locked under the DEPENDENCY name, so
         // the classic rewriter reads which package it is from the
-        // directory's `package.json` (#1236). Advisory: never rewritten,
-        // and an unreadable one only leaves that copy unnamed.
-        let dirs: BTreeSet<String> = out
+        // directory's `package.json` (#1236), at the path vendored and VEX
+        // read it from (#1951): outside the root too, never at an absolute
+        // path. Advisory: never rewritten, and an unreadable one only
+        // leaves that copy unnamed.
+        let manifests: BTreeSet<String> = out
             .files
             .get("yarn.lock")
             .map(|lock| {
+                use crate::formats::yarn::copy::{classic_copy_ref, CopyRef};
                 crate::vendor::lock_inventory::yarn::classic_entries(lock)
                     .iter()
-                    .filter_map(|e| {
-                        crate::formats::yarn::source::classic_file_directory(&e.patterns)
+                    .filter_map(|e| match classic_copy_ref(&e.patterns, None)? {
+                        copy @ CopyRef::Directory(_) => copy.read_path(),
+                        _ => None,
                     })
                     .collect()
             })
             .unwrap_or_default();
-        for dir in dirs {
-            let rel = if dir.is_empty() {
-                "package.json".to_string()
-            } else {
-                format!("{dir}/package.json")
-            };
+        for rel in manifests {
             if out.files.contains_key(&rel) {
                 continue;
             }
@@ -2991,13 +2993,8 @@ fn read_advisory_text(view: &ProjectView<'_>, rel: &str) -> Option<String> {
 /// root: with a keyless pnpm-workspace.yaml that marks a pnpm <= 10.4
 /// install (see [`crate::formats::pnpm::workspace::lock_has_member_importers`]).
 fn lock_lists_members(view: &ProjectView<'_>) -> bool {
-    read_advisory_text(view, "pnpm-lock.yaml").is_some_and(|text| {
-        let doc =
-            crate::formats::pnpm::grammar::main_document(crate::formats::text::strip_bom(&text));
-        crate::formats::pnpm::workspace::lock_has_member_importers(
-            &crate::formats::pnpm::lines::split_lines(doc),
-        )
-    })
+    read_advisory_text(view, "pnpm-lock.yaml")
+        .is_some_and(|text| crate::formats::pnpm::workspace::lock_text_has_member_importers(&text))
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk project's pnpm
@@ -3177,6 +3174,16 @@ fn npm_allow_remote(
                 npm_replace_registry_host_detail(&blocked, &setting),
             ));
         }
+    }
+    // #1871: npm >= 8's `omit-lockfile-registry-resolved` strips every
+    // registry dependency's `resolved` (the hosted pins included) on the
+    // next lock save, keeping the patched `integrity`. Reported, never
+    // overridden, like `replace-registry-host`.
+    if let Some(setting) = effective_omit_lockfile_registry_resolved(project, &outer) {
+        npm_warnings.push(warning(
+            NPM_OMIT_LOCKFILE_RESOLVED_CODE,
+            npm_omit_lockfile_resolved_detail(&npm_hosts, &setting),
+        ));
     }
     (npm_warnings, npmrc_config_write)
 }
@@ -4327,6 +4334,57 @@ mod tests {
         )
         .await;
         (read, done)
+    }
+
+    /// #1951: the hosted run reads a yarn classic `file:` directory copy's
+    /// `package.json` where vendored and VEX read it
+    /// ([`crate::formats::yarn::copy::CopyRef::read_path`]): from outside
+    /// the root too, since yarn 1 installs `file:../ext/lpdir` all the same,
+    /// but never at an absolute path a lock names (#1516).
+    #[tokio::test]
+    async fn issue_1951_yarn_classic_copy_manifests_read_as_vendored_reads_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("app");
+        let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        for dir in ["app/lpdir", "ext/lpdir", "abs/lpdir"] {
+            let dir = tmp.path().join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("package.json"), manifest).unwrap();
+        }
+        let abs = tmp.path().join("abs/lpdir");
+        let abs = abs.to_str().unwrap().replace('\\', "/");
+        std::fs::write(
+            root.join("yarn.lock"),
+            format!(
+                "# yarn lockfile v1\n\n\n\
+                 left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+                 resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n\n\
+                 \"lp2@file:./lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp3@file:../ext/lpdir\":\n  version \"1.3.0\"\n\n\
+                 \"lp4@file:{abs}\":\n  version \"1.3.0\"\n"
+            ),
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(&root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("lpdir/package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            read.files
+                .get("../ext/lpdir/package.json")
+                .map(String::as_str),
+            Some(manifest),
+            "{:?}",
+            read.files.keys()
+        );
+        assert!(
+            !read.files.keys().any(|k| k.contains("abs/lpdir")),
+            "{:?}",
+            read.files.keys()
+        );
     }
 
     #[tokio::test]

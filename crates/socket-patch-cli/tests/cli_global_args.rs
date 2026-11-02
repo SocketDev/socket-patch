@@ -20,6 +20,8 @@ use clap::Parser;
 use socket_patch_cli::args::GlobalArgs;
 use socket_patch_cli::Cli;
 
+#[path = "common/clap_parse.rs"]
+mod clap_parse;
 #[path = "common/hermetic.rs"]
 mod hermetic;
 
@@ -158,18 +160,15 @@ fn try_parse(subcommand: &str, extra: &[&str]) -> Result<Cli, clap::Error> {
     for &arg in extra {
         argv.push(arg.into());
     }
-    Cli::try_parse_from(&argv)
+    hermetic::try_parse(&argv.iter().map(String::as_str).collect::<Vec<_>>())
 }
 
 #[test]
 #[serial_test::serial]
 fn every_global_flag_parses_on_every_subcommand() {
-    // Serial + env-isolated: clap validates a field's `env` value during parse
-    // even when the field is not on the CLI (an invalid `SOCKET_OFFLINE` will
-    // abort a parse that never mentions `--offline`). So any ambient or
-    // concurrently-set `SOCKET_*` value can break this matrix — the old
-    // "CLI args win so it's deterministic" comment was wrong. Clear the slate.
-    let saved = save_and_clear_global_env();
+    // Serial: clap validates a field's `env` value during parse even when the
+    // field is not on the CLI, so a concurrently-set `SOCKET_*` value from
+    // the env tests below can break this matrix.
     let cases = global_flag_cases();
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
         .iter()
@@ -191,13 +190,10 @@ fn every_global_flag_parses_on_every_subcommand() {
                 )
             });
             // Not just "parsed" — the value must actually land in the
-            // matching GlobalArgs field on this subcommand. With the env
-            // cleared above, the only source for the field is the CLI flag.
+            // matching GlobalArgs field on this subcommand.
             verify(common_of(&cli));
         }
     }
-
-    restore_global_env(saved);
 }
 
 /// Tripwire: the long-flag matrix in `global_flag_cases()` must have exactly
@@ -210,8 +206,7 @@ fn every_global_flag_parses_on_every_subcommand() {
 #[test]
 #[serial_test::serial]
 fn global_flag_cases_cover_every_global_field() {
-    let saved = save_and_clear_global_env();
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let cli = hermetic::try_parse(&["socket-patch", "list"]).expect("parse");
     let common = common_of(&cli).clone();
     // Exhaustive: every field must be named here. `_`-binding keeps it honest
     // (we only care that the set of fields matches), and a `..` rest pattern is
@@ -253,8 +248,6 @@ fn global_flag_cases_cover_every_global_field() {
         27,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
-
-    restore_global_env(saved);
 }
 
 /// Tripwire for the tripwire above: the manual field count can be bumped
@@ -343,9 +336,7 @@ fn all_subcommands_are_covered() {
 #[test]
 #[serial_test::serial]
 fn every_global_short_form_parses_on_every_subcommand() {
-    // Serial + env-isolated for the same reason as the long-flag matrix: an
-    // ambient/concurrent invalid `SOCKET_*` bool would abort these parses.
-    let saved = save_and_clear_global_env();
+    // Serial for the same reason as the long-flag matrix.
     // (short, value-or-None, verifier) — only flags that actually have a
     // short. The verifier proves the short maps to the *intended* GlobalArgs
     // field, not just that it parses (a short silently rebound to a different
@@ -388,8 +379,6 @@ fn every_global_short_form_parses_on_every_subcommand() {
             verify(common_of(&cli));
         }
     }
-
-    restore_global_env(saved);
 }
 
 /// `-d` and `-m` were intentionally dropped (formerly aliases for
@@ -400,10 +389,9 @@ fn every_global_short_form_parses_on_every_subcommand() {
 #[test]
 #[serial_test::serial]
 fn reserved_short_forms_are_not_assigned() {
-    // Env-isolated: an invalid ambient `SOCKET_*` bool would make clap fail
+    // Serial: an invalid concurrent `SOCKET_*` bool would make clap fail
     // with ValueValidation *before* it ever reports UnknownArgument for the
-    // reserved short, turning this assertion into a false positive/negative.
-    let saved = save_and_clear_global_env();
+    // reserved short.
     let all_subcommands: Vec<&str> = SUBCOMMANDS_NO_POSITIONAL
         .iter()
         .chain(SUBCOMMANDS_WITH_IDENTIFIER.iter())
@@ -431,8 +419,6 @@ fn reserved_short_forms_are_not_assigned() {
             );
         }
     }
-
-    restore_global_env(saved);
 }
 
 /// Locks the env-var bindings: setting a SOCKET_* env var must populate
@@ -442,7 +428,6 @@ fn reserved_short_forms_are_not_assigned() {
 #[test]
 #[serial_test::serial]
 fn env_vars_populate_global_args() {
-    // Save then clear any env vars we set, then verify clap picks them up.
     let pairs = [
         ("SOCKET_CWD", "/env/cwd"),
         ("SOCKET_MANIFEST_PATH", "env-manifest.json"),
@@ -468,18 +453,7 @@ fn env_vars_populate_global_args() {
         ("SOCKET_TELEMETRY_DISABLED", "true"),
     ];
 
-    // Save originals.
-    let saved: Vec<(String, Option<String>)> = pairs
-        .iter()
-        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-        .collect();
-
-    // Set test values.
-    for (k, v) in &pairs {
-        std::env::set_var(k, v);
-    }
-
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let cli = clap_parse::try_parse_with_env(&pairs, &["socket-patch", "list"]).expect("parse");
     if let socket_patch_cli::Commands::List(args) = cli.command {
         assert_eq!(args.common.cwd, std::path::PathBuf::from("/env/cwd"));
         assert_eq!(args.common.manifest_path, "env-manifest.json");
@@ -524,24 +498,11 @@ fn env_vars_populate_global_args() {
     } else {
         panic!("expected List");
     }
-
-    // Restore originals.
-    for (k, orig) in saved {
-        match orig {
-            Some(v) => std::env::set_var(&k, v),
-            None => std::env::remove_var(&k),
-        }
-    }
 }
 
 /// Bool env vars accept "1"/"yes" (the conventional truthy strings), not
 /// just clap's strict "true"/"false": `SOCKET_OFFLINE=1` (or
 /// `SOCKET_DEBUG=1`) must not fail with `invalid value '1' for '--offline'`.
-///
-/// `#[serial]` because env-var state is process-global; without it
-/// these tests race each other (and the existing
-/// `env_vars_populate_global_args`) when cargo runs them in
-/// parallel.
 #[test]
 #[serial_test::serial]
 fn bool_env_vars_accept_one_and_yes() {
@@ -559,15 +520,7 @@ fn bool_env_vars_accept_one_and_yes() {
         ("SOCKET_TELEMETRY_DISABLED", "1"),
     ];
 
-    let saved: Vec<(String, Option<String>)> = cases
-        .iter()
-        .map(|(k, _)| (k.to_string(), std::env::var(k).ok()))
-        .collect();
-    for (k, v) in cases {
-        std::env::set_var(k, v);
-    }
-
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let cli = clap_parse::try_parse_with_env(cases, &["socket-patch", "list"]).expect("parse");
     if let socket_patch_cli::Commands::List(args) = cli.command {
         assert!(args.common.offline, "SOCKET_OFFLINE=1 must parse as true");
         assert!(args.common.strict, "SOCKET_STRICT=on must parse as true");
@@ -585,28 +538,14 @@ fn bool_env_vars_accept_one_and_yes() {
     } else {
         panic!("expected List");
     }
-
-    for (k, orig) in saved {
-        match orig {
-            Some(v) => std::env::set_var(&k, v),
-            None => std::env::remove_var(&k),
-        }
-    }
 }
 
 /// Defensive: "0", "false", "no", "off" must NOT engage a bool. Otherwise
 /// an operator unsetting via `SOCKET_OFFLINE=0` would still get airgap mode
 /// (and various subtler shell idioms).
 ///
-/// The original version of this test was vacuous: every assertion expected
-/// `false`, which is *also* the field default. A regression that dropped the
-/// `env = "SOCKET_*"` binding (or replaced `BoolishValueParser` with a parser
-/// that silently ignored the var) would leave the fields at their default
-/// `false` and the test would stay green — it never actually exercised the
-/// env binding. We now first PROVE the binding is live by setting the var
-/// truthy and asserting the field flips to `true`; only then is the
-/// falsey-resolves-to-false assertion meaningful. Env is fully cleared and
-/// isolated per iteration so no leaked `SOCKET_*` value can taint a parse.
+/// Each var is first set truthy to prove the binding is live; otherwise the
+/// falsey checks would pass on a dead binding, since `false` is the default.
 #[test]
 #[serial_test::serial]
 fn bool_env_vars_reject_zero_and_falsey() {
@@ -617,39 +556,29 @@ fn bool_env_vars_reject_zero_and_falsey() {
         ("SOCKET_JSON", |c| c.json),
     ];
 
-    let saved = save_and_clear_global_env();
-
-    let parse_list = || {
-        let cli = Cli::try_parse_from(["socket-patch", "list"]);
-        cli.map(|cli| match cli.command {
-            socket_patch_cli::Commands::List(args) => args.common,
-            _ => panic!("expected List"),
-        })
+    let parse_list = |var: &str, value: &str| {
+        let cli = clap_parse::try_parse_with_env(&[(var, value)], &["socket-patch", "list"])
+            .unwrap_or_else(|e| panic!("{var}={value} should parse, got: {e}"));
+        common_of(&cli).clone()
     };
 
     for &(var, get) in fields {
         // Liveness proof: a truthy value MUST flip the field to true. If this
         // fails, the env binding is dead and the falsey checks below would be
         // vacuous.
-        std::env::set_var(var, "1");
-        let common = parse_list().unwrap_or_else(|e| panic!("{var}=1 should parse: {e}"));
         assert!(
-            get(&common),
+            get(&parse_list(var, "1")),
             "{var}=1 must engage the bool (proves binding is live)"
         );
-        std::env::remove_var(var);
 
         // Each falsey idiom must resolve to false — not true, not a parse error.
         for falsey in ["0", "false", "no", "off"] {
-            std::env::set_var(var, falsey);
-            let common =
-                parse_list().unwrap_or_else(|e| panic!("{var}={falsey} should parse, got: {e}"));
-            assert!(!get(&common), "{var}={falsey} must NOT engage the bool");
-            std::env::remove_var(var);
+            assert!(
+                !get(&parse_list(var, falsey)),
+                "{var}={falsey} must NOT engage the bool"
+            );
         }
     }
-
-    restore_global_env(saved);
 }
 
 /// An **empty** boolean env var resolves to `false` — it must NOT crash.
@@ -685,12 +614,8 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
         }),
     ];
 
-    let saved = save_and_clear_global_env();
-
     for (var, accessor) in bool_vars {
-        std::env::set_var(var, "");
-        let result = Cli::try_parse_from(["socket-patch", "list"]);
-        std::env::remove_var(var);
+        let result = clap_parse::try_parse_with_env(&[(var, "")], &["socket-patch", "list"]);
 
         let cli =
             result.unwrap_or_else(|e| panic!("{var}= (empty) must parse cleanly, got error: {e}"));
@@ -699,15 +624,7 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
             "{var}= (empty) must resolve to false",
         );
     }
-
-    restore_global_env(saved);
 }
-
-/// Every `SOCKET_*` env var that `GlobalArgs` binds, so tests that need a
-/// clean slate can save/clear/restore them in one place. This is the
-/// production list itself, so it cannot drift from the bound flags;
-/// `save_and_clear_covers_every_bound_global_env_var` below pins that.
-use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS as GLOBAL_ENV_VARS;
 
 /// An exported-but-**empty** non-bool env var must mean "unset", not crash.
 ///
@@ -774,68 +691,6 @@ fn empty_nonbool_env_vars_do_not_crash_the_binary() {
     );
 }
 
-/// `save_and_clear_global_env` must clear **every** env var `GlobalArgs`
-/// binds — the production list, not a private copy that can go stale. A var
-/// that survives the clear taints every parse in this file: an ambient
-/// `SOCKET_STRICT=garbage` in a developer's shell would abort all of them
-/// with a `ValueValidation` error that looks nothing like the real cause.
-#[test]
-#[serial_test::serial]
-fn save_and_clear_covers_every_bound_global_env_var() {
-    use socket_patch_cli::args::GLOBAL_ARG_ENV_VARS;
-
-    // Snapshot the full bound set so this test is hermetic even on failure.
-    let originals: Vec<(&str, Option<String>)> = GLOBAL_ARG_ENV_VARS
-        .iter()
-        .map(|&k| (k, std::env::var(k).ok()))
-        .collect();
-    for &(k, _) in &originals {
-        std::env::set_var(k, "ambient-poison");
-    }
-
-    // Discard the snapshot it returns — it captured the poison values.
-    let _ = save_and_clear_global_env();
-
-    let leaked: Vec<&str> = GLOBAL_ARG_ENV_VARS
-        .iter()
-        .copied()
-        .filter(|k| std::env::var(k).is_ok())
-        .collect();
-
-    // Restore before asserting so a failure can't poison later serial tests.
-    for (k, orig) in originals {
-        match orig {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        }
-    }
-
-    assert!(
-        leaked.is_empty(),
-        "save_and_clear_global_env left GlobalArgs-bound env vars set: {leaked:?}",
-    );
-}
-
-fn save_and_clear_global_env() -> Vec<(&'static str, Option<String>)> {
-    let saved: Vec<(&'static str, Option<String>)> = GLOBAL_ENV_VARS
-        .iter()
-        .map(|&k| (k, std::env::var(k).ok()))
-        .collect();
-    for &k in GLOBAL_ENV_VARS {
-        std::env::remove_var(k);
-    }
-    saved
-}
-
-fn restore_global_env(saved: Vec<(&'static str, Option<String>)>) {
-    for (k, orig) in saved {
-        match orig {
-            Some(v) => std::env::set_var(k, v),
-            None => std::env::remove_var(k),
-        }
-    }
-}
-
 /// Regression for the documented precedence (`CLI arg > env var > default`,
 /// see the module header in `args.rs`): when both a CLI flag and its env var
 /// are set, the CLI value must win. Covers a string field (`--api-url`) and a
@@ -844,16 +699,17 @@ fn restore_global_env(saved: Vec<(&'static str, Option<String>)>) {
 #[test]
 #[serial_test::serial]
 fn cli_arg_overrides_env_var() {
-    let saved = save_and_clear_global_env();
-
+    let api_url_env = [("SOCKET_API_URL", "https://env-api.example.com")];
     // String field: env set, CLI overrides.
-    std::env::set_var("SOCKET_API_URL", "https://env-api.example.com");
-    let cli = Cli::try_parse_from([
-        "socket-patch",
-        "list",
-        "--api-url",
-        "https://cli-api.example.com",
-    ])
+    let cli = clap_parse::try_parse_with_env(
+        &api_url_env,
+        &[
+            "socket-patch",
+            "list",
+            "--api-url",
+            "https://cli-api.example.com",
+        ],
+    )
     .expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
@@ -865,7 +721,8 @@ fn cli_arg_overrides_env_var() {
     );
 
     // Sanity: with the CLI flag absent, the env value resolves through.
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let cli =
+        clap_parse::try_parse_with_env(&api_url_env, &["socket-patch", "list"]).expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
     };
@@ -876,8 +733,11 @@ fn cli_arg_overrides_env_var() {
     );
 
     // Bool field: CLI `--offline` wins over a falsey env value.
-    std::env::set_var("SOCKET_OFFLINE", "0");
-    let cli = Cli::try_parse_from(["socket-patch", "list", "--offline"]).expect("parse");
+    let cli = clap_parse::try_parse_with_env(
+        &[("SOCKET_OFFLINE", "0")],
+        &["socket-patch", "list", "--offline"],
+    )
+    .expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
     };
@@ -885,8 +745,6 @@ fn cli_arg_overrides_env_var() {
         args.common.offline,
         "CLI --offline must win over SOCKET_OFFLINE=0"
     );
-
-    restore_global_env(saved);
 }
 
 /// Regression: with neither CLI flags nor env vars set, clap must populate the
@@ -898,28 +756,15 @@ fn cli_arg_overrides_env_var() {
 #[test]
 #[serial_test::serial]
 fn production_defaults_populate_when_unset() {
-    let saved = save_and_clear_global_env();
-
-    let cli = Cli::try_parse_from(["socket-patch", "list"]).expect("parse");
+    let cli = hermetic::try_parse(&["socket-patch", "list"]).expect("parse");
     let socket_patch_cli::Commands::List(args) = cli.command else {
         panic!("expected List");
     };
     let c = &args.common;
-    assert_eq!(c.cwd, std::path::PathBuf::from("."));
-    assert_eq!(c.manifest_path, ".socket/manifest.json");
-    assert_eq!(c.api_url, None, "no clap default — resolved in core");
-    assert_eq!(c.proxy_url, None, "no clap default — resolved in core");
-    assert_eq!(c.vendor_source, "service");
-    assert!(c.vendor_url.is_none());
-    assert!(c.patch_server_url.is_none());
-    assert!(c.api_token.is_none());
-    assert!(c.org.is_none());
-    assert!(c.ecosystems.is_none());
-    assert!(!c.strict);
-    assert!(!c.offline && !c.global && !c.json && !c.verbose && !c.silent);
-    assert!(!c.dry_run && !c.yes && !c.debug && !c.no_telemetry);
-    assert!(c.lock_timeout.is_none());
-    assert!(c.global_prefix.is_none());
+    assert_eq!(
+        clap_parse::Globals(c.clone()),
+        clap_parse::global_defaults()
+    );
 
     // With no flag and no env var the overrides stay `None`, so the core
     // resolver (env → socket-cli config → documented default) decides.
@@ -928,6 +773,4 @@ fn production_defaults_populate_when_unset() {
     assert!(o.proxy_url.is_none(), "unset --proxy-url must not override");
     assert!(o.api_token.is_none());
     assert!(o.org_slug.is_none());
-
-    restore_global_env(saved);
 }

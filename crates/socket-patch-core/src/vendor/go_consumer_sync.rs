@@ -389,6 +389,168 @@ fn modules_txt_location(project_root: &Path) -> (PathBuf, &'static str) {
     )
 }
 
+// GOFLAGS uses Go's quoted.Split: quotes surround a whole argument and do
+// not unescape its contents. Both -flag and --flag are accepted. Like Go's
+// explicitStringFlag, an empty `-mod=` leaves the mode to be chosen
+// automatically unless an earlier non-empty `-mod` already made it explicit.
+fn go_mod_flag(mut flags: &str) -> Option<&str> {
+    let space = |c: char| matches!(c, ' ' | '\t' | '\n' | '\r');
+    let mut mode = None;
+    let mut explicit = false;
+    loop {
+        flags = flags.trim_start_matches(space);
+        if flags.is_empty() {
+            return mode.filter(|_| explicit);
+        }
+        let (word, rest) =
+            if let Some(quote) = flags.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                let (word, rest) = flags[1..].split_once(quote)?;
+                (word, rest)
+            } else {
+                let end = flags.find(space).unwrap_or(flags.len());
+                (&flags[..end], &flags[end..])
+            };
+        if let Some(value) = word
+            .strip_prefix("-mod=")
+            .or_else(|| word.strip_prefix("--mod="))
+        {
+            explicit |= !value.is_empty();
+            mode = Some(value);
+        }
+        flags = rest;
+    }
+}
+
+/// The native vendor tree selected by Go, including GOFLAGS and go.work.
+/// An absent modules.txt does not disable vendor mode; it makes it invalid.
+pub async fn native_vendor_dir(project_root: &Path) -> Option<PathBuf> {
+    let flags = crate::utils::go_env::go_env("GOFLAGS").unwrap_or_default();
+    let mode = go_mod_flag(&flags);
+    if mode.is_some_and(|mode| mode != "vendor") {
+        return None;
+    }
+    let (modules_txt, _) = modules_txt_location(project_root);
+    let dir = modules_txt.parent()?.to_path_buf();
+    if mode == Some("vendor") {
+        return Some(dir);
+    }
+    if !dir.is_dir() {
+        return None;
+    }
+    let work = workspace_file(project_root);
+    // Go only automatically selects a tree generated in the same mode. A
+    // module vendor tree at a workspace root is otherwise ignored.
+    let modules = read_regular_to_string(&modules_txt)
+        .await
+        .unwrap_or_default();
+    let workspace_tree = modules.lines().next().is_some_and(|line| {
+        line.strip_prefix("## ")
+            .is_some_and(|annotations| annotations.split(';').any(|a| a.trim() == "workspace"))
+    });
+    if workspace_tree != work.is_some() {
+        return None;
+    }
+    let config = work.unwrap_or_else(|| project_root.join("go.mod"));
+    let text = read_regular_to_string(&config).await.ok()?;
+    let go = go_mod_edit::go_directive_version(&go_mod_edit::normalize_for_read(&text))?;
+    vendor_by_default(go).then_some(dir)
+}
+
+/// Whether a `go` directive makes Go select an existing vendor tree without
+/// `-mod=vendor`: go 1.14 or later by gover.Compare, so a prerelease such as
+/// `1.22rc1` counts while `1.14rc1` sorts below 1.14.
+fn vendor_by_default(go: go_mod_edit::GoDirective) -> bool {
+    go.major > 1 || go.major == 1 && (go.minor > 14 || go.minor == 14 && go.release)
+}
+
+/// Drift / omission code for a patch whose bytes the native vendor tree Go
+/// builds does not carry (or cannot be shown to carry).
+pub const NATIVE_VENDOR_CODE: &str = "go_vendor_content_mismatch";
+
+/// The `afterHash` of a Go patch record's module-root `go.mod`, when the
+/// patch changes it: the dependency requirements the native vendor check
+/// needs the patched text for (see [`verify_native_vendor`]'s `known`).
+pub fn patched_go_mod_hash(record: &crate::manifest::schema::PatchRecord) -> Option<&str> {
+    record.files.iter().find_map(|(name, info)| {
+        (crate::patch::apply::normalize_file_path(name) == "go.mod")
+            .then_some(info.after_hash.as_str())
+            .filter(|hash| !hash.is_empty())
+    })
+}
+
+/// Native vendoring copies runtime files and omits dependency tests and
+/// manifests. Its bytes must agree with the patch even when the Socket copy
+/// is intact: Go builds this tree without reading the replacement directory.
+///
+/// Also fails the patch when `vendor/modules.txt` does not record its
+/// module's socket `replace`, for callers (`vex`) that do not run
+/// [`audit`]; the audits that report that drift themselves use
+/// [`verify_native_vendor_tree`]. `known` maps an `afterHash` to patched
+/// text the caller already holds (e.g. fetched from the patch API), for a
+/// patched `go.mod` no local blob or copy provides.
+pub async fn verify_native_vendor(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+) -> Result<(), String> {
+    verify_native_vendor_with(project_root, purl, record, known, true).await
+}
+
+/// [`verify_native_vendor`] without the modules.txt replacement check, for
+/// callers that report [`GoSyncIssue::VendorModulesTxt`] through [`audit`]:
+/// one root cause, one report.
+pub async fn verify_native_vendor_tree(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+) -> Result<(), String> {
+    verify_native_vendor_with(project_root, purl, record, known, false).await
+}
+
+async fn verify_native_vendor_with(
+    project_root: &Path,
+    purl: &str,
+    record: &crate::manifest::schema::PatchRecord,
+    known: &HashMap<String, String>,
+    check_modules_txt: bool,
+) -> Result<(), String> {
+    let Some((module, version)) = crate::utils::purl::parse_golang_purl(purl) else {
+        return Ok(());
+    };
+    let Some(dir) = native_vendor_dir(project_root).await else {
+        return Ok(());
+    };
+    if !crate::patch::redirect::golang_local::are_safe_redirect_coords(&module, &version) {
+        return Err("invalid Go module coordinates".into());
+    }
+    let replaces = go_mod_edit::read_replace_entries(project_root).await;
+    if check_modules_txt {
+        if let Some(issue) = vendor_modules_txt_issues(project_root, &replaces)
+            .await
+            .into_iter()
+            .find(|issue| issue.module() == module)
+        {
+            return Err(issue.to_string());
+        }
+    }
+    let (_, command) = modules_txt_location(project_root);
+    super::go_native_vendor::verify(
+        &super::go_native_vendor::Target {
+            root: project_root,
+            dir: &dir,
+            module: module.as_ref(),
+            version: version.as_ref(),
+            replaces: &replaces,
+            known,
+            command,
+        },
+        record,
+    )
+    .await
+}
+
 fn workspace_file(project_root: &Path) -> Option<PathBuf> {
     match go_workspace::resolve(project_root) {
         GoWork::File(file) => Some(file),
@@ -681,6 +843,46 @@ fn go_semver_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goflags_uses_whole_argument_quotes_and_last_mod_flag() {
+        assert_eq!(
+            go_mod_flag("-mod=vendor '--mod=readonly'"),
+            Some("readonly")
+        );
+        assert_eq!(go_mod_flag("\"--mod=mod\" -tags=linux"), Some("mod"));
+        assert_eq!(
+            go_mod_flag("'-ldflags=-X main.flag=-mod=vendor' --mod=mod"),
+            Some("mod")
+        );
+        assert_eq!(go_mod_flag("'-ldflags=-X main.flag=-mod=vendor'"), None);
+        assert_eq!(go_mod_flag("'unterminated"), None);
+        // An empty value is not explicit: Go still selects vendor/ itself...
+        assert_eq!(go_mod_flag("-mod="), None);
+        assert_eq!(go_mod_flag("--mod= -tags=linux"), None);
+        // ...unless an earlier non-empty -mod already made the mode explicit.
+        assert_eq!(go_mod_flag("-mod=vendor -mod="), Some(""));
+    }
+
+    #[test]
+    fn vendor_is_selected_by_default_from_go_1_14_including_prereleases() {
+        let go = |text: &str| go_mod_edit::go_directive_version(text).unwrap();
+        for selected in [
+            "go 1.14",
+            "go 1.14.1",
+            "go 1.21",
+            "go 1.21.0",
+            "go 1.22rc1",
+            "go 1.21beta1",
+            "go 2",
+        ] {
+            assert!(vendor_by_default(go(selected)), "{selected}");
+        }
+        for ignored in ["go 1.13", "go 1.14rc1", "go 1.14beta2", "go 1"] {
+            assert!(!vendor_by_default(go(ignored)), "{ignored}");
+        }
+        assert!(go_mod_edit::go_directive_version("module m\n").is_none());
+    }
 
     const COPY: &str = ".socket/go-patches/example.com/upstream@v1.0.0";
 
