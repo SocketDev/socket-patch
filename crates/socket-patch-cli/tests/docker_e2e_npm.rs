@@ -27,7 +27,10 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 use common::git_sha256;
+use docker_common::{assert_vex_agent_attested, run_container, skip_if_no_image};
 
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
@@ -35,11 +38,11 @@ mod docker_vendor_common;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const IMAGE: &str = "socket-patch-test-npm:latest";
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:npm/minimist@1.2.2";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
@@ -52,32 +55,6 @@ const GHSA: &str = "GHSA-agent-npm-real";
 /// post-apply that the file has been overwritten.
 const PATCHED_BYTES: &[u8] =
     b"/* SOCKET-PATCH-E2E-MARKER */\nmodule.exports = function () { return {}; };\n";
-
-/// Coverage instrumentation hook. The CI coverage-docker job sets
-/// SOCKET_PATCH_COV_BIN (host path to an llvm-cov-instrumented
-/// socket-patch binary) and SOCKET_PATCH_COV_PROFRAW_DIR (host dir
-/// for in-container *.profraw output). When both are set, the docker
-/// run mounts the instrumented binary over the image's baked-in
-/// /usr/local/bin/socket-patch and points LLVM_PROFILE_FILE into a
-/// host-visible volume so the in-container code paths contribute to
-/// the host's lcov merge. Empty Vec when unset → tests use the
-/// image's stock binary.
-fn cov_docker_args() -> Vec<String> {
-    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
-        return Vec::new();
-    };
-    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
 
 fn host_mode() -> bool {
     std::env::var("SOCKET_PATCH_TEST_HOST")
@@ -101,7 +78,7 @@ fn workspace_root() -> PathBuf {
 async fn make_mock_server(after_hash: &str) -> MockServer {
     // Bind to 0.0.0.0 so the container can reach the host via the
     // `host.docker.internal` alias (added with `--add-host` in
-    // `run_in_container`). Random port chosen by the kernel.
+    // `run_container`). Random port chosen by the kernel.
     let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock to 0.0.0.0:0");
     let server = MockServer::builder().listener(listener).start().await;
 
@@ -559,19 +536,6 @@ exit 0
     )
 }
 
-fn run_in_container(script: &str) -> std::process::Output {
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "--add-host=host.docker.internal:host-gateway",
-        "-i",
-    ])
-    .args(cov_docker_args())
-    .args(["socket-patch-test-npm:latest", "bash", "-c", script]);
-    cmd.output().expect("docker run failed to spawn")
-}
-
 fn run_on_host(script: &str) -> std::process::Output {
     // Host mode: write the script to a tempfile under a fresh tmp workspace
     // and execute it. Requires npm + socket-patch on PATH.
@@ -591,32 +555,6 @@ fn run_on_host(script: &str) -> std::process::Output {
         .expect("bash failed to spawn")
 }
 
-/// Returns `true` when the test should skip (docker missing, image
-/// missing). Prints a skip notice to stderr — the test still reports as
-/// `ok` because Rust integration tests have no native "skipped" outcome.
-///
-/// Note that npm e2e also supports `SOCKET_PATCH_TEST_HOST=1` (see
-/// [`host_mode`]) to run the test against host toolchains instead of
-/// Docker; that's checked independently in the test body before this
-/// helper runs.
-#[must_use]
-fn skip_if_no_docker_image() -> bool {
-    let Ok(out) = Command::new("docker")
-        .args(["image", "inspect", "socket-patch-test-npm:latest"])
-        .output()
-    else {
-        eprintln!(
-            "skipping: `docker` not on PATH (set SOCKET_PATCH_TEST_HOST=1 to run on the host)"
-        );
-        return true;
-    };
-    if !out.status.success() {
-        eprintln!("skipping: docker image `socket-patch-test-npm:latest` not present");
-        return true;
-    }
-    false
-}
-
 #[tokio::test]
 async fn npm_install_scan_apply_rollback_cycle() {
     let after_hash = git_sha256(PATCHED_BYTES);
@@ -626,11 +564,11 @@ async fn npm_install_scan_apply_rollback_cycle() {
         let api = format!("http://127.0.0.1:{}", server.address().port());
         run_on_host(&make_container_script(&api))
     } else {
-        if skip_if_no_docker_image() {
+        if skip_if_no_image(IMAGE) {
             return;
         }
         let api = api_url_for_container(&server);
-        run_in_container(&make_container_script(&api))
+        run_container(IMAGE, &make_container_script(&api))
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -665,7 +603,7 @@ async fn npm_install_scan_apply_rollback_cycle() {
         stderr.contains("===VEX VERIFIED==="),
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    assert_vex_agent_attested(&stdout, PURL);
+    assert_vex_agent_attested(&stdout, PURL, GHSA);
 
     // Keep the workspace_root reference alive; without this clippy warns
     // unused.
@@ -690,11 +628,11 @@ async fn npm_global_install_full_apply_chain() {
         // mutate, so skip silently. Docker mode is the canonical run.
         return;
     }
-    if skip_if_no_docker_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let api = api_url_for_container(&server);
-    let out = run_in_container(&make_global_script(&api));
+    let out = run_container(IMAGE, &make_global_script(&api));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -704,50 +642,6 @@ async fn npm_global_install_full_apply_chain() {
     assert!(stderr.contains("===PATCH VERIFIED==="), "stderr=\n{stderr}");
     assert!(stdout.contains("===E2E PASS==="), "stdout=\n{stdout}");
     assert_real_api_pipeline_ran(&server).await;
-}
-
-/// Host-side oracle over the VEX document the container emitted between the
-/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers. These agent suites run
-/// the workspace inside the container with no bind mount (unlike the vendor
-/// capstones), so the doc is parsed straight from captured stdout. Asserts
-/// exactly one statement attesting the agent patch: the fixture GHSA,
-/// `not_affected`, the installed-package subcomponent purl, and a PLAIN impact
-/// statement with NO `(vendored)`/`(redirected)` marker — the marker's absence
-/// is precisely what distinguishes agent provenance from the vendored/hosted
-/// modes.
-fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
-    const BEGIN: &str = "===VEX DOC BEGIN===";
-    const END: &str = "===VEX DOC END===";
-    let start = stdout
-        .find(BEGIN)
-        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
-        + BEGIN.len();
-    let stop = stdout[start..]
-        .find(END)
-        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
-        + start;
-    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
-        .expect("emitted VEX document must be valid JSON");
-    let stmts = doc["statements"]
-        .as_array()
-        .expect("VEX document must have a statements array");
-    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
-    let st = &stmts[0];
-    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
-    assert_eq!(st["status"], "not_affected");
-    assert_eq!(
-        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
-        "subcomponent must be the patched package purl"
-    );
-    let impact = st["impact_statement"]
-        .as_str()
-        .expect("statement must carry an impact_statement");
-    assert!(
-        impact.contains("Patched via Socket patch")
-            && !impact.contains("(vendored)")
-            && !impact.contains("(redirected)"),
-        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
-    );
 }
 
 /// Shared check: the mock must have served BOTH the metadata discovery
@@ -781,11 +675,11 @@ async fn npm_bun_install_full_apply_chain() {
         // Host mode would need bun installed locally; skip for now.
         return;
     }
-    if skip_if_no_docker_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let api = api_url_for_container(&server);
-    let out = run_in_container(&make_bun_script(&api));
+    let out = run_container(IMAGE, &make_bun_script(&api));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -982,11 +876,11 @@ async fn npm_berry_agent_install_apply_chain() {
         // in-process berry legs already cover the host toolchain.
         return;
     }
-    if skip_if_no_docker_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let api = api_url_for_container(&server);
-    let out = run_in_container(&make_berry_agent_script(&api));
+    let out = run_container(IMAGE, &make_berry_agent_script(&api));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1006,7 +900,7 @@ async fn npm_berry_vendor_frozen_install_chain() {
     if host_mode() {
         return;
     }
-    if skip_if_no_docker_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
@@ -1016,8 +910,7 @@ async fn npm_berry_vendor_frozen_install_chain() {
         docker_vendor_common::bash_prelude(),
         make_berry_vendor_script()
     );
-    let (out, _service) =
-        docker_vendor_common::run_with_fixture("socket-patch-test-npm:latest", &host, &script);
+    let (out, _service) = docker_vendor_common::run_with_fixture(IMAGE, &host, &script);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -1046,14 +939,14 @@ fn npm_image_vlt_smoke() {
     let out = if host_mode() {
         Command::new("vlt").arg("--version").output()
     } else {
-        if skip_if_no_docker_image() {
+        if skip_if_no_image(IMAGE) {
             return;
         }
         Command::new("docker")
             .args([
                 "run",
                 "--rm",
-                "socket-patch-test-npm:latest",
+                IMAGE,
                 "bash",
                 "-c",
                 "VLT_TELEMETRY=0 vlt --version",
@@ -1100,8 +993,3 @@ async fn npm_test_infrastructure_smoke() {
         .expect("read body");
     assert_eq!(body.as_ref(), PATCHED_BYTES);
 }
-
-// Suppress the unused-import warning when SOCKET_PATCH_TEST_HOST=1 (host
-// mode doesn't need Duration or workspace_root). Keep both functions
-// available; the helper signatures are simple enough to keep cheap.
-const _: Option<Duration> = None;

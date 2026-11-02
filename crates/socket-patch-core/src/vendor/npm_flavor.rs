@@ -355,7 +355,26 @@ async fn sniff_yarn_lock(view: &ProjectView<'_>) -> Result<NpmLockFlavor, (&'sta
 /// as it is once `yarn install` writes `.pnp.cjs`, instead of being wired
 /// once and refused on every re-run. Read-only consumers (`vendor
 /// --check`, `--revert`, VEX, the lock inventory) keep the plain probe.
+///
+/// A `vendor_lockfile_missing` refusal in a project installed from a lock
+/// in another directory names that directory ([`lock_elsewhere_detail`],
+/// #1904). Callers that keep only the code use
+/// [`detect_vendorable_npm_flavor_code`], which skips that lookup.
 pub(crate) async fn detect_vendorable_npm_flavor(
+    project_root: &Path,
+) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
+    match detect_vendorable_npm_flavor_code(project_root).await {
+        Err(("vendor_lockfile_missing", detail)) => Err((
+            "vendor_lockfile_missing",
+            lock_elsewhere_detail(project_root).await.unwrap_or(detail),
+        )),
+        found => found,
+    }
+}
+
+/// [`detect_vendorable_npm_flavor`] for callers that keep only the
+/// refusal code: the detail is the probe's own.
+async fn detect_vendorable_npm_flavor_code(
     project_root: &Path,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     detect_vendorable_npm_flavor_with(project_root, || {
@@ -398,6 +417,39 @@ async fn detect_vendorable_npm_flavor_with(
              `yarn patch <pkg>` instead"
         ),
     ))
+}
+
+/// #1904: the `vendor_lockfile_missing` detail for a project with no lock
+/// of its own that its package manager installs from a lock in another
+/// directory (a workspace member, or a pnpm `lockfile-dir`). Running
+/// install in the project only updates that other lock, so the generic
+/// "run install first" remedy would loop: a workspace member is told to
+/// vendor from the workspace root, a `lockfile-dir` project that vendor
+/// cannot wire it. `None` when no other directory governs the project.
+/// Hosted's `redirect_*_lockfile_elsewhere` refusal reads the same lookup.
+async fn lock_elsewhere_detail(project_root: &Path) -> Option<String> {
+    // The member's own path, not the default `--cwd` `.`.
+    let shown = tokio::fs::canonicalize(project_root)
+        .await
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let elsewhere = crate::hosted::governing_root::npm_lock_elsewhere(&shown).await?;
+    Some(if elsewhere.vendorable_dir {
+        format!(
+            "{}, so there is no lockfile here for vendoring to rewire; vendor from {} (the {})",
+            elsewhere.detail,
+            elsewhere.dir.display(),
+            elsewhere.dir_kind
+        )
+    } else {
+        format!(
+            "{}; vendor does not rewire a pnpm lock kept in another directory \
+             (`lockfile-dir`): use `socket-patch scan --mode hosted` from {} (the {}), or \
+             remove `lockfile-dir` and run `pnpm install` to write a lock here",
+            elsewhere.detail,
+            elsewhere.dir.display(),
+            elsewhere.dir_kind
+        )
+    })
 }
 
 /// A workspace member whose own lock its package manager never reads
@@ -624,7 +676,7 @@ pub async fn preflight_packages(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Result<(), &'static str>> {
-    let flavor = match detect_vendorable_npm_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor_code(project_root).await {
         Ok((flavor, _probe_warnings)) => flavor,
         Err((code, _detail)) => return vec![Err(code); packages.len()],
     };
@@ -645,11 +697,13 @@ pub async fn preflight_packages(
     }
 }
 
-/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in a
-/// pnpm, yarn classic or yarn berry project — each package's `(code,
-/// detail)` when its backend refuses it on the project's lock and manifest
-/// text alone, `None` otherwise (and for every package of any other
-/// flavor, or a project the flavor probe refuses).
+/// The lock-text refusals [`vendor_npm_any`] raises for `packages` in an
+/// npm package-lock, pnpm, yarn classic or yarn berry project — each
+/// package's `(code, detail)` when its backend refuses it on the project's
+/// lock and manifest text alone, `None` otherwise (and for every package of
+/// any other flavor, or a project the flavor probe refuses). Package-lock
+/// joined in #1976: its per-entry refusals (a URL / git spec copy, a
+/// workspace member) were otherwise found only after the view fetch.
 ///
 /// Those backends evaluate every such gate — the coordinates, the lock and
 /// manifest reads, override conflicts, the entry present and rewritable —
@@ -663,13 +717,16 @@ pub async fn lock_text_refusals(
     project_root: &Path,
     packages: &[(&str, &PatchRecord)],
 ) -> Vec<Option<(&'static str, String)>> {
-    let flavor = match detect_vendorable_npm_flavor(project_root).await {
+    let flavor = match detect_vendorable_npm_flavor_code(project_root).await {
         Ok((flavor, _)) => flavor,
         Err(_) => return vec![None; packages.len()],
     };
     if !matches!(
         flavor,
-        NpmLockFlavor::Pnpm | NpmLockFlavor::YarnClassic | NpmLockFlavor::YarnBerry
+        NpmLockFlavor::PackageLock
+            | NpmLockFlavor::Pnpm
+            | NpmLockFlavor::YarnClassic
+            | NpmLockFlavor::YarnBerry
     ) {
         return vec![None; packages.len()];
     }
@@ -1004,20 +1061,103 @@ mod lock_text_refusal_tests {
         }
     }
 
-    /// Only the pnpm / yarn classic / yarn berry gates answer: a
-    /// package-lock project refuses nothing here, whatever its backend does.
+    /// A package-lock project whose lock pins `left-pad@1.3.0` with
+    /// `entry` (under `key`) beside a plain registry `is-number@7.0.0`.
+    fn package_lock_project(root: &Path, spec: &str, key: &str, entry: serde_json::Value) {
+        let manifest = serde_json::json!({
+            "name": "t", "version": "0.0.0",
+            "dependencies": { "left-pad": spec, "is-number": "7.0.0" },
+        });
+        std::fs::write(root.join("package.json"), manifest.to_string()).unwrap();
+        let lock = serde_json::json!({
+            "name": "t", "version": "0.0.0", "lockfileVersion": 3, "requires": true,
+            "packages": {
+                "": { "name": "t", "version": "0.0.0",
+                      "dependencies": { "left-pad": spec, "is-number": "7.0.0" } },
+                key: entry,
+                "node_modules/is-number": {
+                    "version": "7.0.0",
+                    "resolved": "https://registry.npmjs.org/is-number/-/is-number-7.0.0.tgz",
+                    "integrity": "sha512-AAAA=="
+                }
+            }
+        });
+        std::fs::write(root.join("package-lock.json"), lock.to_string()).unwrap();
+    }
+
+    /// #1976: the package-lock backend's per-entry refusals (an entry
+    /// installed from a URL or git spec, a workspace member) are answered
+    /// here too, in the backend's own words, while the registry copy beside
+    /// it is wireable. The vendored preview, rollout planning and download
+    /// phase all ask this, so such a package no longer previews as
+    /// vendorable, takes a `--max-new-patches` slot or has its view fetched.
     #[tokio::test]
-    async fn other_flavors_refuse_nothing_early() {
+    async fn package_lock_entry_refusals_are_the_backends_own_words() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let git = "git+ssh://git@github.com/stevemao/left-pad.git#ff8e7ba";
+        let shapes = [
+            (
+                url,
+                "node_modules/left-pad",
+                serde_json::json!({ "version": "1.3.0", "resolved": url, "integrity": "sha512-orig==" }),
+                "vendor_lock_entry_not_rewritable",
+            ),
+            (
+                "github:stevemao/left-pad#v1.3.0",
+                "node_modules/left-pad",
+                serde_json::json!({ "version": "1.3.0", "resolved": git }),
+                "vendor_lock_entry_not_rewritable",
+            ),
+            (
+                "1.3.0",
+                "packages/left-pad",
+                serde_json::json!({ "name": "left-pad", "version": "1.3.0" }),
+                "vendor_workspace_member",
+            ),
+        ];
+        for (spec, key, entry, code) in shapes {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            package_lock_project(root, spec, key, entry);
+            let rec = record();
+            let purls = ["pkg:npm/left-pad@1.3.0", "pkg:npm/is-number@7.0.0"];
+            let packages: Vec<(&str, &PatchRecord)> = purls.iter().map(|p| (*p, &rec)).collect();
+            let refusals = lock_text_refusals(root, &packages).await;
+            assert_eq!(refusals[1], None, "{spec}: is-number is wireable");
+            let nowhere = root.join("not-installed");
+            let sources = PatchSources {
+                blobs_path: &nowhere,
+                mem_blobs: None,
+            };
+            let backend = crate::vendor::test_support::vendor_npm_any(
+                purls[0],
+                nowhere.as_path(),
+                root,
+                &rec,
+                &sources,
+                "t",
+                false,
+                false,
+                None,
+            )
+            .await;
+            let VendorOutcome::Refused { code: got, detail } = backend else {
+                panic!("{spec}: the backend must refuse left-pad");
+            };
+            assert_eq!(got, code, "{spec}");
+            assert_eq!(refusals[0], Some((got, detail)), "{spec}");
+        }
+    }
+
+    /// A project with no npm lock refuses nothing here: the flavor probe
+    /// decides first, and the run-level refusals are not lock-text gates.
+    #[tokio::test]
+    async fn a_lockless_project_refuses_nothing_early() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(
             root.join("package.json"),
             r#"{"name":"t","version":"0.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("package-lock.json"),
-            r#"{"name":"t","version":"0.0.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"t","version":"0.0.0"}}}"#,
         )
         .unwrap();
         let rec = record();
@@ -1074,6 +1214,97 @@ mod tests {
 
     async fn touch(root: &Path, name: &str, content: &str) {
         tokio::fs::write(root.join(name), content).await.unwrap();
+    }
+
+    /// #1904: a workspace member with no lock of its own is installed from
+    /// the workspace root's lock. The vendored refusal keeps its code but
+    /// names that root, as hosted's refusal and the stray-lock refusal
+    /// (#1094) do, instead of a "run install first" remedy that loops.
+    #[tokio::test]
+    async fn lockless_workspace_member_refusal_names_the_workspace_root() {
+        for lock in ["package-lock.json", "yarn.lock", "bun.lock"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path();
+            touch(
+                root,
+                "package.json",
+                r#"{"name":"app","private":true,"workspaces":["packages/*"]}"#,
+            )
+            .await;
+            touch(root, lock, "").await;
+            let member = root.join("packages/a");
+            tokio::fs::create_dir_all(&member).await.unwrap();
+            touch(&member, "package.json", r#"{"name":"a"}"#).await;
+
+            let (code, detail) = detect_vendorable_npm_flavor(&member).await.unwrap_err();
+            assert_eq!(code, "vendor_lockfile_missing", "{lock}");
+            let canonical = tokio::fs::canonicalize(root).await.unwrap();
+            assert!(
+                detail.contains(&format!("vendor from {}", canonical.display()))
+                    && detail.contains("(the workspace root)")
+                    && detail.contains(&canonical.join(lock).display().to_string())
+                    && detail.contains("workspace member"),
+                "{lock}: {detail}"
+            );
+            assert!(!detail.contains("install first"), "{lock}: {detail}");
+        }
+    }
+
+    /// #1904, pnpm: a pnpm workspace member is installed from the root's
+    /// pnpm-lock.yaml; the refusal names the directory holding it.
+    #[tokio::test]
+    async fn lockless_pnpm_member_refusal_names_the_lock_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, "pnpm-workspace.yaml", "packages:\n  - packages/*\n").await;
+        touch(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        let member = root.join("packages/a");
+        tokio::fs::create_dir_all(&member).await.unwrap();
+        touch(&member, "package.json", r#"{"name":"a"}"#).await;
+
+        let (code, detail) = detect_vendorable_npm_flavor(&member).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        let canonical = tokio::fs::canonicalize(root).await.unwrap();
+        assert!(
+            detail.contains(&format!("vendor from {}", canonical.display()))
+                && detail.contains("pnpm-lock.yaml"),
+            "{detail}"
+        );
+    }
+
+    /// #1904, pnpm `lockfile-dir` outside a pnpm workspace: the lock's
+    /// directory holds no project, so the refusal names the setting and
+    /// hosted mode instead of telling the user to vendor from there.
+    #[tokio::test]
+    async fn lockfile_dir_project_refusal_names_the_setting_not_a_dead_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        touch(root, "pnpm-lock.yaml", "lockfileVersion: '9.0'\n").await;
+        let proj = root.join("proj");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        touch(&proj, "package.json", r#"{"name":"p"}"#).await;
+        touch(&proj, ".npmrc", "lockfile-dir=..\n").await;
+
+        let (code, detail) = detect_vendorable_npm_flavor(&proj).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(
+            detail.contains("lockfile-dir") && detail.contains("scan --mode hosted"),
+            "{detail}"
+        );
+        assert!(!detail.contains("vendor from"), "{detail}");
+        assert!(!detail.contains("install first"), "{detail}");
+    }
+
+    /// A lockless project that no workspace governs keeps the generic
+    /// "run your package manager's install first" refusal.
+    #[tokio::test]
+    async fn lockless_standalone_project_keeps_the_install_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "package.json", r#"{"name":"solo"}"#).await;
+        let (code, detail) = detect_vendorable_npm_flavor(tmp.path()).await.unwrap_err();
+        assert_eq!(code, "vendor_lockfile_missing");
+        assert!(detail.contains("install first"), "{detail}");
+        assert!(!detail.contains("vendor from"), "{detail}");
     }
 
     const YARN_V1: &str = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n\

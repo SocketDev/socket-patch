@@ -3289,6 +3289,47 @@ async fn pip_lock_vendor_wires_requirements_with_the_pylock() {
     assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
 }
 
+/// #1873: pip expands `${NAME}` on every requirements line where it runs,
+/// so what `six==${SIXV}` installs is unknowable to vendor. Beside a `pip
+/// lock` pylock.toml, vendor refuses it and writes nothing (it used to wire
+/// only the lock, name requirements.txt an unpatched loser and exit 0),
+/// whatever this process's environment holds. A pylock-only wiring the
+/// templated line later contests fails `vendor --check`.
+#[tokio::test]
+async fn pip_lock_vendor_refuses_an_env_templated_requirements_pin() {
+    const TEMPLATED: &str = "idna==3.7\nsix==${SP_E2E_1873_SIXV}\n";
+    for env in [&[("SP_E2E_1873_SIXV", "1.16.0")][..], &[][..]] {
+        let (_tmp, root) = project();
+        stage_pip_lock(&root);
+        std::fs::write(root.join("requirements.txt"), TEMPLATED).unwrap();
+        stage_manifest(&root);
+        let before = tree(&root);
+        let (code, out) = run_cli(&root, &["vendor"], env);
+        assert_ne!(code, 0, "{env:?}: {out:#}");
+        assert!(
+            out.to_string().contains("pypi_requirement_env_templated"),
+            "{env:?}: {out:#}"
+        );
+        assert_eq!(tree(&root), before, "{env:?}: nothing written");
+    }
+
+    // A pylock-only wiring (vendored before six was named) is contested
+    // once the templated line names six.
+    let env = [("SP_E2E_1873_SIXV", "1.16.0")];
+    let (_tmp, root) = project();
+    stage_pip_lock(&root);
+    std::fs::write(root.join("requirements.txt"), "idna==3.7\n").unwrap();
+    stage_manifest(&root);
+    let (code, out) = run_cli(&root, &["vendor"], &env);
+    assert_eq!(code, 0, "{out:#}");
+    let (code, out) = run_cli(&root, &["vendor", "--check"], &env);
+    assert_eq!(code, 0, "{out:#}");
+    std::fs::write(root.join("requirements.txt"), TEMPLATED).unwrap();
+    let (code, out) = run_cli(&root, &["vendor", "--check"], &env);
+    assert_eq!(code, 1, "pip may install six from PyPI: {out:#}");
+    assert!(out.to_string().contains("contested"), "{out:#}");
+}
+
 /// #1851: requirements.txt pins six only through a `-r` include outside
 /// the project root, beside the `pip lock` pylock.toml. `pip install -r
 /// requirements.txt` installs that pin, and vendor can't edit the
@@ -3801,14 +3842,21 @@ async fn mount_pypi_json(server: &MockServer) {
 /// restored lock still pins (they reinstall a same-version package only
 /// when the LOCKED candidate is a differing URL or file), so after an
 /// unwind a plain `pdm sync` / `uv sync` / `pipenv sync` keeps the patched
-/// build. Every unwind — hosted and vendored `rollback` and `remove`, and
+/// build. #1953: so does `pip install -r requirements.txt`. Every unwind — hosted and vendored `rollback` and `remove`, and
 /// `vendor --revert` — must name the reinstall that restores the upstream
 /// bytes, and rollback's generic note must defer to it.
 #[tokio::test]
 async fn pypi_unwinds_name_the_reinstall_a_plain_sync_skips() {
     type Stage = fn(&Path) -> &'static [&'static str];
-    let tools: [(&str, Stage, Stage, &str); 3] = [
+    let tools: [(&str, Stage, Stage, &str); 4] = [
         ("pdm", stage_pdm, stage_pdm, "`pdm sync --reinstall`"),
+        // #1953: `pip install -r` keeps a same-version install too.
+        (
+            "pip",
+            stage_requirements,
+            stage_requirements,
+            "`pip install -r requirements.txt`",
+        ),
         (
             "pipenv",
             stage_pipenv,
@@ -4365,4 +4413,71 @@ async fn hatch_vendored_rerun_refuses_after_relocation_to_unsafe_root() {
         std::fs::read_to_string(moved.join(files[0])).unwrap(),
         wired
     );
+}
+
+/// #638: a pip project whose venv holds a patched package but which has no
+/// root requirements.txt or Python lock (its pins live in
+/// requirements-dev.txt or requirements/base.txt, it has no requirements
+/// file at all, or it is a uv project whose uv.lock is not committed). The
+/// hosted `--json` envelope used to carry no warning at all; it now says
+/// `redirect_pypi_no_lockfile` once, beside the per-purl
+/// `redirect_unconfirmed` row, and writes nothing. The exit code stays 0
+/// (the hosted exit policy is #704).
+#[tokio::test]
+async fn hosted_scan_without_a_python_lock_warns_no_lockfile() {
+    let pins = "six==1.16.0\nidna==3.7\n";
+    let project_toml = "[project]\nname = \"app\"\nversion = \"0.1.0\"\nrequires-python = \">=3.9\"\ndependencies = [\"six==1.16.0\", \"idna==3.7\"]\n";
+    for (layout, files) in [
+        ("requirements-dev.txt", vec![("requirements-dev.txt", pins)]),
+        (
+            "requirements/base.txt",
+            vec![("requirements/base.txt", pins)],
+        ),
+        ("no requirements file", vec![]),
+        (
+            "pyproject.toml without uv.lock",
+            vec![("pyproject.toml", project_toml)],
+        ),
+    ] {
+        let (_tmp, root) = project();
+        for (rel, text) in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let venv = root.join("../installed-venv");
+        venv_installed_from_patch_a(&venv);
+        let before = tree(&root);
+
+        let server = MockServer::start().await;
+        mount_hosted_api(&server, true).await;
+        let uri = server.uri();
+        let (code, env) = run_cli(
+            &root,
+            &hosted_scan_args(&uri),
+            &[("VIRTUAL_ENV", venv.to_str().unwrap())],
+        );
+        assert_eq!(code, 0, "{layout}: {env:#}");
+        assert_eq!(hosted_pinned(&env), 0, "{layout}: {env:#}");
+        let skipped = hosted_skipped(&env);
+        assert!(
+            skipped
+                .iter()
+                .any(|row| row["purl"] == PURL && row["reason"] == "redirect_unconfirmed"),
+            "{layout}: {env:#}"
+        );
+        let warnings: Vec<&Value> = env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["code"] == "redirect_pypi_no_lockfile")
+            .collect();
+        assert_eq!(warnings.len(), 1, "{layout}: {env:#}");
+        let detail = warnings[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("requirements.txt") && detail.contains("uv.lock"),
+            "{layout}: {detail}"
+        );
+        assert_eq!(tree(&root), before, "{layout}: hosted wrote nothing");
+    }
 }

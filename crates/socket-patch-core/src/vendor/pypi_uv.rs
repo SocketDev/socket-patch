@@ -346,22 +346,12 @@ pub(super) fn check_target_guards(
     // uv drops the [tool.uv.sources] entry under no-sources (or a
     // no-sources-package list naming the package), so the vendored source
     // would be ignored by the next `uv sync` (#564).
-    refuse_uv_no_sources(
-        canon_name,
-        None,
-        Some(&p.pyproject_text),
-        p.uv_toml.as_deref(),
-    )
-    .map_err(|detail| ("pypi_uv_no_sources", detail))?;
+    refuse_uv_no_sources(canon_name, Some(&p.pyproject_text), p.uv_toml.as_deref())
+        .map_err(|detail| ("pypi_uv_no_sources", detail))?;
     // The vendored artifact is a wheel, which uv refuses to install under
     // no-binary (or a no-binary-package list naming the package) (#1603).
-    refuse_uv_no_binary(
-        canon_name,
-        None,
-        Some(&p.pyproject_text),
-        p.uv_toml.as_deref(),
-    )
-    .map_err(|detail| ("pypi_uv_no_binary", detail))?;
+    refuse_uv_no_binary(canon_name, Some(&p.pyproject_text), p.uv_toml.as_deref())
+        .map_err(|detail| ("pypi_uv_no_binary", detail))?;
     // A parent uv.toml / [tool.uv] supplies the project's settings while
     // the project sets none; the [tool.uv] table wired below would make
     // uv drop them, failing `uv sync --locked` (#1545).

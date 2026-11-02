@@ -23,6 +23,7 @@ mod hermetic;
 /// the real CLI. Routing through the wrapper means each name/alias/error-kind
 /// assertion below also exercises the code path users actually hit.
 fn parse(argv: &[&str]) -> Result<Cli, clap::Error> {
+    hermetic::scrub_process_socket_env();
     parse_argv_with_shortcuts(argv.iter().map(|s| s.to_string()).collect())
 }
 

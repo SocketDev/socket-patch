@@ -98,12 +98,12 @@ fn go(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
 /// Build the upstream module into a file-proxy and `go mod download` it into a
 /// temp GOMODCACHE. Returns (consumer_dir, modcache, proxy_url).
 fn stage(tmp: &Path) -> (std::path::PathBuf, std::path::PathBuf, String) {
-    stage_with(tmp, &format!("go {}", golang_e2e_matrix::go_directive()))
+    stage_with(tmp, golang_e2e_matrix::go_directive())
 }
 
-/// [`stage`] with the upstream module's `go` directive. `go mod tidy`
-/// raises the consumer's directive to its dependencies' highest, so an
-/// unpruned (go 1.16) consumer needs a go 1.16 upstream.
+/// [`stage`] with the upstream module's `go` directive version. `go mod
+/// tidy` raises the consumer's directive to its dependencies' highest, so
+/// an unpruned (go 1.16) consumer needs a go 1.16 upstream.
 fn stage_with(tmp: &Path, upstream_go: &str) -> (std::path::PathBuf, std::path::PathBuf, String) {
     let godir = golang_e2e_matrix::go_directive();
     // Staging dir holding `<mod>@<ver>/` for zipping.
@@ -111,7 +111,7 @@ fn stage_with(tmp: &Path, upstream_go: &str) -> (std::path::PathBuf, std::path::
     std::fs::create_dir_all(&stage).unwrap();
     std::fs::write(
         stage.join("go.mod"),
-        format!("module {UMOD}\n\n{upstream_go}\n"),
+        format!("module {UMOD}\n\ngo {upstream_go}\n"),
     )
     .unwrap();
     std::fs::write(stage.join("lib.go"), PRISTINE_LIB).unwrap();
@@ -126,7 +126,7 @@ fn stage_with(tmp: &Path, upstream_go: &str) -> (std::path::PathBuf, std::path::
     .unwrap();
     std::fs::write(
         pxv.join(format!("{UVER}.mod")),
-        format!("module {UMOD}\n\n{upstream_go}\n"),
+        format!("module {UMOD}\n\ngo {upstream_go}\n"),
     )
     .unwrap();
     let zip_out = pxv.join(format!("{UVER}.zip"));
@@ -220,7 +220,7 @@ fn go_build_links_patch_via_replace_redirect() {
     // this suite fails deterministically if the leak returns. `GOTOOLCHAIN`
     // must lose to go_env's `local` pin (or every `go` command chases a
     // nonexistent toolchain through the file proxy). `SOCKET_DRY_RUN` needs
-    // no guard here: `hermetic::command` seeds and scrubs it itself.
+    // no guard here: `spawn_env_hygiene` pins `hermetic::command`'s scrub.
     std::env::set_var("GOTOOLCHAIN", "go1.99.99");
     let tmp = tempfile::tempdir().unwrap();
     let (consumer, modcache, proxy_url) = stage(tmp.path());
@@ -1809,7 +1809,7 @@ fn fork_required_only_by_a_dependency_is_a_replace_target() {
     ] {
         let case = replace_line.clone();
         let tmp = tempfile::tempdir().unwrap();
-        let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+        let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "1.16");
         publish(
             tmp.path(),
             MID,
@@ -1917,7 +1917,7 @@ fn stale_fork_replace_keeps_a_transitive_patch() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "1.16");
     publish(
         tmp.path(),
         MID,
@@ -2273,7 +2273,7 @@ fn downgrade_below_the_patch_leaves_its_replace_unattested() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "1.16");
     publish_upstream(tmp.path(), "v0.9.0", "OLDER");
     let env = go_env(modcache.to_str().unwrap(), &proxy_url);
     let readonly = readonly_env(&env);
@@ -2363,7 +2363,7 @@ fn downgrade_to_the_patch_applies_and_checks_in_sync() {
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
-    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "go 1.16");
+    let (consumer, modcache, proxy_url) = stage_with(tmp.path(), "1.16");
     publish_upstream(tmp.path(), "v1.1.0", "NEWER");
     let env = go_env(modcache.to_str().unwrap(), &proxy_url);
     let readonly = readonly_env(&env);

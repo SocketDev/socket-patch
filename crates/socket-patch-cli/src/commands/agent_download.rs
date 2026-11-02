@@ -769,8 +769,9 @@ impl VendorRefusals<'_> {
 pub(crate) type LockRefusals = HashMap<String, (&'static str, String)>;
 
 /// The lock-text refusals of the vendored download phase (see
-/// [`socket_patch_core::vendor::lock_text_refusals`]: the pnpm / yarn
-/// classic / yarn berry gates and cargo's locked-version gate), over the
+/// [`socket_patch_core::vendor::lock_text_refusals`]: the npm
+/// package-lock / pnpm / yarn classic / yarn berry gates and cargo's
+/// locked-version gate, through [`unclaimed_lock_text_refusals`]), over the
 /// patches the phase would otherwise fetch a view for — past the Bun
 /// refusal and the ledger's idempotency skip, which take precedence in the
 /// fetch loop. A purl the lockfiles pin hosted is left to the vendor loop:
@@ -808,23 +809,15 @@ pub(crate) async fn lock_text_refusals_for(
                 .is_none()
         })
         .collect();
-    let candidates: Vec<(&str, &str)> = fetchable
-        .iter()
-        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
-        .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
-        .collect();
-    let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
-    let options = params.crawler_options();
-    let mut refusals =
-        crate::commands::vendor::lock_refusals_reaching_backend(
-            cwd,
-            refused,
-            &ledger.entries,
-            |purls| async move {
-                crate::commands::vendor::installed_purls(&options, &purls, prior).await
-            },
-        )
-        .await;
+    let mut refusals = unclaimed_lock_text_refusals(
+        cwd,
+        &fetchable,
+        &claimed,
+        ledger,
+        params.crawler_options(),
+        prior,
+    )
+    .await;
     // A hosted gem the takeover will refuse (#775) is refused here too, so
     // its view is never fetched for a package the run cannot vendor. The
     // download phase only runs online (`--offline` refuses `get` and `scan`
@@ -843,6 +836,46 @@ pub(crate) async fn lock_text_refusals_for(
         .await,
     );
     refusals
+}
+
+/// The lock-text half of [`lock_text_refusals_for`], shared with the
+/// vendored dry-run preview and rollout plan (`scan/vendor_flow.rs`) so the
+/// dry run and the wet run refuse exactly the same purls (#1976): the
+/// purls of `selected` the vendor backend refuses on the project's lock
+/// text alone ([`socket_patch_core::vendor::lock_text_refusals`]), leaving
+/// out a purl the lockfiles pin hosted (`claimed`: its takeover restores
+/// the upstream entry first), one the ledger's idempotency skip settles
+/// ([`detached_ledger_record`]), and one the vendor loop would never hand
+/// to its backend ([`crate::commands::vendor::lock_refusals_reaching_backend`];
+/// `options` and `prior` drive its installed-copy lookup).
+pub(crate) async fn unclaimed_lock_text_refusals(
+    cwd: &Path,
+    selected: &[&PatchSearchResult],
+    claimed: &std::collections::HashSet<PurlKey>,
+    ledger: &VendorState,
+    options: CrawlerOptions,
+    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+) -> LockRefusals {
+    let candidates: Vec<(&str, &str)> = selected
+        .iter()
+        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
+        .filter(|sr| {
+            detached_ledger_record(RecordStore::Ledger(&ledger.entries), &sr.purl, &sr.uuid)
+                .is_none()
+        })
+        .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
+        .collect();
+    if candidates.is_empty() {
+        return LockRefusals::new();
+    }
+    let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
+    crate::commands::vendor::lock_refusals_reaching_backend(
+        cwd,
+        refused,
+        &ledger.entries,
+        |purls| async move { crate::commands::vendor::installed_purls(&options, &purls, prior).await },
+    )
+    .await
 }
 
 /// The purl keys the project's lockfiles pin hosted (a patch-server

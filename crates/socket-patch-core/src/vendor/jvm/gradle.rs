@@ -3418,7 +3418,7 @@ mod tests {
     fn detect_routes_gradle_only_roots_here() {
         let files = fs(&[("build.gradle", "")]);
         let read = |rel: &str| files.get(rel).cloned();
-        assert_eq!(detect(&read), Shape::Gradle);
+        assert_eq!(detect(&read, &super::super::no_list), Shape::Gradle);
     }
 
     #[test]

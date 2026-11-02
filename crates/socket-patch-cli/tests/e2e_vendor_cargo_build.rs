@@ -271,19 +271,6 @@ fn stage_patch(proj: &Path, purl: &str, file_key: &str, before: &[u8], after: &[
     std::fs::write(socket.join("blobs").join(git_sha256(after)), after).unwrap();
 }
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap() {
-        let entry = entry.unwrap();
-        let to = dst.join(entry.file_name());
-        if entry.file_type().unwrap().is_dir() {
-            copy_dir_recursive(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), &to).unwrap();
-        }
-    }
-}
-
 /// `manifest` without its `[patch.crates-io]` table (the header through the
 /// next table header or EOF, plus the blank line before it) — a hand revert
 /// of the vendored wiring.
@@ -551,8 +538,8 @@ impl ManifestlessVendored {
             strip_patch_table(&std::fs::read_to_string(fresh.join("Cargo.toml")).unwrap()),
         )
         .unwrap();
-        copy_dir_recursive(&fresh.join("src"), &revert.join("src"));
-        copy_dir_recursive(&fresh.join(".socket"), &revert.join(".socket"));
+        common::fs_tree::copy_tree(&fresh.join("src"), &revert.join("src"));
+        common::fs_tree::copy_tree(&fresh.join(".socket"), &revert.join(".socket"));
         std::fs::write(
             revert.join("src/main.rs"),
             "fn main() { println!(\"baseline\"); }\n",
@@ -773,8 +760,8 @@ fn cargo_vendor_fresh_checkout_locked_offline_build_and_revert() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(&lock_path, fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_home = tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -1230,8 +1217,8 @@ async fn cargo_get_uuid_vendored_fresh_checkout_locked_build() {
     std::fs::create_dir_all(&fresh).unwrap();
     std::fs::copy(proj.join("Cargo.toml"), fresh.join("Cargo.toml")).unwrap();
     std::fs::copy(proj.join("Cargo.lock"), fresh.join("Cargo.lock")).unwrap();
-    copy_dir_recursive(&proj.join("src"), &fresh.join("src"));
-    copy_dir_recursive(&proj.join(".socket"), &fresh.join(".socket"));
+    common::fs_tree::copy_tree(&proj.join("src"), &fresh.join("src"));
+    common::fs_tree::copy_tree(&proj.join(".socket"), &fresh.join(".socket"));
 
     let fresh_home = tmp.path().join("fresh-cargo-home");
     std::fs::create_dir_all(&fresh_home).unwrap();
@@ -1342,7 +1329,7 @@ fn fresh_checkout(proj: &Path, tmp: &Path, tag: &str) -> (PathBuf, PathBuf) {
     }
     for dir in ["src", ".socket", ".cargo"] {
         if proj.join(dir).exists() {
-            copy_dir_recursive(&proj.join(dir), &fresh.join(dir));
+            common::fs_tree::copy_tree(&proj.join(dir), &fresh.join(dir));
         }
     }
     let home = tmp.join(format!("fresh-home-{tag}"));
@@ -2629,7 +2616,7 @@ fn cargo_url_spelled_crates_io_patch_table_is_refused() {
         return;
     };
     // A user's same-version fork of cfg-if under the URL spelling.
-    copy_dir_recursive(&crate_dir, &proj.join("fork-cfg-if"));
+    common::fs_tree::copy_tree(&crate_dir, &proj.join("fork-cfg-if"));
     let manifest = format!(
         "{}\n[patch.\"https://github.com/rust-lang/crates.io-index\"]\n{DEP} = {{ path = \"fork-cfg-if\" }}\n",
         std::fs::read_to_string(proj.join("Cargo.toml")).unwrap()
@@ -2713,7 +2700,7 @@ fn cargo_ancestor_config_patch_cannot_silently_shadow_the_vendored_copy() {
     // A monorepo-level config adds the user's same-version, unpatched fork
     // under the bare crate name.
     let fork = tmp.path().join(format!("forks/{DEP}-{version}"));
-    copy_dir_recursive(&crate_dir, &fork);
+    common::fs_tree::copy_tree(&crate_dir, &fork);
     std::fs::create_dir_all(tmp.path().join(".cargo")).unwrap();
     std::fs::write(
         tmp.path().join(".cargo/config.toml"),

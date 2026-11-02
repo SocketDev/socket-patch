@@ -1114,63 +1114,10 @@ fn manifest_write_failure_prints_human_error_line() {
 
 #[cfg(unix)]
 mod interactive {
-    use std::path::Path;
-
-    use crate::common;
     use crate::common::git_sha256;
+    use crate::pty_io;
     use crate::rollback_fixture::*;
-    use portable_pty::{native_pty_system, PtySize};
     use std::time::Duration;
-
-    /// Spawn the binary inside a PTY, send `input`, collect all output —
-    /// the `interactive_prompts_e2e.rs` harness (same env scrubbing).
-    fn run_in_pty(args: &[&str], cwd: &Path, input: &str, timeout: Duration) -> (i32, String) {
-        let pty_system = native_pty_system();
-        let pair = pty_system
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        // The hermetic environment: SOCKET_YES would skip the very prompt
-        // under test.
-        let mut cmd = common::hermetic::pty_binary_command();
-        for a in args {
-            cmd.arg(a);
-        }
-        cmd.cwd(cwd);
-
-        let mut child = pair
-            .slave
-            .spawn_command(cmd)
-            .expect("spawn socket-patch in PTY");
-        drop(pair.slave);
-
-        let reader_handle =
-            crate::pty_io::PtyOutput::spawn(pair.master.try_clone_reader().expect("clone reader"));
-
-        let mut killer = child.clone_killer();
-        std::thread::spawn(move || {
-            std::thread::sleep(timeout);
-            let _ = killer.kill();
-        });
-
-        let mut writer = pair.master.take_writer().expect("take writer");
-        crate::pty_io::send_when_prompted(&reader_handle, &mut writer, input.as_bytes());
-        drop(writer);
-
-        let status = child.wait().expect("child.wait");
-        drop(pair.master);
-
-        let output = reader_handle.finish();
-        (
-            status.exit_code() as i32,
-            String::from_utf8_lossy(&output).to_string(),
-        )
-    }
 
     /// Declining the rollback confirm prompt cancels cleanly: the composed
     /// manifest clause renders with the `[Y/n]` hint, "Cancelled; no changes made."
@@ -1192,7 +1139,7 @@ mod interactive {
         let manifest_before =
             std::fs::read(socket.join("manifest.json")).expect("read manifest bytes");
 
-        let (code, output) = run_in_pty(
+        let (code, output) = pty_io::run(
             &["rollback", "--offline"],
             tmp.path(),
             "n\n",

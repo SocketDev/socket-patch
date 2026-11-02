@@ -28,7 +28,7 @@ use serde_json::json;
 use super::layout::{self, safe_coordinates};
 use super::{
     adopt, coursier_tree, finish_writes, fragment, maven_reactor, owned_file, CommittedTree,
-    Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ReadFn, Shape,
+    Coords, FileWrite, JvmPatch, JvmPlan, JvmRefusal, JvmUnplan, JvmWarning, ListFn, ReadFn, Shape,
     WiringAction, WiringRecord, OWNED_FILE_KIND, SBT_FRAGMENT_KIND, TREE_GITATTRIBUTES,
 };
 use crate::formats::sbt::build::{
@@ -233,8 +233,12 @@ fn owned_file_refusal(e: OwnedFileError) -> JvmRefusal {
 
 /// Plan vendoring `patch` into the sbt build `read` serves (`docs/design/
 /// sbt-support.md` §5.1). Refusals come before any write is planned.
-pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusal> {
-    plan_with_digest(read, patch, None)
+pub fn plan(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+) -> Result<JvmPlan, JvmRefusal> {
+    plan_with_digest(read, list, patch, None)
 }
 
 /// [`plan`], the pin recording `deps` as its dependency digest: the
@@ -244,6 +248,7 @@ pub fn plan(read: ReadFn<'_>, patch: &JvmPatch<'_>) -> Result<JvmPlan, JvmRefusa
 /// the conventional sources [`build_sources`] reads, an existing pin's kept.
 pub fn plan_with_digest(
     read: ReadFn<'_>,
+    list: ListFn<'_>,
     patch: &JvmPatch<'_>,
     deps: Option<&str>,
 ) -> Result<JvmPlan, JvmRefusal> {
@@ -257,12 +262,13 @@ pub fn plan_with_digest(
     let read_text = text(read);
     let mut warnings = Vec::new();
 
-    if let Some(pom) = read_text("pom.xml") {
-        if maven_reactor::declares_modules(&pom) {
+    if read_text("pom.xml").is_some() {
+        if maven_reactor::is_reactor_root(read, list) {
             return Err(refusal(
                 "vendor_jvm_build_ambiguous",
-                "a root pom.xml declaring <modules> sits beside the sbt build, so which build \
-                 runs is unknowable; vendor from a checkout holding only one of them",
+                "a root pom.xml heading a Maven reactor (<modules>, or Maven 4 subprojects) \
+                 sits beside the sbt build, so which build runs is unknowable; vendor from a \
+                 checkout holding only one of them",
             ));
         }
         warnings.push(warning(
@@ -656,7 +662,11 @@ mod tests {
         files: &BTreeMap<String, Vec<u8>>,
         p: &JvmPatch<'_>,
     ) -> Result<JvmPlan, JvmRefusal> {
-        plan(&|rel: &str| files.get(rel).cloned(), p)
+        plan(
+            &|rel: &str| files.get(rel).cloned(),
+            &|dir: &str| super::super::testing::list_of(files, dir),
+            p,
+        )
     }
 
     fn code(r: Result<JvmPlan, JvmRefusal>) -> &'static str {
@@ -675,7 +685,7 @@ mod tests {
         let files = build("1.9.9", &[]);
         assert_eq!(detect(&|p: &str| files.get(p).cloned()), Some(Shape::Sbt));
         assert_eq!(
-            super::super::detect(&|p: &str| files.get(p).cloned()),
+            super::super::detect(&|p: &str| files.get(p).cloned(), &super::super::no_list),
             Shape::Sbt
         );
         // A subproject directory (no project/) is still sbt-shaped.
@@ -692,7 +702,10 @@ mod tests {
         );
         let read = |p: &str| reactor.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::MavenReactor);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::MavenReactor
+        );
         // An unwired reactor beside sbt routes to sbt, which refuses it.
         let ambiguous = build(
             "1.9.9",
@@ -709,6 +722,28 @@ mod tests {
             code(plan_over(&ambiguous, &text_patch(UUID_A))),
             "vendor_jvm_build_ambiguous"
         );
+        // #1809: so does a Maven 4 root whose subprojects Maven discovers
+        // (model 4.1.0, `pom` packaging, no list, a child holding a pom).
+        let implicit_root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\
+            <modelVersion>4.1.0</modelVersion><packaging>pom</packaging></project>";
+        let implicit = build(
+            "1.9.9",
+            &[
+                ("pom.xml", implicit_root),
+                ("a/pom.xml", "<project><artifactId>a</artifactId></project>"),
+            ],
+        );
+        assert_eq!(
+            code(plan_over(&implicit, &text_patch(UUID_A))),
+            "vendor_jvm_build_ambiguous"
+        );
+        // Without a subproject it is a single pom sbt never reads.
+        let lone = build("1.9.9", &[("pom.xml", implicit_root)]);
+        let planned = plan_over(&lone, &text_patch(UUID_A)).unwrap();
+        assert!(planned
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_sbt_pom_ignored"));
         // A Gradle build already wired keeps Gradle.
         let gradle = build(
             "1.9.9",
@@ -719,7 +754,10 @@ mod tests {
         );
         let read = |p: &str| gradle.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::Gradle);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::Gradle
+        );
         // A scala-cli build already wired keeps scala-cli when it gains
         // sbt files.
         let scala = build(
@@ -734,7 +772,10 @@ mod tests {
         );
         let read = |p: &str| scala.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::ScalaCli);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::ScalaCli
+        );
         // A single-module pom the pre-v5 path already wired stays off sbt
         // (a Maven root, refused until reverted); an unwired one beside
         // sbt routes to sbt.
@@ -749,7 +790,10 @@ mod tests {
         );
         let read = |p: &str| legacy.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::MavenReactor);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::MavenReactor
+        );
         // A Gradle build with an unrelated `project/build.properties` is
         // not sbt-shaped.
         let stray: BTreeMap<String, Vec<u8>> = [
@@ -759,10 +803,13 @@ mod tests {
         .into();
         let read = |p: &str| stray.get(p).cloned();
         assert_eq!(detect(&read), None);
-        assert_eq!(super::super::detect(&read), Shape::Gradle);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::Gradle
+        );
         let plain = build("1.9.9", &[("pom.xml", "<project></project>")]);
         assert_eq!(
-            super::super::detect(&|p: &str| plain.get(p).cloned()),
+            super::super::detect(&|p: &str| plain.get(p).cloned(), &super::super::no_list),
             Shape::Sbt
         );
     }
@@ -1074,7 +1121,8 @@ mod tests {
             let files = files.clone();
             move |rel: &str| files.get(rel).cloned()
         };
-        let first = plan_with_digest(&read(&files), &p, Some("feedf00d")).unwrap();
+        let first =
+            plan_with_digest(&read(&files), &super::super::no_list, &p, Some("feedf00d")).unwrap();
         for w in &first.writes {
             files.insert(w.rel.clone(), w.bytes.clone());
         }
@@ -1088,9 +1136,11 @@ mod tests {
                 .clone()
         };
         assert_eq!(pin(&files).deps_digest, "feedf00d");
-        let same = plan_with_digest(&read(&files), &p, Some("feedf00d")).unwrap();
+        let same =
+            plan_with_digest(&read(&files), &super::super::no_list, &p, Some("feedf00d")).unwrap();
         assert!(same.writes.is_empty() && same.warnings.is_empty());
-        let refreshed = plan_with_digest(&read(&files), &p, Some("0badcafe")).unwrap();
+        let refreshed =
+            plan_with_digest(&read(&files), &super::super::no_list, &p, Some("0badcafe")).unwrap();
         assert!(refreshed.warnings.is_empty(), "{:?}", refreshed.warnings);
         for w in &refreshed.writes {
             files.insert(w.rel.clone(), w.bytes.clone());
@@ -1372,7 +1422,7 @@ mod tests {
         );
         let reader = |root: &Path| {
             let r = apply::ProjectReader::new(root);
-            super::super::detect(&|rel: &str| r.read(rel))
+            super::super::detect(&|rel: &str| r.read(rel), &|d: &str| r.list(d))
         };
         assert_eq!(reader(root), Shape::MavenReactor);
         let mut ledger = BTreeMap::new();
@@ -1412,7 +1462,10 @@ mod tests {
                 reader.read(rel)
             }
         };
-        assert_eq!(super::super::detect(&read), Shape::Sbt);
+        assert_eq!(
+            super::super::detect(&read, &super::super::no_list),
+            Shape::Sbt
+        );
         let replanned = super::super::plan(Shape::Sbt, &read, &super::super::no_list, &p).unwrap();
         let tree: Vec<_> = replanned.writes.iter().filter(|w| w.tree).collect();
         let recorded: Vec<_> = e.wiring.iter().filter(|w| w.kind == TREE_KIND).collect();
@@ -1435,6 +1488,9 @@ mod tests {
             upstream_module: module.as_deref(),
             ..p
         };
-        assert!(plan(&read, &again).unwrap().writes.is_empty());
+        assert!(plan(&read, &|d: &str| reader.list(d), &again)
+            .unwrap()
+            .writes
+            .is_empty());
     }
 }

@@ -93,6 +93,8 @@ mod platform_wheel_tests;
 #[cfg(test)]
 mod pnpm_equivalence_tests;
 mod poetry;
+#[cfg(test)]
+mod pypi_no_lockfile_tests;
 mod pypi_takeover;
 pub use pypi_takeover::preflight_pypi_takeover;
 #[cfg(test)]
@@ -757,6 +759,7 @@ fn rewriter_groups<'a>(
             rewrite_hatch(files, overrides, result);
             rewrite_uv_lock(files, overrides, artifact_metadata, result);
             poetry::rewrite_poetry(files, overrides, result);
+            warn_no_pypi_wiring(files, overrides, result);
         }),
         Box::new(move |result| rewrite_cargo_with(files, overrides, cargo_outer, result)),
         Box::new(move |result| rewrite_composer_lock(files, overrides, result)),
@@ -1020,6 +1023,86 @@ fn merge_group_outputs(prefix: &RewriteResult, outs: Vec<RewriteResult>) -> Opti
         merge_group_delta(&mut result, delta);
     }
     Some(result)
+}
+
+/// #638: the PyPI twin of `redirect_npm_no_lockfile` /
+/// `redirect_composer_no_lockfile`. A pypi patch reached the PyPI lane, but
+/// the project has no file any PyPI rewriter reads (a root
+/// `requirements.txt`, a tool lock, a PEP 751 / PEP 723 lock, or a Hatch
+/// configuration), so nothing can pin it. Said once per run, naming what
+/// was looked for; the per-patch `redirect_unconfirmed` row still follows.
+/// A file that IS present owns its deps' diagnostics instead.
+fn warn_no_pypi_wiring(
+    files: &BTreeMap<String, String>,
+    overrides: &[DepOverride],
+    result: &mut RewriteResult,
+) {
+    if !overrides.iter().any(|dep| dep.ecosystem == "pypi") {
+        return;
+    }
+    let wired = files.keys().any(|key| {
+        key == crate::formats::governing_locks::PYPI_REQUIREMENTS
+            || crate::formats::governing_locks::PYPI_TOOL_LOCKS.contains(&key.as_str())
+            || crate::utils::python_lock::is_python_lock_name(key)
+    });
+    if wired || crate::utils::hatch::is_hatch(files) {
+        return;
+    }
+    result.warnings.push(RewriteWarning {
+        code: "redirect_pypi_no_lockfile".into(),
+        detail: format!(
+            "no readable requirements.txt, uv.lock, poetry.lock, pdm.lock, \
+             Pipfile.lock, pylock.toml / pylock.<name>.toml, PEP 723 script lock \
+             (<script>.py.lock) or Hatch configuration at the project root (hosted \
+             mode does not read other requirements files such as \
+             requirements-dev.txt); {}",
+            pypi_no_lockfile_remedy(files)
+        ),
+    });
+}
+
+/// What the project's own Python tooling suggests doing about
+/// `redirect_pypi_no_lockfile`: a Pipfile asks for `pipenv lock`; a
+/// pyproject naming its lock tool (a `[tool.<tool>]` table or its build
+/// backend) asks for that tool's lock; any other pyproject may be a plain
+/// pip project or a tool that writes no table of its own (`uv init`), so
+/// both remedies are offered.
+fn pypi_no_lockfile_remedy(files: &BTreeMap<String, String>) -> String {
+    const PIN: &str = "pin the package in a root requirements.txt";
+    if files.contains_key("Pipfile") {
+        return "run `pipenv lock` and commit Pipfile.lock, then re-run".into();
+    }
+    let Some(pyproject) = files.get("pyproject.toml") else {
+        return format!("{PIN} or commit the project's lock, then re-run");
+    };
+    let document = pyproject.parse::<toml_edit::DocumentMut>().ok();
+    let backend = document
+        .as_ref()
+        .and_then(|doc| doc.get("build-system"))
+        .and_then(|build| build.get("build-backend"))
+        .and_then(toml_edit::Item::as_str)
+        .unwrap_or_default();
+    let names = |tool: &str| {
+        document
+            .as_ref()
+            .and_then(|doc| doc.get("tool"))
+            .is_some_and(|table| table.get(tool).is_some())
+            || backend.starts_with(&format!("{tool}."))
+            || backend.starts_with(&format!("{tool}_"))
+    };
+    for (tool, command) in [
+        ("uv", "uv lock"),
+        ("poetry", "poetry lock"),
+        ("pdm", "pdm lock"),
+    ] {
+        if names(tool) {
+            return format!("run `{command}` and commit its lock, then re-run");
+        }
+    }
+    format!(
+        "{PIN}, or, if a lock tool installs the project, generate and commit its \
+         lock (`uv lock`, `poetry lock`, `pdm lock`), then re-run"
+    )
 }
 
 fn rewrite_hatch(
@@ -4591,7 +4674,7 @@ fn rewrite_yarn_classic_with(
         .zip(&heads)
         .map(|(b, (patterns, _))| {
             let version = classic_field(&b.lines, "version")?;
-            let (name, source) = crate::formats::yarn::source::classic_copy_real_name(
+            let (name, source) = crate::formats::yarn::copy::classic_copy_name(
                 patterns,
                 classic_field(&b.lines, "resolved"),
                 version,
@@ -6493,14 +6576,12 @@ fn plan_python_metadata_with(
     } else {
         crate::utils::python_script::refuse_uv_no_sources(
             &dep.name,
-            None,
             Some(&original),
             project_file(crate::utils::python_script::UV_TOML),
         )
         .and_then(|()| {
             crate::utils::python_script::refuse_uv_no_binary(
                 &dep.name,
-                None,
                 Some(&original),
                 project_file(crate::utils::python_script::UV_TOML),
             )
@@ -8575,10 +8656,13 @@ fn rewrite_maven_pom(
     // would keep the unpatched upstream jar while the dep counts as
     // redirected and VEX attests it (#261). Refuse the whole root, untouched;
     // vendored mode's reactor planner rewrites each module's declaration.
-    if pom
-        .as_deref()
-        .is_some_and(crate::vendor::jvm::maven_reactor::declares_modules)
-    {
+    // Maven 4 subprojects found by discovery count too (#1809): the engine
+    // reads each direct subdirectory's `pom.xml` beside such a root.
+    if pom.is_some() && {
+        let read = |rel: &str| files.get(rel).map(|t| t.as_bytes().to_vec());
+        let list = |dir: &str| gradle::key_list(files, dir);
+        crate::vendor::jvm::maven_reactor::is_reactor_root(&read, &list)
+    } {
         let gas: Vec<String> = maven
             .iter()
             .map(|dep| match &dep.namespace {
@@ -8589,7 +8673,7 @@ fn rewrite_maven_pom(
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_multimodule_unsupported".into(),
             detail: format!(
-                "pom.xml declares <modules>/<subprojects>; hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
+                "pom.xml heads a multi-module reactor (<modules>/<subprojects>, or Maven 4 subproject discovery); hosted mode reads only the root pom, so a module's own <version> of {} would stay unpatched. pom.xml and .mvn/ were left as they are and the dep is not counted as redirected; use `scan --mode vendored`, which pins each module's declaration",
                 gas.join(", ")
             ),
         });
@@ -10407,6 +10491,64 @@ mod tests {
             "single-module root still rewritten"
         );
         assert!(!warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"));
+    }
+
+    /// #1809: a Maven 4 (model 4.1.0) `pom`-packaged root that lists no
+    /// subprojects builds every direct subdirectory holding a `pom.xml`, so
+    /// it is a reactor like a declared one and refused untouched. Without
+    /// such a subdirectory, under a 4.0.0 model, or with discovery turned
+    /// off in `.mvn/maven.config`, it is a single pom and still rewritten.
+    #[test]
+    fn maven_4_implicit_subprojects_root_is_refused() {
+        let dep = "<dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n";
+        let root = |model: &str| {
+            format!(
+                "<project xmlns=\"http://maven.apache.org/POM/{model}\">\n  <modelVersion>{model}</modelVersion>\n  <groupId>com.example</groupId>\n  <artifactId>root</artifactId>\n  <version>1.0.0</version>\n  <packaging>pom</packaging>\n  {dep}</project>\n"
+            )
+        };
+        let child = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\n  <modelVersion>4.1.0</modelVersion>\n  <parent/>\n  <artifactId>child</artifactId>\n  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n    </dependency>\n  </dependencies>\n</project>\n";
+        let tree = |model: &str, extra: &[(&str, &str)]| {
+            let mut files = BTreeMap::from([("pom.xml".to_string(), root(model))]);
+            files.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+            rewrite_registry_redirect(&files, &[maven_override()])
+        };
+
+        let r = tree("4.1.0", &[("child/pom.xml", child)]);
+        assert!(
+            r.files.is_empty() && r.edits.is_empty(),
+            "an implicit reactor root must not be edited: files={:?} edits={:?}",
+            r.files.keys(),
+            r.edits
+        );
+        assert_eq!(
+            warning_codes(&r),
+            vec!["redirect_maven_multimodule_unsupported"]
+        );
+        assert!(r.warnings[0]
+            .detail
+            .contains("Maven 4 subproject discovery"));
+
+        let off = "-Dmaven.project.discoverSubprojects=false\n";
+        for (case, r) in [
+            ("no subproject", tree("4.1.0", &[])),
+            ("model 4.0.0", tree("4.0.0", &[("child/pom.xml", child)])),
+            (
+                "discovery off",
+                tree(
+                    "4.1.0",
+                    &[("child/pom.xml", child), (".mvn/maven.config", off)],
+                ),
+            ),
+        ] {
+            assert!(
+                r.files["pom.xml"].contains(MAVEN_SUFFIXED),
+                "{case}: a single pom is still rewritten"
+            );
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_multimodule_unsupported"),
+                "{case}"
+            );
+        }
     }
 
     /// A direct declaration whose groupId / artifactId is a property of
@@ -13807,6 +13949,90 @@ mod tests {
             let r = run(copy, manifest);
             assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
             assert!(r.bundled_skipped_uuids.is_empty(), "{case}");
+        }
+    }
+
+    /// #1951: the hosted rewriter reads which package a yarn classic
+    /// `file:` / url copy holds through the same reader vendored and VEX use
+    /// ([`crate::formats::yarn::copy::classic_copy_ref`] and
+    /// [`crate::formats::yarn::copy::CopyRef::identity`]), so the modes
+    /// identify the same copies. (A copy no reader identifies is a separate
+    /// rule: vendored keeps it as a possible copy, #1516.) yarn 1 installs
+    /// `file:../ext/lpdir` from outside the root as readily as from inside
+    /// it, so that copy is read and named; an absolute `file:` path is never
+    /// read (a lock is untrusted input, #1516); a codeload tarball names no
+    /// registry package.
+    #[test]
+    fn issue_1951_yarn_classic_copy_named_as_vendored_reads_it() {
+        use crate::formats::yarn::copy::classic_copy_ref;
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://p.test/lp.tgz",
+            "sha512-PATCHED==",
+        );
+        let registry_block = "left-pad@1.3.0:\n  version \"1.3.0\"\n  \
+             resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.0.tgz#bbbb\"\n  \
+             integrity sha512-UPSTREAMupstream==\n";
+        let left_pad = r#"{"name":"left-pad","version":"1.3.0"}"#;
+        let manifests = BTreeMap::from([
+            (
+                "../ext/lpdir/package.json".to_string(),
+                left_pad.to_string(),
+            ),
+            ("/abs/lpdir/package.json".to_string(), left_pad.to_string()),
+            ("lpdir/package.json".to_string(), left_pad.to_string()),
+        ]);
+        let codeload = "https://codeload.github.com/stevemao/left-pad/tar.gz/abc";
+        for (case, patterns, resolved, named) in [
+            ("in-root directory", "lp2@file:./lpdir", None, true),
+            ("out-of-root directory", "lp2@file:../ext/lpdir", None, true),
+            ("absolute directory", "lp2@file:/abs/lpdir", None, false),
+            (
+                "codeload tarball",
+                "lp2@stevemao/left-pad#v1.3.0",
+                Some(codeload),
+                false,
+            ),
+        ] {
+            // The package vendored and VEX identify this copy as.
+            let pats = vec![patterns.to_string()];
+            let vendored = classic_copy_ref(&pats, resolved).and_then(|copy| {
+                let bytes = copy
+                    .read_path()
+                    .and_then(|rel| manifests.get(&rel))
+                    .map(|t| t.as_bytes());
+                copy.identity("1.3.0", bytes)
+            });
+            assert_eq!(
+                vendored.is_some(),
+                named,
+                "{case}: vendored reads {vendored:?}"
+            );
+
+            let mut block = format!("\"{patterns}\":\n  version \"1.3.0\"\n");
+            if let Some(url) = resolved {
+                block.push_str(&format!("  resolved \"{url}\"\n"));
+            }
+            let mut files = manifests.clone();
+            files.insert(
+                "yarn.lock".to_string(),
+                format!("# yarn lockfile v1\n\n\n{registry_block}\n{block}"),
+            );
+            let mut r = RewriteResult::default();
+            rewrite_yarn_classic(&files, std::slice::from_ref(&ovr), &mut r);
+            assert!(
+                r.files["yarn.lock"].contains("resolved \"http://p.test/lp.tgz#5ha1\""),
+                "{case}: the registry block is still pinned: {:?}",
+                r.warnings
+            );
+            let hosted = r.warnings.iter().any(|w| w.detail.contains("lp2@"));
+            assert_eq!(hosted, named, "{case}: {:?}", r.warnings);
+            assert_eq!(
+                r.bundled_skipped_uuids.contains(&ovr.patch_uuid),
+                named,
+                "{case}"
+            );
         }
     }
 

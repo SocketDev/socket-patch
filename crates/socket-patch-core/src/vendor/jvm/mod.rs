@@ -304,9 +304,10 @@ pub struct JvmUnplan {
 /// The Maven half of a project root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MavenShape {
-    /// A root `pom.xml` that declares `<modules>`.
+    /// A root `pom.xml` heading a reactor: it declares `<modules>`, or
+    /// Maven 4 discovers its subprojects ([`maven_reactor::is_reactor_root`]).
     Reactor,
-    /// A root `pom.xml` without `<modules>`.
+    /// Any other root `pom.xml`.
     Single,
 }
 
@@ -345,9 +346,9 @@ impl Detected {
 }
 
 /// Every build the project root holds.
-pub fn detect_builds(read: ReadFn<'_>) -> Detected {
-    let maven = read(layout::POM_FILE).map(|pom| {
-        if maven_reactor::declares_modules(&String::from_utf8_lossy(&pom)) {
+pub fn detect_builds(read: ReadFn<'_>, list: ListFn<'_>) -> Detected {
+    let maven = read(layout::POM_FILE).map(|_| {
+        if maven_reactor::is_reactor_root(read, list) {
             MavenShape::Reactor
         } else {
             MavenShape::Single
@@ -361,8 +362,8 @@ pub fn detect_builds(read: ReadFn<'_>) -> Detected {
 }
 
 /// Classify the project root (see [`Detected::shape`]).
-pub fn detect(read: ReadFn<'_>) -> Shape {
-    detect_builds(read).shape()
+pub fn detect(read: ReadFn<'_>, list: ListFn<'_>) -> Shape {
+    detect_builds(read, list).shape()
 }
 
 /// Plan the vendoring of `patch` for a project of `shape`.
@@ -409,7 +410,7 @@ pub fn plan_with_external(
             let gradle = gradle::plan(read, list, patch)?;
             Ok(compose(maven, gradle))
         }
-        Shape::Sbt => sbt::plan(read, patch),
+        Shape::Sbt => sbt::plan(read, list, patch),
         Shape::ScalaCli => scala_cli::plan(read, patch),
         Shape::Other => Err(no_build_file_refusal()),
     }
@@ -874,13 +875,13 @@ mod tests {
             (p == "pom.xml")
                 .then(|| b"<project><modules><module>a</module></modules></project>".to_vec())
         };
-        assert_eq!(detect(&reactor), Shape::MavenReactor);
+        assert_eq!(detect(&reactor, &no_list), Shape::MavenReactor);
         let single = |p: &str| (p == "pom.xml").then(|| b"<project></project>".to_vec());
-        assert_eq!(detect(&single), Shape::MavenReactor);
+        assert_eq!(detect(&single, &no_list), Shape::MavenReactor);
         let gradle = |p: &str| (p == "settings.gradle.kts").then(Vec::new);
-        assert_eq!(detect(&gradle), Shape::Gradle);
+        assert_eq!(detect(&gradle, &no_list), Shape::Gradle);
         let empty = |_: &str| None;
-        assert_eq!(detect(&empty), Shape::Other);
+        assert_eq!(detect(&empty, &no_list), Shape::Other);
     }
 
     /// #395: a `pom.xml` next to a Gradle build is both, whichever kind of
@@ -921,11 +922,32 @@ mod tests {
             (&single[..], None, MavenShape::Single, Shape::MavenReactor),
         ] {
             let read = files(pom, gradle);
-            let d = detect_builds(&read);
+            let d = detect_builds(&read, &no_list);
             assert_eq!(d.maven, Some(maven), "{gradle:?}");
             assert_eq!(d.gradle, gradle.is_some(), "{gradle:?}");
             assert_eq!(d.shape(), shape, "{gradle:?}");
         }
+    }
+
+    /// #1809: a Maven 4 root whose subprojects Maven discovers (model
+    /// 4.1.0, `pom` packaging, no list, a child directory holding a pom)
+    /// is a reactor, not a single pom.
+    #[test]
+    fn a_maven_4_implicit_subprojects_root_is_a_reactor() {
+        let root = "<project xmlns=\"http://maven.apache.org/POM/4.1.0\">\
+            <modelVersion>4.1.0</modelVersion><packaging>pom</packaging></project>";
+        use std::collections::BTreeMap;
+        let mut files = BTreeMap::from([("pom.xml".to_string(), root.as_bytes().to_vec())]);
+        let read = |files: &BTreeMap<String, Vec<u8>>| {
+            let files = files.clone();
+            move |rel: &str| files.get(rel).cloned()
+        };
+        let maven = |files: &BTreeMap<String, Vec<u8>>| {
+            detect_builds(&read(files), &|d: &str| testing::list_of(files, d)).maven
+        };
+        assert_eq!(maven(&files), Some(MavenShape::Single));
+        files.insert("a/pom.xml".into(), b"<project/>".to_vec());
+        assert_eq!(maven(&files), Some(MavenShape::Reactor));
     }
 
     const MIXED_UUID: &str = "1d3c1fd2-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
@@ -966,7 +988,7 @@ mod tests {
         );
         let (pristine, pristine_dirs) = (testing::snapshot(root), testing::dirs(root));
         let read = |rel: &str| apply::read_project_file(root, rel);
-        assert_eq!(detect(&read), Shape::Mixed);
+        assert_eq!(detect(&read, &no_list), Shape::Mixed);
         let mut ledger = std::collections::BTreeMap::new();
         let p = mixed_patch();
         let plan = testing::vendor(root, Shape::Mixed, &p, &mut ledger)

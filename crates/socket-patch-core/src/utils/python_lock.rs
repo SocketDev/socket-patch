@@ -27,8 +27,6 @@ impl ArtifactSource<'_> {
     }
 }
 
-// ── read model shared by the lock inventory and lockfile discovery ────
-
 /// The `[[…]]` array holding a native Python lock's packages, and whether
 /// the lock is PEP 751: `packages` (a `lock-version` pylock), `distribution`
 /// (uv 0.2.x) or `package` (uv ≥ 0.2.35 and PEP 723 script locks). The
@@ -183,7 +181,7 @@ pub fn is_pep751_lock_name(name: &str) -> bool {
     name == "pylock.toml" || (name.starts_with("pylock.") && name.ends_with(".toml"))
 }
 
-/// #912 / #1122: whether Pipenv installs from the PEP 751 lock `rel` (a
+/// Whether Pipenv installs from the PEP 751 lock `rel` (a
 /// project-relative path). A `Pipfile` beside the lock makes Pipenv the
 /// installer — unless a higher-ranked tool lock (`uv.lock`, `poetry.lock`,
 /// `pdm.lock`) governs the directory, leaving the Pipfile a leftover — and
@@ -205,33 +203,19 @@ pub fn pipenv_reads_pylock(rel: &str, exists: impl Fn(&str) -> bool) -> bool {
 }
 
 pub fn python_lock_paths(root: &Path) -> std::io::Result<Vec<String>> {
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        // One unreadable directory entry must not hide every other lock:
-        // the callers treat an `Err` as "no Python locks here", which would
-        // silently drop the whole project from inventory, repair, and the
-        // hosted candidate list.
-        let Ok(entry) = entry else {
-            continue;
-        };
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        if !is_python_lock_name(&name) {
-            continue;
-        }
-        // `DirEntry::file_type` does NOT follow symlinks, so a lock that is a
-        // symlink (a shared pylock, a checked-in link) was never discovered
-        // even though every reader opens it fine. `fs::metadata` follows the
-        // link; a link to a directory or FIFO is still excluded by `is_file`.
-        if !std::fs::metadata(entry.path())
-            .map(|metadata| metadata.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        paths.push(name);
-    }
+    let mut paths: Vec<String> = std::fs::read_dir(root)?
+        // One unreadable entry must not hide every other lock: callers
+        // treat an `Err` as "no Python locks here".
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().into_string().ok()?;
+            // `fs::metadata` follows a symlinked lock; `is_file` still
+            // excludes a link to a directory or FIFO.
+            (is_python_lock_name(&name)
+                && std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()))
+            .then_some(name)
+        })
+        .collect();
     paths.sort();
     Ok(paths)
 }
@@ -297,6 +281,29 @@ fn inline(entries: &[(&str, Value)]) -> Value {
     Value::InlineTable(table)
 }
 
+/// Whether the inline table `entry` is named `name` (canonical).
+fn names(entry: &InlineTable, name: &str) -> bool {
+    entry
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|value| canonicalize_pypi_name(value) == name)
+}
+
+/// Point a `{ name, specifier | url | path, … }` requirement at `artifact`.
+fn repoint(requirement: &mut InlineTable, artifact: ArtifactSource<'_>) {
+    requirement.remove("specifier");
+    requirement.remove("url");
+    requirement.remove("path");
+    requirement.insert(artifact.key(), Value::from(artifact.location()));
+}
+
+/// The final path segment of an artifact location, query and fragment
+/// stripped.
+fn artifact_filename(location: &str) -> &str {
+    let path = location.split(['?', '#']).next().unwrap_or(location);
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 fn matching_package(table: &Table, name: &str, version: &str) -> bool {
     table
         .get("name")
@@ -345,10 +352,7 @@ fn rewrite_reference_value(
             }
         }
         Value::InlineTable(table) => {
-            if table
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|value| canonicalize_pypi_name(value) == name)
+            if names(table, name)
                 && table
                     .get("version")
                     .and_then(Value::as_str)
@@ -412,7 +416,7 @@ fn rewrite_references(
 
 /// Whether the lock's `[manifest]` `constraints` / `build-constraints` name
 /// `name`: the entries [`rewrite_manifest`] repoints at the artifact, a
-/// shape uv before 0.5.5 rejects under `uv sync --locked` (#1569).
+/// shape uv before 0.5.5 rejects under `uv sync --locked`.
 fn manifest_constrains(document: &DocumentMut, name: &str) -> bool {
     let name = canonicalize_pypi_name(name);
     let Some(manifest) = document.get("manifest").and_then(Item::as_table_like) else {
@@ -425,12 +429,7 @@ fn manifest_constrains(document: &DocumentMut, name: &str) -> bool {
             .into_iter()
             .flatten()
             .filter_map(Value::as_inline_table)
-            .any(|constraint| {
-                constraint
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| canonicalize_pypi_name(value) == name)
-            })
+            .any(|constraint| names(constraint, &name))
     })
 }
 
@@ -453,17 +452,9 @@ fn rewrite_manifest(document: &mut DocumentMut, name: &str, artifact: ArtifactSo
             for constraint in constraints
                 .iter_mut()
                 .filter_map(Value::as_inline_table_mut)
+                .filter(|constraint| names(constraint, name))
             {
-                if constraint
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| canonicalize_pypi_name(value) == name)
-                {
-                    constraint.remove("specifier");
-                    constraint.remove("url");
-                    constraint.remove("path");
-                    constraint.insert(artifact.key(), Value::from(artifact.location()));
-                }
+                repoint(constraint, artifact);
             }
         }
     }
@@ -478,18 +469,10 @@ fn rewrite_manifest(document: &mut DocumentMut, name: &str, artifact: ArtifactSo
         for requirement in requirements
             .iter_mut()
             .filter_map(Value::as_inline_table_mut)
+            .filter(|requirement| names(requirement, name))
         {
-            if requirement
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|value| canonicalize_pypi_name(value) == name)
-            {
-                requirement.remove("specifier");
-                requirement.remove("url");
-                requirement.remove("path");
-                requirement.insert(artifact.key(), Value::from(artifact.location()));
-                direct = true;
-            }
+            repoint(requirement, artifact);
+            direct = true;
         }
     }
     if direct {
@@ -501,18 +484,13 @@ fn rewrite_manifest(document: &mut DocumentMut, name: &str, artifact: ArtifactSo
     let Some(overrides) = overrides.as_array_mut() else {
         return;
     };
-    for requirement in overrides.iter_mut().filter_map(Value::as_inline_table_mut) {
-        if requirement
-            .get("name")
-            .and_then(Value::as_str)
-            .is_some_and(|value| canonicalize_pypi_name(value) == name)
-        {
-            requirement.remove("specifier");
-            requirement.remove("url");
-            requirement.remove("path");
-            requirement.insert(artifact.key(), Value::from(artifact.location()));
-            return;
-        }
+    if let Some(requirement) = overrides
+        .iter_mut()
+        .filter_map(Value::as_inline_table_mut)
+        .find(|requirement| names(requirement, name))
+    {
+        repoint(requirement, artifact);
+        return;
     }
     overrides.push_formatted(inline(&[
         ("name", Value::from(name)),
@@ -553,17 +531,9 @@ fn rewrite_requirement_sources(item: &mut Item, name: &str, artifact: ArtifactSo
         for requirement in requirements
             .iter_mut()
             .filter_map(Value::as_inline_table_mut)
+            .filter(|requirement| names(requirement, name))
         {
-            if requirement
-                .get("name")
-                .and_then(Value::as_str)
-                .is_some_and(|value| canonicalize_pypi_name(value) == name)
-            {
-                requirement.remove("specifier");
-                requirement.remove("url");
-                requirement.remove("path");
-                requirement.insert(artifact.key(), Value::from(artifact.location()));
-            }
+            repoint(requirement, artifact);
         }
     } else if let Some(table) = item.as_table_like_mut() {
         for (_, item) in table.iter_mut() {
@@ -572,61 +542,12 @@ fn rewrite_requirement_sources(item: &mut Item, name: &str, artifact: ArtifactSo
     }
 }
 
-pub fn complete_python_lock_metadata(
-    text: &str,
-    project: Option<&str>,
-    name: &str,
-    version: &str,
-    artifact: ArtifactSource<'_>,
-    wheel_metadata: Option<&str>,
-) -> Result<String, String> {
-    let mut document: DocumentMut = text
-        .parse()
-        .map_err(|error| format!("invalid Python lock: {error}"))?;
-    if document
-        .get("package")
-        .and_then(Item::as_array_of_tables)
-        .is_none()
-    {
-        return Ok(text.to_string());
-    }
-    complete_python_lock_metadata_in(
-        &mut document,
-        project,
-        name,
-        version,
-        artifact,
-        wheel_metadata,
-    )?;
-    Ok(preserve_line_endings(text, document.to_string()))
-}
-
-/// [`complete_python_lock_metadata`] on an already-parsed lock, in place.
-/// A lock with no `[[package]]` collection is left untouched. Every `Err` is
-/// raised before the document is touched.
-fn complete_python_lock_metadata_in(
-    document: &mut DocumentMut,
-    project: Option<&str>,
-    name: &str,
-    version: &str,
-    artifact: ArtifactSource<'_>,
-    wheel_metadata: Option<&str>,
-) -> Result<(), String> {
-    let Some(completion) = prepare_metadata_completion(document, project, name, wheel_metadata)?
-    else {
-        return Ok(());
-    };
-    finish_metadata_completion(document, completion, version, artifact);
-    Ok(())
-}
-
-/// Everything [`complete_python_lock_metadata`] can refuse over, decided
-/// before it mutates the lock. The refusals read only the metadata inputs,
-/// the lock's `[[package]]` collection and its `manifest` / `overrides`
-/// shapes — none of which [`apply_python_lock_plan`] changes (it replaces
-/// entry sources and artifacts, and only ever inserts an ARRAY `overrides`
-/// where none existed) — so preparing against the pre-rewrite lock gives the
-/// verdict the post-rewrite lock would.
+/// The metadata completion of [`PythonLockSession::rewrite`], decided before
+/// it mutates the lock. The refusals read only the metadata inputs, the
+/// lock's `[[package]]` collection and its `manifest` / `overrides` shapes,
+/// none of which [`apply_python_lock_plan`] changes (it only ever inserts an
+/// ARRAY `overrides` where none existed), so preparing against the
+/// pre-rewrite lock gives the verdict the post-rewrite lock would.
 struct MetadataCompletion {
     name: String,
     /// The pyproject's `[tool.uv] override-dependencies` names the dep.
@@ -721,7 +642,7 @@ fn prepare_metadata_completion(
 
 /// Refuse when `project` declares PEP 621 `dynamic` dependencies (or
 /// optional-dependencies) and the lock's root package lists `name` in
-/// `requires-dist` (#639). That entry came from the build backend, not from
+/// `requires-dist`. That entry came from the build backend, not from
 /// pyproject.toml, so upstream restore has no declaration to derive its
 /// specifier from, and rollback, remove and a vendored takeover could never
 /// undo the repointed entry. `requires-dev` comes from PEP 735 groups,
@@ -828,12 +749,7 @@ fn finish_metadata_completion(
                 overrides
                     .iter()
                     .filter_map(Value::as_inline_table)
-                    .any(|requirement| {
-                        requirement
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .is_some_and(|value| canonicalize_pypi_name(value) == name)
-                    })
+                    .any(|requirement| names(requirement, &name))
             });
             if exists {
                 rewrite_requirement_sources(overrides, &name, artifact);
@@ -890,8 +806,8 @@ fn plan_python_lock_rewrite(
     {
         source_scope(document, name, version)?;
     }
-    let pep751 = document.get("lock-version").is_some();
-    let legacy = document.get("distribution").is_some();
+    let (collection, pep751) = lock_package_collection(document.as_table());
+    let legacy = collection == "distribution";
     if pep751 {
         if document.get("lock-version").and_then(Item::as_str) != Some("1.0") {
             return Err("unsupported PEP 751 lock version".to_string());
@@ -899,13 +815,6 @@ fn plan_python_lock_rewrite(
     } else if document.get("version").and_then(Item::as_integer) != Some(1) {
         return Err("unsupported uv lock version".to_string());
     }
-    let collection = if pep751 {
-        "packages"
-    } else if legacy {
-        "distribution"
-    } else {
-        "package"
-    };
     let name = canonicalize_pypi_name(name);
     let Some(packages) = document.get(collection).and_then(Item::as_array_of_tables) else {
         return Ok(None);
@@ -971,7 +880,7 @@ fn plan_python_lock_rewrite(
     }
     // An entry resolved from a direct URL (uv.lock `source = { url }`, a
     // pylock `archive = { url }`) is the user's own source choice unless it
-    // is socket-patch's earlier hosted artifact for this release (#767).
+    // is socket-patch's earlier hosted artifact for this release.
     let direct_url = if pep751 {
         package
             .get("archive")
@@ -1001,13 +910,7 @@ fn plan_python_lock_rewrite(
         }
     }
     let location = artifact.location();
-    let filename = location
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(&location)
-        .rsplit('/')
-        .next()
-        .unwrap_or(&location);
+    let filename = artifact_filename(&location);
     if !filename.ends_with(".whl")
         && !filename.ends_with(".tar.gz")
         && !filename.ends_with(".zip")
@@ -1035,46 +938,13 @@ fn plan_python_lock_rewrite(
     }))
 }
 
-/// A Python lock parsed ONCE for repeated "would [`rewrite_python_lock`]
-/// rewrite this dep?" checks — the hosted wheel-metadata gate asks it for
-/// every pypi dep without re-parsing and re-serializing the lock each time.
-pub struct PythonLockProbe<'t> {
-    text: &'t str,
-    /// `None` when the lock does not parse (every dep then probes false,
-    /// as `rewrite_python_lock`'s `Err` would).
-    document: Option<DocumentMut>,
-}
-
-impl<'t> PythonLockProbe<'t> {
-    pub fn new(text: &'t str) -> Self {
-        Self {
-            text,
-            document: text.parse().ok(),
-        }
-    }
-
-    /// Exactly `matches!(rewrite_python_lock(text, …), Ok(Some(_)))`.
-    pub fn rewrites(&self, name: &str, version: &str, artifact: ArtifactSource<'_>) -> bool {
-        self.document.as_ref().is_some_and(|document| {
-            matches!(
-                plan_python_lock_rewrite(document, self.text, name, version, artifact),
-                Ok(Some(_))
-            )
-        })
-    }
-}
-
-/// A native Python lock parsed ONCE for a whole hosted rewrite: the hosted
-/// rewriter plans, applies and completes every dep against this one
-/// in-memory document instead of re-parsing the lock three times per dep
-/// (rewrite, source scope, metadata completion).
+/// A native Python lock parsed once for a whole hosted rewrite (and for the
+/// hosted wheel-metadata gate's "would this dep be rewritten?" probe).
 ///
-/// Each step answers exactly what its text twin answers on the lock's
-/// current rendering: [`Self::plan`] is [`rewrite_python_lock`]'s verdict,
-/// [`Self::source_scope`] is [`check_python_lock_source_scope`], and
-/// [`Self::rewrite`] renders what `complete_python_lock_metadata(
-/// rewrite_python_lock(…))` would. A refused dep leaves the document as it
-/// was, since every refusal is decided before the first mutation.
+/// [`Self::plan`] is [`rewrite_python_lock`]'s verdict on the lock's current
+/// rendering and [`Self::source_scope`] is [`check_python_lock_source_scope`].
+/// A refused dep leaves the document as it was, since every refusal is
+/// decided before the first mutation.
 pub(crate) struct PythonLockSession {
     document: Result<DocumentMut, String>,
 }
@@ -1195,13 +1065,7 @@ fn apply_python_lock_plan(
         .and_then(|packages| packages.get_mut(index))
         .expect("planned package index exists");
     let location = artifact.location();
-    let filename = location
-        .split(['?', '#'])
-        .next()
-        .unwrap_or(&location)
-        .rsplit('/')
-        .next()
-        .unwrap_or(&location);
+    let filename = artifact_filename(&location);
     let wheel = filename.ends_with(".whl");
     for key in ["sdist", "wheel", "wheels", "archive"] {
         package.remove(key);
@@ -1307,7 +1171,7 @@ pub fn paired_metadata_path(lock: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod script_lock_name_tests {
+mod tests {
     use super::*;
 
     #[test]
@@ -1331,11 +1195,6 @@ mod script_lock_name_tests {
         );
         assert_eq!(paired_metadata_path("package.json"), None);
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{is_python_lock_name, rewrite_python_lock, ArtifactSource};
 
     const URL: &str = "https://patch.socket.dev/pkg/urllib3-1.26.18-py2.py3-none-any.whl";
     const SHA256: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
@@ -1365,7 +1224,7 @@ source = { registry = "https://pypi.org/simple" }
 wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha256:other" }]
 "#;
 
-    /// #767: a lock entry resolved from the user's own direct URL (uv.lock
+    /// A lock entry resolved from the user's own direct URL (uv.lock
     /// `source = { url }`, pylock `archive = { url }`) is refused in both
     /// modes; the hosted rewrite's own earlier artifact is still replaced.
     #[test]
@@ -1397,14 +1256,21 @@ wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha
             }
             // The hosted rewrite's own artifact (a re-scan) is not the user's.
             let ours = lock.replace(USER, URL);
-            assert!(rewrite_python_lock(
+            let rewritten = rewrite_python_lock(
                 &ours,
                 "urllib3",
                 "1.26.18",
                 ArtifactSource::Url(URL),
-                SHA256
+                SHA256,
             )
-            .is_ok());
+            .unwrap();
+            // The fixture's old digest `aa` gives way to the artifact's.
+            assert!(
+                rewritten.is_some_and(|text| text.contains(SHA256)
+                    && !text.contains("\"aa\"")
+                    && !text.contains("sha256:aa")),
+                "{ours}"
+            );
         }
     }
 
@@ -1995,11 +1861,6 @@ wheels = [{url = "https://pypi.org/urllib3.whl", hashes = {sha256 = "old"}}]
             assert!(!is_python_lock_name(name));
         }
     }
-}
-
-#[cfg(test)]
-mod discovery_and_line_ending_tests {
-    use super::*;
 
     #[test]
     fn crlf_locks_keep_their_line_endings_through_a_rewrite() {
@@ -2069,14 +1930,6 @@ mod discovery_and_line_ending_tests {
             vec!["pylock.toml".to_string(), "tool.py.lock".to_string()]
         );
     }
-}
-
-#[cfg(test)]
-mod manifest_constraints_tests {
-    use super::{rewrite_python_lock, ArtifactSource};
-
-    const URL: &str = "https://patch.socket.dev/pkg/urllib3-1.26.18-py2.py3-none-any.whl";
-    const SHA256: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
 
     /// `[tool.uv] constraint-dependencies` / `build-constraint-dependencies`
     /// land in `[manifest] constraints` / `build-constraints` as
@@ -2141,143 +1994,6 @@ wheels = [
         assert!(
             manifest.as_table_like().unwrap().get("overrides").is_none(),
             "a direct dependency must not gain an overrides array: {rewritten}"
-        );
-    }
-}
-
-/// `PythonLockProbe::rewrites` must agree with `rewrite_python_lock`
-/// returning `Ok(Some(_))` for every lock shape and every refusal /
-/// not-applicable path — the hosted wheel-metadata gate relies on it.
-#[cfg(test)]
-mod probe_equivalence_tests {
-    use super::{rewrite_python_lock, ArtifactSource, PythonLockProbe};
-
-    const SHA256: &str = "ccc9a9e0b18a5efc7038c504cfc580e47d2e02e5390f2e29cad833cbccb956b6";
-    const NATIVE: &str = r#"version = 1
-revision = 3
-
-[[package]]
-name = "project"
-version = "1"
-source = { virtual = "." }
-dependencies = [
-    { name = "urllib3", version = "1.26.18", source = { registry = "https://pypi.org/simple" } },
-]
-
-[[package]]
-name = "urllib3"
-version = "1.26.18"
-source = { registry = "https://pypi.org/simple" }
-wheels = [{ url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hash = "sha256:old" }]
-
-[[package]]
-name = "Zope.Interface"
-version = "6.0"
-source = { git = "https://example.test/zope" }
-
-[[package]]
-name = "six"
-version = "1.16.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://pypi.org/six-1.16.0.tar.gz", hash = "sha256:old" }
-"#;
-    const LEGACY_STRINGS: &str = r#"version = 1
-
-[[distribution]]
-name = "urllib3"
-version = "1.26.18"
-source = "registry+https://pypi.org/simple"
-
-[[distribution.wheel]]
-url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl"
-hash = "sha256:old"
-
-[[distribution]]
-name = "six"
-version = "1.16.0"
-source = "git+https://example.test/six"
-"#;
-    const PEP751: &str = r#"lock-version = "1.0"
-
-[[packages]]
-name = "urllib3"
-version = "1.26.18"
-index = "https://pypi.org/simple"
-wheels = [{ url = "https://pypi.org/urllib3-1.26.18-py2.py3-none-any.whl", hashes = { sha256 = "old" } }]
-
-[[packages]]
-name = "six"
-version = "1.16.0"
-vcs = { type = "git", url = "https://example.test/six", commit-id = "abc" }
-"#;
-
-    #[test]
-    fn probe_matches_rewrite_outcome_for_every_shape() {
-        let script = NATIVE.replacen(
-            "[[package]]",
-            "[manifest]\nrequirements = [{ name = \"urllib3\", specifier = \"==1.26.18\" }]\n\n[[package]]",
-            1,
-        );
-        let multi_version = format!(
-            "{script}\n[[package]]\nname = \"urllib3\"\nversion = \"2.0.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n"
-        );
-        let duplicate = NATIVE.replace(
-            "name = \"six\"\nversion = \"1.16.0\"",
-            "name = \"urllib3\"\nversion = \"1.26.18\"",
-        );
-        let locks = [
-            NATIVE.to_string(),
-            NATIVE.replace("\n", "\r\n"),
-            script,
-            multi_version,
-            duplicate,
-            LEGACY_STRINGS.to_string(),
-            PEP751.to_string(),
-            "version = 2\n".to_string(),
-            "lock-version = '2.0'\n".to_string(),
-            "version = 1\n".to_string(),
-            "this is [not toml".to_string(),
-        ];
-        let wheel = "https://patch.socket.dev/pkg/urllib3-1.26.18-py2.py3-none-any.whl";
-        let sdist = "https://patch.socket.dev/pkg/six-1.16.0.tar.gz?token=x#frag";
-        let artifacts = [
-            ArtifactSource::Url(wheel),
-            ArtifactSource::Url(sdist),
-            ArtifactSource::Url("https://patch.socket.dev/pkg/urllib3.exe"),
-            ArtifactSource::Path(".socket/vendor/pypi/id/urllib3-1.26.18-py2.py3-none-any.whl"),
-        ];
-        let targets = [
-            ("urllib3", "1.26.18"),
-            ("URLLIB3", "1.26.18"),
-            ("urllib3", "2.0.0"),
-            ("urllib3", "9.9.9"),
-            ("six", "1.16.0"),
-            ("zope-interface", "6.0"),
-            ("absent", "1.0"),
-        ];
-        let mut outcomes = std::collections::BTreeSet::new();
-        for lock in &locks {
-            let probe = PythonLockProbe::new(lock);
-            for (name, version) in targets {
-                for artifact in artifacts {
-                    let rewrite = rewrite_python_lock(lock, name, version, artifact, SHA256);
-                    outcomes.insert(match &rewrite {
-                        Ok(Some(_)) => "some",
-                        Ok(None) => "none",
-                        Err(_) => "err",
-                    });
-                    assert_eq!(
-                        probe.rewrites(name, version, artifact),
-                        matches!(rewrite, Ok(Some(_))),
-                        "{name}@{version} via {artifact:?} over:\n{lock}\nrewrite: {rewrite:?}"
-                    );
-                }
-            }
-        }
-        assert_eq!(
-            outcomes.len(),
-            3,
-            "every outcome is exercised: {outcomes:?}"
         );
     }
 }

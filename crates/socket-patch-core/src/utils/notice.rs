@@ -37,19 +37,15 @@ pub fn is_quiet() -> bool {
     SILENT.load(Ordering::Relaxed) || JSON.load(Ordering::Relaxed)
 }
 
-/// Whether an advisory of `level` is suppressed in the current mode.
-pub(crate) fn is_muted(level: Notice) -> bool {
-    match level {
-        Notice::Info => is_quiet(),
-        Notice::Warning => SILENT.load(Ordering::Relaxed),
-    }
-}
-
 /// Print `msg()` to stderr unless `level` is muted or `shown` already
 /// fired. The message is built lazily so a suppressed advisory costs
 /// nothing, and a muted call does not consume the once.
 pub(crate) fn notice_once(level: Notice, shown: &AtomicBool, msg: impl FnOnce() -> String) {
-    if is_muted(level) {
+    let muted = match level {
+        Notice::Info => is_quiet(),
+        Notice::Warning => SILENT.load(Ordering::Relaxed),
+    };
+    if muted {
         return;
     }
     if !shown.swap(true, Ordering::Relaxed) {

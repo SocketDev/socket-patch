@@ -1413,18 +1413,6 @@ fn gradle_vendor_429_repair_restores_missing_gitattributes() {
     ok(root, &["vendor", "--check"]);
 }
 
-fn copy_dir(from: &Path, to: &Path) {
-    std::fs::create_dir_all(to).unwrap();
-    for e in std::fs::read_dir(from).unwrap() {
-        let e = e.unwrap();
-        if e.file_type().unwrap().is_dir() {
-            copy_dir(&e.path(), &to.join(e.file_name()));
-        } else {
-            std::fs::copy(e.path(), to.join(e.file_name())).unwrap();
-        }
-    }
-}
-
 /// #428 repair: a JVM ledger entry under a subproject of the Gradle build
 /// is not repaired there (the real build would never read the restored
 /// tree); nothing is written.
@@ -1435,7 +1423,7 @@ fn gradle_vendor_428_repair_from_subproject_refuses() {
     fixture(root, Shape::Gradle, &[("foo", FOO_UUID)]);
     std::fs::create_dir_all(root.join("proj/.git")).unwrap();
     ok(root, &["vendor"]);
-    copy_dir(&root.join("proj/.socket"), &root.join("proj/app/.socket"));
+    common::fs_tree::copy_tree(&root.join("proj/.socket"), &root.join("proj/app/.socket"));
     std::fs::remove_file(
         root.join("proj/app/.socket/vendor/gradle/org/example/foo/1.0/foo-1.0.jar"),
     )

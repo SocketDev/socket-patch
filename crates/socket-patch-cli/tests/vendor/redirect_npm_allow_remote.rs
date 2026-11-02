@@ -45,6 +45,7 @@ const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const CODE: &str = "redirect_npm_allow_remote";
 const LEFT: &str = "npm_allow_remote_left";
 const REPLACE_HOST: &str = "redirect_npm_replace_registry_host";
+const OMIT_RESOLVED: &str = "redirect_npm_omit_lockfile_registry_resolved";
 
 fn hosted_url() -> String {
     format!(
@@ -191,6 +192,14 @@ fn npm_isolation(root: &Path) -> Vec<(String, String)> {
         ("npm_config_allow_remote".into(), String::new()),
         ("NPM_CONFIG_REPLACE_REGISTRY_HOST".into(), String::new()),
         ("npm_config_replace_registry_host".into(), String::new()),
+        (
+            "NPM_CONFIG_OMIT_LOCKFILE_REGISTRY_RESOLVED".into(),
+            String::new(),
+        ),
+        (
+            "npm_config_omit_lockfile_registry_resolved".into(),
+            String::new(),
+        ),
     ]
 }
 
@@ -1000,6 +1009,136 @@ async fn replace_registry_host_via_env_interpolation_is_warned() {
     let (code, doc, _) = scan_hosted_env(tmp.path(), &server.uri(), &["--json"], &[]);
     assert_eq!(code, 0, "{doc:#}");
     assert_eq!(replace_host_warning(&doc), None, "{doc:#}");
+}
+
+fn omit_resolved_warning(doc: &Value) -> Option<&str> {
+    doc["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|w| w["code"] == OMIT_RESOLVED)
+        .and_then(|w| w["detail"].as_str())
+}
+
+/// #1871: npm >= 8's `omit-lockfile-registry-resolved=true` makes the next
+/// lock save (even a no-op `npm install`) drop the hosted pin's `resolved`
+/// while keeping its patched `integrity`, so every cold-cache install
+/// fails EINTEGRITY and `vex` loses the hosted reference. The hosted run
+/// said nothing and exited 0. It now warns
+/// `redirect_npm_omit_lockfile_registry_resolved` (JSON + human), naming
+/// the layer that sets it, on the first run and the "already hosted"
+/// re-run; a value npm reads as false stays quiet.
+#[tokio::test]
+async fn omit_lockfile_registry_resolved_is_warned() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+
+    // Project `.npmrc`: first run and the idempotent re-run both warn.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "omit-lockfile-registry-resolved=true\n",
+    )
+    .unwrap();
+    for run in 0..2 {
+        let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+        assert_eq!(code, 0, "{doc:#}");
+        let detail = omit_resolved_warning(&doc)
+            .unwrap_or_else(|| panic!("run {run}: no {OMIT_RESOLVED}: {doc:#}"));
+        assert!(
+            detail.contains("patch.test")
+                && detail
+                    .contains("the project .npmrc sets `omit-lockfile-registry-resolved=true`")
+                && detail.contains("EINTEGRITY")
+                && detail.contains("omit-lockfile-registry-resolved=false")
+                && detail.contains("--mode vendored"),
+            "{detail}"
+        );
+        assert!(allow_remote_warning(&doc).is_some(), "{doc:#}");
+        assert_eq!(replace_host_warning(&doc), None, "{doc:#}");
+    }
+    let (code, _, stderr) = scan_hosted(tmp.path(), &server.uri(), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("Warning: ") && stderr.contains("`omit-lockfile-registry-resolved=true`"),
+        "{stderr}"
+    );
+
+    // npm reads the value through `parseField` + nopt's Boolean: a bare
+    // key, a blank value and any other string are true; `false`, `null`,
+    // `undefined` and `0` are not (measured on npm 10.9.4).
+    for (line, warns) in [
+        ("omit-lockfile-registry-resolved", true),
+        ("omit-lockfile-registry-resolved=1", true),
+        ("omit-lockfile-registry-resolved=", true),
+        ("omit-lockfile-registry-resolved=undefined", false),
+        ("omit-lockfile-registry-resolved=false", false),
+        ("omit-lockfile-registry-resolved=null", false),
+        ("omit-lockfile-registry-resolved=0", false),
+        ("[scope]\nomit-lockfile-registry-resolved=true", false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_npm_project(tmp.path(), "package-lock.json");
+        std::fs::write(tmp.path().join(".npmrc"), format!("{line}\n")).unwrap();
+        let (code, doc, _) = scan_hosted(tmp.path(), &server.uri(), &["--json"]);
+        assert_eq!(code, 0, "{doc:#}");
+        assert_eq!(
+            omit_resolved_warning(&doc).is_some(),
+            warns,
+            "{line}: {doc:#}"
+        );
+    }
+
+    // User config (relocated the way npm allows).
+    let tmp = tempfile::tempdir().unwrap();
+    let cfg = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    let user = cfg.path().join("user.npmrc");
+    std::fs::write(&user, "omit-lockfile-registry-resolved=true\n").unwrap();
+    let user_s = user.to_str().unwrap();
+    let user_env = [
+        ("NPM_CONFIG_USERCONFIG", user_s),
+        ("npm_config_userconfig", user_s),
+    ];
+    let (code, doc, _) = scan_hosted_env(tmp.path(), &server.uri(), &["--json"], &user_env);
+    assert_eq!(code, 0, "{doc:#}");
+    let detail =
+        omit_resolved_warning(&doc).unwrap_or_else(|| panic!("no {OMIT_RESOLVED}: {doc:#}"));
+    assert!(
+        detail.contains("the user npm config")
+            && detail.contains(user_s)
+            && detail.contains("in the project .npmrc (it outranks the user config)"),
+        "{detail}"
+    );
+    // ...which a project `false` overrides, as it does for npm.
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), "package-lock.json");
+    std::fs::write(
+        tmp.path().join(".npmrc"),
+        "omit-lockfile-registry-resolved=false\n",
+    )
+    .unwrap();
+    let (code, doc, _) = scan_hosted_env(tmp.path(), &server.uri(), &["--json"], &user_env);
+    assert_eq!(code, 0, "{doc:#}");
+    assert_eq!(omit_resolved_warning(&doc), None, "{doc:#}");
+
+    // The env var beats a project `false`.
+    let (code, doc, _) = scan_hosted_env(
+        tmp.path(),
+        &server.uri(),
+        &["--json"],
+        &[("npm_config_omit_lockfile_registry_resolved", "true")],
+    );
+    assert_eq!(code, 0, "{doc:#}");
+    let detail =
+        omit_resolved_warning(&doc).unwrap_or_else(|| panic!("no {OMIT_RESOLVED}: {doc:#}"));
+    assert!(
+        detail.to_ascii_lowercase().contains(
+            "npm_config_omit_lockfile_registry_resolved sets `omit-lockfile-registry-resolved=true`"
+        ),
+        "{detail}"
+    );
 }
 
 /// Review finding: `remove` dropped the hosted leg's warnings. A

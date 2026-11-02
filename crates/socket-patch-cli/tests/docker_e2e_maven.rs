@@ -13,14 +13,16 @@
 
 #[path = "common/mod.rs"]
 mod common;
+#[path = "docker_common/mod.rs"]
+mod docker_common;
 use common::git_sha256;
-
-use std::process::Command;
+use docker_common::{assert_vex_agent_attested, run_container, skip_if_no_image};
 
 use base64::Engine;
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+const IMAGE: &str = "socket-patch-test-maven:latest";
 const ORG: &str = "test-org";
 const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
 const UUID: &str = "16161616-1616-4161-8161-161616161616";
@@ -40,26 +42,6 @@ const PATCHED_POM: &[u8] = b"<!-- SOCKET-PATCH-E2E-MARKER -->\n\
                              <artifactId>commons-lang3</artifactId>\n\
                              <version>3.12.0-patched</version>\n\
                              </project>\n";
-
-/// See docker_e2e_npm.rs::cov_docker_args for the coverage hook
-/// semantics. The CI coverage-docker job sets the env vars; locally
-/// they're unset and this returns an empty Vec.
-fn cov_docker_args() -> Vec<String> {
-    let Ok(bin) = std::env::var("SOCKET_PATCH_COV_BIN") else {
-        return Vec::new();
-    };
-    let Ok(dir) = std::env::var("SOCKET_PATCH_COV_PROFRAW_DIR") else {
-        return Vec::new();
-    };
-    vec![
-        "-v".into(),
-        format!("{bin}:/usr/local/bin/socket-patch:ro"),
-        "-v".into(),
-        format!("{dir}:/coverage"),
-        "-e".into(),
-        "LLVM_PROFILE_FILE=/coverage/docker-e2e-%p-%14m.profraw".into(),
-    ]
-}
 
 async fn make_mock_server(after_hash: &str) -> MockServer {
     let listener = std::net::TcpListener::bind("0.0.0.0:0").expect("bind wiremock");
@@ -352,92 +334,15 @@ exit 0
     )
 }
 
-/// Host-side oracle over the VEX document the container emitted between the
-/// `===VEX DOC BEGIN===` / `===VEX DOC END===` markers (these agent suites run
-/// the workspace inside the container with no bind mount, so the doc is parsed
-/// from captured stdout). Asserts exactly one statement attesting the agent
-/// patch: the fixture GHSA, `not_affected`, the installed-package subcomponent
-/// purl, and a PLAIN impact statement with NO `(vendored)`/`(redirected)`
-/// marker — the marker's absence is what distinguishes agent provenance.
-fn assert_vex_agent_attested(stdout: &str, subcomponent_purl: &str) {
-    const BEGIN: &str = "===VEX DOC BEGIN===";
-    const END: &str = "===VEX DOC END===";
-    let start = stdout
-        .find(BEGIN)
-        .unwrap_or_else(|| panic!("VEX DOC BEGIN marker missing from stdout:\n{stdout}"))
-        + BEGIN.len();
-    let stop = stdout[start..]
-        .find(END)
-        .unwrap_or_else(|| panic!("VEX DOC END marker missing from stdout:\n{stdout}"))
-        + start;
-    let doc: serde_json::Value = serde_json::from_str(stdout[start..stop].trim())
-        .expect("emitted VEX document must be valid JSON");
-    let stmts = doc["statements"]
-        .as_array()
-        .expect("VEX document must have a statements array");
-    assert_eq!(stmts.len(), 1, "exactly one VEX statement expected: {doc}");
-    let st = &stmts[0];
-    assert_eq!(st["vulnerability"]["name"], GHSA, "attested GHSA mismatch");
-    assert_eq!(st["status"], "not_affected");
-    assert_eq!(
-        st["products"][0]["subcomponents"][0]["@id"], subcomponent_purl,
-        "subcomponent must be the patched package purl"
-    );
-    let impact = st["impact_statement"]
-        .as_str()
-        .expect("statement must carry an impact_statement");
-    assert!(
-        impact.contains("Patched via Socket patch")
-            && !impact.contains("(vendored)")
-            && !impact.contains("(redirected)"),
-        "agent-mode attestation must carry a PLAIN impact statement (no vendored/redirected marker): {impact}"
-    );
-}
-
-/// Returns `true` when the test should skip (docker missing, image
-/// missing). Prints a skip notice to stderr — the test still reports
-/// as `ok` because Rust integration tests have no native "skipped"
-/// outcome. Build locally with
-/// `docker build -f tests/docker/Dockerfile.maven -t socket-patch-test-maven:latest .`
-#[must_use]
-fn skip_if_no_image() -> bool {
-    let Ok(out) = Command::new("docker")
-        .args(["image", "inspect", "socket-patch-test-maven:latest"])
-        .output()
-    else {
-        eprintln!("skipping: `docker` not on PATH");
-        return true;
-    };
-    if !out.status.success() {
-        eprintln!("skipping: docker image `socket-patch-test-maven:latest` not present");
-        return true;
-    }
-    false
-}
-
 #[tokio::test]
 async fn maven_install_full_apply_chain() {
     let after_hash = git_sha256(PATCHED_POM);
     let server = make_mock_server(&after_hash).await;
     let api_url = format!("http://host.docker.internal:{}", server.address().port());
-    if skip_if_no_image() {
+    if skip_if_no_image(IMAGE) {
         return;
     }
-    let mut cmd = Command::new("docker");
-    cmd.args([
-        "run",
-        "--rm",
-        "--add-host=host.docker.internal:host-gateway",
-        "-i",
-    ])
-    .args(cov_docker_args())
-    .args([
-        "socket-patch-test-maven:latest",
-        "bash",
-        "-c",
-        &local_script(&api_url, &after_hash),
-    ]);
-    let out = cmd.output().expect("docker run");
+    let out = run_container(IMAGE, &local_script(&api_url, &after_hash));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
@@ -453,7 +358,7 @@ async fn maven_install_full_apply_chain() {
         stderr.contains("===VEX VERIFIED==="),
         "agent-mode VEX leg did not run/pass (===VEX VERIFIED=== missing).\nstderr=\n{stderr}"
     );
-    assert_vex_agent_attested(&stdout, PURL);
+    assert_vex_agent_attested(&stdout, PURL, GHSA);
 
     // The script gates on an exact git-blob-hash match; confirm the
     // expected hash actually appears in the log so a future edit that

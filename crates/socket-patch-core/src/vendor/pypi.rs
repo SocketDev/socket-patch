@@ -263,6 +263,24 @@ async fn refuse_pin_outside_root(
     }
 }
 
+/// #1873: refuse wiring a lock beside a requirements set that names the
+/// target through a `${NAME}` pip expands where it runs (`six==${SIXV}`).
+/// The release it installs is unknowable here, so naming requirements.txt
+/// a loser would let the lock wiring report the package patched while pip
+/// installs it from the registry.
+async fn refuse_templated_pin(
+    project_root: &Path,
+    target: Option<(&str, &str)>,
+) -> Result<(), (&'static str, String)> {
+    let Some((name, _)) = target else {
+        return Ok(());
+    };
+    match super::pypi_requirements::templated_pin(project_root, name).await {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
 /// Route the project to a wiring flavor, first match wins. Lockfiles are the
 /// authoritative "this tool manages installs" signal, so locks are compared
 /// with locks (precedence follows migration direction / ecosystem currency:
@@ -416,6 +434,7 @@ async fn detect_pypi_flavor(
             None => false,
         };
         refuse_pin_outside_root(project_root, target).await?;
+        refuse_templated_pin(project_root, target).await?;
         if !wired_with_lock && exists(PYPI_REQUIREMENTS).await {
             present.push(PYPI_REQUIREMENTS);
         }
@@ -471,6 +490,7 @@ async fn detect_pypi_flavor(
     };
     if governing.is_some() {
         refuse_pin_outside_root(project_root, target).await?;
+        refuse_templated_pin(project_root, target).await?;
     }
     if governing.is_some()
         && !wired_with_lock
@@ -825,61 +845,21 @@ async fn pipenv_stale_install_warning(
     let (name, version) = parse_pypi_purl(strip_purl_qualifiers(purl))
         .map(|(name, version)| (name.to_string(), version.to_string()))
         .unwrap_or_else(|| (purl.to_string(), String::new()));
-    let join = |dirs: &[&std::path::PathBuf]| {
-        dirs.iter()
-            .map(|d| d.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    let listed = join(&stale_dirs.iter().collect::<Vec<_>>());
+    let listed = super::pypi_pipenv::join_dirs(&stale_dirs);
     // A base interpreter's copy a `--site-packages` venv inherits survives
     // both the uninstall-and-sync and the recreate-and-sync remedies (#1450).
     let inherited = crate::crawlers::python_crawler::inherited_base_site_dirs(&sites).await;
-    let (base, own): (Vec<_>, Vec<_>) = stale_dirs.iter().partition(|d| inherited.contains(*d));
-    // A venv copy that hides the same release in its base interpreter: the
-    // uninstall-and-sync remedy would only expose that base copy.
-    let mut shadowing = Vec::new();
-    let mut plain = Vec::new();
-    for dir in own {
-        match crate::crawlers::python_crawler::inherited_same_release(dir, &name, &version).await {
-            Some(base_dir) => shadowing.push((dir, base_dir)),
-            None => plain.push(dir),
-        }
-    }
-    let own = plain;
-    let mut detail =
-        format!("{purl}: the UNPATCHED upstream release is still installed in {listed}.");
-    let several = [!own.is_empty(), !shadowing.is_empty(), !base.is_empty()]
-        .iter()
-        .filter(|kind| **kind)
-        .count()
-        > 1;
-    if !own.is_empty() {
-        let remedy = super::pypi_pipenv::stale_install_remedy(Some(lock), &name);
-        let lead = if !several {
-            String::new()
-        } else {
-            format!("For {}: ", join(&own))
-        };
-        detail.push_str(&format!(
-            " {lead}Pipenv does not reinstall a release that is already present (`pipenv install`, `pipenv install --deploy` and `pipenv sync` all keep those bytes), so the wired Pipfile.lock only protects fresh installs. {remedy}."
-        ));
-    }
-    for (dir, base_dir) in &shadowing {
-        let remedy = super::pypi_pipenv::shadowing_stale_install_remedy(
-            Some(lock),
-            &name,
-            &dir.display().to_string(),
-            &base_dir.display().to_string(),
-        );
-        detail.push_str(&format!(" {remedy}."));
-    }
-    if !base.is_empty() {
-        let remedy =
-            super::pypi_pipenv::base_site_stale_install_remedy(Some(lock), &name, &join(&base));
-        detail.push_str(&format!(" {remedy}."));
-    }
-    detail.push_str(" Then `socket-patch vex` re-verifies the installed files.");
+    let remedy = super::pypi_pipenv::stale_install_detail(
+        Some(lock),
+        &name,
+        &version,
+        &stale_dirs,
+        &inherited,
+        "wired",
+    )
+    .await;
+    let detail =
+        format!("{purl}: the UNPATCHED upstream release is still installed in {listed}. {remedy}");
     Some(VendorWarning::new("pypi_pipenv_stale_install", detail))
 }
 
@@ -4347,6 +4327,21 @@ mod tests {
                 loud[0].detail
             );
         }
+    }
+
+    /// #1873: beside a governing tool lock, a requirements pin templated
+    /// with pip's `${VAR}` refuses instead of being named a loser: the
+    /// release it installs is unknown.
+    #[tokio::test]
+    async fn governing_lock_refuses_an_env_templated_requirements_pin() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "Pipfile", "[packages]\nsix = \"==1.16.0\"\n").await;
+        touch(tmp.path(), "Pipfile.lock", "{}").await;
+        touch(tmp.path(), "requirements.txt", "six==${SIXV}\n").await;
+        let (code, detail) = detect_pypi_flavor(tmp.path(), Some(("six", "1.16.0")))
+            .await
+            .unwrap_err();
+        assert_eq!(code, "pypi_requirement_env_templated", "{detail}");
     }
 
     /// #912: a pylock-only Pipenv checkout can't be vendored — Pipenv drops

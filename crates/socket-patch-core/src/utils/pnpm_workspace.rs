@@ -262,37 +262,6 @@ pub fn shared_lockfile_disabled(workspace: &str, npmrc: Option<&str>) -> bool {
     .is_some_and(|setting| setting.as_bool() == Some(false))
 }
 
-/// Whether a root lock is a SHARED workspace lock: its `importers:` names a
-/// project other than the root (`.`). Such a lock is what pnpm installs
-/// every member from, whatever the settings say now, so member locks
-/// beside it are stale leftovers.
-pub fn root_lock_lists_members(lock: &str) -> bool {
-    let mut in_importers = false;
-    for line in lock.lines() {
-        let line = line.strip_suffix('\r').unwrap_or(line);
-        if !line.starts_with([' ', '\t']) && !line.trim().is_empty() {
-            in_importers = line.trim_end() == "importers:";
-            continue;
-        }
-        if !in_importers {
-            continue;
-        }
-        // An importer key sits at exactly two spaces.
-        let Some(key) = line
-            .strip_prefix("  ")
-            .filter(|k| !k.starts_with([' ', '#']))
-        else {
-            continue;
-        };
-        let key = key.split(':').next().unwrap_or("").trim();
-        let key = key.trim_matches(['\'', '"']);
-        if !key.is_empty() && key != "." {
-            return true;
-        }
-    }
-    false
-}
-
 /// Whether pnpm's project finder lists the directory at `rel` (relative
 /// to the workspace root, one entry per component) under `globs`
 /// (`pnpm-workspace.yaml` `packages:`, as [`read_package_globs`] reads them), as
@@ -473,7 +442,13 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         return Members::Shared;
     }
     let root_lock = view.read_text(PNPM_LOCK).await.ok();
-    if root_lock.as_deref().is_some_and(root_lock_lists_members) {
+    // A root lock whose importers name a project other than `.` is a
+    // SHARED workspace lock: pnpm installs every member from it, whatever
+    // the settings say now, so member locks beside it are stale leftovers.
+    if root_lock
+        .as_deref()
+        .is_some_and(crate::formats::pnpm::workspace::lock_text_has_member_importers)
+    {
         return Members::Shared;
     }
     let globs = match read_package_globs(&workspace) {
@@ -1217,18 +1192,19 @@ mod tests {
 
     #[test]
     fn a_root_lock_listing_member_importers_is_shared() {
+        use crate::formats::pnpm::workspace::lock_text_has_member_importers;
         let root_only = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      a:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n";
-        assert!(!root_lock_lists_members(root_only));
-        assert!(!root_lock_lists_members(
+        assert!(!lock_text_has_member_importers(root_only));
+        assert!(!lock_text_has_member_importers(
             "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n"
         ));
-        assert!(!root_lock_lists_members(
+        assert!(!lock_text_has_member_importers(
             "lockfileVersion: 5.4\n\ndependencies:\n  a: 1.0.0\n"
         ));
-        assert!(root_lock_lists_members(
+        assert!(lock_text_has_member_importers(
             "lockfileVersion: '9.0'\r\n\r\nimporters:\r\n\r\n  .: {}\r\n\r\n  packages/a:\r\n    dependencies: {}\r\n"
         ));
-        assert!(root_lock_lists_members(
+        assert!(lock_text_has_member_importers(
             "lockfileVersion: '6.0'\nimporters:\n  '.': {}\n  'packages/a': {}\n"
         ));
     }

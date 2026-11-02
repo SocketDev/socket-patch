@@ -15,6 +15,7 @@ pub mod repair;
 pub mod rollback;
 pub mod scan;
 pub mod update;
+pub(crate) mod user_patches;
 pub mod vendor;
 pub(crate) mod vendor_orphans;
 pub(crate) mod vendored_backend;
@@ -384,42 +385,12 @@ pub(crate) fn hosted_state_from_pins(
 ) -> socket_patch_core::patch::redirect::RedirectState {
     let mut state = socket_patch_core::patch::redirect::RedirectState::new();
     for pin in pins {
-        state.records.entry(pin.purl.clone()).or_insert_with(|| {
-            socket_patch_core::manifest::schema::PatchRecord {
-                uuid: pin.uuid.clone(),
-                exported_at: String::new(),
-                files: Default::default(),
-                vulnerabilities: Default::default(),
-                description: String::new(),
-                license: String::new(),
-                tier: String::new(),
-            }
-        });
+        state
+            .records
+            .entry(pin.purl.clone())
+            .or_insert_with(|| socket_patch_core::ledgers::uuid_only_record(&pin.uuid));
     }
     state
-}
-
-/// Read-only lenient view of a loaded vendor ledger (`.socket/vendor/state.json`):
-/// missing → an empty ledger; malformed/unreadable → `None` with the
-/// problem surfaced on stderr unless `silent`. A read-only
-/// consumer (`list`) degrades a broken ledger to nothing-to-consult but
-/// must say so, while every path that writes or attests from it fails
-/// closed instead.
-pub(crate) fn vendor_state_lenient(
-    loaded: &std::io::Result<socket_patch_core::vendor::state::VendorState>,
-    silent: bool,
-) -> Option<&socket_patch_core::vendor::state::VendorState> {
-    match loaded {
-        Ok(state) => Some(state),
-        Err(e) => {
-            if !silent {
-                eprintln!(
-                    "Warning: unreadable vendor ledger ({e}); its vendored patches are not listed"
-                );
-            }
-            None
-        }
-    }
 }
 
 #[cfg(test)]
@@ -485,6 +456,29 @@ mod tests {
         .unwrap();
     }
 
+    /// The usage error for agent-mode patches beside a vendor ledger in
+    /// the project at `root`.
+    fn agent_and_vendored(root: &Path) -> String {
+        format!(
+            "{} holds both agent-mode patches ({}) and vendored patches \
+             (.socket/vendor/state.json): pass --mode agent, --mode vendored or \
+             --mode hosted to choose the mode this run uses",
+            root.display(),
+            root.join(".socket/manifest.json").display(),
+        )
+    }
+
+    /// The usage error for hosted pins (`named`) beside a vendor ledger in
+    /// the project at `root`.
+    fn hosted_and_vendored(root: &Path, named: &str) -> String {
+        format!(
+            "{} holds both hosted pins in its dependency files ({named}) and vendored \
+             patches (.socket/vendor/state.json): pass --mode hosted, --mode vendored \
+             or --mode agent to choose the mode this run uses",
+            root.display(),
+        )
+    }
+
     fn args(cwd: &Path, manifest_path: &str) -> crate::args::GlobalArgs {
         crate::args::GlobalArgs {
             cwd: PathBuf::from(cwd),
@@ -513,8 +507,7 @@ mod tests {
         write_ledger(tmp.path()).await;
         write_manifest(tmp.path(), &[LEDGER_PURL, "pkg:npm/is-odd@3.0.1"]);
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
-        let err = mode.expect_err("agent and vendored state together");
-        assert!(err.contains("--mode"), "{err}");
+        assert_eq!(mode, Err(agent_and_vendored(tmp.path())));
     }
 
     /// A malformed manifest is agent state: a bare run must not take the
@@ -532,7 +525,10 @@ mod tests {
 
         // Beside a vendor ledger it is ambiguous, not silently vendored.
         write_ledger(tmp.path()).await;
-        assert!(mode_from_project_state(&common).await.is_err());
+        assert_eq!(
+            mode_from_project_state(&common).await,
+            Err(agent_and_vendored(tmp.path()))
+        );
     }
 
     /// A `package-lock.json` at `root` pinning `name@version` to Socket's
@@ -571,9 +567,10 @@ mod tests {
         write_ledger(tmp.path()).await;
         write_hosted_lock(tmp.path(), "minimist", "1.2.2");
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
-        let err = mode.expect_err("vendored and hosted state together");
-        assert!(err.contains("hosted"), "{err}");
-        assert!(err.contains("--mode"), "{err}");
+        assert_eq!(
+            mode,
+            Err(hosted_and_vendored(tmp.path(), "pkg:npm/minimist@1.2.2"))
+        );
     }
 
     /// A hosted pin over the very package the ledger holds is still a
@@ -584,7 +581,10 @@ mod tests {
         write_ledger(tmp.path()).await;
         write_hosted_lock(tmp.path(), "left-pad", "1.3.0");
         let mode = mode_from_project_state(&args(tmp.path(), ".socket/manifest.json")).await;
-        assert!(mode.is_err(), "{mode:?}");
+        assert_eq!(
+            mode,
+            Err(hosted_and_vendored(tmp.path(), "pkg:npm/left-pad@1.3.0"))
+        );
     }
 
     /// A lockless hosted pin (a nuget source no lock records yet) is
@@ -672,4 +672,3 @@ mod tests {
         assert_eq!(mode, Ok(scan::ScanMode::Vendored));
     }
 }
-pub(crate) mod user_patches;

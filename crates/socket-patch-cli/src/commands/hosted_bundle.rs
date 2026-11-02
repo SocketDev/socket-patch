@@ -10,7 +10,7 @@
 //! Stdin: `{"files": {path: text}, "binaryFiles"?: {path: base64},
 //! "presentOnly"?: [path], "symlinks"?: [path], "projectRoots"?: [dir],
 //! "pipenvMajor"?: n, "batchSize"?: n, "noSocketYml"?: bool,
-//! "minSeverity"?: severity, "policyPaths"?: [path],
+//! "minSeverity"?: severity, "policyPaths"?: [path], "policySha256"?: hex,
 //! "maxNewPatches"?: n | "none", "maxNewPatchesCap"?: n,
 //! "inFlightPatches"?: [purl]}`. Stdout: the engine result
 //! (`HostedScanResult`, binary contents base64), or
@@ -122,7 +122,7 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         print_error("invalid_bundle", &format!("cannot read stdin: {e}"));
         return 2;
     }
-    let bundle: Bundle = match serde_json::from_str(&raw) {
+    let mut bundle: Bundle = match serde_json::from_str(&raw) {
         Ok(bundle) => bundle,
         Err(e) => {
             print_error("invalid_bundle", &e.to_string());
@@ -137,14 +137,14 @@ pub async fn run(args: HostedBundleArgs) -> i32 {
         pipenv_major: bundle.pipenv_major,
         trust_lockfile_config: Some(!common.no_trust_lockfile_config),
         npm_allow_remote_config: Some(!common.no_npm_allow_remote_config),
-        project_roots: bundle.project_roots.clone(),
+        project_roots: bundle.project_roots.take(),
         no_socket_yml: bundle.no_socket_yml,
-        min_severity: bundle.min_severity.clone(),
-        policy_paths: bundle.policy_paths.clone(),
-        policy_sha256: bundle.policy_sha256.clone(),
+        min_severity: bundle.min_severity.take(),
+        policy_paths: bundle.policy_paths.take(),
+        policy_sha256: bundle.policy_sha256.take(),
         max_new_patches: bundle.max_new_patches,
         max_new_patches_cap: bundle.max_new_patches_cap,
-        in_flight_patches: bundle.in_flight_patches.clone(),
+        in_flight_patches: bundle.in_flight_patches.take(),
         ..HostedScanOptions::default()
     };
     let input = match build_input(bundle, options) {

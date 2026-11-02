@@ -1256,16 +1256,6 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
         };
         env.record(event.with_details(hosted()));
     }
-    for purl in &leg.unsupported {
-        env.record(
-            PatchEvent::new(PatchAction::Failed, purl.clone())
-                .with_error(
-                    "hosted_unsupported",
-                    "this ecosystem has no per-package hosted restore",
-                )
-                .with_details(hosted()),
-        );
-    }
     if let Some(refusal) = report.contested {
         env.record(
             PatchEvent::artifact(PatchAction::Failed)
@@ -2332,13 +2322,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // Not-installed entries never flip the exit code (see
             // `RollbackOutcome`). Everything that leaves the system still
             // patched DOES: agent failures, vendored drift-keeps and
-            // failures, hosted refusals/unsupported targets, corrupt
+            // failures, hosted refusals, corrupt
             // ledgers, and a failed manifest write.
             let success = agent_success
                 && vendored_leg.kept.is_empty()
                 && vendored_leg.failed.is_empty()
                 && hosted_leg.failed.is_empty()
-                && hosted_leg.unsupported.is_empty()
                 && contested.is_none()
                 && !vendor_corrupt
                 && manifest_write_failed.is_none();
@@ -6511,7 +6500,7 @@ mod tests {
     fn reinstall_note_defers_to_the_pypi_advisory() {
         let note = format_reinstall_note(1, false, false, true);
         assert!(
-            note.contains("(PDM, uv and Pipenv keep a same-version install")
+            note.contains("(pip, PDM, uv and Pipenv keep a same-version install through a plain install or sync")
                 && note.contains("pypi_reinstall_required"),
             "{note}"
         );

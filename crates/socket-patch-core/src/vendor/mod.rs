@@ -234,15 +234,7 @@ pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorW
         return None;
     }
     let manifest = read_regular_to_string_sync(&project_root.join("package.json")).ok()?;
-    let manifest: serde_json::Value =
-        serde_json::from_str(crate::formats::text::strip_bom(&manifest)).ok()?;
-    let workspaces = manifest.get("workspaces")?;
-    let globs = workspaces.as_array().or_else(|| {
-        workspaces
-            .get("packages")
-            .and_then(serde_json::Value::as_array)
-    })?;
-    if globs.is_empty() {
+    if !crate::formats::package_json::Workspaces::parse(&manifest)?.lists_any() {
         return None;
     }
     Some(VendorWarning::new(
@@ -934,8 +926,9 @@ pub async fn service_preflight(
 
 /// The lock-text refusals among `candidates` (purls with the uuid of the
 /// patch to vendor): each purl its backend refuses on the project's lock
-/// and manifest text alone, with the backend's `(code, detail)` — the pnpm,
-/// yarn classic and yarn berry gates ([`npm_flavor::lock_text_refusals`])
+/// and manifest text alone, with the backend's `(code, detail)` — the npm
+/// package-lock, pnpm, yarn classic and yarn berry gates
+/// ([`npm_flavor::lock_text_refusals`])
 /// and cargo's locked-version gate ([`cargo::lock_text_refusal`]). None of
 /// them reads the patch, so the answer needs no view: a vendored run asks
 /// before it fetches views and pristine sources, and a package that will
@@ -2169,7 +2162,12 @@ mod berry_migration_risk_tests {
     /// 1.10.1 and 1.22.22; no relative spelling installs from both.
     #[test]
     fn issue_691_wired_classic_workspaces_warn_about_member_dir_installs() {
-        for workspaces in [r#"["a","b"]"#, r#"{"packages":["packages/*"]}"#] {
+        // #1900: a malformed list still warns for the patterns it names.
+        for workspaces in [
+            r#"["a","b"]"#,
+            r#"{"packages":["packages/*"]}"#,
+            r#"["a",1]"#,
+        ] {
             let pkg = format!(r#"{{"name":"root","private":true,"workspaces":{workspaces}}}"#);
             let tmp = project(Some(WIRED_V1), Some(&pkg));
             let w = yarn_classic_workspace_member_risk(tmp.path()).expect("must warn");
@@ -2191,6 +2189,8 @@ mod berry_migration_risk_tests {
                 Some(r#"{"name":"x","workspaces":{"packages":[]}}"#),
             ),
             (Some(WIRED_V1), None),
+            // #1900: a field naming no pattern string lists no member.
+            (Some(WIRED_V1), Some(r#"{"name":"x","workspaces":[1]}"#)),
             (Some(UNWIRED_V1), Some(r#"{"name":"x","workspaces":["a"]}"#)),
             (None, Some(r#"{"name":"x","workspaces":["a"]}"#)),
         ] {

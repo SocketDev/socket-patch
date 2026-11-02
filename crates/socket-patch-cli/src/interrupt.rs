@@ -12,10 +12,16 @@
 //!
 //! Only an uncatchable kill (SIGKILL, power loss) can still leave the file,
 //! and the next lock-taking command reclaims and removes it.
+//!
+//! On Unix, [`install`] also resets SIGPIPE to its default disposition
+//! (unconditionally, unlike the signals above), so a pipe consumer that
+//! closes stdout ends the process quietly instead of a panic on EPIPE.
+//! Network writes still suppress SIGPIPE through std/socket2.
 
 use socket_patch_core::patch::apply_lock::cleanup_held_lock_on_interrupt;
 
-/// Install the interrupt handlers. Call once, first thing in `main`.
+/// Install the interrupt handlers (and, on Unix, the default SIGPIPE
+/// disposition). Call once, first thing in `main`, before any output.
 ///
 /// Unix: a signal the process started with ignored (`nohup`, a launcher
 /// that ignores Ctrl-C) keeps being ignored. The prompt's cursor guard
@@ -45,6 +51,10 @@ mod imp {
     }
 
     pub(super) fn install() {
+        // SAFETY: SIG_DFL is a valid disposition for SIGPIPE.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
         for sig in SIGNALS {
             // SAFETY: plain sigaction calls with zeroed, then filled,
             // structs; the handler only calls async-signal-safe code.

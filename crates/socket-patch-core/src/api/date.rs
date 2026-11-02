@@ -41,10 +41,8 @@ pub fn parse_timestamp_secs(s: &str) -> Option<u64> {
 /// Days since 1970-01-01 for a civil (proleptic Gregorian) date.
 ///
 /// Howard Hinnant's `days_from_civil` (public domain):
-/// <http://howardhinnant.github.io/date_algorithms.html#days_from_civil>.
-/// This is the exact inverse of the `civil_from_days` half of
-/// [`crate::vex::time::unix_to_ymdhms`]; the round-trip is pinned by
-/// `days_from_civil_inverts_unix_to_ymdhms` below.
+/// <http://howardhinnant.github.io/date_algorithms.html#days_from_civil>,
+/// the inverse of [`crate::vex::time::unix_to_ymdhms`]'s `civil_from_days`.
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let y = if month <= 2 { year - 1 } else { year };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -90,10 +88,7 @@ fn month_from_abbrev(abbrev: &str) -> Option<u32> {
 /// the malformed-but-common no-zone spelling).
 fn parse_rfc2822(s: &str) -> Option<u64> {
     // Drop the optional `Fri,` day-of-week prefix.
-    let rest = match s.split_once(',') {
-        Some((_dow, rest)) => rest,
-        None => s,
-    };
+    let rest = s.split_once(',').map_or(s, |(_dow, rest)| rest);
     let mut parts = rest.split_ascii_whitespace();
 
     let day: u32 = parts.next()?.parse().ok()?;
@@ -120,8 +115,6 @@ fn parse_rfc2822(s: &str) -> Option<u64> {
 fn apply_zone(base: u64, zone: &str) -> Option<u64> {
     let offset_secs = match zone {
         "GMT" | "UTC" | "UT" | "Z" | "+0000" | "-0000" => 0,
-        // An unrecognized token is an obsolete RFC 822 named zone, which
-        // RFC 2822 §4.3 says to read as `-0000` — i.e. no shift.
         _ => parse_numeric_offset(zone).unwrap_or_default(),
     };
     // The parsed fields were wall-clock in `zone`; UTC is that minus the
@@ -207,8 +200,6 @@ fn parse_rfc3339(s: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::vex::time::unix_to_ymdhms;
-
-    // ── RFC 2822 / HTTP-date: the format production actually emits ──
 
     /// Verbatim payloads captured from
     /// `GET https://patches-api.socket.dev/patch/by-package/<purl>` on
@@ -375,8 +366,6 @@ mod tests {
         }
     }
 
-    // ── RFC 3339 / ISO 8601: the format every in-repo fixture uses ──
-
     #[test]
     fn parses_rfc3339_fixture_format() {
         let secs = parse_timestamp_secs("2024-01-01T00:00:00Z").unwrap();
@@ -419,8 +408,6 @@ mod tests {
         let secs = parse_timestamp_secs("2024-02-29T00:00:00Z").unwrap();
         assert_eq!(unix_to_ymdhms(secs), (2024, 2, 29, 0, 0, 0));
     }
-
-    // ── Rejection ─────────────────────────────────────────────────────
 
     #[test]
     fn rejects_unparseable_input() {
@@ -483,8 +470,6 @@ mod tests {
         }
     }
 
-    // ── Cross-checks against the existing formatter ───────────────────
-
     /// `days_from_civil` must invert the `civil_from_days` half of
     /// `vex::time::unix_to_ymdhms` exactly. Swept across ~1265 years so
     /// every leap rule and century boundary is covered.
@@ -500,17 +485,16 @@ mod tests {
         }
     }
 
-    /// Parsing must be monotonic: a later instant always yields a larger
-    /// epoch value, in both wire formats. Oracle-free guard against a
-    /// scrambled field or a dropped carry.
+    /// Every instant `unix_to_ymdhms` formats, in either wire format,
+    /// parses back to exactly that instant: a scrambled field or a dropped
+    /// carry shows up as a mismatch.
     #[test]
-    fn parsed_order_is_chronological_in_both_formats() {
+    fn formatted_instants_parse_back_exactly_in_both_formats() {
         const MONTHS: [&str; 12] = [
             "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
         ];
         const STRIDE: u64 = 147_853; // ~1.71 days
         let mut secs = 0u64;
-        let mut prev_2822 = 0u64;
         while secs < 1_900_000_000 {
             let (y, m, d, h, mi, s) = unix_to_ymdhms(secs);
             let iso = format!("{y:04}-{m:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z");
@@ -520,8 +504,6 @@ mod tests {
             );
             assert_eq!(parse_timestamp_secs(&iso), Some(secs), "iso={iso}");
             assert_eq!(parse_timestamp_secs(&rfc), Some(secs), "rfc={rfc}");
-            assert!(secs > prev_2822 || secs == 0);
-            prev_2822 = secs;
             secs += STRIDE;
         }
     }

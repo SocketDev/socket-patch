@@ -1420,10 +1420,16 @@ mod tests {
             ("-e git+https://example.com/click.git#egg=click\n", true),
             ("git+https://example.com/click.git#egg=click\n", true),
             ("../wheels/click-8.1.7-py3-none-any.whl\n", true),
+            // #1873: pip expands `${NAME}` where it installs, so a
+            // templated pin may install the wired release from PyPI.
+            ("click==${CLICK_VERSION}\n", true),
+            ("click${CLICK_SPEC}\n", true),
             (
                 "click @ https://files.pythonhosted.org/packages/click-8.1.6-py3-none-any.whl\n",
                 false,
             ),
+            ("click==${click_version}\n", false),
+            ("idna==${IDNA_VERSION}\n", false),
             ("click==8.1.6\n", false),
             ("idna==3.7\n", false),
         ] {

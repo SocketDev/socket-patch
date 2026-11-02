@@ -8,7 +8,7 @@ use serde::Deserialize;
 use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
-use crate::formats::text::strip_bom;
+use crate::formats::yarn::classic_rc;
 use crate::patch::path_safety;
 use crate::utils::fs::{is_dir, is_dir_sync, read_dir_entries_sync};
 use crate::utils::purl::{percent_decode_purl_component, strip_purl_qualifiers};
@@ -124,7 +124,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
 
     let Some(patterns) = crate::utils::fs::read_regular_to_string_sync(&root.join("package.json"))
         .ok()
-        .and_then(|text| crate::hosted::governing_root::workspace_patterns(&text))
+        .and_then(|text| crate::formats::package_json::Workspaces::listed_patterns(&text))
     else {
         return Vec::new();
     };
@@ -301,6 +301,9 @@ pub(super) fn merge_configured_install_roots(
 /// the (untrusted) project, and a FIFO planted there would wedge a plain
 /// read forever.
 fn yarnrc_modules_folder(start_path: &Path) -> Option<String> {
+    // Walk the absolute spelling: the default `--cwd .` has no lexical
+    // parents, so a parent `.yarnrc` would never be read (#1902).
+    let start_path = &crate::utils::relpath::absolute_lexically(start_path);
     let mut general: Option<(&Path, String)> = None;
     let mut install: Option<(&Path, String)> = None;
     for dir in start_path.ancestors() {
@@ -365,57 +368,19 @@ struct YarnrcModulesFolder {
 }
 
 /// The `--modules-folder` and command-scoped `--install.modules-folder`
-/// values of a yarn classic `.yarnrc`. The file is yarn's lockfile
-/// syntax: one `key value` pair per line, either side optionally
-/// double-quoted, an optional `:` after the key, `#` comment lines. For
-/// each key the last setting wins.
+/// values of a yarn classic `.yarnrc`, read as yarn 1 reads the file
+/// ([`crate::formats::yarn::classic_rc`]). A key whose value is empty, not
+/// a string, or in a file yarn can't read is unset (an empty value set
+/// last still overrides an earlier one, as in yarn).
 fn parse_yarnrc_modules_folder(rc: &str) -> YarnrcModulesFolder {
-    let mut found = YarnrcModulesFolder::default();
-    for line in strip_bom(rc).lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, rest)) = split_yarnrc_token(line, true) else {
-            continue;
-        };
-        let slot = match key.as_str() {
-            "--modules-folder" => &mut found.general,
-            "--install.modules-folder" => &mut found.install,
-            _ => continue,
-        };
-        let rest = rest.trim_start();
-        let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
-        if let Some((value, _)) = split_yarnrc_token(rest, false) {
-            if !value.is_empty() {
-                *slot = Some(value);
-            }
-        }
+    let Some(mut settings) = classic_rc::settings(rc) else {
+        return YarnrcModulesFolder::default();
+    };
+    let mut read = |key| classic_rc::take_str(&mut settings, key).filter(|v| !v.is_empty());
+    YarnrcModulesFolder {
+        general: read("--modules-folder"),
+        install: read("--install.modules-folder"),
     }
-    found
-}
-
-/// Split the leading token off `s`: a double-quoted string (with `\"` and
-/// `\\` escapes) or a run of non-whitespace — for a key (`is_key`) also
-/// ending at a `:`, which a value may contain (`C:\deps`). Returns the
-/// unquoted token and the remainder.
-fn split_yarnrc_token(s: &str, is_key: bool) -> Option<(String, &str)> {
-    if let Some(quoted) = s.strip_prefix('"') {
-        let mut value = String::new();
-        let mut chars = quoted.char_indices();
-        while let Some((i, c)) = chars.next() {
-            match c {
-                '\\' => value.push(chars.next()?.1),
-                '"' => return Some((value, &quoted[i + 1..])),
-                c => value.push(c),
-            }
-        }
-        return None;
-    }
-    let end = s
-        .find(|c: char| c.is_whitespace() || (is_key && c == ':'))
-        .unwrap_or(s.len());
-    (end > 0).then(|| (s[..end].to_string(), &s[end..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +607,92 @@ fn pnpm_shaped_store_layout(name: &str) -> Option<StoreLayout> {
         .iter()
         .find(|(store, _)| *store == name)
         .map(|(_, layout)| *layout)
+}
+
+/// Whether `store` sits inside another store: below a `node_modules`
+/// child whose name makes it a store (pnpm-shaped, `.vlt`, pnpm <=3's
+/// `.registry.*`, npm's `.store`), or below one of `stores` that has no
+/// such name (a store relocated by `virtualStoreDir`). Such a "store"
+/// lives in a store entry's own `node_modules`, which never holds a store
+/// (see [`StoreKind::classify`]), so the peer fan-out skips it as the scan
+/// and the resolver do. A store-named dir that is not a `node_modules`
+/// child (Bun's `~/.bun` install root, a project under `~/.deno`) is no
+/// store, even though the ancestor walk collects it into `stores`, so it
+/// never hides one. Scoped and legacy entries nest deeper than
+/// `<store>/<entry>/node_modules`, and a relocated store has no fixed
+/// name, hence the walk up every ancestor.
+fn is_inside_another_store(store: &Path, stores: &[(StoreLayout, PathBuf)]) -> bool {
+    store.ancestors().skip(1).any(|dir| {
+        let fixed_name = dir.file_name().and_then(OsStr::to_str).is_some_and(|name| {
+            pnpm_shaped_store_layout(name).is_some()
+                || name == VLT_STORE_NAME
+                || is_legacy_pnpm_store_dir_name(name)
+                || name == NPM_LINKED_STORE_NAME
+        });
+        if fixed_name {
+            dir.parent().and_then(Path::file_name) == Some(OsStr::new("node_modules"))
+        } else {
+            stores.iter().any(|(_, other)| other == dir)
+        }
+    })
+}
+
+/// Which package-manager store a `node_modules` child is. The resolver
+/// (`find_by_purls`) and the scan (`crawl_all`) both classify a child
+/// through [`StoreKind::classify`], so they agree on which children are
+/// stores and on the store-entry rule below.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum StoreKind {
+    /// pnpm's `.pnpm`, Bun's `.bun` or Deno's `.deno` (see
+    /// [`PNPM_SHAPED_STORES`]).
+    PnpmShaped(StoreLayout),
+    /// vlt's `.vlt` store.
+    Vlt,
+    /// npm's `install-strategy=linked` `.store`.
+    NpmLinked,
+    /// pnpm's `.modules.yaml`: it names a store relocated by
+    /// `virtualStoreDir`, or else the global virtual store's entries are
+    /// reached through it.
+    PnpmModulesYaml,
+    /// A pnpm <=3 `.<registry-host>` store (see
+    /// [`is_legacy_pnpm_store_dir_name`]).
+    LegacyPnpm,
+}
+
+impl StoreKind {
+    /// The store a `node_modules` child named `name` of type `file_type`
+    /// is, or `None` for anything else.
+    ///
+    /// Inside a store entry's own `node_modules` (`in_store_entry`) no
+    /// child is a store: a store entry holds packages and links to sibling
+    /// entries, never a nested store, so a hidden child there is skipped
+    /// like any other hidden entry. A store name with the wrong file type
+    /// (a `.pnpm` file, a `.modules.yaml` dir) is not a store either; every
+    /// store name is hidden, so callers skip it too.
+    fn classify(name: &str, file_type: Option<FileType>, in_store_entry: bool) -> Option<Self> {
+        if in_store_entry {
+            return None;
+        }
+        let kind = if let Some(layout) = pnpm_shaped_store_layout(name) {
+            StoreKind::PnpmShaped(layout)
+        } else if name == VLT_STORE_NAME {
+            StoreKind::Vlt
+        } else if name == NPM_LINKED_STORE_NAME {
+            StoreKind::NpmLinked
+        } else if name == PNPM_MODULES_YAML {
+            StoreKind::PnpmModulesYaml
+        } else if is_legacy_pnpm_store_dir_name(name) {
+            StoreKind::LegacyPnpm
+        } else {
+            return None;
+        };
+        let file_type = file_type?;
+        let shaped = match kind {
+            StoreKind::PnpmModulesYaml => file_type.is_file(),
+            _ => file_type.is_dir(),
+        };
+        shaped.then_some(kind)
+    }
 }
 
 /// Decode a `.bun` store entry name (`<name>@<version>`, a peer set
@@ -943,20 +994,17 @@ fn bun_workspace_pattern_members_sync(root: &Path) -> Option<Vec<PathBuf>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
         Err(_) => return None,
     };
-    let text = strip_bom(&text);
-    let doc: serde_json::Value = serde_json::from_str(text).ok()?;
-    let patterns = match doc.get("workspaces") {
-        None | Some(serde_json::Value::Null) => Vec::new(),
-        Some(serde_json::Value::Array(list)) => list.clone(),
-        Some(serde_json::Value::Object(map)) => match map.get("packages") {
-            None => Vec::new(),
-            Some(packages) => packages.as_array()?.clone(),
-        },
-        Some(_) => return None,
+    use crate::formats::package_json::Workspaces;
+
+    // Bun refuses to install from a malformed field (#1900), so it names
+    // no member set.
+    let patterns = match Workspaces::parse(&text)? {
+        Workspaces::None => Vec::new(),
+        Workspaces::Patterns(patterns) => patterns,
+        Workspaces::Malformed(_) => return None,
     };
     let mut members = Vec::new();
     for pattern in &patterns {
-        let pattern = pattern.as_str()?;
         if pattern.starts_with('!') {
             continue;
         }
@@ -1449,29 +1497,9 @@ fn decode_npm_store_entry_name(entry_name: &str) -> Option<(String, String)> {
     Some((key[..at].to_string(), version.to_string()))
 }
 
-/// The `virtualStoreDir` value of a `.modules.yaml`: JSON on pnpm 10+,
-/// YAML before (a top-level `virtualStoreDir:` scalar, maybe quoted).
+/// The non-empty `virtualStoreDir` value of a `.modules.yaml`.
 fn parse_modules_yaml_virtual_store_dir(text: &str) -> Option<String> {
-    let text = crate::formats::text::strip_bom(text);
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
-        return value
-            .get("virtualStoreDir")?
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-    }
-    let raw = text
-        .lines()
-        .find_map(|line| line.strip_prefix("virtualStoreDir:"))?
-        .trim();
-    let value = if raw.starts_with('"') {
-        serde_json::from_str::<String>(raw).ok()?
-    } else if let Some(inner) = raw.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')) {
-        inner.replace("''", "'")
-    } else {
-        raw.to_string()
-    };
-    (!value.is_empty()).then_some(value)
+    crate::formats::pnpm::modules_yaml::field(text, "virtualStoreDir").filter(|s| !s.is_empty())
 }
 
 /// `store` relative to `importer`, when it names a directory strictly
@@ -1570,14 +1598,13 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
-    let project = nm
-        .parent()?
-        .ancestors()
-        .find(|dir| dir.join("yarn.lock").is_file())?;
-    let store = super::pkg_managers::active_yarn_pnpm_store(project)?;
-    let (Ok(real_store), Ok(real_project)) =
-        (std::fs::canonicalize(store), std::fs::canonicalize(project))
-    else {
+    let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
+        .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
+    let (Ok(real_store), Ok(real_project)) = (
+        std::fs::canonicalize(store),
+        std::fs::canonicalize(&abs_project),
+    ) else {
         return None;
     };
     let below = path_below(&real_project, &real_store)?;
@@ -1586,7 +1613,7 @@ fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
     {
         return None;
     }
-    let mut dir = project.to_path_buf();
+    let mut dir = project;
     for component in below.components() {
         dir.push(component);
         if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
@@ -2899,8 +2926,8 @@ impl NpmCrawler {
         if pending.is_empty() {
             return pending;
         }
-        // Each dir is tagged `true` when it is a pnpm or vlt store entry's
-        // `node_modules`.
+        // Each dir is tagged `true` when it is a store entry's
+        // `node_modules` (see `StoreKind::classify`).
         let mut level: Vec<(PathBuf, bool)> = vec![(node_modules_path.to_path_buf(), false)];
         let mut visited = HashSet::new();
         // The root's relocated Yarn pnpm-linker store (#859), contributed
@@ -3057,7 +3084,7 @@ impl NpmCrawler {
             matched.extend(aliases);
         }
         let gvs_member = !store_entry && may_be_gvs_workspace_member(&listing);
-        let mut nested = Self::collect_nested_node_modules(&nm_path, listing);
+        let mut nested = Self::collect_nested_node_modules(&nm_path, listing, store_entry);
         if store_entry {
             nested.extend(own_package_nested_node_modules_sync(&nm_path));
         }
@@ -3166,90 +3193,30 @@ impl NpmCrawler {
     ///
     /// Entries are examined in parallel; their contributions keep listing
     /// order.
-    fn collect_nested_node_modules(nm_path: &Path, listing: Listing) -> Vec<NestedNodeModules> {
+    fn collect_nested_node_modules(
+        nm_path: &Path,
+        listing: Listing,
+        store_entry: bool,
+    ) -> Vec<NestedNodeModules> {
         let found: Vec<Vec<NestedNodeModules>> = par_map(listing.entries, |entry| {
-            Self::nested_node_modules_of(nm_path, entry)
+            Self::nested_node_modules_of(nm_path, entry, store_entry)
         });
         found.into_iter().flatten().collect()
     }
 
     /// What one listing entry of `nm_path` contributes to the resolver's
-    /// next level (see [`Self::collect_nested_node_modules`]).
-    fn nested_node_modules_of(nm_path: &Path, entry: ListedEntry) -> Vec<NestedNodeModules> {
+    /// next level (see [`Self::collect_nested_node_modules`]). `store_entry`
+    /// says `nm_path` is a store entry's own `node_modules`, whose children
+    /// are never stores (see [`StoreKind::classify`]), as in the scan.
+    fn nested_node_modules_of(
+        nm_path: &Path,
+        entry: ListedEntry,
+        store_entry: bool,
+    ) -> Vec<NestedNodeModules> {
         let name_str = entry.name_str.as_str();
-        // pnpm's virtual store. Under the isolated linker the store is
-        // the ONLY physical home of transitive dependencies: the
-        // importer's node_modules holds symlinks for direct deps only,
-        // so a transitive-only target (installed at
-        // `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is
-        // unreachable through the symlink-free walk above — invisible
-        // to apply despite being importable. Probe REAL store entries'
-        // `node_modules`; the name+version match in `find_by_purls`
-        // keeps aliases and multi-version store entries distinct, and
-        // BFS order guarantees a root-linked install has already been
-        // probed (and removed from `pending`) before these are
-        // dequeued, so a package is never resolved twice.
-        // Bun's `.bun` and Deno's `.deno` stores share the shape and the
-        // property (see `PNPM_SHAPED_STORES`).
-        if let Some(layout) = pnpm_shaped_store_layout(name_str) {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let store = nm_path.join(&entry.name);
-            let entries = StoreEntry::from_dirs(Self::list_pnpm_shaped_store_entries_sync(
-                &store, layout, false, false,
-            ));
+        if let Some(kind) = StoreKind::classify(name_str, entry.file_type, store_entry) {
+            let entries = Self::resolver_store_entries(nm_path, &entry.name, kind);
             return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // vlt's store has the same transitive-only-home property: every
-        // package lives at `.vlt/<DepID>/node_modules/<name>` and the
-        // importer holds only links into it.
-        if name_str == VLT_STORE_NAME {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = Self::list_vlt_store_entries_sync(&nm_path.join(&entry.name));
-            return vec![NestedNodeModules::StoreEntries(StoreEntry::vlt(entries))];
-        }
-        // npm's `install-strategy=linked` store: the same transitive-only
-        // home, at `.store/<name>@<version>-<hash>/node_modules/<name>`.
-        if name_str == NPM_LINKED_STORE_NAME {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = StoreEntry::from_dirs(Self::list_npm_store_entries_sync(
-                &nm_path.join(&entry.name),
-                false,
-            ));
-            return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // A pnpm virtual store relocated by `virtualStoreDir`, found
-        // through the `.modules.yaml` pnpm writes next to it. It may sit
-        // outside this `node_modules` or under a hidden name the skip
-        // below would swallow.
-        if name_str == PNPM_MODULES_YAML {
-            if !entry.file_type.is_some_and(|ft| ft.is_file()) {
-                return Vec::new();
-            }
-            let Some(store) = relocated_pnpm_virtual_store_sync(nm_path) else {
-                let entries = reachable_pnpm_global_virtual_store_entries_sync(nm_path);
-                return vec![NestedNodeModules::StoreEntries(entries)];
-            };
-            let entries = StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false));
-            return vec![NestedNodeModules::StoreEntries(entries)];
-        }
-        // pnpm <=3: the virtual store is a hidden `.<registry-host>` dir
-        // (there is no `.pnpm` at all) with the same
-        // transitive-only-deps property, so it gets the same probing.
-        // Must run before the generic hidden-entry skip below, which
-        // would otherwise swallow it — leaving every transitive-only
-        // install unpatchable on those layouts.
-        if is_legacy_pnpm_store_dir_name(name_str) {
-            if !entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                return Vec::new();
-            }
-            let entries = Self::collect_nested_store_entries_sync(&nm_path.join(&entry.name));
-            return vec![NestedNodeModules::StoreEntries(StoreEntry::pnpm(entries))];
         }
         if name_str.starts_with('.') || name_str == "node_modules" {
             return Vec::new();
@@ -3277,6 +3244,46 @@ impl NpmCrawler {
                 vec![NestedNodeModules::Dir(nested)]
             } else {
                 Vec::new()
+            }
+        }
+    }
+
+    /// The entries of the store `kind` that `nm_path`'s child `name` is,
+    /// for the resolver to probe.
+    ///
+    /// Under the isolated linkers a store is the ONLY physical home of
+    /// transitive dependencies: the importer's `node_modules` holds links
+    /// for direct deps only, so a transitive-only target (installed at
+    /// `.pnpm/<x>/node_modules/<name>`, runtime-loaded) is unreachable
+    /// through the link-free walk, and its REAL store entries are probed
+    /// instead. The name+version match in `find_by_purls` keeps aliases and
+    /// multi-version store entries distinct, and BFS order guarantees a
+    /// root-linked install has already been probed (and removed from
+    /// `pending`) before these are dequeued, so a package is never
+    /// resolved twice. pnpm's, Bun's and Deno's stores, vlt's
+    /// `.vlt/<DepID>/node_modules/<name>`, npm's linked
+    /// `.store/<name>@<version>-<hash>/node_modules/<name>`, a pnpm store
+    /// relocated by `virtualStoreDir` (found through `.modules.yaml`, it may
+    /// sit outside this `node_modules`) and pnpm <=3's hidden
+    /// `.<registry-host>` store all have this property.
+    fn resolver_store_entries(nm_path: &Path, name: &OsStr, kind: StoreKind) -> Vec<StoreEntry> {
+        let store = nm_path.join(name);
+        match kind {
+            StoreKind::PnpmShaped(layout) => StoreEntry::from_dirs(
+                Self::list_pnpm_shaped_store_entries_sync(&store, layout, false, false),
+            ),
+            StoreKind::Vlt => StoreEntry::vlt(Self::list_vlt_store_entries_sync(&store)),
+            StoreKind::NpmLinked => {
+                StoreEntry::from_dirs(Self::list_npm_store_entries_sync(&store, false))
+            }
+            StoreKind::PnpmModulesYaml => match relocated_pnpm_virtual_store_sync(nm_path) {
+                Some(store) => {
+                    StoreEntry::from_dirs(Self::list_pnpm_store_entries_sync(&store, false))
+                }
+                None => reachable_pnpm_global_virtual_store_entries_sync(nm_path),
+            },
+            StoreKind::LegacyPnpm => {
+                StoreEntry::pnpm(Self::collect_nested_store_entries_sync(&store))
             }
         }
     }
@@ -3548,14 +3555,14 @@ impl NpmCrawler {
     /// Gather one `node_modules` directory's scan into [`ScanEvent`]s, in
     /// the exact order the sequential walk visits it: the directory's own
     /// entries (each package followed by its nested `node_modules`), then
-    /// the deferred pnpm and vlt store(s). `listing` is the directory's
-    /// listing when the caller already read it. `store_entry` selects the
-    /// one policy bit distinguishing an importer/package tree from a pnpm
-    /// or vlt store entry's `node_modules`:
+    /// the deferred store(s). `listing` is the directory's listing when the
+    /// caller already read it. `store_entry` selects the one policy bit
+    /// distinguishing an importer/package tree from a store entry's
+    /// `node_modules`:
     /// - importer trees accept both directories and symlinks (pnpm and vlt
     ///   link direct deps; `npm link` targets) but never traverse a symlink,
-    ///   and a `.pnpm` (or pnpm <=3 `.<registry-host>`) or `.vlt` child is
-    ///   the virtual store, walked after the loop;
+    ///   and a store child (see [`StoreKind::classify`]) is walked after
+    ///   the loop;
     /// - a store entry accepts REAL directories only — a symlinked (or, on
     ///   Windows, junctioned) entry there is the package's dependency
     ///   pointing at a sibling store entry, inventoried via that entry, and
@@ -3587,64 +3594,30 @@ impl NpmCrawler {
         for entry in listing.entries {
             let name_str = entry.name_str;
 
-            // pnpm's virtual store: under the isolated linker it is the
-            // ONLY physical home of transitive dependencies (the
-            // importer's node_modules symlinks direct deps only), so
-            // skipping it as just-another-hidden-dir leaves every
-            // transitive-only install invisible to scan. Deferred until
-            // after this loop so root-level entries are inventoried
-            // first and win the `seen` name@version dedup at their
-            // importer-root paths. (A store entry's own children never
-            // include a nested `.pnpm`; under the store-entry policy the
-            // name falls through to the hidden-entry skip below.)
-            // Bun's `.bun` and Deno's `.deno` share both the shape and
-            // the property (see `PNPM_SHAPED_STORES`).
-            if let Some(layout) = pnpm_shaped_store_layout(&name_str).filter(|_| !store_entry) {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    pnpm_shaped_stores.push((node_modules_path.join(&name_str), layout));
-                }
-                continue;
-            }
-
-            // vlt's store, deferred for the same reason: importer links
-            // win the `seen` dedup at their importer-root paths.
-            if !store_entry && name_str == VLT_STORE_NAME {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    vlt_store = Some(node_modules_path.join(&name_str));
-                }
-                continue;
-            }
-
-            // npm's linked-strategy store, deferred for the same reason.
-            if !store_entry && name_str == NPM_LINKED_STORE_NAME {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    npm_store = Some(node_modules_path.join(&name_str));
-                }
-                continue;
-            }
-
-            // A pnpm virtual store relocated by `virtualStoreDir` (see
-            // `relocated_pnpm_virtual_store_sync`), deferred like `.pnpm`.
-            if !store_entry && name_str == PNPM_MODULES_YAML {
-                if entry.file_type.is_some_and(|ft| ft.is_file()) {
-                    relocated_pnpm_store = relocated_pnpm_virtual_store_sync(node_modules_path);
-                    if relocated_pnpm_store.is_none() {
-                        global_store_entries =
-                            reachable_pnpm_global_virtual_store_entries_sync(node_modules_path);
+            // A store: under the isolated linkers it is the ONLY physical
+            // home of transitive dependencies (the importer's node_modules
+            // links direct deps only), so skipping it as
+            // just-another-hidden-dir would leave every transitive-only
+            // install invisible to scan. Every store is deferred until
+            // after this loop so root-level entries are inventoried first
+            // and win the `seen` name@version dedup at their importer-root
+            // paths. A store entry's own children are never stores (see
+            // `StoreKind::classify`), so under the store-entry policy the
+            // names fall through to the hidden-entry skip below.
+            if let Some(kind) = StoreKind::classify(&name_str, entry.file_type, store_entry) {
+                let store = node_modules_path.join(&name_str);
+                match kind {
+                    StoreKind::PnpmShaped(layout) => pnpm_shaped_stores.push((store, layout)),
+                    StoreKind::Vlt => vlt_store = Some(store),
+                    StoreKind::NpmLinked => npm_store = Some(store),
+                    StoreKind::PnpmModulesYaml => {
+                        relocated_pnpm_store = relocated_pnpm_virtual_store_sync(node_modules_path);
+                        if relocated_pnpm_store.is_none() {
+                            global_store_entries =
+                                reachable_pnpm_global_virtual_store_entries_sync(node_modules_path);
+                        }
                     }
-                }
-                continue;
-            }
-
-            // pnpm <=3 virtual store (a hidden `.<registry-host>` dir;
-            // no `.pnpm` exists on those layouts): same
-            // transitive-only-home property, same deferred scan so
-            // root-level entries win the `seen` dedup. Must run before
-            // the hidden-entry skip below, which would otherwise leave
-            // every transitive-only install invisible to scan.
-            if !store_entry && is_legacy_pnpm_store_dir_name(&name_str) {
-                if entry.file_type.is_some_and(|ft| ft.is_dir()) {
-                    legacy_stores.push(node_modules_path.join(&name_str));
+                    StoreKind::LegacyPnpm => legacy_stores.push(store),
                 }
                 continue;
             }
@@ -4611,6 +4584,9 @@ async fn find_store_peer_variant_copies_reusing(
             }
         }
     }
+    // A store nested in another store's entry is not a store (#1899).
+    let all_stores = stores.clone();
+    stores.retain(|(_, store)| !is_inside_another_store(store, &all_stores));
     if stores.is_empty() {
         return Vec::new();
     }
@@ -4845,6 +4821,28 @@ fn is_safe_npm_component(component: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1918: `.modules.yaml`'s `virtualStoreDir` is read through the shared
+    /// pnpm settings reader: every key spelling, the last key, no comment.
+    #[test]
+    fn modules_yaml_virtual_store_dir_uses_the_shared_reader() {
+        let read = parse_modules_yaml_virtual_store_dir;
+        assert_eq!(read("virtualStoreDir: .pnpm\n").as_deref(), Some(".pnpm"));
+        assert_eq!(
+            read("virtualStoreDir: .pnpm # default\n").as_deref(),
+            Some(".pnpm")
+        );
+        assert_eq!(
+            read("virtualStoreDir: a\nvirtualStoreDir: 'b''c'\n").as_deref(),
+            Some("b'c")
+        );
+        assert_eq!(read("\"virtualStoreDir\": \"x\"\n").as_deref(), Some("x"));
+        assert_eq!(read("virtualStoreDir: ''\n"), None);
+        assert_eq!(
+            read("{\"virtualStoreDir\":\"/abs/.pnpm\"}").as_deref(),
+            Some("/abs/.pnpm")
+        );
+    }
 
     tokio::task_local! {
         pub(super) static VARIANT_STORE_SCANS: std::cell::RefCell<Vec<PathBuf>>;
@@ -6694,6 +6692,150 @@ mod tests {
         assert_eq!(found[&scoped_purl][0].namespace.as_deref(), Some("@s"));
     }
 
+    /// #1899: a store entry's own `node_modules` holds packages and links
+    /// to sibling entries, never a nested store. Scan always skipped a
+    /// store-named child there as a hidden entry, but the resolver walked
+    /// it as a store, so `apply` could patch a copy `scan` never reported.
+    /// Both now classify through `StoreKind::classify` and agree: such a
+    /// copy is neither reported, resolved nor reached by the apply peer
+    /// fan-out, for every store name.
+    #[tokio::test]
+    async fn test_store_named_child_of_a_store_entry_is_not_a_store() {
+        for (store_name, nested_entry) in [
+            (".pnpm", "hidden@1.0.0/node_modules/hidden"),
+            (".bun", "hidden@1.0.0/node_modules/hidden"),
+            (".deno", "hidden@1.0.0/node_modules/hidden"),
+            (".store", "hidden@1.0.0-abcdef/node_modules/hidden"),
+            (".registry.npmjs.org", "hidden/1.0.0/node_modules/hidden"),
+            (".vlt", "··hidden@1.0.0/node_modules/hidden"),
+            // `.modules.yaml` names a relocated store, `.vs` here.
+            (".vs", "hidden@1.0.0/node_modules/hidden"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let nm = root.join("node_modules");
+            let entry_nm = nm.join(".pnpm/outer@1.0.0/node_modules");
+            let outer = entry_nm.join("outer");
+            write_pkg(&outer, "outer", "1.0.0");
+            link_dir(&outer, &nm.join("outer"));
+            let hidden = entry_nm.join(store_name).join(nested_entry);
+            write_pkg(&hidden, "hidden", "1.0.0");
+            if store_name == ".vs" {
+                std::fs::write(
+                    entry_nm.join(".modules.yaml"),
+                    "layoutVersion: 5\nvirtualStoreDir: '.vs'\n",
+                )
+                .unwrap();
+            }
+            // A peer variant of `outer` in the nested store: the apply
+            // fan-out must not reach it either.
+            let nested_twin = entry_nm.join(".pnpm/outer@1.0.0(react@18.2.0)/node_modules/outer");
+            if store_name == ".pnpm" {
+                write_pkg(&nested_twin, "outer", "1.0.0");
+            }
+
+            let scanned = scan_paths(&root).await;
+            assert!(
+                scanned
+                    .iter()
+                    .any(|(purl, _)| purl == "pkg:npm/outer@1.0.0"),
+                "{store_name}: {scanned:?}"
+            );
+            assert!(
+                !scanned
+                    .iter()
+                    .any(|(purl, _)| purl == "pkg:npm/hidden@1.0.0"),
+                "{store_name}: scan reported a nested store's copy: {scanned:?}"
+            );
+
+            let found = NpmCrawler::new()
+                .find_by_purls(&nm, &["pkg:npm/hidden@1.0.0".to_string()])
+                .await
+                .unwrap();
+            assert!(
+                found.is_empty(),
+                "{store_name}: resolver walked a nested store: {found:?}"
+            );
+            assert!(
+                !find_store_peer_variant_copies(&outer)
+                    .await
+                    .contains(&nested_twin),
+                "{store_name}: peer fan-out walked a nested store"
+            );
+        }
+    }
+
+    /// #1899: apply's peer fan-out skips a store nested in a store entry's
+    /// own `node_modules`, whatever shape the outer entry has: a pnpm
+    /// entry, a scoped npm `.store` entry, a pnpm <=3 `.registry.*` entry
+    /// (both nest deeper than `<store>/<entry>/node_modules`) or an entry
+    /// of a store relocated by `virtualStoreDir`.
+    #[tokio::test]
+    async fn test_peer_fan_out_skips_a_store_nested_in_any_store_entry() {
+        for (outer_entry_nm, modules_yaml) in [
+            ("node_modules/.pnpm/@s+outer@1.0.0/node_modules", None),
+            (
+                "node_modules/.store/@s+outer@1.0.0-abcdef/node_modules",
+                None,
+            ),
+            (
+                "node_modules/.registry.npmjs.org/@s/outer/1.0.0/node_modules",
+                None,
+            ),
+            (
+                ".vs/@s+outer@1.0.0/node_modules",
+                Some("layoutVersion: 5\nvirtualStoreDir: '../.vs'\n"),
+            ),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let entry_nm = root.join(outer_entry_nm);
+            let outer = entry_nm.join("@s/outer");
+            write_pkg(&outer, "@s/outer", "1.0.0");
+            if let Some(yaml) = modules_yaml {
+                std::fs::create_dir_all(root.join("node_modules")).unwrap();
+                std::fs::write(root.join("node_modules/.modules.yaml"), yaml).unwrap();
+            }
+            let nested_twin =
+                entry_nm.join(".pnpm/@s+outer@1.0.0(react@18.2.0)/node_modules/@s/outer");
+            write_pkg(&nested_twin, "@s/outer", "1.0.0");
+
+            let copies = find_store_peer_variant_copies(&outer).await;
+            assert!(
+                !copies.contains(&nested_twin),
+                "{outer_entry_nm}: peer fan-out walked a nested store: {copies:?}"
+            );
+        }
+    }
+
+    /// #1986 review: a store-named dir above the project (Bun's `~/.bun`
+    /// install root holding the global `node_modules`, a project under
+    /// `~/.deno` or `~/.vlt`) is not a `node_modules` child, so it is no
+    /// store and the peer fan-out still walks the project's own store.
+    #[tokio::test]
+    async fn test_peer_fan_out_keeps_a_store_below_a_store_named_ancestor() {
+        for project in [
+            "home/plain/proj",
+            "home/.deno/proj",
+            "home/.vlt/proj",
+            ".bun/install/global",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root: PathBuf = tmp.path().components().collect();
+            let store = root.join(project).join("node_modules/.pnpm");
+            let primary = store.join("a@1.0.0(react@17.0.2)/node_modules/a");
+            let twin = store.join("a@1.0.0(react@18.2.0)/node_modules/a");
+            write_pkg(&primary, "a", "1.0.0");
+            write_pkg(&twin, "a", "1.0.0");
+
+            let copies = find_store_peer_variant_copies(&primary).await;
+            assert!(
+                copies.contains(&twin),
+                "{project}: peer fan-out dropped the project's store: {copies:?}"
+            );
+        }
+    }
+
     /// #362: pnpm's `virtualStoreDir` moves the virtual store, and
     /// `node_modules/.modules.yaml` records where (relative to
     /// `node_modules`: JSON on pnpm 10+, YAML before). A relocated store
@@ -8156,6 +8298,19 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bun_workspace_pattern_members_sync(dir.path()), None);
+
+        // #1900: Bun refuses to install from a `null` or non-string
+        // `workspaces`, so the patterns cannot name the member set.
+        for manifest in [r#"{"workspaces":null}"#, r#"{"workspaces":["a",1]}"#] {
+            std::fs::write(dir.path().join("package.json"), manifest).unwrap();
+            assert_eq!(
+                bun_workspace_pattern_members_sync(dir.path()),
+                None,
+                "{manifest}"
+            );
+        }
+        std::fs::write(dir.path().join("package.json"), r#"{"name":"x"}"#).unwrap();
+        assert_eq!(bun_workspace_pattern_members_sync(dir.path()), Some(vec![]));
     }
 
     /// `.yarnrc` `--modules-folder` parsing: bare and quoted keys and
@@ -8206,10 +8361,9 @@ mod tests {
             parse("--modules-folder \"C:\\\\deps\"\n").as_deref(),
             Some("C:\\deps")
         );
-        assert_eq!(
-            parse("--modules-folder C:\\deps\n").as_deref(),
-            Some("C:\\deps")
-        );
+        // An unquoted `C:\deps` is a token yarn can't read (a bare word
+        // ends at `:`, and `\` starts no token): not a setting.
+        assert_eq!(parse("--modules-folder C:\\deps\n"), None);
         assert_eq!(
             parse("--modules-folder a\n--modules-folder b\n").as_deref(),
             Some("b")
@@ -8229,6 +8383,71 @@ mod tests {
                 "{rc:?}"
             );
         }
+    }
+
+    /// REGRESSION (#1901): the crawler reads a `.yarnrc` line the way
+    /// yarn 1.22.22 (and the hosted redirect's reader) does. A
+    /// single-quoted value loses its quotes in a `key: '…'` pair and sets
+    /// nothing in a `key '…'` line (yarn installs into `node_modules`
+    /// then), and a value yarn can't tokenize (`~/x`) sets nothing, so the
+    /// crawl never roots at a folder yarn does not install into.
+    #[test]
+    fn yarnrc_modules_folder_reads_like_yarn() {
+        let parse = |rc: &str| parse_yarnrc_modules_folder(rc).general;
+        assert_eq!(parse("--modules-folder: 'deps'\n").as_deref(), Some("deps"));
+        assert_eq!(
+            parse("\"--modules-folder\": 'my deps'\n").as_deref(),
+            Some("my deps")
+        );
+        assert_eq!(
+            parse_yarnrc_modules_folder("--install.modules-folder: 'vm'\n").install,
+            Some("vm".into())
+        );
+        for rc in [
+            "--modules-folder 'deps'\n",
+            "--modules-folder ~/x\n",
+            "--modules-folder deps\n--modules-folder ~/x\n",
+            "--modules-folder deps, x\n",
+            "--modules-folder: 'unterminated\n",
+        ] {
+            assert_eq!(parse(rc), None, "{rc:?}");
+        }
+        // A double-quoted value is JSON: its escapes are decoded.
+        assert_eq!(
+            parse("--modules-folder \"a\\u0062\"\n").as_deref(),
+            Some("ab")
+        );
+    }
+
+    /// REGRESSION (#1901): a single-quoted `--modules-folder: 'deps'` is a
+    /// crawl root at its unquoted path, and `--modules-folder 'deps'`
+    /// (which yarn does not read) leaves `node_modules` the root.
+    #[tokio::test]
+    async fn test_yarnrc_single_quoted_modules_folder_is_a_crawl_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("package.json"), r#"{"name":"app"}"#).unwrap();
+        write_pkg(&root.join("deps/left-pad"), "left-pad", "1.3.0");
+        write_pkg(&root.join("node_modules/is-number"), "is-number", "7.0.0");
+        let crawl = |rc: &'static str| async move {
+            std::fs::write(root.join(".yarnrc"), rc).unwrap();
+            let mut purls: Vec<String> = NpmCrawler::new()
+                .crawl_all(&local_options(root))
+                .await
+                .into_iter()
+                .map(|p| p.purl)
+                .collect();
+            purls.sort();
+            purls
+        };
+        let left_pad = "pkg:npm/left-pad@1.3.0".to_string();
+        assert!(crawl("--modules-folder: 'deps'\n")
+            .await
+            .contains(&left_pad));
+        assert_eq!(
+            crawl("--modules-folder 'deps'\n").await,
+            vec!["pkg:npm/is-number@7.0.0".to_string()]
+        );
     }
 
     fn local_options(cwd: &Path) -> CrawlerOptions {
