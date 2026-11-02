@@ -364,9 +364,9 @@ impl Stage {
     /// Whether a NEW row of `purl` could be admitted: budget left, or its
     /// package already admitted by an earlier directory.
     pub fn may_admit(&self, purl: &str) -> bool {
-        self.may_admit_new()
-            || (!(self.capped() && self.incomplete)
-                && self
+        !(self.capped() && self.incomplete)
+            && (self.budget.value != Some(0)
+                || self
                     .already_admitted
                     .contains(&PurlKey::new(purl).into_string()))
     }

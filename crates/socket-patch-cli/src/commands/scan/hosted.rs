@@ -1058,8 +1058,8 @@ async fn run_redirect_selected_untracked(
     let may_write = rollout.as_ref().is_none_or(|gate| {
         let new = gate.new_keys();
         candidates.iter().any(|c| {
-            !new.contains(&(sel_purl(c), c.dep.patch_uuid.clone()))
-                || gate.stage.may_admit(&sel_purl(c))
+            let purl = sel_purl(c);
+            gate.stage.may_admit(&purl) || !new.contains(&(purl, c.dep.patch_uuid.clone()))
         })
     });
     let mut lock: Option<LockGuard> = if !common.dry_run && !candidates.is_empty() && may_write {

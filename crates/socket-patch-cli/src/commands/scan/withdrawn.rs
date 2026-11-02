@@ -52,6 +52,13 @@ pub(super) const REDIRECT_WITHDRAWN_RESTORE_FAILED: &str = "redirect_withdrawn_r
 /// could not tell whether any pin was withdrawn. Every pin is kept.
 pub(super) const REDIRECT_WITHDRAWN_CHECK_FAILED: &str = "redirect_withdrawn_check_failed";
 
+/// Whether a reference `status` means the pinned patch is gone for good.
+/// `build_failed` keeps the pin (the vendor fetch reads it as unavailable):
+/// a failed build can be rebuilt.
+fn is_gone(status: &str) -> bool {
+    matches!(status, "withdrawn" | "not_found")
+}
+
 /// What the sweep did, for the `--json` envelope. Human output is printed
 /// as the sweep runs.
 #[derive(Debug, Default)]
@@ -178,8 +185,7 @@ pub(super) async fn sweep(
         .iter()
         .filter_map(|pin| {
             let status = &references.get(&pin.uuid)?.status;
-            matches!(status.as_str(), "withdrawn" | "not_found")
-                .then(|| (pin.clone(), status.clone()))
+            is_gone(status).then(|| (pin.clone(), status.clone()))
         })
         .collect();
     out.references = Some(KnownReferences::settled(&uuids, references));
@@ -279,6 +285,22 @@ mod tests {
             purl: purl.to_string(),
             uuid: uuid.to_string(),
             files: vec!["package-lock.json".to_string()],
+        }
+    }
+
+    #[test]
+    fn only_withdrawn_and_not_found_are_gone() {
+        assert!(is_gone("withdrawn"));
+        assert!(is_gone("not_found"));
+        for kept in [
+            "granted",
+            "reused",
+            "pending_build",
+            "build_failed",
+            "forbidden",
+            "",
+        ] {
+            assert!(!is_gone(kept), "{kept} must keep the pin");
         }
     }
 
