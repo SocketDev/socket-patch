@@ -370,12 +370,20 @@ fn split_selector(key: &str) -> (&str, Option<&str>) {
 
 /// The packages on the path from the project root to the lock key `from`,
 /// outermost first, as `(name, version)`: each `node_modules/<name>`
-/// segment's entry (its `name` field for an alias, else the segment). The
-/// root and workspace members contribute nothing.
+/// segment's entry (its `name` field for an alias, else the segment). A
+/// dependent inside a workspace member starts with that member, which npm
+/// reaches through the root's link edge, so a rule keyed by the member's
+/// name scopes to its dependencies (#1965). The root contributes nothing.
 fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Option<String>)> {
     let mut chain = Vec::new();
     let mut rest = from;
     let mut prefix = String::new();
+    if !from.is_empty() && !from.starts_with("node_modules/") {
+        let member = from.split("/node_modules/").next().unwrap_or(from);
+        chain.push(workspace_member(packages, member));
+        prefix.push_str(member);
+        rest = &from[member.len()..];
+    }
     while let Some(ix) = rest.find("node_modules/") {
         let after = &rest[ix + "node_modules/".len()..];
         // A package segment runs to the next nested `node_modules/`.
@@ -397,6 +405,33 @@ fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Op
         rest = &rest[consumed..];
     }
     chain
+}
+
+/// The `(name, version)` of the workspace member at lock key `member`: its
+/// `name` field, else the name of the root link entry that points at it
+/// (npm omits `name` when it matches), else its folder name.
+fn workspace_member(packages: &Map<String, Value>, member: &str) -> (String, Option<String>) {
+    let entry = packages.get(member);
+    let version = entry
+        .and_then(|e| e.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = entry
+        .and_then(|e| e.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            packages.iter().find_map(|(key, link)| {
+                let linked = link.get("link").and_then(Value::as_bool) == Some(true)
+                    && link.get("resolved").and_then(Value::as_str) == Some(member);
+                linked
+                    .then(|| key.rsplit_once("node_modules/").map(|(_, name)| name))
+                    .flatten()
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_else(|| member.rsplit('/').next().unwrap_or(member).to_string());
+    (name, version)
 }
 
 /// The dependency maps whose specs npm resolves against `packages` entries.
@@ -1391,6 +1426,58 @@ mod tests {
                 found.contains_key("node_modules/left-pad"),
                 "{overrides}: {found:?}"
             );
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_url_override_scoped_to_a_workspace_member_is_non_registry() {
+        // The Bugbot probe: npm reaches a workspace member through the
+        // root's link edge, so a rule keyed by the member's name scopes to
+        // its dependencies, hoisted or nested. Members are found by their
+        // `name` field, their link entry's key, or their folder name.
+        let lock_with = |member: Value| {
+            lock(json!({
+                "": { "name": "root", "workspaces": ["packages/*"] },
+                "packages/app": member,
+                "node_modules/app": { "resolved": "packages/app", "link": true },
+                "packages/app/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REGISTRY_TGZ
+                },
+                "node_modules/other": {
+                    "version": "1.0.0",
+                    "resolved": REGISTRY_TGZ,
+                    "dependencies": { "left-pad": "^1.0.0" }
+                },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": REGISTRY_TGZ }
+            }))
+        };
+        let deps = json!({ "left-pad": "^1.3.0" });
+        for member in [
+            json!({ "name": "app", "version": "2.0.0", "dependencies": deps }),
+            json!({ "version": "2.0.0", "dependencies": deps }),
+        ] {
+            let lock = lock_with(member.clone());
+            for (scope, flagged) in [
+                ("app", true),
+                ("app@2.0.0", true),
+                ("app@3.0.0", false),
+                ("other-member", false),
+            ] {
+                let found = npm_non_registry_entries(
+                    &lock,
+                    &NpmOverrides::from_manifest(&json!({
+                        "overrides": { scope: { "left-pad": REGISTRY_TGZ } }
+                    })),
+                );
+                assert_eq!(
+                    found.contains_key("packages/app/node_modules/left-pad"),
+                    flagged,
+                    "{scope} / {member}: {found:?}"
+                );
+                // `other`'s hoisted copy is outside the member's subtree.
+                assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+            }
         }
     }
 
