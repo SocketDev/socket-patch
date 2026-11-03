@@ -1271,8 +1271,10 @@ jobs:
           # Ruby <= 3.3 and 1.17-2.1 need Ruby <= 3.1 (`untaint`). 2.7.2
           # (no boundary of its own) is in e2e-full.
           # Hosted and vendored share each era's leg (one Ruby + bundler
-          # setup; the run step loops over `suite`).
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.4', bundler: '4.0.21'}
+          # setup; the run step loops over `suite`), as does the agent-mode
+          # C-extension rebuild capstone (#1996), which needs the same Ruby
+          # plus the runner's C compiler.
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build e2e_gem_native_ext_build, ruby: '3.4', bundler: '4.0.21'}
           # The live-API smoke suites (e2e_npm, e2e_pypi, e2e_gem,
           # e2e_scan) are intentionally NOT in the PR matrix — their
           # `#[ignore]`-gated tests hit the real public proxy at
@@ -2008,7 +2010,7 @@ jobs:
           # composer 1.10 keeps the PHP 8.2 it has always run on here
           # (composer-compatibility.yml runs 1.10.28 on 8.1).
           - {os: ubuntu-latest, suite: e2e_vendor_composer_build e2e_redirect_composer_build, composer: '1', php: '8.2'}
-          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '1.17.3'}
+          - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build e2e_gem_native_ext_build, ruby: '3.1', bundler: '1.17.3'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.1.4'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.1', bundler: '2.2.33'}
           - {os: ubuntu-latest, suite: e2e_redirect_gem_build e2e_vendor_gem_build, ruby: '3.3', bundler: '2.5.23'}

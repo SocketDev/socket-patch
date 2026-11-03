@@ -350,6 +350,21 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_vlt_install_cleanup: bool,
+
+    /// Agent mode (`apply`, `scan`/`get --mode agent`): write a gem patch
+    /// that changes native-extension sources WITHOUT rebuilding the
+    /// extension, for a caller that compiles it itself. Ruby keeps loading
+    /// the old build until then, so `vex` and `apply --check` do not attest
+    /// those patches (`native_extension_not_rebuilt`). Other subcommands
+    /// accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-gem-native-rebuild",
+        env = "SOCKET_NO_GEM_NATIVE_REBUILD",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_gem_native_rebuild: bool,
 }
 
 impl GlobalArgs {
@@ -641,6 +656,7 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
+    "SOCKET_NO_GEM_NATIVE_REBUILD",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -709,6 +725,7 @@ impl Default for GlobalArgs {
             no_trust_lockfile_config: false,
             no_npm_allow_remote_config: false,
             no_vlt_install_cleanup: false,
+            no_gem_native_rebuild: false,
         }
     }
 }

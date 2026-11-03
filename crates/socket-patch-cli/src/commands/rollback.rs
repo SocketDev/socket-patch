@@ -3276,14 +3276,32 @@ pub(crate) async fn rollback_patches_inner(
             match try_rollback_local_go(purl, pkg_path, patch, common).await {
                 Some(r) => r,
                 None => {
-                    rollback_package_patch(
+                    let mut result = rollback_package_patch(
                         purl,
                         pkg_path,
                         &patch.files,
                         &blobs_path,
                         common.dry_run,
                     )
-                    .await
+                    .await;
+                    // A gem whose native extension `apply` rebuilt gets its
+                    // original compiled extension back with its sources
+                    // (#1996).
+                    if result.success
+                        && !common.dry_run
+                        && Ecosystem::from_purl(purl) == Some(Ecosystem::Gem)
+                    {
+                        use socket_patch_core::patch::gem_ext;
+                        let env = gem_ext::RubyEnv {
+                            cwd: common.cwd.clone(),
+                            rebuild: !common.no_gem_native_rebuild,
+                        };
+                        if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
+                            result.success = false;
+                            result.error = Some(format!("{}: {e}", gem_ext::RESTORE_FAILED_CODE));
+                        }
+                    }
+                    result
                 }
             }
         };

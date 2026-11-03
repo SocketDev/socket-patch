@@ -2769,7 +2769,7 @@ fn attr_mention<'a>(line: &'a str, attr: &str, anchored: bool) -> Option<&'a str
 /// refusal's nicer error, never safety, because a match REFUSES). A miss —
 /// e.g. extensions assigned through interpolation tricks — falls through,
 /// which likewise only loses the nicer error.
-fn gemspec_declares_extensions(spec_text: &str) -> bool {
+pub(crate) fn gemspec_declares_extensions(spec_text: &str) -> bool {
     for raw in spec_text.lines() {
         let line = raw.split('#').next().unwrap_or("");
         if let Some(after) = attr_mention(line, "extensions", false) {

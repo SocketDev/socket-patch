@@ -204,6 +204,8 @@ pub async fn applied_patches_with_copies(
                     }
                 }
                 first_failure.map_or(Ok(()), Err)
+            } else if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
+                verify_every_gem_copy(paths, record).await
             } else {
                 verify_every_copy(paths, record).await
             }
@@ -450,6 +452,21 @@ fn judge_installed_files(pkg_path: &Path, files: &[(String, String)]) -> Install
 async fn verify_every_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<(), String> {
     for path in paths {
         verify_patch_record(path, record).await?;
+    }
+    Ok(())
+}
+
+/// [`verify_every_copy`] for an agent-patched gem: a copy whose record
+/// changes its native extension's sources must also run an extension built
+/// from them (#1996), which `apply` records when it rebuilds
+/// ([`verify_native_build`](crate::patch::gem_ext::verify_native_build)).
+/// A copy holding the patched sources over the install-time build is
+/// `native_extension_not_rebuilt`. Hosted copies are judged without this:
+/// RubyGems compiled the patched gem when Bundler installed it.
+async fn verify_every_gem_copy(paths: &[PathBuf], record: &PatchRecord) -> Result<(), String> {
+    for path in paths {
+        verify_patch_record(path, record).await?;
+        crate::patch::gem_ext::verify_native_build(path, &record.files).await?;
     }
     Ok(())
 }
