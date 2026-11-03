@@ -4774,7 +4774,8 @@ async fn gem_vendored_unwind_names_a_patched_archive_in_vendor_cache() {
 /// `core.autocrlf=true`) keeps it CRLF throughout, for a plain top-level
 /// declaration and for one inside the user's own `source … do` block; a
 /// real bundler converges the result, a re-scan is a no-op, and `rollback`
-/// hands back a CRLF Gemfile that still declares the gem.
+/// hands back a CRLF Gemfile that still declares the gem. The source-block
+/// arm needs bundler >= 2.2 (a separate patch-registry GEM section).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -4792,6 +4793,18 @@ async fn gem_hosted_redirect_keeps_a_crlf_gemfile_crlf() {
         else {
             return;
         };
+        // Same era floor as `gem_hosted_unwind_keeps_a_source_block_bang`:
+        // before 2.2 bundler merges every rubygems source into one GEM
+        // section, and the redirect nests the Socket block inside the
+        // user's, so rollback cannot attribute the gem to the patch.
+        if driver == Driver::ScanVexSourceBlock && !fx.bundler.at_least(2, 2) {
+            println!(
+                "SKIP e2e_redirect_gem_build ({tag}): bundler {} merges every rubygems \
+                 source into one GEM section",
+                fx.bundler.version
+            );
+            continue;
+        }
         let api = fx._server.uri();
         let gemfile_path = fx.proj.join(fx.gemfile_name);
         let lock_path = fx.proj.join(fx.lock_name);
