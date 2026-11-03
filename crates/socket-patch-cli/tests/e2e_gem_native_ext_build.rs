@@ -267,6 +267,11 @@ fn native_patch_is_rebuilt_attested_and_rolled_back() {
             || stdout.contains("not compiled into the extension"),
         "{stdout}\n{stderr}"
     );
+    // A dry run says the rebuild is still to do, and does it not.
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--dry-run"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(stdout.contains("apply would rebuild it"), "{stdout}");
+    assert_eq!(fx.value(), "1");
     let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(stdout.contains("native_extension_rebuilt"), "{stdout}");

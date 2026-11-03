@@ -42,6 +42,7 @@ use crate::patch::apply::{
     ApplyResult, MismatchPolicy, PatchSources,
 };
 use crate::patch::file_hash::compute_file_git_sha256_sync;
+use crate::utils::fs::read_regular_to_bytes_sync;
 
 /// The refusal when a native-extension patch cannot be rebuilt in place
 /// (the vendored backend's code for the same limitation).
@@ -532,8 +533,10 @@ fn gem_path_for(home: &Path) -> Option<OsString> {
     Some(joined)
 }
 
-/// Run the Ruby program in `mode` (`probe` / `build`) on `copy`. `Ok`
-/// carries stdout; `Err` a short reason (stderr's tail on a failed exit).
+/// Run the Ruby program in `mode` (`probe` / `build`) on `copy`, bounded
+/// by `budget` through [`build_output_within`](crate::utils::process::build_output_within)
+/// (a timeout kills the build's whole process group). `Ok` carries stdout;
+/// `Err` a short reason (stderr's tail on a failed exit).
 async fn run_ruby(
     ruby: &Path,
     mode: &str,
@@ -541,21 +544,14 @@ async fn run_ruby(
     env: &RubyEnv,
     budget: Duration,
 ) -> Result<String, String> {
-    let mut command = tokio::process::Command::from(crate::utils::process::command_for(ruby));
+    use crate::utils::process::{build_output_within, command_for, BoundedError};
+    let mut command = command_for(ruby);
     command
         .arg("-e")
         .arg(RUBY_SCRIPT)
         .arg(mode)
         .arg(&copy.spec_path)
-        .current_dir(&env.cwd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    // Its own process group, so a timeout reaches `make` / `cc` / `cargo`
-    // too, not only the Ruby that started them.
-    #[cfg(unix)]
-    command.process_group(0);
+        .current_dir(&env.cwd);
     // A Bundler-run parent (`bundle exec`, the Bundler plugin) must not
     // load the project's bundle into this Ruby.
     for (key, _) in std::env::vars_os() {
@@ -567,42 +563,25 @@ async fn run_ruby(
     if let Some(gem_path) = gem_path_for(&copy.home) {
         command.env("GEM_PATH", gem_path);
     }
-    let child = command
-        .spawn()
-        .map_err(|e| format!("could not run {}: {e}", ruby.display()))?;
-    let pid = child.id();
-    let output = match tokio::time::timeout(budget, child.wait_with_output()).await {
-        Err(_) => {
-            kill_process_group(pid);
+    let output = crate::utils::fs::run_blocking(move || build_output_within(command, budget)).await;
+    let output = match output {
+        Err(BoundedError::TimedOut) => {
             return Err(format!(
                 "{} {mode} did not finish within {} minutes",
                 ruby.display(),
                 budget.as_secs() / 60
-            ));
+            ))
         }
-        Ok(Err(e)) => return Err(format!("could not run {}: {e}", ruby.display())),
-        Ok(Ok(output)) => output,
+        Err(BoundedError::Spawn(e)) => {
+            return Err(format!("could not run {}: {e}", ruby.display()))
+        }
+        Ok(output) => output,
     };
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         Err(stderr_tail(&String::from_utf8_lossy(&output.stderr)))
     }
-}
-
-/// SIGKILL the process group a timed-out build leads (Unix). Elsewhere the
-/// dropped child is killed (`kill_on_drop`); its own children may outlive it.
-fn kill_process_group(pid: Option<u32>) {
-    #[cfg(unix)]
-    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) {
-        // SAFETY: plain syscall on a pgid this process created; no memory
-        // is shared with the callee.
-        unsafe {
-            libc::kill(-pid, libc::SIGKILL);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = pid;
 }
 
 /// The useful end of a failed build's stderr: RubyGems' trailing
@@ -868,13 +847,13 @@ fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
             let Some(lib) = lib_rel(probe, &rel) else {
                 continue;
             };
-            let src = copy.gem_dir.join(&lib);
-            if src.is_file() {
+            // Only a regular file: a FIFO there would block the read.
+            if let Ok(bytes) = read_regular_to_bytes_sync(&copy.gem_dir.join(&lib)) {
                 let dst = stage.join("lib").join(&lib);
                 if let Some(parent) = dst.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                std::fs::copy(&src, &dst)?;
+                std::fs::write(&dst, bytes)?;
                 lib_files.push(lib);
             }
         }
@@ -902,7 +881,7 @@ fn snapshot_lib_copies(copy: &GemCopy, probe: &Probe, rels: &[String]) -> Vec<Li
         .filter_map(|lib| {
             let path = copy.gem_dir.join(&lib);
             let perms = std::fs::metadata(&path).ok()?.permissions();
-            let bytes = std::fs::read(&path).ok()?;
+            let bytes = read_regular_to_bytes_sync(&path).ok()?;
             Some((lib, bytes, perms))
         })
         .collect()
@@ -928,7 +907,7 @@ fn set_aside(copy: &GemCopy, probe: &Probe) -> std::io::Result<Aside> {
     };
     let lib = snapshot_lib_copies(copy, probe, &rels);
     let marker_path = copy.gem_dir.join(MARKER_FILE);
-    let marker = std::fs::read(&marker_path).ok();
+    let marker = read_regular_to_bytes_sync(&marker_path).ok();
     let old_ext = if ext.is_dir() {
         let leaf = ext
             .file_name()
@@ -1251,10 +1230,7 @@ pub async fn apply_gem_package_patch(
             keys.into_iter()
                 .filter(|k| is_safe_relative_subpath(normalize_file_path(k)))
                 .map(|k| {
-                    let bytes = crate::utils::fs::read_regular_to_bytes_sync(
-                        &dir.join(normalize_file_path(&k)),
-                    )
-                    .ok();
+                    let bytes = read_regular_to_bytes_sync(&dir.join(normalize_file_path(&k))).ok();
                     (k, bytes)
                 })
                 .collect()
@@ -1265,10 +1241,25 @@ pub async fn apply_gem_package_patch(
     let mut result =
         apply_package_patch(package_key, pkg_path, files, sources, dry_run, policy).await;
     if dry_run {
-        return GemApplied {
-            result,
-            warning: None,
-        };
+        // The build is not one made from these sources (the marker check
+        // above), so a real run rebuilds it. With every source already
+        // patched the event reads `already_patched`; the warning says what
+        // `apply` would still do (the real run's `native_extension_rebuilt`).
+        let all_patched = !result.files_verified.is_empty()
+            && result
+                .files_verified
+                .iter()
+                .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched);
+        let warning = (result.success && all_patched).then(|| {
+            (
+                REBUILT_CODE.to_string(),
+                format!(
+                    "{package_key}: dry run: its sources are already patched, but its native \
+                     extension was not built from them ({inputs}); apply would rebuild it"
+                ),
+            )
+        });
+        return GemApplied { result, warning };
     }
     if !result.success {
         revert_sources(pkg_path, &originals, &result.files_patched).await;
@@ -1418,8 +1409,9 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
 /// nothing is touched.
 fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Result<()> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    let info: BackupInfo = serde_json::from_slice(&std::fs::read(backup.join(BACKUP_INFO))?)
-        .map_err(std::io::Error::other)?;
+    let info: BackupInfo =
+        serde_json::from_slice(&read_regular_to_bytes_sync(&backup.join(BACKUP_INFO))?)
+            .map_err(std::io::Error::other)?;
     let ext_dir = confined_ext_dir(copy, &info.extension_dir)
         .filter(|dir| !is_symlink(dir))
         .ok_or_else(|| {
@@ -1446,9 +1438,9 @@ fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Resu
         if !is_safe_relative_subpath(lib) {
             continue;
         }
-        let src = backup.join("lib").join(lib);
+        let bytes = read_regular_to_bytes_sync(&backup.join("lib").join(lib))?;
         replace_file(&copy.gem_dir.join(lib), |stage| {
-            std::fs::copy(&src, stage).map(|_| ())
+            std::fs::write(stage, &bytes)
         })?;
     }
     match std::fs::remove_file(copy.gem_dir.join(MARKER_FILE)) {
@@ -1748,6 +1740,37 @@ mod tests {
             );
             assert!(home.join("extensions/p/3.4.0/a-1/a/a.so").is_file());
         }
+    }
+
+    /// A FIFO planted where the backup's description goes fails the
+    /// rollback fast instead of blocking in open(2).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rollback_does_not_block_on_a_planted_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let gem_dir = rebuilt_gem(&home, true);
+        let info = gem_dir.join(BACKUP_DIR).join(BACKUP_INFO);
+        std::fs::remove_file(&info).unwrap();
+        let c_path = std::ffi::CString::new(info.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: mkfifo on a NUL-terminated path this test owns.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o644) }, 0);
+        let env = RubyEnv {
+            cwd: home.clone(),
+            rebuild: true,
+        };
+        let restored = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            restore_original_build(&gem_dir, &env),
+        )
+        .await
+        .expect("rollback blocked on a FIFO");
+        assert!(restored.is_err());
+        assert_eq!(
+            std::fs::read(home.join("extensions/p/3.4.0/a-1/a/a.so")).unwrap(),
+            b"patched",
+            "nothing was changed"
+        );
     }
 
     #[tokio::test]

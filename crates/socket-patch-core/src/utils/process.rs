@@ -93,6 +93,91 @@ pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, B
     }
 }
 
+/// [`output_within`] for a build whose diagnostics matter (a gem's native
+/// extension, #1996): stderr is captured too, and on Unix the child leads
+/// its own process group, which is killed whole at the deadline, so the
+/// `make` / `cc` / `cargo` it started never outlives the budget. (Elsewhere
+/// only the child itself is killed.)
+///
+/// Once the child exits, its pipes are drained for whatever budget is left;
+/// a grandchild still holding one past that is killed with the group and its
+/// stream is returned as read so far.
+///
+/// Blocking: async callers run it through `utils::fs::run_blocking`.
+pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    let deadline = Instant::now() + budget;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(BoundedError::Spawn)?;
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = pipe.read_to_end(&mut bytes);
+            let _ = sender.send(bytes);
+        });
+        receiver
+    };
+    let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
+    let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
+    let pid = child.id();
+    let kill_all = |child: &mut std::process::Child| {
+        kill_process_group(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                kill_all(&mut child);
+                return Err(BoundedError::TimedOut);
+            }
+            Err(error) => {
+                kill_all(&mut child);
+                return Err(BoundedError::Spawn(error));
+            }
+        }
+    };
+    let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        receiver.recv_timeout(left).unwrap_or_else(|_| {
+            kill_process_group(pid);
+            Vec::new()
+        })
+    };
+    Ok(Output {
+        status,
+        stdout: collect(stdout),
+        stderr: collect(stderr),
+    })
+}
+
+/// SIGKILL the process group `pid` leads (Unix; a no-op elsewhere).
+fn kill_process_group(pid: u32) {
+    #[cfg(unix)]
+    if let Ok(pid) = i32::try_from(pid) {
+        if pid > 0 {
+            // SAFETY: a plain syscall on a process group this process
+            // created; no memory is shared with the callee.
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
 /// no entry holds one.
 ///
@@ -608,6 +693,62 @@ pub(crate) mod tests {
             output_within(missing, PROBE_TIMEOUT),
             Err(BoundedError::Spawn(_))
         ));
+    }
+
+    /// The build spawn keeps stderr (the compiler's diagnostic) as well as
+    /// stdout and the exit status, with stdin null.
+    #[cfg(unix)]
+    #[test]
+    fn build_output_within_keeps_stderr_and_status() {
+        let mut failing = Command::new("sh");
+        failing.args(["-c", "cat; printf out; printf err >&2; exit 2"]);
+        let output = build_output_within(failing, PROBE_TIMEOUT).unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert_eq!(output.stdout, b"out");
+        assert_eq!(output.stderr, b"err");
+        let missing = Command::new("/definitely/not/a/real/binary-1234567");
+        assert!(matches!(
+            build_output_within(missing, PROBE_TIMEOUT),
+            Err(BoundedError::Spawn(_))
+        ));
+    }
+
+    /// At the deadline the whole process group goes: a grandchild the
+    /// build started (a `make` / `cc`) does not outlive it.
+    #[cfg(unix)]
+    #[test]
+    fn build_output_within_kills_the_process_group_at_the_deadline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "sleep 30 & echo $! > '{}'; wait",
+            pid_file.display()
+        ));
+        let start = Instant::now();
+        let result = build_output_within(command, Duration::from_millis(500));
+        assert!(matches!(result, Err(BoundedError::TimedOut)), "{result:?}");
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The killed grandchild is reaped by init shortly after; signal 0
+        // probes whether it still exists.
+        let gone = (0..100).any(|_| {
+            // SAFETY: signal 0 only checks the pid; nothing is delivered.
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the grandchild {pid} outlived the deadline");
     }
 
     /// Spawn failure → None. The binary name is intentionally one
