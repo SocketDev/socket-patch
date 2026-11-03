@@ -12,6 +12,7 @@ use socket_patch_core::patch::apply::{
     apply_package_patch, verify_file_patch, ApplyResult, MismatchPolicy, PatchSources, VerifyStatus,
 };
 use socket_patch_core::patch::apply_lock::LockGuard;
+use socket_patch_core::patch::gem_ext;
 use socket_patch_core::patch::redirect::golang_local::{
     apply_go_redirect, reconcile_go_redirects, verify_go_redirect_state,
 };
@@ -717,6 +718,10 @@ fn describe_check_failure(reason: &str) -> &'static str {
         "hash_mismatch" => "an installed copy matches neither the original nor the patched bytes",
         "file_not_found" => "a patched file is missing from an installed copy",
         "no_files" => "the patch record lists no files to verify",
+        "native_extension_not_rebuilt" => {
+            "the patched native-extension sources were not compiled into the extension \
+             Ruby loads"
+        }
         "no_matching_variant" => {
             "an installed copy matches none of the manifest's release variants \
              (no matching variant found)"
@@ -2703,15 +2708,41 @@ async fn apply_patches_inner(
                     }
 
                     attempted = true;
-                    let result = apply_package_patch(
-                        variant_purl,
-                        pkg_path,
-                        &patch.files,
-                        &sources,
-                        args.common.dry_run,
-                        policy,
-                    )
-                    .await;
+                    // A gem patch to native-extension sources rebuilds the
+                    // extension, or is refused with nothing written (#1996).
+                    let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
+                        let applied = gem_ext::apply_gem_package_patch(
+                            variant_purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            args.common.dry_run,
+                            policy,
+                            &gem_ext::RubyEnv {
+                                cwd: args.common.cwd.clone(),
+                            },
+                        )
+                        .await;
+                        // A best-effort fallback-home copy's refusal is
+                        // its per-copy skip below, not a run warning.
+                        if let Some((code, detail)) = applied
+                            .warning
+                            .filter(|_| applied.result.success || !best_effort)
+                        {
+                            run_warnings.push(RunWarning { code, detail });
+                        }
+                        applied.result
+                    } else {
+                        apply_package_patch(
+                            variant_purl,
+                            pkg_path,
+                            &patch.files,
+                            &sources,
+                            args.common.dry_run,
+                            policy,
+                        )
+                        .await
+                    };
 
                     warn_mismatch_overwrites(&result, &args.common);
                     // A variant that reached apply is the installed distribution

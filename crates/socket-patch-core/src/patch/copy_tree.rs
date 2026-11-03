@@ -148,7 +148,7 @@ fn copy_tree_blocking_reference(
 /// Recursively remove a tree, retrying once after relaxing *directory* perms
 /// (a previously patched copy may carry read-only dir modes copied from the
 /// registry/cache; on unix file modes never gate unlinking).
-fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn force_remove_dir_all(dir: &Path) -> std::io::Result<()> {
     match std::fs::remove_dir_all(dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

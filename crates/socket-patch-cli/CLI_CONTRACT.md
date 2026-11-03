@@ -705,6 +705,39 @@ are patched by `socket-patch apply` like every other ecosystem:
   or a bare `--global-prefix` cache with no known `go install` directory) the same warning code says
   so, and VEX is not withheld (#422).
 
+### Ruby gems with native extensions in agent mode
+
+Ruby loads the extension RubyGems compiled at install time
+(`extensions/<platform>/<abi>/<gem>-<version>/`, and its copy under the gem's `lib/`), never
+the `ext/` sources beside it. When a gem record changes a native-extension build input, `apply`
+writes the patched sources and then rebuilds the extension from them with RubyGems' own builder
+(the step `gem pristine --extensions` runs), using the Ruby that owns the install: the one in
+`<prefix>/bin` of a `<prefix>/lib/ruby/gems/<abi>` home, else the `ruby` on `PATH` run from
+`--cwd`. A build input is a changed `.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`,
+`.m`, `.y` or `.rl` file, an `extconf.rb`, a `depend` under `ext/`, or any file under the
+directory of a build script the installed gemspec's `extensions` names (#1996). A grammar file
+(`.y`, `.rl`) in a gem that declares no extensions is not one: nothing compiles it at install
+time.
+
+The first rebuild of a copy backs up the install-time build (extension directory and `lib/`
+copies) to `.socket-patch-native-orig/` in the gem directory, and every rebuild records
+`.socket-patch-native-build.json` there: the source hashes it was built from and the hash of every
+artifact it produced. A record whose sources are patched and whose marker matches is
+`already_patched`; sources an earlier release patched without a rebuild are rebuilt, with a
+`native_extension_rebuilt` warning. `rollback` (and `remove`) puts the backed-up build back with
+the sources; without a backup it rebuilds from the restored sources.
+
+| Code | Run result | Meaning |
+|---|---|---|
+| `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt in place: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout), the gem declares no extensions (a precompiled platform gem), or no Ruby whose extension directory for the gem is the installed one was found. Nothing is written; use `scan --mode hosted`, where RubyGems compiles the patched gem. |
+| `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error). The previous build and the original sources are put back; the error carries the build output's tail. |
+| `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996) and the extension was rebuilt from them. |
+| `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions`. |
+
+`vex` and `apply --check` attest such a copy only while its marker matches the record's patched
+sources and every artifact it lists; otherwise the purl fails with `native_extension_not_rebuilt`.
+Hosted copies are judged on their files alone, since RubyGems compiled them from the patched gem.
+
 ### sbt / Mill / scala-cli caches in agent mode
 
 A JVM project root (any `JVM_PROJECT_MARKERS` file, `build.sbt` / `build.mill` / `build.sc` /

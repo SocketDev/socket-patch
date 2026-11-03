@@ -2091,6 +2091,10 @@ fn omission_phrase(reason: &str) -> &'static str {
              against"
         }
         "stale_install" => "the installed copy is not patched",
+        "native_extension_not_rebuilt" => {
+            "the patched native-extension sources were not compiled into the extension Ruby \
+             loads; run socket-patch apply to rebuild it"
+        }
         DEPENDENCY_NOT_INSTALLED => {
             "the patched package.json declares a dependency that is not installed beside \
              the package"

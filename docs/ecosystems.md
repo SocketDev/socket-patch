@@ -1706,6 +1706,31 @@ Important limits:
 The implemented hosted shape and fresh-checkout behavior are exercised by
 [`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
 
+## Ruby gems: native extensions
+
+Some gem fixes change only a C extension's sources (`ext/**/*.c`, `*.h`, `extconf.rb`). Ruby
+never loads those sources: it loads the shared object RubyGems compiled when it installed the
+gem. How each mode gets the patched code running:
+
+| Mode | What happens |
+|---|---|
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
+| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
+| Agent (`apply`) | The patched sources are written, then the extension is rebuilt in place with RubyGems' builder, the step `gem pristine --extensions` runs, against the Ruby that owns the install. |
+
+An agent-mode rebuild needs a compiler toolchain and the Ruby headers (`ruby-dev` /
+`ruby-devel` on Linux distributions, the Xcode command line tools on macOS), the same
+requirements as `gem install` for that gem. When the build fails, `apply` puts the original
+sources and build back and fails that package with `native_extension_build_failed`, showing the
+tail of the build output. When it can't rebuild at all (a precompiled platform gem, a Bundler git
+checkout, or no matching Ruby), nothing is written and the package fails with
+`native_extensions_unsupported`. Use hosted mode for those.
+
+`apply` keeps the install-time build in `.socket-patch-native-orig/` inside the gem directory, so
+`rollback` restores it without recompiling, and records what it built in
+`.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
+installed extension: after `gem pristine` or a reinstall, run `apply` again.
+
 ## Supported platforms
 
 Prebuilt binaries are published for:
