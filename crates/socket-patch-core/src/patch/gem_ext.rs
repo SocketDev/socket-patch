@@ -86,14 +86,24 @@ const NATIVE_SOURCE_EXTENSIONS: &[&str] = &[
 const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 
 /// The probe/build program run by the gem's Ruby. One line: `-e` with an
-/// embedded newline is fragile through a Windows command line.
-const RUBY_SCRIPT: &str = "mode, path = ARGV; \
+/// embedded newline is fragile through a Windows command line. Ruby 1.8 does
+/// not load RubyGems by default (and `RUBYOPT` is cleared), so it is required
+/// explicitly; a RubyGems older than 2.2 (no per-gem extension dir, no
+/// `raw_require_paths`) is refused by name. Probe lines carry an `sp_` key
+/// so stray output (an `operating_system.rb`, a shim) is skipped.
+const RUBY_SCRIPT: &str = "require 'rubygems'; mode, path = ARGV; \
+unless Gem::Specification.respond_to?(:load) && \
+Gem::Specification.method_defined?(:extension_dir) && \
+Gem::Specification.method_defined?(:raw_require_paths) then \
+abort(\"RubyGems #{defined?(Gem::VERSION) ? Gem::VERSION : Gem::RubyGemsVersion} is older than 2.2, \
+which has no per-gem extension dir to rebuild into\"); \
+end; \
 spec = Gem::Specification.load(path) or abort(\"cannot load #{path}\"); \
 if mode == 'probe' then \
-puts \"gem_dir\\t#{spec.full_gem_path}\"; \
-puts \"extension_dir\\t#{spec.extension_dir}\"; \
-puts \"lib_dir\\t#{File.join(spec.full_gem_path, spec.raw_require_paths.first.to_s)}\"; \
-spec.extensions.each { |e| puts \"extension\\t#{e}\" }; \
+puts \"sp_gem_dir\\t#{spec.full_gem_path}\"; \
+puts \"sp_extension_dir\\t#{spec.extension_dir}\"; \
+puts \"sp_lib_dir\\t#{File.join(spec.full_gem_path, spec.raw_require_paths.first.to_s)}\"; \
+spec.extensions.each { |e| puts \"sp_extension\\t#{e}\" }; \
 else \
 require 'rubygems/ext'; \
 Gem::DefaultUserInteraction.ui = Gem::SilentUI.new; \
@@ -144,10 +154,14 @@ struct ExtensionDecl {
 
 /// Parse `s.extensions = ["ext/foo/extconf.rb".freeze, …]` out of an
 /// installed gemspec (the `Specification#to_ruby` shape RubyGems writes).
-/// Comments are stripped per line; an assignment whose entries are not
-/// string literals is `declared` with no `entries`.
+/// Whether extensions are declared is the vendored backend's test
+/// ([`gemspec_declares_extensions`](crate::vendor::gem::gemspec_declares_extensions)),
+/// so both modes agree on which gems are native; the build scripts are the
+/// string literals those assignments list. Comments are stripped per line;
+/// an assignment whose entries are not string literals is `declared` with
+/// no `entries`.
 fn parse_extensions(spec_text: &str) -> ExtensionDecl {
-    let mut decl = ExtensionDecl::default();
+    let mut entries = Vec::new();
     for raw in spec_text.lines() {
         let line = raw.split('#').next().unwrap_or("");
         let Some(idx) = line.find(".extensions") else {
@@ -162,26 +176,18 @@ fn parse_extensions(spec_text: &str) -> ExtensionDecl {
             continue;
         }
         let after = after.trim_start();
-        let rhs = if let Some(rest) = after.strip_prefix("+=") {
-            rest
-        } else if let Some(rest) = after.strip_prefix("<<") {
-            rest
-        } else if let Some(rest) = after.strip_prefix('=') {
-            if rest.starts_with('=') {
-                continue;
-            }
-            rest
-        } else {
-            continue;
-        };
-        let literals = string_literals(rhs);
-        let empty_list = literals.is_empty() && rhs.trim().trim_end_matches(".freeze") == "[]";
-        if !empty_list {
-            decl.declared = true;
+        let rhs = ["+=", "<<", ".push", ".concat"]
+            .iter()
+            .find_map(|op| after.strip_prefix(op))
+            .or_else(|| after.strip_prefix('=').filter(|r| !r.starts_with('=')));
+        if let Some(rhs) = rhs {
+            entries.extend(string_literals(rhs));
         }
-        decl.entries.extend(literals);
     }
-    decl
+    ExtensionDecl {
+        declared: crate::vendor::gem::gemspec_declares_extensions(spec_text),
+        entries,
+    }
 }
 
 /// The double- and single-quoted string literals in `text`, in order.
@@ -241,33 +247,50 @@ struct NativeScope {
     builds_extensions: bool,
 }
 
-/// Classify `files` against the extension declaration `decl`: a key is a
-/// build input by name ([`is_native_by_name`]) or by living under the dir
-/// of a declared build script (a Rust extension's `.rs` sources, a
-/// `Rakefile`-built tree). A declaration whose scripts are unknown makes
-/// everything under `ext/` an input. In a gem that builds no extension,
-/// grammar sources are not inputs.
+/// Classify `files` against the extension declaration `decl`.
+///
+/// In a gem that declares extensions, a key is a build input by name
+/// ([`is_native_by_name`]) or by living under the dir of a declared build
+/// script (a Rust extension's `.rs` sources, a `Rakefile`-built tree); a
+/// script at the gem root (`extensions = ["extconf.rb"]`) makes the files
+/// beside it inputs, the ones mkmf compiles, not every file of the gem. A
+/// declaration whose scripts are unknown makes everything under `ext/` an
+/// input.
+///
+/// In a gem that declares none, only a name-matched source under `ext/`
+/// counts: that is where a precompiled platform gem keeps the sources of
+/// the binary it ships. C or Objective-C files elsewhere (a template, a
+/// test fixture) compile nothing, and neither do grammar sources, whose
+/// generated output the gem packs.
 fn classify(decl: &ExtensionDecl, files: &HashMap<String, PatchFileInfo>) -> NativeScope {
-    let dirs: Vec<String> = decl
+    // `None`: a script at the gem root.
+    let dirs: Vec<Option<String>> = decl
         .entries
         .iter()
         .map(|e| {
-            let e = e.trim_start_matches("./");
-            match e.rsplit_once('/') {
-                Some((dir, _)) => format!("{dir}/"),
-                None => String::new(),
-            }
+            e.trim_start_matches("./")
+                .rsplit_once('/')
+                .map(|(dir, _)| format!("{dir}/"))
         })
         .collect();
+    let under_script_dir = |path: &str| {
+        dirs.iter().any(|d| match d {
+            Some(d) => path.starts_with(d.as_str()),
+            None => !path.contains('/'),
+        })
+    };
     let unknown_scripts = decl.declared && decl.entries.is_empty();
     let mut inputs: Vec<String> = files
         .keys()
         .filter(|key| {
             let path = normalize_file_path(key);
-            let native = is_native_by_name(path)
-                || dirs.iter().any(|d| path.starts_with(d.as_str()))
-                || (unknown_scripts && path.starts_with("ext/"));
-            native && (decl.declared || !is_generated_grammar(path))
+            if decl.declared {
+                is_native_by_name(path)
+                    || under_script_dir(path)
+                    || (unknown_scripts && path.starts_with("ext/"))
+            } else {
+                path.starts_with("ext/") && is_native_by_name(path) && !is_generated_grammar(path)
+            }
         })
         .cloned()
         .collect();
@@ -309,8 +332,8 @@ pub struct BuildMarker {
     pub schema: u32,
     /// Native input (normalized path) → its git-sha256 when it was built.
     pub sources: BTreeMap<String, String>,
-    /// The extension dir built into: relative to the gem home when under it,
-    /// otherwise absolute.
+    /// The extension dir built into, relative to the gem home:
+    /// `extensions/<platform>/<abi>/<full_name>` (see [`confined_ext_dir`]).
     pub extension_dir: String,
     /// Artifact path relative to the extension dir → git-sha256.
     pub ext_artifacts: BTreeMap<String, String>,
@@ -321,15 +344,22 @@ pub struct BuildMarker {
 
 const MARKER_SCHEMA: u32 = 1;
 
-impl BuildMarker {
-    fn extension_dir_in(&self, home: &Path) -> PathBuf {
-        let p = Path::new(&self.extension_dir);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            home.join(p)
-        }
-    }
+/// The extension dir a marker or backup names, only when it is
+/// `extensions/<platform>/<abi>/<full_name>` under the copy's home: those
+/// files sit in the gem dir, where a checkout could plant them, so the path
+/// they hold is never trusted further than the one dir RubyGems builds this
+/// gem into.
+fn confined_ext_dir(copy: &GemCopy, label: &str) -> Option<PathBuf> {
+    let parts: Vec<&str> = label.split('/').collect();
+    let confined = parts.len() == 4
+        && parts[0] == "extensions"
+        && parts[3] == copy.full_name
+        && is_safe_relative_subpath(label);
+    confined.then(|| copy.home.join(label))
+}
+
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
 fn read_marker_sync(gem_dir: &Path) -> Option<BuildMarker> {
@@ -354,7 +384,9 @@ fn marker_holds(
     if !sources_match || marker.sources.len() != scope.inputs.len() {
         return false;
     }
-    let ext_dir = marker.extension_dir_in(&copy.home);
+    let Some(ext_dir) = confined_ext_dir(copy, &marker.extension_dir) else {
+        return false;
+    };
     let artifact_ok = |base: &Path, rel: &str, hash: &str| {
         is_safe_relative_subpath(rel)
             && compute_file_git_sha256_sync(&base.join(rel)).is_ok_and(|h| h == hash)
@@ -411,6 +443,10 @@ pub struct RubyEnv {
     /// The project dir the Ruby on `PATH` runs from (a version manager's
     /// `.ruby-version` there picks the project's Ruby).
     pub cwd: PathBuf,
+    /// Rebuild native extensions. `false` (`--no-gem-native-rebuild`): the
+    /// caller compiles them itself, so patched sources are written without
+    /// a build, as before #1996, with a [`NOT_REBUILT_REASON`] warning.
+    pub rebuild: bool,
 }
 
 /// What a Ruby reports about a gem copy.
@@ -429,12 +465,14 @@ fn parse_probe(ruby: &Path, stdout: &str) -> Option<Probe> {
     let mut lib_dir = None;
     let mut extensions = Vec::new();
     for line in stdout.lines() {
-        let (key, value) = line.split_once('\t')?;
+        let Some((key, value)) = line.split_once('\t') else {
+            continue;
+        };
         match key {
-            "gem_dir" => gem_dir = Some(PathBuf::from(value)),
-            "extension_dir" => extension_dir = Some(PathBuf::from(value)),
-            "lib_dir" => lib_dir = Some(PathBuf::from(value)),
-            "extension" => extensions.push(value.to_string()),
+            "sp_gem_dir" => gem_dir = Some(PathBuf::from(value)),
+            "sp_extension_dir" => extension_dir = Some(PathBuf::from(value)),
+            "sp_lib_dir" => lib_dir = Some(PathBuf::from(value)),
+            "sp_extension" => extensions.push(value.to_string()),
             _ => {}
         }
     }
@@ -514,6 +552,10 @@ async fn run_ruby(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Its own process group, so a timeout reaches `make` / `cc` / `cargo`
+    // too, not only the Ruby that started them.
+    #[cfg(unix)]
+    command.process_group(0);
     // A Bundler-run parent (`bundle exec`, the Bundler plugin) must not
     // load the project's bundle into this Ruby.
     for (key, _) in std::env::vars_os() {
@@ -525,8 +567,19 @@ async fn run_ruby(
     if let Some(gem_path) = gem_path_for(&copy.home) {
         command.env("GEM_PATH", gem_path);
     }
-    let output = match tokio::time::timeout(budget, command.output()).await {
-        Err(_) => return Err(format!("{} {mode} timed out", ruby.display())),
+    let child = command
+        .spawn()
+        .map_err(|e| format!("could not run {}: {e}", ruby.display()))?;
+    let pid = child.id();
+    let output = match tokio::time::timeout(budget, child.wait_with_output()).await {
+        Err(_) => {
+            kill_process_group(pid);
+            return Err(format!(
+                "{} {mode} did not finish within {} minutes",
+                ruby.display(),
+                budget.as_secs() / 60
+            ));
+        }
         Ok(Err(e)) => return Err(format!("could not run {}: {e}", ruby.display())),
         Ok(Ok(output)) => output,
     };
@@ -535,6 +588,21 @@ async fn run_ruby(
     } else {
         Err(stderr_tail(&String::from_utf8_lossy(&output.stderr)))
     }
+}
+
+/// SIGKILL the process group a timed-out build leads (Unix). Elsewhere the
+/// dropped child is killed (`kill_on_drop`); its own children may outlive it.
+fn kill_process_group(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()).filter(|p| *p > 0) {
+        // SAFETY: plain syscall on a pgid this process created; no memory
+        // is shared with the callee.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// The useful end of a failed build's stderr: RubyGems' trailing
@@ -570,7 +638,7 @@ fn installed_extension_dirs(copy: &GemCopy) -> Vec<PathBuf> {
         };
         for abi in abis.flatten() {
             let dir = abi.path().join(&copy.full_name);
-            if dir.is_dir() {
+            if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
                 out.push(dir);
             }
         }
@@ -590,18 +658,27 @@ fn canonical(p: &Path) -> Option<PathBuf> {
     std::fs::canonicalize(p).ok()
 }
 
-/// Find the Ruby that owns `copy`'s install: one whose spec resolves to
-/// this gem dir and whose extension dir for it is the one on disk (any, when
-/// the gem has none yet). `Err` names why none qualifies.
+/// Find the Ruby that owns `copy`'s install: the one whose extension dir
+/// for this gem is the installed `<home>/extensions/<platform>/<abi>/` one
+/// (its platform and ABI). A gem with no such dir (installed by a RubyGems
+/// older than 2.2, or its build removed) has no build a Ruby can be matched
+/// to, so none qualifies. `Err` names why.
 async fn find_ruby(copy: &GemCopy, env: &RubyEnv) -> Result<Probe, String> {
-    let candidates = ruby_candidates(copy, &env.cwd);
-    if candidates.is_empty() {
-        return Err("no `ruby` was found on PATH to rebuild it with".to_string());
-    }
     let installed = {
         let copy = copy.clone();
         crate::utils::fs::run_blocking(move || installed_extension_dirs(&copy)).await
     };
+    if installed.is_empty() {
+        return Err(format!(
+            "the gem has no compiled extension dir under {} (it was installed by a \
+             RubyGems older than 2.2, or its build is missing)",
+            copy.home.join("extensions").display()
+        ));
+    }
+    let candidates = ruby_candidates(copy, &env.cwd);
+    if candidates.is_empty() {
+        return Err("no `ruby` was found on PATH to rebuild it with".to_string());
+    }
     let mut reasons = Vec::new();
     for ruby in candidates {
         let stdout = match run_ruby(&ruby, "probe", copy, env, PROBE_TIMEOUT).await {
@@ -623,10 +700,7 @@ async fn find_ruby(copy: &GemCopy, env: &RubyEnv) -> Result<Probe, String> {
             ));
             continue;
         }
-        let matches_disk = installed.is_empty()
-            || probe.extension_dir.is_dir()
-            || installed.iter().any(|d| same_path(d, &probe.extension_dir));
-        if !matches_disk {
+        if !installed.iter().any(|d| same_path(d, &probe.extension_dir)) {
             reasons.push(format!(
                 "{} builds into {}, but the installed extension is {} (another Ruby's)",
                 ruby.display(),
@@ -698,24 +772,32 @@ fn lib_rel(probe: &Probe, rel: &str) -> Option<String> {
     is_safe_relative_subpath(&s).then_some(s)
 }
 
+/// A fresh copy of the tree `from` at `to` (replacing it).
 fn copy_tree_sync(from: &Path, to: &Path) -> std::io::Result<()> {
-    for entry in walkdir::WalkDir::new(from).follow_links(false) {
-        let entry = entry.map_err(std::io::Error::other)?;
-        let rel = entry
-            .path()
-            .strip_prefix(from)
-            .map_err(std::io::Error::other)?;
-        let target = to.join(rel);
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)?;
-        } else if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::copy(entry.path(), &target)?;
-        }
+    crate::patch::copy_tree::copy_tree_blocking(from, to, None)
+}
+
+/// Replace `dst` through a stage beside it and a rename, never rewriting
+/// its inode: a running Ruby may have the old `.so` / `.bundle` mapped, and
+/// rewriting those pages under it crashes it. `fill` writes the stage.
+fn replace_file(
+    dst: &Path,
+    fill: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let leaf = dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let stage = dst.with_file_name(format!(".{leaf}.socket-patch-stage"));
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    Ok(())
+    let _ = std::fs::remove_file(&stage);
+    let filled = fill(&stage).and_then(|()| std::fs::rename(&stage, dst));
+    if filled.is_err() {
+        let _ = std::fs::remove_file(&stage);
+    }
+    filled
 }
 
 fn remove_dir_if_exists(dir: &Path) -> std::io::Result<()> {
@@ -738,10 +820,11 @@ struct BackupInfo {
     lib_files: Vec<String>,
 }
 
-/// [`BuildMarker::extension_dir`] for `ext_dir`: relative to `home` when it
-/// is under it, compared canonically too (Ruby and the crawler may spell
-/// the same dir differently: a relative crawl root, `/tmp` vs
-/// `/private/tmp`), so the record survives the project moving.
+/// [`BuildMarker::extension_dir`] for `ext_dir` (one of the copy's
+/// installed extension dirs, [`find_ruby`]): relative to `home`, compared
+/// canonically too (Ruby and the crawler may spell the same dir
+/// differently: a relative crawl root, `/tmp` vs `/private/tmp`), so the
+/// record survives the project moving.
 fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
     let canonical_rel = || {
         let (home, ext) = (canonical(home)?, canonical(ext_dir)?);
@@ -769,7 +852,9 @@ fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
 /// `Ok(true)` when this call made the backup.
 fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
-    if backup.exists() || copy.gem_dir.join(MARKER_FILE).exists() {
+    if std::fs::symlink_metadata(&backup).is_ok()
+        || std::fs::symlink_metadata(copy.gem_dir.join(MARKER_FILE)).is_ok()
+    {
         return Ok(false);
     }
     let stage = copy.gem_dir.join(format!("{BACKUP_DIR}.tmp"));
@@ -807,14 +892,18 @@ fn back_up_original(copy: &GemCopy, probe: &Probe) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// The lib copies of an extension dir's artifacts, read into memory:
-/// `(gem-dir-relative path, bytes)`.
-fn snapshot_lib_copies(copy: &GemCopy, probe: &Probe, rels: &[String]) -> Vec<(String, Vec<u8>)> {
+/// One lib copy read into memory: gem-dir-relative path, bytes, mode.
+type LibSnapshot = (String, Vec<u8>, std::fs::Permissions);
+
+/// The lib copies of an extension dir's artifacts, read into memory.
+fn snapshot_lib_copies(copy: &GemCopy, probe: &Probe, rels: &[String]) -> Vec<LibSnapshot> {
     rels.iter()
         .filter_map(|rel| lib_rel(probe, rel))
         .filter_map(|lib| {
-            let bytes = std::fs::read(copy.gem_dir.join(&lib)).ok()?;
-            Some((lib, bytes))
+            let path = copy.gem_dir.join(&lib);
+            let perms = std::fs::metadata(&path).ok()?.permissions();
+            let bytes = std::fs::read(&path).ok()?;
+            Some((lib, bytes, perms))
         })
         .collect()
 }
@@ -824,7 +913,7 @@ struct Aside {
     /// The previous extension dir, renamed beside itself.
     old_ext: Option<PathBuf>,
     /// The previous build's lib copies.
-    lib: Vec<(String, Vec<u8>)>,
+    lib: Vec<LibSnapshot>,
     /// The previous marker's bytes.
     marker: Option<Vec<u8>>,
 }
@@ -876,7 +965,7 @@ fn put_back(copy: &GemCopy, probe: &Probe, aside: Aside) -> std::io::Result<()> 
     } else {
         Vec::new()
     };
-    let kept: Vec<&str> = aside.lib.iter().map(|(p, _)| p.as_str()).collect();
+    let kept: Vec<&str> = aside.lib.iter().map(|(p, _, _)| p.as_str()).collect();
     for rel in &produced {
         if let Some(lib) = lib_rel(probe, rel) {
             if !kept.contains(&lib.as_str()) {
@@ -888,8 +977,11 @@ fn put_back(copy: &GemCopy, probe: &Probe, aside: Aside) -> std::io::Result<()> 
     if let Some(old) = &aside.old_ext {
         std::fs::rename(old, ext)?;
     }
-    for (lib, bytes) in &aside.lib {
-        std::fs::write(copy.gem_dir.join(lib), bytes)?;
+    for (lib, bytes, perms) in &aside.lib {
+        replace_file(&copy.gem_dir.join(lib), |stage| {
+            std::fs::write(stage, bytes)?;
+            std::fs::set_permissions(stage, perms.clone())
+        })?;
     }
     if let Some(marker) = &aside.marker {
         std::fs::write(copy.gem_dir.join(MARKER_FILE), marker)?;
@@ -931,8 +1023,12 @@ fn commit_build(
     let bytes = serde_json::to_vec_pretty(&marker).map_err(std::io::Error::other)?;
     let marker_path = copy.gem_dir.join(MARKER_FILE);
     let stage = copy.gem_dir.join(format!("{MARKER_FILE}.tmp"));
-    std::fs::write(&stage, bytes)?;
-    std::fs::rename(&stage, &marker_path)?;
+    if let Err(e) =
+        std::fs::write(&stage, bytes).and_then(|()| std::fs::rename(&stage, &marker_path))
+    {
+        let _ = std::fs::remove_file(&stage);
+        return Err(e);
+    }
     if let Some(old) = &aside.old_ext {
         let _ = remove_dir_if_exists(old);
     }
@@ -981,14 +1077,18 @@ async fn rebuild(
     };
     let built = run_ruby(&probe.ruby, "build", copy, env, BUILD_TIMEOUT).await;
     let (copy, probe, scope, files) = (copy.clone(), probe.clone(), scope.clone(), files.clone());
-    crate::utils::fs::run_blocking(move || match built {
-        Ok(_) => commit_build(&copy, &probe, &scope, &files, &aside).map_err(|e| {
-            format!(
-                "the extension built, but its build record could not be written ({e}); \
-                 `vex` will not attest it until `apply` runs again"
-            )
-        }),
-        Err(diagnostic) => match put_back(&copy, &probe, aside) {
+    crate::utils::fs::run_blocking(move || {
+        // A build whose record cannot be written is undone like a failed
+        // one: an unrecorded build would never be attested, and the caller
+        // puts the original sources back.
+        let diagnostic = match built {
+            Ok(_) => match commit_build(&copy, &probe, &scope, &files, &aside) {
+                Ok(()) => return Ok(()),
+                Err(e) => format!("the extension built, but its build record could not be written: {e}"),
+            },
+            Err(diagnostic) => diagnostic,
+        };
+        match put_back(&copy, &probe, aside) {
             Ok(()) => {
                 drop_new_backup(&copy, made_backup);
                 Err(diagnostic)
@@ -998,7 +1098,7 @@ async fn rebuild(
                  --extensions` to rebuild it)",
                 gem_name_of(&copy.full_name)
             )),
-        },
+        }
     })
     .await
 }
@@ -1069,6 +1169,23 @@ pub async fn apply_gem_package_patch(
         return plain().await;
     }
     let inputs = list_inputs(&scope);
+    // `--no-gem-native-rebuild`: the caller compiles the extension itself
+    // (the patches evaluation harness does), so the sources are written as
+    // before #1996, and the warning says the build is the caller's.
+    if !env.rebuild {
+        let mut applied = plain().await;
+        if applied.result.success {
+            applied.warning = Some((
+                NOT_REBUILT_REASON.to_string(),
+                format!(
+                    "{package_key}: the patch changes native-extension sources ({inputs}), \
+                     written without rebuilding the extension (--no-gem-native-rebuild); Ruby \
+                     loads the old build until it is recompiled, and vex does not attest it"
+                ),
+            ));
+        }
+        return applied;
+    }
     let hosted_hint = "Use `socket-patch scan --mode hosted`, which installs the patched gem \
                        through Bundler so RubyGems compiles it.";
     let Some(copy) = copy else {
@@ -1239,6 +1356,16 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
         crate::utils::fs::run_blocking(move || read_marker_sync(&gem_dir)).await
     };
     let backup = copy.gem_dir.join(BACKUP_DIR);
+    let pristine_hint = format!(
+        "run `gem pristine {} --extensions`",
+        gem_name_of(&copy.full_name)
+    );
+    if is_symlink(&backup) {
+        return Err(format!(
+            "{} is a symlink, not a backup this tool made; left as it is, {pristine_hint}",
+            backup.display()
+        ));
+    }
     let has_backup = tokio::fs::metadata(backup.join(BACKUP_INFO)).await.is_ok();
     if has_backup {
         let c = copy.clone();
@@ -1255,6 +1382,13 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
     }
     if marker.is_none() {
         return Ok(false);
+    }
+    if !env.rebuild {
+        return Err(format!(
+            "the compiled extension still holds the patched build, and no backup of the \
+             original is left to restore without a rebuild (--no-gem-native-rebuild); \
+             {pristine_hint}"
+        ));
     }
     // No backup: rebuild from the restored sources.
     let probe = find_ruby(&copy, env).await.map_err(|why| {
@@ -1279,16 +1413,25 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
 }
 
 /// Put the backed-up original build back over socket-patch's build, then
-/// drop the marker and the backup.
+/// drop the marker and the backup. The extension dir the backup names must
+/// be this gem's under the home ([`confined_ext_dir`]) and no symlink, or
+/// nothing is touched.
 fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Result<()> {
     let backup = copy.gem_dir.join(BACKUP_DIR);
     let info: BackupInfo = serde_json::from_slice(&std::fs::read(backup.join(BACKUP_INFO))?)
         .map_err(std::io::Error::other)?;
-    let ext_dir = BuildMarker {
-        extension_dir: info.extension_dir.clone(),
-        ..BuildMarker::default()
-    }
-    .extension_dir_in(&copy.home);
+    let ext_dir = confined_ext_dir(copy, &info.extension_dir)
+        .filter(|dir| !is_symlink(dir))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "the backup names {:?}, which is not this gem's extension dir under {}",
+                    info.extension_dir,
+                    copy.home.display()
+                ),
+            )
+        })?;
     // socket-patch's lib copies go; the originals come back.
     for lib in marker.iter().flat_map(|m| m.lib_artifacts.keys()) {
         if is_safe_relative_subpath(lib) && !info.lib_files.contains(lib) {
@@ -1303,11 +1446,10 @@ fn restore_backup(copy: &GemCopy, marker: Option<&BuildMarker>) -> std::io::Resu
         if !is_safe_relative_subpath(lib) {
             continue;
         }
-        let dst = copy.gem_dir.join(lib);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(backup.join("lib").join(lib), &dst)?;
+        let src = backup.join("lib").join(lib);
+        replace_file(&copy.gem_dir.join(lib), |stage| {
+            std::fs::copy(&src, stage).map(|_| ())
+        })?;
     }
     match std::fs::remove_file(copy.gem_dir.join(MARKER_FILE)) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
@@ -1355,11 +1497,13 @@ mod tests {
             "# s.extensions = [\"ext/a/extconf.rb\"]\n",
             "raise if s.extensions == [\"e\"]\n",
             "s.extensions_dir = \"x\"\n",
-            "s.extensions = []\n",
-            "s.extensions = [].freeze\n",
         ] {
             assert!(!parse_extensions(spec).declared, "{spec}");
         }
+        // The vendored backend's test, `.push` / `.concat` included.
+        let pushed = parse_extensions("s.extensions.push(\"ext/a/extconf.rb\")\n");
+        assert!(pushed.declared);
+        assert_eq!(pushed.entries, vec!["ext/a/extconf.rb"]);
         let decl = parse_extensions("s.extensions = EXTS\n");
         assert!(decl.declared);
         assert!(decl.entries.is_empty());
@@ -1415,6 +1559,47 @@ mod tests {
         assert!(ruby_only.inputs.is_empty());
     }
 
+    /// Non-compiled C / Objective-C files outside `ext/` in a gem that builds
+    /// nothing (templates, fixtures) are plain files.
+    #[test]
+    fn classify_without_extensions_ignores_c_outside_ext() {
+        let scope = classify(
+            &ExtensionDecl::default(),
+            &files(&["lib/templates/App.m", "test/fixtures/a.c", "lib/a.h"]),
+        );
+        assert!(scope.inputs.is_empty());
+    }
+
+    /// A root-level script makes the files beside it inputs, not `lib/`.
+    #[test]
+    fn classify_root_level_script_counts_top_level_files_only() {
+        let decl = ExtensionDecl {
+            declared: true,
+            entries: vec!["extconf.rb".into()],
+        };
+        let scope = classify(&decl, &files(&["extconf.rb", "foo.c", "lib/foo.rb"]));
+        assert_eq!(scope.inputs, vec!["extconf.rb", "foo.c"]);
+    }
+
+    #[test]
+    fn confined_ext_dir_only_names_this_gems_dir_under_home() {
+        let copy = GemCopy::of(Path::new("/h/gems/a-1")).unwrap();
+        assert_eq!(
+            confined_ext_dir(&copy, "extensions/p/3.4.0/a-1"),
+            Some(PathBuf::from("/h/extensions/p/3.4.0/a-1"))
+        );
+        for bad in [
+            "/home/ci",
+            "../../../..",
+            "extensions/p/3.4.0/other-1",
+            "extensions/../../x/a-1",
+            "extensions/p/a-1",
+            "gems/p/3.4.0/a-1",
+        ] {
+            assert_eq!(confined_ext_dir(&copy, bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn unknown_scripts_make_ext_tree_native() {
         let decl = ExtensionDecl {
@@ -1461,12 +1646,12 @@ mod tests {
     fn probe_output_parses() {
         let probe = parse_probe(
             Path::new("/r"),
-            "gem_dir\t/h/gems/a-1\nextension_dir\t/h/extensions/p/3.4.0/a-1\nlib_dir\t/h/gems/a-1/lib\nextension\text/a/extconf.rb\n",
+            "warning: a shim talking\nsp_gem_dir\t/h/gems/a-1\nsp_extension_dir\t/h/extensions/p/3.4.0/a-1\nother\tline\nsp_lib_dir\t/h/gems/a-1/lib\nsp_extension\text/a/extconf.rb\n",
         )
         .unwrap();
         assert_eq!(probe.extensions, vec!["ext/a/extconf.rb"]);
         assert_eq!(lib_rel(&probe, "a/a.so").as_deref(), Some("lib/a/a.so"));
-        assert!(parse_probe(Path::new("/r"), "gem_dir\t/x\n").is_none());
+        assert!(parse_probe(Path::new("/r"), "sp_gem_dir\t/x\n").is_none());
     }
 
     #[test]
@@ -1531,6 +1716,40 @@ mod tests {
         gem_dir
     }
 
+    /// A planted backup naming a dir outside this gem's extension dir is
+    /// refused before anything is deleted.
+    #[tokio::test]
+    async fn rollback_refuses_a_backup_naming_another_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep"), b"x").unwrap();
+        let gem_dir = rebuilt_gem(&home, true);
+        for label in [victim.display().to_string(), "../../victim".to_string()] {
+            let info = BackupInfo {
+                extension_dir: label,
+                had_extension_dir: true,
+                lib_files: Vec::new(),
+            };
+            std::fs::write(
+                gem_dir.join(BACKUP_DIR).join(BACKUP_INFO),
+                serde_json::to_vec(&info).unwrap(),
+            )
+            .unwrap();
+            let env = RubyEnv {
+                cwd: home.clone(),
+                rebuild: true,
+            };
+            assert!(restore_original_build(&gem_dir, &env).await.is_err());
+            assert!(
+                victim.join("keep").is_file(),
+                "nothing outside the gem home goes"
+            );
+            assert!(home.join("extensions/p/3.4.0/a-1/a/a.so").is_file());
+        }
+    }
+
     #[tokio::test]
     async fn rollback_restores_the_backed_up_build() {
         for with_marker in [true, false] {
@@ -1539,6 +1758,7 @@ mod tests {
             let gem_dir = rebuilt_gem(home, with_marker);
             let env = RubyEnv {
                 cwd: home.to_path_buf(),
+                rebuild: true,
             };
             assert_eq!(restore_original_build(&gem_dir, &env).await, Ok(true));
             let ext = home.join("extensions/p/3.4.0/a-1");

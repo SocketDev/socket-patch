@@ -3294,6 +3294,7 @@ pub(crate) async fn rollback_patches_inner(
                         use socket_patch_core::patch::gem_ext;
                         let env = gem_ext::RubyEnv {
                             cwd: common.cwd.clone(),
+                            rebuild: !common.no_gem_native_rebuild,
                         };
                         if let Err(e) = gem_ext::restore_original_build(pkg_path, &env).await {
                             result.success = false;

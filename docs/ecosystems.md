@@ -1726,6 +1726,10 @@ tail of the build output. When it can't rebuild at all (a precompiled platform g
 checkout, or no matching Ruby), nothing is written and the package fails with
 `native_extensions_unsupported`. Use hosted mode for those.
 
+A tool that compiles the extension itself after `apply` (as the patches evaluation harness does)
+passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sources are written
+without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
+
 `apply` keeps the install-time build in `.socket-patch-native-orig/` inside the gem directory, so
 `rollback` restores it without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the

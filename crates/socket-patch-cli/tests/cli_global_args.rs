@@ -126,6 +126,9 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--no-vlt-install-cleanup", None, |c| {
             assert!(c.no_vlt_install_cleanup)
         }),
+        ("--no-gem-native-rebuild", None, |c| {
+            assert!(c.no_gem_native_rebuild)
+        }),
         ("--lock-timeout", Some("30"), |c| {
             assert_eq!(c.lock_timeout, Some(30))
         }),
@@ -233,6 +236,7 @@ fn global_flag_cases_cover_every_global_field() {
         no_trust_lockfile_config: _,
         no_npm_allow_remote_config: _,
         no_vlt_install_cleanup: _,
+        no_gem_native_rebuild: _,
         strict: _,
         allow_patch_conflicts: _,
         vendor_source: _,
@@ -241,11 +245,11 @@ fn global_flag_cases_cover_every_global_field() {
         maven_config: _,
     } = common;
 
-    // 27 fields ↔ 27 long-flag cases. Bump both this count and add a case when
+    // 28 fields ↔ 28 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        27,
+        28,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 }
@@ -592,7 +596,7 @@ fn bool_env_vars_reject_zero_and_falsey() {
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
     // (env var, accessor) for every boolean global.
-    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 13] = [
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 14] = [
         ("SOCKET_OFFLINE", |c| c.offline),
         ("SOCKET_STRICT", |c| c.strict),
         ("SOCKET_GLOBAL", |c| c.global),
@@ -612,6 +616,7 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
         ("SOCKET_NO_VLT_INSTALL_CLEANUP", |c| {
             c.no_vlt_install_cleanup
         }),
+        ("SOCKET_NO_GEM_NATIVE_REBUILD", |c| c.no_gem_native_rebuild),
     ];
 
     for (var, accessor) in bool_vars {

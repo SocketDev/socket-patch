@@ -47,7 +47,11 @@ pub(crate) async fn fresh_copy(
 /// the skip is not pruned, so its contents are still copied and must create
 /// the skipped directory on demand (it then exists in the copy only when it
 /// has contents, as it always has).
-fn copy_tree_blocking(src: &Path, dst: &Path, skip_file_name: Option<&str>) -> std::io::Result<()> {
+pub(crate) fn copy_tree_blocking(
+    src: &Path,
+    dst: &Path,
+    skip_file_name: Option<&str>,
+) -> std::io::Result<()> {
     force_remove_dir_all(dst)?;
     std::fs::create_dir_all(dst)?;
     // Depth of the outermost skipped directory the walk is inside.

@@ -2720,6 +2720,7 @@ async fn apply_patches_inner(
                             policy,
                             &gem_ext::RubyEnv {
                                 cwd: args.common.cwd.clone(),
+                                rebuild: !args.common.no_gem_native_rebuild,
                             },
                         )
                         .await;

@@ -458,3 +458,39 @@ fn patched_sources_over_the_install_time_build_do_not_check_clean() {
         "{stdout}\n{stderr}"
     );
 }
+
+/// `--no-gem-native-rebuild` / `SOCKET_NO_GEM_NATIVE_REBUILD` (a caller
+/// that compiles the extension itself, such as the patches evaluation
+/// harness): the sources are written with no Ruby involved, the run
+/// succeeds with a `native_extension_not_rebuilt` warning, and nothing of
+/// socket-patch's build is left behind.
+#[test]
+fn opted_out_native_patch_writes_sources_without_a_build() {
+    for opt_out in [
+        &["apply", "--json", "--no-gem-native-rebuild"][..],
+        &["apply", "--json"][..],
+    ] {
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+        let empty = proj.join(".empty-path");
+        std::fs::create_dir_all(&empty).unwrap();
+        let path = empty.display().to_string();
+        let mut env = vec![("PATH", path.as_str())];
+        if opt_out.len() == 2 {
+            env.push(("SOCKET_NO_GEM_NATIVE_REBUILD", "1"));
+        }
+        let (code, stdout, stderr) = common::run_with_env(&proj, opt_out, &env);
+        assert_eq!(code, 0, "{stdout}\n{stderr}");
+        assert_eq!(event_action(&stdout), "applied", "{stdout}");
+        assert!(stdout.contains("native_extension_not_rebuilt"), "{stdout}");
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(2)
+        );
+        assert!(!gem_dir.join(".socket-patch-native-build.json").exists());
+        assert!(!gem_dir.join(".socket-patch-native-orig").exists());
+        // The build Ruby loads is still the old one: no attestation.
+        let (code, stdout, _) = run_without_ruby(&proj, &["apply", "--check", "--json"]);
+        assert_ne!(code, 0, "{stdout}");
+    }
+}
