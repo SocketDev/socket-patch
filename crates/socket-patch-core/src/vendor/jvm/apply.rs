@@ -993,12 +993,15 @@ pub fn recorded_tree_files(entry: &VendorEntry) -> BTreeSet<String> {
         .collect()
 }
 
-/// Whether the project still wires the JVM `entry` for `vex` (see
-/// [`entry_wired_checked`]).
+/// Whether the project provably still wires the JVM `entry` (see
+/// [`entry_wired_checked`]): the liveness every attesting reader of the
+/// vendor ledger applies. Fails closed: a file that cannot be read or
+/// parsed proves nothing wired, so the answer is `false`. Callers that
+/// must not delete on an unknown answer (the `scan --prune` GC) ask
+/// [`entry_references`] instead, which keeps the tree then; `vex` uses the
+/// checked variant to report the diagnostic.
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
-    // Failure to read does not prove that deleting a tree is safe. Attestation
-    // uses the checked variant and reports the diagnostic instead.
-    entry_wired_checked(root, entry).unwrap_or(true)
+    entry_wired_checked(root, entry).unwrap_or(false)
 }
 
 /// Whether the project still references the JVM `entry`'s tree (its
@@ -1026,7 +1029,7 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
         scala_cli::wired_checked(&read, &c).unwrap_or(true)
     } else {
         let (maven, gradle) = sides(&entry.wiring);
-        (maven && maven_reactor::wired_checked(&read, &list, &c).unwrap_or(true))
+        (maven && maven_reactor::references_checked(&read, &list, &c).unwrap_or(true))
             || (gradle && gradle::references_checked(&read, &c).unwrap_or(true))
     };
     // `read` answers `None` for an unreadable file as for a missing one;
@@ -1435,6 +1438,35 @@ mod tests {
             .unwrap();
             assert!(entry_references(dir.path(), &gradle_entry()));
         }
+    }
+
+    /// A reactor pom the reader cannot read proves nothing either way:
+    /// liveness for attestation (`vex`, `vendor`'s kept-patch rule, `scan`'s
+    /// takeover classifier) answers "not live", while the `scan --prune`
+    /// GC's [`entry_references`] still keeps the tree.
+    #[tokio::test]
+    async fn an_unreadable_pom_is_not_live_but_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version><packaging>pom</packaging>\
+             <modules><module>m</module></modules><dependencies><dependency>\
+             <groupId>g</groupId><artifactId>a</artifactId><version>1-socket.1d3c1fd2</version>\
+             </dependency></dependencies></project>",
+        )
+        .unwrap();
+        // The module's pom is a directory: unreadable, not missing.
+        std::fs::create_dir_all(root.join("m/pom.xml")).unwrap();
+        let e = entry(vec![record(POM_FRAGMENT_KIND, "pom.xml")]);
+        assert!(is_jvm_entry(&e));
+        assert!(entry_wired_checked(root, &e).is_err());
+        assert!(!entry_wired(root, &e));
+        let discovery = crate::vex::discover::Discovery::default();
+        assert!(!discovery.vendor_entry_live(root, &e).await);
+        assert!(entry_references(root, &e));
+        assert_eq!(discovery.vendor_entry_in_use(root, &e).await, Some(true));
     }
 
     #[test]

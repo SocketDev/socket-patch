@@ -551,6 +551,19 @@ pub(crate) fn may_shadow(
         && may_name(dep_artifact, artifact)
 }
 
+/// The classifiers whose jars never run on a classpath: `sources` and
+/// `javadoc`. Every other classifier copy of a patched GA (tests, a native
+/// or JDK-specific build) carries code, so it must resolve the patched
+/// release too. The hosted rewriter, VEX discovery and the vendored
+/// reactor's attestation share this rule.
+pub(crate) const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
+
+/// Whether a `<classifier>` copy of a GA carries code onto a classpath
+/// (see [`NON_EXECUTABLE_CLASSIFIERS`]).
+pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
+    !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
+}
+
 fn is_property_name(name: &str) -> bool {
     !name.is_empty()
         && name

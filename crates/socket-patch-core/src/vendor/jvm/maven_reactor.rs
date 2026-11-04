@@ -516,13 +516,34 @@ pub fn unplan(
     }
 }
 
-/// Whether a pom of the reactor still declares `c`'s suffixed version
-/// (outside comments): the liveness proof `vex` needs for this layout.
+/// [`wired_checked`], `false` when the reactor cannot be read.
 pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
     wired_checked(read, list, c).unwrap_or(false)
 }
 
+/// Whether a declaration Maven always reads wires `c`: a `<dependencies>`
+/// or `<dependencyManagement>` entry of a reactor pom (outside
+/// `<profiles>`, `<build>` and `<reporting>`) naming `c`'s main jar at its
+/// suffixed version — literally or through a property the checkout defines
+/// — or the root's pin. The liveness proof `vex` needs for this layout:
+/// the suffixed version left only in a build plugin's dependencies, a
+/// profile, an unused property, a comment or a classifier copy does not
+/// put the patched jar on the project's classpath.
 pub fn wired_checked(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+) -> Result<bool, JvmRefusal> {
+    Reactor::discover(read, list).map(|reactor| reactor.wires(c))
+}
+
+/// Whether a pom of the reactor still names `c`'s suffixed version
+/// anywhere outside comments — a declaration, a build plugin's dependency,
+/// a profile or a property: anything that may still resolve from the tree
+/// (the maven.config tail serves plugin resolution too), so what the
+/// `scan --prune` GC must not revert from under the build. Broader than
+/// [`wired_checked`], which is what attests.
+pub fn references_checked(
     read: ReadFn<'_>,
     list: ListFn<'_>,
     c: &Coords<'_>,
@@ -608,11 +629,7 @@ pub fn attestable_checked(
 ) -> Result<bool, JvmRefusal> {
     let sv = c.suffixed_version();
     let reactor = Reactor::discover(read, list)?;
-    if !reactor
-        .scope
-        .iter()
-        .any(|rel| reactor.poms[rel].doc.masked.contains(&sv))
-    {
+    if !reactor.wires(c) {
         return Ok(false);
     }
     let patch = JvmPatch {
@@ -1724,6 +1741,29 @@ impl Reactor {
         roots
     }
 
+    /// Whether a pom of the scope declares `c`'s main jar at its suffixed
+    /// version where Maven always reads it (see [`wired_checked`]).
+    fn wires(&self, c: &Coords<'_>) -> bool {
+        let sv = c.suffixed_version();
+        self.scope.iter().any(|rel| {
+            let doc = &self.poms[rel].doc;
+            let resolve = |v: &str| self.interpolate(rel, v, 0);
+            let value = |dep: usize, name: &str| doc.coordinate(dep, name, &resolve);
+            doc.declarations().into_iter().any(|dep| {
+                !doc.section_of(dep).starts_with("profile:")
+                    && value(dep, "groupId").as_deref() == Some(c.group_id)
+                    && value(dep, "artifactId").as_deref() == Some(c.artifact_id)
+                    && doc
+                        .child_text(dep, "type")
+                        .is_none_or(|t| t.is_empty() || t == "jar")
+                    && doc
+                        .child_text(dep, "classifier")
+                        .is_none_or(|t| t.is_empty())
+                    && value(dep, "version").as_deref() == Some(sv.as_str())
+            })
+        })
+    }
+
     /// The g:a declarations of `rel`, with `${...}` coordinates
     /// interpolated in its context.
     fn keyed_declarations(&self, rel: &str, g: &str, a: &str) -> Vec<(usize, String)> {
@@ -1881,14 +1921,31 @@ impl Reactor {
                 continue;
             }
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
-            if doc
-                .child_text(dep, "classifier")
-                .is_some_and(|c| !c.is_empty())
-            {
+            if let Some(classifier) = doc.child_text(dep, "classifier").filter(|c| !c.is_empty()) {
                 warnings.push(degraded(
                     "classifier_declared",
                     format!("{at}: a classifier variant of {ga} bypasses the pin"),
                 ));
+                // The classifier-less pin does not retarget the copy and the
+                // tree serves only the main jar, so Maven fetches the public
+                // release: an executable copy (tests, a native build) keeps
+                // the unpatched code on the classpath, which hosted mode and
+                // VEX discovery refuse to attest too. Only a used copy
+                // counts; a managed entry alone puts nothing on a classpath.
+                let resolved = || {
+                    let v = doc.child_text(dep, "version")?;
+                    if v.contains("${") {
+                        self.interpolate(rel, &v, 0)
+                    } else {
+                        Some(v)
+                    }
+                };
+                if !doc.section_of(dep).ends_with("dependencyManagement")
+                    && crate::formats::maven::is_executable_classifier(&classifier)
+                    && resolved().as_deref() != Some(sv)
+                {
+                    uncertain.insert(at);
+                }
                 continue;
             }
             let root = self.local_root(rel);
@@ -5905,6 +5962,129 @@ mod tests {
             ("b/pom.xml", &module("b", &dep("1.10.0"))),
         ]);
         let (_, after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+    }
+
+    /// A `<classifier>` copy of the GA is its own coordinate: the
+    /// classifier-less pin does not retarget it and the vendored tree does
+    /// not serve it, so Maven fetches the public release. An executable
+    /// one (tests, a native build) keeps the unpatched code on the
+    /// classpath: not attestable, as in hosted mode and VEX discovery.
+    /// `sources` / `javadoc` jars never run, so they only warn.
+    #[test]
+    fn an_executable_classifier_copy_is_not_attestable() {
+        let classified = |classifier: &str, version: &str| {
+            format!(
+                "<dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId><version>{version}</version>\
+                 <classifier>{classifier}</classifier></dependency>"
+            )
+        };
+        for (classifier, version, attests) in [
+            ("tests", "1.10.0", false),
+            ("linux-x86_64", "1.10.0", false),
+            // Not the base release, but still not the patched one.
+            ("tests", "1.9", false),
+            // Versioned by a profile's property: the base once it is active.
+            ("tests", "${ct.tests}", false),
+            ("sources", "1.10.0", true),
+            ("javadoc", "1.10.0", true),
+        ] {
+            let b = if version.starts_with("${") {
+                with_profile(
+                    &module("b", &classified(classifier, version)),
+                    "t",
+                    "<ct.tests>1.10.0</ct.tests>",
+                )
+            } else {
+                module("b", &classified(classifier, version))
+            };
+            let files = fs(&[
+                ("pom.xml", ROOT),
+                ("a/pom.xml", &module("a", &dep("1.10.0"))),
+                ("b/pom.xml", &b),
+            ]);
+            let (plan, after) = vendor(&files);
+            assert_eq!(reasons(&plan), ["classifier_declared"], "{classifier}");
+            assert_eq!(text(&after, "a/pom.xml"), module("a", &dep(SV)));
+            assert_eq!(
+                attestable(&after),
+                (true, attests),
+                "{classifier} {version}"
+            );
+        }
+        // A classifier copy added inside a profile after vendoring.
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (_, mut after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+        let b = module("b", "").replace(
+            "  <dependencies>",
+            &format!(
+                "  <profiles><profile><id>it</id><dependencies>{}</dependencies></profile>\
+                 </profiles>\n  <dependencies>",
+                classified("tests", "1.10.0")
+            ),
+        );
+        after.insert("b/pom.xml".into(), b.into_bytes());
+        assert_eq!(attestable(&after), (true, false));
+    }
+
+    /// Only a declaration Maven always reads wires the patch: a
+    /// `<dependencies>` / `<dependencyManagement>` entry of the GA's main
+    /// jar outside `<profiles>` whose version resolves to the suffixed
+    /// one. The suffixed version left in a build plugin's dependencies, a
+    /// profile, an unused property or another artifact's declaration
+    /// builds the base for the project's own classpath.
+    #[test]
+    fn a_suffixed_version_outside_the_declarations_is_not_wired() {
+        let plugin = format!(
+            "<build><plugins><plugin><groupId>p</groupId><artifactId>p</artifactId>\
+             <dependencies>{}</dependencies></plugin></plugins></build>",
+            dep(SV)
+        );
+        let profile = format!(
+            "<profiles><profile><id>p</id><dependencies>{}</dependencies></profile></profiles>",
+            dep(SV)
+        );
+        let property = format!("<properties><ct.version>{SV}</ct.version></properties>");
+        let other = dep(SV).replace("commons-text", "commons-lang3");
+        let classifier =
+            dep(SV).replace("</version>", "</version><classifier>sources</classifier>");
+        for extra in [plugin, profile, property, other.clone(), classifier.clone()] {
+            let a = if extra.starts_with("<dependency>") {
+                module("a", &extra)
+            } else {
+                module("a", "").replace("  <dependencies>", &format!("  {extra}\n  <dependencies>"))
+            };
+            let files = fs(&[
+                ("pom.xml", ROOT),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            assert_eq!(attestable(&files), (false, false), "{extra}");
+        }
+        // A property the declaration reads, and the root's managed pin, do.
+        let via_property = module("a", &dep("${ct.version}")).replace(
+            "  <dependencies>",
+            &format!("  <properties><ct.version>{SV}</ct.version></properties>\n  <dependencies>"),
+        );
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &via_property),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        assert_eq!(attestable(&files), (true, true));
+        let files = fs(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (_, after) = vendor(&files);
+        assert!(text(&after, "pom.xml").contains(SV));
         assert_eq!(attestable(&after), (true, true));
     }
 

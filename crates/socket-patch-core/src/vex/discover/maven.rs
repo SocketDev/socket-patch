@@ -712,11 +712,6 @@ fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
     map
 }
 
-/// The classifiers whose jars never run on a classpath. Every other
-/// classifier copy of a pinned GA (tests, a native or JDK-specific build)
-/// executes, so it must resolve the patched release too.
-const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
-
 /// The first live executable classifier copy of `group:artifact` that does
 /// not resolve `pinned`, with the version it resolves (`None` when this pom
 /// gives it none). Its version is its own literal, else a
@@ -734,7 +729,7 @@ fn unpatched_executable_classifier<'a>(
         .filter(|d| !d.managed)
         .filter_map(|d| {
             let classifier = d.classifier.as_deref()?;
-            (!NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)).then_some((d, classifier))
+            crate::formats::maven::is_executable_classifier(classifier).then_some((d, classifier))
         })
         .find_map(|(d, classifier)| {
             let version = d.version.as_deref().or_else(|| {
