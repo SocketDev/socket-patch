@@ -14,6 +14,8 @@ use crate::utils::purl::npm_purl;
 use crate::vendor::npm_flavor::NpmLockFlavor;
 
 use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
+#[cfg(test)]
+use super::dedup_prefer_integrity;
 use super::npm::inventory_package_lock_in;
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_pnpm_member_locks_in,
@@ -22,7 +24,7 @@ use super::pnpm::{
 use super::view::ProjectView;
 use super::vlt::inventory_vlt_in;
 use super::yarn::{inventory_yarn_berry_in, inventory_yarn_classic_in};
-use super::{dedup_prefer_integrity, LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
+use super::{LockIntegrity, LockfileEntry, UnsupportedNpmLayout};
 use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
 
 // ── registry view ──
@@ -42,64 +44,73 @@ use crate::vendor::npm_flavor::detect_npm_lock_flavor_in;
 /// the pnpm <=2-era `shrinkwrap.yaml` (same v5 grammar, older filename) or,
 /// failing that, the workspace members' own locks. A pnpm workspace with
 /// `sharedWorkspaceLockfile: false` reads those beside its root lock
-/// ([`inventory_pnpm_member_locks_in`], #492).
-/// Rush's common and subspace locks are read beside whatever this picks
-/// whenever `rush.json` is present ([`inventory_npm_lock_raw_in`]).
+/// ([`inventory_pnpm_member_locks_in`], #492). The flavor names that
+/// routed lock; Rush's locks, which no flavor routes, are read beside it by
+/// [`inventory_npm_trees_raw_in`].
 #[cfg(test)]
 pub(crate) async fn inventory_npm_lock(
     project_root: &Path,
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
-    inventory_npm_lock_in(&ProjectView::Disk(project_root)).await
-}
-
-/// [`inventory_npm_lock`] over a [`ProjectView`].
-pub(super) async fn inventory_npm_lock_in(
-    view: &ProjectView<'_>,
-) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
-    inventory_npm_lock_raw_in(view)
+    let view = ProjectView::Disk(project_root);
+    let rush = view.exists("rush.json").await;
+    inventory_npm_lock_raw_in(&view, rush)
         .await
         .map(|found| found.map(|(flavor, raw)| (flavor, dedup_prefer_integrity(raw))))
 }
 
-/// [`inventory_npm_lock`] before its collapse: every
-/// guarded instance ([`super::inventory_project_every_lock`]).
-///
-/// Two rules follow lockfile discovery (`vex::discover::npm`'s
-/// `extract_pnpm`), which reads what hosted mode pins:
-///
-/// * Rush's common and subspace locks are separate install trees, read
-///   whenever `rush.json` is present, beside whatever the router chose
-///   (before: only when the root had no lock; lock-model divergence N12).
-/// * pnpm's `lockfile` setting off ([`lockfile_disabled`], not under Rush,
-///   which runs pnpm with settings of its own): pnpm neither reads nor
-///   writes the root or member locks, so a Socket-hosted pin in them is no
-///   lockfile basis. Discovery keeps such a ref but withholds its lock pin;
-///   here the entry stays listed (what it names is still the dependency
-///   set, and its hosted url still shows liveness the wiring) with its
-///   integrity dropped, so nothing verifies or fetches against the pin
-///   (N14). Registry entries keep theirs: a registry release's integrity
-///   is its content verifier whether or not pnpm reads the lock.
-pub(super) async fn inventory_npm_lock_raw_in(
+/// Every npm-family tree the inventory reads, collapsed: what
+/// [`super::inventory_project`] lists for npm.
+#[cfg(test)]
+pub(crate) async fn inventory_npm_trees(
+    project_root: &Path,
+) -> Result<Vec<LockfileEntry>, UnsupportedNpmLayout> {
+    inventory_npm_trees_raw_in(&ProjectView::Disk(project_root))
+        .await
+        .map(dedup_prefer_integrity)
+}
+
+/// Every guarded npm-family instance, uncollapsed: the routed lock
+/// ([`inventory_npm_lock`]) and, whenever `rush.json` is present, Rush's
+/// common and subspace locks, separate install trees beside it as hosted
+/// mode and lockfile discovery read them (before: only when the root had
+/// no lock; lock-model divergence N12).
+pub(super) async fn inventory_npm_trees_raw_in(
     view: &ProjectView<'_>,
+) -> Result<Vec<LockfileEntry>, UnsupportedNpmLayout> {
+    let rush = view.exists("rush.json").await;
+    let mut out = inventory_npm_lock_raw_in(view, rush)
+        .await?
+        .map(|(_, entries)| entries)
+        .unwrap_or_default();
+    if rush {
+        out.extend(guard_npm(inventory_rush_pnpm_locks_in(view).await));
+    }
+    Ok(out)
+}
+
+/// The routed lock's guarded instances ([`inventory_npm_lock`] before its
+/// collapse). With pnpm's `lockfile` setting off ([`lockfile_disabled`];
+/// not under Rush, `rush` being whether `rush.json` exists, which runs
+/// pnpm with settings of its own, as in lockfile discovery's
+/// `extract_pnpm`), pnpm neither reads nor writes the root or member
+/// locks, so a Socket-hosted pin in them is no lockfile basis. Discovery
+/// keeps such a ref but withholds its lock pin; here the entry stays
+/// listed (what it names is still the dependency set, and its hosted url
+/// still shows ledger liveness the wiring) with its integrity dropped, so
+/// nothing verifies or fetches against the pin (N14). Registry entries
+/// keep theirs: a registry release's integrity is its content verifier
+/// whether or not pnpm reads the lock.
+async fn inventory_npm_lock_raw_in(
+    view: &ProjectView<'_>,
+    rush: bool,
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     let mut found = inventory_npm_router_lock_raw_in(view).await?;
-    let rush = view.exists("rush.json").await;
     if let Some((NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy, entries)) = &mut found {
         if !rush && lockfile_disabled(view, false).await.is_some() {
             withhold_hosted_pins(entries);
         }
     }
-    let rush = guard_npm(inventory_rush_pnpm_locks_in(view).await);
-    if rush.is_empty() {
-        return Ok(found);
-    }
-    Ok(Some(match found {
-        Some((flavor, mut entries)) => {
-            entries.extend(rush);
-            (flavor, entries)
-        }
-        None => (NpmLockFlavor::Pnpm, rush),
-    }))
+    Ok(found)
 }
 
 /// Drop the integrity of every entry resolving from Socket's patch server
@@ -118,7 +129,7 @@ fn withhold_hosted_pins(entries: &mut [LockfileEntry]) {
 }
 
 /// The lock the npm flavor router picks, with its fallbacks (see
-/// [`inventory_npm_lock`]); Rush's locks are added by the caller.
+/// [`inventory_npm_lock`]).
 async fn inventory_npm_router_lock_raw_in(
     view: &ProjectView<'_>,
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {

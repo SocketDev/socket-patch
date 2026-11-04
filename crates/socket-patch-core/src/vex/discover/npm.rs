@@ -53,9 +53,9 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use super::{
-    npm_purl, npm_vendored_tarball_names, parse_json, pnpm_document_tree, vendor_ref, CopyTarget,
-    DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef, UnattestedKind, UnwiredCopy,
-    VendorRef, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    npm_purl, npm_vendored_tarball_names, parse_json, vendor_ref, CopyTarget, DiscoverCtx,
+    Discovery, LocateOpts, Located, PatchedRef, TreePart, UnattestedKind, UnwiredCopy, VendorRef,
+    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{NPM_LOCKS, PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::pnpm::{
@@ -645,7 +645,7 @@ fn entry_ref(
 /// Every document of a lock is read. pnpm 11+'s env lockfile document
 /// (config dependencies, the pinned package manager; identified by its
 /// importers, [`PnpmLock::packages`]) is an install tree of its own
-/// ([`pnpm_document_tree`]): its refs are emitted, and they never contest
+/// ([`TreePart::PnpmEnv`]): its refs are emitted, and they never contest
 /// or are contested by the project document or another lock.
 ///
 /// ## Entries
@@ -755,19 +755,39 @@ async fn extract_pnpm_lock(
         return;
     }
     // Each document is its own install tree: pnpm 11+'s env lockfile is
-    // read under its own tree key ([`pnpm_document_tree`]), so its refs and
-    // the project document's entries never contest each other.
+    // read as [`TreePart::PnpmEnv`], so its refs and the project document's
+    // entries never contest each other.
     for document in lock.documents() {
-        let tree = pnpm_document_tree(file, document);
+        let tree = PnpmTree::of(file, document);
         extract_pnpm_document(ctx, &tree, &lock, document, disabled, out).await;
     }
 }
 
-/// The refs and copies of one document of a pnpm lock, recorded under the
-/// document's install-tree key `file` (see [`extract_pnpm_lock`]).
+/// One install tree of a pnpm lock: the lock's root-relative `file`, the
+/// [`TreePart`] its records carry, and the `label` its diagnostics name it
+/// by (`<file> (env lockfile)` for the env document).
+struct PnpmTree<'a> {
+    file: &'a str,
+    part: TreePart,
+    label: String,
+}
+
+impl<'a> PnpmTree<'a> {
+    fn of(file: &'a str, document: PnpmDocument) -> Self {
+        let part = TreePart::from(document);
+        let label = match part {
+            TreePart::File => file.to_string(),
+            TreePart::PnpmEnv => format!("{file} (env lockfile)"),
+        };
+        PnpmTree { file, part, label }
+    }
+}
+
+/// The refs and copies of one document of a pnpm lock, recorded in its
+/// install tree (see [`extract_pnpm_lock`]).
 async fn extract_pnpm_document(
     ctx: &DiscoverCtx<'_>,
-    file: &str,
+    tree: &PnpmTree<'_>,
     lock: &PnpmLock<'_>,
     document: PnpmDocument,
     disabled: Option<&str>,
@@ -778,17 +798,18 @@ async fn extract_pnpm_document(
     let mut withheld: BTreeSet<String> = BTreeSet::new();
     for package in lock.packages_of(document) {
         let withhold = disabled.map(|_| &mut withheld);
-        pnpm_entry_ref(ctx, file, package, &mut copies, withhold, out);
+        pnpm_entry_ref(ctx, tree, package, &mut copies, withhold, out);
         bundles.extend(entry_bundled(&package.entry).map(|b| (package.key, b)));
     }
-    record_pnpm_file_copies(ctx, file, copies, out).await;
-    record_pnpm_bundled_copies(file, bundles, out);
+    record_pnpm_file_copies(ctx, tree, copies, out).await;
+    record_pnpm_bundled_copies(tree, bundles, out);
+    let label = &tree.label;
     if let (Some(source), false) = (disabled, withheld.is_empty()) {
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
-            file,
+            tree.file,
             format!(
-                "{file}: {}, so its hosted pins of {} are not attested from the lock alone, \
+                "{label}: {}, so its hosted pins of {} are not attested from the lock alone, \
                  only from an installed tree whose every copy verifies; \
                  `socket-patch scan --mode vendored` wires them without a lock",
                 crate::utils::pnpm_workspace::describe_lockfile_disabled(source),
@@ -814,7 +835,12 @@ async fn extract_pnpm_document(
 /// stay refs: the wiring is intact and no rewire could clear the bundled
 /// copy, so the ledgers' liveness gates (`vendor --check`, `scan`) keep
 /// seeing them live, and the copy is no cross-lock evidence either.
-fn record_pnpm_bundled_copies(file: &str, bundles: Vec<(&str, Bundled<'_>)>, out: &mut Discovery) {
+fn record_pnpm_bundled_copies(
+    tree: &PnpmTree<'_>,
+    bundles: Vec<(&str, Bundled<'_>)>,
+    out: &mut Discovery,
+) {
+    let (file, label) = (tree.file, &tree.label);
     for (parent, bundled) in bundles {
         let (targets, what) = match bundled {
             Bundled::All => (
@@ -831,11 +857,11 @@ fn record_pnpm_bundled_copies(file: &str, bundles: Vec<(&str, Bundled<'_>)>, out
         };
         for target in targets {
             out.unwired_copy(UnwiredCopy {
-                scope: Some(PathBuf::from(file)),
+                scope: Some((PathBuf::from(file), tree.part)),
                 target,
                 file: PathBuf::from(file),
                 detail: format!(
-                    "{file} entry `{parent}` {what}, which pnpm unpacks from that package's \
+                    "{label} entry `{parent}` {what}, which pnpm unpacks from that package's \
                      own tarball without locking its version, so no Socket wiring reaches it"
                 ),
                 kind: UnattestedKind::BundledCopy,
@@ -865,11 +891,11 @@ struct PnpmFileCopy {
 /// read is left alone.
 async fn record_pnpm_file_copies(
     ctx: &DiscoverCtx<'_>,
-    file: &str,
+    tree: &PnpmTree<'_>,
     copies: Vec<PnpmFileCopy>,
     out: &mut Discovery,
 ) {
-    let lock_dir = std::path::Path::new(file)
+    let lock_dir = std::path::Path::new(tree.file)
         .parent()
         .map(|d| d.to_string_lossy().replace('\\', "/"))
         .unwrap_or_default();
@@ -919,8 +945,9 @@ async fn record_pnpm_file_copies(
         } else {
             "tarball"
         };
-        out.unpatched_copy(
-            file,
+        out.unpatched_copy_in(
+            tree.file,
+            tree.part,
             npm_purl(&name, &version),
             &copy.key,
             &format!(
@@ -977,7 +1004,8 @@ pub(crate) async fn pnpm_lock_file_copies(
         }));
     }
     let mut scratch = Discovery::default();
-    record_pnpm_file_copies(&ctx, file, copies, &mut scratch).await;
+    let tree = PnpmTree::of(file, PnpmDocument::Project);
+    record_pnpm_file_copies(&ctx, &tree, copies, &mut scratch).await;
     let purl = crate::utils::purl_key::canonical_base_purl(&purl);
     scratch
         .unpatched_copies
@@ -1009,12 +1037,13 @@ fn pnpm_file_copy(package: &PnpmPackage<'_>, directory: bool) -> Option<PnpmFile
 /// Classify one `packages:` entry and push its ref, if any.
 fn pnpm_entry_ref(
     ctx: &DiscoverCtx<'_>,
-    file: &str,
+    tree: &PnpmTree<'_>,
     package: &PnpmPackage<'_>,
     copies: &mut Vec<PnpmFileCopy>,
     withheld: Option<&mut BTreeSet<String>>,
     out: &mut Discovery,
 ) {
+    let (file, label) = (tree.file, &tree.label);
     let key = package.key;
     let Some(resolution) = &package.resolution else {
         if resolution_is_socket_shaped(ctx, package) {
@@ -1022,7 +1051,7 @@ fn pnpm_entry_ref(
                 DIAG_REF_INVALID,
                 file,
                 format!(
-                    "{file}: packages entry {key:?} references a Socket patch through a \
+                    "{label}: packages entry {key:?} references a Socket patch through a \
                      resolution that is not a flat pnpm resolution map; it is ignored"
                 ),
             );
@@ -1031,7 +1060,7 @@ fn pnpm_entry_ref(
     };
     let Some(tarball) = resolution.tarball() else {
         // A plain registry entry (integrity only) or a directory/git dep.
-        out.resolved_elsewhere(file, pnpm_registry_key_purl(key));
+        out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, true));
         return;
     };
@@ -1041,14 +1070,14 @@ fn pnpm_entry_ref(
         .map(|sri| LockIntegrity::Sri(sri.to_string()));
     let located = ctx.locate(tarball, LocateOpts::LITERAL_CHECKED);
     if let Some(vref) = located.vendored {
-        pnpm_vendored_ref(file, package, tarball, &vref, integrity, out);
+        pnpm_vendored_ref(tree, package, tarball, &vref, integrity, out);
     } else if located.decorated_leaf {
         // pnpm fetches the literal file (`#` / `::` included).
         out.diag(
             DIAG_REF_INVALID,
             file,
             format!(
-                "{file}: packages entry {key:?} (tarball {tarball:?}) is not a literal \
+                "{label}: packages entry {key:?} (tarball {tarball:?}) is not a literal \
                  .socket/vendor/npm/<uuid>/<tarball> path; it is ignored"
             ),
         );
@@ -1058,7 +1087,7 @@ fn pnpm_entry_ref(
                 DIAG_REF_INVALID,
                 file,
                 format!(
-                    "{file}: packages entry {key:?} resolves from the Socket patch server but \
+                    "{label}: packages entry {key:?} resolves from the Socket patch server but \
                      its key is not a registry name@version"
                 ),
             );
@@ -1072,25 +1101,20 @@ fn pnpm_entry_ref(
             }
             None => integrity,
         };
-        out.push(PatchedRef::hosted(
-            purl,
-            uuid,
-            file,
-            Some(tarball),
-            integrity,
-            true,
-        ));
+        out.push(
+            PatchedRef::hosted(purl, uuid, file, Some(tarball), integrity, true).in_part(tree.part),
+        );
     } else {
         // A registry-keyed entry fetching some other tarball, or a user's
         // `file:` tarball.
-        out.resolved_elsewhere(file, pnpm_registry_key_purl(key));
+        out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, false));
     }
 }
 
 /// A vendored packages entry (see [`extract_pnpm`] for the key shapes).
 fn pnpm_vendored_ref(
-    file: &str,
+    tree: &PnpmTree<'_>,
     package: &PnpmPackage<'_>,
     tarball: &str,
     vref: &VendorRef,
@@ -1101,8 +1125,11 @@ fn pnpm_vendored_ref(
     let invalid = |out: &mut Discovery, why: &str| {
         out.diag(
             DIAG_REF_INVALID,
-            file,
-            format!("{file}: packages entry {key:?} (tarball {tarball:?}) {why}; it is ignored"),
+            tree.file,
+            format!(
+                "{}: packages entry {key:?} (tarball {tarball:?}) {why}; it is ignored",
+                tree.label
+            ),
         );
     };
     // (name, the key's own `file:` path if the key was rekeyed).
@@ -1113,7 +1140,7 @@ fn pnpm_vendored_ref(
         PnpmKey::V9File { name, path } => (Some(name), Some(path)),
         // Registry-form key with a hand-pointed `file:` tarball.
         PnpmKey::Registry { name, version } => {
-            return finish_vendored(file, name, version, vref, integrity, invalid, out)
+            return finish_vendored(tree, name, version, vref, integrity, invalid, out)
         }
         PnpmKey::Other => return invalid(out, "has no registry name@version key"),
     };
@@ -1128,11 +1155,11 @@ fn pnpm_vendored_ref(
     let Some(version) = entry_field(&package.entry, "version") else {
         return invalid(out, "has no (single) `version:` line");
     };
-    finish_vendored(file, name, version, vref, integrity, invalid, out)
+    finish_vendored(tree, name, version, vref, integrity, invalid, out)
 }
 
 fn finish_vendored(
-    file: &str,
+    tree: &PnpmTree<'_>,
     name: &str,
     version: &str,
     vref: &VendorRef,
@@ -1149,7 +1176,7 @@ fn finish_vendored(
             &format!("names {purl} but its tarball is not that package's vendored npm tarball"),
         );
     }
-    out.push(PatchedRef::vendored(purl, vref, file, integrity));
+    out.push(PatchedRef::vendored(purl, vref, tree.file, integrity).in_part(tree.part));
 }
 
 /// [`pnpm_registry_key`] (the lock inventory's key grammar) as a validated
@@ -3171,10 +3198,13 @@ mod tests {
                 );
                 let out = p.discover().await;
                 assert_refs(&out, &hosted);
+                // The real lock path, with the tree carried beside it
+                // (code-review finding 6: no pseudo path).
                 assert_eq!(
                     out.refs[0].source_file,
                     std::path::Path::new("pnpm-lock.yaml")
                 );
+                assert_eq!(out.refs[0].part, TreePart::PnpmEnv, "{case}");
                 assert!(out.unattested.is_empty(), "{case}: {:#?}", out.unattested);
                 assert!(out.shadowed.is_empty(), "{case}: {:#?}", out.shadowed);
                 assert!(out.contested.is_empty(), "{case}: {:#?}", out.contested);
@@ -3195,7 +3225,25 @@ mod tests {
         );
         let out = p.discover().await;
         assert_refs(&out, &hosted);
+        assert_eq!(out.refs[0].part, TreePart::File);
         assert!(out.contested.is_empty(), "{:#?}", out.contested);
+
+        // Wired in both documents, the pins differing: ONE ref, the project
+        // document's (code-review finding 6: no twin refs of one file).
+        let env_wired = wired.replace(SRI, "sha512-ENVPIN==");
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!("{}{}", env(&env_wired), project(&wired)),
+        );
+        let out = p.discover().await;
+        assert_refs(&out, &hosted);
+        assert_eq!(out.refs.len(), 1, "{:#?}", out.refs);
+        assert_eq!(out.refs[0].part, TreePart::File);
+        assert_eq!(
+            out.refs[0].locked_integrity,
+            Some(LockIntegrity::Sri(SRI.into()))
+        );
 
         // The env document's registry entry contests no other lock's ref.
         let npm_lock = format!(

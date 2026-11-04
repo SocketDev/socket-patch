@@ -55,6 +55,7 @@ pub async fn recover_lock_entry(
             Ok(LockfileEntry {
                 ecosystem: "cargo",
                 source_kind: SourceKind::CratesIo,
+                pnpm_env: false,
                 purl: format!("pkg:cargo/{name}@{version}"),
                 name,
                 version,
@@ -81,6 +82,7 @@ pub async fn recover_lock_entry(
             Ok(LockfileEntry {
                 ecosystem: "composer",
                 source_kind: SourceKind::Unspecified,
+                pnpm_env: false,
                 purl: format!("pkg:composer/{name}@{version}"),
                 name,
                 version,
@@ -135,6 +137,7 @@ pub async fn recover_lock_entry(
             Ok(LockfileEntry {
                 ecosystem: "gem",
                 source_kind: SourceKind::Unspecified,
+                pnpm_env: false,
                 purl: format!("pkg:gem/{name}@{version}"),
                 resolved: gem_download_url(&base, &name, &version),
                 name,
@@ -242,6 +245,7 @@ pub async fn recover_lock_entry(
                 return Ok(LockfileEntry {
                     ecosystem: "pypi",
                     source_kind: SourceKind::Unspecified,
+                    pnpm_env: false,
                     purl: format!("pkg:pypi/{name}@{version}"),
                     name,
                     version,
@@ -254,6 +258,7 @@ pub async fn recover_lock_entry(
             Ok(LockfileEntry {
                 ecosystem: "pypi",
                 source_kind: SourceKind::Unspecified,
+                pnpm_env: false,
                 purl: format!("pkg:pypi/{name}@{version}"),
                 name,
                 version,
@@ -311,6 +316,7 @@ fn recover_npm_fragment(
     let mk = |resolved: Option<String>, integrity: LockIntegrity| LockfileEntry {
         ecosystem: "npm",
         source_kind: SourceKind::Unspecified,
+        pnpm_env: false,
         purl: format!("pkg:npm/{name}@{version}"),
         name: name.to_string(),
         version: version.to_string(),

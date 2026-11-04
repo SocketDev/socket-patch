@@ -102,11 +102,11 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// `common/config/subspaces/<name>/pnpm-lock.yaml`. `rush install` copies
 /// the source lock into common/temp and runs pnpm there.
 ///
-/// Only called (via [`inventory_npm_lock`]) when there is NO root lock but
-/// `rush.json` is present, so it never shadows a plain pnpm project. The
+/// Called (via `npm_family::inventory_npm_trees_raw_in`) only when
+/// `rush.json` is present, which that caller checks once through the
+/// view; the locks are read beside whatever lock the router picks. The
 /// subspace directory is read sorted for deterministic output. Missing
-/// files/dirs are skipped fail-soft; the caller drops the whole result when
-/// it comes back empty.
+/// files/dirs are skipped fail-soft.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
     let project = match view {
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
@@ -115,9 +115,6 @@ pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<
         }
         ProjectView::Memory(project) => *project,
     };
-    if !project.contains("rush.json") {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     if let Some(entries) = inventory_pnpm_lock_rel_in(view, RUSH_COMMON_LOCK_REL).await {
         out.extend(entries);
@@ -135,12 +132,6 @@ pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<
 }
 
 async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
-    if tokio::fs::metadata(project_root.join("rush.json"))
-        .await
-        .is_err()
-    {
-        return Vec::new();
-    }
     let mut out = Vec::new();
 
     // The single source-of-truth lock.

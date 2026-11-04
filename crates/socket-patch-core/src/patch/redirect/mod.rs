@@ -28324,6 +28324,14 @@ packages:
                 legacy_overrides_only,
                 "redirect_pnpm_entry_not_found",
             ),
+            // Code-review finding 3: another version vendored is not this
+            // one (the dep's version is simply not locked).
+            (
+                "another version vendored",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz"))
+                    .replace("version: 1.3.0", "version: 1.2.0"),
+                "redirect_pnpm_entry_not_found",
+            ),
         ] {
             assert_eq!(codes(&lock), vec![want], "{case}");
         }

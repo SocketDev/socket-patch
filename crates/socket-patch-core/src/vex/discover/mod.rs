@@ -182,7 +182,7 @@
 //!     `vlt-lock.json`), so discovery and the inventory see one entry walk
 //!     per format (an architecture test in this module enforces it).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -244,33 +244,32 @@ pub const DIAG_REF_INVALID: &str = "patched_ref_invalid";
 /// dependency version, a nuget source with no package mapping).
 pub const DIAG_REF_UNATTRIBUTABLE: &str = "patched_ref_unattributable";
 
-/// The label [`pnpm_document_tree`] appends to a pnpm lock's path to key
-/// its env lockfile document as an install tree of its own. No file
-/// discovery reads ends in it (every lock path ends in `.yaml`).
-pub(crate) const PNPM_ENV_TREE_SUFFIX: &str = " (env lockfile)";
+/// Which install tree of its file a record belongs to: the install-tree
+/// key is the file (its [`Discovery::install_trees`] root) plus this part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TreePart {
+    /// The file's own tree (every format but the one below).
+    #[default]
+    File,
+    /// pnpm 11+'s env lockfile document (config dependencies, the pinned
+    /// package manager), which installs apart from the project's
+    /// `node_modules`: its own tree (owner decision, lock-model divergence
+    /// N4). Its refs and the project document's entries of the same lock
+    /// never contest each other ([`Discovery::contest_within_locks`],
+    /// [`UnwiredCopy`] scopes), its wiring never exempts the project
+    /// document in [`Discovery::contest_across_locks`], and that contest
+    /// skips it both ways: no other lock decides a config dependency, and a
+    /// config dependency decides no other lock's ref. Within the document
+    /// the same-lock rules apply.
+    PnpmEnv,
+}
 
-/// The install-tree key of one document of the pnpm lock at root-relative
-/// `file`. pnpm 11+'s env lockfile document (config dependencies, the
-/// pinned package manager) installs apart from the project's
-/// `node_modules`, so it is its own tree (owner decision, lock-model
-/// divergence N4): its records carry `<file> (env lockfile)` as their
-/// file. That keeps its refs and the project document's entries apart in
-/// the same-lock and bundled-copy contests ([`Discovery::contest_within_locks`],
-/// [`UnwiredCopy`] scopes), keeps its wiring from exempting the project
-/// document in [`Discovery::contest_across_locks`], and lets that contest
-/// skip it both ways: config dependencies install apart from every
-/// `node_modules`, so no other lock decides them and they decide no other
-/// lock's ref. Within the env document the same-lock rules apply. The
-/// project document keeps `file` itself. [`Discovery::finalize`] maps
-/// every key back to `file`, so consumers only ever see real paths; detail
-/// texts keep the label.
-pub(crate) fn pnpm_document_tree(
-    file: &str,
-    document: crate::formats::pnpm::PnpmDocument,
-) -> String {
-    match document {
-        crate::formats::pnpm::PnpmDocument::Project => file.to_string(),
-        crate::formats::pnpm::PnpmDocument::Env => format!("{file}{PNPM_ENV_TREE_SUFFIX}"),
+impl From<crate::formats::pnpm::PnpmDocument> for TreePart {
+    fn from(document: crate::formats::pnpm::PnpmDocument) -> Self {
+        match document {
+            crate::formats::pnpm::PnpmDocument::Project => TreePart::File,
+            crate::formats::pnpm::PnpmDocument::Env => TreePart::PnpmEnv,
+        }
     }
 }
 
@@ -328,6 +327,8 @@ pub struct PatchedRef {
     /// package from, whose dependency sub-maps decide which dependencies
     /// install beside it (#1538).
     pub yarn_classic_block: Option<ClassicPinnedBlock>,
+    /// The install tree of `source_file` the wiring is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 /// A hosted yarn classic pin's lock block, as lock-only VEX reads it
@@ -386,7 +387,14 @@ impl PatchedRef {
             integrity_required,
             url: url.map(str::to_string),
             yarn_classic_block: None,
+            part: TreePart::File,
         }
+    }
+
+    /// This ref, in install tree `part` of its file.
+    pub(crate) fn in_part(mut self, part: TreePart) -> Self {
+        self.part = part;
+        self
     }
 
     /// A vendored ref for the artifact `vref` names.
@@ -406,6 +414,7 @@ impl PatchedRef {
             integrity_required: false,
             url: None,
             yarn_classic_block: None,
+            part: TreePart::File,
         }
     }
 
@@ -507,6 +516,8 @@ pub struct ResolvedElsewhere {
     /// which pip compares as a string
     /// ([`Discovery::resolved_elsewhere_as_spelled`]).
     pub as_spelled: bool,
+    /// The install tree of `file` the entry is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 impl ResolvedElsewhere {
@@ -578,6 +589,8 @@ pub struct UnpatchedCopy {
     /// What makes the build patch that copy, when it is not the usual
     /// "depend on the registry release instead" (a bundled copy, #758).
     pub remedy: Option<String>,
+    /// The install tree of `file` the entry is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 /// A lock entry that installs SOME package (at `version`, when known) under
@@ -684,8 +697,9 @@ pub enum CopyTarget {
 /// extractor has run ([`Discovery::unattest_unwired_copies`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnwiredCopy {
-    /// Only refs of this root-relative file; `None` = refs of any file.
-    pub(crate) scope: Option<PathBuf>,
+    /// Only refs of this root-relative file, in this tree of it; `None` =
+    /// refs of any file.
+    pub(crate) scope: Option<(PathBuf, TreePart)>,
     pub(crate) target: CopyTarget,
     /// Root-relative file that shows the copy.
     pub(crate) file: PathBuf,
@@ -696,7 +710,11 @@ pub struct UnwiredCopy {
 
 impl UnwiredCopy {
     fn covers(&self, r: &PatchedRef) -> bool {
-        if self.scope.as_ref().is_some_and(|f| *f != r.source_file) {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|(f, part)| *f != r.source_file || *part != r.part)
+        {
             return false;
         }
         match &self.target {
@@ -1004,11 +1022,22 @@ impl Discovery {
     /// lock's size (#993), and every reader before then only asks whether
     /// some entry matches.
     pub(crate) fn resolved_elsewhere(&mut self, file: &str, purl: Option<String>) {
+        self.resolved_elsewhere_in(file, TreePart::File, purl);
+    }
+
+    /// [`Discovery::resolved_elsewhere`] in install tree `part` of `file`.
+    pub(crate) fn resolved_elsewhere_in(
+        &mut self,
+        file: &str,
+        part: TreePart,
+        purl: Option<String>,
+    ) {
         let Some(purl) = purl else { return };
         self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
             as_spelled: false,
+            part,
         });
     }
 
@@ -1021,6 +1050,7 @@ impl Discovery {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
             as_spelled: true,
+            part: TreePart::File,
         });
     }
 
@@ -1040,6 +1070,7 @@ impl Discovery {
             purl,
             file: PathBuf::from(file),
             as_spelled: false,
+            part: TreePart::File,
         });
     }
 
@@ -1058,10 +1089,22 @@ impl Discovery {
         key: &str,
         how: &str,
     ) {
+        self.unpatched_copy_in(file, TreePart::File, purl, key, how);
+    }
+
+    /// [`Discovery::unpatched_copy`] in install tree `part` of `file`.
+    pub(crate) fn unpatched_copy_in(
+        &mut self,
+        file: &str,
+        part: TreePart,
+        purl: Option<String>,
+        key: &str,
+        how: &str,
+    ) {
         let Some(purl) = purl else {
             return;
         };
-        self.resolved_elsewhere(file, Some(purl.clone()));
+        self.resolved_elsewhere_in(file, part, Some(purl.clone()));
         // Deduplicated once, in `finalize`: a per-push scan is quadratic
         // over a lock with thousands of registry blocks.
         self.unpatched_copies.push(UnpatchedCopy {
@@ -1070,6 +1113,7 @@ impl Discovery {
             key: key.to_string(),
             how: how.to_string(),
             remedy: None,
+            part,
         });
     }
 
@@ -1121,7 +1165,9 @@ impl Discovery {
             let purls: BTreeSet<&str> = self
                 .refs
                 .iter()
-                .filter(|r| r.source_file == u.file)
+                // A file-level copy: no extractor records one in a pnpm
+                // env lockfile, whose refs are a tree of their own.
+                .filter(|r| r.source_file == u.file && r.part == TreePart::File)
                 .filter(|r| match &u.version {
                     Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
                     None => true,
@@ -1140,6 +1186,7 @@ impl Discovery {
                     key: u.key.clone(),
                     how: u.how.clone(),
                     remedy: None,
+                    part: TreePart::File,
                 });
             }
         }
@@ -1162,7 +1209,7 @@ impl Discovery {
             let copy = self
                 .unpatched_copies
                 .iter()
-                .find(|c| c.purl == r.purl && c.file == r.source_file)
+                .find(|c| c.purl == r.purl && c.file == r.source_file && c.part == r.part)
                 .cloned();
             match copy {
                 Some(c) => {
@@ -1199,15 +1246,16 @@ impl Discovery {
     /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
     /// neither contest nor are contested: each is scoped to its own script's
     /// install. Neither is a pnpm env lockfile document
-    /// ([`pnpm_document_tree`]): pnpm installs its config dependencies into
-    /// its config store whatever else runs. Files of one install tree ([`Discovery::install_trees`]) are
-    /// one lock here: pip resolves a direct reference and a compatible `==`
-    /// pin of the same version in `requirements.txt` and its `-r` includes
-    /// to the reference (#1086).
+    /// ([`TreePart::PnpmEnv`]): pnpm installs its config dependencies into
+    /// its config store whatever else runs, and its wiring exempts no
+    /// other tree. Files of one install tree ([`Discovery::install_trees`])
+    /// are one lock here: pip resolves a direct reference and a compatible
+    /// `==` pin of the same version in `requirements.txt` and its `-r`
+    /// includes to the reference (#1086).
     fn contest_across_locks(&mut self) {
         // The purls each install tree wires.
         let mut wiring: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
-        for r in &self.refs {
+        for r in self.refs.iter().filter(|r| r.part == TreePart::File) {
             wiring
                 .entry(self.tree_of(&r.source_file).to_path_buf())
                 .or_default()
@@ -1225,7 +1273,7 @@ impl Discovery {
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let other = (!is_script_lock(&r.source_file) && !is_pnpm_env_tree(&r.source_file))
+            let other = (!is_script_lock(&r.source_file) && r.part == TreePart::File)
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
                     // Only a PyPI ref can match another spelling of its
@@ -1250,7 +1298,7 @@ impl Discovery {
                             // other tree.
                             e.covers(&r.purl)
                                 && other != tree
-                                && !is_pnpm_env_tree(&e.file)
+                                && e.part == TreePart::File
                                 && !wiring.get(other).is_some_and(|purls| {
                                     purls.contains(&r.purl)
                                         || (pypi
@@ -1306,39 +1354,33 @@ impl Discovery {
         }
     }
 
-    /// Map every [`pnpm_document_tree`] key back to its real lock file once
-    /// the contests that needed the trees apart have run: consumers read,
-    /// match and display `source_file` / `file` as root-relative paths.
-    /// Detail texts keep the key's label, which names the document.
-    fn resolve_document_trees(&mut self) {
-        fn real(path: &mut PathBuf) {
-            if let Some(file) = path
-                .to_str()
-                .and_then(|p| p.strip_suffix(PNPM_ENV_TREE_SUFFIX))
-            {
-                *path = PathBuf::from(file);
-            }
-        }
-        for r in self
-            .refs
-            .iter_mut()
-            .chain(&mut self.shadowed)
-            .chain(&mut self.rewirable)
-        {
-            real(&mut r.source_file);
-        }
-        self.elsewhere.iter_mut().for_each(|e| real(&mut e.file));
-        self.unpatched_copies
-            .iter_mut()
-            .for_each(|c| real(&mut c.file));
-        self.unattested.iter_mut().for_each(|u| real(&mut u.file));
-        for c in &mut self.contested {
-            real(&mut c.file);
-            real(&mut c.other);
-        }
-        self.diagnostics.iter_mut().for_each(|d| real(&mut d.file));
-        self.recognized.iter_mut().for_each(|r| real(&mut r.file));
-        self.withheld.iter_mut().for_each(|r| real(&mut r.file));
+    /// Drop a pnpm env-lockfile ref ([`TreePart::PnpmEnv`]) that the same
+    /// file's project document also wires (the same `(purl, uuid, mode)`):
+    /// one wiring of the package in that file, whose project instance is
+    /// the one an installed `node_modules` copy is verified against, even
+    /// when the two pins differ.
+    fn drop_env_twins(refs: &mut Vec<PatchedRef>) {
+        let project: HashSet<(PathBuf, String, String, WiringMode)> = refs
+            .iter()
+            .filter(|r| r.part == TreePart::File)
+            .map(|r| {
+                (
+                    r.source_file.clone(),
+                    r.purl.clone(),
+                    r.uuid.clone(),
+                    r.mode,
+                )
+            })
+            .collect();
+        refs.retain(|r| {
+            r.part == TreePart::File
+                || !project.contains(&(
+                    r.source_file.clone(),
+                    r.purl.clone(),
+                    r.uuid.clone(),
+                    r.mode,
+                ))
+        });
     }
 
     /// The install tree `file` belongs to: its tree's root file, or itself.
@@ -1496,7 +1538,6 @@ impl Discovery {
     }
 
     fn finalize(&mut self) {
-        self.resolve_document_trees();
         self.elsewhere.sort();
         self.elsewhere.dedup();
         self.unpatched_copies.sort();
@@ -1506,12 +1547,14 @@ impl Discovery {
         self.contested.sort();
         self.contested.dedup();
         for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
+            Self::drop_env_twins(refs);
             refs.sort_by(|a, b| {
-                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                (&a.source_file, &a.purl, &a.uuid, a.mode, a.part).cmp(&(
                     &b.source_file,
                     &b.purl,
                     &b.uuid,
                     b.mode,
+                    b.part,
                 ))
             });
             refs.dedup();
@@ -1675,13 +1718,6 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
 /// A PEP 723 script lock (`<script>.py.lock`).
 fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
-}
-
-/// Whether `file` is a [`pnpm_document_tree`] key of a pnpm env lockfile
-/// document (before [`Discovery::finalize`] maps it back).
-fn is_pnpm_env_tree(file: &Path) -> bool {
-    file.to_str()
-        .is_some_and(|f| f.ends_with(PNPM_ENV_TREE_SUFFIX))
 }
 
 /// What every extractor receives: the project view plus the hosted-origin

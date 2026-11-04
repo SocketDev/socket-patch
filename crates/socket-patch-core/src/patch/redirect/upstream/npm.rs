@@ -3802,6 +3802,13 @@ mod tests {
         // A lone leading `---` marker is no env document.
         let marker_only = format!("---\n{}", lock(""));
         assert!(include(&marker_only, None, Some(RC_ON), None));
+        // Neither is an env-shaped document AFTER the project one: pnpm
+        // writes the env document first (code-review finding 2).
+        let env_last = format!("---\n{}{env}", lock(""));
+        assert_eq!(super::pnpm_settings_major(&pinned_only, None), Some(11));
+        assert_eq!(super::pnpm_settings_major(&env_last, None), None);
+        // Its bare entry is project evidence: the setting is off.
+        assert!(!include(&env_last, None, Some(RC_ON), None));
         // A bare entry in the main document still proves it off.
         let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
         assert!(!include(

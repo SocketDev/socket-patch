@@ -232,7 +232,7 @@ fn indexed_pnpm_rewrite_matches_golden_on_depscan_sized_lock_set() {
     };
     let root_extra = vec![
         format!(
-            "  vendored-pkg@file:.socket/vendor/npm/0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d/vendored-pkg-1.0.0.tgz:\n    resolution: {{tarball: file:.socket/vendor/npm/0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d/vendored-pkg-1.0.0.tgz}}\n"
+            "  vendored-pkg@file:.socket/vendor/npm/0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d/vendored-pkg-1.0.0.tgz:\n    resolution: {{tarball: file:.socket/vendor/npm/0a1b2c3d-4e5f-4a6b-8c7d-8e9f0a1b2c3d/vendored-pkg-1.0.0.tgz}}\n    version: 1.0.0\n"
         ),
         // A second copy of an entry that already points at the hosted
         // artifact (a re-run): rebuilt == original, no edit.

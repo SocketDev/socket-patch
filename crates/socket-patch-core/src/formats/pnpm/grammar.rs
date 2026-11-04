@@ -109,14 +109,16 @@ pub enum PnpmDocument {
 /// is. A text without a column-0 `---` line is one project document. A
 /// blank document (the empty span before a leading `---`) is dropped.
 ///
-/// pnpm >= 11 writes the env lockfile as a first document ahead of the
-/// project lock. A document is identified by its CONTENT, not by its
-/// position: in a lock of two or more documents, one whose `importers:`
-/// carry only [`ENV_DOC_IMPORTER_FIELDS`] (at least one) is
-/// [`PnpmDocument::Env`]; every other document is
-/// [`PnpmDocument::Project`]. So a crafted lock cannot hide entries from a
-/// reader by adding documents: each one is read, as the tree its content
-/// says it is. CRLF reads like LF.
+/// pnpm >= 11 writes the env lockfile as the FIRST document, ahead of the
+/// project lock, and reads it from there (as the vendored planners'
+/// `lines::split_project_document` does). So the env document is told by
+/// position AND content: in a lock of two or more documents, the first one
+/// is [`PnpmDocument::Env`] when its `importers:` carry only
+/// [`ENV_DOC_IMPORTER_FIELDS`] (at least one). Every other document is
+/// [`PnpmDocument::Project`], an env-shaped later one included: no
+/// document can opt out of the project tree's contests, and a crafted lock
+/// cannot hide entries by adding documents, since each one is read. CRLF
+/// reads like LF.
 pub(crate) fn documents(content: &str) -> Vec<(Range<usize>, PnpmDocument)> {
     let mut spans = Vec::new();
     let mut start = 0;
@@ -146,8 +148,9 @@ pub(crate) fn documents(content: &str) -> Vec<(Range<usize>, PnpmDocument)> {
     let several = spans.len() > 1;
     spans
         .into_iter()
-        .map(|span| {
-            let kind = if several && is_env_document(&content[span.clone()]) {
+        .enumerate()
+        .map(|(i, span)| {
+            let kind = if several && i == 0 && is_env_document(&content[span.clone()]) {
                 PnpmDocument::Env
             } else {
                 PnpmDocument::Project
