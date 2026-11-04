@@ -244,6 +244,36 @@ pub const DIAG_REF_INVALID: &str = "patched_ref_invalid";
 /// dependency version, a nuget source with no package mapping).
 pub const DIAG_REF_UNATTRIBUTABLE: &str = "patched_ref_unattributable";
 
+/// The label [`pnpm_document_tree`] appends to a pnpm lock's path to key
+/// its env lockfile document as an install tree of its own. No file
+/// discovery reads ends in it (every lock path ends in `.yaml`).
+pub(crate) const PNPM_ENV_TREE_SUFFIX: &str = " (env lockfile)";
+
+/// The install-tree key of one document of the pnpm lock at root-relative
+/// `file`. pnpm 11+'s env lockfile document (config dependencies, the
+/// pinned package manager) installs apart from the project's
+/// `node_modules`, so it is its own tree (owner decision, lock-model
+/// divergence N4): its records carry `<file> (env lockfile)` as their
+/// file. That keeps its refs and the project document's entries apart in
+/// the same-lock and bundled-copy contests ([`Discovery::contest_within_locks`],
+/// [`UnwiredCopy`] scopes), keeps its wiring from exempting the project
+/// document in [`Discovery::contest_across_locks`], and lets that contest
+/// skip it both ways: config dependencies install apart from every
+/// `node_modules`, so no other lock decides them and they decide no other
+/// lock's ref. Within the env document the same-lock rules apply. The
+/// project document keeps `file` itself. [`Discovery::finalize`] maps
+/// every key back to `file`, so consumers only ever see real paths; detail
+/// texts keep the label.
+pub(crate) fn pnpm_document_tree(
+    file: &str,
+    document: crate::formats::pnpm::PnpmDocument,
+) -> String {
+    match document {
+        crate::formats::pnpm::PnpmDocument::Project => file.to_string(),
+        crate::formats::pnpm::PnpmDocument::Env => format!("{file}{PNPM_ENV_TREE_SUFFIX}"),
+    }
+}
+
 /// One non-fatal discovery finding. The CLI surfaces each as a run warning
 /// (`code` is the stable routing tag, `file` the root-relative source).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1168,7 +1198,9 @@ impl Discovery {
     /// 11). This generalizes the npm extractor's shrinkwrap/package-lock
     /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
     /// neither contest nor are contested: each is scoped to its own script's
-    /// install. Files of one install tree ([`Discovery::install_trees`]) are
+    /// install. Neither is a pnpm env lockfile document
+    /// ([`pnpm_document_tree`]): pnpm installs its config dependencies into
+    /// its config store whatever else runs. Files of one install tree ([`Discovery::install_trees`]) are
     /// one lock here: pip resolves a direct reference and a compatible `==`
     /// pin of the same version in `requirements.txt` and its `-r` includes
     /// to the reference (#1086).
@@ -1193,7 +1225,7 @@ impl Discovery {
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let other = (!is_script_lock(&r.source_file))
+            let other = (!is_script_lock(&r.source_file) && !is_pnpm_env_tree(&r.source_file))
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
                     // Only a PyPI ref can match another spelling of its
@@ -1212,9 +1244,13 @@ impl Discovery {
                         .find(|e| {
                             let other = self.tree_of(&e.file);
                             // A tree that wires the release itself, in any
-                            // spelling, is no contester.
+                            // spelling, is no contester. A pnpm env
+                            // lockfile installs config dependencies apart
+                            // from every `node_modules`: it contests no
+                            // other tree.
                             e.covers(&r.purl)
                                 && other != tree
+                                && !is_pnpm_env_tree(&e.file)
                                 && !wiring.get(other).is_some_and(|purls| {
                                     purls.contains(&r.purl)
                                         || (pypi
@@ -1268,6 +1304,41 @@ impl Discovery {
             self.install_trees
                 .insert(PathBuf::from(file), PathBuf::from(root));
         }
+    }
+
+    /// Map every [`pnpm_document_tree`] key back to its real lock file once
+    /// the contests that needed the trees apart have run: consumers read,
+    /// match and display `source_file` / `file` as root-relative paths.
+    /// Detail texts keep the key's label, which names the document.
+    fn resolve_document_trees(&mut self) {
+        fn real(path: &mut PathBuf) {
+            if let Some(file) = path
+                .to_str()
+                .and_then(|p| p.strip_suffix(PNPM_ENV_TREE_SUFFIX))
+            {
+                *path = PathBuf::from(file);
+            }
+        }
+        for r in self
+            .refs
+            .iter_mut()
+            .chain(&mut self.shadowed)
+            .chain(&mut self.rewirable)
+        {
+            real(&mut r.source_file);
+        }
+        self.elsewhere.iter_mut().for_each(|e| real(&mut e.file));
+        self.unpatched_copies
+            .iter_mut()
+            .for_each(|c| real(&mut c.file));
+        self.unattested.iter_mut().for_each(|u| real(&mut u.file));
+        for c in &mut self.contested {
+            real(&mut c.file);
+            real(&mut c.other);
+        }
+        self.diagnostics.iter_mut().for_each(|d| real(&mut d.file));
+        self.recognized.iter_mut().for_each(|r| real(&mut r.file));
+        self.withheld.iter_mut().for_each(|r| real(&mut r.file));
     }
 
     /// The install tree `file` belongs to: its tree's root file, or itself.
@@ -1425,6 +1496,7 @@ impl Discovery {
     }
 
     fn finalize(&mut self) {
+        self.resolve_document_trees();
         self.elsewhere.sort();
         self.elsewhere.dedup();
         self.unpatched_copies.sort();
@@ -1603,6 +1675,13 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
 /// A PEP 723 script lock (`<script>.py.lock`).
 fn is_script_lock(file: &Path) -> bool {
     crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
+}
+
+/// Whether `file` is a [`pnpm_document_tree`] key of a pnpm env lockfile
+/// document (before [`Discovery::finalize`] maps it back).
+fn is_pnpm_env_tree(file: &Path) -> bool {
+    file.to_str()
+        .is_some_and(|f| f.ends_with(PNPM_ENV_TREE_SUFFIX))
 }
 
 /// What every extractor receives: the project view plus the hosted-origin

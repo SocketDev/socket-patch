@@ -9,6 +9,8 @@ use std::ops::Range;
 
 use crate::formats::text::strip_bom;
 
+use super::lines::ENV_DOC_IMPORTER_FIELDS;
+
 /// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
 /// unconditionally drops registry tarball URLs on install. Its frozen flag
 /// cannot preserve this redirect (verified with pnpm 1.0.0).
@@ -88,24 +90,93 @@ pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
         .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
 }
 
-/// The main document of a pnpm lock: the text after its last column-0
-/// `---` marker, else all of it. pnpm 11+ writes the env lockfile
-/// (`configDependencies` / `packageManagerDependencies`, whose resolutions
-/// never carry `tarball:`) as a first document ahead of the project lock.
-pub(crate) fn main_document(content: &str) -> &str {
+/// Which document of a pnpm lock a span belongs to ([`documents`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PnpmDocument {
+    /// The project lock: what `pnpm install` links into `node_modules`.
+    Project,
+    /// pnpm 11+'s env lockfile: the `configDependencies` /
+    /// `packageManagerDependencies` pnpm installs into its config store
+    /// and its own package-manager install, not into `node_modules`. Its
+    /// own install tree (docs/design/lock-model-unification.md, Decisions).
+    Env,
+}
+
+/// The documents of a pnpm lock, in file order: the byte range of each
+/// (separator lines excluded, a leading BOM inside the first) and what it
+/// is. A text without a column-0 `---` line is one project document. A
+/// blank document (the empty span before a leading `---`) is dropped.
+///
+/// pnpm >= 11 writes the env lockfile as a first document ahead of the
+/// project lock. A document is identified by its CONTENT, not by its
+/// position: in a lock of two or more documents, one whose `importers:`
+/// carry only [`ENV_DOC_IMPORTER_FIELDS`] (at least one) is
+/// [`PnpmDocument::Env`]; every other document is
+/// [`PnpmDocument::Project`]. So a crafted lock cannot hide entries from a
+/// reader by adding documents: each one is read, as the tree its content
+/// says it is. CRLF reads like LF.
+pub(crate) fn documents(content: &str) -> Vec<(Range<usize>, PnpmDocument)> {
+    let mut spans = Vec::new();
     let mut start = 0;
     let mut offset = 0;
-    for line in content.split_inclusive('\n') {
-        offset += line.len();
+    for (i, line) in content.split_inclusive('\n').enumerate() {
         let text = line.trim_end_matches(['\r', '\n']);
+        let text = if i == 0 { strip_bom(text) } else { text };
         if text
             .strip_prefix("---")
             .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
         {
-            start = offset;
+            spans.push(start..offset);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    spans.push(start..content.len());
+    spans.retain(|span| {
+        strip_bom(&content[span.clone()]).lines().any(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+    });
+    if spans.is_empty() {
+        return vec![(0..content.len(), PnpmDocument::Project)];
+    }
+    let several = spans.len() > 1;
+    spans
+        .into_iter()
+        .map(|span| {
+            let kind = if several && is_env_document(&content[span.clone()]) {
+                PnpmDocument::Env
+            } else {
+                PnpmDocument::Project
+            };
+            (span, kind)
+        })
+        .collect()
+}
+
+/// Whether one document's `importers:` carry only the env lockfile's
+/// fields ([`ENV_DOC_IMPORTER_FIELDS`]), at least one of them.
+fn is_env_document(doc: &str) -> bool {
+    let mut in_importers = false;
+    let mut env_fields = 0usize;
+    for line in strip_bom(doc).split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() && !line.starts_with([' ', '#']) {
+            in_importers = line == "importers:";
+            continue;
+        }
+        if !in_importers {
+            continue;
+        }
+        if let Some((field, _, _)) = super::lines::parse_key_line(line, 4) {
+            if !ENV_DOC_IMPORTER_FIELDS.contains(&field) {
+                return false;
+            }
+            env_fields += 1;
         }
     }
-    &content[start..]
+    env_fields > 0
 }
 
 /// The value of the entry-level (four-space) `field:` line of a packages

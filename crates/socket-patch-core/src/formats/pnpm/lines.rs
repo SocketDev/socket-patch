@@ -26,7 +26,8 @@ pub(crate) fn section_bounds(lines: &[String], name: &str) -> Option<(usize, usi
 
 /// The importer dependency fields pnpm writes into the env document of a
 /// two-document lock.
-const ENV_DOC_IMPORTER_FIELDS: [&str; 2] = ["configDependencies", "packageManagerDependencies"];
+pub(crate) const ENV_DOC_IMPORTER_FIELDS: [&str; 2] =
+    ["configDependencies", "packageManagerDependencies"];
 
 /// Split a lock into `(prefix, project document)`, `prefix + project ==
 /// text`. pnpm >= 11 writes `pnpm-lock.yaml` as two YAML documents when the

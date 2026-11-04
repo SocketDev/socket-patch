@@ -1276,15 +1276,16 @@ fn pnpm_registry_is_own(registry: Option<&str>) -> bool {
 /// env lockfile document ahead of the project lock (only pnpm >= 11
 /// writes one, so its `.npmrc` pnpm settings are ignored).
 pub(crate) fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
-    use crate::formats::pnpm::grammar::{is_pnpm_lock_text, main_document};
+    use crate::formats::pnpm::grammar::{documents, PnpmDocument};
     use crate::formats::pnpm::lock_version_major;
 
     let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
         || text
             .lines()
             .any(|line| line.starts_with("shrinkwrapVersion:"));
-    let main = main_document(text);
-    let env_document = is_pnpm_lock_text(&text[..text.len() - main.len()]);
+    let env_document = documents(text)
+        .iter()
+        .any(|(_, kind)| *kind == PnpmDocument::Env);
     pm_major
         .or(legacy_lock.then_some(8))
         .or(env_document.then_some(11))
@@ -1504,17 +1505,17 @@ fn pnpm_include_tarball(
 /// URL can still appear with it off, under a second registry). With no
 /// bare one, a tarball pnpm could have derived proves it on. `None`: no
 /// such resolution (an unconventional URL is recorded either way). Only
-/// the main document counts: pnpm 11+'s env lockfile document records its
+/// the project documents count: pnpm 11+'s env lockfile document records its
 /// resolutions bare whatever the setting.
 fn pnpm_lock_tarball_evidence(
     text: &str,
     registry: impl Fn(&str) -> Option<String>,
     is_hosted: impl Fn(&str) -> bool,
 ) -> Option<bool> {
-    use crate::formats::pnpm::{classify_pnpm_key, grammar::main_document, pnpm_packages, PnpmKey};
+    use crate::formats::pnpm::{classify_pnpm_key, PnpmDocument, PnpmKey, PnpmLock};
 
     let mut derived = false;
-    for package in pnpm_packages(main_document(text)) {
+    for package in PnpmLock::parse(text).packages_of(PnpmDocument::Project) {
         let PnpmKey::Registry { name, version } = classify_pnpm_key(package.key) else {
             continue;
         };
