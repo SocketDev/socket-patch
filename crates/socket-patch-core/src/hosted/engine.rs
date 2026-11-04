@@ -337,6 +337,105 @@ pub fn withhold_everywhere(
     candidates.retain(|c| !withheld_everywhere.contains_key(&c.dep.patch_uuid));
 }
 
+/// Skip reason of an npm candidate withheld because the project patches
+/// that package itself ([`withhold_user_patched`]): the code the CLI's
+/// consent gate reports for the same packages.
+pub const USER_PATCH_CONFLICT: &str = "user_patch_conflict";
+
+/// The pnpm and yarn locks [`withhold_user_patched`] reads when `files`
+/// does not already hold them.
+const USER_PATCH_LOCKS: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "shrinkwrap.yaml",
+    "yarn.lock",
+    crate::constants::npm_family::RUSH_COMMON_LOCK_REL,
+];
+
+/// Withhold from every rewriter each npm candidate whose package the
+/// project patches itself with pnpm (`patchedDependencies`), yarn (a
+/// `patch:` descriptor) or patch-package, recording each as skipped
+/// ([`USER_PATCH_CONFLICT`]). The package manager applies the user's
+/// diff on top of whatever tarball the lock names, so a hosted pin either
+/// fails the install once the diff no longer applies or installs bytes
+/// that are neither the user's package nor the Socket patch. The
+/// evidence is [`UserPatchIndex::npm_family_in`], which `vex` discovery
+/// reads too, over `files` (the candidate texts already read: a member's
+/// own pnpm lock) and the root pnpm, yarn and Rush locks. npm's and Bun's
+/// own `patchedDependencies` are not read here: their rewriters skip such
+/// a package per resolution (#711, #367). `allow` is the caller's explicit
+/// consent (the CLI's `--allow-patch-conflicts`): nothing is withheld.
+/// Returns one [`USER_PATCH_CONFLICT`] warning per withheld candidate,
+/// with the skip's detail.
+///
+/// [`UserPatchIndex::npm_family_in`]: crate::patch::user_patches::UserPatchIndex::npm_family_in
+pub async fn withhold_user_patched(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+    allow: bool,
+) -> Vec<RewriteWarning> {
+    let mut warnings = Vec::new();
+    if allow || !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        return warnings;
+    }
+    let mut read: Vec<(String, String)> = Vec::new();
+    for rel in USER_PATCH_LOCKS {
+        if files.contains_key(rel) {
+            continue;
+        }
+        if let Ok(text) = view.read_text(rel).await {
+            read.push((rel.to_string(), text));
+        }
+    }
+    let locks: Vec<(&str, &str)> = files
+        .iter()
+        .chain(read.iter().map(|(rel, text)| (rel, text)))
+        .filter(|(rel, _)| {
+            matches!(
+                rel.rsplit('/').next(),
+                Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
+            )
+        })
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    if index.is_empty() {
+        return warnings;
+    }
+    candidates.retain(|c| {
+        if c.dep.ecosystem != "npm" {
+            return true;
+        }
+        let sources = index.conflicts(&c.purl);
+        if sources.is_empty() {
+            return true;
+        }
+        let detail = user_patched_detail(&c.purl, &sources);
+        warnings.push(warning(USER_PATCH_CONFLICT, detail.clone()));
+        skipped.push(SkippedPatch {
+            detail: Some(detail),
+            ..SkippedPatch::new(&c.purl, &c.dep.patch_uuid, USER_PATCH_CONFLICT)
+        });
+        false
+    });
+    warnings
+}
+
+/// [`withhold_user_patched`]'s skip detail.
+fn user_patched_detail(purl: &str, sources: &[String]) -> String {
+    format!(
+        "{purl}: {} declares a patch the project applies to this package itself (pnpm \
+         `patchedDependencies`, a yarn `patch:` descriptor, or a patch-package patch); the \
+         package manager applies it on top of whatever tarball the lock names, so pinning the \
+         hosted patch would stack the two (or fail every install once the user's diff no \
+         longer applies). It is left unchanged and stays without the Socket patch: fold the \
+         Socket fix into your own patch, or remove the user patch and re-run (the CLI's \
+         explicit `--allow-patch-conflicts` wires it anyway)",
+        sources.join(", ")
+    )
+}
+
 /// The project's candidate files as the rewriters read them.
 #[derive(Debug, Clone, Default)]
 pub struct CandidateFiles {

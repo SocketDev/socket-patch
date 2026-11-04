@@ -887,6 +887,20 @@ async fn run_redirect_selected_untracked(
         &vlt_preflight.withheld_everywhere,
         &mut skipped,
     );
+    // The engine's own user-patch gate (pnpm, yarn, patch-package), which
+    // the in-memory engine applies too. The consent gate above already
+    // left such packages out unless `--allow-patch-conflicts`, which lifts
+    // this one as well; it still covers evidence that gate does not read
+    // (a Rush lock's patched entries). Each such package is a skip event,
+    // as the consent gate reports it.
+    let _ = engine::withhold_user_patched(
+        &view,
+        &std::collections::BTreeMap::new(),
+        &mut candidates,
+        &mut skipped,
+        common.allow_patch_conflicts,
+    )
+    .await;
     // A NEW row the lockfiles already pin on the patch server these
     // references name (not a configured one, so the recorded view's
     // discovery could not see it) is ALREADY: decided here, before the lock

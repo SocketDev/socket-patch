@@ -207,6 +207,12 @@ pub(crate) async fn plan(
     } else {
         engine::read_candidate_files(&view, &unreadable, &candidates).await
     };
+    // A package the project patches itself (pnpm, yarn, patch-package) is
+    // never wired: the in-memory engine has no consent knob.
+    pre_warnings.extend(
+        engine::withhold_user_patched(&view, &read.files, &mut candidates, &mut skipped, false)
+            .await,
+    );
     let wheels = engine::wheel_targets(&candidates, &read.files)
         .into_iter()
         .map(|(dep, sha256)| (dep.artifact_url.clone(), sha256.to_string()))

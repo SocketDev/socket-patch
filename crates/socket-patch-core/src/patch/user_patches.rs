@@ -17,6 +17,7 @@ use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+use crate::vendor::lock_inventory::ProjectView;
 
 #[derive(Default, Debug)]
 pub struct UserPatchIndex {
@@ -79,18 +80,7 @@ impl UserPatchIndex {
             let mut globs = Vec::new();
             if let Some(value) = index.json(&dir.join("package.json"), "npm").await {
                 index.native(&value, &dir.join("package.json"));
-                for field in [
-                    "dependencies",
-                    "devDependencies",
-                    "optionalDependencies",
-                    "resolutions",
-                ] {
-                    if let Some(map) = value[field].as_object() {
-                        for spec in map.values().filter_map(Value::as_str) {
-                            index.yarn(spec, &dir.join("package.json"));
-                        }
-                    }
-                }
+                index.yarn_manifest(&value, &dir.join("package.json"));
                 // A malformed field still names its string items (#1900):
                 // walking them can only find more patches.
                 globs.extend(Workspaces::of(&value).into_listed().into_iter().flatten());
@@ -100,52 +90,20 @@ impl UserPatchIndex {
             }
             let yarn_lock = dir.join("yarn.lock");
             if let Some(text) = index.read(&yarn_lock, "npm").await {
-                // Only Berry has patch: locators. Every Berry lock carries
-                // builtin compat patches, so scan the resolution lines rather
-                // than parse what can be a very large lockfile, and visit
-                // only the few lines that can hold one.
-                for line in lines_containing(&text, "@patch:") {
-                    let Some(value) = line.trim_start().strip_prefix("resolution:") else {
-                        continue;
-                    };
-                    let value = value.trim().trim_matches('"');
-                    // A locator has an ident before @patch:.
-                    if let Some((_, source)) = value.split_once("@patch:") {
-                        index.yarn(&format!("patch:{source}"), &yarn_lock);
-                    }
-                }
+                index.yarn_lock(&text, &yarn_lock);
             }
             for file in ["pnpm-workspace.yaml", "pnpm-lock.yaml"] {
                 let path = dir.join(file);
                 if let Some(text) = index.read(&path, "npm").await {
-                    if file == "pnpm-lock.yaml"
-                        && !text.contains("patchedDependencies")
-                        && !text.contains("patch_hash")
-                        && !text.contains("patched:")
-                    {
-                        continue;
-                    }
-                    match serde_saphyr::from_multiple_with_options::<Value>(&text, lock_options()) {
-                        Ok(documents) => {
-                            for value in documents {
-                                index.native(&value, &path);
-                                if file == "pnpm-workspace.yaml" {
-                                    if let Some(packages) = value["packages"].as_array() {
-                                        globs.extend(
-                                            packages
-                                                .iter()
-                                                .filter_map(Value::as_str)
-                                                .map(str::to_owned),
-                                        );
-                                    }
-                                }
+                    let lock = file == "pnpm-lock.yaml";
+                    for value in index.pnpm_yaml(&text, &path, lock, true) {
+                        if !lock {
+                            if let Some(packages) = value["packages"].as_array() {
+                                globs.extend(
+                                    packages.iter().filter_map(Value::as_str).map(str::to_owned),
+                                );
                             }
                         }
-                        Err(e) => index.unknown(
-                            "npm",
-                            &path,
-                            &format!("cannot inspect patch metadata: {e}"),
-                        ),
                     }
                 }
             }
@@ -206,6 +164,99 @@ impl UserPatchIndex {
             }
         }
         index
+    }
+
+    /// The patches a project's pnpm, yarn or patch-package setup applies
+    /// to its npm dependencies, declared at the project root and read
+    /// through `view` as the hosted engine and `vex` discovery read the
+    /// project: `package.json`'s `pnpm.patchedDependencies`, its yarn
+    /// `patch:` descriptors and its patch-package directories (`patches/`
+    /// and every `--patch-dir` its scripts name), `pnpm-workspace.yaml`'s
+    /// `patchedDependencies`, and of `locks` (root-relative path and text)
+    /// each pnpm lock's patches and each `yarn.lock`'s user `patch:`
+    /// locators. These are the parse rules [`Self::discover`] (the CLI's
+    /// consent gate) applies, without its workspace and ancestor walk, and
+    /// without npm's and Bun's own top-level `patchedDependencies`, which
+    /// no other package manager reads and which their own rewriters and
+    /// discovery judge per resolution (#711, #367). vlt has no patch
+    /// mechanism of its own, so a vlt project patches a dependency only
+    /// through a postinstall tool such as patch-package.
+    pub(crate) async fn npm_family_in(view: &ProjectView<'_>, locks: &[(&str, &str)]) -> Self {
+        let mut index = Self::default();
+        let manifest = Path::new("package.json");
+        match index.read_view(view, "package.json").await {
+            Some(text) => {
+                if let Some(value) = index.parse_json(&text, manifest, "npm") {
+                    index.patched_dependencies(&value["pnpm"]["patchedDependencies"], manifest);
+                    index.yarn_manifest(&value, manifest);
+                    index.list_patch_directory(view, "patches", false).await;
+                    for dir in index.patch_package_dirs(manifest, &value) {
+                        index.list_patch_directory(view, &dir, true).await;
+                    }
+                }
+            }
+            None => index.list_patch_directory(view, "patches", false).await,
+        }
+        let workspace = "pnpm-workspace.yaml";
+        if let Some(text) = index.read_view(view, workspace).await {
+            index.pnpm_yaml(&text, Path::new(workspace), false, false);
+        }
+        for (rel, text) in locks {
+            let path = Path::new(rel);
+            match rel.rsplit('/').next() {
+                Some("pnpm-lock.yaml" | "shrinkwrap.yaml") => {
+                    index.pnpm_yaml(strip_bom(text), path, true, false);
+                }
+                Some("yarn.lock") => index.yarn_lock(text, path),
+                _ => {}
+            }
+        }
+        index
+    }
+
+    /// Whether the index holds no evidence at all.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// [`Self::read`] through a project view.
+    async fn read_view(&mut self, view: &ProjectView<'_>, rel: &str) -> Option<String> {
+        match view.read_text(rel).await {
+            Ok(text) => Some(strip_bom(&text).to_owned()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            // An in-memory link has no content to read: the engine refuses
+            // a project with a linked candidate file on its own, so it is
+            // not taken for unknown metadata, which would withhold every
+            // package ahead of that refusal.
+            Err(_) if view.is_symlink(rel) => None,
+            Err(e) => {
+                self.unknown(
+                    "npm",
+                    Path::new(rel),
+                    &format!("cannot inspect patch metadata: {e}"),
+                );
+                None
+            }
+        }
+    }
+
+    /// [`Self::patch_directory`] through a project view.
+    async fn list_patch_directory(&mut self, view: &ProjectView<'_>, rel: &str, required: bool) {
+        let rel = rel.trim_start_matches("./").trim_end_matches('/');
+        match view.list_dir(rel).await {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = Path::new(rel).join(&entry.name);
+                    self.patch_file(&entry.name, &path, required);
+                }
+            }
+            Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => self.unknown(
+                "npm",
+                Path::new(rel),
+                &format!("cannot inspect patch-package directory: {e}"),
+            ),
+        }
     }
 
     // Use the existing npm/Yarn glob grammar, with a bounded, link-free walk.
@@ -435,19 +486,28 @@ impl UserPatchIndex {
     }
 
     fn native(&mut self, value: &Value, path: &Path) {
-        for field in [
-            &value["patchedDependencies"],
-            &value["pnpm"]["patchedDependencies"],
-        ] {
-            if let Some(map) = field.as_object() {
-                for key in map.keys() {
-                    let (name, version) = split_selector(key);
-                    self.add("npm", name, version, path);
-                }
-            } else if !field.is_null() {
-                self.unknown("npm", path, "invalid patchedDependencies");
+        self.patched_dependencies(&value["patchedDependencies"], path);
+        self.patched_dependencies(&value["pnpm"]["patchedDependencies"], path);
+        self.pnpm_lock_patches(value, path);
+    }
+
+    /// A `patchedDependencies` map's keys (`name`, `name@version`,
+    /// `name@range`, or Bun's `name@<resolution>`), as npm, Bun and pnpm
+    /// all spell them.
+    fn patched_dependencies(&mut self, field: &Value, path: &Path) {
+        if let Some(map) = field.as_object() {
+            for key in map.keys() {
+                let (name, version) = split_selector(key);
+                self.add("npm", name, version, path);
             }
+        } else if !field.is_null() {
+            self.unknown("npm", path, "invalid patchedDependencies");
         }
+    }
+
+    /// The pnpm lock entries pnpm patches: a `(patch_hash=…)` key suffix,
+    /// or an older lock's `patched: true`.
+    fn pnpm_lock_patches(&mut self, value: &Value, path: &Path) {
         // Older pnpm locks can carry patch hashes without a mirrored map.
         for field in ["packages", "snapshots"] {
             if let Some(map) = value[field].as_object() {
@@ -459,6 +519,74 @@ impl UserPatchIndex {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The pnpm declarations of `pnpm-workspace.yaml` (`lock` false) or of
+    /// a pnpm lock (`lock` true): the top-level `patchedDependencies` map
+    /// (pnpm 10+'s workspace setting, and the copy every lock records) and
+    /// the lock's patched entries. A lock that never spells a patch is not
+    /// parsed. `any_map` also reads a `pnpm.patchedDependencies` map, which
+    /// only `package.json` defines. Returns the parsed documents.
+    fn pnpm_yaml(&mut self, text: &str, path: &Path, lock: bool, any_map: bool) -> Vec<Value> {
+        if lock
+            && !text.contains("patchedDependencies")
+            && !text.contains("patch_hash")
+            && !text.contains("patched:")
+        {
+            return Vec::new();
+        }
+        match serde_saphyr::from_multiple_with_options::<Value>(text, lock_options()) {
+            Ok(documents) => {
+                for value in &documents {
+                    self.patched_dependencies(&value["patchedDependencies"], path);
+                    if any_map {
+                        self.patched_dependencies(&value["pnpm"]["patchedDependencies"], path);
+                    }
+                    self.pnpm_lock_patches(value, path);
+                }
+                documents
+            }
+            Err(e) => {
+                self.unknown("npm", path, &format!("cannot inspect patch metadata: {e}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// The yarn `patch:` descriptors a `package.json` declares, in its
+    /// dependency maps and `resolutions`.
+    fn yarn_manifest(&mut self, value: &Value, path: &Path) {
+        for field in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "resolutions",
+        ] {
+            if let Some(map) = value[field].as_object() {
+                for spec in map.values().filter_map(Value::as_str) {
+                    self.yarn(spec, path);
+                }
+            }
+        }
+    }
+
+    /// The user `patch:` locators a yarn berry lock resolves (a classic
+    /// lock has none).
+    fn yarn_lock(&mut self, text: &str, path: &Path) {
+        // Only Berry has patch: locators. Every Berry lock carries builtin
+        // compat patches, so scan the resolution lines rather than parse
+        // what can be a very large lockfile, and visit only the few lines
+        // that can hold one.
+        for line in lines_containing(text, "@patch:") {
+            let Some(value) = line.trim_start().strip_prefix("resolution:") else {
+                continue;
+            };
+            let value = value.trim().trim_matches('"');
+            // A locator has an ident before @patch:.
+            if let Some((_, source)) = value.split_once("@patch:") {
+                self.yarn(&format!("patch:{source}"), path);
             }
         }
     }
@@ -479,12 +607,23 @@ impl UserPatchIndex {
 
     async fn patch_package(&mut self, dir: &Path, value: &Value) {
         self.patch_directory(&dir.join("patches"), false).await;
+        for patch_dir in self.patch_package_dirs(&dir.join("package.json"), value) {
+            self.patch_directory(&dir.join(patch_dir), true).await;
+        }
+    }
+
+    /// The `--patch-dir` directories the `patch-package` scripts of the
+    /// `package.json` at `manifest` name, relative to its directory. A
+    /// script whose directory can't be read without running it protects
+    /// every npm package instead.
+    fn patch_package_dirs(&mut self, manifest: &Path, value: &Value) -> Vec<String> {
         // Compiled once, and only for a project whose scripts run patch-package.
         static FLAG: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r#"--patch-dir(?:=|\s+)(?:"([^"]+)"|'([^']+)'|([^\s;&|]+))"#).unwrap()
         });
         // `cd` as a command, not the tail of a word like `abcd`.
         static CD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?:^|[\s;&|(])cd\s").unwrap());
+        let mut dirs = Vec::new();
         if let Some(scripts) = value["scripts"].as_object() {
             for script in scripts
                 .values()
@@ -499,7 +638,7 @@ impl UserPatchIndex {
                 if moved || (script.contains("--patch-dir") && !FLAG.is_match(script)) {
                     self.unknown(
                         "npm",
-                        &dir.join("package.json"),
+                        manifest,
                         "cannot resolve patch-package directory without executing the script",
                     );
                 }
@@ -508,15 +647,16 @@ impl UserPatchIndex {
                     if path.contains(['$', '`']) || moved {
                         self.unknown(
                             "npm",
-                            &dir.join("package.json"),
+                            manifest,
                             "dynamic patch-package directory; inspect it before opting in",
                         );
                     } else {
-                        self.patch_directory(&dir.join(path), true).await;
+                        dirs.push(path.to_string());
                     }
                 }
             }
         }
+        dirs
     }
 
     async fn patch_directory(&mut self, dir: &Path, required: bool) {
@@ -533,32 +673,37 @@ impl UserPatchIndex {
             }
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    self.unknown("npm", dir, &e.to_string());
-                    continue;
-                }
-            };
-            let file = entry.file_name().to_string_lossy().into_owned();
-            let Some(stem) = file.strip_suffix(".patch") else {
-                continue;
-            };
-            let leaf = stem.rsplit("++").next().unwrap_or(stem);
-            let parts: Vec<_> = leaf.split('+').collect();
-            let scoped = leaf.starts_with('@');
-            let version_idx = if scoped { 2 } else { 1 };
-            if let Some(version) = parts.get(version_idx) {
-                let version = version.trim_end_matches(".dev");
-                let name = if scoped {
-                    format!("{}/{}", parts[0], parts[1])
-                } else {
-                    parts[0].to_string()
-                };
-                self.add("npm", &name, Some(version), &entry.path());
-            } else if required {
-                self.unknown("npm", &entry.path(), "unrecognized patch-package filename");
+            match entry {
+                Ok(entry) => self.patch_file(
+                    &entry.file_name().to_string_lossy(),
+                    &entry.path(),
+                    required,
+                ),
+                Err(e) => self.unknown("npm", dir, &e.to_string()),
             }
+        }
+    }
+
+    /// One file of a patch-package directory, named
+    /// `[<parent>++]<name>+<version>[.dev].patch` (`@scope+name+…` scoped).
+    fn patch_file(&mut self, file: &str, path: &Path, required: bool) {
+        let Some(stem) = file.strip_suffix(".patch") else {
+            return;
+        };
+        let leaf = stem.rsplit("++").next().unwrap_or(stem);
+        let parts: Vec<_> = leaf.split('+').collect();
+        let scoped = leaf.starts_with('@');
+        let version_idx = if scoped { 2 } else { 1 };
+        if let Some(version) = parts.get(version_idx) {
+            let version = version.trim_end_matches(".dev");
+            let name = if scoped {
+                format!("{}/{}", parts[0], parts[1])
+            } else {
+                parts[0].to_string()
+            };
+            self.add("npm", &name, Some(version), path);
+        } else if required {
+            self.unknown("npm", path, "unrecognized patch-package filename");
         }
     }
 
@@ -1239,5 +1384,112 @@ mod tests {
             );
             assert!(index.conflicts("pkg:pypi/anything@1.0.0").is_empty());
         }
+    }
+
+    /// The view-based index the hosted engine and `vex` discovery read
+    /// ([`UserPatchIndex::npm_family_in`]) protects exactly what the CLI's
+    /// consent gate ([`UserPatchIndex::discover`]) protects for a root
+    /// project's pnpm, yarn and patch-package declarations, so hosted,
+    /// vendored and discovery never disagree about one, in memory and on
+    /// disk. npm's and Bun's own top-level `patchedDependencies` are the
+    /// gate's alone: their rewriters and extractors judge them per
+    /// resolution.
+    #[tokio::test]
+    async fn npm_family_view_index_agrees_with_the_consent_gate() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        const LOCK: &str = "pnpm-lock.yaml";
+        let pnpm_lock = "lockfileVersion: '9.0'\n\npatchedDependencies:\n  left-pad@1.3.0:\n    hash: abc\n    path: patches/left-pad.patch\n\npackages:\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n\nsnapshots:\n  left-pad@1.3.0(patch_hash=abc): {}\n";
+        let berry_lock = "__metadata:\n  version: 8\n\n\"left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/lp.patch\":\n  version: 1.3.0\n  resolution: \"left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/lp.patch::version=1.3.0&hash=abc\"\n";
+        let cases: &[(&[(&str, &str)], bool)] = &[
+            (&[(LOCK, pnpm_lock)], true),
+            (&[("yarn.lock", berry_lock)], true),
+            (
+                &[(
+                    "pnpm-workspace.yaml",
+                    "patchedDependencies:\n  left-pad: p.patch\n",
+                )],
+                true,
+            ),
+            (
+                &[(
+                    "package.json",
+                    r#"{"pnpm":{"patchedDependencies":{"left-pad@^1":"p.patch"}}}"#,
+                )],
+                true,
+            ),
+            (
+                &[(
+                    "package.json",
+                    r#"{"resolutions":{"left-pad":"patch:left-pad@npm%3A1.3.0#./p.patch"}}"#,
+                )],
+                true,
+            ),
+            (&[("patches/left-pad+1.3.0.patch", "diff")], true),
+            (
+                &[
+                    (
+                        "package.json",
+                        r#"{"scripts":{"postinstall":"patch-package --patch-dir fixes"}}"#,
+                    ),
+                    ("fixes/left-pad+1.3.0.patch", "diff"),
+                ],
+                true,
+            ),
+            (&[("patches/left-pad+1.2.0.patch", "diff")], false),
+            (
+                &[(
+                    "package.json",
+                    r#"{"resolutions":{"x":"patch:x@npm%3A1.0.0#~/.yarn/patches/x.patch"}}"#,
+                )],
+                false,
+            ),
+            (&[("package.json", "{broken json")], true),
+        ];
+        for (files, protected) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let mut memory = MemoryProject::new();
+            for (path, text) in *files {
+                write(tmp.path(), path, text);
+                memory.insert(*path, MemoryEntry::Text((*text).into()));
+            }
+            let gate = UserPatchIndex::discover(tmp.path()).await;
+            let locks: Vec<(&str, &str)> = files
+                .iter()
+                .copied()
+                .filter(|(p, _)| *p == LOCK || *p == "yarn.lock")
+                .collect();
+            for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
+                let index = UserPatchIndex::npm_family_in(&view, &locks).await;
+                for purl in ["pkg:npm/left-pad@1.3.0", "pkg:npm/other@1.0.0"] {
+                    let want =
+                        *protected && (purl.contains("left-pad") || files[0].1 == "{broken json");
+                    assert_eq!(
+                        !gate.conflicts(purl).is_empty(),
+                        want,
+                        "gate {files:?} {purl}"
+                    );
+                    assert_eq!(
+                        !index.conflicts(purl).is_empty(),
+                        want,
+                        "{files:?} {purl}: {index:?}"
+                    );
+                }
+            }
+        }
+        // npm's and Bun's own map: the gate's alone.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"patchedDependencies":{"left-pad@1.3.0":"p.patch"}}"#,
+        );
+        let purl = "pkg:npm/left-pad@1.3.0";
+        assert!(!UserPatchIndex::discover(tmp.path())
+            .await
+            .conflicts(purl)
+            .is_empty());
+        let index = UserPatchIndex::npm_family_in(&ProjectView::Disk(tmp.path()), &[]).await;
+        assert!(index.is_empty(), "{index:?}");
     }
 }
