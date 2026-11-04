@@ -2732,6 +2732,13 @@ async fn sweep_stale_artifact(
     );
 }
 
+/// Whether the lock (or, for a vendored package, the ledger's pre-vendor
+/// fragment) resolves `purl` with a content verifier: the yes/no gate
+/// [`lock_refusals_reaching_backend`] reads. It downloads nothing — the
+/// vendored backends take their bytes from the patch service by patch
+/// uuid — so a Socket-hosted entry's patched URL and hash are never used
+/// as a pristine source here (the callers leave hosted-pinned purls to the
+/// takeover, which restores the upstream entry from the registry).
 pub(crate) async fn pristine_fetch_is_verifiable(
     project_root: &Path,
     inventory: &[lock_inventory::LockfileEntry],

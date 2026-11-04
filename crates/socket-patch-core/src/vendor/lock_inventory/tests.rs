@@ -2739,6 +2739,26 @@ async fn bun_binary_hosted_pins_inventory_as_their_registry_package() {
     assert_eq!(minimist.integrity, LockIntegrity::None);
 }
 
+/// A composer.lock saved with a UTF-8 BOM inventories past it, as lockfile
+/// discovery and the vendored backend read it; before, the whole lock
+/// vanished from the inventory. A second BOM is content (unparseable).
+#[tokio::test]
+async fn composer_lock_with_a_bom_inventories_its_entries() {
+    let lock = r#"{"packages": [{"name": "good/pkg", "version": "1.0.0",
+        "dist": {"type": "zip", "url": "https://example.com/p.zip",
+                 "shasum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}]}"#;
+    let bom = crate::formats::text::BOM;
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "composer.lock", &format!("{bom}{lock}")).await;
+    let entries = inventory_composer_lock(tmp.path()).await.unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].purl, "pkg:composer/good/pkg@1.0.0");
+    assert!(matches!(entries[0].integrity, LockIntegrity::Sha1Hex(_)));
+
+    write(tmp.path(), "composer.lock", &format!("{bom}{bom}{lock}")).await;
+    assert!(inventory_composer_lock(tmp.path()).await.is_none());
+}
+
 /// composer.lock packages missing a name or version are skipped, and
 /// names that are unsafe or not `vendor/pkg`-shaped are dropped
 /// fail-closed (SECURITY: they feed paths and download URLs).
@@ -3733,4 +3753,96 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
     assert_ne!(warnings[0].1, "probe detail text");
     assert_ne!(warnings[1].1, "probe detail text");
     assert_eq!(warnings[2].1, "probe detail text");
+}
+
+/// The guard that keeps Socket's PATCHED bytes from ever standing in for a
+/// pristine upstream artifact. This inventory (and [`recover_lock_entry`])
+/// lists a Socket-hosted entry as the package it replaces, with the hosted
+/// artifact's URL as `resolved` and the patched artifact's hash as
+/// `integrity` (composer's dist sha1, a gem's CHECKSUMS sha256, an npm
+/// hosted tarball's SRI). That is safe only because no code downloads
+/// what a lock pins:
+///
+/// * the vendored backends and `repair` take their bytes from the patch
+///   service by patch uuid (`vendor::service_fetch::fetch_verified_archive`),
+///   verified against the service's own digest;
+/// * `recover_lock_entry`'s one production caller is the CLI's
+///   `pristine_fetch_is_verifiable`, a yes/no gate on which lock-text
+///   refusals to report; it fetches nothing;
+/// * the only registry downloads are the hosted → vendored takeover's
+///   upstream restore (`patch::redirect::upstream::client`), which
+///   re-resolves the entry from the registry's own metadata and never
+///   reads the hosted pin's URL or hash, and the JVM backend's Maven
+///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
+///   coordinates and checked against the upstream checksum files.
+///
+/// A new call site of any of these must keep that property: read the
+/// pristine source from the registry, never from a lock entry that might
+/// be Socket-hosted.
+#[test]
+fn lock_pinned_locations_never_drive_a_download() {
+    fn walk(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let core = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let crates = core.parent().unwrap();
+    let mut files = Vec::new();
+    for krate in ["socket-patch-core", "socket-patch-cli"] {
+        walk(&crates.join(krate).join("src"), &mut files);
+    }
+    // Test modules kept in files of their own (this one included).
+    files.retain(|path| {
+        let path = path.to_string_lossy();
+        !path.ends_with("tests.rs") && !path.contains("test_support")
+    });
+    let allowed: &[(&str, &[&str])] = &[
+        (
+            "registry_fetch::download(",
+            &["socket-patch-core/src/patch/redirect/upstream/client.rs"],
+        ),
+        (
+            "fetch_registry_bytes(",
+            &[
+                "socket-patch-core/src/patch/jvm_jar.rs",
+                "socket-patch-core/src/vendor/maven_repo.rs",
+            ],
+        ),
+        (
+            "recover_lock_entry(",
+            &[
+                "socket-patch-cli/src/commands/vendor.rs",
+                "socket-patch-core/src/vendor/lock_inventory/recover.rs",
+            ],
+        ),
+    ];
+    for (needle, expected) in allowed {
+        let mut found: Vec<String> = files
+            .iter()
+            .filter(|path| {
+                let text = std::fs::read_to_string(path).unwrap();
+                let production = text.split("#[cfg(test)]").next().unwrap_or_default();
+                production.contains(needle)
+            })
+            .map(|path| {
+                path.strip_prefix(crates)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found, *expected,
+            "`{needle}` gained or lost a production call site. A download must never take \
+             its URL or hash from a lock entry, which may be Socket-hosted (patched bytes); \
+             re-check the new site against this test's docs, then update the list"
+        );
+    }
 }
