@@ -756,10 +756,12 @@ async fn rush_json_without_any_lock_yields_none() {
     assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
 }
 
+/// Lock-model divergence N12: Rush's locks are their own install trees,
+/// read whenever `rush.json` is present — beside a root lock too, as
+/// hosted mode and lockfile discovery read them. Before, a root lock
+/// shadowed them (this test pinned "the root lock wins").
 #[tokio::test]
-async fn root_pnpm_lock_wins_over_rush_fallback() {
-    // A plain pnpm project that also happens to carry a stray rush.json
-    // must route through the normal root-lock path, never the fallback.
+async fn rush_locks_are_read_beside_the_root_lock() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
@@ -780,8 +782,90 @@ packages:
     assert_eq!(flavor, NpmLockFlavor::Pnpm);
     assert!(entries.iter().any(|e| e.name == "left-pad"));
     assert!(
+        entries.iter().any(|e| e.name == "only-in-common"),
+        "the Rush common lock is read beside the root lock: {entries:?}"
+    );
+
+    // Beside another family's lock too.
+    tokio::fs::remove_file(tmp.path().join("pnpm-lock.yaml"))
+        .await
+        .unwrap();
+    write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::PackageLock);
+    assert!(
+        entries.iter().any(|e| e.name == "only-in-common"),
+        "{entries:?}"
+    );
+
+    // Without rush.json they are not Rush's.
+    tokio::fs::remove_file(tmp.path().join("rush.json"))
+        .await
+        .unwrap();
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert!(
         !entries.iter().any(|e| e.name == "only-in-common"),
-        "the root lock must win; the rush fallback must not run: {entries:?}"
+        "{entries:?}"
+    );
+}
+
+/// Lock-model divergence N14: with pnpm's `lockfile` setting off, pnpm
+/// never reads the lock, so a Socket-hosted pin in it is no lockfile
+/// basis. Lockfile discovery keeps the ref and withholds its pin; the
+/// inventory keeps the entry (and its hosted url) and drops its
+/// integrity, so nothing fetches or verifies against it. Registry entries
+/// keep theirs. Before, the inventory ignored the setting. Rush runs pnpm
+/// with settings of its own, so its locks are untouched (as in discovery).
+#[tokio::test]
+async fn pnpm_lockfile_off_withholds_hosted_pins() {
+    let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
+    let url =
+        format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/{uuid}/left-pad-1.3.0.tgz");
+    let lock = format!(
+        "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+         resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n\n  \
+         right-pad@2.0.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n"
+    );
+    let integrity = |entries: &[LockfileEntry], name: &str| entry(entries, name).integrity.clone();
+    for (setting, withheld) in [
+        (None, false),
+        (Some((".npmrc", "lockfile=false\n")), true),
+        (Some(("pnpm-workspace.yaml", "lockfile: false\n")), true),
+        (Some((".npmrc", "lockfile=true\n")), false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", &lock).await;
+        if let Some((file, text)) = setting {
+            write(tmp.path(), file, text).await;
+        }
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        let left = entry(&entries, "left-pad");
+        assert_eq!(left.resolved.as_deref(), Some(url.as_str()), "{setting:?}");
+        assert_eq!(
+            integrity(&entries, "left-pad"),
+            if withheld {
+                LockIntegrity::None
+            } else {
+                LockIntegrity::Sri("sha512-PATCHED==".into())
+            },
+            "{setting:?}"
+        );
+        assert_eq!(
+            integrity(&entries, "right-pad"),
+            LockIntegrity::Sri("sha512-UPSTREAM==".into()),
+            "{setting:?}"
+        );
+    }
+
+    // Rush: the setting is not Rush's, so its lock keeps the pin.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+    write(tmp.path(), ".npmrc", "lockfile=false\n").await;
+    write_nested(tmp.path(), "common/config/rush/pnpm-lock.yaml", &lock).await;
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(
+        integrity(&entries, "left-pad"),
+        LockIntegrity::Sri("sha512-PATCHED==".into())
     );
 }
 
