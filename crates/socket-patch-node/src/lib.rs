@@ -217,9 +217,6 @@ impl NativeHostedScanSession {
             fetch_registry_references: provider_function(&provider, "fetchRegistryReferences")?
                 .create_ref()
                 .map_err(napi_js_error)?,
-            fetch_patch: provider_function(&provider, "fetchPatch")?
-                .create_ref()
-                .map_err(napi_js_error)?,
             download_artifact: provider_function(&provider, "downloadArtifact")?
                 .create_ref()
                 .map_err(napi_js_error)?,

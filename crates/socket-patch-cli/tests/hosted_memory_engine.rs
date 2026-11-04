@@ -14,9 +14,7 @@ use socket_patch_cli::hosted_memory::{
     HostedScanOutput, SelectOptions, SessionBuilder, TreeEntryInput,
 };
 use socket_patch_core::api::client::{ApiError, ApiFuture, PatchApi};
-use socket_patch_core::api::types::{
-    BatchSearchResponse, PackageVendorResult, PatchResponse, SearchResponse,
-};
+use socket_patch_core::api::types::{BatchSearchResponse, PackageVendorResult, SearchResponse};
 use tokio_util::sync::CancellationToken;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -79,7 +77,7 @@ async fn roots_sharing_a_purl_share_every_lookup() {
     assert_eq!(count(&server, "POST", "/patches/batch").await, 1);
     assert_eq!(count(&server, "GET", "/patches/by-package/").await, 1);
     assert_eq!(count(&server, "POST", "/patches/package").await, 1);
-    assert_eq!(count(&server, "GET", "/patches/view/").await, 1);
+    assert_eq!(count(&server, "GET", "/patches/view/").await, 0);
     let paths: Vec<&str> = output
         .changed_files
         .iter()
@@ -363,9 +361,6 @@ impl PatchApi for Stalled {
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
         Box::pin(std::future::pending())
     }
-    fn fetch_patch<'a>(&'a self, _: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
-        Box::pin(std::future::pending())
-    }
     fn download_artifact<'a>(&'a self, _: &'a str, _: u64) -> ApiFuture<'a, Vec<u8>> {
         Box::pin(async { Err(ApiError::Other("unused".into())) })
     }
@@ -420,9 +415,6 @@ impl PatchApi for CountingStalled {
         &'a self,
         _: &'a [String],
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
-        Box::pin(std::future::pending())
-    }
-    fn fetch_patch<'a>(&'a self, _: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
         Box::pin(std::future::pending())
     }
     fn download_artifact<'a>(&'a self, _: &'a str, _: u64) -> ApiFuture<'a, Vec<u8>> {
@@ -945,7 +937,6 @@ async fn stats_count_inputs_and_calls() {
         "searchPatchesBatch",
         "searchPatchesByPackage",
         "fetchRegistryReferences",
-        "fetchPatch",
     ] {
         assert_eq!(
             output.stats.provider_calls.get(method_name),
@@ -953,6 +944,7 @@ async fn stats_count_inputs_and_calls() {
             "{method_name}"
         );
     }
+    assert_eq!(output.stats.provider_calls.get("fetchPatch"), None);
 }
 
 #[test]

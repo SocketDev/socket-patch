@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use crate::api::client::{ApiError, ApiFuture, PatchApi};
 use crate::api::ranking::cmp_search_results;
-use crate::api::types::{BatchPackagePatches, PackageVendorResult, PatchResponse, SearchResponse};
+use crate::api::types::{BatchPackagePatches, PackageVendorResult, SearchResponse};
 use crate::hosted::npm_manifest::HostedClassicArtifact;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::purl_key::PurlKey;
@@ -133,10 +133,6 @@ impl Provider {
             self.api.fetch_registry_references(uuids),
         )
         .await
-    }
-
-    pub(crate) async fn fetch_patch(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
-        self.call("fetchPatch", self.api.fetch_patch(uuid)).await
     }
 
     pub(crate) async fn download_artifact(
@@ -423,24 +419,6 @@ pub(crate) async fn fetch_classic_artifacts(
         .collect()
 }
 
-/// Patch views for every distinct confirmed uuid (wet runs only).
-pub(crate) async fn fetch_records(
-    provider: &Provider,
-    uuids: &BTreeSet<String>,
-) -> BTreeMap<String, Option<PatchResponse>> {
-    let ordered: Vec<&String> = uuids.iter().collect();
-    let futures: Vec<BoxFuture<'_, _>> = ordered
-        .iter()
-        .map(|uuid| -> BoxFuture<'_, _> { Box::pin(provider.fetch_patch(uuid)) })
-        .collect();
-    let results = join_bounded(futures, provider.concurrency).await;
-    ordered
-        .into_iter()
-        .cloned()
-        .zip(results.into_iter().map(|r| r.ok().flatten()))
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,12 +533,6 @@ mod tests {
             &'a self,
             _uuids: &'a [String],
         ) -> ApiFuture<'a, HashMap<String, crate::api::types::PackageVendorResult>> {
-            Box::pin(async { Err(ApiError::Other("unused".into())) })
-        }
-        fn fetch_patch<'a>(
-            &'a self,
-            _uuid: &'a str,
-        ) -> ApiFuture<'a, Option<crate::api::types::PatchResponse>> {
             Box::pin(async { Err(ApiError::Other("unused".into())) })
         }
         fn download_artifact<'a>(&'a self, _url: &'a str, _max: u64) -> ApiFuture<'a, Vec<u8>> {

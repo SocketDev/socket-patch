@@ -2009,9 +2009,6 @@ async fn scan_redirect_heals_digestless_bun_tuple_and_rollback_restores_the_regi
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
-    // The record fetch too, so the "no warnings at all" assertion below is
-    // exact (without it every run carries a `record_fetch_failed` advisory).
-    mock_view(&server).await;
 
     let tmp = tempfile::tempdir().unwrap();
     write_bun_project(tmp.path(), 1);
@@ -3167,8 +3164,8 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
          values; stderr=\n{stderr}"
     );
 
-    // Leg 2 — a GRANTED reference whose patch record cannot be fetched (no
-    // `view/{uuid}` mock → 404) produces a `record_fetch_failed` warning.
+    // Leg 2 — a GRANTED reference redirects without the patch record: the
+    // hosted scan never asks for `view/{uuid}`, so nothing warns about it.
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -3195,17 +3192,20 @@ async fn redirect_human_mode_warnings_are_not_json_quoted() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stdout.contains("Switched 1 package to hosted patches; rewrote"),
-        "anchor: the dep must have been redirected so the record fetch runs; \
-         stdout=\n{stdout}\nstderr=\n{stderr}"
+        "anchor: the dep must have been redirected; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains(&format!(
-            "Warning: {PURL} was switched to hosted, but its patch record could not \
-             be fetched"
-        )),
-        "the record-fetch warning must print the bare detail string, not a \
-         JSON-quoted one; stderr=\n{stderr}"
+        !stderr.contains("patch record"),
+        "a hosted scan fetches no patch record; stderr=\n{stderr}"
     );
+    let views = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|r| r.url.path().contains("/view/"))
+        .count();
+    assert_eq!(views, 0, "a hosted scan never fetches a patch view");
 }
 
 /// The `redirect_rush_repo_state_stale` warning fires exactly when a Rush lock
@@ -4979,8 +4979,7 @@ async fn composer_redirect_is_confirmed_and_recorded() {
         "dist.shasum must pin the patched artifact's sha1; got:\n{lock}"
     );
 
-    // The confirmation is what drives the record fetch (held in memory for
-    // the in-run VEX — v5 persists no ledger): no confirmation, no record.
+    // A hosted scan fetches no patch record (v5 persists no ledger).
     let views = server
         .received_requests()
         .await
@@ -4988,7 +4987,7 @@ async fn composer_redirect_is_confirmed_and_recorded() {
         .iter()
         .filter(|r| r.url.path().contains("/patches/view/"))
         .count();
-    assert_eq!(views, 1, "the confirmed redirect fetched its patch record");
+    assert_eq!(views, 0, "a hosted scan never fetches a patch view");
     vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 

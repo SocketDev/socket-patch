@@ -31,6 +31,8 @@ use std::path::Path;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
+#[path = "common/patched_wheel.rs"]
+mod patched_wheel;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 #[path = "vex_pipenv_pip_steps/mod.rs"]
@@ -109,6 +111,24 @@ fn hosted_args(cwd: &Path, api_url: String, vex: Option<&Path>) -> ScanArgs {
 
 async fn mock_api(server: &MockServer) {
     mock_api_serving(server, HOSTED_URL).await;
+}
+
+/// Serve the patched wheel the stale-install probe judges against and pin
+/// it ahead of [`mock_api`]'s grant; returns its URL.
+async fn mock_patched_wheel(server: &MockServer) -> String {
+    let wheel = patched_wheel::build(
+        "urllib3-1.26.18.dist-info",
+        &[("urllib3/response.py", PATCHED)],
+    );
+    patched_wheel::mount_grant(
+        server,
+        ORG,
+        UUID,
+        PURL,
+        "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl",
+        wheel,
+    )
+    .await
 }
 
 /// [`mock_api`] with the grant serving `hosted_url` as the patched artifact.
@@ -243,8 +263,8 @@ fn write_project(root: &Path) {
 fn write_project_with_upstream_install(root: &Path) {
     write_project(root);
     let site = site_packages(root);
+    patched_wheel::install_wheel_metadata(&site, "urllib3-1.26.18.dist-info");
     let dist_info = site.join("urllib3-1.26.18.dist-info");
-    std::fs::create_dir_all(&dist_info).unwrap();
     std::fs::write(
         dist_info.join("METADATA"),
         "Metadata-Version: 2.1\nName: urllib3\nVersion: 1.26.18\n",
@@ -318,14 +338,18 @@ async fn mock_pypi(server: &MockServer) {
         .await;
 }
 
-/// In-process `rollback`: the hosted pin (on patch.socket.dev) is restored
-/// to its upstream entry, re-resolved from the mocked PyPI JSON API.
+/// In-process `rollback`: the hosted pin (on patch.socket.dev, or on the
+/// mock's own origin where it serves the patched wheel) is restored to its
+/// upstream entry, re-resolved from the mocked PyPI JSON API.
 async fn roll_back(cwd: &Path, server: &MockServer) {
     mock_pypi(server).await;
     std::env::set_var("SOCKET_PYPI_JSON_API", format!("{}/pypi", server.uri()));
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
-        common: global(cwd, server.uri()),
+        common: GlobalArgs {
+            patch_server_url: Some(server.uri()),
+            ..global(cwd, server.uri())
+        },
         preserve_state: false,
     })
     .await;
@@ -661,6 +685,7 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
     let _major = MajorGuard::set("2026");
     let server = MockServer::start().await;
     mock_api(&server).await;
+    let hosted = mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project_with_upstream_install(tmp.path());
     let lock_path = tmp.path().join("Pipfile.lock");
@@ -673,7 +698,7 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
     let code = run(hosted_args(tmp.path(), server.uri(), Some(&vex_path))).await;
     let redirected = read(&lock_path);
     assert!(
-        redirected.contains(HOSTED_URL),
+        redirected.contains(&hosted),
         "the lock is still repointed: {redirected}"
     );
     let attested = vex_path
@@ -701,6 +726,8 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
 
     // Manifest-less: the installed UPSTREAM copy is the evidence, whatever
     // the lock says — `not_applied`, online (the record from the API).
+    // The served wheel's origin is the patch server the lock now names.
+    let origin = server.uri();
     std::thread::scope(|scope| {
         scope
             .spawn(|| {
@@ -714,6 +741,7 @@ async fn warm_venv_with_the_upstream_release_is_not_attested() {
                     &p,
                     &vex_e2e_common::VexRun {
                         product: Some(VEX_PRODUCT.into()),
+                        patch_server_url: Some(origin.clone()),
                         ..vex_e2e_common::VexRun::online(&api)
                     },
                 );
@@ -744,6 +772,7 @@ async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
     ] {
         let server = MockServer::start().await;
         mock_api(&server).await;
+        let hosted = mock_patched_wheel(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         std::fs::create_dir_all(&project).unwrap();
@@ -840,7 +869,7 @@ async fn dotenv_selected_pipenv_install_is_checked_before_vex() {
             "the ambient env is unchanged"
         );
         assert_eq!(read(&project.join("Pipfile")), PIPFILE);
-        assert!(read(&project.join("Pipfile.lock")).contains(HOSTED_URL));
+        assert!(read(&project.join("Pipfile.lock")).contains(&hosted));
     }
 }
 
@@ -852,6 +881,7 @@ async fn legacy_dotenv_workon_install_is_checked_before_vex() {
     for forward_reference in [true, false] {
         let server = MockServer::start().await;
         mock_api(&server).await;
+        mock_patched_wheel(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("project");
         let legacy = tmp.path().join("legacy-workon");

@@ -17,7 +17,6 @@ const JSON_PROVIDER_METHODS = [
   'searchPatchesBatch',
   'searchPatchesByPackage',
   'fetchRegistryReferences',
-  'fetchPatch',
 ]
 const MAX_PROVIDER_MESSAGE = 2000
 const REQUIRED_EXPORTS = [

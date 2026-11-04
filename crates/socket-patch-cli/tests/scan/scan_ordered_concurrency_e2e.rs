@@ -830,13 +830,12 @@ async fn mount_hosted(server: &MockServer, failing: &[usize], delay: fn(usize) -
     }
 }
 
-/// A wet hosted run where 2 of 6 record views fail, with reversed
-/// latencies: the `record_fetch_failed` warnings keep `confirmed` order,
-/// stdout and the rewritten lockfile equal a zero-latency run's, and (v5)
-/// neither run writes a redirect ledger — a failed record fetch only drops
-/// the purl from this run's in-memory VEX records.
+/// A wet hosted run fetches no record views: with 2 of 6 views failing and
+/// reversed latencies mounted, no view is requested, nothing warns about a
+/// record, stdout and the rewritten lockfile equal a zero-latency run's,
+/// and (v5) neither run writes a redirect ledger.
 #[tokio::test]
-async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
+async fn hosted_scan_fetches_no_record_views() {
     let failing = [1usize, 3];
     let slow: fn(usize) -> Duration = |i| Duration::from_millis(50 * (6 - i as u64));
     let fast: fn(usize) -> Duration = |_| Duration::ZERO;
@@ -854,6 +853,14 @@ async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
             &["--json", "--mode", "hosted", "--yes"],
         );
         assert_eq!(code, 0, "stdout={stdout} stderr={stderr}");
+        let views = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|r| r.url.path().contains("/patches/view/"))
+            .count();
+        assert_eq!(views, 0, "a hosted scan never fetches a patch view");
         let lock = std::fs::read_to_string(tmp.path().join("package-lock.json")).unwrap();
         assert!(
             !tmp.path()
@@ -865,26 +872,7 @@ async fn hosted_record_fetch_failures_keep_order_and_lock_bytes() {
     }
 
     let (stdout, lock) = &outcomes[0];
-    let v: serde_json::Value = serde_json::from_str(stdout).unwrap();
-    let warnings: Vec<&str> = v["warnings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|w| w["code"] == "record_fetch_failed")
-        .map(|w| w["detail"].as_str().unwrap())
-        .collect();
-    assert_eq!(warnings.len(), 2, "{stdout}");
-    for (warning, idx) in warnings.iter().zip([1usize, 3]) {
-        assert_eq!(
-            *warning,
-            format!(
-                "{} was switched to hosted, but its patch record could not be fetched; this \
-                 run's VEX attestation omits it (`socket-patch vex` fetches it again once the \
-                 API answers)",
-                purl(NAMES[idx])
-            )
-        );
-    }
+    assert!(!stdout.contains("record_fetch_failed"), "{stdout}");
     for idx in 0..NAMES.len() {
         assert!(lock.contains(&hosted_url(idx)), "{lock}");
     }

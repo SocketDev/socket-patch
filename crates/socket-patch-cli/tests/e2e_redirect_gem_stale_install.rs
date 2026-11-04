@@ -15,13 +15,13 @@
 //!   3. FRESH checkout (no materialization) → quiet.
 //!   4. TWO gem homes both stale → one warning per home, each naming its
 //!      own paths.
-//!   5. RE-SCAN with a failing record fetch: v5 hosted mode keeps no ledger,
-//!      so a re-scan whose /patches/view fetch fails has no persisted record
-//!      to judge from — it surfaces `record_fetch_failed` (the VEX-omission
-//!      detail) and leaves the committed wiring untouched.
+//!   5. RE-SCAN: a hosted scan fetches no patch record — the installed
+//!      gem is judged by the archive RubyGems cached when installing it, so
+//!      the warning re-fires on every re-scan while the committed wiring is
+//!      left untouched.
 //!   6. Same-run `--vex`: the stale purl is excluded from the attestation
-//!      (built from this run's fetched records) — the envelope must never
-//!      attest a CVE its own warning says is live.
+//!      — the envelope must never attest a CVE its own warning says is
+//!      live.
 //!   7. Manifest-less standalone `vex` over the same committed state follows
 //!      the installed tree: stale → nothing discoverable (no ledger, lock not
 //!      yet converged); after the prescribed re-install (the lock bundler
@@ -52,11 +52,21 @@ const GHSA: &str = "GHSA-gem-stale-e2e";
 const UPSTREAM_LIB: &str =
     "module StaleProbeGem\n  def self.status\n    \"VULNERABLE\"\n  end\nend\n";
 const PATCHED_LIB: &str = "module StaleProbeGem\n  def self.status\n    \"PATCHED\"\n  end\nend\n";
+/// The `.gem` archives a real install leaves in the home's `cache/`: the
+/// patched one is the artifact the grant names (its sha256 below).
+const UPSTREAM_ARCHIVE: &[u8] = b"upstream-gem-archive-bytes";
+const PATCHED_ARCHIVE: &[u8] = b"patched-gem-archive-bytes";
+
+fn patched_archive_sha256() -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(PATCHED_ARCHIVE))
+}
 
 /// Mount the whole patches API: batch discovery, by-package selection, the
-/// granted reference (rubygems-compact-index override), and — unless
-/// `view_budget` caps it — the patch view whose file map carries the REAL
-/// before/after hashes of the fixture lib. With `view_budget: Some(n)` the
+/// granted reference (rubygems-compact-index override, carrying the patched
+/// archive's sha256), and — unless `view_budget` caps it — the patch view
+/// whose file map carries the REAL before/after hashes of the fixture lib
+/// (the standalone `vex` reads it). With `view_budget: Some(n)` the
 /// view answers 200 exactly n times and 500 afterwards (the transient-fetch
 /// re-fire arm).
 async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
@@ -106,7 +116,7 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
                     "artifacts": [{
                         "kind": "tarball",
                         "url": hosted_url,
-                        "integrity": { "sha256": "c0ffee".repeat(10) + "abcd" }
+                        "integrity": { "sha256": patched_archive_sha256() }
                     }],
                     "registryOverride": {
                         "kind": "rubygems-compact-index",
@@ -114,7 +124,7 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
                         "identifiers": {
                             "name": DEP,
                             "version": DEP_VERSION,
-                            "gemChecksumSha256": "c0ffee".repeat(10) + "abcd",
+                            "gemChecksumSha256": patched_archive_sha256(),
                         }
                     }
                 }
@@ -180,7 +190,8 @@ fn write_manifest_pair(proj: &Path) {
 
 /// Materialize the gem in bundler's deployment layout under one ruby-version
 /// home — installed dir + cached `.gem` + specifications entry, exactly what
-/// a real `bundle install` leaves. Paths are built COMPONENT-WISE (the same
+/// a real `bundle install` leaves (the cached archive is the patched one
+/// exactly when the lib is). Paths are built COMPONENT-WISE (the same
 /// join operations the crawler uses) so their `display()` matches the
 /// production warning text byte-for-byte on every platform.
 /// Returns (installed gem dir, cache .gem path, specifications path).
@@ -199,13 +210,25 @@ fn materialize_installed_gem(
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), lib_content).unwrap();
     let cache = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
     std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
-    std::fs::write(&cache, b"upstream-gem-archive-bytes").unwrap();
+    let archive = if lib_content == PATCHED_LIB {
+        PATCHED_ARCHIVE
+    } else {
+        UPSTREAM_ARCHIVE
+    };
+    std::fs::write(&cache, archive).unwrap();
     let spec = home
         .join("specifications")
         .join(format!("{DEP}-{DEP_VERSION}.gemspec"));
     std::fs::create_dir_all(spec.parent().unwrap()).unwrap();
     std::fs::write(&spec, "# stub gemspec\n").unwrap();
     (gem_dir, cache, spec)
+}
+
+/// The archive RubyGems leaves in `home/cache/` for the gem it installed.
+fn cache_archive(home: &Path, archive: &[u8]) {
+    let cache = home.join("cache");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join(format!("{DEP}-{DEP_VERSION}.gem")), archive).unwrap();
 }
 
 fn hosted_scan_json(proj: &Path, api: &str) -> (i32, String, String) {
@@ -531,22 +554,21 @@ async fn gem_hosted_redirect_warns_once_per_stale_gem_home() {
     assert!(b.contains(&cache_b.display().to_string()), "{b}");
 }
 
-/// v5 hosted mode keeps no ledger: scan 1 warns (from its fetched record)
-/// and persists nothing but the Gemfile/lock edits; scan 2's /patches/view
-/// fetch fails transiently (500), so it surfaces `record_fetch_failed` with
-/// the VEX-omission detail, exits 0, and leaves the committed wiring
-/// byte-identical (the re-run is idempotent) — still with no ledger.
+/// v5 hosted mode keeps no ledger and fetches no record: scan 1 warns
+/// (from the installed gem's cached archive) and persists nothing but the
+/// Gemfile/lock edits; scan 2 asks for no patch view either, warns again,
+/// exits 0, and leaves the committed wiring byte-identical (the re-run is
+/// idempotent) — still with no ledger.
 #[tokio::test(flavor = "multi_thread")]
-async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wiring() {
+async fn gem_hosted_rescan_rewarns_without_fetching_records_and_keeps_the_wiring() {
     let server = MockServer::start().await;
-    mount_api(&server, Some(1)).await; // view answers 200 exactly once
+    mount_api(&server, None).await;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     write_manifest_pair(&proj);
     let (gem_dir, ..) = materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
 
-    // Scan 1: fresh record, warning fires, no ledger persists anything.
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
     assert_eq!(code, 0);
     let env = common::parse_json_envelope(&stdout);
@@ -558,24 +580,19 @@ async fn gem_hosted_rescan_with_failing_record_fetch_reports_it_and_keeps_the_wi
     let gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
     let lock = std::fs::read(proj.join("Gemfile.lock")).unwrap();
 
-    // Scan 2: view 500s → record_fetch_failed with the VEX-omission detail.
     let (code, stdout, _) = hosted_scan_json(&proj, &server.uri());
     assert_eq!(code, 0, "{stdout}");
     let env = common::parse_json_envelope(&stdout);
-    let failed = env["warnings"]
-        .as_array()
+    assert_eq!(stale_warnings(&env).len(), 1, "scan 2 warns again: {env}");
+    assert!(!stdout.contains("record_fetch_failed"), "{env}");
+    let views = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
-        .find(|w| w["code"] == "record_fetch_failed")
-        .unwrap_or_else(|| panic!("the transient fetch failure is surfaced: {env}"));
-    assert_eq!(
-        failed["detail"],
-        format!(
-            "{PURL} was switched to hosted, but its patch record could not be fetched; this run's VEX \
-             attestation omits it (`socket-patch vex` fetches it again once the API answers)"
-        ),
-        "{env}"
-    );
+        .filter(|r| r.url.path().contains("/patches/view/"))
+        .count();
+    assert_eq!(views, 0, "a hosted scan never fetches a patch view");
     assert_eq!(
         std::fs::read(proj.join("Gemfile")).unwrap(),
         gemfile,
@@ -671,6 +688,7 @@ async fn gem_hosted_stale_bundler4_standalone_install_warns_and_is_not_attested(
     let gem_dir = home.join("gems").join(format!("{DEP}-{DEP_VERSION}"));
     std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    cache_archive(&home, UPSTREAM_ARCHIVE);
     std::fs::create_dir_all(proj.join("bundle").join("bundler")).unwrap();
     std::fs::write(
         proj.join("bundle").join("bundler").join("setup.rb"),
@@ -750,6 +768,7 @@ async fn gem_hosted_stale_dot_bundle_install_warns_and_is_not_attested() {
         let gem_dir = home.join("gems").join(format!("{DEP}-{DEP_VERSION}"));
         std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
         std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+        cache_archive(&home, UPSTREAM_ARCHIVE);
         std::fs::write(proj.join(".bundle").join("config"), config).unwrap();
 
         let vex_path = proj.join("out.vex.json");
@@ -849,7 +868,7 @@ async fn gem_hosted_stale_archive_at_configured_cache_path_warns_and_is_not_atte
             .join(cache_dir)
             .join(format!("{DEP}-{DEP_VERSION}.gem"));
         std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
-        std::fs::write(&archive, b"upstream-gem-archive-bytes").unwrap();
+        std::fs::write(&archive, UPSTREAM_ARCHIVE).unwrap();
 
         let vex_path = proj.join("out.vex.json");
         let (code, stdout, stderr) = common::run_with_env(
@@ -960,7 +979,7 @@ async fn gem_hosted_stale_archive_at_global_cache_path_warns_and_is_not_attested
             .join(cache_dir)
             .join(format!("{DEP}-{DEP_VERSION}.gem"));
         std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
-        std::fs::write(&archive, b"upstream-gem-archive-bytes").unwrap();
+        std::fs::write(&archive, UPSTREAM_ARCHIVE).unwrap();
 
         let global_value = global_value.to_str().unwrap().to_string();
         let mut env: Vec<(&str, &str)> = vec![(global_var, &global_value)];
@@ -1320,6 +1339,7 @@ async fn gem_hosted_stale_install_under_out_of_tree_config_path_is_not_attested(
         .join(format!("{DEP}-{DEP_VERSION}"));
     std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
     std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), UPSTREAM_LIB).unwrap();
+    cache_archive(&bundle.join("ruby").join("3.3.0"), UPSTREAM_ARCHIVE);
 
     let vex_path = proj.join("out.vex.json");
     let (code, stdout, stderr) = common::run_with_env(
@@ -1386,7 +1406,7 @@ fn stage_system_home_copy(home: &Path, bin_dir: &Path) -> PathBuf {
     std::fs::create_dir_all(home.join("cache")).unwrap();
     std::fs::write(
         home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem")),
-        b"upstream-gem-archive-bytes",
+        UPSTREAM_ARCHIVE,
     )
     .unwrap();
     std::fs::create_dir_all(home.join("specifications")).unwrap();
@@ -1565,7 +1585,7 @@ async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
         proj.join("vendor")
             .join("cache")
             .join(format!("{DEP}-{DEP_VERSION}.gem")),
-        b"upstream-gem-archive-bytes",
+        UPSTREAM_ARCHIVE,
     )
     .unwrap();
 

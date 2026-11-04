@@ -127,16 +127,21 @@ pub(crate) struct Sources {
     pub vendor: VendorState,
     pub redirect: Option<RedirectState>,
     pub discovery: Discovery,
+    /// Embedded hosted `scan --vex` only: the uuids that run confirmed.
+    /// v5 hosted mode keeps no ledger, so [`plan`] fetches their records
+    /// and files them as hosted records. Empty everywhere else.
+    pub hosted_uuids: Vec<String>,
 }
 
 impl Sources {
     /// Nothing anywhere could name a patch: no manifest patches, no ledger
-    /// entries or records, no lockfile references.
+    /// entries or records, no lockfile references, no in-run hosted pins.
     pub(crate) fn is_empty(&self) -> bool {
         self.manifest.patches.is_empty()
             && self.vendor.entries.is_empty()
             && self.redirect.as_ref().is_none_or(|r| r.records.is_empty())
             && self.discovery.refs.is_empty()
+            && self.hosted_uuids.is_empty()
     }
 }
 
@@ -359,9 +364,28 @@ pub(crate) async fn plan(
     let Sources {
         manifest,
         vendor,
-        redirect,
+        mut redirect,
         discovery,
+        hosted_uuids,
     } = sources;
+    let mut notes = Vec::new();
+    // The in-run hosted pins' records, filed under the API's purl like a
+    // pre-v5 hosted ledger's, later uuids winning. A uuid fetched here is
+    // not asked for again below.
+    let mut prefetched: HashSet<String> = HashSet::new();
+    let hosted_uuids: Vec<String> = hosted_uuids
+        .into_iter()
+        .filter(|uuid| prefetched.insert(uuid.clone()))
+        .collect();
+    if !hosted_uuids.is_empty() {
+        let mut fetched = fetch_records(common, api_client, &hosted_uuids, &mut notes).await;
+        let state = redirect.get_or_insert_with(RedirectState::new);
+        for uuid in &hosted_uuids {
+            if let Some((purl, record)) = fetched.remove(uuid) {
+                state.records.insert(purl, record);
+            }
+        }
+    }
     let redirect_records: BTreeMap<String, PatchRecord> = redirect
         .as_ref()
         .map(|r| r.records.clone())
@@ -371,7 +395,6 @@ pub(crate) async fn plan(
         .map(|p| strip_purl_qualifiers(p))
         .collect();
 
-    let mut notes = Vec::new();
     let mut gated: Vec<FailedPatch> = Vec::new();
     let mut cands = build_candidates(&manifest, &vendor, redirect.as_ref());
     let conflicts = wiring_conflicts(&discovery);
@@ -565,7 +588,11 @@ pub(crate) async fn plan(
         }
     }
     let uuids: Vec<String> = {
-        let mut u: Vec<String> = need_api.iter().map(|&i| based[i].0.uuid.clone()).collect();
+        let mut u: Vec<String> = need_api
+            .iter()
+            .map(|&i| based[i].0.uuid.clone())
+            .filter(|uuid| !prefetched.contains(uuid))
+            .collect();
         u.sort();
         u.dedup();
         u
@@ -1378,6 +1405,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.view.patches["pkg:npm/x@1.0.0"].uuid, U2);
@@ -1401,6 +1429,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: None,
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U2, true)]),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(
@@ -1436,6 +1465,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert!(plan
@@ -1478,6 +1508,7 @@ mod tests {
                 shrinkwrap,
                 hosted_ref("pkg:npm/y@1.0.0", U2, true),
             ]),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.gated, vec![failed("pkg:npm/x@1.0.0", WIRING_CONFLICT)]);
@@ -1526,6 +1557,7 @@ mod tests {
             vendor: vendor.clone(),
             redirect: Some(redirect.clone()),
             discovery: Discovery::default(),
+            hosted_uuids: Vec::new(),
         };
         let live = plan(
             &common(tmp.path()),
@@ -1619,6 +1651,7 @@ mod tests {
             vendor: vendor.clone(),
             redirect: Some(redirect.clone()),
             discovery,
+            hosted_uuids: Vec::new(),
         };
 
         // Control — nothing recognized: the ledgers' own recorded files
@@ -1704,6 +1737,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: Some(redirect),
             discovery: discovery(vec![hosted_ref("pkg:npm/x@1.0.0", U1, true)]),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         let wiring = &plan.hosted["pkg:npm/x@1.0.0"];
@@ -1735,6 +1769,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: Some(redirect.clone()),
             discovery,
+            hosted_uuids: Vec::new(),
         };
         let gated = plan(
             &common(tmp.path()),
@@ -1787,6 +1822,7 @@ mod tests {
             vendor: VendorState::new(),
             redirect: Some(redirect),
             discovery: Discovery::default(),
+            hosted_uuids: Vec::new(),
         };
         let plan = plan(
             &common(tmp.path()),
@@ -1863,6 +1899,7 @@ mod tests {
                     // The lock does not mention the uuid, and the Gemfile is
                     // not a discovery input: the ledger fallback decides.
                     discovery: Discovery::default(),
+                    hosted_uuids: Vec::new(),
                 };
                 let plan = plan(&common(root), sources, &[], &RunApiClient::new()).await;
                 if gemfile_wired {

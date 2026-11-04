@@ -46,8 +46,8 @@ pub fn advisory_invalidated(n: usize) -> String {
 pub fn advisory_undeterminable(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
-         installed copies (node_modules is a link, or no patch record was available); run \
-         `vlt ci` to be sure the patched packages are installed."
+         installed copies (node_modules is a link, or node_modules/.vlt-lock.json is missing \
+         or unreadable); run `vlt ci` to be sure the patched packages are installed."
     )
 }
 

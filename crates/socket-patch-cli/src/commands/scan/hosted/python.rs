@@ -2,42 +2,110 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::crawlers::PythonCrawler;
+use socket_patch_core::hosted::wheel_record::{
+    fetch_patched_wheel_record, judge_installed_wheel, WheelRecord,
+};
 use socket_patch_core::manifest::schema::PatchRecord;
+use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
-use socket_patch_core::vex::verify::judge_installed_record;
+use socket_patch_core::vex::verify::{judge_installed_record, InstalledRecordJudgment};
 
 use super::StaleInstallOutcome;
+
+/// What an installed copy of one confirmed patch is judged against.
+enum Evidence<'a> {
+    /// An agent-mode manifest record of the same patch: its `afterHash`
+    /// map, already local.
+    Local(&'a PatchRecord),
+    /// The patched wheel the lock now pins, fetched on the first installed
+    /// copy found (`Some(None)` once that fetch failed).
+    Wheel {
+        dep: &'a DepOverride,
+        sha256: &'a str,
+        fetched: Option<Option<WheelRecord>>,
+    },
+}
+
+impl Evidence<'_> {
+    async fn judge(&mut self, api: &ApiClient, site: &std::path::Path) -> InstalledRecordJudgment {
+        match self {
+            Evidence::Local(record) => judge_installed_record(site, record).await,
+            Evidence::Wheel {
+                dep,
+                sha256,
+                fetched,
+            } => {
+                if fetched.is_none() {
+                    *fetched =
+                        Some(fetch_patched_wheel_record(api, &dep.artifact_url, sha256).await);
+                }
+                match fetched {
+                    Some(Some(record)) => judge_installed_wheel(site, record).await,
+                    _ => InstalledRecordJudgment::default(),
+                }
+            }
+        }
+    }
+}
 
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
 /// Use the project's own venv discovery (`--global`/`--global-prefix` use
 /// the crawler's global paths), and inspect every interpreter rather than
 /// deduplicating by package name.
-/// Missing/unreadable files are not positive evidence of stale bytes.
+///
+/// Each installed copy is judged against an agent-mode manifest record of
+/// the same patch when one exists, else against the patched wheel's own
+/// `RECORD` ([`socket_patch_core::hosted::wheel_record`]), downloaded only
+/// when a copy is installed. Missing/unreadable files are not positive
+/// evidence of stale bytes.
 pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
+    api_client: &ApiClient,
     confirmed: &[(String, String)],
     pipenv_uuids: &BTreeSet<String>,
     // The run's final Pipfile.lock text: the remedy's `pipenv sync`
     // arguments follow the categories that pin each package.
     pipenv_lock: Option<&str>,
-    // This run's fetched records MERGED with the ledger's persisted ones
-    // (the caller hands the post-merge ledger map), looked up by uuid.
-    records: &BTreeMap<String, PatchRecord>,
+    // The overrides the rewrite pinned: each patch's wheel URL and sha256.
+    overrides: &[DepOverride],
+    // The agent-mode manifest's records, looked up by uuid.
+    local_records: &BTreeMap<String, PatchRecord>,
 ) -> StaleInstallOutcome {
     let mut out = StaleInstallOutcome::default();
     let pipenv_lock: Option<serde_json::Value> = pipenv_lock.and_then(|text| {
         serde_json::from_str(socket_patch_core::formats::text::strip_bom(text)).ok()
     });
-    let candidates: Vec<_> = confirmed
+    let mut candidates: Vec<(&String, &str, Evidence<'_>)> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:pypi/"))
         .filter_map(|(purl, uuid)| {
-            records
+            let local = local_records
                 .values()
-                .find(|record| &record.uuid == uuid)
-                .filter(|record| !record.files.is_empty())
-                .map(|record| (purl, record))
+                .find(|record| &record.uuid == uuid && !record.files.is_empty());
+            let evidence = match local {
+                Some(record) => Evidence::Local(record),
+                // `--offline` downloads nothing, so there is no wheel to judge by.
+                None if common.offline => return None,
+                None => {
+                    let dep = overrides.iter().find(|dep| {
+                        dep.ecosystem == "pypi"
+                            && &dep.patch_uuid == uuid
+                            && dep
+                                .artifact_url
+                                .split(['?', '#'])
+                                .next()
+                                .is_some_and(|path| path.ends_with(".whl"))
+                    })?;
+                    Evidence::Wheel {
+                        dep,
+                        sha256: dep.integrity.sha256.as_deref()?,
+                        fetched: None,
+                    }
+                }
+            };
+            Some((purl, uuid.as_str(), evidence))
         })
         .collect();
     if candidates.is_empty() {
@@ -105,15 +173,15 @@ pub(super) async fn stale_install_warnings(
     // (candidate, site) order.
     let bases: Vec<String> = candidates
         .iter()
-        .map(|(purl, _)| strip_purl_qualifiers(purl).to_string())
+        .map(|(purl, _, _)| strip_purl_qualifiers(purl).to_string())
         .collect();
     let mut found_per_site = Vec::with_capacity(paths.len());
     for site in &paths {
         found_per_site.push(crawler.find_each_by_purl(site, &bases).await);
     }
-    for (index, (purl, record)) in candidates.into_iter().enumerate() {
-        if pipenv_uuids.contains(&record.uuid) {
-            pipenv_purls.insert(purl.clone());
+    for (index, (purl, uuid, evidence)) in candidates.iter_mut().enumerate() {
+        if pipenv_uuids.contains(*uuid) {
+            pipenv_purls.insert((*purl).clone());
         }
         for found in &found_per_site {
             let Some(pkg) = &found[index] else {
@@ -122,8 +190,8 @@ pub(super) async fn stale_install_warnings(
             let judgment: &mut Judgment = judgments
                 .entry((pkg.path.clone(), pkg.name.clone(), pkg.version.clone()))
                 .or_default();
-            judgment.purls.insert(purl.clone());
-            let judged = judge_installed_record(&pkg.path, record).await;
+            judgment.purls.insert((*purl).clone());
+            let judged = evidence.judge(api_client, &pkg.path).await;
             if judged.patched {
                 judgment.patched = true;
             } else if judged.stale_evidence {
@@ -189,6 +257,15 @@ mod tests {
     use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
     use socket_patch_core::manifest::schema::PatchFileInfo;
 
+    /// A client nothing answers: these tests judge by local records only.
+    fn offline_api() -> ApiClient {
+        ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".into(),
+            api_token: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
+        })
+    }
+
     fn record(uuid: &str, file: &str, patched: &[u8]) -> PatchRecord {
         PatchRecord {
             uuid: uuid.to_string(),
@@ -233,8 +310,16 @@ mod tests {
             ("one".into(), record("first-uuid", "first.py", b"patched")),
             ("two".into(), record("second-uuid", "second.py", b"patched")),
         ]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([first.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         assert!(out.warnings[0]["detail"]
@@ -249,8 +334,16 @@ mod tests {
             "variant".into(),
         ));
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+        )
+        .await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }
@@ -288,8 +381,16 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
@@ -301,8 +402,16 @@ mod tests {
 
         // Patched in the env: nothing to warn about.
         std::fs::write(site.join("six.py"), b"patched").unwrap();
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+        )
+        .await;
         assert!(out.warnings.is_empty());
     }
 
@@ -325,8 +434,16 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
     }
@@ -353,7 +470,16 @@ mod tests {
         let pipenv = BTreeSet::from(["six-uuid".to_string()]);
         let text =
             r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"file": "x"}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(text), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(text),
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         let lock: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -392,7 +518,16 @@ mod tests {
         // #790: a named category reaches the hosted remedy too.
         let docs =
             r#"{"_meta": {"pipfile-spec": 6}, "default": {"requests": {}}, "docs": {"six": {}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(docs), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(docs),
+            &[],
+            &ledger,
+        )
+        .await;
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
             detail.contains("-y six && pipenv sync --categories \"docs\"`"),
@@ -457,7 +592,16 @@ mod tests {
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
         let pipenv = BTreeSet::from(["six-uuid".to_string()]);
         let lock = r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
@@ -487,7 +631,16 @@ mod tests {
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
         std::fs::write(venv_site.join("six.py"), b"upstream").unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
@@ -507,7 +660,16 @@ mod tests {
         // counts as installed: the usual remedy replaces the venv's copy.
         let base_dist = base_site.join("six-1.16.0.dist-info");
         std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.15.0\n").unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
@@ -525,7 +687,16 @@ mod tests {
             "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
         )
         .unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
