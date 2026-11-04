@@ -232,6 +232,10 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a hosted Cargo pin beside another declaration of
+/// the crate that names no Socket registry, which cargo resolves as a
+/// separate, unpatched package (`vex::Unattested`).
+const NOTE_CARGO_UNPINNED_DECLARATION: &str = "vex_cargo_unpinned_declaration";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -267,6 +271,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::CargoUnpinnedDeclaration => (
+            NOTE_CARGO_UNPINNED_DECLARATION,
+            "not attested while that declaration names no Socket registry (re-run \
+             `socket-patch scan` to pin a crates.io declaration too; one from another \
+             registry, a path or git cannot be pinned, so roll the patch back)",
         ),
     }
 }
@@ -1760,6 +1770,52 @@ mod tests {
         .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
         assert!(live.hosted.contains_key(PURL));
+    }
+
+    /// A hosted Cargo pin beside an unpinned declaration of the crate is
+    /// omitted as `vex_cargo_unpinned_declaration`, the note naming the
+    /// declaration and the remedy.
+    #[tokio::test]
+    async fn a_cargo_pin_beside_an_unpinned_declaration_is_gated() {
+        const PURL: &str = "pkg:cargo/serde@1.0.1";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut redirect = RedirectState::new();
+        redirect.records.insert(PURL.into(), record(U1));
+        let mut found = discovery(vec![hosted_ref(PURL, U1, true)]);
+        found.unattested.push(socket_patch_core::vex::Unattested {
+            purl: PURL.into(),
+            uuid: U1.into(),
+            file: "crates/a/Cargo.toml".into(),
+            detail: "crates/a/Cargo.toml declares serde \"1\" from crates.io".into(),
+            kind: UnattestedKind::CargoUnpinnedDeclaration,
+        });
+        let gated = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest: PatchManifest::new(),
+                vendor: VendorState::new(),
+                redirect: Some(redirect),
+                discovery: found,
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(
+            gated.gated,
+            vec![failed(PURL, NOTE_CARGO_UNPINNED_DECLARATION)]
+        );
+        assert!(
+            gated
+                .notes
+                .iter()
+                .any(|n| n.code == NOTE_CARGO_UNPINNED_DECLARATION
+                    && n.detail.contains("crates/a/Cargo.toml declares serde")
+                    && n.detail.contains("socket-patch scan")),
+            "{:?}",
+            gated.notes
+        );
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the
