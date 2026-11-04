@@ -440,7 +440,7 @@ pub(super) async fn inventory_package_lock_in(
         // Our own vendored spec: not a registry dependency.
         if node
             .resolved
-            .is_some_and(|r| parse_vendor_path(r).is_some())
+            .is_some_and(|r| crate::vendor::path::recognize_vendor_path_anywhere(r).is_some())
         {
             continue;
         }

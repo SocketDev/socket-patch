@@ -12,8 +12,9 @@ use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::utils::fs::read_regular_to_string;
 use socket_patch_core::utils::purl::normalize_purl;
 use socket_patch_core::vendor::{
-    self, artifact_is_file_shaped, check_vendored_artifact, parse_vendor_path,
-    path::parse_vendor_reference, ArtifactHealth, VendorEntry, VendorState, VendorWarning,
+    self, artifact_is_file_shaped, check_vendored_artifact,
+    path::{parse_vendor_reference, recognize_vendor_path_anywhere},
+    ArtifactHealth, VendorEntry, VendorState, VendorWarning,
 };
 
 use super::VendoredBackend;
@@ -37,6 +38,13 @@ struct Candidate {
 /// path parser. Used by repair (references the ledger does not cover), by
 /// the orphan sweeps (`vendor --revert`, `scan --prune`: a dir a lockfile
 /// still points at is never deleted) and by rollback.
+///
+/// RECOGNITION only: a reference counts wherever its `.socket/vendor/`
+/// anchor sits (a sibling's `../.socket/vendor/…` too), which only ever
+/// keeps one of THIS project's dirs from being swept or flags it as
+/// wired. Nothing here rewrites the referencing file; the writers and
+/// reverters claim wiring through the root-anchored
+/// [`socket_patch_core::vendor::parse_vendor_path`].
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
@@ -54,7 +62,9 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
             socket_patch_core::vendor::bun_lock::binary_vendor_paths(project_root).await
         {
             for path in paths {
-                if let Some(parts) = parse_vendor_path(&path) {
+                if let Some(parts) =
+                    recognize_vendor_path_anywhere(&path).filter(|p| !p.leaf.is_empty())
+                {
                     if seen.insert((parts.eco.to_string(), parts.uuid.clone())) {
                         let rel =
                             format!(".socket/vendor/{}/{}/{}", parts.eco, parts.uuid, parts.leaf);

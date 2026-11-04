@@ -2351,14 +2351,12 @@ pub(crate) fn is_decorated_vendor_path(s: &str) -> bool {
     vendor_ref(s).is_none() && vendor_ref_decorated(s).is_some()
 }
 
-/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`, one
-/// `./`, backslash and `\/` normalization), or `None`.
+/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`,
+/// `./`, backslash and `\/` normalization), or `None`: the writers' own
+/// root-anchoring rule ([`crate::vendor::path::vendor_rest_from`]), so
+/// discovery attests exactly the references the writers claim.
 fn root_anchored_vendor_rest(s: &str) -> Option<String> {
-    let norm = s.trim().replace("\\/", "/").replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    norm.strip_prefix(&format!("{VENDOR_DIR}/"))
-        .map(str::to_string)
+    crate::vendor::path::vendor_rest_from("", s)
 }
 
 /// Cut the lock-format decorations off a vendored leaf: everything from the
@@ -2966,7 +2964,9 @@ pub async fn vendored_wiring_in_files(root: &Path, files: &[&str], eco: &str, uu
                 .await
                 .iter()
                 .any(|resolution| {
-                    crate::vendor::parse_vendor_path(resolution)
+                    // A nested `sub/bun.lockb` resolves from `sub/`.
+                    let base = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    crate::vendor::path::parse_vendor_path_from(base, resolution)
                         .is_some_and(|p| p.eco == eco && p.uuid == uuid)
                 })
             {
@@ -3069,8 +3069,10 @@ pub async fn hosted_wiring_in_files(root: &Path, files: &[&str], uuid: &str) -> 
                 .await
                 .iter()
                 .any(|resolution| {
+                    // Any vendored spelling, ours or a sibling's, is not
+                    // hosted wiring.
                     resolution.contains(uuid)
-                        && crate::vendor::parse_vendor_path(resolution).is_none()
+                        && crate::vendor::path::recognize_vendor_path_anywhere(resolution).is_none()
                 })
             {
                 return true;
