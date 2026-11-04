@@ -338,44 +338,18 @@ pub(crate) fn plan_hosted(
         // is named as such: `socket-patch vendor` removes the registry
         // resolution this grammar looks for (v9 respells the packages key
         // `<name>@file:.socket/vendor/…`; v5/v6 rekey it to a bare `file:`
-        // key but keep the `<name>@<version>: file:…` overrides line), so
-        // the generic not-locked wording would send users on a wild-goose
-        // `pnpm install` when the real path is a mode switch. Fail-closed
-        // either way: nothing is rewritten for the dep.
+        // key with a `name:` line), so the generic not-locked wording would
+        // send users on a wild-goose `pnpm install` when the real path is a
+        // mode switch. Fail-closed either way: nothing is rewritten for the
+        // dep.
         if !matched_any {
-            let v9_vendored_key = format!("{fname}@file:");
-            let override_key = format!("{fname}@{}", dep.version);
             // Scanned over the post-splice text, so fold pending splices in.
             for lock in locks.iter_mut() {
                 lock.materialize();
             }
-            let vendored = locks.iter().any(|lock| {
-                lock.text.lines().any(|line| {
-                    let t = line.trim_start();
-                    let t = t.strip_prefix('\'').unwrap_or(t);
-                    // v9 packages/snapshots key (leading `/` in v6 spelling).
-                    // The vendor backend always writes the RELATIVE
-                    // `file:.socket/vendor/…` spelling here, so anchoring on
-                    // it keeps a user's own `file:` dep of the same name
-                    // from being misreported as vendored.
-                    let key = t.strip_prefix('/').unwrap_or(t);
-                    if key
-                        .strip_prefix(&v9_vendored_key)
-                        .is_some_and(|rest| rest.starts_with(".socket/vendor/"))
-                    {
-                        return true;
-                    }
-                    // overrides / root-dep line: `<name>@<version>: file:…`
-                    // (pnpm <=8 absolutizes the value, so only the
-                    // `.socket/vendor/` tail is stable enough to match).
-                    t.strip_prefix(&override_key)
-                        .map(|rest| rest.strip_prefix('\'').unwrap_or(rest))
-                        .and_then(|rest| rest.strip_prefix(':'))
-                        .is_some_and(|rest| {
-                            rest.contains("file:") && rest.contains(".socket/vendor/")
-                        })
-                })
-            });
+            let vendored = locks
+                .iter()
+                .any(|lock| vendors_package(&super::PnpmLock::parse(&lock.text), &fname));
             if vendored {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_vendored".into(),
@@ -402,6 +376,27 @@ pub(crate) fn plan_hosted(
             result.files.insert(key.clone(), content);
         }
     }
+}
+
+/// Whether `lock` has a packages entry the vendor backends rekeyed for
+/// package `fname`: v9's `<name>@file:<artifact>` key or legacy's bare
+/// `file:<artifact>` key with a `name:` line, whose path is this project's
+/// vendored npm artifact ([`crate::origin::vendor_ref`]: root-anchored,
+/// canonical uuid, traversal-safe leaf) — the one rule lockfile discovery
+/// reads vendored pnpm keys with. A user's own `file:` dep of the same name,
+/// a `../.socket/vendor/…` path from another checkout, and an `overrides:`
+/// line alone (pnpm mirrors it from package.json whether or not anything
+/// matches) are not vendoring.
+fn vendors_package(lock: &super::PnpmLock<'_>, fname: &str) -> bool {
+    use super::{classify_pnpm_key, PnpmKey};
+    lock.packages().iter().any(|package| {
+        let (name, path) = match classify_pnpm_key(package.key) {
+            PnpmKey::V9File { name, path } => (Some(name.trim_start_matches('/')), path),
+            PnpmKey::LegacyFile { path } => (pnpm::entry_field(&package.entry, "name"), path),
+            PnpmKey::Registry { .. } | PnpmKey::Other => return false,
+        };
+        name == Some(fname) && crate::origin::vendor_ref(path).is_some_and(|v| v.eco == "npm")
+    })
 }
 
 /// Test-only reference for the residual gate: every instance of this exact

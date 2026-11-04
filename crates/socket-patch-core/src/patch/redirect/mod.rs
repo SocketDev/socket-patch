@@ -28267,6 +28267,68 @@ packages:
         );
     }
 
+    /// Lock-model divergence N5 (pnpm): "is this dep vendored?" reads the
+    /// rekeyed packages entry with the origin classifier
+    /// (`origin::vendor_ref`), the rule discovery reads vendored pnpm keys
+    /// with, instead of a substring test over every line. A path that is
+    /// not this project's vendored npm artifact (no canonical uuid dir,
+    /// another ecosystem's dir) and an `overrides:` line with no rekeyed
+    /// entry behind it are the generic entry-not-found now; the backends'
+    /// real v9 and legacy shapes stay vendored (see
+    /// `pnpm_vendored_entry_is_named_vendored_not_entry_not_found`).
+    #[test]
+    fn pnpm_vendored_diagnosis_reads_the_rekeyed_entry_through_origin() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
+        let v9 = |path: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@file:{path}:\n    \
+                 resolution: {{integrity: sha512-VENDORED==, tarball: file:{path}}}\n    \
+                 version: 1.3.0\n"
+            )
+        };
+        let legacy_overrides_only = format!(
+            "lockfileVersion: '6.0'\n\noverrides:\n  left-pad@1.3.0: \
+             file:/abs/project/.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\n\npackages:\n\n  \
+             /other@1.0.0:\n    resolution: {{integrity: sha512-OTHER==}}\n    dev: false\n"
+        );
+        let codes = |lock: &str| {
+            let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock.to_string())]);
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{lock}");
+            r.warnings.into_iter().map(|w| w.code).collect::<Vec<_>>()
+        };
+        for (case, lock, want) in [
+            (
+                "the backend's v9 shape",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_vendored",
+            ),
+            (
+                "no uuid dir",
+                v9(".socket/vendor/npm/left-pad-1.3.0.tgz"),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "another ecosystem's dir",
+                v9(&format!(".socket/vendor/cargo/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "an overrides line alone",
+                legacy_overrides_only,
+                "redirect_pnpm_entry_not_found",
+            ),
+        ] {
+            assert_eq!(codes(&lock), vec![want], "{case}");
+        }
+    }
+
     /// A classic-lock block whose first line is not a `key:` line
     /// (hand-mangled) is skipped without derailing the rewrite of the real
     /// entry — and survives byte-identically.
