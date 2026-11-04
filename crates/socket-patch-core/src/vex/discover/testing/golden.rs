@@ -137,6 +137,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
         unwired_copies: _,
         // Already folded into `unpatched_copies` by the time a run returns.
         unidentified_copies: _,
+        // The run's input (the golden runs with none), not a finding.
+        patch_server_origins: _,
     } = out;
     let render_ref = |r: &PatchedRef| {
         let PatchedRef {

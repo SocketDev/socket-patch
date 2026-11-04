@@ -760,6 +760,12 @@ pub struct Discovery {
     /// (#1445) ([`StaleSelector`]). Not refs and not contested wiring: the
     /// management commands retire them. Sorted, deduped.
     pub stale_selectors: Vec<StaleSelector>,
+    /// The operator's patch-server origins ([`DiscoverOptions::patch_server_origins`])
+    /// this discovery classified urls with. Ledger liveness
+    /// ([`Discovery::redirect_record_live`]) classifies the lock inventory's
+    /// urls with the same origins, so a record discovery does not claim is
+    /// judged by the one origin rule ([`crate::patch::redirect::hosted_patch_uuid`]).
+    pub patch_server_origins: Vec<String>,
 }
 
 /// A Socket-hosted yarn berry `resolutions` selector whose lock entry is
@@ -1544,6 +1550,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     out.unattest_unwired_copies();
     out.recognized.extend(ctx.take_recognized());
     out.read.extend(ctx.take_read());
+    out.patch_server_origins = ctx.patch_server_origins.to_vec();
     out.finalize();
     out
 }
@@ -2755,8 +2762,11 @@ impl Discovery {
     ///    `source "<patch registry>" do` block still declares the gem
     ///    ([`gem::gemfile_source_block_pins`]): live — bundler re-resolves
     ///    from it whatever the lock says;
-    /// 1. a lock inventory entry for this purl whose resolved url carries
-    ///    the uuid: live;
+    /// 1. a lock inventory entry for this purl whose resolved url is a
+    ///    Socket-hosted url for THIS uuid
+    ///    ([`crate::patch::redirect::hosted_patch_uuid`] over Socket's host
+    ///    and [`Discovery::patch_server_origins`]): live. A url on any other
+    ///    host that merely contains the uuid is not a patch reference;
     /// 2. a lock inventory entry that resolves the purl from somewhere ELSE
     ///    (a registry url, a crates.io-checksummed Cargo.lock source): dead
     ///    — the lock positively says the build fetches the unpatched
@@ -2823,10 +2833,12 @@ impl Discovery {
             .iter()
             .filter(|e| lookup(std::slice::from_ref(*e), purl).is_some())
             .collect();
-        if entries
-            .iter()
-            .any(|e| e.resolved.as_deref().is_some_and(|r| r.contains(uuid)))
-        {
+        if entries.iter().any(|e| {
+            e.resolved.as_deref().is_some_and(|r| {
+                crate::patch::redirect::hosted_patch_uuid(r, &self.patch_server_origins).as_deref()
+                    == Some(uuid)
+            })
+        }) {
             return true;
         }
         if entries.iter().any(|e| resolves_elsewhere(e)) {
@@ -2929,9 +2941,10 @@ impl<'a> LedgerLiveness<'a> {
     }
 }
 
-/// A lock inventory entry (already known NOT to carry the patch uuid in its
-/// resolved url) that positively resolves from a non-patch source: an
-/// explicit artifact url, or a crates.io Cargo.lock source (the registry
+/// A lock inventory entry (already known NOT to resolve from the record's
+/// patch: its resolved url, if any, is no Socket-hosted url for that uuid)
+/// that positively resolves from somewhere else: an explicit artifact url
+/// (another host, or another patch), or a crates.io Cargo.lock source (the registry
 /// view's [`SourceKind::CratesIo`]; Socket sparse sources carry no url in
 /// the inventory and so prove nothing either way). An entry with no url is
 /// the conventional registry for most formats but is also how the inventory
@@ -3900,12 +3913,13 @@ mod tests {
     }
 
     /// REGRESSION: step 2's negative evidence reads EVERY lock's instance.
-    /// `uv.lock` routes six to a hosted wheel on a patch host outside the
-    /// discovery allowlist (no `hosted_claim`), and a PEP 723 script lock
-    /// that sorts first resolves the same six from PyPI. The collapsed
-    /// inventory keeps only the script lock's instance, which made the
-    /// record look resolved-elsewhere (dead) although the project lock still
-    /// installs the patch.
+    /// `uv.lock` routes six to a hosted wheel on the operator's configured
+    /// patch server, which a discovery that holds no claim on the uuid
+    /// classifies with the run's origins, and a PEP 723 script lock that
+    /// sorts first resolves the same six from PyPI. The collapsed inventory
+    /// keeps only the script lock's instance, which made the record look
+    /// resolved-elsewhere (dead) although the project lock still installs
+    /// the patch.
     #[tokio::test]
     async fn a_script_lock_registry_instance_does_not_veto_the_hosted_project_lock() {
         let p = Project::new();
@@ -3964,6 +3978,19 @@ mod tests {
             None,
             "host not allowlisted"
         );
+        // Without the origin, the internal host's url is no patch reference
+        // however much of the uuid it spells: dead.
+        let mut inventory = None;
+        assert!(
+            !discovery
+                .redirect_record_live(root, purl, UUID_A, &["uv.lock"], &mut inventory)
+                .await,
+            "a uuid on an unconfigured host keeps nothing alive"
+        );
+        let discovery = Discovery {
+            patch_server_origins: vec!["https://patches.internal.example".to_string()],
+            ..Discovery::default()
+        };
         let mut inventory = None;
         assert!(
             discovery
@@ -4094,6 +4121,70 @@ mod tests {
         );
         assert!(!hosted_wiring_in_files(root, &["package-lock.json"], UUID_B).await);
         assert!(!hosted_wiring_in_files(root, &["package-lock.json"], "not-a-uuid").await);
+    }
+
+    /// REGRESSION (P6): step 1 classifies a lock entry's resolved url with
+    /// the one origin rule ([`crate::patch::redirect::hosted_patch_uuid`]),
+    /// never by substring. A url on another host that merely spells the
+    /// record's uuid — even in Socket's own path shape — resolves the
+    /// package from somewhere else (step 2: dead), as does a Socket url for
+    /// ANOTHER patch whose path also carries the uuid (as its grant
+    /// token). A Socket-host url and a configured origin's url for the
+    /// record's uuid stay live.
+    #[tokio::test]
+    async fn liveness_matches_the_resolved_url_by_origin_not_substring() {
+        let origin = "http://127.0.0.1:4545";
+        let purl = "pkg:npm/x@1.0.0";
+        let elsewhere =
+            format!("https://evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let other_patch =
+            format!("https://patch.socket.dev/patch/npm/x/1.0.0/{UUID_A}/{UUID_B}/x-1.0.0.tgz");
+        let socket = hosted_url("npm", "x", "1.0.0", UUID_A, "x-1.0.0.tgz");
+        let configured = format!("{origin}/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let with_origin = Discovery {
+            patch_server_origins: vec![origin.to_string()],
+            ..Discovery::default()
+        };
+        for (resolved, origins_discovery, live) in [
+            (&elsewhere, &with_origin, false),
+            (&other_patch, &with_origin, false),
+            (&configured, &Discovery::default(), false),
+            (&socket, &Discovery::default(), true),
+            (&configured, &with_origin, true),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                format!(
+                    r#"{{"lockfileVersion":3,"packages":{{"":{{}},"node_modules/x":{{"version":"1.0.0","resolved":"{resolved}"}}}}}}"#
+                ),
+            );
+            let mut inventory = None;
+            assert_eq!(
+                origins_discovery
+                    .redirect_record_live(
+                        p.root(),
+                        purl,
+                        UUID_A,
+                        &["package-lock.json"],
+                        &mut inventory,
+                    )
+                    .await,
+                live,
+                "{resolved} (origins {:?})",
+                origins_discovery.patch_server_origins
+            );
+        }
+    }
+
+    /// Discovery records the origins it classified with, for liveness.
+    #[tokio::test]
+    async fn discovery_carries_its_patch_server_origins() {
+        let p = Project::new().with_origin("http://127.0.0.1:4545");
+        assert_eq!(
+            p.discover().await.patch_server_origins,
+            vec!["http://127.0.0.1:4545".to_string()]
+        );
     }
 
     /// [`LedgerLiveness`]: the redirect ledger's edit files are sorted and
