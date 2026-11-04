@@ -189,13 +189,17 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 // ── `bun patch` ──────────────────────────────────────────────────────────
 
 /// Mark every ref of `file` whose package the project patches itself with
-/// `bun patch` (#367) [`UnattestedKind::UserPatchedDependency`], by the
-/// hosted rewriters' own per-dependency rule (the npm extractor's
-/// [`mark_user_patched`], read against the ref's hosted URL or vendored
-/// tarball): Bun applies that patch only to the resolution it is keyed on,
-/// so hosted and vendored mode leave the package where it is and never
-/// confirm the Socket patch. A ref a pre-#367 run wired stays a ref, so
-/// `rollback` / `remove` / `list` still find it.
+/// `bun patch` (#367) [`UnattestedKind::UserPatchedDependency`] (the npm
+/// extractor's [`mark_user_patched`]): any `patchedDependencies` key for
+/// its `name@version`, whatever resolution the key names. A key for
+/// another resolution is one Bun applies only there, so hosted and
+/// vendored mode leave the package where it is and never confirm the
+/// Socket patch. A key for the ref's own tarball (a `bun patch` made on
+/// top of the pin, #1019) is one Bun applies on top of the Socket bytes:
+/// the hosted rewriters leave that pin wired (no conflict for them), but
+/// the install never runs the Socket patch alone, so it is never attested
+/// either. A ref stays a ref, so `rollback` / `remove` / `list` still find
+/// it.
 fn unattest_user_patched(file: &str, user_patches: &NpmUserPatches, out: &mut Discovery) {
     let refs: Vec<PatchedRef> = out
         .refs
@@ -1930,9 +1934,11 @@ mod tests {
     /// `bun patch` is one the hosted rewriters (text and binary) leave on
     /// its resolution and never confirm, and one vendored mode refuses. A
     /// pin a pre-#367 run left stays a ref, for rollback, but is never
-    /// attested — by the rewriters' own per-dependency rule, so a key for
-    /// the pin's own tarball (a `bun patch` made on top of it) is no
-    /// conflict, and the manifest's keys and `bun.lock`'s mirror both count.
+    /// attested. A key for the pin's own tarball (a `bun patch` made on top
+    /// of it) is no conflict for the rewriters, which keep the pin, but the
+    /// user's diff then runs over the Socket bytes, so that pin is never
+    /// attested either. The manifest's keys and `bun.lock`'s mirror both
+    /// count.
     #[tokio::test]
     async fn bun_user_patched_dependency_pin_is_not_attested() {
         let p = fixture("basic", "expected");
@@ -1953,12 +1959,17 @@ mod tests {
             assert!(detail.contains(&format!("`{key}`")), "{detail}");
         }
         // A patch keyed to the pin's own tarball applies on top of it: the
-        // rewriters leave such a package wired, and so does discovery.
+        // rewriters leave such a package wired, but the install runs the
+        // user's diff over the Socket bytes, so it is never attested.
         p.write(
             "package.json",
             format!(r#"{{"patchedDependencies":{{"left-pad@{url}":"patches/left-pad.patch"}}}}"#),
         );
-        assert_eq!(user_patched(&run(&p).await), []);
+        let out = run(&p).await;
+        assert_refs(&out, &[(LEFT_PAD, FIXTURE_UUID, WiringMode::Hosted)]);
+        assert_eq!(user_patched(&out), [(LEFT_PAD, FIXTURE_UUID)]);
+        let detail = &out.unattested[0].detail;
+        assert!(detail.contains("on top of this pin's tarball"), "{detail}");
 
         // Vendored, keyed to the registry release; the key mirrored at the
         // top of `bun.lock` counts like the manifest's.

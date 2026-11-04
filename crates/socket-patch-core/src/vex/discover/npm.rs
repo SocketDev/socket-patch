@@ -312,22 +312,29 @@ fn push_uncontested(
 
 /// Why the project counts as patching `r`'s package itself
 /// ([`NpmUserPatches::source`], the hosted rewriters' #711 / #367 gate),
-/// read against what `r` resolves the package to: its hosted URL, or its
-/// vendored tarball. A ref with neither is still matched by its
-/// `name@version` (and every tarball key counts against it).
-fn user_patch_source(user_patches: &NpmUserPatches, r: &PatchedRef) -> Option<String> {
+/// read against no target: unlike for that gate, a `patchedDependencies`
+/// key naming `r`'s own tarball (its hosted URL or vendored tarball) counts
+/// too, since the user's diff is then applied on top of the Socket bytes
+/// and the install never runs the Socket patch alone. The flag is set when
+/// only such a key matches (the gate, read against `r`'s target, finds
+/// none). A ref with neither a url nor a vendored tarball is matched by its
+/// `name@version`.
+fn user_patch_source(user_patches: &NpmUserPatches, r: &PatchedRef) -> Option<(String, bool)> {
     let (name, version) = crate::utils::purl::purl_name_version(&r.purl)?;
+    let source = user_patches.source(name, version, "")?;
     let target = r
         .url
         .as_deref()
         .or(r.artifact_rel.as_deref())
         .unwrap_or_default();
-    user_patches.source(name, version, target)
+    let on_pin = !target.is_empty() && user_patches.source(name, version, target).is_none();
+    Some((source, on_pin))
 }
 
 /// Mark the npm or Bun ref `r` [`UnattestedKind::UserPatchedDependency`]
 /// when the project patches its package itself ([`user_patch_source`]).
-/// `how` completes the detail after the key or record it names. The mark
+/// `how` completes the detail after the key or record it names, unless the
+/// key names `r`'s own tarball (a patch made on top of the pin). The mark
 /// is an [`UnwiredCopy`] for exactly `r`, so it lands only if `r` survives
 /// every contest: a ref another lock drops carries no stale reason.
 pub(super) fn mark_user_patched(
@@ -336,8 +343,14 @@ pub(super) fn mark_user_patched(
     how: &str,
     out: &mut Discovery,
 ) {
-    let Some(source) = user_patch_source(user_patches, r) else {
+    let Some((source, on_pin)) = user_patch_source(user_patches, r) else {
         return;
+    };
+    let how = if on_pin {
+        "a patch the project applies on top of this pin's tarball, so the install runs the \
+         user's diff over the Socket patch, never the Socket patch alone"
+    } else {
+        how
     };
     out.unwired_copy(UnwiredCopy {
         scope: Some(r.source_file.clone()),
@@ -3718,8 +3731,8 @@ mod tests {
         let source = super::user_patch_source(&patches, &r);
         assert!(
             source
-                .as_deref()
-                .is_some_and(|s| s.contains("`left-pad@1.3.0`")),
+                .as_ref()
+                .is_some_and(|(s, on_pin)| s.contains("`left-pad@1.3.0`") && !on_pin),
             "{source:?}"
         );
     }
