@@ -23,6 +23,7 @@ use crate::gradle::dsl::{
     self, all_blocks, is_ident, is_punct, matching_close, strings, Dsl, Tok, Token,
 };
 use crate::gradle::graph::{filter_claims_group, DeclKind, ScriptGraph, Site};
+use crate::gradle::locks;
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -337,6 +338,7 @@ pub fn plan(
     };
     let graph = ScriptGraph::collect(&text, list, "", &[]);
     check_graph(&graph, &undecodable.borrow(), patch, &mut warnings)?;
+    check_locks(read, list, &graph, patch, &mut warnings);
 
     let mut targets = vec![root];
     if let Some(bs) = read_buildsrc(read)? {
@@ -772,6 +774,82 @@ fn check_graph(
         ));
     }
     Ok(())
+}
+
+/// Gradle dependency locks (`gradle.lockfile`, `buildscript-gradle.lockfile`,
+/// `settings-gradle.lockfile` and the legacy `gradle/dependency-locks/`
+/// files of every project of every build, read with the same [`locks`]
+/// reader the hosted backend uses). Vendoring leaves locks unchanged, so a
+/// lock that pins the patched GA at another version wins: Gradle resolves
+/// that version (from upstream, unless another vendored entry serves it)
+/// or fails lock validation, and never consumes this patch there. That is
+/// degraded (`gradle_lock_overrides_vendored`), which also withholds VEX
+/// attestation: [`wired`] re-plans and requires no degraded warning. A
+/// custom lock-file location (`lockFile`) hides a lock from this check and
+/// is degraded too (`gradle_custom_lock_file`), as hosted discovery
+/// invalidates it.
+///
+/// The mapping from the hosted rules (`vex::discover::gradle`): hosted
+/// pins a suffixed version, so a lock must name the suffix (a lock below
+/// the base is invalid, one above it an unattested upstream release).
+/// Vendored keeps the ORIGINAL GAV, so the one lock entry it serves is the
+/// vendored version itself; any other version, above or below, is a build
+/// that does not consume the patch. Hosted also rejects every
+/// settings-classpath lock of the GA, because its script runs after that
+/// classpath resolves; vendored wires the settings `buildscript` and
+/// `pluginManagement` repositories with an in-block `exclusiveContent`
+/// entry for the GAV, so a settings lock at the vendored version is served
+/// and one at another version is degraded like any other lock.
+fn check_locks(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    graph: &ScriptGraph,
+    patch: &JvmPatch<'_>,
+    warnings: &mut Vec<JvmWarning>,
+) {
+    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+    if let Some(rel) = graph.custom_lock_file() {
+        warnings.push(degraded(
+            "gradle_custom_lock_file",
+            format!(
+                "{rel} sets a custom dependency-lock file (`lockFile`), which may lock {g}:{a} \
+                 at a version other than the vendored {v}; that lock is unchecked"
+            ),
+        ));
+    }
+    let mut overrides = Vec::new();
+    for rel in graph.lockfile_paths(list) {
+        let Some(bytes) = read(&rel) else { continue };
+        let Some(text) = dsl::decode(&bytes) else {
+            overrides.push(format!(
+                "{rel} is not UTF-8, so a lock of {g}:{a} there is unchecked"
+            ));
+            continue;
+        };
+        if let Some(e) = locks::parse(&text)
+            .entries_of(g, a)
+            .find(|e| e.version != v)
+        {
+            overrides.push(format!(
+                "{rel}:{} locks {g}:{a} at {}, not the vendored {v}",
+                e.line, e.version
+            ));
+        }
+    }
+    if let Some(first) = overrides.first() {
+        warnings.push(degraded(
+            "gradle_lock_overrides_vendored",
+            format!(
+                "{first}{}; Gradle resolves the locked version (or fails lock validation), so \
+                 that build does not consume the patched {g}:{a}:{v}; lock {v} \
+                 (`./gradlew dependencies --write-locks`) or vendor the locked version",
+                match overrides.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                }
+            ),
+        ));
+    }
 }
 
 /// `../` once per segment of `dir`: the script path from that build.
@@ -4657,5 +4735,103 @@ mod tests {
             .extend_from_slice(b"// x\n");
         assert!(!live(&edited));
         assert!(references(&|r: &str| edited.get(r).cloned(), &p.coords()));
+    }
+
+    /// A dependency lock of the build that pins the patched GA at another
+    /// version than the vendored one wins over the vendored GAV: Gradle
+    /// resolves the locked version, so liveness (and the planner) withhold
+    /// attestation. Every lock kind of every project of the build counts,
+    /// the settings classpath included; a lock at the vendored version,
+    /// another GA's lock and a nested build the root does not include do
+    /// not. A custom `lockFile` hides a lock and withholds it too.
+    #[test]
+    fn lock_at_another_version_withholds_liveness() {
+        let files = fs(&[
+            ("settings.gradle", "include 'app'\n"),
+            (
+                "app/build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+            ),
+        ]);
+        let p = patch();
+        let plan = run(&files, &p).unwrap();
+        let after = applied(&files, &plan);
+        let live = |files: &BTreeMap<String, Vec<u8>>| {
+            wired(
+                &|r: &str| files.get(r).cloned(),
+                &|d: &str| list_of(files, d),
+                &p.coords(),
+            )
+        };
+        let with = |extra: &[(&str, &str)]| {
+            let mut out = after.clone();
+            for (rel, text) in extra {
+                out.insert(rel.to_string(), text.as_bytes().to_vec());
+            }
+            out
+        };
+        assert!(live(&after));
+        const AT: &str = "com.google.code.gson:gson:2.10.1=compileClasspath,runtimeClasspath\n";
+        const ABOVE: &str = "com.google.code.gson:gson:2.11.0=compileClasspath,runtimeClasspath\n";
+        const BELOW: &str = "com.google.code.gson:gson:2.9.0=runtimeClasspath\n";
+        let other = "org.x:y:1=runtimeClasspath\nempty=\n";
+        for (rel, text, consumed) in [
+            ("app/gradle.lockfile", AT, true),
+            ("app/gradle.lockfile", other, true),
+            ("app/gradle.lockfile", ABOVE, false),
+            ("app/gradle.lockfile", BELOW, false),
+            ("gradle.lockfile", ABOVE, false),
+            ("app/buildscript-gradle.lockfile", ABOVE, false),
+            ("settings-gradle.lockfile", AT, true),
+            ("settings-gradle.lockfile", ABOVE, false),
+            (
+                "app/gradle/dependency-locks/runtimeClasspath.lockfile",
+                "com.google.code.gson:gson:2.11.0\n",
+                false,
+            ),
+            // A nested build the root does not include governs nothing.
+            ("samples/demo/gradle.lockfile", ABOVE, true),
+        ] {
+            let locked = with(&[(rel, text)]);
+            assert_eq!(live(&locked), consumed, "{rel}: {text}");
+            assert_eq!(
+                wired_checked(
+                    &|r: &str| locked.get(r).cloned(),
+                    &|d: &str| list_of(&locked, d),
+                    &p.coords()
+                ),
+                Ok(consumed),
+                "{rel}: {text}"
+            );
+            let replan = run(&locked, &p).unwrap();
+            let degraded = replan.warnings.iter().any(|w| {
+                w.code == DEGRADED
+                    && w.detail
+                        .starts_with("reason: gradle_lock_overrides_vendored: ")
+                    && w.detail.contains(rel)
+            });
+            assert_eq!(degraded, !consumed, "{rel}: {text}");
+            // A lock never stops the vendoring itself.
+            assert!(replan.writes.is_empty(), "{rel}");
+        }
+        // Two locks at the vendored version and one above: still not live.
+        assert!(!live(&with(&[
+            ("gradle.lockfile", AT),
+            ("app/gradle.lockfile", ABOVE),
+        ])));
+        // A lock file that is not UTF-8 proves nothing.
+        let mut bad = after.clone();
+        bad.insert("app/gradle.lockfile".into(), b"\xff\xfe\n".to_vec());
+        assert!(!live(&bad));
+        // A custom lock-file location hides the lock from the check.
+        let custom = with(&[(
+            "app/build.gradle",
+            "dependencyLocking { lockFile = file('locks/app.lockfile') }\n\
+             dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+        )]);
+        assert!(!live(&custom));
+        assert!(run(&custom, &p).unwrap().warnings.iter().any(|w| {
+            w.code == DEGRADED && w.detail.starts_with("reason: gradle_custom_lock_file: ")
+        }));
     }
 }

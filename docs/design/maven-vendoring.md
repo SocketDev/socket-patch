@@ -165,6 +165,17 @@ files receive an apply line for `.socket/gradle/socket-patch.settings.gradle`.
 Settings plugin and buildscript classpaths receive an in-block exclusive
 repository entry because those classpaths resolve before the apply line runs.
 
+Because lockfiles stay unchanged, a lock that pins the patched module at
+another version wins over the vendored GAV: Gradle resolves the locked version
+or fails lock validation. Every lock file of every project of the build is
+read (`gradle.lockfile`, `buildscript-gradle.lockfile`,
+`settings-gradle.lockfile`, and the legacy `gradle/dependency-locks/`), and an
+entry for the module at any version other than the vendored one is degraded
+(`gradle_lock_overrides_vendored`), as is a custom `lockFile` location the
+check cannot follow (`gradle_custom_lock_file`). The patch is still applied,
+and `vex` does not attest it. A settings classpath lock at the vendored version
+is served by the in-block entry, so it is not degraded.
+
 The script, the index, the derived metadata and the `.gitattributes` files are
 owned text and are compared line-ending blind, so a `core.autocrlf` checkout
 passes `--check` and reverts clean. `.socket/gradle/.gitattributes` (`* -text`,
