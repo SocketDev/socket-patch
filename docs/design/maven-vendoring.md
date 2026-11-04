@@ -169,12 +169,15 @@ Because lockfiles stay unchanged, a lock that pins the patched module at
 another version wins over the vendored GAV: Gradle resolves the locked version
 or fails lock validation. Every lock file of every project of the build is
 read (`gradle.lockfile`, `buildscript-gradle.lockfile`,
-`settings-gradle.lockfile`, and the legacy `gradle/dependency-locks/`), and an
-entry for the module at any version other than the vendored one is degraded
-(`gradle_lock_overrides_vendored`), as is a custom `lockFile` location the
-check cannot follow (`gradle_custom_lock_file`). The patch is still applied,
-and `vex` does not attest it. A settings classpath lock at the vendored version
-is served by the in-block entry, so it is not degraded.
+`settings-gradle.lockfile`, the legacy `gradle/dependency-locks/`, and a custom
+`lockFile` set as a literal `file(…)` in a project's own build script). The
+following are degraded: an entry at a version no vendored row serves
+(`gradle_lock_overrides_vendored`; another vendored version of the same module
+is served), a settings classpath entry whose settings script lacks the in-block
+entry for it (`gradle_settings_lock_unrouted`; liveness requires the committed
+entry), a lock file that cannot be read (`gradle_lock_unreadable`), and a
+custom `lockFile` that cannot be followed (`gradle_custom_lock_file`). The
+patch is still applied, and `vex` does not attest it.
 
 The script, the index, the derived metadata and the `.gitattributes` files are
 owned text and are compared line-ending blind, so a `core.autocrlf` checkout
