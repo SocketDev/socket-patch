@@ -349,6 +349,52 @@ async fn get_vendored_over_hosted_v1_package_lock_keeps_the_hosted_pin() {
     assert_still_hosted(root, "package-lock.json", &lock, &npmrc);
 }
 
+/// A v1 lock with no hosted pin: `get <uuid> --mode vendored` raises the
+/// backend's refusal before the engine, with the uuid path's pre-record
+/// envelope (`status: "error"`), so the run writes nothing at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn get_uuid_vendored_over_unhosted_v1_lock_refuses_before_any_write() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write_npm_project(root, "package-lock.json", 1);
+    let lock = std::fs::read_to_string(root.join("package-lock.json")).unwrap();
+
+    let fixture = prebuilt_common::Server::view(patch_view());
+    let api = server.uri();
+    let args = [
+        "get",
+        UUID,
+        "--mode",
+        "vendored",
+        "--json",
+        "--yes",
+        "--api-url",
+        &api,
+        "--api-token",
+        "fake",
+        "--org",
+        ORG,
+        "--cwd",
+        root.to_str().unwrap(),
+        "--vendor-url",
+        &fixture.uri,
+    ];
+    let (code, env) = run_json(root, &api, &args);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(env["status"], "error", "{env:#}");
+    assert_eq!(env["error"]["code"], V1_CODE, "{env:#}");
+    assert!(
+        !root.join(".socket").exists(),
+        "nothing may be written: {env:#}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("package-lock.json")).unwrap(),
+        lock
+    );
+}
+
 /// #659: the `npm-shrinkwrap.json` v1 variant.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_vendored_over_hosted_v1_shrinkwrap_keeps_the_hosted_pin() {

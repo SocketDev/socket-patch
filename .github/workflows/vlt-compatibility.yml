@@ -70,7 +70,6 @@ on:
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
       - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/get.rs'
-      - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/vex*'
       - 'crates/socket-patch-cli/tests/common/**'
