@@ -31,8 +31,8 @@ use socket_patch_core::vex::{
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::vex_sources::{
-    self, Plan, RunApiClient, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED,
-    VENDOR_UNWIRED, WIRING_CONFLICT,
+    self, Plan, RunApiClient, Sources, GO_WORKSPACE_OVERRIDE, RECORD_MISMATCH, RECORD_UNAVAILABLE,
+    REDIRECT_UNWIRED, VENDOR_UNWIRED, WIRING_CONFLICT,
 };
 use crate::ecosystem_dispatch::{find_manifest_package_copies_reusing, JvmScope};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
@@ -1952,10 +1952,6 @@ fn join_and(items: &[&str]) -> String {
         [init @ .., last] => format!("{} and {last}", init.join(", ")),
     }
 }
-
-/// Omission tag for a Go patch whose go.mod replace the `go.work` in effect
-/// overrides, ignores or rejects (#393, #458, #531).
-const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 
 /// Omission tag for a global Go patch while a tool built from the unpatched
 /// module with `go install` remains (#422).

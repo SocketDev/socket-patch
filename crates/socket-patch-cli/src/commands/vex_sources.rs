@@ -232,6 +232,12 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag for a Go patch whose replace the `go.work` in effect
+/// overrides, ignores or rejects (#393, #458, #531): the reason of `vex`'s
+/// own go.mod gate, and the note of a discovered hosted or vendored ref the
+/// governing workspace keeps from the build (`vex::Unattested`,
+/// `UnattestedKind::GoWorkspaceOverride`).
+pub(crate) const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -267,6 +273,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::GoWorkspaceOverride => (
+            GO_WORKSPACE_OVERRIDE,
+            "not attested while the Go workspace in effect keeps it from the build; the wiring \
+             itself is intact, so re-running `scan` / `vendor` does not change this",
         ),
     }
 }

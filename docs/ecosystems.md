@@ -1543,9 +1543,12 @@ Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,
 otherwise (`GOWORK` unset, empty or `auto`) the nearest `go.work` at or
 above the project. A relative `GOWORK` makes go fail
 (`invalid GOWORK: not an absolute path`), so socket-patch writes nothing for
-it and attests nothing. `vex` reads only the project's own `go.work`: when
-`GOWORK` names any other file, it attests none of the project's Go patches
-and reports each as `patched_ref_invalid`.
+it and attests nothing. `vex` reads the same workspace, members outside the
+project included: a Socket replace that workspace overrides, ignores or
+rejects (the check the writers run before writing one), or one in the
+project's own `go.work` while go builds another, stays listed, so `list`,
+`rollback` and `remove` find it, but is not attested
+(`go_workspace_override`).
 
 `GOFLAGS` is read the same way (the environment, then the `go env -w`
 file). A `-modfile` in it that names any file other than the project's

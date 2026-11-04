@@ -606,6 +606,12 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A Go `replace` the workspace go resolves keeps from the build: that
+    /// `go.work` (an ancestor's, or one `GOWORK` names) is not the root's,
+    /// overrides the replace, does not `use` its module, or another member
+    /// replaces the same module elsewhere — exactly where the hosted and
+    /// vendored writers refuse to write one.
+    GoWorkspaceOverride,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

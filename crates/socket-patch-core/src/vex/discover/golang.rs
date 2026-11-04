@@ -61,13 +61,13 @@
 //!   sum file (go rejects the whole file) — is not a pin:
 //!   `integrity_required = true`, no `locked_integrity`. Hashes of other
 //!   algorithms are ignored, as go ignores them. The sum files are the
-//!   ones go verifies against: the root `go.sum`, or with a `go.work`,
-//!   `go.work.sum` and each in-root `use` member's `go.sum` (the root's
-//!   only when `.` is a member). Under `GOWORK=off` go ignores `go.work`,
-//!   so discovery reads neither it nor its sum files. A `GOWORK` naming
-//!   another file than the root's `go.work`, or a relative one (which go
-//!   rejects), leaves the workspace unreadable here: every Go ref becomes
-//!   a diagnostic.
+//!   ones go verifies against inside the project: the root `go.sum`, or
+//!   with a `go.work`, `go.work.sum` (when the `go.work` is the root's)
+//!   and each in-root `use` member's `go.sum` (the root's only when `.`
+//!   is a member). Under `GOWORK=off` go ignores `go.work`, so discovery
+//!   reads neither it nor its sum files. A `GOWORK` go rejects (a
+//!   relative path, a file it cannot read or parse) leaves no build:
+//!   every Go ref becomes a diagnostic.
 //!   NB for the CLI's installed-tree basis: under a hosted replace the
 //!   module cache's `M@v` (if any, e.g. from before the redirect) is
 //!   pristine BY CONSTRUCTION — the build consumes
@@ -99,12 +99,30 @@
 //!   refs are emitted with `source_file = "go.work"`, and hosted pins looked
 //!   up in the sum files above. Versions are checked against the root
 //!   `go.mod`'s `require` in module mode, and in workspace mode against the
-//!   highest version any read member requires. go.work replaces override
-//!   go.mod replaces in Go, but rule 10 leaves cross-file precedence to the
-//!   CLI's `wiring_conflict` gate. In-root members' go.mod files are read
-//!   for their `require`s and their go.sum for pins; their replaces only
-//!   when the root has no go.mod of its own (a go.work root), each emitted
-//!   with its own `source_file` (`<member>/go.mod`).
+//!   highest version any read member requires. Two Socket replaces of one
+//!   module in go.work and a go.mod are left to the CLI's
+//!   `wiring_conflict` gate (rule 10). In-root members' go.mod files are
+//!   read for their `require`s and their go.sum for pins; their replaces
+//!   only when the root has no go.mod of its own (a go.work root), each
+//!   emitted with its own `source_file` (`<member>/go.mod`).
+//! * **Which workspace governs (G1).** On disk it is the one go resolves,
+//!   read by the loader hosted and vendored modes use
+//!   ([`go_workspace::load_with`]): `GOWORK` (from the environment, then
+//!   the `go env -w` file), else the nearest `go.work` at or above the
+//!   root, with `use` members anywhere, so an out-of-root member's
+//!   `require` or replace counts too. In memory (no directory to search
+//!   from, no environment the project builds under) it is the root
+//!   `go.work` and its in-root members, as the in-memory hosted engine
+//!   reads them. A wired Socket replace that workspace keeps from the
+//!   build exactly where the writers refuse to write one
+//!   ([`go_workspace::Loaded::host_conflict`]: it overrides the replace,
+//!   doesn't `use` the module, or another member replaces the same
+//!   `module@version` elsewhere), or one in the root `go.work` while go
+//!   builds another `go.work`, stays a ref, so list, rollback and remove
+//!   find it, but is marked [`UnattestedKind::GoWorkspaceOverride`]: the
+//!   writers refuse to rewrite it there, so re-running them can never
+//!   clear it. A replace the workspace's version selection makes inert is
+//!   diagnosed, never a ref, as in module mode.
 //! * **Hand-edit tolerance**: a UTF-8 BOM, CRLF line ends, tab-separated
 //!   tokens, `replace(` without a space, `// comments`, and Go string
 //!   literals (`"github.com/foo/bar"`, `` `…` ``) around escape- and
@@ -120,7 +138,7 @@ use std::path::Path;
 
 use super::{
     golang_purl, vendor_ref, vendored_leaf_purl, DiscoverCtx, Discovery, PatchedRef,
-    DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
+    UnattestedKind, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::patch::path_safety::is_safe_single_segment;
 use crate::utils::go_env::{go_env, goflags_modfile, GoflagsModfile};
@@ -130,7 +148,7 @@ use crate::vendor::go_mod_edit::{
     ReplaceOwner, HOSTED_GO_MODULE_PREFIX,
 };
 use crate::vendor::go_sum_edit::{go_semver_cmp, go_sum_lines, is_h1_dirhash};
-use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWork, GoWorkspace, Member};
+use crate::vendor::go_workspace::{self, in_root_dir, same_dir_key, GoWorkspace, Loaded, Member};
 use crate::vendor::lock_inventory::LockIntegrity;
 
 const GO_MOD: &str = "go.mod";
@@ -188,43 +206,61 @@ async fn extract_goenv(
 }
 
 /// [`extract`] for an explicit `GOWORK` value.
+///
+/// On disk the workspace is the one go resolves, read by the loader the
+/// hosted engine and the vendored backend use ([`go_workspace::load_with`]):
+/// `GOWORK`, else the nearest `go.work` at or above the root, with members
+/// anywhere. In memory there is no directory to search from or environment
+/// the project builds under, so the root `go.work` and its in-root members
+/// are the workspace, as the in-memory hosted engine reads them; `GOWORK`
+/// keeps the effect it always had there (`off` reads no `go.work`, any
+/// other explicit file withholds every ref), and `GOFLAGS` is not read.
 async fn extract_gowork(ctx: &DiscoverCtx<'_>, out: &mut Discovery, gowork: Option<&str>) {
-    match gowork {
-        Some("off") => extract_with(ctx, out, false).await,
-        None | Some("") | Some("auto") => extract_with(ctx, out, true).await,
-        Some(gowork) => match unread_workspace(ctx, gowork) {
-            None => extract_with(ctx, out, true).await,
-            Some(why) => withhold(ctx, out, &why).await,
-        },
+    let Some(root) = ctx.disk_root_reading(std::iter::empty::<&Path>()) else {
+        return match gowork {
+            Some("off") => extract_with(ctx, out, Governing::Module).await,
+            None | Some("") | Some("auto") => extract_with(ctx, out, Governing::Root).await,
+            Some(gowork) => {
+                let why = format!(
+                    "GOWORK={gowork} names a workspace other than this project's {GO_WORK}, \
+                     which discovery cannot read in memory"
+                );
+                withhold(ctx, out, &why).await
+            }
+        };
+    };
+    // The files go_workspace::resolve_with probes; the loader's own reads
+    // of a workspace are declared where it is read.
+    let mut touched: Vec<std::path::PathBuf> =
+        root.ancestors().map(|dir| dir.join(GO_WORK)).collect();
+    touched.extend(
+        gowork
+            .filter(|g| Path::new(g).is_absolute())
+            .map(Into::into),
+    );
+    ctx.disk_root_reading(&touched);
+    match go_workspace::load_with(root, gowork).await {
+        Loaded::None => extract_with(ctx, out, Governing::Module).await,
+        Loaded::Invalid(why) => withhold(ctx, out, &why).await,
+        Loaded::Workspace(ws) => extract_with(ctx, out, Governing::Loaded(root, ws)).await,
     }
 }
 
-/// Why the `go.work` an explicit `GOWORK` names is not the root's, which
-/// is the only one discovery reads (`None`: it is).
-fn unread_workspace(ctx: &DiscoverCtx<'_>, gowork: &str) -> Option<String> {
-    let root = ctx.disk_root();
-    let why = match go_workspace::resolve_with(root.unwrap_or(Path::new("")), Some(gowork)) {
-        GoWork::Invalid(why) => why,
-        GoWork::File(file) => {
-            let own = root.map(|r| r.join(GO_WORK)).filter(|own| own.is_file());
-            if own.is_some_and(|own| same_dir_key(&own) == same_dir_key(&file)) {
-                return None;
-            }
-            format!(
-                "GOWORK={gowork} names a workspace other than this directory's {GO_WORK}, \
-                 which discovery cannot read"
-            )
-        }
-        GoWork::None => return None,
-    };
-    Some(why)
+/// The workspace that decides what the build reads.
+enum Governing<'a> {
+    /// Module mode: `GOWORK=off`, or no `go.work` at or above the root.
+    Module,
+    /// The root's own `go.work`, if any, read through the view (in memory).
+    Root,
+    /// The workspace go resolves for the project at this disk root.
+    Loaded(&'a Path, GoWorkspace),
 }
 
-/// Discovery under a workspace it cannot read: what it would find reported
-/// as unattested, never as refs.
+/// Discovery under a workspace go refuses or that discovery cannot read:
+/// what it would find reported as diagnostics, never as refs.
 async fn withhold(ctx: &DiscoverCtx<'_>, out: &mut Discovery, why: &str) {
     let mut found = Discovery::default();
-    extract_with(ctx, &mut found, true).await;
+    extract_with(ctx, &mut found, Governing::Root).await;
     out.diagnostics.append(&mut found.diagnostics);
     for r in found.refs {
         let file = r.source_file.to_string_lossy().into_owned();
@@ -236,22 +272,30 @@ async fn withhold(ctx: &DiscoverCtx<'_>, out: &mut Discovery, why: &str) {
     }
 }
 
-/// [`extract`], with `workspaces` false under `GOWORK=off`: go then ignores
+/// [`extract`] under the `governing` workspace. In module mode go ignores
 /// `go.work`, its replaces and its sum files.
-async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bool) {
+async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, governing: Governing<'_>) {
     let go_mod = match ctx.read_text(GO_MOD, out).await {
         Some(text) => parse_go_file(GO_MOD, &text, out),
         None => None,
     };
-    let go_work = if workspaces {
-        ctx.read_text(GO_WORK, out).await
-    } else {
-        None
+    // The root's go.work is read whenever a workspace governs: its
+    // replaces are the build's when it is that workspace, and Socket
+    // wiring left unread otherwise ([`Workspace::bypass`]).
+    let go_work = match governing {
+        Governing::Module => None,
+        Governing::Root | Governing::Loaded(..) => ctx.read_text(GO_WORK, out).await,
     };
     let go_work = go_work.and_then(|text| parse_go_file(GO_WORK, &text, out));
-    let workspace = match go_work.as_deref() {
-        Some(work) => Some(read_workspace(ctx, out, go_mod.as_deref(), work).await),
-        None => None,
+    let workspace = match governing {
+        Governing::Module => None,
+        Governing::Root => match go_work.as_deref() {
+            Some(work) => Some(read_workspace(ctx, out, go_mod.as_deref(), work).await),
+            None => None,
+        },
+        Governing::Loaded(root, model) => {
+            Some(read_loaded_workspace(ctx, out, go_mod.as_deref(), root, model).await)
+        }
     };
 
     // The go.mod files whose replaces apply: the root's, or (a go.work root
@@ -307,7 +351,7 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, workspaces: bo
         sums = SumPins::read(ctx, out, &sum_files).await;
     }
     for (file, entries) in &files {
-        extract_file(out, file, entries, &graph, &sums);
+        extract_file(out, file, entries, &graph, &sums, workspace.as_ref());
     }
 }
 
@@ -385,16 +429,71 @@ impl<'a> Graph<'a> {
 
 /// The `go.work` in effect, as discovery reads it.
 struct Workspace {
-    /// Members outside the root, or whose go.mod is unreadable, carry no
-    /// go.mod, which leaves every selection unknown.
+    /// Members whose go.mod is unreadable (or, in memory, outside the
+    /// root) carry no go.mod, which leaves every selection unknown.
     model: GoWorkspace,
     /// `(root-relative dir, index into model.members)` of in-root members.
     in_root: Vec<(String, usize)>,
-    /// The sum files go verifies against in workspace mode: `go.work.sum`
-    /// and each member's `go.sum` (the root's only when `.` is a member).
+    /// The sum files go verifies against in workspace mode that lie in the
+    /// project: `go.work.sum` (when go.work is the root's) and each in-root
+    /// member's `go.sum` (the root's only when `.` is a member).
     sum_files: Vec<String>,
+    /// The project root the model's paths are matched against (empty in
+    /// memory, where the model's paths are root-relative).
+    root: std::path::PathBuf,
+    /// Whether the model is the root's own `go.work`.
+    rooted: bool,
 }
 
+impl Workspace {
+    /// Why the Socket replace `entry` of `module@version` in the
+    /// root-relative `file` does not reach the build of this workspace
+    /// although it is wired (`None`: it does): go reads another `go.work`
+    /// than the root's, or the workspace overrides, ignores or rejects the
+    /// replace as the hosted and vendored writers' own check
+    /// ([`go_workspace::Loaded::host_conflict`]) says before they write one.
+    fn bypass(&self, file: &str, entry: &ReplaceEntry, version: &str) -> Option<String> {
+        let module = entry.module.as_str();
+        if file == GO_WORK {
+            if !self.rooted {
+                return Some(format!(
+                    "go builds the workspace of {}, never this directory's {GO_WORK}, so its \
+                     replace of {module} {version} has no effect",
+                    go_workspace::display_path(&self.root, &self.model.work_file)
+                ));
+            }
+            return self
+                .model
+                .work_conflict(&self.root, module, version, entry)
+                .map(|c| {
+                    format!(
+                        "the {GO_WORK} replace of {module} {version} {}",
+                        c.consequence(module, version)
+                    )
+                });
+        }
+        let dir = file
+            .strip_suffix(GO_MOD)
+            .unwrap_or_default()
+            .trim_end_matches('/');
+        let project = if dir.is_empty() {
+            self.root.clone()
+        } else {
+            self.root.join(dir)
+        };
+        self.model
+            .conflict(&project, module, version, entry)
+            .map(|c| {
+                format!(
+                    "the {file} replace of {module} {version} {}",
+                    c.consequence(module, version)
+                )
+            })
+    }
+}
+
+/// The root's own `go.work` (`go_work`) and its in-root members, read
+/// through the view: the workspace in memory, and what [`withhold`] reports.
 async fn read_workspace(
     ctx: &DiscoverCtx<'_>,
     out: &mut Discovery,
@@ -413,17 +512,7 @@ async fn read_workspace(
             });
             continue;
         };
-        let text = if dir.is_empty() {
-            go_mod.map(str::to_string)
-        } else {
-            let rel = member_file(&dir, GO_MOD);
-            match ctx.read_text(&rel, out).await {
-                Some(text) => parse_go_file(&rel, &text, out),
-                None => None,
-            }
-        };
-        let sum = member_file(&dir, GO_SUM);
-        let go_sum = ctx.read_text(&sum, out).await;
+        let (text, go_sum, sum) = read_member(ctx, out, go_mod, &dir).await;
         if !sum_files.contains(&sum) {
             sum_files.push(sum);
         }
@@ -435,27 +524,90 @@ async fn read_workspace(
         });
     }
     let work_sum = ctx.read_text(GO_WORK_SUM, out).await;
-    let mut model = GoWorkspace {
+    let model = GoWorkspace {
         work_file: GO_WORK.into(),
         work: go_work.to_string(),
         work_sum,
         members,
         graph: None,
     };
-    if let Some(root) = ctx.disk_root() {
-        let mut on_disk = model.clone();
-        on_disk.work_file = root.join(GO_WORK);
-        for member in &mut on_disk.members {
-            member.dir = root.join(&member.dir);
-        }
-        on_disk.read_graph().await;
-        model.graph = on_disk.graph;
-    }
     Workspace {
         model,
         in_root,
         sum_files,
+        root: std::path::PathBuf::new(),
+        rooted: true,
     }
+}
+
+/// The workspace go resolves for the project at `root` on disk
+/// ([`go_workspace::load_with`]), with every member wherever it lies. The
+/// in-root members' go.mod and go.sum are re-read through the view, so
+/// their Socket identities are recognized and a go.mod go cannot parse is
+/// diagnosed; the others keep what the loader read. The module graph is
+/// read from the module cache, as the hosted engine reads it.
+async fn read_loaded_workspace(
+    ctx: &DiscoverCtx<'_>,
+    out: &mut Discovery,
+    go_mod: Option<&str>,
+    root: &Path,
+    mut model: GoWorkspace,
+) -> Workspace {
+    let rooted = model.rooted_at(root);
+    let base = same_dir_key(root);
+    let mut in_root = Vec::new();
+    let mut sum_files = Vec::new();
+    if rooted {
+        sum_files.push(GO_WORK_SUM.to_string());
+    }
+    for (index, member) in model.members.iter_mut().enumerate() {
+        let Ok(rel) = same_dir_key(&member.dir)
+            .strip_prefix(&base)
+            .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        else {
+            continue;
+        };
+        let (text, go_sum, sum) = read_member(ctx, out, go_mod, &rel).await;
+        member.go_mod = text;
+        member.go_sum = go_sum;
+        if !sum_files.contains(&sum) {
+            sum_files.push(sum);
+        }
+        in_root.push((rel, index));
+    }
+    // The loader read go.work, go.work.sum and every member outside the
+    // view, and the module graph reads the module cache.
+    let _ = ctx.disk_root();
+    model.read_graph().await;
+    Workspace {
+        model,
+        in_root,
+        sum_files,
+        root: root.to_path_buf(),
+        rooted,
+    }
+}
+
+/// An in-root member's go.mod (the root's own `go_mod` for `""`), its
+/// go.sum, and the go.sum's root-relative path.
+async fn read_member(
+    ctx: &DiscoverCtx<'_>,
+    out: &mut Discovery,
+    go_mod: Option<&str>,
+    dir: &str,
+) -> (Option<String>, Option<String>, String) {
+    let text = if dir.is_empty() {
+        go_mod.map(str::to_string)
+    } else {
+        let rel = member_file(dir, GO_MOD);
+        match ctx.read_text(&rel, out).await {
+            Some(text) => parse_go_file(&rel, &text, out),
+            None => None,
+        }
+    };
+    let sum = member_file(dir, GO_SUM);
+    let go_sum = ctx.read_text(&sum, out).await;
+    (text, go_sum, sum)
 }
 
 /// Normalize a go.mod-grammar file (BOM, simple string literals) and check
@@ -481,8 +633,24 @@ fn extract_file(
     entries: &[ReplaceEntry],
     graph: &Graph<'_>,
     sums: &SumPins,
+    workspace: Option<&Workspace>,
 ) {
     let required = &graph.required;
+    // A wired replace the workspace keeps from the build stays a ref (so
+    // list, rollback and remove find it) but is never attested.
+    let bypass = |out: &mut Discovery, purl: &str, uuid: &str, entry: &ReplaceEntry| {
+        let req = required.get(&entry.module).map(String::as_str);
+        let version = entry.version.as_deref().or(req).unwrap_or_default();
+        if let Some(detail) = workspace.and_then(|ws| ws.bypass(file, entry, version)) {
+            out.unattested(
+                purl,
+                uuid,
+                file,
+                detail,
+                UnattestedKind::GoWorkspaceOverride,
+            );
+        }
+    };
     // Versioned directives of ANY owner: they shadow a version-less replace
     // of the same module at that version.
     let versioned: HashSet<(&str, &str)> = entries
@@ -574,6 +742,7 @@ fn extract_file(
                     SumPin::Unpinned => (None, true),
                 };
                 let url = format!("{rhs}@{rhs_version}");
+                bypass(out, &purl, &uuid, entry);
                 out.push(PatchedRef::hosted(
                     purl,
                     uuid,
@@ -619,6 +788,7 @@ fn extract_file(
                     );
                     continue;
                 }
+                bypass(out, &purl, &vref.uuid, entry);
                 out.push(PatchedRef::vendored(purl, &vref, file, None));
             }
             // Socket-shaped but not something we write (another tree's copy,
@@ -859,12 +1029,12 @@ mod tests {
         "module example.com/app\n\ngo 1.21\n\nrequire github.com/foo/bar v1.4.2\n";
 
     async fn run(p: &Project) -> Discovery {
-        p.run(|c, o| Box::pin(super::extract_with(c, o, true)))
+        p.run(|c, o| Box::pin(super::extract_gowork(c, o, None)))
             .await
     }
 
     async fn gowork_off(p: &Project) -> Discovery {
-        p.run(|c, o| Box::pin(super::extract_with(c, o, false)))
+        p.run(|c, o| Box::pin(super::extract_gowork(c, o, Some("off"))))
             .await
     }
 
@@ -1920,11 +2090,11 @@ mod tests {
         assert_refs(&gowork_off(&p).await, &[]);
     }
 
-    /// An explicit `GOWORK` other than the root's go.work (another file, or a
-    /// relative path go rejects) leaves the workspace unread: what discovery
-    /// finds is diagnosed, never a ref.
+    /// An explicit `GOWORK` go refuses (a relative path, a file it cannot
+    /// read) leaves no build: what discovery finds is diagnosed, never a
+    /// ref.
     #[tokio::test]
-    async fn gowork_naming_another_workspace_attests_nothing() {
+    async fn gowork_go_refuses_attests_nothing() {
         let m = gopatch(UUID_A);
         let sver = "v1.4.2-socketpatch.1";
         let p = Project::new();
@@ -1964,8 +2134,8 @@ mod tests {
         let missing = outside.path().join("nonexistent").join("go.work");
         for (gowork, why) in [
             ("go.work".to_string(), "not an absolute path"),
-            (missing.to_string_lossy().into_owned(), "other than"),
-            (elsewhere.to_string_lossy().into_owned(), "other than"),
+            (missing.to_string_lossy().into_owned(), "cannot be read"),
+            (elsewhere.to_string_lossy().into_owned(), "cannot be read"),
         ] {
             let out = extract(Some(gowork.clone())).await;
             assert!(out.refs.is_empty(), "{gowork}");
@@ -2156,5 +2326,244 @@ mod tests {
             replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
             None
         );
+    }
+
+    /// Whether `out` holds exactly the hosted ref of [`PURL`] marked
+    /// unattested as a Go workspace override (`Some(detail fragment)`), or
+    /// that ref attested (`None`).
+    fn assert_overridden(out: &Discovery, overridden: Option<&str>, case: &str) {
+        assert_refs(out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.diagnostics.is_empty(), "{case}: {:?}", out.diagnostics);
+        match overridden {
+            Some(why) => {
+                assert_eq!(out.unattested.len(), 1, "{case}: {:?}", out.unattested);
+                let u = &out.unattested[0];
+                assert_eq!(u.kind, UnattestedKind::GoWorkspaceOverride, "{case}");
+                assert_eq!((u.purl.as_str(), u.uuid.as_str()), (PURL, UUID_A), "{case}");
+                assert!(u.detail.contains(why), "{case}: {}", u.detail);
+            }
+            None => assert!(out.unattested.is_empty(), "{case}: {:?}", out.unattested),
+        }
+    }
+
+    /// G1: with `GOWORK` unset go builds a module inside an ancestor's
+    /// `go.work` in that workspace, as the hosted and vendored writers
+    /// resolve it. Its replace of the module overrides the root go.mod's,
+    /// a workspace that doesn't `use` the module ignores it, and another
+    /// member's higher `require` makes it inert: none of those is attested.
+    #[tokio::test]
+    async fn ancestor_go_work_governs_the_root_module() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let svc = |require: &str| format!("module example.com/svc\n\ngo 1.21\n{require}");
+        for (case, work, svc_mod, overridden, inert) in [
+            (
+                "overriding replace",
+                format!("go 1.21\n\nuse ./app\n\nreplace {MODULE} {VERSION} => ./fork\n"),
+                None,
+                Some("has no effect"),
+                false,
+            ),
+            (
+                "module not used",
+                "go 1.21\n\nuse ./svc\n".to_string(),
+                Some(svc("")),
+                Some("does not `use` this module"),
+                false,
+            ),
+            (
+                "member raises the module",
+                "go 1.21\n\nuse (\n\t./app\n\t./svc\n)\n".to_string(),
+                Some(svc(&format!("\nrequire {MODULE} v1.5.0\n"))),
+                None,
+                true,
+            ),
+            (
+                "workspace uses the module",
+                "go 1.21\n\nuse ./app\n".to_string(),
+                None,
+                None,
+                false,
+            ),
+        ] {
+            let p = Project::nested("app");
+            p.write(
+                "go.mod",
+                format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+            )
+            .write("go.sum", go_sum_for(UUID_A, sver))
+            .write("../go.work", &work);
+            if let Some(text) = &svc_mod {
+                p.write("../svc/go.mod", text);
+            }
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert!(
+                    out.diagnostics
+                        .iter()
+                        .any(|d| d.code == DIAG_REF_INVALID && d.detail.contains("v1.5.0")),
+                    "{case}: {:?}",
+                    out.diagnostics
+                );
+            } else {
+                assert_overridden(&out, overridden, case);
+            }
+            // GOWORK=off: module mode, the root go.mod's replace is built.
+            let out = gowork_off(&p).await;
+            assert_overridden(&out, None, case);
+            assert!(out.refs[0].lockfile_basis_ok(), "{case}");
+        }
+    }
+
+    /// G1: a `GOWORK` naming another readable workspace is the one go
+    /// builds: it governs the root module as an ancestor's would, and the
+    /// root's own `go.work` replaces are never read.
+    #[tokio::test]
+    async fn gowork_naming_another_workspace_governs() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let ours = format!("replace {MODULE} {VERSION} => {m} {sver}\n");
+        async fn extract(p: &Project, gowork: String) -> Discovery {
+            let ctx = p.ctx();
+            let mut out = Discovery::default();
+            super::extract_gowork(&ctx, &mut out, Some(&gowork)).await;
+            out
+        }
+        for (case, work, overridden) in [
+            (
+                "overriding replace",
+                format!("go 1.21\n\nuse ../app\n\nreplace {MODULE} => ./fork\n"),
+                Some("has no effect"),
+            ),
+            (
+                "module not used",
+                "go 1.21\n\nuse ../other\n".to_string(),
+                Some("does not `use` this module"),
+            ),
+            (
+                "uses the module",
+                "go 1.21\n\nuse ../app\n".to_string(),
+                None,
+            ),
+        ] {
+            let p = Project::nested("app");
+            p.write("go.mod", format!("{BASE_GO_MOD}\n{ours}"))
+                .write("go.sum", go_sum_for(UUID_A, sver))
+                .write("../ci/go.work", &work);
+            let gowork = p
+                .root()
+                .join("../ci/go.work")
+                .to_string_lossy()
+                .into_owned();
+            assert_overridden(&extract(&p, gowork).await, overridden, case);
+        }
+
+        // The root's own go.work holds the wiring, but GOWORK sends go
+        // elsewhere: still a ref, never attested.
+        let p = Project::nested("app");
+        p.write("go.mod", BASE_GO_MOD)
+            .write("go.work", format!("go 1.21\n\nuse .\n\n{ours}"))
+            .write("go.work.sum", go_sum_for(UUID_A, sver))
+            .write("../ci/go.work", "go 1.21\n\nuse ../app\n");
+        let gowork = p
+            .root()
+            .join("../ci/go.work")
+            .to_string_lossy()
+            .into_owned();
+        let out = extract(&p, gowork).await;
+        assert_overridden(&out, Some("never this directory's go.work"), "root go.work");
+        assert_eq!(out.refs[0].source_file, std::path::PathBuf::from("go.work"));
+        // Its own go.work named explicitly is the workspace again.
+        let own = p.root().join("go.work").to_string_lossy().into_owned();
+        assert_overridden(&extract(&p, own).await, None, "own go.work");
+    }
+
+    /// G1: a `use` member outside the root is part of the workspace go
+    /// builds: its `require` can raise the module, and its own replace of
+    /// the same `module@version` makes go refuse the workspace.
+    #[tokio::test]
+    async fn workspace_member_outside_the_root_is_read() {
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        let svc = |extra: &str| format!("module example.com/svc\n\ngo 1.21\n{extra}");
+        for (case, svc_mod, overridden, inert) in [
+            (
+                "member raises the module",
+                svc(&format!("\nrequire {MODULE} v1.5.0\n")),
+                None,
+                true,
+            ),
+            (
+                "member replaces the module elsewhere",
+                svc(&format!(
+                    "\nrequire {MODULE} {VERSION}\n\nreplace {MODULE} {VERSION} => ./fork\n"
+                )),
+                Some("conflicts with"),
+                false,
+            ),
+            (
+                "member requires the same version",
+                svc(&format!("\nrequire {MODULE} {VERSION}\n")),
+                None,
+                false,
+            ),
+        ] {
+            let p = Project::nested("app");
+            p.write(
+                "go.mod",
+                format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+            )
+            .write("go.sum", go_sum_for(UUID_A, sver))
+            .write("go.work", "go 1.21\n\nuse (\n\t.\n\t../svc\n)\n")
+            .write("../svc/go.mod", &svc_mod);
+            let out = run(&p).await;
+            if inert {
+                assert_refs(&out, &[]);
+                assert!(
+                    out.diagnostics.iter().any(|d| d.code == DIAG_REF_INVALID
+                        && d.detail.contains("is inert")
+                        && d.detail.contains("v1.5.0")),
+                    "{case}: {:?}",
+                    out.diagnostics
+                );
+            } else {
+                assert_overridden(&out, overridden, case);
+            }
+        }
+    }
+
+    /// In memory the root `go.work` and its in-root members are the
+    /// workspace (as the in-memory hosted engine reads them), with the same
+    /// gate: a root module the go.work doesn't `use` is never attested.
+    #[tokio::test]
+    async fn in_memory_root_go_work_governs_the_root_module() {
+        use crate::vendor::lock_inventory::{MemoryProject, ProjectView};
+        let m = gopatch(UUID_A);
+        let sver = "v1.4.2-socketpatch.1";
+        for (case, work, overridden) in [
+            ("module not used", "go 1.21\n\nuse ./svc\n", true),
+            ("module used", "go 1.21\n\nuse (\n\t.\n\t./svc\n)\n", false),
+        ] {
+            let mut project = MemoryProject::new();
+            project.insert_text(
+                "go.mod",
+                format!("{BASE_GO_MOD}\nreplace {MODULE} {VERSION} => {m} {sver}\n"),
+            );
+            project.insert_text("go.sum", go_sum_for(UUID_A, sver));
+            project.insert_text("go.work", work);
+            project.insert_text(
+                "svc/go.mod",
+                format!("module example.com/svc\n\ngo 1.21\n\nrequire {MODULE} {VERSION}\n"),
+            );
+            let ctx = DiscoverCtx::over(ProjectView::Memory(&project), &[]);
+            let mut out = Discovery::default();
+            super::extract_gowork(&ctx, &mut out, None).await;
+            assert_refs(&out, &[(PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), usize::from(overridden), "{case}");
+            if overridden {
+                assert_eq!(out.unattested[0].kind, UnattestedKind::GoWorkspaceOverride);
+            }
+        }
     }
 }
