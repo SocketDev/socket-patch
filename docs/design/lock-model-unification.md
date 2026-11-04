@@ -57,10 +57,15 @@ the model, and the end state has fewer implementation lines than today.
    a rewired entry points (a Socket URL or a committed `.socket/vendor/`
    path). Everything else, from reading the lock to choosing entries and
    refusing unsafe states, is one implementation.
-3. **When in doubt, hosted semantics are correct.** Where the modes or
-   readers disagree and the right answer isn't clear, the hosted mode's
-   current behavior wins. Every such call is listed under
-   [Decisions](#decisions-under-the-hosted-rule), so it can be overruled.
+3. **When in doubt, the modes are ground truth.** Where a reader (discovery,
+   the inventory) disagrees with what hosted or vendored mode writes, the
+   mode wins. Between the two modes, hosted's behavior wins, except where
+   vendored supports something hosted lacks: then the support is
+   back-ported to hosted as the planners merge (Maven profiles and reactors,
+   scala-cli). Every call is listed under
+   [Decisions](#decisions-under-the-hosted-rule) and in
+   [lock-model-divergences.md](lock-model-divergences.md), so it can be
+   overruled.
 4. **Behavior changes are allowed, and visible.** A PR that aligns behavior
    lists each change in its description, adds a test that pins the new
    behavior, and shows its golden diffs.
@@ -170,9 +175,15 @@ pub struct InstallTree {
 
 Rule: **precedence within a tree, union across trees.**
 
-* npm: `npm-shrinkwrap.json` governs and `package-lock.json` is shadowed.
-  pnpm: `pnpm-lock.yaml` governs `shrinkwrap.yaml`. Bun: `bun.lock` governs
-  `bun.lockb`, which `bun_text_lock_drives` already decides.
+* npm: `npm-shrinkwrap.json` and `package-lock.json` are both read, as
+  hosted, vendored and discovery already do, with discovery's contest
+  between the two. The inventory, which reads only the shrinkwrap today,
+  follows. pnpm: `pnpm-lock.yaml` governs `shrinkwrap.yaml`. Bun: `bun.lock`
+  governs `bun.lockb`, which `bun_text_lock_drives` already decides.
+* npm-family locks of different package managers in one project (for
+  example `pnpm-lock.yaml` beside `yarn.lock`) are separate trees, as hosted
+  and discovery treat them. The inventory and vendored mode stop picking one
+  family.
 * **Python (owner decision):** each tool's lock is its own tree, because
   which lock is installed depends on which tool runs. uv.lock, poetry.lock,
   pdm.lock, Pipfile.lock, each pylock, each PEP 723 script lock, and
@@ -276,7 +287,9 @@ A format whose planner merge is large splits into two PRs, readers first.
 | 8 | `lock-model/8-cargo-go` | One `Cargo.toml` dependency-table walk. Go `replace` and `go.sum` records. |
 | 9 | `lock-model/9-gem-composer` | Gemfile.lock and composer.lock records. The inventory stops dropping BOM-prefixed `composer.lock` files. |
 | 10 | `lock-model/10-nuget` | NuGet records with the config join, `NugetContentHash`, and inventory entries |
-| 11 | `lock-model/11-jvm` | One `checksums.sha256` reader, one Gradle index parser, a `verification-metadata.xml` reader, then Gradle-lock and root-pom inventory entries and sbt's owned-file entries |
+| 11a | `lock-model/11a-jvm-readers` | One pom model (`maven_reactor::Doc`), one interpolator, one `checksums.sha256` reader, one Gradle index grammar, a `verification-metadata.xml` reader, then Gradle-lock and pom inventory entries and sbt's owned-file entries |
+| 11b | `lock-model/11b-maven-planner` | One Maven planner for both modes. Hosted gains reactor and profile support. |
+| 11c | `lock-model/11c-gradle-sbt-scala` | One Gradle and one sbt planner, one evidence route. Hosted gains scala-cli wiring. |
 | 12 | `lock-model/12-install-trees` | Install-tree selection across formats, Python trees, Deno governance, the single classifier for the inventory, liveness on `Origin`. Deletes the npm flavor router's lock choice, the Python precedence rules, `resolved_elsewhere` and the `UnwiredCopy` plumbing. |
 | 13 | `lock-model/13-cleanup` | Removes the raw-text liveness fallbacks if the model makes them redundant, plus whatever is left of `vendor/lock_inventory/`. Final budget. |
 
