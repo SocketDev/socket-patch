@@ -1,9 +1,11 @@
 //! The `packages:` entry grammar: read pnpm's package blocks without
 //! reserializing unrelated YAML. The old shrinkwrap and lockfile 5.1/5.2
 //! formats use block resolutions; newer locks use flow mappings. Peer
-//! suffixes are identities, not part of the version. The hosted planner
-//! ([`super::hosted`]), the lock inventory and lockfile discovery all read
-//! entries through this one walk.
+//! suffixes are identities, not part of the version. Every reader reads
+//! entries through [`super::PnpmLock`], which wraps this walk; the writers
+//! that splice byte ranges (the hosted planner, [`super::hosted`], and the
+//! hosted unwind) call it directly (see `architecture_tests` in
+//! `formats/pnpm/mod.rs`).
 
 use std::ops::Range;
 

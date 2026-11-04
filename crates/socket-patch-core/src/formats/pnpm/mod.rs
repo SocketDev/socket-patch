@@ -1065,3 +1065,124 @@ mod tests {
         assert!(!may_need_store_flag("packages: {}\n"));
     }
 }
+
+/// ARCHITECTURE GUARD: outside `formats/pnpm`, pnpm lock entries are READ
+/// through [`PnpmLock`] (one walk, every document tagged), never through
+/// the grammar's raw entry walk or a hand-rolled `packages:` line walk.
+/// Writers that splice by byte range or line position keep their own
+/// walk; each such use is allowlisted below with a label and a count, so
+/// a new reader in the same file still fails.
+#[cfg(test)]
+mod architecture_tests {
+    use std::path::{Path, PathBuf};
+
+    /// `(root-relative file, uses, why)`.
+    const WRITERS: &[(&str, usize, &str)] = &[
+        (
+            "patch/redirect/upstream/npm.rs",
+            2,
+            "hosted unwind (`restore_pnpm_locks`): splices each pin's \
+             resolution byte range back to the registry spelling",
+        ),
+        (
+            "vendor/pnpm_lock.rs",
+            3,
+            "v9 vendored planner: preflight and splices over line blocks \
+             (`lock_has_target_package`, `edit_packages`, `LockIndex`)",
+        ),
+        (
+            "vendor/pnpm_lock_legacy.rs",
+            6,
+            "5.4 / 6.0 vendored planner: preflight, splices and revert over \
+             line blocks",
+        ),
+    ];
+
+    /// Whether one production line reads pnpm entries outside the model.
+    fn raw_walk(line: &str) -> bool {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            return false;
+        }
+        [
+            "grammar::entries(",
+            "pnpm::entries(",
+            "pnpm_grammar::entries(",
+            "pnpm_packages(",
+            "== \"packages:\"",
+        ]
+        .iter()
+        .any(|needle| code.contains(needle))
+            || (code.contains("\"packages\")")
+                && (code.contains("bounds(") || code.contains("SectionIndex::build(")))
+    }
+
+    /// `text` up to its test module.
+    fn production(text: &str) -> &str {
+        ["#[cfg(test)]\nmod ", "#[cfg(test)]\npub(crate) mod "]
+            .iter()
+            .filter_map(|marker| text.find(marker))
+            .min()
+            .map_or(text, |at| &text[..at])
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn pnpm_entries_are_read_through_the_model() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.starts_with("formats/pnpm/") || rel.ends_with("tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let uses = production(&text).lines().filter(|l| raw_walk(l)).count();
+            if uses > 0 {
+                found.push((rel, uses));
+            }
+        }
+        found.sort();
+        let mut allowed: Vec<(String, usize)> = WRITERS
+            .iter()
+            .map(|(rel, uses, _)| (rel.to_string(), *uses))
+            .collect();
+        allowed.sort();
+        assert_eq!(
+            found, allowed,
+            "pnpm lock entries read outside formats/pnpm: read them through \
+             PnpmLock::packages (a reader), or allowlist a writer that needs \
+             byte or line positions in WRITERS with its reason"
+        );
+    }
+
+    #[test]
+    fn raw_walk_needles() {
+        assert!(raw_walk("    for entry in pnpm::entries(&text) {"));
+        assert!(raw_walk("        in_packages = line == \"packages:\";"));
+        assert!(raw_walk(
+            "    let (s, e) = section_bounds(lines, \"packages\").unwrap();"
+        ));
+        assert!(!raw_walk("    // pnpm::entries(&text)"));
+        assert!(!raw_walk("    lock.get(\"packages\")"));
+        assert!(!raw_walk("    for p in PnpmLock::parse(t).packages() {"));
+    }
+}

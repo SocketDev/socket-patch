@@ -30,7 +30,7 @@
 //! lockfile supplement, the vendored fetch inventory) read each format
 //! through ONE shared reader that yields EVERY entry, Socket-owned ones
 //! included: the npm-family entry models in `lock_inventory`
-//! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
+//! (`npm_lock_nodes`, `PnpmLock::packages`, `yarn::classic_entries` /
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
 //! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
@@ -4621,7 +4621,7 @@ mod tests {
 
     /// ARCHITECTURE GUARD (rule 12): the npm-family extractors read their
     /// locks through the entry models the lock inventory shares
-    /// (`classic_entries` / `berry_entries`, `pnpm_packages`,
+    /// (`classic_entries` / `berry_entries`, `PnpmLock::packages`,
     /// `bun_text_entries`, `BunLockb::parse_packages`), never through the
     /// grammar primitives those models wrap, nor a second parser of the
     /// same lock (a JSON read of `bun.lock`) — so discovery and the
