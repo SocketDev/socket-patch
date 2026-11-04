@@ -136,7 +136,9 @@ pub async fn judge_installed_wheel(site: &Path, record: &WheelRecord) -> Install
     let record = record.clone();
     crate::utils::fs::run_blocking(move || {
         let installed_wheel = site.join(&record.dist_info).join("WHEEL");
-        let same_build = std::fs::read_to_string(installed_wheel)
+        // Site-packages is user-writable: read through the regular-file
+        // guard so a FIFO or device counts as unreadable instead of blocking.
+        let same_build = crate::utils::fs::read_regular_to_string_sync(&installed_wheel)
             .is_ok_and(|text| wheel_tags(&text) == record.tags && !record.tags.is_empty());
         if !same_build || record.files.is_empty() {
             return InstalledRecordJudgment::default();
@@ -150,7 +152,7 @@ pub async fn judge_installed_wheel(site: &Path, record: &WheelRecord) -> Install
                 out.patched = false;
                 continue;
             }
-            let Ok(bytes) = std::fs::read(site.join(path)) else {
+            let Ok(bytes) = crate::utils::fs::read_regular_to_bytes_sync(&site.join(path)) else {
                 out.patched = false;
                 continue;
             };
@@ -253,6 +255,27 @@ mod tests {
             InstalledRecordJudgment::default(),
             "another build's bytes are never evidence"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_site_packages_is_unreadable_not_a_hang() {
+        let record = parse_wheel_record(&wheel()).unwrap();
+        for target in ["pkg/mod.py", "pkg-1.0.dist-info/WHEEL"] {
+            let tmp = tempfile::tempdir().unwrap();
+            install(tmp.path(), PATCHED, WHEEL);
+            let fifo = tmp.path().join(target);
+            std::fs::remove_file(&fifo).unwrap();
+            let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+            let judged = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                judge_installed_wheel(tmp.path(), &record),
+            )
+            .await
+            .expect("a FIFO must not block the probe");
+            assert_eq!(judged, InstalledRecordJudgment::default(), "{target}");
+        }
     }
 
     #[tokio::test]
