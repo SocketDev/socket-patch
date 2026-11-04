@@ -11,7 +11,9 @@ use std::ops::Range;
 
 use serde_json::{json, Value};
 
-use crate::formats::maven::maven_config_properties as cli_properties;
+use crate::formats::maven::{
+    interpolate_strict, maven_config_properties as cli_properties, MAX_INTERPOLATION_DEPTH,
+};
 
 use super::super::state::{WiringAction, WiringRecord};
 use super::layout::{self, safe_coordinates};
@@ -51,8 +53,6 @@ const NESTED_MVN_FILES: &[&str] = &[
 const SHAPE_UNSUPPORTED: &str = "vendor_jvm_shape_unsupported";
 const UPSTREAM_UNAVAILABLE: &str = "vendor_jvm_upstream_unavailable";
 const DEGRADED: &str = "vendor_jvm_degraded";
-/// Property interpolation depth cap (Maven itself fails on cycles).
-const MAX_INTERPOLATION_DEPTH: usize = 16;
 
 /// Whether the pom declares a `<modules>` or `<subprojects>` of the project
 /// or of a profile (plugin configuration, comments and CDATA do not count).
@@ -737,7 +737,7 @@ fn restore_versions(
     let resolve = |v: &str| {
         reactor
             .filter(|r| r.poms.contains_key(rel))
-            .and_then(|r| r.interpolate(rel, v, 0))
+            .and_then(|r| r.interpolate(rel, v))
     };
     let mut edits = Vec::new();
     for (dep, key) in doc.keyed_declarations(c.group_id, c.artifact_id, &resolve) {
@@ -1055,30 +1055,6 @@ struct ExternalPom {
     pom: Pom,
 }
 
-/// `${name}` interpolation through `lookup`; `None` when a name is
-/// undefined or the nesting is too deep.
-fn interpolate_by(
-    value: &str,
-    lookup: &dyn Fn(&str) -> Option<String>,
-    depth: usize,
-) -> Option<String> {
-    if depth > MAX_INTERPOLATION_DEPTH {
-        return None;
-    }
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(at) = rest.find("${") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let close = after.find('}')?;
-        let raw = lookup(&after[..close])?;
-        out.push_str(&interpolate_by(&raw, lookup, depth + 1)?);
-        rest = &after[close + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
-}
-
 impl Reactor {
     /// Management of `patch`'s g:a that a pin in local root `root` would
     /// override and that does not manage it at the patch's base version:
@@ -1120,7 +1096,7 @@ impl Reactor {
                 })
             };
             let resolve = |value: &str, what: &str| -> Result<String, Missing> {
-                interpolate_by(value, &props, 0).ok_or_else(|| {
+                interpolate_strict(value, &props).ok_or_else(|| {
                     Missing::Unresolved(format!("{rel}: {what} {value} is not defined"))
                 })
             };
@@ -1207,8 +1183,7 @@ impl Reactor {
     ) -> Result<Vec<ExternalPom>, Missing> {
         let mut chain: Vec<ExternalPom> = Vec::new();
         let mut parent = self.poms[root].parent.as_ref().map(|p| {
-            let local =
-                |v: &Option<String>| v.as_deref().and_then(|v| self.interpolate(root, v, 0));
+            let local = |v: &Option<String>| v.as_deref().and_then(|v| self.interpolate(root, v));
             (local(&p.group), local(&p.artifact), local(&p.version))
         });
         while let Some((pg, pa, pv)) = parent {
@@ -1374,7 +1349,7 @@ fn bom_manages<'b>(
         chain.iter().find_map(|e| e.pom.props.get(name).cloned())
     };
     let resolve = |value: &str| -> Result<String, Missing> {
-        interpolate_by(value, &props, 0).ok_or_else(|| {
+        interpolate_strict(value, &props).ok_or_else(|| {
             Missing::Unresolved(format!(
                 "the BOM {}:{}:{} manages {g}:{a} at {value}, which it does not define",
                 bom.0, bom.1, bom.2
@@ -1729,13 +1704,13 @@ impl Reactor {
     fn keyed_declarations(&self, rel: &str, g: &str, a: &str) -> Vec<(usize, String)> {
         self.poms[rel]
             .doc
-            .keyed_declarations(g, a, &|v| self.interpolate(rel, v, 0))
+            .keyed_declarations(g, a, &|v| self.interpolate(rel, v))
     }
 
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
-    fn interpolate(&self, rel: &str, value: &str, depth: usize) -> Option<String> {
-        self.interpolate_with(rel, value, depth, None)
+    fn interpolate(&self, rel: &str, value: &str) -> Option<String> {
+        self.interpolate_with(rel, value, None)
     }
 
     /// [`Self::interpolate`] with `overlay`'s properties (a profile's)
@@ -1744,24 +1719,9 @@ impl Reactor {
         &self,
         rel: &str,
         value: &str,
-        depth: usize,
         overlay: Option<Overlay<'_>>,
     ) -> Option<String> {
-        if depth > MAX_INTERPOLATION_DEPTH {
-            return None;
-        }
-        let mut out = String::new();
-        let mut rest = value;
-        while let Some(at) = rest.find("${") {
-            out.push_str(&rest[..at]);
-            let after = &rest[at + 2..];
-            let close = after.find('}')?;
-            let raw = self.lookup_with(rel, &after[..close], overlay)?;
-            out.push_str(&self.interpolate_with(rel, &raw, depth + 1, overlay)?);
-            rest = &after[close + 1..];
-        }
-        out.push_str(rest);
-        Some(out)
+        interpolate_strict(value, &|name| self.lookup_with(rel, name, overlay))
     }
 
     /// User properties win over model properties, as in Maven; then the
@@ -1827,17 +1787,14 @@ impl Reactor {
                 // has redefined something it names: that moves it too.
                 let undefined = || "an undefined value".to_string();
                 let plain = (reader != rel)
-                    .then(|| {
-                        self.interpolate(reader, declared, 0)
-                            .unwrap_or_else(undefined)
-                    })
+                    .then(|| self.interpolate(reader, declared).unwrap_or_else(undefined))
                     .filter(|v| moved(v))
                     .map(|v| (v, reader.to_string()));
                 plain.or_else(|| {
                     self.chain(reader).find_map(|at| {
                         self.poms[at].profile_props.iter().find_map(|(id, props)| {
                             let v = self
-                                .interpolate_with(reader, declared, 0, Some((at, props)))
+                                .interpolate_with(reader, declared, Some((at, props)))
                                 .unwrap_or_else(undefined);
                             moved(&v).then(|| (v, format!("{reader} under profile {id} of {at}")))
                         })
@@ -1897,7 +1854,7 @@ impl Reactor {
             // literal SV must not reach.
             if doc.has_property_coordinate(dep) {
                 let other = self.inheritors(rel).find(|p| {
-                    let resolve = |v: &str| self.interpolate(p, v, 0);
+                    let resolve = |v: &str| self.interpolate(p, v);
                     doc.coordinate(dep, "groupId", &resolve).as_deref() != Some(patch.group_id)
                         || doc.coordinate(dep, "artifactId", &resolve).as_deref()
                             != Some(patch.artifact_id)
@@ -1924,7 +1881,7 @@ impl Reactor {
             };
             let declared = doc.text_of(version);
             let resolved = if declared.contains("${") {
-                match self.interpolate(rel, &declared, 0) {
+                match self.interpolate(rel, &declared) {
                     Some(v) => v,
                     None => {
                         warnings.push(degraded(
@@ -2012,7 +1969,7 @@ impl Reactor {
         uncertain: &mut BTreeSet<String>,
     ) {
         let doc = &self.poms[rel].doc;
-        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let resolve = |v: &str| self.interpolate(rel, v);
         for dep in doc.declarations() {
             let (Some(g), Some(a)) = (
                 doc.child_text(dep, "groupId"),

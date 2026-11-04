@@ -609,8 +609,11 @@ pub enum UnattestedKind {
     /// A Maven pin (hosted, or the pre-v5 single-pom vendored repository)
     /// whose GA a `<profiles>` declaration of the root pom gives another
     /// version (the base release, another release, an
-    /// unresolved `${property}`): whenever that profile is active it
-    /// overrides the pin, so the build resolves the unpatched jar.
+    /// unresolved `${property}`), or whose `${property}` version a
+    /// profile's `<properties>` redefine (directly or through a property
+    /// it names) to another or an unresolvable version: whenever that
+    /// profile is active it overrides the pin, so the build resolves the
+    /// unpatched jar.
     MavenProfileUnpatched,
     /// A hosted Maven pin the root pom spells through a `${property}` that
     /// `.mvn/maven.config` redefines (`-D`, which Maven reads before the
