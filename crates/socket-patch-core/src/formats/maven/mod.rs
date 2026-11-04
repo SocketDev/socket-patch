@@ -1,10 +1,13 @@
 //! The root `pom.xml` reader (repositories and dependencies, see
 //! [`parse_pom`]), the Maven coordinate grammars and the hosted
-//! `<base>-socket.<hex8>` version split. Pure: text in, structure out.
+//! `<base>-socket.<hex8>` version split, and the Trusted Checksums files
+//! ([`trusted_checksums`]). Pure: text in, structure out.
 
 use std::collections::BTreeMap;
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
+
+pub(crate) mod trusted_checksums;
 
 // ── pure reader ──
 

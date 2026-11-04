@@ -105,10 +105,9 @@ use super::{
 };
 use crate::formats::maven::{
     is_maven_coordinate, is_maven_version_text, maven_config_properties, may_shadow,
-    parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
+    parse_pom_with, split_socket_version, trusted_checksums, Pom, PomDep, PomRepo,
 };
-use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
-use crate::utils::digest::sha256_hex;
+use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG};
 use crate::vendor::jvm::layout;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::maven_repo::{sha1_sidecar_matches, VENDOR_REPO_URL_PREFIX};
@@ -378,7 +377,7 @@ async fn extract_hosted(
             continue;
         };
         if checksums.is_none() {
-            checksums = Some(trusted_checksums(ctx, out).await);
+            checksums = Some(pinned_checksums(ctx, out).await);
         }
         let jar = layout::artifact_path(group, artifact, pinned, None, "jar");
         let integrity = checksums
@@ -398,32 +397,20 @@ async fn extract_hosted(
 
 /// `path -> sha256 hex` from `.mvn/checksums/checksums.sha256`, or empty
 /// when `.mvn/maven.config` does not switch the trusted-checksums resolver
-/// on (the file is then inert and pins nothing). Malformed lines are
-/// skipped, like the rewriter's own merge.
-async fn trusted_checksums(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+/// on (the file is then inert and pins nothing). Both files are read as the
+/// hosted rewriter reads them ([`trusted_checksums`]): only a line Maven
+/// itself enforces attests.
+async fn pinned_checksums(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> BTreeMap<String, String> {
     let Some(config) = ctx.read_text(MVN_CONFIG, out).await else {
-        return map;
+        return BTreeMap::new();
     };
-    if !config
-        .split_whitespace()
-        .any(|arg| arg == TRUSTED_CHECKSUMS_ON)
-    {
-        return map;
+    if !trusted_checksums::switch_on(&config) {
+        return BTreeMap::new();
     }
-    let Some(text) = ctx.read_text(MVN_CHECKSUMS, out).await else {
-        return map;
-    };
-    for line in text.lines() {
-        let Some((hash, path)) = line.trim().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let path = path.trim_start().trim_start_matches('*').trim_end();
-        if let Some(hash) = sha256_hex(hash).filter(|_| !path.is_empty()) {
-            map.insert(path.to_string(), hash);
-        }
-    }
-    map
+    ctx.read_text(MVN_CHECKSUMS, out)
+        .await
+        .map(|text| trusted_checksums::pinned(&text))
+        .unwrap_or_default()
 }
 
 // ── vendored ─────────────────────────────────────────────────────────────
@@ -902,6 +889,43 @@ mod tests {
             out.refs[0].lockfile_basis_ok(),
             "maven never requires a pin"
         );
+    }
+
+    /// The switch and the summary file are read as the hosted rewriter
+    /// reads them: a bare or CRLF `-D` switch is on, and only a jar line in
+    /// the `<sha256>  <path>` shape Maven enforces attests. A tolerated
+    /// spelling (one space, a `*` marker) is a line Maven skips, so it
+    /// pins nothing.
+    #[tokio::test]
+    async fn checksums_attest_only_lines_maven_enforces() {
+        let jar = "org/slf4j/slf4j-api/1.7.36-socket.77777777/slf4j-api-1.7.36-socket.77777777.jar";
+        let switch = format!("-D{}", crate::formats::maven::trusted_checksums::SWITCH_KEY);
+        for (config, sums, attests) in [
+            (
+                format!("{switch}\r\n"),
+                format!("{FX_JAR_SHA}  {jar}\r\n"),
+                true,
+            ),
+            (switch.clone(), format!("# pins\n{FX_JAR_SHA}  {jar}"), true),
+            (
+                format!("{switch}=false"),
+                format!("{FX_JAR_SHA}  {jar}\n"),
+                false,
+            ),
+            (switch.clone(), format!("{FX_JAR_SHA} {jar}\n"), false),
+            (switch.clone(), format!("{FX_JAR_SHA} *{jar}\n"), false),
+        ] {
+            let p = fixture("basic");
+            p.write(".mvn/maven.config", config.clone());
+            p.write(".mvn/checksums/checksums.sha256", sums.clone());
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);
+            assert_eq!(
+                out.refs[0].locked_integrity,
+                attests.then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into())),
+                "{config:?} / {sums:?}"
+            );
+        }
     }
 
     #[tokio::test]

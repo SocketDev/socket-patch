@@ -69,6 +69,7 @@ use crate::formats::gem::hosted::{
     refresh_merged_gem_lock_remote,
 };
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
+use crate::formats::maven::trusted_checksums;
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -8491,9 +8492,9 @@ const MVN_CONFIG_ARGS: &[&str] = &[
 ];
 
 /// The resolver switch (the first [`MVN_CONFIG_ARGS`] line) that makes the
-/// checksums file an enforced pin; without it the file is inert.
-pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
-    "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
+/// checksums file an enforced pin; without it the file is inert. Read back
+/// by [`trusted_checksums::switch_on`], as every mode reads it.
+const TRUSTED_CHECKSUMS_ON: &str = "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
 
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
@@ -9250,32 +9251,21 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    // LF-normalized, so the drop check and the filter below split lines the
-    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
-    let existing_checksums = files
-        .get(MVN_CHECKSUMS)
-        .map(|text| text.replace("\r\n", "\n"))
-        .unwrap_or_default();
-    let names_dropped_path = |line: &str| {
-        line.split_once("  ")
-            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
-    };
-    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
-    if !checksum_entries.is_empty() || drops_checksums {
-        let action = if files.contains_key(MVN_CHECKSUMS) {
+    // Every line this run does not own (another path's entry in any
+    // spelling, a comment, an unparseable line) keeps its bytes and place.
+    let existing_checksums = files.get(MVN_CHECKSUMS).map(String::as_str);
+    let merged_checksums = trusted_checksums::edit(
+        existing_checksums.unwrap_or_default(),
+        |path| checksum_drops.iter().any(|d| d == path),
+        &checksum_entries,
+    );
+    if merged_checksums != existing_checksums.unwrap_or_default() {
+        let action = if existing_checksums.is_some() {
             "rewritten"
         } else {
             "added"
         };
-        let kept: String = existing_checksums
-            .split('\n')
-            .filter(|l| !names_dropped_path(l))
-            .collect::<Vec<_>>()
-            .join("\n");
-        result.files.insert(
-            MVN_CHECKSUMS.into(),
-            merge_checksums(&kept, &checksum_entries),
-        );
+        result.files.insert(MVN_CHECKSUMS.into(), merged_checksums);
         result.edits.push(FileEdit {
             path: MVN_CHECKSUMS.into(),
             kind: "redirect_maven_trusted_checksums".into(),
@@ -9292,13 +9282,10 @@ fn rewrite_maven_pom(
     // content pinning. Judged on the files as they stand after this run, so a
     // re-scan of an already-pinned project warns as well.
     let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
-    let pin_in_place = final_text(MVN_CONFIG)
-        .is_some_and(|c| c.lines().any(|l| l.trim() == TRUSTED_CHECKSUMS_ON))
+    let pin_in_place = final_text(MVN_CONFIG).is_some_and(|c| trusted_checksums::switch_on(c))
         && final_text(MVN_CHECKSUMS).is_some_and(|c| {
-            pinned_jar_paths.iter().any(|p| {
-                c.lines()
-                    .any(|l| l.split_whitespace().nth(1) == Some(p.as_str()))
-            })
+            let pinned = trusted_checksums::pinned(c);
+            pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
         });
     if let Some(version) = files
         .get(MVN_WRAPPER_PROPERTIES)
@@ -9409,35 +9396,6 @@ fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
         format!("{existing}\n")
     };
     (format!("{base}{}\n", appended.join("\n")), conflicts)
-}
-
-/// Merge trusted-checksum entries into `.mvn/checksums/checksums.sha256` (GNU
-/// coreutils format: `<sha256-hex><TWO spaces><local-repo-relative path>`).
-/// Parse existing entries, replace/add by path, re-sort by path, trailing
-/// newline. A malformed line (no double-space separator) is dropped. Twin of
-/// the TS `mergeChecksums`.
-fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
-    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
-    if !existing.is_empty() {
-        for line in existing.split('\n') {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(sep) = line.find("  ") {
-                by_path.insert(line[sep + 2..].to_string(), line[..sep].to_string());
-            }
-        }
-    }
-    for (path, sha256) in entries {
-        by_path.insert(path.clone(), sha256.clone());
-    }
-    // BTreeMap iterates keys in sorted (byte) order — matching JS's default
-    // sort on the ASCII paths.
-    let body: Vec<String> = by_path
-        .iter()
-        .map(|(path, sha)| format!("{sha}  {path}"))
-        .collect();
-    format!("{}\n", body.join("\n"))
 }
 
 // ── golang (go.mod fork-replace + go.sum pin) ────────────────────────────────
@@ -30328,6 +30286,52 @@ mod owned_pin_generation_matrix {
         let (repinned, _) = plan(&wired, &maven(B, tok));
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        // The file stays CRLF: nothing is normalized to LF.
+        assert!(
+            checksums
+                .split_inclusive('\n')
+                .all(|line| line.ends_with("\r\n")),
+            "{checksums:?}"
+        );
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A user's checksums lines survive the pin and the re-pin byte for
+    /// byte, in any spelling `sha256sum`-style tools write (one space, a
+    /// `*` binary marker, a tab) and as comments or stray text. The hosted
+    /// merge used to re-parse the file on two spaces and silently drop
+    /// every line it could not split that way.
+    #[test]
+    fn maven_checksums_merge_keeps_every_user_line() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let h = "0123456789abcdef".repeat(4);
+        let user = [
+            "# team pins".to_string(),
+            format!("{h} com/acme/single/1.0/single-1.0.jar"),
+            format!("{h} *com/acme/binary/1.0/binary-1.0.jar"),
+            format!("{h}\tcom/acme/tab/1.0/tab-1.0.jar"),
+            format!("{h}  com/acme/canonical/1.0/canonical-1.0.jar"),
+            "not a checksum line".to_string(),
+        ];
+        let mut files = pom_project();
+        files.insert(MVN_CHECKSUMS.into(), format!("{}\n", user.join("\n")));
+        let (wired, result) = plan(&files, &maven(A, tok));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        for (stage, tree) in [("pin", &wired), ("re-pin", &repinned)] {
+            let checksums = &tree[MVN_CHECKSUMS];
+            let lines: Vec<&str> = checksums.lines().collect();
+            for line in &user {
+                assert!(
+                    lines.contains(&line.as_str()),
+                    "{stage} lost {line:?}:\n{checksums}"
+                );
+            }
+            assert_eq!(lines.len(), user.len() + 2, "{stage}:\n{checksums}");
+        }
+        assert!(repinned[MVN_CHECKSUMS].contains("3.12.0-socket.bbbbbbbb"));
+        assert!(!repinned[MVN_CHECKSUMS].contains("socket.aaaaaaaa"));
         let (_, again) = plan(&repinned, &maven(B, tok));
         assert!(again.files.is_empty(), "{:?}", again.files.keys());
     }
