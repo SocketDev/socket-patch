@@ -236,6 +236,10 @@ const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// `<profiles>` at another version, which overrides the pin whenever that
 /// profile is active (`vex::Unattested`).
 const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
+/// Omission tag and note: a hosted Maven pin is spelled through a
+/// `${property}` that `.mvn/maven.config` redefines, so the build resolves
+/// another version (`vex::Unattested`).
+const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -277,6 +281,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while a profile declares it at another version; the wiring itself is \
              intact, so re-running `scan` does not change this (drop that profile <version> or \
              set it to the pin, or re-patch with `scan --mode vendored`)",
+        ),
+        UnattestedKind::MavenConfigOverride => (
+            NOTE_MAVEN_CONFIG_OVERRIDE,
+            "not attested while .mvn/maven.config redefines the property it is spelled \
+             through; the wiring itself is intact, so re-running `scan` does not change this \
+             (drop that -D from .mvn/maven.config, or write the pinned version literally)",
         ),
     }
 }

@@ -42,9 +42,14 @@ pub(crate) struct PomDep {
     pub(crate) group: String,
     pub(crate) artifact: String,
     /// Trimmed literal version, `${prop}` resolved (one level) from the
-    /// build's user properties, else the root `<properties>`, when
-    /// possible; `None` when the declaration has none.
+    /// root `<properties>` when possible: the version the pom itself
+    /// spells, which the hosted rewriter writes and rolls back. `None` when
+    /// the declaration has none.
     pub(crate) version: Option<String>,
+    /// [`Self::version`] as the build resolves it: `${prop}` resolved from
+    /// the build's user properties first (`.mvn/maven.config`'s `-D`),
+    /// else the root `<properties>` — Maven's own lookup order.
+    pub(crate) build_version: Option<String>,
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
     pub(crate) classifier: Option<String>,
@@ -68,9 +73,13 @@ pub(crate) struct PomScope {
     pub(crate) masked: String,
     ignored: Vec<Element>,
     profiles: Vec<Element>,
-    /// The root `<properties>` (see [`properties`]) with the build's user
-    /// properties laid over them: what a `${name}` resolves to.
+    /// The root `<properties>` (see [`properties`]).
     properties: BTreeMap<String, String>,
+    /// [`Self::properties`] with the build's user properties laid over
+    /// them, except `project.*` / `pom.*`, which Maven reads from the model
+    /// before any user property: what a `${name}` version resolves to in
+    /// the build.
+    build_properties: BTreeMap<String, String>,
     /// [`Self::properties`] plus the `${project.*}` model references a
     /// coordinate may name (see [`model_refs`]).
     coordinate_refs: BTreeMap<String, String>,
@@ -105,13 +114,19 @@ impl PomScope {
         ]
         .concat();
         let profiles = elements(&masked, "profiles")?;
-        let mut properties = properties(&masked, &ignored, &profiles)?;
-        properties.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let properties = properties(&masked, &ignored, &profiles)?;
+        let mut build_properties = properties.clone();
+        build_properties.extend(
+            user.iter()
+                .filter(|(k, _)| !is_model_reference(k))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         let mut coordinate_refs = properties.clone();
+        coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
         // A `project.*` / `pom.*` reference names the model, whatever a
         // same-named property says; the deprecated bare form yields to one.
         for (name, value) in model_refs(&masked, &coordinate_refs.clone())? {
-            if name.starts_with("project.") || name.starts_with("pom.") {
+            if is_model_reference(&name) {
                 coordinate_refs.insert(name, value);
             } else {
                 coordinate_refs.entry(name).or_insert(value);
@@ -122,6 +137,7 @@ impl PomScope {
             ignored,
             profiles,
             properties,
+            build_properties,
             coordinate_refs,
         })
     }
@@ -250,7 +266,12 @@ pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Resu
             artifact,
             version: dep
                 .version_text
-                .map(|v| resolve_property(&v, &scope.properties)),
+                .as_deref()
+                .map(|v| resolve_property(v, &scope.properties)),
+            build_version: dep
+                .version_text
+                .as_deref()
+                .map(|v| resolve_property(v, &scope.build_properties)),
             classifier: dep.classifier,
             type_text: dep.type_text,
             managed: inside(dep.element.start, &managed),
@@ -553,6 +574,25 @@ pub(crate) fn may_shadow(
         && may_name(dep_artifact, artifact)
 }
 
+/// The classifiers whose jars never run on a classpath: `sources` and
+/// `javadoc`. Every other classifier copy of a patched GA (tests, a native
+/// or JDK-specific build) carries code, so it must resolve the patched
+/// release too. The hosted rewriter, VEX discovery and the vendored
+/// reactor's attestation share this rule.
+pub(crate) const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
+
+/// Whether a `<classifier>` copy of a GA carries code onto a classpath
+/// (see [`NON_EXECUTABLE_CLASSIFIERS`]).
+pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
+    !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
+}
+
+/// A `project.*` / `pom.*` reference: Maven reads it from the model, ahead
+/// of any user or pom property of the same name.
+fn is_model_reference(name: &str) -> bool {
+    name.starts_with("project.") || name.starts_with("pom.")
+}
+
 fn is_property_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -756,15 +796,49 @@ mod tests {
                 .unwrap()
                 .deps
                 .into_iter()
-                .map(|d| d.version.unwrap())
+                .map(|d| (d.version.unwrap(), d.build_version.unwrap()))
                 .collect::<Vec<_>>()
         };
-        assert_eq!(versions(&[]), ["1.0-socket.77777777", "2", "${u}"]);
+        let both = |v: &str| (v.to_string(), v.to_string());
+        assert_eq!(
+            versions(&[]),
+            [both("1.0-socket.77777777"), both("2"), both("${u}")]
+        );
         assert_eq!(
             versions(&[("v", "1.0"), ("u", "3")]),
-            ["1.0", "2", "3"],
-            "a user property wins over the pom's and defines one it lacks"
+            [
+                ("1.0-socket.77777777".to_string(), "1.0".to_string()),
+                both("2"),
+                ("${u}".to_string(), "3".to_string()),
+            ],
+            "the build's user property wins over the pom's and defines one it lacks; \
+             `version` keeps what the pom spells"
         );
+    }
+
+    /// Maven reads `${project.*}` / `${pom.*}` from the model before any
+    /// user property: `-Dproject.version=` does not move a dependency
+    /// version written through the model.
+    #[test]
+    fn model_reference_version_ignores_user_properties() {
+        let pom = "<project><version>1</version><dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${project.version}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${pom.version}</version></dependency>\
+                   </dependencies></project>";
+        let user = [
+            ("project.version".to_string(), "9".to_string()),
+            ("pom.version".to_string(), "9".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let deps = super::parse_pom_with(pom, &user).unwrap().deps;
+        for d in &deps {
+            assert_eq!(d.build_version, d.version, "{d:?}");
+            assert!(
+                d.build_version.as_deref().is_some_and(|v| v != "9"),
+                "{d:?}"
+            );
+        }
     }
 
     #[test]
