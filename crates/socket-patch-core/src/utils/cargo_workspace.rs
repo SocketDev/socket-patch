@@ -18,7 +18,7 @@ use std::sync::Arc;
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::utils::workspace_globs::segment_glob_matches;
-use crate::vendor::lock_inventory::view::{MemoryProject, ProjectView};
+use crate::vendor::lock_inventory::view::{DiskSnapshot, MemoryProject, ProjectView};
 use crate::vendor::parse_memo::ParseMemo;
 
 /// Upper bound on discovered manifests — a runaway glob (or a hostile tree)
@@ -36,13 +36,44 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
 /// reads the manifests the host supplied and expands member globs against
 /// the supplied paths (a directory exists when some supplied path lives
 /// under it; symbolic links are never directories).
+///
+/// Over a [`DiskSnapshot`] the walk reads the disk, but notes every
+/// manifest it reads and every directory it probes or lists with the
+/// snapshot, so a recording read set covers the walk (asking for the
+/// snapshot's raw root would end the recording).
 pub fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
     match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
-            let root = view.disk_root().expect("a disk view has a root");
-            member_manifests(root)
-        }
+        ProjectView::Disk(root) => member_manifests(root),
+        ProjectView::Snapshot(snap) => member_manifests_with(&SnapshotTree(snap)),
         ProjectView::Memory(project) => member_manifests_with(&MemoryTree(project)),
+    }
+}
+
+/// The disk under a [`DiskSnapshot`], each access noted with it first.
+struct SnapshotTree<'a, 'b>(&'a DiskSnapshot<'b>);
+
+impl SnapshotTree<'_, '_> {
+    fn disk(&self) -> DiskTree<'_> {
+        DiskTree(self.0.root_reading(std::iter::empty::<&str>()))
+    }
+}
+
+impl Tree for SnapshotTree<'_, '_> {
+    fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
+        self.0.touch(rel);
+        self.disk().read_manifest(rel)
+    }
+}
+
+impl DirTree for SnapshotTree<'_, '_> {
+    fn is_real_dir(&self, rel: &str) -> bool {
+        self.0.touch(rel);
+        self.disk().is_real_dir(rel)
+    }
+
+    fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+        self.0.touch_listing(rel);
+        self.disk().child_dirs(rel)
     }
 }
 
@@ -476,6 +507,42 @@ mod tests {
 
     fn pkg(name: &str) -> String {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
+    }
+
+    /// Over a tracked snapshot the walk answers as on disk and keeps the
+    /// recording usable: it notes what it reads and lists, so a member
+    /// added under a glob afterwards changes the read set.
+    #[test]
+    fn snapshot_walk_records_what_it_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n",
+        );
+        write(root, "crates/a/Cargo.toml", &pkg("a"));
+        // Files stamped just now are racy: the walk reads around the
+        // snapshot's content cache, so such a read set never holds.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for rel in ["Cargo.toml", "crates/a/Cargo.toml"] {
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(rel))
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let snap = DiskSnapshot::tracked(root);
+        snap.begin_recording();
+        assert_eq!(
+            member_manifests_in(&ProjectView::Snapshot(&snap)),
+            member_manifests(root)
+        );
+        let reads = snap.end_recording().expect("the walk keeps the recording");
+        assert!(reads.unchanged());
+        write(root, "crates/b/Cargo.toml", &pkg("b"));
+        assert!(!reads.unchanged(), "a new member dir changes the listing");
     }
 
     #[test]

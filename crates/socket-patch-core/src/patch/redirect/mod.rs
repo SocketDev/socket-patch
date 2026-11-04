@@ -2415,7 +2415,7 @@ fn crlf_to_lf(text: &str) -> Option<String> {
 /// A workspace-member manifest key the caller supplied: `<dir>/Cargo.toml`,
 /// a plain repo-relative path (never absolute, never `..`, never under the
 /// ledger's `.socket/` or a build `target/`).
-fn is_cargo_member_manifest_key(key: &str) -> bool {
+pub(crate) fn is_cargo_member_manifest_key(key: &str) -> bool {
     let Some(dir) = key.strip_suffix("/Cargo.toml") else {
         return false;
     };
