@@ -77,6 +77,8 @@ Non-goal: adding new hosted or vendored backends.
 | Question | Readers before | Decision |
 |---|---|---|
 | Is pnpm 11's env-lockfile document (the first YAML document, holding `configDependencies` / `packageManagerDependencies`) part of the project? | The hosted planner and the v9 vendored in-use check read it. `PnpmLock` (inventory and discovery), `InstalledPackages` and the legacy vendored check skip it (#1949). | It counts. pnpm installs config dependencies (into its config store, not `node_modules`), and the hosted planner patches them. The document becomes its own install tree. |
+| Does Socket patch a dependency the user patched themselves (npm `patchedDependencies` / `"patched"`, `bun patch`, pnpm `patchedDependencies`, yarn berry `patch:`, vlt patches)? | Hosted skips npm and bun user patches (#711, #367). Vendored refuses them. Discovery attested them until #2010. pnpm, yarn and vlt user patches are not detected anywhere. | **Owner decision:** never, by default, in every mode and every package manager. A Socket pin under a user patch is not attested. Only an explicit user override patches it. |
+| May a reader or writer read project files outside the git repository root? | Several do: vendored paths spelled `../.socket/vendor/…`, an ancestor `go.work`, out-of-root `-r` includes, parent NuGet configs. | **Owner decision:** no. Every project-file read is bounded to the git repository root (the project root when there is no repository). Machine-level tool configuration (for example `GOENV`, the user `NuGet.Config`) is listed separately for review. |
 
 ## The model
 
