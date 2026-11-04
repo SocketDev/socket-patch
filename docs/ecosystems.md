@@ -1261,7 +1261,10 @@ the repository list, so it is left as a
 - The in-memory hosted engine (GitHub App) has no `target/` evidence, so it
   never wires sbt.
 - Vendored sbt VEX attests through the vendor ledger; the generated file alone
-  is not a VEX reference.
+  is not a VEX reference. The ledger entry needs the same `target/` evidence
+  as a hosted pin: until `sbt update` records the pinned bytes (and while a
+  build source reassigns `dependencyOverrides` / `resolvers` or a
+  `build.sbt.lock` exists) it is omitted as `vex_sbt_resolution_unverified`.
 
 ## Cargo: shared registry cache
 

@@ -232,6 +232,14 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a vendored sbt pin the build's local resolution
+/// evidence does not verify, or under a build-wide blocker
+/// (`vex::Unattested`, `UnattestedKind::SbtResolutionUnverified`).
+const NOTE_SBT_RESOLUTION_UNVERIFIED: &str = "vex_sbt_resolution_unverified";
+/// Omission tag and note: a vendored sbt pin's committed tree file is
+/// missing or modified (`vex::Unattested`,
+/// `UnattestedKind::SbtVendoredTreeMissing`).
+const NOTE_SBT_VENDORED_TREE_MISSING: &str = "vex_sbt_vendored_tree_missing";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -267,6 +275,17 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::SbtResolutionUnverified => (
+            NOTE_SBT_RESOLUTION_UNVERIFIED,
+            "not attested until sbt's own resolution records verify the pin (run `sbt update` \
+             for the whole build; a `dependencyOverrides` / `resolvers` reassignment or a \
+             `build.sbt.lock` withholds it until removed)",
+        ),
+        UnattestedKind::SbtVendoredTreeMissing => (
+            NOTE_SBT_VENDORED_TREE_MISSING,
+            "not attested while the committed tree differs from the pin (restore \
+             `.socket/vendor/maven2` from version control, or re-run `socket-patch vendor`)",
         ),
     }
 }

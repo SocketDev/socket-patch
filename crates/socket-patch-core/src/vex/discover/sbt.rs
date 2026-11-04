@@ -19,9 +19,16 @@
 //! first checkout's `file:` origin (`docs/design/sbt-template-probe.md`,
 //! case i), and a copy whose bytes are the pinned ones is the patch.
 //!
-//! Vendored pins are attested by the vendor ledger; this extractor only
-//! diagnoses what would make that attestation a lie: a tree file gone or
-//! changed (`vendored_tree_missing`) or an unverified resolution.
+//! Vendored pins are attested by the vendor ledger; this extractor holds
+//! them to the same evidence a hosted pin needs. A tree file gone or
+//! changed (`vendored_tree_missing`) or a resolution the evidence does not
+//! verify (`sbt_resolution_unverified`, the hosted check and build-wide
+//! blockers verbatim) is diagnosed AND marked [`Unattested`] for the pin's
+//! `(purl, uuid)`, so `vex` omits the ledger entry. Its liveness is
+//! untouched: the wiring is intact, and `scan --prune` must not revert a
+//! pin only because `sbt update` has not run since.
+//!
+//! [`Unattested`]: super::Unattested
 //!
 //! A generated file socket-patch cannot parse strictly is
 //! `sbt_owned_file_modified` (a foreign file under the name is not ours and
@@ -30,7 +37,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{DiscoverCtx, Discovery, PatchedRef, DIAG_REF_INVALID};
+use super::{DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_REF_INVALID};
 use crate::formats::sbt::owned_file::{
     parse, OwnedFileError, SbtFileMode, SbtPin, HOSTED_FILE, VENDORED_FILE, VENDORED_REPO_REL,
 };
@@ -326,6 +333,16 @@ async fn vendored_check(
     hashes: &mut Hashes,
     out: &mut Discovery,
 ) {
+    // The vendor ledger records the pin under this purl (the planner builds
+    // it the same way); a coordinate it rejects was never vendored. `why`
+    // completes "patch <uuid> is wired, but …" (the VEX note).
+    let purl = maven_purl(&pin.group, &pin.artifact, &pin.base);
+    let withhold = |out: &mut Discovery, code, diag: String, why: String, kind| {
+        out.diag(code, VENDORED_FILE, format!("{VENDORED_FILE}: {diag}"));
+        if let Some(purl) = &purl {
+            out.unattested(purl, &pin.uuid, VENDORED_FILE, why, kind);
+        }
+    };
     for (ext, want) in [("pom", &pin.pom_sha256), ("jar", &pin.jar_sha256)] {
         let rel = format!("{VENDORED_REPO_REL}/{}", pin.repo_path(ext));
         let got = match ctx.disk_root() {
@@ -333,23 +350,24 @@ async fn vendored_check(
             None => None,
         };
         if got.as_deref() != Some(want.as_str()) {
-            out.diag(
+            let state = if got.is_some() { "modified" } else { "missing" };
+            withhold(
+                out,
                 DIAG_VENDORED_TREE_MISSING,
-                VENDORED_FILE,
-                format!(
-                    "{VENDORED_FILE}: patch {} pins {rel}, which is {}",
-                    pin.uuid,
-                    if got.is_some() { "modified" } else { "missing" }
-                ),
+                format!("patch {} pins {rel}, which is {state}", pin.uuid),
+                format!("{VENDORED_FILE} pins {rel}, which is {state}"),
+                UnattestedKind::SbtVendoredTreeMissing,
             );
             return;
         }
     }
     if let Err(why) = verify_with(pin, res, blocker, hashes).await {
-        out.diag(
+        withhold(
+            out,
             DIAG_SBT_RESOLUTION_UNVERIFIED,
-            VENDORED_FILE,
-            format!("{VENDORED_FILE}: patch {}: {why}", pin.uuid),
+            format!("patch {}: {why}", pin.uuid),
+            why,
+            UnattestedKind::SbtResolutionUnverified,
         );
     }
 }
@@ -502,6 +520,203 @@ mod tests {
             )
             .await,
             Ok(())
+        );
+    }
+
+    // ── vendored pins: the hosted evidence gate, end to end ────────────
+
+    const GSON_UUID: &str = "1d3c1fd2-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    const GSON_PURL: &str = "pkg:maven/com.google.code.gson/gson@2.8.9";
+    const GSON_BUILD: &str =
+        "libraryDependencies += \"com.google.code.gson\" % \"gson\" % \"2.8.9\"\n";
+    const EVIDENCE: &str = "target/update/update_cache/output";
+
+    /// The `file:` URI sbt records for `path` (`file:///C:/x` on Windows).
+    fn file_uri(path: &Path) -> String {
+        let text = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+
+    fn set_mtime(path: &Path, at: std::time::SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+    }
+
+    fn later(secs: u64) -> std::time::SystemTime {
+        std::time::SystemTime::now() + std::time::Duration::from_secs(secs)
+    }
+
+    /// An sbt 1.9.9 build with gson vendored for real (generated file,
+    /// committed tree, ledger) and, unless `evidence` is false, the record
+    /// `sbt update` writes after it: the suffixed version resolved from the
+    /// tree jar, newer than every build source. `(tmp, root, pin)`.
+    async fn vendored_gson(evidence: bool) -> (tempfile::TempDir, PathBuf, SbtPin) {
+        use crate::vendor::jvm::testing::{populate, vendor};
+        use crate::vendor::jvm::{JvmPatch, Shape};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        populate(
+            &root,
+            &[
+                ("project/build.properties", "sbt.version=1.9.9\n"),
+                ("build.sbt", GSON_BUILD),
+            ],
+        );
+        let patch = JvmPatch {
+            group_id: "com.google.code.gson",
+            artifact_id: "gson",
+            version: "2.8.9",
+            uuid: GSON_UUID,
+            jar: b"PK-gson",
+            upstream_pom: b"<project>\n  <groupId>com.google.code.gson</groupId>\n  \
+                <artifactId>gson</artifactId>\n  <version>2.8.9</version>\n</project>\n",
+            upstream_module: None,
+            extra_artifacts: &[],
+            patched_members: &[],
+        };
+        let mut ledger = BTreeMap::new();
+        vendor(&root, Shape::Sbt, &patch, &mut ledger)
+            .await
+            .expect("vendor gson");
+        let text = std::fs::read_to_string(root.join(VENDORED_FILE)).unwrap();
+        let pin = parse(SbtFileMode::Vendored, &text)
+            .unwrap()
+            .pins
+            .remove(GSON_UUID)
+            .expect("gson pin");
+        if evidence {
+            let jar = root.join(VENDORED_REPO_REL).join(pin.repo_path("jar"));
+            assert!(jar.is_file(), "{}", jar.display());
+            let json = format!(
+                r#"{{"configurations":[{{"configuration":{{"name":"compile"}},"modules":[{{"module":{{"organization":"com.google.code.gson","name":"gson","revision":"{}"}},"artifacts":[[{{"name":"gson"}},"{}"]],"evicted":false}}],"details":[]}}]}}"#,
+                pin.sv,
+                file_uri(&jar)
+            );
+            populate(&root, &[(EVIDENCE, json.as_str())]);
+            set_mtime(&root.join(EVIDENCE), later(60));
+        }
+        (tmp, root, pin)
+    }
+
+    /// The `(purl, uuid, kind)` of every [`super::super::Unattested`] mark.
+    fn marks(out: &Discovery) -> Vec<(String, String, UnattestedKind)> {
+        out.unattested
+            .iter()
+            .map(|u| (u.purl.clone(), u.uuid.clone(), u.kind))
+            .collect()
+    }
+
+    fn unverified() -> Vec<(String, String, UnattestedKind)> {
+        vec![(
+            GSON_PURL.to_string(),
+            GSON_UUID.to_string(),
+            UnattestedKind::SbtResolutionUnverified,
+        )]
+    }
+
+    /// Fresh evidence resolving the pinned bytes from the tree: no
+    /// diagnostic, nothing withheld (the ledger attests it).
+    #[tokio::test]
+    async fn vendored_pin_with_verifying_evidence_is_attestable() {
+        let (_tmp, root, _) = vendored_gson(true).await;
+        let out = super::super::discover_patched_refs(&root).await;
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
+    /// The owner rule: a vendored sbt pin needs the evidence a hosted one
+    /// does, so with none (no `sbt update` since vendoring) the ledger
+    /// entry is withheld from VEX, not only diagnosed.
+    #[tokio::test]
+    async fn vendored_pin_without_evidence_is_unattested() {
+        let (_tmp, root, _) = vendored_gson(false).await;
+        let out = super::super::discover_patched_refs(&root).await;
+        assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
+        assert!(
+            out.unattested[0]
+                .detail
+                .contains("no sbt resolution evidence"),
+            "{:?}",
+            out.unattested[0]
+        );
+    }
+
+    /// Evidence showing the pinned bytes, but older than a build source
+    /// edited since: it proves nothing about the build as it stands.
+    #[tokio::test]
+    async fn vendored_pin_with_stale_evidence_is_unattested() {
+        let (_tmp, root, _) = vendored_gson(true).await;
+        set_mtime(&root.join("build.sbt"), later(120));
+        let out = super::super::discover_patched_refs(&root).await;
+        assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
+        assert!(
+            out.unattested[0].detail.contains("changed after the last"),
+            "{:?}",
+            out.unattested[0]
+        );
+    }
+
+    /// A project reassigning `dependencyOverrides` replaces the generated
+    /// override where it applies, whatever the (fresh) evidence shows.
+    #[tokio::test]
+    async fn vendored_pin_under_an_overrides_reassignment_is_unattested() {
+        let (_tmp, root, _) = vendored_gson(true).await;
+        std::fs::write(
+            root.join("build.sbt"),
+            format!(
+                "{GSON_BUILD}dependencyOverrides := Seq(\"com.google.code.gson\" % \"gson\" % \
+                 \"2.8.9\")\n"
+            ),
+        )
+        .unwrap();
+        let out = super::super::discover_patched_refs(&root).await;
+        assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
+        assert!(
+            out.unattested[0].detail.contains("`dependencyOverrides`"),
+            "{:?}",
+            out.unattested[0]
+        );
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_SBT_RESOLUTION_UNVERIFIED),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// A tree file gone: sbt's load-time check fails the build, so no
+    /// copy is the patch.
+    #[tokio::test]
+    async fn vendored_pin_with_a_missing_tree_file_is_unattested() {
+        let (_tmp, root, pin) = vendored_gson(true).await;
+        std::fs::remove_file(root.join(VENDORED_REPO_REL).join(pin.repo_path("pom"))).unwrap();
+        let out = super::super::discover_patched_refs(&root).await;
+        assert_eq!(
+            marks(&out),
+            vec![(
+                GSON_PURL.to_string(),
+                GSON_UUID.to_string(),
+                UnattestedKind::SbtVendoredTreeMissing,
+            )],
+            "{:#?}",
+            out.diagnostics
+        );
+        assert!(
+            out.unattested[0].detail.ends_with("which is missing"),
+            "{:?}",
+            out.unattested[0]
         );
     }
 }

@@ -606,13 +606,25 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
+    /// build's local evidence does not verify, or under a build-wide
+    /// blocker (stale or partial evidence, a `dependencyOverrides` /
+    /// `resolvers` reassignment, a `build.sbt.lock`): the same conditions
+    /// that withhold a hosted sbt ref's lock pin. The vendor ledger, not a
+    /// ref, carries this wiring, so the mark stands alone.
+    SbtResolutionUnverified,
+    /// A vendored sbt pin whose committed `.socket/vendor/maven2` tree file
+    /// is missing or does not hash to the pinned sha256: sbt's load-time
+    /// check fails the build closed, so no copy is the patch.
+    SbtVendoredTreeMissing,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,
 /// and the ledgers' liveness gates still see it wired) that must not be
 /// attested: the files show a build that may run a copy the pin does not
-/// reach ([`UnattestedKind`]). The CLI's VEX plan omits every candidate of
-/// `(purl, uuid)` with `detail`. Unlike a contest
+/// reach ([`UnattestedKind`]). A vendored sbt pin is marked with no ref
+/// beside it (its vendor ledger entry is the claim). The CLI's VEX plan
+/// omits every candidate of `(purl, uuid)` with `detail`. Unlike a contest
 /// ([`Discovery::unpatched_copy`], [`Discovery::contest_across_locks`]),
 /// this never drops the ref, so `vendor --check` and `scan` keep treating
 /// the wiring as live — the right answer when re-running `scan` / `vendor`
