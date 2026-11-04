@@ -606,6 +606,12 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A Maven pin (hosted, or the pre-v5 single-pom vendored repository)
+    /// whose GA a `<profiles>` declaration of the root pom gives another
+    /// version (the base release, another release, an
+    /// unresolved `${property}`): whenever that profile is active it
+    /// overrides the pin, so the build resolves the unpatched jar.
+    MavenProfileUnpatched,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

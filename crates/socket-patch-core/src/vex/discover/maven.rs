@@ -49,8 +49,14 @@
 //! retarget and the grant does not serve: a live executable one (anything
 //! but `sources` / `javadoc`) that resolves any version other than the pin
 //! — its own literal, a classifier-keyed managed entry, or none in this
-//! pom — keeps the ref but marks it unattested. A `${property}`
-//! version is resolved one level from the root `<properties>`.
+//! pom — keeps the ref but marks it unattested. So does a `<profiles>`
+//! declaration of the GA (main jar, or an executable classifier copy) at
+//! any version other than the pin: the rewriter leaves it as written, and
+//! whenever that profile is active it overrides the pin (vendored mode
+//! treats every profile as live and rewrites it too). A `${property}`
+//! version is resolved one level from `.mvn/maven.config`'s `-D` user
+//! properties, else the root `<properties>` (Maven reads user properties
+//! first).
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
 //! Trusted Checksums — `.mvn/checksums/checksums.sha256` lines
@@ -92,9 +98,11 @@
 //! deploy targets) and dependencies inside `<build>` / `<reporting>`
 //! (plugin classpaths) are not project resolution and are skipped silently;
 //! `<profiles>` are only read when activated, so a Socket repository or pin
-//! there is diagnosed, never a ref. Submodule poms and parent poms are not
-//! read (root-only). Gradle builds are discovered by `gradle.rs` (the
-//! hosted index) and the vendored JVM backend's own probes.
+//! there is diagnosed, never a ref, and a profile declaration of a pinned
+//! GA at another version withholds the pin's attestation. Submodule poms
+//! and parent poms are not read (root-only). Gradle builds are discovered
+//! by `gradle.rs` (the hosted index) and the vendored JVM backend's own
+//! probes.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -129,7 +137,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         return;
     };
     // `.mvn/maven.config`'s `-D` user properties win over the pom's own
-    // when Maven interpolates a coordinate.
+    // when Maven interpolates a coordinate or a version.
     let config = ctx.read_text(MVN_CONFIG, out).await;
     let user_properties = match &config {
         Some(config) => maven_config_properties(config),
@@ -319,6 +327,15 @@ async fn extract_hosted(
                             version.unwrap_or("(none in this pom)")
                         ),
                         UnattestedKind::MavenClassifierUnpatched,
+                    );
+                }
+                if let Some(detail) = profile_override(&pom.deps, group, artifact, &pinned) {
+                    out.unattested(
+                        &purl,
+                        uuid,
+                        POM,
+                        detail,
+                        UnattestedKind::MavenProfileUnpatched,
                     );
                 }
                 ties.entry(*uuid).or_default().insert((
@@ -530,6 +547,17 @@ async fn extract_vendored(
                 );
                 continue;
             }
+        }
+        // A profile that moves the GA off the vendored version bypasses
+        // the vendored repository whenever it is active.
+        if let Some(detail) = profile_override(deps, group, artifact, version) {
+            out.unattested(
+                &purl,
+                uuid,
+                POM,
+                detail,
+                UnattestedKind::MavenProfileUnpatched,
+            );
         }
         out.push(PatchedRef::vendored(purl, &vref, POM, None));
     }
@@ -745,6 +773,60 @@ fn unpatched_executable_classifier<'a>(
             });
             (version != Some(pinned)).then_some((classifier, version))
         })
+}
+
+/// Why a `<profiles>` declaration of `group:artifact` moves it off
+/// `pinned` whenever that profile is active, for the first such one: a
+/// main-jar declaration (or one an undefined coordinate property may make
+/// the main jar, [`may_shadow`]) at another version, or an executable
+/// classifier copy that does not name `pinned` itself. A profile's
+/// `<dependencies>` and `<dependencyManagement>` merge over the pom's own,
+/// so either overrides the pin; activation is not evaluated, so every
+/// profile counts, as in vendored mode. A main-jar declaration without a
+/// version takes the live one and moves nothing.
+fn profile_override(deps: &[PomDep], group: &str, artifact: &str, pinned: &str) -> Option<String> {
+    deps.iter().filter(|d| d.in_profile).find_map(|d| {
+        let literal = d.group == group && d.artifact == artifact;
+        let what = match d.classifier.as_deref() {
+            None if literal
+                || may_shadow(
+                    (&d.group, &d.artifact),
+                    d.type_text.as_deref(),
+                    None,
+                    (group, artifact),
+                ) =>
+            {
+                let version = d.version.as_deref().filter(|v| *v != pinned)?;
+                format!("<version>{version}</version>")
+            }
+            Some(c) if literal && !NON_EXECUTABLE_CLASSIFIERS.contains(&c) => {
+                match d.version.as_deref() {
+                    Some(v) if v == pinned => return None,
+                    Some(v) => format!("classifier {c} at <version>{v}</version>"),
+                    None => format!("classifier {c} with no <version> of its own"),
+                }
+            }
+            _ => return None,
+        };
+        let section = if d.managed {
+            "<dependencyManagement> "
+        } else {
+            ""
+        };
+        let named = if literal {
+            format!("{group}:{artifact}")
+        } else {
+            format!(
+                "{}:{} (which may be {group}:{artifact})",
+                d.group, d.artifact
+            )
+        };
+        Some(format!(
+            "{POM}: a <profiles> {section}declaration of {named} carries {what}, not the \
+             patched {pinned}; whenever that profile is active Maven resolves it instead of \
+             the pin"
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -1467,6 +1549,150 @@ mod tests {
         }
     }
 
+    /// Maven gives `.mvn/maven.config`'s `-D` user properties precedence
+    /// over the pom's `<properties>` for a `<version>` too: a pin the pom
+    /// spells through a property the build config redefines to the base
+    /// release resolves the unpatched jar, so it is no attested pin.
+    #[tokio::test]
+    async fn version_property_reads_maven_config_overrides() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let pin = suffixed(UUID_A);
+        for (value, config, attested) in [
+            // The build config moves the pin back to the base release.
+            (pin.as_str(), "-Dslf4j.version=1.7.36\n", false),
+            (pin.as_str(), "--define slf4j.version=1.7.30\n", false),
+            // The build config supplies the pin itself.
+            ("1.7.36", &format!("-Dslf4j.version={pin}\n"), true),
+            // Unrelated user properties leave the pom's own.
+            (pin.as_str(), "-Dother=1\n", true),
+        ] {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<properties><slf4j.version>{value}</slf4j.version></properties>\n\
+                     <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n",
+                    dep("org.slf4j", "slf4j-api", Some("${slf4j.version}")),
+                )),
+            );
+            p.write(".mvn/maven.config", config);
+            let out = run(&p).await;
+            let attested_refs: Vec<_> = out
+                .refs
+                .iter()
+                .filter(|r| {
+                    r.purl == FX_PURL
+                        && !out
+                            .unattested
+                            .iter()
+                            .any(|u| u.purl == r.purl && u.uuid == r.uuid)
+                })
+                .collect();
+            assert_eq!(
+                !attested_refs.is_empty(),
+                attested,
+                "{config}: {:?} {:?} {:?}",
+                out.refs,
+                out.unattested,
+                out.diagnostics
+            );
+        }
+    }
+
+    /// A `<profiles>` declaration of the pinned GA applies whenever that
+    /// profile is active, and the hosted rewriter leaves it as written
+    /// (`redirect_maven_profile_dependency_unpatched`); vendored mode treats
+    /// every profile as live. One at any version other than the pin keeps
+    /// the ref (rollback / remove / list still find it) but is never
+    /// attested: with the profile on, Maven resolves the unpatched jar.
+    #[tokio::test]
+    async fn profile_declaration_off_the_pin_is_not_attested() {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let pin = suffixed(UUID_A);
+        let project = |profile: &str| {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                pom(&format!(
+                    "<dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n\
+                     <profiles><profile><id>p</id>\n{profile}</profile></profiles>\n",
+                    dep("org.slf4j", "slf4j-api", Some(&pin)),
+                )),
+            );
+            p
+        };
+        let direct = |v: Option<&str>| {
+            format!(
+                "<dependencies>\n{}</dependencies>\n",
+                dep("org.slf4j", "slf4j-api", v)
+            )
+        };
+        let managed = |v: Option<&str>| {
+            format!(
+                "<dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n",
+                dep("org.slf4j", "slf4j-api", v)
+            )
+        };
+        let classified = |c: &str, v: Option<&str>| {
+            let v = v.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependencies><dependency><groupId>org.slf4j</groupId>\
+                 <artifactId>slf4j-api</artifactId>{v}<classifier>{c}</classifier>\
+                 </dependency></dependencies>\n"
+            )
+        };
+        for profile in [
+            // The base release, directly or managed.
+            direct(Some("1.7.36")),
+            managed(Some("1.7.36")),
+            // Another release, or one this pom cannot resolve.
+            direct(Some("1.7.30")),
+            direct(Some("${undefined}")),
+            // Another Socket pin.
+            direct(Some("1.7.36-socket.88888888")),
+            // An executable classifier copy off the pin.
+            classified("tests", Some("1.7.36")),
+            classified("tests", None),
+        ] {
+            let out = run(&project(&profile)).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{profile}: {:?}", out.unattested);
+            let u = &out.unattested[0];
+            assert_eq!(u.kind, UnattestedKind::MavenProfileUnpatched, "{profile}");
+            assert_eq!(
+                (u.purl.as_str(), u.uuid.as_str()),
+                (FX_PURL, UUID_A),
+                "{profile}"
+            );
+            assert!(
+                u.detail.contains("org.slf4j:slf4j-api") && u.detail.contains("<profiles>"),
+                "{}",
+                u.detail
+            );
+        }
+
+        for profile in [
+            // No version: the live pin applies.
+            direct(None),
+            // The pin itself.
+            direct(Some(&pin)),
+            // Another GA.
+            format!(
+                "<dependencies>\n{}</dependencies>\n",
+                dep("org.slf4j", "slf4j-simple", Some("1.7.36"))
+            ),
+            // A non-executable classifier copy, or one on the pin.
+            classified("sources", Some("1.7.36")),
+            classified("tests", Some(&pin)),
+            // Profile properties only.
+            "<properties><x>1</x></properties>\n".to_string(),
+        ] {
+            let out = run(&project(&profile)).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert!(out.unattested.is_empty(), "{profile}: {:?}", out.unattested);
+        }
+    }
+
     /// A versioned declaration whose coordinate is a property this pom
     /// does not define may be the pinned GA, so the pin is not attested
     /// past it (#683).
@@ -1682,6 +1908,38 @@ mod tests {
         assert_eq!(r.source_file, std::path::PathBuf::from("pom.xml"));
         assert_eq!(r.locked_integrity, None);
         assert!(!r.lockfile_basis_ok());
+    }
+
+    /// The retired vendored wiring serves the ORIGINAL GAV: a profile that
+    /// moves the GA to another version bypasses it whenever it is active,
+    /// so the ref stays but is not attested.
+    #[tokio::test]
+    async fn vendored_ref_under_a_profile_version_is_not_attested() {
+        for (version, attested) in [("1.10.1", false), ("1.10.0", true)] {
+            let p = vendored_project(UUID_A);
+            let wired = std::fs::read_to_string(p.root().join("pom.xml")).expect("read pom");
+            let at = wired.rfind("</project>").expect("project close");
+            p.write(
+                "pom.xml",
+                format!(
+                    "{}<profiles><profile><id>p</id><dependencies>\n{}</dependencies></profile></profiles>\n{}",
+                    &wired[..at],
+                    dep("org.apache.commons", "commons-text", Some(version)),
+                    &wired[at..]
+                ),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+            if attested {
+                assert!(out.unattested.is_empty(), "{version}: {:?}", out.unattested);
+            } else {
+                assert_eq!(out.unattested.len(), 1, "{version}: {:?}", out.unattested);
+                assert_eq!(
+                    out.unattested[0].kind,
+                    UnattestedKind::MavenProfileUnpatched
+                );
+            }
+        }
     }
 
     #[tokio::test]

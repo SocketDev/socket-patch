@@ -41,8 +41,9 @@ pub(crate) struct PomRepo {
 pub(crate) struct PomDep {
     pub(crate) group: String,
     pub(crate) artifact: String,
-    /// Trimmed literal version, `${prop}` resolved from the root
-    /// `<properties>` when possible; `None` when the declaration has none.
+    /// Trimmed literal version, `${prop}` resolved (one level) from the
+    /// build's user properties, else the root `<properties>`, when
+    /// possible; `None` when the declaration has none.
     pub(crate) version: Option<String>,
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
@@ -67,7 +68,8 @@ pub(crate) struct PomScope {
     pub(crate) masked: String,
     ignored: Vec<Element>,
     profiles: Vec<Element>,
-    /// The root `<properties>` (see [`properties`]).
+    /// The root `<properties>` (see [`properties`]) with the build's user
+    /// properties laid over them: what a `${name}` resolves to.
     properties: BTreeMap<String, String>,
     /// [`Self::properties`] plus the `${project.*}` model references a
     /// coordinate may name (see [`model_refs`]).
@@ -84,8 +86,8 @@ impl PomScope {
 
     /// [`Self::new`], with the user properties the build passes Maven
     /// (`.mvn/maven.config`'s `-D`, see [`maven_config_properties`]): they
-    /// override a same-named pom property when a coordinate is
-    /// interpolated, as Maven's model interpolator reads them after the
+    /// override a same-named pom property when a coordinate or a version is
+    /// interpolated, as Maven's model interpolator looks them up before the
     /// model's own.
     pub(crate) fn with_user_properties(
         raw: &str,
@@ -103,9 +105,9 @@ impl PomScope {
         ]
         .concat();
         let profiles = elements(&masked, "profiles")?;
-        let properties = properties(&masked, &ignored, &profiles)?;
+        let mut properties = properties(&masked, &ignored, &profiles)?;
+        properties.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
         let mut coordinate_refs = properties.clone();
-        coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
         // A `project.*` / `pom.*` reference names the model, whatever a
         // same-named property says; the deprecated bare form yields to one.
         for (name, value) in model_refs(&masked, &coordinate_refs.clone())? {
@@ -731,6 +733,38 @@ mod tests {
         let deps = scope.dependencies().unwrap();
         assert_eq!(deps[0].group.as_deref(), Some("com.acme"));
         assert!(!scope.coordinate_refs.contains_key("project.version"));
+    }
+
+    /// Maven's model interpolator reads user properties (`.mvn/maven.config`'s
+    /// `-D`) before the pom's own `<properties>`, for a `<version>` just as
+    /// for a coordinate: `-Dv=1.0` makes `${v}` the base release whatever
+    /// the pom defines.
+    #[test]
+    fn version_property_reads_user_properties_first() {
+        let pom = "<project><properties><v>1.0-socket.77777777</v><w>2</w></properties>\
+                   <dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${w}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>c</artifactId><version>${u}</version></dependency>\
+                   </dependencies></project>";
+        let versions = |user: &[(&str, &str)]| {
+            let user = user
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            super::parse_pom_with(pom, &user)
+                .unwrap()
+                .deps
+                .into_iter()
+                .map(|d| d.version.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(versions(&[]), ["1.0-socket.77777777", "2", "${u}"]);
+        assert_eq!(
+            versions(&[("v", "1.0"), ("u", "3")]),
+            ["1.0", "2", "3"],
+            "a user property wins over the pom's and defines one it lacks"
+        );
     }
 
     #[test]

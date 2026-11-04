@@ -232,6 +232,10 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a hosted Maven pin's GA is also declared inside
+/// `<profiles>` at another version, which overrides the pin whenever that
+/// profile is active (`vex::Unattested`).
+const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -267,6 +271,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::MavenProfileUnpatched => (
+            NOTE_MAVEN_PROFILE_UNPATCHED,
+            "not attested while a profile declares it at another version; the wiring itself is \
+             intact, so re-running `scan` does not change this (drop that profile <version> or \
+             set it to the pin, or re-patch with `scan --mode vendored`)",
         ),
     }
 }
