@@ -52,8 +52,16 @@
 //!   release has none and is kept (#411);
 //! * the metadata's `[tool.uv.sources].<name> = { url }` is removed.
 //!
-//! uv 0.2 `[[distribution]]` locks are refused (their artifact grammar
-//! changed across 0.2.x releases).
+//! uv 0.2 `[[distribution]]` locks (uv < 0.2.35) come back the same way, in
+//! whichever of their three grammars the lock's other registry packages
+//! show — the evidence the hosted rewrite itself followed: string sources
+//! (`source = "registry+<R>"`, which the rewrite made `"direct+<url>"`) or
+//! inline ones (uv 0.2.18–0.2.34), and artifacts as `[distribution.sdist]` /
+//! `[[distribution.wheel]]` sub-tables (uv ≤ 0.2.5) or inline `sdist` /
+//! `wheels` (uv 0.2.6 and later). Dependents' references, inline or
+//! `[[distribution.dependencies]]` tables, get the registry source back in
+//! the spelling they carry. Those locks have no `[manifest]` or
+//! `[package.metadata]` for the rewrite to touch.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -93,8 +101,10 @@ struct Shape {
     datetime: bool,
     /// `wheels` puts one entry per line.
     multiline: bool,
-    /// pylock: artifacts are standard tables (`[[packages.wheels]]`,
-    /// `[packages.sdist]`), as `pip lock` writes them, not inline ones.
+    /// Artifacts are standard tables, not inline ones: pylock
+    /// `[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` writes
+    /// them, or uv ≤ 0.2.5's `[[distribution.wheel]]` /
+    /// `[distribution.sdist]`.
     tables: bool,
     /// With `tables`: `hashes` is a sub-table (`[packages.wheels.hashes]`).
     hash_tables: bool,
@@ -323,13 +333,6 @@ async fn restore_lock(
             result.refuse(&hit.uuid, format!("{rel}: {why}"));
         }
     };
-    if collection == "distribution" {
-        return refuse_hits(
-            result,
-            "uv 0.2 `[[distribution]]` locks changed their artifact grammar across releases; \
-             which one this lock follows is not derivable",
-        );
-    }
     let version_ok = if pep751 {
         doc.get("lock-version").and_then(Item::as_str) == Some("1.0")
     } else {
@@ -505,7 +508,7 @@ async fn restore_lock(
         let restore = if pep751 {
             restore_pylock_entry(&mut doc, hit, &shape, artifacts)
         } else {
-            restore_uv_entry(&mut doc, hit, &shape, artifacts, ctx)
+            restore_uv_entry(&mut doc, collection, hit, &shape, artifacts, ctx)
                 .and_then(|()| restore_requirements(&mut doc, hit, metadata.as_ref(), &styles, ctx))
         };
         if let Err(why) = restore {
@@ -615,12 +618,13 @@ impl SiblingRegistry<'_> {
     }
 }
 
-/// A package's `wheels` and `sdist` artifact tables, in either PEP 751
-/// spelling: inline (`wheels = [{ … }]`, as uv writes them) or standard
-/// tables (`[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` does).
+/// A package's `wheels` and `sdist` artifact tables, in either spelling:
+/// inline (`wheels = [{ … }]`, as uv writes them) or standard tables
+/// (`[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` does, and uv
+/// ≤ 0.2.5's `[[distribution.wheel]]` / `[distribution.sdist]`).
 fn artifact_tables(package: &toml_edit::Table) -> Vec<&dyn TableLike> {
     let mut tables: Vec<&dyn TableLike> = Vec::new();
-    match package.get("wheels") {
+    match package.get("wheels").or_else(|| package.get("wheel")) {
         Some(Item::Value(Value::Array(wheels))) => tables.extend(
             wheels
                 .iter()
@@ -1194,7 +1198,7 @@ fn lock_shape(
             .get("wheels")
             .and_then(Item::as_array)
             .is_none_or(|a| a.to_string().contains('\n'));
-        let tables = match package.get("wheels") {
+        let tables = match package.get("wheels").or_else(|| package.get("wheel")) {
             Some(Item::ArrayOfTables(wheels)) => !wheels.is_empty(),
             Some(Item::Value(Value::Array(wheels))) if !wheels.is_empty() => false,
             _ => package.get("sdist").is_some_and(Item::is_table),
@@ -1423,6 +1427,25 @@ fn inline_source(registry: &str) -> Value {
         .expect("a registry source renders as TOML")
 }
 
+/// The registry source that replaces `source`, in its spelling, when it
+/// routes `hit` to its hosted artifact: `{ url }` becomes `{ registry }`,
+/// and uv 0.2's string `"direct+<url>"` becomes `"registry+<registry>"`.
+fn restored_source(source: &Value, hit: &Hit, registry: &str, ctx: &Ctx<'_>) -> Option<Value> {
+    let (url, string) = match source {
+        Value::String(s) => (s.value().strip_prefix("direct+")?, true),
+        Value::InlineTable(t) => (t.get("url")?.as_str()?, false),
+        _ => return None,
+    };
+    if ctx.hosted_uuid(url)? != hit.uuid {
+        return None;
+    }
+    Some(if string {
+        Value::from(format!("registry+{registry}"))
+    } else {
+        inline_source(registry)
+    })
+}
+
 /// Replace `item`'s value, keeping its decor.
 fn replace_keeping_decor(slot: &mut Value, mut value: Value) {
     *value.decor_mut() = slot.decor().clone();
@@ -1432,20 +1455,25 @@ fn replace_keeping_decor(slot: &mut Value, mut value: Value) {
 /// The package entry itself, and every dependent reference to it.
 fn restore_uv_entry(
     doc: &mut DocumentMut,
+    collection: &str,
     hit: &Hit,
     shape: &Shape,
     (sdist, wheels): (Option<Item>, Option<Item>),
     ctx: &Ctx<'_>,
 ) -> Result<(), String> {
+    let legacy = collection == "distribution";
     let package = doc
-        .get_mut("package")
+        .get_mut(collection)
         .and_then(Item::as_array_of_tables_mut)
         .and_then(|p| p.get_mut(hit.index))
         .ok_or("the package entry vanished")?;
-    match package.get_mut("source").and_then(Item::as_value_mut) {
-        Some(slot) => replace_keeping_decor(slot, inline_source(&shape.registry)),
-        None => return Err("the package source is not an inline table".to_string()),
-    }
+    let slot = package
+        .get_mut("source")
+        .and_then(Item::as_value_mut)
+        .ok_or("the package source is not an inline table or a string")?;
+    let source = restored_source(slot, hit, &shape.registry, ctx)
+        .ok_or("the package source no longer names the hosted artifact")?;
+    replace_keeping_decor(slot, source);
     for key in ["sdist", "wheels", "wheel", "archive"] {
         package.remove(key);
     }
@@ -1453,30 +1481,59 @@ fn restore_uv_entry(
         package.insert("sdist", sdist);
     }
     if let Some(wheels) = wheels {
-        package.insert("wheels", wheels);
+        // uv ≤ 0.2.5 names its wheel sub-tables `[[distribution.wheel]]`.
+        let key = if legacy && shape.tables {
+            "wheel"
+        } else {
+            "wheels"
+        };
+        package.insert(key, wheels);
+    }
+    if legacy && shape.tables {
+        // uv ≤ 0.2.5 writes an entry's `[distribution.sdist]` before its
+        // `[[distribution.dependencies]]` and `[[distribution.wheel]]` after
+        // them, and a new sub-table renders where its key sits.
+        let rank = |key: &str| match key {
+            "sdist" => 0,
+            "wheel" => 2,
+            _ => 1,
+        };
+        package.sort_values_by(|a, _, b, _| rank(a.get()).cmp(&rank(b.get())));
     }
     package.remove("metadata");
     restore_refs(doc.as_item_mut(), hit, &shape.registry, ctx);
     Ok(())
 }
 
-/// Dependents' `{ name, source = { url } }` references back to the registry.
+/// Dependents' references back to the registry: inline `{ name, source }`
+/// tables, and uv 0.2's `[[distribution.dependencies]]` tables.
 fn restore_refs(item: &mut Item, hit: &Hit, registry: &str, ctx: &Ctx<'_>) {
     match item {
         Item::Value(value) => restore_ref_value(value, hit, registry, ctx),
-        Item::Table(table) => {
-            for (_, item) in table.iter_mut() {
-                restore_refs(item, hit, registry, ctx);
-            }
-        }
+        Item::Table(table) => restore_ref_table(table, hit, registry, ctx),
         Item::ArrayOfTables(tables) => {
             for table in tables.iter_mut() {
-                for (_, item) in table.iter_mut() {
-                    restore_refs(item, hit, registry, ctx);
-                }
+                restore_ref_table(table, hit, registry, ctx);
             }
         }
         Item::None => {}
+    }
+}
+
+fn restore_ref_table(table: &mut toml_edit::Table, hit: &Hit, registry: &str, ctx: &Ctx<'_>) {
+    let names_hit = table
+        .get("name")
+        .and_then(Item::as_str)
+        .is_some_and(|n| canonicalize_pypi_name(n) == hit.name);
+    if names_hit {
+        if let Some(slot) = table.get_mut("source").and_then(Item::as_value_mut) {
+            if let Some(source) = restored_source(slot, hit, registry, ctx) {
+                replace_keeping_decor(slot, source);
+            }
+        }
+    }
+    for (_, item) in table.iter_mut() {
+        restore_refs(item, hit, registry, ctx);
     }
 }
 
@@ -1492,16 +1549,11 @@ fn restore_ref_value(value: &mut Value, hit: &Hit, registry: &str, ctx: &Ctx<'_>
                 .get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|n| canonicalize_pypi_name(n) == hit.name);
-            let hosted = table
-                .get("source")
-                .and_then(Value::as_inline_table)
-                .and_then(|s| s.get("url"))
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u))
-                .is_some_and(|u| u == hit.uuid);
-            if names_hit && hosted {
+            if names_hit {
                 if let Some(slot) = table.get_mut("source") {
-                    replace_keeping_decor(slot, inline_source(registry));
+                    if let Some(source) = restored_source(slot, hit, registry, ctx) {
+                        replace_keeping_decor(slot, source);
+                    }
                 }
             }
             for (_, value) in table.iter_mut() {

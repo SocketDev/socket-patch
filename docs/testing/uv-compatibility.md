@@ -60,8 +60,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   string source and silently ignore the lock (`--frozen` / `--locked` fail,
   an ordinary `uv sync` still installs the patch via the pyproject source),
   and 0.2.6–0.2.17 ignore an unexpected `[[distribution.wheel]]` and try to
-  build the direct wheel URL as a source archive. The `[[distribution]]`
-  grammar is hosted-only: vendored native wiring is refused with
+  build the direct wheel URL as a source archive. The hosted unwind
+  (`rollback`, `remove`, and `scan` dropping a pin) restores the registry
+  entry in the same shape, read off the lock's other registry packages. The
+  `[[distribution]]` grammar is hosted-only: vendored native wiring is refused with
   `pypi_uv_legacy_lock_unsupported`. The refusal is kept because no spelling of
   a committed wheel is stable across that era: through 0.2.6 a relative path
   source cannot be parsed at all (`path+<rel>` is an invalid URL, `path+file:`

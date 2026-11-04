@@ -2123,6 +2123,219 @@ async fn uv_underscore_upload_time_locks_round_trip() {
     assert_pypi_round_trip("uv 0.6.17 script", &input, &[urllib3_dep()], None).await;
 }
 
+const REQUESTS_UUID: &str = "44444444-4444-4444-4444-444444444444";
+const REQUESTS_WHEEL: &str = "requests-2.31.0-py3-none-any.whl";
+const REQUESTS_SDIST: &str = "requests-2.31.0.tar.gz";
+const REQUESTS_WHEEL_SHA: &str = "58cd2187c01e70e6e26505bca751777aa9f2ee0b7f4300988b709f44e013003f";
+const REQUESTS_SDIST_SHA: &str = "942c5a758f98d790eaed1a29cb6eefc7ffb0d1cf7af05c3d2791656dbd6ad1e1";
+
+fn requests_release() -> Release<'static> {
+    (
+        "requests",
+        "2.31.0",
+        vec![
+            (
+                REQUESTS_WHEEL,
+                REQUESTS_WHEEL_SHA,
+                62574,
+                "2023-05-22T15:12:42.313790Z",
+            ),
+            (
+                REQUESTS_SDIST,
+                REQUESTS_SDIST_SHA,
+                110794,
+                "2023-05-22T15:12:44.175917Z",
+            ),
+        ],
+    )
+}
+
+/// A uv 0.2 `[[distribution]]` lock (uv < 0.2.35) in one of its three
+/// grammars, holding a registry `idna`, the editable root `proj`, `requests`
+/// (depending on `idna` and `urllib3`) and `urllib3`.
+fn uv_distribution_lock(grammar: &str) -> String {
+    let a = "a".repeat(64);
+    let b = "b".repeat(64);
+    let url = pypi_file_url;
+    let idna_sdist = "https://files.pythonhosted.org/packages/aa/idna-3.4.tar.gz";
+    let idna_wheel = "https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl";
+    match grammar {
+        // uv ≤ 0.2.5: string sources, artifact sub-tables, source-qualified
+        // dependency tables.
+        "0.2.5" => {
+            let dep = |name: &str, version: &str| {
+                format!("\n[[distribution.dependencies]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n")
+            };
+            let entry = |name: &str,
+                         version: &str,
+                         sdist: &str,
+                         sdist_sha: &str,
+                         deps: &str,
+                         wheel: &str,
+                         wheel_sha: &str| {
+                format!(
+                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n\n\
+[distribution.sdist]\nurl = \"{sdist}\"\nhash = \"sha256:{sdist_sha}\"\n{deps}\n\
+[[distribution.wheel]]\nurl = \"{wheel}\"\nhash = \"sha256:{wheel_sha}\"\n"
+                )
+            };
+            format!(
+                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = \"editable+.\"\n{}{}{}",
+                entry("idna", "3.4", idna_sdist, &a, "", idna_wheel, &b),
+                dep("requests", "2.31.0"),
+                entry(
+                    "requests",
+                    "2.31.0",
+                    &url(REQUESTS_SDIST),
+                    REQUESTS_SDIST_SHA,
+                    &(dep("idna", "3.4") + &dep("urllib3", "1.26.18")),
+                    &url(REQUESTS_WHEEL),
+                    REQUESTS_WHEEL_SHA,
+                ),
+                entry(
+                    "urllib3",
+                    "1.26.18",
+                    &url(URLLIB3_SDIST),
+                    URLLIB3_SDIST_SHA,
+                    "",
+                    &url(URLLIB3_WHEEL),
+                    URLLIB3_WHEEL_SHA,
+                ),
+            )
+        }
+        // uv 0.2.6–0.2.17: string sources, inline artifacts, dependency
+        // tables.
+        "0.2.15" => {
+            let dep = |name: &str, version: &str| {
+                format!("\n[[distribution.dependencies]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n")
+            };
+            let entry = |name: &str,
+                         version: &str,
+                         sdist: &str,
+                         sdist_sha: &str,
+                         size: u64,
+                         deps: &str,
+                         wheel: &str,
+                         wheel_sha: &str,
+                         wheel_size: u64| {
+                format!(
+                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n\
+sdist = {{ url = \"{sdist}\", hash = \"sha256:{sdist_sha}\", size = {size} }}\n\
+wheels = [{{ url = \"{wheel}\", hash = \"sha256:{wheel_sha}\", size = {wheel_size} }}]\n{deps}"
+                )
+            };
+            format!(
+                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = \"editable+.\"\n{}{}{}",
+                entry("idna", "3.4", idna_sdist, &a, 183077, "", idna_wheel, &b, 61538),
+                dep("requests", "2.31.0"),
+                entry(
+                    "requests",
+                    "2.31.0",
+                    &url(REQUESTS_SDIST),
+                    REQUESTS_SDIST_SHA,
+                    110794,
+                    &(dep("idna", "3.4") + &dep("urllib3", "1.26.18")),
+                    &url(REQUESTS_WHEEL),
+                    REQUESTS_WHEEL_SHA,
+                    62574,
+                ),
+                entry(
+                    "urllib3",
+                    "1.26.18",
+                    &url(URLLIB3_SDIST),
+                    URLLIB3_SDIST_SHA,
+                    305687,
+                    "",
+                    &url(URLLIB3_WHEEL),
+                    URLLIB3_WHEEL_SHA,
+                    143835,
+                ),
+            )
+        }
+        // uv 0.2.18–0.2.34: inline-table sources and artifacts, inline
+        // dependency references.
+        "0.2.34" => {
+            let entry = |name: &str,
+                         version: &str,
+                         deps: &str,
+                         sdist: &str,
+                         sdist_sha: &str,
+                         size: u64,
+                         wheel: &str,
+                         wheel_sha: &str,
+                         wheel_size: u64| {
+                format!(
+                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n{deps}\
+sdist = {{ url = \"{sdist}\", hash = \"sha256:{sdist_sha}\", size = {size} }}\n\
+wheels = [\n    {{ url = \"{wheel}\", hash = \"sha256:{wheel_sha}\", size = {wheel_size} }},\n]\n"
+                )
+            };
+            format!(
+                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = {{ editable = \".\" }}\ndependencies = [\n    {{ name = \"requests\" }},\n]\n{}{}",
+                entry("idna", "3.4", "", idna_sdist, &a, 183077, idna_wheel, &b, 61538),
+                entry(
+                    "requests",
+                    "2.31.0",
+                    "dependencies = [\n    { name = \"idna\" },\n    { name = \"urllib3\" },\n]\n",
+                    &url(REQUESTS_SDIST),
+                    REQUESTS_SDIST_SHA,
+                    110794,
+                    &url(REQUESTS_WHEEL),
+                    REQUESTS_WHEEL_SHA,
+                    62574,
+                ),
+                entry(
+                    "urllib3",
+                    "1.26.18",
+                    "",
+                    &url(URLLIB3_SDIST),
+                    URLLIB3_SDIST_SHA,
+                    305687,
+                    &url(URLLIB3_WHEEL),
+                    URLLIB3_WHEEL_SHA,
+                    143835,
+                ),
+            )
+        }
+        other => panic!("no uv {other} grammar"),
+    }
+}
+
+/// uv 0.2 `[[distribution]]` locks: whatever the hosted rewrite writes into
+/// each of the three grammars, the unwind restores byte for byte — the
+/// registry source in the lock's spelling, the artifacts in the shape its
+/// other registry packages show, dependents' references, and the paired
+/// pyproject's `[tool.uv.sources]` (a direct dependency) and hosted
+/// `override-dependencies` entry (a transitive one).
+#[tokio::test]
+#[serial]
+async fn uv_distribution_locks_round_trip() {
+    let (_server, _env) = pypi_mock(&[urllib3_release(), requests_release()]).await;
+    let requests = pypi_dep("requests", "2.31.0", REQUESTS_WHEEL, REQUESTS_UUID);
+    let deps = [requests, urllib3_dep()];
+    let pyproject =
+        "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"requests==2.31.0\"]\n";
+    for grammar in ["0.2.5", "0.2.15", "0.2.34"] {
+        let lock = uv_distribution_lock(grammar);
+        let rewritten = hosted(&tree(&[("uv.lock", lock.clone())]), &deps, None);
+        assert!(
+            !rewritten["uv.lock"].contains("pythonhosted.org/packages/0c")
+                && !rewritten["uv.lock"].contains("pythonhosted.org/packages/b0"),
+            "uv {grammar}: the hosted rewrite left a pin unwired:\n{}",
+            rewritten["uv.lock"]
+        );
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[
+                ("uv.lock", lock.replace('\n', eol)),
+                ("pyproject.toml", pyproject.replace('\n', eol)),
+            ]);
+            assert_pypi_round_trip(&format!("uv {grammar} {eol:?}"), &input, &deps, None).await;
+        }
+        let input = tree(&[("uv.lock", lock)]);
+        assert_pypi_round_trip(&format!("uv {grammar} lock-only"), &input, &deps, None).await;
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn pylock_round_trips() {
