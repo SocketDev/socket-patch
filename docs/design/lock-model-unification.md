@@ -51,6 +51,19 @@ backends.
 
 ## The model
 
+### Layers
+
+1. **`formats/`: pure models.** Text in, records out. Each record carries
+   the raw location strings the lock spells (resolved URL, tarball, path,
+   source). The existing architecture test keeps these models free of I/O
+   and of the host policy, and that rule stays.
+2. **`origin`: the one classifier.** A top-level module, not part of
+   `formats/`, because it applies the host policy. See [Origin](#origin).
+3. **The project layer.** Reads files through `ProjectView`, picks install
+   trees, joins files where a format needs it, and turns each record's raw
+   location into an `Origin`. Discovery, the inventory and the writers all
+   consume it.
+
 ### Entries
 
 Every reader yields `LockEntry` records. Each record holds the package
@@ -79,14 +92,21 @@ flags: bundled, link, the v2 mirror, a `hasShrinkwrap` ancestor, Yarn's
 `live`, Berry's checksum cache key, and so on. These are fields of the format's
 record, not new side channels.
 
-One classifier, `formats::origin`, decides `Origin`. It is discovery's
-validators moved, not rewritten:
+### Origin
 
-* the Socket host allowlist and the last-canonical-uuid rule
-  (`hosted_uuid`);
-* `vendor_ref`, `vendor_ref_decorated` and `vendor_uuid_dir`;
-* the `socket-patch-<uuid>` name grammar;
-* the validating purl builders.
+One classifier, the `origin` module, decides `Origin`. It is moved, not
+rewritten, from two places:
+
+* from `patch::redirect`: `hosted_patch_uuid` (Socket's patch server or a
+  configured origin, the last canonical-uuid path segment) and
+  `SOCKET_PATCH_SERVER_HOST`. The hosted unwind already calls these
+  directly;
+* from discovery: `OriginPolicy::hosted_uuid` (the same rule with a memoized
+  fast path for plain registry URLs), `vendor_ref`, `vendor_ref_decorated`
+  and `vendor_uuid_dir`, `locate`, `Wired`, and the `socket-patch-<uuid>`
+  name grammar.
+
+The validating purl builders already live in `utils::purl`.
 
 The inventory's any-host matching goes away. That is a behavior change only
 where a non-allowlisted host serves a URL that looks like Socket's, and it
@@ -217,13 +237,13 @@ by line.
 | PR | Branch | Change |
 |---|---|---|
 | 0 | `lock-model/0-design` | This document and the size budget |
-| 1 | `lock-model/1-origin` | `LockEntry`, `Origin` and `formats::origin` (discovery's classifier, moved). Discovery calls it. The inventory doesn't yet. |
+| 1 | `lock-model/1-origin` | The `origin` module: discovery's classifier and the redirect's hosted-URL rule, moved verbatim. Discovery and the redirect re-export it. |
 | 2 | `lock-model/2-pnpm` | Pilot. One pnpm reader feeds the inventory, discovery and the hosted planner. Removes `InstalledPackages`, `vendored_npm_uuids`, the whole-text planner walk and the second Rush listing. |
 | 3 | `lock-model/3-npm` | package-lock and shrinkwrap. Folds `vendor/npm_origin.rs`'s second walk into the records. |
 | 4 | `lock-model/4-yarn` | Classic and Berry. One block model for every reader and writer, `BerryStanzas` included. |
 | 5 | `lock-model/5-bun-vlt` | `bun.lock`, `bun.lockb` and vlt. The vlt writers move off their line grammar. |
 | 6 | `lock-model/6-deno` | The `deno.lock` reader in `formats/`, for all four of its callers |
-| 7 | `lock-model/7-python` | One lister, one parse per lock, one include walker and one PEP 508 parser. `pypi_locks.rs` stops parsing TOML itself. Poetry wiring uses `formats::origin`. Hatch gets inventory entries. |
+| 7 | `lock-model/7-python` | One lister, one parse per lock, one include walker and one PEP 508 parser. `pypi_locks.rs` stops parsing TOML itself. Poetry wiring uses `origin`. Hatch gets inventory entries. |
 | 8 | `lock-model/8-cargo-go` | One `Cargo.toml` dependency-table walk. Go `replace` and `go.sum` records. |
 | 9 | `lock-model/9-gem-composer` | Gemfile.lock and composer.lock records. The inventory stops dropping BOM-prefixed `composer.lock` files. |
 | 10 | `lock-model/10-nuget` | NuGet records with the config join, `NugetContentHash`, and inventory entries |
