@@ -2280,7 +2280,14 @@ reference to `.socket/vendor/<eco>/<uuid>/` that no ledger entry owns (the
 artifact-level event repair emits: `uuid` plus `details.{ecosystem,path}`, no
 purl), so a checkout whose ledger was ignored or dropped from the commit no
 longer passes with nothing to check. Offline upstream metadata is reported as the run warning
-`vendor_jvm_upstream_unverified`. The check never starts an API client or writes
+`vendor_jvm_upstream_unverified`. A Maven reactor entry that is intact and wired
+but that `vex` does not attest — a declaration may still build the base release:
+an executable classifier or type copy of the patched GA (`tests`, `test-jar`, a
+native build), a version a property, a profile or an unpinned local root may
+move, or a base declaration added since vendoring that the re-plan cannot take
+— stays `verified` and adds the run warning `vendor_jvm_unattested`, whose
+detail names the entry and the declarations. Like the other unattested
+references, re-vendoring cannot clear it, so it is not drift. The check never starts an API client or writes
 lock/recovery files. `--check` conflicts with `--revert`.
 
 `vendor --check --local-repo <path>` additionally checks existing suffixed Maven
@@ -2634,6 +2641,7 @@ with `reason: <reason>: `:
 | `vendor_jvm_degraded` | applied, VEX withheld | `gradle_unscanned_build_logic`, `unwired_build_logic` (a nonliteral included build), `settings_plugins_unwired`, `classifier_unpatched_copy` (a classifier jar carries an unpatched copy of a patched member), `verification_parent_chain_unhandled`, `conflicting_managed_version` / `management_unresolved` (Maven reactor: an imported BOM or an out-of-checkout parent manages the artifact at another version, or its POM is unavailable; that local root is not pinned) |
 | `vendor_jvm_note` | applied, informational | `range_declared` (a range, prefix or rich selector lists versions from the derived `maven-metadata.xml`), `ide_sources_unavailable` |
 | `vendor_jvm_upstream_unverified` | warning | Upstream metadata was taken offline and not authenticated against registry checksums. |
+| `vendor_jvm_unattested` | warning (`vendor --check`) | A Maven reactor entry is intact and wired, but a declaration may still build the base release (an executable classifier or type copy, a version a property, profile or unpinned local root may move), so `vex` does not attest it. The entry stays `verified`; the detail names the purl and the declarations (`<pom>:<line>`). |
 
 The Maven half of a root (single-module, reactor or mixed) also reports
 `vendor_jvm_degraded` with `reason: maven_f_outside_root` (Maven 3.9.2–3.9.8

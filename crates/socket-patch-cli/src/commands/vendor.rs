@@ -1334,7 +1334,18 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
-            failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
+            match vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()) {
+                Ok(None) => {}
+                // Intact and wired, but `vex` will not attest it: a
+                // declaration may still build the base. Re-vendoring cannot
+                // clear that, so it warns rather than fails (the unattested
+                // references rule).
+                Ok(Some(why)) => env.warnings.push(RunWarning {
+                    code: "vendor_jvm_unattested".into(),
+                    detail: format!("{key}: {why}; vex does not attest it"),
+                }),
+                Err(e) => failure = Some(e),
+            }
         }
         // The npm check names the exact unwired lock entry, so it runs
         // before the generic liveness rule below.

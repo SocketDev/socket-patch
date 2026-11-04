@@ -564,6 +564,34 @@ pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
     !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
 }
 
+/// Whether a declaration of a GA's main jar: untyped or `jar`-typed, with
+/// no classifier.
+pub(crate) fn is_main_jar(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    type_text.is_none_or(|t| t.is_empty() || t == "jar") && classifier.is_none_or(str::is_empty)
+}
+
+/// Whether a declaration of a GA that is not its main jar
+/// ([`is_main_jar`]) is a copy that carries code onto a classpath. Maven
+/// derives a classifier from some types (`test-jar` is the `tests` jar,
+/// `ejb-client` the `client` one, `java-source` / `javadoc` the
+/// non-executable ones), so a type counts like the classifier it implies.
+/// Of the rest only `pom` holds no code; every other type (`ejb`,
+/// `maven-plugin`, `bundle`, an unknown or `${...}` one) is executable.
+pub(crate) fn is_executable_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    let type_text = type_text.filter(|t| !t.is_empty()).unwrap_or("jar");
+    let implied = match type_text {
+        "test-jar" => Some("tests"),
+        "ejb-client" => Some("client"),
+        "java-source" => Some("sources"),
+        "javadoc" => Some("javadoc"),
+        _ => None,
+    };
+    match classifier.filter(|c| !c.is_empty()).or(implied) {
+        Some(c) => is_executable_classifier(c),
+        None => type_text != "pom",
+    }
+}
+
 fn is_property_name(name: &str) -> bool {
     !name.is_empty()
         && name

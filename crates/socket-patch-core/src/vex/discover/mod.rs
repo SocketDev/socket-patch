@@ -2659,6 +2659,20 @@ impl Discovery {
         vendored_wiring_live(root, &files, &entry.ecosystem, &entry.uuid).await
     }
 
+    /// [`Discovery::vendor_entry_live`] for a reader that must tell a dead
+    /// claim from an undecided one (`scan`'s takeover classifier, which
+    /// tells the user to remove a dead one): `None` when a JVM entry's
+    /// liveness cannot be decided — a pom could not be read, or the tree
+    /// is still referenced without attestable wiring
+    /// ([`crate::vendor::jvm::apply::entry_liveness`]). Every other entry
+    /// answers [`Discovery::vendor_entry_live`].
+    pub async fn vendor_entry_liveness(&self, root: &Path, entry: &VendorEntry) -> Option<bool> {
+        if crate::vendor::jvm::apply::is_jvm_entry(entry) {
+            return crate::vendor::jvm::apply::entry_liveness(root, entry);
+        }
+        Some(self.vendor_entry_live(root, entry).await)
+    }
+
     /// Whether the project still CONSUMES a vendor-ledger entry's artifact —
     /// the question the `scan --prune` GC reverts by and `scan`'s vendored
     /// ledger supplement re-discovers by, answered from the same discovery
@@ -2926,6 +2940,11 @@ impl<'a> LedgerLiveness<'a> {
     /// [`Discovery::vendor_entry_live`] for this project state.
     pub async fn vendor_entry(&self, entry: &VendorEntry) -> bool {
         self.discovery.vendor_entry_live(self.root, entry).await
+    }
+
+    /// [`Discovery::vendor_entry_liveness`] for this project state.
+    pub async fn vendor_entry_state(&self, entry: &VendorEntry) -> Option<bool> {
+        self.discovery.vendor_entry_liveness(self.root, entry).await
     }
 }
 

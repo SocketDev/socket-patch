@@ -1004,6 +1004,20 @@ pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
     entry_wired_checked(root, entry).unwrap_or(false)
 }
 
+/// [`entry_wired`] for a reader that must tell "dead" from "unknown":
+/// `Some(true)` wired ([`entry_wired_checked`]); `Some(false)` the project
+/// no longer references the tree at all ([`entry_references`] is
+/// `false`); `None` otherwise — a file could not be read or parsed, or the
+/// tree is still referenced (a build plugin, a profile, a declaration that
+/// may still build the base) without wiring that `vex` attests.
+pub fn entry_liveness(root: &Path, entry: &VendorEntry) -> Option<bool> {
+    match entry_wired_checked(root, entry) {
+        Ok(true) => Some(true),
+        _ if entry_references(root, entry) => None,
+        _ => Some(false),
+    }
+}
+
 /// Whether the project still references the JVM `entry`'s tree (its
 /// suffixed version in a reactor pom; its index rows plus the root apply
 /// line for Gradle): what a revert must not pull from under a peer.
@@ -1103,11 +1117,17 @@ fn local_external_poms(
 }
 
 /// Verify every recorded file plus the effective wiring, without writes or network I/O.
+///
+/// `Ok(Some(why))`: the entry is intact and wired, but a Maven declaration
+/// may still build the base, so `vex` does not attest it
+/// ([`maven_reactor::unattestable_checked`]). Like the other unattested
+/// references, re-vendoring cannot clear that, so it is not drift:
+/// `vendor --check` verifies the entry and warns with `why`.
 pub fn check_entry(
     root: &Path,
     entry: &VendorEntry,
     local_repo: Option<&Path>,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
         group_id: &g,
@@ -1213,6 +1233,11 @@ pub fn check_entry(
     if !referenced {
         return Err("vendored artifact is no longer wired into the build".into());
     }
+    let unattested = if maven && !(sbt_entry || scala_cli_entry) {
+        maven_reactor::unattestable_checked(&read, &list, &c).map_err(|e| e.detail)?
+    } else {
+        None
+    };
     let mut tree_dirs = vec![plan.tree_dir.clone()];
     if maven && gradle {
         tree_dirs.push(gradle::tree_dir(&c));
@@ -1249,7 +1274,7 @@ pub fn check_entry(
     if let Some(rel) = reader.escaped() {
         return Err(outside_root_detail(&rel));
     }
-    Ok(())
+    Ok(unattested)
 }
 
 /// The vendored jar of the JVM `entry` for `uuid`, project-relative: the
@@ -1467,6 +1492,18 @@ mod tests {
         assert!(!discovery.vendor_entry_live(root, &e).await);
         assert!(entry_references(root, &e));
         assert_eq!(discovery.vendor_entry_in_use(root, &e).await, Some(true));
+        // Undecided, not dead: `scan`'s takeover classifier stays silent.
+        assert_eq!(entry_liveness(root, &e), None);
+        assert_eq!(discovery.vendor_entry_liveness(root, &e).await, None);
+        // Readable and referenced nowhere: dead.
+        std::fs::remove_dir(root.join("m/pom.xml")).unwrap();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>t</groupId>\
+             <artifactId>root</artifactId><version>1</version></project>",
+        )
+        .unwrap();
+        assert_eq!(entry_liveness(root, &e), Some(false));
     }
 
     #[test]

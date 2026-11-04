@@ -516,19 +516,16 @@ pub fn unplan(
     }
 }
 
-/// [`wired_checked`], `false` when the reactor cannot be read.
-pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
-    wired_checked(read, list, c).unwrap_or(false)
-}
-
 /// Whether a declaration Maven always reads wires `c`: a `<dependencies>`
 /// or `<dependencyManagement>` entry of a reactor pom (outside
 /// `<profiles>`, `<build>` and `<reporting>`) naming `c`'s main jar at its
 /// suffixed version — literally or through a property the checkout defines
-/// — or the root's pin. The liveness proof `vex` needs for this layout:
-/// the suffixed version left only in a build plugin's dependencies, a
-/// profile, an unused property, a comment or a classifier copy does not
-/// put the patched jar on the project's classpath.
+/// for the pom that declares it or one that inherits it, as Maven
+/// interpolates after inheritance — or the root's pin. The liveness proof
+/// `vex` needs for this layout: the suffixed version left only in a build
+/// plugin's dependencies, a profile, an unused property, a comment or a
+/// classifier copy does not put the patched jar on the project's
+/// classpath.
 pub fn wired_checked(
     read: ReadFn<'_>,
     list: ListFn<'_>,
@@ -620,17 +617,32 @@ pub fn refuse_unwired(
 /// that may still read the base: the base itself, as a module or
 /// dependency added since vendoring declares it (#584), or a `${...}` the
 /// checkout does not define or that an inheriting pom or a profile moves
-/// (#513, #459). Such a module builds the unpatched jar, so `vex` must
-/// not attest.
+/// (#513, #459), a version-less one whose local root is left unpinned, or
+/// an executable classifier or type copy of the GA (`tests`, `test-jar`, a
+/// native build) the pin does not retarget. Such a module builds the
+/// unpatched jar, so `vex` must not attest.
 pub fn attestable_checked(
     read: ReadFn<'_>,
     list: ListFn<'_>,
     c: &Coords<'_>,
 ) -> Result<bool, JvmRefusal> {
+    Ok(unattestable_checked(read, list, c)?.is_none())
+}
+
+/// Why [`attestable_checked`] fails for `c`, `None` when it passes.
+pub fn unattestable_checked(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    c: &Coords<'_>,
+) -> Result<Option<String>, JvmRefusal> {
     let sv = c.suffixed_version();
+    let ga = format!("{}:{}", c.group_id, c.artifact_id);
     let reactor = Reactor::discover(read, list)?;
     if !reactor.wires(c) {
-        return Ok(false);
+        return Ok(Some(format!(
+            "no dependency or dependencyManagement declaration Maven always reads names \
+             {ga}:{sv}"
+        )));
     }
     let patch = JvmPatch {
         group_id: c.group_id,
@@ -657,7 +669,17 @@ pub fn attestable_checked(
             &mut uncertain,
         );
     }
-    Ok(edits.is_empty() && uncertain.is_empty())
+    let mut at: Vec<String> = edits.into_keys().collect();
+    at.extend(uncertain);
+    Ok((!at.is_empty()).then(|| {
+        format!(
+            "{} may still build {ga}:{} rather than {sv}: a base version declared since \
+             vendoring, a version a property, profile or unpinned root may move, or an \
+             executable classifier or type copy the pin does not retarget",
+            at.join(", "),
+            c.version
+        )
+    }))
 }
 
 /// `<!-- socket-patch <uuid>:` — the start of `c`'s pin comment.
@@ -1284,12 +1306,7 @@ fn jar_declaration(doc: &Doc, g: &str, a: &str) -> Option<(usize, bool)> {
     let is_jar = |dep: usize| {
         doc.child_text(dep, "groupId").as_deref() == Some(g)
             && doc.child_text(dep, "artifactId").as_deref() == Some(a)
-            && doc
-                .child_text(dep, "classifier")
-                .is_none_or(|c| c.is_empty())
-            && doc
-                .child_text(dep, "type")
-                .is_none_or(|t| t.is_empty() || t == "jar")
+            && doc.is_main_jar(dep)
     };
     let managed = doc
         .child(doc.project, "dependencyManagement")
@@ -1747,21 +1764,64 @@ impl Reactor {
         let sv = c.suffixed_version();
         self.scope.iter().any(|rel| {
             let doc = &self.poms[rel].doc;
-            let resolve = |v: &str| self.interpolate(rel, v, 0);
-            let value = |dep: usize, name: &str| doc.coordinate(dep, name, &resolve);
-            doc.declarations().into_iter().any(|dep| {
-                !doc.section_of(dep).starts_with("profile:")
-                    && value(dep, "groupId").as_deref() == Some(c.group_id)
-                    && value(dep, "artifactId").as_deref() == Some(c.artifact_id)
-                    && doc
-                        .child_text(dep, "type")
-                        .is_none_or(|t| t.is_empty() || t == "jar")
-                    && doc
-                        .child_text(dep, "classifier")
-                        .is_none_or(|t| t.is_empty())
-                    && value(dep, "version").as_deref() == Some(sv.as_str())
-            })
+            doc.declarations()
+                .into_iter()
+                .filter(|&dep| !doc.section_of(dep).starts_with("profile:") && doc.is_main_jar(dep))
+                .any(|dep| {
+                    // Maven interpolates after inheritance: the declaring
+                    // pom or any pom inheriting it may define the property.
+                    std::iter::once(rel.as_str())
+                        .chain(self.inheritors(rel))
+                        .any(|reader| {
+                            let resolve = |v: &str| self.interpolate(reader, v, 0);
+                            let value = |name: &str| doc.coordinate(dep, name, &resolve);
+                            value("groupId").as_deref() == Some(c.group_id)
+                                && value("artifactId").as_deref() == Some(c.artifact_id)
+                                && value("version").as_deref() == Some(sv.as_str())
+                        })
+                })
         })
+    }
+
+    /// The version `rel` reads for `g:a`'s main jar from
+    /// `<dependencyManagement>`: the nearest local pom on its chain that
+    /// manages it (Maven merges management child over parent; the local
+    /// root's pin is such an entry), interpolated as `rel` reads it.
+    /// `None` when no local pom manages it — the version then comes from
+    /// outside the checkout (an external parent or BOM) or a transitive
+    /// path — or when it cannot be interpolated.
+    fn managed_version(&self, rel: &str, g: &str, a: &str) -> Option<String> {
+        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        self.chain(rel)
+            .find_map(|p| {
+                let doc = &self.poms[p].doc;
+                doc.declarations()
+                    .into_iter()
+                    .find(|&dep| {
+                        doc.is_top_level_managed(dep)
+                            && doc.is_main_jar(dep)
+                            && doc.coordinate(dep, "groupId", &resolve).as_deref() == Some(g)
+                            && doc.coordinate(dep, "artifactId", &resolve).as_deref() == Some(a)
+                    })
+                    .map(|dep| doc.coordinate(dep, "version", &resolve))
+            })
+            .flatten()
+    }
+
+    /// Whether every pom that reads `dep` of `rel` resolves its version
+    /// to `sv`: `rel` and each pom inheriting it, with or without a
+    /// profile on its chain active (see [`Self::version_moved`]).
+    fn always_reads(&self, rel: &str, dep: usize, sv: &str) -> bool {
+        let doc = &self.poms[rel].doc;
+        let Some(declared) = doc.child_text(dep, "version") else {
+            return false;
+        };
+        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        doc.coordinate(dep, "version", &resolve).as_deref() == Some(sv)
+            && (!declared.contains("${")
+                || self
+                    .version_moved(rel, &declared, &|v: &str| v != sv)
+                    .is_none())
     }
 
     /// The g:a declarations of `rel`, with `${...}` coordinates
@@ -1859,7 +1919,19 @@ impl Reactor {
         base: &str,
         sv: &str,
     ) -> Option<(String, String)> {
-        let moved = |v: &str| !is_base_like(v, base) && v != sv;
+        self.version_moved(rel, declared, &|v: &str| !is_base_like(v, base) && v != sv)
+    }
+
+    /// The first version `declared` reaches in a pom that reads it (an
+    /// inheritor of `rel`, or `rel` or an inheritor with a profile on its
+    /// chain active) for which `moved` holds, and where; an undefined
+    /// value is passed as `an undefined value`.
+    fn version_moved(
+        &self,
+        rel: &str,
+        declared: &str,
+        moved: &dyn Fn(&str) -> bool,
+    ) -> Option<(String, String)> {
         std::iter::once(rel)
             .chain(self.inheritors(rel))
             .find_map(|reader| {
@@ -1914,36 +1986,34 @@ impl Reactor {
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
         self.warn_unresolved_coordinates(rel, patch, warnings, unpinned, uncertain);
         for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
-            if doc
-                .child_text(dep, "type")
-                .is_some_and(|t| !t.is_empty() && t != "jar")
-            {
-                continue;
-            }
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
-            if let Some(classifier) = doc.child_text(dep, "classifier").filter(|c| !c.is_empty()) {
-                warnings.push(degraded(
-                    "classifier_declared",
-                    format!("{at}: a classifier variant of {ga} bypasses the pin"),
-                ));
+            let managed_section = doc.section_of(dep).ends_with("dependencyManagement");
+            if !doc.is_main_jar(dep) {
+                let type_text = doc.child_text(dep, "type").filter(|t| !t.is_empty());
+                let classifier = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
+                let executable = crate::formats::maven::is_executable_variant(
+                    type_text.as_deref(),
+                    classifier.as_deref(),
+                );
+                if classifier.is_some() || executable {
+                    let what = match (&classifier, &type_text) {
+                        (Some(c), _) => format!("classifier {c}"),
+                        (None, Some(t)) => format!("<type>{t}</type>"),
+                        (None, None) => "classifier".to_string(),
+                    };
+                    warnings.push(degraded(
+                        "classifier_declared",
+                        format!("{at}: the {what} variant of {ga} bypasses the pin"),
+                    ));
+                }
                 // The classifier-less pin does not retarget the copy and the
                 // tree serves only the main jar, so Maven fetches the public
-                // release: an executable copy (tests, a native build) keeps
-                // the unpatched code on the classpath, which hosted mode and
-                // VEX discovery refuse to attest too. Only a used copy
-                // counts; a managed entry alone puts nothing on a classpath.
-                let resolved = || {
-                    let v = doc.child_text(dep, "version")?;
-                    if v.contains("${") {
-                        self.interpolate(rel, &v, 0)
-                    } else {
-                        Some(v)
-                    }
-                };
-                if !doc.section_of(dep).ends_with("dependencyManagement")
-                    && crate::formats::maven::is_executable_classifier(&classifier)
-                    && resolved().as_deref() != Some(sv)
-                {
+                // release: an executable copy (tests, a `test-jar`, a native
+                // build) keeps the unpatched code on the classpath, which
+                // hosted mode and VEX discovery refuse to attest too. Only a
+                // used copy counts; a managed entry alone puts nothing on a
+                // classpath.
+                if executable && !managed_section && !self.always_reads(rel, dep, sv) {
                     uncertain.insert(at);
                 }
                 continue;
@@ -1977,6 +2047,17 @@ impl Reactor {
                 managed_roots.insert(root.clone());
             }
             let Some(version) = doc.child(dep, "version") else {
+                // A version-less declaration reads its management: under a
+                // local root left unpinned (management conflicting or
+                // unresolved outside the checkout) that may be the base.
+                if !managed_section
+                    && self
+                        .managed_version(rel, patch.group_id, patch.artifact_id)
+                        .as_deref()
+                        != Some(sv)
+                {
+                    uncertain.insert(at);
+                }
                 continue;
             };
             let declared = doc.text_of(version);
@@ -2086,14 +2167,8 @@ impl Reactor {
                 Some(v) => v == want,
                 None => may_interpolate_to(raw, want),
             };
-            let other_variant = doc
-                .child_text(dep, "type")
-                .is_some_and(|t| !t.is_empty() && t != "jar")
-                || doc
-                    .child_text(dep, "classifier")
-                    .is_some_and(|c| !c.is_empty());
             if unresolved.is_empty()
-                || other_variant
+                || !doc.is_main_jar(dep)
                 || !could_be(&g, patch.group_id)
                 || !could_be(&a, patch.artifact_id)
             {
@@ -3136,6 +3211,15 @@ impl Doc {
                                 .is_some_and(|p| self.is_model_root(p))))
             })
             .collect()
+    }
+
+    /// Whether `dep` declares its GA's main jar (see
+    /// [`crate::formats::maven::is_main_jar`]).
+    fn is_main_jar(&self, dep: usize) -> bool {
+        crate::formats::maven::is_main_jar(
+            self.child_text(dep, "type").as_deref(),
+            self.child_text(dep, "classifier").as_deref(),
+        )
     }
 
     /// `project/dependencyManagement/dependencies/dependency`.
@@ -4428,25 +4512,46 @@ mod tests {
         assert_eq!(text(&after, "b/pom.xml"), b.replace("1.10.0", SV));
     }
 
+    /// Plugin dependencies, exclusions and other types are never
+    /// rewritten. A type that carries code (`test-jar` is the `tests`
+    /// classifier jar; `ejb`, `maven-plugin` and unknown types are
+    /// executable too) bypasses the pin like an executable classifier
+    /// copy: it warns and is not attestable. A `pom` or `java-source` type
+    /// holds no code and passes silently.
     #[test]
     fn plugin_dependencies_exclusions_and_other_types_are_untouched() {
-        let a = format!(
-            "<project>\n  <parent><groupId>t</groupId><artifactId>root</artifactId><version>1-SNAPSHOT</version></parent>\n  \
-             <artifactId>a</artifactId>\n  <dependencies>\n    \
-             <dependency><groupId>x</groupId><artifactId>y</artifactId><version>1</version>\
-             <exclusions><exclusion><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId></exclusion></exclusions></dependency>\n    \
-             <dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.10.0</version><type>test-jar</type></dependency>\n  \
-             </dependencies>\n  <build><plugins><plugin><artifactId>p</artifactId><dependencies>{}</dependencies></plugin></plugins></build>\n</project>\n",
-            dep("1.10.0")
-        );
-        let files = fs(&[
-            ("pom.xml", ROOT),
-            ("a/pom.xml", &a),
-            ("b/pom.xml", &module("b", "")),
-        ]);
-        let (plan, after) = vendor(&files);
-        assert!(plan.warnings.is_empty());
-        assert_eq!(text(&after, "a/pom.xml"), a);
+        for (type_text, executable) in [
+            ("test-jar", true),
+            ("ejb", true),
+            ("ejb-client", true),
+            ("pom", false),
+            ("java-source", false),
+        ] {
+            let a = format!(
+                "<project>\n  <parent><groupId>t</groupId><artifactId>root</artifactId><version>1-SNAPSHOT</version></parent>\n  \
+                 <artifactId>a</artifactId>\n  <dependencies>\n    \
+                 <dependency><groupId>x</groupId><artifactId>y</artifactId><version>1</version>\
+                 <exclusions><exclusion><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId></exclusion></exclusions></dependency>\n    \
+                 <dependency><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.10.0</version><type>{type_text}</type></dependency>\n  \
+                 </dependencies>\n  <build><plugins><plugin><artifactId>p</artifactId><dependencies>{}</dependencies></plugin></plugins></build>\n</project>\n",
+                dep("1.10.0")
+            );
+            let files = fs(&[
+                ("pom.xml", ROOT),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            let (plan, after) = vendor(&files);
+            let warned: &[&str] = if executable {
+                &["classifier_declared"]
+            } else {
+                &[]
+            };
+            assert_eq!(reasons(&plan), warned, "{type_text}");
+            assert_eq!(text(&after, "a/pom.xml"), a, "{type_text}");
+            assert!(text(&after, "pom.xml").contains(PIN_TAG), "{type_text}");
+            assert_eq!(attestable(&after), (true, !executable), "{type_text}");
+        }
     }
 
     #[test]
@@ -6086,6 +6191,167 @@ mod tests {
         let (_, after) = vendor(&files);
         assert!(text(&after, "pom.xml").contains(SV));
         assert_eq!(attestable(&after), (true, true));
+    }
+
+    /// A classifier copy whose `${...}` version reads the pin where it is
+    /// declared still builds the base where an inheriting pom, or a
+    /// profile, moves the property back: the same override check as the
+    /// main jar's declarations.
+    #[test]
+    fn a_classifier_copy_a_reader_moves_back_to_the_base_is_not_attestable() {
+        let copy = "<dependencies><dependency><groupId>org.apache.commons</groupId>\
+                    <artifactId>commons-text</artifactId><version>${ct.tests}</version>\
+                    <classifier>tests</classifier></dependency></dependencies>\n  <build>";
+        let root = ROOT
+            .replace(
+                "  <modules>",
+                &format!("  <properties><ct.tests>{SV}</ct.tests></properties>\n  <modules>"),
+            )
+            .replace("  <build>", &format!("  {copy}"));
+        let base = "<ct.tests>1.10.0</ct.tests>";
+        let b_moves = module("b", "").replace(
+            "  <dependencies>",
+            &format!("  <properties>{base}</properties>\n  <dependencies>"),
+        );
+        for (what, root, b, attests) in [
+            (
+                "every reader reads the pin",
+                root.clone(),
+                module("b", ""),
+                true,
+            ),
+            ("an inheritor moves it", root.clone(), b_moves, false),
+            (
+                "a profile moves it",
+                with_profile(&root, "base", base),
+                module("b", ""),
+                false,
+            ),
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root),
+                ("a/pom.xml", &module("a", &dep("1.10.0"))),
+                ("b/pom.xml", &b),
+            ]);
+            let (_, after) = vendor(&files);
+            assert_eq!(attestable(&after), (true, attests), "{what}");
+        }
+    }
+
+    /// Two local roots (remote parents): one pinned, the other left
+    /// unpinned because its parent's management cannot be read. The
+    /// pinned root wires the patch, but a version-less declaration under
+    /// the unpinned one resolves whatever that parent manages, maybe the
+    /// base: not attestable.
+    #[test]
+    fn a_version_less_declaration_under_an_unpinned_root_is_not_attestable() {
+        let agg = "<project>\n  <groupId>t</groupId>\n  <artifactId>agg</artifactId>\n  \
+                   <version>1</version>\n  <packaging>pom</packaging>\n  <modules>\n    \
+                   <module>a</module>\n    <module>b</module>\n  </modules>\n</project>\n";
+        let child = |name: &str| {
+            format!(
+                "<project>\n  <parent>\n    <groupId>com.corp</groupId>\n    \
+                 <artifactId>parent-{name}</artifactId>\n    <version>1</version>\n    \
+                 <relativePath/>\n  </parent>\n  <groupId>t</groupId>\n  \
+                 <artifactId>{name}</artifactId>\n  <dependencies>\n    \
+                 <dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId></dependency>\n  </dependencies>\n\
+                 </project>\n"
+            )
+        };
+        let files = fs(&[
+            ("pom.xml", agg),
+            ("a/pom.xml", &child("a")),
+            ("b/pom.xml", &child("b")),
+        ]);
+        let parent = |name: &str| {
+            let a = format!("parent-{name}");
+            (corp(&a, "1"), Some(bom(&a, "1", "")))
+        };
+        // parent-b is unavailable: b is left unpinned.
+        let plan = run_external(&files, &ExternalPoms::from([parent("a")]))
+            .0
+            .unwrap();
+        assert_eq!(reasons(&plan), ["management_unresolved"]);
+        let after = applied(&files, &plan);
+        assert!(text(&after, "a/pom.xml").contains(PIN_TAG));
+        assert!(!text(&after, "b/pom.xml").contains(PIN_TAG));
+        assert_eq!(attestable(&after), (true, false));
+        // Both parents readable: both roots pinned, and it attests.
+        let plan = run_external(&files, &ExternalPoms::from([parent("a"), parent("b")]))
+            .0
+            .unwrap();
+        assert!(reasons(&plan).is_empty(), "{:?}", plan.warnings);
+        assert_eq!(attestable(&applied(&files, &plan)), (true, true));
+    }
+
+    /// Maven interpolates after inheritance: a parent's managed
+    /// `${ct.version}` that every module defines as the suffixed version
+    /// wires the patch, so the plan is not refused as wiring nothing.
+    #[test]
+    fn a_parent_declaration_its_modules_resolve_to_the_pin_is_wired() {
+        let managed = "<dependencyManagement><dependencies><dependency>\
+                       <groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId>\
+                       <version>${ct.version}</version></dependency></dependencies>\
+                       </dependencyManagement>\n  <build>";
+        let root = ROOT.replace("  <build>", &format!("  {managed}"));
+        let child = |name: &str| {
+            module(
+                name,
+                "<dependency><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-text</artifactId></dependency>",
+            )
+            .replace(
+                "  <dependencies>",
+                &format!(
+                    "  <properties><ct.version>{SV}</ct.version></properties>\n  <dependencies>"
+                ),
+            )
+        };
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &child("a")),
+            ("b/pom.xml", &child("b")),
+        ]);
+        let read = |p: &str| files.get(p).cloned();
+        assert!(wired_checked(&read, &lister(&files), &patch().coords()).unwrap());
+        let plan = run(&files).unwrap();
+        refuse_unwired(&read, &lister(&files), &patch().coords(), &plan).unwrap();
+    }
+
+    /// `vendor --check` agrees with `vex`: an intact, wired entry that a
+    /// declaration added since may keep building the base is verified
+    /// (re-vendoring cannot clear an executable copy) with the reason
+    /// `vex` does not attest it.
+    #[tokio::test]
+    async fn vendor_check_reports_an_unattestable_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        super::super::testing::populate(
+            root,
+            &[
+                ("pom.xml", ROOT),
+                ("a/pom.xml", &module("a", &dep("1.10.0"))),
+                ("b/pom.xml", &module("b", "")),
+            ],
+        );
+        let mut ledger = BTreeMap::new();
+        super::super::testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap();
+        let check = || super::super::apply::check_entry(root, entry, None);
+        assert_eq!(check(), Ok(None));
+        let copy = "<dependency><groupId>org.apache.commons</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version>\
+                    <type>test-jar</type></dependency>";
+        std::fs::write(root.join("b/pom.xml"), module("b", copy)).unwrap();
+        let why = check().unwrap().expect("not attestable");
+        assert!(why.starts_with("b/pom.xml:"), "{why}");
+        assert_eq!(
+            super::super::apply::entry_wired_checked(root, entry),
+            Ok(false)
+        );
     }
 
     /// #584: a module added after vendoring, or a dependency added to an
