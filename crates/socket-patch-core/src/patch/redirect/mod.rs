@@ -7069,6 +7069,11 @@ pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sou
 /// packages already (`packageSourceMapping`, which NuGet merges too).
 pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
 
+/// The synthetic candidate key present, holding the reason, when NuGet
+/// would also merge a parent config above the repository root, which is
+/// never read ([`crate::vendor::nuget_config::Inherited::outside`]).
+pub const NUGET_INHERITED_OUTSIDE_KEY: &str = "<socket-patch:nuget-inherited-outside>";
+
 /// A config with no sources, the base of a fresh one when the inherited
 /// configs dropped nuget.org.
 const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
@@ -7293,6 +7298,16 @@ fn rewrite_nuget(
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_lock_other_version".into(),
                 detail,
+            });
+            continue;
+        }
+        // A parent config above the repository root is merged by NuGet but
+        // never read here, so the sources and mappings this edit must
+        // account for are unknown: skip rather than guess.
+        if let Some(why) = files.get(NUGET_INHERITED_OUTSIDE_KEY) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_inherited_config_outside_root".into(),
+                detail: format!("{why}; {} not redirected", dep.name),
             });
             continue;
         }
@@ -27579,6 +27594,31 @@ packages:
         files.insert("nuget.config".to_string(), default_nuget_config());
         let r = rewrite_registry_redirect(&files, &[nuget_override()]);
         assert_eq!(nuget_catch_all(&r.files["nuget.config"]), ["nuget.org"]);
+    }
+
+    /// A parent config above the repository root, which the engine never
+    /// reads, skips the dep with a warning and writes nothing.
+    #[test]
+    fn nuget_inherited_config_outside_the_repository_skips_the_dep() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org".to_string(),
+        );
+        files.insert(
+            NUGET_INHERITED_OUTSIDE_KEY.to_string(),
+            "NuGet also merges /x/nuget.config, which is outside the repository root".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_nuget_inherited_config_outside_root"]
+        );
     }
 
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget

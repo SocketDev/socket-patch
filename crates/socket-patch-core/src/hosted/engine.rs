@@ -807,6 +807,12 @@ pub async fn read_candidate_files(
                     String::new(),
                 );
             }
+            if let Some(why) = inherited.outside_refusal() {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_OUTSIDE_KEY.to_string(),
+                    why,
+                );
+            }
         }
     }
 
@@ -4403,6 +4409,8 @@ mod tests {
     #[tokio::test]
     async fn issue_1951_yarn_classic_copy_manifests_read_as_vendored_reads_them() {
         let tmp = tempfile::tempdir().unwrap();
+        // The repository every path of the fixture lives in.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let root = tmp.path().join("app");
         let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
         for dir in ["app/lpdir", "ext/lpdir", "abs/lpdir"] {

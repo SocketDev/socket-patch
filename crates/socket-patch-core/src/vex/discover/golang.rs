@@ -1964,7 +1964,11 @@ mod tests {
         let missing = outside.path().join("nonexistent").join("go.work");
         for (gowork, why) in [
             ("go.work".to_string(), "not an absolute path"),
-            (missing.to_string_lossy().into_owned(), "other than"),
+            // Outside the repository root: never read, never modeled.
+            (
+                missing.to_string_lossy().into_owned(),
+                "outside the repository root",
+            ),
             (elsewhere.to_string_lossy().into_owned(), "other than"),
         ] {
             let out = extract(Some(gowork.clone())).await;

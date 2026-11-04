@@ -13,6 +13,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::utils::fs::{read_regular_to_bytes, read_regular_to_string};
+use crate::utils::repo_root::bounded_project_path;
 
 /// One in-memory file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,10 +616,12 @@ impl<'a> DiskSnapshot<'a> {
 
     async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
         self.touch(rel);
+        // Before the cache, which would not keep the refusal's payload.
+        let path = bounded_project_path(self.root, rel)?;
         if let Some(hit) = self.cached(rel) {
             return hit.map(|b| b.to_vec());
         }
-        let read = read_regular_to_bytes(&self.root.join(rel)).await;
+        let read = read_regular_to_bytes(&path).await;
         self.remember(rel, &read);
         read
     }
@@ -736,35 +739,46 @@ impl<'a> ProjectView<'a> {
         }
     }
 
-    /// FIFO-safe regular-file text read.
+    /// FIFO-safe regular-file text read. A `rel` that climbs out of the
+    /// repository root (`../…`, absolute) is refused as missing
+    /// ([`bounded_project_path`]).
     pub async fn read_text(&self, rel: &str) -> io::Result<String> {
         if let ProjectView::Snapshot(snap) = self {
             snap.touch(rel);
         }
         match self {
-            ProjectView::Disk(root) => read_regular_to_string(&root.join(rel)).await,
+            ProjectView::Disk(root) => {
+                read_regular_to_string(&bounded_project_path(root, rel)?).await
+            }
             ProjectView::Memory(project) => project.read_text(rel),
-            ProjectView::Snapshot(snap) => match snap.cached(rel) {
-                Some(hit) => hit.and_then(|b| utf8(b.to_vec())),
-                None => {
-                    let read = read_regular_to_string(&snap.root.join(rel)).await;
-                    snap.remember(
-                        rel,
-                        &read
-                            .as_ref()
-                            .map(|t| t.as_bytes().to_vec())
-                            .map_err(|e| io::Error::new(e.kind(), e.to_string())),
-                    );
-                    read
+            ProjectView::Snapshot(snap) => {
+                // Before the cache, which would not keep the refusal's
+                // payload ([`crate::utils::repo_root::is_refused_read`]).
+                let path = bounded_project_path(snap.root, rel)?;
+                match snap.cached(rel) {
+                    Some(hit) => hit.and_then(|b| utf8(b.to_vec())),
+                    None => {
+                        let read = read_regular_to_string(&path).await;
+                        snap.remember(
+                            rel,
+                            &read
+                                .as_ref()
+                                .map(|t| t.as_bytes().to_vec())
+                                .map_err(|e| io::Error::new(e.kind(), e.to_string())),
+                        );
+                        read
+                    }
                 }
-            },
+            }
         }
     }
 
-    /// FIFO-safe regular-file byte read.
+    /// FIFO-safe regular-file byte read, bounded as [`Self::read_text`].
     pub async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
         match self {
-            ProjectView::Disk(root) => read_regular_to_bytes(&root.join(rel)).await,
+            ProjectView::Disk(root) => {
+                read_regular_to_bytes(&bounded_project_path(root, rel)?).await
+            }
             ProjectView::Memory(project) => project.read_bytes(rel),
             ProjectView::Snapshot(snap) => snap.read_bytes(rel).await,
         }

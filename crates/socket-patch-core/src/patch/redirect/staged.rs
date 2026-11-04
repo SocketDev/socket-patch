@@ -25,7 +25,11 @@ pub(super) type StagedBytes = BTreeMap<String, Vec<u8>>;
 /// blocking open — the same posture as every other raw read in the patch
 /// engine. Errors read `read <rel>: <cause>`.
 pub(super) async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
-    match crate::utils::fs::read_regular_to_string(&project_root.join(rel)).await {
+    // A writer's read outside the repository root refuses rather than
+    // reading as missing: what it would write next depends on it.
+    let path = crate::utils::repo_root::bounded_project_path(project_root, rel)
+        .map_err(|refused| format!("read {rel}: {refused}"))?;
+    match crate::utils::fs::read_regular_to_string(&path).await {
         Ok(content) => Ok(Some(content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("read {rel}: {e}")),
@@ -102,4 +106,32 @@ async fn refuse_non_regular(path: &Path, rel: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_rel;
+
+    /// The restore's reads stay inside the repository root: a file outside
+    /// it refuses (the restore stops) instead of reading as missing.
+    #[tokio::test]
+    async fn reads_outside_the_repository_refuse() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let root = repo.join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(repo.join(".npmrc"), "x=1\n").unwrap();
+        std::fs::write(tmp.path().join(".npmrc"), "x=2\n").unwrap();
+        assert_eq!(
+            read_rel(&root, "../.npmrc").await,
+            Ok(Some("x=1\n".to_string()))
+        );
+        assert_eq!(read_rel(&root, "../missing").await, Ok(None));
+        let above = tmp.path().join(".npmrc");
+        for rel in ["../../.npmrc".to_string(), above.display().to_string()] {
+            let err = read_rel(&root, &rel).await.unwrap_err();
+            assert!(err.contains("outside the repository root"), "{rel}: {err}");
+        }
+    }
 }

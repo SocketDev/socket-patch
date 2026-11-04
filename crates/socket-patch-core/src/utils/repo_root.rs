@@ -124,6 +124,119 @@ pub fn find_git_repo(start: &Path) -> Option<GitRepo> {
     repo_at_end_of(search_dirs(start))
 }
 
+/// The directory no read of a PROJECT file may leave: the git checkout
+/// enclosing `project_root` ([`find_git_repo`]), else `project_root`
+/// itself. Canonical when `project_root` exists.
+///
+/// Every reader and writer that follows a project file's reference
+/// (an ancestor `go.work`, a `-r ../x.txt` include, a parent
+/// `nuget.config`, a `file:../x` dependency) asks [`ReadBoundary::contains`]
+/// before opening it: a refused read behaves like a missing file for a
+/// reader, and a writer refuses with a diagnostic instead of guessing.
+/// Machine-level tool configuration (`~/.npmrc`, the user NuGet.Config,
+/// the `GOENV` file, `$CARGO_HOME`) is not a project file and is not
+/// bounded by this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadBoundary {
+    root: PathBuf,
+}
+
+impl ReadBoundary {
+    /// The boundary for a project at `project_root`.
+    pub fn of(project_root: &Path) -> Self {
+        let project = canonical_or_lexical(project_root);
+        let root = find_git_repo(&project).map_or(project, |repo| repo.root);
+        ReadBoundary { root }
+    }
+
+    /// The boundary directory itself.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether `path` lies at or below the boundary. `path` is made
+    /// absolute against the working directory, `..` folded, and its
+    /// deepest existing level canonicalized, so neither a `..` nor a
+    /// symlinked level inside the tree reaches outside it.
+    pub fn contains(&self, path: &Path) -> bool {
+        canonical_or_lexical(path).starts_with(&self.root)
+    }
+
+    /// The user-facing reason a read of `path` was refused.
+    pub fn refusal(&self, path: &Path) -> String {
+        format!(
+            "{} is outside the repository root {}; socket-patch does not read project \
+             files outside it",
+            path.display(),
+            self.root.display()
+        )
+    }
+}
+
+/// `project_root.join(rel)` for a project file named by a root-relative
+/// `rel` that may climb (`../shared/requirements.txt`) or be absolute;
+/// `Err` of kind `NotFound` (a refused read reads as a missing file)
+/// carrying [`ReadBoundary::refusal`] when it lies outside the repository
+/// root. A plain in-tree `rel` (no `..`, not absolute) is never refused,
+/// and costs no filesystem lookups.
+pub fn bounded_project_path(project_root: &Path, rel: &str) -> std::io::Result<PathBuf> {
+    let path = project_root.join(rel);
+    let climbs =
+        crate::utils::relpath::is_anchored(rel) || rel.split(['/', '\\']).any(|seg| seg == "..");
+    if climbs {
+        let bound = ReadBoundary::of(project_root);
+        if !bound.contains(&path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                OutsideRepoRoot(bound.refusal(&path)),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+/// The payload of a read [`bounded_project_path`] refused.
+#[derive(Debug)]
+struct OutsideRepoRoot(String);
+
+impl std::fmt::Display for OutsideRepoRoot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for OutsideRepoRoot {}
+
+/// Whether `e` is a read [`bounded_project_path`] refused. It reads as
+/// `NotFound` (missing) to a reader; a writer, which must not proceed as
+/// if the file were absent, refuses on it instead.
+pub fn is_refused_read(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<OutsideRepoRoot>())
+}
+
+/// `path` absolute, `..` folded lexically, with its deepest existing level
+/// canonicalized (the rest re-appended as spelled).
+fn canonical_or_lexical(path: &Path) -> PathBuf {
+    let abs = crate::utils::relpath::absolute_lexically(path);
+    let mut tail = Vec::new();
+    let mut probe: &Path = &abs;
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(probe) {
+            let mut out = canon;
+            out.extend(tail.iter().rev());
+            return out;
+        }
+        match (probe.parent(), probe.file_name()) {
+            (Some(parent), Some(name)) => {
+                tail.push(name.to_os_string());
+                probe = parent;
+            }
+            _ => return abs,
+        }
+    }
+}
+
 /// The checkout AT the home directory that a lookup from `start` stopped
 /// short of (the home rule), if there is one: for callers that should say
 /// why a repository the user may expect was not used.
@@ -268,6 +381,54 @@ mod tests {
         let mut dirs = search_dirs_with(&sub, Some(&base.join("outer")), &[], false);
         dirs.remove(0);
         assert!(dirs.is_empty(), "{dirs:?}");
+    }
+
+    #[test]
+    fn read_boundary_is_the_checkout_else_the_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        let project = repo.join("packages/app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        let bound = ReadBoundary::of(&project);
+        assert_eq!(bound.root(), repo.as_path());
+        assert!(bound.contains(&project.join("../../go.work")));
+        assert!(bound.contains(&repo.join("not/yet/created.txt")));
+        assert!(!bound.contains(&project.join("../../../go.work")));
+        assert!(!bound.contains(&base.join("sibling/.socket/vendor")));
+        // No checkout: the project itself is the boundary.
+        let plain = base.join("plain/app");
+        fs::create_dir_all(&plain).unwrap();
+        let bound = ReadBoundary::of(&plain);
+        assert_eq!(bound.root(), plain.as_path());
+        assert!(!bound.contains(&plain.join("../go.work")));
+        // A project file named by a climbing path: refused as missing.
+        let err = bounded_project_path(&plain, "../go.work").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert!(is_refused_read(&err));
+        assert_eq!(
+            bounded_project_path(&plain, "sub/go.work").unwrap(),
+            plain.join("sub/go.work")
+        );
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(!is_refused_read(&missing));
+    }
+
+    /// A symlink inside the tree that points out of it does not carry a
+    /// read across the boundary.
+    #[cfg(unix)]
+    #[test]
+    fn read_boundary_sees_through_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(base.join("outside")).unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), repo.join("link")).unwrap();
+        let bound = ReadBoundary::of(&repo);
+        assert!(!bound.contains(&repo.join("link/requirements.txt")));
+        assert!(bound.contains(&repo.join("requirements.txt")));
     }
 
     #[test]

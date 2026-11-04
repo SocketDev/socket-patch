@@ -3332,9 +3332,14 @@ pub(crate) mod testing {
 
         /// A project rooted at `sub/` inside the throwaway directory, so a
         /// fixture can write files beside it (`../ext/…`) without leaving
-        /// the tempdir (#1516).
+        /// the tempdir (#1516). The throwaway directory is the git
+        /// checkout, so what lies beside the project is inside the
+        /// repository root that bounds every read.
         pub(crate) fn nested(sub: &str) -> Self {
             let dir = tempfile::tempdir().expect("create tempdir");
+            if !sub.is_empty() {
+                std::fs::create_dir_all(dir.path().join(".git")).expect("create .git");
+            }
             let root = dir.path().join(sub);
             std::fs::create_dir_all(&root).expect("create project root");
             Project {

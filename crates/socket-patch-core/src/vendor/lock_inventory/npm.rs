@@ -13,7 +13,6 @@ use crate::constants::npm_family::NPM_LOCKS;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::npm_common::declares_bundled_deps;
 use crate::vendor::npm_origin::legacy_packages_key;
-use crate::vendor::path::parse_vendor_path;
 
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};

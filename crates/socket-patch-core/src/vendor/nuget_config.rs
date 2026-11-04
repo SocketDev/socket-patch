@@ -90,7 +90,8 @@ pub(crate) mod tests_support {
 /// default — the `nuget.org` source it writes on first run), then each
 /// parent directory's config from the filesystem root down, each `<clear />`
 /// dropping the farther ones. A file that cannot be read or parsed is
-/// skipped: it contributes nothing NuGet could use either.
+/// skipped: it contributes nothing NuGet could use either. A parent config
+/// above the repository root is not read ([`Inherited::outside`]).
 #[cfg(test)]
 pub(crate) async fn inherited_source_keys(project_root: &std::path::Path) -> Vec<String> {
     inherited_source_keys_traced(project_root).await.0.keys
@@ -106,6 +107,26 @@ pub(crate) struct Inherited {
     /// already route every other package, and a `*` catch-all written here
     /// would WIDEN a source they restrict.
     pub(crate) mapped: bool,
+    /// The nearest parent config above the repository root
+    /// ([`crate::utils::repo_root::ReadBoundary`]): NuGet merges it, but it
+    /// is never read, so `keys` and `mapped` cannot account for it and a
+    /// writer refuses ([`Inherited::outside_refusal`]).
+    pub(crate) outside: Option<std::path::PathBuf>,
+}
+
+impl Inherited {
+    /// Why a writer cannot wire `nuget.config` under a parent config it may
+    /// not read, if there is one.
+    pub(crate) fn outside_refusal(&self) -> Option<String> {
+        self.outside.as_ref().map(|path| {
+            format!(
+                "NuGet also merges {}, which is outside the repository root, so socket-patch \
+                 does not read it and cannot tell which sources and mappings it adds; move \
+                 the settings into the repository's nuget.config",
+                path.display()
+            )
+        })
+    }
 }
 
 /// [`Inherited`] for `project_root`.
@@ -137,6 +158,8 @@ pub(crate) async fn inherited_source_keys_traced(
         )],
         ..NugetConfig::default()
     }));
+    let bound = crate::utils::repo_root::ReadBoundary::of(project_root);
+    let mut outside = None;
     let mut ancestors: Vec<&std::path::Path> = project_root.ancestors().skip(1).collect();
     ancestors.reverse();
     for dir in ancestors {
@@ -146,6 +169,12 @@ pub(crate) async fn inherited_source_keys_traced(
             touched.push(path.clone());
             if !exists {
                 continue;
+            }
+            // Above the repository root: never read, only noted (nearest
+            // wins), so a writer can refuse instead of guessing.
+            if !bound.contains(&path) {
+                outside = Some(path);
+                break;
             }
             if let Some(cfg) = crate::utils::fs::read_regular_to_string(&path)
                 .await
@@ -162,6 +191,7 @@ pub(crate) async fn inherited_source_keys_traced(
         Inherited {
             keys: effective_source_keys(&chain),
             mapped,
+            outside,
         },
         touched,
     )
@@ -534,6 +564,7 @@ mod tests {
         .unwrap();
         let project = tmp.path().join("repo/app");
         std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
         USER_CONFIG.with(|c| *c.borrow_mut() = Some(user.clone()));
         assert_eq!(inherited_source_keys(&project).await, ["nuget.org", "corp"]);
         // A repo-root config adds its own feed.
@@ -565,6 +596,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("repo/app");
         std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
         assert!(!super::inherited_sources(&project).await.mapped);
         std::fs::write(
             tmp.path().join("repo/nuget.config"),
@@ -574,6 +606,30 @@ mod tests {
         let got = super::inherited_sources(&project).await;
         assert!(got.mapped);
         assert_eq!(got.keys, ["nuget.org", "corp"]);
+        assert_eq!(got.outside, None);
+    }
+
+    /// A parent config above the repository root is never read: its
+    /// sources and mappings do not show, and it is named so writers refuse.
+    #[tokio::test]
+    async fn a_parent_config_above_the_repository_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo/app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+        let above = tmp.path().join("nuget.config");
+        std::fs::write(
+            &above,
+            "<configuration><packageSources><clear /><add key=\"corp\" value=\"https://corp/\" /></packageSources><packageSourceMapping><packageSource key=\"corp\"><package pattern=\"*\" /></packageSource></packageSourceMapping></configuration>",
+        )
+        .unwrap();
+        let got = super::inherited_sources(&project).await;
+        assert_eq!(got.keys, ["nuget.org"], "never read");
+        assert!(!got.mapped);
+        assert_eq!(got.outside.as_deref(), Some(above.as_path()));
+        assert!(got
+            .outside_refusal()
+            .is_some_and(|why| why.contains("outside the repository root")));
     }
 
     /// The walk reads a symlinked project file, never enters build output

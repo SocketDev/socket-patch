@@ -50,7 +50,11 @@ async fn expected_text(t: &Target<'_>, name: &str, hash: &str) -> Option<String>
         e.module == t.module && (e.version.is_none() || e.version.as_deref() == Some(t.version))
     }) {
         if let Some(path) = &entry.path {
-            paths.push(t.root.join(path).join(name));
+            // A replacement directory outside the repository is never read.
+            let file = t.root.join(path).join(name);
+            if crate::utils::repo_root::ReadBoundary::of(t.root).contains(&file) {
+                paths.push(file);
+            }
         } else if let (Some(cache), Some(target), Some(ver)) = (
             GoCrawler::get_gomodcache(),
             &entry.rhs_module,

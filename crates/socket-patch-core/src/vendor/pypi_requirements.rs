@@ -537,7 +537,13 @@ pub(super) async fn pin_outside_root(
             // pip reads an include this walk can't (or fails the install):
             // its pins are unknowable, so fail closed rather than wire the
             // lock beside it. Discovery diagnoses the same file.
-            Err(e) if outside && e.kind() != std::io::ErrorKind::NotFound => {
+            // One outside the repository root is never read at all: its
+            // pins are just as unknowable.
+            Err(e)
+                if outside
+                    && (e.kind() != std::io::ErrorKind::NotFound
+                        || crate::utils::repo_root::is_refused_read(&e)) =>
+            {
                 found = Some((
                     "pypi_requirements_outside_root",
                     format!(
@@ -1388,6 +1394,16 @@ async fn collect_requirements_files(root: &Path) -> Result<Vec<ReqFile>, (&'stat
         Err(_) if out.is_empty() => Err((
             "pypi_no_requirements",
             format!("cannot read {}", root.join(rel).display()),
+        )),
+        // An include outside the repository root is never read, so the
+        // pins pip installs from it are unknowable: refuse, as for a pin
+        // found in an out-of-root include.
+        Err(e) if crate::utils::repo_root::is_refused_read(&e) => Err((
+            "pypi_requirements_outside_root",
+            format!(
+                "{rel}: {e}, so vendor cannot tell what pip installs from it; inline it or \
+                 use agent mode (`scan --mode agent` + `socket-patch apply`) instead"
+            ),
         )),
         // A broken include is pip's error to report; vendor just can't see
         // inside it. Skip.
@@ -3206,6 +3222,55 @@ mod tests {
                 .unwrap(),
             "six==1.16.0\n"
         );
+    }
+
+    /// An include inside the repository but outside the project is read
+    /// (its pin refuses as one outside the project); one outside the
+    /// repository is never read, and refuses because its pins are
+    /// unknowable. Discovery's and the lock flavors' walks see the same.
+    #[tokio::test]
+    async fn includes_outside_the_repository_are_never_read() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        let root = repo.join("project");
+        tokio::fs::create_dir_all(repo.join(".git")).await.unwrap();
+        tokio::fs::create_dir_all(&root).await.unwrap();
+        tokio::fs::write(repo.join("shared.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        tokio::fs::write(outer.path().join("above.txt"), "six==1.16.0\n")
+            .await
+            .unwrap();
+        let view = || crate::vendor::lock_inventory::ProjectView::Disk(&root);
+
+        tokio::fs::write(root.join("requirements.txt"), "-r ../shared.txt\n")
+            .await
+            .unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert!(err.1.contains("is pinned in"), "{err:?}");
+        assert_eq!(
+            requirements_outside_root_names_in(view()).await,
+            ["../shared.txt"]
+        );
+
+        tokio::fs::write(root.join("requirements.txt"), "-r ../../above.txt\n")
+            .await
+            .unwrap();
+        let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, "pypi_requirements_outside_root");
+        assert!(err.1.contains("outside the repository root"), "{err:?}");
+        let err = pin_outside_root(&root, "six", "1.16.0").await.unwrap();
+        assert_eq!(err.0, "pypi_requirements_outside_root");
+        assert!(err.1.contains("outside the repository root"), "{err:?}");
+        // To a reader it is missing.
+        let read = view().read_text("../../above.txt").await.unwrap_err();
+        assert_eq!(read.kind(), std::io::ErrorKind::NotFound);
+        assert!(crate::utils::repo_root::is_refused_read(&read));
+        assert!(requirements_outside_root_names_in(view()).await.is_empty());
     }
 
     // ── revert edge cases ────────────────────────────────────────────────

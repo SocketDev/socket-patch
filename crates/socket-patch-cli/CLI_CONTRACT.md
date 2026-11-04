@@ -661,7 +661,9 @@ are patched by `socket-patch apply` like every other ecosystem:
   --check` is a read-only audit of the committed redirect.
   The `go.work` in effect is resolved as go resolves it: `GOWORK` naming an absolute file, none under
   `GOWORK=off`, else (unset, empty or `auto`) the nearest `go.work` at or above the project; a relative
-  `GOWORK` is invalid to go, so nothing is written or attested. A `-modfile` in `GOFLAGS` (#1799)
+  `GOWORK` is invalid to go, so nothing is written or attested. A `go.work` outside the repository
+  root is never read and refuses the same way (see "Reads bounded to the repository root").
+  A `-modfile` in `GOFLAGS` (#1799)
   that names any file other than the project's `go.mod` (a relative one is taken from the project
   directory) makes go build from that file and ignore `go.mod`'s replaces, and in workspace mode go
   refuses `-modfile` outright: `apply`, `vendor` and `scan --mode hosted` write nothing
@@ -901,6 +903,16 @@ socket-patch creates `.socket/` and everything under it itself and never writes 
 - **Agent-mode apply and rollback outside the install tree**: `apply` and `rollback` (dry run included) refuse a package whose written directories resolve outside the install tree they were found in: a Composer path repository (`vendor/<ns>/<name>` linked to first-party source), a `flit install --symlink` / editable-by-link package, or a package directory a package manager links into `site-packages` from its own prefix (Homebrew's Cellar, a Nix store path). The per-package error carries `outside the install tree`. For `apply` the remedy is to patch that source directly or install the package as a copy; for `rollback` it is to restore that source from version control, since socket-patch does not write into a tree it does not own.
 
 Not covered: the agent-mode blob cache and manifest are checked from `.socket` down, so a `.socket` that is itself a link still redirects those writes (deciding that at lock time is deferred).
+
+### Reads bounded to the repository root
+
+VEX discovery, the lock inventory, hosted mode and vendored mode never read a PROJECT file outside the repository root: the git checkout enclosing the project (the nearest `.git`, by the same rules as the repository lookup), or the project directory itself when there is none. One check (core `utils::repo_root::ReadBoundary`) decides it; a level that resolves outside through `..` or a symlink counts as outside. A refused read behaves like a missing file to a reader; a writer refuses with the reason (`… is outside the repository root …; socket-patch does not read project files outside it`). Machine-level tool configuration (the user `~/.npmrc` / `.yarnrc.yml` / `NuGet.Config`, the `GOENV` file, `$CARGO_HOME`, module and package caches) is not a project file and is read as before.
+
+- **Go**: a `go.work` outside the root (an ancestor's, or one an absolute `GOWORK` names) is only noticed, never read: the workspace is invalid, so vendored and hosted writes refuse with the Go workspace refusal and discovery withholds every Go ref. Inside the root, a `use` member or a `replace` directory outside it reads as missing, so the selection it would decide is unknown.
+- **Requirements includes**: a `-r` include outside the root is never read. Discovery and the lock inventory see it as missing; vendored mode refuses `pypi_requirements_outside_root`, since the pins pip installs from it are unknowable.
+- **NuGet parent configs**: a `nuget.config` in a directory above the root is never read. Vendoring refuses (`… also merges <path>, which is outside the repository root …`) and hosted mode skips each NuGet dep with `redirect_nuget_inherited_config_outside_root`, writing nothing for it.
+- **Relative and absolute references read through the project view** (yarn `file:` / `portal:` / `link:` copies, include chains, any `../` path a lockfile names) and the hosted upstream restore's staged reads: outside the root they read as missing, and the restore refuses.
+- **Vendored ownership**: writers, reverters and the GC claim a lockfile reference only when it is root-anchored into THIS project's `.socket/vendor/` (`./.socket/vendor/…`, or `../` from a file below the root back to exactly the root). A sibling checkout's `../.socket/vendor/<eco>/<uuid>/…`, even for the same patch uuid, is never rewritten, reverted or deleted; the revert leaves it with `vendor_lock_entry_drifted` and keeps the artifact. The one exception is pnpm <= 8, which records override specifiers as machine-absolute paths itself: an absolute `…/.socket/vendor/npm/<uuid>/<leaf>` naming the entry's own uuid and leaf is still the entry's.
 
 ## Vendor command contract
 
