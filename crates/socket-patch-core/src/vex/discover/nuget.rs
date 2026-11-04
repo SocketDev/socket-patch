@@ -37,7 +37,15 @@
 //! derives it by stripping `sha512-` from the patch's SRI — so it is carried
 //! as [`LockIntegrity::Sri`] `sha512-<contentHash>`, and only when every lock
 //! entry of that version agrees (divergent hashes fail restore: diagnosed,
-//! no ref).
+//! no ref). Versions are keyed through `normalize_nuget_version`, as the
+//! writers match lock entries (`1.0` and `1.0.0` are one version).
+//!
+//! The mapping routes EVERY version of the id to a source that serves only
+//! the patched one, so both writers refuse a lock that also locks the id at
+//! another version (`*_nuget_lock_other_version`). Here such a source's refs
+//! stay refs (the wiring is still there to roll back) but are marked
+//! [`UnattestedKind::NugetLockOtherVersion`], never attested: see
+//! [`other_versions`] for how the patched version is known.
 //!
 //! **`integrity_required = true`** for hosted refs: `rewrite_nuget` refuses a
 //! dep without a sha512 (`redirect_nuget_missing_sha512`) and always writes
@@ -74,14 +82,14 @@ use serde_json::Value;
 
 use super::{
     parse_json, simple_purl, socket_patch_name_uuid, vendor_ref, vendor_uuid_dir, DiscoverCtx,
-    Discovery, PatchedRef, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE,
+    Discovery, PatchedRef, UnattestedKind, UnlockedPin, WiringMode, DIAG_LOCKFILE_UNPARSEABLE,
     DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::nuget::lock::nuget_lock_entries;
 use crate::formats::nuget::{parse_config, NugetConfig};
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::nuget_config::{same_file, CONFIG_NAMES};
-use crate::vendor::nuget_feed::{is_plain_nuget_token, nupkg_leaf};
+use crate::vendor::nuget_feed::{is_plain_nuget_token, normalize_nuget_version, nupkg_leaf};
 use crate::vendor::path::VENDOR_DIR;
 
 /// The lock NuGet writes beside the project (default name).
@@ -268,9 +276,16 @@ fn is_nuget_id(id: &str) -> bool {
 
 // ── packages.lock.json ───────────────────────────────────────────────────
 
-/// What the lock says about one `(id, resolved version)`.
+/// What the governed locks say about one `(id, version)`, the version
+/// keyed through [`normalize_nuget_version`] exactly as the writers match
+/// it (`locked_at`, `other_versions`): `1.0` and `1.0.0` are one package.
 #[derive(Debug, Default)]
 struct Pins {
+    /// The first trimmed `resolved` spelling seen — the purl's version
+    /// (purls compare NuGet versions through the same normalization).
+    spelling: String,
+    /// The governed locks that lock this version.
+    files: BTreeSet<String>,
     /// Distinct non-empty `contentHash` values across target frameworks.
     hashes: BTreeSet<String>,
     /// Some entry of this version carries no `contentHash`.
@@ -281,7 +296,7 @@ enum Lock {
     Absent,
     /// Present but unreadable / unparseable (already diagnosed).
     Unusable,
-    /// Lowercased id → resolved version → pins.
+    /// Lowercased id → normalized version → pins.
     Parsed(BTreeMap<String, BTreeMap<String, Pins>>),
 }
 
@@ -352,11 +367,17 @@ async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
             }
         };
         for entry in nuget_lock_entries(&doc) {
+            // The raw `resolved`, normalized as the writers' `other_versions`
+            // does: a spelling they count as another version is one here.
             let pins = index
                 .entry(entry.id.to_ascii_lowercase())
                 .or_default()
-                .entry(entry.resolved.trim().to_string())
-                .or_default();
+                .entry(normalize_nuget_version(entry.resolved))
+                .or_insert_with(|| Pins {
+                    spelling: entry.resolved.trim().to_string(),
+                    ..Pins::default()
+                });
+            pins.files.insert(rel.clone());
             match entry.content_hash {
                 Some(hash) if !hash.trim().is_empty() => {
                     pins.hashes.insert(hash.trim().to_string());
@@ -371,18 +392,32 @@ async fn load_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) -> Lock {
     Lock::Parsed(index)
 }
 
-/// The lock's `(version, integrity)` rows for `id`, or `None` when the lock
-/// has no entry for it. A version whose entries disagree on `contentHash` is
-/// diagnosed and dropped (NuGet fails that restore).
+/// What the governed locks say about one Socket source's id.
+struct Locked {
+    /// `(version, integrity)` per locked version (the first spelling of
+    /// each). A version whose entries disagree on `contentHash` is diagnosed
+    /// and dropped (NuGet fails that restore).
+    rows: Vec<(String, Option<LockIntegrity>)>,
+    /// `(file, detail)` when the id is also locked at a version other than
+    /// the patched one ([`other_versions`]): every row is then wired but
+    /// [`UnattestedKind::NugetLockOtherVersion`].
+    other: Option<(String, String)>,
+}
+
+/// The governed locks' rows for `src`'s id, or `None` when no lock has an
+/// entry for it. `patched` is the patched version, normalized, when the
+/// files name it (the vendored feed's single nupkg); see [`other_versions`].
 fn lock_versions(
     index: &BTreeMap<String, BTreeMap<String, Pins>>,
     src: &SocketSource,
+    patched: Option<&str>,
     cfg_rel: &str,
     out: &mut Discovery,
-) -> Option<Vec<(String, Option<LockIntegrity>)>> {
+) -> Option<Locked> {
     let versions = index.get(&src.id.to_ascii_lowercase())?;
     let mut rows = Vec::new();
-    for (version, pins) in versions {
+    for pins in versions.values() {
+        let version = &pins.spelling;
         if pins.hashes.len() > 1 {
             out.diag(
                 DIAG_REF_INVALID,
@@ -401,7 +436,57 @@ fn lock_versions(
         };
         rows.push((version.clone(), integrity));
     }
-    Some(rows)
+    Some(Locked {
+        rows,
+        other: other_versions(versions, src, patched, cfg_rel),
+    })
+}
+
+/// The writers' other-version rule (`formats::nuget::lock::other_versions`):
+/// the exact-id mapping routes EVERY version of the id to a Socket source
+/// that serves only the patched one, so a lock entry at any other version
+/// cannot restore, and both writers refuse to wire such a lock
+/// (`redirect_nuget_lock_other_version`, `vendor_nuget_lock_other_version`).
+/// The writers take the patched version from the patch; of the files, only
+/// the vendored feed names it (`patched`). A hosted source's url names only
+/// the uuid, so there any two locked versions mean one is not the patched
+/// one, whichever that is. `(file, detail)` of the first such lock, or
+/// `None` when the project is wired as the writers would wire it.
+fn other_versions(
+    versions: &BTreeMap<String, Pins>,
+    src: &SocketSource,
+    patched: Option<&str>,
+    cfg_rel: &str,
+) -> Option<(String, String)> {
+    let others: Vec<(&String, &Pins)> = match patched {
+        Some(patched) => versions.iter().filter(|(v, _)| *v != patched).collect(),
+        None if versions.len() > 1 => versions.iter().collect(),
+        None => return None,
+    };
+    let file = others.first()?.1.files.first()?.clone();
+    let listed = others
+        .iter()
+        .map(|(v, pins)| {
+            let files: Vec<&str> = pins.files.iter().map(String::as_str).collect();
+            format!("{v} ({})", files.join(", "))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let detail = match patched {
+        Some(patched) => format!(
+            "the NuGet locks also lock {} at {listed}, while {cfg_rel} routes every version of \
+             it to the vendored feed {VENDOR_DIR}/nuget/{}, which serves only {patched}, so \
+             those target frameworks cannot restore",
+            src.id, src.uuid
+        ),
+        None => format!(
+            "the NuGet locks lock {} at several versions ({listed}), while {cfg_rel} routes \
+             every version of it to Socket patch source {}, which serves only the patched one, \
+             so a target framework locking another cannot restore",
+            src.id, src.key
+        ),
+    };
+    Some((file, detail))
 }
 
 // ── refs ─────────────────────────────────────────────────────────────────
@@ -496,9 +581,9 @@ fn emit_hosted(
             }
             None
         }
-        Lock::Parsed(index) => lock_versions(index, src, cfg_rel, out),
+        Lock::Parsed(index) => lock_versions(index, src, None, cfg_rel, out),
     };
-    let Some(rows) = rows else {
+    let Some(Locked { rows, other }) = rows else {
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
             cfg_rel,
@@ -522,6 +607,17 @@ fn emit_hosted(
             );
             continue;
         };
+        // Still a ref (rollback, remove and the ledger's liveness gate see
+        // the wiring, which a re-run cannot clear either), never attested.
+        if let Some((file, detail)) = &other {
+            out.unattested(
+                &purl,
+                &src.uuid,
+                file,
+                detail.clone(),
+                UnattestedKind::NugetLockOtherVersion,
+            );
+        }
         out.push(PatchedRef::hosted(
             purl,
             src.uuid.clone(),
@@ -543,17 +639,25 @@ async fn emit_vendored(
     let id_lower = src.id.to_ascii_lowercase();
     // (purl version, artifact leaf, integrity)
     let mut rows: Vec<(String, String, Option<LockIntegrity>)> = Vec::new();
+    let leaves = feed_leaves(ctx, &src.uuid, &id_lower).await;
+    // The version the feed serves: the writer vendors exactly one nupkg per
+    // patch, named for the patched version.
+    let patched = match leaves.as_slice() {
+        [(_, version)] => Some(normalize_nuget_version(version)),
+        _ => None,
+    };
     let locked = match lock {
-        Lock::Parsed(index) => lock_versions(index, src, cfg_rel, out),
+        Lock::Parsed(index) => lock_versions(index, src, patched.as_deref(), cfg_rel, out),
         Lock::Absent | Lock::Unusable => None,
     };
+    let mut other = None;
     if let Some(locked) = locked {
-        for (version, integrity) in locked {
+        other = locked.other;
+        for (version, integrity) in locked.rows {
             let leaf = nupkg_leaf(&id_lower, &version);
             rows.push((version, leaf, integrity));
         }
     } else {
-        let leaves = feed_leaves(ctx, &src.uuid, &id_lower).await;
         match leaves.as_slice() {
             [(leaf, version)] => rows.push((version.clone(), leaf.clone(), None)),
             _ => {
@@ -592,6 +696,15 @@ async fn emit_vendored(
             );
             continue;
         };
+        if let Some((file, detail)) = &other {
+            out.unattested(
+                &purl,
+                &src.uuid,
+                file,
+                detail.clone(),
+                UnattestedKind::NugetLockOtherVersion,
+            );
+        }
         out.push(PatchedRef::vendored(purl, &vref, cfg_rel, integrity));
     }
 }
@@ -1675,5 +1788,247 @@ mod tests {
         let out = run(&p).await;
         assert_refs(&out, &[]);
         assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+    }
+
+    /// The kinds of the [`Unattested`] marks, per canonical purl.
+    fn unattested(out: &Discovery) -> Vec<(String, UnattestedKind)> {
+        out.unattested
+            .iter()
+            .map(|u| (u.purl.clone(), u.kind))
+            .collect()
+    }
+
+    /// Both writers refuse a lock that locks the mapped id at a version
+    /// other than the patched one (`*_nuget_lock_other_version`): the
+    /// mapping routes every version to a source serving only the patched
+    /// one, so that target framework cannot restore. A hosted url names no
+    /// version, so ANY two locked versions (across target frameworks or
+    /// across governed locks) mean one is unpatched: every ref stays (the
+    /// ledger's liveness, rollback and remove still see the wiring) but is
+    /// never attested.
+    #[tokio::test]
+    async fn hosted_id_locked_at_two_versions_is_unattested() {
+        let cfg = config(
+            &[(&socket_key(UUID_A), &index_url(UUID_A))],
+            &[(&socket_key(UUID_A), "Newtonsoft.Json")],
+        );
+        let expected = [
+            (
+                "pkg:nuget/newtonsoft.json@13.0.1",
+                UUID_A,
+                WiringMode::Hosted,
+            ),
+            (
+                "pkg:nuget/newtonsoft.json@13.0.3",
+                UUID_A,
+                WiringMode::Hosted,
+            ),
+        ];
+        let marks = vec![
+            (
+                "pkg:nuget/newtonsoft.json@13.0.1".to_string(),
+                UnattestedKind::NugetLockOtherVersion,
+            ),
+            (
+                "pkg:nuget/newtonsoft.json@13.0.3".to_string(),
+                UnattestedKind::NugetLockOtherVersion,
+            ),
+        ];
+
+        // Two target frameworks of one lock.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.1", Some("T1RIRVI=")),
+                ("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &expected);
+        assert_eq!(unattested(&out), marks);
+        assert!(
+            out.unattested[0]
+                .detail
+                .contains("13.0.1 (packages.lock.json)"),
+            "{}",
+            out.unattested[0].detail
+        );
+        // Still live wiring for the ledger record of either version.
+        assert_eq!(
+            out.hosted_claim("pkg:nuget/newtonsoft.json@13.0.3", UUID_A),
+            Some(true)
+        );
+
+        // The root lock and a member project's lock.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH))]),
+        );
+        p.write("src/App/App.csproj", "<Project />");
+        p.write(
+            "src/App/packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.1", Some("T1RIRVI="))]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &expected);
+        assert_eq!(unattested(&out), marks);
+        assert_eq!(
+            out.unattested[0].file,
+            std::path::PathBuf::from("src/App/packages.lock.json")
+        );
+
+        // One version (the writers' own output) is attested as before.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+                ("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &expected[1..]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// The vendored feed names the patched version (its single
+    /// `<idLower>.<versionNorm>.nupkg`): a lock entry at any other version,
+    /// beside the patched one or alone, is the writer's refusal.
+    #[tokio::test]
+    async fn vendored_id_locked_at_another_version_is_unattested() {
+        let cfg = config(
+            &[ORG, (&socket_key(UUID_A), &feed(UUID_A))],
+            &[("nuget.org", "*"), (&socket_key(UUID_A), "Newtonsoft.Json")],
+        );
+        let nupkg = format!(".socket/vendor/nuget/{UUID_A}/newtonsoft.json.13.0.3.nupkg");
+        let other = (
+            "pkg:nuget/newtonsoft.json@13.0.1".to_string(),
+            UnattestedKind::NugetLockOtherVersion,
+        );
+        let patched = (
+            "pkg:nuget/newtonsoft.json@13.0.3".to_string(),
+            UnattestedKind::NugetLockOtherVersion,
+        );
+
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(&nupkg, b"PK");
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.1", Some("T1RIRVI=")),
+                ("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 2, "{:#?}", out.refs);
+        assert_eq!(unattested(&out), vec![other.clone(), patched]);
+        assert!(
+            out.unattested[0].detail.contains("serves only 13.0.3"),
+            "{}",
+            out.unattested[0].detail
+        );
+        // The ledger's own artifact is still wired (rollback / remove).
+        assert_eq!(
+            out.vendored_claim("pkg:nuget/newtonsoft.json@13.0.3", UUID_A, &nupkg),
+            Some(true)
+        );
+
+        // The lock names only another version than the feed serves.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(&nupkg, b"PK");
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.1", Some("T1RIRVI="))]),
+        );
+        let out = run(&p).await;
+        assert_eq!(unattested(&out), vec![other]);
+
+        // The patched version, in a spelling that normalizes to the feed's.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(&nupkg, b"PK");
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.3.0", Some(HASH))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[(
+                "pkg:nuget/newtonsoft.json@13.0.3.0",
+                UUID_A,
+                WiringMode::Vendored,
+            )],
+        );
+        assert_eq!(out.refs[0].artifact_rel.as_deref(), Some(nupkg.as_str()));
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+    }
+
+    /// Versions are keyed through `normalize_nuget_version`, as the writers
+    /// match them: `13.0.3` and `13.0.3.0` in two target frameworks are ONE
+    /// package, so one ref whose pin is checked across both, never two refs
+    /// with independent pins.
+    #[tokio::test]
+    async fn non_normalized_version_spellings_are_one_version() {
+        let cfg = config(
+            &[(&socket_key(UUID_A), &index_url(UUID_A))],
+            &[(&socket_key(UUID_A), "Newtonsoft.Json")],
+        );
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+                ("net8.0", "Newtonsoft.Json", "13.0.3.0", Some(HASH)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[(
+                "pkg:nuget/newtonsoft.json@13.0.3",
+                UUID_A,
+                WiringMode::Hosted,
+            )],
+        );
+        assert!(out.refs[0].lockfile_basis_ok());
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+
+        // The two spellings pinned to different bytes: one package with
+        // conflicting contentHash values, which NuGet fails to restore.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+                ("net8.0", "Newtonsoft.Json", "13.0.3.0", Some("T1RIRVI=")),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+
+        // One spelling pinned, the other not: not a Socket-written pin.
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+                ("net8.0", "Newtonsoft.Json", "13.0.03", None),
+            ]),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:#?}", out.refs);
+        assert!(!out.refs[0].lockfile_basis_ok());
     }
 }

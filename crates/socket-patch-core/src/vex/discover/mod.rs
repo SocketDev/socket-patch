@@ -606,6 +606,13 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A NuGet Socket source whose mapped id a governed `packages.lock.json`
+    /// also locks at a version other than the patched one: the mapping
+    /// routes every version of the id to a source that serves only the
+    /// patched one, so that target framework cannot restore — the case both
+    /// writers refuse (`redirect_nuget_lock_other_version`,
+    /// `vendor_nuget_lock_other_version`).
+    NugetLockOtherVersion,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,
