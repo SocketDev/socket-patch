@@ -775,6 +775,14 @@ pub fn is_git_branch_lock_name(name: &str) -> bool {
 /// on pnpm 11+, `npm_config_git_branch_lockfile` on pnpm 10 and older,
 /// see [`env_setting`]).
 pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> {
+    git_branch_locks_in(view, true).await
+}
+
+/// [`git_branch_locks`], consulting the environment only with `env`: the
+/// hosted and vendored writers run in the install's environment, while
+/// `vex` discovery answers from the project's files alone (as it does for
+/// [`lockfile_disabled`]).
+pub async fn git_branch_locks_in(view: &ProjectView<'_>, env: bool) -> Option<GitBranchLocks> {
     let mut locks = branch_lock_names(view, "").await;
     let mut members_unlisted = None;
     match workspace_members(view).await {
@@ -808,7 +816,7 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
                 });
         }
     }
-    if setting.is_none() {
+    if setting.is_none() && env {
         setting = view_setting(view, None, None, KEYS.0, KEYS.1).await;
     }
     let setting = git_branch_on(setting)?;
