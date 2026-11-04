@@ -42,12 +42,36 @@ discovery reads.
 
 ## Goal
 
-One per-project lock model. Every consumer reads it, and the end state has
-fewer implementation lines than today. `scripts/loc-budget.py` tracks the
-lines (see [Size budget](#size-budget)).
+One per-project lock model and one set of behaviors. Every consumer reads
+the model, and the end state has fewer implementation lines than today.
+`scripts/loc-budget.py` tracks the lines (see [Size budget](#size-budget)).
 
-Non-goals: changing what any mode writes, or adding new hosted or vendored
-backends.
+## Principles (owner decisions, 2026-11-04)
+
+1. **One set of behaviors.** Discovery (VEX), the inventory, hosted mode and
+   vendored mode answer each question the same way: which files count,
+   which entries are installed, what is Socket wiring, what a malformed
+   entry means. An inconsistency between them is a bug to remove, not
+   behavior to preserve.
+2. **Hosted and vendored share the core.** The two modes differ only in where
+   a rewired entry points (a Socket URL or a committed `.socket/vendor/`
+   path). Everything else, from reading the lock to choosing entries and
+   refusing unsafe states, is one implementation.
+3. **When in doubt, hosted semantics are correct.** Where the modes or
+   readers disagree and the right answer isn't clear, the hosted mode's
+   current behavior wins. Every such call is listed under
+   [Decisions](#decisions-under-the-hosted-rule), so it can be overruled.
+4. **Behavior changes are allowed, and visible.** A PR that aligns behavior
+   lists each change in its description, adds a test that pins the new
+   behavior, and shows its golden diffs.
+
+Non-goal: adding new hosted or vendored backends.
+
+## Decisions under the hosted rule
+
+| Question | Readers before | Decision |
+|---|---|---|
+| Is pnpm 11's env-lockfile document (the first YAML document, holding `configDependencies` / `packageManagerDependencies`) part of the project? | The hosted planner and the v9 vendored in-use check read it. `PnpmLock` (inventory and discovery), `InstalledPackages` and the legacy vendored check skip it (#1949). | It counts. pnpm installs config dependencies (into its config store, not `node_modules`), and the hosted planner patches them. The document becomes its own install tree. |
 
 ## The model
 
@@ -229,16 +253,21 @@ add code and raise the readers' maximum by hand, saying why.
 
 ## Stack
 
-Each PR is based on the one before. PRs 1 to 11 must leave
-`tests/fixtures/vex-discover-golden/` and the redirect goldens byte for byte
-unchanged. Only PR 12 may change them, and its golden diff is reviewed line
-by line.
+Each PR is based on the one before. A PR that changes behavior follows
+principle 4: it lists every change, pins it with a test and shows its golden
+diffs (`tests/fixtures/vex-discover-golden/`, `tests/fixtures/redirect/`).
+
+Each format PR does two things for its format: one reader model that
+discovery, the inventory and both modes consume, with every divergence
+resolved under the principles; and, where the hosted and vendored planners
+duplicate each other, one planner with the target as its only parameter.
+A format whose planner merge is large splits into two PRs, readers first.
 
 | PR | Branch | Change |
 |---|---|---|
 | 0 | `lock-model/0-design` | This document and the size budget |
 | 1 | `lock-model/1-origin` | The `origin` module: discovery's classifier and the redirect's hosted-URL rule, moved verbatim. Discovery and the redirect re-export it. |
-| 2 | `lock-model/2-pnpm` | Pilot. One pnpm reader feeds the inventory, discovery and the hosted planner. Removes `InstalledPackages`, `vendored_npm_uuids`, the whole-text planner walk and the second Rush listing. |
+| 2 | `lock-model/2-pnpm` | Pilot. One pnpm entry walk for the inventory, discovery, the store crawler, the hosted planner and the vendored in-use check. The env-lockfile document becomes its own tree (see Decisions). |
 | 3 | `lock-model/3-npm` | package-lock and shrinkwrap. Folds `vendor/npm_origin.rs`'s second walk into the records. |
 | 4 | `lock-model/4-yarn` | Classic and Berry. One block model for every reader and writer, `BerryStanzas` included. |
 | 5 | `lock-model/5-bun-vlt` | `bun.lock`, `bun.lockb` and vlt. The vlt writers move off their line grammar. |
@@ -248,7 +277,7 @@ by line.
 | 9 | `lock-model/9-gem-composer` | Gemfile.lock and composer.lock records. The inventory stops dropping BOM-prefixed `composer.lock` files. |
 | 10 | `lock-model/10-nuget` | NuGet records with the config join, `NugetContentHash`, and inventory entries |
 | 11 | `lock-model/11-jvm` | One `checksums.sha256` reader, one Gradle index parser, a `verification-metadata.xml` reader, then Gradle-lock and root-pom inventory entries and sbt's owned-file entries |
-| 12 | `lock-model/12-install-trees` | Install-tree selection, Python trees, Deno governance, the single classifier for the inventory, liveness on `Origin`. Deletes the npm flavor router's lock choice, the Python precedence rules, `resolved_elsewhere` and the `UnwiredCopy` plumbing. |
+| 12 | `lock-model/12-install-trees` | Install-tree selection across formats, Python trees, Deno governance, the single classifier for the inventory, liveness on `Origin`. Deletes the npm flavor router's lock choice, the Python precedence rules, `resolved_elsewhere` and the `UnwiredCopy` plumbing. |
 | 13 | `lock-model/13-cleanup` | Removes the raw-text liveness fallbacks if the model makes them redundant, plus whatever is left of `vendor/lock_inventory/`. Final budget. |
 
 ## Open questions
