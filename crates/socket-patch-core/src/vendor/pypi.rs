@@ -3067,7 +3067,8 @@ pub async fn pypi_reference(project_root: &Path, uuid: &str) -> Option<String> {
 /// that cannot be read, or a listed file (a symlink included — lstat only,
 /// so an unreadable target is still probed) that exists but cannot be read
 /// all block the deletion, because none of them can prove the absence of a
-/// reference.
+/// reference. The mention matches every spelling of the uuid dir
+/// ([`crate::utils::path_spelling::mentions_path`]).
 async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -> Option<String> {
     let needle = format!(".socket/vendor/pypi/{uuid}/");
     let mut names: Vec<String> = [
@@ -3159,7 +3160,11 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
         // UTF-16 `pip freeze >` output is still probed instead of failing
         // closed on every revert with no way out.
         match read_regular_to_bytes(&path).await {
-            Ok(bytes) if probe_text(&bytes).contains(&needle) => {
+            // Any spelling of the path counts (a backslashed Windows
+            // requirement line, a `\/`-escaped Pipfile.lock).
+            Ok(bytes)
+                if crate::utils::path_spelling::mentions_path(&probe_text(&bytes), &needle) =>
+            {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}

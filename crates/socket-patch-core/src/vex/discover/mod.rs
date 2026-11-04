@@ -2057,21 +2057,11 @@ pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<S
 
 fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
     use aho_corasick::AhoCorasick;
-    use std::borrow::Cow;
 
     let mut found = BTreeSet::new();
-    let decoded = decode_escapes(text);
-    // The folds only ever touch a backslash.
-    let norm: Cow<'_, str> = if decoded.contains('\\') {
-        Cow::Owned(
-            decoded
-                .replace("\\/", "/")
-                .replace("\\\\", "/")
-                .replace('\\', "/"),
-        )
-    } else {
-        decoded
-    };
+    // The same fold the vendored revert's keep-checks read through
+    // ([`crate::utils::path_spelling::mentions_path`]).
+    let norm = crate::utils::path_spelling::fold_path_spellings(text);
     let bytes = norm.as_bytes();
 
     // Every anchor in one pass. None of them overlaps itself, so each
@@ -2148,65 +2138,6 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
         }
     }
     found
-}
-
-/// Best-effort decode of `\uXXXX` / `\UXXXXXXXX` escapes and XML entities
-/// (`&#x2F;`, `&#47;`, `&amp;`, …) for [`socket_identities`] — over-decoding
-/// (an escaped backslash before `u`) only ever ADDS recognition, which can
-/// only make a claim dead, never live.
-fn decode_escapes(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("\\u") && !text.contains("\\U") && !text.contains('&') {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(['\\', '&']) {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        match decode_one_escape(tail) {
-            Some((ch, used)) => {
-                out.push(ch);
-                rest = &tail[used..];
-            }
-            None => {
-                // `\` and `&` are one byte each.
-                out.push_str(&tail[..1]);
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    std::borrow::Cow::Owned(out)
-}
-
-/// The char one escape at the start of `tail` stands for, and its length.
-fn decode_one_escape(tail: &str) -> Option<(char, usize)> {
-    let hex_char = |digits: &str| char::from_u32(u32::from_str_radix(digits, 16).ok()?);
-    if let Some(rest) = tail.strip_prefix("\\u") {
-        return Some((hex_char(rest.get(..4)?)?, 6));
-    }
-    if let Some(rest) = tail.strip_prefix("\\U") {
-        return Some((hex_char(rest.get(..8)?)?, 10));
-    }
-    if let Some(rest) = tail.strip_prefix("&#") {
-        let end = rest.get(..rest.len().min(10))?.find(';')?;
-        let body = &rest[..end];
-        let ch = match body.strip_prefix(['x', 'X']) {
-            Some(hex) => hex_char(hex)?,
-            None => char::from_u32(body.parse().ok()?)?,
-        };
-        return Some((ch, end + 3));
-    }
-    [
-        ("&amp;", '&'),
-        ("&quot;", '"'),
-        ("&apos;", '\''),
-        ("&lt;", '<'),
-        ("&gt;", '>'),
-    ]
-    .into_iter()
-    .find(|(name, _)| tail.starts_with(name))
-    .map(|(name, ch)| (ch, name.len()))
 }
 
 /// Start of the url whose `://` (or `%3A%2F%2F`) is at byte `at`: the

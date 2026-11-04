@@ -422,6 +422,12 @@ pub(crate) async fn prune_empty_vendor_levels(uuid_dir: &Path) {
 /// both safe (nothing a file still routes at is deleted) and live (the
 /// user can always undo the drift). A file that cannot be read (absent,
 /// unreadable, not a regular file) references nothing.
+///
+/// Every spelling a file may give the path counts
+/// ([`mentions_path`](crate::utils::path_spelling::mentions_path)): an
+/// older composer.lock's `\/`-escaped slashes, a Windows backslashed path,
+/// `\u` / XML-entity escapes. A plain text match misses those and would
+/// delete an artifact the lock still installs from.
 pub(crate) async fn any_live_file_references(
     root: &Path,
     files: &[&str],
@@ -430,7 +436,7 @@ pub(crate) async fn any_live_file_references(
     for file in files {
         if read_regular_to_string(&root.join(file))
             .await
-            .is_ok_and(|live| live.contains(uuid_dir_rel))
+            .is_ok_and(|live| crate::utils::path_spelling::mentions_path(&live, uuid_dir_rel))
         {
             return true;
         }

@@ -72,7 +72,13 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
         let Ok(text) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
-        let mut rest = text.as_str();
+        // Every spelling folded to forward slashes first, the way
+        // discovery's identity sweep reads a file: an older composer.lock's
+        // `\/`-escaped JSON, single or doubled Windows backslashes, `\u` /
+        // XML-entity escapes. Missing one here lets the orphan sweep delete
+        // a dir a lock still installs from.
+        let text = socket_patch_core::utils::path_spelling::fold_path_spellings(&text);
+        let mut rest: &str = &text;
         while let Some(idx) = rest.find(".socket") {
             let slice = &rest[idx..];
             // `:` ends a reference too: pnpm snapshot keys are
@@ -84,9 +90,9 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
                     '"', '\'', '`', ' ', '\t', '\n', '\r', ',', ')', ']', '}', ';', ':', '<',
                 ])
                 .unwrap_or(slice.len());
-            let candidate = slice[..end].replace('\\', "/");
+            let candidate = &slice[..end];
             // NuGet's feed and Maven's repository name the uuid dir itself.
-            if let Some(parts) = parse_vendor_reference(&candidate) {
+            if let Some(parts) = parse_vendor_reference(candidate) {
                 if seen.insert((parts.eco.to_string(), parts.uuid.clone())) {
                     out.push((
                         parts.eco.to_string(),
@@ -1280,6 +1286,31 @@ mod tests {
     /// non-uuid path segment) must never be reported as a vendor reference
     /// — `parse_vendor_path`'s reject branch is what keeps `repair` from
     /// reconstructing ledger entries out of ordinary `.socket/` mentions.
+    /// An older composer.lock spells slashes `\/` and a Windows checkout may
+    /// double its backslashes: the scan folds both to the canonical path, so
+    /// the orphan sweep keeps a dir such a lock still installs from. A
+    /// different uuid's dir is never this one's reference.
+    #[tokio::test]
+    async fn scan_recovers_escaped_and_doubled_backslash_references() {
+        let uuid = "33333333-3333-4333-8333-333333333333";
+        let path = format!(".socket/vendor/composer/{uuid}/psr/log@3.0.2");
+        for lock in [
+            format!("{{\"url\": \"{}\"}}", path.replace('/', "\\/")),
+            format!("{{\"url\": \"{}\"}}", path.replace('/', "\\\\")),
+            format!("{{\"url\": \"./{}\"}}", path.replace('/', "\\/")),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            tokio::fs::write(tmp.path().join("composer.lock"), &lock)
+                .await
+                .unwrap();
+            assert_eq!(
+                scan_vendor_references(tmp.path()).await,
+                vec![("composer".to_string(), uuid.to_string(), path.clone())],
+                "{lock}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn scan_ignores_non_vendor_socket_mentions() {
         let tmp = tempfile::tempdir().unwrap();
