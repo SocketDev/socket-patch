@@ -1283,9 +1283,7 @@ pub(crate) fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u
         || text
             .lines()
             .any(|line| line.starts_with("shrinkwrapVersion:"));
-    let env_document = documents(text)
-        .iter()
-        .any(|(_, kind)| *kind == PnpmDocument::Env);
+    let env_document = documents(text).iter().any(|(_, k)| *k == PnpmDocument::Env);
     pm_major
         .or(legacy_lock.then_some(8))
         .or(env_document.then_some(11))
