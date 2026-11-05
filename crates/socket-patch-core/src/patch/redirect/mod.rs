@@ -69,7 +69,7 @@ use crate::formats::gem::hosted::{
     refresh_merged_gem_lock_remote,
 };
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
-use crate::formats::maven::trusted_checksums;
+use crate::formats::maven::trusted_checksums::{self, CONFIG_ARGS as MVN_CONFIG_ARGS};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -8477,77 +8477,12 @@ pub(crate) fn no_maven_or_gradle(files: &BTreeMap<String, String>) -> bool {
     !files.contains_key("pom.xml") && !gradle::gradle_build_present(files)
 }
 
-/// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
-/// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
-/// line. `failIfMissing=false` so a dependency without a committed checksum
-/// still resolves (only a MISMATCH fails); origin-unaware so one checksum
-/// matches the artifact from any repository.
-const MVN_CONFIG_ARGS: &[&str] = &[
-    TRUSTED_CHECKSUMS_ON,
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
-    "-Daether.trustedChecksumsSource.summaryFile=true",
-    "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
-    "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
-];
-
-/// The resolver switch (the first [`MVN_CONFIG_ARGS`] line) that makes the
-/// checksums file an enforced pin; without it the file is inert. Read back
-/// by [`trusted_checksums::switch_on`], as every mode reads it.
-const TRUSTED_CHECKSUMS_ON: &str = "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
-
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 /// The Maven Wrapper's settings file. Read only, never edited: its
 /// `distributionUrl` names the Maven release the project builds with, so the
 /// rewriter can tell when the Trusted Checksums files it writes are inert.
 pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.properties";
-
-/// The first Maven release that enforces the `.mvn/*` Trusted Checksums
-/// files (#258). 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`
-/// in `maven.config`, so the summary file is never found; 3.9.2 / 3.9.3
-/// ignore `checksumAlgorithms=SHA-256` and check SHA-1 only. Older lines have
-/// no Trusted Checksums post-processor at all.
-const TRUSTED_CHECKSUMS_MIN_MAVEN: [u32; 3] = [3, 9, 4];
-
-/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
-/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
-/// for a missing key or any other distribution (e.g. mvnd), which then goes
-/// unwarned.
-fn maven_wrapper_version(props: &str) -> Option<String> {
-    props.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('!') {
-            return None;
-        }
-        let rest = line.strip_prefix("distributionUrl")?;
-        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
-            return None;
-        }
-        let value = rest
-            .trim_start()
-            .strip_prefix(['=', ':'])
-            .unwrap_or(rest)
-            .trim();
-        let file = value.rsplit('/').next()?;
-        let version = file
-            .strip_prefix("apache-maven-")?
-            .strip_suffix(".zip")
-            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
-            .strip_suffix("-bin")?;
-        (!version.is_empty()).then(|| version.to_string())
-    })
-}
-
-/// Whether Maven `version` enforces the Trusted Checksums files (≥ 3.9.4;
-/// pre-release suffixes such as `-rc-6` compare as their release).
-fn maven_enforces_trusted_checksums(version: &str) -> bool {
-    let mut parts = [0u32; 3];
-    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
-        *slot = part.parse().unwrap_or(0);
-    }
-    parts >= TRUSTED_CHECKSUMS_MIN_MAVEN
-}
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -8745,8 +8680,19 @@ fn rewrite_maven_pom(
             .clone()
             .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
-        let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
-        let jar_sha256 = dep.integrity.sha256.clone();
+        // The jar and served-pom sha256 a Trusted Checksums pin needs, as
+        // the bare lowercase hex Maven compares; a grant hash of any other
+        // shape (an SRI base64 digest, a truncated hex) writes no pin.
+        let checksum_hashes = dep
+            .integrity
+            .sha256
+            .as_deref()
+            .zip(ov.identifiers.maven_pom_sha256.as_deref())
+            .map(|(jar, pom)| (bare_sha256_hex(jar), bare_sha256_hex(pom)));
+        let bad_checksum_hashes = checksum_hashes
+            .as_ref()
+            .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
+        let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
@@ -9100,7 +9046,7 @@ fn rewrite_maven_pom(
             });
         }
 
-        if jar_sha256.is_some() && pom_sha256.is_some() {
+        if checksum_hashes.is_some() {
             pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
                 &group_id,
                 &artifact_id,
@@ -9194,7 +9140,17 @@ fn rewrite_maven_pom(
         // Trusted Checksums: only when BOTH the jar sha256 and the served pom
         // sha256 are known. Two entries per dep — the jar and the pom — under
         // the SUFFIXED version's local-repo path.
-        if let (Some(jar), Some(pom_hash)) = (&jar_sha256, &pom_sha256) {
+        if bad_checksum_hashes {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_trusted_checksums_invalid_hash".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id}: the grant's sha256 is not 64 hex digits; \
+                     no Trusted Checksums pin written to {MVN_CHECKSUMS} (the -socket \
+                     version suffix still pins the patched artifact)"
+                ),
+            });
+        }
+        if let Some((jar, pom_hash)) = &checksum_hashes {
             let (merged, conflicts) =
                 merge_mvn_config(&mvn_config, &format!("{group_id}:{artifact_id}"));
             for conflict in conflicts {
@@ -9228,7 +9184,7 @@ fn rewrite_maven_pom(
                     None,
                     "jar",
                 ),
-                bare_sha256_hex(jar),
+                jar.clone(),
             ));
             checksum_entries.push((
                 crate::vendor::jvm::layout::artifact_path(
@@ -9238,7 +9194,7 @@ fn rewrite_maven_pom(
                     None,
                     "pom",
                 ),
-                bare_sha256_hex(pom_hash),
+                pom_hash.clone(),
             ));
         }
     }
@@ -9282,15 +9238,16 @@ fn rewrite_maven_pom(
     // content pinning. Judged on the files as they stand after this run, so a
     // re-scan of an already-pinned project warns as well.
     let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
-    let pin_in_place = final_text(MVN_CONFIG).is_some_and(|c| trusted_checksums::switch_on(c))
+    let pin_in_place = final_text(MVN_CONFIG)
+        .is_some_and(|c| trusted_checksums::config_enforces(c))
         && final_text(MVN_CHECKSUMS).is_some_and(|c| {
             let pinned = trusted_checksums::pinned(c);
             pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
         });
     if let Some(version) = files
         .get(MVN_WRAPPER_PROPERTIES)
-        .and_then(|props| maven_wrapper_version(props))
-        .filter(|v| pin_in_place && !maven_enforces_trusted_checksums(v))
+        .and_then(|props| trusted_checksums::wrapper_maven_version(props))
+        .filter(|v| pin_in_place && !trusted_checksums::maven_enforces(v))
     {
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_trusted_checksums_unenforced".into(),
@@ -10917,33 +10874,38 @@ mod tests {
     #[test]
     fn maven_wrapper_version_parses_distribution_url() {
         assert_eq!(
-            maven_wrapper_version(&maven_wrapper("3.9.3")).as_deref(),
+            trusted_checksums::wrapper_maven_version(&maven_wrapper("3.9.3")).as_deref(),
             Some("3.9.3")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
             )
             .as_deref(),
             Some("3.9.2")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
             )
             .as_deref(),
             Some("4.0.0-rc-6")
         );
-        assert_eq!(maven_wrapper_version("wrapperVersion=3.3.2\n"), None);
         assert_eq!(
-            maven_wrapper_version("distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"),
+            trusted_checksums::wrapper_maven_version("wrapperVersion=3.3.2\n"),
             None
         );
-        assert!(!maven_enforces_trusted_checksums("3.9.3"));
-        assert!(maven_enforces_trusted_checksums("3.9.4"));
-        assert!(maven_enforces_trusted_checksums("3.10.0-rc-1"));
-        assert!(maven_enforces_trusted_checksums("4.0.0"));
-        assert!(!maven_enforces_trusted_checksums("3.8.9"));
+        assert_eq!(
+            trusted_checksums::wrapper_maven_version(
+                "distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"
+            ),
+            None
+        );
+        assert!(!trusted_checksums::maven_enforces("3.9.3"));
+        assert!(trusted_checksums::maven_enforces("3.9.4"));
+        assert!(trusted_checksums::maven_enforces("3.10.0-rc-1"));
+        assert!(trusted_checksums::maven_enforces("4.0.0"));
+        assert!(!trusted_checksums::maven_enforces("3.8.9"));
     }
 
     #[test]
@@ -30334,6 +30296,48 @@ mod owned_pin_generation_matrix {
         assert!(!repinned[MVN_CHECKSUMS].contains("socket.aaaaaaaa"));
         let (_, again) = plan(&repinned, &maven(B, tok));
         assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A superseded generation's checksum line goes on re-pin whatever its
+    /// hash holds (a past writer's SRI or truncated digest included), and a
+    /// grant whose hash is not 64 hex digits writes no checksum line at all.
+    #[test]
+    fn maven_checksums_owned_lines_go_whatever_their_hash() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (clean, _) = plan(&pom_project(), &maven(A, tok));
+        for stale in ["sha256-q83vEjRWeJA=", "a".repeat(63).as_str()] {
+            let mut wired = clean.clone();
+            let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), stale);
+            wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+            let (repinned, _) = plan(&wired, &maven(B, tok));
+            let checksums = &repinned[MVN_CHECKSUMS];
+            assert!(
+                !checksums.contains("socket.aaaaaaaa"),
+                "{stale}: {checksums}"
+            );
+            assert_eq!(checksums.lines().count(), 2, "{stale}: {checksums}");
+        }
+
+        let mut bad = maven(A, tok);
+        bad.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let (wired, result) = plan(&pom_project(), &bad);
+        assert!(
+            wired["pom.xml"].contains("3.12.0-socket.aaaaaaaa"),
+            "the version pin still lands"
+        );
+        assert!(
+            !wired.contains_key(MVN_CHECKSUMS),
+            "{:?}",
+            wired.get(MVN_CHECKSUMS)
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_trusted_checksums_invalid_hash"),
+            "{:?}",
+            result.warnings
+        );
     }
 
     /// #266: a rotated grant token (same uuid, new token path segment)
