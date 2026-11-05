@@ -11,14 +11,15 @@
 //! would follow it). Cargo still reads those manifests; the rewriter's
 //! Cargo.lock dependents check refuses a crate one of them depends on.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use toml_edit::{DocumentMut, Item, Table};
 
 use crate::utils::workspace_globs::segment_glob_matches;
-use crate::vendor::lock_inventory::view::{DiskSnapshot, MemoryProject, ProjectView};
+use crate::vendor::lock_inventory::view::{MemoryProject, ProjectView};
 use crate::vendor::parse_memo::ParseMemo;
 
 /// Upper bound on discovered manifests — a runaway glob (or a hostile tree)
@@ -32,49 +33,176 @@ pub fn member_manifests(root: &Path) -> Vec<String> {
     member_manifests_with(&DiskTree(root))
 }
 
-/// [`member_manifests`] over a [`ProjectView`]: the in-memory variant
-/// reads the manifests the host supplied and expands member globs against
-/// the supplied paths (a directory exists when some supplied path lives
-/// under it; symbolic links are never directories).
-///
-/// Over a [`DiskSnapshot`] the walk reads the disk, but notes every
-/// manifest it reads and every directory it probes or lists with the
-/// snapshot, so a recording read set covers the walk (asking for the
-/// snapshot's raw root would end the recording).
-pub fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
-    match view {
-        ProjectView::Disk(root) => member_manifests(root),
-        ProjectView::Snapshot(snap) => member_manifests_with(&SnapshotTree(snap)),
-        ProjectView::Memory(project) => member_manifests_with(&MemoryTree(project)),
-    }
+/// [`member_manifests`] of an in-memory project: the manifests the host
+/// supplied, member globs expanded against the supplied paths (a directory
+/// exists when some supplied path lives under it; symbolic links are never
+/// directories).
+pub fn member_manifests_in_memory(project: &MemoryProject) -> Vec<String> {
+    member_manifests_with(&MemoryTree(project))
 }
 
-/// The disk under a [`DiskSnapshot`], each access noted with it first.
-struct SnapshotTree<'a, 'b>(&'a DiskSnapshot<'b>);
-
-impl SnapshotTree<'_, '_> {
-    fn disk(&self) -> DiskTree<'_> {
-        DiskTree(self.0.root_reading(std::iter::empty::<&str>()))
-    }
+/// [`member_manifests`] over a [`ProjectView`], every read, probe and
+/// listing going through the view: a snapshot's overlays and content cache
+/// apply and its recording notes the walk; in memory it reads the supplied
+/// files. The manifests are read concurrently (bounded).
+pub async fn member_manifests_in(view: &ProjectView<'_>) -> Vec<String> {
+    member_manifest_texts_in(view)
+        .await
+        .into_iter()
+        .map(|(rel, _)| rel)
+        .collect()
 }
 
-impl Tree for SnapshotTree<'_, '_> {
-    fn read_manifest(&self, rel: &str) -> Option<Arc<ManifestFacts>> {
-        self.0.touch(rel);
-        self.disk().read_manifest(rel)
+/// In-flight manifest reads of one [`member_manifest_texts_in`] level.
+const MEMBER_READ_CONCURRENCY: usize = 16;
+
+/// [`member_manifests_in`], each key with the text the walk read through
+/// the view (so a caller need not read it again).
+pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(String, String)> {
+    let Some((facts, _)) = view_manifest(view, "Cargo.toml").await else {
+        return Vec::new();
+    };
+    let mut frontier: Vec<String> = Vec::new();
+    if let Some((members, exclude)) = &facts.workspace {
+        let mut excluded: BTreeSet<String> = BTreeSet::new();
+        for pattern in exclude {
+            excluded.extend(expand_glob_in(view, pattern, CARGO_SKIP).await);
+        }
+        for pattern in members {
+            for dir in expand_glob_in(view, pattern, CARGO_SKIP).await {
+                if !excluded.contains(&dir) {
+                    frontier.push(dir);
+                }
+            }
+        }
     }
+    frontier.extend(
+        facts
+            .path_deps
+            .iter()
+            .filter_map(|dep| normalize_rel("", dep)),
+    );
+    let mut found: BTreeMap<String, String> = BTreeMap::new();
+    let mut tried: BTreeSet<String> = BTreeSet::new();
+    while !frontier.is_empty() {
+        let mut level: Vec<String> = Vec::new();
+        for dir in std::mem::take(&mut frontier) {
+            if found.len() + level.len() >= MAX_MANIFESTS {
+                break;
+            }
+            if !walkable(&dir) || tried.contains(&dir) {
+                continue;
+            }
+            tried.insert(dir.clone());
+            if every_segment(&dir, |at| view_is_real_dir(view, at)) {
+                level.push(dir);
+            }
+        }
+        let read: Vec<(String, Option<(Arc<ManifestFacts>, String)>)> =
+            crate::utils::concurrent::ordered_concurrent(
+                level,
+                MEMBER_READ_CONCURRENCY,
+                |dir| async move {
+                    let manifest = view_manifest(view, &format!("{dir}/Cargo.toml")).await;
+                    (dir, manifest)
+                },
+            )
+            .collect()
+            .await;
+        for (dir, manifest) in read {
+            let Some((facts, text)) = manifest else {
+                continue;
+            };
+            frontier.extend(
+                facts
+                    .path_deps
+                    .iter()
+                    .filter_map(|dep| normalize_rel(&dir, dep)),
+            );
+            found.insert(dir, text);
+        }
+    }
+    found
+        .into_iter()
+        .map(|(dir, text)| (format!("{dir}/Cargo.toml"), text))
+        .collect()
 }
 
-impl DirTree for SnapshotTree<'_, '_> {
-    fn is_real_dir(&self, rel: &str) -> bool {
-        self.0.touch(rel);
-        self.disk().is_real_dir(rel)
+/// A regular (non-symlink) manifest read through the view: its walk facts
+/// and its text.
+async fn view_manifest(view: &ProjectView<'_>, rel: &str) -> Option<(Arc<ManifestFacts>, String)> {
+    if view.is_symlink(rel) {
+        return None;
     }
+    let text = view.read_text(rel).await.ok()?;
+    let facts = FACTS_MEMO
+        .parse(text.as_bytes(), || {
+            text.parse::<DocumentMut>()
+                .map(|doc| ManifestFacts::of(&doc))
+        })
+        .ok()?;
+    Some((facts, text))
+}
 
-    fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
-        self.0.touch_listing(rel);
-        self.disk().child_dirs(rel)
+/// [`DirTree::is_real_dir`] through the view's own mediated probes (a
+/// snapshot notes each and sees its overlays).
+fn view_is_real_dir(view: &ProjectView<'_>, rel: &str) -> bool {
+    view.is_dir(rel) && !view.is_symlink(rel)
+}
+
+/// [`expand_glob`] over a [`ProjectView`]: the same walk, listing through
+/// the view's `list_dir` (a real directory's real sub-directories, as
+/// [`DirTree::child_dirs`] answers).
+async fn expand_glob_in(view: &ProjectView<'_>, pattern: &str, skip: &[&str]) -> Vec<String> {
+    let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
+        return Vec::new();
+    };
+    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    // [`expand_from`]'s recursion as an explicit stack, children pushed in
+    // reverse so they are visited in the same order.
+    let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
+    while let Some((at, i)) = stack.pop() {
+        if out.len() >= MAX_MANIFESTS {
+            break;
+        }
+        let Some(seg) = segments.get(i) else {
+            out.push(at);
+            continue;
+        };
+        if !segment_is_pattern(seg) {
+            let next = join_rel(&at, seg);
+            if view_is_real_dir(view, &next) {
+                stack.push((next, i + 1));
+            }
+            continue;
+        }
+        let Ok(entries) = view.list_dir(&at).await else {
+            continue;
+        };
+        let children = glob_children(
+            entries.into_iter().filter(|e| e.is_dir).map(|e| e.name),
+            seg,
+            skip,
+        );
+        let mut next: Vec<(String, usize)> = Vec::new();
+        if *seg == "**" {
+            next.push((at.clone(), i + 1));
+            next.extend(children.iter().map(|child| (join_rel(&at, child), i)));
+        } else {
+            let pattern = cargo_segment(seg);
+            for child in &children {
+                let name: Vec<char> = child.chars().collect();
+                if segment_glob_matches(&pattern, &name) {
+                    next.push((join_rel(&at, child), i + 1));
+                }
+            }
+        }
+        stack.extend(next.into_iter().rev());
     }
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The two directory questions a glob walk asks, keyed by `/`-separated
@@ -289,11 +417,25 @@ fn is_real_dir(path: &Path) -> bool {
 /// Every component of repo-relative `dir` is a real directory under
 /// the root — none is a symbolic link (which may lead outside the root).
 pub(crate) fn is_real_dir_path(tree: &dyn DirTree, dir: &str) -> bool {
+    every_segment(dir, |at| tree.is_real_dir(at))
+}
+
+/// Whether `real` holds for every ancestor-or-self prefix of `dir`.
+fn every_segment(dir: &str, real: impl Fn(&str) -> bool) -> bool {
     let mut at = String::new();
     dir.split('/').all(|seg| {
         at = join_rel(&at, seg);
-        tree.is_real_dir(&at)
+        real(&at)
     })
+}
+
+/// Whether the walk may enter `dir` at all. `target` is cargo's build
+/// directory at every level: the glob walk already skips it, and a literal
+/// `members = ["target/gen"]` or a path dependency into it names a manifest
+/// the next `cargo clean` deletes — pinning it would record a hosted edit
+/// whose file can vanish, blocking the rollback of every other cargo edit.
+fn walkable(dir: &str) -> bool {
+    !dir.is_empty() && !dir.split('/').any(|seg| seg == "target")
 }
 
 fn enqueue(
@@ -302,15 +444,9 @@ fn enqueue(
     dirs: &mut BTreeSet<String>,
     queue: &mut Vec<(String, Arc<ManifestFacts>)>,
 ) {
-    // `target` is cargo's build directory at every level: the glob walk
-    // already skips it, and a literal `members = ["target/gen"]` or a path
-    // dependency into it names a manifest the next `cargo clean` deletes —
-    // pinning it would record a hosted edit whose file can vanish, blocking
-    // the rollback of every other cargo edit.
-    if dir.is_empty()
+    if !walkable(&dir)
         || dirs.len() >= MAX_MANIFESTS
         || dirs.contains(&dir)
-        || dir.split('/').any(|seg| seg == "target")
         || !is_real_dir_path(tree, &dir)
     {
         return;
@@ -435,6 +571,23 @@ fn cargo_segment(seg: &str) -> Vec<char> {
     seg.replace("[^", "[\0^").chars().collect()
 }
 
+/// The sub-directories a wildcard segment `seg` may match, sorted: never a
+/// dot-directory (unless `seg` itself starts with `.`) or a name in `skip`.
+fn glob_children(
+    entries: impl IntoIterator<Item = String>,
+    seg: &str,
+    skip: &[&str],
+) -> Vec<String> {
+    let mut children: Vec<String> = entries
+        .into_iter()
+        .filter(|name| {
+            (!name.starts_with('.') || seg.starts_with('.')) && !skip.contains(&name.as_str())
+        })
+        .collect();
+    children.sort();
+    children
+}
+
 fn expand_from(
     tree: &dyn DirTree,
     at: String,
@@ -459,13 +612,7 @@ fn expand_from(
     let Some(entries) = tree.child_dirs(&at) else {
         return;
     };
-    let mut children: Vec<String> = entries
-        .into_iter()
-        .filter(|name| {
-            (!name.starts_with('.') || seg.starts_with('.')) && !skip.contains(&name.as_str())
-        })
-        .collect();
-    children.sort();
+    let children = glob_children(entries, seg, skip);
     if *seg == "**" {
         expand_from(tree, at.clone(), tail, skip, out);
         for child in children {
@@ -509,11 +656,42 @@ mod tests {
         format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n")
     }
 
-    /// Over a tracked snapshot the walk answers as on disk and keeps the
-    /// recording usable: it notes what it reads and lists, so a member
-    /// added under a glob afterwards changes the read set.
-    #[test]
-    fn snapshot_walk_records_what_it_reads() {
+    /// Over a tracked snapshot the walk reads through the view: its reads
+    /// fill the content cache, so files written just now (racy by stat
+    /// alone) — including a `.socket/` copy's manifest the walk follows
+    /// through `[patch]` — still leave a read set that holds; a member
+    /// added under a glob afterwards breaks it (the listing was recorded).
+    #[tokio::test]
+    async fn snapshot_walk_records_what_it_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\"]\n\n\
+             [patch.crates-io]\nserde = { path = \".socket/vendor/cargo/u1/serde-1.0.0\" }\n",
+        );
+        write(root, "crates/a/Cargo.toml", &pkg("a"));
+        write(
+            root,
+            ".socket/vendor/cargo/u1/serde-1.0.0/Cargo.toml",
+            &pkg("serde"),
+        );
+        let snap = crate::vendor::lock_inventory::DiskSnapshot::tracked(root);
+        snap.begin_recording();
+        let walked = member_manifests_in(&ProjectView::Snapshot(&snap)).await;
+        assert_eq!(walked, member_manifests(root));
+        assert!(walked.contains(&".socket/vendor/cargo/u1/serde-1.0.0/Cargo.toml".to_string()));
+        let reads = snap.end_recording().expect("the walk keeps the recording");
+        assert!(reads.unchanged(), "fresh files read through the view hold");
+        write(root, "crates/b/Cargo.toml", &pkg("b"));
+        assert!(!reads.unchanged(), "a new member dir changes the listing");
+    }
+
+    /// A snapshot's overlays are part of the walk: an overlaid member
+    /// manifest (a pending write) is a member before it reaches the disk.
+    #[tokio::test]
+    async fn snapshot_walk_sees_overlays() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         write(
@@ -522,27 +700,78 @@ mod tests {
             "[workspace]\nmembers = [\"crates/*\"]\n",
         );
         write(root, "crates/a/Cargo.toml", &pkg("a"));
-        // Files stamped just now are racy: the walk reads around the
-        // snapshot's content cache, so such a read set never holds.
-        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-        for rel in ["Cargo.toml", "crates/a/Cargo.toml"] {
-            std::fs::File::options()
-                .write(true)
-                .open(root.join(rel))
-                .unwrap()
-                .set_modified(old)
-                .unwrap();
-        }
-        let snap = DiskSnapshot::tracked(root);
-        snap.begin_recording();
+        let snap = crate::vendor::lock_inventory::DiskSnapshot::new(root);
+        snap.overlay("crates/c/Cargo.toml", pkg("c").as_bytes());
         assert_eq!(
-            member_manifests_in(&ProjectView::Snapshot(&snap)),
-            member_manifests(root)
+            member_manifests_in(&ProjectView::Snapshot(&snap)).await,
+            vec!["crates/a/Cargo.toml", "crates/c/Cargo.toml"]
         );
-        let reads = snap.end_recording().expect("the walk keeps the recording");
-        assert!(reads.unchanged());
+        assert_eq!(member_manifests(root), vec!["crates/a/Cargo.toml"]);
+    }
+
+    /// The view walk answers exactly as the disk walk over every shape the
+    /// memo test covers (globs, `**`, excludes, nested path dependencies,
+    /// `[patch]` copies, unparseable manifests) plus a symlinked member
+    /// directory, and returns the text it read for each.
+    #[tokio::test]
+    async fn view_walk_matches_the_disk_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            root,
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\", \"tools/**\", \"lit\"]\n\
+             exclude = [\"crates/x\"]\n\
+             [patch.crates-io]\nserde = { path = \".socket/vendor/cargo/u1/serde-1.0.0\" }\n\
+             [workspace.dependencies]\nshared = { path = \"libs/shared\" }\n",
+        );
+        write(
+            root,
+            "crates/a/Cargo.toml",
+            &format!("{}[dependencies.b]\npath = \"../b\"\n", pkg("a")),
+        );
         write(root, "crates/b/Cargo.toml", &pkg("b"));
-        assert!(!reads.unchanged(), "a new member dir changes the listing");
+        write(root, "crates/x/Cargo.toml", &pkg("x"));
+        write(root, "crates/.hidden/Cargo.toml", &pkg("hidden"));
+        write(root, "crates/target/Cargo.toml", &pkg("target"));
+        write(root, "crates/bad/Cargo.toml", "not = [toml");
+        write(root, "tools/deep/t/Cargo.toml", &pkg("t"));
+        write(root, "lit/Cargo.toml", &pkg("lit"));
+        write(root, "libs/shared/Cargo.toml", &pkg("shared"));
+        write(
+            root,
+            ".socket/vendor/cargo/u1/serde-1.0.0/Cargo.toml",
+            &format!(
+                "{}[dependencies]\nderive = {{ path = \"../derive\" }}\n",
+                pkg("serde")
+            ),
+        );
+        write(
+            root,
+            ".socket/vendor/cargo/u1/derive/Cargo.toml",
+            &pkg("derive"),
+        );
+        #[cfg(unix)]
+        {
+            write(root, "elsewhere/l/Cargo.toml", &pkg("l"));
+            std::os::unix::fs::symlink(root.join("elsewhere"), root.join("crates/link")).unwrap();
+        }
+        let disk = member_manifests(root);
+        assert!(disk.contains(&"tools/deep/t/Cargo.toml".to_string()));
+        assert!(!disk.iter().any(|k| k.starts_with("crates/link")));
+        assert_eq!(member_manifests_in(&ProjectView::Disk(root)).await, disk);
+        let snap = crate::vendor::lock_inventory::DiskSnapshot::new(root);
+        assert_eq!(
+            member_manifests_in(&ProjectView::Snapshot(&snap)).await,
+            disk
+        );
+        for (rel, text) in member_manifest_texts_in(&ProjectView::Disk(root)).await {
+            assert_eq!(
+                text,
+                std::fs::read_to_string(root.join(&rel)).unwrap(),
+                "{rel}"
+            );
+        }
     }
 
     #[test]

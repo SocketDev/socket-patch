@@ -415,6 +415,13 @@ pub struct UnlockedPin {
     /// `version = "…"`); a ledger version must satisfy every one. Empty =
     /// none to check (nuget: the csproj `Version` is only a minimum).
     pub version_reqs: Vec<String>,
+    /// Requirements of the package's OTHER declarations, which carry no
+    /// pin (cargo: a member's `serde = "0.9"` beside the root's pinned
+    /// `serde = "1"`). The hosted rewriter pins every declaration whose
+    /// requirement accepts the patched version, so one that accepts a
+    /// ledger version means the pin does not reach it: a ledger version must
+    /// satisfy none of these.
+    pub excluded_reqs: Vec<String>,
     /// The Socket index url the pin routes to (the nuget source value, the
     /// cargo registry's `index`): its grant-token segment is part of this
     /// pin, not other hosted wiring.
@@ -438,16 +445,22 @@ impl UnlockedPin {
         };
         let pinned =
             canonical_base_purl(&format!("pkg:{}/{}@{version}", self.ecosystem, self.name));
+        let parsed = semver::Version::parse(version);
+        // An unreadable requirement or version answers `None`: it matches
+        // no pinned requirement and is never proven excluded.
+        let matches = |req: &str| match (semver::VersionReq::parse(req), &parsed) {
+            (Ok(req), Ok(version)) => Some(req.matches(version)),
+            _ => None,
+        };
         pinned == key
-            && self.version_reqs.iter().all(|req| {
-                match (
-                    semver::VersionReq::parse(req),
-                    semver::Version::parse(version),
-                ) {
-                    (Ok(req), Ok(version)) => req.matches(&version),
-                    _ => false,
-                }
-            })
+            && self
+                .version_reqs
+                .iter()
+                .all(|req| matches(req) == Some(true))
+            && self
+                .excluded_reqs
+                .iter()
+                .all(|req| matches(req) == Some(false))
     }
 }
 
@@ -1654,6 +1667,14 @@ impl<'a> DiscoverCtx<'a> {
     }
 
     /// Log a guarded read of `rel` ([`Discovery::read`]).
+    /// Account for `text`, which a walk through [`Self::view`] read from
+    /// `rel` on this ctx's behalf, exactly as [`Self::read_text`] accounts
+    /// for its own reads (rule 11 recognition and the read log).
+    pub(crate) fn adopt_read(&self, rel: &str, text: &str) {
+        self.log_read(rel, true);
+        self.recognize_text(rel, text);
+    }
+
     fn log_read(&self, rel: &str, readable: bool) {
         self.read
             .lock()
@@ -2765,8 +2786,12 @@ impl Discovery {
     /// 1. a lock inventory entry for this purl whose resolved url is a
     ///    Socket-hosted url for THIS uuid
     ///    ([`crate::patch::redirect::hosted_patch_uuid`] over Socket's host
-    ///    and [`Discovery::patch_server_origins`]): live. A url on any other
-    ///    host that merely contains the uuid is not a patch reference;
+    ///    and [`Discovery::patch_server_origins`]): live. Failing that, an
+    ///    entry whose url has the hosted shape for this uuid on an origin
+    ///    this run was not given (a patch server an earlier run was pointed
+    ///    at with `--patch-server-url`, or a host that merely spells the
+    ///    uuid): [`RecordLiveness::Undecided`] — never attested, never
+    ///    judged dead;
     /// 2. a lock inventory entry that resolves the purl from somewhere ELSE
     ///    (a registry url, a crates.io-checksummed Cargo.lock source): dead
     ///    — the lock positively says the build fetches the unpatched
@@ -2781,6 +2806,9 @@ impl Discovery {
     /// ([`inventory_project_every_lock`] — step 2 is negative evidence, so a
     /// collapsed view that dropped the hosted instance must not feed it),
     /// loaded on first need and shared across calls.
+    ///
+    /// The attestation-grade verdict: [`Self::redirect_record_verdict`]
+    /// is [`RecordLiveness::Live`].
     pub async fn redirect_record_live(
         &self,
         root: &Path,
@@ -2789,8 +2817,23 @@ impl Discovery {
         recorded_files: &[&str],
         inventory: &mut Option<Vec<LockfileEntry>>,
     ) -> bool {
+        self.redirect_record_verdict(root, purl, uuid, recorded_files, inventory)
+            .await
+            .attests()
+    }
+
+    /// [`Self::redirect_record_live`]'s three-way verdict (see
+    /// [`RecordLiveness`]).
+    pub async fn redirect_record_verdict(
+        &self,
+        root: &Path,
+        purl: &str,
+        uuid: &str,
+        recorded_files: &[&str],
+        inventory: &mut Option<Vec<LockfileEntry>>,
+    ) -> RecordLiveness {
         if let Some(live) = self.hosted_claim(purl, uuid) {
-            return live;
+            return RecordLiveness::from_bool(live);
         }
         // Bundler resolves from the Gemfile / `gems.rb`: when a `source
         // "<patch registry>" do` block there still pins the uuid but the
@@ -2815,7 +2858,7 @@ impl Discovery {
                     continue;
                 };
                 if gem::gemfile_source_block_pins(&text, uuid, Some(&gem_name)) {
-                    return true;
+                    return RecordLiveness::Live;
                 }
             }
         }
@@ -2833,19 +2876,68 @@ impl Discovery {
             .iter()
             .filter(|e| lookup(std::slice::from_ref(*e), purl).is_some())
             .collect();
-        if entries.iter().any(|e| {
-            e.resolved.as_deref().is_some_and(|r| {
-                crate::patch::redirect::hosted_patch_uuid(r, &self.patch_server_origins).as_deref()
-                    == Some(uuid)
-            })
+        let resolved = || entries.iter().filter_map(|e| e.resolved.as_deref());
+        if resolved().any(|r| {
+            crate::patch::redirect::hosted_patch_uuid(r, &self.patch_server_origins).as_deref()
+                == Some(uuid)
         }) {
-            return true;
+            return RecordLiveness::Live;
+        }
+        if resolved().any(|r| foreign_hosted_uuid(r).as_deref() == Some(uuid)) {
+            return RecordLiveness::Undecided;
         }
         if entries.iter().any(|e| resolves_elsewhere(e)) {
-            return false;
+            return RecordLiveness::Dead;
         }
-        hosted_wiring_in_files(root, &recorded, uuid).await
+        RecordLiveness::from_bool(hosted_wiring_in_files(root, &recorded, uuid).await)
     }
+}
+
+/// A redirect-ledger record's liveness ([`Discovery::redirect_record_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLiveness {
+    /// The build resolves the package from the record's patch.
+    Live,
+    /// A lock entry resolves the package from a url with the hosted shape
+    /// for the record's patch, on an origin this run does not accept as a
+    /// patch server: perhaps the operator's own server, configured on an
+    /// earlier run (`--patch-server-url`) but not this one; perhaps a host
+    /// that merely spells the uuid. Never attested, never judged dead —
+    /// what keeps the wiring (the hosted-wiring advisories) keeps it.
+    Undecided,
+    /// The build does not resolve the package from the record's patch.
+    Dead,
+}
+
+impl RecordLiveness {
+    fn from_bool(live: bool) -> Self {
+        if live {
+            Self::Live
+        } else {
+            Self::Dead
+        }
+    }
+
+    /// Whether the record may be attested.
+    pub fn attests(self) -> bool {
+        self == Self::Live
+    }
+
+    /// Whether the record's wiring is to be kept (not judged gone).
+    pub fn retained(self) -> bool {
+        self != Self::Dead
+    }
+}
+
+/// The patch uuid `url` names when read as a hosted url of its OWN origin
+/// ([`crate::patch::redirect::hosted_patch_uuid`]'s grammar — no userinfo,
+/// the last canonical-uuid path segment — with the url's origin taken as
+/// configured): what a lock entry on an origin this run was not given
+/// claims to resolve from.
+fn foreign_hosted_uuid(url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(url.trim()).ok()?;
+    let origin = parsed.origin().ascii_serialization();
+    crate::patch::redirect::hosted_patch_uuid(url, &[origin])
 }
 
 /// Whether root-relative `file` is one of `ecosystem`'s lockfiles — what an
@@ -2922,10 +3014,24 @@ impl<'a> LedgerLiveness<'a> {
         }
     }
 
-    /// [`Discovery::redirect_record_live`] for this project state.
+    /// [`Discovery::redirect_record_live`] for this project state: whether
+    /// the record may be ATTESTED.
     pub async fn redirect_record(&mut self, purl: &str, uuid: &str) -> bool {
+        self.redirect_record_verdict(purl, uuid).await.attests()
+    }
+
+    /// Whether the record's hosted wiring is still in place for a caller
+    /// that keeps or reports wiring rather than attesting it
+    /// ([`RecordLiveness::retained`]: an [`RecordLiveness::Undecided`]
+    /// record is kept).
+    pub async fn redirect_record_retained(&mut self, purl: &str, uuid: &str) -> bool {
+        self.redirect_record_verdict(purl, uuid).await.retained()
+    }
+
+    /// [`Discovery::redirect_record_verdict`] for this project state.
+    pub async fn redirect_record_verdict(&mut self, purl: &str, uuid: &str) -> RecordLiveness {
         self.discovery
-            .redirect_record_live(
+            .redirect_record_verdict(
                 self.root,
                 purl,
                 uuid,
@@ -3978,14 +4084,16 @@ mod tests {
             None,
             "host not allowlisted"
         );
-        // Without the origin, the internal host's url is no patch reference
-        // however much of the uuid it spells: dead.
+        // Without the origin, the internal host's url is undecided: never
+        // attested, and — the regression — not vetoed by the script lock's
+        // registry instance either.
         let mut inventory = None;
-        assert!(
-            !discovery
-                .redirect_record_live(root, purl, UUID_A, &["uv.lock"], &mut inventory)
+        assert_eq!(
+            discovery
+                .redirect_record_verdict(root, purl, UUID_A, &["uv.lock"], &mut inventory)
                 .await,
-            "a uuid on an unconfigured host keeps nothing alive"
+            RecordLiveness::Undecided,
+            "an unconfigured patch host is never attested, nor judged dead"
         );
         let discovery = Discovery {
             patch_server_origins: vec!["https://patches.internal.example".to_string()],
@@ -4125,18 +4233,23 @@ mod tests {
 
     /// REGRESSION (P6): step 1 classifies a lock entry's resolved url with
     /// the one origin rule ([`crate::patch::redirect::hosted_patch_uuid`]),
-    /// never by substring. A url on another host that merely spells the
-    /// record's uuid — even in Socket's own path shape — resolves the
-    /// package from somewhere else (step 2: dead), as does a Socket url for
-    /// ANOTHER patch whose path also carries the uuid (as its grant
-    /// token). A Socket-host url and a configured origin's url for the
-    /// record's uuid stay live.
+    /// never by substring. Only a Socket-host url or a configured origin's
+    /// url for the record's uuid is LIVE (attested). A url with the hosted
+    /// shape for the uuid on an origin this run was not given — a patch
+    /// server an earlier run was pointed at, or a host that merely spells
+    /// it — is UNDECIDED: never attested, but its wiring is retained. A url
+    /// that only contains the uuid (a file name, a query) and a Socket url
+    /// for ANOTHER patch (whose path carries the uuid as its grant token)
+    /// resolve the package from somewhere else: DEAD.
     #[tokio::test]
     async fn liveness_matches_the_resolved_url_by_origin_not_substring() {
+        use RecordLiveness::{Dead, Live, Undecided};
         let origin = "http://127.0.0.1:4545";
         let purl = "pkg:npm/x@1.0.0";
         let elsewhere =
             format!("https://evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let in_name = format!("https://evil.example/files/x-{UUID_A}.tgz");
+        let in_query = format!("https://evil.example/files/x-1.0.0.tgz?id={UUID_A}");
         let other_patch =
             format!("https://patch.socket.dev/patch/npm/x/1.0.0/{UUID_A}/{UUID_B}/x-1.0.0.tgz");
         let socket = hosted_url("npm", "x", "1.0.0", UUID_A, "x-1.0.0.tgz");
@@ -4145,12 +4258,15 @@ mod tests {
             patch_server_origins: vec![origin.to_string()],
             ..Discovery::default()
         };
-        for (resolved, origins_discovery, live) in [
-            (&elsewhere, &with_origin, false),
-            (&other_patch, &with_origin, false),
-            (&configured, &Discovery::default(), false),
-            (&socket, &Discovery::default(), true),
-            (&configured, &with_origin, true),
+        let without = Discovery::default();
+        for (resolved, discovery, verdict) in [
+            (&elsewhere, &with_origin, Undecided),
+            (&configured, &without, Undecided),
+            (&in_name, &with_origin, Dead),
+            (&in_query, &with_origin, Dead),
+            (&other_patch, &with_origin, Dead),
+            (&socket, &without, Live),
+            (&configured, &with_origin, Live),
         ] {
             let p = Project::new();
             p.write(
@@ -4159,9 +4275,24 @@ mod tests {
                     r#"{{"lockfileVersion":3,"packages":{{"":{{}},"node_modules/x":{{"version":"1.0.0","resolved":"{resolved}"}}}}}}"#
                 ),
             );
+            let why = format!("{resolved} (origins {:?})", discovery.patch_server_origins);
             let mut inventory = None;
             assert_eq!(
-                origins_discovery
+                discovery
+                    .redirect_record_verdict(
+                        p.root(),
+                        purl,
+                        UUID_A,
+                        &["package-lock.json"],
+                        &mut inventory,
+                    )
+                    .await,
+                verdict,
+                "{why}"
+            );
+            let mut inventory = None;
+            assert_eq!(
+                discovery
                     .redirect_record_live(
                         p.root(),
                         purl,
@@ -4170,9 +4301,19 @@ mod tests {
                         &mut inventory,
                     )
                     .await,
-                live,
-                "{resolved} (origins {:?})",
-                origins_discovery.patch_server_origins
+                verdict == Live,
+                "only a live record attests: {why}"
+            );
+            let mut liveness = LedgerLiveness::new(p.root(), discovery, None);
+            assert_eq!(
+                liveness.redirect_record(purl, UUID_A).await,
+                verdict.attests(),
+                "{why}"
+            );
+            assert_eq!(
+                liveness.redirect_record_retained(purl, UUID_A).await,
+                verdict != Dead,
+                "{why}"
             );
         }
     }

@@ -751,7 +751,7 @@ pub async fn read_candidate_files(
     // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
     if out.files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
     {
-        for rel in crate::utils::cargo_workspace::member_manifests_in(view) {
+        for rel in crate::utils::cargo_workspace::member_manifests_in(view).await {
             out.read(view, unreadable, &rel).await;
         }
     }

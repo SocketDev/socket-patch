@@ -197,15 +197,22 @@ fn render(out: &Discovery, root: &Path) -> Value {
                 uuid,
                 file,
                 version_reqs,
+                excluded_reqs,
                 index_url: _,
             } = p;
-            json!({
+            let mut pin = json!({
                 "ecosystem": ecosystem,
                 "name": name,
                 "uuid": uuid,
                 "file": path_str(file),
                 "version_reqs": version_reqs,
-            })
+            });
+            // Rendered only when present, so goldens without any keep
+            // their shape.
+            if !excluded_reqs.is_empty() {
+                pin["excluded_reqs"] = json!(excluded_reqs);
+            }
+            pin
         })
         .collect();
     let elsewhere_rendered: Vec<Value> = elsewhere

@@ -501,14 +501,12 @@ impl<'a> DiskSnapshot<'a> {
     }
 
     /// Note that `rel` is about to be read or probed (see [`Self::tracked`]).
-    /// Crate-visible for a walk the view does not mediate that reads only
-    /// what it touches (the cargo workspace member walk).
-    pub(crate) fn touch(&self, rel: &str) {
+    fn touch(&self, rel: &str) {
         self.touch_as(rel, Access::Probe);
     }
 
     /// Note that directory `rel` is about to be listed.
-    pub(crate) fn touch_listing(&self, rel: &str) {
+    fn touch_listing(&self, rel: &str) {
         self.touch_as(rel, Access::List);
     }
 
