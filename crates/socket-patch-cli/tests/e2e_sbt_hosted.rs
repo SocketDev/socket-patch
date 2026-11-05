@@ -430,6 +430,52 @@ fn hosted_vex_without_evidence_is_unverified() {
     );
 }
 
+/// An unverified pin (no evidence) keeps the installed-copy basis: the
+/// suffixed copy sbt downloaded into `.socket/sbt-hosted` at load attests
+/// it. A build source reassigning `dependencyOverrides` or `resolvers`
+/// drops the pin where it applies, so the same copy proves nothing about
+/// what the build runs: the patch is omitted with `vex_sbt_pin_bypassed`.
+#[test]
+fn hosted_vex_installed_copy_is_withdrawn_by_a_pin_dropping_edit() {
+    for edit in [
+        None,
+        Some("dependencyOverrides := Seq()\n"),
+        Some("resolvers := Seq(Resolver.mavenLocal)\n"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = SbtHome::new(tmp.path());
+        let project = committed_project(tmp.path());
+        if let Some(edit) = edit {
+            let mut build = std::fs::read_to_string(project.join("build.sbt")).unwrap();
+            build.push_str(edit);
+            std::fs::write(project.join("build.sbt"), build).unwrap();
+        }
+        let copy = project
+            .join(HOSTED_REPO_REL)
+            .join("com/google/code/gson/gson")
+            .join(SV);
+        std::fs::create_dir_all(&copy).unwrap();
+        std::fs::write(copy.join(format!("gson-{SV}.jar")), JAR).unwrap();
+        std::fs::write(copy.join(format!("gson-{SV}.pom")), POM).unwrap();
+        let api = Api::start();
+        api.grant(UUID, GROUP, ARTIFACT, BASE);
+        let (_, json) = vex(&home, &project, &api.server.uri());
+        let codes = all_codes(&json);
+        assert!(
+            codes.contains(&"sbt_resolution_unverified".to_string()),
+            "{edit:?}: {json}"
+        );
+        let doc = std::fs::read_to_string(project.join("vex.json")).unwrap_or_default();
+        let attested = doc.contains("\"not_affected\"");
+        let bypassed = codes.contains(&"vex_sbt_pin_bypassed".to_string());
+        assert_eq!(
+            (attested, bypassed),
+            (edit.is_none(), edit.is_some()),
+            "{edit:?}: {json}\n{doc}"
+        );
+    }
+}
+
 /// What `sbt update` records after wiring: `b` resolves the pinned version,
 /// its jar at `jar` (absolute), dated after the generated file.
 fn post_update_evidence(project: &Path, jar: &Path) {

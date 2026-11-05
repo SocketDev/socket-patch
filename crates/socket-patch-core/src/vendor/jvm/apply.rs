@@ -1038,8 +1038,18 @@ pub fn entry_references(root: &Path, entry: &VendorEntry) -> bool {
 /// Gradle half's script is intact and re-plans with no refusal and no
 /// degraded warning (a conflicting rule or unchecked build logic added
 /// since vendoring withholds attestation), and no Maven declaration is
-/// left at a version that may still read the base.
+/// left at a version that may still read the base. An sbt or scala-cli
+/// entry's committed files must also route the build to the vendored copy
+/// (`sbt::attestable_checked`, `scala_cli::attestable_checked`): when they
+/// do not, the reason is the `Err`, which withholds attestation without
+/// declaring the wiring gone.
 pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, String> {
+    entry_wiring_checked(root, entry, true)
+}
+
+/// [`entry_wired_checked`]; `attest: false` skips the sbt / scala-cli
+/// attestability checks (`check_entry`'s reference test).
+fn entry_wiring_checked(root: &Path, entry: &VendorEntry, attest: bool) -> Result<bool, String> {
     let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
         group_id: &g,
@@ -1051,9 +1061,17 @@ pub fn entry_wired_checked(root: &Path, entry: &VendorEntry) -> Result<bool, Str
     let read = |rel: &str| reader.read(rel);
     let list = |dir: &str| reader.list(dir);
     let wired = if sbt::owns(&entry.wiring) {
-        sbt::wired_checked(&read, &c).map_err(|e| e.detail)
+        match sbt::wired_checked(&read, &c) {
+            Ok(true) if attest => sbt::attestable_checked(&read, &c).map(|()| true),
+            other => other,
+        }
+        .map_err(|e| e.detail)
     } else if scala_cli::owns(&entry.wiring) {
-        scala_cli::wired_checked(&read, &c).map_err(|e| e.detail)
+        match scala_cli::wired_checked(&read, &c) {
+            Ok(true) if attest => scala_cli::attestable_checked(root, &read, &c).map(|()| true),
+            other => other,
+        }
+        .map_err(|e| e.detail)
     } else {
         let (maven, gradle) = sides(&entry.wiring);
         let mut wired = Ok(true);
@@ -1202,7 +1220,7 @@ pub fn check_entry(
         return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
     }
     let referenced = if sbt_entry || scala_cli_entry {
-        entry_wired_checked(root, entry)?
+        entry_wiring_checked(root, entry, false)?
     } else {
         (!maven || maven_reactor::wired_checked(&read, &list, &c).map_err(|e| e.detail)?)
             && (!gradle || gradle::references(&read, &c))

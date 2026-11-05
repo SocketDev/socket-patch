@@ -181,6 +181,25 @@ fn directive_refusal(
     Some(refuse("vendor_scala_cli_repository_shadowed", detail))
 }
 
+/// The gate's `vendor_scala_cli_repository_shadowed` directive check over
+/// the build at `project_root` as it stands, for `vex` liveness
+/// (`scala_cli::attestable_checked`): the detail naming the input that
+/// declares a repository or pins `g` to a direct `url=`, if any. The
+/// inputs are the directory's own plus, when evidence lists them, the
+/// out-of-root ones it builds.
+pub(crate) fn shadowing_directive(project_root: &Path, g: &str, a: &str) -> Option<String> {
+    let evidence = scala_evidence::discover(project_root);
+    let sources = evidence
+        .as_ref()
+        .map(|e| e.sources.as_slice())
+        .unwrap_or_default();
+    match directive_refusal(project_root, sources, g, a)? {
+        GateStop::Refuse(r) => Some(r.detail),
+        GateStop::Skip(w) => Some(w.detail),
+        GateStop::Silent => None,
+    }
+}
+
 /// Whether the committed tree's index already lists `g:a:base` (under any
 /// patch uuid: an update re-plans it too). FIFO-safe; an unreadable index
 /// lists nothing (the planner refuses it).

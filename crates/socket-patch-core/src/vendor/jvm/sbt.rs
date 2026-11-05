@@ -592,6 +592,50 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
     }))
 }
 
+/// Why the committed hosted `socket-patch.sbt` may force another copy of
+/// the GA at `c` than the vendored one, though [`wired_checked`] finds the
+/// pin: `vex` liveness only (the revert / prune reference tests keep the
+/// plain wiring test). Both generated files' `dependencyOverrides +=` lines
+/// apply build-wide and the build resolves one version of a GA, so a
+/// hosted pin of it under another patch (as a merge of two branches
+/// leaves) may win, and the post-resolution verifier holds the GA to its
+/// first pin, the hosted row (`sbt_pin_conflict`). A hosted file that no
+/// longer parses strictly may pin anything. The planner refuses both
+/// (`vendor_sbt_hosted_conflict`), so `vendor --check` fails, but the
+/// liveness test never re-plans. (The vendored file itself never parses
+/// strictly with two pins of one GA.)
+pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<(), JvmRefusal> {
+    let conflict = |detail: String| JvmRefusal {
+        code: "vendor_jvm_shape_unsupported",
+        detail: format!("reason: sbt_pin_conflict: {detail}"),
+    };
+    let (g, a) = (c.group_id, c.artifact_id);
+    let hosted = match read_owned(read, SbtFileMode::Hosted) {
+        Ok(file) => file,
+        Err(OwnedFileError::Foreign) => None,
+        Err(OwnedFileError::Modified(why)) => {
+            return Err(conflict(format!(
+                "{HOSTED_FILE} is not what socket-patch generated ({why}), so it may pin \
+                 {g}:{a} too; restore or remove it"
+            )))
+        }
+    };
+    let others: Vec<String> = hosted
+        .iter()
+        .flat_map(|f| f.pins.values())
+        .filter(|p| p.uuid != c.uuid && p.group == g && p.artifact == a)
+        .map(|p| format!("{} (patch {})", p.sv, p.uuid))
+        .collect();
+    if !others.is_empty() {
+        return Err(conflict(format!(
+            "{HOSTED_FILE} also pins {g}:{a} at {}, and the build resolves one version of it; \
+             roll that patch back",
+            others.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 /// The committed tree bytes of the patch at `c` (the reactor's tree).
 pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<CommittedTree> {
     maven_reactor::committed(read, c).map(|(jar, pom)| (jar, pom, None))
@@ -1492,5 +1536,67 @@ mod tests {
             .unwrap()
             .writes
             .is_empty());
+    }
+
+    /// VEX liveness reads the committed hosted file too: its pin of the
+    /// same GA under another patch (as a merge of two branches leaves) may
+    /// be the one the build resolves, and a hosted file that no longer
+    /// parses strictly may pin anything. The revert / prune reference test
+    /// still sees the pin. (Two rows of one GA in the vendored file never
+    /// parse strictly, so `wired_checked` already fails there.)
+    #[tokio::test]
+    async fn liveness_refuses_another_committed_pin_of_the_ga() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "1.9.9", &[]);
+        let mut ledger = BTreeMap::new();
+        vendor(root, Shape::Sbt, &text_patch(UUID_A), &mut ledger)
+            .await
+            .unwrap();
+        let e = ledger.values().next().unwrap().clone();
+        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+        let reader = super::super::apply::ProjectReader::new(root);
+        let read = |rel: &str| reader.read(rel);
+        let committed = read_owned(&read, SbtFileMode::Vendored).unwrap().unwrap();
+        let mine = committed.pins[UUID_A].clone();
+        let other = |uuid: &str, mode: SbtFileMode| SbtPin {
+            uuid: uuid.into(),
+            sv: format!("1.10.0-socket.{}", &uuid[..8]),
+            index_url: (mode == SbtFileMode::Hosted)
+                .then(|| format!("https://patch.socket.dev/patch-registry/maven/t/{uuid}/maven2")),
+            ..mine.clone()
+        };
+        let conflict = |what: &str| {
+            let err = apply::entry_wired_checked(root, &e).unwrap_err();
+            assert!(err.contains("reason: sbt_pin_conflict:"), "{what}: {err}");
+            assert!(apply::entry_references(root, &e), "{what}");
+            // `vendor --check` re-plans, and the planner refuses it.
+            assert!(apply::check_entry(root, &e, None).is_err(), "{what}");
+        };
+
+        // A hosted row of the GA under another patch.
+        let hosted = SbtOwnedFile {
+            mode: SbtFileMode::Hosted,
+            line: committed.line,
+            crlf: false,
+            pins: [(UUID_A2.to_string(), other(UUID_A2, SbtFileMode::Hosted))].into(),
+        };
+        let hosted_text = render(&hosted).unwrap();
+        std::fs::write(root.join(HOSTED_FILE), &hosted_text).unwrap();
+        conflict("hosted row");
+        // The same patch hosted is the same version and bytes.
+        let same = SbtOwnedFile {
+            pins: [(UUID_A.to_string(), other(UUID_A, SbtFileMode::Hosted))].into(),
+            ..hosted.clone()
+        };
+        std::fs::write(root.join(HOSTED_FILE), render(&same).unwrap()).unwrap();
+        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+        // An edited hosted file, but not a user's own file under the name.
+        std::fs::write(root.join(HOSTED_FILE), format!("{hosted_text}// edit\n")).unwrap();
+        conflict("modified hosted file");
+        std::fs::write(root.join(HOSTED_FILE), "lazy val x = 1\n").unwrap();
+        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+        std::fs::remove_file(root.join(HOSTED_FILE)).unwrap();
+        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
     }
 }

@@ -233,6 +233,74 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
     Ok(indexed && ours(ROOT_FILE, ROOT_BYTES) && ours(GUARD_REL, GUARD_BYTES))
 }
 
+/// Why the committed files of the project at `root` (served by `read`)
+/// let scala-cli resolve the patch at `c` from somewhere other than the
+/// tree, though [`wired_checked`] finds the wiring: `vex` liveness only.
+/// `vendor --check` and the revert / prune reference tests keep the plain
+/// wiring test, so the patch stays managed. The tree keeps the upstream
+/// GAV and wins only by being found first:
+///
+/// - `scala_cli_tree_uncommitted`: the index lacks a row for the patch's
+///   jar or pom, or the committed file is missing or does not hash to its
+///   row. Coursier reads a module's pom from the first repository that has
+///   one, so without the tree's pom the next repository (Central) serves
+///   the module, and its unpatched jar with it.
+/// - `scala_cli_repository_shadowed`: an input declares a repository,
+///   which scala-cli consults before the tree, or pins the patched group
+///   to a direct `url=` (the gate's directive check: `vendor` refuses
+///   it, but an input edited afterwards is only caught here).
+///
+/// A re-plan would rewrite neither: it writes the tree from the patch's
+/// bytes, and never edits a user input. So only the committed files are
+/// judged here, never what a re-plan would write.
+pub fn attestable_checked(
+    root: &std::path::Path,
+    read: ReadFn<'_>,
+    c: &Coords<'_>,
+) -> Result<(), JvmRefusal> {
+    let not_attestable = |reason: &str, detail: String| JvmRefusal {
+        code: "vendor_jvm_shape_unsupported",
+        detail: format!("reason: {reason}: {detail}"),
+    };
+    let rows = match read(INDEX_REL) {
+        Some(bytes) => coursier_tree::parse_index(&bytes).map_err(|why| {
+            not_attestable(
+                "coursier_index_unreadable",
+                format!("{INDEX_REL}: {why}; restore it from git"),
+            )
+        })?,
+        None => Vec::new(),
+    };
+    let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
+    let version_dir = layout::version_dir(c.group_id, c.artifact_id, c.version);
+    for ext in ["jar", "pom"] {
+        let rel = format!("{version_dir}/{}-{}.{ext}", c.artifact_id, c.version);
+        let path = format!("{}/{rel}", layout::COURSIER_TREE);
+        let row = rows
+            .iter()
+            .find(|r| r.gav == gav && r.uuid == c.uuid && r.rel == rel);
+        let why = match (row, read(&path)) {
+            (None, _) => format!("{INDEX_REL} lists no {ext} of patch {}", c.uuid),
+            (Some(_), None) => format!("{path} is missing"),
+            (Some(row), Some(bytes)) if super::sha256_hex(&bytes) != row.sha256 => {
+                format!("{path} does not hash to its {INDEX_REL} row")
+            }
+            (Some(_), Some(_)) => continue,
+        };
+        return Err(not_attestable(
+            "scala_cli_tree_uncommitted",
+            format!(
+                "{why}, so scala-cli may resolve {gav} past the vendored tree; restore \
+                 .socket/vendor/coursier from git or re-run socket-patch vendor"
+            ),
+        ));
+    }
+    if let Some(why) = super::coursier_gate::shadowing_directive(root, c.group_id, c.artifact_id) {
+        return Err(not_attestable("scala_cli_repository_shadowed", why));
+    }
+    Ok(())
+}
+
 /// The committed tree bytes of the patch at `c`.
 pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<CommittedTree> {
     coursier_tree::committed(read, c)
@@ -542,5 +610,75 @@ mod tests {
         }
         let bad = fs(&[(INDEX_REL, "#nope\n")]);
         assert!(wired_checked(&bad, &p.coords()).is_err());
+    }
+
+    /// VEX liveness judges the committed files a build reads, not the
+    /// wiring test alone: a tree pom gone (Coursier then reads the module
+    /// from the next repository, Central's unpatched jar with it), a tree
+    /// file the index no longer vouches for, or a repository directive
+    /// added since vendoring withholds attestation with its reason, while
+    /// `vendor --check`'s reference test and the revert / prune reference
+    /// test still see the wiring.
+    #[tokio::test]
+    async fn liveness_needs_the_committed_tree_and_no_shadowing_repository() {
+        use super::super::apply::{check_entry, entry_references, entry_wired_checked};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        populate(
+            root,
+            &[
+                (PROJECT_FILE, "//> using scala 3.3.6\n"),
+                ("main.scala", "x\n"),
+            ],
+        );
+        let mut ledger = BTreeMap::new();
+        let p = patch("config", UUID, b"PATCHED");
+        vendor(root, Shape::ScalaCli, &p, &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap().clone();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+        check_entry(root, &entry, None).unwrap();
+
+        let tree = root.join(coursier_tree::tree_dir(&p.coords()));
+        let reason = |want: &str| {
+            let err = entry_wired_checked(root, &entry).unwrap_err();
+            assert!(err.contains(&format!("reason: {want}:")), "{err}");
+            // Still wired for every other caller.
+            let read = |rel: &str| super::super::apply::read_project_file(root, rel);
+            assert_eq!(wired_checked(&read, &p.coords()), Ok(true));
+            assert!(entry_references(root, &entry));
+        };
+        let pom = tree.join("config-1.4.3.pom");
+        let pom_bytes = std::fs::read(&pom).unwrap();
+        std::fs::remove_file(&pom).unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&pom, b"<project><relocation/></project>\n").unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&pom, &pom_bytes).unwrap();
+        // An index edited to drop the pom row no longer vouches for it.
+        let index = root.join(INDEX_REL);
+        let index_bytes = std::fs::read(&index).unwrap();
+        let kept: String = String::from_utf8(index_bytes.clone())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains(".pom\t"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&index, kept).unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&index, &index_bytes).unwrap();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+
+        // A repository another input declares is consulted before the tree.
+        std::fs::write(
+            root.join("main.scala"),
+            "//> using repository https://repo.example.com/maven2\nx\n",
+        )
+        .unwrap();
+        reason("scala_cli_repository_shadowed");
+        check_entry(root, &entry, None).unwrap();
+        std::fs::write(root.join("main.scala"), "x\n").unwrap();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
     }
 }

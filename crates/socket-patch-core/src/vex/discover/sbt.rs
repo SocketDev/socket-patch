@@ -11,8 +11,16 @@
 //! verifies it: every version sbt recorded for the GA is the pinned
 //! `<base>-socket.<hex8>`, and every artifact file recorded for it hashes to
 //! one of the pin's sha256s, the jar's among them. Otherwise the diagnostic
-//! `sbt_resolution_unverified`, and the ref stays unattested (it must still
-//! be verified against an installed copy).
+//! `sbt_resolution_unverified`, and the ref keeps only the installed-copy
+//! basis (the suffixed copy under `.socket/sbt-hosted`, which only the
+//! hosted file downloads).
+//!
+//! That copy proves sbt loaded the hosted file once, not that the build
+//! resolves it. Where the build provably does not apply the pin
+//! ([`bypass`]: a build edit dropping the generated override or resolver,
+//! or current evidence resolving another version or other bytes), the ref
+//! is also marked [`Unattested`] (`SbtPinBypassed`), so no basis attests
+//! it.
 //!
 //! The check is on content, not location, like the generated file's own
 //! load-time verifier: Ivy legitimately serves a second checkout from the
@@ -26,11 +34,13 @@
 //! A generated file socket-patch cannot parse strictly is
 //! `sbt_owned_file_modified` (a foreign file under the name is not ours and
 //! is ignored).
+//!
+//! [`Unattested`]: super::Unattested
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use super::{DiscoverCtx, Discovery, PatchedRef, DIAG_REF_INVALID};
+use super::{DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_REF_INVALID};
 use crate::formats::sbt::owned_file::{
     parse, OwnedFileError, SbtFileMode, SbtPin, HOSTED_FILE, VENDORED_FILE, VENDORED_REPO_REL,
 };
@@ -51,44 +61,157 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if hosted.is_none() && vendored.is_none() {
         return;
     }
-    // The resolution evidence is sbt's own output tree: only a disk has one.
-    let (res, blocker) = match ctx.disk_root() {
-        Some(root) => evidence(root).await,
-        None => (None, None),
+    // The resolution evidence is sbt's own output tree, and the build
+    // sources are a walk: only a disk has either.
+    let build = match ctx.disk_root() {
+        Some(root) => build_state(root).await,
+        None => BuildState::default(),
     };
-    let blocker = blocker.as_deref();
     let mut hashes = Hashes::default();
     if let Some(text) = hosted {
         if let Some(pins) = strict(SbtFileMode::Hosted, &text, out) {
             for pin in pins {
-                hosted_ref(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
+                hosted_ref(ctx, &pin, &build, &mut hashes, out).await;
             }
         }
     }
     if let Some(text) = vendored {
         if let Some(pins) = strict(SbtFileMode::Vendored, &text, out) {
+            let (res, blocker) = (build.res.as_ref(), build.blocker.as_deref());
             for pin in pins {
-                vendored_check(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
+                vendored_check(ctx, &pin, res, blocker, &mut hashes, out).await;
             }
         }
     }
 }
 
-/// The build's resolution evidence, read off disk (`None` when there is
-/// none), and why it cannot vouch for any pin even where it shows one
-/// ([`evidence_blocker`]).
-async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
+/// What the build's local state says about every pin.
+#[derive(Debug, Default)]
+struct BuildState {
+    /// The build's resolution evidence (`None` when there is none).
+    res: Option<JvmResolution>,
+    /// Why the evidence cannot vouch for any pin even where it shows one
+    /// ([`evidence_blocker`]).
+    blocker: Option<String>,
+    /// A build edit that keeps the generated pin from applying
+    /// ([`edit_bypass`]), read off the build sources whether or not any
+    /// evidence exists.
+    edit: Option<String>,
+    /// The evidence postdates every build source and the generated files,
+    /// so what it records is what the build resolves now.
+    current: bool,
+}
+
+/// The build's state under `root`: its sources scanned, its evidence read
+/// (`sbt_evidence::discover`'s rule: no evidence file, no evidence).
+async fn build_state(root: &Path) -> BuildState {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let Some(e) = crate::crawlers::sbt_evidence::discover(&root) else {
-            return (None, None);
+        let Ok(e) = crate::crawlers::sbt_evidence::scan(&root) else {
+            return BuildState::default();
         };
+        let edit = edit_bypass(&crate::formats::sbt::build::scan_build_sources(
+            &e.build_sources,
+        ));
+        if e.files.is_empty() {
+            return BuildState {
+                edit,
+                ..BuildState::default()
+            };
+        }
         let res = crate::crawlers::sbt_evidence::resolution(&e);
         let blocker = res.as_ref().and_then(|res| evidence_blocker(&e, res));
-        (res, blocker)
+        BuildState {
+            res,
+            blocker,
+            edit,
+            current: !e.stale && !e.wiring_newer,
+        }
     })
     .await
     .unwrap_or_default()
+}
+
+/// The build edit under which the generated file pins nothing where the
+/// edit applies, so no copy (installed, cached or resolved) shows that the
+/// build uses the pinned bytes: a `dependencyOverrides` reassignment
+/// replaces the generated override (the build resolves the version it
+/// declares), and a `resolvers` reassignment or `sbt.override.build.repos`
+/// drops the generated resolver (the pinned version resolves from another
+/// repository, or not at all). The other build-wide blockers
+/// ([`evidence_blocker`]) only make the evidence too old or too partial to
+/// verify a pin, and a `build.sbt.lock` checks the resolution without
+/// changing it: under none of them does the pin stop applying.
+fn edit_bypass(findings: &crate::formats::sbt::build::BuildFindings) -> Option<String> {
+    if !findings.overrides_assignment.is_empty() {
+        return Some(format!(
+            "{} reassign(s) `dependencyOverrides`, which replaces socket-patch's override where \
+             it applies, so the build resolves the version it declares there (append with `+=` \
+             instead)",
+            findings.overrides_assignment.join(", ")
+        ));
+    }
+    if !findings.resolvers_assignment.is_empty() {
+        return Some(format!(
+            "{} reassign(s) `resolvers`, which drops socket-patch's resolver where it applies, \
+             so the pinned version does not resolve from it there (append with `+=` instead)",
+            findings.resolvers_assignment.join(", ")
+        ));
+    }
+    if !findings.override_build_repos.is_empty() {
+        return Some(format!(
+            "{} set(s) `sbt.override.build.repos=true`, so the launcher's repositories replace \
+             the build's, socket-patch's resolver among them",
+            findings.override_build_repos.join(", ")
+        ));
+    }
+    None
+}
+
+/// Why the build provably does not use `pin`'s bytes, whatever copy is
+/// installed: a build edit ([`edit_bypass`]), or current evidence
+/// ([`BuildState::current`]) recording another version of the GA, or a
+/// readable artifact of the pinned version whose bytes are not pinned.
+/// Evidence older than a build source or the generated files proves
+/// nothing either way (it may predate the pin), and neither does an
+/// artifact file that is gone (an evicted cache).
+async fn bypass(pin: &SbtPin, build: &BuildState, hashes: &mut Hashes) -> Option<String> {
+    if let Some(edit) = &build.edit {
+        return Some(edit.clone());
+    }
+    let res = build.res.as_ref().filter(|_| build.current)?;
+    let ga = format!("{}:{}", pin.group, pin.artifact);
+    if let Some(other) = res
+        .versions(&pin.group, &pin.artifact)
+        .into_iter()
+        .find(|v| *v != pin.sv)
+    {
+        return Some(format!(
+            "the build's current resolution evidence resolves {ga}:{other}, not the pinned {} \
+             (something in the build forces that version, or a project the pin does not reach \
+             resolves it)",
+            pin.sv
+        ));
+    }
+    let paths = res
+        .artifacts
+        .get(&(pin.group.clone(), pin.artifact.clone(), pin.sv.clone()))
+        .into_iter()
+        .flatten();
+    for path in paths {
+        if let Some(got) = hashes.of(path).await {
+            if got != pin.jar_sha256 && got != pin.pom_sha256 {
+                return Some(format!(
+                    "the build's current resolution evidence resolves {ga}:{} to {} with \
+                     sha256 {got}, which is not pinned (a copy another repository serves, \
+                     such as `mavenLocal` or an Ivy-local publish)",
+                    pin.sv,
+                    path.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// The build-wide conditions under which evidence showing the pin is not
@@ -266,8 +389,7 @@ async fn verify(
 async fn hosted_ref(
     ctx: &DiscoverCtx<'_>,
     pin: &SbtPin,
-    res: Option<&JvmResolution>,
-    blocker: Option<&str>,
+    build: &BuildState,
     hashes: &mut Hashes,
     out: &mut Discovery,
 ) {
@@ -297,6 +419,7 @@ async fn hosted_ref(
         );
         return;
     }
+    let (res, blocker) = (build.res.as_ref(), build.blocker.as_deref());
     let locked = match verify_with(pin, res, blocker, hashes).await {
         Ok(()) => Some(LockIntegrity::Sha256Hex(pin.jar_sha256.clone())),
         Err(why) => {
@@ -308,6 +431,17 @@ async fn hosted_ref(
             None
         }
     };
+    // Unverified, the ref still attests from the installed copy; where the
+    // build provably does not apply the pin, from nothing.
+    if let Some(why) = bypass(pin, build, hashes).await {
+        out.unattested(
+            &purl,
+            &pin.uuid,
+            HOSTED_FILE,
+            why,
+            UnattestedKind::SbtPinBypassed,
+        );
+    }
     out.push(PatchedRef::hosted(
         purl,
         pin.uuid.clone(),
@@ -503,5 +637,175 @@ mod tests {
             .await,
             Ok(())
         );
+    }
+
+    /// Only the edits that drop the generated override or resolver mean the
+    /// pin is not applied; staleness, partial evidence and a lock do not.
+    #[test]
+    fn edit_bypass_is_the_pin_dropping_edits_only() {
+        use crate::formats::sbt::build::BuildFindings;
+        assert_eq!(edit_bypass(&BuildFindings::default()), None);
+        let lock = BuildFindings {
+            dependency_lock: vec!["build.sbt.lock".into()],
+            ..Default::default()
+        };
+        assert_eq!(edit_bypass(&lock), None);
+        for (findings, want) in [
+            (
+                BuildFindings {
+                    overrides_assignment: vec!["a/build.sbt:1".into()],
+                    ..Default::default()
+                },
+                "`dependencyOverrides`",
+            ),
+            (
+                BuildFindings {
+                    resolvers_assignment: vec!["build.sbt:2".into()],
+                    ..Default::default()
+                },
+                "`resolvers`",
+            ),
+            (
+                BuildFindings {
+                    override_build_repos: vec![".sbtopts:1".into()],
+                    ..Default::default()
+                },
+                "sbt.override.build.repos",
+            ),
+        ] {
+            let why = edit_bypass(&findings).unwrap();
+            assert!(why.contains(want), "{why}");
+        }
+    }
+
+    /// The installed-copy fallback is withdrawn by an edit whatever the
+    /// evidence, and by evidence only when it postdates the sources and the
+    /// generated file and shows another version or other bytes.
+    #[tokio::test]
+    async fn bypass_needs_an_edit_or_current_evidence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jar = tmp.path().join("x.jar");
+        std::fs::write(&jar, b"patched").unwrap();
+        let sha = hex::encode(Sha256::digest(b"patched"));
+        let evil = tmp.path().join("evil.jar");
+        std::fs::write(&evil, b"evil").unwrap();
+        let gone = tmp.path().join("gone.jar");
+        let state = |res: Option<JvmResolution>, current: bool| BuildState {
+            res,
+            current,
+            ..Default::default()
+        };
+        let mut h = Hashes::default();
+        let p = pin(&sha);
+
+        assert_eq!(bypass(&p, &BuildState::default(), &mut h).await, None);
+        let edited = BuildState {
+            edit: Some("build.sbt:1 reassign(s) `dependencyOverrides`".into()),
+            ..Default::default()
+        };
+        let why = bypass(&p, &edited, &mut h).await.unwrap();
+        assert!(why.contains("build.sbt:1"), "{why}");
+        // The pinned version and bytes: nothing bypasses.
+        let ok = res(&[SV], Some(&jar));
+        assert_eq!(bypass(&p, &state(Some(ok), true), &mut h).await, None);
+        // Another version: only current evidence counts.
+        let shadowed = res(&[SV, "3.11"], Some(&jar));
+        assert_eq!(
+            bypass(&p, &state(Some(shadowed.clone()), false), &mut h).await,
+            None
+        );
+        let why = bypass(&p, &state(Some(shadowed), true), &mut h)
+            .await
+            .unwrap();
+        assert!(why.contains("3.11, not the pinned"), "{why}");
+        let base_only = res(&["3.11"], None);
+        assert!(bypass(&p, &state(Some(base_only), true), &mut h)
+            .await
+            .is_some());
+        // Other bytes at the pinned version: the same.
+        let elsewhere = res(&[SV], Some(&evil));
+        assert_eq!(
+            bypass(&p, &state(Some(elsewhere.clone()), false), &mut h).await,
+            None
+        );
+        let why = bypass(&p, &state(Some(elsewhere), true), &mut h)
+            .await
+            .unwrap();
+        assert!(why.contains("which is not pinned"), "{why}");
+        // A recorded file that is gone, or no resolution of the GA at all,
+        // proves nothing.
+        let evicted = res(&[SV], Some(&gone));
+        assert_eq!(bypass(&p, &state(Some(evicted), true), &mut h).await, None);
+        assert_eq!(
+            bypass(&p, &state(Some(res(&[], None)), true), &mut h).await,
+            None
+        );
+    }
+
+    /// A hosted file at the root of an sbt build with no evidence (a fresh
+    /// clone), over `build_sbt`.
+    fn hosted_build(build_sbt: &str) -> tempfile::TempDir {
+        use crate::formats::sbt::owned_file::{render, SbtLine, SbtOwnedFile};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(root.join("project/build.properties"), "sbt.version=1.9.9\n").unwrap();
+        std::fs::write(root.join("build.sbt"), build_sbt).unwrap();
+        let file = render(&SbtOwnedFile {
+            mode: SbtFileMode::Hosted,
+            line: SbtLine::Sbt1,
+            crlf: false,
+            pins: [(UUID.to_string(), pin(&"b".repeat(64)))].into(),
+        })
+        .unwrap();
+        std::fs::write(root.join(HOSTED_FILE), file).unwrap();
+        tmp
+    }
+
+    /// A build source reassigning `dependencyOverrides` (or `resolvers`)
+    /// drops the pin where it applies: the hosted ref stays (rollback,
+    /// remove and list find it) but is marked unattested, so the copy sbt
+    /// downloaded into `.socket/sbt-hosted` cannot attest it. Without the
+    /// edit, the unverified ref keeps its installed-copy basis.
+    #[tokio::test]
+    async fn a_pin_dropping_edit_unattests_the_hosted_ref() {
+        const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.11";
+        let plain = hosted_build(
+            "libraryDependencies += \"org.apache.commons\" % \"commons-lang3\" % \"3.11\"\n",
+        );
+        let out = super::super::discover_patched_refs(plain.path()).await;
+        assert!(
+            out.refs.iter().any(|r| r.uuid == UUID && r.purl == PURL),
+            "{:?}",
+            out.refs
+        );
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+
+        for (edit, want) in [
+            (
+                "dependencyOverrides := Seq(\"org.apache.commons\" % \"commons-lang3\" % \"3.11\")\n",
+                "`dependencyOverrides`",
+            ),
+            ("resolvers := Nil\n", "`resolvers`"),
+        ] {
+            let edited = hosted_build(&format!(
+                "libraryDependencies += \"org.apache.commons\" % \"commons-lang3\" % \"3.11\"\n{edit}"
+            ));
+            let out = super::super::discover_patched_refs(edited.path()).await;
+            assert!(
+                out.refs.iter().any(|r| r.uuid == UUID && r.purl == PURL),
+                "the ref stays: {:?}",
+                out.refs
+            );
+            let [u] = out.unattested.as_slice() else {
+                panic!("{edit}: {:?}", out.unattested);
+            };
+            assert_eq!(
+                (u.kind, u.uuid.as_str(), u.purl.as_str()),
+                (UnattestedKind::SbtPinBypassed, UUID, PURL)
+            );
+            assert_eq!(u.file, Path::new(HOSTED_FILE));
+            assert!(u.detail.contains("build.sbt:2") && u.detail.contains(want), "{}", u.detail);
+        }
     }
 }
