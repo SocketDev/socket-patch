@@ -2121,8 +2121,9 @@ fn omission_phrase(reason: &str) -> &'static str {
              package any more"
         }
         GO_WORKSPACE_OVERRIDE => {
-            "the go.work in effect overrides, ignores or conflicts with its go.mod replace, \
-             so the build does not link the patched module"
+            "the Go workspace in effect keeps its replace from the build (overrides, ignores \
+             or rejects it, or go builds from a go.work other than the one holding it), so \
+             the build does not link the patched module; the run warning names which"
         }
         GO_INSTALLED_TOOL_STALE => {
             "a tool installed with `go install` was built from the unpatched module and keeps \

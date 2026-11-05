@@ -614,6 +614,17 @@ pub enum UnattestedKind {
     GoWorkspaceOverride,
 }
 
+impl UnattestedKind {
+    /// Whether the mark bypasses only the wiring in its own file: another
+    /// file's live ref of the same patch still reaches the build (a root
+    /// go.mod mirroring a go.work replace go never reads). Every other
+    /// kind shows a copy the build may run unpatched, which withholds the
+    /// patch however many files wire it.
+    pub fn file_scoped(self) -> bool {
+        matches!(self, UnattestedKind::GoWorkspaceOverride)
+    }
+}
+
 /// A ref discovery emits (so rollback, remove and list find the wiring,
 /// and the ledgers' liveness gates still see it wired) that must not be
 /// attested: the files show a build that may run a copy the pin does not
