@@ -649,14 +649,64 @@ fn plan_as(
         writes.push(text_write(VERIFICATION_REL, new.into_bytes()));
     }
 
+    let tree_files = super::tree_files(&writes);
+    let writes = finish_writes(read, writes);
+    if committed == Committed::Only {
+        uncommitted_wiring(&writes, g, a, v, &mut warnings);
+    }
     Ok(JvmPlan {
-        tree_files: super::tree_files(&writes),
-        writes: finish_writes(read, writes),
+        tree_files,
+        writes,
         records,
         warnings,
         jar_rel: format!("{tree_dir}/{jar_name}"),
         tree_dir,
     })
+}
+
+/// Owned files that only keep the wiring intact through git (EOL
+/// conversion, an ignored `*.jar`); Gradle never reads them, so a missing
+/// one changes nothing this checkout resolves.
+const GIT_HYGIENE: &[&str] = &[
+    GITATTRIBUTES_REL,
+    GITIGNORE_REL,
+    SCRIPT_GITATTRIBUTES_REL,
+    VENDOR_GITATTRIBUTES_REL,
+];
+
+/// Liveness ([`Committed::Only`]): a re-plan over the committed tree that
+/// still writes wiring proves that wiring is not committed, and the build
+/// may resolve another copy. Every pending write counts except the tree
+/// itself (rebuilt from the committed bytes; the script checks its hashes
+/// against the index, whose writes do count) and [`GIT_HYGIENE`]: the
+/// settings files (apply lines of every wired build, in-block
+/// `buildscript` / `pluginManagement` entries), the index, the derived
+/// `maven-metadata.xml`, the script and `gradle/verification-metadata.xml`.
+fn uncommitted_wiring(
+    writes: &[FileWrite],
+    g: &str,
+    a: &str,
+    v: &str,
+    warnings: &mut Vec<JvmWarning>,
+) {
+    let pending: Vec<&str> = writes
+        .iter()
+        .filter(|w| !w.tree && !GIT_HYGIENE.contains(&w.rel.as_str()))
+        .map(|w| w.rel.as_str())
+        .collect();
+    if let Some(first) = pending.first() {
+        warnings.push(degraded(
+            "gradle_wiring_uncommitted",
+            format!(
+                "{first}{} lacks wiring a re-plan would write for {g}:{a}:{v}, so the build may \
+                 resolve a copy other than the vendored one; re-run `socket-patch vendor`",
+                match pending.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                }
+            ),
+        ));
+    }
 }
 
 /// The whole-graph checks: Android / KMP and a user `exclusiveContent`
@@ -1443,7 +1493,11 @@ pub fn references_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Option<bool> {
 
 /// The liveness proof `vex` needs for this layout: `c` is
 /// [`references`]d, the script is ours (line endings aside), and a re-plan
-/// over the committed tree is refused nowhere and degraded nowhere.
+/// over the committed tree is refused nowhere and degraded nowhere. The
+/// re-plan runs as [`Committed::Only`]: it counts only committed in-block
+/// entries, and any wiring it would still write degrades it
+/// ([`uncommitted_wiring`]), so a pending write never stands in for a
+/// missing committed one.
 pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
     if !references(read, c) || !is_ours(read(SCRIPT_REL).as_deref(), SCRIPT) {
         return false;
@@ -5050,21 +5104,27 @@ mod tests {
         );
         assert!(!run(&stripped, &p).unwrap().writes.is_empty());
         assert!(!live_in(&stripped, &p));
-        // Without the lock, liveness is unchanged by this check.
-        let mut unlocked = stripped.clone();
-        unlocked.remove("settings-gradle.lockfile");
-        assert_eq!(
+        let liveness_reasons = |files: &BTreeMap<String, Vec<u8>>| {
             degraded_reasons(
                 &plan_as(
-                    &|r: &str| unlocked.get(r).cloned(),
-                    &|d: &str| list_of(&unlocked, d),
+                    &|r: &str| files.get(r).cloned(),
+                    &|d: &str| list_of(files, d),
                     &p,
-                    Committed::Only
+                    Committed::Only,
                 )
-                .unwrap()
-            ),
-            Vec::<String>::new()
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            liveness_reasons(&stripped),
+            ["gradle_settings_lock_unrouted", "gradle_wiring_uncommitted"]
         );
+        // Without the lock the classpath is still unrouted: the pending
+        // in-block write alone withholds it.
+        let mut unlocked = stripped.clone();
+        unlocked.remove("settings-gradle.lockfile");
+        assert!(!live_in(&unlocked, &p));
+        assert_eq!(liveness_reasons(&unlocked), ["gradle_wiring_uncommitted"]);
     }
 
     /// Two vendored versions of one GA (the index is keyed by GAV, and the
@@ -5184,5 +5244,97 @@ mod tests {
             degraded_reasons(&run(&unfollowed, &p).unwrap()),
             ["gradle_custom_lock_file"]
         );
+    }
+
+    /// Liveness judges the committed wiring, never what a re-plan would
+    /// write: with no lock at all, a settings classpath on the GA whose
+    /// in-block entry is gone, a settings `plugins{}` block added since
+    /// vendoring, a `buildSrc` or included build that lost its apply line,
+    /// a deleted derived `maven-metadata.xml`, a verification file without
+    /// the patched hashes and an index row whose hash no longer matches
+    /// the tree each withhold attestation. The git hygiene files are not
+    /// wiring Gradle reads, so a missing one does not. Vendoring's own
+    /// first run still counts the entries it writes.
+    #[test]
+    fn liveness_judges_committed_wiring_not_a_replan() {
+        let p = patch();
+        let settings =
+            "buildscript { dependencies { classpath 'com.google.code.gson:gson:2.10.1' } }\n\
+                        includeBuild('tools')\ninclude 'app'\n";
+        let verification = format!("{VM_HEAD}{VM_TAIL}");
+        let files = with_files(
+            &app_build(),
+            &[
+                ("settings.gradle", settings),
+                ("tools/build.gradle", ""),
+                ("buildSrc/build.gradle", ""),
+                (VERIFICATION_REL, &verification),
+            ],
+        );
+        let plan = run(&files, &p).unwrap();
+        assert_eq!(degraded_reasons(&plan), Vec::<String>::new());
+        let after = applied(&files, &plan);
+        assert!(live_in(&after, &p));
+        let text = |rel: &str| String::from_utf8(after[rel].clone()).unwrap();
+        let entry = in_block_line(false, "", &p.coords());
+        let committed = text("settings.gradle");
+        assert_eq!(committed.matches(&entry).count(), 1, "{committed}");
+        let metadata = derived_metadata_rel("com.google.code.gson", "gson");
+        let index = text(INDEX_REL);
+        let jar_sha = sha256_hex(p.jar);
+        assert!(index.contains(&jar_sha));
+        let tampered_index = index.replace(&jar_sha, &"0".repeat(64));
+        let plugins = format!("plugins {{ id 'com.example.p' version '1' }}\n{committed}");
+        let mut cases: Vec<(&str, BTreeMap<String, Vec<u8>>)> = vec![
+            (
+                "settings in-block entry",
+                with_files(
+                    &after,
+                    &[("settings.gradle", &committed.replace(&entry, ""))],
+                ),
+            ),
+            (
+                "settings plugins added",
+                with_files(&after, &[("settings.gradle", &plugins)]),
+            ),
+            (
+                "included build apply line",
+                with_files(&after, &[("tools/settings.gradle", "")]),
+            ),
+            (
+                "buildSrc apply line",
+                with_files(&after, &[("buildSrc/settings.gradle", "")]),
+            ),
+            (
+                "verification hashes",
+                with_files(&after, &[(VERIFICATION_REL, &verification)]),
+            ),
+            (
+                "index hash",
+                with_files(&after, &[(INDEX_REL, &tampered_index)]),
+            ),
+        ];
+        let mut no_metadata = after.clone();
+        no_metadata.remove(&metadata);
+        cases.push(("derived metadata", no_metadata));
+        for (what, broken) in &cases {
+            assert!(
+                references(&|r: &str| broken.get(r).cloned(), &p.coords()),
+                "{what}"
+            );
+            // Vendoring there repairs it.
+            assert!(!run(broken, &p).unwrap().writes.is_empty(), "{what}");
+        }
+        let masked: Vec<&str> = cases
+            .iter()
+            .filter(|(_, broken)| live_in(broken, &p))
+            .map(|(what, _)| *what)
+            .collect();
+        assert_eq!(masked, Vec::<&str>::new());
+        for hygiene in [GITIGNORE_REL, GITATTRIBUTES_REL, VENDOR_GITATTRIBUTES_REL] {
+            let mut missing = after.clone();
+            missing.remove(hygiene);
+            assert!(live_in(&missing, &p), "{hygiene}");
+        }
     }
 }

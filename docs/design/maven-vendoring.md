@@ -179,6 +179,13 @@ entry), a lock file that cannot be read (`gradle_lock_unreadable`), and a
 custom `lockFile` that cannot be followed (`gradle_custom_lock_file`). The
 patch is still applied, and `vex` does not attest it.
 
+`vex` liveness re-plans over the committed tree but judges only the committed
+files: a re-plan that would still write a settings file (an apply line of any
+wired build, an in-block entry), the index, the derived `maven-metadata.xml`,
+the script or the verification file means that wiring is missing, and the
+entry is not attested (`gradle_wiring_uncommitted`). The `.gitattributes` and
+`.gitignore` files are not read by Gradle and do not count.
+
 The script, the index, the derived metadata and the `.gitattributes` files are
 owned text and are compared line-ending blind, so a `core.autocrlf` checkout
 passes `--check` and reverts clean. `.socket/gradle/.gitattributes` (`* -text`,
