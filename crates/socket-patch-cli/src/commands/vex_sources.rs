@@ -743,10 +743,13 @@ fn build_candidates(
 fn wiring_conflicts(discovery: &Discovery) -> BTreeMap<String, String> {
     let mut by_pkg: BTreeMap<&str, BTreeMap<&str, BTreeSet<String>>> = BTreeMap::new();
     // A ref whose file the build never reads wires nothing it installs.
+    // The root go.mod is the exception: a `GOWORK=off` build from the root
+    // reads it (cf. `ReplaceHost::mirrors_root_go_mod`), so a different
+    // patch there still disagrees with the go.work that overrides it.
     for r in discovery
         .refs
         .iter()
-        .filter(|r| !bypassed_ref(discovery, r))
+        .filter(|r| r.source_file == std::path::Path::new("go.mod") || !bypassed_ref(discovery, r))
     {
         by_pkg
             .entry(r.purl.as_str())
