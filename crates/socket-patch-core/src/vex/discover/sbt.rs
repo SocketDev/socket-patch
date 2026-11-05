@@ -26,7 +26,8 @@
 //! blockers verbatim) is diagnosed AND marked [`Unattested`] for the pin's
 //! `(purl, uuid)`, so `vex` omits the ledger entry. Its liveness is
 //! untouched: the wiring is intact, and `scan --prune` must not revert a
-//! pin only because `sbt update` has not run since.
+//! pin only because `sbt update` has not run since. A memory view has no
+//! committed tree to hash, so it reports none missing.
 //!
 //! [`Unattested`]: super::Unattested
 //!
@@ -104,7 +105,9 @@ async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
 /// declared project with no evidence (only part of the build resolved), a
 /// project definition that cannot be read statically, a build source
 /// reassigning `dependencyOverrides` (it replaces the generated override
-/// where it applies) or `resolvers`, or a `build.sbt.lock`.
+/// where it applies) or `resolvers`, or a `build.sbt.lock`. Each reason
+/// names its own remedy (or that there is none), so a reader can relay it
+/// as is.
 fn evidence_blocker(
     e: &crate::crawlers::sbt_evidence::SbtEvidence,
     res: &JvmResolution,
@@ -117,8 +120,10 @@ fn evidence_blocker(
     }
     let Some(declared) = declared_projects(&e.build_sources) else {
         return Some(
-            "the build's project definitions cannot be read statically, so its evidence may \
-             not cover every project"
+            "the build's project definitions cannot be read statically (a computed \
+             `Project(...)`, `projectMatrix` or `crossProject`), so its evidence may not cover \
+             every project; only a build whose projects are literal `project` / \
+             `Project(\"<id>\", file(\"<dir>\"))` definitions can be verified"
                 .to_string(),
         );
     };
@@ -136,19 +141,22 @@ fn evidence_blocker(
     let findings = scan_build_sources(&e.build_sources);
     if !findings.overrides_assignment.is_empty() {
         return Some(format!(
-            "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies",
+            "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies; \
+             append with `+=` instead",
             findings.overrides_assignment.join(", ")
         ));
     }
     if !findings.resolvers_assignment.is_empty() {
         return Some(format!(
-            "{} reassign(s) `resolvers`, which can drop the pin's repository",
+            "{} reassign(s) `resolvers`, which can drop the pin's repository; append with \
+             `+=` instead",
             findings.resolvers_assignment.join(", ")
         ));
     }
     if !findings.dependency_lock.is_empty() {
         return Some(format!(
-            "{} locks the build's dependencies, which rejects the pinned version",
+            "{} locks the build's dependencies, which rejects the pinned version; the pin \
+             cannot be verified while it exists",
             findings.dependency_lock.join(", ")
         ));
     }
@@ -224,7 +232,9 @@ async fn verify(
     }
     if let Some(other) = versions.iter().find(|v| **v != pin.sv) {
         return Err(format!(
-            "the build resolves {ga}:{other}, not the pinned {}",
+            "the build resolves {ga}:{other}, not the pinned {}; run `sbt update`, and if it \
+             still does, something in the build forces that version (a `dependencyOverrides \
+             +=` or `force()` of it, or a project the pin does not reach): remove it",
             pin.sv
         ));
     }
@@ -236,7 +246,8 @@ async fn verify(
         .collect();
     if paths.is_empty() {
         return Err(format!(
-            "the build's resolution evidence records no artifact file for {ga}:{}",
+            "the build's resolution evidence records no artifact file for {ga}:{}, so it \
+             cannot show which copy the build uses; run `sbt update`",
             pin.sv
         ));
     }
@@ -247,14 +258,17 @@ async fn verify(
             Some(got) if got == pin.pom_sha256 => {}
             Some(got) => {
                 return Err(format!(
-                    "{ga}:{} resolved to {} with sha256 {got}, which is not pinned",
+                    "{ga}:{} resolved to {} with sha256 {got}, which is not pinned (a copy \
+                     another repository serves, such as `mavenLocal` or an Ivy-local publish, \
+                     or a modified file): remove or restore it, then run `sbt update`",
                     pin.sv,
                     path.display()
                 ))
             }
             None => {
                 return Err(format!(
-                    "{ga}:{} resolved to {}, which cannot be read",
+                    "{ga}:{} resolved to {}, which cannot be read; restore it or run \
+                     `sbt update`",
                     pin.sv,
                     path.display()
                 ))
@@ -263,7 +277,7 @@ async fn verify(
     }
     if !jar_seen {
         return Err(format!(
-            "no resolved artifact of {ga}:{} is the pinned jar",
+            "no resolved artifact of {ga}:{} is the pinned jar; run `sbt update`",
             pin.sv
         ));
     }
@@ -335,37 +349,43 @@ async fn vendored_check(
 ) {
     // The vendor ledger records the pin under this purl (the planner builds
     // it the same way); a coordinate it rejects was never vendored. `why`
-    // completes "patch <uuid> is wired, but …" (the VEX note).
+    // is both the diagnostic's text and the mark's detail, which completes
+    // "patch <uuid> is wired, but …" (the VEX note).
     let purl = maven_purl(&pin.group, &pin.artifact, &pin.base);
-    let withhold = |out: &mut Discovery, code, diag: String, why: String, kind| {
-        out.diag(code, VENDORED_FILE, format!("{VENDORED_FILE}: {diag}"));
+    let withhold = |out: &mut Discovery, code, why: String, kind| {
+        out.diag(
+            code,
+            VENDORED_FILE,
+            format!("{VENDORED_FILE}: patch {}: {why}", pin.uuid),
+        );
         if let Some(purl) = &purl {
             out.unattested(purl, &pin.uuid, VENDORED_FILE, why, kind);
         }
     };
-    for (ext, want) in [("pom", &pin.pom_sha256), ("jar", &pin.jar_sha256)] {
-        let rel = format!("{VENDORED_REPO_REL}/{}", pin.repo_path(ext));
-        let got = match ctx.disk_root() {
-            Some(root) => hashes.of(&root.join(&rel)).await,
-            None => None,
-        };
-        if got.as_deref() != Some(want.as_str()) {
-            let state = if got.is_some() { "modified" } else { "missing" };
-            withhold(
-                out,
-                DIAG_VENDORED_TREE_MISSING,
-                format!("patch {} pins {rel}, which is {state}", pin.uuid),
-                format!("{VENDORED_FILE} pins {rel}, which is {state}"),
-                UnattestedKind::SbtVendoredTreeMissing,
-            );
-            return;
+    // Only a disk holds the committed tree: a memory view has none to
+    // hash, which proves nothing missing.
+    if let Some(root) = ctx.disk_root() {
+        for (ext, want) in [("pom", &pin.pom_sha256), ("jar", &pin.jar_sha256)] {
+            let rel = format!("{VENDORED_REPO_REL}/{}", pin.repo_path(ext));
+            let got = hashes.of(&root.join(&rel)).await;
+            if got.as_deref() != Some(want.as_str()) {
+                let state = if got.is_some() { "modified" } else { "missing" };
+                withhold(
+                    out,
+                    DIAG_VENDORED_TREE_MISSING,
+                    format!("{rel} is {state}"),
+                    UnattestedKind::SbtVendoredTreeMissing,
+                );
+                return;
+            }
         }
     }
+    // Without a disk there is no evidence either: unverified, exactly as a
+    // hosted pin read from memory gets no lock pin.
     if let Err(why) = verify_with(pin, res, blocker, hashes).await {
         withhold(
             out,
             DIAG_SBT_RESOLUTION_UNVERIFIED,
-            format!("patch {}: {why}", pin.uuid),
             why,
             UnattestedKind::SbtResolutionUnverified,
         );
@@ -375,6 +395,7 @@ async fn vendored_check(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crawlers::sbt_evidence::testing::{file_uri, set_mtime};
     use sha2::{Digest as _, Sha256};
 
     const UUID: &str = "abcdef12-0000-4000-8000-000000000001";
@@ -531,30 +552,12 @@ mod tests {
         "libraryDependencies += \"com.google.code.gson\" % \"gson\" % \"2.8.9\"\n";
     const EVIDENCE: &str = "target/update/update_cache/output";
 
-    /// The `file:` URI sbt records for `path` (`file:///C:/x` on Windows).
-    fn file_uri(path: &Path) -> String {
-        let text = path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .replace(' ', "%20");
-        if text.starts_with('/') {
-            format!("file://{text}")
-        } else {
-            format!("file:///{text}")
-        }
-    }
-
-    fn set_mtime(path: &Path, at: std::time::SystemTime) {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(at)
-            .unwrap();
-    }
-
     fn later(secs: u64) -> std::time::SystemTime {
         std::time::SystemTime::now() + std::time::Duration::from_secs(secs)
+    }
+
+    fn earlier(secs: u64) -> std::time::SystemTime {
+        std::time::SystemTime::now() - std::time::Duration::from_secs(secs)
     }
 
     /// An sbt 1.9.9 build with gson vendored for real (generated file,
@@ -564,8 +567,10 @@ mod tests {
     async fn vendored_gson(evidence: bool) -> (tempfile::TempDir, PathBuf, SbtPin) {
         use crate::vendor::jvm::testing::{populate, vendor};
         use crate::vendor::jvm::{JvmPatch, Shape};
+        // The raw tempdir path: a canonical Windows path is verbatim
+        // (`\\?\C:\…`), which sbt never records.
         let tmp = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let root = tmp.path().to_path_buf();
         populate(
             &root,
             &[
@@ -680,6 +685,8 @@ mod tests {
             ),
         )
         .unwrap();
+        // Still older than the evidence, however slow the run.
+        set_mtime(&root.join("build.sbt"), earlier(60));
         let out = super::super::discover_patched_refs(&root).await;
         assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
         assert!(
@@ -714,9 +721,41 @@ mod tests {
             out.diagnostics
         );
         assert!(
-            out.unattested[0].detail.ends_with("which is missing"),
+            out.unattested[0].detail.ends_with(".pom is missing"),
             "{:?}",
             out.unattested[0]
         );
+        // The diagnostic and the mark say the same thing.
+        let diag = out
+            .diagnostics
+            .iter()
+            .find(|d| d.code == DIAG_VENDORED_TREE_MISSING)
+            .expect("diagnosed");
+        assert!(diag.detail.ends_with(&out.unattested[0].detail), "{diag:?}");
+    }
+
+    /// A memory view holds no committed tree to hash: no tree is reported
+    /// missing (a gating mark discovery cannot back), while the pin is
+    /// still unverified, as a hosted pin read from memory gets no lock pin.
+    #[tokio::test]
+    async fn vendored_pin_over_a_memory_view_reports_no_missing_tree() {
+        let (_tmp, root, _) = vendored_gson(true).await;
+        let mut project = crate::vendor::lock_inventory::MemoryProject::new();
+        for rel in [VENDORED_FILE, "build.sbt", "project/build.properties"] {
+            project.insert_text(rel, std::fs::read_to_string(root.join(rel)).unwrap());
+        }
+        let out = super::super::discover_patched_refs_view(
+            crate::vendor::lock_inventory::ProjectView::Memory(&project),
+            &super::super::DiscoverOptions::default(),
+        )
+        .await;
+        assert!(
+            !out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_VENDORED_TREE_MISSING),
+            "{:#?}",
+            out.diagnostics
+        );
+        assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
     }
 }

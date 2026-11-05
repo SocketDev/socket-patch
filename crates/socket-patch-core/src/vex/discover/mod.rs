@@ -706,7 +706,10 @@ pub struct Discovery {
     /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
     /// always empty once discovery returns (folded into `unpatched_copies`).
     pub unidentified_copies: Vec<UnidentifiedCopy>,
-    /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
+    /// Wired patches that must not be attested ([`Unattested`]): a ref in
+    /// `refs` whose wiring a build bypasses, or a vendored sbt pin whose
+    /// claim is its vendor ledger entry (no ref at all). Consumers match a
+    /// mark by `(purl, uuid)`, never by a ref.
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
     /// always empty once discovery returns (folded into `unattested`).
@@ -1376,8 +1379,10 @@ impl Discovery {
         });
     }
 
-    /// Record that the ref `(purl, uuid)` is wired but bypassed by the
-    /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
+    /// Record that patch `uuid` is wired for `purl` but must not be
+    /// attested, for the reason `file` shows ([`Unattested`]). Pushed
+    /// beside the ref itself, or, for a vendored sbt pin (whose claim is
+    /// the vendor ledger's, not a ref's), alone.
     pub(crate) fn unattested(
         &mut self,
         purl: &str,

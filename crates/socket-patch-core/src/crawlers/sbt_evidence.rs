@@ -634,3 +634,36 @@ pub(crate) fn stage_fixture(from: &Path, to: &Path) {
 
 #[cfg(test)]
 mod tests;
+
+/// Helpers for tests that stage sbt evidence on disk (this module's and
+/// `vex::discover::sbt`'s).
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    /// Date `path` at `t`.
+    pub(crate) fn set_mtime(path: &Path, t: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// The `file:` URI sbt writes for `path`: `file:///C:/x` on Windows (a
+    /// backslash is no URI separator, and an invalid JSON escape). `path`
+    /// must not be a verbatim (`\\?\`) path, which sbt never records.
+    pub(crate) fn file_uri(path: &Path) -> String {
+        let text = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+}

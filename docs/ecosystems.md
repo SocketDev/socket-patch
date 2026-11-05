@@ -1262,9 +1262,14 @@ the repository list, so it is left as a
   never wires sbt.
 - Vendored sbt VEX attests through the vendor ledger; the generated file alone
   is not a VEX reference. The ledger entry needs the same `target/` evidence
-  as a hosted pin: until `sbt update` records the pinned bytes (and while a
-  build source reassigns `dependencyOverrides` / `resolvers` or a
-  `build.sbt.lock` exists) it is omitted as `vex_sbt_resolution_unverified`.
+  as a hosted pin, and is omitted as `vex_sbt_resolution_unverified` while
+  that evidence does not show the build resolving the pinned bytes: before
+  `sbt update` has run since vendoring or since a build source changed,
+  while a build source reassigns `dependencyOverrides` / `resolvers` with
+  `:=` or a `build.sbt.lock` exists, while something forces another
+  version, and always for a build whose projects cannot be read statically
+  (`projectMatrix`, `crossProject`, a computed `Project(...)`). The note
+  names the cause and its remedy.
 
 ## Cargo: shared registry cache
 

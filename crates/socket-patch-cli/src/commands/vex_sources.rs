@@ -278,9 +278,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,
-            "not attested until sbt's own resolution records verify the pin (run `sbt update` \
-             for the whole build; a `dependencyOverrides` / `resolvers` reassignment or a \
-             `build.sbt.lock` withholds it until removed)",
+            "not attested until the build's own resolution records (under `target/`) show it \
+             resolves the pinned bytes; the wiring itself is intact, so `vendor --check` and \
+             `scan` still treat it as live",
         ),
         UnattestedKind::SbtVendoredTreeMissing => (
             NOTE_SBT_VENDORED_TREE_MISSING,
@@ -288,6 +288,39 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              `.socket/vendor/maven2` from version control, or re-run `socket-patch vendor`)",
         ),
     }
+}
+
+/// The [`Unattested`](socket_patch_core::vex::Unattested) mark discovery
+/// put on patch `uuid` for `purl`'s package, if any.
+fn unattested_mark<'d>(
+    discovery: &'d Discovery,
+    purl: &str,
+    uuid: &str,
+) -> Option<&'d socket_patch_core::vex::Unattested> {
+    let pkg = canonical_base_purl(purl);
+    discovery
+        .unattested
+        .iter()
+        .find(|u| u.uuid == uuid && PurlKey::same(&u.purl, &pkg))
+}
+
+/// Omit `key` for the mark `u`: its `failed[]` entry and the note naming
+/// why and the remedy.
+fn gate_unattested(
+    key: &str,
+    u: &socket_patch_core::vex::Unattested,
+    gated: &mut Vec<FailedPatch>,
+    notes: &mut Vec<PlanNote>,
+) {
+    let (code, remedy) = unattested_note(u.kind);
+    gated.push(failed(key, code));
+    notes.push(PlanNote {
+        code,
+        detail: format!(
+            "{key}: patch {} is wired, but {}; {remedy}",
+            u.uuid, u.detail
+        ),
+    });
 }
 
 /// One hosted-basis view purl's wiring (see [`Plan::hosted`]).
@@ -441,23 +474,10 @@ pub(crate) async fn plan(
     // rollback, remove, list and the ledgers' liveness working, and the
     // patch is omitted.
     cands.retain(|c| {
-        let pkg = canonical_base_purl(&c.key);
-        let Some(u) = discovery
-            .unattested
-            .iter()
-            .find(|u| u.uuid == c.uuid && PurlKey::same(&u.purl, &pkg))
-        else {
+        let Some(u) = unattested_mark(&discovery, &c.key, &c.uuid) else {
             return true;
         };
-        let (code, remedy) = unattested_note(u.kind);
-        gated.push(failed(&c.key, code));
-        notes.push(PlanNote {
-            code,
-            detail: format!(
-                "{}: patch {} is wired, but {}; {remedy}",
-                c.key, c.uuid, u.detail
-            ),
-        });
+        gate_unattested(&c.key, u, &mut gated, &mut notes);
         false
     });
     for (key, old_uuid, wired) in &superseded {
@@ -561,6 +581,16 @@ pub(crate) async fn plan(
         } else {
             Basis::Installed
         };
+        // The vendored basis attests the ENTRY's patch, which need not be
+        // the candidate's uuid (a manifest record under another uuid keeps
+        // the key; a vendored sbt pin has no ref to swap it in): its mark
+        // is checked against what is actually attested.
+        if let Basis::Vendored(entry) = &basis {
+            if let Some(u) = unattested_mark(&discovery, &entry.base_purl, &entry.uuid) {
+                gate_unattested(&cand.key, u, &mut gated, &mut notes);
+                continue;
+            }
+        }
         based.push((cand, basis));
     }
 

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use super::testing::{file_uri, set_mtime};
 use super::*;
 
 const VERSIONS: &[&str] = &["0.13.18", "1.2.8", "1.3.13", "1.9.9", "1.13.0", "2.0.9"];
@@ -30,15 +31,6 @@ fn write(root: &Path, rel: &str, body: &[u8]) -> PathBuf {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(&path, body).unwrap();
     path
-}
-
-fn set_mtime(path: &Path, t: SystemTime) {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .unwrap()
-        .set_modified(t)
-        .unwrap();
 }
 
 const JSON: &str = r#"{"configurations":[{"configuration":{"name":"compile"},"modules":[{"module":{"organization":"g","name":"a","revision":"1"},"artifacts":[],"evicted":false}],"details":[]}]}"#;
@@ -344,20 +336,6 @@ fn symlinks_are_never_followed() {
     let e = scan(root).unwrap();
     assert!(e.files.is_empty(), "{:?}", rels(&e));
     assert_eq!(e.build_sources.len(), 1);
-}
-
-/// The `file:` URI sbt writes for `path`: `file:///C:/x` on Windows (a
-/// backslash is no URI separator, and an invalid JSON escape).
-fn file_uri(path: &Path) -> String {
-    let text = path
-        .to_string_lossy()
-        .replace('\\', "/")
-        .replace(' ', "%20");
-    if text.starts_with('/') {
-        format!("file://{text}")
-    } else {
-        format!("file:///{text}")
-    }
 }
 
 #[test]
