@@ -636,12 +636,18 @@ fn extract_file(
     workspace: Option<&Workspace>,
 ) {
     let required = &graph.required;
-    // A wired replace the workspace keeps from the build stays a ref (so
-    // list, rollback and remove find it) but is never attested.
-    let bypass = |out: &mut Discovery, purl: &str, uuid: &str, entry: &ReplaceEntry| {
+    // Why the workspace keeps a wired replace from the build, if it does.
+    // Such a replace stays a ref (so list, rollback and remove find it) but
+    // is never attested, and it is checked before version-selection
+    // inertness: a replace go never applies here is not "inert" in a way a
+    // re-run of scan or vendor clears, so dropping it would hide wiring.
+    let bypass_of = |entry: &ReplaceEntry| {
         let req = required.get(&entry.module).map(String::as_str);
         let version = entry.version.as_deref().or(req).unwrap_or_default();
-        if let Some(detail) = workspace.and_then(|ws| ws.bypass(file, entry, version)) {
+        workspace.and_then(|ws| ws.bypass(file, entry, version))
+    };
+    let mark_bypassed = |out: &mut Discovery, purl: &str, uuid: &str, bypassed: Option<String>| {
+        if let Some(detail) = bypassed {
             out.unattested(
                 purl,
                 uuid,
@@ -690,7 +696,10 @@ fn extract_file(
                     );
                     continue;
                 };
-                let Some(purl) = replaced_purl(entry, graph, &versioned, file, out) else {
+                let bypassed = bypass_of(entry);
+                let Some(purl) =
+                    replaced_purl(entry, graph, &versioned, file, out, bypassed.is_some())
+                else {
                     continue;
                 };
                 // `replaced_purl` resolved the version from one of the two.
@@ -706,7 +715,7 @@ fn extract_file(
                 // A module go builds only as another module's replacement
                 // is never redirected by its own replace, whatever the sum
                 // files hold: go doesn't chain replaces (#1823).
-                if let Selection::ReplaceTarget(via) = &selected {
+                if let (Selection::ReplaceTarget(via), None) = (&selected, &bypassed) {
                     out.diag(
                         DIAG_REF_INVALID,
                         file,
@@ -720,7 +729,10 @@ fn extract_file(
                     );
                     continue;
                 }
-                if let Some(other) = selected.other_version().filter(|_| !proven) {
+                if let Some(other) = selected
+                    .other_version()
+                    .filter(|_| !proven && bypassed.is_none())
+                {
                     out.diag(
                         DIAG_REF_INVALID,
                         file,
@@ -742,7 +754,7 @@ fn extract_file(
                     SumPin::Unpinned => (None, true),
                 };
                 let url = format!("{rhs}@{rhs_version}");
-                bypass(out, &purl, &uuid, entry);
+                mark_bypassed(out, &purl, &uuid, bypassed);
                 out.push(PatchedRef::hosted(
                     purl,
                     uuid,
@@ -774,7 +786,10 @@ fn extract_file(
                     );
                     continue;
                 };
-                let Some(purl) = replaced_purl(entry, graph, &versioned, file, out) else {
+                let bypassed = bypass_of(entry);
+                let Some(purl) =
+                    replaced_purl(entry, graph, &versioned, file, out, bypassed.is_some())
+                else {
                     continue;
                 };
                 if vendored_leaf_purl("golang", &vref.leaf).as_deref() != Some(purl.as_str()) {
@@ -788,7 +803,7 @@ fn extract_file(
                     );
                     continue;
                 }
-                bypass(out, &purl, &vref.uuid, entry);
+                mark_bypassed(out, &purl, &vref.uuid, bypassed);
                 out.push(PatchedRef::vendored(purl, &vref, file, None));
             }
             // Socket-shaped but not something we write (another tree's copy,
@@ -831,13 +846,16 @@ fn is_foreign_socket_target(entry: &ReplaceEntry) -> bool {
 
 /// `pkg:golang/<M>@<v>` for the module a Socket `replace` substitutes, with
 /// the version the build actually applies it at — or `None` (diagnosed)
-/// when the directive is inert or its version is unknowable.
+/// when the directive is inert or its version is unknowable. A replace the
+/// workspace keeps from the build (`bypassed`) is never judged inert: it
+/// stays a ref, at the version it names, so it is reported as unattested.
 fn replaced_purl(
     entry: &ReplaceEntry,
     graph: &Graph<'_>,
     versioned: &HashSet<(&str, &str)>,
     file: &str,
     out: &mut Discovery,
+    bypassed: bool,
 ) -> Option<String> {
     let module = entry.module.as_str();
     let req = graph.required.get(module).map(String::as_str);
@@ -849,7 +867,7 @@ fn replaced_purl(
     let version = match (entry.version.as_deref(), req) {
         // In a workspace a dependency can raise the module above every
         // member's `require`; a pin of the version the graph selects is live.
-        (Some(v), Some(r)) if v != r && !graph.selects(module, v) => {
+        (Some(v), Some(r)) if !bypassed && v != r && !graph.selects(module, v) => {
             out.diag(
                 DIAG_REF_INVALID,
                 file,
@@ -861,7 +879,7 @@ fn replaced_purl(
             return None;
         }
         (Some(v), _) => v,
-        (None, Some(r)) if versioned.contains(&(module, r)) => {
+        (None, Some(r)) if !bypassed && versioned.contains(&(module, r)) => {
             out.diag(
                 DIAG_REF_INVALID,
                 file,
@@ -2307,14 +2325,28 @@ mod tests {
             owner: Some(ReplaceOwner::Hosted),
         };
         let mut out = Discovery::default();
-        let purl = replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        let purl = replaced_purl(
+            &entry("v1.5.0"),
+            &graph,
+            &HashSet::new(),
+            GO_WORK,
+            &mut out,
+            false,
+        );
         assert_eq!(
             purl.as_deref(),
             Some("pkg:golang/github.com/foo/bar@v1.5.0")
         );
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
         // A version the graph does not select stays inert.
-        let purl = replaced_purl(&entry("v1.6.0"), &graph, &HashSet::new(), GO_WORK, &mut out);
+        let purl = replaced_purl(
+            &entry("v1.6.0"),
+            &graph,
+            &HashSet::new(),
+            GO_WORK,
+            &mut out,
+            false,
+        );
         assert_eq!(purl, None);
         assert_eq!(out.diagnostics.len(), 1, "{:?}", out.diagnostics);
         assert!(out.diagnostics[0].detail.contains("is inert"));
@@ -2323,7 +2355,14 @@ mod tests {
         let graph = Graph::new(None, Some(&ws), None);
         let mut out = Discovery::default();
         assert_eq!(
-            replaced_purl(&entry("v1.5.0"), &graph, &HashSet::new(), GO_WORK, &mut out),
+            replaced_purl(
+                &entry("v1.5.0"),
+                &graph,
+                &HashSet::new(),
+                GO_WORK,
+                &mut out,
+                false
+            ),
             None
         );
     }
@@ -2351,6 +2390,8 @@ mod tests {
     /// resolve it. Its replace of the module overrides the root go.mod's,
     /// a workspace that doesn't `use` the module ignores it, and another
     /// member's higher `require` makes it inert: none of those is attested.
+    /// A replace the workspace ignores stays a ref even when a member
+    /// raises the module too.
     #[tokio::test]
     async fn ancestor_go_work_governs_the_root_module() {
         let m = gopatch(UUID_A);
@@ -2368,6 +2409,16 @@ mod tests {
                 "module not used",
                 "go 1.21\n\nuse ./svc\n".to_string(),
                 Some(svc("")),
+                Some("does not `use` this module"),
+                false,
+            ),
+            // The workspace ignores the replace AND selects another version:
+            // the bypass, not the version, says why it is unattested, so
+            // the wiring stays a ref instead of being dropped as inert.
+            (
+                "module not used, member raises the module",
+                "go 1.21\n\nuse ./svc\n".to_string(),
+                Some(svc(&format!("\nrequire {MODULE} v1.5.0\n"))),
                 Some("does not `use` this module"),
                 false,
             ),
