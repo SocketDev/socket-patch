@@ -36,9 +36,22 @@ impl UserPatchIndex {
     /// Inspect the project, declared workspace members and ancestor workspace
     /// settings. Errors in a potentially governing file protect its ecosystem;
     /// unreadable metadata must not silently disable the consent check.
+    ///
+    /// A workspace run: nothing outside the git repository root is read
+    /// (see [`Self::discover_scoped`]).
     pub async fn discover(root: &Path) -> Self {
+        Self::discover_scoped(root, ReadScope::Workspace).await
+    }
+
+    /// [`Self::discover`] in the read scope the run's mode fixes. A
+    /// [`ReadScope::Workspace`] run never reads a project file outside the
+    /// git repository root: a workspace member or `--patch-dir` beyond it
+    /// protects every npm package instead. A [`ReadScope::Global`] run reads
+    /// the evidence wherever it lives, with no repository bound and no
+    /// such fallback.
+    pub async fn discover_scoped(root: &Path, reads: ReadScope) -> Self {
         let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-        Self::walk(&ProjectView::Disk(&root), Some(&root), Scope::Gate).await
+        Self::walk(&ProjectView::Disk(&root), Some(&root), Scope::Gate, reads).await
     }
 
     /// The patches a project's pnpm, yarn or patch-package setup applies
@@ -61,7 +74,8 @@ impl UserPatchIndex {
     /// a vlt project patches a dependency only through a postinstall tool
     /// such as patch-package. Sources are reported root-relative.
     pub(crate) async fn npm_family_in(view: &ProjectView<'_>, locks: &[(&str, &str)]) -> Self {
-        let mut index = Self::walk(view, None, Scope::NpmFamily).await;
+        // Discovery and the hosted engine only ever run on a workspace.
+        let mut index = Self::walk(view, None, Scope::NpmFamily, ReadScope::Workspace).await;
         for (rel, text) in locks {
             let path = Path::new(rel);
             match rel.rsplit('/').next() {
@@ -86,13 +100,20 @@ impl UserPatchIndex {
     /// anchored: the absolute project root for the gate, `None` for
     /// root-relative sources.
     ///
-    /// Nothing outside the git repository root is read: the ancestor walk
-    /// stops at the directory holding `.git`, and a workspace member or
-    /// patch-package directory beyond it protects every npm package
-    /// instead of being read. Without a `.git` the gate's container rule
-    /// holds (the walk never reaches the home directory or above it). An
-    /// in-memory project is its own repository root.
-    async fn walk(view: &ProjectView<'_>, shown_root: Option<&Path>, scope: Scope) -> Self {
+    /// The ancestor walk stops at the directory holding `.git`, and without
+    /// a `.git` the gate's container rule holds (the walk never reaches the
+    /// home directory or above it). In a [`ReadScope::Workspace`] run
+    /// nothing outside that git repository root is read: a workspace member
+    /// or patch-package directory beyond it protects every npm package
+    /// instead of being read. An in-memory project is its own repository
+    /// root. A [`ReadScope::Global`] run reads members and patch-package
+    /// directories wherever they are.
+    async fn walk(
+        view: &ProjectView<'_>,
+        shown_root: Option<&Path>,
+        scope: Scope,
+        reads: ReadScope,
+    ) -> Self {
         let mut index = Self::default();
         let shown_base = shown_root.unwrap_or(Path::new(""));
         let at = |rel: &Path| Dir {
@@ -157,6 +178,12 @@ impl UserPatchIndex {
         } else {
             repo_depth = Some(0);
         }
+        // The read bound: the repository root in a workspace run, none in a
+        // global one.
+        let repo_depth = match reads {
+            ReadScope::Workspace => repo_depth,
+            ReadScope::Global => None,
+        };
         let mut seen = BTreeSet::new();
         while let Some(dir) = pending.pop_front() {
             if !seen.insert(dir.rel.clone()) {
@@ -950,6 +977,31 @@ impl UserPatchIndex {
     }
 }
 
+/// Which project files a run may read, chosen once from the CLI mode
+/// (never inferred from the filesystem). The same shape as #2025's
+/// `utils::repo_root::ReadScope`, which replaces it when the two meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadScope {
+    /// A project run (the default `--cwd` project): project files are read
+    /// only inside the git repository root.
+    Workspace,
+    /// A global run (`--global` / `--global-prefix`): files are read
+    /// wherever they live on the system.
+    Global,
+}
+
+impl ReadScope {
+    /// The scope of a run whose global flag (`--global` or
+    /// `--global-prefix`) is `global`.
+    pub fn of_global(global: bool) -> Self {
+        if global {
+            ReadScope::Global
+        } else {
+            ReadScope::Workspace
+        }
+    }
+}
+
 /// What a [`UserPatchIndex::walk`] reads.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
@@ -1594,6 +1646,76 @@ mod tests {
             );
             assert!(index.conflicts("pkg:pypi/anything@1.0.0").is_empty());
         }
+    }
+
+    /// The repository-root bound is a workspace-run rule only. A workspace
+    /// run reads no workspace member or `--patch-dir` outside the git
+    /// repository: each protects every npm package instead. A global run
+    /// reads both wherever they are and protects exactly the packages they
+    /// patch.
+    #[tokio::test]
+    async fn the_repository_bound_holds_for_workspace_runs_only() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+        write(
+            &repo,
+            "package.json",
+            r#"{"workspaces":["../shared/*"],"scripts":{"postinstall":"patch-package --patch-dir ../fixes"}}"#,
+        );
+        write(outer.path(), "fixes/left-pad+1.3.0.patch", "diff\n");
+        write(outer.path(), "shared/a/package.json", "{}");
+        write(
+            outer.path(),
+            "shared/a/patches/is-number+7.0.0.patch",
+            "diff\n",
+        );
+
+        let workspace = UserPatchIndex::discover_scoped(&repo, ReadScope::Workspace).await;
+        let sources = workspace.conflicts("pkg:npm/other@1.0.0");
+        for what in [
+            "workspace outside the git repository",
+            "patch-package directory outside",
+        ] {
+            assert!(
+                sources.iter().any(|s| s.contains(what)),
+                "{what}: {sources:?}"
+            );
+        }
+        assert!(
+            !sources.iter().any(|s| s.ends_with(".patch")),
+            "{sources:?}"
+        );
+        assert_eq!(
+            UserPatchIndex::discover(&repo)
+                .await
+                .conflicts("pkg:npm/other@1.0.0"),
+            sources,
+            "discover() is the workspace scope"
+        );
+
+        let global = UserPatchIndex::discover_scoped(&repo, ReadScope::Global).await;
+        assert!(
+            global.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{global:?}"
+        );
+        let left_pad = global.conflicts("pkg:npm/left-pad@1.3.0");
+        assert!(
+            left_pad
+                .iter()
+                .any(|s| s.ends_with("fixes/left-pad+1.3.0.patch")),
+            "{left_pad:?}"
+        );
+        let is_number = global.conflicts("pkg:npm/is-number@7.0.0");
+        assert!(
+            is_number
+                .iter()
+                .any(|s| s.ends_with("shared/a/patches/is-number+7.0.0.patch")),
+            "{is_number:?}"
+        );
+        assert!(global.conflicts("pkg:npm/left-pad@1.2.0").is_empty());
+        assert_eq!(ReadScope::of_global(true), ReadScope::Global);
+        assert_eq!(ReadScope::of_global(false), ReadScope::Workspace);
     }
 
     /// The view-based index the hosted engine and `vex` discovery read

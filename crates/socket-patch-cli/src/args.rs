@@ -447,6 +447,14 @@ impl GlobalArgs {
         self.global || self.global_prefix.is_some()
     }
 
+    /// The read scope this run's mode fixes: a global run (`--global` /
+    /// `--global-prefix`) reads anywhere on the system; a project run never
+    /// reads a project file outside the git repository root. #2025's
+    /// `GlobalArgs::read_scope` has the same contract.
+    pub(crate) fn read_scope(&self) -> socket_patch_core::patch::user_patches::ReadScope {
+        socket_patch_core::patch::user_patches::ReadScope::of_global(self.is_global())
+    }
+
     /// Whether `--ecosystems` selects `eco` (every ecosystem when unset or
     /// empty). The names are validated at parse time, so this is an exact
     /// match.

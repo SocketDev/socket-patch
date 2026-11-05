@@ -211,7 +211,11 @@ ancestor walk stops there, and a workspace member or literal `--patch-dir`
 beyond it protects every npm package with a `workspace outside the git
 repository` / `patch-package directory outside the git repository` diagnostic
 instead of being read. Without a `.git`, the ancestor walk stops below the home
-directory. The hosted engine and `vex` run this same walk (npm-family rows only,
+directory. This repository bound is a workspace-run rule: the walk's global
+read scope has none (members and patch directories are read wherever they
+are, and protect only what they patch), though a global run (`--global`,
+`--global-prefix`) inspects no project today, since a local checkout does not
+govern the global tree. The hosted engine and `vex` run this same walk (npm-family rows only,
 without native npm / Bun); in memory the project is its own repository root.
 
 | Mechanism | Evidence |
