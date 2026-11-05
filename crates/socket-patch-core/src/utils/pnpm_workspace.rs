@@ -790,6 +790,22 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     git_branch_locks_in(view, true).await
 }
 
+/// Every `pnpm-lock.<branch>.yaml` pnpm could install the project from,
+/// root-relative and sorted per directory: the root's, then those of the
+/// workspace members that install from their own lock ([`member_locks`]),
+/// whatever `gitBranchLockfile` says. `vex` discovery withholds on their
+/// mere presence (fail-closed), so the setting is not read; neither is the
+/// environment, and nothing outside the project.
+pub async fn git_branch_lock_files(view: &ProjectView<'_>) -> Vec<String> {
+    let mut locks = branch_lock_names(view, "").await;
+    if let Members::Dirs { dirs, .. } = workspace_members(view, false).await {
+        for dir in dirs {
+            locks.extend(branch_lock_names(view, &dir).await);
+        }
+    }
+    locks
+}
+
 /// [`git_branch_locks`], consulting the environment only with `env`: the
 /// hosted and vendored writers run in the install's environment, while
 /// `vex` discovery answers from the project's files alone (as it does for

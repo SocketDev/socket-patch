@@ -821,53 +821,57 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             read.push(rel);
         }
     }
-    // `gitBranchLockfile` with a branch lock (#556): pnpm installs a branch
-    // from `pnpm-lock.<branch>.yaml`, so no root or member lock is what
-    // installs. Detected as the hosted engine detects it (and, like it,
-    // only while the lock is enabled), from the project's files alone, and
-    // only when one of those locks wired something.
+    // A branch lock (#556): with `gitBranchLockfile` on, pnpm installs a
+    // branch from `pnpm-lock.<branch>.yaml`, so no root or member lock is
+    // what installs. Whether the setting is on (and in which environment)
+    // is not decided here: a branch lock's presence alone withholds
+    // (fail-closed), read from the project's files only, and only when one
+    // of those locks wired something.
     let wired = out
         .refs
         .iter()
         .any(|r| read.iter().any(|rel| r.source_file == Path::new(rel)));
-    if !wired || disabled.is_some() {
+    if !wired {
         return;
     }
-    if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks_in(&ctx.view, false).await
-    {
-        for rel in &read {
-            unattest_git_branch_lock(rel, &branch, out);
-        }
+    let branch_locks = crate::utils::pnpm_workspace::git_branch_lock_files(&ctx.view).await;
+    if branch_locks.is_empty() {
+        return;
+    }
+    for rel in &read {
+        unattest_git_branch_lock(rel, &branch_locks, out);
     }
 }
 
 /// Mark every ref of the pnpm lock `file` [`UnattestedKind::PnpmGitBranchLock`]
-/// when `branch` (pnpm's `gitBranchLockfile` on, a branch lock present) says
-/// pnpm installs a branch from its own `pnpm-lock.<branch>.yaml` instead.
-/// The hosted engine then leaves the root lock out and refuses every pnpm
-/// pin, vendored mode refuses the project, and neither reads member locks;
-/// discovery does not read branch locks either, so which bytes a branch
-/// installs is unknown. The refs stay refs: the wiring in `file` is intact
-/// (rollback, remove and list still manage it, and the ledgers keep it
-/// live), and no `scan` / `vendor` re-run can rewire the branch lock. The
-/// mark names the branch lock in `file`'s own directory when there is one.
-fn unattest_git_branch_lock(
-    file: &str,
-    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
-    out: &mut Discovery,
-) {
+/// because `branch_locks` (root-relative `pnpm-lock.<branch>.yaml` files)
+/// exist: with `gitBranchLockfile` on pnpm installs a branch from its own
+/// lock instead, the hosted engine then leaves the root lock out and
+/// refuses every pnpm pin, and vendored mode refuses the project.
+/// Discovery reads neither the setting nor the branch locks, so a branch
+/// lock's presence withholds whatever the setting says. The refs stay refs:
+/// the wiring in `file` is intact (rollback, remove and list still manage
+/// it, and the ledgers keep it live), and no `scan` / `vendor` re-run can
+/// rewire the branch lock. The mark names the branch lock in `file`'s own
+/// directory when there is one.
+fn unattest_git_branch_lock(file: &str, branch_locks: &[String], out: &mut Discovery) {
     let dir = Path::new(file).parent().unwrap_or(Path::new(""));
-    let shown = branch
-        .locks
+    let shown = branch_locks
         .iter()
         .find(|lock| Path::new(lock.as_str()).parent() == Some(dir))
-        .or(branch.locks.first())
+        .or(branch_locks.first())
         .map_or(file, String::as_str);
     out.unwired_copy(UnwiredCopy {
         scope: Some(PathBuf::from(file)),
         target: CopyTarget::Any,
         file: PathBuf::from(shown),
-        detail: format!("its pin is in {file} and {}", branch.describe()),
+        detail: format!(
+            "its pin is in {file} while the pnpm branch lock(s) {} exist: with \
+             `gitBranchLockfile` on, pnpm installs a git branch from its own \
+             `pnpm-lock.<branch>.yaml` rather than {file}, and a branch lock's presence \
+             withholds the statement whatever the setting says",
+            branch_locks.join(", ")
+        ),
         kind: UnattestedKind::PnpmGitBranchLock,
     });
 }
@@ -3498,12 +3502,14 @@ mod tests {
     /// lock, so hosted mode withholds the root (and member) locks and refuses
     /// every pnpm pin, and vendored mode refuses the project. Their pins stay
     /// refs (the wiring is intact; rollback must still find it) but are never
-    /// attested. The setting off, or no branch lock, attests as before.
+    /// attested. Owner decision: discovery withholds on a branch lock's mere
+    /// presence, whatever `gitBranchLockfile` (or pnpm's `lockfile`) says —
+    /// deterministic and fail-closed. No branch lock attests as before.
     #[tokio::test]
     async fn pnpm_git_branch_lockfile_marks_the_lock_pins_unattested() {
         let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
         let wired = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
-        let branch_lock = |out: &Discovery, lock: &str, setting: &str| {
+        let branch_lock = |out: &Discovery, lock: &str| {
             assert_refs(out, &[("pkg:npm/ms@1.3.0", UUID_B, WiringMode::Hosted)]);
             let u = out
                 .unattested
@@ -3516,7 +3522,7 @@ mod tests {
             );
             assert_eq!(u.file, std::path::PathBuf::from(lock));
             assert!(
-                u.detail.contains(setting) && u.detail.contains(lock),
+                u.detail.contains(lock) && u.detail.contains("presence withholds"),
                 "{}",
                 u.detail
             );
@@ -3533,33 +3539,38 @@ mod tests {
             "control: no branch lock"
         );
         p.write("pnpm-lock.feature.yaml", lock);
-        branch_lock(
-            &run(&p).await,
-            "pnpm-lock.feature.yaml",
-            "`gitBranchLockfile: true` in pnpm-workspace.yaml",
-        );
+        branch_lock(&run(&p).await, "pnpm-lock.feature.yaml");
+        // The setting off: a branch lock's presence still withholds.
         p.write(
             "pnpm-workspace.yaml",
             "packages:\n  - '.'\ngitBranchLockfile: false\n",
         );
-        assert!(run(&p).await.unattested.is_empty(), "control: setting off");
+        branch_lock(&run(&p).await, "pnpm-lock.feature.yaml");
+        // No setting anywhere, and `.npmrc` turning it off: the same.
+        std::fs::remove_file(p.root().join("pnpm-workspace.yaml")).unwrap();
+        branch_lock(&run(&p).await, "pnpm-lock.feature.yaml");
+        p.write(".npmrc", "git-branch-lockfile=false\n");
+        branch_lock(&run(&p).await, "pnpm-lock.feature.yaml");
+        // The branch lock gone: attested again.
+        std::fs::remove_file(p.root().join("pnpm-lock.feature.yaml")).unwrap();
+        assert!(
+            run(&p).await.unattested.is_empty(),
+            "control: no branch lock"
+        );
 
-        // The `.npmrc` spelling.
+        // pnpm's `lockfile` setting off as well: still withheld (fail-closed).
         let p = Project::new();
         p.write("pnpm-lock.yaml", &wired);
         p.write("pnpm-lock.feature.yaml", lock);
-        p.write(".npmrc", "git-branch-lockfile=true\n");
-        branch_lock(
-            &run(&p).await,
-            "pnpm-lock.feature.yaml",
-            "git-branch-lockfile",
-        );
+        p.write("pnpm-workspace.yaml", "lockfile: false\n");
+        branch_lock(&run(&p).await, "pnpm-lock.feature.yaml");
 
-        // A member that installs from its own lock, with its branch lock.
+        // A member that installs from its own lock, with its branch lock and
+        // no `gitBranchLockfile` setting.
         let p = Project::new();
         p.write(
             "pnpm-workspace.yaml",
-            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ngitBranchLockfile: true\n",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
         );
         p.write("packages/a/package.json", "{}");
         p.write("packages/a/pnpm-lock.yaml", &wired);
@@ -3568,11 +3579,7 @@ mod tests {
             "control: no branch lock"
         );
         p.write("packages/a/pnpm-lock.feature.yaml", lock);
-        branch_lock(
-            &run(&p).await,
-            "packages/a/pnpm-lock.feature.yaml",
-            "gitBranchLockfile",
-        );
+        branch_lock(&run(&p).await, "packages/a/pnpm-lock.feature.yaml");
     }
 
     /// The hosted npm rewriter's own pin of `left-pad@1.3.0` under `UUID_A`,

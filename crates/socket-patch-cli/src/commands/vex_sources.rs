@@ -232,8 +232,9 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
-/// Omission tag and note: a pnpm lock pins the patch, but `gitBranchLockfile`
-/// makes pnpm install from a `pnpm-lock.<branch>.yaml` (`vex::Unattested`).
+/// Omission tag and note: a pnpm lock pins the patch, but a
+/// `pnpm-lock.<branch>.yaml` exists, which pnpm installs from instead when
+/// `gitBranchLockfile` is on; its presence withholds (`vex::Unattested`).
 const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
 /// Omission tag and note: an npm or Bun pin's package is one the project
 /// patches itself (`patchedDependencies`, `vex::Unattested`).
@@ -276,9 +277,10 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::PnpmGitBranchLock => (
             NOTE_PNPM_GIT_BRANCH_LOCKFILE,
-            "not attested while branch locks are in use; the wiring itself is intact, so \
-             re-running `scan` / `vendor` does not change this (turn gitBranchLockfile off and \
-             fold the branch locks in with `pnpm install --merge-git-branch-lockfiles`)",
+            "not attested while any branch lock exists, whatever gitBranchLockfile says; the \
+             wiring itself is intact, so re-running `scan` / `vendor` does not change this \
+             (fold the branch locks in with `pnpm install --merge-git-branch-lockfiles`, turn \
+             gitBranchLockfile off and delete the `pnpm-lock.<branch>.yaml` files)",
         ),
         UnattestedKind::UserPatchedDependency => (
             NOTE_NPM_PATCHED_DEPENDENCY,
