@@ -98,7 +98,7 @@ pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(Str
                 level.push(dir);
             }
         }
-        let read: Vec<(String, Option<(Arc<ManifestFacts>, String)>)> =
+        let read: Vec<(String, Option<ReadManifest>)> =
             crate::utils::concurrent::ordered_concurrent(
                 level,
                 MEMBER_READ_CONCURRENCY,
@@ -128,9 +128,12 @@ pub(crate) async fn member_manifest_texts_in(view: &ProjectView<'_>) -> Vec<(Str
         .collect()
 }
 
+/// A manifest the view walk read: its walk facts and its text.
+type ReadManifest = (Arc<ManifestFacts>, String);
+
 /// A regular (non-symlink) manifest read through the view: its walk facts
 /// and its text.
-async fn view_manifest(view: &ProjectView<'_>, rel: &str) -> Option<(Arc<ManifestFacts>, String)> {
+async fn view_manifest(view: &ProjectView<'_>, rel: &str) -> Option<ReadManifest> {
     if view.is_symlink(rel) {
         return None;
     }
