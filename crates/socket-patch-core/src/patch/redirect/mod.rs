@@ -9480,6 +9480,24 @@ pub struct HostedGoWorkspace {
     /// a module-to-module replace makes it matter (#1840).
     #[serde(default)]
     pub module_graph: Option<crate::vendor::go_build_list::ModuleGraph>,
+    /// In memory: the root-relative files that exist (`go.work`, the root
+    /// `go.mod`, the in-root members' `go.mod`), so every workspace check
+    /// compares paths lexically ([`PathSpace::Memory`]) and never touches
+    /// the filesystem or the process's working directory. `None` on disk.
+    ///
+    /// [`PathSpace::Memory`]: crate::vendor::go_workspace::PathSpace::Memory
+    #[serde(default)]
+    pub files: Option<std::collections::BTreeSet<std::path::PathBuf>>,
+}
+
+impl HostedGoWorkspace {
+    /// Where the workspace's paths live.
+    pub fn paths(&self) -> crate::vendor::go_workspace::PathSpace<'_> {
+        match &self.files {
+            Some(files) => crate::vendor::go_workspace::PathSpace::Memory { files },
+            None => crate::vendor::go_workspace::PathSpace::Disk,
+        }
+    }
 }
 
 fn rewrite_golang(
@@ -9505,7 +9523,7 @@ fn rewrite_golang(
     // a module the workspace shares; a go.work root has no go.mod at all.
     let root_work = workspace.as_ref().and_then(|ws| match &ws.loaded {
         crate::vendor::go_workspace::Loaded::Workspace(w)
-            if w.rooted_at(&ws.root) && files.contains_key("go.work") =>
+            if w.rooted_at_in(ws.paths(), &ws.root) && files.contains_key("go.work") =>
         {
             Some(w)
         }
@@ -9604,7 +9622,7 @@ fn rewrite_golang(
             continue;
         }
         let host = match (&workspace, root_work) {
-            (Some(ws), Some(w)) => w.replace_host(&ws.root, has_go_mod, &fname),
+            (Some(ws), Some(w)) => w.replace_host_in(ws.paths(), &ws.root, has_go_mod, &fname),
             _ => crate::vendor::go_workspace::ReplaceHost::GoMod,
         };
         // The go.work in effect may override or reject the replace, or
@@ -9612,7 +9630,7 @@ fn rewrite_golang(
         // the whole workspace, checked before anything is written.
         let selection = workspace
             .as_ref()
-            .and_then(|ws| ws.loaded.selection(&fname, &dep.version));
+            .and_then(|ws| ws.loaded.selection_in(ws.paths(), &fname, &dep.version));
         if let Some(ws) = &workspace {
             let ours = go_mod_edit::ReplaceEntry {
                 module: fname.clone(),
@@ -9628,7 +9646,7 @@ fn rewrite_golang(
                 .map(|setting| crate::vendor::go_workspace::WorkspaceConflict::ModFile { setting });
             if let Some(conflict) = modfile.or_else(|| {
                 ws.loaded
-                    .host_conflict(host, &ws.root, &fname, &dep.version, &ours)
+                    .host_conflict_in(ws.paths(), host, &ws.root, &fname, &dep.version, &ours)
             }) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_golang_workspace_conflict".into(),
@@ -24281,11 +24299,29 @@ packages:
             }),
             modfile: None,
             module_graph: None,
+            files: Some(memory_go_files(members.iter().map(|(dir, _)| *dir))),
         };
         (
             GO_WORKSPACE_KEY.to_string(),
             serde_json::to_string(&hosted).unwrap(),
         )
+    }
+
+    /// The files an in-memory workspace of the `use` members `dirs` holds,
+    /// as the engine lists them: go.work and each in-root member's go.mod.
+    fn memory_go_files<'a>(
+        dirs: impl IntoIterator<Item = &'a str>,
+    ) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut files = std::collections::BTreeSet::from(["go.work".into()]);
+        for dir in dirs {
+            files.extend(crate::vendor::go_workspace::in_root_dir(dir).map(
+                |dir| match dir.as_str() {
+                    "" => "go.mod".into(),
+                    dir => format!("{dir}/go.mod").into(),
+                },
+            ));
+        }
+        files
     }
 
     /// [`go_workspace_key`] plus the root go.work itself as a candidate
@@ -24504,6 +24540,7 @@ packages:
             }),
             modfile: None,
             module_graph: None,
+            files: Some(memory_go_files([".", "../out"])),
         };
         again.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -24562,6 +24599,7 @@ packages:
                 loaded: Loaded::None,
                 modfile: None,
                 module_graph: module_graph.clone(),
+                files: None,
             };
             files.insert(
                 GO_WORKSPACE_KEY.to_string(),
@@ -24617,6 +24655,7 @@ packages:
                 loaded: Loaded::None,
                 modfile: None,
                 module_graph: module_graph.clone(),
+                files: None,
             };
             files.insert(
                 GO_WORKSPACE_KEY.to_string(),
@@ -24652,6 +24691,7 @@ packages:
             loaded: Loaded::None,
             modfile: Some("GOFLAGS sets -modfile=go.alt.mod, so go builds from go.alt.mod".into()),
             module_graph: None,
+            files: None,
         };
         files.insert(
             GO_WORKSPACE_KEY.to_string(),
@@ -24688,6 +24728,58 @@ packages:
         assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
         assert!(
             out.warnings[0].detail.contains("b/go.mod"),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// The in-memory engine's workspace is judged lexically, from the
+    /// project's own files: a root module go.work doesn't `use` is "not a
+    /// member", whatever the process's working directory holds. The disk
+    /// check probed `<cwd>/go.mod` instead, so with this crate's directory
+    /// as the cwd (no go.mod) it called the root module-less ("nowhere to
+    /// go"), and with a go.mod there it gave the member answer.
+    #[tokio::test]
+    async fn golang_memory_workspace_never_probes_the_cwd() {
+        use crate::hosted::engine::{read_go_workspace, CandidateFiles};
+        use crate::vendor::lock_inventory::{MemoryProject, ProjectView};
+        let ovr = golang_override();
+        let mut project = MemoryProject::new();
+        let mut files = golang_files();
+        let b = go_member("v1.4.2", "");
+        files.insert("go.work".into(), "go 1.21\n\nuse ./b\n".into());
+        files.insert("b/go.mod".into(), b);
+        for (path, text) in &files {
+            project.insert_text(path, text.as_str());
+        }
+        let mut read = CandidateFiles::default();
+        read_go_workspace(
+            &ProjectView::Memory(&project),
+            &std::collections::BTreeSet::new(),
+            &mut read,
+        )
+        .await;
+        let hosted: HostedGoWorkspace =
+            serde_json::from_str(&read.files[GO_WORKSPACE_KEY]).unwrap();
+        assert_eq!(
+            hosted.files,
+            Some(
+                ["go.mod", "go.work", "b/go.mod"]
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            )
+        );
+        files.extend(read.files);
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("go.work does not `use` this module"),
             "{:?}",
             out.warnings
         );

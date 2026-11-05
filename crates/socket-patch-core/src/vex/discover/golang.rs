@@ -363,7 +363,7 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, governing: Gov
     }
     let graph = Graph::new(
         go_mod.as_deref(),
-        workspace.as_ref().map(|ws| &ws.model),
+        workspace.as_ref().map(|ws| (&ws.model, ws.paths())),
         module_graph.as_ref(),
     );
     let mut sums = SumPins::default();
@@ -388,7 +388,8 @@ struct Graph<'a> {
     /// workspace mode the highest each read member requires.
     required: HashMap<String, String>,
     root: Option<&'a str>,
-    workspace: Option<&'a GoWorkspace>,
+    /// The workspace and where its paths live.
+    workspace: Option<(&'a GoWorkspace, PathSpace<'a>)>,
     /// The root module's unpruned graph from the module cache, when read.
     module_graph: Option<&'a ModuleGraph>,
 }
@@ -396,11 +397,11 @@ struct Graph<'a> {
 impl<'a> Graph<'a> {
     fn new(
         go_mod: Option<&'a str>,
-        workspace: Option<&'a GoWorkspace>,
+        workspace: Option<(&'a GoWorkspace, PathSpace<'a>)>,
         module_graph: Option<&'a ModuleGraph>,
     ) -> Self {
         let required = match workspace {
-            Some(ws) => {
+            Some((ws, _)) => {
                 let mut max: HashMap<String, String> = HashMap::new();
                 for text in ws.members.iter().filter_map(|m| m.go_mod.as_deref()) {
                     for (module, v) in go_mod_edit::parse_required_versions(text) {
@@ -431,7 +432,7 @@ impl<'a> Graph<'a> {
     /// zip lines, or [`GoWorkspace::selection`]).
     fn select(&self, module: &str, version: &str, zips: &[&str]) -> Selection {
         match self.workspace {
-            Some(ws) => ws.selection(module, version),
+            Some((ws, paths)) => ws.selection_in(paths, module, version),
             None => {
                 let root = self.root.unwrap_or_default();
                 go_build_list::select_in(
@@ -449,8 +450,9 @@ impl<'a> Graph<'a> {
     /// Whether the workspace module graph proves the build selects exactly
     /// `module@version`.
     fn selects(&self, module: &str, version: &str) -> bool {
-        self.workspace
-            .is_some_and(|ws| ws.selection(module, version) == Selection::Selected)
+        self.workspace.is_some_and(|(ws, paths)| {
+            ws.selection_in(paths, module, version) == Selection::Selected
+        })
     }
 }
 
@@ -2419,7 +2421,7 @@ mod tests {
                 .collect(),
             ),
         };
-        let graph = Graph::new(None, Some(&ws), None);
+        let graph = Graph::new(None, Some((&ws, PathSpace::Disk)), None);
         let entry = |version: &str| ReplaceEntry {
             module: MODULE.to_string(),
             version: Some(version.to_string()),
@@ -2456,7 +2458,7 @@ mod tests {
         assert!(out.diagnostics[0].detail.contains("is inert"));
         // Without the graph nothing proves the raise.
         let ws = GoWorkspace { graph: None, ..ws };
-        let graph = Graph::new(None, Some(&ws), None);
+        let graph = Graph::new(None, Some((&ws, PathSpace::Disk)), None);
         let mut out = Discovery::default();
         assert_eq!(
             replaced_purl(

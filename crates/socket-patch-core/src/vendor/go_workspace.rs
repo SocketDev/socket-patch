@@ -585,10 +585,15 @@ impl GoWorkspace {
     /// [`Selection::Unknown`] without them. A module that is a `use` member
     /// is built from its directory, never at `version`.
     pub fn selection(&self, module: &str, version: &str) -> Selection {
+        self.selection_in(PathSpace::Disk, module, version)
+    }
+
+    /// [`GoWorkspace::selection`] in `paths`.
+    pub fn selection_in(&self, paths: PathSpace<'_>, module: &str, version: &str) -> Selection {
         if let Some(member) = self.main_module(module) {
             return Selection::Other(format!(
                 "(the workspace module in {})",
-                display_path(self.work_dir(), &member.dir)
+                paths.display(self.work_dir(), &member.dir)
             ));
         }
         let mut complete = !self.members.is_empty() && self.graph.is_some();
@@ -775,11 +780,22 @@ impl GoWorkspace {
     /// module's go.mod keeps the replace too
     /// ([`ReplaceHost::mirrors_root_go_mod`]).
     pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
-        if !self.rooted_at(root) {
+        self.replace_host_in(PathSpace::Disk, root, root_has_go_mod, module)
+    }
+
+    /// [`GoWorkspace::replace_host`] in `paths`.
+    pub fn replace_host_in(
+        &self,
+        paths: PathSpace<'_>,
+        root: &Path,
+        root_has_go_mod: bool,
+        module: &str,
+    ) -> ReplaceHost {
+        if !self.rooted_at_in(paths, root) {
             return ReplaceHost::GoMod;
         }
-        let own = same_dir_key(root);
-        let root_is_member = self.members.iter().any(|m| same_dir_key(&m.dir) == own);
+        let own = paths.key(root);
+        let root_is_member = self.members.iter().any(|m| paths.key(&m.dir) == own);
         let ours_here = self
             .replaces()
             .iter()
@@ -787,7 +803,7 @@ impl GoWorkspace {
         let listed_elsewhere = self
             .members
             .iter()
-            .any(|m| same_dir_key(&m.dir) != own && m.lists(module));
+            .any(|m| paths.key(&m.dir) != own && m.lists(module));
         let shared = !root_has_go_mod || (root_is_member && (ours_here || listed_elsewhere));
         if shared {
             ReplaceHost::GoWork
@@ -989,17 +1005,38 @@ impl Loaded {
     /// [`GoWorkspace::selection`]; [`Selection::Unknown`] when go refuses
     /// the workspace, `None` in module mode.
     pub fn selection(&self, module: &str, version: &str) -> Option<Selection> {
+        self.selection_in(PathSpace::Disk, module, version)
+    }
+
+    /// [`Loaded::selection`] in `paths`.
+    pub fn selection_in(
+        &self,
+        paths: PathSpace<'_>,
+        module: &str,
+        version: &str,
+    ) -> Option<Selection> {
         match self {
             Loaded::None => None,
-            Loaded::Workspace(ws) => Some(ws.selection(module, version)),
+            Loaded::Workspace(ws) => Some(ws.selection_in(paths, module, version)),
             Loaded::Invalid(_) => Some(Selection::Unknown),
         }
     }
 
     /// [`GoWorkspace::replace_host`]; go.mod outside a workspace.
     pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
+        self.replace_host_in(PathSpace::Disk, root, root_has_go_mod, module)
+    }
+
+    /// [`Loaded::replace_host`] in `paths`.
+    pub fn replace_host_in(
+        &self,
+        paths: PathSpace<'_>,
+        root: &Path,
+        root_has_go_mod: bool,
+        module: &str,
+    ) -> ReplaceHost {
         match self {
-            Loaded::Workspace(ws) => ws.replace_host(root, root_has_go_mod, module),
+            Loaded::Workspace(ws) => ws.replace_host_in(paths, root, root_has_go_mod, module),
             Loaded::None | Loaded::Invalid(_) => ReplaceHost::GoMod,
         }
     }
@@ -1015,11 +1052,24 @@ impl Loaded {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
+        self.host_conflict_in(PathSpace::Disk, host, project_root, module, version, ours)
+    }
+
+    /// [`Loaded::host_conflict`] in `paths`.
+    pub fn host_conflict_in(
+        &self,
+        paths: PathSpace<'_>,
+        host: ReplaceHost,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
         match (self, host) {
             (Loaded::Workspace(ws), ReplaceHost::GoWork) => {
-                ws.work_conflict(project_root, module, version, ours)
+                ws.work_conflict_in(paths, project_root, module, version, ours)
             }
-            _ => self.conflict(project_root, module, version, ours),
+            _ => self.conflict_in(paths, project_root, module, version, ours),
         }
     }
 
@@ -1031,9 +1081,21 @@ impl Loaded {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
+        self.conflict_in(PathSpace::Disk, project_root, module, version, ours)
+    }
+
+    /// [`Loaded::conflict`] in `paths`.
+    pub fn conflict_in(
+        &self,
+        paths: PathSpace<'_>,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
         match self {
             Loaded::None => None,
-            Loaded::Workspace(ws) => ws.conflict(project_root, module, version, ours),
+            Loaded::Workspace(ws) => ws.conflict_in(paths, project_root, module, version, ours),
             Loaded::Invalid(reason) => Some(WorkspaceConflict::Invalid {
                 reason: reason.clone(),
             }),

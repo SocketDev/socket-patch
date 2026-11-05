@@ -491,19 +491,30 @@ async fn read_advisory(
 /// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
 /// the one go resolves (`GOWORK`, else a go.work at or above the root, with
 /// members anywhere, plus a `-modfile` that GOFLAGS sets); in memory a root
-/// `go.work` and its in-root members. A root go.work and go.work.sum are candidate files the rewriter writes.
-async fn read_go_workspace(
+/// `go.work` and its in-root members, with the files that exist
+/// ([`crate::patch::redirect::HostedGoWorkspace::files`]) so the rewriter
+/// compares their paths lexically and never probes the disk or the
+/// process's working directory. A root go.work and go.work.sum are
+/// candidate files the rewriter writes.
+pub(crate) async fn read_go_workspace(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
     use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
-    let (root, loaded, modfile, module_graph) = match view {
+    let (root, loaded, modfile, module_graph, files) = match view {
         ProjectView::Memory(_) => 'memory: {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
             };
             let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
+            // The files that exist, as discovery's in-memory workspace
+            // lists them: go.work, a readable root go.mod and each in-root
+            // member's readable go.mod.
+            let mut files: BTreeSet<std::path::PathBuf> = BTreeSet::from(["go.work".into()]);
+            if read_advisory(view, unreadable, "go.mod").await.is_some() {
+                files.insert("go.mod".into());
+            }
             // As on disk (`go_workspace::load`): a go.work go cannot parse
             // is a workspace go refuses to build, never module mode.
             if let Some(problem) = crate::vendor::go_mod_edit::block_structure_error(&work) {
@@ -512,6 +523,7 @@ async fn read_go_workspace(
                     Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
                     None,
                     None,
+                    Some(files),
                 );
             }
             let mut members = Vec::new();
@@ -528,10 +540,14 @@ async fn read_go_workspace(
                     "" => file.to_string(),
                     dir => format!("{dir}/{file}"),
                 };
+                let go_mod = read_advisory(view, unreadable, &at("go.mod"))
+                    .await
+                    .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t));
+                if go_mod.is_some() {
+                    files.insert(at("go.mod").into());
+                }
                 members.push(Member {
-                    go_mod: read_advisory(view, unreadable, &at("go.mod"))
-                        .await
-                        .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t)),
+                    go_mod,
                     go_sum: read_advisory(view, unreadable, &at("go.sum")).await,
                     dir: dir.into(),
                 });
@@ -544,7 +560,13 @@ async fn read_go_workspace(
                 members,
                 graph: None,
             };
-            (std::path::PathBuf::new(), Loaded::Workspace(ws), None, None)
+            (
+                std::path::PathBuf::new(),
+                Loaded::Workspace(ws),
+                None,
+                None,
+                Some(files),
+            )
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -586,7 +608,7 @@ async fn read_go_workspace(
             view.disk_root_reading(&touched);
             // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
             let modfile = go_workspace::modfile_setting(&root);
-            (root, loaded, modfile, module_graph)
+            (root, loaded, modfile, module_graph, None)
         }
     };
     if loaded == Loaded::None && modfile.is_none() && module_graph.is_none() {
@@ -597,6 +619,7 @@ async fn read_go_workspace(
         loaded,
         modfile,
         module_graph,
+        files,
     };
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files
