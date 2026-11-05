@@ -64,9 +64,9 @@ use crate::utils::fs::read_regular_to_string;
 use super::common::refused;
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
-    dep_field_lines, drifted, lines_value, merge_live_dep_refs, ref_record_blocks, removed,
-    revert_overrides_line, same_modulo_dep_refs, value_lines, vendor_value_is_for, DepRef, EditCtx,
-    PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    dep_entries, drifted, lines_value, lock_has_target_package, ref_record_blocks, removed,
+    revert_block, revert_overrides_line, target_blocks, target_key, vendor_value_is_for, DepPair,
+    DepRef, EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -76,7 +76,7 @@ use crate::formats::pnpm::lines::{
     next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
     yaml_key_like, yaml_value,
 };
-use crate::formats::pnpm::{sniff_lock_grammar, PnpmLock, PnpmLockGrammar};
+use crate::formats::pnpm::{PnpmLock, PnpmLockGrammar};
 
 /// The [`VendorEntry::flavor`] string legacy wirings are stamped with.
 /// Distinct from the v9 backend's `"pnpm"` so an older binary (which has no
@@ -230,15 +230,6 @@ pub(super) struct LegacyLock {
     abs_root: String,
 }
 
-pub(super) fn check_lock_version(text: &str) -> Result<PnpmLockGrammar, String> {
-    match sniff_lock_grammar(text) {
-        Ok(PnpmLockGrammar::V9) => Err(format!(
-            "{PNPM_LOCK} is a lockfileVersion 9.0 lock; not a legacy grammar"
-        )),
-        result => result,
-    }
-}
-
 pub(super) fn read_lock(
     lock_text: &str,
     project_root: &Path,
@@ -310,7 +301,7 @@ pub(super) fn preflight_package(
     if let Err(detail) = check_rewritable_refs(&lock.lines, &ctx) {
         return Err(Box::new(refused("vendor_lock_entry_unsupported", detail)));
     }
-    if !lock_has_target_package(&lock.lines, &ctx) {
+    if !lock_has_target_package(&lock.lines, name, version) {
         return Err(Box::new(refused(
             "vendor_lock_entry_not_found",
             format!(
@@ -341,10 +332,7 @@ pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) 
     let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
         .await
         .ok()?;
-    match sniff_lock_grammar(&text) {
-        Ok(PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => {}
-        _ => return None,
-    }
+    PnpmDialect::Legacy.check_lock(&text).ok()?;
     Some(PnpmLock::parse(&text).vendored_in_use(&entry.uuid))
 }
 
@@ -399,24 +387,6 @@ impl LegacyLock {
 
 // ─────────────────────────── pre-flight checks ───────────────────────────
 
-/// Does the lock have a packages entry vendoring can target — the grammar's
-/// registry key, or our rekeyed `file:` key (the in-sync / stale-uuid
-/// re-run)?
-fn lock_has_target_package(lines: &[String], ctx: &Ctx<'_>) -> bool {
-    let Some((start, end)) = section_bounds(lines, "packages") else {
-        return false;
-    };
-    let reg_key = ctx.reg_key();
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        if block.key == reg_key || ctx.is_ours(&block.key) {
-            return true;
-        }
-        i = block.end;
-    }
-    false
-}
-
 /// Fail-closed guard against legacy reference forms the surgery does not
 /// rewrite: PEER-SUFFIXED dep paths (`/name/version_peer…` in v5.4,
 /// `/name@version(peer…)` in v6.0) and ALIASED references (a dep whose
@@ -436,29 +406,20 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
             ctx.name, ctx.version
         ))
     };
-    // Root dep maps (v5.4 bare values; v6.0 version: fields).
+    // Root dep maps: v5.4 bare values, v6.0 nested `version:` fields.
     for section in ROOT_DEP_SECTIONS {
         let Some((start, end)) = section_bounds(lines, section) else {
             continue;
         };
-        let mut k = start + 1;
-        while k < end {
-            let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 2) else {
-                k += 1;
-                continue;
-            };
-            let value = if rest.is_empty() {
-                // v6.0 nested shape: read the version: field.
-                let (_, ver, f) = dep_field_lines(lines, k + 1, end, 4);
-                k = f;
-                match ver {
-                    Some((_, v)) => v,
-                    None => continue,
-                }
-            } else {
-                k += 1;
-                rest.to_string()
-            };
+        let bare = lines[start + 1..end]
+            .iter()
+            .filter_map(|line| parse_key_line(line, 2))
+            .filter(|(_, _, value)| !value.is_empty())
+            .map(|(dep, _, value)| (dep.to_string(), value.to_string()));
+        let nested = dep_entries(lines, start + 1, end, 2)
+            .into_iter()
+            .filter_map(|entry| Some((entry.dep, entry.ver?.1)));
+        for (dep, value) in bare.chain(nested) {
             if value == reg_key || value.starts_with(&key_peer_prefix) {
                 return refuse("an aliased root dependency", &value);
             }
@@ -617,52 +578,32 @@ fn edit_root_deps_v60(
         let Some((start, end)) = section_bounds(lines, section) else {
             continue;
         };
-        let mut k = start + 1;
-        while k < end {
-            let Some((dep, _repr, rest)) = parse_key_line(&lines[k], 2) else {
-                k += 1;
+        for entry in dep_entries(lines, start + 1, end, 2) {
+            let (Some((si, old_spec)), Some((vi, old_ver))) = (entry.spec, entry.ver) else {
                 continue;
             };
-            if dep != ctx.name || !rest.is_empty() {
-                k += 1;
+            if entry.dep != ctx.name || !(old_ver == ctx.version || ctx.is_ours(&old_ver)) {
                 continue;
             }
-            let (spec_f, ver_f, f) = dep_field_lines(lines, k + 1, end, 4);
-            if let (Some((si, old_spec)), Some((vi, old_ver))) = (spec_f, ver_f) {
-                let target = old_ver == ctx.version || ctx.is_ours(&old_ver);
-                if target {
-                    hit = true;
-                    if old_ver == ctx.spec && old_spec == abs_yaml {
-                        k = f;
-                        continue; // in sync
-                    }
-                    let was_ours = ctx.is_ours(&old_ver);
-                    // Built before the splices below: `dep` borrows `lines[k]`.
-                    let record = WiringRecord {
-                        file: PNPM_LOCK.to_string(),
-                        kind: KIND_LOCK_ROOT_DEP_PAIR.to_string(),
-                        action: WiringAction::Rewritten,
-                        key: Some(format!("{section}|{dep}")),
-                        original: if was_ours {
-                            None
-                        } else {
-                            Some(serde_json::json!({
-                                "specifier": old_spec,
-                                "version": old_ver,
-                            }))
-                        },
-                        new: Some(serde_json::json!({
-                            "specifier": ctx.abs_spec,
-                            "version": ctx.spec,
-                        })),
-                    };
-                    lines[si] = format!("    specifier: {abs_yaml}");
-                    lines[vi] = format!("    version: {}", ctx.spec);
-                    wiring.push(record);
-                    changed = true;
-                }
+            hit = true;
+            if old_ver == ctx.spec && old_spec == abs_yaml {
+                continue; // in sync
             }
-            k = f;
+            wiring.push(WiringRecord {
+                file: PNPM_LOCK.to_string(),
+                kind: KIND_LOCK_ROOT_DEP_PAIR.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(format!("{section}|{}", entry.dep)),
+                original: (!ctx.is_ours(&old_ver))
+                    .then(|| serde_json::json!({ "specifier": old_spec, "version": old_ver })),
+                new: Some(serde_json::json!({
+                    "specifier": ctx.abs_spec,
+                    "version": ctx.spec,
+                })),
+            });
+            lines[si] = format!("    specifier: {abs_yaml}");
+            lines[vi] = format!("    version: {}", ctx.spec);
+            changed = true;
         }
     }
     Ok((changed, hit))
@@ -677,37 +618,14 @@ fn edit_packages(
     ctx: &Ctx<'_>,
     wiring: &mut Vec<WiringRecord>,
 ) -> Result<bool, String> {
-    let (start, end) = section_bounds(lines, "packages").ok_or("no packages: section")?;
+    let bounds = section_bounds(lines, "packages").ok_or("no packages: section")?;
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-
-    // Fail closed on a half-drifted lock carrying BOTH spellings.
-    let mut has_registry = false;
-    let mut has_ours = false;
-    let mut j = start + 1;
-    while let Some(block) = next_block(lines, j, end) {
-        if block.key == reg_key {
-            has_registry = true;
-        } else if ctx.is_ours(&block.key) {
-            has_ours = true;
-        }
-        j = block.end;
-    }
-    if has_registry && has_ours {
-        return Err(format!(
-            "packages section carries BOTH `{reg_key}` and a `file:…` entry (a \
-             half-edited lock); run `pnpm install` to re-resolve it, then re-vendor"
-        ));
-    }
-
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        let is_registry = block.key == reg_key;
-        let is_ours_key = ctx.is_ours(&block.key);
-        if !is_registry && !is_ours_key {
-            i = block.end;
-            continue;
-        }
+    let matches = target_blocks(&*lines, "packages", bounds, ctx.name, ctx.version)?;
+    // The first registry-or-ours block is the one rewritten (every path
+    // below returns).
+    if let Some(block) = matches.into_iter().next() {
+        let is_ours_key = target_key(&block.key, ctx.name, ctx.version) == Some(true);
         let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
         let expected_resolution = format!(
             "    resolution: {{integrity: {}, tarball: {}}}",
@@ -844,7 +762,7 @@ fn edit_pkg_dep_refs(
 /// sort before `file:`-keys). pnpm sorts package keys with the `sort-keys`
 /// default compare (JS code-unit order), which plain Rust `str` ordering
 /// matches for these ASCII keys.
-fn swap_block_sorted(
+pub(super) fn swap_block_sorted(
     lines: &mut Vec<String>,
     section: &str,
     old_key: &str,
@@ -940,7 +858,7 @@ pub(super) fn revert_lock_record(
         KIND_LOCK_ROOT_DEP_PAIR => {
             revert_root_dep_pair(lines, rec, key, entry_uuid, dirty, warnings)
         }
-        KIND_LOCK_PACKAGE => revert_package_block(lines, rec, key, entry_uuid, dirty, warnings),
+        KIND_LOCK_PACKAGE => revert_block(lines, rec, key, "packages", entry_uuid, dirty, warnings),
         KIND_LOCK_PKG_DEP_REF => revert_pkg_dep_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
@@ -1030,156 +948,14 @@ fn revert_root_dep_pair(
         )));
         return;
     };
-    let mut k = start + 1;
-    while k < end {
-        let Some((d, _repr, rest)) = parse_key_line(&lines[k], 2) else {
-            k += 1;
-            continue;
-        };
-        if d != dep || !rest.is_empty() {
-            k += 1;
-            continue;
-        }
-        let (spec_f, ver_f, _) = dep_field_lines(lines, k + 1, end, 4);
-        let (Some((si, live_spec)), Some((vi, live_ver))) = (spec_f, ver_f) else {
-            break;
-        };
-        // ALREADY CONVERGED: both fields already equal the recorded
-        // pre-vendor original — an earlier partial revert (or the user, by
-        // hand) already restored this record. Not drift: stay silent so
-        // the drift-skip keep gate can converge.
-        if let Some(original) = rec.original.as_ref() {
-            if original.get("specifier").and_then(Value::as_str) == Some(live_spec.as_str())
-                && original.get("version").and_then(Value::as_str) == Some(live_ver.as_str())
-            {
-                return;
-            }
-        }
-        let new_ver = rec
-            .new
-            .as_ref()
-            .and_then(|n| n.get("version"))
-            .and_then(Value::as_str);
-        let ours = Some(live_ver.as_str()) == new_ver
-            || parse_vendor_path(&live_ver).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-        if !ours {
-            warnings.push(drifted(format!(
-                "root dep `{key}` was re-resolved since vendoring ({live_ver}); left alone"
-            )));
-            return;
-        }
-        let Some(original) = rec.original.as_ref() else {
-            warnings.push(drifted(format!(
-                "root dep `{key}` has no recorded pre-vendor original; left as-is \
-                 (re-run `pnpm install` to re-resolve it)"
-            )));
-            return;
-        };
-        let (Some(orig_spec), Some(orig_ver)) = (
-            original.get("specifier").and_then(Value::as_str),
-            original.get("version").and_then(Value::as_str),
-        ) else {
-            warnings.push(drifted(format!("root dep `{key}` original is malformed")));
-            return;
-        };
-        lines[si] = format!("    specifier: {orig_spec}");
-        lines[vi] = format!("    version: {orig_ver}");
-        *dirty = true;
-        return;
-    }
-    warnings.push(removed(format!(
-        "root dep `{key}` no longer exists; nothing to restore"
-    )));
-}
-
-/// Restore the rekeyed packages block: locate it by the NEW `file:` key,
-/// verify ownership, then reinsert the ORIGINAL block at its byte-sorted
-/// position (the rekey moved it across the `/` vs `file:` sort boundary, so
-/// an in-place splice would restore it out of order and break byte-identity
-/// with the pre-vendor lock) — merged with any dependency ref ANOTHER entry
-/// rewrote inside the block since (#830, [`merge_live_dep_refs`]).
-fn revert_package_block(
-    lines: &mut Vec<String>,
-    rec: &WiringRecord,
-    key: &str,
-    entry_uuid: &str,
-    dirty: &mut bool,
-    warnings: &mut Vec<VendorWarning>,
-) {
-    let Some(new_lines) = rec.new.as_ref().and_then(value_lines) else {
-        warnings.push(drifted(format!(
-            "record for `{key}` has no `new` fragment; left alone"
-        )));
-        return;
+    let pair = DepPair {
+        rec,
+        key,
+        dep,
+        entry_uuid,
+        label: "root dep",
     };
-    let Some((new_key, _repr, _rest)) = new_lines.first().and_then(|l| parse_key_line(l, 2)) else {
-        warnings.push(drifted(format!(
-            "record for `{key}` has a malformed fragment"
-        )));
-        return;
-    };
-    let Some((start, end)) = section_bounds(lines, "packages") else {
-        warnings.push(drifted(format!(
-            "packages section is gone; `{key}` not restored"
-        )));
-        return;
-    };
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        if block.key != new_key {
-            i = block.end;
-            continue;
-        }
-        let live: Vec<String> = lines[block.header..block.end].to_vec();
-        let key_is_ours =
-            parse_vendor_path(new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
-        if live != new_lines && !key_is_ours {
-            warnings.push(drifted(format!(
-                "packages entry `{new_key}` was changed since vendoring; left alone"
-            )));
-            return;
-        }
-        let Some(original) = rec.original.as_ref().and_then(value_lines) else {
-            warnings.push(drifted(format!(
-                "packages entry `{key}` has no recorded pre-vendor original; left as-is \
-                 (re-run `pnpm install` to re-resolve it)"
-            )));
-            return;
-        };
-        let Some((orig_key, _r, _v)) = original.first().and_then(|l| parse_key_line(l, 2)) else {
-            warnings.push(drifted(format!(
-                "packages entry `{key}` original is malformed"
-            )));
-            return;
-        };
-        let restored = merge_live_dep_refs(&original, &new_lines, &live);
-        if swap_block_sorted(lines, "packages", new_key, orig_key, &restored).is_err() {
-            warnings.push(drifted(format!(
-                "packages entry `{new_key}` vanished mid-restore; left alone"
-            )));
-            return;
-        }
-        *dirty = true;
-        return;
-    }
-    // ALREADY CONVERGED: an earlier partial revert restored this record —
-    // the restore rekeys the block back to its pre-vendor key, so the
-    // recorded `file:` key no longer matches while the original block is
-    // live (up to the dependency refs the merge kept). Not drift: stay
-    // silent so the drift-skip keep gate can converge instead of keeping
-    // the artifacts forever.
-    if let Some(orig) = rec.original.as_ref().and_then(value_lines) {
-        let mut j = start + 1;
-        while let Some(block) = next_block(lines, j, end) {
-            if same_modulo_dep_refs(&lines[block.header..block.end], &orig) {
-                return;
-            }
-            j = block.end;
-        }
-    }
-    warnings.push(removed(format!(
-        "packages entry `{new_key}` no longer exists; nothing to restore"
-    )));
+    pair.restore(lines, start + 1, end, 2, dirty, warnings);
 }
 
 /// Restore one dependent packages block's dep ref to this entry. Keyed by
@@ -2622,14 +2398,21 @@ packages:
         assert_eq!(fx.read(PNPM_LOCK).await, lock, "refusal writes nothing");
     }
 
-    /// CRLF and non-allowlisted lock versions refuse with the same codes
-    /// and byte-untouched files as the v9 backend.
+    /// Divergences N15 on a legacy lock: a CRLF 5.4 lock is wired like its
+    /// LF twin (the captured pnpm 7 shape) and stays CRLF; vendoring used to
+    /// refuse it. Non-allowlisted lock versions still refuse, with
+    /// byte-untouched files, as the v9 backend does (N16, target-specific).
     #[tokio::test]
-    async fn crlf_and_foreign_versions_refuse() {
+    async fn crlf_is_wired_and_foreign_versions_refuse() {
         let crlf = T7_BEFORE_LOCK.replace('\n', "\r\n");
         let fx = fixture_with(T_BEFORE_PKG, &crlf).await;
-        expect_refused(fx.vendor(false).await, "vendor_lockfile_crlf_unsupported");
-        assert_eq!(fx.read(PNPM_LOCK).await, crlf, "refusal writes nothing");
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let wired = fx.expected_lock(T7_AFTER_LOCK).await;
+        assert_eq!(fx.read(PNPM_LOCK).await, wired.replace('\n', "\r\n"));
+        let outcome = revert_pnpm_legacy(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PNPM_LOCK).await, crlf, "CRLF bytes restored");
 
         // pnpm 6's 5.3 is NOT allowlisted.
         let old = T7_BEFORE_LOCK.replace("lockfileVersion: 5.4", "lockfileVersion: 5.3");
@@ -2858,8 +2641,8 @@ packages:
         );
     }
 
-    /// Wiring records left alone during a WIRED revert (here: a
-    /// CRLF-converted lock whose LF-exact probes all miss) must KEEP the
+    /// Wiring records left alone during a WIRED revert (here: a root dep
+    /// re-resolved by hand since vendoring) must KEEP the
     /// artifact dir — the lock still resolves through the tarball, and
     /// deleting it bricks every subsequent install (the lossiness guard,
     /// present in the v9/npm/bun backends).
@@ -2868,8 +2651,12 @@ packages:
         let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
-        let crlf = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
-        tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf)
+        let drifted = fx.read(PNPM_LOCK).await.replacen(
+            &format!("  left-pad: file:{}\n", fx.rel_tgz()),
+            "  left-pad: 1.3.1\n",
+            1,
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &drifted)
             .await
             .unwrap();
 
@@ -2890,12 +2677,11 @@ packages:
         );
         assert!(
             fx.root().join(fx.rel_tgz()).exists(),
-            "the CRLF lock still resolves through the tarball; deleting it bricks installs"
+            "the lock still resolves through the tarball; deleting it bricks installs"
         );
-        assert_eq!(
-            fx.read(PNPM_LOCK).await,
-            crlf,
-            "the drifted lock is left alone"
+        assert!(
+            fx.read(PNPM_LOCK).await.contains("  left-pad: 1.3.1\n"),
+            "the drifted line is left alone"
         );
     }
 

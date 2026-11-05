@@ -1,7 +1,7 @@
 //! Hermetic hosted → vendored takeover tests through the built binary for
 //! pnpm projects whose shape the pnpm vendored backend refuses although
 //! hosted mode accepts it (#853): a `catalog:` dependency
-//! (`vendor_lock_entry_unsupported`), a CRLF `pnpm-lock.yaml`
+//! (`vendor_lock_entry_unsupported`), a `pnpm-lock.yaml` mixing CRLF and LF
 //! (`vendor_lockfile_crlf_unsupported`) and a conflicting user override
 //! (a range) in `pnpm-workspace.yaml` (`vendor_override_conflict`).
 //!
@@ -54,6 +54,8 @@ enum Shape {
     Catalog,
     /// A plain dependency whose lock is converted to CRLF after hosting.
     Crlf,
+    /// A plain dependency whose lock mixes CRLF and LF after hosting.
+    MixedEol,
     /// A plain dependency plus a conflicting user
     /// `overrides: { left-pad: ^1.3.0 }` in pnpm-workspace.yaml.
     Override,
@@ -90,7 +92,7 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
         Shape::Catalog => format!("packages:\n  - .\ncatalog:\n  {NAME}: {VERSION}\n"),
         Shape::Override => format!("overrides:\n  {NAME}: ^{VERSION}\n"),
         Shape::ExactPin => format!("overrides:\n  {NAME}: {VERSION}\n"),
-        Shape::Crlf | Shape::Plain | Shape::TwoDocument => String::new(),
+        Shape::Crlf | Shape::MixedEol | Shape::Plain | Shape::TwoDocument => String::new(),
     };
     if !workspace.is_empty() {
         std::fs::write(root.join("pnpm-workspace.yaml"), workspace).unwrap();
@@ -117,7 +119,7 @@ fn write_pnpm_project(root: &Path, shape: Shape) {
         )),
         Shape::Override => lock.push_str(&format!("overrides:\n  {NAME}: ^{VERSION}\n\n")),
         Shape::ExactPin => lock.push_str(&format!("overrides:\n  {NAME}: {VERSION}\n\n")),
-        Shape::Crlf | Shape::Plain | Shape::TwoDocument => {}
+        Shape::Crlf | Shape::MixedEol | Shape::Plain | Shape::TwoDocument => {}
     }
     let specifier = match shape {
         Shape::Catalog => "'catalog:'".to_string(),
@@ -305,7 +307,8 @@ fn snapshot(root: &Path) -> Vec<(&'static str, Option<Vec<u8>>)> {
 
 /// The hosted project: pristine lock, then a real `scan --mode hosted`
 /// (and, for [`Shape::Crlf`], the lock converted to CRLF as a
-/// `core.autocrlf` checkout would leave it). Returns the hosted wiring.
+/// `core.autocrlf` checkout would leave it; for [`Shape::MixedEol`], its
+/// first line only). Returns the hosted wiring.
 fn host_project(root: &Path, api: &str, shape: Shape) -> Vec<(&'static str, Option<Vec<u8>>)> {
     write_pnpm_project(root, shape);
     let (code, env) = run_mode(root, api, "scan", "hosted", &[]);
@@ -316,8 +319,10 @@ fn host_project(root: &Path, api: &str, shape: Shape) -> Vec<(&'static str, Opti
         lock.contains(HOSTED_URL),
         "hosted mode must pin the {shape:?} lock entry:\n{lock}\n{env:#}"
     );
-    if matches!(shape, Shape::Crlf) {
-        std::fs::write(&lock_path, lock.replace('\n', "\r\n")).unwrap();
+    match shape {
+        Shape::Crlf => std::fs::write(&lock_path, lock.replace('\n', "\r\n")).unwrap(),
+        Shape::MixedEol => std::fs::write(&lock_path, lock.replacen('\n', "\r\n", 1)).unwrap(),
+        _ => {}
     }
     snapshot(root)
 }
@@ -402,17 +407,21 @@ async fn get_vendored_over_hosted_pnpm_catalog_dep_keeps_the_hosted_pin() {
     refused_takeover_keeps_hosted_pin(Shape::Catalog, "get", "vendor_lock_entry_unsupported").await;
 }
 
-/// #853: a CRLF `pnpm-lock.yaml` (a `core.autocrlf` checkout).
+/// #853: a `pnpm-lock.yaml` mixing CRLF and LF. (A CRLF lock, a
+/// `core.autocrlf` checkout, takes over since lock-model 2b: see
+/// [`scan_vendored_over_hosted_pnpm_crlf_lock_takes_over_and_stays_crlf`].)
 #[tokio::test(flavor = "multi_thread")]
-async fn scan_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
-    refused_takeover_keeps_hosted_pin(Shape::Crlf, "scan", "vendor_lockfile_crlf_unsupported")
+async fn scan_vendored_over_hosted_pnpm_mixed_eol_lock_keeps_the_hosted_pin() {
+    refused_takeover_keeps_hosted_pin(Shape::MixedEol, "scan", "vendor_lockfile_crlf_unsupported")
         .await;
 }
 
-/// #853: `get --mode vendored` over a CRLF lock (a project-level refusal).
+/// #853: `get --mode vendored` over a mixed-ending lock (a project-level
+/// refusal).
 #[tokio::test(flavor = "multi_thread")]
-async fn get_vendored_over_hosted_pnpm_crlf_lock_keeps_the_hosted_pin() {
-    refused_takeover_keeps_hosted_pin(Shape::Crlf, "get", "vendor_lockfile_crlf_unsupported").await;
+async fn get_vendored_over_hosted_pnpm_mixed_eol_lock_keeps_the_hosted_pin() {
+    refused_takeover_keeps_hosted_pin(Shape::MixedEol, "get", "vendor_lockfile_crlf_unsupported")
+        .await;
 }
 
 /// #853: a conflicting user override (a range) in `pnpm-workspace.yaml`.
@@ -519,6 +528,32 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
     assert!(
         lock.contains(&format!(".socket/vendor/npm/{UUID}/")),
         "the lock must point at the vendored artifact:\n{lock}"
+    );
+}
+
+/// Lock-model 2b (divergence N15): a CRLF `pnpm-lock.yaml` (a
+/// `core.autocrlf` checkout) takes over like its LF twin, and the vendored
+/// lock keeps its CRLF endings. It used to be refused
+/// (`vendor_lockfile_crlf_unsupported`) and keep the hosted pin.
+#[tokio::test(flavor = "multi_thread")]
+async fn scan_vendored_over_hosted_pnpm_crlf_lock_takes_over_and_stays_crlf() {
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    host_project(root, &server.uri(), Shape::Crlf);
+
+    let (exit, env) = run_mode(root, &server.uri(), "scan", "vendored", &[]);
+    assert_eq!(exit, 0, "the CRLF takeover must succeed: {env:#}");
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(!lock.contains(HOSTED_URL), "{lock}");
+    assert!(
+        lock.contains(&format!(".socket/vendor/npm/{UUID}/")),
+        "the lock must point at the vendored artifact:\n{lock}"
+    );
+    assert!(
+        !lock.replace("\r\n", "").contains('\n'),
+        "the lock keeps its CRLF endings: {lock:?}"
     );
 }
 

@@ -28332,6 +28332,28 @@ packages:
                     .replace("version: 1.3.0", "version: 1.2.0"),
                 "redirect_pnpm_entry_not_found",
             ),
+            // Lock-model 2b: the hint reads the key with the planning core's
+            // `match_key`, the rule the vendored planner rekeys by, so the
+            // artifact leaf names the release and the `version:` line is not
+            // consulted. Before, a rekey without a `version:` line was "not
+            // found" and one whose leaf names another release but whose
+            // `version:` line matched was "vendored".
+            (
+                "a rekey without a version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"))
+                    .replace("    version: 1.3.0\n", ""),
+                "redirect_pnpm_entry_vendored",
+            ),
+            (
+                "another release's artifact under this version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "a sibling checkout's artifact",
+                v9(&format!("../.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
         ] {
             assert_eq!(codes(&lock), vec![want], "{case}");
         }

@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
+use super::plan::{match_key, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
@@ -42,11 +43,8 @@ struct PnpmLockState<'f> {
     /// Entry indices sorted by normalized (unquoted, `/`-stripped) key.
     sorted: Vec<usize>,
     pending: Vec<(std::ops::Range<usize>, String)>,
-    spliced: std::collections::HashSet<usize>,
+    spliced: HashSet<usize>,
     changed: bool,
-    /// [`vendored_packages`] of `text`, computed on the first unmatched dep
-    /// and dropped when [`PnpmLockState::materialize`] replaces `text`.
-    vendored: Option<HashSet<(String, String)>>,
 }
 
 impl<'f> PnpmLockState<'f> {
@@ -54,13 +52,12 @@ impl<'f> PnpmLockState<'f> {
         let mut state = PnpmLockState {
             path,
             text: Cow::Borrowed(text),
-            early_shrinkwrap: pnpm::unsupported_early_shrinkwrap(text),
+            early_shrinkwrap: Target::Hosted.check_lock(text).is_err(),
             entries: Vec::new(),
             sorted: Vec::new(),
             pending: Vec::new(),
             spliced: Default::default(),
             changed: false,
-            vendored: None,
         };
         state.reindex();
         state
@@ -84,17 +81,6 @@ impl<'f> PnpmLockState<'f> {
         self.sorted = sorted;
     }
 
-    /// Whether the lock vendors `fname@version` ([`vendored_packages`]).
-    /// Read from `text` without folding `pending` in: a resolution splice
-    /// never touches a packages key or a `name:` / `version:` line (see
-    /// the type docs), so the answer is the post-splice lock's.
-    fn vendors(&mut self, fname: &str, version: &str) -> bool {
-        let text: &str = &self.text;
-        self.vendored
-            .get_or_insert_with(|| vendored_packages(text))
-            .contains(&(fname.to_string(), version.to_string()))
-    }
-
     fn entry(&self, i: usize) -> pnpm::Entry<'_> {
         let (key, body) = &self.entries[i];
         pnpm::Entry {
@@ -111,20 +97,32 @@ impl<'f> PnpmLockState<'f> {
     }
 
     /// Entries whose key names `fname@version` (any suffix), in file order —
-    /// the same set a full [`pnpm::suffix`] scan of the logical lock yields.
+    /// the same set a full [`match_key`] scan of the logical lock yields.
     fn hits(&mut self, fname: &str, version: &str) -> Vec<usize> {
-        let hits = self.lookup(fname, version);
+        let hits = self.lookup(fname, version, false);
         if hits.iter().any(|i| self.spliced.contains(i)) {
             self.materialize();
-            return self.lookup(fname, version);
+            return self.lookup(fname, version, false);
         }
         hits
     }
 
-    fn lookup(&self, fname: &str, version: &str) -> Vec<usize> {
+    /// Whether a vendored rewire rekeyed `fname@version`
+    /// ([`KeyMatch::Rekeyed`]). Read from `text` without folding `pending`
+    /// in: a resolution splice never touches a key (see the type docs).
+    fn vendors(&self, fname: &str, version: &str) -> bool {
+        !self.lookup(fname, version, true).is_empty()
+    }
+
+    /// The entries [`match_key`] matches as a registry instance or, with
+    /// `rekeyed`, as a vendored rekey, found by their key prefixes.
+    fn lookup(&self, fname: &str, version: &str, rekeyed: bool) -> Vec<usize> {
+        let prefixes = match rekeyed {
+            false => [format!("{fname}@{version}"), format!("{fname}/{version}")],
+            true => [format!("{fname}@file:"), "file:".to_string()],
+        };
         let mut out = Vec::new();
-        for sep in ['@', '/'] {
-            let prefix = format!("{fname}{sep}{version}");
+        for prefix in &prefixes {
             let start = self
                 .sorted
                 .partition_point(|&i| self.norm_key(i) < prefix.as_str());
@@ -137,7 +135,11 @@ impl<'f> PnpmLockState<'f> {
         }
         out.sort_unstable();
         out.dedup();
-        out.retain(|&i| pnpm::suffix(self.entry(i).key, fname, version).is_some());
+        out.retain(|&i| match match_key(self.entry(i).key, fname, version) {
+            Some(KeyMatch::Registry { .. }) => !rekeyed,
+            Some(KeyMatch::Rekeyed) => rekeyed,
+            None => false,
+        });
         out
     }
 
@@ -162,7 +164,6 @@ impl<'f> PnpmLockState<'f> {
         out.push_str(&self.text[cursor..]);
         self.text = Cow::Owned(out);
         self.spliced.clear();
-        self.vendored = None;
         self.reindex();
         #[cfg(debug_assertions)]
         debug_assert_eq!(
@@ -268,7 +269,7 @@ pub(crate) fn plan_hosted(
                 let entry = lock.entry(i);
                 let suffix = pnpm::suffix(entry.key, &fname, &dep.version)
                     .expect("hits only holds entries naming this dep");
-                let resolution = if pnpm::supported_suffix(suffix) {
+                let resolution = if Target::Hosted.repoints(suffix) {
                     pnpm::resolution(&entry)
                 } else {
                     None
@@ -359,9 +360,7 @@ pub(crate) fn plan_hosted(
         // mode switch. Fail-closed either way: nothing is rewritten for the
         // dep.
         if !matched_any {
-            let vendored = locks
-                .iter_mut()
-                .any(|lock| lock.vendors(&fname, &dep.version));
+            let vendored = locks.iter().any(|lock| lock.vendors(&fname, &dep.version));
             if vendored {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_vendored".into(),
@@ -388,35 +387,6 @@ pub(crate) fn plan_hosted(
             result.files.insert(key.clone(), content);
         }
     }
-}
-
-/// The `(name, version)` of every packages entry of `text` the vendor
-/// backends rekeyed: v9's `<name>@file:<artifact>` key or legacy's bare
-/// `file:<artifact>` key with a `name:` line, each with its `version:`
-/// line, whose path is this project's vendored npm artifact
-/// ([`crate::origin::vendor_ref`]: root-anchored, canonical uuid,
-/// traversal-safe leaf) — the one rule lockfile discovery reads vendored
-/// pnpm keys with. A user's own `file:` dep of the same name, a
-/// `../.socket/vendor/…` path from another checkout, and an `overrides:`
-/// line alone (pnpm mirrors it from package.json whether or not anything
-/// matches) are not vendoring.
-fn vendored_packages(text: &str) -> HashSet<(String, String)> {
-    use super::{classify_pnpm_key, PnpmKey};
-    let lock = super::PnpmLock::parse_keys(text);
-    lock.packages()
-        .iter()
-        .filter_map(|package| {
-            let (name, path) = match classify_pnpm_key(package.key) {
-                PnpmKey::V9File { name, path } => (name.trim_start_matches('/'), path),
-                PnpmKey::LegacyFile { path } => (pnpm::entry_field(&package.entry, "name")?, path),
-                PnpmKey::Registry { .. } | PnpmKey::Other => return None,
-            };
-            let version = pnpm::entry_field(&package.entry, "version")?;
-            crate::origin::vendor_ref(path)
-                .filter(|v| v.eco == "npm")
-                .map(|_| (name.to_string(), version.to_string()))
-        })
-        .collect()
 }
 
 /// Test-only reference for the residual gate: every instance of this exact
