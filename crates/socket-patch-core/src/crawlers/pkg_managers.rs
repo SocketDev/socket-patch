@@ -239,9 +239,26 @@ impl YarnEnv {
             let Some((start, env_list)) = &self.env_files.run else {
                 return Default::default();
             };
-            let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+            // Inside a git checkout neither an rc file nor an env file
+            // above its root is read: what it would inject is missing.
+            // The home folder's rc file and the env files beside it are
+            // machine-level, read as before.
+            let bound = crate::utils::repo_root::upward_bound(start);
+            let within = |path: &Path| {
+                bound.as_ref().is_none_or(|b| b.contains(path))
+                    || self
+                        .home
+                        .as_deref()
+                        .is_some_and(|home| path.parent() == Some(home))
+            };
+            let read = |path: &Path| {
+                within(path)
+                    .then(|| crate::utils::fs::read_regular_to_string_sync(path).ok())
+                    .flatten()
+            };
             let mut rcs: Vec<(PathBuf, String)> = start
                 .ancestors()
+                .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
                 .filter_map(|dir| Some((dir.to_path_buf(), read(&dir.join(&self.rc_filename))?)))
                 .collect();
             if let Some(home) = &self.home {
@@ -361,12 +378,22 @@ pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<
         return Some(env.resolve_linker(linker));
     }
     let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let bound = crate::utils::repo_root::upward_bound(&start);
     start
         .ancestors()
+        .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
         .find_map(|dir| {
             let rc =
                 crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
             rc_node_linker(&rc, env)
+        })
+        // An rc file above the repository root is never read, and may set
+        // the linker: fail closed with a value no linker has, which reads
+        // as PnP (see [`YarnEnv::resolve_linker`]) and names the file.
+        .or_else(|| {
+            let bound = bound.as_ref()?;
+            let marker = bound.marker_above(&[env.rc_filename.as_str()])?;
+            Some(format!("<unread: {}>", bound.marker_refusal(&marker)))
         })
         .or_else(|| env.home_node_linker())
 }
@@ -396,8 +423,23 @@ pub(crate) fn yarn_pnpm_store_folder_in(project_root: &Path, env: &YarnEnv) -> O
         crate::formats::yarn::rc::raw_setting(&rc, "pnpmStoreFolder")
             .map(|raw| expand(&raw).map(|value| dir.join(value)))
     };
+    // An rc file above the repository root is never read: the store it
+    // may name is unknown, so none is admitted.
+    let bound = crate::utils::repo_root::upward_bound(&start);
+    if bound
+        .as_ref()
+        .and_then(|b| b.marker_above(&[env.rc_filename.as_str()]))
+        .is_some()
+        && !start
+            .ancestors()
+            .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
+            .any(|dir| from_rc(dir).is_some())
+    {
+        return None;
+    }
     let found = start
         .ancestors()
+        .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
         .find_map(from_rc)
         .or_else(|| env.home.as_deref().and_then(from_rc));
     match found {

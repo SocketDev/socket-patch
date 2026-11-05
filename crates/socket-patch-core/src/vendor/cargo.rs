@@ -456,6 +456,11 @@ async fn cargo_prelude(
     // `$CARGO_HOME`) — that overrides, or may override, this crate@version
     // is never shadowed or overwritten.
     let chain = cargo_config::read_config_chain(project_root).await;
+    // A config above the repository root is never read, so a user patch
+    // there cannot be ruled out.
+    if let Some(detail) = cargo_config::config_above_repo(project_root) {
+        return Err(refused("user_authored_patch_entry", detail));
+    }
     if let Some(detail) =
         user_patch_conflict(project_root, &manifest_entries, &chain, name, version).await
     {
@@ -1414,9 +1419,17 @@ pub(crate) async fn workspace_root_refusal(
     let root = tokio::fs::canonicalize(project_root)
         .await
         .unwrap_or_else(|_| project_root.to_path_buf());
+    let bound = crate::utils::repo_root::upward_bound(&root);
     for ancestor in root.ancestors().skip(1) {
         if ancestor.ends_with("target/package") {
             break;
+        }
+        // Above the repository root nothing is read; a Cargo.toml there
+        // may be the workspace root cargo finds, so the run refuses.
+        if let Some(bound) = bound.as_ref().filter(|b| !b.contains(ancestor)) {
+            return bound
+                .marker_above(&[cargo_manifest::CARGO_TOML])
+                .map(|marker| format!("{}; {hint}", bound.marker_refusal(&marker)));
         }
         let manifest = ancestor.join(cargo_manifest::CARGO_TOML);
         let Ok(text) = read_regular_to_string(&manifest).await else {
@@ -1548,6 +1561,11 @@ async fn path_crate_version(base: &Path, rel: &str) -> Option<String> {
     } else {
         base.join(rel)
     };
+    // A path outside the repository root is never read: its version is
+    // unknown, so the patch may override the target and the caller refuses.
+    if !crate::utils::repo_root::upward_readable(base, &dir) {
+        return None;
+    }
     let text = read_regular_to_string(&dir.join("Cargo.toml")).await.ok()?;
     let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
     doc.get("package")?
@@ -1720,6 +1738,9 @@ async fn move_wiring_into_manifest(
     }
     let manifest_entries = cargo_manifest::crates_io_patch_entries(&doc);
     let chain = cargo_config::read_config_chain(project_root).await;
+    if let Some(detail) = cargo_config::config_above_repo(project_root) {
+        return Err(detail);
+    }
     if let Some(detail) =
         user_patch_conflict(project_root, &manifest_entries, &chain, name, version).await
     {
@@ -1948,6 +1969,29 @@ pub async fn revert_cargo_vendor_opts(
 mod tests {
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// A user `[patch]` path outside the repository root is never read:
+    /// its version is unknown, so the caller refuses.
+    #[tokio::test]
+    async fn patch_path_outside_the_repository_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let fork = tmp.path().join("fork");
+        std::fs::create_dir_all(&fork).unwrap();
+        std::fs::write(
+            fork.join("Cargo.toml"),
+            "[package]\nname = \"serde\"\nversion = \"9.9.9\"\n",
+        )
+        .unwrap();
+        assert_eq!(path_crate_version(&repo, "../fork").await, None);
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(
+            path_crate_version(&repo, "../fork").await.as_deref(),
+            Some("9.9.9"),
+            "without a checkout, read as before"
+        );
+    }
     use crate::manifest::schema::{PatchFileInfo, VulnerabilityInfo};
     use crate::patch::apply::ApplyResult;
     use crate::vendor::common::backup_dir_for;

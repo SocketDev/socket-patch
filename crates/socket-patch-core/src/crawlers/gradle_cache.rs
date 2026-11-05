@@ -906,7 +906,14 @@ pub fn build_roots(cwd: &Path) -> Vec<PathBuf> {
     }
     let mut roots = vec![cwd.to_path_buf()];
     if !has_settings(cwd) {
-        if let Some(up) = cwd.ancestors().skip(1).find(|d| has_settings(d)) {
+        // Settings above the repository root are never read: that build
+        // reads as absent (the crawler is a reader).
+        if let Some(up) = cwd
+            .ancestors()
+            .skip(1)
+            .find(|d| has_settings(d))
+            .filter(|up| crate::utils::repo_root::upward_readable(cwd, up))
+        {
             roots.push(up.to_path_buf());
         }
     }

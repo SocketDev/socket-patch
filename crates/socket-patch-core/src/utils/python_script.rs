@@ -479,8 +479,16 @@ fn pyproject_has_uv_settings(pyproject: &str) -> bool {
 /// a `[tool.uv]` table, with `uv.toml` first in each directory. A
 /// user-level `uv.toml`
 /// (`~/.config/uv`) is the installing machine's and is not looked up.
+///
+/// Inside a git checkout the lookup never reads above its root
+/// ([`crate::utils::repo_root::upward_bound`]); [`uv_config_above_repo`]
+/// then says whether a settings file there may apply.
 pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
+    let bound = crate::utils::repo_root::upward_bound(root);
     for (rel, path) in ancestor_uv_config_files(root) {
+        if bound.as_ref().is_some_and(|b| !b.contains(&path)) {
+            return None;
+        }
         let text = match crate::utils::fs::read_regular_to_string_sync(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -493,6 +501,24 @@ pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
         }
     }
     None
+}
+
+/// Why the uv settings for `root` are unknowable: inside a git checkout,
+/// [`find_ancestor_uv_config`] found none up to the repository root, and
+/// a `uv.toml` or `pyproject.toml` exists above it (stat only, never
+/// read), which uv may apply. Writers refuse on it rather than wire what
+/// those settings may reject.
+pub fn uv_config_above_repo(root: &Path) -> Option<String> {
+    let bound = crate::utils::repo_root::upward_bound(root)?;
+    if find_ancestor_uv_config(root).is_some() {
+        return None;
+    }
+    let marker = bound.marker_above(&[UV_TOML, "pyproject.toml"])?;
+    Some(format!(
+        "uv may apply the settings in {}: {}",
+        marker.display(),
+        bound.marker_refusal(&marker)
+    ))
 }
 
 /// `[tool.uv]` keys that describe the project declaring them rather than

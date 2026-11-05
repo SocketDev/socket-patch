@@ -26,9 +26,21 @@ pub(super) type StagedBytes = BTreeMap<String, Vec<u8>>;
 /// engine. Errors read `read <rel>: <cause>`.
 pub(super) async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<String>, String> {
     // A writer's read outside the repository root refuses rather than
-    // reading as missing: what it would write next depends on it.
-    let path = crate::utils::repo_root::bounded_project_path(project_root, rel)
-        .map_err(|refused| format!("read {rel}: {refused}"))?;
+    // reading as missing: what it would write next depends on it. An
+    // absolute `rel` is an upward lookup's (a pnpm workspace root's
+    // settings above the project), bounded as one: only inside a checkout.
+    let path = if crate::utils::relpath::is_anchored(rel) {
+        let path = project_root.join(rel);
+        match crate::utils::repo_root::upward_bound(project_root) {
+            Some(bound) if !bound.contains(&path) => {
+                return Err(format!("read {rel}: {}", bound.refusal(&path)))
+            }
+            _ => path,
+        }
+    } else {
+        crate::utils::repo_root::bounded_project_path(project_root, rel)
+            .map_err(|refused| format!("read {rel}: {refused}"))?
+    };
     match crate::utils::fs::read_regular_to_string(&path).await {
         Ok(content) => Ok(Some(content)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -133,5 +145,12 @@ mod tests {
             let err = read_rel(&root, &rel).await.unwrap_err();
             assert!(err.contains("outside the repository root"), "{rel}: {err}");
         }
+        // Without a checkout an absolute path (an upward lookup's, the
+        // pnpm workspace root's settings) is read as before.
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(
+            read_rel(&root, &above.display().to_string()).await,
+            Ok(Some("x=2\n".to_string()))
+        );
     }
 }

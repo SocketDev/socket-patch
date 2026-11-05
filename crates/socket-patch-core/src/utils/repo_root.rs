@@ -171,6 +171,51 @@ impl ReadBoundary {
             self.root.display()
         )
     }
+
+    /// The nearest file named one of `names` in a directory ABOVE the
+    /// boundary, nearest directory first and `names` in order. Stat only:
+    /// the file is never opened. Like git's own lookup it never reaches
+    /// the home directory or anything above it, so a stray `~/package.json`
+    /// governs nothing.
+    pub fn marker_above(&self, names: &[&str]) -> Option<PathBuf> {
+        let home = home();
+        self.root
+            .ancestors()
+            .skip(1)
+            .take_while(|dir| home.as_deref().is_none_or(|home| !home.starts_with(dir)))
+            .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
+            .find(|path| std::fs::metadata(path).is_ok())
+    }
+
+    /// The reason an upward lookup stopped at the boundary although the
+    /// tool it models would read `marker` above it.
+    pub fn marker_refusal(&self, marker: &Path) -> String {
+        format!(
+            "{} exists above the repository root {}, and socket-patch does not read \
+             project files outside the repository, so it cannot tell whether that file \
+             governs this project",
+            marker.display(),
+            self.root.display()
+        )
+    }
+}
+
+/// The bound of an UPWARD lookup from `start` (a workspace root, an
+/// inherited config, a settings file the package manager searches its
+/// ancestors for): inside a git checkout the lookup never reads above the
+/// checkout's root, and a caller asks [`ReadBoundary::marker_above`]
+/// whether the tool would have found something there (a writer then
+/// refuses, a reader withholds). `None` outside any checkout, where the
+/// lookup walks on as it always has: stopping it at the project would
+/// silently treat a workspace member as standalone.
+pub fn upward_bound(start: &Path) -> Option<ReadBoundary> {
+    find_git_repo(&canonical_or_lexical(start)).map(|repo| ReadBoundary { root: repo.root })
+}
+
+/// Whether an upward lookup from `start` may read `path`
+/// ([`upward_bound`]): always outside a checkout, else only inside it.
+pub fn upward_readable(start: &Path, path: &Path) -> bool {
+    upward_bound(start).is_none_or(|bound| bound.contains(path))
 }
 
 /// `project_root.join(rel)` for a project file named by a root-relative
@@ -309,6 +354,10 @@ fn owner_trusted(owner: u32, euid: u32, sudo_uid: Option<u32>) -> bool {
 fn trusted_owner(_meta: &std::fs::Metadata) -> bool {
     true
 }
+
+#[cfg(test)]
+#[path = "repo_root_upward_tests.rs"]
+mod upward_tests;
 
 #[cfg(test)]
 mod tests {

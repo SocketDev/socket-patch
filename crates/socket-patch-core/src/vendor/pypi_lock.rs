@@ -188,6 +188,18 @@ pub(super) async fn load_python_locks(
     load_listed_locks(root, paths, name, version, uuid, true).await
 }
 
+/// Why the uv settings [`project_config_of`] stands for are unknowable:
+/// the root sets none, none was found up to the repository root, and one
+/// may apply from above it ([`crate::utils::python_script::uv_config_above_repo`]).
+fn ancestor_settings_unknown(
+    root: &Path,
+    (pyproject, uv_toml, ancestor): &(Option<String>, Option<String>, Option<UvConfig>),
+) -> Option<String> {
+    (ancestor.is_none() && !root_governs_script(pyproject.as_deref(), uv_toml.as_deref()))
+        .then(|| crate::utils::python_script::uv_config_above_repo(root))
+        .flatten()
+}
+
 /// The project's pyproject.toml and uv.toml, and the uv settings file
 /// above the root that uv applies when the root holds none (#1501), read
 /// into `cache` on the first call.
@@ -272,7 +284,11 @@ async fn load_listed_locks(
             in_sync = false;
         }
         if uv_pip && is_pep751_lock_name(&path) {
-            let (pyproject, uv_toml, ancestor) = project_config_of(root, &mut project_config).await;
+            let config = project_config_of(root, &mut project_config).await;
+            if let Some(why) = ancestor_settings_unknown(root, config) {
+                return Err(("pypi_uv_ancestor_settings", format!("{path}: {why}")));
+            }
+            let (pyproject, uv_toml, ancestor) = config;
             let settings: Vec<_> =
                 root_uv_settings(uv_toml.as_deref(), pyproject.as_deref(), ancestor.as_ref())
                     .into_iter()
@@ -303,7 +319,11 @@ async fn load_listed_locks(
                 return Err(("pypi_script_multiple_versions", format!("{path} resolves multiple versions of {name}; a script source override cannot select only {version}")));
             }
             let script = read_file(&root.join(script_name)).await?;
-            let (pyproject, uv_toml, ancestor) = project_config_of(root, &mut project_config).await;
+            let config = project_config_of(root, &mut project_config).await;
+            if let Some(why) = ancestor_settings_unknown(root, config) {
+                return Err(("pypi_uv_ancestor_settings", format!("{script_name}: {why}")));
+            }
+            let (pyproject, uv_toml, ancestor) = config;
             refuse_uv_script_no_sources(
                 name,
                 &script,

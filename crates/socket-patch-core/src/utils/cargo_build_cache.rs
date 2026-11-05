@@ -123,13 +123,18 @@ fn expand_build_dir(raw: &str, ws_root: &Path, cargo_home: Option<&Path>) -> Opt
 /// The nearest ancestor of `cwd` holding a `Cargo.lock` (cargo writes it
 /// beside the workspace root manifest), else the nearest one holding a
 /// `[workspace]` manifest, else `cwd`.
+///
+/// Inside a git checkout neither walk leaves the repository root: a
+/// workspace above it is never read nor its build cache touched.
 fn workspace_root(cwd: &Path) -> PathBuf {
-    for dir in cwd.ancestors() {
+    let bound = crate::utils::repo_root::upward_bound(cwd);
+    let within = |dir: &&Path| bound.as_ref().is_none_or(|b| b.contains(dir));
+    for dir in cwd.ancestors().take_while(within) {
         if dir.join("Cargo.lock").is_file() {
             return dir.to_path_buf();
         }
     }
-    for dir in cwd.ancestors() {
+    for dir in cwd.ancestors().take_while(within) {
         let manifest = dir.join("Cargo.toml");
         if let Ok(text) = crate::utils::fs::read_regular_to_string_sync(&manifest) {
             if text
@@ -361,6 +366,22 @@ pub fn cargo_purl_name(purl: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace above the repository root is neither read nor its
+    /// build cache touched; without a checkout it is found as before.
+    #[test]
+    fn workspace_root_stays_in_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let app = outer.join("repo/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(outer.join("Cargo.lock"), "").unwrap();
+        std::fs::write(outer.join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::create_dir_all(outer.join("repo/.git")).unwrap();
+        assert_eq!(workspace_root(&app), app);
+        std::fs::remove_dir(outer.join("repo/.git")).unwrap();
+        assert_eq!(workspace_root(&app), outer);
+    }
 
     fn mkfp(root: &Path, rel: &str) -> PathBuf {
         let p = root.join(rel);

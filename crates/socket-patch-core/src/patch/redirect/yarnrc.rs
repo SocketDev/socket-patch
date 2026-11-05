@@ -264,10 +264,23 @@ pub fn resolve_outer_yarn_mirror(
             file: first_file(
                 files("yarnrc", env_value(env, &["yarn_"], "userconfig")),
                 yarnrc_value,
-            ),
+            )
+            .or_else(|| unread_rc_above(project)),
         },
         member: None,
     }
+}
+
+/// Inside a git checkout, a `.yarnrc` or `.npmrc` above the repository
+/// root (stat only, never read) may set `yarn-offline-mirror`: fail closed
+/// as a mirror, so the hosted rewriter refuses with the file named.
+fn unread_rc_above(project: &Path) -> Option<MirrorSetting> {
+    let bound = crate::utils::repo_root::upward_bound(project)?;
+    let marker = bound.marker_above(&[".yarnrc", ".npmrc"])?;
+    Some(MirrorSetting {
+        value: MirrorValue::Path("<unknown>".to_string()),
+        origin: bound.marker_refusal(&marker),
+    })
 }
 
 /// Where yarn 1 looks for rc files outside the project (see the module
@@ -332,10 +345,14 @@ impl RcLayout {
                 out.push(home.join(&local));
             }
         }
+        // Inside a git checkout, never above its root (see
+        // [`unread_rc_above`]).
+        let bound = crate::utils::repo_root::upward_bound(project);
         out.extend(
             project
                 .ancestors()
                 .skip(1)
+                .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
                 .filter(|dir| dir.parent().is_some())
                 .map(|dir| dir.join(&local)),
         );
@@ -624,6 +641,9 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
         .unwrap_or(0);
     let mut members = Vec::new();
     let mut budget = MEMBER_SEARCH_DIR_BUDGET;
+    // Inside a git checkout a directory link out of it is never followed:
+    // its rc files are outside the repository.
+    let bound = crate::utils::repo_root::upward_bound(root);
     let mut stack = vec![(root.to_path_buf(), Vec::<String>::new())];
     while let Some((dir, rel)) = stack.pop() {
         if !rel.is_empty()
@@ -646,6 +666,19 @@ pub fn yarn_classic_workspace_members(root: &Path) -> Vec<PathBuf> {
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
             if name == "node_modules" || name == ".git" || !path.is_dir() {
+                continue;
+            }
+            if bound.as_ref().is_some_and(|b| !b.contains(&path)) {
+                // Not descended into: only a member AT the link counts
+                // (stat only), and its rc files are never read
+                // ([`resolve_outer_yarn_mirror_for_process`] fails closed).
+                let mut child = rel.clone();
+                child.push(name);
+                if path.join("package.json").is_file()
+                    && workspaces_include_as(&patterns, &child, WorkspacesDialect::YARN_CLASSIC)
+                {
+                    members.push(path);
+                }
                 continue;
             }
             let mut child = rel.clone();
@@ -675,13 +708,28 @@ pub fn resolve_outer_yarn_mirror_for_process(project: &Path) -> OuterYarnMirror 
     let root_user = process_is_root_user();
     let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
     let mut outer = resolve_outer_yarn_mirror(&env, root_user, &project, read);
-    outer.member = resolve_member_yarn_mirror(
-        &env,
-        root_user,
-        &yarn_classic_workspace_members(&project),
-        read,
-    );
+    let members = yarn_classic_workspace_members(&project);
+    outer.member = linked_member_outside(&project, &members)
+        .or_else(|| resolve_member_yarn_mirror(&env, root_user, &members, read));
     outer
+}
+
+/// Inside a git checkout, a workspace member linked from outside it
+/// ([`yarn_classic_workspace_members`]): yarn run there reads its own
+/// `.yarnrc` / `.npmrc`, which are never read here, so fail closed as a
+/// mirror and the hosted rewriter refuses with the member named.
+fn linked_member_outside(project: &Path, members: &[PathBuf]) -> Option<MirrorSetting> {
+    let bound = crate::utils::repo_root::upward_bound(project)?;
+    let member = members.iter().find(|member| !bound.contains(member))?;
+    Some(MirrorSetting {
+        value: MirrorValue::Path("<unknown>".to_string()),
+        origin: format!(
+            "the workspace member {}, linked from outside the repository root {}, whose \
+             .yarnrc / .npmrc socket-patch does not read",
+            member.display(),
+            bound.root().display()
+        ),
+    })
 }
 
 #[cfg(test)]

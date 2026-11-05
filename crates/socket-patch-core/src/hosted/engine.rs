@@ -897,6 +897,14 @@ pub async fn read_candidate_files(
                 crate::patch::redirect::UV_ANCESTOR_CONFIG_KEY.to_string(),
                 format!("{}\n{}", config.rel, config.text),
             );
+        } else if let Some(why) = view
+            .disk_root_reading(std::iter::empty::<&std::path::Path>())
+            .and_then(crate::utils::python_script::uv_config_above_repo)
+        {
+            out.files.insert(
+                crate::patch::redirect::UV_ANCESTOR_OUTSIDE_KEY.to_string(),
+                why,
+            );
         }
     }
 
@@ -2781,12 +2789,18 @@ fn pnpm_trust(
         // only from the workspace root's file, and a nested one would be
         // ignored (#880). The governing-root pre-check refused every root
         // file but these two, so nothing is written here.
+        // One above the repository root is never read (the pre-check
+        // refuses it; this keeps the read bounded on its own).
+        let readable = view
+            .disk_root()
+            .is_some_and(|root| crate::utils::repo_root::upward_readable(root, &root_file));
         let root_file = root_file.display().to_string();
         if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
             pnpm_trust_env_set_detail(&server, &found.source)
         } else {
-            match read_workspace_for_trust(std::path::Path::new(&root_file))
-                .ok()
+            match readable
+                .then(|| read_workspace_for_trust(std::path::Path::new(&root_file)))
+                .and_then(Result::ok)
                 .flatten()
                 .map(|text| plan_workspace_trust(Some(&text)))
             {

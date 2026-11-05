@@ -25,7 +25,41 @@ use crate::utils::workspace_globs::glob_matches;
 /// installs a listed member from the workspace root's `uv.lock` and never
 /// reads a `uv.lock`, `poetry.lock`, `pdm.lock`, `Pipfile.lock` or pylock
 /// left in the member directory.
+#[cfg(test)]
 pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
+    match walk(dir).await {
+        Walk::Governed(root) => Some(root),
+        Walk::Ungoverned | Walk::Beyond(..) => None,
+    }
+}
+
+/// The refusal both modes give a run from `dir`: [`member_detail`] for a
+/// governed member, or, inside a git checkout whose walk ran off the
+/// repository root with a `pyproject.toml` above it (stat only, never
+/// read), the reason it cannot tell whether that one is the workspace
+/// root.
+pub(crate) async fn governing_uv_refusal(dir: &Path) -> Option<String> {
+    match walk(dir).await {
+        Walk::Governed(root) => Some(member_detail(dir, &root)),
+        Walk::Ungoverned => None,
+        Walk::Beyond(bound, marker) => Some(format!(
+            "{} may be a member of a uv workspace rooted above the repository: {}; \
+             nothing was written",
+            dir.display(),
+            bound.marker_refusal(&marker)
+        )),
+    }
+}
+
+/// How the walk up from a member ended.
+enum Walk {
+    Governed(PathBuf),
+    Ungoverned,
+    /// It reached the repository root, and a `pyproject.toml` exists above.
+    Beyond(crate::utils::repo_root::ReadBoundary, PathBuf),
+}
+
+async fn walk(dir: &Path) -> Walk {
     let dir = tokio::fs::canonicalize(dir)
         .await
         .unwrap_or_else(|_| dir.to_path_buf());
@@ -33,9 +67,16 @@ pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
         .await
         .is_err()
     {
-        return None;
+        return Walk::Ungoverned;
     }
+    let bound = crate::utils::repo_root::upward_bound(&dir);
     for ancestor in dir.ancestors().skip(1) {
+        if let Some(bound) = bound.as_ref().filter(|b| !b.contains(ancestor)) {
+            return match bound.marker_above(&["pyproject.toml"]) {
+                Some(marker) => Walk::Beyond(bound.clone(), marker),
+                None => Walk::Ungoverned,
+            };
+        }
         let Ok(text) = read_regular_to_string(&ancestor.join("pyproject.toml")).await else {
             continue;
         };
@@ -51,13 +92,14 @@ pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
             .and_then(Item::as_table_like)
         else {
             if doc.contains_key("project") {
-                return None;
+                return Walk::Ungoverned;
             }
             continue;
         };
-        let rel: Vec<String> = dir
-            .strip_prefix(ancestor)
-            .ok()?
+        let Ok(rel) = dir.strip_prefix(ancestor) else {
+            return Walk::Ungoverned;
+        };
+        let rel: Vec<String> = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy().into_owned())
             .collect();
@@ -76,9 +118,12 @@ pub(crate) async fn governing_uv_workspace(dir: &Path) -> Option<PathBuf> {
             && !globs("exclude")
                 .iter()
                 .any(|pattern| glob_matches(pattern, &rel));
-        return member.then(|| ancestor.to_path_buf());
+        return match member {
+            true => Walk::Governed(ancestor.to_path_buf()),
+            false => Walk::Ungoverned,
+        };
     }
-    None
+    Walk::Ungoverned
 }
 
 /// The one-line detail both modes refuse a governed member with: names the

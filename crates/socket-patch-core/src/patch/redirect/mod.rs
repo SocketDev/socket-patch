@@ -6546,6 +6546,9 @@ fn plan_python_metadata_with(
         detail: format!("{metadata_path}: {detail}"),
     };
     source_scope().map_err(unsupported)?;
+    if let Some(why) = files.get(UV_ANCESTOR_OUTSIDE_KEY) {
+        return Err(unsupported(why.clone()));
+    }
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
     let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
         let (rel, text) = value.split_once('\n')?;
@@ -6772,9 +6775,10 @@ fn rewrite_uv_lock(
             // Every patched artifact is a wheel, which uv refuses to
             // install under no-binary (#1603).
             let no_binary = match (&planned, uv_pip_settings) {
-                (Ok(Some(_)), Some(settings)) => {
-                    upstream::pylock_no_binary(original, &dep.name, settings)
-                }
+                (Ok(Some(_)), Some(settings)) => files
+                    .get(UV_ANCESTOR_OUTSIDE_KEY)
+                    .cloned()
+                    .or_else(|| upstream::pylock_no_binary(original, &dep.name, settings)),
                 _ => None,
             };
             if let Some(why) = no_binary {
@@ -7087,6 +7091,12 @@ const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<c
 ///
 /// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
+
+/// The synthetic candidate key present, holding the reason, when uv may
+/// apply a settings file above the repository root, which is never read
+/// ([`crate::utils::python_script::uv_config_above_repo`]): every uv
+/// project, script and `uv pip` lock wiring refuses.
+pub const UV_ANCESTOR_OUTSIDE_KEY: &str = "<socket-patch:uv-ancestor-outside>";
 
 /// The uv settings `uv pip` reads for a PEP 751 lock in the root
 /// ([`upstream::root_uv_settings`]), with the settings file above the root

@@ -686,11 +686,15 @@ fn forces(overrides: &[(Option<String>, String)], owner: Option<&str>, name: &st
 /// The copy of the package `name` node resolves from the package directory
 /// `from`: `<dir>/node_modules/<name>` for the nearest of `from` and its
 /// ancestors that is not itself a `node_modules` directory.
+///
+/// Inside a git checkout a copy above its root is never read: `None`, so
+/// the dependency is unresolved rather than verified from outside.
 fn node_resolve(from: &Path, name: &str) -> Option<PathBuf> {
     from.ancestors()
         .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
         .map(|dir| dir.join("node_modules").join(name))
         .find(|copy| copy.exists())
+        .filter(|copy| crate::utils::repo_root::upward_readable(from, copy))
 }
 
 /// The registry semver range of a `dependencies` value: the value itself,
@@ -763,6 +767,24 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, PatchRecord};
     use std::collections::HashMap;
+
+    /// Node resolution never verifies from a copy above the repository
+    /// root; without a checkout it resolves as before.
+    #[test]
+    fn node_resolve_stays_in_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let from = outer.join("repo/node_modules/a");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(outer.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(outer.join("repo/.git")).unwrap();
+        assert_eq!(node_resolve(&from, "dep"), None);
+        std::fs::remove_dir(outer.join("repo/.git")).unwrap();
+        assert_eq!(
+            node_resolve(&from, "dep"),
+            Some(outer.join("node_modules/dep"))
+        );
+    }
 
     fn record_with_one_file(after_hash: &str) -> PatchRecord {
         let mut files = HashMap::new();

@@ -795,17 +795,34 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
     if setting.is_none() {
         if let Some(file) = governing_file(view) {
-            let workspace = read_regular_to_string(&file).await.ok();
-            let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
-                .await
-                .ok();
-            setting =
+            // Above the repository root nothing is read, so the setting is
+            // unknowable: fail closed, as if it were on, so writers refuse
+            // rather than pin a lock pnpm may not read.
+            let readable = view
+                .disk_root()
+                .is_some_and(|root| crate::utils::repo_root::upward_readable(root, &file));
+            setting = if readable {
+                let workspace = read_regular_to_string(&file).await.ok();
+                let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
+                    .await
+                    .ok();
                 pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1).map(|found| {
                     PnpmSetting {
                         source: format!("{} (at {})", found.source, file.display()),
                         ..found
                     }
-                });
+                })
+            } else {
+                Some(PnpmSetting {
+                    value: "true".to_string(),
+                    source: format!(
+                        "{} (above the repository root, never read, so `gitBranchLockfile` \
+                         may be on)",
+                        file.display()
+                    ),
+                    yaml: true,
+                })
+            };
         }
     }
     if setting.is_none() {
@@ -985,6 +1002,12 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
         .skip(1)
         .find(|dir| dir.join(PNPM_WORKSPACE).is_file())?;
     let file = dir.join(PNPM_WORKSPACE);
+    // Above the repository root the file is never read: fail closed, as a
+    // member, like an unreadable one (callers do not read it either, see
+    // [`crate::utils::repo_root::upward_readable`]).
+    if !crate::utils::repo_root::upward_readable(&canonical, &file) {
+        return Some(without_verbatim_prefix(file));
+    }
     let rel: Vec<String> = canonical
         .strip_prefix(dir)
         .ok()?

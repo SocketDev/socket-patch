@@ -35,6 +35,7 @@ use crate::utils::fs::{
     read_regular_to_string_sync,
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
+use crate::utils::repo_root::upward_bound;
 use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 use crate::vendor::cargo::NOT_WORKSPACE_ROOT;
 use crate::vendor::cargo_manifest;
@@ -63,6 +64,11 @@ pub const WORKSPACE_LOCKFILE_ELSEWHERE: &str = "redirect_workspace_lockfile_else
 /// settings (`trustLockfile`) live in an ancestor `pnpm-workspace.yaml`
 /// that does not trust the lock yet.
 pub const PNPM_SETTINGS_ELSEWHERE: &str = "redirect_pnpm_settings_elsewhere";
+
+/// Refusal code for a cargo project inside a git checkout when a
+/// `.cargo/config(.toml)` exists above the repository root: cargo merges
+/// it, but socket-patch never reads it.
+pub const CARGO_CONFIG_OUTSIDE_ROOT: &str = "redirect_cargo_config_outside_root";
 
 const PNPM_LOCK: &str = "pnpm-lock.yaml";
 const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
@@ -97,12 +103,20 @@ pub async fn refusal(
         if let Some(refusal) = cargo_member_refusal(root).await {
             return Some(refusal);
         }
+        // A cargo config above the repository root is never read; its
+        // source replacement or `[patch]` may decide what cargo builds.
+        if let Some(detail) = crate::vendor::cargo_config::config_above_repo(root) {
+            return Some(Refusal {
+                code: CARGO_CONFIG_OUTSIDE_ROOT.to_string(),
+                message: format!("{detail}; nothing was written"),
+            });
+        }
     }
     if candidates.iter().any(|c| c.dep.ecosystem == "pypi") {
-        if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(root).await {
+        if let Some(message) = crate::utils::uv_workspace::governing_uv_refusal(root).await {
             return Some(Refusal {
                 code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
-                message: crate::utils::uv_workspace::member_detail(root, &workspace),
+                message,
             });
         }
     }
@@ -133,7 +147,9 @@ fn pnpm_settings_elsewhere(root: &Path) -> Option<Refusal> {
         return None;
     }
     let file = governing_workspace_file(root)?;
-    if let Ok(Some(text)) = read_workspace_for_trust(&file) {
+    // One above the repository root is never read: it refuses.
+    let readable = crate::utils::repo_root::upward_readable(root, &file);
+    if let Some(Ok(Some(text))) = readable.then(|| read_workspace_for_trust(&file)) {
         if matches!(
             plan_workspace_trust(Some(&text)),
             TrustPlan::AlreadyTrue | TrustPlan::UserSet(_)
@@ -244,7 +260,7 @@ pub(crate) async fn npm_lock_elsewhere(root: &Path) -> Option<LockElsewhere> {
         vlt_workspace_elsewhere(root).await,
     );
     let Some(lock) = pnpm_lock_elsewhere(root).await else {
-        return workspace;
+        return workspace.or_else(|| lock_marker_above(root));
     };
     let shown_dir = lock.parent().unwrap_or(&lock).to_path_buf();
     // Canonical, like the other branches' roots: a relative `lockfile-dir`
@@ -290,7 +306,12 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
         .unwrap_or_else(|_| root.to_path_buf());
 
     let mut workspace = None;
+    let bound = upward_bound(&canonical);
     for ancestor in canonical.ancestors() {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            // Above the repository: [`npm_lock_elsewhere`] stats it.
+            break;
+        }
         let path = ancestor.join(PNPM_WORKSPACE);
         if let Ok(yaml) = read_regular_to_string(&path).await {
             workspace = Some((ancestor.to_path_buf(), yaml));
@@ -502,7 +523,15 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
                 .await
                 .clone(),
         };
-        let (ancestor, locks) = found?;
+        let Some((ancestor, locks)) = found else {
+            // Nothing inside the repository lists the member; a workspace
+            // file above it is never read, so it may still govern.
+            let markers: &[&str] = match family {
+                NpmLockFamily::Vlt => &[VLT_JSON, PNPM_WORKSPACE, "package.json"],
+                _ => &["package.json"],
+            };
+            return stray_lock_marker_above(root, &own, markers);
+        };
         let root_locks: Vec<&'static str> = locks
             .into_iter()
             .filter(|name| files.contains(name))
@@ -539,6 +568,58 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
         root_kind,
         ignored: own,
         detail,
+    })
+}
+
+/// The workspace files an npm-family member's governing root may hold.
+const WORKSPACE_MARKERS: [&str; 3] = [PNPM_WORKSPACE, VLT_JSON, "package.json"];
+
+/// [`member_stray_lock`] when the only candidate root is above the
+/// repository root: one of `markers` exists there (stat only), so the
+/// member's own locks `own` may be ignored. Callers treat it like a
+/// governing root: hosted and vendored refuse, discovery withholds.
+fn stray_lock_marker_above(
+    root: &Path,
+    own: &[&'static str],
+    markers: &[&str],
+) -> Option<MemberStrayLock> {
+    let bound = upward_bound(root)?;
+    let marker = bound.marker_above(markers)?;
+    let dir = marker.parent()?.to_path_buf();
+    Some(MemberStrayLock {
+        detail: format!(
+            "{} may be a member of a workspace rooted above the repository, whose package \
+             manager would ignore its own {}: {}",
+            root.display(),
+            join_paths(root, own),
+            bound.marker_refusal(&marker)
+        ),
+        root: dir,
+        root_kind: "workspace root",
+        ignored: own.to_vec(),
+    })
+}
+
+/// [`npm_lock_elsewhere`] when nothing inside the repository governs a
+/// lockless project but a workspace file sits above the repository root
+/// (stat only): pnpm, npm, yarn, Bun or vlt may install the project from
+/// there, so hosted and vendored refuse rather than write a member.
+fn lock_marker_above(root: &Path) -> Option<LockElsewhere> {
+    let bound = upward_bound(root)?;
+    let marker = bound.marker_above(&WORKSPACE_MARKERS)?;
+    let dir = marker.parent()?.to_path_buf();
+    Some(LockElsewhere {
+        code: WORKSPACE_LOCKFILE_ELSEWHERE,
+        detail: format!(
+            "{} has no lockfile of its own and may be installed from a workspace rooted \
+             above the repository: {}",
+            root.display(),
+            bound.marker_refusal(&marker)
+        ),
+        shown_dir: dir.clone(),
+        dir,
+        dir_kind: "workspace root",
+        vendorable_dir: false,
     })
 }
 
@@ -771,7 +852,11 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         .await
         .unwrap_or_else(|_| root.to_path_buf());
     let mut member: &Path = &canonical;
+    let bound = upward_bound(&canonical);
     for ancestor in canonical.ancestors().skip(1) {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            break;
+        }
         let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
             continue;
         };
@@ -1031,7 +1116,11 @@ async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
+    let bound = upward_bound(&canonical);
     for ancestor in canonical.ancestors().skip(1) {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            break;
+        }
         let Some((groups, source)) = vlt_workspace_groups(ancestor).await else {
             continue;
         };

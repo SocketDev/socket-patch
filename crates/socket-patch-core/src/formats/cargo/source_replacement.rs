@@ -124,7 +124,13 @@ pub fn config_layer_paths(
     };
     let mut layers = Vec::new();
     let mut dirs_seen: Vec<PathBuf> = Vec::new();
+    // Inside a git checkout a config above its root is never read
+    // (writers refuse on [`crate::vendor::cargo_config::config_above_repo`]).
+    let bound = crate::utils::repo_root::upward_bound(cwd);
     for ancestor in cwd.ancestors() {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            break;
+        }
         let dot_cargo = ancestor.join(".cargo");
         if let Some(file) = pick(&dot_cargo) {
             layers.push((file, ancestor.to_path_buf()));

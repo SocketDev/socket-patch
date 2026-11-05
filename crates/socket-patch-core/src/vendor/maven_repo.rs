@@ -335,8 +335,26 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let ancestors = crate::utils::repo_root::ancestor_search_dirs(&canonical_root);
+    let bound = crate::utils::repo_root::upward_bound(&canonical_root);
     for ancestor in &ancestors {
         let ancestor = ancestor.as_path();
+        // Above the repository root (a submodule's superproject, a
+        // directory around the checkout) nothing is read: a build file
+        // there may make this project a module, so it refuses.
+        if let Some(bound) = bound.as_ref().filter(|b| !b.contains(ancestor)) {
+            let marker = std::iter::once("pom.xml")
+                .chain(layout::GRADLE_SETTINGS_FILES.iter().copied())
+                .chain(["build.sbt"])
+                .map(|name| ancestor.join(name))
+                .find(|path| std::fs::metadata(path).is_ok());
+            if let Some(marker) = marker {
+                return Some(format!(
+                    "reason: not_build_root: {}",
+                    bound.marker_refusal(&marker)
+                ));
+            }
+            continue;
+        }
         let reader = super::jvm::apply::ProjectReader::new(ancestor);
         let rel = canonical_root
             .strip_prefix(ancestor)
@@ -1690,6 +1708,24 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+
+    /// A reactor `pom.xml` above the repository root is never read: the
+    /// project may be one of its modules, so vendoring refuses.
+    #[test]
+    fn a_build_above_the_repository_refuses_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let app = outer.join("repo");
+        std::fs::create_dir_all(app.join(".git")).unwrap();
+        std::fs::write(app.join("pom.xml"), "<project/>").unwrap();
+        std::fs::write(
+            outer.join("pom.xml"),
+            "<project><modules><module>other</module></modules></project>",
+        )
+        .unwrap();
+        let why = not_build_root(&app).unwrap();
+        assert!(why.contains("outside the repository"), "{why}");
+    }
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::PatchFileInfo;
     use crate::patch::apply::ApplyResult;
