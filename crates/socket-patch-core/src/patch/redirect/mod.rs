@@ -6768,7 +6768,7 @@ fn rewrite_uv_lock(
             .filter(|_| is_pep751_lock_name(path) && !pipenv_reads);
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
-            let planned = session.plan(&content, &dep.name, &dep.version, artifact);
+            let planned = session.plan(&dep.name, &dep.version, artifact);
             // Every patched artifact is a wheel, which uv refuses to
             // install under no-binary (#1603).
             let no_binary = match (&planned, uv_pip_settings) {
@@ -6794,6 +6794,21 @@ fn rewrite_uv_lock(
                         .insert(dep.patch_uuid.clone());
                     result.warnings.push(pipenv_pylock_refusal(path, dep));
                     continue;
+                }
+                Ok(Some(plan)) if plan.distribution_inline_artifacts() => {
+                    match distribution_project_cutoff(files) {
+                        Some(why) => {
+                            result
+                                .refused_python_lock_uuids
+                                .insert(dep.patch_uuid.clone());
+                            result.warnings.push(RewriteWarning {
+                                code: "redirect_uv_lock_unsupported".into(),
+                                detail: format!("{path}: {why}"),
+                            });
+                            continue;
+                        }
+                        None => plan,
+                    }
                 }
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
@@ -6880,6 +6895,38 @@ fn rewrite_uv_lock(
             result.files.insert(path.clone(), content);
         }
     }
+}
+
+/// Why a uv 0.2 `[[distribution]]` lock with inline artifacts may not be
+/// restorable once rewritten: the project's uv settings (`uv.toml`, else
+/// the pyproject's `[tool.uv]`, as uv reads them) set an `exclude-newer`
+/// cutoff, which uv 0.2.12–0.2.27 apply without recording it in the lock,
+/// so the unwind could not tell which release files it kept.
+fn distribution_project_cutoff(files: &BTreeMap<String, String>) -> Option<String> {
+    use crate::utils::python_script::UV_TOML;
+    let parse = |rel: &str| files.get(rel)?.parse::<toml_edit::DocumentMut>().ok();
+    let (file, key) = match parse(UV_TOML) {
+        Some(doc) => (
+            UV_TOML,
+            crate::utils::python_lock::sets_exclude_newer(doc.as_table())?.to_string(),
+        ),
+        None => {
+            let doc = parse("pyproject.toml")?;
+            let uv = doc
+                .get("tool")
+                .and_then(|t| t.get("uv"))
+                .and_then(toml_edit::Item::as_table_like)?;
+            (
+                "pyproject.toml",
+                crate::utils::python_lock::sets_exclude_newer(uv)?.to_string(),
+            )
+        }
+    };
+    Some(format!(
+        "{file} sets uv `{key}`, which uv 0.2.12–0.2.27 apply to a `[[distribution]]` lock \
+         without recording it, so rollback could not tell which release files the lock kept; \
+         re-lock with uv >=0.2.35"
+    ))
 }
 
 // ── composer.lock ────────────────────────────────────────────────────────────

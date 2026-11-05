@@ -1163,10 +1163,16 @@ async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
     for (name, version, files) in releases {
         let urls: Vec<serde_json::Value> = files
             .iter()
-            .map(|(filename, sha, size, uploaded)| {
+            .map(|(file, sha, size, uploaded)| {
+                // A full URL is served as is; a bare filename at
+                // `pypi_file_url`'s.
+                let (filename, url) = match file.rsplit_once('/') {
+                    Some((_, leaf)) => (leaf.to_string(), file.to_string()),
+                    None => (file.to_string(), pypi_file_url(file)),
+                };
                 serde_json::json!({
                     "filename": filename,
-                    "url": pypi_file_url(filename),
+                    "url": url,
                     "digests": { "sha256": sha },
                     "size": size,
                     "upload_time_iso_8601": uploaded,
@@ -2123,217 +2129,298 @@ async fn uv_underscore_upload_time_locks_round_trip() {
     assert_pypi_round_trip("uv 0.6.17 script", &input, &[urllib3_dep()], None).await;
 }
 
-const REQUESTS_UUID: &str = "44444444-4444-4444-4444-444444444444";
-const REQUESTS_WHEEL: &str = "requests-2.31.0-py3-none-any.whl";
-const REQUESTS_SDIST: &str = "requests-2.31.0.tar.gz";
-const REQUESTS_WHEEL_SHA: &str = "58cd2187c01e70e6e26505bca751777aa9f2ee0b7f4300988b709f44e013003f";
-const REQUESTS_SDIST_SHA: &str = "942c5a758f98d790eaed1a29cb6eefc7ffb0d1cf7af05c3d2791656dbd6ad1e1";
+// ── uv 0.2 `[[distribution]]` locks ──────────────────────────────────────────
 
-fn requests_release() -> Release<'static> {
-    (
-        "requests",
-        "2.31.0",
-        vec![
-            (
-                REQUESTS_WHEEL,
-                REQUESTS_WHEEL_SHA,
-                62574,
-                "2023-05-22T15:12:42.313790Z",
-            ),
-            (
-                REQUESTS_SDIST,
-                REQUESTS_SDIST_SHA,
-                110794,
-                "2023-05-22T15:12:44.175917Z",
-            ),
-        ],
+const DATEUTIL_UUID: &str = "44444444-4444-4444-4444-444444444444";
+const DATEUTIL_WHEEL: &str = "python_dateutil-2.9.0.post0-py2.py3-none-any.whl";
+
+/// The real `uv lock` output in `tests/fixtures/upstream/uv-0.2/`: the
+/// sub-table grammar (uv 0.1.45, 0.2.5), string sources with inline
+/// artifacts (0.2.15 with source-qualified dependency tables, 0.2.16 with
+/// bare ones) and inline sources (0.2.18, which writes an `sdist` before
+/// inline `dependencies`, and 0.2.34, which writes it after them).
+const UV_02_LOCKS: [&str; 6] = ["0.1.45", "0.2.5", "0.2.15", "0.2.16", "0.2.18", "0.2.34"];
+
+/// A uv 0.2 fixture project: its `uv.lock` and `pyproject.toml`.
+fn uv_02_project(version: &str) -> BTreeMap<String, String> {
+    let file = |name: &str| fixture(&format!("upstream/uv-0.2/{version}/{name}"));
+    tree(&[
+        ("uv.lock", file("uv.lock")),
+        ("pyproject.toml", file("pyproject.toml")),
+    ])
+}
+
+fn dateutil_dep() -> DepOverride {
+    pypi_dep(
+        "python-dateutil",
+        "2.9.0.post0",
+        DATEUTIL_WHEEL,
+        DATEUTIL_UUID,
     )
 }
 
-/// A uv 0.2 `[[distribution]]` lock (uv < 0.2.35) in one of its three
-/// grammars, holding a registry `idna`, the editable root `proj`, `requests`
-/// (depending on `idna` and `urllib3`) and `urllib3`.
-fn uv_distribution_lock(grammar: &str) -> String {
-    let a = "a".repeat(64);
-    let b = "b".repeat(64);
-    let url = pypi_file_url;
-    let idna_sdist = "https://files.pythonhosted.org/packages/aa/idna-3.4.tar.gz";
-    let idna_wheel = "https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl";
-    match grammar {
-        // uv ≤ 0.2.5: string sources, artifact sub-tables, source-qualified
-        // dependency tables.
-        "0.2.5" => {
-            let dep = |name: &str, version: &str| {
-                format!("\n[[distribution.dependencies]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n")
-            };
-            let entry = |name: &str,
-                         version: &str,
-                         sdist: &str,
-                         sdist_sha: &str,
-                         deps: &str,
-                         wheel: &str,
-                         wheel_sha: &str| {
-                format!(
-                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n\n\
-[distribution.sdist]\nurl = \"{sdist}\"\nhash = \"sha256:{sdist_sha}\"\n{deps}\n\
-[[distribution.wheel]]\nurl = \"{wheel}\"\nhash = \"sha256:{wheel_sha}\"\n"
-                )
-            };
-            format!(
-                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = \"editable+.\"\n{}{}{}",
-                entry("idna", "3.4", idna_sdist, &a, "", idna_wheel, &b),
-                dep("requests", "2.31.0"),
-                entry(
-                    "requests",
-                    "2.31.0",
-                    &url(REQUESTS_SDIST),
-                    REQUESTS_SDIST_SHA,
-                    &(dep("idna", "3.4") + &dep("urllib3", "1.26.18")),
-                    &url(REQUESTS_WHEEL),
-                    REQUESTS_WHEEL_SHA,
-                ),
-                entry(
-                    "urllib3",
-                    "1.26.18",
-                    &url(URLLIB3_SDIST),
-                    URLLIB3_SDIST_SHA,
-                    "",
-                    &url(URLLIB3_WHEEL),
-                    URLLIB3_WHEEL_SHA,
-                ),
-            )
-        }
-        // uv 0.2.6–0.2.17: string sources, inline artifacts, dependency
-        // tables.
-        "0.2.15" => {
-            let dep = |name: &str, version: &str| {
-                format!("\n[[distribution.dependencies]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n")
-            };
-            let entry = |name: &str,
-                         version: &str,
-                         sdist: &str,
-                         sdist_sha: &str,
-                         size: u64,
-                         deps: &str,
-                         wheel: &str,
-                         wheel_sha: &str,
-                         wheel_size: u64| {
-                format!(
-                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = \"registry+https://pypi.org/simple\"\n\
-sdist = {{ url = \"{sdist}\", hash = \"sha256:{sdist_sha}\", size = {size} }}\n\
-wheels = [{{ url = \"{wheel}\", hash = \"sha256:{wheel_sha}\", size = {wheel_size} }}]\n{deps}"
-                )
-            };
-            format!(
-                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = \"editable+.\"\n{}{}{}",
-                entry("idna", "3.4", idna_sdist, &a, 183077, "", idna_wheel, &b, 61538),
-                dep("requests", "2.31.0"),
-                entry(
-                    "requests",
-                    "2.31.0",
-                    &url(REQUESTS_SDIST),
-                    REQUESTS_SDIST_SHA,
-                    110794,
-                    &(dep("idna", "3.4") + &dep("urllib3", "1.26.18")),
-                    &url(REQUESTS_WHEEL),
-                    REQUESTS_WHEEL_SHA,
-                    62574,
-                ),
-                entry(
-                    "urllib3",
-                    "1.26.18",
-                    &url(URLLIB3_SDIST),
-                    URLLIB3_SDIST_SHA,
-                    305687,
-                    "",
-                    &url(URLLIB3_WHEEL),
+/// A mock PyPI serving the files the uv 0.2 fixtures pin for urllib3 and
+/// python-dateutil, at their real URLs.
+async fn uv_02_pypi() -> (MockServer, EnvGuard) {
+    pypi_mock(&[
+        (
+            "urllib3",
+            "1.26.18",
+            vec![
+                (
+                    "https://files.pythonhosted.org/packages/b0/53/aa91e163dcfd1e5b82d8a890ecf13314e3e149c05270cc644581f77f17fd/urllib3-1.26.18-py2.py3-none-any.whl",
                     URLLIB3_WHEEL_SHA,
                     143835,
+                    "2023-10-17T17:46:21.184066Z",
                 ),
-            )
-        }
-        // uv 0.2.18–0.2.34: inline-table sources and artifacts, inline
-        // dependency references.
-        "0.2.34" => {
-            let entry = |name: &str,
-                         version: &str,
-                         deps: &str,
-                         sdist: &str,
-                         sdist_sha: &str,
-                         size: u64,
-                         wheel: &str,
-                         wheel_sha: &str,
-                         wheel_size: u64| {
-                format!(
-                    "\n[[distribution]]\nname = \"{name}\"\nversion = \"{version}\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n{deps}\
-sdist = {{ url = \"{sdist}\", hash = \"sha256:{sdist_sha}\", size = {size} }}\n\
-wheels = [\n    {{ url = \"{wheel}\", hash = \"sha256:{wheel_sha}\", size = {wheel_size} }},\n]\n"
-                )
-            };
-            format!(
-                "version = 1\nrequires-python = \">=3.8\"\n{}\n[[distribution]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = {{ editable = \".\" }}\ndependencies = [\n    {{ name = \"requests\" }},\n]\n{}{}",
-                entry("idna", "3.4", "", idna_sdist, &a, 183077, idna_wheel, &b, 61538),
-                entry(
-                    "requests",
-                    "2.31.0",
-                    "dependencies = [\n    { name = \"idna\" },\n    { name = \"urllib3\" },\n]\n",
-                    &url(REQUESTS_SDIST),
-                    REQUESTS_SDIST_SHA,
-                    110794,
-                    &url(REQUESTS_WHEEL),
-                    REQUESTS_WHEEL_SHA,
-                    62574,
-                ),
-                entry(
-                    "urllib3",
-                    "1.26.18",
-                    "",
-                    &url(URLLIB3_SDIST),
+                (
+                    "https://files.pythonhosted.org/packages/0c/39/64487bf07df2ed854cc06078c27c0d0abc59bd27b32232876e403c333a08/urllib3-1.26.18.tar.gz",
                     URLLIB3_SDIST_SHA,
                     305687,
-                    &url(URLLIB3_WHEEL),
-                    URLLIB3_WHEEL_SHA,
-                    143835,
+                    "2023-10-17T17:46:24.000000Z",
                 ),
-            )
-        }
-        other => panic!("no uv {other} grammar"),
-    }
+            ],
+        ),
+        (
+            "python-dateutil",
+            "2.9.0.post0",
+            vec![
+                (
+                    "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz",
+                    "37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3",
+                    342432,
+                    "2024-03-01T18:46:02.000000Z",
+                ),
+                (
+                    "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl",
+                    "a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427",
+                    229892,
+                    "2024-03-01T18:46:03.000000Z",
+                ),
+            ],
+        ),
+    ])
+    .await
 }
 
-/// uv 0.2 `[[distribution]]` locks: whatever the hosted rewrite writes into
-/// each of the three grammars, the unwind restores byte for byte — the
-/// registry source in the lock's spelling, the artifacts in the shape its
-/// other registry packages show, dependents' references, and the paired
-/// pyproject's `[tool.uv.sources]` (a direct dependency) and hosted
-/// `override-dependencies` entry (a transitive one).
+/// The hosted rewrite's warnings for `input`.
+fn hosted_warnings(
+    input: &BTreeMap<String, String>,
+    deps: &[DepOverride],
+) -> Vec<(String, String)> {
+    rewrite_registry_redirect_with_pipenv_version(input, deps, &BTreeMap::new(), None, false)
+        .warnings
+        .into_iter()
+        .map(|w| (w.code, w.detail))
+        .collect()
+}
+
+/// Whatever the hosted rewrite writes into a real uv 0.2 lock, in each of
+/// its grammars, the unwind restores byte for byte: the source in the
+/// entry's spelling, the artifacts in the entry's grammar (sub-tables in
+/// uv's order, an `sdist` placed beside inline `dependencies` as the
+/// lock's other registry packages show), dependents' references, and the
+/// paired pyproject's `[tool.uv.sources]`.
 #[tokio::test]
 #[serial]
 async fn uv_distribution_locks_round_trip() {
-    let (_server, _env) = pypi_mock(&[urllib3_release(), requests_release()]).await;
-    let requests = pypi_dep("requests", "2.31.0", REQUESTS_WHEEL, REQUESTS_UUID);
-    let deps = [requests, urllib3_dep()];
-    let pyproject =
-        "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"requests==2.31.0\"]\n";
-    for grammar in ["0.2.5", "0.2.15", "0.2.34"] {
-        let lock = uv_distribution_lock(grammar);
-        let rewritten = hosted(&tree(&[("uv.lock", lock.clone())]), &deps, None);
-        assert!(
-            !rewritten["uv.lock"].contains("pythonhosted.org/packages/0c")
-                && !rewritten["uv.lock"].contains("pythonhosted.org/packages/b0"),
-            "uv {grammar}: the hosted rewrite left a pin unwired:\n{}",
-            rewritten["uv.lock"]
-        );
-        for eol in ["\n", "\r\n"] {
-            let input = tree(&[
-                ("uv.lock", lock.replace('\n', eol)),
-                ("pyproject.toml", pyproject.replace('\n', eol)),
-            ]);
-            assert_pypi_round_trip(&format!("uv {grammar} {eol:?}"), &input, &deps, None).await;
+    let (_server, _env) = uv_02_pypi().await;
+    for version in UV_02_LOCKS {
+        let project = uv_02_project(version);
+        for deps in [vec![urllib3_dep()], vec![urllib3_dep(), dateutil_dep()]] {
+            let label = format!("uv {version} {} pins", deps.len());
+            assert_eq!(hosted_warnings(&project, &deps), vec![], "{label}");
+            let rewritten = hosted(&project, &deps, None);
+            assert!(
+                !rewritten["uv.lock"].contains("files.pythonhosted.org/packages/b0/53")
+                    && rewritten["uv.lock"].contains("patch.socket.dev"),
+                "{label}: the hosted rewrite did not wire urllib3:\n{}",
+                rewritten["uv.lock"]
+            );
+            for eol in ["\n", "\r\n"] {
+                let input = project
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.replace('\n', eol)))
+                    .collect();
+                assert_pypi_round_trip(&format!("{label} {eol:?}"), &input, &deps, None).await;
+            }
+            let lock_only = tree(&[("uv.lock", project["uv.lock"].clone())]);
+            assert_pypi_round_trip(&format!("{label} lock-only"), &lock_only, &deps, None).await;
         }
-        let input = tree(&[("uv.lock", lock)]);
-        assert_pypi_round_trip(&format!("uv {grammar} lock-only"), &input, &deps, None).await;
     }
+}
+
+/// The entry `name` of a uv 0.2 lock, cut out with its sub-tables.
+fn without_distribution(lock: &str, name: &str) -> String {
+    let start = lock
+        .find(&format!("[[distribution]]\nname = \"{name}\""))
+        .unwrap();
+    let end = lock[start + 1..]
+        .find("\n[[distribution]]\n")
+        .map_or(lock.len(), |i| start + 2 + i);
+    format!("{}{}", &lock[..start], &lock[end..])
+}
+
+/// uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
+/// `dependencies`, 0.2.23–0.2.34 after them. When no other registry entry
+/// carries both, the rewrite refuses an entry the unwind could not place
+/// its `sdist` in, and the unwind refuses an entry an earlier release
+/// wired that way; the rest of the lock is still handled.
+#[tokio::test]
+#[serial]
+async fn uv_distribution_sdist_order_without_evidence_is_refused() {
+    let (_server, _env) = uv_02_pypi().await;
+    for version in ["0.2.18", "0.2.34"] {
+        // isodate is the only other registry entry with both.
+        let mut project = uv_02_project(version);
+        let lock = without_distribution(&project["uv.lock"], "isodate");
+        project.insert("uv.lock".into(), lock);
+        let deps = [urllib3_dep(), dateutil_dep()];
+        let warnings = hosted_warnings(&project, &deps);
+        assert!(
+            matches!(warnings.as_slice(), [(code, detail)]
+                if code == "redirect_uv_lock_unsupported"
+                    && detail.contains("python-dateutil==2.9.0.post0")
+                    && detail.contains("0.2.23")),
+            "uv {version}: {warnings:?}"
+        );
+        let rewritten = hosted(&project, &deps, None);
+        assert!(rewritten["uv.lock"].contains("files.pythonhosted.org/packages/66/c0"));
+        assert!(!rewritten["uv.lock"].contains("files.pythonhosted.org/packages/b0/53"));
+
+        // A lock wired before the refusal existed.
+        let full = uv_02_project(version);
+        let mut wired = hosted(&full, &deps, None);
+        let lock = without_distribution(&wired["uv.lock"], "isodate");
+        wired.insert("uv.lock".into(), lock);
+        let (after, statuses) = restore_tree(&wired, &RestoreOptions::default()).await;
+        let status = |purl: &str| {
+            statuses
+                .iter()
+                .find(|(p, _)| p.contains(purl))
+                .map(|(_, s)| s.clone())
+                .unwrap()
+        };
+        assert_eq!(status("urllib3"), PinStatus::Restored, "uv {version}");
+        assert!(
+            matches!(status("python-dateutil"), PinStatus::Refused(why) if why.contains("not derivable")),
+            "uv {version}: {statuses:?}"
+        );
+        assert!(after["uv.lock"].contains("files.pythonhosted.org/packages/b0/53"));
+        assert!(after["uv.lock"].contains(&format!("/{DATEUTIL_UUID}/")));
+    }
+}
+
+/// Both directions read an entry's grammar off the entry itself before
+/// any sibling: an entry with sub-table artifacts and a string source in a
+/// lock whose first registry package is inline in both comes back as it
+/// was, not in the first package's shape.
+#[tokio::test]
+#[serial]
+async fn uv_distribution_entry_grammar_wins_over_the_first_sibling() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = format!(
+        "version = 1\n\n\
+[[distribution]]\nname = \"idna\"\nversion = \"3.4\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+wheels = [{{ url = \"https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl\", hash = \"sha256:{b}\" }}]\n\n\
+[[distribution]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nsource = \"registry+https://pypi.org/simple\"\n\n\
+[distribution.sdist]\nurl = \"{sdist}\"\nhash = \"sha256:{URLLIB3_SDIST_SHA}\"\n\n\
+[[distribution.wheel]]\nurl = \"{wheel}\"\nhash = \"sha256:{URLLIB3_WHEEL_SHA}\"\n",
+        b = "b".repeat(64),
+        sdist = pypi_file_url(URLLIB3_SDIST),
+        wheel = pypi_file_url(URLLIB3_WHEEL),
+    );
+    let input = tree(&[("uv.lock", lock)]);
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    assert!(
+        rewritten["uv.lock"].contains("[[distribution.wheel]]")
+            && rewritten["uv.lock"].contains("source = \"direct+"),
+        "{}",
+        rewritten["uv.lock"]
+    );
+    assert_pypi_round_trip("entry grammar", &input, &[urllib3_dep()], None).await;
+}
+
+/// uv 0.2.12–0.2.27 apply an `exclude-newer` cutoff from the project's or
+/// the user's settings, or `UV_EXCLUDE_NEWER`, without recording it in the
+/// lock, and 0.2.28–0.2.33 record it at the lock's top level: which release
+/// files the lock kept is then not derivable. The rewrite refuses a lock
+/// whose project sets one; the unwind refuses on any of them. uv ≤ 0.2.5
+/// (the sub-table grammar) apply no cutoff, so those locks round-trip.
+#[tokio::test]
+#[serial]
+async fn uv_distribution_exclude_newer_is_refused() {
+    let (_server, _env) = uv_02_pypi().await;
+    let cutoff = "\n[tool.uv]\nexclude-newer = \"2024-06-01T00:00:00Z\"\n";
+    for version in ["0.2.15", "0.2.34"] {
+        let mut project = uv_02_project(version);
+        let pyproject = project["pyproject.toml"].clone() + cutoff;
+        project.insert("pyproject.toml".into(), pyproject);
+        let warnings = hosted_warnings(&project, &[urllib3_dep()]);
+        assert!(
+            matches!(warnings.as_slice(), [(code, detail)]
+                if code == "redirect_uv_lock_unsupported" && detail.contains("exclude-newer")),
+            "uv {version}: {warnings:?}"
+        );
+        assert_eq!(hosted(&project, &[urllib3_dep()], None), project);
+
+        // Pins wired before the setting appeared.
+        let project = uv_02_project(version);
+        let opts = RestoreOptions::default();
+        let (why, _, after) = pypi_refusal_after(&project, &[urllib3_dep()], &opts, |files| {
+            files.insert("uv.toml".into(), "exclude-newer = \"2024-06-01\"\n".into());
+        })
+        .await;
+        assert!(why.contains("uv.toml sets uv `exclude-newer`"), "{why}");
+        assert!(after["uv.lock"].contains(&format!("/{PYPI_UUID}/")));
+        let (why, _, _) = pypi_refusal_after(&project, &[urllib3_dep()], &opts, |files| {
+            let lock = files["uv.lock"].replacen(
+                "requires-python = \">=3.9\"\n",
+                "requires-python = \">=3.9\"\nexclude-newer = \"2024-06-01 00:00:00 UTC\"\n",
+                1,
+            );
+            files.insert("uv.lock".into(), lock);
+        })
+        .await;
+        assert!(why.contains("the lock's `exclude-newer` option"), "{why}");
+        let _cutoff = EnvGuard::set("UV_EXCLUDE_NEWER", "2024-06-01T00:00:00Z");
+        let (why, _, _) = pypi_refusal(&project, &[urllib3_dep()], &opts).await;
+        assert!(why.contains("`UV_EXCLUDE_NEWER` is set"), "{why}");
+    }
+    let mut project = uv_02_project("0.2.5");
+    let pyproject = project["pyproject.toml"].clone() + cutoff;
+    project.insert("pyproject.toml".into(), pyproject);
+    assert_pypi_round_trip("uv 0.2.5 exclude-newer", &project, &[urllib3_dep()], None).await;
+}
+
+/// A hosted entry whose source was respelled as a `[distribution.source]`
+/// table (which uv never writes, but reads) is restored in that spelling.
+#[tokio::test]
+#[serial]
+async fn uv_distribution_source_table_is_restored() {
+    let (_server, _env) = uv_02_pypi().await;
+    let project = tree(&[("uv.lock", uv_02_project("0.2.34")["uv.lock"].clone())]);
+    let mut wired = hosted(&project, &[urllib3_dep()], None);
+    let lock = &wired["uv.lock"];
+    // urllib3 is the lock's last entry.
+    let start = lock.rfind("source = { url = ").unwrap();
+    let end = start + lock[start..].find('\n').unwrap() + 1;
+    let url = lock[start..end].split('"').nth(1).unwrap().to_string();
+    let lock = format!(
+        "{}{}\n[distribution.source]\nurl = \"{url}\"\n",
+        &lock[..start],
+        &lock[end..]
+    );
+    wired.insert("uv.lock".into(), lock);
+    let (after, statuses) = restore_tree(&wired, &RestoreOptions::default()).await;
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    assert_eq!(statuses[0].1, PinStatus::Restored);
+    let want = project["uv.lock"].replacen(
+        "source = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://files.pythonhosted.org/packages/0c/39",
+        "sdist = { url = \"https://files.pythonhosted.org/packages/0c/39",
+        1,
+    ) + "\n[distribution.source]\nregistry = \"https://pypi.org/simple\"\n";
+    assert_eq!(after["uv.lock"], want);
 }
 
 #[tokio::test]
