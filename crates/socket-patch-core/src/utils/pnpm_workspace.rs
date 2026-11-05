@@ -221,16 +221,21 @@ pub async fn trust_lockfile_env_for(
 
 /// [`pnpm_setting`], falling back to the environment ([`env_setting`],
 /// for the project's pnpm major) on disk, where the CLI runs pnpm's
-/// environment.
+/// environment. Without `env` (`vex` discovery, which answers from the
+/// project's files alone) the environment is never read.
 async fn view_setting(
     view: &ProjectView<'_>,
     workspace: Option<&str>,
     npmrc: Option<&str>,
     yaml_key: &str,
     npmrc_key: &str,
+    env: bool,
 ) -> Option<PnpmSetting> {
     if let Some(found) = pnpm_setting(workspace, npmrc, yaml_key, npmrc_key) {
         return Some(found);
+    }
+    if !env {
+        return None;
     }
     let env = |var: &str| std::env::var(var).ok();
     if matches!(view, ProjectView::Memory(_)) || !env_any(&[npmrc_key], env) {
@@ -520,7 +525,13 @@ pub(crate) fn member_dirs(tree: &dyn DirTree, globs: &[String]) -> Result<Vec<St
 /// `pnpm-lock.yaml` through the view's FIFO-safe reader; a file that
 /// cannot be read counts as absent, which keeps the shared default.
 pub async fn member_locks(view: &ProjectView<'_>) -> MemberLocks {
-    let (dirs, globs, root_lock) = match workspace_members(view).await {
+    member_locks_in(view, true).await
+}
+
+/// [`member_locks`], consulting the environment only with `env` (see
+/// [`git_branch_locks_in`]).
+pub async fn member_locks_in(view: &ProjectView<'_>, env: bool) -> MemberLocks {
+    let (dirs, globs, root_lock) = match workspace_members(view, env).await {
         Members::Shared => return MemberLocks::Shared,
         Members::Unresolved(why) => return MemberLocks::Unresolved(why),
         Members::Dirs {
@@ -603,7 +614,7 @@ enum Members {
     Unresolved(String),
 }
 
-async fn workspace_members(view: &ProjectView<'_>) -> Members {
+async fn workspace_members(view: &ProjectView<'_>, env: bool) -> Members {
     let Ok(workspace) = view.read_text(PNPM_WORKSPACE).await else {
         return Members::Shared;
     };
@@ -614,6 +625,7 @@ async fn workspace_members(view: &ProjectView<'_>) -> Members {
         npmrc.as_deref(),
         "sharedWorkspaceLockfile",
         "shared-workspace-lockfile",
+        env,
     )
     .await;
     if shared.is_none_or(|setting| setting.as_bool() != Some(false)) {
@@ -781,11 +793,13 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
 /// [`git_branch_locks`], consulting the environment only with `env`: the
 /// hosted and vendored writers run in the install's environment, while
 /// `vex` discovery answers from the project's files alone (as it does for
-/// [`lockfile_disabled`]).
+/// [`lockfile_disabled`]). Without `env` a governing ancestor's settings
+/// are read only from inside the project's git repository
+/// ([`governing_file_in_git_repository`]), never from above its root.
 pub async fn git_branch_locks_in(view: &ProjectView<'_>, env: bool) -> Option<GitBranchLocks> {
     let mut locks = branch_lock_names(view, "").await;
     let mut members_unlisted = None;
-    match workspace_members(view).await {
+    match workspace_members(view, env).await {
         Members::Dirs { dirs, .. } => {
             for dir in dirs {
                 locks.extend(branch_lock_names(view, &dir).await);
@@ -802,7 +816,15 @@ pub async fn git_branch_locks_in(view: &ProjectView<'_>, env: bool) -> Option<Gi
     const KEYS: (&str, &str) = ("gitBranchLockfile", "git-branch-lockfile");
     let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
     if setting.is_none() {
-        if let Some(file) = governing_file(view) {
+        let in_repository = || {
+            view.disk_root()
+                .is_some_and(governing_file_in_git_repository)
+        };
+        let governing = match env || in_repository() {
+            true => governing_file(view),
+            false => None,
+        };
+        if let Some(file) = governing {
             let workspace = read_regular_to_string(&file).await.ok();
             let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
                 .await
@@ -816,8 +838,8 @@ pub async fn git_branch_locks_in(view: &ProjectView<'_>, env: bool) -> Option<Gi
                 });
         }
     }
-    if setting.is_none() && env {
-        setting = view_setting(view, None, None, KEYS.0, KEYS.1).await;
+    if setting.is_none() {
+        setting = view_setting(view, None, None, KEYS.0, KEYS.1, env).await;
     }
     let setting = git_branch_on(setting)?;
     Some(GitBranchLocks {
@@ -955,6 +977,27 @@ async fn branch_lock_names(view: &ProjectView<'_>, dir: &str) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Whether the nearest `pnpm-workspace.yaml` above `project_root` (the one
+/// [`governing_workspace_file`] would read) lies inside the project's git
+/// repository: at or below the nearest directory, `project_root` itself
+/// included, with a `.git` entry. `false` outside any repository. Only
+/// stats paths, so nothing above the repository root is read.
+fn governing_file_in_git_repository(project_root: &Path) -> bool {
+    let canonical =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let Some(repository) = canonical
+        .ancestors()
+        .find(|dir| std::fs::symlink_metadata(dir.join(".git")).is_ok())
+    else {
+        return false;
+    };
+    canonical
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(repository))
+        .any(|dir| dir.join(PNPM_WORKSPACE).is_file())
 }
 
 /// The ancestor `pnpm-workspace.yaml` governing a disk view's project
@@ -1844,6 +1887,37 @@ mod tests {
         // A shared lock: members never install from a lock of their own.
         write(root, PNPM_WORKSPACE, "gitBranchLockfile: true\n");
         assert_eq!(git_branch_locks(&view).await, None);
+    }
+
+    /// The files-only reading (`vex` discovery) takes the setting from a
+    /// governing ancestor `pnpm-workspace.yaml` only inside the project's
+    /// git repository, never from a file above the repository root; the
+    /// install-time reading is unchanged.
+    #[tokio::test]
+    async fn the_files_only_reading_stays_inside_the_git_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path();
+        write(
+            outer,
+            PNPM_WORKSPACE,
+            "packages:\n  - 'proj'\ngitBranchLockfile: true\n",
+        );
+        let root = outer.join("proj");
+        write(&root, "package.json", "{}");
+        write(&root, PNPM_LOCK, "lockfileVersion: '9.0'\n");
+        write(&root, "pnpm-lock.feature.yaml", "lockfileVersion: '9.0'\n");
+        let view = ProjectView::Disk(&root);
+        assert!(git_branch_locks(&view).await.is_some());
+        // No repository at all: nothing above the project is read.
+        assert_eq!(git_branch_locks_in(&view, false).await, None);
+        // A repository rooted at the project: the ancestor is outside it.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(git_branch_locks_in(&view, false).await, None);
+        assert!(git_branch_locks(&view).await.is_some());
+        // A repository rooted at the ancestor: its file is read.
+        std::fs::remove_dir(root.join(".git")).unwrap();
+        std::fs::create_dir(outer.join(".git")).unwrap();
+        assert!(git_branch_locks_in(&view, false).await.is_some());
     }
 
     #[test]

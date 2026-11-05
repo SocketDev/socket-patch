@@ -54,7 +54,7 @@
 //! hosted rewriter's own gate ([`NpmUserPatches`]).
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
@@ -295,21 +295,15 @@ fn push_uncontested(
                         UnattestedKind::NpmShrinkwrapOnly,
                     );
                 }
-                if let Some(source) = user_patch_source(user_patches, r) {
-                    out.unattested(
-                        &r.purl,
-                        &r.uuid,
-                        lock.file,
-                        format!(
-                            "{source}, a patch the project applies with npm's native `npm \
-                             patch` on top of whatever tarball the lock names, so npm \
-                             installs bytes that are neither the original nor the Socket \
-                             patch (or fails `EPATCHFAILED`), and hosted mode leaves the \
-                             package alone"
-                        ),
-                        UnattestedKind::UserPatchedDependency,
-                    );
-                }
+                mark_user_patched(
+                    user_patches,
+                    r,
+                    "a patch the project applies with npm's native `npm patch` on top of \
+                     whatever tarball the lock names, so npm installs bytes that are neither \
+                     the original nor the Socket patch (or fails `EPATCHFAILED`), and hosted \
+                     mode leaves the package alone",
+                    out,
+                );
                 out.push(r.clone());
             }
         }
@@ -317,14 +311,49 @@ fn push_uncontested(
 }
 
 /// Why the project counts as patching `r`'s package itself
-/// ([`NpmUserPatches::source`], the hosted rewriter's #711 / #367 gate),
+/// ([`NpmUserPatches::source`], the hosted rewriters' #711 / #367 gate),
 /// read against what `r` resolves the package to: its hosted URL, or its
-/// vendored tarball.
+/// vendored tarball. A ref with neither is still matched by its
+/// `name@version` (and every tarball key counts against it).
 fn user_patch_source(user_patches: &NpmUserPatches, r: &PatchedRef) -> Option<String> {
     let (name, version) = crate::utils::purl::purl_name_version(&r.purl)?;
-    let target = r.url.as_deref().or(r.artifact_rel.as_deref())?;
+    let target = r
+        .url
+        .as_deref()
+        .or(r.artifact_rel.as_deref())
+        .unwrap_or_default();
     user_patches.source(name, version, target)
 }
+
+/// Mark the npm or Bun ref `r` [`UnattestedKind::UserPatchedDependency`]
+/// when the project patches its package itself ([`user_patch_source`]).
+/// `how` completes the detail after the key or record it names. The mark
+/// is an [`UnwiredCopy`] for exactly `r`, so it lands only if `r` survives
+/// every contest: a ref another lock drops carries no stale reason.
+pub(super) fn mark_user_patched(
+    user_patches: &NpmUserPatches,
+    r: &PatchedRef,
+    how: &str,
+    out: &mut Discovery,
+) {
+    let Some(source) = user_patch_source(user_patches, r) else {
+        return;
+    };
+    out.unwired_copy(UnwiredCopy {
+        scope: Some(r.source_file.clone()),
+        target: CopyTarget::Ref {
+            purl: r.purl.clone(),
+            uuid: r.uuid.clone(),
+        },
+        file: r.source_file.clone(),
+        detail: format!("{source}, {how}"),
+        kind: UnattestedKind::UserPatchedDependency,
+    });
+}
+
+/// npm's lock-entry record of a native `npm patch` (#711), as JSON spells
+/// its key.
+const PATCHED_KEY: &[u8] = b"\"patched\"";
 
 /// One npm lock (`file` is root-relative): both entry trees, see the module
 /// docs. `None` when the lock is absent, unreadable or unparseable (already
@@ -374,7 +403,11 @@ async fn extract_package_lock(
             read.bundled.entry(purl).or_insert(location);
         }
     }
-    user_patches.add_lock(file, &doc);
+    // Only a lock that spells `"patched"` at all is walked for npm's
+    // records, as in the hosted rewriter.
+    if bytes.windows(PATCHED_KEY.len()).any(|w| w == PATCHED_KEY) {
+        user_patches.add_lock(file, &doc);
+    }
     // The root manifest's `overrides` (#490): which git / url / `file:`
     // dependent specs npm really installs from.
     let overrides = manifest
@@ -752,15 +785,9 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view, false).await
     };
     let disabled = disabled.as_deref();
-    // `gitBranchLockfile` with a branch lock (#556): pnpm installs a branch
-    // from `pnpm-lock.<branch>.yaml`, so no root or member lock is what
-    // installs. Detected as the hosted engine detects it (and, like it,
-    // only while the lock is enabled), from the project's files alone.
-    let branch = match (rush, disabled) {
-        (false, None) => crate::utils::pnpm_workspace::git_branch_locks_in(&ctx.view, false).await,
-        _ => None,
-    };
-    let branch = branch.as_ref();
+    // The root and member locks read (Rush's are not: its pnpm runs with a
+    // workspace of its own).
+    let mut read: Vec<String> = Vec::new();
     let root_lock = ctx.exists(PNPM_LOCK).await;
     if root_lock {
         extract_pnpm_lock(ctx, PNPM_LOCK, disabled, out).await;
@@ -768,10 +795,10 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // are recognized as NOT wired (module docs, rule 11), so a ledger
         // record its stale Socket url alone keeps "mentioned" is dead.
         ctx.recognize_ignored(PNPM_SHRINKWRAP_LEGACY).await;
-        unattest_git_branch_lock(PNPM_LOCK, branch, out);
+        read.push(PNPM_LOCK.to_string());
     } else {
         extract_pnpm_lock(ctx, PNPM_SHRINKWRAP_LEGACY, disabled, out).await;
-        unattest_git_branch_lock(PNPM_SHRINKWRAP_LEGACY, branch, out);
+        read.push(PNPM_SHRINKWRAP_LEGACY.to_string());
     }
     if rush {
         // The common lock, then each subspace's, sorted for deterministic
@@ -779,8 +806,10 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         for rel in rush_lock_rels(ctx.view).await {
             extract_pnpm_lock(ctx, &rel, None, out).await;
         }
-    } else if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =
-        crate::utils::pnpm_workspace::member_locks(&ctx.view).await
+        return;
+    }
+    if let crate::utils::pnpm_workspace::MemberLocks::PerMember(rels) =
+        crate::utils::pnpm_workspace::member_locks_in(&ctx.view, false).await
     {
         // `sharedWorkspaceLockfile: false`: each workspace member installs
         // from its own lock, which hosted mode pins beside the root's
@@ -789,7 +818,25 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // not among `rels`.
         for rel in rels {
             extract_pnpm_lock(ctx, &rel, disabled, out).await;
-            unattest_git_branch_lock(&rel, branch, out);
+            read.push(rel);
+        }
+    }
+    // `gitBranchLockfile` with a branch lock (#556): pnpm installs a branch
+    // from `pnpm-lock.<branch>.yaml`, so no root or member lock is what
+    // installs. Detected as the hosted engine detects it (and, like it,
+    // only while the lock is enabled), from the project's files alone, and
+    // only when one of those locks wired something.
+    let wired = out
+        .refs
+        .iter()
+        .any(|r| read.iter().any(|rel| r.source_file == Path::new(rel)));
+    if !wired || disabled.is_some() {
+        return;
+    }
+    if let Some(branch) = crate::utils::pnpm_workspace::git_branch_locks_in(&ctx.view, false).await
+    {
+        for rel in &read {
+            unattest_git_branch_lock(rel, &branch, out);
         }
     }
 }
@@ -802,16 +849,20 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// discovery does not read branch locks either, so which bytes a branch
 /// installs is unknown. The refs stay refs: the wiring in `file` is intact
 /// (rollback, remove and list still manage it, and the ledgers keep it
-/// live), and no `scan` / `vendor` re-run can rewire the branch lock.
+/// live), and no `scan` / `vendor` re-run can rewire the branch lock. The
+/// mark names the branch lock in `file`'s own directory when there is one.
 fn unattest_git_branch_lock(
     file: &str,
-    branch: Option<&crate::utils::pnpm_workspace::GitBranchLocks>,
+    branch: &crate::utils::pnpm_workspace::GitBranchLocks,
     out: &mut Discovery,
 ) {
-    let Some(branch) = branch else {
-        return;
-    };
-    let shown = branch.locks.first().map_or(file, String::as_str);
+    let dir = Path::new(file).parent().unwrap_or(Path::new(""));
+    let shown = branch
+        .locks
+        .iter()
+        .find(|lock| Path::new(lock.as_str()).parent() == Some(dir))
+        .or(branch.locks.first())
+        .map_or(file, String::as_str);
     out.unwired_copy(UnwiredCopy {
         scope: Some(PathBuf::from(file)),
         target: CopyTarget::Any,
@@ -3639,6 +3690,121 @@ mod tests {
         let out = run(&p).await;
         assert_refs(&out, &refs);
         assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
+    /// Review (#2010): a ref with no target to compare a tarball key with
+    /// (neither a hosted url nor a vendored artifact) is still matched by
+    /// its `name@version` key, not skipped.
+    #[test]
+    fn a_ref_without_a_target_is_still_matched_by_name_and_version() {
+        let patches = super::NpmUserPatches::from_manifest(Some(
+            r#"{"patchedDependencies":{"left-pad@1.3.0":"p.patch"}}"#,
+        ));
+        let r = PatchedRef::hosted(
+            "pkg:npm/left-pad@1.3.0".into(),
+            UUID_A.into(),
+            "package-lock.json",
+            None,
+            None,
+            true,
+        );
+        let source = super::user_patch_source(&patches, &r);
+        assert!(
+            source
+                .as_deref()
+                .is_some_and(|s| s.contains("`left-pad@1.3.0`")),
+            "{source:?}"
+        );
+    }
+
+    /// Review (#2010): a user-patched ref another lock contests is dropped
+    /// by the cross-lock contest, so it must leave no `UserPatchedDependency`
+    /// mark behind (the vex plan would report that reason for it).
+    #[tokio::test]
+    async fn a_contested_user_patched_ref_leaves_no_mark() {
+        let p = Project::new();
+        p.write(
+            "package-lock.json",
+            npm_hosted_lock(3, serde_json::json!({})),
+        );
+        p.write(
+            "package.json",
+            r#"{"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad.patch"}}"#,
+        );
+        // A pnpm lock resolving the same version from the registry.
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-UP==}\n",
+        );
+        let out = p.discover().await;
+        assert!(
+            out.refs.iter().all(|r| r.purl != "pkg:npm/left-pad@1.3.0"),
+            "the contest drops the ref: {:#?}",
+            out.refs
+        );
+        assert!(!out.contested.is_empty(), "{:#?}", out.diagnostics);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
+    /// Review (#2010): discovery reads pnpm's settings from the project's
+    /// files only. `sharedWorkspaceLockfile` set only in the environment
+    /// must not turn the workspace's member branch lock into one that
+    /// withholds the root lock's pin.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pnpm_git_branch_lockfile_discovery_reads_no_environment() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let wired = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &wired);
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\ngitBranchLockfile: true\n",
+        );
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.feature.yaml", lock);
+        let _env = crate::test_env::EnvGuard::many([
+            ("npm_config_shared_workspace_lockfile", Some("false")),
+            ("pnpm_config_shared_workspace_lockfile", Some("false")),
+        ]);
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:npm/ms@1.3.0", UUID_B, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
+    /// Review (#2010): a member lock's mark names the branch lock in the
+    /// member's own directory, not the first one found (the root's).
+    #[tokio::test]
+    async fn pnpm_git_branch_lock_mark_names_the_locks_own_branch_lock() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let root = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_A, None)]);
+        let member = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_B, None)]);
+        let p = Project::new();
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ngitBranchLockfile: true\n",
+        );
+        p.write("pnpm-lock.yaml", &root);
+        p.write("pnpm-lock.feature.yaml", lock);
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &member);
+        p.write("packages/a/pnpm-lock.feature.yaml", lock);
+        let out = run(&p).await;
+        let file_of = |uuid: &str| {
+            out.unattested
+                .iter()
+                .find(|u| u.uuid == uuid && u.kind == UnattestedKind::PnpmGitBranchLock)
+                .map(|u| u.file.clone())
+                .unwrap_or_else(|| panic!("{uuid}: {:#?}", out.unattested))
+        };
+        assert_eq!(
+            file_of(UUID_A),
+            std::path::PathBuf::from("pnpm-lock.feature.yaml")
+        );
+        assert_eq!(
+            file_of(UUID_B),
+            std::path::PathBuf::from("packages/a/pnpm-lock.feature.yaml")
+        );
     }
 
     /// `shrinkwrap.yaml` (pnpm <= 2) is read only when there is no

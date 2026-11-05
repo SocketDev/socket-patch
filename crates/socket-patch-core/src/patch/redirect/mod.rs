@@ -1416,11 +1416,16 @@ pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
 /// record npm writes on a lock's `packages` dependency entry (lockfileVersion
 /// 4) in any present npm lock. npm applies that diff to every install of the
 /// package, whichever lock names it. `vex` discovery reads the same
-/// evidence, so it never attests a pin hosted mode refuses.
+/// evidence, so it never attests a pin hosted mode refuses, and reads Bun's
+/// (`bun patch`, #367: the same manifest key, or the copy `bun.lock`
+/// mirrors, [`NpmUserPatches::add_mirrored_keys`]) through it too.
 #[derive(Debug, Default)]
 pub(crate) struct NpmUserPatches {
-    /// The root manifest's `patchedDependencies` keys.
+    /// The `patchedDependencies` keys: the root manifest's, then any only a
+    /// lock mirrors.
     keys: Vec<String>,
+    /// `(key, lockfile)` of each key only a lock mirrors.
+    mirrored: Vec<(String, String)>,
     /// `(name, version, lockfile, entry key)` of every lock entry carrying
     /// a `patched` record.
     locked: Vec<(String, String, String, String)>,
@@ -1432,7 +1437,18 @@ impl NpmUserPatches {
     pub(crate) fn from_manifest(manifest: Option<&str>) -> Self {
         NpmUserPatches {
             keys: crate::vendor::bun_lock_text::patched_dependency_keys(manifest, None),
-            locked: Vec::new(),
+            ..Self::default()
+        }
+    }
+
+    /// Add the `patchedDependencies` keys the text lock `lockfile`
+    /// (`bun.lock`) mirrors at its top that the manifest does not have.
+    pub(crate) fn add_mirrored_keys(&mut self, lockfile: &str, lock: &str) {
+        for key in crate::vendor::bun_lock_text::patched_dependency_keys(None, Some(lock)) {
+            if !self.keys.contains(&key) {
+                self.mirrored.push((key.clone(), lockfile.to_string()));
+                self.keys.push(key);
+            }
         }
     }
 
@@ -1463,7 +1479,12 @@ impl NpmUserPatches {
         if let Some(key) =
             crate::vendor::bun_lock_text::patched_dependency_key(&self.keys, name, version, target)
         {
-            return Some(format!("package.json `patchedDependencies` has `{key}`"));
+            let file = self
+                .mirrored
+                .iter()
+                .find(|(k, _)| k == key)
+                .map_or("package.json", |(_, lockfile)| lockfile.as_str());
+            return Some(format!("{file} `patchedDependencies` has `{key}`"));
         }
         self.locked
             .iter()

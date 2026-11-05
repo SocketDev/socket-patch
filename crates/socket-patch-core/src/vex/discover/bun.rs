@@ -91,17 +91,16 @@
 //! keeps none for it) withdraws every ref of the same package in that lock
 //! ([`Unwired`], #497).
 
+use super::npm::mark_user_patched;
 use super::{
     canonical_base_purl, npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef,
-    UnattestedKind, WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID,
-    DIAG_REF_UNATTRIBUTABLE,
+    WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
-use crate::patch::redirect::hosted_url_version;
+use crate::patch::redirect::{hosted_url_version, NpmUserPatches};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::bun_lock_text::{
-    decode_json_string, is_bundled_entry, patched_dependency_key, patched_dependency_keys,
-    split_name_spec, user_tarball_version,
+    decode_json_string, is_bundled_entry, split_name_spec, user_tarball_version,
 };
 use crate::vendor::bun_lockb::BunLockb;
 use crate::vendor::lock_inventory::bun::bun_text_entries;
@@ -182,47 +181,36 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // The hosted text rewriter reads the manifest's keys and the copy Bun
     // mirrors at the top of `bun.lock`.
     let manifest = ctx.read_advisory_text("package.json").await;
-    let keys = patched_dependency_keys(manifest.as_deref(), Some(&text));
-    unattest_user_patched(BUN_LOCK, &keys, out);
+    let mut user_patches = NpmUserPatches::from_manifest(manifest.as_deref());
+    user_patches.add_mirrored_keys(BUN_LOCK, &text);
+    unattest_user_patched(BUN_LOCK, &user_patches, out);
 }
 
 // ── `bun patch` ──────────────────────────────────────────────────────────
 
 /// Mark every ref of `file` whose package the project patches itself with
 /// `bun patch` (#367) [`UnattestedKind::UserPatchedDependency`], by the
-/// hosted rewriters' own per-dependency rule ([`patched_dependency_key`],
-/// read against the ref's hosted URL or vendored tarball): Bun applies that
-/// patch only to the resolution it is keyed on, so hosted and vendored mode
-/// leave the package where it is and never confirm the Socket patch. A ref
-/// a pre-#367 run wired stays a ref, so `rollback` / `remove` / `list`
-/// still find it.
-fn unattest_user_patched(file: &str, keys: &[String], out: &mut Discovery) {
-    if keys.is_empty() {
-        return;
-    }
-    let marks: Vec<(String, String, String)> = out
+/// hosted rewriters' own per-dependency rule (the npm extractor's
+/// [`mark_user_patched`], read against the ref's hosted URL or vendored
+/// tarball): Bun applies that patch only to the resolution it is keyed on,
+/// so hosted and vendored mode leave the package where it is and never
+/// confirm the Socket patch. A ref a pre-#367 run wired stays a ref, so
+/// `rollback` / `remove` / `list` still find it.
+fn unattest_user_patched(file: &str, user_patches: &NpmUserPatches, out: &mut Discovery) {
+    let refs: Vec<PatchedRef> = out
         .refs
         .iter()
         .filter(|r| r.source_file == std::path::Path::new(file))
-        .filter_map(|r| {
-            let (name, version) = crate::utils::purl::purl_name_version(&r.purl)?;
-            let target = r.url.as_deref().or(r.artifact_rel.as_deref())?;
-            let key = patched_dependency_key(keys, name, version, target)?;
-            let detail = format!(
-                "package.json `patchedDependencies` has `{key}`, a patch the project applies \
-                 with `bun patch` only while {name}@{version} resolves to what that key names, \
-                 not to this pin, so hosted and vendored mode leave the package alone"
-            );
-            Some((r.purl.clone(), r.uuid.clone(), detail))
-        })
+        .cloned()
         .collect();
-    for (purl, uuid, detail) in marks {
-        out.unattested(
-            &purl,
-            &uuid,
-            file,
-            detail,
-            UnattestedKind::UserPatchedDependency,
+    for r in &refs {
+        mark_user_patched(
+            user_patches,
+            r,
+            "a patch the project applies with `bun patch` only while the package resolves \
+             to what that key names, not to this pin, so hosted and vendored mode leave the \
+             package alone",
+            out,
         );
     }
 }
@@ -398,8 +386,8 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // The binary lock mirrors no keys: the hosted engine and the vendored
     // binary backend read the manifest's alone.
     let manifest = ctx.read_advisory_text("package.json").await;
-    let keys = patched_dependency_keys(manifest.as_deref(), None);
-    unattest_user_patched(BUN_LOCKB, &keys, out);
+    let user_patches = NpmUserPatches::from_manifest(manifest.as_deref());
+    unattest_user_patched(BUN_LOCKB, &user_patches, out);
 }
 
 // ── shared classification ────────────────────────────────────────────────
@@ -1994,6 +1982,14 @@ mod tests {
         let out = run(&p).await;
         assert_refs(&out, &[(LEFT_PAD, UUID_A, WiringMode::Vendored)]);
         assert_eq!(user_patched(&out), [(LEFT_PAD, UUID_A)]);
+        // Review (#2010): the detail names where the key is, not
+        // package.json when only the lock mirrors it.
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("bun.lock `patchedDependencies` has `left-pad@1.3.0`")
+                && !detail.contains("package.json"),
+            "{detail}"
+        );
 
         // `bun.lockb`: the manifest's keys.
         let (_, bytes) = lockb_fixtures().into_iter().next().unwrap();
@@ -2012,6 +2008,28 @@ mod tests {
             &[("pkg:npm/minimist@1.2.2", UUID_A, WiringMode::Hosted)],
         );
         assert_eq!(user_patched(&out), [("pkg:npm/minimist@1.2.2", UUID_A)]);
+    }
+
+    /// Review (#2010): a user-patched `bun.lock` ref another lock contests
+    /// is dropped by the cross-lock contest and leaves no mark behind.
+    #[tokio::test]
+    async fn a_contested_user_patched_bun_ref_leaves_no_mark() {
+        let p = fixture("basic", "expected");
+        p.write(
+            "package.json",
+            r#"{"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad.patch"}}"#,
+        );
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-UP==}\n",
+        );
+        let out = p.discover().await;
+        assert!(
+            out.refs.iter().all(|r| r.purl != LEFT_PAD),
+            "the contest drops the ref: {:#?}",
+            out.refs
+        );
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
     }
 
     /// REGRESSION (#469), `bun.lockb`: a record a bundled edge reaches is

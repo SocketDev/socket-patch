@@ -649,6 +649,10 @@ pub enum CopyTarget {
     NpmName(String),
     /// Every ref.
     Any,
+    /// Exactly the ref of this canonical base purl wiring this patch uuid:
+    /// a mark for one ref that applies only if that ref survives every
+    /// contest.
+    Ref { purl: String, uuid: String },
 }
 
 /// A copy some build installs where no Socket wiring reaches, recorded by
@@ -678,6 +682,7 @@ impl UnwiredCopy {
                 .and_then(|(_, version)| npm_purl(name, version))
                 .is_some_and(|p| PurlKey::same(&p, &r.purl)),
             CopyTarget::Any => true,
+            CopyTarget::Ref { purl, uuid } => *uuid == r.uuid && PurlKey::same(purl, &r.purl),
         }
     }
 }

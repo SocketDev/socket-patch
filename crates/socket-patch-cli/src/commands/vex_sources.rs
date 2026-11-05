@@ -283,7 +283,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         UnattestedKind::UserPatchedDependency => (
             NOTE_NPM_PATCHED_DEPENDENCY,
             "not attested while the project patches the package itself (fold the Socket fix \
-             into your own patch, or remove the `patchedDependencies` entry and re-run)",
+             into your own patch, or remove the `patchedDependencies` entry and re-run); an \
+             npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
+             `socket-patch rollback <uuid>` restores the registry entry",
         ),
     }
 }
@@ -1806,6 +1808,10 @@ mod tests {
             unattested_note(UnattestedKind::UserPatchedDependency).0,
             "vex_npm_patched_dependency"
         );
+        // Review (#2010): a pre-#711 pin breaks `npm ci` (EPATCHFAILED)
+        // until it is rolled back, as hosted's warning says.
+        let remedy = unattested_note(UnattestedKind::UserPatchedDependency).1;
+        assert!(remedy.contains("socket-patch rollback"), "{remedy}");
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the
