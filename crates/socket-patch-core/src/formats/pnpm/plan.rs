@@ -18,7 +18,6 @@
 
 use super::grammar;
 use super::{sniff_lock_grammar, PnpmLockGrammar};
-use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::text::strip_bom;
 use crate::vendor::npm_common::tgz_rel_leaf;
 
@@ -52,13 +51,10 @@ impl Target {
             .is_some_and(|v| v.trim().trim_matches(['\'', '"']) == "3")
             && !field("shrinkwrapMinorVersion:")
                 .is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0));
-        match early {
-            true => Err(format!(
-                "{PNPM_LOCK} uses early pnpm 1 shrinkwrapVersion 3 without a supported \
-                 minor version"
-            )),
-            false => Ok(None),
+        if early {
+            return Err("early pnpm 1 shrinkwrapVersion 3 without a minor version".into());
         }
+        Ok(None)
     }
 
     /// Whether this target's edit repoints a registry instance whose key
@@ -82,6 +78,29 @@ impl Target {
         depth == 0
     }
 }
+/// The pnpm locks among `keys` (root-relative paths) a planner rewrites, in
+/// their order: every `pnpm-lock.yaml`, and a pnpm <= 2 `shrinkwrap.yaml`
+/// only when no `pnpm-lock.yaml` sits beside it. pnpm never reads a
+/// `shrinkwrap.yaml` it has a `pnpm-lock.yaml` for, so that one is
+/// SHADOWED (owner decision on divergence N11): never rewritten, never part
+/// of the all-or-nothing gate (debris in it cannot refuse a dependency),
+/// and only swept for stale Socket identities by lockfile discovery.
+pub(crate) fn planned_locks<'k>(keys: &[&'k String]) -> Vec<&'k String> {
+    // `dir` keeps its trailing `/` (empty at the root).
+    let shadowed = |key: &str| {
+        key.strip_suffix("shrinkwrap.yaml").is_some_and(|dir| {
+            keys.iter()
+                .any(|k| k.strip_suffix("pnpm-lock.yaml") == Some(dir))
+        })
+    };
+    let planned = |key: &&String| match key.rsplit('/').next() {
+        Some("pnpm-lock.yaml") => true,
+        Some("shrinkwrap.yaml") => !shadowed(key),
+        _ => false,
+    };
+    keys.iter().copied().filter(planned).collect()
+}
+
 /// How one `packages:` / `snapshots:` key names a patched release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyMatch<'k> {
@@ -160,6 +179,27 @@ mod tests {
         assert_eq!(
             match_key(&format!("left-pad@file:../{ART}"), "left-pad", "1.3.0"),
             None
+        );
+    }
+
+    /// N11 (owner decision): a `shrinkwrap.yaml` with a `pnpm-lock.yaml`
+    /// beside it is shadowed; one without is planned.
+    #[test]
+    fn a_pnpm_lock_shadows_its_sibling_shrinkwrap() {
+        let keys: Vec<String> = [
+            "a/pnpm-lock.yaml",
+            "a/shrinkwrap.yaml",
+            "b/shrinkwrap.yaml",
+            "package.json",
+            "pnpm-lock.yaml",
+            "shrinkwrap.yaml",
+        ]
+        .map(String::from)
+        .into();
+        let refs: Vec<&String> = keys.iter().collect();
+        assert_eq!(
+            planned_locks(&refs),
+            ["a/pnpm-lock.yaml", "b/shrinkwrap.yaml", "pnpm-lock.yaml"]
         );
     }
 

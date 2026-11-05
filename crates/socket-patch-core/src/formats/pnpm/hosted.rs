@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
-use super::plan::{match_key, KeyMatch, Target};
+use super::plan::{match_key, planned_locks, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
@@ -107,13 +107,6 @@ impl<'f> PnpmLockState<'f> {
         hits
     }
 
-    /// Whether a vendored rewire rekeyed `fname@version`
-    /// ([`KeyMatch::Rekeyed`]). Read from `text` without folding `pending`
-    /// in: a resolution splice never touches a key (see the type docs).
-    fn vendors(&self, fname: &str, version: &str) -> bool {
-        !self.lookup(fname, version, true).is_empty()
-    }
-
     /// The entries [`match_key`] matches as a registry instance or, with
     /// `rekeyed`, as a vendored rekey, found by their key prefixes.
     fn lookup(&self, fname: &str, version: &str, rekeyed: bool) -> Vec<usize> {
@@ -135,10 +128,9 @@ impl<'f> PnpmLockState<'f> {
         }
         out.sort_unstable();
         out.dedup();
-        out.retain(|&i| match match_key(self.entry(i).key, fname, version) {
-            Some(KeyMatch::Registry { .. }) => !rekeyed,
-            Some(KeyMatch::Rekeyed) => rekeyed,
-            None => false,
+        out.retain(|&i| {
+            match_key(self.entry(i).key, fname, version)
+                .is_some_and(|m| (m == KeyMatch::Rekeyed) == rekeyed)
         });
         out
     }
@@ -192,17 +184,10 @@ pub(crate) fn plan_hosted(
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     // A pnpm lock lives at the project root or at any nested path (e.g. Rush
     // repos keep them under `common/config/rush/`); every such files-map key
-    // is rewritten under the same grammar. Deterministic order: BTreeMap
-    // iterates keys sorted, so goldens are stable across every lock in the set.
-    let lock_keys: Vec<&String> = files
-        .keys()
-        .filter(|k| {
-            matches!(
-                k.rsplit('/').next(),
-                Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
-            )
-        })
-        .collect();
+    // is rewritten under the same grammar, except a `shrinkwrap.yaml` a
+    // `pnpm-lock.yaml` shadows ([`planned_locks`]). Deterministic order:
+    // BTreeMap iterates keys sorted, so goldens are stable across every lock.
+    let lock_keys = planned_locks(&files.keys().collect::<Vec<_>>());
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
@@ -360,7 +345,11 @@ pub(crate) fn plan_hosted(
         // mode switch. Fail-closed either way: nothing is rewritten for the
         // dep.
         if !matched_any {
-            let vendored = locks.iter().any(|lock| lock.vendors(&fname, &dep.version));
+            // A rekey ([`KeyMatch::Rekeyed`]) is read from `text` without
+            // folding `pending` in: a resolution splice never touches a key.
+            let vendored = locks
+                .iter()
+                .any(|lock| !lock.lookup(&fname, &dep.version, true).is_empty());
             if vendored {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_vendored".into(),
