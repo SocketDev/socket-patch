@@ -31,15 +31,22 @@ pub(super) async fn read_rel(project_root: &Path, rel: &str) -> Result<Option<St
     // settings above the project), bounded as one: only inside a checkout.
     let path = if crate::utils::relpath::is_anchored(rel) {
         let path = project_root.join(rel);
-        match crate::utils::repo_root::upward_bound(project_root) {
+        match crate::utils::repo_root::upward_bound(
+            crate::utils::repo_root::ReadScope::Workspace,
+            project_root,
+        ) {
             Some(bound) if !bound.contains(&path) => {
                 return Err(format!("read {rel}: {}", bound.refusal(&path)))
             }
             _ => path,
         }
     } else {
-        crate::utils::repo_root::bounded_project_path(project_root, rel)
-            .map_err(|refused| format!("read {rel}: {refused}"))?
+        crate::utils::repo_root::bounded_project_path(
+            crate::utils::repo_root::ReadScope::Workspace,
+            project_root,
+            rel,
+        )
+        .map_err(|refused| format!("read {rel}: {refused}"))?
     };
     match crate::utils::fs::read_regular_to_string(&path).await {
         Ok(content) => Ok(Some(content)),

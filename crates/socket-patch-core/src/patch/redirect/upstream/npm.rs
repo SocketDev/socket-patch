@@ -639,7 +639,10 @@ impl BerryRegistrySettings {
         let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
         // Inside a git checkout an rc file above its root is never read;
         // one there may name the registry, so every lookup refuses.
-        let bound = crate::utils::repo_root::upward_bound(&root);
+        let bound = crate::utils::repo_root::upward_bound(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &root,
+        );
         let unread = bound.as_ref().and_then(|bound| {
             let marker = bound.marker_above(&[rc_name.as_str()])?;
             Some(bound.marker_refusal(&marker))
@@ -669,7 +672,10 @@ impl BerryRegistrySettings {
         BerryRegistrySettings {
             rcs,
             env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
-            env: crate::crawlers::pkg_managers::YarnEnv::for_project(&root),
+            env: crate::crawlers::pkg_managers::YarnEnv::for_project(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &root,
+            ),
             unread,
         }
     }
@@ -1935,7 +1941,12 @@ pub(crate) async fn restore_pnpm_locks(
         let prefix = pnpm_settings_prefix(view, rel).await;
         if let Some(bound) = std::path::Path::new(&prefix)
             .is_absolute()
-            .then(|| crate::utils::repo_root::upward_bound(view.root()))
+            .then(|| {
+                crate::utils::repo_root::upward_bound(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    view.root(),
+                )
+            })
             .flatten()
             .filter(|bound| !bound.contains(std::path::Path::new(&prefix)))
         {

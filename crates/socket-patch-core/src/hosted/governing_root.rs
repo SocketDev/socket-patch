@@ -148,7 +148,11 @@ fn pnpm_settings_elsewhere(root: &Path) -> Option<Refusal> {
     }
     let file = governing_workspace_file(root)?;
     // One above the repository root is never read: it refuses.
-    let readable = crate::utils::repo_root::upward_readable(root, &file);
+    let readable = crate::utils::repo_root::upward_readable(
+        crate::utils::repo_root::ReadScope::Workspace,
+        root,
+        &file,
+    );
     if let Some(Ok(Some(text))) = readable.then(|| read_workspace_for_trust(&file)) {
         if matches!(
             plan_workspace_trust(Some(&text)),
@@ -306,7 +310,7 @@ async fn pnpm_lock_elsewhere(root: &Path) -> Option<PathBuf> {
         .unwrap_or_else(|_| root.to_path_buf());
 
     let mut workspace = None;
-    let bound = upward_bound(&canonical);
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, &canonical);
     for ancestor in canonical.ancestors() {
         if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
             // Above the repository: [`npm_lock_elsewhere`] stats it.
@@ -583,7 +587,7 @@ fn stray_lock_marker_above(
     own: &[&'static str],
     markers: &[&str],
 ) -> Option<MemberStrayLock> {
-    let bound = upward_bound(root)?;
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, root)?;
     let marker = bound.marker_above(markers)?;
     let dir = marker.parent()?.to_path_buf();
     Some(MemberStrayLock {
@@ -605,7 +609,7 @@ fn stray_lock_marker_above(
 /// (stat only): pnpm, npm, yarn, Bun or vlt may install the project from
 /// there, so hosted and vendored refuse rather than write a member.
 fn lock_marker_above(root: &Path) -> Option<LockElsewhere> {
-    let bound = upward_bound(root)?;
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, root)?;
     let marker = bound.marker_above(&WORKSPACE_MARKERS)?;
     let dir = marker.parent()?.to_path_buf();
     Some(LockElsewhere {
@@ -852,7 +856,7 @@ async fn package_json_workspace_root(root: &Path) -> Option<(PathBuf, Vec<&'stat
         .await
         .unwrap_or_else(|_| root.to_path_buf());
     let mut member: &Path = &canonical;
-    let bound = upward_bound(&canonical);
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, &canonical);
     for ancestor in canonical.ancestors().skip(1) {
         if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
             break;
@@ -1116,7 +1120,7 @@ async fn vlt_workspace_root(root: &Path) -> Option<(PathBuf, VltWorkspaceSource)
     let canonical = tokio::fs::canonicalize(root)
         .await
         .unwrap_or_else(|_| root.to_path_buf());
-    let bound = upward_bound(&canonical);
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, &canonical);
     for ancestor in canonical.ancestors().skip(1) {
         if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
             break;

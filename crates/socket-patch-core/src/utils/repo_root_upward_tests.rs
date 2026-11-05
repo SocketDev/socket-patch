@@ -45,8 +45,8 @@ fn write(path: &Path, text: &str) {
 #[test]
 fn marker_above_is_stat_only_and_starts_above_the_checkout() {
     let l = layout(true);
-    let bound = upward_bound(&l.app).unwrap();
-    assert_eq!(bound.root(), l.repo.as_path());
+    let bound = upward_bound(ReadScope::Workspace, &l.app).unwrap();
+    assert_eq!(bound.root(), Some(l.repo.as_path()));
     assert_eq!(bound.marker_above(&["package.json"]), None);
     write(&l.repo.join("package.json"), "{}");
     assert_eq!(bound.marker_above(&["package.json"]), None, "inside");
@@ -55,12 +55,21 @@ fn marker_above_is_stat_only_and_starts_above_the_checkout() {
         bound.marker_above(&["package.json"]),
         Some(l.outer.join("package.json"))
     );
-    assert!(upward_readable(&l.app, &l.repo.join("package.json")));
-    assert!(!upward_readable(&l.app, &l.outer.join("package.json")));
+    assert!(upward_readable(
+        ReadScope::Workspace,
+        &l.app,
+        &l.repo.join("package.json")
+    ));
+    assert!(!upward_readable(
+        ReadScope::Workspace,
+        &l.app,
+        &l.outer.join("package.json")
+    ));
     // No checkout: no bound, every ancestor stays readable.
     let plain = layout(false);
-    assert_eq!(upward_bound(&plain.app), None);
+    assert_eq!(upward_bound(ReadScope::Workspace, &plain.app), None);
     assert!(upward_readable(
+        ReadScope::Workspace,
         &plain.app,
         &plain.outer.join("package.json")
     ));
@@ -199,10 +208,12 @@ async fn cargo_workspace_and_configs_above_the_repository() {
             crate::vendor::cargo_config::config_above_repo(&l.app).is_some(),
             git
         );
-        let layers =
-            crate::formats::cargo::source_replacement::config_layer_paths(&l.app, None, |p| {
-                p.is_file()
-            });
+        let layers = crate::formats::cargo::source_replacement::config_layer_paths(
+            ReadScope::Workspace,
+            &l.app,
+            None,
+            |p| p.is_file(),
+        );
         assert_eq!(layers.is_empty(), git, "{layers:?}");
     }
 }
@@ -213,7 +224,7 @@ fn gradle_settings_above_the_repository() {
         let l = layout(git);
         write(&l.app.join("build.gradle"), "");
         write(&l.outer.join("settings.gradle"), "include 'repo:app'\n");
-        let roots = crate::crawlers::gradle_cache::build_roots(&l.app);
+        let roots = crate::crawlers::gradle_cache::build_roots(ReadScope::Workspace, &l.app);
         assert_eq!(roots.contains(&l.outer), !git, "{roots:?}");
     }
 }
@@ -226,6 +237,7 @@ fn yarn_env() -> crate::crawlers::pkg_managers::YarnEnv {
         home: None,
         vars: Some(Default::default()),
         env_files: Default::default(),
+        scope: ReadScope::Workspace,
     }
 }
 
@@ -274,4 +286,105 @@ fn yarn_classic_rc_above_the_repository() {
             assert_eq!(file.value, MirrorValue::Path("./m".to_string()));
         }
     }
+}
+
+/// A global run (`--global` / `--global-prefix`) is unbounded: every
+/// lookup the CLI threads `ReadScope::Global` into reads above the
+/// repository root, exactly as before the bound, while the same layout in
+/// a workspace run stays bounded (the tests above).
+#[test]
+fn global_scope_reads_above_the_repository() {
+    let l = layout(true);
+    write(&l.outer.join("go.work"), "go 1.22\n");
+    write(&l.outer.join(".cargo/config.toml"), "[build]\njobs = 1\n");
+    write(&l.app.join("build.gradle"), "");
+    write(&l.outer.join("settings.gradle"), "include 'repo:app'\n");
+    write(
+        &l.outer.join(".yarnrc.yml"),
+        "nodeLinker: node-modules\npnpmStoreFolder: store\n",
+    );
+
+    assert_eq!(upward_bound(ReadScope::Global, &l.app), None);
+    assert!(upward_readable(
+        ReadScope::Global,
+        &l.app,
+        &l.outer.join("go.work")
+    ));
+    assert!(ReadBoundary::of(ReadScope::Global, &l.app).contains(&l.outer));
+    assert!(bounded_project_path(ReadScope::Global, &l.app, "../../go.work").is_ok());
+    assert!(bounded_project_path(ReadScope::Workspace, &l.app, "../../go.work").is_err());
+
+    // `GOWORK` in the environment would decide instead.
+    if std::env::var_os("GOWORK").is_none() {
+        use crate::vendor::go_workspace::{resolve_in, GoWork};
+        assert_eq!(
+            resolve_in(ReadScope::Global, &l.app),
+            GoWork::File(l.outer.join("go.work"))
+        );
+        assert!(matches!(
+            resolve_in(ReadScope::Workspace, &l.app),
+            GoWork::Invalid(_)
+        ));
+    }
+
+    let layers = crate::formats::cargo::source_replacement::config_layer_paths(
+        ReadScope::Global,
+        &l.app,
+        None,
+        |p| p.is_file(),
+    );
+    assert!(
+        layers.contains(&(l.outer.join(".cargo/config.toml"), l.outer.clone())),
+        "{layers:?}"
+    );
+
+    let roots = crate::crawlers::gradle_cache::build_roots(ReadScope::Global, &l.app);
+    assert!(roots.contains(&l.outer), "{roots:?}");
+
+    use crate::crawlers::pkg_managers::{yarn_node_linker_in, yarn_pnpm_store_folder_in};
+    let env = crate::crawlers::pkg_managers::YarnEnv {
+        scope: ReadScope::Global,
+        ..yarn_env()
+    };
+    assert_eq!(
+        yarn_node_linker_in(&l.app, &env).as_deref(),
+        Some("node-modules")
+    );
+    assert_eq!(
+        yarn_pnpm_store_folder_in(&l.app, &env),
+        Some(l.outer.join("store"))
+    );
+}
+
+/// The crawler's scope comes from its CLI mode, never from the
+/// filesystem: a `--global-prefix` crawl outside any repository finds its
+/// packages while the working directory sits in a checkout.
+#[tokio::test]
+async fn global_crawl_reads_a_package_outside_the_repository() {
+    use crate::crawlers::types::CrawlerOptions;
+    let l = layout(true);
+    let global = l.outer.join("global/node_modules");
+    write(
+        &global.join("left-pad/package.json"),
+        r#"{"name":"left-pad","version":"1.3.0"}"#,
+    );
+    let options = CrawlerOptions {
+        cwd: l.app.clone(),
+        global: true,
+        global_prefix: Some(global.clone()),
+    };
+    assert_eq!(options.read_scope(), ReadScope::Global);
+    let local = CrawlerOptions {
+        cwd: l.app.clone(),
+        global: false,
+        global_prefix: None,
+    };
+    assert_eq!(local.read_scope(), ReadScope::Workspace);
+    let found = crate::crawlers::npm_crawler::NpmCrawler
+        .crawl_all(&options)
+        .await;
+    assert!(
+        found.iter().any(|p| p.purl == "pkg:npm/left-pad@1.3.0"),
+        "{found:?}"
+    );
 }

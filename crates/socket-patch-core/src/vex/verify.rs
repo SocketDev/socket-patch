@@ -694,7 +694,13 @@ fn node_resolve(from: &Path, name: &str) -> Option<PathBuf> {
         .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
         .map(|dir| dir.join("node_modules").join(name))
         .find(|copy| copy.exists())
-        .filter(|copy| crate::utils::repo_root::upward_readable(from, copy))
+        .filter(|copy| {
+            crate::utils::repo_root::upward_readable(
+                crate::utils::repo_root::ReadScope::Workspace,
+                from,
+                copy,
+            )
+        })
 }
 
 /// The registry semver range of a `dependencies` value: the value itself,

@@ -484,7 +484,8 @@ fn pyproject_has_uv_settings(pyproject: &str) -> bool {
 /// ([`crate::utils::repo_root::upward_bound`]); [`uv_config_above_repo`]
 /// then says whether a settings file there may apply.
 pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
-    let bound = crate::utils::repo_root::upward_bound(root);
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, root);
     for (rel, path) in ancestor_uv_config_files(root) {
         if bound.as_ref().is_some_and(|b| !b.contains(&path)) {
             return None;
@@ -509,7 +510,8 @@ pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
 /// read), which uv may apply. Writers refuse on it rather than wire what
 /// those settings may reject.
 pub fn uv_config_above_repo(root: &Path) -> Option<String> {
-    let bound = crate::utils::repo_root::upward_bound(root)?;
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, root)?;
     if find_ancestor_uv_config(root).is_some() {
         return None;
     }

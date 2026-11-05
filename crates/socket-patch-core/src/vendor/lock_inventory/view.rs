@@ -617,7 +617,11 @@ impl<'a> DiskSnapshot<'a> {
     async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
         self.touch(rel);
         // Before the cache, which would not keep the refusal's payload.
-        let path = bounded_project_path(self.root, rel)?;
+        let path = bounded_project_path(
+            crate::utils::repo_root::ReadScope::Workspace,
+            self.root,
+            rel,
+        )?;
         if let Some(hit) = self.cached(rel) {
             return hit.map(|b| b.to_vec());
         }
@@ -748,13 +752,22 @@ impl<'a> ProjectView<'a> {
         }
         match self {
             ProjectView::Disk(root) => {
-                read_regular_to_string(&bounded_project_path(root, rel)?).await
+                read_regular_to_string(&bounded_project_path(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    root,
+                    rel,
+                )?)
+                .await
             }
             ProjectView::Memory(project) => project.read_text(rel),
             ProjectView::Snapshot(snap) => {
                 // Before the cache, which would not keep the refusal's
                 // payload ([`crate::utils::repo_root::is_refused_read`]).
-                let path = bounded_project_path(snap.root, rel)?;
+                let path = bounded_project_path(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    snap.root,
+                    rel,
+                )?;
                 match snap.cached(rel) {
                     Some(hit) => hit.and_then(|b| utf8(b.to_vec())),
                     None => {
@@ -777,7 +790,12 @@ impl<'a> ProjectView<'a> {
     pub async fn read_bytes(&self, rel: &str) -> io::Result<Vec<u8>> {
         match self {
             ProjectView::Disk(root) => {
-                read_regular_to_bytes(&bounded_project_path(root, rel)?).await
+                read_regular_to_bytes(&bounded_project_path(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    root,
+                    rel,
+                )?)
+                .await
             }
             ProjectView::Memory(project) => project.read_bytes(rel),
             ProjectView::Snapshot(snap) => snap.read_bytes(rel).await,
@@ -873,7 +891,10 @@ impl<'a> ProjectView<'a> {
                 let root = disk_root.expect("a disk view has a root");
                 let lock = crate::utils::fs::read_regular_to_string_sync(&root.join("yarn.lock"));
                 effective_yarn_linker(lock.ok().as_deref(), || {
-                    crate::crawlers::pkg_managers::yarn_node_linker(root)
+                    crate::crawlers::pkg_managers::yarn_node_linker(
+                        crate::utils::repo_root::ReadScope::Workspace,
+                        root,
+                    )
                 })
             }
             ProjectView::Memory(project) => {

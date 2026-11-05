@@ -2791,9 +2791,13 @@ fn pnpm_trust(
         // file but these two, so nothing is written here.
         // One above the repository root is never read (the pre-check
         // refuses it; this keeps the read bounded on its own).
-        let readable = view
-            .disk_root()
-            .is_some_and(|root| crate::utils::repo_root::upward_readable(root, &root_file));
+        let readable = view.disk_root().is_some_and(|root| {
+            crate::utils::repo_root::upward_readable(
+                crate::utils::repo_root::ReadScope::Workspace,
+                root,
+                &root_file,
+            )
+        });
         let root_file = root_file.display().to_string();
         if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
             pnpm_trust_env_set_detail(&server, &found.source)

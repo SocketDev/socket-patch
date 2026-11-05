@@ -158,7 +158,10 @@ pub(crate) async fn inherited_source_keys_traced(
         )],
         ..NugetConfig::default()
     }));
-    let bound = crate::utils::repo_root::ReadBoundary::of(project_root);
+    let bound = crate::utils::repo_root::ReadBoundary::of(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project_root,
+    );
     let mut outside = None;
     let mut ancestors: Vec<&std::path::Path> = project_root.ancestors().skip(1).collect();
     ancestors.reverse();

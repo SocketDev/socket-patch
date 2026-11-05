@@ -69,7 +69,8 @@ async fn walk(dir: &Path) -> Walk {
     {
         return Walk::Ungoverned;
     }
-    let bound = crate::utils::repo_root::upward_bound(&dir);
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, &dir);
     for ancestor in dir.ancestors().skip(1) {
         if let Some(bound) = bound.as_ref().filter(|b| !b.contains(ancestor)) {
             return match bound.marker_above(&["pyproject.toml"]) {

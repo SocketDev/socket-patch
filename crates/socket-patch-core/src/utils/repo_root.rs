@@ -124,9 +124,35 @@ pub fn find_git_repo(start: &Path) -> Option<GitRepo> {
     repo_at_end_of(search_dirs(start))
 }
 
-/// The directory no read of a PROJECT file may leave: the git checkout
-/// enclosing `project_root` ([`find_git_repo`]), else `project_root`
-/// itself. Canonical when `project_root` exists.
+/// Which project files a run may read, chosen ONCE from the CLI mode and
+/// passed to every bounded read (never inferred from the filesystem).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadScope {
+    /// A project run (the default `--cwd` project): project files are read
+    /// only inside the repository root ([`ReadBoundary::Workspace`]).
+    Workspace,
+    /// A global run (`--global` / `--global-prefix`): global installs,
+    /// caches and their settings are read wherever they live on the system
+    /// ([`ReadBoundary::Unbounded`]).
+    Global,
+}
+
+impl ReadScope {
+    /// The scope of a run whose global flag (`--global` or
+    /// `--global-prefix`) is `global`.
+    pub fn of_global(global: bool) -> Self {
+        if global {
+            ReadScope::Global
+        } else {
+            ReadScope::Workspace
+        }
+    }
+}
+
+/// The directory no read of a PROJECT file may leave in a
+/// [`ReadScope::Workspace`] run: the git checkout enclosing the project
+/// ([`find_git_repo`]), else the project itself. A
+/// [`ReadScope::Global`] run reads anywhere ([`ReadBoundary::Unbounded`]).
 ///
 /// Every reader and writer that follows a project file's reference
 /// (an ancestor `go.work`, a `-r ../x.txt` include, a parent
@@ -137,29 +163,43 @@ pub fn find_git_repo(start: &Path) -> Option<GitRepo> {
 /// the `GOENV` file, `$CARGO_HOME`) is not a project file and is not
 /// bounded by this.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadBoundary {
-    root: PathBuf,
+pub enum ReadBoundary {
+    /// Reads stay at or below `root` (canonical when it exists).
+    Workspace { root: PathBuf },
+    /// A global run: every path is readable.
+    Unbounded,
 }
 
 impl ReadBoundary {
-    /// The boundary for a project at `project_root`.
-    pub fn of(project_root: &Path) -> Self {
-        let project = canonical_or_lexical(project_root);
-        let root = find_git_repo(&project).map_or(project, |repo| repo.root);
-        ReadBoundary { root }
+    /// The boundary of a `scope` run for the project at `project_root`.
+    pub fn of(scope: ReadScope, project_root: &Path) -> Self {
+        match scope {
+            ReadScope::Global => ReadBoundary::Unbounded,
+            ReadScope::Workspace => {
+                let project = canonical_or_lexical(project_root);
+                let root = find_git_repo(&project).map_or(project, |repo| repo.root);
+                ReadBoundary::Workspace { root }
+            }
+        }
     }
 
-    /// The boundary directory itself.
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The boundary directory; `None` when unbounded.
+    pub fn root(&self) -> Option<&Path> {
+        match self {
+            ReadBoundary::Workspace { root } => Some(root),
+            ReadBoundary::Unbounded => None,
+        }
     }
 
-    /// Whether `path` lies at or below the boundary. `path` is made
-    /// absolute against the working directory, `..` folded, and its
-    /// deepest existing level canonicalized, so neither a `..` nor a
-    /// symlinked level inside the tree reaches outside it.
+    /// Whether `path` lies at or below the boundary (always, unbounded).
+    /// `path` is made absolute against the working directory, `..`
+    /// folded, and its deepest existing level canonicalized, so neither a
+    /// `..` nor a symlinked level inside the tree reaches outside it.
     pub fn contains(&self, path: &Path) -> bool {
-        canonical_or_lexical(path).starts_with(&self.root)
+        match self {
+            ReadBoundary::Workspace { root } => canonical_or_lexical(path).starts_with(root),
+            ReadBoundary::Unbounded => true,
+        }
     }
 
     /// The user-facing reason a read of `path` was refused.
@@ -168,19 +208,21 @@ impl ReadBoundary {
             "{} is outside the repository root {}; socket-patch does not read project \
              files outside it",
             path.display(),
-            self.root.display()
+            self.shown_root()
         )
     }
 
     /// The nearest file named one of `names` in a directory ABOVE the
-    /// boundary, nearest directory first and `names` in order. Stat only:
-    /// the file is never opened. Like git's own lookup it never reaches
-    /// the home directory or anything above it, so a stray `~/package.json`
-    /// governs nothing.
+    /// boundary, nearest directory first and `names` in order (`None`
+    /// unbounded: nothing is above). Stat only: the file is never opened.
+    /// Like git's own lookup it never reaches the home directory or
+    /// anything above it, so a stray `~/package.json` governs nothing.
     pub fn marker_above(&self, names: &[&str]) -> Option<PathBuf> {
+        let ReadBoundary::Workspace { root } = self else {
+            return None;
+        };
         let home = home();
-        self.root
-            .ancestors()
+        root.ancestors()
             .skip(1)
             .take_while(|dir| home.as_deref().is_none_or(|home| !home.starts_with(dir)))
             .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
@@ -195,41 +237,55 @@ impl ReadBoundary {
              project files outside the repository, so it cannot tell whether that file \
              governs this project",
             marker.display(),
-            self.root.display()
+            self.shown_root()
         )
+    }
+
+    fn shown_root(&self) -> std::path::Display<'_> {
+        self.root().unwrap_or(Path::new("/")).display()
     }
 }
 
 /// The bound of an UPWARD lookup from `start` (a workspace root, an
 /// inherited config, a settings file the package manager searches its
-/// ancestors for): inside a git checkout the lookup never reads above the
-/// checkout's root, and a caller asks [`ReadBoundary::marker_above`]
-/// whether the tool would have found something there (a writer then
-/// refuses, a reader withholds). `None` outside any checkout, where the
-/// lookup walks on as it always has: stopping it at the project would
-/// silently treat a workspace member as standalone.
-pub fn upward_bound(start: &Path) -> Option<ReadBoundary> {
-    find_git_repo(&canonical_or_lexical(start)).map(|repo| ReadBoundary { root: repo.root })
+/// ancestors for) in a `scope` run: in a [`ReadScope::Workspace`] run
+/// inside a git checkout the lookup never reads above the checkout's
+/// root, and a caller asks [`ReadBoundary::marker_above`] whether the tool
+/// would have found something there (a writer then refuses, a reader
+/// withholds). `None` in a [`ReadScope::Global`] run, and outside any
+/// checkout, where the lookup walks on as it always has: stopping it at
+/// the project would silently treat a workspace member as standalone.
+pub fn upward_bound(scope: ReadScope, start: &Path) -> Option<ReadBoundary> {
+    match scope {
+        ReadScope::Global => None,
+        ReadScope::Workspace => find_git_repo(&canonical_or_lexical(start))
+            .map(|repo| ReadBoundary::Workspace { root: repo.root }),
+    }
 }
 
-/// Whether an upward lookup from `start` may read `path`
-/// ([`upward_bound`]): always outside a checkout, else only inside it.
-pub fn upward_readable(start: &Path, path: &Path) -> bool {
-    upward_bound(start).is_none_or(|bound| bound.contains(path))
+/// Whether an upward lookup from `start` may read `path` in a `scope` run
+/// ([`upward_bound`]): always in a global run or outside a checkout, else
+/// only inside it.
+pub fn upward_readable(scope: ReadScope, start: &Path, path: &Path) -> bool {
+    upward_bound(scope, start).is_none_or(|bound| bound.contains(path))
 }
 
 /// `project_root.join(rel)` for a project file named by a root-relative
 /// `rel` that may climb (`../shared/requirements.txt`) or be absolute;
 /// `Err` of kind `NotFound` (a refused read reads as a missing file)
-/// carrying [`ReadBoundary::refusal`] when it lies outside the repository
-/// root. A plain in-tree `rel` (no `..`, not absolute) is never refused,
-/// and costs no filesystem lookups.
-pub fn bounded_project_path(project_root: &Path, rel: &str) -> std::io::Result<PathBuf> {
+/// carrying [`ReadBoundary::refusal`] when, in a `scope` run, it lies
+/// outside the boundary ([`ReadBoundary::of`]). A plain in-tree `rel` (no
+/// `..`, not absolute) is never refused, and costs no filesystem lookups.
+pub fn bounded_project_path(
+    scope: ReadScope,
+    project_root: &Path,
+    rel: &str,
+) -> std::io::Result<PathBuf> {
     let path = project_root.join(rel);
     let climbs =
         crate::utils::relpath::is_anchored(rel) || rel.split(['/', '\\']).any(|seg| seg == "..");
     if climbs {
-        let bound = ReadBoundary::of(project_root);
+        let bound = ReadBoundary::of(scope, project_root);
         if !bound.contains(&path) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -440,8 +496,8 @@ mod tests {
         let project = repo.join("packages/app");
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(&project).unwrap();
-        let bound = ReadBoundary::of(&project);
-        assert_eq!(bound.root(), repo.as_path());
+        let bound = ReadBoundary::of(ReadScope::Workspace, &project);
+        assert_eq!(bound.root(), Some(repo.as_path()));
         assert!(bound.contains(&project.join("../../go.work")));
         assert!(bound.contains(&repo.join("not/yet/created.txt")));
         assert!(!bound.contains(&project.join("../../../go.work")));
@@ -449,19 +505,34 @@ mod tests {
         // No checkout: the project itself is the boundary.
         let plain = base.join("plain/app");
         fs::create_dir_all(&plain).unwrap();
-        let bound = ReadBoundary::of(&plain);
-        assert_eq!(bound.root(), plain.as_path());
+        let bound = ReadBoundary::of(ReadScope::Workspace, &plain);
+        assert_eq!(bound.root(), Some(plain.as_path()));
         assert!(!bound.contains(&plain.join("../go.work")));
         // A project file named by a climbing path: refused as missing.
-        let err = bounded_project_path(&plain, "../go.work").unwrap_err();
+        let err = bounded_project_path(ReadScope::Workspace, &plain, "../go.work").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(is_refused_read(&err));
         assert_eq!(
-            bounded_project_path(&plain, "sub/go.work").unwrap(),
+            bounded_project_path(ReadScope::Workspace, &plain, "sub/go.work").unwrap(),
             plain.join("sub/go.work")
         );
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(!is_refused_read(&missing));
+        // A global run is unbounded: it reads anywhere on the system.
+        let global = ReadBoundary::of(ReadScope::Global, &project);
+        assert_eq!(global, ReadBoundary::Unbounded);
+        assert!(global.contains(&base.join("sibling/.socket/vendor")));
+        assert_eq!(global.marker_above(&["go.work"]), None);
+        assert_eq!(
+            bounded_project_path(ReadScope::Global, &plain, "../go.work").unwrap(),
+            plain.join("../go.work")
+        );
+        assert_eq!(upward_bound(ReadScope::Global, &project), None);
+        assert!(upward_readable(
+            ReadScope::Global,
+            &project,
+            &base.join("x")
+        ));
     }
 
     /// A symlink inside the tree that points out of it does not carry a
@@ -475,7 +546,7 @@ mod tests {
         fs::create_dir_all(repo.join(".git")).unwrap();
         fs::create_dir_all(base.join("outside")).unwrap();
         std::os::unix::fs::symlink(base.join("outside"), repo.join("link")).unwrap();
-        let bound = ReadBoundary::of(&repo);
+        let bound = ReadBoundary::of(ReadScope::Workspace, &repo);
         assert!(!bound.contains(&repo.join("link/requirements.txt")));
         assert!(bound.contains(&repo.join("requirements.txt")));
     }

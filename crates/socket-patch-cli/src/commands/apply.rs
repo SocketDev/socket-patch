@@ -471,7 +471,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     // The same PnP gate `apply` runs: a PnP tree hides every npm copy, so
     // without it each npm patch would read as not installed and pass calm.
     if matches!(
-        detect_npm_pkg_manager(&args.common.cwd),
+        detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd),
         NpmPkgManager::YarnBerryPnP
     ) && eco_in_local_scope(&args.common, Ecosystem::Npm)
         && manifest_targets_npm(&tree)
@@ -1061,7 +1061,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // filter excluding npm never touches it.
         if eco_in_local_scope(&args.common, Ecosystem::Npm)
             && matches!(
-                detect_npm_pkg_manager(&args.common.cwd),
+                detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd),
                 NpmPkgManager::YarnBerryPnP
             )
         {
@@ -1388,7 +1388,7 @@ pub(crate) async fn run_locked(
     // informational note; the substantive safety is core's rename-over
     // write (`utils::fs::atomic_write_bytes` never touches the store's
     // shared inode).
-    match detect_npm_pkg_manager(&args.common.cwd) {
+    match detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
                 let code = refuse_yarn_pnp_with_skips(&args, &user_patch_skips);
@@ -1512,6 +1512,7 @@ pub(crate) async fn run_locked(
                 });
                 cache_warnings.extend(
                     socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                        args.common.read_scope(),
                         &args.common.cwd,
                         rewritten.map(|r| r.package_key.as_str()),
                     )

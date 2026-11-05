@@ -335,7 +335,10 @@ pub(super) fn not_build_root(project_root: &Path) -> Option<String> {
     let canonical_root =
         std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     let ancestors = crate::utils::repo_root::ancestor_search_dirs(&canonical_root);
-    let bound = crate::utils::repo_root::upward_bound(&canonical_root);
+    let bound = crate::utils::repo_root::upward_bound(
+        crate::utils::repo_root::ReadScope::Workspace,
+        &canonical_root,
+    );
     for ancestor in &ancestors {
         let ancestor = ancestor.as_path();
         // Above the repository root (a submodule's superproject, a

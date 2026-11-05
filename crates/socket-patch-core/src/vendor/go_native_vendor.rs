@@ -52,7 +52,12 @@ async fn expected_text(t: &Target<'_>, name: &str, hash: &str) -> Option<String>
         if let Some(path) = &entry.path {
             // A replacement directory outside the repository is never read.
             let file = t.root.join(path).join(name);
-            if crate::utils::repo_root::ReadBoundary::of(t.root).contains(&file) {
+            if crate::utils::repo_root::ReadBoundary::of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                t.root,
+            )
+            .contains(&file)
+            {
                 paths.push(file);
             }
         } else if let (Some(cache), Some(target), Some(ver)) = (

@@ -55,7 +55,8 @@ impl CargoCrawler {
     /// directory, never the shared registry cache. The directory need not
     /// exist.
     pub async fn directory_source(&self, cwd: &Path) -> Option<PathBuf> {
-        match crates_io_source(cwd).await {
+        // A local project's question (a global crawl has no project).
+        match crates_io_source(crate::utils::repo_root::ReadScope::Workspace, cwd).await {
             CratesIoSource::Directory(dir) => Some(dir),
             CratesIoSource::Registry
             | CratesIoSource::LocalRegistry(_)
@@ -272,7 +273,12 @@ impl CargoCrawler {
     /// each parent directory's `.cargo/config*`, then `$CARGO_HOME`'s).
     /// Blocking file reads; the hosted scan's cargo refusal reads it too.
     pub fn crates_io_source_for(cwd: &Path) -> CratesIoSource {
-        resolve_for(cwd, Self::cargo_home().as_deref())
+        // Only a project (workspace) run asks: hosted mode is never global.
+        resolve_for(
+            crate::utils::repo_root::ReadScope::Workspace,
+            cwd,
+            Self::cargo_home().as_deref(),
+        )
     }
 }
 
@@ -328,7 +334,7 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
     // registry cache, even when an unwired `vendor/` sits beside the
     // manifest (#338). A replacement directory that is missing yields
     // nothing: cargo can't build from the cache either.
-    match crates_io_source(&options.cwd).await {
+    match crates_io_source(options.read_scope(), &options.cwd).await {
         CratesIoSource::Directory(dir) => {
             if is_dir(&dir).await {
                 (vec![dir], false)
@@ -354,10 +360,14 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
 /// reads `a/proj`'s ancestors, not `a/b`'s; a directory under the folded
 /// cwd is reported back under the cwd as given, which path-scoped
 /// commands strip as a prefix.
-fn resolve_for(cwd: &Path, cargo_home: Option<&Path>) -> CratesIoSource {
+fn resolve_for(
+    scope: crate::utils::repo_root::ReadScope,
+    cwd: &Path,
+    cargo_home: Option<&Path>,
+) -> CratesIoSource {
     let given = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let folded = fold_parent_dirs(&given);
-    let files = config_layer_paths(&folded, cargo_home, |p| p.is_file());
+    let files = config_layer_paths(scope, &folded, cargo_home, |p| p.is_file());
     let texts: Vec<(PathBuf, String)> = files
         .into_iter()
         .filter_map(|(file, base)| {
@@ -398,10 +408,10 @@ fn fold_parent_dirs(path: &Path) -> PathBuf {
 
 /// Where cargo takes crates.io packages from for a build in `cwd`
 /// ([`resolve_for`]), off the runtime.
-async fn crates_io_source(cwd: &Path) -> CratesIoSource {
+async fn crates_io_source(scope: crate::utils::repo_root::ReadScope, cwd: &Path) -> CratesIoSource {
     let cwd = cwd.to_path_buf();
     let cargo_home = CargoCrawler::cargo_home();
-    run_blocking(move || resolve_for(&cwd, cargo_home.as_deref())).await
+    run_blocking(move || resolve_for(scope, &cwd, cargo_home.as_deref())).await
 }
 
 /// The registry crates `options`' build takes from the shared registry

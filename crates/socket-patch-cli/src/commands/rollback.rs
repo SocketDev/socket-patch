@@ -3400,6 +3400,7 @@ pub(crate) async fn rollback_patches_inner(
     if !common.dry_run {
         warnings.extend(
             socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                common.read_scope(),
                 &common.cwd,
                 results
                     .iter()

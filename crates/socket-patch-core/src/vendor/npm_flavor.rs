@@ -378,7 +378,10 @@ async fn detect_vendorable_npm_flavor_code(
     project_root: &Path,
 ) -> Result<(NpmLockFlavor, Vec<VendorWarning>), (&'static str, String)> {
     detect_vendorable_npm_flavor_with(project_root, || {
-        crate::crawlers::pkg_managers::yarn_node_linker(project_root)
+        crate::crawlers::pkg_managers::yarn_node_linker(
+            crate::utils::repo_root::ReadScope::Workspace,
+            project_root,
+        )
     })
     .await
 }
@@ -660,9 +663,11 @@ pub async fn vlt_routes(project_root: &Path) -> Option<Result<(), (&'static str,
         Ok((NpmLockFlavor::Vlt, _)) => Some(Ok(())),
         Ok(_) => None,
         Err(refusal) => {
-            let pnp = crate::crawlers::pkg_managers::live_pnp_marker(project_root, |m| {
-                std::fs::symlink_metadata(project_root.join(m)).is_ok()
-            })
+            let pnp = crate::crawlers::pkg_managers::live_pnp_marker(
+                crate::utils::repo_root::ReadScope::Workspace,
+                project_root,
+                |m| std::fs::symlink_metadata(project_root.join(m)).is_ok(),
+            )
             .is_some();
             let vlt = tokio::fs::metadata(project_root.join(VLT_LOCK))
                 .await
@@ -1427,6 +1432,7 @@ mod tests {
             home: Some(home.path().to_path_buf()),
             vars: Some(Default::default()),
             env_files: Default::default(),
+            scope: crate::utils::repo_root::ReadScope::Workspace,
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
@@ -1444,6 +1450,7 @@ mod tests {
             home: None,
             vars: Some(Default::default()),
             env_files: Default::default(),
+            scope: crate::utils::repo_root::ReadScope::Workspace,
         };
         let (flavor, _) =
             detect_vendorable_npm_flavor_with(tmp.path(), || yarn_node_linker_in(tmp.path(), &env))
@@ -1477,6 +1484,7 @@ mod tests {
                 home: None,
                 vars: Some([("SOCKET_PATCH_T_SECRET".to_string(), "secret".to_string())].into()),
                 env_files: Default::default(),
+                scope: crate::utils::repo_root::ReadScope::Workspace,
             };
             let (code, message) = detect_vendorable_npm_flavor_with(tmp.path(), || {
                 yarn_node_linker_in(tmp.path(), &env)

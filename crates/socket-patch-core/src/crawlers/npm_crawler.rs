@@ -1594,13 +1594,16 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
 /// one elsewhere (a home rc's folder) may be shared with other projects,
 /// and patching it would patch them too. `None` for the default location,
 /// which the walks find by name. The path keeps the project's spelling.
-fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
+fn relocated_yarn_pnpm_store_sync(
+    scope: crate::utils::repo_root::ReadScope,
+    nm: &Path,
+) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
     let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
         .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
-    let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(scope, &abs_project)?;
     let (Ok(real_store), Ok(real_project)) = (
         std::fs::canonicalize(store),
         std::fs::canonicalize(&abs_project),
@@ -2757,7 +2760,7 @@ impl NpmCrawler {
         let roots: Vec<(&PathBuf, Option<PathBuf>)> = nm_paths
             .iter()
             .map(|nm| {
-                let store = relocated_yarn_pnpm_store_sync(nm)
+                let store = relocated_yarn_pnpm_store_sync(options.read_scope(), nm)
                     .filter(|store| seen_stores.insert(store.clone()));
                 (nm, store)
             })
@@ -2932,7 +2935,11 @@ impl NpmCrawler {
         let mut visited = HashSet::new();
         // The root's relocated Yarn pnpm-linker store (#859), contributed
         // by the root's visit like a store found there by name.
-        let mut yarn_store = relocated_yarn_pnpm_store_sync(node_modules_path).map(|store| {
+        let mut yarn_store = relocated_yarn_pnpm_store_sync(
+            crate::utils::repo_root::ReadScope::Workspace,
+            node_modules_path,
+        )
+        .map(|store| {
             NestedNodeModules::StoreEntries(StoreEntry::from_dirs(
                 Self::list_npm_store_entries_sync(&store, false),
             ))
@@ -3458,7 +3465,9 @@ impl NpmCrawler {
         // `node_modules` of its entries are not importers of their own.
         let stores: Vec<PathBuf> = results
             .iter()
-            .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+            .filter_map(|nm| {
+                relocated_yarn_pnpm_store_sync(crate::utils::repo_root::ReadScope::Workspace, nm)
+            })
             .filter_map(|store| std::fs::canonicalize(store).ok())
             .collect();
         if !stores.is_empty() {
@@ -4571,7 +4580,12 @@ async fn find_store_peer_variant_copies_reusing(
         let yarn_stores = run_walk(move || {
             projects
                 .iter()
-                .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+                .filter_map(|nm| {
+                    relocated_yarn_pnpm_store_sync(
+                        crate::utils::repo_root::ReadScope::Workspace,
+                        nm,
+                    )
+                })
                 .filter(|store| {
                     std::fs::canonicalize(store).is_ok_and(|real| canonical.starts_with(real))
                 })
@@ -8126,7 +8140,10 @@ mod tests {
             let member_nm = root.join("packages").join("a").join("node_modules");
             std::fs::create_dir_all(&member_nm).unwrap();
             assert_eq!(
-                relocated_yarn_pnpm_store_sync(&member_nm),
+                relocated_yarn_pnpm_store_sync(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &member_nm
+                ),
                 Some(store.clone()),
                 "{folder}: member"
             );
@@ -8138,7 +8155,8 @@ mod tests {
             .unwrap();
             std::fs::create_dir_all(root.join("../shared")).unwrap();
             assert!(
-                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                relocated_yarn_pnpm_store_sync(crate::utils::repo_root::ReadScope::Workspace, &nm)
+                    .is_none(),
                 "{folder}: outside the project"
             );
 
@@ -8149,7 +8167,8 @@ mod tests {
             )
             .unwrap();
             assert!(
-                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                relocated_yarn_pnpm_store_sync(crate::utils::repo_root::ReadScope::Workspace, &nm)
+                    .is_none(),
                 "{folder}: node-modules linker"
             );
         }

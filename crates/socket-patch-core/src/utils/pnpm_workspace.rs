@@ -798,9 +798,13 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
             // Above the repository root nothing is read, so the setting is
             // unknowable: fail closed, as if it were on, so writers refuse
             // rather than pin a lock pnpm may not read.
-            let readable = view
-                .disk_root()
-                .is_some_and(|root| crate::utils::repo_root::upward_readable(root, &file));
+            let readable = view.disk_root().is_some_and(|root| {
+                crate::utils::repo_root::upward_readable(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    root,
+                    &file,
+                )
+            });
             setting = if readable {
                 let workspace = read_regular_to_string(&file).await.ok();
                 let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
@@ -1005,7 +1009,11 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
     // Above the repository root the file is never read: fail closed, as a
     // member, like an unreadable one (callers do not read it either, see
     // [`crate::utils::repo_root::upward_readable`]).
-    if !crate::utils::repo_root::upward_readable(&canonical, &file) {
+    if !crate::utils::repo_root::upward_readable(
+        crate::utils::repo_root::ReadScope::Workspace,
+        &canonical,
+        &file,
+    ) {
         return Some(without_verbatim_prefix(file));
     }
     let rel: Vec<String> = canonical

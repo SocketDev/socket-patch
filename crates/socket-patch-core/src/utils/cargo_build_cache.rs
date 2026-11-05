@@ -44,8 +44,9 @@ pub struct Invalidation {
 }
 
 /// The project's build directories, reading the process environment.
-pub fn build_dirs(cwd: &Path) -> BuildDirs {
+pub fn build_dirs(scope: crate::utils::repo_root::ReadScope, cwd: &Path) -> BuildDirs {
     build_dirs_with(
+        scope,
         cwd,
         &|k| std::env::var(k).ok(),
         super::cargo_home::cargo_home().as_deref(),
@@ -54,6 +55,7 @@ pub fn build_dirs(cwd: &Path) -> BuildDirs {
 
 /// [`build_dirs`] with an injected environment and `CARGO_HOME`.
 pub fn build_dirs_with(
+    scope: crate::utils::repo_root::ReadScope,
     cwd: &Path,
     env: &dyn Fn(&str) -> Option<String>,
     cargo_home: Option<&Path>,
@@ -65,8 +67,8 @@ pub fn build_dirs_with(
         &std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
     );
     let env = |k: &str| env(k).filter(|v| !v.trim().is_empty());
-    let ws_root = workspace_root(cwd);
-    let config = ConfigDirs::read(cwd, cargo_home);
+    let ws_root = workspace_root(scope, cwd);
+    let config = ConfigDirs::read(scope, cwd, cargo_home);
 
     let mut candidates: Vec<PathBuf> = Vec::new();
     let mut unresolved = Vec::new();
@@ -126,8 +128,8 @@ fn expand_build_dir(raw: &str, ws_root: &Path, cargo_home: Option<&Path>) -> Opt
 ///
 /// Inside a git checkout neither walk leaves the repository root: a
 /// workspace above it is never read nor its build cache touched.
-fn workspace_root(cwd: &Path) -> PathBuf {
-    let bound = crate::utils::repo_root::upward_bound(cwd);
+fn workspace_root(scope: crate::utils::repo_root::ReadScope, cwd: &Path) -> PathBuf {
+    let bound = crate::utils::repo_root::upward_bound(scope, cwd);
     let within = |dir: &&Path| bound.as_ref().is_none_or(|b| b.contains(dir));
     for dir in cwd.ancestors().take_while(within) {
         if dir.join("Cargo.lock").is_file() {
@@ -160,9 +162,13 @@ struct ConfigDirs {
 }
 
 impl ConfigDirs {
-    fn read(cwd: &Path, cargo_home: Option<&Path>) -> Self {
+    fn read(
+        scope: crate::utils::repo_root::ReadScope,
+        cwd: &Path,
+        cargo_home: Option<&Path>,
+    ) -> Self {
         let mut out = ConfigDirs::default();
-        for (file, base) in config_layer_paths(cwd, cargo_home, |p| {
+        for (file, base) in config_layer_paths(scope, cwd, cargo_home, |p| {
             crate::utils::group_commit::exists(p).unwrap_or_else(|| p.is_file())
         }) {
             let text = crate::utils::fs::read_regular_to_string_sync(&file).ok();
@@ -314,6 +320,7 @@ pub const STALE_WARNING: &str = "cargo_build_cache_stale";
 /// `(code, detail)` for what could not be invalidated, each naming the
 /// `cargo clean -p` remedy.
 pub fn invalidate_project<'a>(
+    scope: crate::utils::repo_root::ReadScope,
     cwd: &Path,
     purls: impl IntoIterator<Item = &'a str>,
 ) -> Vec<(String, String)> {
@@ -327,7 +334,7 @@ pub fn invalidate_project<'a>(
     if names.is_empty() {
         return Vec::new();
     }
-    let dirs = build_dirs(cwd);
+    let dirs = build_dirs(scope, cwd);
     let inv = invalidate(&dirs.dirs, &names);
     let mut warnings = Vec::new();
     for (path, err) in &inv.failed {
@@ -378,9 +385,15 @@ mod tests {
         std::fs::write(outer.join("Cargo.lock"), "").unwrap();
         std::fs::write(outer.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::create_dir_all(outer.join("repo/.git")).unwrap();
-        assert_eq!(workspace_root(&app), app);
+        assert_eq!(
+            workspace_root(crate::utils::repo_root::ReadScope::Workspace, &app),
+            app
+        );
         std::fs::remove_dir(outer.join("repo/.git")).unwrap();
-        assert_eq!(workspace_root(&app), outer);
+        assert_eq!(
+            workspace_root(crate::utils::repo_root::ReadScope::Workspace, &app),
+            outer
+        );
     }
 
     fn mkfp(root: &Path, rel: &str) -> PathBuf {
@@ -463,7 +476,12 @@ mod tests {
             "[build]\ntarget-dir = \"modern\"\n",
         )
         .unwrap();
-        let d = build_dirs_with(&root, &|_| None, None);
+        let d = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &root,
+            &|_| None,
+            None,
+        );
         assert_eq!(
             d.dirs,
             vec![std::fs::canonicalize(root.join("legacy")).unwrap()]
@@ -498,9 +516,19 @@ mod tests {
         .unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::set_current_dir(&member).unwrap();
-        let from_member = build_dirs_with(Path::new("."), &|_| None, None);
+        let from_member = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            Path::new("."),
+            &|_| None,
+            None,
+        );
         std::env::set_current_dir(&left).unwrap();
-        let from_sibling = build_dirs_with(Path::new("../ws/member"), &|_| None, None);
+        let from_sibling = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            Path::new("../ws/member"),
+            &|_| None,
+            None,
+        );
         std::env::set_current_dir(prev).unwrap();
         let out = vec![std::fs::canonicalize(root.join("out")).unwrap()];
         assert_eq!(from_member.dirs, out);
@@ -516,7 +544,12 @@ mod tests {
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("Cargo.lock"), "").unwrap();
         let none = |_: &str| None;
-        let d = build_dirs_with(&member, &none, None);
+        let d = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &member,
+            &none,
+            None,
+        );
         let canon = |p: PathBuf| std::fs::canonicalize(p).unwrap();
         assert_eq!(
             d.dirs,
@@ -532,7 +565,12 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(root.join("bd")).unwrap();
-        let d = build_dirs_with(&member, &none, None);
+        let d = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &member,
+            &none,
+            None,
+        );
         assert_eq!(d.dirs[0], canon(root.join("out")));
         assert_eq!(d.dirs[1], canon(root.join("bd")));
 
@@ -541,7 +579,12 @@ mod tests {
         std::fs::create_dir_all(&ext).unwrap();
         let ext_s = ext.to_string_lossy().to_string();
         let env = move |k: &str| (k == "CARGO_TARGET_DIR").then(|| ext_s.clone());
-        let d = build_dirs_with(&member, &env, None);
+        let d = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &member,
+            &env,
+            None,
+        );
         assert_eq!(d.dirs[0], canon(ext.clone()));
 
         // An unresolvable template is reported.
@@ -550,7 +593,12 @@ mod tests {
             "[build]\nbuild-dir = \"{cargo-cache-home}/b/{workspace-path-hash}\"\n",
         )
         .unwrap();
-        let d = build_dirs_with(&member, &none, Some(t.path()));
+        let d = build_dirs_with(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &member,
+            &none,
+            Some(t.path()),
+        );
         assert_eq!(
             d.unresolved,
             vec!["{cargo-cache-home}/b/{workspace-path-hash}"]

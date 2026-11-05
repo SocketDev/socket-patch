@@ -63,9 +63,16 @@ pub enum GoWork {
 }
 
 /// The `go.work` go would use for `project_root`, reading `GOWORK` from
-/// the environment, then the `go env -w` file.
+/// the environment, then the `go env -w` file, in a workspace run.
 pub fn resolve(project_root: &Path) -> GoWork {
-    resolve_with(
+    resolve_in(crate::utils::repo_root::ReadScope::Workspace, project_root)
+}
+
+/// [`resolve`] in a `scope` run: a global run (the Go crawler's
+/// `--global`) is not bounded by the repository root.
+pub fn resolve_in(scope: crate::utils::repo_root::ReadScope, project_root: &Path) -> GoWork {
+    resolve_scoped(
+        scope,
         project_root,
         crate::utils::go_env::go_env("GOWORK").as_deref(),
     )
@@ -73,8 +80,20 @@ pub fn resolve(project_root: &Path) -> GoWork {
 
 /// [`resolve`] for an explicit `GOWORK` value.
 pub fn resolve_with(project_root: &Path, gowork: Option<&str>) -> GoWork {
+    resolve_scoped(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project_root,
+        gowork,
+    )
+}
+
+fn resolve_scoped(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+    gowork: Option<&str>,
+) -> GoWork {
     let bounded = |file: PathBuf| {
-        let bound = crate::utils::repo_root::ReadBoundary::of(project_root);
+        let bound = crate::utils::repo_root::ReadBoundary::of(scope, project_root);
         if bound.contains(&file) {
             GoWork::File(file)
         } else {
@@ -251,7 +270,10 @@ pub async fn load_with(project_root: &Path, gowork: Option<&str>) -> Loaded {
         GoWork::File(work_file) => {
             load_file(
                 work_file,
-                &crate::utils::repo_root::ReadBoundary::of(project_root),
+                &crate::utils::repo_root::ReadBoundary::of(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    project_root,
+                ),
             )
             .await
         }
@@ -673,7 +695,10 @@ impl GoWorkspace {
     /// [`GoWorkspace::read_graph`] against the module cache `cache`.
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
-        let bound = crate::utils::repo_root::ReadBoundary::of(self.work_dir());
+        let bound = crate::utils::repo_root::ReadBoundary::of(
+            crate::utils::repo_root::ReadScope::Workspace,
+            self.work_dir(),
+        );
         let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
         // go loads each member at its `workspace` level, which queues the
         // member's requirements at the member's own pruning.
@@ -1159,7 +1184,10 @@ pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
     }
     match load_file(
         root.join("go.work"),
-        &crate::utils::repo_root::ReadBoundary::of(root),
+        &crate::utils::repo_root::ReadBoundary::of(
+            crate::utils::repo_root::ReadScope::Workspace,
+            root,
+        ),
     )
     .await
     {

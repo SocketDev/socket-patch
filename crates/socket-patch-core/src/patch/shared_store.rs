@@ -343,7 +343,10 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
     else {
         return false;
     };
-    let Some(store) = crate::crawlers::pkg_managers::active_yarn_pnpm_store(project) else {
+    let Some(store) = crate::crawlers::pkg_managers::active_yarn_pnpm_store(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project,
+    ) else {
         return false;
     };
     let (Ok(store), Ok(project)) = (std::fs::canonicalize(store), std::fs::canonicalize(project))

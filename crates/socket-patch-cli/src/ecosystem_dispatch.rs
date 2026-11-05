@@ -1209,10 +1209,14 @@ impl JvmScope {
         let probe_env = env.clone();
         let probe = move || {
             let gate = m2_gate(&cwd, &probe_env);
-            let metadata = gradle_cache::build_roots(&cwd)
-                .into_iter()
-                .map(|root| root.join("gradle").join("verification-metadata.xml"))
-                .find(|p| p.is_file());
+            // A global run returned above: this is a project run.
+            let metadata = gradle_cache::build_roots(
+                socket_patch_core::utils::repo_root::ReadScope::Workspace,
+                &cwd,
+            )
+            .into_iter()
+            .map(|root| root.join("gradle").join("verification-metadata.xml"))
+            .find(|p| p.is_file());
             (gate, metadata)
         };
         // Script reads and stats: off the async workers.

@@ -1419,7 +1419,8 @@ pub(crate) async fn workspace_root_refusal(
     let root = tokio::fs::canonicalize(project_root)
         .await
         .unwrap_or_else(|_| project_root.to_path_buf());
-    let bound = crate::utils::repo_root::upward_bound(&root);
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, &root);
     for ancestor in root.ancestors().skip(1) {
         if ancestor.ends_with("target/package") {
             break;
@@ -1563,7 +1564,11 @@ async fn path_crate_version(base: &Path, rel: &str) -> Option<String> {
     };
     // A path outside the repository root is never read: its version is
     // unknown, so the patch may override the target and the caller refuses.
-    if !crate::utils::repo_root::upward_readable(base, &dir) {
+    if !crate::utils::repo_root::upward_readable(
+        crate::utils::repo_root::ReadScope::Workspace,
+        base,
+        &dir,
+    ) {
         return None;
     }
     let text = read_regular_to_string(&dir.join("Cargo.toml")).await.ok()?;
