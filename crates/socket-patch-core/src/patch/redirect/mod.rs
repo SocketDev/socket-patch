@@ -6758,9 +6758,16 @@ fn rewrite_uv_lock(
         .iter()
         .any(|(path, _)| is_pep751_lock_name(path))
         .then(|| pylock_uv_settings(files));
+    // The project settings' `exclude-newer`, which a `[[distribution]]`
+    // lock does not record (read once, as the unwind reads them).
+    let project_cutoff = distribution_project_cutoff(&pylock_uv_settings(files));
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
+        // The cutoff a uv lock records, which the unwind refuses to undo.
+        let lock_doc = (!is_pep751_lock_name(path))
+            .then(|| original.parse::<toml_edit::DocumentMut>().ok())
+            .flatten();
         let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
         // Pipenv installs the pylocks it reads, and reads no uv setting.
         let uv_pip_settings = pip_settings
@@ -6787,6 +6794,12 @@ fn rewrite_uv_lock(
                 });
                 continue;
             }
+            let lock_cutoff = lock_doc.as_ref().and_then(|doc| {
+                upstream::lock_cutoff(
+                    doc,
+                    &crate::crawlers::python_crawler::canonicalize_pypi_name(&dep.name),
+                )
+            });
             let plan = match planned {
                 Ok(Some(_)) if pipenv_reads => {
                     result
@@ -6795,21 +6808,35 @@ fn rewrite_uv_lock(
                     result.warnings.push(pipenv_pylock_refusal(path, dep));
                     continue;
                 }
-                Ok(Some(plan)) if plan.distribution_inline_artifacts() => {
-                    match distribution_project_cutoff(files) {
-                        Some(why) => {
-                            result
-                                .refused_python_lock_uuids
-                                .insert(dep.patch_uuid.clone());
-                            result.warnings.push(RewriteWarning {
-                                code: "redirect_uv_lock_unsupported".into(),
-                                detail: format!("{path}: {why}"),
-                            });
-                            continue;
-                        }
-                        None => plan,
-                    }
+                Ok(Some(_)) if lock_cutoff.is_some() => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_uv_lock_unsupported".into(),
+                        detail: format!(
+                            "{path}: the lock's `{}` option filters {}'s release files by \
+                             upload time, so rollback could not tell which files to restore; \
+                             re-lock without it to redirect this package",
+                            lock_cutoff.unwrap_or_default(),
+                            dep.name
+                        ),
+                    });
+                    continue;
                 }
+                Ok(Some(plan)) if plan.distribution_inline_artifacts() => match &project_cutoff {
+                    Some(why) => {
+                        result
+                            .refused_python_lock_uuids
+                            .insert(dep.patch_uuid.clone());
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_uv_lock_unsupported".into(),
+                            detail: format!("{path}: {why}"),
+                        });
+                        continue;
+                    }
+                    None => plan,
+                },
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {
@@ -6898,35 +6925,21 @@ fn rewrite_uv_lock(
 }
 
 /// Why a uv 0.2 `[[distribution]]` lock with inline artifacts may not be
-/// restorable once rewritten: the project's uv settings (`uv.toml`, else
-/// the pyproject's `[tool.uv]`, as uv reads them) set an `exclude-newer`
-/// cutoff, which uv 0.2.12–0.2.27 apply without recording it in the lock,
-/// so the unwind could not tell which release files it kept.
-fn distribution_project_cutoff(files: &BTreeMap<String, String>) -> Option<String> {
-    use crate::utils::python_script::UV_TOML;
-    let parse = |rel: &str| files.get(rel)?.parse::<toml_edit::DocumentMut>().ok();
-    let (file, key) = match parse(UV_TOML) {
-        Some(doc) => (
-            UV_TOML,
-            crate::utils::python_lock::sets_exclude_newer(doc.as_table())?.to_string(),
-        ),
-        None => {
-            let doc = parse("pyproject.toml")?;
-            let uv = doc
-                .get("tool")
-                .and_then(|t| t.get("uv"))
-                .and_then(toml_edit::Item::as_table_like)?;
-            (
-                "pyproject.toml",
-                crate::utils::python_lock::sets_exclude_newer(uv)?.to_string(),
-            )
-        }
-    };
-    Some(format!(
-        "{file} sets uv `{key}`, which uv 0.2.12–0.2.27 apply to a `[[distribution]]` lock \
-         without recording it, so rollback could not tell which release files the lock kept; \
-         re-lock with uv >=0.2.35"
-    ))
+/// restorable once rewritten: the project's uv settings (`settings`, as
+/// [`pylock_uv_settings`] finds them: `uv.toml`, else the pyproject's
+/// `[tool.uv]`, else the settings file above the root, as uv and the
+/// unwind read them) set an `exclude-newer` cutoff, which uv 0.2.12–0.2.27
+/// apply without recording it in the lock, so the unwind could not tell
+/// which release files it kept.
+fn distribution_project_cutoff(settings: &[(String, toml_edit::Table)]) -> Option<String> {
+    settings.iter().find_map(|(file, table)| {
+        let key = crate::utils::python_lock::sets_exclude_newer(table)?;
+        Some(format!(
+            "{file} sets uv `{key}`, which uv 0.2.12–0.2.27 apply to a `[[distribution]]` lock \
+             without recording it, so rollback could not tell which release files the lock \
+             kept; re-lock with uv >=0.2.35"
+        ))
+    })
 }
 
 // ── composer.lock ────────────────────────────────────────────────────────────
@@ -10120,6 +10133,61 @@ mod tests {
                 sha256: Some(sha256.into()),
                 ..Default::default()
             },
+        }
+    }
+
+    /// A uv lock that records an `exclude-newer` cutoff for the package
+    /// (globally under `[options]` or at the top level, or per package) is
+    /// never wired: the unwind refuses to undo such a pin, so hosted must
+    /// not write one. A package the per-package table exempts is wired.
+    #[test]
+    fn uv_lock_recording_a_cutoff_is_not_wired() {
+        const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let dep = pypi_override(
+            "six",
+            "1.16.0",
+            "https://patch.test/six-1.16.0-py2.py3-none-any.whl",
+            &"c".repeat(64),
+        );
+        let lock = |head: &str| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "uv.lock".to_string(),
+                format!("version = 1\nrequires-python = \">=3.9\"\n{head}\n{SIX}"),
+            );
+            rewrite_registry_redirect(&files, std::slice::from_ref(&dep))
+        };
+        for head in [
+            "\n[options]\nexclude-newer = \"2024-06-01T00:00:00Z\"\n",
+            "exclude-newer = \"2024-06-01 00:00:00 UTC\"\n",
+            "\n[options]\nexclude-newer-package = { six = \"2024-06-01T00:00:00Z\" }\n",
+        ] {
+            let r = lock(head);
+            assert!(r.files.is_empty(), "{head}: {:?}", r.files);
+            assert!(
+                r.refused_python_lock_uuids.contains(&dep.patch_uuid),
+                "{head}"
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_uv_lock_unsupported"
+                        && w.detail.contains("exclude-newer")),
+                "{head}: {:?}",
+                r.warnings
+            );
+        }
+        for head in [
+            "",
+            "\n[options]\nexclude-newer = \"2024-06-01T00:00:00Z\"\nexclude-newer-package = { six = false }\n",
+            "\n[options]\nexclude-newer-package = { other = \"2024-06-01T00:00:00Z\" }\n",
+        ] {
+            let r = lock(head);
+            assert!(
+                r.files.get("uv.lock").is_some_and(|l| l.contains("patch.test")),
+                "{head}: {:?}",
+                r.warnings
+            );
         }
     }
 

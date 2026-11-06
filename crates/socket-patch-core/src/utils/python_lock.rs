@@ -931,6 +931,21 @@ fn plan_python_lock_rewrite(
     // `wheels = [ … ]` instead of the `[distribution.sdist]` /
     // `[[distribution.wheel]]` tables of uv ≤0.2.5.
     let legacy_artifact_tables = legacy && distribution_artifact_tables(packages, index);
+    if !pep751
+        && !original_source.as_ref().is_some_and(|source| {
+            source_identity(source).is_some_and(|(kind, value)| {
+                kind != "legacy"
+                    || value.starts_with("registry+")
+                    || value.starts_with("direct+")
+                    || value.starts_with("path+")
+            })
+        })
+    {
+        return Ok(None);
+    }
+    if pep751 && (package.contains_key("vcs") || package.contains_key("directory")) {
+        return Ok(None);
+    }
     // uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
     // `dependencies`, 0.2.23–0.2.34 after them. The rewrite drops the sdist,
     // so the unwind can put it back only where another registry entry shows
@@ -948,21 +963,6 @@ fn plan_python_lock_rewrite(
              differently, so rollback could not restore {name}=={version}'s entry; re-lock \
              with uv >=0.2.35"
         ));
-    }
-    if !pep751
-        && !original_source.as_ref().is_some_and(|source| {
-            source_identity(source).is_some_and(|(kind, value)| {
-                kind != "legacy"
-                    || value.starts_with("registry+")
-                    || value.starts_with("direct+")
-                    || value.starts_with("path+")
-            })
-        })
-    {
-        return Ok(None);
-    }
-    if pep751 && (package.contains_key("vcs") || package.contains_key("directory")) {
-        return Ok(None);
     }
     // An entry resolved from a direct URL (uv.lock `source = { url }`, a
     // pylock `archive = { url }`) is the user's own source choice unless it
@@ -1265,6 +1265,21 @@ pub fn paired_metadata_path(lock: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry the rewrite does not apply to (a non-registry, non-direct
+    /// string source) is not applicable, not refused: the sdist-order
+    /// refusal only judges entries the rewrite would change.
+    #[test]
+    fn a_not_applicable_distribution_entry_is_not_refused_for_its_sdist() {
+        let lock = "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nsource = \"git+https://github.com/urllib3/urllib3?rev=1.26.18#abc\"\nsdist = { url = \"https://example.test/urllib3-1.26.18.tar.gz\", hash = \"sha256:aa\" }\ndependencies = [{ name = \"idna\" }]\n";
+        let session = PythonLockSession::new(lock);
+        let planned = session.plan(
+            "urllib3",
+            "1.26.18",
+            ArtifactSource::Url("https://patch.test/urllib3-1.26.18-py3-none-any.whl"),
+        );
+        assert!(matches!(planned, Ok(None)), "{:?}", planned.err());
+    }
 
     /// `exclude-newer-package` names packages (or exempts them with `false`);
     /// uv 0.2 ignores it, so it is not the global cutoff that blocks a

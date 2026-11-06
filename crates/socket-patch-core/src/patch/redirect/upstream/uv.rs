@@ -355,28 +355,8 @@ async fn restore_lock(
     if !version_ok {
         return refuse_hits(result, "unsupported lock version");
     }
-    let options = doc.get("options").and_then(Item::as_table_like);
-    // uv 0.2.28–0.2.33 record the cutoff at the lock's top level, later
-    // releases under `[options]`.
-    let global_cutoff = options
-        .into_iter()
-        .chain(Some(doc.as_table() as &dyn TableLike))
-        .find_map(|t| {
-            t.iter()
-                .map(|(k, _)| k)
-                .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
-        });
-    // A per-package cutoff (#1604) filters only the packages it names, and
-    // one of `false` exempts its package from the global cutoff.
-    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
     for hit in &hits {
-        let key = if cutoffs.is_some_and(|c| names_package(c, &hit.name)) {
-            "exclude-newer-package"
-        } else if let Some(key) =
-            global_cutoff.filter(|_| !cutoffs.is_some_and(|c| exempts(c, &hit.name)))
-        {
-            key
-        } else {
+        let Some(key) = lock_cutoff(&doc, &hit.name) else {
             continue;
         };
         result.refuse(
@@ -955,6 +935,26 @@ fn names_package(item: &Item, name: &str) -> bool {
             .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
         _ => false,
     }
+}
+
+/// The `exclude-newer` option uv recorded in lock `doc` that filters
+/// canonical package `name`'s release files by upload time, if any: a
+/// per-package `exclude-newer-package` naming it (#1604), else a global
+/// cutoff it is not exempted from. uv 0.2.28–0.2.33 record the global
+/// cutoff at the lock's top level, later releases under `[options]`. The
+/// unwind cannot tell which files such a cutoff kept, so it refuses the
+/// pin, and the hosted rewrite refuses to write one it could not unwind.
+pub(crate) fn lock_cutoff<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a str> {
+    let options = doc.get("options").and_then(Item::as_table_like);
+    let global = options
+        .into_iter()
+        .chain(Some(doc.as_table() as &dyn TableLike))
+        .find_map(crate::utils::python_lock::sets_exclude_newer);
+    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
+    if cutoffs.is_some_and(|c| names_package(c, name)) {
+        return Some("exclude-newer-package");
+    }
+    global.filter(|_| !cutoffs.is_some_and(|c| exempts(c, name)))
 }
 
 /// Whether a per-package cutoff table exempts `name` from the global

@@ -2364,6 +2364,35 @@ async fn uv_distribution_exclude_newer_is_refused() {
         );
         assert_eq!(hosted(&project, &[urllib3_dep()], None), project);
 
+        // The same cutoff from the settings file above the root (uv reads
+        // it, and so does the unwind), or recorded in the lock itself.
+        let plain = uv_02_project(version);
+        let mut ancestor = plain.clone();
+        ancestor.insert(
+            socket_patch_core::patch::redirect::UV_ANCESTOR_CONFIG_KEY.into(),
+            "../uv.toml\nexclude-newer = \"2024-06-01\"\n".into(),
+        );
+        let mut recorded = plain.clone();
+        recorded.insert(
+            "uv.lock".into(),
+            plain["uv.lock"].replacen(
+                "requires-python = \">=3.9\"\n",
+                "requires-python = \">=3.9\"\nexclude-newer = \"2024-06-01 00:00:00 UTC\"\n",
+                1,
+            ),
+        );
+        for (label, input) in [("ancestor", &ancestor), ("recorded", &recorded)] {
+            let warnings = hosted_warnings(input, &[urllib3_dep()]);
+            assert!(
+                warnings
+                    .iter()
+                    .any(|(code, detail)| code == "redirect_uv_lock_unsupported"
+                        && detail.contains("exclude-newer")),
+                "uv {version} {label}: {warnings:?}"
+            );
+            assert_eq!(&hosted(input, &[urllib3_dep()], None), input, "{label}");
+        }
+
         // Pins wired before the setting appeared.
         let project = uv_02_project(version);
         let opts = RestoreOptions::default();
@@ -2908,8 +2937,25 @@ async fn uv_refusals() {
             "requires-python = \">=3.8\"\n",
             "requires-python = \">=3.8\"\n\n[options]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
         );
-        let input = tree(&[("uv.lock", newer)]);
-        let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+        // The hosted rewrite refuses to wire such a lock; one wired before
+        // the cutoff was recorded comes back to the restore.
+        let input = tree(&[("uv.lock", newer.clone())]);
+        assert_eq!(hosted(&input, &[urllib3_dep()], None), input);
+        let input = tree(&[("uv.lock", direct.clone())]);
+        let (why, _, _) = pypi_refusal_after(
+            &input,
+            &[urllib3_dep()],
+            &RestoreOptions::default(),
+            |files| {
+                let lock = files["uv.lock"].replacen(
+                    "requires-python = \">=3.8\"\n",
+                    "requires-python = \">=3.8\"\n\n[options]\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+                    1,
+                );
+                files.insert("uv.lock".into(), lock);
+            },
+        )
+        .await;
         assert!(why.contains("exclude-newer"), "{why}");
         // Offline.
         let input = tree(&[("uv.lock", direct.clone())]);
@@ -2979,9 +3025,28 @@ async fn uv_exclude_newer_package_refuses_only_its_package() {
             // Exempting another package leaves the global cutoff on urllib3.
             "exclude-newer = \"2024-01-01T00:00:00Z\"\n\n[options.exclude-newer-package]\nidna = false\n",
         ] {
+            // The hosted rewrite refuses to wire it; a pin wired before
+            // the cutoff was recorded comes back to the restore.
             let input = input_with(options);
-            let (why, rewritten, after) =
-                pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
+            assert_eq!(
+                hosted(&input, &[urllib3_dep()], None),
+                input,
+                "{rel} {options}"
+            );
+            let (why, rewritten, after) = pypi_refusal_after(
+                &input_with(""),
+                &[urllib3_dep()],
+                &RestoreOptions::default(),
+                |files| {
+                    let lock = files[*rel].replacen(
+                        "[options]\n\n",
+                        &format!("[options]\n\n{options}"),
+                        1,
+                    );
+                    files.insert(rel.to_string(), lock);
+                },
+            )
+            .await;
             assert_eq!(after, rewritten, "{rel} {options}: the lock stays hosted");
             assert!(why.contains("exclude-newer"), "{rel} {options}: {why}");
         }

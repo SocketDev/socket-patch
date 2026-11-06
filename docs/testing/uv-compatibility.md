@@ -64,9 +64,10 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   (`rollback`, `remove`, and `scan` dropping a pin) restores the registry
   entry in the shape the entry itself carries. Measured with real binaries
   (macOS arm64, CPython 3.11): every release from 0.1.45 to 0.2.34 records
-  each file of a release on every platform (a release between 0.2.19 and 0.2.25 began dropping
-  wheels `requires-python` excludes), so a pure-Python 3 release is
-  re-derivable. uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
+  each file of a release that the project's `requires-python` admits, on
+  every platform (releases up to somewhere between 0.2.19 and 0.2.25 record
+  every wheel; later ones drop the wheels `requires-python` excludes), so a
+  pure-Python 3 release is re-derivable. uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
   `dependencies` and 0.2.23–0.2.34 after them, which only another registry
   entry carrying both shows. `uv lock` takes no `exclude-newer` through
   0.2.5, takes `--exclude-newer` from 0.2.6, and from 0.2.12 also
