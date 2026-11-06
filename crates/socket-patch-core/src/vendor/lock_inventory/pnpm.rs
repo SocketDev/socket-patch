@@ -11,13 +11,15 @@ use super::LockfileEntry;
 
 // ── file selection ──
 
-/// Whether the project is a Rush monorepo: a `rush.json` at the root,
-/// probed through the view without following links (a dangling link or,
-/// in memory, an implied directory counts). The one gate lockfile
-/// discovery and every lock-inventory reader share, so they agree on which
-/// locks a Rush project installs from.
+/// Whether the project is a Rush monorepo: a regular `rush.json` file at
+/// the root, probed through the view (on disk a link to a file counts; a
+/// dangling link, a directory or, in memory, an implied directory does
+/// not, since Rush cannot load any of them). The one gate hosted mode,
+/// the vendor flavor probe, lockfile discovery and every lock-inventory
+/// reader share, so they agree on which locks a Rush project installs
+/// from. Hosted mode's gate is the ground truth it was taken from.
 pub(crate) async fn is_rush(view: ProjectView<'_>) -> bool {
-    view.exists_no_follow("rush.json").await
+    view.is_file("rush.json")
 }
 
 /// A Rush monorepo's pnpm locks, root-relative, in lockfile discovery's

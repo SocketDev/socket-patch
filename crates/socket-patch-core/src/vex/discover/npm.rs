@@ -3942,6 +3942,28 @@ packages:
         );
     }
 
+    /// Discovery's Rush gate is hosted mode's: a dangling `rush.json` link
+    /// is not a Rush monorepo (Rush cannot load it, and hosted never pins
+    /// Rush's locks there), so the common lock is not attested.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pnpm_rush_gate_ignores_a_dangling_rush_json() {
+        let common = hosted_rewrite(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n",
+            &[pnpm_override("ms", UUID_A, None)],
+        );
+        let p = Project::new();
+        p.write("common/config/rush/pnpm-lock.yaml", &common);
+        std::os::unix::fs::symlink("missing.json", p.root().join("rush.json")).unwrap();
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        std::fs::remove_file(p.root().join("rush.json")).unwrap();
+        p.write("rush.json", "{}");
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:npm/ms@1.3.0", UUID_A, WiringMode::Hosted)]);
+    }
+
     /// Rush without subspaces reads the common lock alone; a subspace dir
     /// whose name is not a safe path segment is never read.
     #[tokio::test]

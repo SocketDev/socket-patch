@@ -882,26 +882,41 @@ async fn rush_gate_keeps_the_recording_reusable() {
     assert!(!reads.is_empty());
 }
 
-/// A dangling rush.json symlink is Rush to discovery's lstat, so it is to
-/// the inventory too.
+/// A dangling rush.json symlink is not Rush (Rush cannot load it): hosted
+/// mode's gate, which discovery and the inventory share.
 #[cfg(unix)]
 #[tokio::test]
-async fn rush_gate_counts_a_dangling_symlink() {
+async fn rush_gate_ignores_a_dangling_symlink() {
     let tmp = tempfile::tempdir().unwrap();
     write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
     std::os::unix::fs::symlink("missing.json", tmp.path().join("rush.json")).unwrap();
+    assert!(!super::pnpm::is_rush(ProjectView::Disk(tmp.path())).await);
     let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
-    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
 }
 
-/// An implied in-memory directory named rush.json counts as discovery
-/// counts it.
+/// An implied in-memory directory named rush.json is not Rush either; a
+/// link to a regular rush.json is.
 #[tokio::test]
-async fn rush_gate_counts_a_memory_implied_dir() {
+async fn rush_gate_ignores_a_memory_implied_dir() {
     let mut project = MemoryProject::new();
     project.insert_present("rush.json/placeholder");
     project.insert_text(RUSH_COMMON_LOCK, PNPM_LOCK);
+    assert!(!super::pnpm::is_rush(ProjectView::Memory(&project)).await);
     let names = npm_inventory_names(&ProjectView::Memory(&project)).await;
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// On disk a symlink to a regular rush.json counts, as hosted's
+/// `is_file` gate always counted it.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_gate_counts_a_link_to_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "real-rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    std::os::unix::fs::symlink("real-rush.json", tmp.path().join("rush.json")).unwrap();
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
     assert!(names.contains(&"left-pad".to_string()), "{names:?}");
 }
 
@@ -921,7 +936,15 @@ async fn rush_member_locks_gate_matches_discovery() {
             .is_empty(),
         "the fixture must list a member lock without rush.json"
     );
+    // An implied directory named rush.json is not Rush: members still count.
     project.insert_present("rush.json/placeholder");
+    let view = ProjectView::Memory(&project);
+    assert!(!super::pnpm::inventory_pnpm_member_locks_in(&view)
+        .await
+        .is_empty());
+    let mut project = project.clone();
+    project.remove("rush.json/placeholder");
+    project.insert_text("rush.json", RUSH_JSON);
     let view = ProjectView::Memory(&project);
     let members = super::pnpm::inventory_pnpm_member_locks_in(&view).await;
     assert!(members.is_empty(), "{members:?}");
