@@ -1666,7 +1666,6 @@ impl<'a> DiscoverCtx<'a> {
         }
     }
 
-    /// Log a guarded read of `rel` ([`Discovery::read`]).
     /// Account for `text`, which a walk through [`Self::view`] read from
     /// `rel` on this ctx's behalf, exactly as [`Self::read_text`] accounts
     /// for its own reads (rule 11 recognition and the read log).
@@ -1675,6 +1674,7 @@ impl<'a> DiscoverCtx<'a> {
         self.recognize_text(rel, text);
     }
 
+    /// Log a guarded read of `rel` ([`Discovery::read`]).
     fn log_read(&self, rel: &str, readable: bool) {
         self.read
             .lock()
@@ -2933,12 +2933,21 @@ impl RecordLiveness {
 /// ([`crate::patch::redirect::hosted_patch_uuid`]'s grammar — no userinfo,
 /// the last canonical-uuid path segment — with the url's origin taken as
 /// configured): what a lock entry on an origin this run was not given
-/// claims to resolve from.
+/// claims to resolve from. Only a url in a Socket patch server's path
+/// shape (a `patch`, `patch-registry` or `gopatch` segment) counts: any
+/// other url merely ending in the uuid (an artifact store's blob path)
+/// resolves from elsewhere.
 fn foreign_hosted_uuid(url: &str) -> Option<String> {
     // Normalized the way `hosted_patch_uuid` reads it, so an escaped,
     // percent-encoded or `sparse+` url still yields its origin.
     let normalized = crate::patch::redirect::normalized_hosted_url(url)?;
     let parsed = reqwest::Url::parse(&normalized).ok()?;
+    if !parsed
+        .path_segments()?
+        .any(|s| matches!(s, "patch" | "patch-registry" | "gopatch"))
+    {
+        return None;
+    }
     let origin = parsed.origin().ascii_serialization();
     crate::patch::redirect::hosted_patch_uuid(url, &[origin])
 }
@@ -3637,6 +3646,14 @@ mod tests {
             format!("registry+https://mirror.example/patch/{U}/"),
         ] {
             assert_eq!(foreign_hosted_uuid(&url).as_deref(), Some(U), "{url}");
+        }
+        // Review on #2012 (round 2): a url merely ending in the uuid is not
+        // a patch server's.
+        for url in [
+            format!("https://artifacts.corp/blobs/{U}/x-1.0.0.tgz"),
+            format!("https://evil.example/{U}/x.tgz"),
+        ] {
+            assert_eq!(foreign_hosted_uuid(&url), None, "{url}");
         }
     }
 

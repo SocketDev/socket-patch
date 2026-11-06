@@ -7642,12 +7642,6 @@ pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> 
     hosted_patch_url_uuids(url, extra_origins)?.pop()
 }
 
-/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
-/// (the grant token first when it is uuid-shaped, the patch uuid last), or
-/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
-/// exact acceptance rules, without electing one segment. `vex` discovery
-/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
-/// the malformed or rejected shapes whose "last uuid" is not a patch.
 /// `url` normalized the way [`hosted_patch_url_uuids`] reads it: `\/`
 /// unescaped, a percent-encoded `http(s)://` url decoded, and a Cargo
 /// `sparse+` / `registry+` source prefix stripped. `None` without a
@@ -7672,6 +7666,12 @@ pub(crate) fn normalized_hosted_url(url: &str) -> Option<String> {
     })
 }
 
+/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
+/// (the grant token first when it is uuid-shaped, the patch uuid last), or
+/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
+/// exact acceptance rules, without electing one segment. `vex` discovery
+/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
+/// the malformed or rejected shapes whose "last uuid" is not a patch.
 pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
     use crate::patch::path_safety::is_canonical_uuid;
     use crate::utils::purl::percent_decode_purl_component;

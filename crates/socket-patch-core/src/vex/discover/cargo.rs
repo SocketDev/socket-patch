@@ -156,7 +156,12 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // hosted rewriter pins a crate in (each that declares it).
     let mut manifests: Vec<(String, DocumentMut)> = Vec::new();
     if let Some(doc) = root {
-        let root_pins = manifest_has_socket_pin(&doc);
+        // Any Socket pin the root or the config carries, a `[patch]`
+        // entry included: members may hold the declarations it governs.
+        let root_pins = doc.to_string().contains(PIN_NAME_PREFIX)
+            || config
+                .as_ref()
+                .is_some_and(|c| c.1.to_string().contains(PIN_NAME_PREFIX));
         manifests.push((CARGO_TOML.to_string(), doc));
         manifests.extend(read_members(ctx, &lock, root_pins, out).await);
     }
@@ -337,30 +342,26 @@ async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Op
 /// not a declaration — or a build `target/`). Unparseable ones are skipped
 /// (diagnosed).
 ///
-/// Members only ever decide about Socket wiring, so the walk is skipped
-/// when there is none they could decide about: a parsed lock with no
-/// Socket-sourced package, or an unparseable one (no ref either way). With
-/// no lock, a member matters only when some manifest carries a
-/// `socket-patch-` pin (a lockless pin, [`UnlockedPin`]); the walk has the
-/// texts, so the parse is skipped otherwise.
+/// Members only ever decide about Socket wiring, so they are parsed only
+/// when there is some they could decide about: a lock with a
+/// Socket-sourced package, or a `socket-patch-` name in a member's own
+/// text, the root's or the config's (a pin to diagnose or recognize, a
+/// `[patch]` entry members declare, a lockless pin, [`UnlockedPin`]),
+/// whatever the lock says (stale, unparseable or absent).
 async fn read_members(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
     root_pins: bool,
     out: &mut Discovery,
 ) -> Vec<(String, DocumentMut)> {
-    let lockless = match lock {
-        Lock::Parsed(_) if has_socket_sourced(ctx, lock) => false,
-        Lock::Parsed(_) | Lock::Unparseable => return Vec::new(),
-        Lock::Absent => true,
-    };
+    let socket_sourced = matches!(lock, Lock::Parsed(_)) && has_socket_sourced(ctx, lock);
     let texts: Vec<(String, String)> =
         crate::utils::cargo_workspace::member_manifest_texts_in(&ctx.view)
             .await
             .into_iter()
             .filter(|(rel, _)| crate::patch::redirect::is_cargo_member_manifest_key(rel))
             .collect();
-    if lockless && !root_pins && !texts.iter().any(|(_, t)| t.contains(PIN_NAME_PREFIX)) {
+    if !socket_sourced && !root_pins && !texts.iter().any(|(_, t)| t.contains(PIN_NAME_PREFIX)) {
         return Vec::new();
     }
     let mut members = Vec::new();
@@ -371,16 +372,6 @@ async fn read_members(
         }
     }
     members
-}
-
-/// Whether some dependency declaration of `doc` names a `socket-patch-`
-/// registry.
-fn manifest_has_socket_pin(doc: &DocumentMut) -> bool {
-    dependency_entries(doc).iter().any(|d| {
-        d.registry
-            .as_deref()
-            .is_some_and(|r| r.trim().starts_with(PIN_NAME_PREFIX))
-    })
 }
 
 /// Whether the lock resolves some package from a Socket patch server.
@@ -1843,6 +1834,24 @@ mod tests {
         let p = Project::new();
         workspace_with_member(&p, &pinned("serde", "1", UUID_A));
         assert!(member_read(&p.discover().await));
+        // Review on #2012 (round 2): a stale crates.io lock beside a member
+        // pin still reads the member, so the pin is diagnosed (a stale lock
+        // or a server outside the allowlist) and its uuid recognized.
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_A));
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(CRATES_IO), Some(CKSUM))]),
+        );
+        let out = p.discover().await;
+        assert!(member_read(&out));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     /// A rotated grant token in the definition is the same patch.
