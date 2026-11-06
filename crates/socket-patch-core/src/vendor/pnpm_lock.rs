@@ -74,12 +74,12 @@ use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
 use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
-use crate::constants::npm_family::PNPM_LOCK;
+use crate::constants::npm_family::{PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::pnpm::lines::{
     indent_of, next_block, parse_key_line, section_bounds, split_lines, split_project_document,
     unquote_value, yaml_key, yaml_key_like, YamlBlock,
 };
-use crate::formats::pnpm::plan::{match_key, KeyMatch, Target};
+use crate::formats::pnpm::plan::{governing_pnpm_lock, match_key, KeyMatch, Target};
 use crate::formats::pnpm::sniff_lock_grammar;
 use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{vendored_npm_uuids, PnpmLockGrammar};
@@ -577,12 +577,23 @@ async fn read_project(
             )));
         }
     };
-    if let Some(refusal) = git_branch_lock_refusal(
-        &crate::vendor::lock_inventory::ProjectView::Disk(project_root),
-    )
-    .await
-    {
+    let view = crate::vendor::lock_inventory::ProjectView::Disk(project_root);
+    if let Some(refusal) = git_branch_lock_refusal(&view).await {
         return Err(Box::new(refused(refusal.0, refusal.1)));
+    }
+    // pnpm 1 / 2 read only `shrinkwrap.yaml`, whose grammar the rekey has no
+    // fixture for: there `pnpm-lock.yaml` is stray, and wiring it would
+    // patch nothing pnpm installs (N11, the choice hosted and discovery make).
+    let shrinkwrap = view.exists_no_follow(PNPM_SHRINKWRAP_LEGACY).await;
+    let pinned = crate::utils::pnpm_workspace::pinned_pnpm_major_in(&view).await;
+    if governing_pnpm_lock(true, shrinkwrap, pinned) == Some(PNPM_SHRINKWRAP_LEGACY) {
+        let why = "the project pins pnpm 1 / 2, which installs from shrinkwrap.yaml and ignores \
+                   pnpm-lock.yaml; vendored mode does not write that grammar — upgrade pnpm \
+                   and re-lock, or use `--mode hosted`";
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            why,
+        )));
     }
     let (lock_text, lock_eol) = read_pnpm_text(project_root, PNPM_LOCK)
         .await
@@ -687,49 +698,34 @@ async fn read_project(
     })
 }
 
-/// A pnpm file mixing CRLF and LF (see [`read_pnpm_text`]).
-#[derive(Debug)]
-struct MixedEndings(&'static str);
-
-impl std::fmt::Display for MixedEndings {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{} mixes CRLF and LF line endings, which this rewriter cannot write back \
-             byte-faithfully — normalize the file to one line ending and retry",
-            self.0
-        )
-    }
-}
-
-impl std::error::Error for MixedEndings {}
-
 /// Read `file` under `root` as every vendored pnpm reader does (vendoring,
 /// its pre-flight and the revert): its text with LF line endings, and the
 /// endings it is written back with. A CRLF file (a Windows autocrlf
 /// checkout) is edited like its LF twin and written back CRLF, as hosted
 /// mode's byte splices keep it (divergences N15). A file that mixes endings
-/// is an error ([`is_mixed`]): no one ending writes it back byte-faithfully,
-/// so vendoring refuses it and the revert fails before any write.
-async fn read_pnpm_text(root: &Path, file: &'static str) -> std::io::Result<(String, LineEndings)> {
+/// is an `Unsupported` error, which no read of a regular file returns: no
+/// one ending writes it back byte-faithfully, so vendoring refuses it and
+/// the revert fails before any write.
+async fn read_pnpm_text(root: &Path, file: &str) -> std::io::Result<(String, LineEndings)> {
     let text = read_regular_to_string(&root.join(file)).await?;
     match LineEndings::of(&text) {
-        LineEndings::Mixed => Err(std::io::Error::other(MixedEndings(file))),
+        LineEndings::Mixed => Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "{file} mixes CRLF and LF line endings, which this rewriter cannot write back \
+                 byte-faithfully — normalize the file to one line ending and retry"
+            ),
+        )),
         LineEndings::Crlf => Ok((text.replace("\r\n", "\n"), LineEndings::Crlf)),
         eol => Ok((text, eol)),
     }
-}
-
-/// Whether a [`read_pnpm_text`] error is a mixed-ending file.
-fn is_mixed(e: &std::io::Error) -> bool {
-    e.get_ref().is_some_and(|inner| inner.is::<MixedEndings>())
 }
 
 /// The vendoring refusal for a [`read_pnpm_text`] error other than a
 /// missing file: `vendor_lockfile_crlf_unsupported` for mixed endings, else
 /// `vendor_lockfile_missing` with `remedy`.
 fn read_refusal(file: &str, e: std::io::Error, remedy: &str) -> Box<VendorOutcome> {
-    Box::new(match is_mixed(&e) {
+    Box::new(match e.kind() == std::io::ErrorKind::Unsupported {
         true => refused("vendor_lockfile_crlf_unsupported", e.to_string()),
         false => refused(
             "vendor_lockfile_missing",
@@ -1018,7 +1014,7 @@ pub(super) async fn revert_pnpm_dialect(
         .flatten()
         .filter_map(|r| r.as_ref().err())
     {
-        if is_mixed(e) {
+        if e.kind() == std::io::ErrorKind::Unsupported {
             return RevertOutcome::failed(format!("{e}; nothing was reverted"));
         }
     }
@@ -6041,6 +6037,38 @@ snapshots:
     /// project lock.
     fn two_doc(env: &str, project: &str) -> String {
         format!("---\n{env}\n---\n{project}")
+    }
+
+    /// N11: a project that pins pnpm 1 / 2 installs from `shrinkwrap.yaml`,
+    /// so its `pnpm-lock.yaml` is stray. Vendoring refuses it, with nothing
+    /// written, instead of wiring a lock pnpm never reads, which is the
+    /// choice hosted mode and discovery make (`plan::governing_pnpm_lock`).
+    /// With no pin, the `pnpm-lock.yaml` governs and is vendored as before.
+    #[tokio::test]
+    async fn a_pnpm_2_pin_beside_a_shrinkwrap_refuses() {
+        let shrinkwrap = "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9\n";
+        let pinned = P1_BEFORE_PKG.replacen('{', "{\n  \"packageManager\": \"pnpm@2.25.7\",", 1);
+        let fx = fixture_with(&pinned, P1_BEFORE_LOCK).await;
+        tokio::fs::write(fx.root().join("shrinkwrap.yaml"), shrinkwrap)
+            .await
+            .unwrap();
+        let detail = expect_refused(
+            fx.vendor(false).await,
+            "vendor_lockfile_version_unsupported",
+        );
+        assert!(
+            detail.contains("pnpm 1 / 2") && detail.contains("shrinkwrap.yaml"),
+            "{detail}"
+        );
+        assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "lock untouched");
+        assert_eq!(fx.read(PACKAGE_JSON).await, pinned, "pkg untouched");
+        assert!(!fx.root().join(".socket/vendor").exists());
+
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        tokio::fs::write(fx.root().join("shrinkwrap.yaml"), shrinkwrap)
+            .await
+            .unwrap();
+        assert!(matches!(fx.vendor(false).await, VendorOutcome::Done { .. }));
     }
 
     /// N15 on pnpm 11's two-document lock: vendored, then checked out with
