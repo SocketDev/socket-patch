@@ -93,7 +93,7 @@ fn resolve_scoped(
     gowork: Option<&str>,
 ) -> GoWork {
     let bounded = |file: PathBuf| {
-        let bound = crate::utils::repo_root::ReadBoundary::of(scope, project_root);
+        let bound = crate::utils::repo_root::ReadBoundary::upward(scope, project_root);
         if bound.contains(&file) {
             GoWork::File(file)
         } else {
@@ -270,7 +270,7 @@ pub async fn load_with(project_root: &Path, gowork: Option<&str>) -> Loaded {
         GoWork::File(work_file) => {
             load_file(
                 work_file,
-                &crate::utils::repo_root::ReadBoundary::of(
+                &crate::utils::repo_root::ReadBoundary::upward(
                     crate::utils::repo_root::ReadScope::Workspace,
                     project_root,
                 ),
@@ -695,7 +695,7 @@ impl GoWorkspace {
     /// [`GoWorkspace::read_graph`] against the module cache `cache`.
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
-        let bound = crate::utils::repo_root::ReadBoundary::of(
+        let bound = crate::utils::repo_root::ReadBoundary::upward(
             crate::utils::repo_root::ReadScope::Workspace,
             self.work_dir(),
         );
@@ -1184,7 +1184,7 @@ pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
     }
     match load_file(
         root.join("go.work"),
-        &crate::utils::repo_root::ReadBoundary::of(
+        &crate::utils::repo_root::ReadBoundary::upward(
             crate::utils::repo_root::ReadScope::Workspace,
             root,
         ),
@@ -1311,8 +1311,6 @@ mod tests {
     #[test]
     fn gowork_resolves_as_go_does() {
         let tmp = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let project = tmp.path().join("ws").join("app");
         std::fs::create_dir_all(&project).unwrap();
         for unset in [None, Some(""), Some("auto")] {
@@ -1375,9 +1373,12 @@ mod tests {
             resolve_with(&project, Some(&elsewhere)),
             GoWork::Invalid(why) if why.contains("outside the repository root")
         ));
-        // Without a repository the project itself is the root.
+        // Without a checkout the lookup walks on as before.
         std::fs::remove_dir(repo.join(".git")).unwrap();
-        assert!(matches!(resolve_with(&project, None), GoWork::Invalid(_)));
+        assert_eq!(
+            resolve_with(&project, None),
+            GoWork::File(tmp.path().join("go.work"))
+        );
         std::fs::create_dir_all(repo.join(".git")).unwrap();
 
         // The repository's own go.work: a member outside it, and a replace
@@ -1416,8 +1417,6 @@ mod tests {
     #[test]
     fn goflags_modfile_conflicts_unless_it_names_the_own_go_mod() {
         let tmp = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let project = tmp.path().join("app");
         write(tmp.path(), "app/go.mod", "module example.com/app\n");
         let conflict = |goflags: &str, gowork: Option<&str>| {
@@ -1506,8 +1505,6 @@ mod tests {
     #[tokio::test]
     async fn selection_spans_every_member() {
         let tmp = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let root = &tmp.path().join("ws");
         let cache = &tmp.path().join("cache");
         for v in ["v1.0.0", "v1.1.0"] {

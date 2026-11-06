@@ -204,7 +204,7 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
     let custom = tmp.path().join("custom-nm");
     tokio::fs::create_dir_all(&custom).await.unwrap();
 
-    let crawler = NpmCrawler::default();
+    let crawler = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global);
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: false,
@@ -222,7 +222,7 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
 #[serial_test::parallel]
 async fn get_node_modules_paths_global_mode_no_prefix() {
     let tmp = tempfile::tempdir().unwrap();
-    let crawler = NpmCrawler::default();
+    let crawler = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global);
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -4574,12 +4574,13 @@ async fn deno_npm_cache_prefix_crawls_name_version_layout() {
         global: false,
         global_prefix: Some(registry.clone()),
     };
-    let mut purls: Vec<String> = NpmCrawler::new()
-        .crawl_all(&opts)
-        .await
-        .into_iter()
-        .map(|p| p.purl)
-        .collect();
+    let mut purls: Vec<String> =
+        NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
     purls.sort();
     assert_eq!(
         purls,
@@ -4673,11 +4674,13 @@ async fn global_mode_includes_deno_npm_cache() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
-    let crawled = NpmCrawler::new().crawl_all(&opts).await;
+    let crawled = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+        .crawl_all(&opts)
+        .await;
 
     assert!(roots.contains(&registry), "{roots:?}");
     assert!(
@@ -4702,14 +4705,15 @@ async fn non_deno_root_under_npm_dir_keeps_node_modules_walk() {
         global: false,
         global_prefix: Some(deps.clone()),
     };
-    let purls: Vec<String> = NpmCrawler::new()
-        .crawl_all(&opts)
-        .await
-        .into_iter()
-        .map(|p| p.purl)
-        .collect();
+    let purls: Vec<String> =
+        NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
     assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0"]);
-    let found = NpmCrawler::new()
+    let found = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .find_by_purls(&deps, &["pkg:npm/left-pad@1.3.0".to_string()])
         .await
         .unwrap();
@@ -4778,15 +4782,16 @@ async fn deno_npm_cache_nested_registry_prefix_crawls_and_resolves() {
         global: false,
         global_prefix: Some(registry.clone()),
     };
-    let purls: Vec<String> = NpmCrawler::new()
-        .crawl_all(&opts)
-        .await
-        .into_iter()
-        .map(|p| p.purl)
-        .collect();
+    let purls: Vec<String> =
+        NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
     assert_eq!(purls, vec!["pkg:npm/is-odd@3.0.1"]);
     let purl = "pkg:npm/is-odd@3.0.1".to_string();
-    let found = NpmCrawler::new()
+    let found = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .find_by_purls(&registry, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -4821,7 +4826,7 @@ async fn global_mode_includes_nested_deno_npm_registry() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
@@ -4905,7 +4910,7 @@ async fn global_mode_finds_registry_nested_under_another() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
@@ -4942,7 +4947,7 @@ async fn global_mode_finds_path_registry_behind_same_named_package() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
@@ -4978,7 +4983,7 @@ async fn global_mode_finds_one_segment_registry_under_root_registry() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
@@ -5032,20 +5037,21 @@ async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
             global: true,
             global_prefix: None,
         };
-        let roots = NpmCrawler::new()
+        let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
             .get_node_modules_paths(&opts)
             .await
             .unwrap();
         let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
         assert_eq!(deno_roots, vec![&host, &nested], "{nested_pkg}: {roots:?}");
 
-        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler::new()
-            .crawl_all(&opts)
-            .await
-            .into_iter()
-            .filter(|p| p.path.starts_with(&deno_dir))
-            .map(|p| (p.purl, p.path))
-            .collect();
+        let mut crawled: Vec<(String, PathBuf)> =
+            NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+                .crawl_all(&opts)
+                .await
+                .into_iter()
+                .filter(|p| p.path.starts_with(&deno_dir))
+                .map(|p| (p.purl, p.path))
+                .collect();
         crawled.sort();
         let foo_purl = format!("pkg:npm/{nested_pkg}@1.0.0");
         let mut expected = vec![
@@ -5055,7 +5061,7 @@ async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
         expected.sort();
         assert_eq!(crawled, expected, "{nested_pkg}");
 
-        let found = NpmCrawler::new()
+        let found = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
             .find_by_purls(&nested, &[foo_purl.clone()])
             .await
             .unwrap();
@@ -5093,18 +5099,19 @@ async fn deno_dir_and_npm_dir_prefixes_expand_to_registry_dirs() {
             global: false,
             global_prefix: Some(prefix.clone()),
         };
-        let roots = NpmCrawler::new()
+        let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
             .get_node_modules_paths(&opts)
             .await
             .unwrap();
         assert_eq!(roots, vec![nested.clone(), public.clone()], "{prefix:?}");
 
-        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler::new()
-            .crawl_all(&opts)
-            .await
-            .into_iter()
-            .map(|p| (p.purl, p.path))
-            .collect();
+        let mut crawled: Vec<(String, PathBuf)> =
+            NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+                .crawl_all(&opts)
+                .await
+                .into_iter()
+                .map(|p| (p.purl, p.path))
+                .collect();
         crawled.sort();
         assert_eq!(
             crawled,
@@ -5132,17 +5139,18 @@ async fn prefix_with_npm_package_child_keeps_node_modules_walk() {
         global: false,
         global_prefix: Some(prefix.clone()),
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();
     assert_eq!(roots, vec![prefix.clone()]);
-    let mut purls: Vec<String> = NpmCrawler::new()
-        .crawl_all(&opts)
-        .await
-        .into_iter()
-        .map(|p| p.purl)
-        .collect();
+    let mut purls: Vec<String> =
+        NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
+            .crawl_all(&opts)
+            .await
+            .into_iter()
+            .map(|p| p.purl)
+            .collect();
     purls.sort();
     assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0", "pkg:npm/npm@10.9.0"]);
 }
@@ -5170,7 +5178,7 @@ async fn npm_global_prefix_named_npm_is_not_deno_cache() {
             global: false,
             global_prefix: Some(prefix.clone()),
         };
-        let roots = NpmCrawler::new()
+        let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
             .get_node_modules_paths(&opts)
             .await
             .unwrap();
@@ -5194,7 +5202,7 @@ async fn relative_deno_npm_dir_prefix_expands() {
         global: false,
         global_prefix: Some(PathBuf::from(".")),
     };
-    let roots = NpmCrawler::new()
+    let roots = NpmCrawler::with_scope(socket_patch_core::utils::repo_root::ReadScope::Global)
         .get_node_modules_paths(&opts)
         .await
         .unwrap();

@@ -177,7 +177,15 @@ pub fn parse_vendor_path_or_machine_absolute(s: &str) -> Option<VendorPathParts>
         let norm = normalize_vendor_spelling(s);
         let idx = vendor_anchor_index(&norm)?;
         let prefix = &norm[..idx];
-        let absolute = crate::utils::relpath::is_anchored(prefix)
+        // A drive-absolute spelling (`C:/…`, backslashes already folded)
+        // is absolute whichever OS reads the lock: one written on Windows
+        // reverts on Linux CI too.
+        let drive = prefix
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && prefix.get(1..3) == Some(":/");
+        let absolute = (crate::utils::relpath::is_anchored(prefix) || drive)
             && !prefix.split('/').any(|seg| matches!(seg, "." | ".."));
         if !absolute {
             return None;
@@ -816,6 +824,26 @@ mod tests {
         let abs = format!("/home/ci/app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
         assert!(parse_vendor_path_or_machine_absolute(&abs).is_some());
         assert!(parse_vendor_path_or_machine_absolute(&format!("file:{abs}")).is_some());
+        // Review finding 7: a Windows checkout's drive-absolute specifier
+        // reads as machine-absolute on every OS (a lock written on Windows
+        // reverts on Linux CI); a drive path with `..` still does not.
+        for windows in [
+            format!("C:\\Users\\ci\\app\\.socket\\vendor\\npm\\{UUID}\\left-pad-1.3.0.tgz"),
+            format!("file:D:/ci/app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+        ] {
+            assert!(
+                parse_vendor_path_or_machine_absolute(&windows).is_some_and(|p| p.uuid == UUID),
+                "{windows}"
+            );
+        }
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "C:/ci/app/../other/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
         assert!(parse_vendor_path_or_machine_absolute(&format!(
             "/home/ci/app/../other/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
         ))

@@ -899,7 +899,7 @@ pub async fn read_candidate_files(
             );
         } else if let Some(why) = view
             .disk_root_reading(std::iter::empty::<&std::path::Path>())
-            .and_then(crate::utils::python_script::uv_config_above_repo)
+            .and_then(|root| crate::utils::python_script::uv_config_above_repo(root, None))
         {
             out.files.insert(
                 crate::patch::redirect::UV_ANCESTOR_OUTSIDE_KEY.to_string(),

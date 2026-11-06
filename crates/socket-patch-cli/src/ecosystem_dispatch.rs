@@ -1115,7 +1115,8 @@ pub async fn find_manifest_package_copies_reusing(
     // includes them (#603).
     for (purl, paths) in copies.iter_mut() {
         if purl.starts_with("pkg:npm/") {
-            *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
+            *paths =
+                with_store_peer_variant_copies(common.read_scope(), std::mem::take(paths)).await;
         }
     }
     // A Bun store entry nothing links any more (Bun never prunes `.bun`)

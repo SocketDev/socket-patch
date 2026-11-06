@@ -173,7 +173,11 @@ fn uv_settings_above_the_repository() {
         let l = layout(git);
         write(&l.outer.join("uv.toml"), "[pip]\nno-binary = [\"six\"]\n");
         assert_eq!(find_ancestor_uv_config(&l.app).is_some(), !git);
-        assert_eq!(uv_config_above_repo(&l.app).is_some(), git);
+        let ancestor = find_ancestor_uv_config(&l.app);
+        assert_eq!(
+            uv_config_above_repo(&l.app, ancestor.as_ref()).is_some(),
+            git
+        );
     }
 }
 

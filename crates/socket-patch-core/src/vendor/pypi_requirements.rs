@@ -4357,12 +4357,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn symlinked_requirements_refuses_wire_and_revert_without_writing() {
-        // wire: the planned root file is a link.
+        // wire: the planned root file is a link (to a file inside the
+        // project, so the read itself is in bounds).
         let outer = tempfile::tempdir().unwrap();
-        let real = outer.path().join("real.txt");
-        tokio::fs::write(&real, "six==1.16.0\n").await.unwrap();
         let root = outer.path().join("proj");
         tokio::fs::create_dir_all(&root).await.unwrap();
+        let real = root.join("real.txt");
+        tokio::fs::write(&real, "six==1.16.0\n").await.unwrap();
         std::os::unix::fs::symlink(&real, root.join("requirements.txt")).unwrap();
         let err = wire_requirements(&root, "six", "1.16.0", REL_WHEEL, SHA)
             .await
@@ -4380,7 +4381,7 @@ mod tests {
             .await
             .unwrap();
         let wired = read_root(tmp.path()).await;
-        let target = outer.path().join("wired.txt");
+        let target = tmp.path().join("wired.txt");
         tokio::fs::write(&target, &wired).await.unwrap();
         tokio::fs::remove_file(tmp.path().join("requirements.txt"))
             .await

@@ -1920,8 +1920,6 @@ replace (
     #[tokio::test]
     async fn test_ensure_refuses_a_replace_go_work_defeats() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = dir.path();
         let root = ws.join("app");
         let go_mod = "module example.com/app\n\ngo 1.21\n\nrequire example.com/m v1.0.0\n";
@@ -1974,8 +1972,6 @@ replace (
     #[tokio::test]
     async fn test_symlinked_replace_host_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let root = &dir.path().join("ws");
         for m in ["a", "b"] {
             std::fs::create_dir_all(root.join(m)).unwrap();

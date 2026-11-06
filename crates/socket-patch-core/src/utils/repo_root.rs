@@ -183,6 +183,14 @@ impl ReadBoundary {
         }
     }
 
+    /// The boundary of an UPWARD lookup from `start` (see [`upward_bound`])
+    /// as a [`ReadBoundary`]: the enclosing checkout in a workspace run,
+    /// [`ReadBoundary::Unbounded`] in a global run or outside any checkout,
+    /// where the lookup reads as it always has.
+    pub fn upward(scope: ReadScope, start: &Path) -> Self {
+        upward_bound(scope, start).unwrap_or(ReadBoundary::Unbounded)
+    }
+
     /// The boundary directory; `None` when unbounded.
     pub fn root(&self) -> Option<&Path> {
         match self {
@@ -224,7 +232,7 @@ impl ReadBoundary {
         let home = home();
         root.ancestors()
             .skip(1)
-            .take_while(|dir| home.as_deref().is_none_or(|home| !home.starts_with(dir)))
+            .take_while(|dir| !at_or_above_home(dir, home.as_deref()))
             .flat_map(|dir| names.iter().map(move |name| dir.join(name)))
             .find(|path| std::fs::metadata(path).is_ok())
     }
@@ -244,6 +252,12 @@ impl ReadBoundary {
     fn shown_root(&self) -> std::path::Display<'_> {
         self.root().unwrap_or(Path::new("/")).display()
     }
+}
+
+/// Whether `dir` is the home directory or one of its ancestors: never
+/// read as a marker above a checkout (git's own home rule).
+pub(crate) fn at_or_above_home(dir: &Path, home: Option<&Path>) -> bool {
+    home.is_some_and(|home| home.starts_with(dir))
 }
 
 /// The bound of an UPWARD lookup from `start` (a workspace root, an
@@ -271,27 +285,33 @@ pub fn upward_readable(scope: ReadScope, start: &Path, path: &Path) -> bool {
 }
 
 /// `project_root.join(rel)` for a project file named by a root-relative
-/// `rel` that may climb (`../shared/requirements.txt`) or be absolute;
-/// `Err` of kind `NotFound` (a refused read reads as a missing file)
-/// carrying [`ReadBoundary::refusal`] when, in a `scope` run, it lies
-/// outside the boundary ([`ReadBoundary::of`]). A plain in-tree `rel` (no
-/// `..`, not absolute) is never refused, and costs no filesystem lookups.
+/// `rel` (which may climb, `../shared/requirements.txt`, be absolute, or
+/// pass through a symlinked level); `Err` of kind `NotFound` (a refused
+/// read reads as a missing file) carrying [`ReadBoundary::refusal`] when,
+/// in a [`ReadScope::Workspace`] run, its REAL path lies outside the
+/// boundary ([`ReadBoundary::of`]). Every name is checked: an in-tree
+/// spelling through a link out of the repository is refused like a `..`.
+/// A path that resolves inside the project itself (the common case) needs
+/// no repository lookup.
 pub fn bounded_project_path(
     scope: ReadScope,
     project_root: &Path,
     rel: &str,
 ) -> std::io::Result<PathBuf> {
     let path = project_root.join(rel);
-    let climbs =
-        crate::utils::relpath::is_anchored(rel) || rel.split(['/', '\\']).any(|seg| seg == "..");
-    if climbs {
-        let bound = ReadBoundary::of(scope, project_root);
-        if !bound.contains(&path) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                OutsideRepoRoot(bound.refusal(&path)),
-            ));
-        }
+    if scope == ReadScope::Global {
+        return Ok(path);
+    }
+    let real = canonical_or_lexical(&path);
+    if real.starts_with(canonical_or_lexical(project_root)) {
+        return Ok(path);
+    }
+    let bound = ReadBoundary::of(scope, project_root);
+    if !bound.contains(&real) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            OutsideRepoRoot(bound.refusal(&path)),
+        ));
     }
     Ok(path)
 }
@@ -316,26 +336,38 @@ pub fn is_refused_read(e: &std::io::Error) -> bool {
         .is_some_and(|inner| inner.is::<OutsideRepoRoot>())
 }
 
-/// `path` absolute, `..` folded lexically, with its deepest existing level
-/// canonicalized (the rest re-appended as spelled).
+/// `path` made absolute and resolved the way the OS resolves it, one
+/// component at a time: every existing level is canonicalized (a symlink
+/// is followed) before the next component applies, so a `..` climbs from
+/// the real directory a link points at, never from the link's spelling.
+/// Components past the deepest existing level fold lexically (nothing on
+/// disk can redirect them).
 fn canonical_or_lexical(path: &Path) -> PathBuf {
-    let abs = crate::utils::relpath::absolute_lexically(path);
-    let mut tail = Vec::new();
-    let mut probe: &Path = &abs;
-    loop {
-        if let Ok(canon) = std::fs::canonicalize(probe) {
-            let mut out = canon;
-            out.extend(tail.iter().rev());
-            return out;
-        }
-        match (probe.parent(), probe.file_name()) {
-            (Some(parent), Some(name)) => {
-                tail.push(name.to_os_string());
-                probe = parent;
+    use std::path::Component;
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    // The OS resolves an existing path physically in one call.
+    if let Ok(real) = std::fs::canonicalize(&abs) {
+        return real;
+    }
+    let mut out = PathBuf::new();
+    for component in abs.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            Component::CurDir => {}
+            // `out` is canonical while it exists: its parent is the
+            // physical one.
+            Component::ParentDir => {
+                out.pop();
             }
-            _ => return abs,
+            Component::Normal(name) => {
+                out.push(name);
+                if let Ok(real) = std::fs::canonicalize(&out) {
+                    out = real;
+                }
+            }
         }
     }
+    out
 }
 
 /// The checkout AT the home directory that a lookup from `start` stopped
@@ -549,6 +581,62 @@ mod tests {
         let bound = ReadBoundary::of(ReadScope::Workspace, &repo);
         assert!(!bound.contains(&repo.join("link/requirements.txt")));
         assert!(bound.contains(&repo.join("requirements.txt")));
+    }
+
+    /// Review finding 1: a `..` after a symlinked level climbs from the
+    /// link's TARGET, as the OS resolves it, never from the link's
+    /// spelling.
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_link_resolves_physically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(base.join("outside/dir")).unwrap();
+        fs::write(base.join("outside/secret.txt"), "x").unwrap();
+        fs::write(repo.join("secret.txt"), "in").unwrap();
+        std::os::unix::fs::symlink(base.join("outside/dir"), repo.join("link")).unwrap();
+        let bound = ReadBoundary::of(ReadScope::Workspace, &repo);
+        assert!(!bound.contains(&repo.join("link/../secret.txt")));
+        assert!(!bound.contains(&repo.join("link/../missing/x.txt")));
+        assert!(bound.contains(&repo.join("sub/../secret.txt")));
+        let err = bounded_project_path(ReadScope::Workspace, &repo, "link/../secret.txt");
+        assert!(err.is_err_and(|e| is_refused_read(&e)));
+    }
+
+    /// Review finding 2: an in-tree name read through a symlinked level
+    /// that points out of the repository is refused too, not only a
+    /// climbing (`..`) or absolute one.
+    #[cfg(unix)]
+    #[test]
+    fn in_tree_names_through_an_outward_link_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = fs::canonicalize(tmp.path()).unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(base.join("other")).unwrap();
+        fs::write(base.join("other/base.txt"), "six==1.16.0\n").unwrap();
+        std::os::unix::fs::symlink(base.join("other"), repo.join("shared")).unwrap();
+        let refused = bounded_project_path(ReadScope::Workspace, &repo, "shared/base.txt");
+        assert!(refused.is_err_and(|e| is_refused_read(&e)));
+        assert!(bounded_project_path(ReadScope::Workspace, &repo, "requirements.txt").is_ok());
+        assert!(bounded_project_path(ReadScope::Global, &repo, "shared/base.txt").is_ok());
+        // The project view (discovery, the lock inventory, the
+        // requirements walks) reads through it: missing to a reader.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let view = crate::vendor::lock_inventory::ProjectView::Disk(&repo);
+        let read = rt.block_on(view.read_text("shared/base.txt")).unwrap_err();
+        assert!(is_refused_read(&read));
+        let snap = crate::vendor::lock_inventory::DiskSnapshot::new(&repo);
+        let snapshot = crate::vendor::lock_inventory::ProjectView::Snapshot(&snap);
+        let read = rt
+            .block_on(snapshot.read_text("shared/base.txt"))
+            .unwrap_err();
+        assert!(is_refused_read(&read));
     }
 
     #[test]

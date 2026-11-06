@@ -5250,8 +5250,6 @@ mod tests {
     async fn vendor_keeps_a_parent_directorys_feed_routable() {
         let (dir, blobs, installed, record) = fixture(true, None).await;
         let outer = dir.path();
-        // The parent is inside the repository.
-        tokio::fs::create_dir_all(outer.join(".git")).await.unwrap();
         tokio::fs::write(
             outer.join("nuget.config"),
             "<configuration>\n  <packageSources>\n    <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n",

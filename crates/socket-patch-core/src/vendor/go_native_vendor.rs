@@ -30,6 +30,9 @@ pub(super) struct Target<'a> {
     pub known: &'a HashMap<String, String>,
     /// `go mod vendor` or `go work vendor`.
     pub command: &'static str,
+    /// The boundary replacement directories are read within, computed
+    /// once per check ([`crate::utils::repo_root::ReadBoundary::upward`]).
+    pub bound: crate::utils::repo_root::ReadBoundary,
 }
 
 /// Read expected text from an authenticated blob or replacement copy. Never
@@ -52,12 +55,7 @@ async fn expected_text(t: &Target<'_>, name: &str, hash: &str) -> Option<String>
         if let Some(path) = &entry.path {
             // A replacement directory outside the repository is never read.
             let file = t.root.join(path).join(name);
-            if crate::utils::repo_root::ReadBoundary::of(
-                crate::utils::repo_root::ReadScope::Workspace,
-                t.root,
-            )
-            .contains(&file)
-            {
+            if t.bound.contains(&file) {
                 paths.push(file);
             }
         } else if let (Some(cache), Some(target), Some(ver)) = (
@@ -994,6 +992,7 @@ mod tests {
             replaces: &[],
             known: &known,
             command: "go mod vendor",
+            bound: crate::utils::repo_root::ReadBoundary::Unbounded,
         };
         let rec = record(&[("lib.go", &hash)]);
         assert_eq!(verify(&target("example.com/testonly"), &rec).await, Ok(()));

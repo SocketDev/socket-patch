@@ -359,6 +359,26 @@ pub fn invalidate_project<'a>(
             ),
         ));
     }
+    // A workspace run never reads a cargo config above the repository
+    // root, so a `build.target-dir` / `build.build-dir` it sets is unknown:
+    // say which file, rather than report the invalidation complete.
+    let above = match scope {
+        crate::utils::repo_root::ReadScope::Workspace => {
+            crate::vendor::cargo_config::config_above_repo(cwd)
+        }
+        crate::utils::repo_root::ReadScope::Global => None,
+    };
+    if let Some(why) = above {
+        warnings.push((
+            STALE_WARNING.to_string(),
+            format!(
+                "{why}: a `build.target-dir` or `build.build-dir` it sets was not read, so \
+                 compiled copies there were not invalidated; the next build may link the stale \
+                 code. Run `cargo clean -p <crate>` for: {}",
+                names.join(", ")
+            ),
+        ));
+    }
     warnings
 }
 
@@ -394,6 +414,32 @@ mod tests {
             workspace_root(crate::utils::repo_root::ReadScope::Workspace, &app),
             outer
         );
+    }
+
+    /// Review finding 3: a target dir set by a cargo config above the
+    /// repository root is never read in a workspace run, so the
+    /// invalidation says so instead of reporting itself complete.
+    #[test]
+    fn a_config_above_the_repository_is_named_when_its_target_dir_is_unread() {
+        use crate::utils::repo_root::ReadScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let app = outer.join("repo");
+        std::fs::create_dir_all(app.join(".git")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        let purls = ["pkg:cargo/serde@1.0.0"];
+        assert!(invalidate_project(ReadScope::Workspace, &app, purls).is_empty());
+        std::fs::create_dir_all(outer.join(".cargo")).unwrap();
+        std::fs::write(
+            outer.join(".cargo/config.toml"),
+            "[build]\ntarget-dir = \"/elsewhere/target\"\n",
+        )
+        .unwrap();
+        let warnings = invalidate_project(ReadScope::Workspace, &app, purls);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].1.contains(".cargo/config.toml"), "{warnings:?}");
+        // A global run reads it as before.
+        assert!(invalidate_project(ReadScope::Global, &app, purls).is_empty());
     }
 
     fn mkfp(root: &Path, rel: &str) -> PathBuf {

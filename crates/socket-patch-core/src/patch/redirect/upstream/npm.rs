@@ -4459,8 +4459,6 @@ mod tests {
         use super::{pnpm_settings_prefix, read_sibling};
 
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = std::fs::canonicalize(dir.path()).unwrap();
         write(
             &ws,

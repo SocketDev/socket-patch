@@ -158,7 +158,7 @@ pub(crate) async fn inherited_source_keys_traced(
         )],
         ..NugetConfig::default()
     }));
-    let bound = crate::utils::repo_root::ReadBoundary::of(
+    let bound = crate::utils::repo_root::ReadBoundary::upward(
         crate::utils::repo_root::ReadScope::Workspace,
         project_root,
     );
@@ -567,7 +567,6 @@ mod tests {
         .unwrap();
         let project = tmp.path().join("repo/app");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
         USER_CONFIG.with(|c| *c.borrow_mut() = Some(user.clone()));
         assert_eq!(inherited_source_keys(&project).await, ["nuget.org", "corp"]);
         // A repo-root config adds its own feed.
@@ -599,7 +598,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("repo/app");
         std::fs::create_dir_all(&project).unwrap();
-        std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
         assert!(!super::inherited_sources(&project).await.mapped);
         std::fs::write(
             tmp.path().join("repo/nuget.config"),

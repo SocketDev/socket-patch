@@ -235,7 +235,7 @@ pub(super) async fn load_uv_project(root: &Path) -> Result<UvProject, (&'static 
     // Settings above the repository root are never read: what they set is
     // unknown, so the wiring cannot be checked against them.
     if let Some(why) = (!governs && ancestor.is_none())
-        .then(|| crate::utils::python_script::uv_config_above_repo(root))
+        .then(|| crate::utils::python_script::uv_config_above_repo(root, ancestor.as_ref()))
         .flatten()
     {
         return Err(("pypi_uv_ancestor_settings", why));

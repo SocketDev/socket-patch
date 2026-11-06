@@ -196,7 +196,7 @@ fn ancestor_settings_unknown(
     (pyproject, uv_toml, ancestor): &(Option<String>, Option<String>, Option<UvConfig>),
 ) -> Option<String> {
     (ancestor.is_none() && !root_governs_script(pyproject.as_deref(), uv_toml.as_deref()))
-        .then(|| crate::utils::python_script::uv_config_above_repo(root))
+        .then(|| crate::utils::python_script::uv_config_above_repo(root, ancestor.as_ref()))
         .flatten()
 }
 

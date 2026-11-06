@@ -545,6 +545,11 @@ async fn verify_native_vendor_with(
             replaces: &replaces,
             known,
             command,
+            // A project's Go check: a workspace run.
+            bound: crate::utils::repo_root::ReadBoundary::upward(
+                crate::utils::repo_root::ReadScope::Workspace,
+                project_root,
+            ),
         },
         record,
     )
@@ -975,8 +980,6 @@ mod tests {
     #[tokio::test]
     async fn workspace_modules_txt_is_checked_against_every_member() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let root = dir.path();
         consumer(root, REPLACE);
         write(
@@ -1042,8 +1045,6 @@ mod tests {
             ("../a", COPY),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            // The repository every path of the fixture lives in.
-            std::fs::create_dir_all(dir.path().join(".git")).unwrap();
             let ws = dir.path().join("ws");
             let member = ws.join(use_dir);
             // How go spells a path relative to the go.work directory.
@@ -1088,7 +1089,6 @@ mod tests {
         // has the same spelling as `a`'s recorded one but another target,
         // so the line is stale and `b`'s is not recorded.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = dir.path().join("ws");
         consumer(&ws.join("a"), "");
         consumer(&ws.join("b"), REPLACE);
@@ -1191,8 +1191,6 @@ mod tests {
     #[tokio::test]
     async fn go_work_replace_is_judged_by_where_it_points() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = dir.path();
         let (app, b) = (ws.join("app"), ws.join("b"));
         consumer(&app, REPLACE);
@@ -1222,8 +1220,6 @@ mod tests {
     #[tokio::test]
     async fn go_work_that_does_not_use_the_project_makes_the_replace_inert() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = dir.path();
         let root = ws.join("app");
         consumer(&root, REPLACE);
@@ -1254,8 +1250,6 @@ mod tests {
     #[tokio::test]
     async fn go_work_member_matches_through_a_symlinked_workspace() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let real = dir.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let ws = dir.path().join("link");
@@ -1276,8 +1270,6 @@ mod tests {
     #[tokio::test]
     async fn member_replaces_of_one_module_version_must_agree() {
         let dir = tempfile::tempdir().unwrap();
-        // The repository every path of the fixture lives in.
-        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         let ws = dir.path();
         let (a, b) = (ws.join("a"), ws.join("b"));
         consumer(&a, REPLACE);

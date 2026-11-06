@@ -509,12 +509,15 @@ pub fn find_ancestor_uv_config(root: &Path) -> Option<UvConfig> {
 /// a `uv.toml` or `pyproject.toml` exists above it (stat only, never
 /// read), which uv may apply. Writers refuse on it rather than wire what
 /// those settings may reject.
-pub fn uv_config_above_repo(root: &Path) -> Option<String> {
-    let bound =
-        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, root)?;
-    if find_ancestor_uv_config(root).is_some() {
+///
+/// `ancestor` is the caller's [`find_ancestor_uv_config`] answer, never
+/// looked up twice: one found inside the repository governs instead.
+pub fn uv_config_above_repo(root: &Path, ancestor: Option<&UvConfig>) -> Option<String> {
+    if ancestor.is_some() {
         return None;
     }
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, root)?;
     let marker = bound.marker_above(&[UV_TOML, "pyproject.toml"])?;
     Some(format!(
         "uv may apply the settings in {}: {}",
