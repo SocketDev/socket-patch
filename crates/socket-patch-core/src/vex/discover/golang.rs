@@ -367,11 +367,18 @@ async fn extract_with(ctx: &DiscoverCtx<'_>, out: &mut Discovery, governing: Gov
         module_graph.as_ref(),
     );
     let mut sums = SumPins::default();
+    let sum_files = match &workspace {
+        Some(ws) => ws.sum_files.clone(),
+        None => vec![GO_SUM.to_string()],
+    };
+    if !any_hosted {
+        // Still recognized (rule 11): a sum file's Socket identity with no
+        // wiring left must read as dead, never fall back to raw text.
+        for rel in &sum_files {
+            ctx.recognize_ignored(rel).await;
+        }
+    }
     if any_hosted {
-        let sum_files = match &workspace {
-            Some(ws) => ws.sum_files.clone(),
-            None => vec![GO_SUM.to_string()],
-        };
         sums = SumPins::read(ctx, out, &sum_files).await;
         for (text, selects) in workspace.iter().flat_map(|ws| &ws.outside_sums) {
             sums.add(text, *selects);
@@ -725,24 +732,19 @@ fn extract_file(
     };
     // A module that is itself a `use` member is built from its directory:
     // every replace of it is inert, which says more than any workspace
-    // conflict (go.work names it first too), so it is diagnosed, never a
-    // ref, before the bypass is asked.
-    let main_module_inert = |out: &mut Discovery, entry: &ReplaceEntry| {
-        let Some(dir) = workspace.and_then(|ws| ws.main_module_dir(&entry.module)) else {
-            return false;
-        };
+    // conflict (go.work names it first too). The writers refuse such a
+    // replace (`WorkspaceConflict::MainModule`) and re-running scan or
+    // vendor never clears it, so it stays a ref (list, rollback and remove
+    // find the wiring) that is never attested, like a bypass.
+    let main_module = |entry: &ReplaceEntry| {
+        let dir = workspace.and_then(|ws| ws.main_module_dir(&entry.module))?;
         let req = required.get(&entry.module).map(String::as_str);
         let version = entry.version.as_deref().or(req).unwrap_or_default();
-        out.diag(
-            DIAG_REF_INVALID,
-            file,
-            format!(
-                "{file}: replace {} {version} is inert: the build selects (the workspace \
-                 module in {dir}), so it uses the unpatched module",
-                entry.module
-            ),
-        );
-        true
+        Some(format!(
+            "{file}: replace {} {version} is inert: the build selects (the workspace module \
+             in {dir}), so it uses the unpatched module",
+            entry.module
+        ))
     };
     let mark_bypassed = |out: &mut Discovery, purl: &str, uuid: &str, bypassed: Option<String>| {
         if let Some(detail) = bypassed {
@@ -794,10 +796,7 @@ fn extract_file(
                     );
                     continue;
                 };
-                if main_module_inert(out, entry) {
-                    continue;
-                }
-                let bypassed = bypass_of(entry);
+                let bypassed = main_module(entry).or_else(|| bypass_of(entry));
                 let Some(purl) =
                     replaced_purl(entry, graph, &versioned, file, out, bypassed.is_some())
                 else {
@@ -887,10 +886,7 @@ fn extract_file(
                     );
                     continue;
                 };
-                if main_module_inert(out, entry) {
-                    continue;
-                }
-                let bypassed = bypass_of(entry);
+                let bypassed = main_module(entry).or_else(|| bypass_of(entry));
                 let Some(purl) =
                     replaced_purl(entry, graph, &versioned, file, out, bypassed.is_some())
                 else {
@@ -1945,6 +1941,20 @@ mod tests {
         }
     }
 
+    /// Review on #2011 (round 2): a go.sum still holding a reverted hosted
+    /// patch's lines, with no hosted replace left, is still READ for its
+    /// identity, so a ledger claim on that patch is dead (rule 11), not
+    /// re-derived from the raw sum text.
+    #[tokio::test]
+    async fn a_sum_left_from_a_reverted_patch_is_recognized() {
+        let p = Project::new();
+        p.write("go.mod", BASE_GO_MOD)
+            .write("go.sum", go_sum_for(UUID_A, "v1.4.2-socketpatch.1"));
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.hosted_claim(PURL, UUID_A), Some(false));
+    }
+
     #[tokio::test]
     async fn module_missing_from_require_is_still_emitted() {
         let go_mod = format!(
@@ -2746,15 +2756,19 @@ mod tests {
             format!("replace {MODULE} {VERSION} => ./{}\n", vendored_rel(UUID_A)),
         ] {
             let go_mod = format!("{BASE_GO_MOD}\n{replace}");
+            // Review on #2011 (round 2): the writers refuse such a replace
+            // and a re-run never clears it, so it stays a ref (rollback,
+            // remove and list find the wiring) that is never attested.
             let inert = |out: &Discovery| {
-                assert_refs(out, &[]);
-                assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+                assert_eq!(out.refs.len(), 1, "{replace}: {:?}", out.refs);
+                let [u] = out.unattested.as_slice() else {
+                    panic!("{replace}: {:?}", out.unattested);
+                };
+                assert_eq!(u.kind, UnattestedKind::GoWorkspaceOverride);
                 assert!(
-                    out.diagnostics.iter().any(|d| d.code == DIAG_REF_INVALID
-                        && d.detail.contains("is inert")
-                        && d.detail.contains("workspace module in bar")),
-                    "{replace}: {:?}",
-                    out.diagnostics
+                    u.detail.contains("is inert") && u.detail.contains("workspace module in bar"),
+                    "{replace}: {}",
+                    u.detail
                 );
             };
             let p = Project::new();
