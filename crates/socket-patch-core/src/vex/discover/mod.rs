@@ -606,10 +606,13 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
-    /// A pnpm lock's pin while pnpm's `gitBranchLockfile` setting is on and
-    /// a `pnpm-lock.<branch>.yaml` exists (#556): pnpm installs a branch
-    /// from its own lock, which no wiring reaches, so hosted mode withholds
-    /// these locks and vendored mode refuses the project.
+    /// A pnpm lock's pin while any `pnpm-lock.<branch>.yaml` exists (#556),
+    /// whatever pnpm's `gitBranchLockfile` setting says (discovery reads no
+    /// environment, so the setting cannot be decided), or while the members
+    /// that install from their own lock cannot be listed to rule one out:
+    /// with the setting on, pnpm installs a branch from its own lock, which
+    /// no wiring reaches, so hosted mode withholds these locks and vendored
+    /// mode refuses the project.
     PnpmGitBranchLock,
     /// An npm or Bun pin of a package the project patches itself
     /// (`patchedDependencies`, npm's lock-entry `patched` record; npm
