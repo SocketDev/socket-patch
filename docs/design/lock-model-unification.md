@@ -1,7 +1,7 @@
 # One lock model for every reader
 
 Status: in progress (stacked PRs `lock-model/*`). Owner decisions are dated
-2026-11-04.
+2026-11-04 unless the row says 2026-11-05.
 
 Paths below are relative to `crates/socket-patch-core/src/`.
 
@@ -33,7 +33,7 @@ attestation rules) is real policy and stays.
 | Three Python precedence rules | the inventory's chain (uv by parse success, then poetry or pdm if they have entries, then Pipfile.lock plus requirements), `formats/governing_locks.rs` (uv, poetry, pdm, Pipfile.lock by presence) and discovery (every lock, plus the cross-lock contest). They disagree on four common layouts. |
 | Second walks of one file | `vendor/npm_origin.rs` walks package-lock `packages` again. Yarn writers call `scan_blocks` directly, and the Berry rewriter uses a third model (`formats/yarn/stanzas.rs`). The vlt writers use a separate line grammar. pnpm's `InstalledPackages` and `vendored_npm_uuids`, and the hosted planner's whole-text `grammar::entries`, skip the env-document filter. |
 | Second parses of one file | `vex/discover/pypi_locks.rs` parses uv, pylock and script locks itself. The inventory parses them again. `deno.lock` is parsed by `crawlers/deno_crawler.rs` for discovery, the hosted engine and the npm flavor probe. |
-| Repeated helper parsers | two Python lock listers, two `-r` include walkers, two PEP 508 direct-reference parsers, five walks of `Cargo.toml` dependency tables, two Rush lock listings, three readers of Maven's `checksums.sha256`, two Gradle Socket-index parsers, two routes to sbt resolution evidence |
+| Repeated helper parsers | two Python lock listers, two `-r` include walkers, two PEP 508 direct-reference parsers, five walks of `Cargo.toml` dependency tables, two Rush lock listings, four readers of Maven's `checksums.sha256`, two Gradle Socket-index parsers, two routes to sbt resolution evidence |
 | Two file-selection layers | the npm flavor router (`lock_inventory/npm_family.rs`) picks one family and one lock. Discovery reads every lock and sweeps the ignored ones with `recognize_ignored`. |
 
 The inventory also has gaps. It has no models for NuGet, Maven, Gradle, sbt,
@@ -77,8 +77,12 @@ Non-goal: adding new hosted or vendored backends.
 | Question | Readers before | Decision |
 |---|---|---|
 | Is pnpm 11's env-lockfile document (the first YAML document, holding `configDependencies` / `packageManagerDependencies`) part of the project? | The hosted planner and the v9 vendored in-use check read it. `PnpmLock` (inventory and discovery), `InstalledPackages` and the legacy vendored check skip it (#1949). | It counts. pnpm installs config dependencies (into its config store, not `node_modules`), and the hosted planner patches them. The document becomes its own install tree. |
-| Does Socket patch a dependency the user patched themselves (npm `patchedDependencies` / `"patched"`, `bun patch`, pnpm `patchedDependencies`, yarn berry `patch:`, vlt patches)? | Hosted skips npm and bun user patches (#711, #367). Vendored refuses them. Discovery attested them until #2010. pnpm, yarn and vlt user patches are not detected anywhere. | **Owner decision:** never, by default, in every mode and every package manager. A Socket pin under a user patch is not attested. Only an explicit user override patches it. |
-| May a reader or writer read project files outside the git repository root? | Several do: vendored paths spelled `../.socket/vendor/…`, an ancestor `go.work`, out-of-root `-r` includes, parent NuGet configs. | **Owner decision:** no. Every project-file read is bounded to the git repository root (the project root when there is no repository). Machine-level tool configuration (for example `GOENV`, the user `NuGet.Config`) is listed separately for review. |
+| Does Socket patch a dependency the user patched themselves (npm `patchedDependencies` / `"patched"`, `bun patch`, pnpm `patchedDependencies`, yarn berry `patch:`, vlt patches)? | Hosted skips npm and bun user patches (#711, #367). Vendored refuses them. Discovery attested them until #2010. pnpm, yarn and vlt user patches are not detected anywhere. | **Owner decision:** never, by default, in every mode and every package manager. A Socket pin under a user patch is not attested. **2026-11-05:** the only override is the existing `--allow-patch-conflicts`, and `vex` never attests a pin under a user patch, even with it (#2010, #2018). |
+| May a reader or writer read project files outside the git repository root? | Several do: vendored paths spelled `../.socket/vendor/…`, an ancestor `go.work`, out-of-root `-r` includes, parent NuGet configs. | **Owner decision:** no. Every project-file read is bounded to the git repository root (the project root when there is no repository). Machine-level tool configuration (for example `GOENV`, the user `NuGet.Config`) is listed separately for review. **2026-11-05:** the bound applies to workspace runs only. Global runs (`--global` / `-g` / `--global-prefix`) read anywhere. Without a git checkout, upward lookups (an ancestor `go.work`, parent NuGet configs, workspace and settings files) behave as before (#2025). |
+| In a workspace run, what if a file the tool honors sits above the repository root (an ancestor `pnpm-workspace.yaml`, `.npmrc`, `go.work`, `.cargo/config.toml`)? | Each walk reads it, or stops at a different place. | **Owner decision, 2026-11-05:** such a marker file above the repository root and below the home directory makes hosted and vendored mode refuse with a message naming the file, and readers withhold. Nothing at or above home counts (#2025). |
+| Do out-of-repository `-r` includes of `requirements.txt` count? | Hosted rewrites the root file only; the inventory and discovery follow includes wherever they point. | **Owner decision, 2026-11-05:** includes are followed (P4), but an include outside the repository root stays bounded in workspace runs: never read or rewritten (#2025). |
+| Is a `shrinkwrap.yaml` beside `pnpm-lock.yaml` read (N11)? | Hosted rewrites both under one all-or-nothing gate. Discovery sweeps it as ignored. The inventory reads it as a fallback. Vendored never reads it. | **Owner decision, 2026-11-05:** it is shadowed: swept for stale identities, never rewritten, and outside the gate. If the project's pnpm evidence (install record or `package.json` `packageManager`) pins pnpm 1 or 2, which read only `shrinkwrap.yaml`, then `shrinkwrap.yaml` governs and vendored mode refuses the project (#2029). |
+| Does a pnpm branch lock (`pnpm-lock.<branch>.yaml`) make the root lock unreliable (N1)? | Hosted withholds the root locks and refuses when `gitBranchLockfile` is set. Vendored refuses. Discovery and the inventory never check. | **Owner decision, 2026-11-05:** discovery withholds pnpm root and member-lock attestations whenever any `pnpm-lock.<branch>.yaml` exists, whatever the settings or environment say (#2010). |
 
 ## The model
 
@@ -251,18 +255,24 @@ Deprecation messaging is separate from this work.
 ## Size budget
 
 `scripts/loc-budget.py` counts implementation lines: code outside comments,
-outside `#[cfg(test)]` items and outside test-only modules. It compares the
-groups in `scripts/loc-budget.json` with their maxima. CI's
-`lint-ecosystems` job runs it with `--warn`, which annotates a group over
-budget but never fails, so another PR's bug fix in one of these files never
-fails on it. There are two groups:
-`lock-readers` (`formats/`, `vex/discover/`, `vendor/lock_inventory/`,
-`gradle/`, the Python lock helpers in `utils/`, `vendor/npm_origin.rs` and
-`crawlers/deno_crawler.rs`) and `lock-writers` (`patch/redirect/`, `hosted/`
-and the rest of `vendor/`). At 7bde3ba55 they hold 30,898 and 88,363 lines.
-Each PR in this stack
-lowers the maxima with `--lower` in the same commit. The NuGet and JVM PRs
-add code and raise the readers' maximum by hand, saying why.
+outside items whose `cfg` implies `test` and outside test-only modules. It
+compares the groups in `scripts/loc-budget.json` with their maxima. There are
+two groups: `lock-readers` (`formats/`, `vex/discover/`,
+`vendor/lock_inventory/`, `gradle/`, the Python lock helpers in `utils/`,
+`vendor/npm_origin.rs` and `crawlers/deno_crawler.rs`) and `lock-writers`
+(`patch/redirect/`, `hosted/` and the rest of `vendor/`). At 7bde3ba55 they
+hold 30,462 and 88,362 lines.
+
+CI's `lint-ecosystems` job runs it with `--warn`, which annotates a group
+over budget but never fails. That is deliberate. These groups cover most of
+the lockfile code, and while the stack is open, bug fixes keep landing on
+`main` in the same files (the false-attestation fixes below are a dozen
+PRs). A failing check would block each of them on a number this campaign
+owns, or push them to raise the maximum by hand, which hides the stack's
+progress. The stack is what lowers the numbers: each PR runs `--check`
+locally and lowers the maxima with `--lower` in the same commit. The NuGet
+and JVM PRs add code and raise the readers' maximum by hand, saying why. Once
+the stack lands, `--warn` can become `--check`.
 
 ## Stack
 
@@ -278,9 +288,10 @@ A format whose planner merge is large splits into two PRs, readers first.
 
 | PR | Branch | Change |
 |---|---|---|
-| 0 | `lock-model/0-design` | This document and the size budget |
-| 1 | `lock-model/1-origin` | The `origin` module: discovery's classifier and the redirect's hosted-URL rule, moved verbatim. Discovery and the redirect re-export it. |
-| 2 | `lock-model/2-pnpm` | Pilot. One pnpm entry walk for the inventory, discovery, the store crawler, the hosted planner and the vendored in-use check. The env-lockfile document becomes its own tree (see Decisions). |
+| 0 | `lock-model/0-design` (#2001) | This document and the size budget |
+| 1 | `lock-model/1-origin` (#2002) | The `origin` module: discovery's classifier and the redirect's hosted-URL rule, moved verbatim. Callers import it from `crate::origin`. |
+| 2a | `lock-model/2a-pnpm-readers` (#2009) | Pilot, readers. One pnpm entry walk for the inventory, discovery, the store crawler, the hosted planner and the vendored in-use check. The env-lockfile document becomes its own tree (see Decisions). |
+| 2b | `lock-model/2b-pnpm-planner` (#2029) | Pilot, planner. One pnpm rewire planner for both modes. `shrinkwrap.yaml` beside `pnpm-lock.yaml` is shadowed (see Decisions). |
 | 3 | `lock-model/3-npm` | package-lock and shrinkwrap. Folds `vendor/npm_origin.rs`'s second walk into the records. |
 | 4 | `lock-model/4-yarn` | Classic and Berry. One block model for every reader and writer, `BerryStanzas` included. |
 | 5 | `lock-model/5-bun-vlt` | `bun.lock`, `bun.lockb` and vlt. The vlt writers move off their line grammar. |

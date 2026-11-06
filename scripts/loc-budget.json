@@ -2,7 +2,6 @@
   "groups": {
     "lock-readers": {
       "paths": [
-        "crates/socket-patch-core/src/origin.rs",
         "crates/socket-patch-core/src/formats/",
         "crates/socket-patch-core/src/vex/discover/",
         "crates/socket-patch-core/src/vendor/lock_inventory/",
@@ -17,7 +16,7 @@
         "crates/socket-patch-core/src/utils/pipenv.rs",
         "crates/socket-patch-core/src/crawlers/deno_crawler.rs"
       ],
-      "max": 31207
+      "max": 30482
     },
     "lock-writers": {
       "paths": [
@@ -30,7 +29,7 @@
         "crates/socket-patch-core/src/vendor/npm_origin.rs",
         "crates/socket-patch-core/src/vendor/test_support"
       ],
-      "max": 88314
+      "max": 88313
     }
   }
 }
