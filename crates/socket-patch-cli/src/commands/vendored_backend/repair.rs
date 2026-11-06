@@ -37,7 +37,78 @@ struct Candidate {
 /// path parser. Used by repair (references the ledger does not cover), by
 /// the orphan sweeps (`vendor --revert`, `scan --prune`: a dir a lockfile
 /// still points at is never deleted) and by rollback.
+///
+/// Every escape and separator spelling of a reference counts (an older
+/// composer.lock's `\/`, any run of Windows backslashes, `\u` /
+/// XML-entity escapes). This form REFUSES on what it finds (`vendor`'s
+/// ledger-missing gate, rollback's ledger-less gate, `vendor --check`), so
+/// it folds ASCII case only where the project's file system does: on a
+/// case-sensitive disk another case names another directory. The orphan
+/// sweep's keep-vs-delete reads [`scan_vendor_references_any_case`].
 pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, String, String)> {
+    let fold_case = socket_patch_core::utils::fs::folds_case(
+        &project_root.join(socket_patch_core::constants::SOCKET_DIR),
+    )
+    .await;
+    scan_vendor_references_folding(project_root, fold_case).await
+}
+
+/// [`scan_vendor_references`] matching the `.socket/vendor/<eco>/<uuid>`
+/// anchor in any ASCII case, as the revert keep-checks
+/// ([`socket_patch_core::utils::path_spelling::PathNeedle::keep`]) do: the
+/// orphan sweep only ever KEEPS a dir on what it finds, so erring toward
+/// "referenced" is the safe direction and the two deletion paths agree.
+pub(crate) async fn scan_vendor_references_any_case(
+    project_root: &Path,
+) -> Vec<(String, String, String)> {
+    scan_vendor_references_folding(project_root, true).await
+}
+
+/// Recover a vendored reference from a folded `candidate`, ASCII
+/// case-insensitively when `fold_case` (eco and uuid lower-cased, the leaf
+/// and the relpath kept as spelled).
+fn parse_reference_folding(candidate: &str, fold_case: bool) -> Option<(String, String, String)> {
+    if let Some(parts) = parse_vendor_reference(candidate) {
+        let rel = candidate
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_string();
+        return Some((parts.eco, parts.uuid, rel));
+    }
+    if !fold_case {
+        return None;
+    }
+    let parts = parse_vendor_reference(&candidate.to_ascii_lowercase())?;
+    // ASCII lower-casing keeps every byte offset, and the leaf is the
+    // candidate's own tail.
+    let trimmed = candidate.trim_end_matches('/');
+    let leaf = &trimmed[trimmed.len() - parts.leaf.len()..];
+    let mut rel = format!(".socket/vendor/{}/{}", parts.eco, parts.uuid);
+    if !leaf.is_empty() {
+        rel.push('/');
+        rel.push_str(leaf);
+    }
+    Some((parts.eco, parts.uuid, rel))
+}
+
+/// The byte offset of the first `.socket` in `text`, ASCII
+/// case-insensitively when `fold_case`.
+fn find_socket_anchor(text: &str, fold_case: bool) -> Option<usize> {
+    const ANCHOR: &str = ".socket";
+    if !fold_case {
+        return text.find(ANCHOR);
+    }
+    text.match_indices('.').map(|(i, _)| i).find(|&i| {
+        text.as_bytes()
+            .get(i..i + ANCHOR.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(ANCHOR.as_bytes()))
+    })
+}
+
+async fn scan_vendor_references_folding(
+    project_root: &Path,
+    fold_case: bool,
+) -> Vec<(String, String, String)> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     let mut out = Vec::new();
     // The binary lock is read unless a readable text lock shadows it: a
@@ -72,14 +143,13 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
         let Ok(text) = read_regular_to_string(&project_root.join(file)).await else {
             continue;
         };
-        // Every spelling folded to forward slashes first, the way
-        // discovery's identity sweep reads a file: an older composer.lock's
-        // `\/`-escaped JSON, single or doubled Windows backslashes, `\u` /
-        // XML-entity escapes. Missing one here lets the orphan sweep delete
-        // a dir a lock still installs from.
-        let text = socket_patch_core::utils::path_spelling::fold_path_spellings(&text);
+        // Every spelling folded first: escapes decoded and every run of `/`
+        // and `\` collapsed to one `/` (an older composer.lock's `\/`, any
+        // number of Windows backslashes). Missing one here lets the orphan
+        // sweep delete a dir a lock still installs from.
+        let text = socket_patch_core::utils::path_spelling::canonical_path_text(&text);
         let mut rest: &str = &text;
-        while let Some(idx) = rest.find(".socket") {
+        while let Some(idx) = find_socket_anchor(rest, fold_case) {
             let slice = &rest[idx..];
             // `:` ends a reference too: pnpm snapshot keys are
             // `name@file:<path>:` and yaml mappings suffix the path with a
@@ -92,16 +162,9 @@ pub(crate) async fn scan_vendor_references(project_root: &Path) -> Vec<(String, 
                 .unwrap_or(slice.len());
             let candidate = &slice[..end];
             // NuGet's feed and Maven's repository name the uuid dir itself.
-            if let Some(parts) = parse_vendor_reference(candidate) {
-                if seen.insert((parts.eco.to_string(), parts.uuid.clone())) {
-                    out.push((
-                        parts.eco.to_string(),
-                        parts.uuid.clone(),
-                        candidate
-                            .trim_start_matches("./")
-                            .trim_end_matches('/')
-                            .to_string(),
-                    ));
+            if let Some((eco, uuid, rel)) = parse_reference_folding(candidate, fold_case) {
+                if seen.insert((eco.clone(), uuid.clone())) {
+                    out.push((eco, uuid, rel));
                 }
             }
             rest = &rest[idx + ".socket".len()..];
@@ -1281,36 +1344,75 @@ mod tests {
         );
     }
 
-    /// The scanner's false-positive guard: a `.socket` mention that is NOT
-    /// a parseable vendored-artifact path (the committed manifest, a
-    /// non-uuid path segment) must never be reported as a vendor reference
-    /// — `parse_vendor_path`'s reject branch is what keeps `repair` from
-    /// reconstructing ledger entries out of ordinary `.socket/` mentions.
     /// An older composer.lock spells slashes `\/` and a Windows checkout may
-    /// double its backslashes: the scan folds both to the canonical path, so
-    /// the orphan sweep keeps a dir such a lock still installs from. A
-    /// different uuid's dir is never this one's reference.
+    /// double (or quadruple) its backslashes: the scan folds every run to the
+    /// canonical path, so the orphan sweep keeps a dir such a lock still
+    /// installs from. A different uuid's dir is never this one's reference.
     #[tokio::test]
     async fn scan_recovers_escaped_and_doubled_backslash_references() {
         let uuid = "33333333-3333-4333-8333-333333333333";
+        let other = "44444444-3333-4333-8333-333333333333";
         let path = format!(".socket/vendor/composer/{uuid}/psr/log@3.0.2");
         for lock in [
             format!("{{\"url\": \"{}\"}}", path.replace('/', "\\/")),
             format!("{{\"url\": \"{}\"}}", path.replace('/', "\\\\")),
+            format!("{{\"url\": \"{}\"}}", path.replace('/', "\\\\\\\\")),
+            format!("{{\"url\": \"{}\"}}", path.replace('/', "\\\\\\/")),
             format!("{{\"url\": \"./{}\"}}", path.replace('/', "\\/")),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             tokio::fs::write(tmp.path().join("composer.lock"), &lock)
                 .await
                 .unwrap();
+            let refs = scan_vendor_references(tmp.path()).await;
             assert_eq!(
-                scan_vendor_references(tmp.path()).await,
+                refs,
                 vec![("composer".to_string(), uuid.to_string(), path.clone())],
                 "{lock}"
             );
+            assert!(
+                refs.iter().all(|(_, u, _)| u != other),
+                "a different uuid's dir is never this one's reference"
+            );
+            assert_eq!(scan_vendor_references_any_case(tmp.path()).await, refs);
         }
     }
 
+    /// The orphan sweep's scan matches the anchor in any case, as the revert
+    /// keep-checks do, so a re-cased reference keeps the dir (eco and uuid
+    /// reported canonical, the leaf as spelled). The refusal-side scan folds
+    /// case only where the disk does.
+    #[tokio::test]
+    async fn any_case_scan_recovers_a_recased_reference() {
+        let uuid = "55555555-3333-4333-8333-333333333333";
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = format!(
+            "{{\"url\": \"{}\"}}",
+            format!(
+                ".Socket\\Vendor\\Composer\\{}\\Psr\\Log@3.0.2",
+                uuid.to_ascii_uppercase()
+            )
+        );
+        tokio::fs::write(tmp.path().join("composer.lock"), &lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            scan_vendor_references_any_case(tmp.path()).await,
+            vec![(
+                "composer".to_string(),
+                uuid.to_string(),
+                format!(".socket/vendor/composer/{uuid}/Psr/Log@3.0.2")
+            )]
+        );
+        // No `.socket/` to probe: the refusal-side scan keeps case.
+        assert!(scan_vendor_references(tmp.path()).await.is_empty());
+    }
+
+    /// The scanner's false-positive guard: a `.socket` mention that is NOT
+    /// a parseable vendored-artifact path (the committed manifest, a
+    /// non-uuid path segment) must never be reported as a vendor reference
+    /// — `parse_vendor_path`'s reject branch is what keeps `repair` from
+    /// reconstructing ledger entries out of ordinary `.socket/` mentions.
     #[tokio::test]
     async fn scan_ignores_non_vendor_socket_mentions() {
         let tmp = tempfile::tempdir().unwrap();

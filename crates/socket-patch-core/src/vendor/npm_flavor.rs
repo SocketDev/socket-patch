@@ -788,18 +788,22 @@ pub async fn lock_text_refusals(
 /// install resolves through.
 ///
 /// `Some(false)` lets a revert delete the artifact, so every spelling of
-/// the path counts ([`crate::utils::path_spelling::mentions_path`]): `\/`
-/// JSON escapes, backslashed Windows separators, `\u` escapes.
+/// the path counts: `\/` JSON escapes, backslashed Windows separators, `\u`
+/// escapes. `Some(true)` REFUSES the revert, so ASCII case is folded only
+/// where the file system folds it ([`super::common::refusal_needle`]): on a
+/// case-sensitive disk a differently-cased path is another directory, not
+/// this artifact.
 pub(super) async fn lock_text_mentions_uuid(
     project_root: &Path,
     names: &[&str],
     uuid: &str,
 ) -> Option<bool> {
-    let needle = format!(".socket/vendor/npm/{uuid}/");
+    let needle =
+        super::common::refusal_needle(project_root, &format!(".socket/vendor/npm/{uuid}/")).await;
     let mut any_readable = false;
     for name in names {
         if let Ok(text) = read_regular_to_string(&project_root.join(name)).await {
-            if crate::utils::path_spelling::mentions_path(&text, &needle) {
+            if needle.found_in(&text) {
                 return Some(true);
             }
             any_readable = true;
@@ -1228,6 +1232,31 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    /// Review on #2022: `Some(true)` refuses the revert, so a re-cased
+    /// reference counts only where the disk folds case (where it does
+    /// resolve to the artifact). On a case-sensitive disk it names another
+    /// directory and must not block `vendor --revert`.
+    #[tokio::test]
+    async fn lock_text_mention_folds_case_only_where_the_disk_does() {
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".socket")).unwrap();
+        let folds = crate::utils::fs::folds_case(&dir.path().join(".socket")).await;
+        let recased = format!(
+            ".Socket/Vendor/NPM/{}/left-pad-1.3.0.tgz",
+            uuid.to_ascii_uppercase()
+        );
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            format!("\"resolved\": \"file:{recased}\""),
+        )
+        .unwrap();
+        assert_eq!(
+            lock_text_mentions_uuid(dir.path(), &["package-lock.json"], uuid).await,
+            Some(folds)
+        );
     }
 
     #[test]

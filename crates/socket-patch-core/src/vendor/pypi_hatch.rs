@@ -329,6 +329,11 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         Err((_, error)) => return RevertOutcome::failed(error),
     };
     let mut edits = BTreeMap::new();
+    // A leftover reference FAILS this revert, so case is folded only where
+    // the disk folds it; every escape and separator spelling counts.
+    let needle =
+        super::common::refusal_needle(root, &super::pypi_lock::artifact_needle_rel(&entry.uuid))
+            .await;
     for record in entry
         .wiring
         .iter()
@@ -347,11 +352,7 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         };
         match super::pypi_lock::restore_document(live, original, new) {
             Ok((restored, false))
-                if !super::pypi_lock::still_references_artifact(
-                    &restored,
-                    original,
-                    &entry.uuid,
-                ) =>
+                if !super::pypi_lock::still_references_artifact(&restored, original, &needle) =>
             {
                 edits.insert(record.file.clone(), restored);
             }
