@@ -435,6 +435,15 @@ pub(crate) async fn plan(
     // A file-scoped mark (a Go replace the workspace keeps from the build)
     // bypasses only its own file's ref: another file's live ref of the
     // same patch attests on its own basis, without the bypassed one.
+    // Purls some candidate attests through a ref no mark bypasses: a
+    // lockfile-only candidate left with nothing but file-scoped bypassed
+    // refs of the same purl (a stale pin the workspace keeps from the
+    // build) is then dropped, never both attested and reported skipped.
+    let live_purls: Vec<String> = cands
+        .iter()
+        .filter(|c| c.discovered.iter().any(|r| !bypassed_ref(&discovery, r)))
+        .map(|c| canonical_base_purl(&c.key))
+        .collect();
     cands.retain_mut(|c| {
         let pkg = canonical_base_purl(&c.key);
         let marks: Vec<&Unattested> = discovery
@@ -451,6 +460,17 @@ pub(crate) async fn plan(
                 c.discovered.retain(|r| !bypassed_ref(&discovery, r));
                 if !c.discovered.is_empty() {
                     return true;
+                }
+                if c.lockfile_only && live_purls.iter().any(|p| PurlKey::same(p, &pkg)) {
+                    notes.push(PlanNote {
+                        code: unattested_note(first.kind).0,
+                        detail: format!(
+                            "{}: patch {}'s wiring is bypassed ({}); another patch's live \
+                             wiring of the same package is attested",
+                            c.key, c.uuid, first.detail
+                        ),
+                    });
+                    return false;
                 }
                 first
             }
@@ -1897,8 +1917,10 @@ mod tests {
         };
         let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
         assert_eq!(plan.hosted[PURL].uuid, U1);
+        // Review on #2011 (round 2): the attested purl is never also
+        // reported skipped for its stale, bypassed leftover pin.
         assert!(
-            !plan.gated.iter().any(|f| f.reason == WIRING_CONFLICT),
+            !plan.gated.iter().any(|f| PurlKey::same(&f.purl, PURL)),
             "{:?}",
             plan.gated
         );
