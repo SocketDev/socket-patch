@@ -8197,10 +8197,11 @@ mod lock_download_guard_tests {
             }
         }
         found.sort();
-        let expected: Vec<(String, &str, String)> = PINNED_REFERENCES
+        let mut expected: Vec<(String, &str, String)> = PINNED_REFERENCES
             .iter()
             .map(|(rel, name, line)| (rel.to_string(), *name, line.to_string()))
             .collect();
+        expected.sort();
         assert_eq!(
             found, expected,
             "a production reference to `recover_lock_entry` was added, removed or changed. \

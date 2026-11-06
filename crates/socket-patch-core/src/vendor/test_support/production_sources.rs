@@ -4,9 +4,13 @@
 //!
 //! "Production" is every `.rs` file under `src/` except the test-only
 //! files (`*tests.rs`, `test_support`), with every test-only item removed:
-//! an item behind `#[cfg(test)]` or `#[cfg(all(test, …))]` (a test module,
-//! inline or `mod x;`, a test helper, a test `use`), and the whole file
-//! when it opens with `#![cfg(test)]`. Items are removed in place, never by
+//! an item behind `#[cfg(test)]` or `#[cfg(all(test, …))]` (an inline test
+//! module or a `mod x;` declaration, a test helper, a test `use`, a field,
+//! variant, arm or parameter), and the whole file when it opens with
+//! `#![cfg(test)]`. The FILE an out-of-line test module (`#[cfg(test)] mod
+//! x;`) points at is still read unless its name ends in `tests.rs`, so a
+//! test-only file (the crawlers' `oracle.rs`) must not hold what a guard
+//! forbids, or must open with `#![cfg(test)]`. Items are removed in place, never by
 //! truncating at the first `#[cfg(test)]`, so production code after a test
 //! item is still scanned. Line endings are normalized to LF, and removed
 //! bytes become spaces (newlines kept), so line numbers stay the file's.
@@ -208,14 +212,32 @@ fn matching_close(b: &[u8], kind: &[Kind], open: usize) -> usize {
 
 /// End (exclusive) of the item starting at `start`: its first `;` outside
 /// brackets, or its first top-level `{…}` block (plus a `;` right after).
+/// An item never reaches past the bracket that encloses it, and one in a
+/// comma list (a struct field, an enum variant, a match arm, a parameter)
+/// ends at its `,`. Generic `<…>` count as brackets for that comma (a
+/// `<` or `>` hugged by code on both sides, `->` and `=>` excepted), so
+/// `Result<(), ()>` or `HashMap<K, V>` do not end it.
 fn item_end(b: &[u8], kind: &[Kind], start: usize) -> usize {
     let mut depth = 0usize;
+    let mut angle = 0usize;
     let mut j = start;
+    let code = |i: usize| kind.get(i) == Some(&Kind::Code);
     while j < b.len() {
-        if kind[j] == Kind::Code {
+        if code(j) {
             match b[j] {
                 b'(' | b'[' => depth += 1,
-                b')' | b']' => depth = depth.saturating_sub(1),
+                b')' | b']' | b'}' if depth == 0 => return j,
+                b')' | b']' => depth -= 1,
+                b'<' if j > 0
+                    && code(j - 1)
+                    && !b[j - 1].is_ascii_whitespace()
+                    && b.get(j + 1)
+                        .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=') =>
+                {
+                    angle += 1
+                }
+                b'>' if angle > 0 && j > 0 && !matches!(b[j - 1], b'-' | b'=') => angle -= 1,
+                b',' if depth == 0 && angle == 0 => return j + 1,
                 b';' if depth == 0 => return j + 1,
                 b'{' if depth == 0 => {
                     let close = matching_close(b, kind, j);
@@ -223,7 +245,7 @@ fn item_end(b: &[u8], kind: &[Kind], start: usize) -> usize {
                     while k < b.len() && b[k].is_ascii_whitespace() {
                         k += 1;
                     }
-                    return if b.get(k) == Some(&b';') {
+                    return if b.get(k) == Some(&b';') || b.get(k) == Some(&b',') {
                         k + 1
                     } else {
                         close + 1
@@ -313,8 +335,9 @@ pub fn code_only(src: &str) -> String {
             _ => b' ',
         })
         .collect();
-    // Non-code bytes became ASCII; code bytes are whole chars.
-    String::from_utf8(out).unwrap_or_default()
+    // Non-code bytes became ASCII; code bytes are whole chars. A slip must
+    // fail the guard loudly, never hand it an empty (reference-free) file.
+    String::from_utf8(out).expect("blanking keeps UTF-8")
 }
 
 /// Every reference to the identifier `name` in `code` (from
@@ -370,6 +393,27 @@ mod tests {
         assert!(
             strip_test_items("#[cfg(any(test, feature = \"x\"))]\nfn k() {}\n").contains("fn k")
         );
+    }
+
+    /// A test-only field, variant, arm or parameter ends at its `,` or at
+    /// the bracket that encloses it, never at the next item's block.
+    #[test]
+    fn list_items_end_at_their_comma_or_closer() {
+        let src = "struct S {\n    #[cfg(test)]\n    probe: u32,\n}\nimpl S { fn get(&self) { kept_a(); } }\n\
+                   struct T {\n    #[cfg(test)]\n    m: HashMap<K, V>,\n    keep: u8,\n}\n\
+                   enum E {\n    #[cfg(test)]\n    Probe(u8),\n    Real,\n}\n\
+                   fn f(#[cfg(test)] x: u8, y: u8) { kept_b(); }\n\
+                   #[cfg(test)]\nfn r() -> Result<(), ()> { gone(); }\nfn after() { kept_c(); }\n\
+                   fn m(v: u8) { match v {\n        #[cfg(test)]\n        0 => gone2(),\n        _ => kept_d(),\n    } }\n";
+        let out = strip_test_items(src);
+        for kept in [
+            "kept_a", "keep: u8", "Real", "y: u8", "kept_b", "kept_c", "kept_d",
+        ] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
+        for dropped in ["probe", "HashMap", "Probe", "x: u8", "gone()", "gone2"] {
+            assert!(!out.contains(dropped), "{dropped}: {out}");
+        }
     }
 
     #[test]

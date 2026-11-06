@@ -890,9 +890,20 @@ async fn stranded_wired_packages(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(format!("composer.lock is unreadable ({e})")),
     };
-    let lock = LOCK_MEMO
-        .parse(text.as_bytes(), || parse_json_text(&text))
-        .map_err(|e| format!("composer.lock is not valid JSON ({e})"))?;
+    let lock = match LOCK_MEMO.parse(text.as_bytes(), || parse_json_text(&text)) {
+        Ok(lock) => lock,
+        // A lock that never names the uuid (in any spelling: the uuid has
+        // no `/` to escape) cannot point composer at its directory, so a
+        // broken lock elsewhere does not block this revert.
+        Err(_)
+            if !text
+                .to_ascii_lowercase()
+                .contains(&uuid.to_ascii_lowercase()) =>
+        {
+            return Ok(Vec::new())
+        }
+        Err(e) => return Err(format!("composer.lock is not valid JSON ({e})")),
+    };
     Ok(stranded_in(&lock, uuid, restorable))
 }
 
@@ -1912,7 +1923,12 @@ mod tests {
         let bom = with_bom(&render);
         reseed_memo(&memo, bom.clone(), lock.clone());
         assert_eq!(memo.get(&bom).as_deref(), Some(&lock));
-        assert!(memo.get(&with_bom(&bom)).is_none());
+        // Only one BOM is stripped: two are not the render, so re-seeding
+        // with them stores nothing (and drops the stale slot).
+        let double = with_bom(&bom);
+        reseed_memo(&memo, double.clone(), lock.clone());
+        assert!(memo.get(&double).is_none());
+        assert!(memo.get(&bom).is_none());
     }
 
     /// Vendor then `--revert` on `lock_bytes`, asserting the revert
@@ -3295,12 +3311,20 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
-        // Unparseable lock: fail closed (what it wires cannot be read).
-        tokio::fs::write(&lock_path, b"not json").await.unwrap();
+        // Unparseable lock naming the uuid: fail closed (what it wires
+        // cannot be read). One that never names it wires nothing of it.
+        tokio::fs::write(&lock_path, format!("not json {UUID}"))
+            .await
+            .unwrap();
         let err = stranded_wired_packages(&lock_path, UUID, &none)
             .await
             .unwrap_err();
         assert!(err.contains("not valid JSON"), "{err}");
+        tokio::fs::write(&lock_path, b"not json").await.unwrap();
+        assert!(stranded_wired_packages(&lock_path, UUID, &none)
+            .await
+            .unwrap()
+            .is_empty());
         // No package sections at all.
         tokio::fs::write(
             &lock_path,
@@ -4525,6 +4549,25 @@ mod tests {
                 .unwrap(),
             conflicted,
             "lock untouched"
+        );
+
+        // A broken lock that never names the uuid cannot point composer at
+        // its directory: it does not block the revert.
+        let unrelated = format!(
+            "<<<<<<< HEAD\n{text}=======\n{}>>>>>>> theirs\n",
+            text.replace('/', "\\/")
+        );
+        tokio::fs::write(root.join(COMPOSER_LOCK), &unrelated)
+            .await
+            .unwrap();
+        let outcome = revert_composer(&entry, root, true).await;
+        assert!(
+            !outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("not valid JSON")),
+            "{:?}",
+            outcome.error
         );
     }
 }
