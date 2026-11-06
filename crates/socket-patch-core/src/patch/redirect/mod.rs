@@ -8791,6 +8791,28 @@ fn rewrite_maven_pom(
         // unpatched bytes there while the GA counts as redirected and VEX
         // attests it: the dep is skipped. `sources` / `javadoc` jars are
         // never executed, so they only warn.
+        //
+        // With a suffixed pin, every executable copy is weighed as VEX
+        // discovery weighs it: one that may resolve anything but the pin
+        // (another release, a `${property}` a profile moves, or no version
+        // in this pom) keeps unpatched code on the classpath, so no pin is
+        // written that VEX could never attest.
+        let unserved = suffixed_version
+            .as_deref()
+            .and_then(|s| idx.unserved_classifier_copy(&group_id, &artifact_id, s));
+        if let (Some((classifier, version)), Some(served)) = (unserved, &suffixed_version) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_classifier_unsupported".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id}:{classifier} resolves <version>{}</version>, not \
+                     the suffixed {served}; the Socket patch covers only the main jar, so it is \
+                     left as-is and the dep is not redirected (that variant would keep the \
+                     unpatched code on the classpath)",
+                    version.unwrap_or("(none in this pom)")
+                ),
+            });
+            continue;
+        }
         let mut executable_variant = false;
         for variant in &variants {
             let Some(v) = variant.version_text.as_deref() else {
@@ -8799,9 +8821,10 @@ fn rewrite_maven_pom(
             let names_release = v == dep.version
                 || crate::formats::maven::split_socket_version(v)
                     .is_some_and(|(base, _)| base == dep.version);
-            if names_release {
-                let classifier = variant.classifier.as_deref().unwrap_or_default();
-                let executable = !matches!(classifier, "sources" | "javadoc");
+            let classifier = variant.classifier.as_deref().unwrap_or_default();
+            let executable = crate::formats::maven::is_executable_classifier(classifier);
+            // Weighed above when the pin is suffixed.
+            if names_release && (suffixed_version.is_none() || !executable) {
                 executable_variant |= executable;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_classifier_unsupported".into(),
@@ -10483,6 +10506,89 @@ mod tests {
                 "{out}"
             );
             assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
+        }
+    }
+
+    /// An executable classifier copy that resolves anything but the
+    /// suffixed pin — another release, a `${property}` a profile moves, no
+    /// version in this pom (its classifier-keyed management consulted, a
+    /// profile's too) — keeps unpatched code on the classpath, and VEX never
+    /// attests that pin: nothing is written (#2026 review). One the
+    /// management pins to the suffixed version, or a `sources` / `javadoc`
+    /// one at any version, lets the main jar's pin land.
+    #[test]
+    fn maven_executable_classifier_off_the_pin_blocks_the_redirect() {
+        let pom = |copies: &str, profile: &str| {
+            format!(
+                "<project>\n  <properties><v>1.7.30</v></properties>\n  <dependencies>\n    \
+                 <dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 <version>1.7.36</version></dependency>\n    {copies}\n  </dependencies>\n  \
+                 <profiles><profile><id>p</id>{profile}</profile></profiles>\n</project>\n"
+            )
+        };
+        let copy = |classifier: &str, version: Option<&str>| {
+            let v = version.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>{v}\
+                 <classifier>{classifier}</classifier></dependency>"
+            )
+        };
+        let managed = |version: &str| {
+            format!(
+                "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>",
+                copy("tests", Some(version))
+            )
+        };
+        let refused = [
+            pom(&copy("tests", Some("1.7.30")), ""),
+            pom(&copy("linux-x86_64", Some("${v}")), ""),
+            pom(&copy("tests", None), ""),
+            // A profile's management of a versionless copy, over a live one
+            // at the pin.
+            pom(&copy("tests", None), &managed("1.7.30")).replace(
+                "  <profiles>",
+                &format!("  {}\n  <profiles>", managed(MAVEN_SUFFIXED)),
+            ),
+            // A version a profile's `<properties>` move.
+            pom(
+                &copy("tests", Some("${w}")),
+                "<properties><w>1.7.30</w></properties>",
+            )
+            .replace(
+                "<v>1.7.30</v>",
+                &format!("<v>1.7.30</v><w>{MAVEN_SUFFIXED}</w>"),
+            ),
+        ];
+        for pom in &refused {
+            let files = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{pom}: {:?}", r.files);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_classifier_unsupported"],
+                "{pom}"
+            );
+        }
+        let pinned = [
+            pom(&copy("sources", Some("1.7.30")), ""),
+            pom(&copy("javadoc", None), ""),
+            pom(&copy("tests", Some(MAVEN_SUFFIXED)), ""),
+            // A versionless copy its live management pins to the pin.
+            pom(&copy("tests", None), "").replace(
+                "  <profiles>",
+                &format!("  {}\n  <profiles>", managed(MAVEN_SUFFIXED)),
+            ),
+        ];
+        for pom in &pinned {
+            let files = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let out = r.files.get("pom.xml").expect("main jar pinned");
+            assert!(
+                out.contains(&format!(
+                    "<artifactId>slf4j-api</artifactId><version>{MAVEN_SUFFIXED}</version>"
+                )),
+                "{out}"
+            );
         }
     }
 

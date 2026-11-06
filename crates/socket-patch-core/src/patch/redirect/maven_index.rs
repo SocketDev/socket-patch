@@ -336,6 +336,62 @@ impl PomIndex {
         })
     }
 
+    /// The first executable classifier copy of `group:artifact` (not
+    /// `sources` / `javadoc`; live or inside `<profiles>`) that may resolve
+    /// a version other than `served`, with its classifier and that version
+    /// (`None`: none in this pom), as VEX discovery weighs one: the grant
+    /// serves only the main jar, and a classifier copy is its own
+    /// coordinate, which the pin does not retarget. Its versions are its
+    /// own ([`IndexedDep::build_versions`]), else those of a
+    /// `<dependencyManagement>` entry with the same classifier (Maven keys
+    /// management by classifier; a profile's entry while that profile is
+    /// active), and with no live entry the version comes from outside this
+    /// pom. A `test-jar` typed declaration has no classifier and is refused
+    /// as an unsupported packaging (or a profile bypass) instead.
+    pub(super) fn unserved_classifier_copy(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: &str,
+    ) -> Option<(&str, Option<&str>)> {
+        let copies = |managed: bool| {
+            self.deps.iter().filter_map(move |d| {
+                let c = d.classifier.as_deref()?;
+                (d.managed == managed
+                    && d.group.as_deref() == Some(group)
+                    && d.artifact.as_deref() == Some(artifact)
+                    && is_executable_classifier(c))
+                .then_some((d, c))
+            })
+        };
+        // Every version a declaration may resolve (`None`: it has none).
+        fn versions(d: &IndexedDep) -> Vec<Option<&str>> {
+            match d.build_versions.as_slice() {
+                [] => vec![None],
+                all => all.iter().map(|v| Some(v.as_str())).collect(),
+            }
+        }
+        copies(false).find_map(|(d, classifier)| {
+            let resolved: Vec<Option<&str>> = if d.version_text.is_some() {
+                versions(d)
+            } else {
+                let entries = |in_profile: bool| {
+                    copies(true)
+                        .filter(move |(m, c)| *c == classifier && m.in_profile == in_profile)
+                        .flat_map(|(m, _)| versions(m))
+                };
+                let mut live: Vec<Option<&str>> = entries(false).collect();
+                if live.is_empty() {
+                    live.push(None);
+                }
+                live.extend(entries(true));
+                live
+            };
+            let version = resolved.into_iter().find(|v| *v != Some(served))?;
+            Some((classifier, version))
+        })
+    }
+
     pub(super) fn dep(&self, i: usize) -> &IndexedDep {
         &self.deps[i]
     }
