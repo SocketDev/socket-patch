@@ -34,7 +34,7 @@ fn sibling_locks(files: &BTreeMap<String, String>, bun_lockb_present: bool) -> V
     })
 }
 
-/// Does vlt drive hosted confirmation and the artifact preflight?
+/// Does vlt drive hosted confirmation?
 /// `vlt-lock.json` must be present, and either vlt's install state (the
 /// `node_modules/.vlt-lock.json` sentinel) is too, or no other npm-family
 /// lock is (`bun_lockb_present`: see [`sibling_locks`]). Otherwise both
@@ -57,7 +57,7 @@ fn lock_unsupported(detail: &str) -> RewriteWarning {
 
 /// A lock that passed the lock-level parse, with its nodes section located
 /// and its node ids split once.
-pub(super) struct HostedLock {
+struct HostedLock {
     parsed: ParsedLock,
     nodes: Option<SectionSpan>,
     index: NodeIndex,
@@ -127,7 +127,7 @@ impl NodeIndex {
     }
 }
 
-pub(super) fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
+fn parse_hosted_lock(text: &str) -> Result<HostedLock, RewriteWarning> {
     let parsed = match sniff_lock(text) {
         LockSniff::Readable(parsed) => parsed,
         LockSniff::Bom => {
@@ -190,18 +190,6 @@ fn outside_instances<'a>(lock: &'a HostedLock, name: &str, version: &str) -> Vec
         .filter(|node| installs_outside_registry(&node.dep_id, name, name, version))
         .map(|node| node.id.as_str())
         .collect()
-}
-
-/// The default-registry node ids of `dep` in a lock that passed the
-/// lock-level parse.
-pub(super) fn default_instances<'a>(lock: &'a HostedLock, dep: &DepOverride) -> Vec<&'a str> {
-    partition_instances(lock, &full_name(dep), &dep.version).0
-}
-
-/// Does `dep` have a node of socket-patch's vendored vlt shape in a
-/// lock that passed the lock-level parse?
-pub(super) fn has_vendored_instance(lock: &HostedLock, dep: &DepOverride) -> bool {
-    has_vendored_node(lock, &full_name(dep), &dep.version)
 }
 
 /// The lock-level warnings that say vlt may discard the lock's pins:
@@ -482,14 +470,6 @@ fn instances_pinned(nodes: &Map<String, Value>, ids: &[&str], sha512: &str, url:
                 && t.get(3).and_then(Value::as_str) == Some(url)
         })
     })
-}
-
-/// Did an earlier run pin every one of `ids`? Reads the lock as parsed,
-/// not its text again.
-pub(super) fn already_pinned(lock: &HostedLock, ids: &[&str], sha512: &str, url: &str) -> bool {
-    lock.parsed
-        .nodes()
-        .is_some_and(|nodes| instances_pinned(nodes, ids, sha512, url))
 }
 
 struct Splice {

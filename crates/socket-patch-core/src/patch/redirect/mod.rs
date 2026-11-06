@@ -110,7 +110,6 @@ mod state;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
-pub mod vlt_preflight;
 pub mod yarnrc;
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
@@ -598,13 +597,12 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
-    rewrite_registry_redirect_withholding_vlt(
+    rewrite_registry_redirect_with_host(
         files,
         overrides,
         artifact_metadata,
         pipenv_major,
         bun_lockb_present,
-        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
@@ -671,20 +669,17 @@ fn withhold_pypi_platform_wheels<'a>(
     withhold(overrides, &refused)
 }
 
-/// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
-/// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
-/// failed vlt's preflight while another npm-family lock may be the one the
-/// project installs from. `gradle_unreadable` are the Gradle build files
+/// [`rewrite_registry_redirect_with_pipenv_version`] with the inputs only
+/// the host can resolve. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
 /// the build rather than take them for absent.
 #[allow(clippy::too_many_arguments)]
-pub fn rewrite_registry_redirect_withholding_vlt(
+pub fn rewrite_registry_redirect_with_host(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
-    vlt_withheld: &std::collections::BTreeSet<String>,
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
@@ -705,11 +700,9 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, &overrides, pipenv_major, &mut result);
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
-    let vlt_overrides = withhold(&overrides, vlt_withheld);
     let groups = rewriter_groups(
         files,
         &overrides,
-        &vlt_overrides,
         bun_lockb_present,
         artifact_metadata,
         gradle_unreadable,
@@ -731,13 +724,11 @@ type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
 /// rewriter's confirmations, `rewrite_uv_lock` the python lock sets and a
 /// metadata file an earlier python rewriter may have written) or the
 /// withholding prefix's. Every group sees the full withheld override slice,
-/// exactly as the serial chain did; the vlt rewriter sees `vlt_overrides`,
-/// that slice minus the vlt-withheld uuids.
+/// exactly as the serial chain did.
 #[allow(clippy::too_many_arguments)]
 fn rewriter_groups<'a>(
     files: &'a BTreeMap<String, String>,
     overrides: &'a [DepOverride],
-    vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
     artifact_metadata: &'a BTreeMap<String, String>,
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
@@ -752,9 +743,7 @@ fn rewriter_groups<'a>(
             rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
-        Box::new(move |result| {
-            vlt::rewrite_vlt_lock(files, vlt_overrides, bun_lockb_present, result)
-        }),
+        Box::new(move |result| vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, result)),
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
             rewrite_hatch(files, overrides, result);
@@ -13572,13 +13561,12 @@ mod tests {
         )
         .is_err());
         // The full chain drives it too.
-        let mut r = rewrite_registry_redirect_withholding_vlt(
+        let mut r = rewrite_registry_redirect_with_host(
             &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
             std::slice::from_ref(&ovr),
             &BTreeMap::new(),
             None,
             false,
-            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,

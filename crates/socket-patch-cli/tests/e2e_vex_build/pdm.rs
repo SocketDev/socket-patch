@@ -136,6 +136,14 @@ fn pins_for(v: &str) -> Vec<String> {
         // 2.26.9+ require 1.x).
         if ((2, 21, 0)..(2, 26, 1)).contains(&t) {
             pins.push("hishel<1");
+        } else if t >= (2, 26, 1) {
+            // 2.26.9+ declare an unbounded `hishel>=1.0.0` (2.29.6:
+            // `>=1.4.0`), and hishel 2.0 (2026-11-05) dropped
+            // `SyncSqliteStorage`, so every command dies with "module
+            // 'hishel' has no attribute 'SyncSqliteStorage'". `<2`
+            // resolves the 1.x line those releases shipped against (a
+            // no-op for 2.26.1 - 2.26.8, which already bound `<1`).
+            pins.push("hishel<2");
         }
         // 2.x declares an unbounded `unearth`, and unearth 0.19 (2026-10-27)
         // moved to `httpx2`: PDM's PyPI client is no longer the `httpx`
