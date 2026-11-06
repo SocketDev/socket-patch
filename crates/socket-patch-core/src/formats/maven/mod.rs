@@ -8,8 +8,8 @@ use std::collections::BTreeMap;
 
 pub(crate) use properties::{
     interpolate_keeping, interpolate_strict, is_model_reference, lookup_property,
-    profile_combinations, split_coordinates, Definitions, Interpolate, PomLayer,
-    COORDINATE_SEPARATOR, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+    profile_combinations, Definitions, Interpolate, PomLayer, MAX_COMBINED_PROFILES,
+    MAX_INTERPOLATION_DEPTH,
 };
 use properties::{interpolate_lenient, read_properties};
 
@@ -46,7 +46,7 @@ pub(crate) struct PomRepo {
     pub(crate) in_profile: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PomDep {
     /// `<groupId>` / `<artifactId>` as [`ScopedDep::group`] reads them:
     /// with no profile active, an undefined `${…}` kept as written.
@@ -55,12 +55,13 @@ pub(crate) struct PomDep {
     /// The trimmed `<groupId>` / `<artifactId>` text as written.
     pub(crate) group_text: String,
     pub(crate) artifact_text: String,
-    /// The other `(groupId, artifactId)` pairs the declaration names when
-    /// some combination of profiles is active whose `<properties>` redefine
-    /// a property its coordinates name, or, for one inside a profile, while
-    /// its own profile is ([`PomScope::coordinate_alternatives`]); a
-    /// reference left unresolved stays as written ([`may_name`] reads it as
-    /// any text). Empty when no profile can move it.
+    /// How the declaration reads under each combination of active profiles
+    /// whose `<properties>` move its coordinates off
+    /// [`Self::group`] / [`Self::artifact`] (for one inside a profile, its
+    /// own profile is always active), with the version it resolves there
+    /// ([`PomScope::coordinate_alternatives`]); a coordinate reference left
+    /// unresolved stays as written ([`may_name`] reads it as any text).
+    /// Empty when no profile can move its coordinates.
     pub(crate) coordinate_alternatives: Vec<CoordinateAlternative>,
     /// Trimmed version, every `${prop}` interpolated
     /// ([`interpolate_strict`]) from the project model (`project.*` /
@@ -91,6 +92,10 @@ pub(crate) struct PomDep {
     /// Inside `<dependencyManagement>`.
     pub(crate) managed: bool,
     pub(crate) in_profile: bool,
+    /// `None` for a declaration as the pom writes it ([`parse_pom`]); a
+    /// reader that expands one into its [`Self::coordinate_alternatives`]
+    /// sets the profiles that give each such reading.
+    pub(crate) retargeted_by: Option<MovedBy>,
 }
 
 /// A value some combination of active profiles gives a `${…}` text other
@@ -104,14 +109,22 @@ pub(crate) struct Alternative {
     pub(crate) by: MovedBy,
 }
 
-/// A `(groupId, artifactId)` some combination of active profiles gives a
-/// declaration other than [`PomDep::group`] / [`PomDep::artifact`], and why.
+/// How a declaration reads under one combination of active profiles that
+/// moves its `(groupId, artifactId)` off the no-profile reading, and why.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CoordinateAlternative {
     pub(crate) group: String,
     pub(crate) artifact: String,
+    /// Its `<version>` in the build under the same profiles
+    /// ([`interpolate_strict`], as written when that fails); `None` when
+    /// it has none.
+    pub(crate) version: Option<String>,
     pub(crate) by: MovedBy,
 }
+
+/// What each text of a declaration reads under one combination of active
+/// profiles, and which ([`PomScope::resolve_all_in_build`]).
+type Reading = (Vec<Option<String>>, MovedBy);
 
 /// What gives an [`Alternative`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,86 +348,141 @@ impl PomScope {
         pos: usize,
         interpolate: Interpolate,
     ) -> (Option<String>, Vec<Alternative>) {
+        let (mut base, readings) = self.resolve_all_in_build(&[(text, interpolate)], pos);
+        let mut alternatives: Vec<Alternative> = Vec::new();
+        for (mut values, by) in readings {
+            let value = values.remove(0).unwrap_or_else(|| text.to_string());
+            if alternatives.iter().all(|a| a.value != value) {
+                alternatives.push(Alternative { value, by });
+            }
+        }
+        (base.remove(0), alternatives)
+    }
+
+    /// [`Self::resolve_in_build`] for several texts of one declaration (its
+    /// groupId, artifactId and version), each through its own
+    /// interpolation and work budget but all under the same combination of
+    /// active profiles: what they read with none active but the one holding
+    /// the declaration, and each combination ([`profile_combinations`] of
+    /// them all) under which any reads otherwise, the smallest first, with
+    /// what they all read there. Fails closed: when the combinations cannot
+    /// be enumerated or a profile's `<properties>` is unreadable, every text
+    /// as written is one reading.
+    fn resolve_all_in_build(
+        &self,
+        texts: &[(&str, Interpolate)],
+        pos: usize,
+    ) -> (Vec<Option<String>>, Vec<Reading>) {
         let own = self.own_profile(pos);
-        let base = interpolate(text, &|name| self.lookup(name, &own, true));
-        if !text.contains("${") {
+        let read = |active: &[usize]| -> Vec<Option<String>> {
+            texts
+                .iter()
+                .map(|(text, interpolate)| {
+                    interpolate(text, &|name| self.lookup(name, active, true))
+                })
+                .collect()
+        };
+        let base = read(&own);
+        if texts.iter().all(|(text, _)| !text.contains("${")) {
             return (base, Vec::new());
         }
-        let as_written = |by: MovedBy| Alternative {
-            value: text.to_string(),
-            by,
+        let as_written = |by: MovedBy| {
+            let values = texts.iter().map(|(text, _)| Some(text.to_string()));
+            vec![(values.collect(), by)]
         };
         if let Some(e) = &self.profiles_unreadable {
-            return (base, vec![as_written(MovedBy::Unreadable(e.clone()))]);
+            return (base, as_written(MovedBy::Unreadable(e.clone())));
         }
-        let Some(combinations) = profile_combinations(text, &|name| self.definitions(name, &own))
+        let values: Vec<&str> = texts.iter().map(|(text, _)| *text).collect();
+        let Some(combinations) =
+            profile_combinations(&values, &|name| self.definitions(name, &own))
         else {
-            return (base, vec![as_written(MovedBy::TooManyProfiles)]);
+            return (base, as_written(MovedBy::TooManyProfiles));
         };
-        let mut alternatives: Vec<Alternative> = Vec::new();
+        let mut readings: Vec<Reading> = Vec::new();
         for combination in combinations {
             let mut active: Vec<usize> = own.iter().chain(&combination).copied().collect();
             active.sort_unstable();
             active.dedup();
-            let value = interpolate(text, &|name| self.lookup(name, &active, true))
-                .unwrap_or_else(|| text.to_string());
-            if Some(&value) != base.as_ref() && alternatives.iter().all(|a| a.value != value) {
+            // What a text cannot resolve there is read as written.
+            let values: Vec<Option<String>> = read(&active)
+                .into_iter()
+                .zip(texts)
+                .map(|(v, (text, _))| v.or_else(|| Some(text.to_string())))
+                .collect();
+            if values != base && readings.iter().all(|(v, _)| *v != values) {
                 let ids = combination
                     .iter()
                     .map(|&i| self.profile_properties[i].id.clone())
                     .collect();
-                alternatives.push(Alternative {
-                    value,
-                    by: MovedBy::Profiles(ids),
-                });
+                readings.push((values, MovedBy::Profiles(ids)));
             }
         }
-        (base, alternatives)
+        (base, readings)
     }
 
-    /// [`PomDep::coordinate_alternatives`] of the declaration at `pos`
-    /// whose coordinates are written `text` and read `base` with no profile
-    /// active ([`Self::interpolate_coordinate`]): both resolved together
-    /// ([`COORDINATE_SEPARATOR`]) through [`Self::resolve_in_build`],
-    /// keeping an unresolved reference ([`interpolate_keeping`]). A
-    /// profile declaration's own profile is always active with it, so what
-    /// it reads there is an alternative too.
-    fn coordinate_alternatives(
-        &self,
-        text: (&str, &str),
-        base: (&str, &str),
-        pos: usize,
-    ) -> Vec<CoordinateAlternative> {
-        if !text.0.contains("${") && !text.1.contains("${") {
+    /// [`PomDep::coordinate_alternatives`] of `dep`: its groupId and
+    /// artifactId (keeping an unresolved reference,
+    /// [`interpolate_keeping`]) and version ([`interpolate_strict`]) read
+    /// together ([`Self::resolve_all_in_build`]), every reading whose
+    /// coordinates differ from what it reads with no profile active
+    /// ([`ScopedDep::group`] / [`ScopedDep::artifact`]). A profile
+    /// declaration's own profile is always active with it, so what it reads
+    /// there is one too.
+    pub(crate) fn coordinate_alternatives(&self, dep: &ScopedDep) -> Vec<CoordinateAlternative> {
+        let (Some(group_text), Some(artifact_text), Some(group), Some(artifact)) = (
+            dep.group_text.as_deref(),
+            dep.artifact_text.as_deref(),
+            dep.group.as_deref(),
+            dep.artifact.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        if !group_text.contains("${") && !artifact_text.contains("${") {
             return Vec::new();
         }
-        let joined = format!("{}{COORDINATE_SEPARATOR}{}", text.0, text.1);
-        let (own_base, alternatives) = self.resolve_in_build(&joined, pos, interpolate_keeping);
-        let own_ids = || {
-            self.own_profile(pos)
-                .into_iter()
-                .map(|i| self.profile_properties[i].id.clone())
-                .collect()
-        };
-        let mut out: Vec<CoordinateAlternative> = Vec::new();
-        let candidates = own_base
-            .map(|v| (v, MovedBy::Profiles(own_ids())))
+        let mut texts: Vec<(&str, Interpolate)> = vec![
+            (group_text, interpolate_keeping),
+            (artifact_text, interpolate_keeping),
+        ];
+        if let Some(version) = dep.version_text.as_deref() {
+            texts.push((version, interpolate_strict));
+        }
+        let pos = dep.element.start;
+        let (own_base, readings) = self.resolve_all_in_build(&texts, pos);
+        let own: Vec<String> = self
+            .own_profile(pos)
             .into_iter()
-            .chain(alternatives.into_iter().map(|a| (a.value, a.by)));
-        for (value, by) in candidates {
-            let Some((group, artifact)) = split_coordinates(&value) else {
+            .map(|i| self.profile_properties[i].id.clone())
+            .collect();
+        let own_reading = (!own.is_empty()).then(|| {
+            let mut values = own_base;
+            if let Some(v) = values.get_mut(2) {
+                *v = v.take().or_else(|| dep.version_text.clone());
+            }
+            (values, MovedBy::Profiles(own))
+        });
+        let mut out: Vec<CoordinateAlternative> = Vec::new();
+        for (values, by) in own_reading.into_iter().chain(readings) {
+            let mut values = values.into_iter();
+            let (Some(Some(g)), Some(Some(a))) = (values.next(), values.next()) else {
                 continue;
             };
-            if (group.as_str(), artifact.as_str()) != base
-                && out
-                    .iter()
-                    .all(|o| (&o.group, &o.artifact) != (&group, &artifact))
-            {
-                out.push(CoordinateAlternative {
-                    group,
-                    artifact,
-                    by,
-                });
+            let version = values.next().flatten();
+            if (g.as_str(), a.as_str()) == (group, artifact) {
+                continue;
+            }
+            let reading = CoordinateAlternative {
+                group: g,
+                artifact: a,
+                version,
+                by,
+            };
+            if !out.iter().any(|o| {
+                (&o.group, &o.artifact, &o.version)
+                    == (&reading.group, &reading.artifact, &reading.version)
+            }) {
+                out.push(reading);
             }
         }
         out
@@ -554,16 +622,12 @@ pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Resu
     }
 
     for dep in scope.dependencies()? {
+        let coordinate_alternatives = scope.coordinate_alternatives(&dep);
         let (Some(group), Some(artifact), Some(group_text), Some(artifact_text)) =
             (dep.group, dep.artifact, dep.group_text, dep.artifact_text)
         else {
             continue;
         };
-        let coordinate_alternatives = scope.coordinate_alternatives(
-            (&group_text, &artifact_text),
-            (&group, &artifact),
-            dep.element.start,
-        );
         let (version, build_version, version_alternatives) = match &dep.version_text {
             Some(text) => {
                 let (spelled, build, alternatives) = scope.resolve_version(text, dep.element.start);
@@ -585,6 +649,7 @@ pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Resu
             type_text: dep.type_text,
             managed: inside(dep.element.start, &managed),
             in_profile: dep.in_profile,
+            retargeted_by: None,
         });
     }
     Ok(pom)
@@ -1421,6 +1486,25 @@ mod tests {
         assert_eq!(
             one("<g>org.a</g>", &["<g>${g}</g>"], &[], "${g}", "x").1,
             [pair("${g}", "x")]
+        );
+        // An unterminated `${` in one coordinate stays in that one: each is
+        // read on its own budget, and every reading names its profiles.
+        let pom = format!(
+            "<project><properties><a>x</a></properties><dependencies>{}</dependencies>\
+             <profiles><profile><id>q</id><properties><a>y</a></properties></profile>\
+             </profiles></project>",
+            dep("${g", "${a}")
+        );
+        let d = super::parse_pom(&pom).unwrap().deps.remove(0);
+        assert_eq!((d.group.as_str(), d.artifact.as_str()), ("${g", "x"));
+        assert_eq!(
+            d.coordinate_alternatives,
+            [super::CoordinateAlternative {
+                group: "${g".to_string(),
+                artifact: "y".to_string(),
+                version: Some("1".to_string()),
+                by: super::MovedBy::Profiles(vec!["q".to_string()]),
+            }]
         );
         // Undefined with no profile involved: no alternative.
         assert_eq!(

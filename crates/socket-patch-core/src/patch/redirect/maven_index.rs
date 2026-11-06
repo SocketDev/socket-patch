@@ -6,7 +6,9 @@
 //! shifting offsets, so a pom with many patched dependencies is scanned once,
 //! not once per dependency.
 
-use crate::formats::maven::PomScope;
+use crate::formats::maven::{
+    is_executable_classifier, may_shadow, CoordinateAlternative, PomScope,
+};
 use crate::formats::xml::{child_text, children, elements, Element};
 
 /// One `<dependency>` outside ignored sections.
@@ -20,6 +22,13 @@ pub(super) struct IndexedDep {
     pub(super) type_text: Option<String>,
     pub(super) classifier: Option<String>,
     pub(super) in_profile: bool,
+    /// The trimmed `<groupId>` / `<artifactId>` text as written.
+    pub(super) group_text: Option<String>,
+    pub(super) artifact_text: Option<String>,
+    /// How each combination of profiles that moves its coordinates reads
+    /// it ([`PomScope::coordinate_alternatives`], as VEX discovery reads
+    /// it).
+    pub(super) coordinate_alternatives: Vec<CoordinateAlternative>,
 }
 
 /// One live `<repository>`.
@@ -126,12 +135,16 @@ impl PomIndex {
         pom: &str,
         user: &std::collections::BTreeMap<String, String>,
     ) -> Result<PomIndex, String> {
-        let scope = PomScope::with_user_properties(pom, user)?;
+        let mut scope = PomScope::with_user_properties(pom, user)?;
+        // Profile `<properties>` may move a `${…}` coordinate, as VEX
+        // discovery reads it (one it cannot read fails closed there).
+        scope.read_profiles();
         let masked = &scope.masked;
         let deps = scope
             .dependencies()?
             .into_iter()
             .map(|d| IndexedDep {
+                coordinate_alternatives: scope.coordinate_alternatives(&d),
                 group: d.group,
                 artifact: d.artifact,
                 version_inner: d.version_inner,
@@ -139,6 +152,8 @@ impl PomIndex {
                 type_text: d.type_text,
                 classifier: d.classifier,
                 in_profile: d.in_profile,
+                group_text: d.group_text,
+                artifact_text: d.artifact_text,
             })
             .collect();
         let mut repos = Vec::new();
@@ -198,6 +213,71 @@ impl PomIndex {
                     d.classifier.as_deref(),
                     (group, artifact),
                 )
+        })
+    }
+
+    /// Why a pin of `group:artifact` at `served` (the suffixed version)
+    /// would not hold whenever some combination of profiles is active whose
+    /// `<properties>` redefine a property a `${…}` coordinate names
+    /// ([`IndexedDep::coordinate_alternatives`]), as VEX discovery weighs
+    /// it: a live versioned declaration of it (the one a pin is written
+    /// into) then names another package, or another declaration then names
+    /// its main jar (as [`may_shadow`] reads one) at a version other than
+    /// `served`, or literally one of its executable classifier copies
+    /// (`test-jar` is the `tests` copy) off `served` or with no version of
+    /// its own. A main jar without a version takes the pin.
+    pub(super) fn retargeted(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: Option<&str>,
+    ) -> Option<String> {
+        self.deps.iter().find_map(|d| {
+            let written = format!(
+                "{}:{}",
+                d.group_text.as_deref().unwrap_or_default(),
+                d.artifact_text.as_deref().unwrap_or_default()
+            );
+            if d.group.as_deref() == Some(group) && d.artifact.as_deref() == Some(artifact) {
+                let moved = d.coordinate_alternatives.first()?;
+                return (!d.in_profile && d.classifier.is_none() && d.version_text.is_some()).then(
+                    || {
+                        format!(
+                            "{written} names {group}:{artifact}, but the <properties> of {} \
+                             make it {}:{}",
+                            moved.by, moved.group, moved.artifact
+                        )
+                    },
+                );
+            }
+            let classifier = match (d.type_text.as_deref(), d.classifier.as_deref()) {
+                (None | Some("jar"), c) => c,
+                (Some(t), c) if t.contains("${") => c,
+                (Some("test-jar"), None) => Some("tests"),
+                _ => return None,
+            };
+            d.coordinate_alternatives.iter().find_map(|r| {
+                let literal = r.group == group && r.artifact == artifact;
+                let names = match classifier {
+                    None => {
+                        (literal
+                            || may_shadow((&r.group, &r.artifact), None, None, (group, artifact)))
+                            && r.version.is_some()
+                    }
+                    Some(c) => literal && is_executable_classifier(c),
+                };
+                (names && r.version.as_deref() != served).then(|| {
+                    format!(
+                        "{written}{} declares {}:{} at <version>{}</version> under the \
+                         <properties> of {}",
+                        classifier.map_or(String::new(), |c| format!(" (classifier {c})")),
+                        r.group,
+                        r.artifact,
+                        r.version.as_deref().unwrap_or("(none of its own)"),
+                        r.by
+                    )
+                })
+            })
         })
     }
 
@@ -344,6 +424,9 @@ impl PomIndex {
             type_text: None,
             classifier: None,
             in_profile: false,
+            group_text: Some(group.to_string()),
+            artifact_text: Some(artifact.to_string()),
+            coordinate_alternatives: Vec::new(),
         });
     }
 

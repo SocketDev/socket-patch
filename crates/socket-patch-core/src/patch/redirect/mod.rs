@@ -8897,6 +8897,21 @@ fn rewrite_maven_pom(
                 }
             }
         }
+        // A `${…}` groupId / artifactId some profile's `<properties>`
+        // redefine may move the pinned declaration off this GA, or make
+        // another declaration this GA at its own version, whenever that
+        // profile is active: VEX would never attest such a pin, so none is
+        // written and the dep is not counted as redirected.
+        if let Some(why) = idx.retargeted(&group_id, &artifact_id, suffixed_version.as_deref()) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_profile_coordinates_unpatched".into(),
+                detail: format!(
+                    "{why}; whenever that applies a pin of {group_id}:{artifact_id} would not \
+                     hold, so pom.xml was left as it is and the dep is not counted as redirected"
+                ),
+            });
+            continue;
+        }
         let has_live_repo = idx.has_repository(&repo_id);
 
         // LEGACY same-GAV fallback: no suffixed version means the patched jar is
@@ -10691,6 +10706,101 @@ mod tests {
                 "{other}: pinned: {:?}",
                 r.warnings
             );
+        }
+    }
+
+    /// A `${…}` groupId / artifactId some profile's `<properties>` redefine
+    /// may move the declaration a pin would be written into off the GA, or
+    /// make another declaration the GA at its own version, whenever that
+    /// profile is active, and VEX never attests such a pin: hosted scan
+    /// writes none and says why (#2026 review, back-ported from VEX
+    /// discovery). A profile that leaves the coordinates alone, or makes an
+    /// unrelated declaration another unrelated package, does not block it.
+    #[test]
+    fn maven_pom_profile_moved_coordinates_refuse_the_dep() {
+        let pom = |props: &str, deps: &str, profile: &str| {
+            format!(
+                "<project>\n  <properties>{props}</properties>\n  <dependencies>\n    {deps}\n  \
+                 </dependencies>\n  <profiles><profile><id>p</id><properties>{profile}\
+                 </properties></profile></profiles>\n</project>\n"
+            )
+        };
+        let decl = |g: &str, a: &str, v: &str| {
+            format!(
+                "<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>\
+                 <version>{v}</version></dependency>"
+            )
+        };
+        let pinned = decl("org.slf4j", "slf4j-api", "1.7.36");
+        for (props, deps, profile) in [
+            // The declaration a pin goes into moves off the GA.
+            (
+                "<g>org.slf4j</g>",
+                decl("${g}", "slf4j-api", "1.7.36"),
+                "<g>org.other</g>",
+            ),
+            // Another declaration becomes the GA.
+            (
+                "<h>org.other</h>",
+                format!("{pinned}{}", decl("${h}", "slf4j-api", "1.7.30")),
+                "<h>org.slf4j</h>",
+            ),
+            // ... or its executable classifier copy.
+            (
+                "<h>org.other</h>",
+                format!(
+                    "{pinned}<dependency><groupId>${{h}}</groupId><artifactId>slf4j-api\
+                     </artifactId><version>1.7.36</version><classifier>tests</classifier>\
+                     </dependency>"
+                ),
+                "<h>org.slf4j</h>",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("pom.xml".to_string(), pom(props, &deps, profile));
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                r.files.is_empty() && r.edits.is_empty(),
+                "{deps}: nothing written: {:?}",
+                r.files
+            );
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_profile_coordinates_unpatched"],
+                "{deps}"
+            );
+        }
+        for (props, deps, profile) in [
+            (
+                "<g>org.slf4j</g>",
+                decl("${g}", "slf4j-api", "1.7.36"),
+                "<g>org.slf4j</g>",
+            ),
+            (
+                "<h>org.other</h>",
+                format!("{pinned}{}", decl("${h}", "slf4j-api", "1.7.30")),
+                "<h>org.third</h>",
+            ),
+            // Versionless: it takes the pin.
+            (
+                "<h>org.other</h>",
+                format!(
+                    "{pinned}<dependency><groupId>${{h}}</groupId><artifactId>slf4j-api\
+                     </artifactId></dependency>"
+                ),
+                "<h>org.slf4j</h>",
+            ),
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert("pom.xml".to_string(), pom(props, &deps, profile));
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(
+                !warning_codes(&r).contains(&"redirect_maven_profile_coordinates_unpatched"),
+                "{deps}: {:?}",
+                r.warnings
+            );
+            let out = r.files.get("pom.xml").expect("pom rewritten");
+            assert!(out.contains(MAVEN_SUFFIXED), "{deps}: pinned: {out}");
         }
     }
 

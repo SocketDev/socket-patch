@@ -129,7 +129,7 @@ use super::{
 };
 use crate::formats::maven::{
     is_executable_classifier, is_maven_coordinate, is_maven_version_text, maven_config_properties,
-    may_shadow, parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
+    may_shadow, parse_pom_with, split_socket_version, MovedBy, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -831,16 +831,104 @@ fn bypasses(
             ),
         ));
     }
-    if let Some(detail) = unpatched_classifier_copy(deps, group, artifact, pinned, wiring) {
+    // Each declaration as written, then as each combination of profiles
+    // that moves its coordinates reads it: what it then declares is weighed
+    // by the same checks.
+    let read: Vec<PomDep> = deps.iter().cloned().chain(retargeted(deps)).collect();
+    if let Some(detail) = unpatched_classifier_copy(&read, group, artifact, pinned, wiring) {
         found.push((UnattestedKind::MavenClassifierUnpatched, detail));
     }
     let pin_managed = built.direct.is_empty();
-    if let Some(detail) = profile_override(deps, group, artifact, pinned, pin_managed)
-        .or_else(|| coordinate_override(deps, group, artifact, pinned, pin_managed))
+    if let Some(detail) = profile_override(&read, group, artifact, pinned, pin_managed)
+        .or_else(|| pin_retargeted(deps, group, artifact, pinned, pin_managed))
     {
         found.push((UnattestedKind::MavenProfileUnpatched, detail));
     }
     found
+}
+
+/// Each declaration's [`PomDep::coordinate_alternatives`] as a declaration
+/// of its own: what Maven reads while those profiles are active, so read
+/// only then (`in_profile`), at the version it resolves there, and marked
+/// with the profiles that give it ([`PomDep::retargeted_by`]). Its `<type>`
+/// is read as Maven maps it, as [`may_shadow`] does: `test-jar` is the
+/// `tests` classifier copy, and any other type but `jar` (or a property)
+/// is not a jar on the classpath, so no reading of it is kept.
+fn retargeted(deps: &[PomDep]) -> impl Iterator<Item = PomDep> + '_ {
+    deps.iter().flat_map(|d| {
+        d.coordinate_alternatives.iter().filter_map(move |r| {
+            let (classifier, type_text) = match d.type_text.as_deref() {
+                None | Some("jar") => (d.classifier.clone(), d.type_text.clone()),
+                Some(t) if t.contains("${") => (d.classifier.clone(), d.type_text.clone()),
+                Some("test-jar") if d.classifier.is_none() => (Some("tests".to_string()), None),
+                Some(_) => return None,
+            };
+            Some(PomDep {
+                group: r.group.clone(),
+                artifact: r.artifact.clone(),
+                coordinate_alternatives: Vec::new(),
+                version: r.version.clone(),
+                build_version: r.version.clone(),
+                version_alternatives: Vec::new(),
+                classifier,
+                type_text,
+                in_profile: true,
+                retargeted_by: Some(r.by.clone()),
+                ..d.clone()
+            })
+        })
+    })
+}
+
+/// How a declaration [`retargeted`] reads, for a detail: the declaration as
+/// written and the profiles that make it `group:artifact` (or a property
+/// it leaves unresolved that may be).
+fn retargeted_text(d: &PomDep, by: &MovedBy, group: &str, artifact: &str) -> String {
+    let maybe = if d.group == group && d.artifact == artifact {
+        String::new()
+    } else {
+        format!(" (which may be {group}:{artifact})")
+    };
+    format!(
+        "declared {}:{}, whose coordinates the <properties> of {by} make {}:{}{maybe}",
+        d.group_text, d.artifact_text, d.group, d.artifact
+    )
+}
+
+/// Why the live main-jar declaration carrying `group:artifact`'s pin
+/// `pinned` (a managed one only where management governs it,
+/// `pin_managed`) stops naming it whenever some combination of profiles is
+/// active whose `<properties>` redefine a property its coordinates name
+/// ([`PomDep::coordinate_alternatives`]): the pin then no longer applies to
+/// `group:artifact`, which resolves from its other declarations or a
+/// transitive path. (A declaration that becomes `group:artifact` there is
+/// weighed through [`retargeted`].)
+fn pin_retargeted(
+    deps: &[PomDep],
+    group: &str,
+    artifact: &str,
+    pinned: &str,
+    pin_managed: bool,
+) -> Option<String> {
+    deps.iter()
+        .filter(|d| {
+            !d.in_profile
+                && d.classifier.is_none()
+                && (!d.managed || pin_managed)
+                && d.group == group
+                && d.artifact == artifact
+                && build_version(d) == Some(pinned)
+        })
+        .find_map(|d| {
+            let moved = d.coordinate_alternatives.first()?;
+            Some(format!(
+                "{POM}: the declaration {}:{} carrying the patched {pinned} names \
+                 {group}:{artifact}, but the <properties> of {} redefine its coordinates to \
+                 {}:{}; whenever that applies the pin no longer applies to {group}:{artifact}, \
+                 which Maven resolves from its other declarations instead",
+                d.group_text, d.artifact_text, moved.by, moved.group, moved.artifact
+            ))
+        })
 }
 
 /// Why the first executable classifier copy of `group:artifact` — live or
@@ -897,10 +985,10 @@ fn unpatched_classifier_copy(
             .find(|(version, _)| version.is_none() || *version != served)?;
         Some(format!(
             "{POM}: {group}:{artifact}:{classifier}{} resolves <version>{}</version>, {}",
-            if d.in_profile || from_profile {
-                " (inside <profiles>)"
-            } else {
-                ""
+            match &d.retargeted_by {
+                Some(by) => format!(" ({})", retargeted_text(d, by, group, artifact)),
+                None if d.in_profile || from_profile => " (inside <profiles>)".to_string(),
+                None => String::new(),
             },
             version.unwrap_or("(none in this pom)"),
             match wiring {
@@ -987,104 +1075,18 @@ fn profile_override(
                 ));
             }
             let version = resolutions(d).find_map(|v| v.filter(|v| *v != pinned))?;
+            if let Some(by) = &d.retargeted_by {
+                return Some(format!(
+                    "{POM}: a {section}declaration {} carries <version>{version}</version>, \
+                     not the patched {pinned}; whenever that applies Maven resolves it instead \
+                     of the pin",
+                    retargeted_text(d, by, group, artifact)
+                ));
+            }
             Some(format!(
                 "{POM}: a <profiles> {section}declaration of {named} carries \
                  <version>{version}</version>, not the patched {pinned}; whenever that profile \
                  is active Maven resolves it instead of the pin"
-            ))
-        })
-}
-
-/// Why a profile's `<properties>` move a `${…}` groupId or artifactId so
-/// that `group:artifact`'s pin `pinned` is bypassed, for the first such
-/// declaration ([`PomDep::coordinate_alternatives`]: every combination of
-/// active profiles, and a profile declaration's own). Maven merges an
-/// active profile's properties over the pom's own before it interpolates
-/// the coordinates, then matches management and pins:
-///
-/// * the live main-jar declaration carrying the pin (a managed one only
-///   where management governs it, `pin_managed`) then names another
-///   package, so the pin no longer applies to `group:artifact`, which
-///   resolves from its other declarations or a transitive path;
-/// * any other declaration then becomes `group:artifact`'s main jar (as
-///   [`main_jar_declarations`] reads one; a managed one again only where
-///   management governs) at a version other than `pinned`
-///   ([`resolutions`]), or literally one of its executable classifier
-///   copies off the pin or with no `<version>` of its own. A main jar
-///   without a version takes the live pin and moves nothing.
-fn coordinate_override(
-    deps: &[PomDep],
-    group: &str,
-    artifact: &str,
-    pinned: &str,
-    pin_managed: bool,
-) -> Option<String> {
-    deps.iter()
-        .filter(|d| {
-            !d.coordinate_alternatives.is_empty()
-                && (!d.managed || pin_managed)
-                && !d
-                    .type_text
-                    .as_deref()
-                    .is_some_and(|t| NON_CODE_TYPES.contains(&t))
-        })
-        .find_map(|d| {
-            let section = if d.managed {
-                "<dependencyManagement> "
-            } else {
-                ""
-            };
-            let place = if d.in_profile { "a <profiles> " } else { "a " };
-            let written = format!("{}:{}", d.group_text, d.artifact_text);
-            if d.group == group && d.artifact == artifact {
-                if d.in_profile || d.classifier.is_some() || build_version(d) != Some(pinned) {
-                    return None;
-                }
-                let moved = &d.coordinate_alternatives[0];
-                return Some(format!(
-                    "{POM}: {place}{section}declaration of {written} names {group}:{artifact} at \
-                     the patched {pinned}, but the <properties> of {} redefine its coordinates \
-                     to {}:{}; whenever that applies the pin no longer applies to \
-                     {group}:{artifact}, which Maven resolves from its other declarations instead",
-                    moved.by, moved.group, moved.artifact
-                ));
-            }
-            let moved = d.coordinate_alternatives.iter().find(|m| {
-                let literal = m.group == group && m.artifact == artifact;
-                match d.classifier.as_deref() {
-                    None => {
-                        literal
-                            || may_shadow(
-                                (&m.group, &m.artifact),
-                                d.type_text.as_deref(),
-                                None,
-                                (group, artifact),
-                            )
-                    }
-                    Some(c) => literal && is_executable_classifier(c),
-                }
-            })?;
-            let version = resolutions(d).find_map(|v| v.filter(|v| *v != pinned));
-            let what = match (d.classifier.as_deref(), version) {
-                (None, None) => return None,
-                (None, Some(v)) => format!("<version>{v}</version>"),
-                (Some(c), Some(v)) => format!("classifier {c} at <version>{v}</version>"),
-                (Some(c), None) if build_version(d).is_none() => {
-                    format!("classifier {c} with no <version> of its own")
-                }
-                (Some(_), None) => return None,
-            };
-            let which = if moved.group == group && moved.artifact == artifact {
-                String::new()
-            } else {
-                format!(", which may be {group}:{artifact},")
-            };
-            Some(format!(
-                "{POM}: {place}{section}declaration of {written} names {}:{} with no profile \
-                 active, but the <properties> of {} redefine its coordinates to {}:{}{which} \
-                 carrying {what}, not the patched {pinned}; whenever that applies Maven resolves \
-                 it instead of the pin",
-                d.group, d.artifact, moved.by, moved.group, moved.artifact
             ))
         })
 }
@@ -2251,7 +2253,15 @@ mod tests {
             out.unattested
         );
         let u = &out.unattested[0];
-        assert_eq!(u.kind, UnattestedKind::MavenProfileUnpatched, "{decl}");
+        // A retargeted classifier copy is weighed as one.
+        assert!(
+            matches!(
+                u.kind,
+                UnattestedKind::MavenProfileUnpatched | UnattestedKind::MavenClassifierUnpatched
+            ),
+            "{decl}: {:?}",
+            u.kind
+        );
         assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A));
         assert!(
             u.detail.contains("org.slf4j:slf4j-api")
@@ -2435,6 +2445,16 @@ mod tests {
                 vec![to_slf4j.clone()],
                 None,
             ),
+            // A `test-jar` is the `tests` classifier copy.
+            case(
+                h,
+                with(
+                    "<dependency><groupId>${h}</groupId><artifactId>slf4j-api</artifactId>\
+                     <version>1.7.36</version><type>test-jar</type></dependency>\n",
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
             // A profile declaration its own profile's properties retarget.
             case(
                 h,
@@ -2484,6 +2504,23 @@ mod tests {
                      <version>1.7.36</version><type>pom</type></dependency>\n",
                 ),
                 vec![to_slf4j.clone()],
+                None,
+            ),
+            case(
+                h,
+                with(
+                    "<dependency><groupId>${h}</groupId><artifactId>slf4j-api</artifactId>\
+                     <version>1.7.36</version><type>war</type></dependency>\n",
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // The same profile moves its coordinates and its version onto
+            // the pin: read together, it declares the pin there.
+            case(
+                &format!("{h}<v>2.0.0</v>"),
+                with(&other(Some("${v}"))),
+                vec![in_props(&format!("<h>org.slf4j</h><v>{pin}</v>"))],
                 None,
             ),
             // A user property wins over every profile's.
@@ -2902,6 +2939,52 @@ mod tests {
                 "{version}: {:?}",
                 out.unattested
             );
+        }
+    }
+
+    /// The pre-v5 vendored repository serves only the original GAV's main
+    /// jar, so an executable classifier copy a profile's `<properties>`
+    /// retarget onto the vendored GA comes from the next repository even at
+    /// the vendored version (#2026 review); a non-executable one does not
+    /// withhold.
+    #[tokio::test]
+    async fn vendored_ref_under_a_retargeted_classifier_copy_is_not_attested() {
+        for (classifier, attested) in [("tests", false), ("sources", true)] {
+            let p = vendored_project(UUID_A);
+            let wired = std::fs::read_to_string(p.root().join("pom.xml")).expect("read pom");
+            let copy = format!(
+                "<dependency><groupId>${{h}}</groupId><artifactId>commons-text</artifactId>\
+                 <version>1.10.0</version><classifier>{classifier}</classifier></dependency>\n  \
+                 </dependencies>"
+            );
+            let wired = wired.replacen("</dependencies>", &copy, 1);
+            let at = wired.rfind("</project>").expect("project close");
+            p.write(
+                "pom.xml",
+                format!(
+                    "{}<properties><h>org.other</h></properties>\n<profiles><profile><id>p</id>\
+                     <properties><h>org.apache.commons</h></properties></profile></profiles>\n{}",
+                    &wired[..at],
+                    &wired[at..]
+                ),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+            assert_eq!(
+                attests(&out, V_PURL),
+                attested,
+                "{classifier}: {:?}",
+                out.unattested
+            );
+            if !attested {
+                let u = &out.unattested[0];
+                assert_eq!(u.kind, UnattestedKind::MavenClassifierUnpatched);
+                assert!(
+                    u.detail.contains("coordinates") && u.detail.contains("profile p"),
+                    "{}",
+                    u.detail
+                );
+            }
         }
     }
 

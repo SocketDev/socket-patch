@@ -12,10 +12,9 @@ use std::ops::Range;
 use serde_json::{json, Value};
 
 use crate::formats::maven::{
-    interpolate_keeping, interpolate_strict, is_model_reference, lookup_property,
-    maven_config_properties as cli_properties, profile_combinations, split_coordinates,
-    Definitions, Interpolate, PomLayer, COORDINATE_SEPARATOR, MAX_COMBINED_PROFILES,
-    MAX_INTERPOLATION_DEPTH,
+    interpolate_keeping, interpolate_strict, is_executable_classifier, is_model_reference,
+    lookup_property, maven_config_properties as cli_properties, profile_combinations, Definitions,
+    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
 };
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -1787,32 +1786,66 @@ impl Reactor {
         sv: &str,
     ) -> Option<(String, String)> {
         let moved = |v: &str| !is_base_like(v, base) && v != sv;
+        self.read_elsewhere(rel, &[(declared, interpolate_strict)], &|v| moved(&v[0]))
+            .map(|(mut v, at)| (v.remove(0), at))
+    }
+
+    /// Where `texts` (one declaration's, each read through its own
+    /// interpolation) read values `hit` accepts, other than in `rel` with
+    /// no profile active: in an inheritor of `rel` (Maven interpolates
+    /// after inheritance), or in `rel` or an inheritor with some combination
+    /// of the profiles on its chain active ([`Self::profile_override`]);
+    /// with those values (an undefined one reads "an undefined value") and
+    /// where.
+    fn read_elsewhere(
+        &self,
+        rel: &str,
+        texts: &[(&str, Interpolate)],
+        hit: &dyn Fn(&[String]) -> bool,
+    ) -> Option<(Vec<String>, String)> {
         std::iter::once(rel)
             .chain(self.inheritors(rel))
             .find_map(|reader| {
                 // `rel` resolves it, so a reader or profile that does not
                 // has redefined something it names: that moves it too.
-                let undefined = || "an undefined value".to_string();
                 let plain = (reader != rel)
-                    .then(|| self.interpolate(reader, declared).unwrap_or_else(undefined))
-                    .filter(|v| moved(v))
+                    .then(|| self.read_under(reader, texts, &[]))
+                    .filter(|v| hit(v))
                     .map(|v| (v, reader.to_string()));
-                plain
-                    .or_else(|| self.profile_override(reader, declared, interpolate_strict, &moved))
+                plain.or_else(|| self.profile_override(reader, texts, hit))
             })
     }
 
+    /// What each of `texts` reads in `reader` with the `active` profiles
+    /// active, through its own interpolation and work budget ("an
+    /// undefined value" when that fails).
+    fn read_under(
+        &self,
+        reader: &str,
+        texts: &[(&str, Interpolate)],
+        active: &[Overlay<'_>],
+    ) -> Vec<String> {
+        texts
+            .iter()
+            .map(|(text, interpolate)| {
+                self.interpolate_with(reader, text, active, *interpolate)
+                    .unwrap_or_else(|| "an undefined value".to_string())
+            })
+            .collect()
+    }
+
     /// The first combination of the profiles on `reader`'s chain under
-    /// which `declared` resolves (through `interpolate`) a value `moved`
-    /// accepts, with the value and where; fails closed (an undetermined
-    /// value) when more profiles may change it than are combined.
+    /// which `texts` (all read under the same combination,
+    /// [`Self::read_under`]) read values `moved` accepts, with the values
+    /// and where; fails closed (undetermined values, whatever `moved` says)
+    /// when more profiles may change them than are combined, so a caller
+    /// that weighs only some declarations filters them first.
     fn profile_override(
         &self,
         reader: &str,
-        declared: &str,
-        interpolate: Interpolate,
-        moved: &dyn Fn(&str) -> bool,
-    ) -> Option<(String, String)> {
+        texts: &[(&str, Interpolate)],
+        moved: &dyn Fn(&[String]) -> bool,
+    ) -> Option<(Vec<String>, String)> {
         let profiles: Vec<(&str, &str, &BTreeMap<String, String>)> = self
             .chain(reader)
             .flat_map(|at| {
@@ -1847,9 +1880,10 @@ impl Reactor {
             }
             d
         };
-        let Some(combinations) = profile_combinations(declared, &definitions) else {
+        let values: Vec<&str> = texts.iter().map(|(text, _)| *text).collect();
+        let Some(combinations) = profile_combinations(&values, &definitions) else {
             return Some((
-                "an undetermined value".to_string(),
+                vec!["an undetermined value".to_string(); texts.len()],
                 format!(
                     "{reader} under some combination of the more than {MAX_COMBINED_PROFILES} \
                      profiles on its chain that redefine what it names"
@@ -1861,9 +1895,7 @@ impl Reactor {
                 .iter()
                 .map(|&i| (profiles[i].0, profiles[i].2))
                 .collect();
-            let v = self
-                .interpolate_with(reader, declared, &active, interpolate)
-                .unwrap_or_else(|| "an undefined value".to_string());
+            let v = self.read_under(reader, texts, &active);
             moved(&v).then(|| {
                 let under = combination
                     .iter()
@@ -1877,14 +1909,13 @@ impl Reactor {
 
     /// Where `dep` of `rel`, a declaration named through `${...}`
     /// coordinates, reads a groupId and artifactId that `hit` accepts,
-    /// other than `rel` with no profile active: an inheritor of `rel`, or
-    /// `rel` or an inheritor with some combination of the profiles on its
-    /// chain active ([`Self::profile_override`], which covers the profile
-    /// holding `dep`). Both are read together, an unresolved reference kept
-    /// as written ([`interpolate_keeping`]): Maven interpolates after
-    /// inheritance and with the active profiles' `<properties>` merged in,
-    /// then matches management and pins. More profiles than are combined
-    /// fail closed (accepted whatever `hit` says).
+    /// other than `rel` with no profile active ([`Self::read_elsewhere`],
+    /// which covers the profile holding `dep`): each read under the same
+    /// profiles but on its own, an unresolved reference kept as written
+    /// ([`interpolate_keeping`]). Maven interpolates after inheritance and
+    /// with the active profiles' `<properties>` merged in, then matches
+    /// management and pins. More profiles than are combined fail closed
+    /// (accepted whatever `hit` says).
     fn coordinates_elsewhere(
         &self,
         rel: &str,
@@ -1892,25 +1923,14 @@ impl Reactor {
         hit: &dyn Fn(&str, &str) -> bool,
     ) -> Option<String> {
         let doc = &self.poms[rel].doc;
-        let joined = format!(
-            "{}{COORDINATE_SEPARATOR}{}",
-            doc.child_text(dep, "groupId")?,
-            doc.child_text(dep, "artifactId")?
-        );
-        let accepts = |v: &str| split_coordinates(v).is_some_and(|(g, a)| hit(&g, &a));
-        std::iter::once(rel)
-            .chain(self.inheritors(rel))
-            .find_map(|reader| {
-                let plain = (reader != rel)
-                    .then(|| self.interpolate_with(reader, &joined, &[], interpolate_keeping))
-                    .flatten()
-                    .filter(|v| accepts(v))
-                    .map(|_| reader.to_string());
-                plain.or_else(|| {
-                    self.profile_override(reader, &joined, interpolate_keeping, &accepts)
-                        .map(|(_, at)| at)
-                })
-            })
+        let group = doc.child_text(dep, "groupId")?;
+        let artifact = doc.child_text(dep, "artifactId")?;
+        let texts: [(&str, Interpolate); 2] = [
+            (&group, interpolate_keeping),
+            (&artifact, interpolate_keeping),
+        ];
+        self.read_elsewhere(rel, &texts, &|v| hit(&v[0], &v[1]))
+            .map(|(_, at)| at)
     }
 
     /// Every pom in scope that inherits from `rel` (has it on its chain).
@@ -1939,8 +1959,7 @@ impl Reactor {
     ) {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
-        self.warn_unresolved_coordinates(rel, patch, warnings, unpinned, uncertain);
-        self.warn_moved_coordinates(rel, patch, warnings, unpinned, uncertain);
+        self.warn_property_coordinates(rel, patch, warnings, unpinned, uncertain);
         for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
             if doc
                 .child_text(dep, "type")
@@ -2065,11 +2084,21 @@ impl Reactor {
 }
 
 impl Reactor {
-    /// Warn for each declaration of `rel` that could be `patch`'s g:a but
-    /// names a `${...}` groupId or artifactId undefined in the checkout:
-    /// it is left as is, probably unpatched. One with its own version
-    /// beats any pin, so its local root is not pinned.
-    fn warn_unresolved_coordinates(
+    /// Warn for each declaration of `rel` named through `${...}`
+    /// coordinates that is not `patch`'s g:a in `rel` itself (those
+    /// `rewrite_declarations` weighs) but may be: one whose property the
+    /// checkout does not define (`property_unresolved`), or one an
+    /// inheritor or a combination of profiles makes it
+    /// (`coordinates_overridden`, [`Self::coordinates_elsewhere`]). It is
+    /// left as is, probably unpatched; one with its own version beats any
+    /// pin, so its local root is not pinned. A classifier copy is its own
+    /// coordinate, which no pin reaches: an executable one is warned about
+    /// as `classifier_declared`, as `rewrite_declarations` does (`sources` /
+    /// `javadoc` never run), and any other `<type>` but `jar` is not the
+    /// g:a's jar. Text that can never
+    /// read the g:a, whatever its properties say ([`may_interpolate_to`]),
+    /// is ruled out first, before any inheritor or profile is read.
+    fn warn_property_coordinates(
         &self,
         rel: &str,
         patch: &JvmPatch<'_>,
@@ -2079,6 +2108,7 @@ impl Reactor {
     ) {
         let doc = &self.poms[rel].doc;
         let resolve = |v: &str| self.interpolate(rel, v);
+        let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
         for dep in doc.declarations() {
             let (Some(g), Some(a)) = (
                 doc.child_text(dep, "groupId"),
@@ -2086,108 +2116,83 @@ impl Reactor {
             ) else {
                 continue;
             };
-            let unresolved: Vec<&str> = [&g, &a]
-                .into_iter()
-                .filter(|c| c.contains("${") && resolve(c).is_none())
-                .map(String::as_str)
-                .collect();
-            let could_be = |raw: &str, want: &str| match resolve(raw) {
-                Some(v) => v == want,
-                None => may_interpolate_to(raw, want),
-            };
-            let other_variant = doc
-                .child_text(dep, "type")
-                .is_some_and(|t| !t.is_empty() && t != "jar")
-                || doc
-                    .child_text(dep, "classifier")
-                    .is_some_and(|c| !c.is_empty());
-            if unresolved.is_empty()
-                || other_variant
-                || !could_be(&g, patch.group_id)
-                || !could_be(&a, patch.artifact_id)
-            {
-                continue;
-            }
-            let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
-            let versioned = doc
-                .child_text(dep, "version")
-                .is_some_and(|v| !v.is_empty());
-            let root = self.local_root(rel);
-            let unpin = if versioned {
-                format!(", and {root} is not pinned")
-            } else {
-                String::new()
-            };
-            warnings.push(degraded(
-                "property_unresolved",
-                format!(
-                    "{at}: {g}:{a} may be {}:{} but {} is not defined in the checkout; \
-                     left as is, probably unpatched{unpin}",
-                    patch.group_id,
-                    patch.artifact_id,
-                    unresolved.join(", ")
-                ),
-            ));
-            if versioned {
-                unpinned.insert(root);
-                uncertain.insert(at);
-            }
-        }
-    }
-}
-
-impl Reactor {
-    /// Warn for each declaration of `rel` whose `${...}` groupId or
-    /// artifactId reads another artifact in `rel` itself but may read
-    /// `patch`'s g:a in an inheritor or with a profile active
-    /// ([`Self::coordinates_elsewhere`]): it is left as is, and there it
-    /// declares the g:a at its own version. One with a version beats any
-    /// pin, so its local root is not pinned.
-    fn warn_moved_coordinates(
-        &self,
-        rel: &str,
-        patch: &JvmPatch<'_>,
-        warnings: &mut Vec<JvmWarning>,
-        unpinned: &mut BTreeSet<String>,
-        uncertain: &mut BTreeSet<String>,
-    ) {
-        let doc = &self.poms[rel].doc;
-        let resolve = |v: &str| self.interpolate(rel, v);
-        for dep in doc.declarations() {
-            let (Some(g), Some(a)) = (
-                doc.child_text(dep, "groupId"),
-                doc.child_text(dep, "artifactId"),
-            ) else {
-                continue;
-            };
-            let other_variant = doc
-                .child_text(dep, "type")
-                .is_some_and(|t| !t.is_empty() && t != "jar")
-                || doc
-                    .child_text(dep, "classifier")
-                    .is_some_and(|c| !c.is_empty());
-            // Undefined in `rel`: `warn_unresolved_coordinates` weighs it;
-            // `patch`'s g:a in `rel`: `rewrite_declarations` does.
-            let (Some(here_g), Some(here_a)) = (
-                doc.coordinate(dep, "groupId", &resolve),
-                doc.coordinate(dep, "artifactId", &resolve),
-            ) else {
-                continue;
-            };
-            if other_variant
-                || !doc.has_property_coordinate(dep)
+            let classifier = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
+            if !doc.has_property_coordinate(dep)
                 || doc.pin_at(dep).is_some()
-                || (here_g == patch.group_id && here_a == patch.artifact_id)
+                || classifier
+                    .as_deref()
+                    .is_some_and(|c| !is_executable_classifier(c))
+                || !may_interpolate_to(&g, patch.group_id)
+                || !may_interpolate_to(&a, patch.artifact_id)
+                || doc
+                    .child_text(dep, "type")
+                    .is_some_and(|t| !t.is_empty() && t != "jar")
             {
                 continue;
             }
-            // A reference left unresolved there may read any text.
-            let Some(there) = self.coordinates_elsewhere(rel, dep, &|rg, ra| {
-                may_interpolate_to(rg, patch.group_id) && may_interpolate_to(ra, patch.artifact_id)
-            }) else {
-                continue;
+            let (here_g, here_a) = (resolve(&g), resolve(&a));
+            let here_g = if g.contains("${") {
+                here_g
+            } else {
+                Some(g.clone())
             };
+            let here_a = if a.contains("${") {
+                here_a
+            } else {
+                Some(a.clone())
+            };
+            let why = match (&here_g, &here_a) {
+                (Some(hg), Some(ha)) if hg == patch.group_id && ha == patch.artifact_id => {
+                    continue;
+                }
+                (Some(hg), Some(ha)) => {
+                    let Some(there) = self.coordinates_elsewhere(rel, dep, &|rg, ra| {
+                        may_interpolate_to(rg, patch.group_id)
+                            && may_interpolate_to(ra, patch.artifact_id)
+                    }) else {
+                        continue;
+                    };
+                    (
+                        "coordinates_overridden",
+                        format!("{g}:{a} is {hg}:{ha} here but may be {ga} in {there}"),
+                    )
+                }
+                _ => {
+                    let could_be = |read: &Option<String>, raw: &str, want: &str| match read {
+                        Some(v) => v == want,
+                        None => may_interpolate_to(raw, want),
+                    };
+                    if !could_be(&here_g, &g, patch.group_id)
+                        || !could_be(&here_a, &a, patch.artifact_id)
+                    {
+                        continue;
+                    }
+                    let unresolved: Vec<&str> = [(&g, &here_g), (&a, &here_a)]
+                        .into_iter()
+                        .filter(|(_, read)| read.is_none())
+                        .map(|(raw, _)| raw.as_str())
+                        .collect();
+                    (
+                        "property_unresolved",
+                        format!(
+                            "{g}:{a} may be {ga} but {} is not defined in the checkout",
+                            unresolved.join(", ")
+                        ),
+                    )
+                }
+            };
+            let (reason, detail) = why;
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
+            if let Some(classifier) = classifier {
+                warnings.push(degraded(
+                    "classifier_declared",
+                    format!(
+                        "{at}: {detail}; a classifier variant ({classifier}) of {ga} bypasses \
+                         the pin"
+                    ),
+                ));
+                continue;
+            }
             let versioned = doc
                 .child_text(dep, "version")
                 .is_some_and(|v| !v.is_empty());
@@ -2198,12 +2203,8 @@ impl Reactor {
                 String::new()
             };
             warnings.push(degraded(
-                "coordinates_overridden",
-                format!(
-                    "{at}: {g}:{a} is {here_g}:{here_a} here but may be {}:{} in {there}; \
-                     left as is, probably unpatched there{unpin}",
-                    patch.group_id, patch.artifact_id,
-                ),
+                reason,
+                format!("{at}: {detail}; left as is, probably unpatched{unpin}"),
             ));
             if versioned {
                 unpinned.insert(root);
@@ -6214,6 +6215,86 @@ mod tests {
             b"-Dlib.group=org.other\n".to_vec(),
         );
         assert_eq!(attestable(&later), (true, true));
+    }
+
+    /// Coordinates whose text can never read the patched g:a (`${g}:guava`)
+    /// are not weighed, however many profiles redefine `g`: more than are
+    /// combined would otherwise fail closed and unpin the root (#2026
+    /// review). The same text naming commons-text does fail closed.
+    #[test]
+    fn many_profiles_on_an_unrelated_coordinate_are_not_weighed() {
+        let profiles: String = (0..=MAX_COMBINED_PROFILES)
+            .map(|i| {
+                format!("<profile><id>p{i}</id><properties><g>org.g{i}</g></properties></profile>")
+            })
+            .collect();
+        let root = ROOT.replace(
+            "  <modules>",
+            &format!(
+                "  <properties><g>com.google.guava</g></properties>\n  \
+                 <profiles>{profiles}</profiles>\n  <modules>"
+            ),
+        );
+        let named = |artifact: &str| {
+            module(
+                "a",
+                &format!(
+                    "{}<dependency><groupId>${{g}}</groupId><artifactId>{artifact}</artifactId>\
+                     <version>1</version></dependency>",
+                    dep("1.10.0")
+                ),
+            )
+        };
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &named("guava")),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert!(root_pinned(&plan, &files));
+
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &named("commons-text")),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    /// A classifier copy a profile retargets onto the patched g:a is its
+    /// own coordinate, which no pin reaches: warned about as
+    /// `classifier_declared`, like a literal one, without unpinning the
+    /// root (#2026 review).
+    #[test]
+    fn a_profile_retargeting_a_classifier_copy_warns() {
+        let copy = "<dependency><groupId>${lib.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version>\
+                    <classifier>tests</classifier></dependency>";
+        let files = fs(&[
+            (
+                "pom.xml",
+                &root_with(
+                    "<lib.group>org.other</lib.group>",
+                    "<lib.group>org.apache.commons</lib.group>",
+                ),
+            ),
+            (
+                "a/pom.xml",
+                &module("a", &format!("{}{copy}", dep("1.10.0"))),
+            ),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["classifier_declared"]);
+        assert!(
+            plan.warnings[0].detail.contains("profile corp"),
+            "{:?}",
+            plan.warnings
+        );
+        assert!(root_pinned(&plan, &files));
     }
 
     fn attestable(files: &Fs) -> (bool, bool) {
