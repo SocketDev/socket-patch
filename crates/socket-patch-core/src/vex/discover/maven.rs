@@ -851,24 +851,32 @@ fn unpatched_classifier_copy(
         Wiring::Hosted => Some(pinned),
         Wiring::Vendored => None,
     };
-    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool)> {
+    // Each entry carries whether it names `group:artifact` literally: one
+    // reached only through an undefined property ([`may_name`]) may manage
+    // another GA, so it never stands in for this copy's version alone.
+    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
         classifier_declarations(deps, group, artifact, move |d| {
             d.managed && d.in_profile == in_profile
         })
         .filter(|(_, c)| *c == classifier)
-        .map(|(d, _)| (build_version(d), in_profile))
+        .map(|(d, _)| {
+            let literal = d.group == group && d.artifact == artifact;
+            (build_version(d), in_profile, literal)
+        })
         .collect()
     };
     classifier_declarations(deps, group, artifact, |d| !d.managed).find_map(|(d, classifier)| {
-        let resolved = match build_version(d) {
+        let resolved: Vec<(Option<&str>, bool)> = match build_version(d) {
             Some(version) => vec![(Some(version), false)],
             None => {
                 let mut live = managed(classifier, false);
-                if live.is_empty() {
-                    live.push((None, false));
+                // Without a live entry that surely manages this GA, the
+                // version may come from outside this pom: fail closed.
+                if !live.iter().any(|(_, _, literal)| *literal) {
+                    live.push((None, false, true));
                 }
                 live.extend(managed(classifier, true));
-                live
+                live.into_iter().map(|(v, p, _)| (v, p)).collect()
             }
         };
         let (version, from_profile) = resolved
@@ -1262,6 +1270,17 @@ mod tests {
                  <classifier>tests</classifier></dependency>\n"
                     .to_string(),
                 String::new(),
+            ),
+            // Version-less copy whose only managed entry reaches the GA
+            // through an undefined property: it may manage another GA, so
+            // the copy's version may come from outside this pom.
+            (
+                classified("tests", None),
+                format!(
+                    "<dependency><groupId>${{undefined.group}}</groupId>\
+                     <artifactId>slf4j-api</artifactId><version>{pin}</version>\
+                     <classifier>tests</classifier></dependency>\n"
+                ),
             ),
         ];
         for (deps, managed) in &unattested {
