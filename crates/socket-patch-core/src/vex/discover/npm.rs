@@ -64,7 +64,7 @@ use crate::formats::pnpm::{
 };
 use crate::formats::text::strip_bom;
 use crate::utils::digest::is_sri_pin;
-use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
+use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
 use crate::vendor::lock_inventory::{
     npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes, LockIntegrity,
     NpmLockNode,
@@ -688,7 +688,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // pnpm's `lockfile` setting off (#1074): pnpm reads neither the root
     // lock nor a member's, so their hosted pins keep no lockfile basis.
     // Rush runs pnpm with a workspace and `.npmrc` of its own.
-    let rush = ctx.exists("rush.json").await;
+    let rush = is_rush(ctx.view).await;
     let disabled = if rush {
         None
     } else {

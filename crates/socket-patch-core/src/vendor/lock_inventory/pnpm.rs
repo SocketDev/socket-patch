@@ -11,30 +11,55 @@ use super::LockfileEntry;
 
 // ── file selection ──
 
+/// Whether the project is a Rush monorepo: a `rush.json` at the root,
+/// probed through the view without following links (a dangling link or,
+/// in memory, an implied directory counts). The one gate lockfile
+/// discovery and every lock-inventory reader share, so they agree on which
+/// locks a Rush project installs from.
+pub(crate) async fn is_rush(view: ProjectView<'_>) -> bool {
+    view.exists_no_follow("rush.json").await
+}
+
 /// A Rush monorepo's pnpm locks, root-relative, in lockfile discovery's
-/// order: the single source-of-truth lock
-/// ([`RUSH_COMMON_LOCK_REL`]), then every subspace's
-/// `common/config/subspaces/<name>/pnpm-lock.yaml`, sorted by name — real
-/// directories only (a symlinked subspace dir could point the read outside
-/// the project) with traversal-safe UTF-8 names. Stat / list only; whether
-/// the project IS a Rush monorepo (`rush.json`) is the caller's check.
+/// order: the single source-of-truth lock ([`RUSH_COMMON_LOCK_REL`]), then
+/// every subspace's `common/config/subspaces/<name>/pnpm-lock.yaml`, sorted
+/// by name. Every directory on the way is a real one, never a symlink that
+/// could point the read at another repository: `common`, `common/config`
+/// and `common/config/rush` for the common lock (else it is left out);
+/// `common`, `common/config`, `common/config/subspaces` and each subspace
+/// dir for the subspace locks (else they are). Subspace names must be
+/// traversal-safe UTF-8 segments. Stat / list only; whether the project IS
+/// a Rush monorepo is the caller's [`is_rush`] check.
 pub(crate) async fn rush_lock_rels(view: ProjectView<'_>) -> Vec<String> {
-    let mut names: Vec<String> = view
-        .list_dir(RUSH_SUBSPACES_DIR)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|entry| entry.is_dir && is_safe_single_segment(&entry.name))
-        .map(|entry| entry.name)
-        .collect();
-    names.sort();
-    let mut rels = vec![RUSH_COMMON_LOCK_REL.to_string()];
+    let mut rels = Vec::new();
+    if !has_symlinked_dir(view, RUSH_COMMON_LOCK_DIR) {
+        rels.push(RUSH_COMMON_LOCK_REL.to_string());
+    }
+    if has_symlinked_dir(view, RUSH_SUBSPACES_DIR) {
+        return rels;
+    }
+    // The listing is sorted by name; `is_dir` does not follow links.
     rels.extend(
-        names
+        view.list_dir(RUSH_SUBSPACES_DIR)
+            .await
+            .unwrap_or_default()
             .into_iter()
-            .map(|name| format!("{RUSH_SUBSPACES_DIR}/{name}/{PNPM_LOCK}")),
+            .filter(|entry| entry.is_dir && is_safe_single_segment(&entry.name))
+            .map(|entry| format!("{RUSH_SUBSPACES_DIR}/{}/{PNPM_LOCK}", entry.name)),
     );
     rels
+}
+
+/// The directory holding [`RUSH_COMMON_LOCK_REL`].
+const RUSH_COMMON_LOCK_DIR: &str = "common/config/rush";
+
+/// Whether root-relative directory `dir` or any directory above it (below
+/// the root) is a symlink.
+fn has_symlinked_dir(view: ProjectView<'_>, dir: &str) -> bool {
+    dir.match_indices('/')
+        .map(|(at, _)| &dir[..at])
+        .chain([dir])
+        .any(|rel| view.is_symlink(rel))
 }
 
 // ── registry view ──
@@ -60,18 +85,6 @@ pub(super) async fn inventory_pnpm_lock_rel_in(
     pnpm_lock_text_inventory(&text)
 }
 
-/// Inventory a `pnpm-lock.yaml` at an absolute path (the FIFO test's
-/// handle on a lock outside the root-relative names).
-#[cfg(test)]
-pub(super) async fn inventory_pnpm_lock_at(
-    lock_path: &std::path::Path,
-) -> Option<Vec<LockfileEntry>> {
-    let text = crate::utils::fs::read_regular_to_string(lock_path)
-        .await
-        .ok()?;
-    pnpm_lock_text_inventory(&text)
-}
-
 /// Inventory the workspace members' own locks pnpm installs from under
 /// `sharedWorkspaceLockfile: false` (#492), the same ones hosted mode pins
 /// and discovery reads ([`member_locks`]): empty for a shared lock, an
@@ -79,7 +92,7 @@ pub(super) async fn inventory_pnpm_lock_at(
 /// instead). A member lock that cannot be read adds nothing.
 pub(super) async fn inventory_pnpm_member_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
     use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
-    if view.is_file("rush.json") {
+    if is_rush(*view).await {
         return Vec::new();
     }
     let MemberLocks::PerMember(keys) = member_locks(view).await else {
@@ -106,23 +119,19 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// `common/config/subspaces/<name>/pnpm-lock.yaml`. `rush install` copies
 /// the source lock into common/temp and runs pnpm there.
 ///
-/// Only called (via [`inventory_npm_lock`]) when there is NO root lock but
-/// `rush.json` is present, so it never shadows a plain pnpm project. The
-/// locks are the ones lockfile discovery reads ([`rush_lock_rels`]: sorted,
-/// real dirs with traversal-safe UTF-8 names), each read through the view.
+/// The last fallback of [`super::npm_family::inventory_npm_lock_raw_in`]:
+/// reached whenever the npm-family flavor probe refuses the project (any
+/// refusal but the PnP ones, which propagate) and no earlier fallback (the
+/// out-of-family root pnpm lock, a live sibling lock, pnpm <= 2's
+/// `shrinkwrap.yaml`, the members' own locks) returned entries — typically
+/// no root lock at all, where the probe refuses with
+/// `vendor_rush_unsupported` or `vendor_lockfile_missing`. Outside a Rush
+/// monorepo ([`is_rush`]) it reads nothing. The locks are the ones lockfile
+/// discovery reads ([`rush_lock_rels`]), each read through the view.
 /// Missing files/dirs are skipped fail-soft; the caller drops the whole
 /// result when it comes back empty.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
-    let is_rush = match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
-            let project_root = view.disk_root().expect("a disk view has a root");
-            tokio::fs::metadata(project_root.join("rush.json"))
-                .await
-                .is_ok()
-        }
-        ProjectView::Memory(project) => project.contains("rush.json"),
-    };
-    if !is_rush {
+    if !is_rush(*view).await {
         return Vec::new();
     }
     let mut out = Vec::new();
