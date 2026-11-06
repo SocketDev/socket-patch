@@ -204,6 +204,12 @@ def pins_for(version):
         # ModuleNotFoundError before locking.
         if (2, 21) <= v < (2, 26, 1):
             pins.append("hishel<1")
+        # 2.26.9+ declare an unbounded `hishel>=1.0.0` (2.29.6: `>=1.4.0`);
+        # hishel 2.0 (2026-11-05) dropped `SyncSqliteStorage` and every
+        # command dies with AttributeError. `<2` keeps the 1.x line (a
+        # no-op for 2.26.1 - 2.26.8, which already bound `<1`).
+        elif v >= (2, 26, 1):
+            pins.append("hishel<2")
         # 2.x declares an unbounded `unearth`; 0.19 (2026-10-27) moved to
         # httpx2 and breaks PDM's PyPI client ("PDMPyPIClient is not an
         # instance or subtype of type (Client)" on `pdm lock`, seen on
