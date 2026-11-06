@@ -874,16 +874,27 @@ async fn run_redirect_selected_untracked(
     // in-memory engine applies over its own walk. Here the consent gate
     // already walked the project and left such packages out unless
     // `--allow-patch-conflicts` (which lifts this one too), so only what
-    // its walk does not read is added: a Rush lock's patched entries. Each
-    // such package is a skip event, as the consent gate reports it. Before
-    // the vlt preflight, so a withheld artifact is never downloaded.
+    // its walk does not read is added: a Rush lock's and a root
+    // `shrinkwrap.yaml`'s patched entries (the in-memory engine reads both
+    // too). Each such package is a skip event, as the consent gate reports
+    // it. Before the vlt preflight, so a withheld artifact is never
+    // downloaded.
     if !common.allow_patch_conflicts {
-        let rush = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
-        if let Ok(text) = view.read_text(rush).await {
-            let index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&[(
-                rush,
-                text.as_str(),
-            )]);
+        let mut read: Vec<(&str, String)> = Vec::new();
+        for rel in [
+            socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL,
+            "shrinkwrap.yaml",
+        ] {
+            if let Ok(text) = view.read_text(rel).await {
+                read.push((rel, text));
+            }
+        }
+        if !read.is_empty() {
+            let locks: Vec<(&str, &str)> = read
+                .iter()
+                .map(|(rel, text)| (*rel, text.as_str()))
+                .collect();
+            let index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&locks);
             let _ = engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
         }
     }

@@ -166,8 +166,17 @@ impl UserPatchIndex {
             // policy.
             let dirs = crate::utils::repo_root::search_dirs(root);
             let root_canon = dirs.first().cloned().unwrap_or_else(|| root.to_path_buf());
-            let mut probes: Vec<std::path::PathBuf> = Vec::new();
+            // The root's own `.git` decides the bound, so its appearing or
+            // going away invalidates a snapshot too.
+            let mut probes: Vec<std::path::PathBuf> = vec![root_canon.join(".git")];
+            let home = crate::utils::repo_root::home();
             for (depth, parent) in dirs.iter().enumerate().skip(1) {
+                // Never the home directory or any directory above it (a
+                // project outside home, with no checkout, stops there too),
+                // as before the repository bound.
+                if home.as_deref().is_some_and(|h| h.starts_with(parent)) {
+                    break;
+                }
                 const MARKERS: [&str; 7] = [
                     "pnpm-workspace.yaml",
                     "go.work",
