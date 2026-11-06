@@ -487,86 +487,63 @@ async fn read_advisory(
     }
 }
 
+/// An in-memory project's Go files as the hosted engine reads them
+/// ([`read_advisory`]: a link or an entry without content is unreadable,
+/// but still exists).
+struct AdvisoryGoFiles<'v, 'p> {
+    view: &'v ProjectView<'p>,
+    unreadable: &'v BTreeSet<String>,
+}
+
+impl crate::vendor::go_workspace::MemoryFiles for AdvisoryGoFiles<'_, '_> {
+    async fn exists(&mut self, rel: &str) -> bool {
+        self.unreadable.contains(rel) || self.view.exists_no_follow(rel).await
+    }
+
+    async fn read(&mut self, rel: &str) -> Option<String> {
+        read_advisory(self.view, self.unreadable, rel).await
+    }
+
+    async fn read_sum(&mut self, rel: &str) -> Option<String> {
+        read_advisory(self.view, self.unreadable, rel).await
+    }
+
+    fn unparseable(&mut self, _rel: &str, _problem: &str) {}
+}
+
 /// The Go workspace in effect for the project, handed to the golang
 /// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
 /// the one go resolves (`GOWORK`, else a go.work at or above the root, with
 /// members anywhere, plus a `-modfile` that GOFLAGS sets); in memory a root
-/// `go.work` and its in-root members, with the files that exist
-/// ([`crate::patch::redirect::HostedGoWorkspace::files`]) so the rewriter
-/// compares their paths lexically and never probes the disk or the
-/// process's working directory. A root go.work and go.work.sum are
-/// candidate files the rewriter writes.
-pub(crate) async fn read_go_workspace(
+/// `go.work` and its in-root members, read as discovery reads them
+/// ([`crate::vendor::go_workspace::read_memory`]), whose paths every check
+/// compares lexically, never probing the disk or the process's working
+/// directory. A root go.work and go.work.sum are candidate files the
+/// rewriter writes.
+async fn read_go_workspace(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
-    use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
-    let (root, loaded, modfile, module_graph, files) = match view {
-        ProjectView::Memory(_) => 'memory: {
+    use crate::vendor::go_workspace::{self, Loaded};
+    let (root, loaded, modfile, module_graph) = match view {
+        ProjectView::Memory(_) => {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
             };
             let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
-            // The files that exist, as discovery's in-memory workspace
-            // lists them: go.work, a readable root go.mod and each in-root
-            // member's readable go.mod.
-            let mut files: BTreeSet<std::path::PathBuf> = BTreeSet::from(["go.work".into()]);
-            if read_advisory(view, unreadable, "go.mod").await.is_some() {
-                files.insert("go.mod".into());
-            }
             // As on disk (`go_workspace::load`): a go.work go cannot parse
             // is a workspace go refuses to build, never module mode.
-            if let Some(problem) = crate::vendor::go_mod_edit::block_structure_error(&work) {
-                break 'memory (
-                    std::path::PathBuf::new(),
-                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
-                    None,
-                    None,
-                    Some(files),
-                );
-            }
-            let mut members = Vec::new();
-            for raw in crate::vendor::go_mod_edit::parse_use_dirs(&work) {
-                let Some(dir) = go_workspace::in_root_dir(&raw) else {
-                    members.push(Member {
-                        dir: raw.into(),
-                        go_mod: None,
-                        go_sum: None,
-                    });
-                    continue;
-                };
-                let at = |file: &str| match dir.as_str() {
-                    "" => file.to_string(),
-                    dir => format!("{dir}/{file}"),
-                };
-                let go_mod = read_advisory(view, unreadable, &at("go.mod"))
-                    .await
-                    .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t));
-                if go_mod.is_some() {
-                    files.insert(at("go.mod").into());
+            let loaded = match crate::vendor::go_mod_edit::block_structure_error(&work) {
+                Some(problem) => {
+                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build"))
                 }
-                members.push(Member {
-                    go_mod,
-                    go_sum: read_advisory(view, unreadable, &at("go.sum")).await,
-                    dir: dir.into(),
-                });
-            }
-            let work_sum = read_advisory(view, unreadable, "go.work.sum").await;
-            let ws = GoWorkspace {
-                work_file: "go.work".into(),
-                work,
-                work_sum,
-                members,
-                graph: None,
+                None => {
+                    let mut files = AdvisoryGoFiles { view, unreadable };
+                    Loaded::Workspace(go_workspace::read_memory(&work, &mut files).await.0)
+                }
             };
-            (
-                std::path::PathBuf::new(),
-                Loaded::Workspace(ws),
-                None,
-                None,
-                Some(files),
-            )
+            (std::path::PathBuf::new(), loaded, None, None)
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -608,7 +585,7 @@ pub(crate) async fn read_go_workspace(
             view.disk_root_reading(&touched);
             // `-modfile` in GOFLAGS sends the build to another go.mod (#1799).
             let modfile = go_workspace::modfile_setting(&root);
-            (root, loaded, modfile, module_graph, None)
+            (root, loaded, modfile, module_graph)
         }
     };
     if loaded == Loaded::None && modfile.is_none() && module_graph.is_none() {
@@ -619,7 +596,6 @@ pub(crate) async fn read_go_workspace(
         loaded,
         modfile,
         module_graph,
-        files,
     };
     if let Ok(json) = serde_json::to_string(&hosted) {
         out.files
@@ -3711,6 +3687,120 @@ mod tests {
             matches!(hosted.loaded, Loaded::Invalid(_)),
             "{:?}",
             hosted.loaded
+        );
+    }
+
+    /// The in-memory engine's workspace is judged lexically, from the
+    /// project's own files: a root module go.work doesn't `use` is "not a
+    /// member", whatever the process's working directory holds. The disk
+    /// checks probed `<cwd>/go.mod` instead, so with this crate's directory
+    /// as the cwd (no go.mod) the rewriter called the root module-less
+    /// ("nowhere to go"), and with a go.mod there it gave the member answer.
+    /// A root go.mod go cannot parse, or one that cannot be read (a link),
+    /// still exists: the same files, the same verdict, as discovery's
+    /// `in_memory_workspace_files_are_the_files_that_exist` finds.
+    #[tokio::test]
+    async fn memory_go_workspace_never_probes_the_cwd() {
+        use crate::patch::redirect::{
+            rewrite_registry_redirect, HostedGoWorkspace, Integrity, RegistryOverride,
+            RegistryOverrideIdentifiers, GO_WORKSPACE_KEY,
+        };
+        use crate::vendor::go_workspace::{Loaded, WorkspaceConflict};
+        const MODULE: &str = "github.com/foo/bar";
+        let socket = format!("patch.socket.dev/gopatch/{PATCH_UUID}");
+        let hash = format!("h1:{}=", "A".repeat(43));
+        let ovr = DepOverride {
+            ecosystem: "golang".into(),
+            name: MODULE.into(),
+            version: "v1.4.2".into(),
+            registry_override: Some(RegistryOverride {
+                kind: "goproxy".into(),
+                index_url: "https://patch.socket.dev/patch-registry/golang".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: MODULE.into(),
+                    version: "v1.4.2".into(),
+                    go_module_path: Some(socket.clone()),
+                    go_module_version: Some("v1.4.2-socketpatch.1".into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                dirhash_h1: Some(hash.clone()),
+                go_mod_h1: Some(hash),
+                ..Default::default()
+            },
+            ..grant_dep("golang", String::new())
+        };
+        let go_mod = format!("module example.com/app\n\ngo 1.21\n\nrequire {MODULE} v1.4.2\n");
+        let b = format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} v1.4.2\n");
+        let work = "go 1.21\n\nuse ./b\n";
+        let ours = crate::vendor::go_mod_edit::ReplaceEntry {
+            module: MODULE.into(),
+            version: Some("v1.4.2".into()),
+            path: None,
+            rhs_module: Some(socket),
+            rhs_version: Some("v1.4.2-socketpatch.1".into()),
+            owner: Some(crate::vendor::go_mod_edit::ReplaceOwner::Hosted),
+        };
+        let unparseable = MemoryEntry::Text("module example.com/app\n\nrequire (\n".into());
+        for root in [
+            MemoryEntry::Text(go_mod.as_str().into()),
+            unparseable,
+            MemoryEntry::Symlink,
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert("go.mod", root.clone());
+            p.insert_text("go.work", work);
+            p.insert_text("b/go.mod", b.as_str());
+            let mut out = CandidateFiles::default();
+            read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+            let hosted: HostedGoWorkspace =
+                serde_json::from_str(&out.files[GO_WORKSPACE_KEY]).unwrap();
+            let Loaded::Workspace(ws) = &hosted.loaded else {
+                panic!("{root:?}: {:?}", hosted.loaded);
+            };
+            assert_eq!(
+                ws.files,
+                Some(
+                    ["go.mod", "go.work", "b/go.mod"]
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                ),
+                "{root:?}"
+            );
+            assert!(
+                matches!(
+                    hosted
+                        .loaded
+                        .conflict(&hosted.root, MODULE, "v1.4.2", &ours),
+                    Some(WorkspaceConflict::NotAMember { .. })
+                ),
+                "{root:?}"
+            );
+        }
+        // End to end through the rewriter.
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", go_mod.as_str());
+        p.insert_text("go.work", work);
+        p.insert_text("b/go.mod", b.as_str());
+        let mut read = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut read).await;
+        let mut files = read.files;
+        for (path, text) in [("go.mod", go_mod.as_str()), ("go.work", work)] {
+            files.insert(path.into(), text.into());
+        }
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("go.work does not `use` this module"),
+            "{:?}",
+            out.warnings
         );
     }
 
