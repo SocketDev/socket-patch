@@ -5,8 +5,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{MockServer, ResponseTemplate};
 
 use crate::vlt_hosted_common::*;
 
