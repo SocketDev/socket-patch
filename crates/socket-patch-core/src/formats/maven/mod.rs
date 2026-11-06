@@ -490,7 +490,9 @@ impl PomScope {
 
     /// `text` (a coordinate) with every `${name}` the build defines with
     /// no profile active interpolated, an undefined one kept as written
-    /// ([`interpolate_lenient`]).
+    /// ([`interpolate_lenient`]). What any profile (a declaration's own
+    /// included) makes of it is [`ScopedDep::coordinate_alternatives`]'
+    /// job, which every coordinate check weighs.
     fn interpolate_coordinate(&self, text: &str) -> String {
         interpolate_lenient(text, &|name| self.lookup(name, &[], true))
     }
@@ -677,6 +679,33 @@ fn properties(
     Ok(map)
 }
 
+/// The trimmed text of `body`'s own `<name>` child (depth 0), never one
+/// nested deeper (a `<repository>`'s `<id>` inside a `<profile>`).
+fn direct_child_text(body: &str, name: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut from = 0;
+    while let Some(rel) = body[from..].find('<') {
+        let lt = from + rel;
+        let gt = lt + body[lt..].find('>')?;
+        let tag = &body[lt + 1..gt];
+        from = gt + 1;
+        if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
+            continue;
+        }
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        let tag_name = tag.split(|c: char| c.is_ascii_whitespace()).next()?;
+        if depth == 0 && tag_name == name {
+            let end = from + body[from..].find(&format!("</{name}"))?;
+            return Some(body[from..end].trim().to_string());
+        }
+        depth += 1;
+    }
+    None
+}
+
 /// Each `<properties>` inside `<profiles>` (outside ignored sections) as
 /// `name -> trimmed value`, with the `<profile>` element that holds it.
 fn profile_properties(
@@ -704,7 +733,7 @@ fn profile_properties(
             .find(|p| props.start >= p.start && props.start < p.end)
             .copied();
         let id = holder
-            .and_then(|p| child_text(p.inner(text), "id").ok().flatten())
+            .and_then(|p| direct_child_text(p.inner(text), "id"))
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| format!("#{}", out.len() + 1));
         let mut map = BTreeMap::new();

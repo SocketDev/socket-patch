@@ -228,8 +228,8 @@ const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 /// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
 /// module's own `<version>` may override it (`vex::Unattested`).
 const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
-/// Omission tag and note: a hosted Maven pin's GA also has an executable
-/// classifier copy at another version, which the pin does not reach
+/// Omission tag and note: a hosted (or pre-v5 vendored) Maven pin's GA also
+/// has an executable classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// Omission tag and note: a hosted Maven pin's GA is also declared inside
@@ -237,8 +237,8 @@ const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// the pin's `${property}` version, which overrides the pin whenever that
 /// profile is active (`vex::Unattested`).
 const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
-/// Omission tag and note: a hosted Maven pin is spelled through a
-/// `${property}` that `.mvn/maven.config` redefines, so the build resolves
+/// Omission tag and note: a hosted (or pre-v5 vendored) Maven pin is spelled
+/// through a `${property}` that `.mvn/maven.config` redefines, so the build resolves
 /// another version (`vex::Unattested`).
 const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
 

@@ -615,7 +615,8 @@ pub enum UnattestedKind {
     /// profile is active it overrides the pin, so the build resolves the
     /// unpatched jar.
     MavenProfileUnpatched,
-    /// A hosted Maven pin the root pom spells through a `${property}` that
+    /// A hosted (or pre-v5 vendored) Maven pin the root pom spells through a
+    /// `${property}` that
     /// `.mvn/maven.config` redefines (`-D`, which Maven reads before the
     /// pom's `<properties>`): the build resolves that version, not the pin.
     MavenConfigOverride,
