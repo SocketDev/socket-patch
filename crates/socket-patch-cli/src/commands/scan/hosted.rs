@@ -870,6 +870,24 @@ async fn run_redirect_selected_untracked(
         );
     }
 
+    // The engine's user-patch gate (pnpm, yarn, patch-package), which the
+    // in-memory engine applies over its own walk. Here the consent gate
+    // already walked the project and left such packages out unless
+    // `--allow-patch-conflicts` (which lifts this one too), so only what
+    // its walk does not read is added: a Rush lock's patched entries. Each
+    // such package is a skip event, as the consent gate reports it. Before
+    // the vlt preflight, so a withheld artifact is never downloaded.
+    if !common.allow_patch_conflicts {
+        let rush = socket_patch_core::constants::npm_family::RUSH_COMMON_LOCK_REL;
+        if let Ok(text) = view.read_text(rush).await {
+            let index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&[(
+                rush,
+                text.as_str(),
+            )]);
+            let _ = engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
+        }
+    }
+
     // vlt artifact preflight: before any takeover or rewrite (dry runs
     // included), each in-scope artifact is fetched as vlt fetches it. A
     // failure while vlt drives withholds the dep from every rewriter;
@@ -887,20 +905,6 @@ async fn run_redirect_selected_untracked(
         &vlt_preflight.withheld_everywhere,
         &mut skipped,
     );
-    // The engine's own user-patch gate (pnpm, yarn, patch-package), which
-    // the in-memory engine applies too. The consent gate above already
-    // left such packages out unless `--allow-patch-conflicts`, which lifts
-    // this one as well; it still covers evidence that gate does not read
-    // (a Rush lock's patched entries). Each such package is a skip event,
-    // as the consent gate reports it.
-    let _ = engine::withhold_user_patched(
-        &view,
-        &std::collections::BTreeMap::new(),
-        &mut candidates,
-        &mut skipped,
-        common.allow_patch_conflicts,
-    )
-    .await;
     // A NEW row the lockfiles already pin on the patch server these
     // references name (not a configured one, so the recorded view's
     // discovery could not see it) is ALREADY: decided here, before the lock

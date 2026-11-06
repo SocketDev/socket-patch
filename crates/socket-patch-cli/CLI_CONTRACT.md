@@ -206,9 +206,13 @@ A missing referenced diff does not remove that protection.
 
 Detection covers root and declared npm workspace manifests, ancestor workspace
 settings, and the following evidence. Nothing outside the git repository root
-(the nearest ancestor of the project, inclusive, holding `.git`) is read: the
-ancestor walk stops there, and a workspace member or literal `--patch-dir`
-beyond it protects every npm package with a `workspace outside the git
+(found as git finds it: the nearest ancestor of the project's real path,
+inclusive, holding `.git`, never entering the home directory or a
+`GIT_CEILING_DIRECTORIES` entry) is read: the ancestor walk stops there, each
+ancestor is read at the path its markers were checked at, and a workspace member
+or `--patch-dir` beyond it (relative or absolute; an absolute one inside the
+repository is read) protects every package of the ecosystem that named it (npm,
+or Go for a `go.work` `use` member) with a `workspace outside the git
 repository` / `patch-package directory outside the git repository` diagnostic
 instead of being read. Without a `.git`, the ancestor walk stops below the home
 directory. This repository bound is a workspace-run rule: the walk's global
@@ -216,7 +220,13 @@ read scope has none (members and patch directories are read wherever they
 are, and protect only what they patch), though a global run (`--global`,
 `--global-prefix`) inspects no project today, since a local checkout does not
 govern the global tree. The hosted engine and `vex` run this same walk (npm-family rows only,
-without native npm / Bun); in memory the project is its own repository root.
+without native npm / Bun); in memory the project is its own repository root,
+and path selection asks the host for every file the walk can read (each
+`package.json`, `pnpm-workspace.yaml`, `pnpm-lock.yaml` and `yarn.lock` with
+content, each `*.patch` file by name, outside `node_modules`, `.git`, `.socket`,
+`target` and `.venv`). A file the walk reads that the host supplied without
+content (oversize, an LFS pointer) protects every npm package; a `--patch-dir`
+with no `*.patch` file below it holds no patch.
 
 | Mechanism | Evidence |
 | --- | --- |

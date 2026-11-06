@@ -375,9 +375,8 @@ pub async fn withhold_user_patched(
     skipped: &mut Vec<SkippedPatch>,
     allow: bool,
 ) -> Vec<RewriteWarning> {
-    let mut warnings = Vec::new();
     if allow || !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
-        return warnings;
+        return Vec::new();
     }
     let mut read: Vec<(String, String)> = Vec::new();
     for rel in USER_PATCH_LOCKS {
@@ -400,6 +399,21 @@ pub async fn withhold_user_patched(
         .map(|(rel, text)| (rel.as_str(), text.as_str()))
         .collect();
     let index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    withhold_user_patched_by(&index, candidates, skipped)
+}
+
+/// [`withhold_user_patched`] by evidence the caller already holds: the
+/// disk flow passes what its consent gate's walk did not read (a Rush
+/// lock), [`UserPatchIndex::from_locks`], instead of walking the project
+/// a second time.
+///
+/// [`UserPatchIndex::from_locks`]: crate::patch::user_patches::UserPatchIndex::from_locks
+pub fn withhold_user_patched_by(
+    index: &crate::patch::user_patches::UserPatchIndex,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<RewriteWarning> {
+    let mut warnings = Vec::new();
     if index.is_empty() {
         return warnings;
     }

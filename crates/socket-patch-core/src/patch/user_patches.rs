@@ -16,6 +16,7 @@ use crate::formats::text::strip_bom;
 use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
+use crate::utils::relpath::normalize_lexically_keeping_escapes;
 use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
 use crate::vendor::lock_inventory::ProjectView;
 
@@ -51,7 +52,9 @@ impl UserPatchIndex {
     /// such fallback.
     pub async fn discover_scoped(root: &Path, reads: ReadScope) -> Self {
         let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-        Self::walk(&ProjectView::Disk(&root), Some(&root), Scope::Gate, reads).await
+        Self::walk(&ProjectView::Disk(&root), Some(&root), Scope::Gate, reads)
+            .await
+            .0
     }
 
     /// The patches a project's pnpm, yarn or patch-package setup applies
@@ -75,71 +78,96 @@ impl UserPatchIndex {
     /// such as patch-package. Sources are reported root-relative.
     pub(crate) async fn npm_family_in(view: &ProjectView<'_>, locks: &[(&str, &str)]) -> Self {
         // Discovery and the hosted engine only ever run on a workspace.
-        let mut index = Self::walk(view, None, Scope::NpmFamily, ReadScope::Workspace).await;
+        let (mut index, walked) =
+            Self::walk(view, None, Scope::NpmFamily, ReadScope::Workspace).await;
+        // A directory the walk visited had its pnpm and yarn locks read
+        // already; only the others (a Rush lock, `shrinkwrap.yaml`, a lock
+        // in a directory the walk never reached) are parsed here.
+        let fresh: Vec<(&str, &str)> = locks
+            .iter()
+            .copied()
+            .filter(|(rel, _)| {
+                let path = Path::new(rel);
+                let dir = path.parent().unwrap_or(Path::new(""));
+                !(walked.contains(dir)
+                    && matches!(
+                        path.file_name().and_then(|n| n.to_str()),
+                        Some("pnpm-lock.yaml" | "yarn.lock")
+                    ))
+            })
+            .collect();
+        index.add_locks(&fresh);
+        index
+    }
+
+    /// The patches the pnpm locks (`pnpm-lock.yaml`, `shrinkwrap.yaml`) and
+    /// yarn locks among `locks` (root-relative path and text) record, as
+    /// [`Self::npm_family_in`] reads them: for a lock no walk reaches, such
+    /// as a Rush lock.
+    pub fn from_locks(locks: &[(&str, &str)]) -> Self {
+        let mut index = Self::default();
+        index.add_locks(locks);
+        index
+    }
+
+    fn add_locks(&mut self, locks: &[(&str, &str)]) {
         for (rel, text) in locks {
             let path = Path::new(rel);
             match rel.rsplit('/').next() {
                 Some("pnpm-lock.yaml" | "shrinkwrap.yaml") => {
-                    index.pnpm_yaml(strip_bom(text), path, true, false);
+                    self.pnpm_yaml(strip_bom(text), path, true, false);
                 }
-                Some("yarn.lock") => index.yarn_lock(text, path),
+                Some("yarn.lock") => self.yarn_lock(text, path),
                 _ => {}
             }
         }
-        index
     }
 
     /// Whether the index holds no evidence at all.
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
     /// The walk [`Self::discover`] and [`Self::npm_family_in`] share. Every
-    /// project file is read through `view` at its root-relative path (`..`
-    /// leading to an ancestor). `shown_root` is where reported sources are
-    /// anchored: the absolute project root for the gate, `None` for
-    /// root-relative sources.
+    /// project file is read through `view` at its root-relative path, or,
+    /// for an ancestor directory, at its absolute path. `shown_root` is
+    /// where reported sources are anchored: the absolute project root for
+    /// the gate, `None` for root-relative sources. Also returns the
+    /// directories visited (as read: root-relative, or absolute).
     ///
-    /// The ancestor walk stops at the directory holding `.git`, and without
-    /// a `.git` the gate's container rule holds (the walk never reaches the
-    /// home directory or above it). In a [`ReadScope::Workspace`] run
-    /// nothing outside that git repository root is read: a workspace member
-    /// or patch-package directory beyond it protects every npm package
-    /// instead of being read. An in-memory project is its own repository
-    /// root. A [`ReadScope::Global`] run reads members and patch-package
-    /// directories wherever they are.
+    /// The ancestor walk is git's own repository lookup
+    /// ([`crate::utils::repo_root::search_dirs`]: through the directory
+    /// holding `.git`, never into the home directory or a
+    /// `GIT_CEILING_DIRECTORIES` entry), and each ancestor is checked and
+    /// read at the same (canonical) path. In a [`ReadScope::Workspace`] run
+    /// nothing outside that git repository root is read: a workspace
+    /// member or patch-package directory beyond it protects every package
+    /// of the ecosystem that named it instead of being read. An in-memory
+    /// project is its own repository root. A [`ReadScope::Global`] run
+    /// reads members and patch-package directories wherever they are.
     async fn walk(
         view: &ProjectView<'_>,
         shown_root: Option<&Path>,
         scope: Scope,
         reads: ReadScope,
-    ) -> Self {
+    ) -> (Self, BTreeSet<std::path::PathBuf>) {
         let mut index = Self::default();
         let shown_base = shown_root.unwrap_or(Path::new(""));
         let at = |rel: &Path| Dir {
             rel: rel.to_path_buf(),
-            shown: lexical_join(shown_base, rel),
+            shown: normalize_lexically_keeping_escapes(&shown_base.join(rel)),
         };
-        let mut pending = VecDeque::from([at(Path::new(""))]);
-        // How many levels above the project root the repository root is;
-        // `None`: no repository root is known.
-        let mut repo_depth: Option<usize> = None;
+        // Each pending directory with the ecosystem whose declaration
+        // brought it in.
+        let mut pending = VecDeque::from([(at(Path::new("")), "npm")]);
+        let mut bound = Bound::Memory;
         if let Some(root) = view.disk_root_reading(std::iter::empty::<&Path>()) {
             // A member invocation still inherits the workspace's patch
-            // policy. The walk stops at the checkout's `.git`, and never
-            // reaches the home directory (whose `~/.cargo/config.toml` is
-            // user-wide, not a workspace) or above it, as in a container
-            // build with no `.git`.
-            let root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
-            let home = crate::utils::fs::home_dir();
-            let mut probes: Vec<std::path::PathBuf> = vec![root.join(".git")];
-            if root.join(".git").exists() {
-                repo_depth = Some(0);
-            }
-            for (depth, parent) in root.ancestors().enumerate().skip(1) {
-                if repo_depth.is_some() || home.as_deref().is_some_and(|h| h.starts_with(parent)) {
-                    break;
-                }
+            // policy.
+            let dirs = crate::utils::repo_root::search_dirs(root);
+            let root_canon = dirs.first().cloned().unwrap_or_else(|| root.to_path_buf());
+            let mut probes: Vec<std::path::PathBuf> = Vec::new();
+            for (depth, parent) in dirs.iter().enumerate().skip(1) {
                 const MARKERS: [&str; 7] = [
                     "pnpm-workspace.yaml",
                     "go.work",
@@ -163,29 +191,33 @@ impl UserPatchIndex {
                         .await
                         .is_ok_and(|s| s.contains("[workspace]"))
                 {
-                    let rel: std::path::PathBuf = std::iter::repeat_n("..", depth).collect();
-                    pending.push_back(Dir {
-                        shown: shown_root.map_or_else(|| rel.clone(), |_| parent.to_path_buf()),
-                        rel,
-                    });
-                }
-                if parent.join(".git").exists() {
-                    repo_depth = Some(depth);
+                    let up: std::path::PathBuf = std::iter::repeat_n("..", depth).collect();
+                    pending.push_back((
+                        Dir {
+                            rel: parent.clone(),
+                            shown: shown_root.map_or(up, |_| parent.clone()),
+                        },
+                        "npm",
+                    ));
                 }
             }
             // Fingerprint what the probes read for a snapshot's reuse.
             let _ = view.disk_root_reading(&probes);
-        } else {
-            repo_depth = Some(0);
+            bound = match crate::utils::repo_root::find_git_repo(root) {
+                Some(repo) => Bound::Disk {
+                    root: root_canon,
+                    repo: repo.root,
+                },
+                None => Bound::None,
+            };
         }
         // The read bound: the repository root in a workspace run, none in a
         // global one.
-        let repo_depth = match reads {
-            ReadScope::Workspace => repo_depth,
-            ReadScope::Global => None,
-        };
+        if reads == ReadScope::Global {
+            bound = Bound::None;
+        }
         let mut seen = BTreeSet::new();
-        while let Some(dir) = pending.pop_front() {
+        while let Some((dir, ecosystem)) = pending.pop_front() {
             if !seen.insert(dir.rel.clone()) {
                 continue;
             }
@@ -193,9 +225,9 @@ impl UserPatchIndex {
                 index.unknown("npm", &dir.shown, "workspace inspection limit exceeded");
                 break;
             }
-            if outside_repo(&dir.rel, repo_depth) {
+            if bound.outside(&dir.rel) {
                 index.unknown(
-                    "npm",
+                    ecosystem,
                     &dir.shown,
                     "workspace outside the git repository is not inspected",
                 );
@@ -217,17 +249,17 @@ impl UserPatchIndex {
                 // walking them can only find more patches.
                 globs.extend(Workspaces::of(&value).into_listed().into_iter().flatten());
                 index
-                    .list_patch_directory(view, &dir.file("patches"), false, None)
+                    .list_patch_directory(view, &dir.file("patches"), false, &Bound::None)
                     .await;
                 for patch_dir in index.patch_package_dirs(&manifest.shown, &value) {
                     let patch_dir = dir.file(&patch_dir);
                     index
-                        .list_patch_directory(view, &patch_dir, true, repo_depth)
+                        .list_patch_directory(view, &patch_dir, true, &bound)
                         .await;
                 }
             } else {
                 index
-                    .list_patch_directory(view, &dir.file("patches"), false, None)
+                    .list_patch_directory(view, &dir.file("patches"), false, &Bound::None)
                     .await;
             }
             let yarn_lock = dir.file("yarn.lock");
@@ -251,34 +283,28 @@ impl UserPatchIndex {
                 }
             }
             if scope == Scope::Gate {
-                index.gate_only(view, &dir, &mut pending, shown_base).await;
+                for member in index.gate_only(view, &dir).await {
+                    pending.push_back((at(&member), "golang"));
+                }
             }
             for pattern in globs
                 .iter()
                 .filter(|g| !g.starts_with('!') || g.starts_with("!("))
             {
-                for rel in index
-                    .workspace_members(view, &dir, pattern, repo_depth)
-                    .await
-                {
-                    pending.push_back(at(&rel));
+                for rel in index.workspace_members(view, &dir, pattern, &bound).await {
+                    pending.push_back((at(&rel), "npm"));
                 }
             }
         }
-        index
+        (index, seen)
     }
 
     /// The declarations only the consent gate reads in each directory:
     /// npm's and Bun's lock-entry `patched` records and mirrored maps, and
-    /// the Composer, Cargo and Go overrides (a `go.work`'s members join
-    /// the walk).
-    async fn gate_only(
-        &mut self,
-        view: &ProjectView<'_>,
-        dir: &Dir,
-        pending: &mut VecDeque<Dir>,
-        shown_base: &Path,
-    ) {
+    /// the Composer, Cargo and Go overrides. Returns a `go.work`'s `use`
+    /// members, which join the walk for the Go ecosystem.
+    async fn gate_only(&mut self, view: &ProjectView<'_>, dir: &Dir) -> Vec<std::path::PathBuf> {
+        let mut members = Vec::new();
         for file in ["package-lock.json", "npm-shrinkwrap.json", "bun.lock"] {
             let path = dir.file(file);
             // Like the pnpm lock: a lock that never says `patched` holds
@@ -326,15 +352,12 @@ impl UserPatchIndex {
                 // Workspace members' go.mod replaces still apply under go.work.
                 if file == "go.work" {
                     for member in crate::vendor::go_mod_edit::parse_use_dirs(&text) {
-                        let rel = lexical_join(&dir.rel, Path::new(&member));
-                        pending.push_back(Dir {
-                            shown: lexical_join(shown_base, &rel),
-                            rel,
-                        });
+                        members.push(normalize_lexically_keeping_escapes(&dir.rel.join(member)));
                     }
                 }
             }
         }
+        members
     }
 
     /// [`Self::read`] through a project view.
@@ -371,16 +394,18 @@ impl UserPatchIndex {
     }
 
     /// The patch-package files of directory `dir`. `required`: a directory
-    /// a script names, which must exist; `repo_depth` bounds it to the git
-    /// repository ([`Self::walk`]).
+    /// a script names, which must exist (on disk: an in-memory project
+    /// holds a directory only through a file below it, and path selection
+    /// supplies every `*.patch` file, so one with no listing holds no
+    /// patch); `bound` keeps it inside the git repository ([`Self::walk`]).
     async fn list_patch_directory(
         &mut self,
         view: &ProjectView<'_>,
         dir: &Dir,
         required: bool,
-        repo_depth: Option<usize>,
+        bound: &Bound,
     ) {
-        if outside_repo(&dir.rel, repo_depth) {
+        if bound.outside(&dir.rel) {
             self.unknown(
                 "npm",
                 &dir.shown,
@@ -388,13 +413,14 @@ impl UserPatchIndex {
             );
             return;
         }
+        let in_memory = matches!(view, ProjectView::Memory(_));
         match view.list_dir(&dir.view_rel()).await {
             Ok(entries) => {
                 for entry in entries {
                     self.patch_file(&entry.name, &dir.shown.join(&entry.name), required);
                 }
             }
-            Err(e) if !required && e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if (!required || in_memory) && e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => self.unknown(
                 "npm",
                 &dir.shown,
@@ -412,7 +438,7 @@ impl UserPatchIndex {
         view: &ProjectView<'_>,
         dir: &Dir,
         pattern: &str,
-        repo_depth: Option<usize>,
+        bound: &Bound,
     ) -> Vec<std::path::PathBuf> {
         if Path::new(pattern).is_absolute() {
             self.unknown("npm", &dir.shown, "workspace outside the inspection root");
@@ -454,7 +480,7 @@ impl UserPatchIndex {
             .split('/')
             .take_while(|p| !p.contains(['*', '?', '{', '[', '(']))
             .collect();
-        if outside_repo(&root.rel, repo_depth) {
+        if bound.outside(&root.rel) {
             self.unknown(
                 "npm",
                 &root.shown,
@@ -475,12 +501,7 @@ impl UserPatchIndex {
                 .count()
                 .saturating_sub(prefix.components().count())
         };
-        let skipped = |name: &str| {
-            matches!(
-                name,
-                "node_modules" | ".git" | ".socket" | "target" | ".venv"
-            )
-        };
+        let skipped = |name: &str| WALK_SKIP.contains(&name);
         let mut out = Vec::new();
         let patterns = vec![pattern.to_string()];
         // Depth-first, as `walkdir` walked it: (directory, depth, its
@@ -1023,8 +1044,8 @@ struct Dir {
 impl Dir {
     fn file(&self, name: &str) -> Dir {
         Dir {
-            rel: lexical_join(&self.rel, Path::new(name)),
-            shown: lexical_join(&self.shown, Path::new(name)),
+            rel: normalize_lexically_keeping_escapes(&self.rel.join(name)),
+            shown: normalize_lexically_keeping_escapes(&self.shown.join(name)),
         }
     }
 
@@ -1042,41 +1063,44 @@ impl Dir {
     }
 }
 
-/// `base` joined with `rel`, resolving `.` and `..` lexically (an absolute
-/// `rel` replaces `base`; `..` above a relative `base` stays a leading
-/// `..`).
-fn lexical_join(base: &Path, rel: &Path) -> std::path::PathBuf {
-    use std::path::Component;
-    let mut out = base.to_path_buf();
-    for component in rel.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                Some(Component::RootDir | Component::Prefix(_)) => {}
-                _ => out.push(".."),
-            },
-            other => out.push(other.as_os_str()),
-        }
-    }
-    out
+/// The directories the user-patch walk never enters, which path selection
+/// skips too.
+pub(crate) const WALK_SKIP: [&str; 5] = ["node_modules", ".git", ".socket", "target", ".venv"];
+
+/// What bounds a [`UserPatchIndex::walk`]'s reads.
+enum Bound {
+    /// Nothing: a global run, or a disk project with no git repository
+    /// above it (the ancestor walk's home rule still applies).
+    None,
+    /// A disk project at `root` inside the checkout at `repo` (both
+    /// canonical, as [`crate::utils::repo_root::search_dirs`] spells them).
+    Disk {
+        root: std::path::PathBuf,
+        repo: std::path::PathBuf,
+    },
+    /// An in-memory project, its own repository root.
+    Memory,
 }
 
-/// Whether root-relative `rel` lies outside the git repository whose root
-/// is `repo_depth` levels above the project root (`None`: unknown, so
-/// nothing is).
-fn outside_repo(rel: &Path, repo_depth: Option<usize>) -> bool {
-    let Some(depth) = repo_depth else {
-        return false;
-    };
-    rel.is_absolute()
-        || rel
-            .components()
-            .take_while(|c| matches!(c, std::path::Component::ParentDir))
-            .count()
-            > depth
+impl Bound {
+    /// Whether `rel` (root-relative, or absolute) lies outside the bound.
+    /// An absolute path is inside when it lexically lies under the
+    /// repository root.
+    fn outside(&self, rel: &Path) -> bool {
+        match self {
+            Bound::None => false,
+            Bound::Memory => {
+                rel.is_absolute()
+                    || matches!(
+                        rel.components().next(),
+                        Some(std::path::Component::ParentDir)
+                    )
+            }
+            Bound::Disk { root, repo } => {
+                !normalize_lexically_keeping_escapes(&root.join(rel)).starts_with(repo)
+            }
+        }
+    }
 }
 
 /// The package a Yarn locator installs. An alias (`alias@npm:real@1.0.0`)
@@ -1716,6 +1740,100 @@ mod tests {
         assert!(global.conflicts("pkg:npm/left-pad@1.2.0").is_empty());
         assert_eq!(ReadScope::of_global(true), ReadScope::Global);
         assert_eq!(ReadScope::of_global(false), ReadScope::Workspace);
+    }
+
+    /// Review (#2018): a `go.work` `use` member outside the git repository
+    /// is not read in a workspace run, and protects every Go module (the
+    /// ecosystem whose declaration named it), not every npm package.
+    #[tokio::test]
+    async fn an_out_of_repo_go_member_protects_go_not_npm() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+        write(&repo, "go.work", "go 1.22\n\nuse (\n\t.\n\t../shared\n)\n");
+        write(&repo, "go.mod", "module example.com/app\n\ngo 1.22\n");
+        write(
+            outer.path(),
+            "shared/go.mod",
+            "module example.com/shared\n\ngo 1.22\n\nreplace example.com/dep => ../dep\n",
+        );
+        let index = UserPatchIndex::discover(&repo).await;
+        let go = index.conflicts("pkg:golang/example.com/other@v1.0.0");
+        assert!(
+            go.iter().any(|s| s.contains("outside the git repository")),
+            "{go:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+            "{index:?}"
+        );
+        // A global run reads it: only the replaced module is protected.
+        let global = UserPatchIndex::discover_scoped(&repo, ReadScope::Global).await;
+        assert!(!global
+            .conflicts("pkg:golang/example.com/dep@v1.0.0")
+            .is_empty());
+        assert!(global
+            .conflicts("pkg:golang/example.com/other@v1.0.0")
+            .is_empty());
+    }
+
+    /// Review (#2018): an absolute `--patch-dir` inside the repository is
+    /// read like a relative one (it is not "outside" for being absolute).
+    #[tokio::test]
+    async fn an_absolute_patch_dir_inside_the_repository_is_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+        let fixes = repo.join("fixes");
+        write(
+            &repo,
+            "package.json",
+            &format!(
+                r#"{{"scripts":{{"postinstall":"patch-package --patch-dir {}"}}}}"#,
+                fixes.display()
+            ),
+        );
+        write(&repo, "fixes/left-pad+1.3.0.patch", "diff\n");
+        let index = UserPatchIndex::discover(&repo).await;
+        assert!(
+            !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
+    /// Review (#2018): through a symlinked project root, the ancestor
+    /// workspace settings are found and read where the directory really is
+    /// (where a `..` read lands), not at the link's lexical parent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_root_reads_its_real_ancestors() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        write(&real, ".git/HEAD", "ref: refs/heads/main\n");
+        write(
+            &real,
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'app'\npatchedDependencies:\n  left-pad@1.3.0: p.patch\n",
+        );
+        write(&real, "app/package.json", "{}");
+        let link = outer.path().join("link");
+        std::os::unix::fs::symlink(real.join("app"), &link).unwrap();
+        for view_root in [&link, &real.join("app")] {
+            let index = UserPatchIndex::discover(view_root).await;
+            assert!(
+                !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+                "{}: {index:?}",
+                view_root.display()
+            );
+            let view = ProjectView::Disk(view_root);
+            let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+            assert!(!index.conflicts("pkg:npm/left-pad@1.3.0").is_empty());
+            assert!(index.conflicts("pkg:npm/other@1.0.0").is_empty());
+        }
     }
 
     /// The view-based index the hosted engine and `vex` discovery read
