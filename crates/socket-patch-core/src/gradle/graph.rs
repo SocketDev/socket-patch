@@ -1378,28 +1378,43 @@ impl ScriptGraph {
                 })
                 .flatten();
             // Blocks that configure other projects resolve `file(…)`
-            // against those.
-            let foreign: Vec<(usize, usize)> = ["allprojects", "subprojects", "configure"]
-                .iter()
-                .flat_map(|name| all_blocks(&toks, name))
-                .chain(
-                    (0..toks.len())
-                        .filter(|&i| is_ident(toks.get(i), "project"))
-                        .filter_map(|i| {
-                            // Skip the whole `project(…)` argument list,
-                            // however long, so a named-argument call
-                            // (`project(path: ':a', configuration: 'x') {`)
-                            // still counts as configuring another project.
-                            let after = if is_punct(toks.get(i + 1), b'(') {
-                                matching_close(&toks, i + 1)? + 1
-                            } else {
-                                i + 1
-                            };
-                            let open = (after..toks.len().min(after + 4))
-                                .find(|&j| is_punct(toks.get(j), b'{'))?;
-                            matching_close(&toks, open).map(|c| (open, c))
-                        }),
-                )
+            // against those: `allprojects { … }`, `subprojects { … }`,
+            // `configure(<projects>) { … }`, `project(':x') { … }` (also
+            // `project(':x').afterEvaluate { … }`) and the per-project
+            // hooks (`gradle.beforeProject { … }`, `afterProject`). The
+            // block must open right after the name and its argument list
+            // (or one `.method`), so `implementation(project(':lib'))`
+            // followed by the script's next block is not one.
+            const FOREIGN: [&str; 6] = [
+                "allprojects",
+                "subprojects",
+                "configure",
+                "project",
+                "beforeProject",
+                "afterProject",
+            ];
+            let foreign: Vec<(usize, usize)> = (0..toks.len())
+                .filter(|&i| FOREIGN.iter().any(|name| is_ident(toks.get(i), name)))
+                .filter_map(|i| {
+                    // Skip the whole argument list, however long, so a
+                    // named-argument call (`project(path: ':a', …) {`)
+                    // still counts.
+                    let mut after = if is_punct(toks.get(i + 1), b'(') {
+                        matching_close(&toks, i + 1)? + 1
+                    } else {
+                        i + 1
+                    };
+                    if is_punct(toks.get(after), b'.')
+                        && matches!(
+                            toks.get(after + 1).map(|t| &t.tok),
+                            Some(dsl::Tok::Ident(_))
+                        )
+                    {
+                        after += 2;
+                    }
+                    let open = Some(after).filter(|&j| is_punct(toks.get(j), b'{'))?;
+                    matching_close(&toks, open).map(|c| (open, c))
+                })
                 .collect();
             for i in 0..toks.len() {
                 if !is_ident(toks.get(i), "lockFile") {
@@ -2825,12 +2840,32 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
             "project(':app') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
             "project(path: ':app', configuration: 'default') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
             "project(':app').afterEvaluate { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "configure(allprojects) { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "configure(subprojects.findAll { it.name != 'x' }) { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "gradle.beforeProject { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "gradle.afterProject { p -> dependencyLocking { lockFile = file('x.lockfile') } }\n",
         ] {
             let files = [
                 ("settings.gradle", "include 'app'\n"),
                 ("build.gradle", text),
             ];
             assert_eq!(path_of(&files), vec![None], "{text}");
+        }
+        // A project DEPENDENCY before the script's own block is not a block
+        // configuring that project.
+        for text in [
+            "dependencies { implementation(project(\":lib\")) }\ndependencyLocking { lockFile.set(file(\"locks/app.lockfile\")) }\n",
+            "dependencies {\n  implementation project(':lib')\n}\ndependencyLocking { lockFile = file('locks/app.lockfile') }\n",
+        ] {
+            let files = [
+                ("settings.gradle", "include 'app', 'lib'\n"),
+                ("app/build.gradle", text),
+            ];
+            assert_eq!(
+                path_of(&files),
+                vec![Some("app/locks/app.lockfile".to_string())],
+                "{text}"
+            );
         }
         let applied = [
             ("build.gradle", "apply from: 'locks.gradle'\n"),
