@@ -2404,7 +2404,7 @@ fn crlf_to_lf(text: &str) -> Option<String> {
 /// A workspace-member manifest key the caller supplied: `<dir>/Cargo.toml`,
 /// a plain repo-relative path (never absolute, never `..`, never under the
 /// ledger's `.socket/` or a build `target/`).
-fn is_cargo_member_manifest_key(key: &str) -> bool {
+pub(crate) fn is_cargo_member_manifest_key(key: &str) -> bool {
     let Some(dir) = key.strip_suffix("/Cargo.toml") else {
         return false;
     };
@@ -7631,14 +7631,11 @@ pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> 
     hosted_patch_url_uuids(url, extra_origins)?.pop()
 }
 
-/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
-/// (the grant token first when it is uuid-shaped, the patch uuid last), or
-/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
-/// exact acceptance rules, without electing one segment. `vex` discovery
-/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
-/// the malformed or rejected shapes whose "last uuid" is not a patch.
-pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
-    use crate::patch::path_safety::is_canonical_uuid;
+/// `url` normalized the way [`hosted_patch_url_uuids`] reads it: `\/`
+/// unescaped, a percent-encoded `http(s)://` url decoded, and a Cargo
+/// `sparse+` / `registry+` source prefix stripped. `None` without a
+/// `://`.
+pub(crate) fn normalized_hosted_url(url: &str) -> Option<String> {
     use crate::utils::purl::percent_decode_purl_component;
 
     let unescaped = url.trim().replace("\\/", "/");
@@ -7650,13 +7647,26 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
     };
     // `sparse+https://…` / `registry+https://…` (Cargo.lock `source`).
     let (scheme, _) = decoded.split_once("://")?;
-    let text = match scheme.rsplit_once('+') {
+    Some(match scheme.rsplit_once('+') {
         Some((kind, _)) if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) => {
-            &decoded[kind.len() + 1..]
+            decoded[kind.len() + 1..].to_string()
         }
-        _ => decoded.as_str(),
-    };
-    let parsed = reqwest::Url::parse(text).ok()?;
+        _ => decoded,
+    })
+}
+
+/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
+/// (the grant token first when it is uuid-shaped, the patch uuid last), or
+/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
+/// exact acceptance rules, without electing one segment. `vex` discovery
+/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
+/// the malformed or rejected shapes whose "last uuid" is not a patch.
+pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
+    use crate::patch::path_safety::is_canonical_uuid;
+    use crate::utils::purl::percent_decode_purl_component;
+
+    let text = normalized_hosted_url(url)?;
+    let parsed = reqwest::Url::parse(&text).ok()?;
     if !matches!(parsed.scheme(), "https" | "http")
         || !parsed.username().is_empty()
         || parsed.password().is_some()

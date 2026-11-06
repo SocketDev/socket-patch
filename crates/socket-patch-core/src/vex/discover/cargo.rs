@@ -29,12 +29,17 @@
 //! (cargo < 1.41) files it in `[metadata]` as `"checksum <name> <version>
 //! (<source>)"` instead — read as the same pin.
 //!
-//! `Cargo.toml` decides whether cargo still USES that entry (rule 10): cargo
+//! The manifests decide whether cargo still USES that entry (rule 10): cargo
 //! re-resolves a locked package whose source no longer matches the
-//! manifest's declaration. So for the lock entry's crate:
+//! manifest's declaration. The manifests are the root `Cargo.toml` and every
+//! workspace member's (`<dir>/Cargo.toml`, enumerated as the hosted rewriter
+//! enumerates the manifests it pins:
+//! [`crate::utils::cargo_workspace::member_manifests_in`], minus `.socket/`
+//! and `target/`), whose declarations count alike. So for the lock entry's
+//! crate:
 //!
-//! * not declared in the root `Cargo.toml` at all (a workspace member's dep
-//!   the root lock describes; no / unparseable manifest) → ref;
+//! * not declared in any of them (a transitive-only crate; no / unparseable
+//!   root manifest) → ref;
 //! * some declaration pins `socket-patch-<uuid>` (the same uuid) → ref;
 //! * declarations pin only OTHER `socket-patch-<V>` registries → the lock
 //!   ref AND a `Cargo.toml` ref for `<V>` at the locked version (no pin):
@@ -145,29 +150,48 @@ const DEP_TABLES: [&str; 5] = [
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let lock = load_lock(ctx, out).await;
-    let manifest = read_toml(ctx, CARGO_TOML, out).await;
+    let root = read_toml(ctx, CARGO_TOML, out).await;
     let config = read_config(ctx, out).await;
+    // The root manifest, then every workspace member's — the manifests the
+    // hosted rewriter pins a crate in (each that declares it).
+    let mut manifests: Vec<(String, DocumentMut)> = Vec::new();
+    if let Some(doc) = root {
+        // Any Socket pin the root or the config carries, a `[patch]`
+        // entry included: members may hold the declarations it governs.
+        let root_pins = doc.to_string().contains(PIN_NAME_PREFIX)
+            || config
+                .as_ref()
+                .is_some_and(|c| c.1.to_string().contains(PIN_NAME_PREFIX));
+        manifests.push((CARGO_TOML.to_string(), doc));
+        manifests.extend(read_members(ctx, &lock, root_pins, out).await);
+    }
+    let manifest: Option<&DocumentMut> = manifests.first().map(|(_, doc)| doc);
 
-    // Crate name → the `registry` value of each root-manifest declaration
-    // (`None` = declared with no registry key). Absent map = no usable
-    // manifest.
-    let decls = manifest.as_ref().map(|doc| {
-        let mut decls = manifest_declarations(doc);
+    // Crate name → each declaration of it in the root or a member manifest
+    // (its file, `registry` value — `None` = declared with no registry key —
+    // and version requirement). Absent map = no usable root manifest.
+    let decls = manifest.map(|doc| {
+        let mut decls = manifest_declarations(&manifests);
+        // `[patch]` is read from the root manifest only: cargo ignores (and
+        // warns about) a member's.
         for patch in patch_entries(doc) {
             if let Some(reg) = patch.registry {
                 let name = patch.name.to_string();
-                decls.entry(name).or_default().push(Some(reg.to_string()));
+                decls
+                    .entry(name)
+                    .or_default()
+                    .push(Decl::new(CARGO_TOML, Some(reg), None));
             }
         }
         decls
     });
     // The config's `[patch]` registry pins are also declarations cargo
-    // honors (only matters for crates the manifest also declares).
+    // honors (only matters for crates the manifests also declare).
     let decls = decls.map(|mut decls| {
-        if let Some((_, doc)) = &config {
+        if let Some((file, doc)) = &config {
             for patch in patch_entries(doc) {
                 if let (Some(reg), Some(existing)) = (patch.registry, decls.get_mut(patch.name)) {
-                    existing.push(Some(reg.to_string()));
+                    existing.push(Decl::new(file, Some(reg), None));
                 }
             }
         }
@@ -180,10 +204,10 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
     hosted_from_lock(ctx, &lock, decls.as_ref(), &definitions, out);
     unpatched_twins(ctx, &lock, out);
-    if let (Some(decls), Some(doc)) = (&decls, &manifest) {
-        unresolved_manifest_pins(ctx, &lock, decls, doc, &definitions, out);
+    if let Some(decls) = &decls {
+        unresolved_manifest_pins(ctx, &lock, decls, &definitions, out);
     }
-    if let Some(doc) = &manifest {
+    if let Some(doc) = manifest {
         // Cargo drops a manifest crates.io `[patch]` item that the project
         // config redefines under the same key (any version), and a
         // `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
@@ -223,7 +247,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         vendored_from_patches(ctx, file, doc, &lock, &|_| None, out).await;
     }
     let wired: Vec<VendorRef> = manifest
-        .iter()
+        .into_iter()
         .chain(config.iter().map(|(_, doc)| doc))
         .flat_map(socket_copies)
         .collect();
@@ -311,6 +335,54 @@ async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Op
     parse_toml(file, &text, out)
 }
 
+/// Every workspace member manifest (`<dir>/Cargo.toml`) of the root one,
+/// parsed — the set the hosted rewriter pins in
+/// ([`crate::utils::cargo_workspace::member_manifests_in`], keeping the
+/// keys it accepts: never under `.socket/` — a vendored copy is Socket's,
+/// not a declaration — or a build `target/`). Unparseable ones are skipped
+/// (diagnosed).
+///
+/// Members only ever decide about Socket wiring, so they are parsed only
+/// when there is some they could decide about: a lock with a
+/// Socket-sourced package, or a `socket-patch-` name in a member's own
+/// text, the root's or the config's (a pin to diagnose or recognize, a
+/// `[patch]` entry members declare, a lockless pin, [`UnlockedPin`]),
+/// whatever the lock says (stale, unparseable or absent).
+async fn read_members(
+    ctx: &DiscoverCtx<'_>,
+    lock: &Lock,
+    root_pins: bool,
+    out: &mut Discovery,
+) -> Vec<(String, DocumentMut)> {
+    let socket_sourced = matches!(lock, Lock::Parsed(_)) && has_socket_sourced(ctx, lock);
+    let texts: Vec<(String, String)> =
+        crate::utils::cargo_workspace::member_manifest_texts_in(&ctx.view)
+            .await
+            .into_iter()
+            .filter(|(rel, _)| crate::patch::redirect::is_cargo_member_manifest_key(rel))
+            .collect();
+    if !socket_sourced && !root_pins && !texts.iter().any(|(_, t)| t.contains(PIN_NAME_PREFIX)) {
+        return Vec::new();
+    }
+    let mut members = Vec::new();
+    for (rel, text) in texts {
+        ctx.adopt_read(&rel, &text);
+        if let Some(doc) = parse_toml(&rel, &text, out) {
+            members.push((rel, doc));
+        }
+    }
+    members
+}
+
+/// Whether the lock resolves some package from a Socket patch server.
+fn has_socket_sourced(ctx: &DiscoverCtx<'_>, lock: &Lock) -> bool {
+    lock.packages().iter().any(|p| {
+        p.source
+            .as_deref()
+            .is_some_and(|s| source_uuid(ctx, s).is_some())
+    })
+}
+
 fn parse_toml(file: &str, text: &str, out: &mut Discovery) -> Option<DocumentMut> {
     toml_or_diag(file, text, TomlDiag::TrimEnd, out).map(toml_edit::Document::into_mut)
 }
@@ -355,17 +427,81 @@ async fn read_config(
 
 // ── manifest / config shapes ─────────────────────────────────────────────
 
-/// Every dependency declaration in a manifest, keyed by the crate it names
-/// (`package = "…"` when renamed, else the key): the `registry` value of
-/// each (`None` = no registry key). `workspace = true` inheritors are
-/// skipped — the `[workspace.dependencies]` entry they inherit is itself
-/// collected.
-fn manifest_declarations(doc: &DocumentMut) -> BTreeMap<String, Vec<Option<String>>> {
-    let mut decls: BTreeMap<String, Vec<Option<String>>> = BTreeMap::new();
-    for dep in dependency_entries(doc) {
-        decls.entry(dep.name).or_default().push(dep.registry);
+/// One declaration of a crate: the root-relative file holding it and its
+/// `registry` value (`None` = no registry key).
+#[derive(Debug, Clone)]
+struct Decl {
+    file: String,
+    registry: Option<String>,
+    /// The `version` requirement (`None` for a `[patch]` registry pin, or
+    /// a declaration without one).
+    version: Option<String>,
+}
+
+impl Decl {
+    fn new(file: &str, registry: Option<&str>, version: Option<&str>) -> Self {
+        Decl {
+            file: file.to_string(),
+            registry: registry.map(str::to_string),
+            version: version.map(str::to_string),
+        }
+    }
+
+    /// The Socket patch uuid a well-formed `socket-patch-<uuid>` registry
+    /// names.
+    fn socket_uuid(&self) -> Option<String> {
+        socket_patch_name_uuid(self.registry.as_deref()?, false)
+    }
+
+    /// Whether the registry is `socket-patch-…`-shaped (well-formed or not).
+    fn socket_shaped(&self) -> bool {
+        self.registry
+            .as_deref()
+            .is_some_and(|r| r.trim().starts_with(PIN_NAME_PREFIX))
+    }
+}
+
+/// Crate name → its declarations ([`Decl`]).
+type Decls = BTreeMap<String, Vec<Decl>>;
+
+/// Every dependency declaration in `manifests` (root first, then members),
+/// keyed by the crate it names (`package = "…"` when renamed, else the
+/// key). `workspace = true` inheritors are skipped — the root's
+/// `[workspace.dependencies]` entry they inherit is itself collected.
+fn manifest_declarations(manifests: &[(String, DocumentMut)]) -> Decls {
+    let mut decls = Decls::new();
+    for (file, doc) in manifests {
+        for dep in dependency_entries(doc) {
+            decls.entry(dep.name).or_default().push(Decl::new(
+                file,
+                dep.registry.as_deref(),
+                dep.version.as_deref(),
+            ));
+        }
     }
     decls
+}
+
+/// The distinct present values, in first-seen order.
+fn distinct(values: impl IntoIterator<Item = Option<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in values.into_iter().flatten() {
+        if !out.contains(&value) {
+            out.push(value);
+        }
+    }
+    out
+}
+
+/// The distinct files among `decls`, in order, joined for a message.
+fn decl_files<'a>(decls: impl IntoIterator<Item = &'a Decl>) -> String {
+    let mut files: Vec<&str> = Vec::new();
+    for d in decls {
+        if !files.contains(&d.file.as_str()) {
+            files.push(&d.file);
+        }
+    }
+    files.join(", ")
 }
 
 /// One manifest dependency declaration (see [`manifest_declarations`]).
@@ -437,7 +573,7 @@ fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
 fn hosted_from_lock(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
-    decls: Option<&BTreeMap<String, Vec<Option<String>>>>,
+    decls: Option<&Decls>,
     definitions: &BTreeMap<String, String>,
     out: &mut Discovery,
 ) {
@@ -488,43 +624,53 @@ fn hosted_from_lock(
             true,
         );
         let Some(regs) = decls.and_then(|d| d.get(&pkg.name)) else {
-            // Not declared by the root manifest (a member's dependency the
-            // root lock describes), or no usable manifest: the lock is the
-            // only word.
+            // Declared by no manifest (a transitive-only crate), or no
+            // usable root manifest: the lock is the only word.
             out.push(lock_ref);
             continue;
         };
-        if regs.iter().any(|r| r.as_deref() == Some(reg.as_str())) {
+        if regs
+            .iter()
+            .any(|d| d.registry.as_deref() == Some(reg.as_str()))
+        {
             out.push(lock_ref);
             continue;
         }
-        let others: Vec<String> = regs
+        let others: Vec<(&str, String)> = regs
             .iter()
-            .flatten()
-            .filter_map(|r| socket_patch_name_uuid(r, false))
+            .filter_map(|d| {
+                let other = socket_patch_name_uuid(d.registry.as_deref()?, false)?;
+                Some((d.file.as_str(), other))
+            })
             .collect();
         if others.is_empty() {
+            let files = decl_files(regs);
+            let verb = if files.contains(", ") {
+                "declare"
+            } else {
+                "declares"
+            };
             out.diag(
                 DIAG_REF_INVALID,
                 CARGO_LOCK,
                 format!(
-                    "{CARGO_LOCK}: {purl} resolves from Socket patch {uuid}, but {CARGO_TOML} \
-                     declares {} without registry = \"{reg}\" — cargo re-resolves it from the \
+                    "{CARGO_LOCK}: {purl} resolves from Socket patch {uuid}, but {files} \
+                     {verb} {} without registry = \"{reg}\" — cargo re-resolves it from the \
                      declared source; not counted",
                     pkg.name
                 ),
             );
             continue;
         }
-        // The manifest routes the crate to a DIFFERENT Socket patch than the
+        // A manifest routes the crate to a DIFFERENT Socket patch than the
         // lock pins: emit both wirings and let the CLI's conflict gate refuse
         // to pick one.
         out.push(lock_ref);
-        for other in others {
+        for (file, other) in others {
             out.push(PatchedRef::hosted(
                 purl.clone(),
                 other,
-                CARGO_TOML,
+                file,
                 None,
                 None,
                 true,
@@ -584,74 +730,111 @@ fn unpatched_twins(ctx: &DiscoverCtx<'_>, lock: &Lock, out: &mut Discovery) {
 }
 
 /// Diagnose `Cargo.toml` Socket-registry pins no lock entry turns into a ref
-/// (no exact version to attest), and malformed `socket-patch-*` names.
+/// (no exact version to attest), and malformed `socket-patch-*` names. One
+/// diagnostic per crate and patch, naming every manifest that pins it.
 ///
 /// With NO `Cargo.lock` at all (a library that gitignores it; `rewrite_cargo`
 /// supports that state — `LockCommit::Absent` — and writes only the pin and
-/// the registry definition) a pin is still live wiring for the crate: every
-/// declaration of it routes to `socket-patch-<U>`, the project config defines
-/// that registry on the Socket host for the same `U`, and that registry
-/// serves only the patched version. It is recorded as an [`UnlockedPin`]
-/// carrying the manifest's version requirements, so a redirect-ledger record
-/// whose exact version satisfies them stays live
-/// ([`Discovery::hosted_claim`]); it is still not a ref (no version to
-/// attest on its own).
+/// the registry definition) a pin is still live wiring for the crate: no
+/// declaration routes it to another Socket registry, the project config
+/// defines that registry on the Socket host for the same `U`, and that
+/// registry serves only the patched version. It is recorded as ONE
+/// [`UnlockedPin`] per crate and patch, carrying the pinning declarations'
+/// version requirements (from the root and every member) and, as
+/// `excluded_reqs`, those of the declarations without a pin: the rewriter
+/// leaves a declaration alone only when its requirement excludes the
+/// patched version, so a redirect-ledger record stays live
+/// ([`Discovery::hosted_claim`]) when its exact version satisfies every
+/// pinned requirement and no unpinned one. An unpinned declaration with no
+/// version requirement (git, path) may resolve any version: no pin. It is
+/// still not a ref (no version to attest on its own).
 fn unresolved_manifest_pins(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
-    decls: &BTreeMap<String, Vec<Option<String>>>,
-    manifest: &DocumentMut,
+    decls: &Decls,
     definitions: &BTreeMap<String, String>,
     out: &mut Discovery,
 ) {
-    let deps = dependency_entries(manifest);
     for (name, regs) in decls {
-        for reg in regs.iter().flatten() {
-            if !reg.trim().starts_with(PIN_NAME_PREFIX) {
-                continue;
+        let mut malformed: Vec<(&str, &str)> = Vec::new();
+        let mut uuids: Vec<String> = Vec::new();
+        for decl in regs.iter().filter(|d| d.socket_shaped()) {
+            let reg = decl.registry.as_deref().unwrap_or_default();
+            match decl.socket_uuid() {
+                Some(uuid) if !uuids.contains(&uuid) => uuids.push(uuid),
+                Some(_) => {}
+                None if !malformed.contains(&(decl.file.as_str(), reg)) => {
+                    malformed.push((decl.file.as_str(), reg));
+                }
+                None => {}
             }
-            let Some(uuid) = socket_patch_name_uuid(reg, false) else {
-                out.diag(
-                    DIAG_REF_INVALID,
-                    CARGO_TOML,
-                    format!(
-                        "{CARGO_TOML}: {name} is pinned to registry {reg:?}, which is not a \
-                         socket-patch-<uuid> name"
-                    ),
-                );
-                continue;
-            };
-            let socket_sourced = lock.packages().iter().any(|p| {
-                p.name == *name
-                    && p.source
-                        .as_deref()
-                        .and_then(|s| source_uuid(ctx, s))
-                        .is_some()
-            });
-            if socket_sourced {
-                continue; // a ref (or the conflict pair) came from the lock
-            }
+        }
+        for (file, reg) in malformed {
+            out.diag(
+                DIAG_REF_INVALID,
+                file,
+                format!(
+                    "{file}: {name} is pinned to registry {reg:?}, which is not a \
+                     socket-patch-<uuid> name"
+                ),
+            );
+        }
+        if uuids.is_empty() {
+            continue;
+        }
+        let socket_sourced = lock.packages().iter().any(|p| {
+            p.name == *name
+                && p.source
+                    .as_deref()
+                    .and_then(|s| source_uuid(ctx, s))
+                    .is_some()
+        });
+        if socket_sourced {
+            continue; // a ref (or the conflict pair) came from the lock
+        }
+        for uuid in &uuids {
+            let pinning: Vec<&Decl> = regs
+                .iter()
+                .filter(|d| d.socket_uuid().as_deref() == Some(uuid.as_str()))
+                .collect();
+            let reg = pinning[0].registry.as_deref().unwrap_or_default();
+            let file = pinning[0].file.as_str();
             let why = match lock {
                 Lock::Unparseable => continue, // already diagnosed
                 Lock::Absent => {
-                    let only_this_registry = regs.iter().all(|r| r.as_deref() == Some(reg));
-                    let defined_here = definitions
-                        .get(reg.as_str())
-                        .and_then(|index| source_uuid(ctx, index))
-                        .is_some_and(|u| u == uuid);
-                    let version_reqs: Vec<String> = deps
+                    // Another Socket registry (or a malformed one) for the
+                    // same crate is a conflict, never a pin.
+                    let only_this_patch = regs
                         .iter()
-                        .filter(|d| d.name == *name && d.registry.as_deref() == Some(reg))
-                        .filter_map(|d| d.version.clone())
+                        .filter(|d| d.socket_shaped())
+                        .all(|d| d.socket_uuid().as_deref() == Some(uuid.as_str()));
+                    let defined_here = definitions
+                        .get(reg)
+                        .and_then(|index| source_uuid(ctx, index))
+                        .is_some_and(|u| u == *uuid);
+                    let version_reqs = distinct(pinning.iter().map(|d| d.version.clone()));
+                    // `None` when some unpinned declaration carries no
+                    // requirement (git, path): it may resolve any version.
+                    let excluded_reqs: Option<Vec<String>> = regs
+                        .iter()
+                        .filter(|d| !d.socket_shaped())
+                        .map(|d| d.version.clone())
                         .collect();
-                    if only_this_registry && defined_here && !version_reqs.is_empty() {
+                    if let (true, true, false, Some(excluded_reqs)) = (
+                        only_this_patch,
+                        defined_here,
+                        version_reqs.is_empty(),
+                        excluded_reqs,
+                    ) {
+                        let excluded_reqs = distinct(excluded_reqs.into_iter().map(Some));
                         out.unlocked_pin(UnlockedPin {
                             ecosystem: "cargo".to_string(),
                             name: name.clone(),
                             uuid: uuid.clone(),
-                            file: CARGO_TOML.into(),
+                            file: file.into(),
                             version_reqs,
-                            index_url: definitions.get(reg.as_str()).cloned(),
+                            excluded_reqs,
+                            index_url: definitions.get(reg).cloned(),
                         });
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")
@@ -662,10 +845,11 @@ fn unresolved_manifest_pins(
                      --patch-server-url)"
                 ),
             };
+            let files = decl_files(pinning.iter().copied());
             out.diag(
                 DIAG_REF_UNATTRIBUTABLE,
-                CARGO_TOML,
-                format!("{CARGO_TOML}: {name} is pinned to Socket patch {uuid}, but {why}"),
+                file,
+                format!("{files}: {name} is pinned to Socket patch {uuid}, but {why}"),
             );
         }
     }
@@ -1360,6 +1544,314 @@ mod tests {
             assert_refs(&out, &[]);
             assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
         }
+    }
+
+    /// A workspace root that declares nothing itself, with one member.
+    fn workspace_with_member(p: &Project, member_deps: &str) {
+        p.write("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        p.write(
+            "crates/a/Cargo.toml",
+            format!(
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\n{member_deps}\n"
+            ),
+        );
+    }
+
+    /// REGRESSION (C2): the hosted rewriter pins the crate in every member
+    /// manifest that declares it, so a member's declaration decides like the
+    /// root's. A member reverted to crates.io (the root declares nothing)
+    /// makes cargo re-resolve from crates.io: no ref, diagnosed against the
+    /// member, and the stale lock entry's patch is recognized (a ledger
+    /// record for it is dead).
+    #[tokio::test]
+    async fn reverted_member_manifest_pin_drops_the_stale_lock_entry() {
+        for decl in [
+            "serde = \"1.0.1\"".to_string(),
+            "serde = { version = \"1\", registry = \"my-corp\" }".to_string(),
+        ] {
+            let p = Project::new();
+            workspace_with_member(&p, &decl);
+            p.write(
+                "Cargo.lock",
+                lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+            );
+            p.write(".cargo/config.toml", registry_block(UUID_A));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{decl}");
+            assert!(
+                out.diagnostics[0].detail.contains("crates/a/Cargo.toml"),
+                "{:#?}",
+                out.diagnostics
+            );
+            assert_eq!(
+                out.hosted_claim("pkg:cargo/serde@1.0.1", UUID_A),
+                Some(false),
+                "{decl}"
+            );
+        }
+    }
+
+    /// The member's own pin keeps the lock entry a ref; a member pin for
+    /// ANOTHER patch emits the conflict pair, attributed to the member.
+    #[tokio::test]
+    async fn member_manifest_pins_count_like_the_roots() {
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_A));
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_B));
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[
+                ("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted),
+                ("pkg:cargo/serde@1.0.1", UUID_B, WiringMode::Hosted),
+            ],
+        );
+        let toml_ref = out.refs.iter().find(|r| r.uuid == UUID_B).unwrap();
+        assert_eq!(
+            toml_ref.source_file,
+            std::path::PathBuf::from("crates/a/Cargo.toml")
+        );
+    }
+
+    /// The root's pin still decides when a member declares the crate under
+    /// another version requirement the pin does not reach (the rewriter
+    /// leaves such a declaration alone): some declaration pins the patch.
+    #[tokio::test]
+    async fn a_root_pin_with_an_unpinned_member_declaration_is_a_ref() {
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"app\"\n\
+                 version = \"0.1.0\"\n\n[dependencies]\n{}\n",
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+        p.write(
+            "crates/a/Cargo.toml",
+            "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"0.9\"\n",
+        );
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+        );
+    }
+
+    /// A manifest under `.socket/` (a path dependency into Socket's own
+    /// tree, as a vendored copy is) is not a declaration the hosted
+    /// rewriter pins, so it never decides: the lock stays the only word.
+    #[tokio::test]
+    async fn manifests_under_dot_socket_are_not_declarations() {
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            manifest("local = { path = \".socket/local\" }"),
+        );
+        p.write(
+            ".socket/local/Cargo.toml",
+            "[package]\nname = \"local\"\nversion = \"0.1.0\"\n\n[dependencies]\nserde = \"1\"\n",
+        );
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+        );
+    }
+
+    /// With no lock, a member's pin is an unlocked pin carrying the member's
+    /// requirement, attributed to the member manifest.
+    #[tokio::test]
+    async fn lockless_member_pin_is_an_unlocked_pin() {
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_A));
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.unlocked_pins.len(), 1, "{:#?}", out.unlocked_pins);
+        let pin = &out.unlocked_pins[0];
+        assert_eq!(pin.file, std::path::PathBuf::from("crates/a/Cargo.toml"));
+        assert_eq!(pin.version_reqs, vec!["1".to_string()]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+        assert_eq!(
+            out.diagnostics[0].file,
+            std::path::PathBuf::from("crates/a/Cargo.toml")
+        );
+    }
+
+    /// A workspace whose root pins `serde` and declares `crates/*` members.
+    fn pinned_root_workspace(p: &Project) {
+        p.write(
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[package]\nname = \"app\"\n\
+                 version = \"0.1.0\"\n\n[dependencies]\n{}\n",
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+    }
+
+    fn member(p: &Project, dir: &str, deps: &str) {
+        p.write(
+            &format!("crates/{dir}/Cargo.toml"),
+            format!("[package]\nname = \"{dir}\"\nversion = \"0.1.0\"\n\n[dependencies]\n{deps}\n"),
+        );
+    }
+
+    /// REVIEW (lockless members): a member's unpinned declaration at a
+    /// version the pin does not reach (`serde = "0.9"` beside the root's
+    /// pinned `serde = "1"`, which the rewriter leaves alone) keeps the
+    /// lockless pin; it only excludes the versions it accepts. One that
+    /// accepts the record's version, or that has no requirement at all (a
+    /// git dependency), leaves the record unrouted.
+    #[tokio::test]
+    async fn lockless_pin_survives_a_member_declaring_another_version() {
+        let record = "pkg:cargo/serde@1.0.1";
+        for (member_decl, live) in [
+            ("serde = \"0.9\"", true),
+            ("serde = \"1.0\"", false),
+            ("serde = { git = \"https://example.com/serde\" }", false),
+        ] {
+            let p = Project::new();
+            pinned_root_workspace(&p);
+            member(&p, "a", member_decl);
+            p.write(".cargo/config.toml", registry_block(UUID_A));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.hosted_claim(record, UUID_A),
+                Some(live),
+                "{member_decl}: {:#?}",
+                out.unlocked_pins
+            );
+        }
+        let p = Project::new();
+        pinned_root_workspace(&p);
+        member(&p, "a", "serde = \"0.9\"");
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert_eq!(out.unlocked_pins.len(), 1);
+        assert_eq!(out.unlocked_pins[0].excluded_reqs, vec!["0.9".to_string()]);
+        assert_eq!(
+            out.hosted_claim("pkg:cargo/serde@0.9.5", UUID_A),
+            Some(false),
+            "the member resolves 0.9 from crates.io"
+        );
+    }
+
+    /// REVIEW (one pin per crate and patch): the root and two members pin the
+    /// same patch — one lockless pin carrying every requirement, one
+    /// diagnostic listing each manifest once.
+    #[tokio::test]
+    async fn one_lockless_pin_and_diagnostic_per_crate_and_patch() {
+        let p = Project::new();
+        pinned_root_workspace(&p);
+        member(&p, "a", &pinned("serde", "1.0", UUID_A));
+        member(
+            &p,
+            "b",
+            &format!(
+                "{}\n\n[dev-dependencies]\n{}",
+                pinned("serde", "1", UUID_A),
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert_eq!(out.unlocked_pins.len(), 1, "{:#?}", out.unlocked_pins);
+        let pin = &out.unlocked_pins[0];
+        assert_eq!(pin.file, std::path::PathBuf::from("Cargo.toml"));
+        assert_eq!(pin.version_reqs, vec!["1".to_string(), "1.0".to_string()]);
+        assert!(pin.excluded_reqs.is_empty());
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+        assert!(
+            out.diagnostics[0]
+                .detail
+                .starts_with("Cargo.toml, crates/a/Cargo.toml, crates/b/Cargo.toml: serde"),
+            "{}",
+            out.diagnostics[0].detail
+        );
+    }
+
+    /// REVIEW (perf): members only matter to Socket wiring, so a project
+    /// with a lock that resolves nothing from a Socket patch server — or no
+    /// lock and no `socket-patch-` pin anywhere — reads no member manifest
+    /// as discovery's own (none in [`Discovery::read`], which the full run
+    /// collects).
+    #[tokio::test]
+    async fn members_are_read_only_when_socket_wiring_could_need_them() {
+        let member_read = |out: &Discovery| {
+            out.read
+                .iter()
+                .any(|r| r.file == std::path::Path::new("crates/a/Cargo.toml"))
+        };
+        // A plain lock: no walk.
+        let p = Project::new();
+        workspace_with_member(&p, "serde = \"1\"");
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(CRATES_IO), Some(CKSUM))]),
+        );
+        assert!(!member_read(&p.discover().await));
+        // No lock, no pin anywhere: walked, not adopted.
+        let p = Project::new();
+        workspace_with_member(&p, "serde = \"1\"");
+        assert!(!member_read(&p.discover().await));
+        // A Socket-sourced lock entry: read.
+        let p = Project::new();
+        workspace_with_member(&p, "serde = \"1\"");
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        assert!(member_read(&p.discover().await));
+        // No lock, a member pin: read.
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_A));
+        assert!(member_read(&p.discover().await));
+        // Review on #2012 (round 2): a stale crates.io lock beside a member
+        // pin still reads the member, so the pin is diagnosed (a stale lock
+        // or a server outside the allowlist) and its uuid recognized.
+        let p = Project::new();
+        workspace_with_member(&p, &pinned("serde", "1", UUID_A));
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(CRATES_IO), Some(CKSUM))]),
+        );
+        let out = p.discover().await;
+        assert!(member_read(&out));
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE),
+            "{:?}",
+            out.diagnostics
+        );
     }
 
     /// A rotated grant token in the definition is the same patch.
