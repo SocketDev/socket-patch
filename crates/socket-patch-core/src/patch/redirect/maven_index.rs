@@ -273,6 +273,8 @@ impl PomIndex {
                 (None | Some("jar"), c) => c,
                 (Some(t), c) if t.contains("${") => c,
                 (Some("test-jar"), None) => Some("tests"),
+                // An explicit classifier names the copy whatever the type.
+                (Some(_), Some(c)) => Some(c),
                 _ => return None,
             };
             d.coordinate_alternatives.iter().find_map(|r| {

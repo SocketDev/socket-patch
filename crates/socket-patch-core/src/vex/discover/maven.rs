@@ -892,6 +892,9 @@ fn retargeted(deps: &[PomDep]) -> impl Iterator<Item = PomDep> + '_ {
                 None | Some("jar") => (d.classifier.clone(), d.type_text.clone()),
                 Some(t) if t.contains("${") => (d.classifier.clone(), d.type_text.clone()),
                 Some("test-jar") if d.classifier.is_none() => (Some("tests".to_string()), None),
+                // An explicit classifier names the copy whatever the type
+                // (`test-jar` + `tests`): weighed as that classifier.
+                Some(_) if d.classifier.is_some() => (d.classifier.clone(), None),
                 Some(_) => return None,
             };
             Some(PomDep {
@@ -2533,6 +2536,17 @@ mod tests {
                 with(
                     "<dependency><groupId>${h}</groupId><artifactId>slf4j-api</artifactId>\
                      <version>1.7.36</version><type>test-jar</type></dependency>\n",
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // A type with an explicit classifier: that classifier's copy.
+            case(
+                h,
+                with(
+                    "<dependency><groupId>${h}</groupId><artifactId>slf4j-api</artifactId>\
+                     <version>1.7.30</version><type>test-jar</type><classifier>tests</classifier>\
+                     </dependency>\n",
                 ),
                 vec![to_slf4j.clone()],
                 None,

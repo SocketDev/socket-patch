@@ -10985,6 +10985,16 @@ mod tests {
                 ),
                 "<h>org.slf4j</h>",
             ),
+            // ... a type with an explicit classifier included.
+            (
+                "<h>org.other</h>",
+                format!(
+                    "{pinned}<dependency><groupId>${{h}}</groupId><artifactId>slf4j-api\
+                     </artifactId><version>1.7.30</version><type>test-jar</type>\
+                     <classifier>tests</classifier></dependency>"
+                ),
+                "<h>org.slf4j</h>",
+            ),
         ] {
             let mut files = BTreeMap::new();
             files.insert("pom.xml".to_string(), pom(props, &deps, profile));
