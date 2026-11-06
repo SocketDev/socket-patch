@@ -235,11 +235,13 @@ pub(crate) fn distribution_sdist_before_dependencies(
 /// `pyproject.toml`, or the top level of a `uv.toml`): uv 0.2.12–0.2.27
 /// apply it when they lock without recording it in a `[[distribution]]`
 /// lock, so which of a release's files that lock kept is not derivable.
+/// `exclude-newer-package` is not such a cutoff: those uv releases predate
+/// it and ignore the key, and a later uv records it in the lock.
 pub(crate) fn sets_exclude_newer(settings: &dyn TableLike) -> Option<&str> {
     settings
         .iter()
         .map(|(k, _)| k)
-        .find(|k| k.starts_with("exclude-newer"))
+        .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
 }
 
 /// A uv package's install location: `source = { url | path }`, or the uv
@@ -1263,6 +1265,22 @@ pub fn paired_metadata_path(lock: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `exclude-newer-package` names packages (or exempts them with `false`);
+    /// uv 0.2 ignores it, so it is not the global cutoff that blocks a
+    /// `[[distribution]]` rewrite.
+    #[test]
+    fn exclude_newer_package_is_not_a_global_cutoff() {
+        let table = |text: &str| text.parse::<toml_edit::DocumentMut>().unwrap();
+        let per_package = table("exclude-newer-package = { six = \"2024-01-01\" }\n");
+        assert_eq!(sets_exclude_newer(per_package.as_table()), None);
+        let exempt = table("exclude-newer-package = { six = false }\n");
+        assert_eq!(sets_exclude_newer(exempt.as_table()), None);
+        let global = table(
+            "exclude-newer-package = { six = false }\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+        );
+        assert_eq!(sets_exclude_newer(global.as_table()), Some("exclude-newer"));
+    }
 
     #[test]
     fn script_locks_pair_with_their_script_and_uv_lock_with_pyproject() {
