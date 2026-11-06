@@ -347,10 +347,11 @@ pub struct CandidateFiles {
     /// The workspace members' own locks among `files`, read beside the
     /// root's when the workspace turned the shared lock off (#492).
     pub pnpm_member_lock_keys: Vec<String>,
-    /// In memory only: candidate files the disk flow reads through a
-    /// symbolic link. Their bytes are unknown here, so a project whose
-    /// candidates could rewrite one is refused like the disk symlink guard
-    /// refuses the write.
+    /// In memory: candidate files the disk flow reads through a symbolic
+    /// link. On disk: candidate files linked out of the repository root,
+    /// whose reads the bound refused. Their bytes are unknown, so a project
+    /// whose candidates could rewrite one is refused like the disk symlink
+    /// guard refuses the write.
     pub symlinked_reads: Vec<String>,
     /// In memory only: candidate files that exist without content; a
     /// project whose candidates could rewrite (or whose rewrite depends on)
@@ -399,6 +400,14 @@ impl CandidateFiles {
                 Ok(text) => Some(text),
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     self.undecodable_reads.push(rel.to_string());
+                    None
+                }
+                // A candidate linked out of the repository root: the bound
+                // refuses the read, but the package manager still honors
+                // the file, so it is a symlinked rewrite target the guard
+                // refuses, never an absent one.
+                Err(e) if crate::utils::repo_root::is_refused_read(&e) && view.is_symlink(rel) => {
+                    self.symlinked_reads.push(rel.to_string());
                     None
                 }
                 Err(_) => None,
@@ -3645,9 +3654,8 @@ pub fn guard(
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
-    let ProjectView::Memory(project) = view else {
-        return None;
-    };
+    // In memory, every linked candidate; on disk, those linked out of the
+    // repository root, whose reads the bound refused.
     if let Some(linked) = done
         .symlinked_reads
         .iter()
@@ -3655,6 +3663,9 @@ pub fn guard(
     {
         return Some(symlink_refusal(linked));
     }
+    let ProjectView::Memory(project) = view else {
+        return None;
+    };
     done.unreadable_reads
         .iter()
         .find(|rel| {
