@@ -7606,8 +7606,6 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
     (!token.is_empty()).then(|| token.to_string())
 }
 
-pub use crate::origin::{hosted_patch_url_uuids, hosted_patch_uuid, SOCKET_PATCH_SERVER_HOST};
-
 /// A dep's Socket index URL as a regex source with the per-request rotating
 /// segments (grant token, patch uuid) wildcarded — an exact-URL pattern
 /// misses the URL a previous run wrote under an older grant. The grant token

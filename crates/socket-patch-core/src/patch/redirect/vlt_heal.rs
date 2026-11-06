@@ -14,9 +14,9 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::hosted_patch_uuid;
 use crate::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR};
 use crate::manifest::schema::PatchRecord;
+use crate::origin::hosted_patch_uuid;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 use crate::patch::file_hash::compute_file_git_sha256;
 use crate::patch::package::read_archive_bytes_to_map_strict;

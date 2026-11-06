@@ -78,7 +78,7 @@
 //!    panic, never `unwrap` on file data, bound every recursion.
 //! 4. **Hosted identity** comes ONLY from [`DiscoverCtx::hosted_uuid`] (the
 //!    Socket host allowlist + last-canonical-uuid-segment rule of
-//!    [`crate::patch::redirect::hosted_patch_uuid`]) — except identities
+//!    [`crate::origin::hosted_patch_uuid`]) — except identities
 //!    that are not URLs: Go's `patch.socket.dev/gopatch/<uuid>` module path
 //!    ([`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`]) and the
 //!    `socket-patch-<uuid>` registry / repository / source names
@@ -197,9 +197,14 @@ use crate::vendor::lock_inventory::{
 use crate::vendor::path::{ecosystem_dir_for_purl, ECOSYSTEM_DIRS, VENDOR_DIR};
 use crate::vendor::state::VendorEntry;
 
+use crate::origin::OriginPolicy;
+// The origin helpers the extractors use, re-exported so they import every
+// identity helper from here (the architecture guard below bans
+// `crate::origin::` in extractor files: hosted identity comes only from
+// `DiscoverCtx::hosted_uuid`).
 pub(crate) use crate::origin::{
     mentions_vendor_dir, names_vendor_dir, npm_vendored_tarball_names, root_anchored_spelling,
-    socket_patch_name_uuid, LocateOpts, Located, OriginPolicy, Wired,
+    socket_patch_name_uuid, LocateOpts, Located, Wired, SOCKET_PATCH_SERVER_HOST,
 };
 pub use crate::origin::{
     strip_leaf_suffix, vendor_ref, vendor_ref_decorated, vendor_uuid_dir, vendored_leaf_purl,
@@ -1578,8 +1583,9 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
     };
     for rel in &stray.ignored {
         let mentions = match ctx.view.read_bytes(rel).await {
-            Ok(bytes) => !socket_identities(&String::from_utf8_lossy(&bytes), ctx.origin.origins())
-                .is_empty(),
+            Ok(bytes) => {
+                !socket_identities(&String::from_utf8_lossy(&bytes), &ctx.origin).is_empty()
+            }
             Err(_) => false,
         };
         ctx.recognize_ignored(rel).await;
@@ -1691,7 +1697,7 @@ impl<'a> DiscoverCtx<'a> {
     /// Record every Socket identity `text` (the content of root-relative
     /// `rel`) mentions — see [`socket_identities`].
     fn recognize_text(&self, rel: &str, text: &str) {
-        let found = socket_identities(text, self.origin.origins());
+        let found = socket_identities(text, &self.origin);
         if found.is_empty() {
             return;
         }
@@ -1903,7 +1909,7 @@ impl<'a> DiscoverCtx<'a> {
 ///   ids, `§` in legacy ids), since a vlt node key may be its only mention;
 /// * [`WiringMode::Hosted`]: every canonical-uuid path segment of a url on
 ///   an accepted patch-server origin
-///   ([`crate::patch::redirect::hosted_patch_url_uuids`]: plain,
+///   ([`crate::origin::hosted_patch_url_uuids`]: plain,
 ///   `sparse+` / `registry+` prefixed, or a wholly percent-encoded berry
 ///   `__archiveUrl`), and every canonical-uuid segment of a
 ///   `patch.socket.dev/gopatch/…` Go module path.
@@ -1917,9 +1923,10 @@ impl<'a> DiscoverCtx<'a> {
 ///
 /// Memoized by content ([`IdentityMemo`]): one scan runs several
 /// discoveries over mostly byte-identical lockfiles, and this sweep is the
-/// largest per-file cost after parsing.
-fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
-    IdentityMemo::sweep(text, origins)
+/// largest per-file cost after parsing. The host matcher is the policy's
+/// own ([`OriginPolicy::host_finder`]), built once per run.
+fn socket_identities(text: &str, policy: &OriginPolicy<'_>) -> BTreeSet<(String, WiringMode)> {
+    IdentityMemo::sweep(text, policy)
 }
 
 /// The process-wide memo behind [`socket_identities`]: the sweep's result
@@ -1947,12 +1954,12 @@ impl IdentityMemo {
         ENTRIES.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
     }
 
-    fn sweep(text: &str, origins: &[String]) -> IdentitySet {
+    fn sweep(text: &str, policy: &OriginPolicy<'_>) -> IdentitySet {
         if text.len() < Self::MIN_LEN {
-            return socket_identities_inner(text, origins);
+            return socket_identities_inner(text, policy);
         }
         use sha2::Digest as _;
-        let mut origin_key = origins.to_vec();
+        let mut origin_key = policy.origins().to_vec();
         origin_key.sort();
         origin_key.dedup();
         let key: IdentityKey = (sha2::Sha256::digest(text.as_bytes()).into(), origin_key);
@@ -1964,7 +1971,7 @@ impl IdentityMemo {
         if let Some((_, found)) = lock().iter().find(|(k, _)| *k == key) {
             return found.clone();
         }
-        let found = socket_identities_inner(text, origins);
+        let found = socket_identities_inner(text, policy);
         let mut entries = lock();
         if !entries.iter().any(|(k, _)| *k == key) {
             if entries.len() == Self::CAPACITY {
@@ -1980,14 +1987,17 @@ impl IdentityMemo {
 /// rules as discovery's sweep (the upstream restore's "does anything in
 /// this file still need the hosted-side setting" probe).
 pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<String> {
-    socket_identities(text, origins)
+    socket_identities(text, &OriginPolicy::new(origins))
         .into_iter()
         .filter(|(_, mode)| *mode == WiringMode::Hosted)
         .map(|(uuid, _)| uuid)
         .collect()
 }
 
-fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+fn socket_identities_inner(
+    text: &str,
+    policy: &OriginPolicy<'_>,
+) -> BTreeSet<(String, WiringMode)> {
     use aho_corasick::AhoCorasick;
     use std::borrow::Cow;
 
@@ -2048,17 +2058,7 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
 
     // Cheap pre-filter: only a token naming an accepted host (any ASCII
     // case) can be ours.
-    let mut hosts = vec![crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()];
-    hosts.extend(origins.iter().filter_map(|o| {
-        reqwest::Url::parse(o.trim())
-            .ok()?
-            .host_str()
-            .map(str::to_ascii_lowercase)
-    }));
-    let host_finder = AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(&hosts)
-        .expect("literal host patterns");
+    let host_finder = policy.host_finder();
     static SEPARATORS: std::sync::OnceLock<AhoCorasick> = std::sync::OnceLock::new();
     let separators = SEPARATORS.get_or_init(|| {
         AhoCorasick::builder()
@@ -2074,7 +2074,7 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
         if !host_finder.is_match(&bytes[start..end]) {
             continue;
         }
-        let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
+        let uuids = crate::origin::hosted_patch_url_uuids(&norm[start..end], policy.origins());
         for uuid in uuids.into_iter().flatten() {
             found.insert((uuid, WiringMode::Hosted));
         }
@@ -4156,15 +4156,16 @@ mod tests {
     fn socket_identities_recognize_every_spelling_and_nothing_else() {
         let a = UUID_A;
         let t = TOKEN;
+        let none = OriginPolicy::new(&[]);
         let hosted = |text: &str| {
-            socket_identities(text, &[])
+            socket_identities(text, &none)
                 .into_iter()
                 .filter(|(_, m)| *m == WiringMode::Hosted)
                 .map(|(u, _)| u)
                 .collect::<Vec<_>>()
         };
         let vendored = |text: &str| {
-            socket_identities(text, &[])
+            socket_identities(text, &none)
                 .into_iter()
                 .filter(|(_, m)| *m == WiringMode::Vendored)
                 .map(|(u, _)| u)
@@ -4241,17 +4242,20 @@ mod tests {
             ".socket/vendor/npm/not-a-uuid/x.tgz".to_string(),
             "https://patch.socket.dev/patch/npm/x/1.0.0/tok/placeholder/x.tgz".to_string(),
         ] {
-            assert!(socket_identities(&text, &[]).is_empty(), "{text}");
+            assert!(socket_identities(&text, &none).is_empty(), "{text}");
         }
         // A configured patch-server origin counts only when configured.
         let staging =
             format!("\"resolved\": \"http://127.0.0.1:4545/patch/npm/x/1/{t}/{a}/x.tgz\"");
-        assert!(socket_identities(&staging, &[]).is_empty());
+        assert!(socket_identities(&staging, &none).is_empty());
         assert_eq!(
-            socket_identities(&staging, &["http://127.0.0.1:4545".to_string()])
-                .into_iter()
-                .map(|(u, _)| u)
-                .collect::<Vec<_>>(),
+            socket_identities(
+                &staging,
+                &OriginPolicy::new(&["http://127.0.0.1:4545".to_string()])
+            )
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect::<Vec<_>>(),
             both
         );
     }
@@ -4273,7 +4277,7 @@ mod tests {
         };
         let staging = ["http://127.0.0.1:4545".to_string()];
         let uuids = |text: &str, origins: &[String]| {
-            socket_identities(text, origins)
+            socket_identities(text, &OriginPolicy::new(origins))
                 .into_iter()
                 .map(|(u, m)| (u, m == WiringMode::Hosted))
                 .collect::<BTreeSet<_>>()
@@ -4301,9 +4305,26 @@ mod tests {
         ];
         assert_eq!(uuids(&lock(a), &twice), uuids(&lock(a), &staging));
         assert_eq!(
-            socket_identities(&lock(a), &staging),
-            socket_identities_inner(&lock(a), &staging)
+            socket_identities(&lock(a), &OriginPolicy::new(&staging)),
+            socket_identities_inner(&lock(a), &OriginPolicy::new(&staging))
         );
+    }
+
+    /// The ctx classifies under the origins it was built with: a url on a
+    /// configured `--patch-server-url` origin is hosted for that run only
+    /// (the classifier itself is tested in `crate::origin`).
+    #[test]
+    fn ctx_hosted_uuid_honours_the_runs_configured_origins() {
+        let root = Path::new("/nonexistent");
+        let staging = ["http://127.0.0.1:4545".to_string()];
+        let url = format!("http://127.0.0.1:4545/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let ctx = DiscoverCtx::with_origins(root, &staging);
+        assert_eq!(ctx.hosted_uuid(&url).as_deref(), Some(UUID_A));
+        assert_eq!(
+            ctx.hosted_uuid("https://registry.npmjs.org/x/-/x-1.0.0.tgz"),
+            None
+        );
+        assert_eq!(DiscoverCtx::with_origins(root, &[]).hosted_uuid(&url), None);
     }
 
     /// The claim API: a recognized uuid is decided by the refs alone (live
@@ -4502,6 +4523,10 @@ mod tests {
             "OpenOptions",
             "hosted_patch_uuid(",
             "hosted_patch_url_uuids(",
+            // The policy itself, and the origin module (its helpers come
+            // re-exported from this module; `npm_origin::` is unrelated).
+            "OriginPolicy",
+            "crate::origin::",
             // The file-reading entry points of the shared readers an
             // extractor imports (the lock inventory, the writers' config
             // readers): each reads content outside the recognizing ctx.
