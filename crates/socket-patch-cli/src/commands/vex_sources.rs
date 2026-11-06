@@ -278,9 +278,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,
-            "not attested until the build's own resolution records (under `target/`) show it \
-             resolves the pinned bytes; the wiring itself is intact, so `vendor --check` and \
-             `scan` still treat it as live",
+            "not attested while that holds (the detail names the remedy, or that there is \
+             none); the wiring itself is intact, so `vendor --check` and `scan` still treat it \
+             as live",
         ),
         UnattestedKind::SbtVendoredTreeMissing => (
             NOTE_SBT_VENDORED_TREE_MISSING,
@@ -510,6 +510,7 @@ pub(crate) async fn plan(
                 continue;
             }
         }
+        let mut took_over = false;
         let basis = if let Some(vref) = cand
             .discovered
             .iter()
@@ -546,6 +547,7 @@ pub(crate) async fn plan(
                 cand.uuid = hosted.uuid.clone();
                 cand.record = Some(hosted);
                 cand.vendor_entry = None;
+                took_over = true;
                 Basis::Hosted {
                     lockfile_basis: false,
                 }
@@ -585,11 +587,16 @@ pub(crate) async fn plan(
         // the candidate's uuid (a manifest record under another uuid keeps
         // the key; a vendored sbt pin has no ref to swap it in): its mark
         // is checked against what is actually attested.
-        if let Basis::Vendored(entry) = &basis {
-            if let Some(u) = unattested_mark(&discovery, &entry.base_purl, &entry.uuid) {
-                gate_unattested(&cand.key, u, &mut gated, &mut notes);
-                continue;
-            }
+        // Likewise the hosted-over-vendored takeover attests the redirect
+        // ledger's uuid, swapped in after the early gate ran.
+        let attested = match &basis {
+            Basis::Vendored(entry) => Some((entry.base_purl.as_str(), entry.uuid.as_str())),
+            Basis::Hosted { .. } if took_over => Some((cand.key.as_str(), cand.uuid.as_str())),
+            _ => None,
+        };
+        if let Some(u) = attested.and_then(|(purl, uuid)| unattested_mark(&discovery, purl, uuid)) {
+            gate_unattested(&cand.key, u, &mut gated, &mut notes);
+            continue;
         }
         based.push((cand, basis));
     }
@@ -1591,6 +1598,29 @@ mod tests {
         let dead = plan(&common(tmp.path()), mk(), &[], &RunApiClient::new()).await;
         assert!(dead.view.patches.is_empty());
         assert_eq!(dead.gated, vec![failed(key, VENDOR_UNWIRED)]);
+
+        // The takeover attests the redirect ledger's uuid, swapped in after
+        // the early mark gate ran: a mark on it still gates.
+        let mut marked = mk();
+        marked
+            .discovery
+            .unattested
+            .push(socket_patch_core::vex::Unattested {
+                purl: key.into(),
+                uuid: U2.into(),
+                file: "package-lock.json".into(),
+                detail: "package-lock.json bypasses it".into(),
+                kind: UnattestedKind::LockAboveBase,
+            });
+        let gated = plan(
+            &common(tmp.path()),
+            marked,
+            &[key.to_string()],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty(), "{:?}", gated.view.patches);
+        assert_eq!(gated.gated, vec![failed(key, NOTE_LOCK_ABOVE_BASE)]);
     }
 
     /// Core discover rule 11 through the plan: a vendor ledger entry and a

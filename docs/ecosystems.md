@@ -1265,8 +1265,8 @@ the repository list, so it is left as a
   as a hosted pin, and is omitted as `vex_sbt_resolution_unverified` while
   that evidence does not show the build resolving the pinned bytes: before
   `sbt update` has run since vendoring or since a build source changed,
-  while a build source reassigns `dependencyOverrides` / `resolvers` with
-  `:=` or a `build.sbt.lock` exists, while something forces another
+  while a build source reassigns `dependencyOverrides` / a resolver setting with
+  `:=`, `~=` or `--=`, or a `build.sbt.lock` exists, while something forces another
   version, and always for a build whose projects cannot be read statically
   (`projectMatrix`, `crossProject`, a computed `Project(...)`). The note
   names the cause and its remedy.

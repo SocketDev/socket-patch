@@ -141,15 +141,17 @@ fn evidence_blocker(
     let findings = scan_build_sources(&e.build_sources);
     if !findings.overrides_assignment.is_empty() {
         return Some(format!(
-            "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies; \
-             append with `+=` instead",
+            "{} reassign(s) or filter(s) `dependencyOverrides` (`:=`, `~=` or `--=`), which can \
+             replace or drop the pin where it applies; keep the setting's existing entries \
+             (append with `+=` / `++=`)",
             findings.overrides_assignment.join(", ")
         ));
     }
     if !findings.resolvers_assignment.is_empty() {
         return Some(format!(
-            "{} reassign(s) `resolvers`, which can drop the pin's repository; append with \
-             `+=` instead",
+            "{} reassign(s) or transform(s) a resolver setting (`resolvers`, \
+             `externalResolvers` or `fullResolvers`, with `:=` or `~=`), which can drop the \
+             pin's repository; keep the setting's existing entries (append with `+=` / `++=`)",
             findings.resolvers_assignment.join(", ")
         ));
     }
@@ -373,7 +375,7 @@ async fn vendored_check(
                 withhold(
                     out,
                     DIAG_VENDORED_TREE_MISSING,
-                    format!("{rel} is {state}"),
+                    format!("{VENDORED_FILE} pins {rel}, which is {state}"),
                     UnattestedKind::SbtVendoredTreeMissing,
                 );
                 return;
@@ -381,8 +383,18 @@ async fn vendored_check(
         }
     }
     // Without a disk there is no evidence either: unverified, exactly as a
-    // hosted pin read from memory gets no lock pin.
-    if let Err(why) = verify_with(pin, res, blocker, hashes).await {
+    // hosted pin read from memory gets no lock pin (and `sbt update` cannot
+    // change that, so the detail says why instead).
+    let verdict = if ctx.disk_root().is_none() {
+        Err(
+            "the project is read from memory, which holds no sbt resolution evidence; \
+             only a scan of the checkout on disk can verify the pin"
+                .to_string(),
+        )
+    } else {
+        verify_with(pin, res, blocker, hashes).await
+    };
+    if let Err(why) = verdict {
         withhold(
             out,
             DIAG_SBT_RESOLUTION_UNVERIFIED,
@@ -685,8 +697,11 @@ mod tests {
             ),
         )
         .unwrap();
-        // Still older than the evidence, however slow the run.
-        set_mtime(&root.join("build.sbt"), earlier(60));
+        // Every build source still older than the evidence, however slow
+        // the run.
+        for rel in ["build.sbt", VENDORED_FILE, "project/build.properties"] {
+            set_mtime(&root.join(rel), earlier(60));
+        }
         let out = super::super::discover_patched_refs(&root).await;
         assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
         assert!(
@@ -721,7 +736,8 @@ mod tests {
             out.diagnostics
         );
         assert!(
-            out.unattested[0].detail.ends_with(".pom is missing"),
+            out.unattested[0].detail.ends_with(".pom, which is missing")
+                && out.unattested[0].detail.starts_with(VENDORED_FILE),
             "{:?}",
             out.unattested[0]
         );
@@ -757,5 +773,11 @@ mod tests {
             out.diagnostics
         );
         assert_eq!(marks(&out), unverified(), "{:#?}", out.diagnostics);
+        // `sbt update` cannot fix a memory view: the detail says why.
+        assert!(
+            out.unattested[0].detail.contains("read from memory"),
+            "{:?}",
+            out.unattested[0]
+        );
     }
 }
