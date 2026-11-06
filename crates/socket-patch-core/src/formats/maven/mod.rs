@@ -564,6 +564,28 @@ pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
     !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
 }
 
+/// Whether a declaration of a GA is a sibling copy of its main jar that
+/// Maven resolves apart from it (and that the main-jar pin does not
+/// reach): a classifier, or a type other than `jar` / `pom`. The `<type>`
+/// a `${...}` leaves unknown counts. The hosted rewriter, VEX discovery and
+/// the vendored reactor share this rule with [`is_executable_variant`].
+pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    classifier.is_some_and(|c| !c.is_empty())
+        || type_text.is_some_and(|t| !t.is_empty() && t != "jar" && t != "pom")
+}
+
+/// The label a variant ([`is_variant`]) is reported by: its classifier,
+/// else its type.
+pub(crate) fn variant_label<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> &'a str {
+    classifier
+        .filter(|c| !c.is_empty())
+        .or(type_text)
+        .unwrap_or_default()
+}
+
 /// Whether a declaration of a GA's main jar: untyped or `jar`-typed, with
 /// no classifier.
 pub(crate) fn is_main_jar(type_text: Option<&str>, classifier: Option<&str>) -> bool {

@@ -174,10 +174,14 @@ async fn keep_older_vendored_patch(
     };
     if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
         let root = common.project_root();
+        // Still in force, not attestable: a JVM tree that is still wired
+        // or referenced (an executable classifier copy beside it, say) is
+        // kept; only a provably dead one gives way.
         if crate::commands::discover_wiring(common, &root)
             .await
-            .vendor_entry_live(&root, kept)
+            .vendor_entry_liveness(&root, kept)
             .await
+            != Some(false)
         {
             return Some(VendorOutcome::Refused {
                 code,
