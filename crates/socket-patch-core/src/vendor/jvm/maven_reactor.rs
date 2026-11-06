@@ -12,7 +12,9 @@ use std::ops::Range;
 use serde_json::{json, Value};
 
 use crate::formats::maven::{
-    interpolate_strict, maven_config_properties as cli_properties, MAX_INTERPOLATION_DEPTH,
+    interpolate_strict, is_model_reference, lookup_property,
+    maven_config_properties as cli_properties, profile_combinations, Definitions, PomLayer,
+    MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
 };
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -1710,68 +1712,64 @@ impl Reactor {
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
     fn interpolate(&self, rel: &str, value: &str) -> Option<String> {
-        self.interpolate_with(rel, value, None)
+        self.interpolate_with(rel, value, &[])
     }
 
-    /// [`Self::interpolate`] with `overlay`'s properties (a profile's)
-    /// layered over its pom's own, as when that profile is active.
-    fn interpolate_with(
-        &self,
-        rel: &str,
-        value: &str,
-        overlay: Option<Overlay<'_>>,
-    ) -> Option<String> {
-        interpolate_strict(value, &|name| self.lookup_with(rel, name, overlay))
+    /// [`Self::interpolate`] with the `active` profiles' properties layered
+    /// over their poms' own, as when those profiles are active.
+    fn interpolate_with(&self, rel: &str, value: &str, active: &[Overlay<'_>]) -> Option<String> {
+        interpolate_strict(value, &|name| self.lookup_with(rel, name, active))
     }
 
-    /// User properties win over model properties, as in Maven; then the
-    /// model's own version expressions, then `<properties>` up the local
-    /// chain.
+    /// Maven's lookup order ([`lookup_property`], shared with VEX
+    /// discovery): the model's own coordinates, user properties, then
+    /// `<properties>` up the local chain with the `active` profiles merged
+    /// over their poms', then the deprecated bare `${version}`.
     fn lookup(&self, rel: &str, name: &str) -> Option<String> {
-        self.lookup_with(rel, name, None)
+        self.lookup_with(rel, name, &[])
     }
 
-    fn lookup_with(&self, rel: &str, name: &str, overlay: Option<Overlay<'_>>) -> Option<String> {
+    fn lookup_with(&self, rel: &str, name: &str, active: &[Overlay<'_>]) -> Option<String> {
+        let layers = self.chain(rel).map(|p| PomLayer {
+            own: &self.poms[p].props,
+            profiles: active
+                .iter()
+                .filter(|(at, _)| *at == p)
+                .map(|(_, props)| *props)
+                .collect(),
+        });
+        lookup_property(name, &|n| self.model_ref(rel, n), &self.cli_props, layers)
+    }
+
+    /// The project model reference `name` of `rel` (`project.version`,
+    /// `project.groupId`, ...; the deprecated bare `version`), raw.
+    fn model_ref(&self, rel: &str, name: &str) -> Option<String> {
         let pom = &self.poms[rel];
         // A Maven 4 child may omit its parent's coordinates too: they come
         // from the inferred local parent.
-        let version = || {
-            self.chain(rel)
-                .find_map(|p| self.poms[p].effective_version())
-                .map(str::to_string)
-        };
         match name {
-            "project.version" | "pom.version" => return version(),
-            "project.groupId" | "pom.groupId" => {
-                return self
-                    .chain(rel)
-                    .find_map(|p| self.poms[p].effective_group())
-                    .map(str::to_string);
-            }
-            "project.artifactId" | "pom.artifactId" => return pom.artifact.clone(),
-            "project.parent.version" => return pom.parent.as_ref()?.version.clone(),
-            "project.parent.groupId" => return pom.parent.as_ref()?.group.clone(),
-            _ => {}
+            "project.version" | "pom.version" | "version" => self
+                .chain(rel)
+                .find_map(|p| self.poms[p].effective_version())
+                .map(str::to_string),
+            "project.groupId" | "pom.groupId" => self
+                .chain(rel)
+                .find_map(|p| self.poms[p].effective_group())
+                .map(str::to_string),
+            "project.artifactId" | "pom.artifactId" => pom.artifact.clone(),
+            "project.parent.version" => pom.parent.as_ref()?.version.clone(),
+            "project.parent.groupId" => pom.parent.as_ref()?.group.clone(),
+            _ => None,
         }
-        if let Some(v) = self.cli_props.get(name) {
-            return Some(v.clone());
-        }
-        if let Some(v) = self.chain(rel).find_map(|p| {
-            overlay
-                .filter(|(at, _)| *at == p)
-                .and_then(|(_, props)| props.get(name))
-                .or_else(|| self.poms[p].props.get(name))
-        }) {
-            return Some(v.clone());
-        }
-        (name == "version").then(version).flatten()
     }
 
     /// A version `declared` (with `${...}`) reaches in a pom that reads
-    /// it, an inheritor of `rel` or `rel` itself with a profile on its
-    /// chain active, that is neither the base nor `sv`: the version and
-    /// where. Profile activation is not evaluated, so every profile counts
-    /// (one at a time).
+    /// it, an inheritor of `rel` or `rel` itself with some combination of
+    /// the profiles on its chain active, that is neither the base nor `sv`:
+    /// the version and where. Profile activation is not evaluated, so every
+    /// combination of profiles that may change it counts
+    /// ([`profile_combinations`], shared with VEX discovery); more of them
+    /// than are combined fails closed.
     fn version_override(
         &self,
         rel: &str,
@@ -1790,17 +1788,80 @@ impl Reactor {
                     .then(|| self.interpolate(reader, declared).unwrap_or_else(undefined))
                     .filter(|v| moved(v))
                     .map(|v| (v, reader.to_string()));
-                plain.or_else(|| {
-                    self.chain(reader).find_map(|at| {
-                        self.poms[at].profile_props.iter().find_map(|(id, props)| {
-                            let v = self
-                                .interpolate_with(reader, declared, Some((at, props)))
-                                .unwrap_or_else(undefined);
-                            moved(&v).then(|| (v, format!("{reader} under profile {id} of {at}")))
-                        })
-                    })
-                })
+                plain.or_else(|| self.profile_override(reader, declared, &moved))
             })
+    }
+
+    /// The first combination of the profiles on `reader`'s chain under
+    /// which `declared` resolves a version `moved` accepts, with the
+    /// version and where; fails closed (an undetermined version) when more
+    /// profiles may change it than are combined.
+    fn profile_override(
+        &self,
+        reader: &str,
+        declared: &str,
+        moved: &dyn Fn(&str) -> bool,
+    ) -> Option<(String, String)> {
+        let profiles: Vec<(&str, &str, &BTreeMap<String, String>)> = self
+            .chain(reader)
+            .flat_map(|at| {
+                self.poms[at]
+                    .profile_props
+                    .iter()
+                    .map(move |(id, props)| (at, id.as_str(), props))
+            })
+            .collect();
+        let definitions = |name: &str| {
+            if let Some(v) = is_model_reference(name)
+                .then(|| self.model_ref(reader, name))
+                .flatten()
+                .or_else(|| self.cli_props.get(name).cloned())
+            {
+                return Definitions {
+                    texts: vec![v],
+                    profiles: Vec::new(),
+                };
+            }
+            let mut d = Definitions::default();
+            d.texts.extend(
+                self.chain(reader)
+                    .filter_map(|p| self.poms[p].props.get(name).cloned()),
+            );
+            d.texts.extend(self.model_ref(reader, name));
+            for (i, (_, _, props)) in profiles.iter().enumerate() {
+                if let Some(v) = props.get(name) {
+                    d.texts.push(v.clone());
+                    d.profiles.push(i);
+                }
+            }
+            d
+        };
+        let Some(combinations) = profile_combinations(declared, &definitions) else {
+            return Some((
+                "an undetermined value".to_string(),
+                format!(
+                    "{reader} under some combination of the more than {MAX_COMBINED_PROFILES} \
+                     profiles on its chain that redefine what it names"
+                ),
+            ));
+        };
+        combinations.into_iter().find_map(|combination| {
+            let active: Vec<Overlay<'_>> = combination
+                .iter()
+                .map(|&i| (profiles[i].0, profiles[i].2))
+                .collect();
+            let v = self
+                .interpolate_with(reader, declared, &active)
+                .unwrap_or_else(|| "an undefined value".to_string());
+            moved(&v).then(|| {
+                let under = combination
+                    .iter()
+                    .map(|&i| format!("profile {} of {}", profiles[i].1, profiles[i].0))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                (v, format!("{reader} under {under}"))
+            })
+        })
     }
 
     /// Every pom in scope that inherits from `rel` (has it on its chain).
@@ -5788,6 +5849,42 @@ mod tests {
             assert_eq!(text(&after, "a/pom.xml"), a);
             assert!(unwired(&after), "{props}");
         }
+    }
+
+    /// Profiles that move the version only when active together (one
+    /// points the property at another, the other redefines that one) are
+    /// weighed like a single one: VEX discovery and this planner share the
+    /// combinations (`formats::maven::profile_combinations`).
+    #[test]
+    fn profiles_that_move_the_version_only_together_are_weighed() {
+        let root = with_profile(
+            &ROOT.replace(
+                "  <modules>",
+                "  <properties><ct.version>1.10.0</ct.version><w>1.10.0</w></properties>\n  \
+                 <modules>",
+            ),
+            "indirect",
+            "<ct.version>${w}</ct.version>",
+        );
+        let a = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "raise",
+            "<w>1.11.0</w>",
+        );
+        let files = fs(&[
+            ("pom.xml", &root),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
+        let detail = &plan.warnings[0].detail;
+        assert!(
+            detail.contains("profile indirect") && detail.contains("profile raise"),
+            "{detail}"
+        );
+        let after = applied(&files, &plan);
+        assert_eq!(text(&after, "a/pom.xml"), a);
     }
 
     /// #459: a module's profile overriding the property an inherited

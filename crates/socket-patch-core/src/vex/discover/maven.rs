@@ -704,17 +704,15 @@ fn build_version(d: &PomDep) -> Option<&str> {
 }
 
 /// Every version the build may resolve for `d` (`None` when it has no
-/// `<version>`), each flagged when a profile gives it: [`build_version`]
-/// (a profile's when `in_profile`), then each version some set of active
-/// profiles' `<properties>` moves it to ([`PomDep::version_alternatives`]).
-fn resolutions(d: &PomDep, in_profile: bool) -> Vec<(Option<&str>, bool)> {
-    std::iter::once((build_version(d), in_profile))
-        .chain(
-            d.version_alternatives
-                .iter()
-                .map(|v| (Some(v.as_str()), true)),
-        )
-        .collect()
+/// `<version>`): [`build_version`], then each version a combination of
+/// active profiles' `<properties>` moves it to
+/// ([`PomDep::version_alternatives`]).
+fn resolutions(d: &PomDep) -> impl Iterator<Item = Option<&str>> {
+    std::iter::once(build_version(d)).chain(
+        d.version_alternatives
+            .iter()
+            .map(|a| Some(a.value.as_str())),
+    )
 }
 
 /// Every GA with a versioned, classifier-less declaration Maven always
@@ -856,17 +854,26 @@ fn unpatched_classifier_copy(
         Wiring::Hosted => Some(pinned),
         Wiring::Vendored => None,
     };
+    // Each version a declaration may resolve, flagged when a profile gives
+    // it: the declaration's own profile, or one whose `<properties>` move
+    // it (every resolution after the first).
+    fn flagged(d: &PomDep, in_profile: bool) -> Vec<(Option<&str>, bool)> {
+        resolutions(d)
+            .enumerate()
+            .map(|(i, v)| (v, in_profile || i > 0))
+            .collect()
+    }
     let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool)> {
         classifier_declarations(deps, group, artifact, move |d| {
             d.managed && d.in_profile == in_profile
         })
         .filter(|(_, c)| *c == classifier)
-        .flat_map(|(d, _)| resolutions(d, in_profile))
+        .flat_map(|(d, _)| flagged(d, in_profile))
         .collect()
     };
     classifier_declarations(deps, group, artifact, |d| !d.managed).find_map(|(d, classifier)| {
         let resolved = match build_version(d) {
-            Some(_) => resolutions(d, false),
+            Some(_) => flagged(d, false),
             None => {
                 let mut live = managed(classifier, false);
                 if live.is_empty() {
@@ -955,18 +962,22 @@ fn profile_override(
                 if build_version(d) != Some(pinned) {
                     return None;
                 }
+                // The smallest combination of profiles that moves it.
                 let moved = d.version_alternatives.first()?;
                 let declared = d.version_text.as_deref().unwrap_or_default();
+                let value = if moved.value.contains("${") {
+                    format!("nothing it can resolve ({})", moved.value)
+                } else {
+                    moved.value.clone()
+                };
                 return Some(format!(
                     "{POM}: {section}{named} <version>{declared}</version> resolves the \
-                     patched {pinned}, but a <profiles> <properties> redefinition of a property \
-                     it names makes it {moved}; whenever that profile is active Maven resolves \
-                     it instead of the pin"
+                     patched {pinned}, but the <properties> of {} make it {value}; whenever that \
+                     applies Maven resolves it instead of the pin",
+                    moved.by
                 ));
             }
-            let version = resolutions(d, true)
-                .into_iter()
-                .find_map(|(v, _)| v.filter(|v| *v != pinned))?;
+            let version = resolutions(d).find_map(|v| v.filter(|v| *v != pinned))?;
             Some(format!(
                 "{POM}: a <profiles> {section}declaration of {named} carries \
                  <version>{version}</version>, not the patched {pinned}; whenever that profile \
@@ -2460,6 +2471,175 @@ mod tests {
                 out.unattested
             );
         }
+    }
+
+    /// A `${project.version}` is the project's own `<version>`, which may
+    /// itself be spelled through a property (`${revision}`, Maven's
+    /// CI-friendly versions): a profile or a `-D` user property that
+    /// redefines that property moves the model reference too.
+    #[tokio::test]
+    async fn model_references_move_with_the_properties_they_are_spelled_through() {
+        let pin = suffixed(UUID_A);
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let project = |revision: &str, profile: &str| {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                format!(
+                    "<?xml version=\"1.0\"?>\n<project>\n<modelVersion>4.0.0</modelVersion>\n\
+                     <groupId>com.example</groupId><artifactId>app</artifactId>\
+                     <version>${{revision}}</version>\n\
+                     <properties><revision>{revision}</revision></properties>\n\
+                     <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n\
+                     <profiles><profile><id>ci</id>{profile}</profile></profiles>\n</project>\n",
+                    dep("org.slf4j", "slf4j-api", Some("${project.version}")),
+                ),
+            );
+            p
+        };
+        // A profile that redefines what the project version is spelled
+        // through moves the pin.
+        let out = run(&project(
+            &pin,
+            "<properties><revision>1.7.36</revision></properties>",
+        ))
+        .await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(
+            out.unattested[0].kind,
+            UnattestedKind::MavenProfileUnpatched
+        );
+        // One that keeps it does not.
+        let out = run(&project(
+            &pin,
+            &format!("<properties><revision>{pin}</revision></properties>"),
+        ))
+        .await;
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+        // A Socket version only `-Drevision=` supplies is no pom.xml ref.
+        let p = project("1.7.36", "");
+        p.write(".mvn/maven.config", format!("-Drevision={pin}\n"));
+        let out = run(&p).await;
+        assert!(!attests(&out, FX_PURL), "{:?}", out.refs);
+        assert!(
+            out.diagnostics.iter().any(
+                |d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains(".mvn/maven.config")
+            ),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// A profile property written with attributes (`combine.self`) or
+    /// whitespace in its tag is still a definition Maven reads.
+    #[tokio::test]
+    async fn profile_properties_with_attributes_are_read() {
+        let pin = suffixed(UUID_A);
+        for profile in [
+            "<properties><slf4j.version combine.self=\"override\">1.7.36</slf4j.version></properties>",
+            "<properties><slf4j.version >1.7.36</slf4j.version ></properties>",
+            "<properties>\n<slf4j.version\n>1.7.36</slf4j.version></properties>",
+        ] {
+            let p = property_project(
+                &format!("<slf4j.version a=\"b\">{pin}</slf4j.version>"),
+                &direct_decl("${slf4j.version}"),
+                &[profile],
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert!(!attests(&out, FX_PURL), "{profile}: {:?}", out.unattested);
+        }
+    }
+
+    /// A nested `${…}` in a profile's value reads that profile's own
+    /// properties first, as Maven merges the whole profile before it
+    /// interpolates: a profile that keeps the pin through its own
+    /// property does not withhold it.
+    #[tokio::test]
+    async fn profile_values_resolve_through_their_own_profile() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version><w>1.7.36</w>"),
+            &direct_decl("${slf4j.version}"),
+            &[&format!(
+                "<properties><slf4j.version>${{w}}</slf4j.version><w>{pin}</w></properties>"
+            )],
+        );
+        let out = run(&p).await;
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+    }
+
+    /// A profile `<properties>` this reader cannot parse withholds a
+    /// `${property}` pin (fail closed) instead of failing the whole pom; a
+    /// literal pin, which no property moves, is still attested.
+    #[tokio::test]
+    async fn unreadable_profile_properties_withhold_only_property_pins() {
+        let pin = suffixed(UUID_A);
+        let broken = "<properties><slf4j.version>1.7.36</properties>";
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[broken],
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(
+            out.unattested[0].kind,
+            UnattestedKind::MavenProfileUnpatched
+        );
+        let p = property_project("", &direct_decl(&pin), &[broken]);
+        let out = run(&p).await;
+        assert!(
+            attests(&out, FX_PURL),
+            "{:?} {:?}",
+            out.unattested,
+            out.diagnostics
+        );
+    }
+
+    /// Profiles that each keep the pin, however many and however deep the
+    /// chain they spell it through, never withhold it: every combination
+    /// is checked, not a capped cross product.
+    #[tokio::test]
+    async fn many_profiles_that_keep_the_pin_are_attested() {
+        let pin = suffixed(UUID_A);
+        // `<p0>${p1}</p0>` ... `<p4>{pin}</p4>`.
+        let chain: String = (0..5)
+            .map(|i| match i {
+                4 => format!("<p4>{pin}</p4>"),
+                i => format!("<p{i}>${{p{}}}</p{i}>", i + 1),
+            })
+            .collect();
+        let profile = format!("<properties>{chain}</properties>");
+        let profiles = [profile.as_str(); 5];
+        let p = property_project(&chain, &direct_decl("${p0}"), &profiles);
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+    }
+
+    /// The withheld statement names the profiles that move the pin and
+    /// the version they move it to.
+    #[tokio::test]
+    async fn profile_property_detail_names_the_profile_and_version() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[
+                "<properties><x>1</x></properties>",
+                "<properties><slf4j.version>1.7.30</slf4j.version></properties>",
+            ],
+        );
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("profile p1") && detail.contains("1.7.30") && !detail.contains("p0"),
+            "{detail}"
+        );
     }
 
     #[tokio::test]

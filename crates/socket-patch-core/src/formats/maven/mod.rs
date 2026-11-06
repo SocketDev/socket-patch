@@ -2,7 +2,15 @@
 //! [`parse_pom`]), the Maven coordinate grammars and the hosted
 //! `<base>-socket.<hex8>` version split. Pure: text in, structure out.
 
-use std::collections::{BTreeMap, BTreeSet};
+mod properties;
+
+use std::collections::BTreeMap;
+
+use properties::{interpolate_lenient, read_properties, Interpolate};
+pub(crate) use properties::{
+    interpolate_strict, is_model_reference, lookup_property, profile_combinations, Definitions,
+    PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+};
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
@@ -56,12 +64,12 @@ pub(crate) struct PomDep {
     pub(crate) build_version: Option<String>,
     /// The trimmed `<version>` text as written.
     pub(crate) version_text: Option<String>,
-    /// The other versions [`Self::build_version`] becomes when some set of
-    /// profiles is active whose `<properties>` redefine a property it
-    /// names (transitively): a superset ([`interpolate_each`]), plus the
-    /// text as written when some such set leaves it unresolved. Empty when
-    /// no profile can move it.
-    pub(crate) version_alternatives: Vec<String>,
+    /// The other versions [`Self::build_version`] becomes when some
+    /// combination of profiles is active whose `<properties>` redefine a
+    /// property it names, directly, through another, or through the
+    /// project model ([`PomScope::resolve_in_build`]); the smallest
+    /// combination that moves it first. Empty when no profile can move it.
+    pub(crate) version_alternatives: Vec<Alternative>,
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
     pub(crate) classifier: Option<String>,
@@ -72,9 +80,57 @@ pub(crate) struct PomDep {
     pub(crate) in_profile: bool,
 }
 
-/// One `<properties>` inside `<profiles>` (`name -> trimmed value`), with
-/// the `<profile>` element that holds it when the scan finds one.
-type ProfileProperties = (Option<Element>, BTreeMap<String, String>);
+/// A value some combination of active profiles gives a `${…}` text other
+/// than its resolution with none active, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Alternative {
+    /// The value, or the text as written when that combination leaves it
+    /// unresolved (undefined, cyclic, too deep) or it could not be worked
+    /// out.
+    pub(crate) value: String,
+    pub(crate) by: MovedBy,
+}
+
+/// What gives an [`Alternative`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MovedBy {
+    /// These profiles (their `<id>`s) active together.
+    Profiles(Vec<String>),
+    /// More profiles may change it than are combined
+    /// ([`MAX_COMBINED_PROFILES`]): not worked out, fail closed.
+    TooManyProfiles,
+    /// A `<profiles>` `<properties>` this reader cannot parse: fail closed.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for MovedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MovedBy::Profiles(ids) => {
+                let s = if ids.len() == 1 { "" } else { "s" };
+                write!(f, "profile{s} {}", ids.join(" + "))
+            }
+            MovedBy::TooManyProfiles => write!(
+                f,
+                "some combination of the more than {MAX_COMBINED_PROFILES} profiles that redefine \
+                 what it names"
+            ),
+            MovedBy::Unreadable(e) => {
+                write!(f, "a <profiles> section this reader cannot parse ({e})")
+            }
+        }
+    }
+}
+
+/// One `<properties>` inside `<profiles>`: the `<profile>` element that
+/// holds it (when the scan finds one), that profile's `<id>`, and its
+/// `name -> trimmed value` pairs.
+#[derive(Debug)]
+struct ProfileProperties {
+    holder: Option<Element>,
+    id: String,
+    props: BTreeMap<String, String>,
+}
 
 /// Where Maven reads a root pom's model from: its text with comments and
 /// CDATA blanked (offsets kept), and the sections that are not the
@@ -91,19 +147,20 @@ pub(crate) struct PomScope {
     profiles: Vec<Element>,
     /// The root `<properties>` (see [`properties`]).
     properties: BTreeMap<String, String>,
-    /// The build's user properties, except `project.*` / `pom.*`, which
-    /// Maven reads from the model before any user property.
+    /// The build's user properties (`.mvn/maven.config`'s `-D`).
     user: BTreeMap<String, String>,
-    /// The `${project.*}` model references (see [`model_refs`]).
+    /// The project model references, raw (see [`model_refs`]).
     model: BTreeMap<String, String>,
-    /// [`Self::properties`] plus the user properties and model references
-    /// a coordinate may name.
-    coordinate_refs: BTreeMap<String, String>,
-    /// Each `<properties>` inside `<profiles>`, with the `<profile>` that
-    /// holds it (when the scan finds one): merged over the root's while
-    /// that profile is active.
+    /// Each `<properties>` inside `<profiles>`, once [`Self::read_profiles`]
+    /// has read them: merged over the root's while that profile is active.
     profile_properties: Vec<ProfileProperties>,
+    /// Why [`Self::read_profiles`] could not read them (every `${…}` then
+    /// fails closed in [`Self::resolve_in_build`]).
+    profiles_unreadable: Option<String>,
 }
+
+/// No user properties: the view of a version as the pom spells it.
+static NO_USER_PROPERTIES: BTreeMap<String, String> = BTreeMap::new();
 
 impl PomScope {
     /// Fails (fail-closed) on a pom that is not well-formed where it
@@ -117,7 +174,8 @@ impl PomScope {
     /// (`.mvn/maven.config`'s `-D`, see [`maven_config_properties`]): they
     /// override a same-named pom property when a coordinate or a version is
     /// interpolated, as Maven's model interpolator looks them up before the
-    /// model's own.
+    /// pom's own. Profile `<properties>` are not read (see
+    /// [`Self::read_profiles`]).
     pub(crate) fn with_user_properties(
         raw: &str,
         user: &BTreeMap<String, String>,
@@ -135,34 +193,28 @@ impl PomScope {
         .concat();
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
-        let mut coordinate_refs = properties.clone();
-        coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
-        let user: BTreeMap<String, String> = user
-            .iter()
-            .filter(|(k, _)| !is_model_reference(k))
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        let model = model_refs(&masked, &coordinate_refs)?;
-        // A `project.*` / `pom.*` reference names the model, whatever a
-        // same-named property says; the deprecated bare form yields to one.
-        for (name, value) in &model {
-            if is_model_reference(name) {
-                coordinate_refs.insert(name.clone(), value.clone());
-            } else {
-                coordinate_refs.entry(name.clone()).or_insert(value.clone());
-            }
-        }
-        let profile_properties = profile_properties(&masked, &ignored, &profiles)?;
+        let model = model_refs(&masked)?;
         Ok(PomScope {
             masked,
             ignored,
             profiles,
             properties,
-            user,
+            user: user.clone(),
             model,
-            coordinate_refs,
-            profile_properties,
+            profile_properties: Vec::new(),
+            profiles_unreadable: None,
         })
+    }
+
+    /// Read every `<properties>` inside `<profiles>`, which only
+    /// [`Self::resolve_in_build`] weighs. One this reader cannot parse
+    /// does not fail the pom: it is recorded, and every `${…}` resolution
+    /// then fails closed ([`MovedBy::Unreadable`]).
+    pub(crate) fn read_profiles(&mut self) {
+        match profile_properties(&self.masked, &self.ignored, &self.profiles) {
+            Ok(found) => self.profile_properties = found,
+            Err(e) => self.profiles_unreadable = Some(e),
+        }
     }
 
     /// The indices into [`Self::profile_properties`] of the profile that
@@ -171,87 +223,138 @@ impl PomScope {
         (0..self.profile_properties.len())
             .filter(|&i| {
                 self.profile_properties[i]
-                    .0
+                    .holder
                     .is_some_and(|p| pos >= p.start && pos < p.end)
             })
             .collect()
     }
 
-    /// Whether no profile's `<properties>` can change what `${name}`
-    /// reads: a model reference, or (in the build's view) a user property,
-    /// both of which Maven looks up first.
-    fn fixed(&self, name: &str, build: bool) -> bool {
-        is_model_reference(name) || (build && self.user.contains_key(name))
+    /// A model reference's raw text (an empty element binds nothing).
+    fn model_ref(&self, name: &str) -> Option<String> {
+        self.model.get(name).filter(|v| !v.is_empty()).cloned()
     }
 
-    /// What `${name}` reads while only the profile `own` is active (if
-    /// any): a model reference, else (in the build's view) a user
-    /// property, else that profile's `<properties>`, else the root's, else
-    /// a deprecated bare model reference (`${version}`).
-    fn lookup(&self, name: &str, own: &[usize], build: bool) -> Option<String> {
-        if is_model_reference(name) {
-            if let Some(v) = self.model.get(name) {
-                return Some(v.clone());
-            }
-        }
-        if build {
-            if let Some(v) = self.user.get(name) {
-                return Some(v.clone());
-            }
-        }
-        if !self.fixed(name, build) {
-            if let Some(v) = own
+    /// What `${name}` reads ([`lookup_property`]) with the profiles `active`
+    /// (indices, in pom order) active, with or without the build's user
+    /// properties.
+    fn lookup(&self, name: &str, active: &[usize], user: bool) -> Option<String> {
+        let layer = PomLayer {
+            own: &self.properties,
+            profiles: active
                 .iter()
-                .find_map(|&i| self.profile_properties[i].1.get(name))
-            {
-                return Some(v.clone());
-            }
-        }
-        self.properties
-            .get(name)
-            .or_else(|| self.model.get(name))
-            .cloned()
+                .map(|&i| &self.profile_properties[i].props)
+                .collect(),
+        };
+        let user = if user {
+            &self.user
+        } else {
+            &NO_USER_PROPERTIES
+        };
+        lookup_property(name, &|n| self.model_ref(n), user, [layer])
     }
 
-    /// Every value `${name}` may read in the build while `own` and any
-    /// other profiles are active: [`Self::lookup`]'s, then every other
-    /// profile's definition. Empty when [`Self::lookup`] finds none: some
-    /// set of profiles leaves it undefined.
-    fn lookup_any(&self, name: &str, own: &[usize]) -> Vec<String> {
-        let Some(base) = self.lookup(name, own, true) else {
-            return Vec::new();
-        };
-        let mut values = vec![base];
-        if !self.fixed(name, true) {
-            values.extend(
-                self.profile_properties
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !own.contains(i))
-                    .filter_map(|(_, (_, props))| props.get(name).cloned()),
-            );
+    /// Where `${name}` may be defined in the build, for
+    /// [`profile_combinations`]: the model or a user property fixes it;
+    /// otherwise the root's, every profile's (each but `own`, which is
+    /// always active, may be the one read) and a bare model reference.
+    fn definitions(&self, name: &str, own: &[usize]) -> Definitions {
+        if let Some(v) = is_model_reference(name)
+            .then(|| self.model_ref(name))
+            .flatten()
+            .or_else(|| self.user.get(name).cloned())
+        {
+            return Definitions {
+                texts: vec![v],
+                profiles: Vec::new(),
+            };
         }
-        values
+        let mut d = Definitions::default();
+        d.texts.extend(self.properties.get(name).cloned());
+        d.texts.extend(self.model_ref(name));
+        for (i, p) in self.profile_properties.iter().enumerate() {
+            if let Some(v) = p.props.get(name) {
+                d.texts.push(v.clone());
+                if !own.contains(&i) {
+                    d.profiles.push(i);
+                }
+            }
+        }
+        d
     }
 
     /// The `<version>` text of the declaration at `pos`, resolved as
     /// [`PomDep::version`], [`PomDep::build_version`] and
     /// [`PomDep::version_alternatives`] describe.
-    fn resolve_version(&self, text: &str, pos: usize) -> (String, String, Vec<String>) {
+    fn resolve_version(&self, text: &str, pos: usize) -> (String, String, Vec<Alternative>) {
         if !text.contains("${") {
             return (text.to_string(), text.to_string(), Vec::new());
         }
         let own = self.own_profile(pos);
         let spelled = interpolate_strict(text, &|name| self.lookup(name, &own, false))
             .unwrap_or_else(|| text.to_string());
-        let Some(build) = interpolate_strict(text, &|name| self.lookup(name, &own, true)) else {
-            return (spelled, text.to_string(), Vec::new());
+        match self.resolve_in_build(text, pos, interpolate_strict) {
+            (Some(build), alternatives) => (spelled, build, alternatives),
+            (None, _) => (spelled, text.to_string(), Vec::new()),
+        }
+    }
+
+    /// What `text` (written in the declaration at `pos`) resolves to in the
+    /// build with no profile active but the one holding it, through
+    /// `interpolate` ([`interpolate_strict`] for a version), and each other
+    /// value a combination of active profiles gives it
+    /// ([`profile_combinations`], the vendored reactor's too), the
+    /// smallest combination first; a combination `interpolate` cannot
+    /// resolve gives the text as written. Fails closed: when the
+    /// combinations cannot be enumerated or a profile's `<properties>` is
+    /// unreadable, the text as written is an alternative.
+    pub(crate) fn resolve_in_build(
+        &self,
+        text: &str,
+        pos: usize,
+        interpolate: Interpolate,
+    ) -> (Option<String>, Vec<Alternative>) {
+        let own = self.own_profile(pos);
+        let base = interpolate(text, &|name| self.lookup(name, &own, true));
+        if !text.contains("${") {
+            return (base, Vec::new());
+        }
+        let as_written = |by: MovedBy| Alternative {
+            value: text.to_string(),
+            by,
         };
-        let alternatives = match interpolate_each(text, &|name| self.lookup_any(name, &own)) {
-            Some(all) => all.into_iter().filter(|v| *v != build).collect(),
-            None => vec![text.to_string()],
+        if let Some(e) = &self.profiles_unreadable {
+            return (base, vec![as_written(MovedBy::Unreadable(e.clone()))]);
+        }
+        let Some(combinations) = profile_combinations(text, &|name| self.definitions(name, &own))
+        else {
+            return (base, vec![as_written(MovedBy::TooManyProfiles)]);
         };
-        (spelled, build, alternatives)
+        let mut alternatives: Vec<Alternative> = Vec::new();
+        for combination in combinations {
+            let mut active: Vec<usize> = own.iter().chain(&combination).copied().collect();
+            active.sort_unstable();
+            active.dedup();
+            let value = interpolate(text, &|name| self.lookup(name, &active, true))
+                .unwrap_or_else(|| text.to_string());
+            if Some(&value) != base.as_ref() && alternatives.iter().all(|a| a.value != value) {
+                let ids = combination
+                    .iter()
+                    .map(|&i| self.profile_properties[i].id.clone())
+                    .collect();
+                alternatives.push(Alternative {
+                    value,
+                    by: MovedBy::Profiles(ids),
+                });
+            }
+        }
+        (base, alternatives)
+    }
+
+    /// `text` (a coordinate) with every `${name}` the build defines with
+    /// no profile active interpolated, an undefined one kept as written
+    /// ([`interpolate_lenient`]).
+    fn interpolate_coordinate(&self, text: &str) -> String {
+        interpolate_lenient(text, &|name| self.lookup(name, &[], true))
     }
 
     /// Inside a plugin / deploy section (never project resolution).
@@ -297,10 +400,11 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 #[derive(Debug)]
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
-    /// `<groupId>` / `<artifactId>` with every `${prop}` the root
-    /// `<properties>` or the project's own coordinates define
-    /// interpolated (see [`interpolate`]); an
-    /// undefined one stays as written, so [`may_name`] can tell it apart.
+    /// `<groupId>` / `<artifactId>` with every `${prop}` the build defines
+    /// with no profile active (user properties, the project model, the
+    /// root `<properties>`) interpolated
+    /// ([`PomScope::interpolate_coordinate`]); an undefined one stays as
+    /// written, so [`may_name`] can tell it apart.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
     /// Inner-text byte range of the literal `<version>`, when present.
@@ -323,10 +427,8 @@ impl PomScope {
             let version = elements(&body, "version")?.into_iter().next();
             out.push(ScopedDep {
                 element: dep,
-                group: child_text(&body, "groupId")?
-                    .map(|g| interpolate(&g, &self.coordinate_refs)),
-                artifact: child_text(&body, "artifactId")?
-                    .map(|a| interpolate(&a, &self.coordinate_refs)),
+                group: child_text(&body, "groupId")?.map(|g| self.interpolate_coordinate(&g)),
+                artifact: child_text(&body, "artifactId")?.map(|a| self.interpolate_coordinate(&a)),
                 version_inner: version.map(|v| {
                     (
                         dep.inner_start + v.inner_start,
@@ -355,7 +457,8 @@ pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
 /// [`parse_pom`] with the build's user properties (see
 /// [`PomScope::with_user_properties`]).
 pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Result<Pom, String> {
-    let scope = PomScope::with_user_properties(raw, user)?;
+    let mut scope = PomScope::with_user_properties(raw, user)?;
+    scope.read_profiles();
     let text = &scope.masked;
     let managed = elements(text, "dependencyManagement")?;
     let mut pom = Pom::default();
@@ -444,204 +547,19 @@ fn profile_properties(
             .iter()
             .find(|p| props.start >= p.start && props.start < p.end)
             .copied();
+        let id = holder
+            .and_then(|p| child_text(p.inner(text), "id").ok().flatten())
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| format!("#{}", out.len() + 1));
         let mut map = BTreeMap::new();
         read_properties(props.inner(text), &mut map)?;
-        out.push((holder, map));
+        out.push(ProfileProperties {
+            holder,
+            id,
+            props: map,
+        });
     }
     Ok(out)
-}
-
-/// The `name -> trimmed value` pairs of a `<properties>` body, into `map`
-/// (a name's first definition wins).
-fn read_properties(body: &str, map: &mut BTreeMap<String, String>) -> Result<(), String> {
-    let mut from = 0;
-    while let Some(rel) = body[from..].find('<') {
-        let lt = from + rel;
-        let Some(gt) = body[lt..].find('>').map(|r| lt + r) else {
-            return Err("unterminated tag in <properties>".to_string());
-        };
-        let name = &body[lt + 1..gt];
-        if !is_property_name(name) {
-            from = gt + 1;
-            continue;
-        }
-        let close = format!("</{name}>");
-        let Some(end) = body[gt + 1..].find(&close).map(|r| gt + 1 + r) else {
-            return Err(format!("unterminated <{name}> in <properties>"));
-        };
-        map.entry(name.to_string())
-            .or_insert_with(|| body[gt + 1..end].trim().to_string());
-        from = end + close.len();
-    }
-    Ok(())
-}
-
-/// Nesting depth past which [`interpolate_strict`] gives up: a property
-/// named through more than this many others (Maven itself fails on a
-/// cycle, which this bounds too).
-pub(crate) const MAX_INTERPOLATION_DEPTH: usize = 16;
-
-/// Most distinct results [`interpolate_each`] enumerates before giving up.
-const MAX_RESOLUTIONS: usize = 16;
-
-/// Most lookups one interpolation makes before giving up: a value naming
-/// the next property many times over would otherwise cost exponentially
-/// many with every level ("billion laughs").
-const MAX_LOOKUPS: usize = 1024;
-
-/// Longest text [`interpolate_each`] builds before giving up.
-const MAX_RESOLVED_LEN: usize = 4096;
-
-/// `value` with every `${name}` replaced by `lookup(name)`, itself
-/// interpolated the same way, as Maven's model interpolator resolves a
-/// property defined through another. `None` when a name is undefined, a
-/// `${` is unterminated, or the nesting is cyclic or deeper than
-/// [`MAX_INTERPOLATION_DEPTH`] (or the work bounds are hit): an unresolved
-/// value never stands for a version. Shared by the vendored reactor
-/// (its `lookup` walks the parent chain) and the VEX reader
-/// ([`PomScope`]).
-pub(crate) fn interpolate_strict(
-    value: &str,
-    lookup: &dyn Fn(&str) -> Option<String>,
-) -> Option<String> {
-    interpolate_each(value, &|name| lookup(name).into_iter().collect())?
-        .into_iter()
-        .next()
-}
-
-/// Every text `value` may interpolate to when each `${name}` may take any
-/// of the values `lookup(name)` gives (an empty list: undefined), each
-/// interpolated in turn ([`interpolate_strict`] with a single value per
-/// name). A name that occurs twice may take a different value each time,
-/// so the set may hold texts no single assignment builds: a superset,
-/// which only ever withholds an attestation. `None` when any choice leaves
-/// a name undefined, a `${` is unterminated, a name is reached through
-/// itself (a cycle) or through more than [`MAX_INTERPOLATION_DEPTH`]
-/// others, or the result or the work exceeds its bound.
-pub(crate) fn interpolate_each(
-    value: &str,
-    lookup: &dyn Fn(&str) -> Vec<String>,
-) -> Option<BTreeSet<String>> {
-    let lookups = std::cell::Cell::new(MAX_LOOKUPS);
-    expand(value, lookup, &mut Vec::new(), &lookups)
-}
-
-fn expand(
-    value: &str,
-    lookup: &dyn Fn(&str) -> Vec<String>,
-    stack: &mut Vec<String>,
-    lookups: &std::cell::Cell<usize>,
-) -> Option<BTreeSet<String>> {
-    if stack.len() > MAX_INTERPOLATION_DEPTH {
-        return None;
-    }
-    let mut texts = BTreeSet::from([String::new()]);
-    let mut rest = value;
-    loop {
-        let (literal, reference) = match rest.find("${") {
-            Some(at) => (&rest[..at], Some(&rest[at + 2..])),
-            None => (rest, None),
-        };
-        let Some(after) = reference else {
-            return concat(&texts, &BTreeSet::from([literal.to_string()]));
-        };
-        let close = after.find('}')?;
-        let name = &after[..close];
-        if stack.iter().any(|n| n == name) {
-            return None;
-        }
-        lookups.set(lookups.get().checked_sub(1)?);
-        let raws = lookup(name);
-        if raws.is_empty() {
-            return None;
-        }
-        stack.push(name.to_string());
-        let mut values = BTreeSet::new();
-        for raw in &raws {
-            values.extend(expand(raw, lookup, stack, lookups)?);
-        }
-        stack.pop();
-        let prefixed = concat(&texts, &BTreeSet::from([literal.to_string()]))?;
-        texts = concat(&prefixed, &values)?;
-        rest = &after[close + 1..];
-    }
-}
-
-/// Every `a + b`, or `None` past [`MAX_RESOLUTIONS`] / [`MAX_RESOLVED_LEN`].
-fn concat(heads: &BTreeSet<String>, tails: &BTreeSet<String>) -> Option<BTreeSet<String>> {
-    let mut out = BTreeSet::new();
-    for head in heads {
-        for tail in tails {
-            if head.len() + tail.len() > MAX_RESOLVED_LEN {
-                return None;
-            }
-            out.insert(format!("{head}{tail}"));
-            if out.len() > MAX_RESOLUTIONS {
-                return None;
-            }
-        }
-    }
-    Some(out)
-}
-
-/// Interpolation rounds before a still-unresolved reference is given up on
-/// (a property defined through another, or a cycle).
-const MAX_INTERPOLATION: usize = 8;
-
-/// Longest text interpolation builds. A real coordinate is far shorter; a
-/// pom whose properties each name the previous one many times would
-/// otherwise grow exponentially with every round ("billion laughs").
-const MAX_INTERPOLATED_LEN: usize = 1024;
-
-/// `text` with every `${name}` the root `<properties>` or project model
-/// defines replaced by its value, as Maven interpolates a coordinate such as
-/// `org.${vendor}` (a value naming another property is resolved too, up to
-/// [`MAX_INTERPOLATION`] rounds); an undefined or malformed reference is
-/// kept as written, and a round that would exceed [`MAX_INTERPOLATED_LEN`]
-/// is not taken, leaving its references unresolved (which fails closed).
-fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
-    let mut text = text.to_string();
-    for _ in 0..MAX_INTERPOLATION {
-        let Some(next) = interpolate_once(&text, properties) else {
-            break;
-        };
-        if next == text {
-            break;
-        }
-        text = next;
-    }
-    text
-}
-
-/// One round of [`interpolate`], or `None` once the result would exceed
-/// [`MAX_INTERPOLATED_LEN`].
-fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(open) = rest.find("${") {
-        if out.len() > MAX_INTERPOLATED_LEN {
-            return None;
-        }
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        match after
-            .find('}')
-            .map(|close| (&after[..close], close))
-            .filter(|(name, _)| is_property_name(name))
-            .and_then(|(name, close)| properties.get(name).map(|v| (v, close)))
-        {
-            Some((value, close)) => {
-                out.push_str(value);
-                rest = &after[close + 1..];
-            }
-            None => {
-                out.push_str("${");
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    (out.len() <= MAX_INTERPOLATED_LEN).then_some(out)
 }
 
 /// The model references a sibling declaration commonly uses
@@ -649,13 +567,12 @@ fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> Option
 /// `${groupId}`, `${project.parent.groupId}`), read from the project's own
 /// `<groupId>` / `<artifactId>` / `<version>` and its `<parent>`'s; groupId
 /// and version fall back to the parent's, which the project inherits when
-/// it omits them. A coordinate written through a property is resolved from
-/// `properties` (never inherited instead: Maven interpolates a present
-/// element), and one that stays unresolved is not bound.
-fn model_refs(
-    masked: &str,
-    properties: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, String> {
+/// it omits them. Each is bound raw: one written through a property
+/// (`<version>${revision}</version>`) is interpolated wherever it is read,
+/// with the user properties and active profiles of that read, as Maven
+/// interpolates the model itself (never inherited instead: Maven
+/// interpolates a present element).
+fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
     let Some(project) = elements(masked, "project")?.into_iter().next() else {
         return Ok(BTreeMap::new());
     };
@@ -680,15 +597,11 @@ fn model_refs(
     ] {
         own = blank_elements(&own, section)?;
     }
-    let usable = |v: Option<String>| {
-        v.map(|v| interpolate(&v, properties))
-            .filter(|v| !v.is_empty() && !v.contains("${"))
-    };
     let mut refs = BTreeMap::new();
     for (field, inherited) in [("groupId", true), ("artifactId", false), ("version", true)] {
-        let parent_value = usable(parent_text(field)?);
+        let parent_value = parent_text(field)?;
         let value = match child_text(&own, field)? {
-            Some(v) => usable(Some(v)),
+            Some(v) => Some(v),
             None if inherited => parent_value.clone(),
             None => None,
         };
@@ -837,12 +750,6 @@ pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
     !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
 }
 
-/// A `project.*` / `pom.*` reference: Maven reads it from the model, ahead
-/// of any user or pom property of the same name.
-fn is_model_reference(name: &str) -> bool {
-    name.starts_with("project.") || name.starts_with("pom.")
-}
-
 fn is_property_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -876,6 +783,8 @@ fn blank_elements(text: &str, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::PomScope;
 
     #[test]
@@ -939,7 +848,7 @@ mod tests {
         let deps = PomScope::new(&pom).unwrap().dependencies().unwrap();
         let group = deps[0].group.as_deref().unwrap();
         assert!(
-            group.len() <= super::MAX_INTERPOLATED_LEN,
+            group.len() <= super::properties::MAX_RESOLVED_LEN,
             "{}",
             group.len()
         );
@@ -1022,7 +931,12 @@ mod tests {
         let scope = PomScope::new(pom).unwrap();
         let deps = scope.dependencies().unwrap();
         assert_eq!(deps[0].group.as_deref(), Some("com.acme"));
-        assert!(!scope.coordinate_refs.contains_key("project.version"));
+        let dep = super::parse_pom(pom).unwrap().deps.remove(0);
+        assert_eq!(
+            dep.build_version.as_deref(),
+            Some("${project.version}"),
+            "an unresolvable project version is not the parent's"
+        );
     }
 
     /// Maven's model interpolator reads user properties (`.mvn/maven.config`'s
@@ -1166,6 +1080,9 @@ mod tests {
     /// properties and model references no profile can redefine.
     #[test]
     fn profile_properties_give_version_alternatives() {
+        fn values(alternatives: Vec<super::Alternative>) -> Vec<String> {
+            alternatives.into_iter().map(|a| a.value).collect()
+        }
         let resolve = |props: &str, profiles: &[&str], user: &[(&str, &str)], deps: &str| {
             let profiles: String = profiles
                 .iter()
@@ -1183,7 +1100,7 @@ mod tests {
                 .unwrap()
                 .deps
                 .into_iter()
-                .map(|d| (d.build_version.unwrap(), d.version_alternatives))
+                .map(|d| (d.build_version.unwrap(), values(d.version_alternatives)))
                 .collect::<Vec<_>>()
         };
         let dep = |v: &str| {
@@ -1258,13 +1175,58 @@ mod tests {
                 )
             })
             .collect();
+        let moved = |value: &str, ids: &[&str]| super::Alternative {
+            value: value.to_string(),
+            by: super::MovedBy::Profiles(s(ids)),
+        };
         assert_eq!(
             deps,
             [
-                (false, "1".to_string(), s(&["2", "3"])),
-                (true, "2".to_string(), s(&["3"])),
+                (
+                    false,
+                    "1".to_string(),
+                    vec![moved("2", &["a"]), moved("3", &["b"])]
+                ),
+                (true, "2".to_string(), vec![moved("3", &["b"])]),
             ]
         );
+
+        // `${project.version}` spelled through a property moves with it.
+        let pom = format!(
+            "<project><version>${{revision}}</version><properties><revision>1</revision>\
+             </properties><dependencies>{}</dependencies><profiles><profile><id>ci</id>\
+             <properties><revision>2</revision></properties></profile></profiles></project>",
+            dep("${project.version}")
+        );
+        let user = [("revision".to_string(), "3".to_string())].into();
+        for (user, built, alternatives) in [
+            (BTreeMap::new(), "1", vec![moved("2", &["ci"])]),
+            (user, "3", vec![]),
+        ] {
+            let d = super::parse_pom_with(&pom, &user).unwrap().deps.remove(0);
+            assert_eq!(d.version.as_deref(), Some("1"));
+            assert_eq!(d.build_version.as_deref(), Some(built));
+            assert_eq!(d.version_alternatives, alternatives);
+        }
+
+        // An unreadable profile `<properties>` fails a `${…}` closed, and
+        // only for the reader that weighs profiles.
+        let pom = format!(
+            "<project><properties><v>1</v></properties><dependencies>{}{}</dependencies>\
+             <profiles><profile><properties><v>2</properties></profile></profiles></project>",
+            dep("${v}"),
+            dep("1")
+        );
+        assert!(PomScope::new(&pom).unwrap().dependencies().is_ok());
+        let deps = super::parse_pom(&pom).unwrap().deps;
+        assert!(matches!(
+            deps[0].version_alternatives[..],
+            [super::Alternative {
+                by: super::MovedBy::Unreadable(_),
+                ..
+            }]
+        ));
+        assert!(deps[1].version_alternatives.is_empty());
     }
 
     /// The shared interpolator's work bounds: a value naming the next
