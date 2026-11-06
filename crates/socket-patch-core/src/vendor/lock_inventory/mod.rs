@@ -10,7 +10,10 @@
 //!   the lock with a content verifier (the CLI's lock-refusal gate), and
 //!   names the lock-resolvable packages an offline run could not vendor;
 //! * [`recover_lock_entry`] answers the same question from a ledger
-//!   entry's pre-vendor fragments.
+//!   entry's pre-vendor fragments;
+//! * ledger liveness (`vex::discover`) reads EVERY lock's instance
+//!   ([`inventory_project_every_lock`]) as evidence that a package resolves
+//!   from somewhere other than its patch.
 //!
 //! None of these DOWNLOADS what an entry pins. A Socket-hosted entry is
 //! listed as the package it replaces, with the hosted artifact's URL and
@@ -19,10 +22,7 @@
 //! pristine source: vendored bytes come from the patch service by patch
 //! uuid, and a hosted → vendored takeover re-resolves the upstream entry
 //! from registry metadata. `tests::lock_pinned_locations_never_drive_a_download`
-//! pins this;
-//! * ledger liveness (`vex::discover`) reads EVERY lock's instance
-//!   ([`inventory_project_every_lock`]) as evidence that a package resolves
-//!   from somewhere other than its patch.
+//! (and the CLI's twin) pins this.
 //!
 //! # Layout
 //!

@@ -8160,3 +8160,53 @@ mod unused_vendored_manifest_keys_tests {
         );
     }
 }
+
+/// The CLI side of core's `lock_pinned_locations_never_drive_a_download`
+/// (see its docs for what the check does and does not catch). Core's
+/// registry downloads (`registry_fetch::download`,
+/// `maven_repo::fetch_registry_bytes`) are `pub(crate)`, so the compiler
+/// already keeps the CLI from calling them (a by-name scan here would
+/// only meet the CLI's own `download` locals). What is pinned is the
+/// public `recover_lock_entry`: its one CLI reference is
+/// [`pristine_fetch_is_verifiable`]'s yes/no gate.
+#[cfg(test)]
+mod lock_download_guard_tests {
+    use socket_patch_core::vendor::test_support::production_sources::{
+        production_sources, references,
+    };
+
+    const PINNED_REFERENCES: &[(&str, &str, &str)] = &[(
+        "commands/vendor.rs",
+        "recover_lock_entry",
+        "Some(le) => lock_inventory::recover_lock_entry(project_root, le)",
+    )];
+
+    #[test]
+    fn lock_pinned_locations_never_drive_a_download() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<(String, &str, String)> = Vec::new();
+        for file in production_sources(&src) {
+            let code = file.code();
+            let lines: Vec<&str> = file.text.lines().collect();
+            for (line, _) in references(&code, "recover_lock_entry") {
+                found.push((
+                    file.rel.clone(),
+                    "recover_lock_entry",
+                    lines[line - 1].trim().to_string(),
+                ));
+            }
+        }
+        found.sort();
+        let expected: Vec<(String, &str, String)> = PINNED_REFERENCES
+            .iter()
+            .map(|(rel, name, line)| (rel.to_string(), *name, line.to_string()))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a production reference to `recover_lock_entry` was added, removed or changed. \
+             Its recovered `resolved`/`integrity` may be a Socket-hosted (patched) artifact's: \
+             never download them as a pristine source; re-check the site, then update \
+             PINNED_REFERENCES"
+        );
+    }
+}

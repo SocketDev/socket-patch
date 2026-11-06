@@ -44,7 +44,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 
-use crate::formats::text::split_bom;
+use crate::formats::text::{split_bom, strip_bom_bytes};
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::patch::copy_tree::remove_tree;
@@ -524,7 +524,17 @@ pub async fn revert_composer_opts(
     // preserve-state revert never performs.
     if !keep_artifact {
         let stranded =
-            stranded_wired_packages(&lock_path, &entry.uuid, &restorable_keys(entry)).await;
+            match stranded_wired_packages(&lock_path, &entry.uuid, &restorable_keys(entry)).await {
+                Ok(stranded) => stranded,
+                Err(why) => {
+                    return RevertOutcome::failed(format!(
+                        "refusing revert: {why}, so whether it still points packages at \
+                         {uuid_dir_rel} cannot be told. The vendored artifacts were LEFT IN \
+                         PLACE. Fix composer.lock (resolve any merge conflict, or restore it \
+                         from version control), then re-run `socket-patch vendor --revert`"
+                    ));
+                }
+            };
         if !stranded.is_empty() {
             let listed = stranded.join(", ");
             let args = stranded.join(" ");
@@ -806,7 +816,9 @@ fn composer_lock_bytes(value: &Value, current: &str) -> std::io::Result<Vec<u8>>
 /// `bytes` are exactly `lock`'s canonical render: the memo then answers the
 /// next package's read with the very document those bytes parse to. Any
 /// other bytes (a CRLF lock written back CRLF, a spliced entry) leave the
-/// memo empty, so the next read parses what is actually on disk.
+/// memo empty, so the next read parses what is actually on disk. A leading
+/// BOM is not compared (the readers parse past it), so a BOM lock keeps the
+/// memo too; the memo stays keyed by the full bytes on disk.
 fn reseed_lock_memo(bytes: Vec<u8>, lock: Value) {
     reseed_memo(&LOCK_MEMO, bytes, lock);
 }
@@ -814,7 +826,7 @@ fn reseed_lock_memo(bytes: Vec<u8>, lock: Value) {
 /// [`reseed_lock_memo`] over any memo (the tests use their own).
 fn reseed_memo(memo: &ParseMemo<Value>, bytes: Vec<u8>, lock: Value) {
     match composer_json_bytes(&lock) {
-        Ok(render) if render == bytes => {
+        Ok(render) if render == strip_bom_bytes(&bytes) => {
             memo.store(bytes, lock);
         }
         _ => memo.invalidate(),
@@ -833,11 +845,14 @@ fn lock_bytes_with_entry(
     idx: usize,
 ) -> std::io::Result<Vec<u8>> {
     let (bom, body) = split_bom(current);
-    let body = match lock_text::replace_entry(body, section, idx, &lock[section][idx]) {
-        Some(text) => text.into_bytes(),
-        None => composer_lock_bytes(lock, body)?,
-    };
-    Ok([bom.as_bytes(), &body].concat())
+    let mut bytes = bom.as_bytes().to_vec();
+    match lock_text::replace_entry(body, section, idx, &lock[section][idx]) {
+        Some(text) if bom.is_empty() => return Ok(text.into_bytes()),
+        Some(text) => bytes.extend_from_slice(text.as_bytes()),
+        None if bom.is_empty() => return composer_lock_bytes(lock, body),
+        None => bytes.extend_from_slice(&composer_lock_bytes(lock, body)?),
+    }
+    Ok(bytes)
 }
 
 /// The `<section>:<lowercase pkg>` keys this entry can actually put back:
@@ -859,24 +874,26 @@ fn restorable_keys(entry: &VendorEntry) -> HashSet<String> {
 /// returned lowercase and deduped (composer package names are canonically
 /// lowercase; the lock's own casing is display-only).
 ///
-/// A missing or unparseable composer.lock yields none: no install can be
-/// consuming a lock nothing can read, and the restore loop already degrades
-/// to `vendor_lock_entry_drifted` for it. A lock with one leading BOM is
-/// parseable (read past it like every other reader of the lock): treating
-/// it as unreadable here would skip the refusal and let the revert delete
-/// artifacts the lock still names.
+/// A missing composer.lock yields none: nothing can be consuming it. One
+/// that exists but cannot be read or parsed (a merge conflict, a trailing
+/// comma, a second BOM, a FIFO) is `Err`, FAIL-CLOSED: the revert cannot
+/// tell what it still installs from, and a record the restore loop then
+/// drift-skips must not let the artifact be deleted from under it. One
+/// leading BOM is encoding, read past like every other reader of the lock.
 async fn stranded_wired_packages(
     lock_path: &Path,
     uuid: &str,
     restorable: &HashSet<String>,
-) -> Vec<String> {
-    let Ok(text) = read_regular_to_string(lock_path).await else {
-        return Vec::new();
+) -> Result<Vec<String>, String> {
+    let text = match read_regular_to_string(lock_path).await {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("composer.lock is unreadable ({e})")),
     };
-    let Ok(lock) = LOCK_MEMO.parse(text.as_bytes(), || parse_json_text(&text)) else {
-        return Vec::new();
-    };
-    stranded_in(&lock, uuid, restorable)
+    let lock = LOCK_MEMO
+        .parse(text.as_bytes(), || parse_json_text(&text))
+        .map_err(|e| format!("composer.lock is not valid JSON ({e})"))?;
+    Ok(stranded_in(&lock, uuid, restorable))
 }
 
 /// [`stranded_wired_packages`] over a parsed lock.
@@ -1886,9 +1903,16 @@ mod tests {
             .replace('/', "\\/")
             .into_bytes();
         reseed_memo(&memo, render.clone(), lock.clone());
-        reseed_memo(&memo, escaped.clone(), lock);
+        reseed_memo(&memo, escaped.clone(), lock.clone());
         assert!(memo.get(&escaped).is_none());
         assert!(memo.get(&render).is_none());
+
+        // A BOM lock is the render behind its BOM: the memo keeps it, keyed
+        // by the bytes on disk.
+        let bom = with_bom(&render);
+        reseed_memo(&memo, bom.clone(), lock.clone());
+        assert_eq!(memo.get(&bom).as_deref(), Some(&lock));
+        assert!(memo.get(&with_bom(&bom)).is_none());
     }
 
     /// Vendor then `--revert` on `lock_bytes`, asserting the revert
@@ -3269,12 +3293,14 @@ mod tests {
         // Missing lock: nothing can be consuming it.
         assert!(stranded_wired_packages(&lock_path, UUID, &none)
             .await
+            .unwrap()
             .is_empty());
-        // Unparseable lock: same degrade (the restore loop reports drift).
+        // Unparseable lock: fail closed (what it wires cannot be read).
         tokio::fs::write(&lock_path, b"not json").await.unwrap();
-        assert!(stranded_wired_packages(&lock_path, UUID, &none)
+        let err = stranded_wired_packages(&lock_path, UUID, &none)
             .await
-            .is_empty());
+            .unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
         // No package sections at all.
         tokio::fs::write(
             &lock_path,
@@ -3284,6 +3310,7 @@ mod tests {
         .unwrap();
         assert!(stranded_wired_packages(&lock_path, UUID, &none)
             .await
+            .unwrap()
             .is_empty());
 
         // A wired entry without a name is skipped; the named one (pretty
@@ -3299,12 +3326,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             stranded_wired_packages(&lock_path, UUID, &none).await,
-            vec!["psr/log".to_string()]
+            Ok(vec!["psr/log".to_string()])
         );
         // The same entry is no longer stranded once a record can restore it.
         let restorable: HashSet<String> = std::iter::once("packages:psr/log".to_string()).collect();
         assert!(stranded_wired_packages(&lock_path, UUID, &restorable)
             .await
+            .unwrap()
             .is_empty());
     }
 
@@ -4380,7 +4408,7 @@ mod tests {
 
     /// The stranded scan reads a BOM lock like any other: an unrestorable
     /// wired entry is still reported (a second BOM is content, so that lock
-    /// stays unparseable).
+    /// is unparseable and the scan fails closed).
     #[tokio::test]
     async fn stranded_scan_reads_a_bom_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -4395,14 +4423,14 @@ mod tests {
         tokio::fs::write(&lock_path, &bytes).await.unwrap();
         assert_eq!(
             stranded_wired_packages(&lock_path, UUID, &none).await,
-            vec!["psr/log".to_string()]
+            Ok(vec!["psr/log".to_string()])
         );
         tokio::fs::write(&lock_path, with_bom(&bytes))
             .await
             .unwrap();
         assert!(stranded_wired_packages(&lock_path, UUID, &none)
             .await
-            .is_empty());
+            .is_err());
     }
 
     /// The stranded refusal guards a BOM lock too. Before, the BOM made the
@@ -4442,6 +4470,60 @@ mod tests {
         assert_eq!(
             tokio::fs::read(root.join(COMPOSER_LOCK)).await.unwrap(),
             wired,
+            "lock untouched"
+        );
+    }
+
+    /// A wired composer.lock that cannot be parsed for any reason (here a
+    /// git merge conflict) refuses a delete-the-artifacts revert, FAIL-CLOSED.
+    /// Before, the stranded scan read it as "nothing wired", the
+    /// no-original record drift-skipped, and the drift-keep's raw-text probe
+    /// missed the `\/`-escaped path: the revert deleted the artifact both
+    /// sides of the conflict still install from.
+    #[tokio::test]
+    async fn revert_refuses_over_an_unparseable_lock() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        tokio::fs::write(root.join(COMPOSER_LOCK), text.replace('/', "\\/"))
+            .await
+            .unwrap();
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let mut entry = entry.unwrap();
+        entry.wiring[0].original = None;
+        let wired = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        let conflicted = format!(
+            "<<<<<<< HEAD\n{wired}=======\n{}>>>>>>> theirs\n",
+            text.replace('/', "\\/")
+        );
+        tokio::fs::write(root.join(COMPOSER_LOCK), &conflicted)
+            .await
+            .unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert_composer(&entry, root, dry_run).await;
+            assert!(
+                !outcome.success,
+                "dry_run={dry_run}: {:?}",
+                outcome.warnings
+            );
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("refusing revert") && error.contains("not valid JSON"),
+                "{error}"
+            );
+        }
+        assert!(root.join(copy_rel()).exists(), "the wired artifact is kept");
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+                .await
+                .unwrap(),
+            conflicted,
             "lock untouched"
         );
     }
