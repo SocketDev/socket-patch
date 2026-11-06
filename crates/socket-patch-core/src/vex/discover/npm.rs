@@ -834,13 +834,42 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if !wired {
         return;
     }
-    let branch_locks = crate::utils::pnpm_workspace::git_branch_lock_files(&ctx.view).await;
+    let branch_locks = match crate::utils::pnpm_workspace::git_branch_lock_files(&ctx.view).await {
+        Ok(locks) => locks,
+        // The members that install from their own lock cannot be listed,
+        // so a member branch lock cannot be ruled out (fail-closed, as in
+        // hosted mode).
+        Err(why) => {
+            for rel in &read {
+                unattest_unlisted_branch_locks(rel, &why, out);
+            }
+            return;
+        }
+    };
     if branch_locks.is_empty() {
         return;
     }
     for rel in &read {
         unattest_git_branch_lock(rel, &branch_locks, out);
     }
+}
+
+/// Mark every ref of the pnpm lock `file` [`UnattestedKind::PnpmGitBranchLock`]
+/// because the workspace members that install from their own lock cannot
+/// be listed (`why`), so a member's `pnpm-lock.<branch>.yaml` cannot be
+/// ruled out. See [`unattest_git_branch_lock`].
+fn unattest_unlisted_branch_locks(file: &str, why: &str, out: &mut Discovery) {
+    out.unwired_copy(UnwiredCopy {
+        scope: Some(PathBuf::from(file)),
+        target: CopyTarget::Any,
+        file: PathBuf::from(file),
+        detail: format!(
+            "its pin is in {file}, but a pnpm branch lock cannot be ruled out: {why}; with \
+             `gitBranchLockfile` on, pnpm installs a git branch from its own \
+             `pnpm-lock.<branch>.yaml` rather than {file}"
+        ),
+        kind: UnattestedKind::PnpmGitBranchLock,
+    });
 }
 
 /// Mark every ref of the pnpm lock `file` [`UnattestedKind::PnpmGitBranchLock`]
@@ -3811,6 +3840,26 @@ mod tests {
         assert_eq!(
             file_of(UUID_B),
             std::path::PathBuf::from("packages/a/pnpm-lock.feature.yaml")
+        );
+    }
+
+    /// With the shared lock off and no `packages:` list, the members that
+    /// install from their own lock cannot be listed, so a member branch
+    /// lock cannot be ruled out: the root pin is withheld (fail-closed).
+    #[tokio::test]
+    async fn pnpm_unlisted_members_withhold_for_a_possible_branch_lock() {
+        let lock = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      ms:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n";
+        let root = hosted_rewrite("pnpm-lock.yaml", lock, &[pnpm_override("ms", UUID_A, None)]);
+        let p = Project::new();
+        p.write("pnpm-workspace.yaml", "sharedWorkspaceLockfile: false\n");
+        p.write("pnpm-lock.yaml", &root);
+        let out = run(&p).await;
+        assert!(
+            out.unattested
+                .iter()
+                .any(|u| u.uuid == UUID_A && u.kind == UnattestedKind::PnpmGitBranchLock),
+            "{:#?}",
+            out.unattested
         );
     }
 
