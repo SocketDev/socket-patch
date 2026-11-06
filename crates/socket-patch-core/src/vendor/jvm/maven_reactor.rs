@@ -1808,6 +1808,50 @@ impl Reactor {
             .flatten()
     }
 
+    /// Whether a version-less `g:a` declaration of `rel` always reads `sv`
+    /// from management: the nearest local management resolves to `sv`
+    /// ([`Self::managed_version`]), no inheritor or active profile moves
+    /// the property it names ([`Self::version_moved`]), and no profile on
+    /// the chain of `rel` or an inheritor manages `g:a`'s main jar at
+    /// another version (a profile's management overrides the base's).
+    fn always_managed_at(&self, rel: &str, g: &str, a: &str, sv: &str) -> bool {
+        if self.managed_version(rel, g, a).as_deref() != Some(sv) {
+            return false;
+        }
+        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let is_ga = |doc: &Doc, dep: usize| {
+            doc.is_main_jar(dep)
+                && doc.coordinate(dep, "groupId", &resolve).as_deref() == Some(g)
+                && doc.coordinate(dep, "artifactId", &resolve).as_deref() == Some(a)
+        };
+        let declared = self.chain(rel).find_map(|p| {
+            let doc = &self.poms[p].doc;
+            doc.declarations()
+                .into_iter()
+                .find(|&dep| doc.is_top_level_managed(dep) && is_ga(doc, dep))
+                .and_then(|dep| doc.child_text(dep, "version"))
+        });
+        if declared.as_deref().is_some_and(|d| {
+            d.contains("${") && self.version_moved(rel, d, &|v: &str| v != sv).is_some()
+        }) {
+            return false;
+        }
+        let up = |doc: &Doc, n: usize| doc.nodes[n].parent;
+        let readers: Vec<&str> = std::iter::once(rel).chain(self.inheritors(rel)).collect();
+        !readers.iter().flat_map(|r| self.chain(r)).any(|p| {
+            let doc = &self.poms[p].doc;
+            doc.declarations().into_iter().any(|dep| {
+                let profile_managed = up(doc, dep).and_then(|d| up(doc, d)).is_some_and(|dm| {
+                    doc.nodes[dm].name == "dependencyManagement"
+                        && up(doc, dm).is_some_and(|m| doc.is_profile(m))
+                });
+                profile_managed
+                    && is_ga(doc, dep)
+                    && doc.coordinate(dep, "version", &resolve).as_deref() != Some(sv)
+            })
+        })
+    }
+
     /// Whether every pom that reads `dep` of `rel` resolves its version
     /// to `sv`: `rel` and each pom inheriting it, with or without a
     /// profile on its chain active (see [`Self::version_moved`]).
@@ -2051,10 +2095,7 @@ impl Reactor {
                 // local root left unpinned (management conflicting or
                 // unresolved outside the checkout) that may be the base.
                 if !managed_section
-                    && self
-                        .managed_version(rel, patch.group_id, patch.artifact_id)
-                        .as_deref()
-                        != Some(sv)
+                    && !self.always_managed_at(rel, patch.group_id, patch.artifact_id, sv)
                 {
                     uncertain.insert(at);
                 }
@@ -6283,6 +6324,61 @@ mod tests {
             .unwrap();
         assert!(reasons(&plan).is_empty(), "{:?}", plan.warnings);
         assert_eq!(attestable(&applied(&files, &plan)), (true, true));
+    }
+
+    /// A version-less declaration reads its management, and an active
+    /// profile overrides that: a profile that redefines the managed
+    /// property, or manages g:a itself at another version, can put the
+    /// base back on the classpath, so neither attests.
+    #[test]
+    fn a_version_less_declaration_a_profile_moves_is_not_attestable() {
+        let pom = "<project>\n  <groupId>t</groupId>\n  <artifactId>app</artifactId>\n  \
+                   <version>1</version>\n  <properties>\n    \
+                   <ct.version>1.10.0</ct.version>\n  </properties>\n  \
+                   <dependencyManagement>\n    <dependencies>\n      \
+                   <dependency><groupId>org.apache.commons</groupId>\
+                   <artifactId>commons-text</artifactId>\
+                   <version>${ct.version}</version></dependency>\n    \
+                   </dependencies>\n  </dependencyManagement>\n  <dependencies>\n    \
+                   <dependency><groupId>org.apache.commons</groupId>\
+                   <artifactId>commons-text</artifactId></dependency>\n  \
+                   </dependencies>\n</project>\n";
+        let (_, after) = vendor(&fs(&[("pom.xml", pom)]));
+        assert_eq!(attestable(&after), (true, true));
+        // The same pin through a property the base pom defines as SV.
+        let mut by_property = after.clone();
+        let t = text(&after, "pom.xml")
+            .replace(
+                &format!("<version>{SV}</version>"),
+                "<version>${ct.version}</version>",
+            )
+            .replace(
+                "<ct.version>1.10.0</ct.version>",
+                &format!("<ct.version>{SV}</ct.version>"),
+            );
+        by_property.insert("pom.xml".to_string(), t.into_bytes());
+        assert_eq!(attestable(&by_property), (true, true));
+        let with = |base: &Fs, profile: &str| {
+            let mut files = base.clone();
+            let t = text(base, "pom.xml").replace(
+                "</project>",
+                &format!("  <profiles>\n    <profile>\n      <id>old</id>\n      {profile}\n    </profile>\n  </profiles>\n</project>"),
+            );
+            files.insert("pom.xml".to_string(), t.into_bytes());
+            files
+        };
+        let property = with(
+            &by_property,
+            "<properties><ct.version>1.10.0</ct.version></properties>",
+        );
+        assert!(!attestable(&property).1);
+        let managed = with(
+            &after,
+            "<dependencyManagement><dependencies><dependency>\
+             <groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId>\
+             <version>1.10.0</version></dependency></dependencies></dependencyManagement>",
+        );
+        assert!(!attestable(&managed).1);
     }
 
     /// Maven interpolates after inheritance: a parent's managed
