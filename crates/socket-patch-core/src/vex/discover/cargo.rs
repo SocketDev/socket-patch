@@ -492,8 +492,8 @@ enum DeclSource {
     RegistryIndex(String),
     /// `path = "…"` (cargo builds it locally, whatever `registry` says).
     Path,
-    /// `git = "…"`.
-    Git,
+    /// `git = "<url>"` (empty when the value is not a string).
+    Git(String),
 }
 
 /// One declaration of a crate: the root-relative file holding it, its
@@ -551,19 +551,29 @@ impl Decl {
 
     /// Whether the `[patch.<table>]` table redirects this declaration:
     /// a registry dependency of that registry (`crates-io`, or a crates.io
-    /// URL alias, for one with no `registry`).
+    /// URL alias, for one with no `registry`), or a git dependency of that
+    /// repository URL (a trailing `/` or `.git` ignored; any other
+    /// difference reads as another repository, so at worst a missed
+    /// redirect).
     fn patched_by(&self, table: &str) -> bool {
-        self.source == DeclSource::Registry
-            && match self.registry.as_deref() {
+        fn git_key(url: &str) -> &str {
+            let url = url.trim().trim_end_matches('/');
+            url.strip_suffix(".git").unwrap_or(url)
+        }
+        match &self.source {
+            DeclSource::Registry => match self.registry.as_deref() {
                 None => is_crates_io_source(table),
                 Some(reg) => reg.trim() == table,
-            }
+            },
+            DeclSource::Git(url) => !url.trim().is_empty() && git_key(url) == git_key(table),
+            _ => false,
+        }
     }
 
     /// Where cargo takes this dependency from, for messages.
     fn origin(&self) -> String {
         match (&self.source, self.registry.as_deref()) {
-            (DeclSource::Git, _) => "a git repository".to_string(),
+            (DeclSource::Git(_), _) => "a git repository".to_string(),
             (DeclSource::Path, _) => "a local path".to_string(),
             (DeclSource::RegistryIndex(url), _) => format!("the registry index {url}"),
             (_, Some(reg)) => format!("registry `{reg}`"),
@@ -694,7 +704,7 @@ fn dependency_entries(doc: &DocumentMut) -> Vec<DepEntry> {
             } else if let Some(entry) = item.as_table_like() {
                 let field = |k: &str| entry.get(k).and_then(Item::as_str).map(str::to_string);
                 let source = if entry.contains_key("git") {
-                    DeclSource::Git
+                    DeclSource::Git(field("git").unwrap_or_default())
                 } else if entry.contains_key("path") {
                     DeclSource::Path
                 } else if let Some(url) = field("registry-index") {
@@ -803,8 +813,17 @@ fn hosted_from_lock(
             beside_the_pin(ctx, lock, pkg, &purl, &uuid, regs, out);
             continue;
         }
+        // Pins to another Socket patch that may select this version; one
+        // whose requirement excludes it (or a template nobody inherits) is
+        // about another version, so it neither conflicts nor keeps the
+        // stale entry.
         let others: Vec<(&str, String)> = regs
             .iter()
+            .filter(|d| {
+                d.live
+                    && cargo_req_selects(d.version.as_deref(), &pkg.version, &[])
+                        != CargoReqMatch::NotOurs
+            })
             .filter_map(|d| Some((d.file.as_str(), d.pin()?)))
             .collect();
         if others.is_empty() {
@@ -1113,13 +1132,20 @@ fn unresolved_manifest_pins(
         let mut uuids: Vec<String> = Vec::new();
         for decl in regs.iter().filter(|d| d.socket_shaped()) {
             let reg = decl.registry.as_deref().unwrap_or_default();
-            match decl.socket_uuid() {
-                Some(uuid) if !uuids.contains(&uuid) => uuids.push(uuid),
-                Some(_) => {}
-                None if !malformed.contains(&(decl.file.as_str(), reg)) => {
-                    malformed.push((decl.file.as_str(), reg));
-                }
-                None => {}
+            if decl.socket_uuid().is_none() && !malformed.contains(&(decl.file.as_str(), reg)) {
+                malformed.push((decl.file.as_str(), reg));
+            }
+        }
+        // Classified like a locked pin ([`route`]): only a live registry
+        // dependency or `[patch]` entry naming `socket-patch-<uuid>` pins
+        // (beside `path` / `git` / `registry-index` the registry key does
+        // not decide, as in the rewriter's own pinned check), and a
+        // `[workspace.dependencies]` template nobody inherits declares
+        // nothing.
+        let live: Vec<&Decl> = regs.iter().filter(|d| d.live).collect();
+        for uuid in live.iter().filter_map(|d| d.pin()) {
+            if !uuids.contains(&uuid) {
+                uuids.push(uuid);
             }
         }
         for (file, reg) in malformed {
@@ -1146,9 +1172,10 @@ fn unresolved_manifest_pins(
             continue; // a ref (or the conflict pair) came from the lock
         }
         for uuid in &uuids {
-            let pinning: Vec<&Decl> = regs
+            let pinning: Vec<&Decl> = live
                 .iter()
-                .filter(|d| d.socket_uuid().as_deref() == Some(uuid.as_str()))
+                .copied()
+                .filter(|d| d.pin().as_deref() == Some(uuid.as_str()))
                 .collect();
             let reg = pinning[0].registry.as_deref().unwrap_or_default();
             let file = pinning[0].file.as_str();
@@ -1157,20 +1184,26 @@ fn unresolved_manifest_pins(
                 Lock::Absent => {
                     // Another Socket registry (or a malformed one) for the
                     // same crate is a conflict, never a pin.
-                    let only_this_patch = regs
+                    let only_this_patch = live
                         .iter()
-                        .filter(|d| d.socket_shaped())
-                        .all(|d| d.socket_uuid().as_deref() == Some(uuid.as_str()));
+                        .filter(|d| {
+                            d.socket_shaped()
+                                && matches!(d.source, DeclSource::Registry | DeclSource::Patch(_))
+                        })
+                        .all(|d| d.pin().as_deref() == Some(uuid.as_str()));
                     let defined_here = definitions
                         .get(reg)
                         .and_then(|index| source_uuid(ctx, index))
                         .is_some_and(|u| u == *uuid);
                     let version_reqs = distinct(pinning.iter().map(|d| d.version.clone()));
-                    // `None` when some unpinned declaration carries no
-                    // requirement (git, path): it may resolve any version.
-                    let excluded_reqs: Option<Vec<String>> = regs
+                    // Every live dependency declaration this patch does
+                    // not pin (a `path` / `git` / `registry-index` one
+                    // beside a `socket-patch-` registry included); `None`
+                    // when one carries no requirement: it may resolve any
+                    // version.
+                    let excluded_reqs: Option<Vec<String>> = live
                         .iter()
-                        .filter(|d| !d.socket_shaped())
+                        .filter(|d| !matches!(d.source, DeclSource::Patch(_)) && d.pin().is_none())
                         .map(|d| d.version.clone())
                         .collect();
                     if let (true, true, false, Some(excluded_reqs)) = (
@@ -1270,7 +1303,7 @@ struct Bypass<'a> {
 ///
 /// * a live dependency declaration (the root's or a workspace member's)
 ///   from another registry, a `registry-index` or git, whose requirement
-///   may select `version`, unless it is a registry dependency that a
+///   may select `version`, unless it is a registry or git dependency that a
 ///   `[patch]` table pointing at this copy redirects ([`Decl::patched_by`]):
 ///   cargo resolves it as a separate package, maybe at this very version;
 /// * a `Cargo.lock` entry of `name` at exactly `version` with a source
@@ -1305,7 +1338,8 @@ fn patch_bypassed(
         .filter(|d| d.live)
         .filter(|d| match &d.source {
             DeclSource::Registry => !d.socket_shaped() && !redirected(d),
-            DeclSource::RegistryIndex(_) | DeclSource::Git => true,
+            DeclSource::Git(_) => !redirected(d),
+            DeclSource::RegistryIndex(_) => true,
             DeclSource::Path | DeclSource::Patch(_) => false,
         })
         .filter(|d| cargo_req_selects(d.version.as_deref(), version, &[]) != CargoReqMatch::NotOurs)
@@ -1994,6 +2028,28 @@ mod tests {
         assert!(!toml_ref.lockfile_basis_ok());
     }
 
+    /// No declaration pins the lock's patch A, and the one pinning B
+    /// cannot select the locked version: B's pin is about another version,
+    /// so there is no conflict pair, and nothing routes the crate to A, so
+    /// the stale lock entry is no ref. (B's pin that may select it is the
+    /// conflict pair, see `manifest_and_lock_disagreeing_on_the_patch_emit_both`.)
+    #[tokio::test]
+    async fn another_patch_pin_excluding_the_locked_version_is_no_conflict() {
+        let p = Project::new();
+        p.write("Cargo.toml", manifest(&pinned("serde", "=1.0.2", UUID_B)));
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert!(
+            diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
     /// A project-config definition of the pinned registry that indexes a
     /// different patch (or a non-Socket host) is what cargo resolves
     /// against: the lock entry is stale.
@@ -2609,6 +2665,95 @@ mod tests {
             out.hosted_claim("pkg:cargo/serde@0.9.5", UUID_A),
             Some(false),
             "the member resolves 0.9 from crates.io"
+        );
+    }
+
+    /// A `socket-patch-<uuid>` registry beside `path`, `git` or
+    /// `registry-index` is no pin (cargo builds the path / git / index
+    /// source; the rewriter's own pinned check agrees): lockless, such a
+    /// member declaration is an unpinned one, so it excludes the versions it
+    /// accepts (all of them with no requirement), and alone it makes no
+    /// lockless pin at all.
+    #[tokio::test]
+    async fn lockless_path_or_git_beside_a_socket_registry_is_no_pin() {
+        let record = "pkg:cargo/serde@1.0.1";
+        let reg = format!("registry = \"socket-patch-{UUID_A}\"");
+        for member_decl in [
+            format!("serde = {{ path = \"../serde\", version = \"1\", {reg} }}"),
+            format!("serde = {{ git = \"https://example.com/serde\", {reg} }}"),
+            format!(
+                "serde = {{ version = \"1\", registry-index = \"sparse+https://x.example/\", {reg} }}"
+            ),
+        ] {
+            let p = Project::new();
+            pinned_root_workspace(&p);
+            member(&p, "a", &member_decl);
+            p.write(".cargo/config.toml", registry_block(UUID_A));
+            let out = run(&p).await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.hosted_claim(record, UUID_A),
+                Some(false),
+                "{member_decl}: {:#?}",
+                out.unlocked_pins
+            );
+        }
+        // The member's overridden registry alone: no pin anywhere.
+        let p = Project::new();
+        workspace_with_member(
+            &p,
+            &format!("serde = {{ path = \"../serde\", version = \"1\", {reg} }}"),
+        );
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert!(out.unlocked_pins.is_empty(), "{:#?}", out.unlocked_pins);
+    }
+
+    /// A `[workspace.dependencies]` template no manifest inherits declares
+    /// nothing cargo resolves: lockless, a Socket-pinned one makes no pin,
+    /// and an unpinned one excludes no version from the root's pin. Once a
+    /// member inherits the pinned template, it is the pin.
+    #[tokio::test]
+    async fn lockless_uninherited_template_is_not_a_declaration() {
+        let template = |dep: &str| {
+            format!("[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\n{dep}\n")
+        };
+        let p = Project::new();
+        p.write("Cargo.toml", template(&pinned("serde", "1", UUID_A)));
+        member(&p, "a", "other = \"1\"");
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert!(out.unlocked_pins.is_empty(), "{:#?}", out.unlocked_pins);
+
+        let p = Project::new();
+        p.write("Cargo.toml", template(&pinned("serde", "1", UUID_A)));
+        member(&p, "a", "serde = { workspace = true }");
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert_eq!(out.unlocked_pins.len(), 1, "{:#?}", out.unlocked_pins);
+        assert_eq!(
+            out.hosted_claim("pkg:cargo/serde@1.0.1", UUID_A),
+            Some(true)
+        );
+
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\n\
+                 serde = \"1\"\n\n[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [dependencies]\n{}\n",
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+        member(&p, "a", "other = \"1\"");
+        p.write(".cargo/config.toml", registry_block(UUID_A));
+        let out = run(&p).await;
+        assert_eq!(out.unlocked_pins.len(), 1, "{:#?}", out.unlocked_pins);
+        assert!(out.unlocked_pins[0].excluded_reqs.is_empty());
+        assert_eq!(
+            out.hosted_claim("pkg:cargo/serde@1.0.1", UUID_A),
+            Some(true)
         );
     }
 
@@ -3739,6 +3884,35 @@ mod tests {
             );
             assert!(out.unattested.is_empty(), "{member}: {:#?}", out.unattested);
         }
+    }
+
+    /// A `[patch."<git url>"]` table pointing at the same copy redirects a
+    /// declaration from that repository (a trailing `/` or `.git` aside),
+    /// so the copy stays attested; one from another repository still
+    /// bypasses it.
+    #[tokio::test]
+    async fn a_git_patch_table_for_the_copy_covers_that_repository_only() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let table =
+            format!("\n[patch.\"https://example.com/cfg-if\"]\ncfg-if = {{ path = \"{rel}\" }}\n");
+        for member in [
+            "cfg-if = { git = \"https://example.com/cfg-if\" }",
+            "cfg-if = { git = \"https://example.com/cfg-if.git/\", branch = \"main\" }",
+        ] {
+            let out = run(&vendored_workspace(member, &table, &[])).await;
+            assert_refs(
+                &out,
+                &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+            );
+            assert!(out.unattested.is_empty(), "{member}: {:#?}", out.unattested);
+        }
+        let out = run(&vendored_workspace(
+            "cfg-if = { git = \"https://example.com/fork/cfg-if\" }",
+            &table,
+            &[],
+        ))
+        .await;
+        bypassed_mark(&out, "crates/a/Cargo.toml");
     }
 
     /// The pre-v5 wiring in the project config redirects only crates.io
