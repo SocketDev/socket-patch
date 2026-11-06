@@ -190,7 +190,7 @@ async fn read_package_json_empty_version_returns_none() {
 #[serial_test::parallel]
 fn npm_crawler_new_and_default_construct_cleanly() {
     let _a = NpmCrawler::new();
-    let _b = NpmCrawler;
+    let _b = NpmCrawler::default();
 }
 
 // ── get_node_modules_paths ─────────────────────────────────────
@@ -204,7 +204,7 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
     let custom = tmp.path().join("custom-nm");
     tokio::fs::create_dir_all(&custom).await.unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: false,
@@ -222,7 +222,7 @@ async fn get_node_modules_paths_global_prefix_passthrough() {
 #[serial_test::parallel]
 async fn get_node_modules_paths_global_mode_no_prefix() {
     let tmp = tempfile::tempdir().unwrap();
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = CrawlerOptions {
         cwd: tmp.path().to_path_buf(),
         global: true,
@@ -671,7 +671,7 @@ async fn find_by_purls_unscoped_package() {
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "lodash", "4.17.21").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/lodash@4.17.21".to_string()])
         .await
@@ -703,7 +703,7 @@ async fn find_by_purls_scoped_package() {
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "@types/node", "20.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/@types/node@20.0.0".to_string()])
         .await
@@ -730,7 +730,7 @@ async fn find_by_purls_version_mismatch_returns_empty() {
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "lodash", "4.17.21").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/lodash@99.99.99".to_string()])
         .await
@@ -751,7 +751,7 @@ async fn find_by_purls_resolves_qualified_purl_keyed_by_input() {
     let nm = tmp.path().join("node_modules");
     stage_npm_pkg(&nm, "lodash", "4.17.21").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let qualified = "pkg:npm/lodash@4.17.21?extension=tgz".to_string();
     let result = crawler
         .find_by_purls(&nm, std::slice::from_ref(&qualified))
@@ -786,7 +786,7 @@ async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
     stage_npm_pkg(&nm, "foo", "1.0.0").await;
     stage_npm_pkg(&nm, "@types/node", "20.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let unscoped_q = "pkg:npm/foo@1.0.0?vcs_url=git@github.com:x/y.git".to_string();
     let scoped_q = "pkg:npm/@types/node@20.0.0?maintainer=a@b.com".to_string();
     let result = crawler
@@ -818,7 +818,7 @@ async fn find_by_purls_qualifier_containing_at_does_not_corrupt_version() {
 async fn find_by_purls_purl_without_at_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/lodash".to_string()])
         .await
@@ -833,7 +833,7 @@ async fn find_by_purls_purl_without_at_skipped() {
 async fn find_by_purls_purl_with_empty_version_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/lodash@".to_string()])
         .await
@@ -848,7 +848,7 @@ async fn find_by_purls_purl_with_empty_version_skipped() {
 async fn find_by_purls_scoped_purl_without_slash_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/@foo@1.0".to_string()])
         .await
@@ -863,7 +863,7 @@ async fn find_by_purls_scoped_purl_without_slash_skipped() {
 async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
     let tmp = tempfile::tempdir().unwrap();
     let nm = tmp.path().join("node_modules");
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/@scope/@1.0".to_string()])
         .await
@@ -875,7 +875,7 @@ async fn find_by_purls_scoped_purl_with_empty_name_skipped() {
 #[serial_test::parallel]
 async fn find_by_purls_invalid_purl_skipped() {
     let tmp = tempfile::tempdir().unwrap();
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(tmp.path(), &["pkg:not-npm/foo@1.0".to_string()])
         .await
@@ -893,7 +893,7 @@ async fn crawl_all_discovers_unscoped_and_scoped() {
     stage_npm_pkg(&nm, "lodash", "4.17.21").await;
     stage_npm_pkg(&nm, "@types/node", "20.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     assert_eq!(
@@ -932,7 +932,7 @@ async fn crawl_all_skips_dirs_without_package_json() {
         .unwrap();
     // No package.json — must be skipped.
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
@@ -949,7 +949,7 @@ async fn crawl_all_recurses_into_workspace_packages() {
     let pkg_dir = tmp.path().join("packages").join("ws-a");
     stage_npm_pkg(&pkg_dir.join("node_modules"), "lodash", "4.17.21").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     let lodash = result
@@ -1026,7 +1026,7 @@ async fn crawl_all_finds_declared_members_with_skip_dir_names() {
             expected.push(stage_member(root, member).await);
         }
 
-        let result = NpmCrawler.crawl_all(&options_at(root)).await;
+        let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
         let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
         got.sort();
         expected.sort();
@@ -1079,7 +1079,7 @@ async fn crawl_all_finds_declared_members_in_hidden_dirs() {
             expected.push(stage_member(root, member).await);
         }
 
-        let result = NpmCrawler.crawl_all(&options_at(root)).await;
+        let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
         let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
         got.sort();
         expected.sort();
@@ -1122,7 +1122,7 @@ async fn crawl_all_still_skips_undeclared_hidden_dirs() {
     )
     .await;
 
-    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
     let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
     assert_eq!(got, vec![member]);
 }
@@ -1145,7 +1145,7 @@ async fn crawl_all_finds_skip_dir_members_of_a_nested_workspace() {
     stage_npm_pkg(&web.join("node_modules"), "ms", "2.1.3").await;
     let member = stage_member(root, "web/packages/dist").await;
 
-    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
     let mut got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
     got.sort();
     assert_eq!(got, vec![web.join("node_modules").join("ms"), member]);
@@ -1176,7 +1176,7 @@ async fn crawl_all_member_walk_keeps_the_walk_rules() {
     .unwrap();
     let member = stage_member(root, "packages/Build").await;
 
-    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
     let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
     assert_eq!(got, vec![member]);
 }
@@ -1203,7 +1203,7 @@ async fn crawl_all_finds_members_of_a_tagged_scan_root() {
     .unwrap();
     let member = stage_member(root, "apps/build").await;
 
-    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
     let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
     assert_eq!(got, vec![member]);
 }
@@ -1239,7 +1239,7 @@ async fn crawl_all_still_skips_undeclared_skip_dirs() {
     // Declared by `build/*` but no package.json.
     stage_npm_pkg(&root.join("build/out/node_modules"), "not-a-member", "1.0").await;
 
-    let result = NpmCrawler.crawl_all(&options_at(root)).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(root)).await;
     let got: Vec<PathBuf> = result.iter().map(|p| p.path.clone()).collect();
     assert_eq!(got, vec![member]);
 }
@@ -1269,7 +1269,7 @@ async fn crawl_all_skips_hidden_and_skip_dirs() {
     )
     .await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
@@ -1308,7 +1308,7 @@ async fn crawl_all_handles_unreadable_node_modules() {
     stage_npm_pkg(&nm, "would-be-found", "1.0.0").await;
     common::chmod_unreadable(&nm);
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&nm);
@@ -1345,7 +1345,7 @@ async fn crawl_all_handles_unreadable_workspace_dir() {
     stage_npm_pkg(&blocked.join("node_modules"), "hidden", "2.0.0").await;
     common::chmod_unreadable(&blocked);
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     common::chmod_readable(&blocked);
@@ -1407,7 +1407,7 @@ async fn crawl_all_handles_nested_and_messy_scope_dir() {
     )
     .await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
 
@@ -1466,7 +1466,7 @@ async fn crawl_all_discovers_deeply_nested_transitive_deps() {
     stage_npm_pkg(&b_nm, "c", "3.0.0").await;
     stage_npm_pkg(&c_nm, "d", "4.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let ver = |n: &str| -> Option<&str> {
@@ -1502,7 +1502,7 @@ async fn crawl_all_skips_dirs_with_corrupt_package_json() {
         .await
         .unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     assert!(result.is_empty());
@@ -1540,7 +1540,7 @@ async fn crawl_all_does_not_recurse_through_symlinked_nested_package() {
     // ...containing a SYMLINK to the out-of-tree store package.
     symlink(&linked_pkg, host_nm.join("linked-pkg")).unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let opts = options_at(tmp.path());
     let result = crawler.crawl_all(&opts).await;
     let names: Vec<&str> = result.iter().map(|p| p.name.as_str()).collect();
@@ -1586,7 +1586,7 @@ async fn read_package_json_tolerates_utf8_bom() {
     );
 
     // The production symptom: the package must be visible to scan…
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let crawled = crawler.crawl_all(&options_at(tmp.path())).await;
     assert_eq!(
         crawled.len(),
@@ -1627,7 +1627,7 @@ async fn find_by_purls_rejects_alias_dir_with_matching_version() {
     .await
     .unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/foo@1.0.0".to_string()])
         .await
@@ -1681,7 +1681,7 @@ async fn find_by_purls_resolves_nested_only_install() {
     // Nested scoped package.
     stage_npm_pkg(&a_nm, "@s/d", "1.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purls = vec![
         "pkg:npm/b@2.0.0".to_string(),
         "pkg:npm/c@5.0.0".to_string(),
@@ -1754,7 +1754,7 @@ async fn read_package_json_rejects_fifo_without_hanging() {
     };
     assert_eq!(direct, None, "a FIFO is not a valid package.json");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let Ok(crawled) =
         tokio::time::timeout(deadline, crawler.crawl_all(&options_at(tmp.path()))).await
     else {
@@ -1894,7 +1894,7 @@ async fn find_by_purls_resolves_pnpm_virtual_store_transitives() {
     let nm = stage_pnpm_isolated_tree(tmp.path()).await;
     let store = nm.join(".pnpm");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purls = vec![
         "pkg:npm/mkdirp@0.5.5".to_string(),
         "pkg:npm/minimist@1.2.8".to_string(),
@@ -1977,7 +1977,7 @@ async fn crawl_all_inventories_pnpm_virtual_store_exactly_once() {
     let nm = stage_pnpm_isolated_tree(tmp.path()).await;
     let store = nm.join(".pnpm");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
@@ -2046,7 +2046,7 @@ async fn find_by_purls_fallback_pass_probes_store_entries_decoding_to_other_name
     )
     .await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purls = vec![
         "pkg:npm/wanted@1.0.0".to_string(),
         "pkg:npm/@s/wanted@1.0.0".to_string(),
@@ -2084,7 +2084,7 @@ async fn find_by_purls_resolves_pnpm_store_entry_with_peer_suffix() {
     let entry_nm = store.join("wanted@1.0.0(peer@2.0.0)").join("node_modules");
     stage_npm_pkg(&entry_nm, "wanted", "1.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/wanted@1.0.0".to_string()])
         .await
@@ -2113,7 +2113,7 @@ async fn find_by_purls_probes_undecodable_pnpm_store_entry() {
         .join("node_modules");
     stage_npm_pkg(&entry_nm, "wanted2", "1.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/wanted2@1.0.0".to_string()])
         .await
@@ -2152,7 +2152,7 @@ async fn crawl_all_inventories_bundled_dep_under_seen_store_entry() {
     // Root-linked direct dep (importer pass inventories it first).
     symlink(host_store_nm.join("host"), nm.join("host")).unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let host = result
@@ -2194,7 +2194,7 @@ async fn find_by_purls_returns_root_and_nested_duplicate_root_first() {
     stage_npm_pkg(&nm, "dup", "1.0.0").await;
     stage_npm_pkg(&nm.join("a").join("node_modules"), "dup", "1.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/dup@1.0.0".to_string()])
         .await
@@ -2330,7 +2330,7 @@ async fn find_by_purls_resolves_pnpm4_nested_store_transitives() {
     let nm = stage_pnpm4_nested_tree(tmp.path()).await;
     let host = nm.join(".pnpm/registry.npmjs.org");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purls = vec![
         "pkg:npm/mkdirp@0.5.5".to_string(),
         "pkg:npm/minimist@1.2.8".to_string(),
@@ -2396,7 +2396,7 @@ async fn crawl_all_inventories_pnpm4_nested_store_exactly_once() {
     let nm = stage_pnpm4_nested_tree(tmp.path()).await;
     let host = nm.join(".pnpm/registry.npmjs.org");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
@@ -2520,7 +2520,7 @@ async fn find_by_purls_resolves_pnpm3_legacy_registry_store_transitive() {
     let nm = stage_pnpm3_legacy_tree(tmp.path()).await;
     let store = nm.join(".registry.npmjs.org");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purls = vec![
         "pkg:npm/mkdirp@0.5.5".to_string(),
         "pkg:npm/minimist@1.2.8".to_string(),
@@ -2561,7 +2561,7 @@ async fn crawl_all_inventories_pnpm3_legacy_registry_store_exactly_once() {
     let nm = stage_pnpm3_legacy_tree(tmp.path()).await;
     let store = nm.join(".registry.npmjs.org");
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler.crawl_all(&options_at(tmp.path())).await;
 
     let purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
@@ -2656,7 +2656,7 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
     );
 
     // Resolve the primary exactly the way apply's dispatcher does.
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let resolved = crawler
         .find_by_purls(&nm, &["pkg:npm/foo@1.0.0".to_string()])
         .await
@@ -2673,6 +2673,7 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
         mem_blobs: None,
     };
     let result = apply_package_patch(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
         "pkg:npm/foo@1.0.0",
         &primary,
         &files,
@@ -2702,7 +2703,15 @@ async fn apply_and_rollback_reach_every_pnpm_peer_variant_copy() {
     );
 
     // Rollback restores every copy too.
-    let rb = rollback_package_patch("pkg:npm/foo@1.0.0", &primary, &files, &blobs, false).await;
+    let rb = rollback_package_patch(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        "pkg:npm/foo@1.0.0",
+        &primary,
+        &files,
+        &blobs,
+        false,
+    )
+    .await;
     assert!(rb.success, "rollback must succeed: {:?}", rb.error);
     for entry_nm in &variants {
         let bytes = tokio::fs::read(entry_nm.join("foo").join("index.js"))
@@ -2777,6 +2786,7 @@ async fn apply_heals_unpatched_pnpm_twin_when_primary_already_patched() {
         mem_blobs: None,
     };
     let result = apply_package_patch(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
         "pkg:npm/foo@1.0.0",
         &nm.join("foo"),
         &files,
@@ -2813,7 +2823,7 @@ async fn find_by_purls_resolves_bundled_only_target_via_fallback_pass() {
     // nested node_modules.
     stage_npm_pkg(&host_nm.join("host").join("node_modules"), "leaf", "2.0.0").await;
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let result = crawler
         .find_by_purls(&nm, &["pkg:npm/leaf@2.0.0".to_string()])
         .await
@@ -2878,7 +2888,7 @@ async fn find_by_purls_returns_bundled_copy_of_an_already_found_target() {
             };
 
             let purl = "pkg:npm/left-pad@1.3.0".to_string();
-            let result = NpmCrawler
+            let result = NpmCrawler::new()
                 .find_by_purls(&nm, std::slice::from_ref(&purl))
                 .await
                 .unwrap();
@@ -2948,7 +2958,7 @@ fn find_by_purls_bounds_bundled_store_cycles_and_keeps_linked_copies() {
         stage_npm_pkg(&entry_nm, "host-c", "1.0.0").await;
         std::os::unix::fs::symlink(&linked, entry_nm.join("host-c/node_modules")).unwrap();
         let purl = "pkg:npm/target@1.0.0".to_string();
-        let found = NpmCrawler
+        let found = NpmCrawler::new()
             .find_by_purls(&nm, std::slice::from_ref(&purl))
             .await
             .unwrap();
@@ -2985,7 +2995,7 @@ async fn find_by_purls_preserves_importer_mode_after_store_visit() {
     stage_npm_pkg(&host_nm, "host", "1.0.0").await;
     std::os::unix::fs::symlink(&opaque_nm, host_nm.join("host/node_modules")).unwrap();
     let purl = "pkg:npm/only-linked@1.0.0".to_string();
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&nm, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -3198,7 +3208,7 @@ async fn find_by_purls_resolves_vlt_store_transitives() {
             .keys()
             .map(|key| nm.join(key))
             .collect();
-        let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+        let result = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
         for purl in &purls {
             let found = result
                 .get(purl)
@@ -3274,7 +3284,7 @@ async fn crawl_all_inventories_vlt_store_exactly_once() {
         let nm = stage_vlt_tree(tmp.path(), &listing).await;
         let copies = vlt_real_copies(tmp.path(), &listing);
 
-        let result = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+        let result = NpmCrawler::new().crawl_all(&options_at(tmp.path())).await;
         let mut purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
         purls.sort_unstable();
         let before = purls.len();
@@ -3339,7 +3349,7 @@ async fn find_by_purls_resolves_vlt_store_entry_with_peer_extra() {
                 if vlt_importer_key(&listing, tmp.path(), &purl).is_some() {
                     continue;
                 }
-                let result = NpmCrawler
+                let result = NpmCrawler::new()
                     .find_by_purls(&nm, std::slice::from_ref(&purl))
                     .await
                     .unwrap();
@@ -3380,7 +3390,7 @@ async fn find_by_purls_probes_undecodable_vlt_store_entry() {
         let find = |purl: &'static str| {
             let nm = nm.clone();
             async move {
-                NpmCrawler
+                NpmCrawler::new()
                     .find_by_purls(&nm, &[purl.to_string()])
                     .await
                     .unwrap()
@@ -3473,7 +3483,7 @@ async fn find_by_purls_skips_vlt_dependency_links_and_importer_resolved_copies()
     .iter()
     .map(|p| p.to_string())
     .collect();
-    let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+    let result = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
     let paths = |purl: &str| -> Vec<std::path::PathBuf> {
         result
             .get(purl)
@@ -3513,7 +3523,7 @@ async fn find_by_purls_returns_same_version_git_copy_as_its_own_primary() {
     std::os::unix::fs::symlink(".vlt/~npm~tap@1.0.0/node_modules/tap", nm.join("tap")).unwrap();
 
     let purl = "pkg:npm/tap@1.0.0".to_string();
-    let result = NpmCrawler
+    let result = NpmCrawler::new()
         .find_by_purls(&nm, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -3524,9 +3534,12 @@ async fn find_by_purls_returns_same_version_git_copy_as_its_own_primary() {
             .collect::<Vec<_>>(),
         vec![nm.join("tap"), git_copy]
     );
-    assert!(find_store_peer_variant_copies(&nm.join("tap"))
-        .await
-        .is_empty());
+    assert!(find_store_peer_variant_copies(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        &nm.join("tap")
+    )
+    .await
+    .is_empty());
 }
 
 /// Only a REAL `node_modules/.vlt` directory is a store: one that links to
@@ -3551,12 +3564,12 @@ async fn find_by_purls_and_crawl_all_never_follow_a_linked_vlt_store() {
     std::os::unix::fs::symlink(outside.path(), nm.join(".vlt")).unwrap();
 
     let purl = "pkg:npm/x@1.0.0".to_string();
-    let result = NpmCrawler
+    let result = NpmCrawler::new()
         .find_by_purls(&nm, std::slice::from_ref(&purl))
         .await
         .unwrap();
     assert!(result.is_empty(), "got {result:?}");
-    let scanned = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    let scanned = NpmCrawler::new().crawl_all(&options_at(tmp.path())).await;
     assert!(!scanned.iter().any(|p| p.purl == purl), "got {scanned:?}");
 }
 
@@ -3627,10 +3640,10 @@ async fn find_by_purls_and_crawl_all_skip_vlt_hoist_dir_and_vlt_json_and_delete_
         "pkg:npm/bin-decoy@9.9.9",
     ];
     let purls: Vec<String> = decoys.iter().map(|p| p.to_string()).collect();
-    let result = NpmCrawler.find_by_purls(&nm, &purls).await.unwrap();
+    let result = NpmCrawler::new().find_by_purls(&nm, &purls).await.unwrap();
     assert!(result.is_empty(), "no decoy resolves; got {result:?}");
 
-    let scanned = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    let scanned = NpmCrawler::new().crawl_all(&options_at(tmp.path())).await;
     for decoy in decoys {
         assert!(
             !scanned.iter().any(|p| p.purl == decoy),
@@ -3656,7 +3669,7 @@ async fn crawl_all_inventories_vlt_workspace_root_store_once() {
     let listing = vlt_listing("1.0.0-rc.22-workspace");
     let nm = stage_vlt_tree(tmp.path(), &listing).await;
 
-    let mut roots = NpmCrawler
+    let mut roots = NpmCrawler::new()
         .get_node_modules_paths(&options_at(tmp.path()))
         .await
         .unwrap();
@@ -3670,7 +3683,7 @@ async fn crawl_all_inventories_vlt_workspace_root_store_once() {
         ]
     );
 
-    let result = NpmCrawler.crawl_all(&options_at(tmp.path())).await;
+    let result = NpmCrawler::new().crawl_all(&options_at(tmp.path())).await;
     let mut purls: Vec<&str> = result.iter().map(|p| p.purl.as_str()).collect();
     purls.sort_unstable();
     let copies = vlt_real_copies(tmp.path(), &listing);
@@ -3734,6 +3747,7 @@ async fn apply_index_js(
         mem_blobs: None,
     };
     apply_package_patch(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
         purl,
         primary,
         &patch.files,
@@ -3837,8 +3851,15 @@ async fn apply_and_rollback_reach_every_vlt_variant_copy() {
         }
         assert_eq!(tokio::fs::read(&cas).await.unwrap(), ORIGINAL);
 
-        let rb =
-            rollback_package_patch(case.purl, &primary, &patch.files, &patch.blobs, false).await;
+        let rb = rollback_package_patch(
+            socket_patch_core::utils::repo_root::ReadScope::Workspace,
+            case.purl,
+            &primary,
+            &patch.files,
+            &patch.blobs,
+            false,
+        )
+        .await;
         assert!(rb.success, "{}: {:?}", case.tree, rb.error);
         for copy in &copies {
             assert_eq!(
@@ -4126,7 +4147,11 @@ async fn find_store_peer_variant_copies_probe_gates() {
     )
     .await;
 
-    let copies = find_store_peer_variant_copies(&primary).await;
+    let copies = find_store_peer_variant_copies(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        &primary,
+    )
+    .await;
 
     let got: std::collections::HashSet<_> = copies.iter().cloned().collect();
     let want: std::collections::HashSet<_> = [twin.clone(), undecodable_copy.clone()]
@@ -4162,7 +4187,11 @@ async fn find_store_peer_variant_copies_unreadable_primary_returns_empty() {
     )
     .await;
 
-    let copies = find_store_peer_variant_copies(&primary).await;
+    let copies = find_store_peer_variant_copies(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        &primary,
+    )
+    .await;
     assert!(
         copies.is_empty(),
         "unreadable primary identity ⇒ no twins reported; got {copies:?}"
@@ -4202,7 +4231,11 @@ async fn find_store_peer_variant_copies_vlt_member_link_and_git_copy() {
     )
     .unwrap();
 
-    let copies = find_store_peer_variant_copies(&member_nm.join("foo")).await;
+    let copies = find_store_peer_variant_copies(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        &member_nm.join("foo"),
+    )
+    .await;
     assert_eq!(
         copies
             .iter()
@@ -4228,7 +4261,12 @@ async fn find_store_peer_variant_copies_vlt_unreadable_primary_returns_empty() {
         "1.0.0",
     )
     .await;
-    assert!(find_store_peer_variant_copies(&primary).await.is_empty());
+    assert!(find_store_peer_variant_copies(
+        socket_patch_core::utils::repo_root::ReadScope::Workspace,
+        &primary
+    )
+    .await
+    .is_empty());
 }
 
 // ── pnpm<=3 legacy store: stray node_modules + depth-1 home ────
@@ -4536,7 +4574,7 @@ async fn deno_npm_cache_prefix_crawls_name_version_layout() {
         global: false,
         global_prefix: Some(registry.clone()),
     };
-    let mut purls: Vec<String> = NpmCrawler
+    let mut purls: Vec<String> = NpmCrawler::new()
         .crawl_all(&opts)
         .await
         .into_iter()
@@ -4574,7 +4612,10 @@ async fn deno_npm_cache_find_by_purls_returns_every_copy() {
         "pkg:npm/left-pad@1.3.0".to_string(),
         "pkg:npm/absent@1.0.0".to_string(),
     ];
-    let found = NpmCrawler.find_by_purls(&registry, &purls).await.unwrap();
+    let found = NpmCrawler::new()
+        .find_by_purls(&registry, &purls)
+        .await
+        .unwrap();
     assert_eq!(
         found_paths(&found, "pkg:npm/is-odd@3.0.1"),
         vec![plain, copy]
@@ -4597,7 +4638,10 @@ async fn deno_npm_cache_find_by_purls_rejects_traversal() {
     stage_deno_npm_pkg(tmp.path(), "evil", "1.0.0", "1.0.0").await;
 
     let purls = vec!["pkg:npm/..%2F..%2Fevil@1.0.0".to_string()];
-    let found = NpmCrawler.find_by_purls(&registry, &purls).await.unwrap();
+    let found = NpmCrawler::new()
+        .find_by_purls(&registry, &purls)
+        .await
+        .unwrap();
     assert!(found.values().all(|copies| copies.is_empty()), "{found:?}");
 }
 
@@ -4629,8 +4673,11 @@ async fn global_mode_includes_deno_npm_cache() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
-    let crawled = NpmCrawler.crawl_all(&opts).await;
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
+    let crawled = NpmCrawler::new().crawl_all(&opts).await;
 
     assert!(roots.contains(&registry), "{roots:?}");
     assert!(
@@ -4655,14 +4702,14 @@ async fn non_deno_root_under_npm_dir_keeps_node_modules_walk() {
         global: false,
         global_prefix: Some(deps.clone()),
     };
-    let purls: Vec<String> = NpmCrawler
+    let purls: Vec<String> = NpmCrawler::new()
         .crawl_all(&opts)
         .await
         .into_iter()
         .map(|p| p.purl)
         .collect();
     assert_eq!(purls, vec!["pkg:npm/left-pad@1.3.0"]);
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&deps, &["pkg:npm/left-pad@1.3.0".to_string()])
         .await
         .unwrap();
@@ -4677,7 +4724,7 @@ async fn deno_npm_cache_find_by_purls_records_each_copy_once() {
     let registry = tmp.path().join("npm").join("registry.npmjs.org");
     let plain = stage_deno_npm_pkg(&registry, "is-odd", "3.0.1", "3.0.1").await;
     let purl = "pkg:npm/is-odd@3.0.1".to_string();
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&registry, &[purl.clone(), purl.clone()])
         .await
         .unwrap();
@@ -4703,7 +4750,7 @@ async fn deno_npm_cache_find_by_purls_resolves_encoded_capital_name() {
         .await
         .unwrap();
     let purl = "pkg:npm/JSONStream@1.3.5".to_string();
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&registry, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -4731,7 +4778,7 @@ async fn deno_npm_cache_nested_registry_prefix_crawls_and_resolves() {
         global: false,
         global_prefix: Some(registry.clone()),
     };
-    let purls: Vec<String> = NpmCrawler
+    let purls: Vec<String> = NpmCrawler::new()
         .crawl_all(&opts)
         .await
         .into_iter()
@@ -4739,7 +4786,7 @@ async fn deno_npm_cache_nested_registry_prefix_crawls_and_resolves() {
         .collect();
     assert_eq!(purls, vec!["pkg:npm/is-odd@3.0.1"]);
     let purl = "pkg:npm/is-odd@3.0.1".to_string();
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&registry, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -4774,7 +4821,10 @@ async fn global_mode_includes_nested_deno_npm_registry() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     assert!(roots.contains(&plain), "{roots:?}");
     assert!(roots.contains(&nested), "{roots:?}");
     assert!(
@@ -4804,7 +4854,7 @@ async fn deno_npm_cache_without_packument_is_still_found() {
     .await
     .unwrap();
     let purl = "pkg:npm/is-odd@3.0.1".to_string();
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&registry, std::slice::from_ref(&purl))
         .await
         .unwrap();
@@ -4815,7 +4865,7 @@ async fn deno_npm_cache_without_packument_is_still_found() {
     let deps = tmp.path().join("npm").join("deps");
     stage_npm_pkg(&deps, "rxjs", "7.8.1").await;
     stage_npm_pkg(&deps.join("rxjs"), "7.8.1", "0.0.0").await;
-    let found = NpmCrawler
+    let found = NpmCrawler::new()
         .find_by_purls(&deps, &["pkg:npm/rxjs@7.8.1".to_string()])
         .await
         .unwrap();
@@ -4855,7 +4905,10 @@ async fn global_mode_finds_registry_nested_under_another() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
@@ -4889,7 +4942,10 @@ async fn global_mode_finds_path_registry_behind_same_named_package() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
@@ -4922,7 +4978,10 @@ async fn global_mode_finds_one_segment_registry_under_root_registry() {
         global: true,
         global_prefix: None,
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
     assert_eq!(deno_roots, vec![&host, &nested], "{roots:?}");
 }
@@ -4973,11 +5032,14 @@ async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
             global: true,
             global_prefix: None,
         };
-        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        let roots = NpmCrawler::new()
+            .get_node_modules_paths(&opts)
+            .await
+            .unwrap();
         let deno_roots: Vec<&PathBuf> = roots.iter().filter(|r| r.starts_with(&deno_dir)).collect();
         assert_eq!(deno_roots, vec![&host, &nested], "{nested_pkg}: {roots:?}");
 
-        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler
+        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler::new()
             .crawl_all(&opts)
             .await
             .into_iter()
@@ -4993,7 +5055,7 @@ async fn global_mode_finds_one_segment_registry_behind_same_named_package() {
         expected.sort();
         assert_eq!(crawled, expected, "{nested_pkg}");
 
-        let found = NpmCrawler
+        let found = NpmCrawler::new()
             .find_by_purls(&nested, &[foo_purl.clone()])
             .await
             .unwrap();
@@ -5031,10 +5093,13 @@ async fn deno_dir_and_npm_dir_prefixes_expand_to_registry_dirs() {
             global: false,
             global_prefix: Some(prefix.clone()),
         };
-        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        let roots = NpmCrawler::new()
+            .get_node_modules_paths(&opts)
+            .await
+            .unwrap();
         assert_eq!(roots, vec![nested.clone(), public.clone()], "{prefix:?}");
 
-        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler
+        let mut crawled: Vec<(String, PathBuf)> = NpmCrawler::new()
             .crawl_all(&opts)
             .await
             .into_iter()
@@ -5067,9 +5132,12 @@ async fn prefix_with_npm_package_child_keeps_node_modules_walk() {
         global: false,
         global_prefix: Some(prefix.clone()),
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     assert_eq!(roots, vec![prefix.clone()]);
-    let mut purls: Vec<String> = NpmCrawler
+    let mut purls: Vec<String> = NpmCrawler::new()
         .crawl_all(&opts)
         .await
         .into_iter()
@@ -5102,7 +5170,10 @@ async fn npm_global_prefix_named_npm_is_not_deno_cache() {
             global: false,
             global_prefix: Some(prefix.clone()),
         };
-        let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+        let roots = NpmCrawler::new()
+            .get_node_modules_paths(&opts)
+            .await
+            .unwrap();
         assert_eq!(roots, vec![prefix.clone()], "{prefix:?}");
     }
 }
@@ -5123,7 +5194,10 @@ async fn relative_deno_npm_dir_prefix_expands() {
         global: false,
         global_prefix: Some(PathBuf::from(".")),
     };
-    let roots = NpmCrawler.get_node_modules_paths(&opts).await.unwrap();
+    let roots = NpmCrawler::new()
+        .get_node_modules_paths(&opts)
+        .await
+        .unwrap();
     assert_eq!(roots.len(), 1, "{roots:?}");
     assert!(roots[0].ends_with("registry.npmjs.org"), "{roots:?}");
 }

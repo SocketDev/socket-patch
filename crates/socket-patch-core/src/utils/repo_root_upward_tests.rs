@@ -380,7 +380,7 @@ async fn global_crawl_reads_a_package_outside_the_repository() {
         global_prefix: None,
     };
     assert_eq!(local.read_scope(), ReadScope::Workspace);
-    let found = crate::crawlers::npm_crawler::NpmCrawler
+    let found = crate::crawlers::npm_crawler::NpmCrawler::for_options(&options)
         .crawl_all(&options)
         .await;
     assert!(

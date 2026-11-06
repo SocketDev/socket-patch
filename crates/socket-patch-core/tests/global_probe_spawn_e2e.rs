@@ -492,7 +492,7 @@ async fn bun_global_dir_falls_back_to_bun_env_resolution() {
             let value = vars.iter().find(|(n, _)| *n == name).map(|(_, v)| v);
             case_env.set(name, value.map(|v| v.as_os_str()));
         }
-        let paths = NpmCrawler
+        let paths = NpmCrawler::new()
             .get_node_modules_paths(&CrawlerOptions {
                 cwd: l.proj.clone(),
                 global: true,

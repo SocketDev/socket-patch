@@ -2713,6 +2713,7 @@ async fn apply_patches_inner(
                     // extension, or is refused with nothing written (#1996).
                     let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
                         let applied = gem_ext::apply_gem_package_patch(
+                            args.common.read_scope(),
                             variant_purl,
                             pkg_path,
                             &patch.files,
@@ -2736,6 +2737,7 @@ async fn apply_patches_inner(
                         applied.result
                     } else {
                         apply_package_patch(
+                            args.common.read_scope(),
                             variant_purl,
                             pkg_path,
                             &patch.files,
@@ -2893,6 +2895,7 @@ async fn apply_patches_inner(
                         }
                         None => {
                             apply_package_patch(
+                                args.common.read_scope(),
                                 purl,
                                 pkg_path,
                                 &patch.files,
@@ -3424,6 +3427,7 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 }
                 attempted = true;
                 let mut result = apply_package_patch(
+                    args.common.read_scope(),
                     variant,
                     &dir,
                     &files,
@@ -3444,6 +3448,7 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             if copy_attempted && !absent.is_empty() {
                 attempted = true;
                 let result = apply_package_patch(
+                    args.common.read_scope(),
                     variant,
                     copy,
                     &absent,

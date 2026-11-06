@@ -43,7 +43,12 @@ pub(crate) trait CopyFold: Sized {
 /// other pnpm/vlt store copy of the same package, folding each copy in.
 /// Copies are visited even when the primary was already done: that is the
 /// state a single-copy run leaves behind (done primary, untouched twin).
-pub(crate) async fn fan_out<R, F, Fut>(package_key: &str, pkg_path: &Path, engine: F) -> R
+pub(crate) async fn fan_out<R, F, Fut>(
+    scope: crate::utils::repo_root::ReadScope,
+    package_key: &str,
+    pkg_path: &Path,
+    engine: F,
+) -> R
 where
     R: CopyFold,
     F: Fn(PathBuf) -> Fut,
@@ -53,7 +58,9 @@ where
     // Only npm purls can name pnpm or vlt store copies; everything else
     // skips the (already cheap) discovery outright.
     if result.success() && package_key.starts_with("pkg:npm/") {
-        for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
+        for copy in
+            crate::crawlers::npm_crawler::find_store_peer_variant_copies(scope, pkg_path).await
+        {
             let copy_result = engine(copy.clone()).await;
             fold(&mut result, &copy, copy_result);
         }
@@ -172,6 +179,7 @@ mod regression_tests {
     async fn apply_reports_a_write_to_an_unpatched_twin_copy() {
         let (_root, primary, copies, blobs, files) = pnpm_twins(PATCHED, ORIGINAL).await;
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -215,6 +223,7 @@ mod regression_tests {
             .await
             .unwrap();
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -243,6 +252,7 @@ mod regression_tests {
     async fn apply_dry_run_carries_an_unpatched_twin_verify_record() {
         let (_root, primary, copies, blobs, files) = pnpm_twins(PATCHED, ORIGINAL).await;
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -266,6 +276,7 @@ mod regression_tests {
     async fn apply_over_patched_twins_stays_already_patched() {
         let (_root, primary, _copies, blobs, files) = pnpm_twins(PATCHED, PATCHED).await;
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -290,8 +301,15 @@ mod regression_tests {
     #[tokio::test]
     async fn rollback_reports_a_restore_of_a_patched_twin_copy() {
         let (_root, primary, copies, blobs, files) = pnpm_twins(ORIGINAL, PATCHED).await;
-        let result =
-            rollback_package_patch("pkg:npm/foo@1.0.0", &primary, &files, &blobs, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            &blobs,
+            false,
+        )
+        .await;
         assert!(result.success, "{:?}", result.error);
         assert_eq!(read(&copies[1].join("index.js")).await, ORIGINAL);
 
@@ -315,8 +333,15 @@ mod regression_tests {
     #[tokio::test]
     async fn rollback_over_original_twins_stays_already_original() {
         let (_root, primary, _copies, blobs, files) = pnpm_twins(ORIGINAL, ORIGINAL).await;
-        let result =
-            rollback_package_patch("pkg:npm/foo@1.0.0", &primary, &files, &blobs, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/foo@1.0.0",
+            &primary,
+            &files,
+            &blobs,
+            false,
+        )
+        .await;
         assert!(result.success, "{:?}", result.error);
         assert!(result.files_rolled_back.is_empty());
         assert_eq!(result.files_verified.len(), 2);
