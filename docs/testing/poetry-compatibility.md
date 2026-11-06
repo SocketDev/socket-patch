@@ -95,7 +95,7 @@ Two consequences for Poetry releases before 1.4:
 
 Hosted mode also checks the installed package's bytes, independently of the lock's
 writer version. `redirect_pypi_stale_install` means readable files in a discovered
-interpreter still differ from the patched hashes. This read-only check repeats on
+interpreter still differ from the pinned patched wheel's `RECORD`. This read-only check repeats on
 re-scans and excludes the package from same-run VEX, even with
 `--vex-no-verify` or a healthy copy in another interpreter. If no patches remain
 to attest, `--vex` fails with `no_applicable_patches`. Reinstall in the affected

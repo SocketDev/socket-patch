@@ -8,10 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
-use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::patch::redirect::vlt;
 use socket_patch_core::patch::redirect::vlt_heal::{
-    self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
+    self, classify_target, read_install_state, LedgerTarget, Target, TargetState,
 };
 
 /// What the post-rewrite heal reports back to the hosted flow: its
@@ -60,13 +59,12 @@ struct HealTally {
     undeterminable_uuids: BTreeSet<String>,
 }
 
-/// Classify `targets` against `expected` and invalidate the stale ones
+/// Classify `targets` against their pins and invalidate the stale ones
 /// vlt reinstalls, unless cleanup is off; `(target, uuid or purl)` per
 /// target.
 async fn heal_targets(
     common: &crate::args::GlobalArgs,
     targets: &[(Target<'_>, &str)],
-    expected: Expected,
 ) -> HealTally {
     let mut tally = HealTally::default();
     if targets.is_empty() {
@@ -75,7 +73,7 @@ async fn heal_targets(
     let state = read_install_state(&common.cwd).await;
     let mut stale: Vec<(String, &str)> = Vec::new();
     for (target, uuid) in targets {
-        match classify_target(&state, &common.cwd, target, expected).await {
+        match classify_target(&state, &common.cwd, target).await {
             TargetState::Stale if !vlt_heal::reinstalls_after_removal(target.flags) => {
                 tally.optional_left += 1;
                 tally.stale_uuids.insert((*uuid).to_string());
@@ -256,8 +254,8 @@ fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
 fn undeterminable_detail(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
-         installed copies (node_modules is a link, or no patch record was available); run \
-         `vlt ci` to be sure the patched packages are installed."
+         installed copies (node_modules is a link, or node_modules/.vlt-lock.json is missing \
+         or unreadable); run `vlt ci` to be sure the patched packages are installed."
     )
 }
 
@@ -265,8 +263,6 @@ fn undeterminable_detail(n: usize) -> String {
 pub(crate) struct HealInputs<'a> {
     /// The final `vlt-lock.json` (as written, or as a dry run would write it).
     pub(crate) final_lock: Option<&'a str>,
-    /// This run's fetched records merged with the ledger's, keyed by purl.
-    pub(crate) records: &'a BTreeMap<String, PatchRecord>,
     pub(crate) confirmed: &'a [(String, String)],
     pub(crate) confirmed_vlt: &'a BTreeSet<String>,
     pub(crate) foreign: &'a BTreeSet<String>,
@@ -297,20 +293,18 @@ pub(crate) async fn heal_after_rewrite(
         let targets: Vec<(Target<'_>, &str)> = owned
             .iter()
             .map(|i| {
-                let record = inputs.records.values().find(|r| r.uuid == i.patch_uuid);
                 (
                     Target {
                         dep_id: &i.dep_id,
                         name: &i.name,
                         lock_sha512: i.sha512.as_deref(),
-                        record,
                         flags: i.flags,
                     },
                     i.patch_uuid.as_str(),
                 )
             })
             .collect();
-        tally = heal_targets(common, &targets, Expected::Patched).await;
+        tally = heal_targets(common, &targets).await;
         healed = true;
         out.warnings.push(serde_json::json!({
             "code": REINSTALL_REQUIRED,
@@ -342,7 +336,8 @@ pub(crate) async fn heal_after_rewrite(
         if healed {
             out.healed_store = Some(copies.clone());
         }
-        for purl in inputs.records.keys() {
+        let confirmed: BTreeSet<&String> = inputs.confirmed.iter().map(|(purl, _)| purl).collect();
+        for purl in confirmed {
             // The store's keys are decoded purls: look a `%40scope` record
             // up the way the attribution gate does.
             let base = socket_patch_core::utils::purl_key::canonical_base_purl(purl);
@@ -403,14 +398,13 @@ pub(crate) async fn rollback_heal(
                     dep_id: &t.dep_id,
                     name: &t.name,
                     lock_sha512: sha.as_deref(),
-                    record: t.record.as_ref(),
                     flags: *flags,
                 },
                 t.purl.as_str(),
             )
         })
         .collect();
-    let tally = heal_targets(common, &classified, Expected::Pristine).await;
+    let tally = heal_targets(common, &classified).await;
     let restored: BTreeSet<&str> = targets.iter().map(|t| t.purl.as_str()).collect();
     rollback_detail(&tally, restored.len())
         .map(|detail| (REINSTALL_REQUIRED.to_string(), detail))
@@ -436,14 +430,13 @@ pub(crate) async fn takeover_heal(
                     dep_id: &t.dep_id,
                     name: &t.name,
                     lock_sha512: None,
-                    record: t.record.as_ref(),
                     flags: t.flags,
                 },
                 t.purl.as_str(),
             )
         })
         .collect();
-    let tally = heal_targets(common, &classified, Expected::Pristine).await;
+    let tally = heal_targets(common, &classified).await;
     let vendored: BTreeSet<&str> = targets.iter().map(|t| t.purl.as_str()).collect();
     takeover_detail(&tally, vendored.len())
 }

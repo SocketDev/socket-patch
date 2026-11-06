@@ -13,6 +13,8 @@ use std::path::Path;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
+#[path = "common/patched_wheel.rs"]
+mod patched_wheel;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 
@@ -378,7 +380,7 @@ fn install_package(root: &Path, venv: &str, bytes: &[u8]) -> std::path::PathBuf 
             .join("python3.12")
             .join("site-packages")
     };
-    std::fs::create_dir_all(site.join("urllib3-1.26.18.dist-info")).unwrap();
+    patched_wheel::install_wheel_metadata(&site, "urllib3-1.26.18.dist-info");
     std::fs::create_dir_all(site.join("urllib3")).unwrap();
     let file = site.join("urllib3").join("response.py");
     std::fs::write(&file, bytes).unwrap();
@@ -423,6 +425,24 @@ fn envelope(out: &std::process::Output) -> serde_json::Value {
     })
 }
 
+/// Serve the patched wheel the stale-install probe judges against and pin
+/// it ahead of [`mock_api`]'s grant.
+async fn mock_patched_wheel(server: &MockServer) {
+    let wheel = patched_wheel::build(
+        "urllib3-1.26.18.dist-info",
+        &[("urllib3/response.py", PATCHED)],
+    );
+    patched_wheel::mount_grant(
+        server,
+        ORG,
+        UUID,
+        PURL,
+        "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl",
+        wheel,
+    )
+    .await;
+}
+
 fn stale_warning(value: &serde_json::Value) -> bool {
     // Top-level `warnings` is omitted when empty.
     value["warnings"]
@@ -439,6 +459,7 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
     for bytes in [UPSTREAM, b"local modification\n".as_slice()] {
         let server = MockServer::start().await;
         mock_api(&server).await;
+        mock_patched_wheel(&server).await;
         let tmp = tempfile::tempdir().unwrap();
         write_project(tmp.path());
         let installed = install_package(tmp.path(), ".venv", bytes);
@@ -460,22 +481,18 @@ async fn stale_python_install_warns_and_cannot_attest_even_on_rescan() {
             assert_eq!(json["error"]["code"], "no_applicable_patches", "{json}");
             assert!(!vex.exists(), "stale bytes cannot produce a VEX file");
         }
-        // A failed fresh record fetch leaves the probe no evidence (v5 keeps
-        // no persisted record): the run still succeeds, says the record
-        // could not be fetched, and never attests.
+        // The probe judges by the pinned wheel, never the patch record: a
+        // failing record fetch changes nothing.
         Mock::given(method("GET"))
             .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
             .respond_with(ResponseTemplate::new(404))
             .with_priority(1)
             .mount(&server)
             .await;
-        let out = scan_output(tmp.path(), &server, &[]).await;
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "{stderr}");
-        assert!(
-            stderr.contains("was switched to hosted, but its patch record could not be fetched"),
-            "{stderr}"
-        );
+        let out = scan_output(tmp.path(), &server, &["--json"]).await;
+        let json = envelope(&out);
+        assert!(out.status.success(), "{json}");
+        assert!(stale_warning(&json), "{json}");
         assert_eq!(
             std::fs::read(installed).unwrap(),
             bytes,
@@ -521,6 +538,7 @@ fn install_behind_system_site_venv(root: &Path, bytes: &[u8]) -> std::path::Path
 async fn stale_base_copy_behind_system_site_venv_warns_and_cannot_attest() {
     let server = MockServer::start().await;
     mock_api(&server).await;
+    mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     let installed = install_behind_system_site_venv(tmp.path(), UPSTREAM);
@@ -546,6 +564,7 @@ async fn stale_base_copy_behind_system_site_venv_warns_and_cannot_attest() {
 async fn venv_copy_shadows_stale_base_copy_behind_system_site_venv() {
     let server = MockServer::start().await;
     mock_api(&server).await;
+    mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     install_behind_system_site_venv(tmp.path(), UPSTREAM);
@@ -567,6 +586,7 @@ async fn venv_copy_shadows_stale_base_copy_behind_system_site_venv() {
 async fn patched_python_install_attests_without_a_stale_warning() {
     let server = MockServer::start().await;
     mock_api(&server).await;
+    mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     let installed = install_package(tmp.path(), ".venv", PATCHED);
@@ -588,6 +608,7 @@ async fn patched_python_install_attests_without_a_stale_warning() {
 async fn healthy_interpreter_cannot_mask_a_stale_python_install() {
     let server = MockServer::start().await;
     mock_api(&server).await;
+    mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     install_package(tmp.path(), ".venv", PATCHED);
@@ -609,6 +630,7 @@ async fn healthy_interpreter_cannot_mask_a_stale_python_install() {
 async fn python_probe_does_not_guess_staleness_or_run_on_dry_run() {
     let server = MockServer::start().await;
     mock_api(&server).await;
+    mock_patched_wheel(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_project(tmp.path());
     let installed = install_package(tmp.path(), ".venv", UPSTREAM);

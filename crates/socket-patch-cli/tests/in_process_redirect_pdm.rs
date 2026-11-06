@@ -33,6 +33,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[allow(clippy::duplicate_mod)]
 #[path = "common/fs_tree.rs"]
 mod fs_tree;
+#[path = "common/patched_wheel.rs"]
+mod patched_wheel;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -546,17 +548,22 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         "pyproject untouched"
     );
     assert_no_ledger(tmp.path());
-    // Confirmed despite the hatch backend: the record was fetched.
-    let views = server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
+    // Confirmed despite the hatch backend: an idempotent re-scan reports
+    // the hosted pin.
+    let (code, json) = scan_json(tmp.path(), &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    let pinned = json["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
         .count();
     assert_eq!(
-        views, 1,
-        "the pdm redirect must be confirmed despite the hatch backend"
+        pinned, 1,
+        "the pdm redirect must be confirmed despite the hatch backend: {json}"
     );
     assert_manifestless_vex(tmp.path(), LOCK);
 
@@ -708,7 +715,7 @@ fn stale_warning(json: &serde_json::Value) -> bool {
 
 /// Lay `urllib3 1.26.18` with `bytes` as its `response.py` into `site`.
 fn install_urllib3(site: &Path, bytes: &[u8]) {
-    std::fs::create_dir_all(site.join("urllib3-1.26.18.dist-info")).unwrap();
+    patched_wheel::install_wheel_metadata(site, "urllib3-1.26.18.dist-info");
     std::fs::create_dir_all(site.join("urllib3")).unwrap();
     std::fs::write(site.join("urllib3").join("response.py"), bytes).unwrap();
 }
@@ -725,6 +732,20 @@ async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
     for pep582 in [false, true] {
         let server = MockServer::start().await;
         mock_api(&server).await;
+        // The patched wheel the stale-install probe judges against.
+        let wheel = patched_wheel::build(
+            "urllib3-1.26.18.dist-info",
+            &[("urllib3/response.py", PATCHED)],
+        );
+        patched_wheel::mount_grant(
+            &server,
+            ORG,
+            UUID,
+            PURL,
+            "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl",
+            wheel,
+        )
+        .await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("app");
         std::fs::create_dir_all(&root).unwrap();

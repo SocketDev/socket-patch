@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
@@ -178,7 +178,7 @@ impl VexEmbedArgs {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: None,
-            hosted_records: Default::default(),
+            hosted_uuids: Vec::new(),
         }
     }
 }
@@ -232,12 +232,12 @@ pub(crate) struct VexBuildParams {
     /// choice and order are unchanged. Ignored when taken with other crawler
     /// options. The standalone `vex` passes `None` and walks the tree.
     pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
-    /// Embedded hosted `scan --vex` only: the patch records THIS RUN
-    /// fetched for the pins it confirmed, keyed by purl. v5 hosted mode
-    /// keeps no ledger, so these are the in-run attestation's hosted
-    /// records (the post-install standalone `vex` fetches them from the
-    /// API instead). Empty everywhere else.
-    pub hosted_records: std::collections::BTreeMap<String, PatchRecord>,
+    /// Embedded hosted `scan --vex` only: the uuids of the pins THIS RUN
+    /// confirmed. v5 hosted mode keeps no ledger, so the plan fetches their
+    /// records as the in-run attestation's hosted records (the post-install
+    /// standalone `vex` finds them through the lockfiles instead). Empty
+    /// everywhere else.
+    pub hosted_uuids: Vec<String>,
     /// The run's API client (see [`RunApiClient`]): seeded by a host
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
@@ -373,7 +373,7 @@ pub async fn run(args: VexArgs) -> i32 {
         dry_run: args.common.dry_run,
         product_flag: "--product",
         npm_prior: None,
-        hosted_records: Default::default(),
+        hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
     };
 
@@ -1813,21 +1813,13 @@ async fn generate_vex_from_manifest_path_inner(
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
-    // This run's hosted records (embedded hosted `scan --vex`) join a
-    // pre-v5 ledger's as the hosted record source, newest wins.
-    let redirect = if params.hosted_records.is_empty() {
-        redirect
-    } else {
-        let mut state =
-            redirect.unwrap_or_else(socket_patch_core::patch::redirect::RedirectState::new);
-        state.records.extend(params.hosted_records.clone());
-        Some(state)
-    };
     let sources = Sources {
         manifest: manifest_file.unwrap_or_else(PatchManifest::new),
         vendor,
         redirect,
         discovery,
+        // Their records join a pre-v5 ledger's as the hosted record source.
+        hosted_uuids: params.hosted_uuids.clone(),
     };
     if sources.is_empty() {
         // A discovery diagnostic (an unparseable lock, a rejected reference)
@@ -2579,7 +2571,7 @@ mod npm_prior_tests {
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: prior,
-            hosted_records: Default::default(),
+            hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
         };
         let manifest_path = common.resolved_manifest_path();
@@ -2653,6 +2645,7 @@ mod npm_prior_tests {
 mod mirror_refusal_tests {
     use super::*;
     use crate::commands::vex_sources::HostedWiring;
+    use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::{BTreeMap, HashSet};
 
     /// The current scan can refuse routing while VEX rediscovers an older pin

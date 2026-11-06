@@ -17,9 +17,7 @@ use napi_derive::napi;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use socket_patch_core::api::client::{sort_batch_response, ApiError, ApiFuture, PatchApi};
-use socket_patch_core::api::types::{
-    BatchSearchResponse, PackageVendorResult, PatchResponse, SearchResponse,
-};
+use socket_patch_core::api::types::{BatchSearchResponse, PackageVendorResult, SearchResponse};
 
 type JsonCall = ThreadsafeFunction<String, Promise<String>, String, Status, false>;
 type DownloadCall = ThreadsafeFunction<String, Promise<NativeDownload>, String, Status, false>;
@@ -42,7 +40,6 @@ pub(crate) struct ProviderRefs {
     pub(crate) search_patches_batch: JsonRef,
     pub(crate) search_patches_by_package: JsonRef,
     pub(crate) fetch_registry_references: JsonRef,
-    pub(crate) fetch_patch: JsonRef,
     pub(crate) download_artifact: DownloadRef,
 }
 
@@ -50,7 +47,6 @@ pub(crate) struct JsPatchApi {
     search_patches_batch: JsonCall,
     search_patches_by_package: JsonCall,
     fetch_registry_references: JsonCall,
-    fetch_patch: JsonCall,
     download_artifact: DownloadCall,
 }
 
@@ -71,7 +67,6 @@ impl JsPatchApi {
             search_patches_batch: json_call(env, &refs.search_patches_batch)?,
             search_patches_by_package: json_call(env, &refs.search_patches_by_package)?,
             fetch_registry_references: json_call(env, &refs.fetch_registry_references)?,
-            fetch_patch: json_call(env, &refs.fetch_patch)?,
             download_artifact: refs
                 .download_artifact
                 .borrow_back(env)?
@@ -233,16 +228,6 @@ impl PatchApi for JsPatchApi {
             {
                 Reply::Value(value) => Ok(value.ok_or_else(|| missing_value(method))?.results),
                 Reply::NotFound(_) => Ok(HashMap::new()),
-            }
-        })
-    }
-
-    fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
-        Box::pin(async move {
-            let request = serde_json::json!({ "uuid": uuid }).to_string();
-            match call_json("fetchPatch", &self.fetch_patch, request).await? {
-                Reply::Value(value) => Ok(value),
-                Reply::NotFound(_) => Ok(None),
             }
         })
     }

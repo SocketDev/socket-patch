@@ -2770,9 +2770,6 @@ pub trait PatchApi: Send + Sync {
         uuids: &'a [String],
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>>;
 
-    /// `GET …/patches/view/<uuid>`; `None` when not found.
-    fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>>;
-
     /// Download a grant-tokenized artifact URL, refusing bodies over
     /// `max_bytes`.
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>>;
@@ -2799,10 +2796,6 @@ impl PatchApi for ApiClient {
         uuids: &'a [String],
     ) -> ApiFuture<'a, std::collections::HashMap<String, PackageVendorResult>> {
         Box::pin(ApiClient::fetch_registry_references(self, uuids))
-    }
-
-    fn fetch_patch<'a>(&'a self, uuid: &'a str) -> ApiFuture<'a, Option<PatchResponse>> {
-        Box::pin(ApiClient::fetch_patch(self, uuid))
     }
 
     fn download_artifact<'a>(&'a self, url: &'a str, max_bytes: u64) -> ApiFuture<'a, Vec<u8>> {

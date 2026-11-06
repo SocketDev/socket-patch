@@ -343,7 +343,10 @@ async fn vlt_pinned_matrix_hosted_heal_rule_b_hidden_lock_without_node() {
     fx.leg.ran();
 }
 
-/// Heal rule (c): no hidden lock, the record's afterHash decides.
+/// Heal rule (c): no hidden lock. Hosted scans no longer fetch patch
+/// records, so nothing records which bytes the installed copies hold: they
+/// are kept, and the advisory says to run `vlt ci`, which installs the
+/// patched packages.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_heal_rule_c_no_hidden_lock() {
@@ -353,19 +356,19 @@ async fn vlt_pinned_matrix_hosted_heal_rule_c_no_hidden_lock() {
     let fx = Fixture::build(leg, Shape::with_bystander().warm()).await;
     let _ = std::fs::remove_file(fx.proj.join(HIDDEN_LOCK));
     let ids = fx.store_ids(fx.t());
-    let snap = fx.snapshot(&fx.proj, &ids);
     let doc = fx.scan(&[]);
-    fx.assert_advisory(&doc, &advisory_invalidated(ids.len()));
+    fx.assert_advisory(&doc, &advisory_undeterminable(ids.len()));
     for id in &ids {
-        assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
+        assert!(store_entry(&fx.proj, id).exists(), "{id} kept");
     }
-    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the rule (c) heal");
     assert!(
         store_entry(&fx.proj, &node_id(&read_lock(&fx.proj), MS.0, MS.1)).exists(),
         "the bystander is healthy"
     );
-    fx.vlt_ok(&fx.proj, &["install"]);
-    assert_eq!(state(&fx.proj, fx.t()), State::Patched);
+    if fx.leg.at_least(HAS_CI_FROM) {
+        fx.vlt_ok(&fx.proj, &["ci"]);
+        assert_eq!(state(&fx.proj, fx.t()), State::Patched);
+    }
     fx.leg.ran();
 }
 

@@ -3584,19 +3584,6 @@ pub fn guard(
         .map(|rel| unreadable_refusal(rel))
 }
 
-/// The `record_fetch_failed` warning for a confirmed redirect whose patch
-/// record could not be fetched.
-pub fn record_fetch_failed_warning(purl: &str) -> RewriteWarning {
-    warning(
-        "record_fetch_failed",
-        format!(
-            "{purl} was switched to hosted, but its patch record could not be \
-             fetched; this run's VEX attestation omits it (`socket-patch vex` \
-             fetches it again once the API answers)"
-        ),
-    )
-}
-
 /// A `{code, detail}` warning.
 pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
     RewriteWarning {
