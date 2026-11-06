@@ -1,20 +1,27 @@
 //! Socket origin: whether a string a lockfile or package-manager config
 //! records routes a package to a Socket patch, and to which one.
 //!
-//! This is the one classifier every reader applies:
+//! The goal is one classifier that every reader applies. Today discovery and
+//! the redirect's hosted unwind apply it, but some readers still classify
+//! on their own: the lock inventory's PyPI view
+//! (`vendor::lock_inventory::pypi::hosted_pypi_reference`) adds its own
+//! url-tail grammar, discovery's PyPI diagnostics (`vex::discover::pypi_other`)
+//! compare hosts directly, the upstream restore keeps its own known-origin
+//! list, and the inventory matches hosted urls on any host. The lock-model
+//! stack moves them here (`docs/design/lock-model-unification.md`).
 //!
 //! * **hosted** — [`hosted_patch_uuid`]: an `http(s)` url on Socket's patch
 //!   server or on an operator-configured origin, the patch uuid its last
-//!   canonical-uuid path segment. [`OriginPolicy::hosted_uuid`] answers the
+//!   canonical-uuid path segment. `OriginPolicy::hosted_uuid` answers the
 //!   same question with a memoized fast path for the plain registry urls
 //!   every lock is full of;
 //! * **vendored** — [`vendor_ref`] / [`vendor_ref_decorated`] /
 //!   [`vendor_uuid_dir`]: a path that STARTS at this project's
 //!   `.socket/vendor/<eco>/<uuid>/`, its leaf traversal-safe;
-//! * **names** — [`socket_patch_name_uuid`]: the `socket-patch-<uuid>`
+//! * **names** — `socket_patch_name_uuid`: the `socket-patch-<uuid>`
 //!   registry, repository and source names.
 //!
-//! [`OriginPolicy::locate`] computes the hosted and vendored answers for one
+//! `OriginPolicy::locate` computes the hosted and vendored answers for one
 //! string at once.
 //!
 //! The format models ([`crate::formats`]) stay pure: they hand out the raw
@@ -74,7 +81,6 @@ pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> 
 /// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
 /// the malformed or rejected shapes whose "last uuid" is not a patch.
 pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
-    use crate::patch::path_safety::is_canonical_uuid;
     use crate::utils::purl::percent_decode_purl_component;
 
     let unescaped = url.trim().replace("\\/", "/");
@@ -174,8 +180,11 @@ fn plain_url_domain(url: &str) -> Option<String> {
 #[derive(Debug)]
 pub(crate) struct OriginPolicy<'a> {
     origins: &'a [String],
-    /// The hosts a Socket-hosted url can name (see [`Self::hosted_uuid`]).
+    /// The hosts a Socket-hosted url can name, lowercased (see
+    /// [`Self::hosts`]).
     hosts: OnceLock<BTreeSet<String>>,
+    /// [`Self::hosts`] as an ASCII-case-insensitive matcher.
+    host_finder: OnceLock<aho_corasick::AhoCorasick>,
 }
 
 impl<'a> OriginPolicy<'a> {
@@ -183,12 +192,40 @@ impl<'a> OriginPolicy<'a> {
         OriginPolicy {
             origins,
             hosts: OnceLock::new(),
+            host_finder: OnceLock::new(),
         }
     }
 
     /// The configured extra origins.
     pub(crate) fn origins(&self) -> &'a [String] {
         self.origins
+    }
+
+    /// The hosts a Socket-hosted url can name: Socket's patch server and
+    /// each configured origin's host, lowercased. Built once per policy.
+    fn hosts(&self) -> &BTreeSet<String> {
+        self.hosts.get_or_init(|| {
+            let mut hosts = BTreeSet::from([SOCKET_PATCH_SERVER_HOST.to_string()]);
+            hosts.extend(self.origins.iter().filter_map(|o| {
+                reqwest::Url::parse(o.trim())
+                    .ok()?
+                    .host_str()
+                    .map(str::to_ascii_lowercase)
+            }));
+            hosts
+        })
+    }
+
+    /// A matcher for any of [`Self::hosts`] in any ASCII case: the cheap
+    /// pre-filter of discovery's identity sweep (only a token naming an
+    /// accepted host can be ours). Built once per policy.
+    pub(crate) fn host_finder(&self) -> &aho_corasick::AhoCorasick {
+        self.host_finder.get_or_init(|| {
+            aho_corasick::AhoCorasick::builder()
+                .ascii_case_insensitive(true)
+                .build(self.hosts())
+                .expect("literal host patterns")
+        })
     }
 
     /// The patch uuid of a Socket-HOSTED url, or `None` for anything else
@@ -200,17 +237,7 @@ impl<'a> OriginPolicy<'a> {
     /// here.
     pub(crate) fn hosted_uuid(&self, url: &str) -> Option<String> {
         if let Some(host) = plain_url_domain(url) {
-            let hosts = self.hosts.get_or_init(|| {
-                let mut hosts = BTreeSet::from([SOCKET_PATCH_SERVER_HOST.to_string()]);
-                hosts.extend(self.origins.iter().filter_map(|o| {
-                    reqwest::Url::parse(o.trim())
-                        .ok()?
-                        .host_str()
-                        .map(str::to_string)
-                }));
-                hosts
-            });
-            if !hosts.contains(&host) {
+            if !self.hosts().contains(&host) {
                 return None;
             }
         }
@@ -241,7 +268,7 @@ impl<'a> OriginPolicy<'a> {
 /// maven `<repository><id>`, nuget `<add key>`) or, with
 /// `vendored = true`, `socket-patch-vendor-<uuid>` (maven's vendored repo
 /// id). Exact grammar only — a suffix or a non-canonical uuid is not ours.
-pub fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
+pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
     crate::patch::redirect::generation::pin_name_uuid(name.trim(), vendored).map(str::to_string)
 }
 

@@ -116,7 +116,7 @@ use toml_edit::DocumentMut;
 use super::{
     mentions_vendor_dir, pypi_purl, toml_or_diag, vendored_leaf_purl, DiscoverCtx, Discovery,
     LocateOpts, PatchedRef, TomlDiag, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID,
+    DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID, SOCKET_PATCH_SERVER_HOST,
 };
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::sha256_hex;
@@ -572,9 +572,7 @@ fn classify(ctx: &DiscoverCtx<'_>, location: &str, uri: bool) -> Result<Option<W
             "{location:?} is not a root-anchored .socket/vendor/pypi/<uuid>/<wheel> path"
         ));
     }
-    if reqwest::Url::parse(location)
-        .is_ok_and(|u| u.host_str() == Some(crate::patch::redirect::SOCKET_PATCH_SERVER_HOST))
-    {
+    if reqwest::Url::parse(location).is_ok_and(|u| u.host_str() == Some(SOCKET_PATCH_SERVER_HOST)) {
         return Err(format!(
             "{location:?} is a Socket patch-server url that names no patch uuid"
         ));

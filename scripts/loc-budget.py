@@ -220,9 +220,18 @@ def _attrs_before(src: str, kind: bytearray, pos: int) -> tuple[int, list[str]]:
     return pos, attrs
 
 
-def _starts_item(src: str, kind: bytearray, j: int) -> bool:
+def _prev_code(src: str, kind: bytearray, j: int) -> int:
+    while j >= 0 and (kind[j] == COMMENT or src[j].isspace()):
+        j -= 1
+    return j
+
+
+def _starts_item(src: str, kind: bytearray, j: int, in_list: bool = False) -> bool:
     """Whether the code at ``j`` is an item or statement, rather than a
-    struct field, enum variant, parameter or match arm."""
+    struct field, enum variant, parameter, generic parameter or match arm.
+
+    ``in_list`` says the attribute follows a ``<`` or ``,``, where an item
+    can't start, so ``const N: usize`` there is a const generic parameter."""
     n = len(src)
     while True:
         j = _next_code(src, kind, j)
@@ -240,8 +249,9 @@ def _starts_item(src: str, kind: bytearray, j: int) -> bool:
     if not m:
         return False
     word, after = m.group(0), _next_code(src, kind, m.end())
-    if word == "pub":
-        if after < n and src[after] == "(":
+    # `crate name: Type` is a crate-visible field, but `crate::f()` is a path.
+    if word == "pub" or (word == "crate" and IDENT.match(src, after)):
+        if word == "pub" and after < n and src[after] == "(":
             after = _next_code(src, kind, (_match_close(src, kind, after) or after) + 1)
         m = IDENT.match(src, after)
         if not m:
@@ -249,10 +259,12 @@ def _starts_item(src: str, kind: bytearray, j: int) -> bool:
         word, after = m.group(0), _next_code(src, kind, m.end())
         # `pub name: Type` is a field.
         return word in ITEM_KEYWORDS or not (src.startswith(":", after) and not src.startswith("::", after))
+    if word == "const" and in_list:
+        return False  # `const N: usize` in a generic parameter list
     return word in ITEM_KEYWORDS or (after < n and src[after] == "!")  # or a macro call
 
 
-def _item_end(src: str, kind: bytearray, pos: int) -> int:
+def _item_end(src: str, kind: bytearray, pos: int, in_list: bool = False) -> int:
     """End of the item that starts at ``pos``.
 
     An item ends at its first top-level ``;``, at the brace closing its first
@@ -261,7 +273,7 @@ def _item_end(src: str, kind: bytearray, pos: int) -> int:
     ends at its first top-level ``,``.
     """
     n = len(src)
-    is_field = not _starts_item(src, kind, pos)
+    is_field = not _starts_item(src, kind, pos, in_list)
     depth, angle, in_expr = 0, 0, False
     for j in range(pos, n):
         if kind[j] != CODE:
@@ -345,8 +357,10 @@ def count_source(src: str) -> FileCount:
                 excluded = bytearray(b"\x01" * n)
                 break
             continue
-        end = _item_end(src, kind, attr_end + 1)
         start, _ = _attrs_before(src, kind, start)
+        prev = _prev_code(src, kind, start - 1)
+        in_list = prev >= 0 and kind[prev] == CODE and src[prev] in "<,"
+        end = _item_end(src, kind, attr_end + 1, in_list)
         test_mods.extend(_file_mods(src, kind, start, end))
         excluded[start:end] = b"\x01" * (end - start)
 
