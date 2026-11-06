@@ -282,9 +282,8 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::CargoPatchBypassed => (
             NOTE_CARGO_PATCH_BYPASSED,
-            "not attested while that copy builds; the vendored wiring itself is intact, so \
-             re-running `vendor` does not change this (declare the crate from crates.io \
-             there, or roll the patch back)",
+            "not attested while that copy can build beside the vendored one; the vendored \
+             wiring itself is intact (the warning above says how to clear it)",
         ),
     }
 }
@@ -1874,7 +1873,7 @@ mod tests {
                 .iter()
                 .any(|n| n.code == NOTE_CARGO_PATCH_BYPASSED
                     && n.detail.contains("from registry `my-corp`")
-                    && n.detail.contains("re-running `vendor`")),
+                    && n.detail.contains("says how to clear it")),
             "{:?}",
             gated.notes
         );

@@ -153,10 +153,11 @@ use crate::patch::redirect::generation::{hosted_pin_name, PIN_NAME_PREFIX};
 use crate::patch::redirect::{cargo_req_selects, CargoReqMatch};
 use crate::utils::digest::is_hex64_lower;
 use crate::vendor::cargo_config::{
-    effective_config_rel_in, patch_entries, registry_definitions, CargoPatchEntry, CONFIG_LEGACY,
-    CONFIG_TOML,
+    effective_config_rel_in, patch_entries, registry_definitions, CONFIG_LEGACY, CONFIG_TOML,
 };
-use crate::vendor::cargo_manifest::{crates_io_url_alias_tables, is_crates_io_source};
+use crate::vendor::cargo_manifest::{
+    crates_io_url_alias_tables, is_crates_io_source, is_crates_io_url_alias,
+};
 use crate::vendor::cargo_tag;
 use crate::vendor::lock_inventory::LockIntegrity;
 
@@ -179,14 +180,27 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let config = read_config(ctx, out).await;
     // The root manifest, then every workspace member's — the manifests the
     // hosted rewriter pins a crate in (each that declares it).
+    // Every `[patch]` entry pointing at a Socket copy, the root manifest's
+    // (with why cargo ignores it, if it does) and then the config's.
+    let mut wired_all: Vec<(WiredCopy, Option<String>)> = Vec::new();
+    let mut shadow: Option<Shadow> = None;
+    if let Some(doc) = &root {
+        let s = Shadow::new(doc, config.as_ref());
+        wired_all.extend(socket_copies(doc).into_iter().map(|w| {
+            let why = s.why(&w.table, &w.key, Some(&w.path));
+            (w, why)
+        }));
+        shadow = Some(s);
+    }
+    if let Some((_, doc)) = &config {
+        wired_all.extend(socket_copies(doc).into_iter().map(|w| (w, None)));
+    }
     let mut manifests: Vec<(String, DocumentMut)> = Vec::new();
     if let Some(doc) = root {
         let root_pins = manifest_has_socket_pin(&doc);
         // A vendored copy wired in the root or the config is weighed against
         // every member's declarations ([`patch_bypassed`]).
-        let vendored = std::iter::once(&doc)
-            .chain(config.iter().map(|(_, c)| c))
-            .any(|d| !socket_copies(d).is_empty());
+        let vendored = !wired_all.is_empty();
         manifests.push((CARGO_TOML.to_string(), doc));
         manifests.extend(read_members(ctx, &lock, root_pins, vendored, out).await);
     }
@@ -232,10 +246,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if let Some(decls) = &decls {
         unresolved_manifest_pins(ctx, &lock, decls, &definitions, out);
     }
-    let wired: Vec<(String, VendorRef)> = manifest
-        .into_iter()
-        .chain(config.iter().map(|(_, doc)| doc))
-        .flat_map(socket_copies)
+    // Only the entries cargo honors redirect declarations to a copy: a
+    // shadowed manifest entry covers nothing (cargo builds whatever replaced
+    // it).
+    let wired: Vec<WiredCopy> = wired_all
+        .iter()
+        .filter(|(_, why)| why.is_none())
+        .map(|(w, _)| w.clone())
         .collect();
     let bypass = Bypass {
         lock: &lock,
@@ -243,56 +260,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         wired: &wired,
     };
     if let Some(doc) = manifest {
-        // Cargo drops a manifest crates.io `[patch]` item that the project
-        // config redefines under the same key (any version), and a
-        // `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
-        // wholesale — a Socket entry there is dead wiring, never attested.
-        let config_keys: Vec<(&str, String, Option<String>)> = config
-            .iter()
-            .flat_map(|(file, doc)| {
-                patch_entries(doc)
-                    .into_iter()
-                    .filter(|e| is_crates_io_source(e.source))
-                    .map(move |e| (*file, e.key.to_string(), e.path.map(same_path_key)))
-            })
-            .collect();
-        let aliases = crates_io_url_alias_tables(doc);
-        let shadowed = |entry: &CargoPatchEntry<'_>| -> Option<String> {
-            if !is_crates_io_source(entry.source) {
-                return None;
-            }
-            if let (true, Some(alias)) = (entry.source == "crates-io", aliases.first()) {
-                return Some(format!(
-                    "the `[patch.\"{alias}\"]` table replaces `[patch.crates-io]` in cargo"
-                ));
-            }
-            // The same key wiring the same copy (a half-migrated project)
-            // is not a shadow: the config's own ref carries it.
-            let own = entry.path.map(same_path_key);
-            config_keys
-                .iter()
-                .find(|(_, key, path)| key == entry.key && *path != own)
-                .map(|(file, key, _)| {
-                    format!("{file} redefines `[patch]` key `{key}`, which replaces it in cargo")
-                })
-        };
-        vendored_from_patches(ctx, CARGO_TOML, doc, &lock, &shadowed, &bypass, out).await;
+        vendored_from_patches(ctx, CARGO_TOML, doc, &lock, shadow.as_ref(), &bypass, out).await;
     }
     if let Some((file, doc)) = &config {
-        vendored_from_patches(ctx, file, doc, &lock, &|_| None, &bypass, out).await;
+        vendored_from_patches(ctx, file, doc, &lock, None, &bypass, out).await;
     }
-    let copies: Vec<VendorRef> = wired.into_iter().map(|(_, v)| v).collect();
+    let copies: Vec<VendorRef> = wired_all.into_iter().map(|(w, _)| w.vref).collect();
     unattributed_tags(&lock, &copies, out);
-}
-
-/// Every Socket copy a file's `[patch]` tables point at, with the
-/// `[patch.<source>]` table pointing at it.
-fn socket_copies(doc: &DocumentMut) -> Vec<(String, VendorRef)> {
-    patch_entries(doc)
-        .into_iter()
-        .filter_map(|e| Some((e.source.to_string(), e.path.and_then(vendor_ref)?)))
-        .filter(|(_, v)| v.eco == "cargo")
-        .collect()
 }
 
 /// Diagnose Socket-tagged sourceless lock entries that no visible
@@ -550,24 +524,40 @@ impl Decl {
     }
 
     /// Whether the `[patch.<table>]` table redirects this declaration:
-    /// a registry dependency of that registry (`crates-io`, or a crates.io
-    /// URL alias, for one with no `registry`), or a git dependency of that
-    /// repository URL (a trailing `/` or `.git` ignored; any other
-    /// difference reads as another repository, so at worst a missed
-    /// redirect).
+    ///
+    /// * a registry dependency of that registry (`crates-io`, or a
+    ///   crates.io URL alias, for one with no `registry`);
+    /// * a `registry-index` dependency of that index URL ([`index_key`]);
+    ///   one naming the crates.io git index is crates.io itself (the same
+    ///   cargo source), so `[patch.crates-io]` redirects it too;
+    /// * a git dependency of that repository ([`git_key`], cargo's
+    ///   canonical spelling).
+    ///
+    /// Any other difference reads as another source: at worst a missed
+    /// redirect, so a withheld statement, never a false one.
     fn patched_by(&self, table: &str) -> bool {
-        fn git_key(url: &str) -> &str {
-            let url = url.trim().trim_end_matches('/');
-            url.strip_suffix(".git").unwrap_or(url)
-        }
         match &self.source {
             DeclSource::Registry => match self.registry.as_deref() {
                 None => is_crates_io_source(table),
                 Some(reg) => reg.trim() == table,
             },
-            DeclSource::Git(url) => !url.trim().is_empty() && git_key(url) == git_key(table),
-            _ => false,
+            DeclSource::RegistryIndex(url) => {
+                (is_crates_io_url_alias(url) && is_crates_io_source(table))
+                    || index_key(url).is_some_and(|k| index_key(table) == Some(k))
+            }
+            DeclSource::Git(url) => git_key(url).is_some_and(|k| git_key(table) == Some(k)),
+            DeclSource::Path | DeclSource::Patch(_) => false,
         }
+    }
+
+    /// "`<file>` declares `<name>` `<requirement>` from `<source>`", for
+    /// messages.
+    fn describe(&self, name: &str) -> String {
+        let req = self
+            .version
+            .as_deref()
+            .map_or_else(|| "with no version".to_string(), |v| format!("{v:?}"));
+        format!("{} declares {name} {req} from {}", self.file, self.origin())
     }
 
     /// Where cargo takes this dependency from, for messages.
@@ -580,6 +570,77 @@ impl Decl {
             (_, None) => "crates.io".to_string(),
         }
     }
+}
+
+/// `url` with its scheme and host lowercased (both are case-insensitive),
+/// trimmed, or `None` when empty.
+fn lower_host(url: &str) -> Option<String> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let host_end = url.find("://").map(|s| s + 3).map_or(0, |start| {
+        start + url[start..].find('/').unwrap_or(url.len() - start)
+    });
+    Some(format!(
+        "{}{}",
+        url[..host_end].to_ascii_lowercase(),
+        &url[host_end..]
+    ))
+}
+
+/// A git repository URL as cargo's `CanonicalUrl` spells it: one trailing
+/// `/` dropped, a GitHub URL lowercased whole (GitHub paths are
+/// case-insensitive), a trailing `.git` dropped. `None` when empty.
+fn git_key(url: &str) -> Option<String> {
+    let mut url = lower_host(url)?;
+    if url.ends_with('/') {
+        url.pop();
+    }
+    let github = url
+        .split_once("://")
+        .is_some_and(|(_, rest)| rest.split('/').next() == Some("github.com"));
+    if github {
+        url = url.to_ascii_lowercase();
+    }
+    if let Some(stripped) = url.strip_suffix(".git") {
+        url = stripped.to_string();
+    }
+    Some(url)
+}
+
+/// A registry index URL for comparison: a `registry+` prefix (the lock's
+/// spelling of a git index) dropped, a `sparse+` one kept (a sparse index
+/// is another cargo source than the git index at the same URL), the host
+/// lowercased and a trailing `/` dropped. `None` when empty.
+fn index_key(url: &str) -> Option<String> {
+    let url = url.trim();
+    let url = url.strip_prefix("registry+").unwrap_or(url);
+    let (sparse, url) = match url.strip_prefix("sparse+") {
+        Some(rest) => ("sparse+", rest),
+        None => ("", url),
+    };
+    let url = lower_host(url)?;
+    Some(format!("{sparse}{}", url.trim_end_matches('/')))
+}
+
+/// The source of a lock entry of `name` at exactly `version` that is not a
+/// Socket patch server's: a copy cargo builds from crates.io, another
+/// registry or git beside the patched one.
+fn same_version_foreign_entry<'l>(
+    ctx: &DiscoverCtx<'_>,
+    lock: &'l Lock,
+    name: &str,
+    version: &str,
+) -> Option<&'l str> {
+    lock.packages()
+        .iter()
+        .filter(|p| p.name == name && p.version == version)
+        .find_map(|p| {
+            p.source
+                .as_deref()
+                .filter(|s| source_uuid(ctx, s).is_none())
+        })
 }
 
 /// Crate name → its declarations ([`Decl`]).
@@ -932,13 +993,7 @@ fn beside_the_pin(
     out: &mut Discovery,
 ) {
     let same_name = || lock.packages().iter().filter(|p| p.name == pkg.name);
-    let twin = same_name().any(|p| {
-        p.version == pkg.version
-            && p.source
-                .as_deref()
-                .is_some_and(|s| source_uuid(ctx, s).is_none())
-    });
-    if twin {
+    if same_version_foreign_entry(ctx, lock, &pkg.name, &pkg.version).is_some() {
         return;
     }
     let others = distinct(
@@ -986,13 +1041,7 @@ fn beside_the_pin(
     };
     let declared = unpinned
         .iter()
-        .map(|(d, _)| {
-            let req = d
-                .version
-                .as_deref()
-                .map_or_else(|| "with no version".to_string(), |v| format!("{v:?}"));
-            format!("{} declares {} {req} from {}", d.file, pkg.name, d.origin())
-        })
+        .map(|(d, _)| d.describe(&pkg.name))
         .collect::<Vec<_>>()
         .join(", and ");
     // What a re-scan can do: the hosted rewriter pins a crates.io
@@ -1158,19 +1207,52 @@ fn unresolved_manifest_pins(
                 ),
             );
         }
+        // A well-formed Socket registry that pins nothing: say so, since the
+        // file reads like wiring.
+        let mut ineffective: Vec<(&str, String)> = Vec::new();
+        for d in regs
+            .iter()
+            .filter(|d| d.socket_uuid().is_some() && (d.pin().is_none() || !d.live))
+        {
+            let why = if d.live {
+                format!(
+                    "cargo builds it from {}, whatever `registry` says",
+                    d.origin()
+                )
+            } else {
+                "no manifest inherits that `[workspace.dependencies]` entry".to_string()
+            };
+            if !ineffective.contains(&(d.file.as_str(), why.clone())) {
+                ineffective.push((d.file.as_str(), why));
+            }
+        }
+        for (file, why) in ineffective {
+            out.diag(
+                DIAG_REF_INVALID,
+                file,
+                format!("{file}: {name}'s Socket patch registry pins nothing there: {why}"),
+            );
+        }
         if uuids.is_empty() {
             continue;
         }
-        let socket_sourced = lock.packages().iter().any(|p| {
-            p.name == *name
-                && p.source
-                    .as_deref()
-                    .and_then(|s| source_uuid(ctx, s))
-                    .is_some()
-        });
-        if socket_sourced {
-            continue; // a ref (or the conflict pair) came from the lock
-        }
+        // Patches the lock resolves the crate from, and those a ref
+        // already carries (the lock's, or a conflict pair beside it).
+        let locked_from: Vec<String> = lock
+            .packages()
+            .iter()
+            .filter(|p| p.name == *name)
+            .filter_map(|p| p.source.as_deref().and_then(|s| source_uuid(ctx, s)))
+            .collect();
+        let carried = |uuid: &str| {
+            locked_from.iter().any(|u| u == uuid)
+                || out.refs.iter().any(|r| {
+                    r.uuid == uuid
+                        && crate::utils::purl::purl_parts(&r.purl)
+                            .is_some_and(|(ty, n, _)| ty == "cargo" && n == *name)
+                })
+        };
+        let uuids: Vec<String> = uuids.into_iter().filter(|u| !carried(u)).collect();
         for uuid in &uuids {
             let pinning: Vec<&Decl> = live
                 .iter()
@@ -1225,6 +1307,11 @@ fn unresolved_manifest_pins(
                     }
                     format!("there is no {CARGO_LOCK} to fix its version")
                 }
+                Lock::Parsed { .. } if !locked_from.is_empty() => format!(
+                    "{CARGO_LOCK} resolves it only from other Socket patches, at versions \
+                     this pin's requirement excludes (a stale lock: the next build \
+                     re-resolves this declaration)"
+                ),
                 Lock::Parsed { .. } => format!(
                     "{CARGO_LOCK} does not resolve it from a Socket patch server (a stale \
                      lock, or a patch server outside the allowlist — see \
@@ -1282,6 +1369,81 @@ async fn copy_tag(ctx: &DiscoverCtx<'_>, artifact_rel: &str, out: &mut Discovery
     }
 }
 
+/// One `[patch.<table>]` entry that points at a Socket copy.
+#[derive(Debug, Clone)]
+struct WiredCopy {
+    table: String,
+    key: String,
+    path: String,
+    vref: VendorRef,
+}
+
+/// Every Socket copy a file's `[patch]` tables point at.
+fn socket_copies(doc: &DocumentMut) -> Vec<WiredCopy> {
+    patch_entries(doc)
+        .into_iter()
+        .filter_map(|e| {
+            let path = e.path?;
+            let vref = vendor_ref(path).filter(|v| v.eco == "cargo")?;
+            Some(WiredCopy {
+                table: e.source.to_string(),
+                key: e.key.to_string(),
+                path: path.to_string(),
+                vref,
+            })
+        })
+        .collect()
+}
+
+/// Why cargo ignores a root-manifest `[patch]` entry, if it does: a
+/// `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
+/// wholesale, and a project-config crates.io `[patch]` item with the same
+/// key replaces the manifest's (unless it wires the same path, the
+/// half-migrated shape attested through the config). Config entries are
+/// never shadowed.
+struct Shadow {
+    /// The manifest's `[patch."<crates.io URL>"]` table keys.
+    aliases: Vec<String>,
+    /// The config's crates.io `[patch]` items: (file, key, path).
+    config_keys: Vec<(&'static str, String, Option<String>)>,
+}
+
+impl Shadow {
+    fn new(manifest: &DocumentMut, config: Option<&(&'static str, DocumentMut)>) -> Self {
+        let config_keys = config
+            .into_iter()
+            .flat_map(|(file, doc)| {
+                patch_entries(doc)
+                    .into_iter()
+                    .filter(|e| is_crates_io_source(e.source))
+                    .map(move |e| (*file, e.key.to_string(), e.path.map(same_path_key)))
+            })
+            .collect();
+        Shadow {
+            aliases: crates_io_url_alias_tables(manifest),
+            config_keys,
+        }
+    }
+
+    fn why(&self, table: &str, key: &str, path: Option<&str>) -> Option<String> {
+        if !is_crates_io_source(table) {
+            return None;
+        }
+        if let (true, Some(alias)) = (table == "crates-io", self.aliases.first()) {
+            return Some(format!(
+                "the `[patch.\"{alias}\"]` table replaces `[patch.crates-io]` in cargo"
+            ));
+        }
+        let own = path.map(same_path_key);
+        self.config_keys
+            .iter()
+            .find(|(_, k, p)| k == key && *p != own)
+            .map(|(file, k, _)| {
+                format!("{file} redefines `[patch]` key `{k}`, which replaces it in cargo")
+            })
+    }
+}
+
 /// What a vendored copy is weighed against for copies its `[patch]` wiring
 /// does not redirect ([`patch_bypassed`]).
 struct Bypass<'a> {
@@ -1289,30 +1451,37 @@ struct Bypass<'a> {
     /// Every declaration in the root and member manifests (`None`: no
     /// usable root manifest).
     decls: Option<&'a Decls>,
-    /// Every Socket copy the manifest and config `[patch]` tables point at,
-    /// with the `[patch.<source>]` table pointing at it.
-    wired: &'a [(String, VendorRef)],
+    /// The `[patch]` entries pointing at a Socket copy that cargo honors
+    /// (a shadowed manifest entry redirects nothing).
+    wired: &'a [WiredCopy],
+}
+
+/// Whether a `Cargo.lock` `source` is crates.io (its git or sparse index).
+fn is_crates_io_lock_source(source: &str) -> bool {
+    is_crates_io_url_alias(source.trim().trim_start_matches("registry+"))
+        || index_key(source).as_deref() == Some("sparse+https://index.crates.io")
 }
 
 /// Mark the vendored ref `purl` (the copy `vref` of `name`@`version`)
 /// [`UnattestedKind::CargoPatchBypassed`] when the build may also compile
-/// a copy of that version its wiring does not reach. A `[patch.<source>]`
-/// entry replaces the crate only in declarations from `<source>` (v5
+/// a copy of that version its wiring does not reach. A `[patch.<table>]`
+/// entry replaces the crate only in declarations from `<table>` (v5
 /// `vendor` writes `[patch.crates-io]`), so either of these builds
 /// unpatched bytes:
 ///
-/// * a live dependency declaration (the root's or a workspace member's)
-///   from another registry, a `registry-index` or git, whose requirement
-///   may select `version`, unless it is a registry or git dependency that a
-///   `[patch]` table pointing at this copy redirects ([`Decl::patched_by`]):
-///   cargo resolves it as a separate package, maybe at this very version;
-/// * a `Cargo.lock` entry of `name` at exactly `version` with a source
-///   (any registry or git; a Socket patch server's is hosted wiring, a ref
-///   of its own): that copy is already locked beside the vendored one.
+/// * a declaration (the root's or a workspace member's) that [`route`]
+///   finds [`Route::Unpinned`] against the honored entries pointing at
+///   this copy — the classifier hosted pins use, with this copy's tables
+///   as the pins: a live dependency that may select `version` from a
+///   source no such table redirects (another registry, a
+///   `registry-index`, git, or crates.io when the copy is wired for
+///   another source only). A path declaration (the user's own fork) is
+///   left alone, as the lock's copy claim leaves its sourceless entry
+///   alone; a `socket-patch-*` registry dependency is hosted wiring;
+/// * a `Cargo.lock` entry of `name` at exactly `version` with a non-Socket
+///   source: that copy is already locked beside the vendored one.
 ///
-/// A path declaration (the user's own fork) is left alone, as the lock's
-/// copy claim leaves its sourceless entry alone; a `socket-patch-*`
-/// registry dependency is hosted wiring, weighed there. The ref stays
+/// The detail ends with the remedy for its evidence. The ref stays
 /// (rollback, remove and the ledgers still see the wiring), but nothing
 /// attests it.
 fn patch_bypassed(
@@ -1324,36 +1493,29 @@ fn patch_bypassed(
     purl: &str,
     out: &mut Discovery,
 ) {
-    let redirected = |d: &Decl| {
+    let pins: Vec<(&str, String)> = bypass
+        .wired
+        .iter()
+        .filter(|w| w.vref.uuid == vref.uuid && w.vref.leaf == vref.leaf)
+        .map(|w| (w.table.as_str(), vref.uuid.clone()))
+        .collect();
+    let others = distinct(
         bypass
-            .wired
+            .lock
+            .packages()
             .iter()
-            .any(|(table, v)| v.uuid == vref.uuid && v.leaf == vref.leaf && d.patched_by(table))
-    };
+            .filter(|p| p.name == name && cargo_tag::strip_tag(&p.version) != version)
+            .map(|p| Some(cargo_tag::strip_tag(&p.version).to_string())),
+    );
     let declared: Vec<&Decl> = bypass
         .decls
         .and_then(|d| d.get(name))
         .into_iter()
         .flatten()
-        .filter(|d| d.live)
-        .filter(|d| match &d.source {
-            DeclSource::Registry => !d.socket_shaped() && !redirected(d),
-            DeclSource::Git(_) => !redirected(d),
-            DeclSource::RegistryIndex(_) => true,
-            DeclSource::Path | DeclSource::Patch(_) => false,
-        })
-        .filter(|d| cargo_req_selects(d.version.as_deref(), version, &[]) != CargoReqMatch::NotOurs)
+        .filter(|d| d.source != DeclSource::Path)
+        .filter(|d| matches!(route(d, &pins, version, &others), Route::Unpinned(_)))
         .collect();
-    let locked = bypass
-        .lock
-        .packages()
-        .iter()
-        .filter(|p| p.name == name && p.version == version)
-        .find_map(|p| {
-            p.source
-                .as_deref()
-                .filter(|s| source_uuid(ctx, s).is_none())
-        });
+    let locked = same_version_foreign_entry(ctx, bypass.lock, name, version);
     let redirects = format!(
         "which no [patch] entry pointing at {} redirects",
         vref.artifact_rel
@@ -1365,13 +1527,7 @@ fn patch_bypassed(
             });
             let declared = declared
                 .iter()
-                .map(|d| {
-                    let req = d
-                        .version
-                        .as_deref()
-                        .map_or_else(|| "with no version".to_string(), |v| format!("{v:?}"));
-                    format!("{} declares {name} {req} from {}", d.file, d.origin())
-                })
+                .map(|d| d.describe(name))
                 .collect::<Vec<_>>()
                 .join(", and ");
             (
@@ -1379,17 +1535,38 @@ fn patch_bypassed(
                 format!(
                     "{declared}, {redirects}: cargo resolves that declaration as a separate \
                      package, so the crate declaring it builds an unpatched {name} that the \
-                     requirement allows to be {version}{evidence}"
+                     requirement allows to be {version}{evidence}. Re-running `vendor` does \
+                     not change this: declare {name} from crates.io there (or point a \
+                     [patch] table for its source at the copy), or roll the patch back"
                 ),
             )
         }
-        (None, Some(source)) => (
-            CARGO_LOCK,
-            format!(
-                "{CARGO_LOCK} also locks {name} {version} from {source}, {redirects}: cargo \
-                 builds that copy unpatched beside the vendored one"
-            ),
-        ),
+        (None, Some(source)) => {
+            // A crates.io entry beside a copy `[patch.crates-io]` wires is
+            // stale (cargo would redirect it); any other is declared by
+            // some dependency, or left over from one that was removed.
+            let stale = is_crates_io_lock_source(source)
+                && pins.iter().any(|(table, _)| is_crates_io_source(table));
+            let remedy = if stale {
+                format!(
+                    "the entry is stale (`[patch.crates-io]` redirects crates.io), so \
+                     re-lock: re-run `socket-patch vendor`, or `cargo update -p {name}`"
+                )
+            } else {
+                format!(
+                    "`cargo tree -i {name}@{version}` names the dependency that declares it \
+                     (change that declaration or roll the patch back); if none does any \
+                     more, re-lock with `cargo update -p {name}`"
+                )
+            };
+            (
+                CARGO_LOCK,
+                format!(
+                    "{CARGO_LOCK} also locks {name} {version} from {source}, {redirects}: \
+                     cargo builds that copy unpatched beside the vendored one; {remedy}"
+                ),
+            )
+        }
         (None, None) => return,
     };
     out.unattested(
@@ -1401,14 +1578,15 @@ fn patch_bypassed(
     );
 }
 
-/// Vendored refs from one file's `[patch]` tables. `shadowed` names why
-/// cargo ignores an entry (a higher-precedence item replaces it), if so.
+/// Vendored refs from one file's `[patch]` tables. `shadow` (the root
+/// manifest's) names why cargo ignores an entry (a higher-precedence item
+/// replaces it), if so.
 async fn vendored_from_patches(
     ctx: &DiscoverCtx<'_>,
     file: &str,
     doc: &DocumentMut,
     lock: &Lock,
-    shadowed: &(dyn Fn(&CargoPatchEntry<'_>) -> Option<String> + Sync),
+    shadow: Option<&Shadow>,
     bypass: &Bypass<'_>,
     out: &mut Discovery,
 ) {
@@ -1420,7 +1598,7 @@ async fn vendored_from_patches(
             continue; // a user path, or the uuid-less `.socket/cargo-patches/`
         }
         let name = entry.name;
-        if let Some(why) = shadowed(&entry) {
+        if let Some(why) = shadow.and_then(|s| s.why(entry.source, entry.key, entry.path)) {
             out.diag(
                 DIAG_REF_INVALID,
                 file,
@@ -2045,6 +2223,59 @@ mod tests {
         assert_refs(&out, &[]);
         assert!(
             diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:#?}",
+            out.diagnostics
+        );
+        // REVIEW: B's pin, which the lock does not reflect, is still
+        // diagnosed (it used to vanish once any Socket entry was locked).
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.file == std::path::Path::new("Cargo.toml")
+                    && d.detail.contains(UUID_B)
+                    && d.detail.contains("only from other Socket patches")),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// REVIEW: a well-formed Socket registry that pins nothing — beside
+    /// `path` / `git` / `registry-index`, or on a `[workspace.dependencies]`
+    /// entry no manifest inherits — is diagnosed, since the file reads like
+    /// wiring.
+    #[tokio::test]
+    async fn an_ineffective_socket_registry_is_diagnosed() {
+        let reg = format!("registry = \"socket-patch-{UUID_A}\"");
+        let p = mixed_workspace(
+            &pinned("serde", "1", UUID_A),
+            &format!("serde = {{ path = \"../serde\", version = \"1\", {reg} }}"),
+            &[],
+        );
+        let out = run(&p).await;
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == DIAG_REF_INVALID
+                && d.file == std::path::Path::new("crates/a/Cargo.toml")
+                && d.detail.contains("pins nothing there")
+                && d.detail.contains("a local path")),
+            "{:#?}",
+            out.diagnostics
+        );
+
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/*\"]\n\n[workspace.dependencies]\n{}\n",
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+        member(&p, "a", "other = \"1\"");
+        let out = run(&p).await;
+        assert!(
+            out.diagnostics.iter().any(|d| d.code == DIAG_REF_INVALID
+                && d.file == std::path::Path::new("Cargo.toml")
+                && d.detail.contains("no manifest inherits")),
             "{:#?}",
             out.diagnostics
         );
@@ -3956,6 +4187,187 @@ mod tests {
                 &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
             );
             bypassed_mark(&out, "crates/a/Cargo.toml");
+        }
+    }
+
+    // ── review findings ──────────────────────────────────────────────
+
+    /// The one vendored cfg-if ref of `out`: attested (no mark) or not.
+    fn assert_vendored_attested(out: &Discovery, attested: bool, what: &str) {
+        assert_refs(
+            out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+        );
+        assert_eq!(
+            out.unattested.is_empty(),
+            attested,
+            "{what}: {:#?}",
+            out.unattested
+        );
+    }
+
+    /// REVIEW (false attestation): the project config redefines the
+    /// manifest's crates.io `[patch]` key with a git fork, so cargo ignores
+    /// the manifest's entry for the copy and builds the fork for crates.io
+    /// declarations. That shadowed entry used to count as redirecting them,
+    /// so the copy's other (honored) `[patch.my-corp]` entry was attested
+    /// beside the fork.
+    #[tokio::test]
+    async fn a_shadowed_manifest_entry_covers_no_declaration() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = vendored_workspace(
+            "cfg-if = \"1\"",
+            &format!("\n[patch.my-corp]\ncfg-if = {{ path = \"{rel}\" }}\n"),
+            &[],
+        );
+        p.write(
+            ".cargo/config.toml",
+            "[patch.crates-io]\ncfg-if-socket-aaaaaaaa = { package = \"cfg-if\", git = \
+             \"https://example.com/fork/cfg-if\" }\n",
+        );
+        let out = run(&p).await;
+        assert_vendored_attested(&out, false, "shadowed");
+        let u = bypassed_mark(&out, "Cargo.toml");
+        assert!(
+            u.detail
+                .contains("Cargo.toml declares cfg-if \"1\" from crates.io"),
+            "{}",
+            u.detail
+        );
+        assert!(
+            diag_codes(&out).contains(&DIAG_REF_INVALID),
+            "{:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// REVIEW: a `registry-index` declaration is redirected by a
+    /// `[patch."<index URL>"]` table for the same index (host case, a
+    /// trailing `/` and the lock's `registry+` spelling aside; `sparse+` is
+    /// another source), and one naming the crates.io git index is
+    /// crates.io. The sparse crates.io index stays another source: whether
+    /// `[patch.crates-io]` reaches it is not what the files show, so it is
+    /// withheld rather than risked.
+    #[tokio::test]
+    async fn a_registry_index_patch_table_covers_that_index() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let table = |key: &str| format!("\n[patch.\"{key}\"]\ncfg-if = {{ path = \"{rel}\" }}\n");
+        let decl =
+            |index: &str| format!("cfg-if = {{ version = \"1\", registry-index = \"{index}\" }}");
+        for (member, extra, attested) in [
+            (
+                decl("https://My-Corp.example/index/"),
+                table("https://my-corp.example/index"),
+                true,
+            ),
+            (
+                decl("sparse+https://my-corp.example/index/"),
+                table("sparse+https://my-corp.example/index"),
+                true,
+            ),
+            (
+                decl("https://github.com/rust-lang/crates.io-index"),
+                String::new(),
+                true,
+            ),
+            (
+                decl("sparse+https://my-corp.example/index/"),
+                table("https://my-corp.example/index"),
+                false,
+            ),
+            (
+                decl("https://other.example/index"),
+                table("https://my-corp.example/index"),
+                false,
+            ),
+            (
+                decl("sparse+https://index.crates.io/"),
+                String::new(),
+                false,
+            ),
+        ] {
+            let out = run(&vendored_workspace(&member, &extra, &[])).await;
+            assert_vendored_attested(&out, attested, &member);
+        }
+    }
+
+    /// REVIEW: the remedy follows the evidence — a declaration cannot be
+    /// fixed by re-vendoring; a crates.io lock entry beside a
+    /// `[patch.crates-io]` copy is stale (re-lock); another source's entry
+    /// is some dependency's (`cargo tree -i` finds it).
+    #[tokio::test]
+    async fn the_bypass_remedy_follows_its_evidence() {
+        let out = run(&vendored_workspace(
+            "cfg-if = { version = \"1\", registry = \"my-corp\" }",
+            "",
+            &[],
+        ))
+        .await;
+        let u = bypassed_mark(&out, "crates/a/Cargo.toml");
+        assert!(
+            u.detail
+                .contains("Re-running `vendor` does not change this"),
+            "{}",
+            u.detail
+        );
+
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            "",
+            &[("1.0.4", CRATES_IO)],
+        ))
+        .await;
+        let u = bypassed_mark(&out, "Cargo.lock");
+        assert!(
+            u.detail.contains("stale")
+                && u.detail.contains("cargo update -p cfg-if")
+                && !u.detail.contains("Re-running `vendor` does not"),
+            "{}",
+            u.detail
+        );
+
+        let out = run(&vendored_workspace(
+            "cfg-if = \"1\"",
+            "",
+            &[("1.0.4", MY_CORP)],
+        ))
+        .await;
+        let u = bypassed_mark(&out, "Cargo.lock");
+        assert!(
+            u.detail.contains("cargo tree -i cfg-if@1.0.4") && !u.detail.contains("stale"),
+            "{}",
+            u.detail
+        );
+    }
+
+    /// REVIEW: git URLs compare as cargo's `CanonicalUrl` spells them — a
+    /// GitHub URL case-insensitively, any host's case aside, one trailing
+    /// `/` and `.git` dropped — so another path on a non-GitHub host is
+    /// another repository.
+    #[tokio::test]
+    async fn a_git_patch_table_matches_cargos_canonical_url() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let table = |key: &str| format!("\n[patch.\"{key}\"]\ncfg-if = {{ path = \"{rel}\" }}\n");
+        let decl = |url: &str| format!("cfg-if = {{ git = \"{url}\" }}");
+        for (member, extra, attested) in [
+            (
+                decl("https://GitHub.com/Foo/CFG-IF.git"),
+                table("https://github.com/foo/cfg-if"),
+                true,
+            ),
+            (
+                decl("https://EXAMPLE.com/foo/cfg-if/"),
+                table("https://example.com/foo/cfg-if"),
+                true,
+            ),
+            (
+                decl("https://example.com/Foo/cfg-if"),
+                table("https://example.com/foo/cfg-if"),
+                false,
+            ),
+        ] {
+            let out = run(&vendored_workspace(&member, &extra, &[])).await;
+            assert_vendored_attested(&out, attested, &member);
         }
     }
 }

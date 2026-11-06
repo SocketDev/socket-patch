@@ -634,7 +634,13 @@
         "lockfile_basis_ok": true
       }
     ],
-    "diagnostics": [],
+    "diagnostics": [
+      {
+        "code": "patched_ref_invalid",
+        "file": "Cargo.toml",
+        "detail": "Cargo.toml: serde's Socket patch registry pins nothing there: no manifest inherits that `[workspace.dependencies]` entry"
+      }
+    ],
     "recognized": [
       {
         "uuid": "11111111-1111-1111-1111-111111111111",
