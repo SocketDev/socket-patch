@@ -8801,7 +8801,7 @@ fn rewrite_maven_pom(
                     .is_some_and(|(base, _)| base == dep.version);
             if names_release {
                 let classifier = variant.classifier.as_deref().unwrap_or_default();
-                let executable = !matches!(classifier, "sources" | "javadoc");
+                let executable = crate::formats::maven::is_executable_classifier(classifier);
                 executable_variant |= executable;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_classifier_unsupported".into(),
