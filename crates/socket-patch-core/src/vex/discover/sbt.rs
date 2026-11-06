@@ -108,6 +108,10 @@ struct BuildState {
     /// pin in place. An older record (a project or cross build not
     /// re-resolved since) proves nothing about the pin either way.
     current: BTreeSet<String>,
+    /// Every record is [`Self::current`] and every declared project has
+    /// one: only then does evidence verifying a pin speak for the whole
+    /// build, and so overrule a build edit dropping it ([`bypass`]).
+    whole: bool,
 }
 
 /// The build's state under `root`: its sources scanned once, its evidence
@@ -135,18 +139,25 @@ async fn build_state(root: &Path) -> BuildState {
             .as_ref()
             .and_then(|res| evidence_blocker(&e, res, &findings));
         let since = e.generated.max(e.newest_source);
-        let current = e
+        let current: BTreeSet<String> = e
             .record_dates
             .iter()
             .filter(|(_, at)| since.is_none_or(|s| **at > s))
             .map(|(rel, _)| rel.clone())
             .collect();
+        let whole = current.len() == e.record_dates.len()
+            && res.as_ref().is_some_and(|res| {
+                crate::formats::sbt::build::declared_projects(&e.build_sources).is_some_and(
+                    |declared| declared.values().all(|dir| res.projects_seen.contains(dir)),
+                )
+            });
         BuildState {
             res,
             blocker,
             dropped,
             repo,
             current,
+            whole,
         }
     })
     .await
@@ -213,7 +224,9 @@ fn current_view(res: &JvmResolution, pin: &SbtPin, current: &BTreeSet<String>) -
 
 /// Why the build provably does not use `pin`'s bytes, whatever copy is
 /// installed, or `None`. Current evidence that verifies the pin ([`verify`]
-/// over [`current_view`]) always wins. Otherwise: a build edit dropping
+/// over [`current_view`]) wins, over a build edit too when it covers the
+/// whole build ([`BuildState::whole`]): a project not re-resolved since
+/// the edit may be the one it applies to. Otherwise: a build edit dropping
 /// the pin ([`pin_dropped`]: the override replaced, or the load-time
 /// verifier and resolver order removed), or current evidence judged
 /// exactly as the hosted rewriter re-checks an existing pin
@@ -235,7 +248,8 @@ async fn bypass(pin: &SbtPin, build: &BuildState, hashes: &mut Hashes) -> Option
         .as_ref()
         .map(|res| current_view(res, pin, &build.current));
     if let Some(now) = &now {
-        if verify(pin, Some(now), hashes).await.is_ok() {
+        if (build.dropped.is_none() || build.whole) && verify(pin, Some(now), hashes).await.is_ok()
+        {
             return None;
         }
     }
@@ -779,14 +793,26 @@ mod tests {
         let why = bypass(&p, &edited, &mut h).await.unwrap();
         assert!(why.contains("build.sbt:1"), "{why}");
 
-        // A current record verifying the pin wins over the edit.
+        // A current record verifying the pin wins over the edit when the
+        // evidence covers the whole build.
         let mut verified = JvmResolution::default();
         record(&mut verified, "b/target/out", SV, Some(&jar));
         let verified_edited = BuildState {
             dropped: dropped.clone(),
+            whole: true,
             ..state(verified.clone(), &["b/target/out"])
         };
         assert_eq!(bypass(&p, &verified_edited, &mut h).await, None);
+        // Not when another project was not re-resolved since the edit (it
+        // may be the one the edit applies to): the edit is proof.
+        let mut partial = verified.clone();
+        record(&mut partial, "a/target/out", "3.11", None);
+        let partial_edited = BuildState {
+            dropped: dropped.clone(),
+            ..state(partial, &["b/target/out"])
+        };
+        let why = bypass(&p, &partial_edited, &mut h).await.unwrap();
+        assert!(why.contains("build.sbt:1"), "{why}");
         // A stale record of another project beside it changes nothing.
         let mut mixed = verified.clone();
         record(&mut mixed, "a/target/out", "3.11", None);
