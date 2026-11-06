@@ -230,6 +230,7 @@ async fn extract_hosted(
     // A Socket version only a `-D` user property supplies is no pom.xml
     // wiring: hosted mode never writes one, and rollback / remove never
     // edit `.mvn/maven.config`.
+    let mut reported = BTreeSet::new();
     for dep in pom.deps.iter().filter(|d| !d.in_profile) {
         let Some(built) = dep
             .build_version
@@ -247,6 +248,11 @@ async fn extract_hosted(
             .and_then(split_socket_version)
             .is_some()
         {
+            continue;
+        }
+        // Once per GA and version: its managed entry and classifier copies
+        // spell the same property.
+        if !reported.insert((dep.group.clone(), dep.artifact.clone(), built.to_string())) {
             continue;
         }
         out.diag(
@@ -827,15 +833,26 @@ fn bypasses(
     let mut found = Vec::new();
     // `.mvn/maven.config`'s `-D` user properties, which Maven reads before
     // the pom's `<properties>`, redefine what the pin is spelled through.
+    // Only a property that moves the build OFF the pin is an override: one
+    // `.mvn/maven.config` alone defines, at the pinned version, is the pin.
     let spelled = ga_versions(deps, group, artifact, pom_version);
     let built = ga_versions(deps, group, artifact, build_version);
-    if built.effective() != spelled.effective() {
+    let resolved = built.effective();
+    if resolved != spelled.effective() && !(resolved.len() == 1 && resolved.contains(pinned)) {
+        let listed = if resolved.is_empty() {
+            "no version this pom gives".to_string()
+        } else {
+            resolved
+                .iter()
+                .map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         found.push((
             UnattestedKind::MavenConfigOverride,
             format!(
                 "{POM}: {ga} is wired to {pinned}, but a -D user property in {MVN_CONFIG} \
-                 (which Maven reads before the pom's <properties>) makes it resolve {:?}",
-                built.effective()
+                 (which Maven reads before the pom's <properties>) makes it resolve {listed}"
             ),
         ));
     }
@@ -903,7 +920,13 @@ fn unpatched_classifier_copy(
                 if !live.iter().any(|(_, _, literal)| *literal) {
                     live.push((None, false, true));
                 }
-                live.extend(managed(classifier, true));
+                // A profile entry with no `<version>` (scope or exclusions
+                // only) overrides no version.
+                live.extend(
+                    managed(classifier, true)
+                        .into_iter()
+                        .filter(|(v, _, _)| v.is_some()),
+                );
                 live.into_iter().map(|(v, p, _)| (v, p)).collect()
             }
         };
@@ -2697,6 +2720,68 @@ mod tests {
             detail.contains("profile p1") && detail.contains("1.7.30") && !detail.contains("p0"),
             "{detail}"
         );
+    }
+
+    /// Review on #2005 (round 2): a `-D` property `.mvn/maven.config` alone
+    /// defines AT the vendored version is the pin, not an override.
+    #[tokio::test]
+    async fn vendored_version_from_maven_config_at_the_pin_is_attested() {
+        let p = vendored_project(UUID_A);
+        let wired = std::fs::read_to_string(p.root().join("pom.xml")).expect("read pom");
+        let spelled = wired.replacen(
+            "<version>1.10.0</version>",
+            "<version>${commons.version}</version>",
+            1,
+        );
+        assert_ne!(spelled, wired);
+        p.write("pom.xml", &spelled);
+        p.write(".mvn/maven.config", "-Dcommons.version=1.10.0\n");
+        let out = run(&p).await;
+        assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+        p.write(".mvn/maven.config", "-Dcommons.version=1.9\n");
+        let out = run(&p).await;
+        let kinds: Vec<_> = out.unattested.iter().map(|u| u.kind).collect();
+        assert_eq!(kinds, [UnattestedKind::MavenConfigOverride]);
+        assert!(
+            out.unattested[0].detail.ends_with("makes it resolve 1.9"),
+            "{}",
+            out.unattested[0].detail
+        );
+    }
+
+    /// Review on #2005 (round 2): a profile `<dependencyManagement>` entry
+    /// for a classifier copy that sets no `<version>` (scope, exclusions)
+    /// overrides no version: the live managed pin still governs.
+    #[tokio::test]
+    async fn a_versionless_profile_management_entry_overrides_nothing() {
+        let pin = suffixed(UUID_A);
+        let tests = |v: Option<&str>| {
+            let v = v.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 {v}<classifier>tests</classifier><scope>test</scope></dependency>\n"
+            )
+        };
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<dependencyManagement>\n<dependencies>\n{}</dependencies>\n</dependencyManagement>\n\
+                 <dependencies>\n{}{}</dependencies>\n\
+                 <profiles><profile><id>p</id><dependencyManagement><dependencies>\n{}\
+                 </dependencies></dependencyManagement></profile></profiles>\n\
+                 <repositories>\n{}</repositories>\n",
+                tests(Some(&pin)),
+                dep("org.slf4j", "slf4j-api", Some(&pin)),
+                tests(None),
+                tests(None),
+                hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A)),
+            )),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
     #[tokio::test]
