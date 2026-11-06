@@ -329,11 +329,12 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         Err((_, error)) => return RevertOutcome::failed(error),
     };
     let mut edits = BTreeMap::new();
-    // A leftover reference FAILS this revert, so case is folded only where
-    // the disk folds it; every escape and separator spelling counts.
-    let needle =
-        super::common::refusal_needle(root, &super::pypi_lock::artifact_needle_rel(&entry.uuid))
-            .await;
+    // A leftover reference FAILS this revert, and a miss lets the wheel be
+    // deleted: every escape, separator and case spelling counts, as in the
+    // pylock revert.
+    let needle = crate::utils::path_spelling::PathNeedle::keep(
+        &super::pypi_lock::artifact_needle_rel(&entry.uuid),
+    );
     for record in entry
         .wiring
         .iter()

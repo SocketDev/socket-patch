@@ -458,12 +458,12 @@ pub(crate) async fn first_file_naming<'a>(
     None
 }
 
-/// The needle a REFUSAL searches project files with for `rel`: every
-/// escape and separator spelling, but ASCII case folded only where the
-/// project's file system folds it (probed on its `.socket/` dir). On a
-/// case-sensitive disk a differently-cased path names another directory,
-/// and refusing a revert over it would block the user for nothing.
-/// Keep-vs-delete decisions use the broad [`PathNeedle::keep`] instead.
+/// The needle a REFUSAL whose miss is safe searches project files with for
+/// `rel` (lifting another refusal, a report): every escape and separator
+/// spelling, but ASCII case folded only where the project's file system
+/// folds it (probed on its `.socket/` dir). Any check whose miss lets an
+/// artifact be deleted uses the broad [`PathNeedle::keep`] instead: a
+/// committed file is installed on case-folding disks too.
 pub(crate) async fn refusal_needle(project_root: &Path, rel: &str) -> PathNeedle {
     let folds =
         crate::utils::fs::folds_case(&project_root.join(crate::constants::SOCKET_DIR)).await;

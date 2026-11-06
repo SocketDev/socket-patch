@@ -2870,14 +2870,10 @@ async fn unwire_superseded(
         },
     )
     .await;
-    // A residual reference in any spelling (`\/`-escaped, backslashed) must
-    // refuse: past this point the old uuid dir is swept as stale. Case is
-    // folded only where the disk folds it — elsewhere another case is
-    // another dir, and refusing over it would block the re-vendor for
-    // nothing.
-    let needle =
-        super::common::refusal_needle(project_root, &format!(".socket/vendor/pypi/{}/", prev.uuid))
-            .await;
+    // A residual reference in any spelling (`\/`-escaped, backslashed, any
+    // case) must refuse: past this point the old uuid dir is swept as
+    // stale, and a committed file is installed on case-folding disks too.
+    let needle = PathNeedle::keep(&format!(".socket/vendor/pypi/{}/", prev.uuid));
     let residual = super::common::first_file_naming(
         project_root,
         snapshot.iter().map(|(file, _)| file.as_str()),
@@ -3021,7 +3017,8 @@ async fn guard_unwired_pypi_revert(
     uuid: &str,
     uuid_dir_rel: &str,
 ) -> Option<RevertOutcome> {
-    let clause = pypi_refusal_clause(project_root, uuid).await?;
+    // A miss deletes the artifact: every spelling in any case counts.
+    let clause = pypi_reference_clause(project_root, uuid, &[]).await?;
     let detail = format!(
         "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
          replay (it was likely reconstructed by `socket-patch repair`; the pre-vendor Python \
@@ -3077,9 +3074,9 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
     pypi_reference_clause_for(project_root, &needle, skip).await
 }
 
-/// [`pypi_reference_clause`] for a REFUSAL (the unwired-revert guard) or a
-/// report (`vendor --check`): every spelling, but case folded only where
-/// the disk folds it ([`super::common::refusal_needle`]).
+/// [`pypi_reference_clause`] for a report (`vendor --check`): every
+/// spelling, but case folded only where the disk folds it
+/// ([`super::common::refusal_needle`]). Never a deletion gate.
 async fn pypi_refusal_clause(project_root: &Path, uuid: &str) -> Option<String> {
     let needle =
         super::common::refusal_needle(project_root, &format!(".socket/vendor/pypi/{uuid}/")).await;
@@ -7041,6 +7038,35 @@ wheels = [
                 );
             }
         }
+    }
+
+    /// Review on #2022 (round 2): the unwired-revert guard's miss deletes
+    /// the wheel, and a committed lock is installed on case-folding disks
+    /// too, so a re-cased reference refuses on every disk.
+    #[tokio::test]
+    async fn unwired_python_entry_revert_refuses_on_a_recased_reference() {
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let recased = format!(
+            ".Socket/Vendor/PyPI/{}/six-1.16.0-py2.py3-none-any.whl",
+            UUID.to_ascii_uppercase()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("pylock.toml"),
+            format!("lock-version = \"1.0\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"{recased}\" }}\n"),
+        )
+        .await
+        .unwrap();
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let entry = revert_entry("python-lock", &rel_wheel, Vec::new());
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(wheel.is_file(), "the artifact must survive");
     }
 
     /// Nothing references the artifact any more (the user re-locked by

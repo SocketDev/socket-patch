@@ -2059,8 +2059,10 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
     use aho_corasick::AhoCorasick;
 
     let mut found = BTreeSet::new();
-    // The same fold the vendored revert's keep-checks read through
-    // ([`crate::utils::path_spelling::mentions_path`]).
+    // The escape fold the vendored revert's keep-checks share
+    // ([`crate::utils::path_spelling::mentions_path`] also collapses
+    // separator runs and ignores case; this sweep keeps both as written,
+    // since its hosted-url recognition anchors on `://`).
     let norm = crate::utils::path_spelling::fold_path_spellings(text);
     let bytes = norm.as_bytes();
 

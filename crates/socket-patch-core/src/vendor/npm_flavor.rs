@@ -788,18 +788,18 @@ pub async fn lock_text_refusals(
 /// install resolves through.
 ///
 /// `Some(false)` lets a revert delete the artifact, so every spelling of
-/// the path counts: `\/` JSON escapes, backslashed Windows separators, `\u`
-/// escapes. `Some(true)` REFUSES the revert, so ASCII case is folded only
-/// where the file system folds it ([`super::common::refusal_needle`]): on a
-/// case-sensitive disk a differently-cased path is another directory, not
-/// this artifact.
+/// the path counts ([`crate::utils::path_spelling::PathNeedle::keep`]): `\/` JSON escapes, backslashed
+/// Windows separators, `\u` escapes, and any ASCII case. A committed lock
+/// is installed on case-folding disks (macOS, Windows) too, where a
+/// re-cased path does resolve to this artifact, so a case-sensitive CI
+/// disk must not delete it.
 pub(super) async fn lock_text_mentions_uuid(
     project_root: &Path,
     names: &[&str],
     uuid: &str,
 ) -> Option<bool> {
     let needle =
-        super::common::refusal_needle(project_root, &format!(".socket/vendor/npm/{uuid}/")).await;
+        crate::utils::path_spelling::PathNeedle::keep(&format!(".socket/vendor/npm/{uuid}/"));
     let mut any_readable = false;
     for name in names {
         if let Ok(text) = read_regular_to_string(&project_root.join(name)).await {
@@ -1234,12 +1234,11 @@ mod tests {
         }
     }
 
-    /// Review on #2022: `Some(true)` refuses the revert, so a re-cased
-    /// reference counts only where the disk folds case (where it does
-    /// resolve to the artifact). On a case-sensitive disk it names another
-    /// directory and must not block `vendor --revert`.
+    /// Review on #2022 (round 2): `Some(false)` lets the revert delete the
+    /// artifact, and a committed lock is installed on case-folding disks
+    /// too, so a re-cased reference counts on every disk.
     #[tokio::test]
-    async fn lock_text_mention_folds_case_only_where_the_disk_does() {
+    async fn lock_text_mention_folds_case_on_every_disk() {
         let uuid = "44444444-4444-4444-8444-444444444444";
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".socket")).unwrap();
@@ -1253,9 +1252,10 @@ mod tests {
             format!("\"resolved\": \"file:{recased}\""),
         )
         .unwrap();
+        let _ = folds;
         assert_eq!(
             lock_text_mentions_uuid(dir.path(), &["package-lock.json"], uuid).await,
-            Some(folds)
+            Some(true)
         );
     }
 

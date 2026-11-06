@@ -6,11 +6,13 @@
 //! Every vendored check that asks "does this project file still name this
 //! `.socket/vendor/` path?" answers through one [`PathNeedle`]. It folds
 //! each escape, collapses every run of `/` and `\` to one `/`, and
-//! optionally ignores ASCII case. Keep-vs-delete decisions fold case
-//! ([`PathNeedle::keep`], [`mentions_path`]): erring toward "mentioned"
-//! keeps the artifact. Refusals fold case only where the project's file
-//! system does (`vendor::common::refusal_needle`), so a differently-cased
-//! path that resolves elsewhere never blocks a revert.
+//! optionally ignores ASCII case. Every check whose miss lets an artifact
+//! be deleted folds case ([`PathNeedle::keep`], [`mentions_path`]), even
+//! where it refuses on a hit: a committed file is installed on
+//! case-folding disks too, and erring toward "mentioned" keeps the
+//! artifact. Only a refusal whose miss is safe (lifting another refusal, a
+//! report) folds case where the project's file system does
+//! (`vendor::common::refusal_needle`).
 //!
 //! Discovery's identity sweep keeps its own [`fold_path_spellings`], which
 //! leaves separator runs alone: its hosted-url recognition anchors on `://`.
