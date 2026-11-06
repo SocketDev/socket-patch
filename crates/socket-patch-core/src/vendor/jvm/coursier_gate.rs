@@ -67,7 +67,7 @@ pub(crate) fn gate(
     // adding one must refuse even before the next build refreshes evidence.
     let early_directive = || {
         let sources = evidence.map(|e| e.sources.as_slice()).unwrap_or_default();
-        directive_refusal(project_root, sources, g, a)
+        directive_detail(project_root, sources, g, a).map(shadowed)
     };
     let Some(e) = evidence.filter(|e| !e.resolution.is_empty()) else {
         if vendored {
@@ -140,33 +140,25 @@ pub(crate) fn gate(
             ))
         }
     }
-    if let Some(stop) = directive_refusal(project_root, &e.sources, g, a) {
-        return Err(stop);
+    if let Some(why) = directive_detail(project_root, &e.sources, g, a) {
+        return Err(shadowed(why));
     }
-    if let Some(path) = resolved_elsewhere(project_root, e, g, a, base) {
-        return Err(refuse(
-            "vendor_scala_cli_repository_shadowed",
-            format!(
-                "the last build after vendoring resolved {g}:{a}:{base} from {} instead of {}; \
-                 a repository passed on the command line (`-r`) or declared elsewhere wins",
-                path.display(),
-                layout::COURSIER_TREE
-            ),
-        ));
+    if let Some(why) = elsewhere_detail(project_root, e, g, a, base) {
+        return Err(shadowed(why));
     }
     Ok(Vec::new())
 }
 
-/// `vendor_scala_cli_repository_shadowed` when an input declares a
-/// repository or pins `g` to a direct `url=`.
-fn directive_refusal(
-    project_root: &Path,
-    sources: &[PathBuf],
-    g: &str,
-    a: &str,
-) -> Option<GateStop> {
+/// The refusal `vendor_scala_cli_repository_shadowed` with `detail`.
+fn shadowed(detail: String) -> GateStop {
+    refuse("vendor_scala_cli_repository_shadowed", detail)
+}
+
+/// Why the tree does not serve `g:a` because an input declares a
+/// repository or pins `g` to a direct `url=`, if one does.
+fn directive_detail(project_root: &Path, sources: &[PathBuf], g: &str, a: &str) -> Option<String> {
     let (file, found) = repository_directive(project_root, sources, g)?;
-    let detail = match found {
+    Some(match found {
         Directive::Repository => format!(
             "{file} declares a repository; scala-cli consults it before the vendored tree, so \
              a copy of {g}:{a} there would win silently. Move it to COURSIER_REPOSITORIES \
@@ -177,27 +169,44 @@ fn directive_refusal(
              instead of resolving it from any repository, so the vendored tree would never \
              serve it. Drop the `url=` or use hosted mode"
         ),
-    };
-    Some(refuse("vendor_scala_cli_repository_shadowed", detail))
+    })
 }
 
-/// The gate's `vendor_scala_cli_repository_shadowed` directive check over
-/// the build at `project_root` as it stands, for `vex` liveness
-/// (`scala_cli::attestable_checked`): the detail naming the input that
-/// declares a repository or pins `g` to a direct `url=`, if any. The
-/// inputs are the directory's own plus, when evidence lists them, the
-/// out-of-root ones it builds.
-pub(crate) fn shadowing_directive(project_root: &Path, g: &str, a: &str) -> Option<String> {
+/// Why the last build after vendoring did not resolve `g:a:base` from the
+/// tree ([`resolved_elsewhere`]), if it did not.
+fn elsewhere_detail(
+    project_root: &Path,
+    e: &ScalaEvidence,
+    g: &str,
+    a: &str,
+    base: &str,
+) -> Option<String> {
+    let path = resolved_elsewhere(project_root, e, g, a, base)?;
+    Some(format!(
+        "the last build after vendoring resolved {g}:{a}:{base} from {} instead of {}; a \
+         repository passed on the command line (`-r`) or declared elsewhere wins",
+        path.display(),
+        layout::COURSIER_TREE
+    ))
+}
+
+/// The gate's `vendor_scala_cli_repository_shadowed` conditions over the
+/// vendored build at `project_root` as it stands, for `vex` liveness
+/// (`scala_cli::attestable_checked`): an input declaring a repository or
+/// pinning `g` to a direct `url=` (the directory's own inputs plus, when
+/// evidence lists them, the out-of-root ones it builds), or evidence that
+/// postdates every input and the wiring and resolved `g:a:base` outside the
+/// tree. Stale evidence proves nothing either way.
+pub(crate) fn vendored_bypass(project_root: &Path, g: &str, a: &str, base: &str) -> Option<String> {
     let evidence = scala_evidence::discover(project_root);
     let sources = evidence
         .as_ref()
         .map(|e| e.sources.as_slice())
         .unwrap_or_default();
-    match directive_refusal(project_root, sources, g, a)? {
-        GateStop::Refuse(r) => Some(r.detail),
-        GateStop::Skip(w) => Some(w.detail),
-        GateStop::Silent => None,
-    }
+    directive_detail(project_root, sources, g, a).or_else(|| {
+        let e = evidence.as_ref().filter(|e| !e.stale)?;
+        elsewhere_detail(project_root, e, g, a, base)
+    })
 }
 
 /// Whether the committed tree's index already lists `g:a:base` (under any

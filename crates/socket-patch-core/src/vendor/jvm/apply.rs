@@ -997,8 +997,10 @@ pub fn recorded_tree_files(entry: &VendorEntry) -> BTreeSet<String> {
 /// [`entry_wired_checked`]).
 pub fn entry_wired(root: &Path, entry: &VendorEntry) -> bool {
     // Failure to read does not prove that deleting a tree is safe. Attestation
-    // uses the checked variant and reports the diagnostic instead.
-    entry_wired_checked(root, entry).unwrap_or(true)
+    // uses the checked variant and reports the diagnostic instead, so the
+    // sbt / scala-cli attestability checks (whose every `Err` would read as
+    // `true` here) are not run.
+    entry_wiring_checked(root, entry, false).unwrap_or(true)
 }
 
 /// Whether the project still references the JVM `entry`'s tree (its

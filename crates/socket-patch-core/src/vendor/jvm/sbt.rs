@@ -600,8 +600,9 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
 /// hosted pin of it under another patch (as a merge of two branches
 /// leaves) may win, and the post-resolution verifier holds the GA to its
 /// first pin, the hosted row (`sbt_pin_conflict`). A hosted file that no
-/// longer parses strictly may pin anything. The planner refuses both
-/// (`vendor_sbt_hosted_conflict`), so `vendor --check` fails, but the
+/// longer parses strictly, or a user's own file under that name (sbt loads
+/// it like any root `*.sbt`), may pin anything. The planner refuses all
+/// three (`vendor_sbt_hosted_conflict`), so `vendor --check` fails, but the
 /// liveness test never re-plans. (The vendored file itself never parses
 /// strictly with two pins of one GA.)
 pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<(), JvmRefusal> {
@@ -612,12 +613,17 @@ pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<(), JvmRef
     let (g, a) = (c.group_id, c.artifact_id);
     let hosted = match read_owned(read, SbtFileMode::Hosted) {
         Ok(file) => file,
-        Err(OwnedFileError::Foreign) => None,
-        Err(OwnedFileError::Modified(why)) => {
+        Err(e) => {
+            let what = match e {
+                OwnedFileError::Modified(why) => {
+                    format!("is not what socket-patch generated ({why})")
+                }
+                OwnedFileError::Foreign => "is a build file socket-patch did not write".into(),
+            };
             return Err(conflict(format!(
-                "{HOSTED_FILE} is not what socket-patch generated ({why}), so it may pin \
-                 {g}:{a} too; restore or remove it"
-            )))
+                "{HOSTED_FILE} {what}, and sbt loads it like any root .sbt file, so it may \
+                 pin {g}:{a} too; restore, rename or remove it"
+            )));
         }
     };
     let others: Vec<String> = hosted
@@ -1591,11 +1597,16 @@ mod tests {
         };
         std::fs::write(root.join(HOSTED_FILE), render(&same).unwrap()).unwrap();
         assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
-        // An edited hosted file, but not a user's own file under the name.
+        // An edited hosted file.
         std::fs::write(root.join(HOSTED_FILE), format!("{hosted_text}// edit\n")).unwrap();
         conflict("modified hosted file");
-        std::fs::write(root.join(HOSTED_FILE), "lazy val x = 1\n").unwrap();
-        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+        // A user's own file under the name is loaded like any root .sbt.
+        std::fs::write(
+            root.join(HOSTED_FILE),
+            "dependencyOverrides += \"org.apache.commons\" % \"commons-text\" % \"1.9\"\n",
+        )
+        .unwrap();
+        conflict("foreign hosted file");
         std::fs::remove_file(root.join(HOSTED_FILE)).unwrap();
         assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
     }

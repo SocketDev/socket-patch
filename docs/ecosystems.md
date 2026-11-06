@@ -1198,10 +1198,10 @@ digest; a build that now declares the GA newer than the patched base is
 refused (`redirect_sbt_pin_declared_newer`: roll the patch back, or declare
 the base again). `rollback` / `remove` restore the file
 offline. `vex` attests a pin that post-wiring evidence verifies, or else from
-the copy sbt downloaded into `.socket/sbt-hosted/`, but never one the build
-provably bypasses: a `dependencyOverrides` / `resolvers` reassignment or
-`sbt.override.build.repos=true`, or current evidence resolving another version
-or other bytes (`vex_sbt_pin_bypassed`). The full code list is in
+the copy sbt downloaded into `.socket/sbt-hosted/`, but never one whose bytes
+the build provably does not use: a `dependencyOverrides` reassignment, or
+evidence recorded after the wiring that still resolves the base version or other bytes
+(`vex_sbt_pin_bypassed`). The full code list is in
 [`CLI_CONTRACT.md`](../crates/socket-patch-cli/CLI_CONTRACT.md) (**Hosted
 sbt**).
 

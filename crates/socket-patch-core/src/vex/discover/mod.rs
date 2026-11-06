@@ -606,11 +606,12 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
-    /// A hosted sbt pin (`socket-patch.sbt`) the build provably does not
-    /// apply: a build source reassigns `dependencyOverrides` or `resolvers`
-    /// (or sets `sbt.override.build.repos`), dropping the generated
-    /// override or resolver, or current resolution evidence records another
-    /// version or other bytes of the GA. The downloaded copy under
+    /// A hosted sbt pin (`socket-patch.sbt`) whose bytes the build provably
+    /// does not use, and that no current evidence verifies: a build source
+    /// reassigns `dependencyOverrides` (replacing the generated override),
+    /// or a resolution record dated after the wiring and every build source
+    /// shows the GA's base version, or the pinned version from outside the
+    /// pin repository with other bytes. The downloaded copy under
     /// `.socket/sbt-hosted` then proves nothing about what the build runs.
     SbtPinBypassed,
 }

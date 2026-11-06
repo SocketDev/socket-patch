@@ -445,6 +445,15 @@ fn first_differing_line(text: &str, fixed: &str) -> usize {
         + 1
 }
 
+/// Whether `text`, found under a generated file's name, lacks the
+/// socket-patch header (after an optional BOM): a user's own file, which
+/// sbt loads like any root `*.sbt` ([`OwnedFileError::Foreign`]).
+pub fn is_foreign(text: &str) -> bool {
+    !text
+        .trim_start_matches('\u{feff}')
+        .starts_with(HEADER_PREFIX)
+}
+
 /// Strict parse of a generated file of `mode`. The syntax line comes from
 /// the installer the file carries.
 ///
@@ -458,10 +467,10 @@ fn first_differing_line(text: &str, fixed: &str) -> usize {
 ///   [`validate_values`]; and the text re-renders byte-identically (modulo
 ///   CRLF), which also fixes the order and one pin per GA.
 pub fn parse(mode: SbtFileMode, text: &str) -> Result<SbtOwnedFile, OwnedFileError> {
-    let unbommed = text.trim_start_matches('\u{feff}');
-    if !unbommed.starts_with(HEADER_PREFIX) {
+    if is_foreign(text) {
         return Err(OwnedFileError::Foreign);
     }
+    let unbommed = text.trim_start_matches('\u{feff}');
     if unbommed.len() != text.len() {
         return Err(modified("the file starts with a byte-order mark"));
     }
