@@ -1,23 +1,18 @@
-//! The vlt steps shared by the hosted flow and the unwinds: the artifact
-//! preflight, run before any takeover or rewrite, and the warm-tree heal
-//! with its `redirect_vlt_reinstall_required` advisory, run after a hosted
+//! The vlt warm-tree heal shared by the hosted flow and the unwinds, with
+//! its `redirect_vlt_reinstall_required` advisory: run after a hosted
 //! rewrite, after rollback/remove restore the vlt pins, and after a
 //! hosted→vendored takeover. A helper module, not a command: `scan`,
 //! `rollback`, `remove` and `vendor` all reach it without importing each
 //! other.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 use socket_patch_core::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_LOCK};
-use socket_patch_core::hosted::vlt::{self as hosted_vlt, Preflight};
 use socket_patch_core::manifest::schema::PatchRecord;
+use socket_patch_core::patch::redirect::vlt;
 use socket_patch_core::patch::redirect::vlt_heal::{
     self, classify_target, read_install_state, Expected, LedgerTarget, Target, TargetState,
 };
-use socket_patch_core::patch::redirect::vlt_preflight;
-use socket_patch_core::patch::redirect::{vlt, DepOverride};
-use socket_patch_core::vendor::lock_inventory::ProjectView;
 
 /// What the post-rewrite heal reports back to the hosted flow: its
 /// advisories, and the confirmed purls whose installed or next-installed
@@ -35,52 +30,6 @@ pub(crate) struct RewriteHeal {
 pub(crate) const REINSTALL_REQUIRED: &str = "redirect_vlt_reinstall_required";
 /// A bundled copy of a redirected package that no rewire reaches.
 pub(crate) const BUNDLED_INSTANCE_SKIPPED: &str = "redirect_vlt_bundled_instance_skipped";
-
-/// The uuids of `deps` whose purl a vlt vendored ledger entry claims: a
-/// hosted takeover reverts them to a registry node before the rewrite.
-async fn vlt_vendored_uuids(cwd: &Path, deps: &[(&str, &DepOverride)]) -> BTreeSet<String> {
-    let Ok(state) = socket_patch_core::vendor::load_state(cwd).await else {
-        return BTreeSet::new();
-    };
-    deps.iter()
-        .filter(|(purl, _)| {
-            socket_patch_core::vendor::lookup_entry(
-                &state.entries,
-                socket_patch_core::utils::purl::strip_purl_qualifiers(purl),
-            )
-            .is_some_and(|e| e.ecosystem == "npm" && e.flavor.as_deref() == Some("vlt"))
-        })
-        .map(|(_, dep)| dep.patch_uuid.clone())
-        .collect()
-}
-
-/// Fetch each in-scope artifact the way vlt does (once per distinct URL,
-/// `offline` making no request) and decide which deps may be pinned in
-/// `vlt-lock.json` ([`socket_patch_core::hosted::vlt`]). Projects without
-/// `vlt-lock.json` make no request. A vlt-vendored dep is probed through
-/// its vendored node, before the takeover reverts it, and a failure keeps
-/// it vendored.
-pub(crate) async fn artifact_preflight(
-    common: &crate::args::GlobalArgs,
-    api_client: &socket_patch_core::api::client::ApiClient,
-    deps: &[(&str, &DepOverride)],
-) -> Preflight {
-    let view = ProjectView::Disk(&common.cwd);
-    let files = hosted_vlt::inputs(&view).await;
-    if files.is_empty() {
-        return Preflight::default();
-    }
-    let vendored = vlt_vendored_uuids(&common.cwd, deps).await;
-    let Some(plan) = hosted_vlt::plan(&view, &files, deps, &vendored) else {
-        return Preflight::default();
-    };
-    let probes = if common.offline {
-        BTreeMap::new()
-    } else {
-        vlt_preflight::probe_artifacts(api_client, &plan.urls()).await
-    };
-    hosted_vlt::judge(&plan, deps, probes)
-}
 
 /// The origins the vlt heal treats as Socket-owned in the final lock: the
 /// patch server plus `--api-url`. Unlike discovery's
@@ -307,8 +256,8 @@ fn takeover_detail(tally: &HealTally, vendored: usize) -> Option<String> {
 fn undeterminable_detail(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
-         installed copies (node_modules is a link, or no patch record or artifact was \
-         available); run `vlt ci` to be sure the patched packages are installed."
+         installed copies (node_modules is a link, or no patch record was available); run \
+         `vlt ci` to be sure the patched packages are installed."
     )
 }
 
@@ -316,7 +265,6 @@ fn undeterminable_detail(n: usize) -> String {
 pub(crate) struct HealInputs<'a> {
     /// The final `vlt-lock.json` (as written, or as a dry run would write it).
     pub(crate) final_lock: Option<&'a str>,
-    pub(crate) preflight: &'a Preflight,
     /// This run's fetched records merged with the ledger's, keyed by purl.
     pub(crate) records: &'a BTreeMap<String, PatchRecord>,
     pub(crate) confirmed: &'a [(String, String)],
@@ -329,8 +277,7 @@ pub(crate) struct HealInputs<'a> {
 /// installed or next-installed bytes are not known to be patched (removed
 /// from the same run's in-run VEX attestation). A confirmed vlt uuid with
 /// no heal target (a non-Socket host, a leaf that disagrees with the
-/// DepID, an artifact no preflight verified) was never checked, so it is
-/// never attested here.
+/// DepID) was never checked, so it is never attested here.
 pub(crate) async fn heal_after_rewrite(
     common: &crate::args::GlobalArgs,
     inputs: &HealInputs<'_>,
@@ -341,7 +288,7 @@ pub(crate) async fn heal_after_rewrite(
         .map(|lock| vlt_heal::socket_owned_instances(lock, &vlt_heal_origins(common)))
         .unwrap_or_default()
         .into_iter()
-        .filter(|i| inputs.preflight.passed.contains(&i.patch_uuid))
+        .filter(|i| inputs.confirmed_vlt.contains(&i.patch_uuid))
         .collect();
     let targeted: BTreeSet<&str> = owned.iter().map(|i| i.patch_uuid.as_str()).collect();
     let mut tally = HealTally::default();
@@ -357,7 +304,6 @@ pub(crate) async fn heal_after_rewrite(
                         name: &i.name,
                         lock_sha512: i.sha512.as_deref(),
                         record,
-                        artifact: inputs.preflight.artifacts.get(&i.url).map(Vec::as_slice),
                         flags: i.flags,
                     },
                     i.patch_uuid.as_str(),
@@ -458,7 +404,6 @@ pub(crate) async fn rollback_heal(
                     name: &t.name,
                     lock_sha512: sha.as_deref(),
                     record: t.record.as_ref(),
-                    artifact: None,
                     flags: *flags,
                 },
                 t.purl.as_str(),
@@ -492,7 +437,6 @@ pub(crate) async fn takeover_heal(
                     name: &t.name,
                     lock_sha512: None,
                     record: t.record.as_ref(),
-                    artifact: None,
                     flags: t.flags,
                 },
                 t.purl.as_str(),
@@ -507,16 +451,6 @@ pub(crate) async fn takeover_heal(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_api() -> socket_patch_core::api::client::ApiClient {
-        socket_patch_core::api::client::ApiClient::new(
-            socket_patch_core::api::client::ApiClientOptions {
-                api_url: "http://127.0.0.1:9".into(),
-                api_token: Some("secret".into()),
-                route: socket_patch_core::api::client::ApiRoute::org("org"),
-            },
-        )
-    }
 
     #[test]
     fn advisory_variants_follow_severity_order() {
@@ -620,135 +554,5 @@ mod tests {
             )
         );
         assert_eq!(takeover_detail(&HealTally::default(), 1), None);
-    }
-
-    fn left_pad_dep(url: &str) -> DepOverride {
-        DepOverride {
-            ecosystem: "npm".into(),
-            name: "left-pad".into(),
-            namespace: None,
-            version: "1.3.0".into(),
-            token: String::new(),
-            patch_uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
-            artifact_url: url.to_string(),
-            registry_override: None,
-            integrity: socket_patch_core::patch::redirect::Integrity {
-                sha512: Some("sha512-new".into()),
-                ..Default::default()
-            },
-        }
-    }
-
-    const LEFT_PAD_LOCK: &str = "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": \
-         {\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-old\",\
-         \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"]\n  },\n  \"edges\": {}\n}\n";
-
-    #[tokio::test]
-    async fn offline_withholds_every_probed_dep_without_a_request() {
-        let server = wiremock::MockServer::start().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let url = format!("{}/patch/npm/t/u/left-pad-1.3.0.tgz", server.uri());
-        std::fs::write(tmp.path().join(VLT_LOCK), LEFT_PAD_LOCK).unwrap();
-        let dep = left_pad_dep(&url);
-        let common = crate::args::GlobalArgs {
-            cwd: tmp.path().to_path_buf(),
-            offline: true,
-            ..crate::args::GlobalArgs::default()
-        };
-        let api = test_api();
-        let pre = artifact_preflight(&common, &api, &[("pkg:npm/left-pad@1.3.0", &dep)]).await;
-        assert!(server.received_requests().await.unwrap().is_empty());
-        assert!(pre.passed.is_empty());
-        assert_eq!(
-            pre.withheld_everywhere
-                .get(&dep.patch_uuid)
-                .map(String::as_str),
-            Some("pkg:npm/left-pad@1.3.0")
-        );
-        assert_eq!(
-            pre.warnings[0].detail,
-            format!(
-                "vlt would fail to verify {url}: offline; nothing was written for \
-                 pkg:npm/left-pad@1.3.0"
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn no_vlt_lock_makes_no_request() {
-        let server = wiremock::MockServer::start().await;
-        let url = format!("{}/patch/npm/t/u/left-pad-1.3.0.tgz", server.uri());
-        let dep = left_pad_dep(&url);
-        let api = test_api();
-        for with_lock in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
-            std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
-            if with_lock {
-                std::fs::write(tmp.path().join(VLT_LOCK), LEFT_PAD_LOCK).unwrap();
-            }
-            let common = crate::args::GlobalArgs {
-                cwd: tmp.path().to_path_buf(),
-                ..crate::args::GlobalArgs::default()
-            };
-            let pre = artifact_preflight(&common, &api, &[("pkg:npm/left-pad@1.3.0", &dep)]).await;
-            let requests = server.received_requests().await.unwrap().len();
-            if with_lock {
-                assert_eq!(requests, 1, "the control probes the vlt lock's dep");
-                assert!(pre.withheld_from_vlt.contains(&dep.patch_uuid));
-            } else {
-                assert_eq!(requests, 0);
-                assert!(pre.passed.is_empty() && pre.warnings.is_empty());
-                assert!(pre.withheld_everywhere.is_empty() && pre.withheld_from_vlt.is_empty());
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_vlt_vendored_dep_is_probed_and_withheld_everywhere() {
-        let server = wiremock::MockServer::start().await;
-        let url = format!("{}/patch/npm/t/u/left-pad-1.3.0.tgz", server.uri());
-        let dep = left_pad_dep(&url);
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("package-lock.json"), "{}").unwrap();
-        std::fs::write(
-            tmp.path().join(VLT_LOCK),
-            "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \
-             \"file~.socket+vendor+npm+11111111-2222-4333-8444-555555555555+left-pad-1.3.0+node__modules+left-pad\": \
-             [0,\"left-pad\",null,\".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0/node_modules/left-pad\"]\n  \
-             },\n  \"edges\": {}\n}\n",
-        )
-        .unwrap();
-        let common = crate::args::GlobalArgs {
-            cwd: tmp.path().to_path_buf(),
-            ..crate::args::GlobalArgs::default()
-        };
-        let api = test_api();
-        let deps = [("pkg:npm/left-pad@1.3.0", &dep)];
-        let unclaimed = artifact_preflight(&common, &api, &deps).await;
-        assert!(server.received_requests().await.unwrap().is_empty());
-        assert!(unclaimed.warnings.is_empty());
-        std::fs::create_dir_all(tmp.path().join(".socket/vendor")).unwrap();
-        std::fs::write(
-            tmp.path().join(".socket/vendor/state.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "version": 1,
-                "entries": { "pkg:npm/left-pad@1.3.0": {
-                    "ecosystem": "npm", "basePurl": "pkg:npm/left-pad@1.3.0",
-                    "uuid": "11111111-2222-4333-8444-555555555555",
-                    "artifact": { "path": ".socket/vendor/npm/11111111-2222-4333-8444-555555555555/left-pad-1.3.0" },
-                    "wiring": [], "flavor": "vlt"
-                }}
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        let claimed = artifact_preflight(&common, &api, &deps).await;
-        assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        assert!(claimed.withheld_from_vlt.is_empty());
-        assert!(claimed.withheld_everywhere.contains_key(&dep.patch_uuid));
-        assert_eq!(
-            claimed.warnings[0].detail,
-            format!("vlt would fail to verify {url}: http 404; nothing was written for pkg:npm/left-pad@1.3.0")
-        );
     }
 }

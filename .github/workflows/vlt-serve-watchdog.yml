@@ -3,8 +3,8 @@ name: vlt serve watchdog
 # vlt hashes the wire body of a registry tarball and asks for
 # `accept-encoding: gzip;q=1.0, identity;q=0.5`, so a patch artifact that
 # patch.socket.dev (or its CDN) serves content-encoded fails `EINTEGRITY` on
-# every vlt release, and hosted mode refuses to pin it
-# (`redirect_vlt_artifact_unverifiable`). This job fetches the public free
+# every vlt release (hosted mode pins it without downloading it, relying on
+# the server's `Cache-Control: no-transform`). This job fetches the public free
 # minimist artifact exactly that way and fails when the response is
 # content-encoded or its sha512 differs from the API's integrity, which pages
 # through the repository's workflow-failure notification.

@@ -51,16 +51,12 @@ the [vendored suite](vendored-production-e2e.md) together.
 
 ## vlt: the serve-encoding gate
 
-vlt verifies the raw response body. If the patch server returns a content-encoded
-artifact, the hosted CLI refuses it with `redirect_vlt_artifact_unverifiable` and
-leaves the lock unchanged. The production leg probes the artifact using vlt's
-request headers and asserts either that refusal or, for identity encoding, the
-full fresh-checkout `vlt ci` proof.
-
-`SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` requires the install branch and
-fails on an encoded response. The
-[serve watchdog](../../.github/workflows/vlt-serve-watchdog.yml) monitors this
-boundary; the current run's probe, not a dated note, determines server behavior.
+vlt verifies the raw response body, so a content-encoded artifact fails
+`EINTEGRITY` at install time. The patch server sends archives with
+`Cache-Control: no-transform`, and the hosted CLI pins them without downloading
+them. The production leg asserts the pin and the full fresh-checkout `vlt ci`
+proof. The [serve watchdog](../../.github/workflows/vlt-serve-watchdog.yml)
+monitors the server's encoding.
 The [vlt guide](vlt-compatibility.md) defines the required leg reporting.
 
 ## Running
@@ -81,7 +77,6 @@ coverage is required.
 | `SOCKET_PATCH_HOSTED_E2E_STRICT=1` | Fail instead of skipping missing required toolchains |
 | `SOCKET_PATCH_HOSTED_E2E_CANARY_STRICT=1` | Fail when a watched ecosystem gains a free fixture, prompting promotion |
 | `SOCKET_PATCH_VLT_E2E_JS` / `SOCKET_PATCH_VLT_E2E_VERSION` | Select an installed, version-pinned vlt executable |
-| `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1` | Require vlt's actual install proof rather than its encoding refusal |
 
 Tools include npm, Corepack for pnpm/Yarn, Bun, uv, Go, and Ruby/Bundler. The gem
 proof requires Bundler 2.6+ for lockfile checksums. vlt requires its configured
