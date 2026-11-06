@@ -109,6 +109,27 @@ pub(crate) fn interpolate_lenient(value: &str, lookup: &dyn Fn(&str) -> Option<S
     expand(value, lookup, &mut Vec::new(), &lookups, true).unwrap_or_else(|| value.to_string())
 }
 
+/// [`interpolate_lenient`] as an [`Interpolate`] (it always gives a text).
+pub(crate) fn interpolate_keeping(
+    value: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    Some(interpolate_lenient(value, lookup))
+}
+
+/// Joins a `<groupId>` and an `<artifactId>` into one text, so that one
+/// interpolation (and one [`profile_combinations`] walk) reads both under
+/// the same active profiles; a control character neither may hold (XML
+/// 1.0 forbids it in a document). [`split_coordinates`] undoes it.
+pub(crate) const COORDINATE_SEPARATOR: char = '\u{1}';
+
+/// The `(groupId, artifactId)` a [`COORDINATE_SEPARATOR`]-joined text
+/// holds.
+pub(crate) fn split_coordinates(joined: &str) -> Option<(String, String)> {
+    let (g, a) = joined.split_once(COORDINATE_SEPARATOR)?;
+    Some((g.to_string(), a.to_string()))
+}
+
 fn expand(
     value: &str,
     lookup: &dyn Fn(&str) -> Option<String>,

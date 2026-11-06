@@ -65,7 +65,13 @@
 //! (hosted mode never writes one; rollback / remove never edit
 //! `.mvn/maven.config`). A pin the build resolves but that any profile's
 //! (or set of profiles') `<properties>` make resolve anything else keeps
-//! the ref unattested too, as a profile declaration does.
+//! the ref unattested too, as a profile declaration does. So do
+//! `${property}` coordinates a profile's `<properties>` redefine (Maven
+//! merges them in before it interpolates a groupId / artifactId, then
+//! matches pins): the declaration carrying the pin then names another
+//! package, or another declaration becomes the pinned GA at a version off
+//! the pin. Coordinates keep an undefined reference as written, so a
+//! profile value this pom cannot resolve may name anything.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
 //! Trusted Checksums — `.mvn/checksums/checksums.sha256` lines
@@ -828,7 +834,10 @@ fn bypasses(
     if let Some(detail) = unpatched_classifier_copy(deps, group, artifact, pinned, wiring) {
         found.push((UnattestedKind::MavenClassifierUnpatched, detail));
     }
-    if let Some(detail) = profile_override(deps, group, artifact, pinned, built.direct.is_empty()) {
+    let pin_managed = built.direct.is_empty();
+    if let Some(detail) = profile_override(deps, group, artifact, pinned, pin_managed)
+        .or_else(|| coordinate_override(deps, group, artifact, pinned, pin_managed))
+    {
         found.push((UnattestedKind::MavenProfileUnpatched, detail));
     }
     found
@@ -982,6 +991,100 @@ fn profile_override(
                 "{POM}: a <profiles> {section}declaration of {named} carries \
                  <version>{version}</version>, not the patched {pinned}; whenever that profile \
                  is active Maven resolves it instead of the pin"
+            ))
+        })
+}
+
+/// Why a profile's `<properties>` move a `${…}` groupId or artifactId so
+/// that `group:artifact`'s pin `pinned` is bypassed, for the first such
+/// declaration ([`PomDep::coordinate_alternatives`]: every combination of
+/// active profiles, and a profile declaration's own). Maven merges an
+/// active profile's properties over the pom's own before it interpolates
+/// the coordinates, then matches management and pins:
+///
+/// * the live main-jar declaration carrying the pin (a managed one only
+///   where management governs it, `pin_managed`) then names another
+///   package, so the pin no longer applies to `group:artifact`, which
+///   resolves from its other declarations or a transitive path;
+/// * any other declaration then becomes `group:artifact`'s main jar (as
+///   [`main_jar_declarations`] reads one; a managed one again only where
+///   management governs) at a version other than `pinned`
+///   ([`resolutions`]), or literally one of its executable classifier
+///   copies off the pin or with no `<version>` of its own. A main jar
+///   without a version takes the live pin and moves nothing.
+fn coordinate_override(
+    deps: &[PomDep],
+    group: &str,
+    artifact: &str,
+    pinned: &str,
+    pin_managed: bool,
+) -> Option<String> {
+    deps.iter()
+        .filter(|d| {
+            !d.coordinate_alternatives.is_empty()
+                && (!d.managed || pin_managed)
+                && !d
+                    .type_text
+                    .as_deref()
+                    .is_some_and(|t| NON_CODE_TYPES.contains(&t))
+        })
+        .find_map(|d| {
+            let section = if d.managed {
+                "<dependencyManagement> "
+            } else {
+                ""
+            };
+            let place = if d.in_profile { "a <profiles> " } else { "a " };
+            let written = format!("{}:{}", d.group_text, d.artifact_text);
+            if d.group == group && d.artifact == artifact {
+                if d.in_profile || d.classifier.is_some() || build_version(d) != Some(pinned) {
+                    return None;
+                }
+                let moved = &d.coordinate_alternatives[0];
+                return Some(format!(
+                    "{POM}: {place}{section}declaration of {written} names {group}:{artifact} at \
+                     the patched {pinned}, but the <properties> of {} redefine its coordinates \
+                     to {}:{}; whenever that applies the pin no longer applies to \
+                     {group}:{artifact}, which Maven resolves from its other declarations instead",
+                    moved.by, moved.group, moved.artifact
+                ));
+            }
+            let moved = d.coordinate_alternatives.iter().find(|m| {
+                let literal = m.group == group && m.artifact == artifact;
+                match d.classifier.as_deref() {
+                    None => {
+                        literal
+                            || may_shadow(
+                                (&m.group, &m.artifact),
+                                d.type_text.as_deref(),
+                                None,
+                                (group, artifact),
+                            )
+                    }
+                    Some(c) => literal && is_executable_classifier(c),
+                }
+            })?;
+            let version = resolutions(d).find_map(|v| v.filter(|v| *v != pinned));
+            let what = match (d.classifier.as_deref(), version) {
+                (None, None) => return None,
+                (None, Some(v)) => format!("<version>{v}</version>"),
+                (Some(c), Some(v)) => format!("classifier {c} at <version>{v}</version>"),
+                (Some(c), None) if build_version(d).is_none() => {
+                    format!("classifier {c} with no <version> of its own")
+                }
+                (Some(_), None) => return None,
+            };
+            let which = if moved.group == group && moved.artifact == artifact {
+                String::new()
+            } else {
+                format!(", which may be {group}:{artifact},")
+            };
+            Some(format!(
+                "{POM}: {place}{section}declaration of {written} names {}:{} with no profile \
+                 active, but the <properties> of {} redefine its coordinates to {}:{}{which} \
+                 carrying {what}, not the patched {pinned}; whenever that applies Maven resolves \
+                 it instead of the pin",
+                d.group, d.artifact, moved.by, moved.group, moved.artifact
             ))
         })
 }
@@ -2114,6 +2217,335 @@ mod tests {
                 "{own}: {:?}",
                 out.unattested
             );
+        }
+    }
+
+    /// One `property_project` case: root `<properties>`, the declarations,
+    /// each profile's body, `.mvn/maven.config`.
+    type CoordinateCase = (String, String, Vec<String>, Option<String>);
+
+    /// Runs `case` and checks the slf4j-api ref is found, and attested
+    /// exactly when `attested` (else withheld as a profile override naming
+    /// the GA and the profile `<properties>`).
+    async fn assert_coordinate_case(case: &CoordinateCase, attested: bool) {
+        let (props, decl, profiles, config) = case;
+        let profiles: Vec<&str> = profiles.iter().map(String::as_str).collect();
+        let p = property_project(props, decl, &profiles);
+        if let Some(config) = config {
+            p.write(".mvn/maven.config", config);
+        }
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        if attested {
+            assert!(
+                attests(&out, FX_PURL),
+                "{props} {decl} {profiles:?}: {:?}",
+                out.unattested
+            );
+            return;
+        }
+        assert_eq!(
+            out.unattested.len(),
+            1,
+            "{props} {decl} {profiles:?}: {:?}",
+            out.unattested
+        );
+        let u = &out.unattested[0];
+        assert_eq!(u.kind, UnattestedKind::MavenProfileUnpatched, "{decl}");
+        assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A));
+        assert!(
+            u.detail.contains("org.slf4j:slf4j-api")
+                && u.detail.contains("<properties>")
+                && u.detail.contains("coordinates"),
+            "{}",
+            u.detail
+        );
+    }
+
+    fn in_props(body: &str) -> String {
+        format!("<properties>{body}</properties>\n")
+    }
+
+    /// A pin declared through a `${property}` groupId or artifactId is the
+    /// pin of that GA only while no active profile's `<properties>`
+    /// redefine the property (or one it names): Maven merges them over the
+    /// pom's own before it interpolates the coordinates, so with such a
+    /// profile active the pin names another package and slf4j-api resolves
+    /// from wherever else it is declared (here: transitively, unpinned).
+    #[tokio::test]
+    async fn profile_properties_moving_the_pinned_coordinates_are_not_attested() {
+        let pin = suffixed(UUID_A);
+        let direct = |g: &str, a: &str| {
+            format!("<dependencies>\n{}</dependencies>\n", dep(g, a, Some(&pin)))
+        };
+        let managed = format!(
+            "<dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n",
+            dep("${g}", "slf4j-api", Some(&pin))
+        );
+        let case = |props: &str, decl: &str, profiles: &[&str], config: Option<&str>| {
+            (
+                props.to_string(),
+                decl.to_string(),
+                profiles.iter().map(|p| in_props(p)).collect::<Vec<_>>(),
+                config.map(str::to_string),
+            )
+        };
+        let g = "<g>org.slf4j</g>";
+        let by_group = direct("${g}", "slf4j-api");
+        let withheld = [
+            // The groupId, the artifactId, or a managed pin.
+            case(g, &by_group, &["<g>org.other</g>"], None),
+            case(
+                "<a>slf4j-api</a>",
+                &direct("org.slf4j", "${a}"),
+                &["<a>slf4j-simple</a>"],
+                None,
+            ),
+            case(g, &managed, &["<g>org.other</g>"], None),
+            // Through a property the coordinate's names, or partly literal.
+            case(
+                "<g>${vendor}</g><vendor>org.slf4j</vendor>",
+                &by_group,
+                &["<vendor>org.other</vendor>"],
+                None,
+            ),
+            case(
+                "<v>slf4j</v>",
+                &direct("org.${v}", "${v}-api"),
+                &["<v>log4j</v>"],
+                None,
+            ),
+            // A value this pom cannot resolve, or a cycle.
+            case(g, &by_group, &["<g>${undefined}</g>"], None),
+            case(g, &by_group, &["<g>${g}</g>"], None),
+            // Two profiles that move it only together.
+            case(
+                "<g>org.slf4j</g><w>org.slf4j</w>",
+                &by_group,
+                &["<g>${w}</g>", "<w>org.other</w>"],
+                None,
+            ),
+            // A user property in the chain does not fix a name above it.
+            case(
+                "<g>${vendor}</g>",
+                &by_group,
+                &["<g>org.other</g>"],
+                Some("-Dvendor=org.slf4j\n"),
+            ),
+        ];
+        for c in &withheld {
+            assert_coordinate_case(c, false).await;
+        }
+        let attested = [
+            // The same GA, or an unrelated property.
+            case(g, &by_group, &["<g>org.slf4j</g>"], None),
+            case(g, &by_group, &["<x>org.other</x>"], None),
+            // A user property wins over every profile's.
+            case(g, &by_group, &["<g>org.other</g>"], Some("-Dg=org.slf4j\n")),
+            case(
+                "<g>${vendor}</g><vendor>org.other</vendor>",
+                &by_group,
+                &["<vendor>org.another</vendor>"],
+                Some("-Dvendor=org.slf4j\n"),
+            ),
+        ];
+        for c in &attested {
+            assert_coordinate_case(c, true).await;
+        }
+    }
+
+    /// Another declaration whose `${property}` coordinates name another
+    /// package while no profile is active but slf4j-api once a profile's
+    /// `<properties>` redefine them overrides the pin with its own version
+    /// whenever that profile is active. So does one inside a profile whose
+    /// own `<properties>` make it slf4j-api.
+    #[tokio::test]
+    async fn profile_properties_turning_a_declaration_into_the_pinned_ga_are_not_attested() {
+        let pin = suffixed(UUID_A);
+        let pinned = dep("org.slf4j", "slf4j-api", Some(&pin));
+        let with = |other: &str| format!("<dependencies>\n{pinned}{other}</dependencies>\n");
+        let other = |v: Option<&str>| dep("${h}", "slf4j-api", v);
+        let classified = |c: &str, v: Option<&str>| {
+            let v = v.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependency><groupId>${{h}}</groupId><artifactId>slf4j-api</artifactId>{v}\
+                 <classifier>{c}</classifier></dependency>\n"
+            )
+        };
+        let h = "<h>org.other</h>";
+        let to_slf4j = in_props("<h>org.slf4j</h>");
+        let case = |props: &str, decl: String, profiles: Vec<String>, config: Option<&str>| {
+            (
+                props.to_string(),
+                decl,
+                profiles,
+                config.map(str::to_string),
+            )
+        };
+        let withheld = [
+            // The base release, or another one.
+            case(
+                h,
+                with(&other(Some("1.7.36"))),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            case(
+                h,
+                with(&other(Some("1.7.30"))),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // Managed, where management governs the pin.
+            case(
+                h,
+                format!(
+                    "<dependencies>\n{}</dependencies>\n<dependencyManagement>\
+                     <dependencies>\n{pinned}{}</dependencies></dependencyManagement>\n",
+                    dep("org.slf4j", "slf4j-api", None),
+                    other(Some("1.7.36"))
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // A version the same profile moves too.
+            case(
+                &format!("{h}<v>2.0.0</v>"),
+                with(&other(Some("${v}"))),
+                vec![in_props("<h>org.slf4j</h><v>1.7.36</v>")],
+                None,
+            ),
+            // A value the pom cannot resolve may be slf4j-api.
+            case(
+                h,
+                with(&other(Some("1.7.36"))),
+                vec![in_props("<h>${undefined}</h>")],
+                None,
+            ),
+            // An executable classifier copy, with or without a version.
+            case(
+                h,
+                with(&classified("tests", Some("1.7.36"))),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            case(
+                h,
+                with(&classified("tests", None)),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // A profile declaration its own profile's properties retarget.
+            case(
+                h,
+                with(""),
+                vec![format!(
+                    "{to_slf4j}<dependencies>\n{}</dependencies>\n",
+                    other(Some("1.7.36"))
+                )],
+                None,
+            ),
+            // Through a user property lower in the chain.
+            case(
+                "<h>${corp}</h>",
+                with(&other(Some("1.7.36"))),
+                vec![to_slf4j.clone()],
+                Some("-Dcorp=org.other\n"),
+            ),
+        ];
+        for c in &withheld {
+            assert_coordinate_case(c, false).await;
+        }
+        let attested = [
+            // No version of its own: the live pin applies.
+            case(h, with(&other(None)), vec![to_slf4j.clone()], None),
+            // Managed, while a direct version (the pin) governs.
+            case(
+                h,
+                format!(
+                    "<dependencies>\n{pinned}</dependencies>\n<dependencyManagement>\
+                     <dependencies>\n{}</dependencies></dependencyManagement>\n",
+                    other(Some("1.7.36"))
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // A non-executable classifier copy, or another type.
+            case(
+                h,
+                with(&classified("sources", Some("1.7.36"))),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            case(
+                h,
+                with(
+                    "<dependency><groupId>${h}</groupId><artifactId>slf4j-api</artifactId>\
+                     <version>1.7.36</version><type>pom</type></dependency>\n",
+                ),
+                vec![to_slf4j.clone()],
+                None,
+            ),
+            // A user property wins over every profile's.
+            case(
+                h,
+                with(&other(Some("1.7.36"))),
+                vec![to_slf4j.clone()],
+                Some("-Dh=org.other\n"),
+            ),
+        ];
+        for c in &attested {
+            assert_coordinate_case(c, true).await;
+        }
+    }
+
+    /// Coordinate properties that cannot make any declaration the pinned
+    /// GA, or move the pin off it, withhold nothing: a profile moving an
+    /// unrelated package to another unrelated one, a partly undefined
+    /// coordinate no profile touches, and a profile property no coordinate
+    /// names.
+    #[tokio::test]
+    async fn unrelated_coordinate_properties_do_not_withhold() {
+        let pin = suffixed(UUID_A);
+        let pinned = dep("org.slf4j", "slf4j-api", Some(&pin));
+        let with = |other: &str| format!("<dependencies>\n{pinned}{other}</dependencies>\n");
+        let none: Option<String> = None;
+        for case in [
+            (
+                "<h>org.other</h>".to_string(),
+                with(&dep("${h}", "slf4j-api", Some("1.7.36"))),
+                vec![in_props("<h>org.third</h>")],
+                none.clone(),
+            ),
+            (
+                "<h>org.other</h>".to_string(),
+                with(&dep("org.slf4j", "${h}", Some("1.7.36"))),
+                vec![in_props("<h>slf4j-simple</h>")],
+                none.clone(),
+            ),
+            (
+                "<h>com.corp</h>".to_string(),
+                with(&dep("${h}.${undefined}", "slf4j-api", Some("1.7.36"))),
+                vec![in_props("<x>1</x>")],
+                none.clone(),
+            ),
+            (
+                "<h>org.other</h><x>1</x>".to_string(),
+                with(&dep("${h}", "slf4j-api", Some("1.7.36"))),
+                vec![in_props("<x>2</x>")],
+                none.clone(),
+            ),
+            (
+                "<g>org.slf4j</g>".to_string(),
+                format!(
+                    "<dependencies>\n{}</dependencies>\n",
+                    dep("${g}", "slf4j-api", Some(&pin))
+                ),
+                vec![in_props("<x>org.other</x>")],
+                none.clone(),
+            ),
+        ] {
+            assert_coordinate_case(&case, true).await;
         }
     }
 

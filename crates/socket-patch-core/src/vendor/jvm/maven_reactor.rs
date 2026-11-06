@@ -12,9 +12,10 @@ use std::ops::Range;
 use serde_json::{json, Value};
 
 use crate::formats::maven::{
-    interpolate_strict, is_model_reference, lookup_property,
-    maven_config_properties as cli_properties, profile_combinations, Definitions, PomLayer,
-    MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+    interpolate_keeping, interpolate_strict, is_model_reference, lookup_property,
+    maven_config_properties as cli_properties, profile_combinations, split_coordinates,
+    Definitions, Interpolate, PomLayer, COORDINATE_SEPARATOR, MAX_COMBINED_PROFILES,
+    MAX_INTERPOLATION_DEPTH,
 };
 
 use super::super::state::{WiringAction, WiringRecord};
@@ -1712,13 +1713,21 @@ impl Reactor {
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
     fn interpolate(&self, rel: &str, value: &str) -> Option<String> {
-        self.interpolate_with(rel, value, &[])
+        self.interpolate_with(rel, value, &[], interpolate_strict)
     }
 
     /// [`Self::interpolate`] with the `active` profiles' properties layered
-    /// over their poms' own, as when those profiles are active.
-    fn interpolate_with(&self, rel: &str, value: &str, active: &[Overlay<'_>]) -> Option<String> {
-        interpolate_strict(value, &|name| self.lookup_with(rel, name, active))
+    /// over their poms' own, as when those profiles are active, through
+    /// `interpolate` ([`interpolate_strict`] for a version,
+    /// [`interpolate_keeping`] for coordinates).
+    fn interpolate_with(
+        &self,
+        rel: &str,
+        value: &str,
+        active: &[Overlay<'_>],
+        interpolate: Interpolate,
+    ) -> Option<String> {
+        interpolate(value, &|name| self.lookup_with(rel, name, active))
     }
 
     /// Maven's lookup order ([`lookup_property`], shared with VEX
@@ -1788,18 +1797,20 @@ impl Reactor {
                     .then(|| self.interpolate(reader, declared).unwrap_or_else(undefined))
                     .filter(|v| moved(v))
                     .map(|v| (v, reader.to_string()));
-                plain.or_else(|| self.profile_override(reader, declared, &moved))
+                plain
+                    .or_else(|| self.profile_override(reader, declared, interpolate_strict, &moved))
             })
     }
 
     /// The first combination of the profiles on `reader`'s chain under
-    /// which `declared` resolves a version `moved` accepts, with the
-    /// version and where; fails closed (an undetermined version) when more
-    /// profiles may change it than are combined.
+    /// which `declared` resolves (through `interpolate`) a value `moved`
+    /// accepts, with the value and where; fails closed (an undetermined
+    /// value) when more profiles may change it than are combined.
     fn profile_override(
         &self,
         reader: &str,
         declared: &str,
+        interpolate: Interpolate,
         moved: &dyn Fn(&str) -> bool,
     ) -> Option<(String, String)> {
         let profiles: Vec<(&str, &str, &BTreeMap<String, String>)> = self
@@ -1851,7 +1862,7 @@ impl Reactor {
                 .map(|&i| (profiles[i].0, profiles[i].2))
                 .collect();
             let v = self
-                .interpolate_with(reader, declared, &active)
+                .interpolate_with(reader, declared, &active, interpolate)
                 .unwrap_or_else(|| "an undefined value".to_string());
             moved(&v).then(|| {
                 let under = combination
@@ -1862,6 +1873,44 @@ impl Reactor {
                 (v, format!("{reader} under {under}"))
             })
         })
+    }
+
+    /// Where `dep` of `rel`, a declaration named through `${...}`
+    /// coordinates, reads a groupId and artifactId that `hit` accepts,
+    /// other than `rel` with no profile active: an inheritor of `rel`, or
+    /// `rel` or an inheritor with some combination of the profiles on its
+    /// chain active ([`Self::profile_override`], which covers the profile
+    /// holding `dep`). Both are read together, an unresolved reference kept
+    /// as written ([`interpolate_keeping`]): Maven interpolates after
+    /// inheritance and with the active profiles' `<properties>` merged in,
+    /// then matches management and pins. More profiles than are combined
+    /// fail closed (accepted whatever `hit` says).
+    fn coordinates_elsewhere(
+        &self,
+        rel: &str,
+        dep: usize,
+        hit: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<String> {
+        let doc = &self.poms[rel].doc;
+        let joined = format!(
+            "{}{COORDINATE_SEPARATOR}{}",
+            doc.child_text(dep, "groupId")?,
+            doc.child_text(dep, "artifactId")?
+        );
+        let accepts = |v: &str| split_coordinates(v).is_some_and(|(g, a)| hit(&g, &a));
+        std::iter::once(rel)
+            .chain(self.inheritors(rel))
+            .find_map(|reader| {
+                let plain = (reader != rel)
+                    .then(|| self.interpolate_with(reader, &joined, &[], interpolate_keeping))
+                    .flatten()
+                    .filter(|v| accepts(v))
+                    .map(|_| reader.to_string());
+                plain.or_else(|| {
+                    self.profile_override(reader, &joined, interpolate_keeping, &accepts)
+                        .map(|(_, at)| at)
+                })
+            })
     }
 
     /// Every pom in scope that inherits from `rel` (has it on its chain).
@@ -1891,6 +1940,7 @@ impl Reactor {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
         self.warn_unresolved_coordinates(rel, patch, warnings, unpinned, uncertain);
+        self.warn_moved_coordinates(rel, patch, warnings, unpinned, uncertain);
         for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
             if doc
                 .child_text(dep, "type")
@@ -1910,15 +1960,13 @@ impl Reactor {
                 continue;
             }
             let root = self.local_root(rel);
-            // Maven interpolates after inheritance: a pom that inherits this
-            // declaration may name another artifact through it, which the
-            // literal SV must not reach.
+            // Maven interpolates after inheritance and with the active
+            // profiles: a pom that inherits this declaration, or a profile
+            // redefining a property it names, may make it another artifact,
+            // which the literal SV must not reach.
             if doc.has_property_coordinate(dep) {
-                let other = self.inheritors(rel).find(|p| {
-                    let resolve = |v: &str| self.interpolate(p, v);
-                    doc.coordinate(dep, "groupId", &resolve).as_deref() != Some(patch.group_id)
-                        || doc.coordinate(dep, "artifactId", &resolve).as_deref()
-                            != Some(patch.artifact_id)
+                let other = self.coordinates_elsewhere(rel, dep, &|g, a| {
+                    g != patch.group_id || a != patch.artifact_id
                 });
                 if let Some(p) = other {
                     warnings.push(degraded(
@@ -2078,6 +2126,83 @@ impl Reactor {
                     patch.group_id,
                     patch.artifact_id,
                     unresolved.join(", ")
+                ),
+            ));
+            if versioned {
+                unpinned.insert(root);
+                uncertain.insert(at);
+            }
+        }
+    }
+}
+
+impl Reactor {
+    /// Warn for each declaration of `rel` whose `${...}` groupId or
+    /// artifactId reads another artifact in `rel` itself but may read
+    /// `patch`'s g:a in an inheritor or with a profile active
+    /// ([`Self::coordinates_elsewhere`]): it is left as is, and there it
+    /// declares the g:a at its own version. One with a version beats any
+    /// pin, so its local root is not pinned.
+    fn warn_moved_coordinates(
+        &self,
+        rel: &str,
+        patch: &JvmPatch<'_>,
+        warnings: &mut Vec<JvmWarning>,
+        unpinned: &mut BTreeSet<String>,
+        uncertain: &mut BTreeSet<String>,
+    ) {
+        let doc = &self.poms[rel].doc;
+        let resolve = |v: &str| self.interpolate(rel, v);
+        for dep in doc.declarations() {
+            let (Some(g), Some(a)) = (
+                doc.child_text(dep, "groupId"),
+                doc.child_text(dep, "artifactId"),
+            ) else {
+                continue;
+            };
+            let other_variant = doc
+                .child_text(dep, "type")
+                .is_some_and(|t| !t.is_empty() && t != "jar")
+                || doc
+                    .child_text(dep, "classifier")
+                    .is_some_and(|c| !c.is_empty());
+            // Undefined in `rel`: `warn_unresolved_coordinates` weighs it;
+            // `patch`'s g:a in `rel`: `rewrite_declarations` does.
+            let (Some(here_g), Some(here_a)) = (
+                doc.coordinate(dep, "groupId", &resolve),
+                doc.coordinate(dep, "artifactId", &resolve),
+            ) else {
+                continue;
+            };
+            if other_variant
+                || !doc.has_property_coordinate(dep)
+                || doc.pin_at(dep).is_some()
+                || (here_g == patch.group_id && here_a == patch.artifact_id)
+            {
+                continue;
+            }
+            // A reference left unresolved there may read any text.
+            let Some(there) = self.coordinates_elsewhere(rel, dep, &|rg, ra| {
+                may_interpolate_to(rg, patch.group_id) && may_interpolate_to(ra, patch.artifact_id)
+            }) else {
+                continue;
+            };
+            let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
+            let versioned = doc
+                .child_text(dep, "version")
+                .is_some_and(|v| !v.is_empty());
+            let root = self.local_root(rel);
+            let unpin = if versioned {
+                format!(", and {root} is not pinned")
+            } else {
+                String::new()
+            };
+            warnings.push(degraded(
+                "coordinates_overridden",
+                format!(
+                    "{at}: {g}:{a} is {here_g}:{here_a} here but may be {}:{} in {there}; \
+                     left as is, probably unpatched there{unpin}",
+                    patch.group_id, patch.artifact_id,
                 ),
             ));
             if versioned {
@@ -5910,6 +6035,185 @@ mod tests {
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
         assert!(unwired(&applied(&files, &plan)));
+    }
+
+    /// `root` with `<properties>{props}</properties>` and a profile `corp`
+    /// whose `<properties>` are `profile` (none when empty), before its
+    /// `<modules>`.
+    fn root_with(props: &str, profile: &str) -> String {
+        let root = ROOT.replace(
+            "  <modules>",
+            &format!("  <properties>{props}</properties>\n  <modules>"),
+        );
+        match profile {
+            "" => root,
+            p => root.replace(
+                "  <modules>",
+                &format!(
+                    "  <profiles><profile><id>corp</id><properties>{p}</properties>\
+                     </profile></profiles>\n  <modules>"
+                ),
+            ),
+        }
+    }
+
+    /// A declaration whose `${...}` groupId a profile redefines names
+    /// another artifact whenever that profile is active, which the literal
+    /// SV must not reach: it is left as is and its root unpinned, as for
+    /// an inheritor that resolves it differently. A `.mvn/maven.config`
+    /// user property wins over the profile's.
+    #[test]
+    fn a_profile_moving_the_declared_coordinates_is_left_alone() {
+        let decl = "<dependency><groupId>${ct.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl);
+        let props = "<ct.group>org.apache.commons</ct.group>";
+        for profile in [
+            "<ct.group>org.other</ct.group>",
+            "<ct.group>${nope}</ct.group>",
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root_with(props, profile)),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            let plan = run(&files).unwrap();
+            assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
+            assert!(
+                plan.warnings[0].detail.contains("profile corp"),
+                "{:?}",
+                plan.warnings
+            );
+            let after = applied(&files, &plan);
+            assert_eq!(text(&after, "a/pom.xml"), a);
+            assert!(!root_pinned(&plan, &files));
+            assert!(unwired(&after), "{profile}");
+        }
+
+        // A vendored reactor a profile is added to later is not attestable.
+        let files = fs(&[
+            ("pom.xml", &root_with(props, "")),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (_, mut after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+        let root = text(&after, "pom.xml").replace(
+            "  <modules>",
+            "  <profiles><profile><id>corp</id><properties><ct.group>org.other</ct.group>\
+             </properties></profile></profiles>\n  <modules>",
+        );
+        after.insert("pom.xml".to_string(), root.into_bytes());
+        assert_eq!(attestable(&after), (true, false));
+
+        // The same profile, beaten by a user property, or agreeing.
+        for (profile, config) in [
+            (
+                "<ct.group>org.other</ct.group>",
+                "-Dct.group=org.apache.commons\n",
+            ),
+            ("<ct.group>org.apache.commons</ct.group>", ""),
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root_with(props, profile)),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+                (".mvn/maven.config", config),
+            ]);
+            let (plan, after) = vendor(&files);
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+            assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+            assert_eq!(attestable(&after), (true, true), "{profile}");
+        }
+    }
+
+    /// A declaration whose `${...}` groupId names another artifact with no
+    /// profile active, but the patched one under a profile, declares the
+    /// patched artifact at its own version there, beating the root pin:
+    /// it is left as is, warned about, and its root unpinned, so a reactor
+    /// vendored before that profile was added is not attestable. Unrelated
+    /// coordinate properties change nothing.
+    #[test]
+    fn a_profile_turning_a_declaration_into_the_patched_artifact_is_weighed() {
+        let other = |v: &str| {
+            format!(
+                "<dependency><groupId>${{lib.group}}</groupId>\
+                 <artifactId>commons-text</artifactId>{v}</dependency>"
+            )
+        };
+        let props = "<lib.group>org.other</lib.group>";
+        let a = module(
+            "a",
+            &format!("{}{}", dep("1.10.0"), other("<version>1.9</version>")),
+        );
+        for (profile, warned) in [
+            ("<lib.group>org.apache.commons</lib.group>", true),
+            ("<lib.group>${nope}</lib.group>", true),
+            ("<lib.group>org.third</lib.group>", false),
+            ("<x>org.apache.commons</x>", false),
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root_with(props, profile)),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            let plan = run(&files).unwrap();
+            if warned {
+                assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
+                assert!(
+                    plan.warnings[0].detail.contains("profile corp")
+                        && plan.warnings[0]
+                            .detail
+                            .contains("org.apache.commons:commons-text"),
+                    "{:?}",
+                    plan.warnings
+                );
+                assert!(!root_pinned(&plan, &files), "{profile}");
+            } else {
+                assert!(plan.warnings.is_empty(), "{profile}: {:?}", plan.warnings);
+                assert!(root_pinned(&plan, &files), "{profile}");
+            }
+        }
+
+        // No version of its own: the pin applies, so the root stays pinned.
+        let files = fs(&[
+            (
+                "pom.xml",
+                &root_with(props, "<lib.group>org.apache.commons</lib.group>"),
+            ),
+            (
+                "a/pom.xml",
+                &module("a", &format!("{}{}", dep("1.10.0"), other(""))),
+            ),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        assert!(root_pinned(&plan, &files));
+
+        // Vendored first, the profile added later: not attestable; a user
+        // property fixing the group keeps it attestable.
+        let files = fs(&[
+            ("pom.xml", &root_with(props, "")),
+            ("a/pom.xml", &a),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let (_, after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+        let profiled = text(&after, "pom.xml").replace(
+            "  <modules>",
+            "  <profiles><profile><id>corp</id><properties>\
+             <lib.group>org.apache.commons</lib.group></properties></profile></profiles>\n  \
+             <modules>",
+        );
+        let mut later = after.clone();
+        later.insert("pom.xml".to_string(), profiled.into_bytes());
+        assert_eq!(attestable(&later), (true, false));
+        later.insert(
+            ".mvn/maven.config".to_string(),
+            b"-Dlib.group=org.other\n".to_vec(),
+        );
+        assert_eq!(attestable(&later), (true, true));
     }
 
     fn attestable(files: &Fs) -> (bool, bool) {

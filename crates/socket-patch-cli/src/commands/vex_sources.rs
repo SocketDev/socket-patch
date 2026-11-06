@@ -280,9 +280,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         UnattestedKind::MavenProfileUnpatched => (
             NOTE_MAVEN_PROFILE_UNPATCHED,
             "not attested while a profile declares it at, or its <properties> move it to, \
-             another version; the wiring itself is intact, so re-running `scan` does not change \
-             this (drop that profile <version> or property or set it to the pin, or re-patch \
-             with `scan --mode vendored`)",
+             another version, or its <properties> redefine a groupId / artifactId property so \
+             the pin names another package or another declaration names this one; the wiring \
+             itself is intact, so re-running `scan` does not change this (drop that profile \
+             <version> or property or set it to the pin, or re-patch with \
+             `scan --mode vendored`)",
         ),
         UnattestedKind::MavenConfigOverride => (
             NOTE_MAVEN_CONFIG_OVERRIDE,
