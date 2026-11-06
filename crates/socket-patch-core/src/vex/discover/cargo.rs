@@ -947,7 +947,10 @@ fn beside_the_pin(
     let refused: Vec<String> = unpinned
         .iter()
         .filter_map(|(d, selects)| {
-            let why = match (&d.source, d.registry.as_deref(), selects) {
+            // `registry = "crates-io"` is crates.io itself, which the
+            // rewriter re-pins like a declaration with no `registry` (#386).
+            let registry = d.registry.as_deref().filter(|r| r.trim() != "crates-io");
+            let why = match (&d.source, registry, selects) {
                 (DeclSource::Registry, None, CargoReqMatch::Ours) => return None,
                 (DeclSource::Registry, None, _) => {
                     let also: Vec<&str> = others
@@ -2161,6 +2164,19 @@ mod tests {
     #[tokio::test]
     async fn the_remedy_says_whether_a_rescan_can_pin_it() {
         let p = mixed_workspace(&pinned("serde", "=1.0.1", UUID_A), "serde = \"1\"", &[]);
+        let u = run(&p).await.unattested.remove(0);
+        assert!(
+            u.detail.contains("re-run `socket-patch scan`"),
+            "{}",
+            u.detail
+        );
+        // Review on #2019 (round 2): `registry = "crates-io"` is crates.io,
+        // which a re-scan re-pins (#386).
+        let p = mixed_workspace(
+            &pinned("serde", "=1.0.1", UUID_A),
+            "serde = { version = \"1\", registry = \"crates-io\" }",
+            &[],
+        );
         let u = run(&p).await.unattested.remove(0);
         assert!(
             u.detail.contains("re-run `socket-patch scan`"),
