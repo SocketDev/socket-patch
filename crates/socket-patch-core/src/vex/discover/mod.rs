@@ -620,8 +620,10 @@ pub enum UnattestedKind {
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
     /// A hosted Cargo pin beside another declaration of the crate (the
-    /// root's or a workspace member's) that names no Socket registry and
-    /// whose requirement accepts the pinned version: cargo resolves that
+    /// root's or a workspace member's) that is not pinned (no Socket
+    /// registry or `[patch]` redirect reaches it, or a path / git /
+    /// `registry-index` overrides its registry) and whose requirement may
+    /// select the pinned version: cargo resolves that
     /// declaration from its own source as a separate package, so the crate
     /// declaring it builds an unpatched copy, possibly of this version.
     CargoUnpinnedDeclaration,

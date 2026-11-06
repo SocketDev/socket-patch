@@ -274,9 +274,7 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::CargoUnpinnedDeclaration => (
             NOTE_CARGO_UNPINNED_DECLARATION,
-            "not attested while that declaration names no Socket registry (re-run \
-             `socket-patch scan` to pin a crates.io declaration too; one from another \
-             registry, a path or git cannot be pinned, so roll the patch back)",
+            "not attested while that declaration stands",
         ),
     }
 }
@@ -1786,7 +1784,9 @@ mod tests {
             purl: PURL.into(),
             uuid: U1.into(),
             file: "crates/a/Cargo.toml".into(),
-            detail: "crates/a/Cargo.toml declares serde \"1\" from crates.io".into(),
+            detail: "crates/a/Cargo.toml declares serde \"1\" from crates.io, not registry \
+                     \"socket-patch-…\"; re-run `socket-patch scan` to pin it too"
+                .into(),
             kind: UnattestedKind::CargoUnpinnedDeclaration,
         });
         let gated = plan(
@@ -1812,7 +1812,10 @@ mod tests {
                 .iter()
                 .any(|n| n.code == NOTE_CARGO_UNPINNED_DECLARATION
                     && n.detail.contains("crates/a/Cargo.toml declares serde")
-                    && n.detail.contains("socket-patch scan")),
+                    && n.detail.ends_with(
+                        "re-run `socket-patch scan` to pin it too; not attested while that \
+                         declaration stands"
+                    )),
             "{:?}",
             gated.notes
         );
