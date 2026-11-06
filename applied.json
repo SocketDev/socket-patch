@@ -70,7 +70,8 @@
   "20261105T132251Z-janitor.json",
   "20261105T191900Z-janitor.json",
   "20261106T011808Z-janitor.json",
-  "20261106T071833Z-janitor.json"
+  "20261106T071833Z-janitor.json",
+  "20261106T132400Z-janitor.json"
  ],
  "failed": {
   "00000000T000000Z-bridge-test.json": [
