@@ -1386,7 +1386,16 @@ impl ScriptGraph {
                     (0..toks.len())
                         .filter(|&i| is_ident(toks.get(i), "project"))
                         .filter_map(|i| {
-                            let open = (i + 1..toks.len().min(i + 8))
+                            // Skip the whole `project(…)` argument list,
+                            // however long, so a named-argument call
+                            // (`project(path: ':a', configuration: 'x') {`)
+                            // still counts as configuring another project.
+                            let after = if is_punct(toks.get(i + 1), b'(') {
+                                matching_close(&toks, i + 1)? + 1
+                            } else {
+                                i + 1
+                            };
+                            let open = (after..toks.len().min(after + 4))
                                 .find(|&j| is_punct(toks.get(j), b'{'))?;
                             matching_close(&toks, open).map(|c| (open, c))
                         }),
@@ -2814,6 +2823,8 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
             "subprojects { dependencyLocking { lockFile = file('x.lockfile') } }\n",
             "allprojects { dependencyLocking { lockFile = file('x.lockfile') } }\n",
             "project(':app') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "project(path: ':app', configuration: 'default') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "project(':app').afterEvaluate { dependencyLocking { lockFile = file('x.lockfile') } }\n",
         ] {
             let files = [
                 ("settings.gradle", "include 'app'\n"),
