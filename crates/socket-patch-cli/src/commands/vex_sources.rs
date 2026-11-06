@@ -278,10 +278,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::PnpmGitBranchLock => (
             NOTE_PNPM_GIT_BRANCH_LOCKFILE,
-            "not attested while any branch lock exists, whatever gitBranchLockfile says; the \
-             wiring itself is intact, so re-running `scan` / `vendor` does not change this \
-             (fold the branch locks in with `pnpm install --merge-git-branch-lockfiles`, turn \
-             gitBranchLockfile off and delete the `pnpm-lock.<branch>.yaml` files)",
+            "not attested while any branch lock exists (or the members that could hold one \
+             cannot be listed), whatever gitBranchLockfile says; the wiring itself is intact, \
+             so re-running `scan` / `vendor` does not change this (fold the branch locks in \
+             with `pnpm install --merge-git-branch-lockfiles`, turn gitBranchLockfile off and \
+             delete the `pnpm-lock.<branch>.yaml` files, or make the workspace's `packages` \
+             listable)",
         ),
         UnattestedKind::UserPatchedDependency => (
             NOTE_NPM_PATCHED_DEPENDENCY,

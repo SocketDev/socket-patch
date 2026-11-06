@@ -796,14 +796,22 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
 /// whatever `gitBranchLockfile` says. `vex` discovery withholds on their
 /// mere presence (fail-closed), so the setting is not read; neither is the
 /// environment, and nothing outside the project.
-pub async fn git_branch_lock_files(view: &ProjectView<'_>) -> Vec<String> {
+///
+/// `Err(why)` when the members that install from their own lock cannot be
+/// listed ([`Members::Unresolved`]): a member branch lock then cannot be
+/// ruled out, as in [`git_branch_locks_in`], and discovery withholds.
+pub async fn git_branch_lock_files(view: &ProjectView<'_>) -> Result<Vec<String>, String> {
     let mut locks = branch_lock_names(view, "").await;
-    if let Members::Dirs { dirs, .. } = workspace_members(view, false).await {
-        for dir in dirs {
-            locks.extend(branch_lock_names(view, &dir).await);
+    match workspace_members(view, false).await {
+        Members::Dirs { dirs, .. } => {
+            for dir in dirs {
+                locks.extend(branch_lock_names(view, &dir).await);
+            }
         }
+        Members::Unresolved(why) => return Err(why),
+        Members::Shared => {}
     }
-    locks
+    Ok(locks)
 }
 
 /// [`git_branch_locks`], consulting the environment only with `env`: the
