@@ -1012,7 +1012,9 @@ fn profile_override(
                 // The smallest combination of profiles that moves it.
                 let moved = d.version_alternatives.first()?;
                 let declared = d.version_text.as_deref().unwrap_or_default();
-                let value = if moved.value.contains("${") {
+                let value = if !matches!(moved.by, crate::formats::maven::MovedBy::Profiles(_)) {
+                    "resolve a version this reader cannot work out".to_string()
+                } else if moved.value.contains("${") {
                     format!("nothing it can resolve ({})", moved.value)
                 } else {
                     moved.value.clone()
@@ -2608,6 +2610,55 @@ mod tests {
             ),
             "{:?}",
             out.diagnostics
+        );
+    }
+
+    /// Review on #2020 (round 2): a property defined twice is Maven's LAST
+    /// definition; a profile declaration's coordinates read its own
+    /// profile's `<properties>` as its version does; a profile is named by
+    /// its own `<id>`, not one nested in it.
+    #[tokio::test]
+    async fn duplicate_properties_profile_coordinates_and_profile_ids() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version><slf4j.version>1.7.36</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[],
+        );
+        let out = run(&p).await;
+        assert!(!attests(&out, FX_PURL), "{:?}", out.refs);
+
+        let p = property_project(
+            "<g>org.other</g>",
+            &direct_decl(&pin),
+            &[
+                "<properties><g>org.slf4j</g></properties>\n<dependencies>\n\
+               <dependency><groupId>${g}</groupId><artifactId>slf4j-api</artifactId>\
+               <version>1.7.30</version></dependency>\n</dependencies>\n",
+            ],
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(!attests(&out, FX_PURL), "{:?}", out.unattested);
+
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<properties><v>{pin}</v></properties>\n{}<repositories>\n{repo}</repositories>\n\
+                 <profiles><profile><repositories><repository><id>mirror</id>\
+                 <url>https://example.test/m2</url></repository></repositories>\
+                 <id>ci</id><properties><v>1.7.30</v></properties></profile></profiles>\n",
+                direct_decl("${v}"),
+            )),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("profile ci") && !detail.contains("mirror"),
+            "{detail}"
         );
     }
 

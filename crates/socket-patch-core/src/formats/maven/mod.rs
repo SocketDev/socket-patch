@@ -350,11 +350,14 @@ impl PomScope {
         (base, alternatives)
     }
 
-    /// `text` (a coordinate) with every `${name}` the build defines with
-    /// no profile active interpolated, an undefined one kept as written
+    /// `text` (a coordinate of the declaration at `pos`) with every
+    /// `${name}` the build defines interpolated, reading the declaration's
+    /// own profile `<properties>` first when it sits in a profile (as its
+    /// version is), an undefined one kept as written
     /// ([`interpolate_lenient`]).
-    fn interpolate_coordinate(&self, text: &str) -> String {
-        interpolate_lenient(text, &|name| self.lookup(name, &[], true))
+    fn interpolate_coordinate(&self, text: &str, pos: usize) -> String {
+        let own = self.own_profile(pos);
+        interpolate_lenient(text, &|name| self.lookup(name, &own, true))
     }
 
     /// Inside a plugin / deploy section (never project resolution).
@@ -427,8 +430,10 @@ impl PomScope {
             let version = elements(&body, "version")?.into_iter().next();
             out.push(ScopedDep {
                 element: dep,
-                group: child_text(&body, "groupId")?.map(|g| self.interpolate_coordinate(&g)),
-                artifact: child_text(&body, "artifactId")?.map(|a| self.interpolate_coordinate(&a)),
+                group: child_text(&body, "groupId")?
+                    .map(|g| self.interpolate_coordinate(&g, dep.start)),
+                artifact: child_text(&body, "artifactId")?
+                    .map(|a| self.interpolate_coordinate(&a, dep.start)),
                 version_inner: version.map(|v| {
                     (
                         dep.inner_start + v.inner_start,
@@ -521,6 +526,33 @@ fn properties(
     Ok(map)
 }
 
+/// The trimmed text of `body`'s own `<name>` child (depth 0), never one
+/// nested deeper (a `<repository>`'s `<id>` inside a `<profile>`).
+fn direct_child_text(body: &str, name: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut from = 0;
+    while let Some(rel) = body[from..].find('<') {
+        let lt = from + rel;
+        let gt = lt + body[lt..].find('>')?;
+        let tag = &body[lt + 1..gt];
+        from = gt + 1;
+        if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
+            continue;
+        }
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        let tag_name = tag.split(|c: char| c.is_ascii_whitespace()).next()?;
+        if depth == 0 && tag_name == name {
+            let end = from + body[from..].find(&format!("</{name}"))?;
+            return Some(body[from..end].trim().to_string());
+        }
+        depth += 1;
+    }
+    None
+}
+
 /// Each `<properties>` inside `<profiles>` (outside ignored sections) as
 /// `name -> trimmed value`, with the `<profile>` element that holds it.
 fn profile_properties(
@@ -548,7 +580,7 @@ fn profile_properties(
             .find(|p| props.start >= p.start && props.start < p.end)
             .copied();
         let id = holder
-            .and_then(|p| child_text(p.inner(text), "id").ok().flatten())
+            .and_then(|p| direct_child_text(p.inner(text), "id"))
             .filter(|id| !id.is_empty())
             .unwrap_or_else(|| format!("#{}", out.len() + 1));
         let mut map = BTreeMap::new();

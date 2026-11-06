@@ -253,8 +253,10 @@ pub(crate) fn read_properties(
             from = gt + 1;
             continue;
         }
+        // A later definition replaces an earlier one, as Maven's model
+        // reader's `Properties.put` does.
         if tag.ends_with('/') {
-            map.entry(name.to_string()).or_default();
+            map.insert(name.to_string(), String::new());
             from = gt + 1;
             continue;
         }
@@ -272,8 +274,7 @@ pub(crate) fn read_properties(
             }
             search = at + close.len();
         };
-        map.entry(name.to_string())
-            .or_insert_with(|| body[gt + 1..end].trim().to_string());
+        map.insert(name.to_string(), body[gt + 1..end].trim().to_string());
         from = after;
     }
     Ok(())
@@ -377,7 +378,7 @@ mod tests {
                 ("c", "3"),
                 ("d", ""),
                 ("e", ""),
-                ("f", "4")
+                ("f", "5")
             ])
         );
         assert!(read_properties("<a>1", &mut BTreeMap::new()).is_err());
