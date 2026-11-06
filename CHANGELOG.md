@@ -139,6 +139,14 @@ a version without a non-empty section in this file.
     slot (#1976, #1977).
   - In a vlt project, `vendor` no longer requests service downloads for
     packages it then refuses (#1909, #1947).
+  - Every vendored entry point (`scan` previews and rollout plans, the
+    download phase, `get`, and `vendor`) applies the same refusals before
+    any download: a v1 `package-lock.json` project, or a hosted pnpm pin
+    whose takeover would be refused, is refused before its patch is
+    fetched; `get <uuid> --mode vendored` reports every such refusal and
+    writes nothing; and `vendor` refuses before restoring a hosted pin
+    instead of restoring it and rolling back. Codes and details are
+    unchanged (#2015).
 - **General.**
   - The nested-project remedy quotes its path for the shell it prints for,
     including Windows and `%` (#1859, #1884).
