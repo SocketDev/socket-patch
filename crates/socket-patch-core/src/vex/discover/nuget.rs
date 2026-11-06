@@ -389,8 +389,11 @@ async fn load_lock(ctx: &DiscoverCtx<'_>, ids: &BTreeSet<String>, out: &mut Disc
                 continue;
             }
             let id_locks = index.entry(id).or_default();
-            let resolved = entry.resolved.trim();
-            if resolved.is_empty() {
+            // Keyed exactly as the writers key it (`normalize_nuget_version`
+            // of the raw `resolved`, no trim): a padded spelling is another
+            // version to them, so it is one here too.
+            let resolved = entry.resolved;
+            if resolved.trim().is_empty() {
                 if id_locks.empty.insert(rel.clone()) {
                     out.diag(
                         DIAG_REF_INVALID,
@@ -480,8 +483,12 @@ fn sorted_versions(locks: &IdLocks) -> Vec<(&String, &Pins)> {
 }
 
 /// A normalized NuGet version's sort key: numeric segments, then a release
-/// above its pre-releases, then the pre-release label. Orders listings only.
-fn precedence(norm: &str) -> (Vec<u64>, bool, &str) {
+/// above its pre-releases, then the pre-release label by dot-separated
+/// identifiers as NuGet (SemVer 2) compares them: a numeric one
+/// numerically and below an alphanumeric one, an alphanumeric one ignoring
+/// case, a shorter label first when it is a prefix (`rc.2` < `rc.10`).
+/// Orders listings only.
+fn precedence(norm: &str) -> (Vec<u64>, bool, Vec<(bool, u64, String)>) {
     let (core, pre) = match norm.split_once('-') {
         Some((core, pre)) => (core, pre),
         None => (norm, ""),
@@ -490,7 +497,15 @@ fn precedence(norm: &str) -> (Vec<u64>, bool, &str) {
         .split('.')
         .map(|s| s.parse().unwrap_or(u64::MAX))
         .collect();
-    (segments, pre.is_empty(), pre)
+    let label = pre
+        .split('.')
+        .filter(|_| !pre.is_empty())
+        .map(|id| match id.parse::<u64>() {
+            Ok(n) if id.bytes().all(|b| b.is_ascii_digit()) => (false, n, String::new()),
+            _ => (true, 0, id.to_ascii_lowercase()),
+        })
+        .collect();
+    (segments, pre.is_empty(), label)
 }
 
 /// `(file, detail)` of an [`other_versions`] finding.
@@ -680,12 +695,19 @@ fn emit_hosted(
     );
     for row in lock_rows(locks, src, cfg_rel, out) {
         let Some(purl) = simple_purl("nuget", &src.id, &row.spelling) else {
+            let files: Vec<&str> = locks.versions[&row.norm]
+                .files
+                .iter()
+                .map(String::as_str)
+                .collect();
             out.diag(
                 DIAG_REF_INVALID,
-                PACKAGES_LOCK,
+                files[0],
                 format!(
-                    "{PACKAGES_LOCK}: {} resolves to the unusable version {:?}",
-                    src.id, row.spelling
+                    "{}: {} resolves to the unusable version {:?}",
+                    files.join(", "),
+                    src.id,
+                    row.spelling
                 ),
             );
             continue;
@@ -722,7 +744,10 @@ async fn emit_vendored(
     let id_lower = src.id.to_ascii_lowercase();
     let locks = match lock {
         Lock::Parsed(index) => index.get(&id_lower),
-        Lock::Absent | Lock::Unusable => None,
+        Lock::Absent => None,
+        // A lock that cannot be read (diagnosed) might lock another version
+        // the writers refuse: no ref, as hosted.
+        Lock::Unusable => return,
     };
     let serves = format!("the vendored feed {VENDOR_DIR}/nuget/{}", src.uuid);
     // (purl version, artifact leaf, integrity, other versions)
@@ -738,10 +763,9 @@ async fn emit_vendored(
                     .into_iter()
                     .find(|row| row.norm == norm);
                 match locked {
-                    Some(row) => {
-                        let leaf = nupkg_leaf(&id_lower, &row.spelling);
-                        rows.push((row.spelling, leaf, row.integrity, other));
-                    }
+                    // The feed's own file, as on disk, whether or not the
+                    // lock pins it.
+                    Some(row) => rows.push((row.spelling, leaf.clone(), row.integrity, other)),
                     // Locked at conflicting hashes: diagnosed, no ref.
                     None if locks.versions.contains_key(&norm) => {}
                     // Not locked at the patched version: the feed's own
@@ -2035,6 +2059,59 @@ mod tests {
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
+    /// Review on #2007 (round 2): a vendored ref behaves as a hosted one
+    /// when the lock cannot be read (no ref: it might lock another version
+    /// the writers refuse), and names the feed's file as it is on disk
+    /// whether or not the lock pins it.
+    #[tokio::test]
+    async fn vendored_unreadable_lock_and_feed_leaf_spelling() {
+        let cfg = config(
+            &[ORG, (&socket_key(UUID_A), &feed(UUID_A))],
+            &[("nuget.org", "*"), (&socket_key(UUID_A), "Newtonsoft.Json")],
+        );
+        let nupkg = format!(".socket/vendor/nuget/{UUID_A}/newtonsoft.json.13.0.3.0.nupkg");
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(&nupkg, b"PK");
+        p.write("packages.lock.json", "{ not json");
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(&nupkg, b"PK");
+        p.write(
+            "packages.lock.json",
+            lock(&[("net8.0", "Newtonsoft.Json", "13.0.3", Some(HASH))]),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.refs.len(), 1, "{:?}", out.refs);
+        assert_eq!(out.refs[0].artifact_rel.as_deref(), Some(nupkg.as_str()));
+    }
+
+    /// Pre-release labels order by identifier, numerically where numeric.
+    #[test]
+    fn precedence_orders_prerelease_identifiers() {
+        let mut v = [
+            "1.0.0",
+            "1.0.0-rc.10",
+            "1.0.0-rc.2",
+            "1.0.0-beta",
+            "1.0.0-RC.3",
+        ];
+        v.sort_by(|a, b| super::precedence(a).cmp(&super::precedence(b)));
+        assert_eq!(
+            v,
+            [
+                "1.0.0-beta",
+                "1.0.0-rc.2",
+                "1.0.0-RC.3",
+                "1.0.0-rc.10",
+                "1.0.0"
+            ]
+        );
+    }
+
     /// The vendored feed names the patched version (its single
     /// `<idLower>.<versionNorm>.nupkg`): the ref is that version alone, and
     /// a lock entry at any other version, beside the patched one or
@@ -2136,11 +2213,12 @@ mod tests {
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
     }
 
-    /// Versions are keyed through `normalize_nuget_version` of the trimmed
-    /// `resolved`, as the writers match them: `13.0.3`, ` 13.0.3` and
-    /// `13.0.3.0` in several target frameworks are ONE package, so one ref
-    /// whose pin is checked across all, never several refs with
-    /// independent pins.
+    /// Versions are keyed through `normalize_nuget_version` of the raw
+    /// `resolved`, as the writers match them: `13.0.3` and `13.0.3.0` in
+    /// several target frameworks are ONE package, so one ref whose pin is
+    /// checked across all, never several refs with independent pins. A
+    /// padded ` 13.0.3 ` is another version to the writers (they refuse
+    /// the lock), so it withholds the ref.
     #[tokio::test]
     async fn non_normalized_version_spellings_are_one_version() {
         let cfg = config(
@@ -2153,7 +2231,6 @@ mod tests {
             "packages.lock.json",
             lock(&[
                 ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
-                ("net7.0", "Newtonsoft.Json", " 13.0.3 ", Some(HASH)),
                 ("net8.0", "Newtonsoft.Json", "13.0.3.0", Some(HASH)),
             ]),
         );
@@ -2169,6 +2246,24 @@ mod tests {
         assert!(out.refs[0].lockfile_basis_ok());
         assert!(out.unattested.is_empty(), "{:?}", out.unattested);
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
+
+        let p = Project::new();
+        p.write("nuget.config", &cfg);
+        p.write(
+            "packages.lock.json",
+            lock(&[
+                ("net6.0", "Newtonsoft.Json", "13.0.3", Some(HASH)),
+                ("net7.0", "Newtonsoft.Json", " 13.0.3 ", Some(HASH)),
+            ]),
+        );
+        let out = run(&p).await;
+        assert!(
+            out.unattested
+                .iter()
+                .any(|u| u.purl == "pkg:nuget/newtonsoft.json@13.0.3"),
+            "{:?}",
+            out.unattested
+        );
 
         // The two spellings pinned to different bytes: one package with
         // conflicting contentHash values, which NuGet fails to restore. The
