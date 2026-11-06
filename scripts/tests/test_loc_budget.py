@@ -122,6 +122,28 @@ class CountSourceTest(unittest.TestCase):
         self.assertEqual(fc.code, 9)
         self.assertEqual(fc.test, 4)
 
+    def test_cfg_test_crate_visible_field(self):
+        src = "struct S {\n    #[cfg(test)]\n    crate probe: u32,\n    real: u32,\n}\nfn shipped() {}\n"
+        fc = count(src)
+        self.assertEqual(fc.code, 4)
+        self.assertEqual(fc.test, 2)
+
+    def test_cfg_test_const_generic_param(self):
+        src = "struct S<\n    #[cfg(test)] const N: usize,\n    T,\n> {\n    t: T,\n}\nfn shipped() {}\n"
+        fc = count(src)
+        self.assertEqual(fc.code, 6)
+        self.assertEqual(fc.test, 1)
+
+    def test_cfg_test_const_item_is_still_an_item(self):
+        src = "#[cfg(test)]\nconst N: u8 = 1;\nfn shipped() {}\n"
+        fc = count(src)
+        self.assertEqual(fc.code, 1)
+        self.assertEqual(fc.test, 2)
+
+    def test_crate_path_statement_is_not_a_field(self):
+        src = "fn f() {\n    #[cfg(test)]\n    crate::probe();\n    real();\n}\n"
+        self.assertEqual(count(src).code, 3)
+
     def test_cfg_test_fn_param(self):
         src = "fn f(\n    a: u8,\n    #[cfg(test)] b: u8,\n) -> u8 {\n    a\n}\nfn g() {}\n"
         self.assertEqual(count(src).code, 6)

@@ -34,7 +34,7 @@ attestation rules) is real policy and stays.
 | Second walks of one file | `vendor/npm_origin.rs` walks package-lock `packages` again. Yarn writers call `scan_blocks` directly, and the Berry rewriter uses a third model (`formats/yarn/stanzas.rs`). The vlt writers use a separate line grammar. pnpm's `InstalledPackages` and `vendored_npm_uuids`, and the hosted planner's whole-text `grammar::entries`, skip the env-document filter. |
 | Second parses of one file | `vex/discover/pypi_locks.rs` parses uv, pylock and script locks itself. The inventory parses them again. `deno.lock` is parsed by `crawlers/deno_crawler.rs` for discovery, the hosted engine and the npm flavor probe. |
 | Repeated helper parsers | two Python lock listers, two `-r` include walkers, two PEP 508 direct-reference parsers, five walks of `Cargo.toml` dependency tables, two Rush lock listings, four readers of Maven's `checksums.sha256`, two Gradle Socket-index parsers, two routes to sbt resolution evidence |
-| Two file-selection layers | the npm flavor router (`lock_inventory/npm_family.rs`) picks one family and one lock. Discovery reads every lock and sweeps the ignored ones with `recognize_ignored`. |
+| Two file-selection layers | the npm flavor router (`vendor/lock_inventory/npm_family.rs`) picks one family and one lock. Discovery reads every lock and sweeps the ignored ones with `recognize_ignored`. |
 
 The inventory also has gaps. It has no models for NuGet, Maven, Gradle, sbt,
 Hatch or Deno, and it reads no `composer.lock` that starts with a BOM, which
@@ -136,7 +136,7 @@ rewritten, from two places:
   configured origin, the last canonical-uuid path segment) and
   `SOCKET_PATCH_SERVER_HOST`. The hosted unwind already calls these
   directly;
-* from discovery: `OriginPolicy::hosted_uuid` (the same rule with a memoized
+* from discovery: `DiscoverCtx::hosted_uuid` (the same rule with a memoized
   fast path for plain registry URLs), `vendor_ref`, `vendor_ref_decorated`
   and `vendor_uuid_dir`, `locate`, `Wired`, and the `socket-patch-<uuid>`
   name grammar.
