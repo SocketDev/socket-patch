@@ -362,6 +362,14 @@ pub fn plan_with_digest(
                 "use `resolvers +=` instead",
             ));
         }
+        if !findings.onload_assignment.is_empty() {
+            return Err(refuse(
+                "vendor_sbt_onload_assignment",
+                "an `onLoad :=` assignment that does not keep the previous value",
+                &findings.onload_assignment,
+                "compose instead (`Global / onLoad := (Global / onLoad).value andThen ...`)",
+            ));
+        }
         if !findings.dependency_lock.is_empty() {
             return Err(refuse(
                 "vendor_sbt_dependency_lock_present",
@@ -605,7 +613,19 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
 /// three (`vendor_sbt_hosted_conflict`), so `vendor --check` fails, but the
 /// liveness test never re-plans. (The vendored file itself never parses
 /// strictly with two pins of one GA.)
-pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<(), JvmRefusal> {
+///
+/// And a build source under `root` reassigning `onLoad` without keeping
+/// its previous value (`sbt_onload_reassigned`): that drops the generated
+/// installer, whose `update` verifier fails a build that does not resolve
+/// the vendored bytes and whose resolver order serves the tree first, so
+/// nothing stops another copy from building silently. The build sources
+/// are the evidence walk's (every root `*.sbt`, `project/*.scala`, each
+/// subproject's), or, when the walk hits a cap, the planner's fixed set.
+pub fn attestable_checked(
+    root: &std::path::Path,
+    read: ReadFn<'_>,
+    c: &Coords<'_>,
+) -> Result<(), JvmRefusal> {
     let conflict = |detail: String| JvmRefusal {
         code: "vendor_jvm_shape_unsupported",
         detail: format!("reason: sbt_pin_conflict: {detail}"),
@@ -638,6 +658,22 @@ pub fn attestable_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<(), JvmRef
              roll that patch back",
             others.join(", ")
         )));
+    }
+    let sources = crate::crawlers::sbt_evidence::scan(root)
+        .map(|e| e.build_sources)
+        .unwrap_or_else(|_| build_sources(read));
+    let onload = scan_build_sources(&sources).onload_assignment;
+    if !onload.is_empty() {
+        return Err(JvmRefusal {
+            code: "vendor_jvm_shape_unsupported",
+            detail: format!(
+                "reason: sbt_onload_reassigned: {} reassign(s) `onLoad` without keeping its \
+                 previous value, which drops {BUILD_FILE}'s load-time verifier and resolver \
+                 order; compose instead (`Global / onLoad := (Global / onLoad).value andThen \
+                 ...`)",
+                onload.join(", ")
+            ),
+        });
     }
     Ok(())
 }
@@ -1040,6 +1076,16 @@ mod tests {
                     ],
                 ),
                 "vendor_sbt_resolvers_assignment",
+            ),
+            (
+                build(
+                    "1.9.9",
+                    &[(
+                        "project/Build.scala",
+                        "object B { onLoad in Global := identity }",
+                    )],
+                ),
+                "vendor_sbt_onload_assignment",
             ),
         ] {
             assert_eq!(code(plan_over(&files, &p)), expected);
@@ -1609,5 +1655,45 @@ mod tests {
         conflict("foreign hosted file");
         std::fs::remove_file(root.join(HOSTED_FILE)).unwrap();
         assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+    }
+
+    /// An `onLoad` reassignment that drops the generated installer (its
+    /// `update` verifier and resolver order) is not attestable, in any
+    /// build source the evidence walk reads; the wiring itself stays live
+    /// and in sync. A composition that keeps it changes nothing.
+    #[tokio::test]
+    async fn liveness_refuses_an_onload_reassignment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(root, "1.9.9", &[]);
+        let mut ledger = BTreeMap::new();
+        vendor(root, Shape::Sbt, &text_patch(UUID_A), &mut ledger)
+            .await
+            .unwrap();
+        let e = ledger.values().next().unwrap().clone();
+        assert_eq!(apply::entry_wired_checked(root, &e), Ok(true));
+        for (rel, text) in [
+            ("global.sbt", "Global / onLoad := identity\n"),
+            (
+                "project/Build.scala",
+                "object B { onLoad in Global := identity }\n",
+            ),
+        ] {
+            std::fs::create_dir_all(root.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(rel), text).unwrap();
+            let err = apply::entry_wired_checked(root, &e).unwrap_err();
+            assert!(
+                err.contains("reason: sbt_onload_reassigned:") && err.contains(rel),
+                "{err}"
+            );
+            assert!(apply::entry_references(root, &e));
+            std::fs::write(
+                root.join(rel),
+                "Global / onLoad := (Global / onLoad).value andThen (s => s)\n",
+            )
+            .unwrap();
+            assert_eq!(apply::entry_wired_checked(root, &e), Ok(true), "{rel}");
+            std::fs::remove_file(root.join(rel)).unwrap();
+        }
     }
 }

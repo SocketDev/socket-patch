@@ -460,13 +460,23 @@ fn vex_verdict(home: &SbtHome, project: &Path) -> (bool, bool, serde_json::Value
 /// runs: the patch is omitted with `vex_sbt_pin_bypassed`. A `resolvers`
 /// reassignment does not: the override still forces the Socket-only
 /// version and sbt's load-time verifier checks its bytes, so that build
-/// runs the pinned bytes or fails.
+/// runs the pinned bytes or fails — unless an `onLoad` reassignment drops
+/// the installer that verifier lives in, which withdraws the pin too.
 #[test]
 fn hosted_vex_installed_copy_is_withdrawn_by_an_overrides_reassignment() {
     for (edit, withdrawn) in [
         (None, false),
         (Some("dependencyOverrides := Seq()\n"), true),
         (Some("resolvers := Seq(Resolver.mavenLocal)\n"), false),
+        // Dropping the generated installer removes that verifier.
+        (
+            Some("resolvers := Seq(Resolver.mavenLocal)\nGlobal / onLoad := identity\n"),
+            true,
+        ),
+        (
+            Some("Global / onLoad := (Global / onLoad).value andThen (s => s)\n"),
+            false,
+        ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
         let home = SbtHome::new(tmp.path());

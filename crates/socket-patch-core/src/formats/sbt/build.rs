@@ -542,6 +542,34 @@ pub struct BuildFindings {
     pub override_build_repos: Vec<String>,
     /// A `build.sbt.lock` (sbt-dependency-lock), which a pin invalidates.
     pub dependency_lock: Vec<String>,
+    /// `onLoad :=` / `~=` / `--=`, in any scope (`Global / onLoad`,
+    /// `onLoad in Global`, ...), that does not keep the previous value: it
+    /// drops the generated file's installer, whose `update` verifier fails
+    /// a build that does not resolve the pinned bytes and whose resolver
+    /// order puts the pin repository first. A `:=` whose right-hand side
+    /// reads `onLoad`'s own `.value` (the generated file's own idiom,
+    /// `(Global / onLoad).value andThen ...`), or a `~=` that composes
+    /// (`andThen` / `compose`), keeps it.
+    pub onload_assignment: Vec<String>,
+}
+
+/// The expression `skeleton` starts with (a setting's right-hand side):
+/// up to the first `,` or line end outside brackets, or the bracket that
+/// closes around it. Leading whitespace and line breaks are skipped (a
+/// line ending in `:=` continues).
+fn expression(skeleton: &str) -> &str {
+    let start = skeleton.len() - skeleton.trim_start().len();
+    let mut depth = 0usize;
+    for (i, ch) in skeleton[start..].char_indices() {
+        match ch {
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' if depth == 0 => return &skeleton[start..start + i],
+            ')' | ']' | '}' => depth -= 1,
+            ',' | '\n' if depth == 0 => return &skeleton[start..start + i],
+            _ => {}
+        }
+    }
+    &skeleton[start..]
 }
 
 /// The build edits that defeat the generated file; see [`BuildFindings`].
@@ -560,6 +588,12 @@ pub fn scan_build_sources(sources: &[(String, String)]) -> BuildFindings {
     static OVERRIDE_REPOS: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?m)^[^#!\n]*sbt\.override\.build\.repos\s*=\s*true\b").expect("regex")
     });
+    static ONLOAD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"\bonLoad\b{SCOPE}(:=|~=|--=)")).expect("regex"));
+    static ONLOAD_VALUE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(&format!(r"\bonLoad\b{SCOPE}\.\s*value\b")).expect("regex"));
+    static COMPOSES: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b(?:andThen|compose)\b").expect("regex"));
     // 1-based line of byte offset `at`, from the text's newline offsets (a
     // binary search, so many matches in a large file are not quadratic).
     let newlines =
@@ -582,6 +616,19 @@ pub fn scan_build_sources(sources: &[(String, String)]) -> BuildFindings {
                 for m in RESOLVERS.find_iter(&skeleton) {
                     out.resolvers_assignment
                         .push(format!("{rel}:{}", line_of(&nl, m.start())));
+                }
+                for c in ONLOAD.captures_iter(&skeleton) {
+                    let (whole, op) = (c.get(0).expect("match"), &c[1]);
+                    let rhs = expression(&skeleton[whole.end()..]);
+                    let keeps = match op {
+                        ":=" => ONLOAD_VALUE.is_match(rhs),
+                        "~=" => COMPOSES.is_match(rhs),
+                        _ => false,
+                    };
+                    if !keeps {
+                        out.onload_assignment
+                            .push(format!("{rel}:{}", line_of(&nl, whole.start())));
+                    }
                 }
             }
             Some(SourceKind::Opts | SourceKind::Properties) => {
@@ -949,5 +996,46 @@ val name = "project"
         );
         assert_eq!(found.dependency_lock, ["a/build.sbt.lock"]);
         assert_eq!(scan_build_sources(&[]), BuildFindings::default());
+    }
+
+    /// An `onLoad` reassignment drops the generated installer unless it
+    /// keeps the previous value; any scope spelling, any file a definition.
+    #[test]
+    fn scan_finds_onload_reassignments_that_drop_the_installer() {
+        let dropped = "Global / onLoad := { s => s }\n\
+                       onLoad in Global := identity\n\
+                       onLoad.in(Global) := identity\n\
+                       ThisBuild / onLoad ~= (_ => identity)\n\
+                       Global / onLoad :=\n  identity\n\
+                       lazy val a = project.settings(onLoad := identity, x := (onLoad).value)\n";
+        let kept = "Global / onLoad := (Global / onLoad).value andThen { s => s }\n\
+                    onLoad in Global := (onLoad in Global).value.andThen(f)\n\
+                    Global / onLoad := {\n  val prev = (Global / onLoad).value\n  prev andThen f\n}\n\
+                    Global / onLoad ~= (_ andThen f)\n\
+                    // Global / onLoad := identity\n\
+                    val s = \"onLoad := identity\"\n\
+                    onLoadMessage := \"hi\"\n";
+        let found = scan_build_sources(&src(&[
+            ("build.sbt", dropped),
+            (
+                "project/Build.scala",
+                "object B { Global / onLoad := identity }",
+            ),
+            ("project/plugins.sbt", "Global / onLoad := identity\n"),
+            ("keep.sbt", kept),
+        ]));
+        assert_eq!(
+            found.onload_assignment,
+            [
+                "build.sbt:1",
+                "build.sbt:2",
+                "build.sbt:3",
+                "build.sbt:4",
+                "build.sbt:5",
+                "build.sbt:7",
+                "project/Build.scala:1"
+            ]
+        );
+        assert_eq!(found.overrides_assignment, Vec::<String>::new());
     }
 }

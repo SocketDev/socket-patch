@@ -608,7 +608,8 @@ pub enum UnattestedKind {
     MavenClassifierUnpatched,
     /// A hosted sbt pin (`socket-patch.sbt`) whose bytes the build provably
     /// does not use, and that no current evidence verifies: a build source
-    /// reassigns `dependencyOverrides` (replacing the generated override),
+    /// reassigns `dependencyOverrides` (replacing the generated override)
+    /// or `onLoad` without keeping it (dropping the load-time verifier),
     /// or a resolution record dated after the wiring and every build source
     /// shows the GA's base version, or the pinned version from outside the
     /// pin repository with other bytes. The downloaded copy under

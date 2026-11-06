@@ -1064,7 +1064,7 @@ fn entry_wiring_checked(root: &Path, entry: &VendorEntry, attest: bool) -> Resul
     let list = |dir: &str| reader.list(dir);
     let wired = if sbt::owns(&entry.wiring) {
         match sbt::wired_checked(&read, &c) {
-            Ok(true) if attest => sbt::attestable_checked(&read, &c).map(|()| true),
+            Ok(true) if attest => sbt::attestable_checked(root, &read, &c).map(|()| true),
             other => other,
         }
         .map_err(|e| e.detail)

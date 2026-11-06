@@ -233,7 +233,8 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// Omission tag and note: a hosted sbt pin whose bytes the build provably
-/// does not use (a `dependencyOverrides` reassignment, or current evidence
+/// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
+/// dropping the load-time verifier, or current evidence
 /// resolving another version or other bytes), so the downloaded copy
 /// proves nothing (`vex::Unattested`).
 const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
