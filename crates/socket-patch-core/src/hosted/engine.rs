@@ -508,7 +508,12 @@ impl crate::vendor::go_workspace::MemoryFiles for AdvisoryGoFiles<'_, '_> {
         read_advisory(self.view, self.unreadable, rel).await
     }
 
-    fn unparseable(&mut self, _rel: &str, _problem: &str) {}
+    /// Kept, as the disk loader keeps it: a member that declares the
+    /// patched module, or replaces it, is still weighed (refused), never
+    /// pinned over.
+    fn unparseable(&mut self, _rel: &str, _problem: &str) -> bool {
+        true
+    }
 }
 
 /// The Go workspace in effect for the project, handed to the golang
@@ -3779,6 +3784,27 @@ mod tests {
                 "{root:?}"
             );
         }
+        // Review on #2031 (round 2): a member go.mod go cannot parse is
+        // still weighed, as the disk loader keeps it: one declaring the
+        // patched module makes every replace of it inert (refused).
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", go_mod.as_str());
+        p.insert_text("go.work", "go 1.21\n\nuse (\n\t.\n\t./b\n)\n");
+        p.insert_text("b/go.mod", format!("module {MODULE}\n\nrequire (\n"));
+        let mut out = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+        let hosted: HostedGoWorkspace = serde_json::from_str(&out.files[GO_WORKSPACE_KEY]).unwrap();
+        assert!(
+            matches!(
+                hosted
+                    .loaded
+                    .conflict(&hosted.root, MODULE, "v1.4.2", &ours),
+                Some(WorkspaceConflict::MainModule { .. })
+            ),
+            "{:?}",
+            hosted.loaded
+        );
+
         // End to end through the rewriter.
         let mut p = MemoryProject::new();
         p.insert_text("go.mod", go_mod.as_str());

@@ -1161,8 +1161,11 @@ pub(crate) trait MemoryFiles {
     /// The sum file `rel`'s text, when this reader keeps sum files with
     /// the workspace.
     async fn read_sum(&mut self, rel: &str) -> Option<String>;
-    /// The go.mod `rel` is one go cannot parse (`problem`).
-    fn unparseable(&mut self, rel: &str, problem: &str);
+    /// The go.mod `rel` is one go cannot parse (`problem`). Whether its
+    /// text is still kept with the member: the hosted engine keeps it, as
+    /// the disk loader ([`load_file`]) does, so its module and replaces are
+    /// still weighed; discovery drops it after its diagnostic.
+    fn unparseable(&mut self, rel: &str, problem: &str) -> bool;
 }
 
 /// The workspace of an in-memory project with the root `go.work` `work`
@@ -1205,10 +1208,7 @@ pub(crate) async fn read_memory(
             Some(text) => {
                 let text = go_mod_edit::normalize_for_read(&text);
                 match go_mod_edit::block_structure_error(&text) {
-                    Some(problem) => {
-                        files.unparseable(&rel, &problem);
-                        None
-                    }
+                    Some(problem) => files.unparseable(&rel, &problem).then_some(text),
                     None => Some(text),
                 }
             }
@@ -2285,8 +2285,9 @@ mod tests {
         async fn read_sum(&mut self, rel: &str) -> Option<String> {
             self.read(rel).await
         }
-        fn unparseable(&mut self, rel: &str, _problem: &str) {
+        fn unparseable(&mut self, rel: &str, _problem: &str) -> bool {
             self.unparseable.push(rel.to_string());
+            false
         }
     }
 

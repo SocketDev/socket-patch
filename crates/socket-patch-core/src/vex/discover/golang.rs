@@ -570,8 +570,9 @@ impl go_workspace::MemoryFiles for ViewGoFiles<'_, '_, '_, '_> {
         None
     }
 
-    fn unparseable(&mut self, rel: &str, problem: &str) {
+    fn unparseable(&mut self, rel: &str, problem: &str) -> bool {
         diag_unparseable(self.out, rel, problem);
+        false
     }
 }
 
