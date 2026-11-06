@@ -129,7 +129,7 @@ use super::{
 };
 use crate::formats::maven::{
     is_executable_classifier, is_maven_coordinate, is_maven_version_text, maven_config_properties,
-    may_shadow, parse_pom_with, split_socket_version, MovedBy, Pom, PomDep, PomRepo,
+    may_name, may_shadow, parse_pom_with, split_socket_version, MovedBy, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -244,6 +244,17 @@ async fn extract_hosted(
         else {
             continue;
         };
+        // A pom spelling that is itself a Socket pin is pom.xml wiring:
+        // pin detection keeps its ref and reports the -D override
+        // (`MavenConfigOverride`) instead.
+        if dep
+            .version
+            .as_deref()
+            .and_then(split_socket_version)
+            .is_some()
+        {
+            continue;
+        }
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
             POM,
@@ -759,7 +770,8 @@ fn main_jar_declarations<'a>(
 
 /// The executable classifier copies of `group:artifact` (tests, a native
 /// or JDK-specific build; not `sources` / `javadoc`) that `in_scope` keeps,
-/// with their classifier.
+/// with their classifier. A groupId or artifactId that is a property this
+/// pom does not define may be this GA ([`may_name`]), so it counts too.
 fn classifier_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -767,7 +779,9 @@ fn classifier_declarations<'a>(
     in_scope: impl Fn(&PomDep) -> bool + 'a,
 ) -> impl Iterator<Item = (&'a PomDep, &'a str)> + 'a {
     deps.iter()
-        .filter(move |d| in_scope(d) && d.group == group && d.artifact == artifact)
+        .filter(move |d| {
+            in_scope(d) && may_name(&d.group, group) && may_name(&d.artifact, artifact)
+        })
         .filter_map(|d| {
             let classifier = d.classifier.as_deref()?;
             is_executable_classifier(classifier).then_some((d, classifier))
@@ -960,24 +974,34 @@ fn unpatched_classifier_copy(
             .map(|(i, v)| (v, in_profile || i > 0))
             .collect()
     }
-    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool)> {
+    // Each entry also carries whether it names `group:artifact` literally:
+    // one reached only through an undefined property ([`may_name`]) may
+    // manage another GA, so it never stands in for this copy's version alone.
+    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
         classifier_declarations(deps, group, artifact, move |d| {
             d.managed && d.in_profile == in_profile
         })
         .filter(|(_, c)| *c == classifier)
-        .flat_map(|(d, _)| flagged(d, in_profile))
+        .flat_map(|(d, _)| {
+            let literal = d.group == group && d.artifact == artifact;
+            flagged(d, in_profile)
+                .into_iter()
+                .map(move |(v, p)| (v, p, literal))
+        })
         .collect()
     };
     classifier_declarations(deps, group, artifact, |d| !d.managed).find_map(|(d, classifier)| {
-        let resolved = match build_version(d) {
+        let resolved: Vec<(Option<&str>, bool)> = match build_version(d) {
             Some(_) => flagged(d, false),
             None => {
                 let mut live = managed(classifier, false);
-                if live.is_empty() {
-                    live.push((None, false));
+                // Without a live entry that surely manages this GA, the
+                // version may come from outside this pom: fail closed.
+                if !live.iter().any(|(_, _, literal)| *literal) {
+                    live.push((None, false, true));
                 }
                 live.extend(managed(classifier, true));
-                live
+                live.into_iter().map(|(v, p, _)| (v, p)).collect()
             }
         };
         let (version, from_profile) = resolved
@@ -1399,6 +1423,25 @@ mod tests {
             ),
             // No version this pom gives it (a parent's): fail closed.
             (classified("tests", None), String::new()),
+            // A coordinate property this pom does not define may be the GA.
+            (
+                "<dependency><groupId>${undefined.group}</groupId>\
+                 <artifactId>slf4j-api</artifactId><version>1.7.36</version>\
+                 <classifier>tests</classifier></dependency>\n"
+                    .to_string(),
+                String::new(),
+            ),
+            // Version-less copy whose only managed entry reaches the GA
+            // through an undefined property: it may manage another GA, so
+            // the copy's version may come from outside this pom.
+            (
+                classified("tests", None),
+                format!(
+                    "<dependency><groupId>${{undefined.group}}</groupId>\
+                     <artifactId>slf4j-api</artifactId><version>{pin}</version>\
+                     <classifier>tests</classifier></dependency>\n"
+                ),
+            ),
         ];
         for (deps, managed) in &unattested {
             let out = run(&project(deps, managed)).await;
@@ -1847,6 +1890,14 @@ mod tests {
                 "--define slf4j.version=1.7.30\n".to_string(),
                 Expect::Overridden,
             ),
+            // The build config swaps one Socket pin for another: the pom's
+            // pin is still pom.xml wiring, so no config-only diagnostic.
+            (
+                pin.as_str(),
+                &by_prop,
+                format!("-Dslf4j.version={}\n", suffixed(UUID_B)),
+                Expect::Overridden,
+            ),
             // The build config alone supplies the pin.
             (
                 "1.7.36",
@@ -1894,6 +1945,12 @@ mod tests {
                         assert_eq!(u.kind, UnattestedKind::MavenConfigOverride, "{what}");
                         assert!(u.detail.contains(".mvn/maven.config"), "{}", u.detail);
                     }
+                    assert!(
+                        !out.diagnostics
+                            .iter()
+                            .any(|d| d.detail.contains("only through")),
+                        "{what}"
+                    );
                 }
                 Expect::ConfigOnly | Expect::NoRef => {
                     assert_refs(&out, &[]);
