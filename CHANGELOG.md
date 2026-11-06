@@ -62,6 +62,10 @@ a version without a non-empty section in this file.
     `=begin`/`=end` blocks, heredoc bodies and `__END__` data are skipped, so
     a commented-out dev dependency no longer adds a bogus requirement and a
     heredoc no longer refuses the Gemfile (#1932, #1936).
+  - A gem declared inside nested `source … do` blocks is attributed to the
+    innermost block, as Bundler reads it, so hosted `rollback` and `remove`
+    of a pin inside the user's own source block no longer refuse with
+    `hosted_wiring_contested` on Bundler 2.1 and older (#1997, #1999).
 - **npm family.**
   - pnpm workspace globs with brace sets and character classes
     (`packages/{a,b}`, `packages/[ab]*`) are read the way pnpm reads them in
@@ -88,6 +92,12 @@ a version without a non-empty section in this file.
     npm config layer sets `omit-lockfile-registry-resolved`, which makes the
     next `npm install` drop the hosted URL and fail with `EINTEGRITY`, and
     names where it is set and the remedies (#1871, #1872).
+  - Hosted vlt scans no longer download every granted patch archive to
+    check its encoding, and no longer withhold dependencies with
+    `redirect_vlt_artifact_unverifiable`; a mirror that re-encodes archives
+    makes `vlt ci` fail closed with `EINTEGRITY`. The in-memory hosted
+    engine (the Node addon and `hosted-bundle`) now pins vlt dependencies
+    instead of withholding them as offline (#2013).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -146,7 +156,8 @@ a version without a non-empty section in this file.
   runner, `copy_tree` and apply fixtures; hermetic children scrub color
   variables; failing tests are annotated in CI; offline bun.lockb rollback
   mock and a Windows venv layout in the PyPI fixture (#1891, #1890, #1905,
-  #1944, #1955, #1964, #1972, #1978, #1988, #1994).
+  #1944, #1955, #1964, #1972, #1978, #1988, #1994, #2000); release
+  workflow artifact steps move off Node 20 actions (#2027).
 
 ## [5.0.1] — 2026-10-13
 
