@@ -2823,6 +2823,56 @@ mod tests {
         );
     }
 
+    /// #1965: a registry range the root `overrides` swap for a remote
+    /// tarball url is installed from that url by `npm ci`, so vendoring
+    /// the copy would report `applied` over unpatched bytes. With no other
+    /// copy the vendor refuses and writes nothing.
+    #[tokio::test]
+    async fn issue_1965_a_registry_edge_overridden_to_a_url_is_refused() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "fixture",
+            "version": "1.0.0",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "fixture", "version": "1.0.0",
+                      "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+                "node_modules/foo": {
+                    "version": "1.0.0",
+                    "resolved": "file:foo-1.0.0.tgz",
+                    "dependencies": { "left-pad": "^1.3.0" }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-orig=="
+                }
+            }
+        });
+        let fx = fixture_with("left-pad", "1.3.0", lock.clone()).await;
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            format!(
+                r#"{{"name":"fixture","version":"1.0.0","dependencies":{{"foo":"file:foo-1.0.0.tgz"}},"overrides":{{"left-pad":"{url}"}}}}"#
+            ),
+        )
+        .await
+        .unwrap();
+        expect_refused(fx.vendor(false).await, "vendor_lock_entry_not_rewritable");
+        assert_eq!(fx.read_lock().await, lock, "nothing is written");
+
+        // Control: a registry override is vendored.
+        tokio::fs::write(
+            fx.root().join("package.json"),
+            r#"{"name":"fixture","version":"1.0.0","dependencies":{"foo":"file:foo-1.0.0.tgz"},"overrides":{"left-pad":"1.3.0"}}"#,
+        )
+        .await
+        .unwrap();
+        let (result, entry, _warnings) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        assert!(entry.is_some());
+    }
+
     #[tokio::test]
     async fn non_registry_only_instances_refuse_and_write_nothing() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";

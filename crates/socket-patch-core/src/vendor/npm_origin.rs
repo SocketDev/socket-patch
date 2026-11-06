@@ -118,19 +118,79 @@ impl NpmOverrides {
         dep_name: &str,
         spec: &str,
     ) -> Option<String> {
+        let search = self.search(packages, from, dep_name, spec)?;
+        if search.unclear {
+            return None;
+        }
+        let best = search.best.filter(|b| !b.contested)?;
+        effective(best.value)
+    }
+
+    /// For an edge whose own `spec` is a registry spec: the non-registry
+    /// spec (url, git, path) an override may make npm install instead, or
+    /// `None` when npm installs a registry release (#1965).
+    ///
+    /// This leans the other way from [`Self::replacement`]: when the
+    /// winning rule can't be decided exactly, any rule for `dep_name` with
+    /// a non-registry value counts, so the copy is left unpatched and
+    /// reported rather than rewired and attested.
+    fn non_registry_replacement(
+        &self,
+        packages: &Map<String, Value>,
+        from: &str,
+        dep_name: &str,
+        spec: &str,
+    ) -> Option<String> {
+        // Nearly every edge is a registry edge, so settle the common case
+        // (no rule for the package can name a non-registry spec) without
+        // walking the dependent's chain.
+        let candidate = self.any_non_registry_rule(&self.rules, dep_name)?;
+        let search = self.search(packages, from, dep_name, spec)?;
+        let decided = match &search.best {
+            Some(best) => !search.unclear && !best.contested,
+            None => !search.unclear,
+        };
+        if decided {
+            return search
+                .best
+                .and_then(|best| effective(best.value))
+                .filter(|value| !npm_spec_is_registry(value));
+        }
+        Some(candidate)
+    }
+
+    /// The rules found for the edge, or `None` when there are no rules.
+    fn search(
+        &self,
+        packages: &Map<String, Value>,
+        from: &str,
+        dep_name: &str,
+        spec: &str,
+    ) -> Option<RuleSearch> {
         if self.rules.is_empty() {
             return None;
         }
         let chain = dependent_chain(packages, from);
         let mut search = RuleSearch::default();
         self.visit(&self.rules, &chain, 0, 0, dep_name, spec, &mut search);
-        if search.unclear {
-            return None;
-        }
-        let best = search.best.filter(|b| !b.contested)?;
-        // npm ignores a `*` (or empty) replacement: the raw spec stays.
-        let value = best.value.trim();
-        (!value.is_empty() && value != "*").then_some(best.value)
+        Some(search)
+    }
+
+    /// The first non-registry value of a rule keyed by `dep_name`, at any
+    /// depth of `rules`, whatever its selectors.
+    fn any_non_registry_rule(&self, rules: &Map<String, Value>, dep_name: &str) -> Option<String> {
+        rules.iter().find_map(|(key, value)| {
+            let own = (key != "." && split_selector(key).0 == dep_name)
+                .then(|| self.rule_value(value))
+                .flatten()
+                .and_then(effective)
+                .filter(|value| !npm_spec_is_registry(value));
+            own.or_else(|| {
+                value
+                    .as_object()
+                    .and_then(|children| self.any_non_registry_rule(children, dep_name))
+            })
+        })
     }
 
     /// Search `rules` (nested `depth` levels deep; the enclosing rules
@@ -224,6 +284,13 @@ impl NpmOverrides {
     }
 }
 
+/// The spec a rule's value makes npm install: `None` for a `*` (or empty)
+/// value, which npm ignores, leaving the dependent's own spec in effect.
+fn effective(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty() && trimmed != "*").then_some(value)
+}
+
 /// What [`NpmOverrides::visit`] has found for one edge.
 #[derive(Debug, Default)]
 struct RuleSearch {
@@ -303,12 +370,20 @@ fn split_selector(key: &str) -> (&str, Option<&str>) {
 
 /// The packages on the path from the project root to the lock key `from`,
 /// outermost first, as `(name, version)`: each `node_modules/<name>`
-/// segment's entry (its `name` field for an alias, else the segment). The
-/// root and workspace members contribute nothing.
+/// segment's entry (its `name` field for an alias, else the segment). A
+/// dependent inside a workspace member starts with that member, which npm
+/// reaches through the root's link edge, so a rule keyed by the member's
+/// name scopes to its dependencies (#1965). The root contributes nothing.
 fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Option<String>)> {
     let mut chain = Vec::new();
     let mut rest = from;
     let mut prefix = String::new();
+    if !from.is_empty() && !from.starts_with("node_modules/") {
+        let member = from.split("/node_modules/").next().unwrap_or(from);
+        chain.push(workspace_member(packages, member));
+        prefix.push_str(member);
+        rest = &from[member.len()..];
+    }
     while let Some(ix) = rest.find("node_modules/") {
         let after = &rest[ix + "node_modules/".len()..];
         // A package segment runs to the next nested `node_modules/`.
@@ -330,6 +405,33 @@ fn dependent_chain(packages: &Map<String, Value>, from: &str) -> Vec<(String, Op
         rest = &rest[consumed..];
     }
     chain
+}
+
+/// The `(name, version)` of the workspace member at lock key `member`: its
+/// `name` field, else the name of the root-level link entry that points at
+/// it (npm omits `name` when it matches; a nested link may be an alias),
+/// else its folder name, keeping an `@scope/` parent as npm does.
+fn workspace_member(packages: &Map<String, Value>, member: &str) -> (String, Option<String>) {
+    let entry = packages.get(member);
+    let version = entry
+        .and_then(|e| e.get("version"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let name = entry
+        .and_then(|e| e.get("name"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            packages.iter().find_map(|(key, link)| {
+                let name = key.strip_prefix("node_modules/")?;
+                let root_level = !name.contains("/node_modules/");
+                let linked = link.get("link").and_then(Value::as_bool) == Some(true)
+                    && link.get("resolved").and_then(Value::as_str) == Some(member);
+                (root_level && linked).then(|| name.to_string())
+            })
+        })
+        .unwrap_or_else(|| name_from_folder(member));
+    (name, version)
 }
 
 /// The dependency maps whose specs npm resolves against `packages` entries.
@@ -359,9 +461,50 @@ pub(crate) fn npm_non_registry_entries(
     lock: &Value,
     overrides: &NpmOverrides,
 ) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
+    non_registry_entries(lock, overrides)
+        .into_iter()
+        .map(|(key, found)| (key, found.reason))
+        .collect()
+}
+
+/// The [`npm_non_registry_entries`] keys whose only evidence is an
+/// `overrides` rule that swaps a registry spec for a url, git or path one
+/// (#1965). Their `resolved` is a registry-style tarball url, so a Socket
+/// rewriter from before #1965 may have wired them: unlike the other
+/// non-registry entries, a Socket ref there is the rewriters' own output,
+/// which rollback and remove must still unwind.
+pub(crate) fn npm_override_only_entries(
+    lock: &Value,
+    overrides: &NpmOverrides,
+) -> std::collections::BTreeSet<String> {
+    non_registry_entries(lock, overrides)
+        .into_iter()
+        .filter(|(_, found)| found.override_only)
+        .map(|(key, _)| key)
+        .collect()
+}
+
+/// Why one `packages` entry is a non-registry install.
+struct NonRegistry {
+    /// The first reason found (for the skip warnings).
+    reason: String,
+    /// Every piece of evidence is a registry spec that `overrides` swap
+    /// for a non-registry one.
+    override_only: bool,
+}
+
+fn non_registry_entries(lock: &Value, overrides: &NpmOverrides) -> BTreeMap<String, NonRegistry> {
+    let mut out: BTreeMap<String, NonRegistry> = BTreeMap::new();
+    let mut note = |key: String, reason: String, override_only: bool| {
+        out.entry(key)
+            .and_modify(|found| found.override_only &= override_only)
+            .or_insert(NonRegistry {
+                reason,
+                override_only,
+            });
+    };
     let Some(packages) = lock.get("packages").and_then(Value::as_object) else {
-        return out;
+        return BTreeMap::new();
     };
     for (key, entry) in packages {
         if !key.contains("node_modules/") {
@@ -369,7 +512,7 @@ pub(crate) fn npm_non_registry_entries(
         }
         if let Some(resolved) = entry.get("resolved").and_then(Value::as_str) {
             if resolved_is_non_registry(resolved) {
-                out.insert(key.clone(), format!("it resolves to {resolved:?}"));
+                note(key.clone(), format!("it resolves to {resolved:?}"), false);
             }
         }
     }
@@ -382,30 +525,47 @@ pub(crate) fn npm_non_registry_entries(
                 let Some(spec) = spec.as_str() else {
                     continue;
                 };
-                if npm_spec_is_registry(spec) {
-                    continue;
-                }
-                // An override that swaps the spec for a registry one makes
-                // npm install the registry release instead (#490).
-                if overrides
-                    .replacement(packages, from, dep_name, spec)
-                    .is_some_and(|replacement| npm_spec_is_registry(&replacement))
-                {
-                    continue;
-                }
+                let dependent = || {
+                    if from.is_empty() {
+                        "the project".to_string()
+                    } else {
+                        format!("`{from}`")
+                    }
+                };
+                let override_only = npm_spec_is_registry(spec);
+                let reason = if override_only {
+                    // An override that swaps a registry spec for a url, git
+                    // or path one makes npm install from that spec, though
+                    // the lock's `resolved` still looks like the registry's
+                    // (#1965).
+                    let Some(replacement) =
+                        overrides.non_registry_replacement(packages, from, dep_name, spec)
+                    else {
+                        continue;
+                    };
+                    format!(
+                        "{} depends on it as {spec:?}, which the root package.json's \
+                         overrides replace with {replacement:?}, and npm installs from that spec",
+                        dependent()
+                    )
+                } else {
+                    // An override that swaps the spec for a registry one
+                    // makes npm install the registry release instead (#490).
+                    if overrides
+                        .replacement(packages, from, dep_name, spec)
+                        .is_some_and(|replacement| npm_spec_is_registry(&replacement))
+                    {
+                        continue;
+                    }
+                    format!(
+                        "{} depends on it as {spec:?}, which npm installs from that spec",
+                        dependent()
+                    )
+                };
                 let Some(target) = resolve_edge(packages, from, dep_name) else {
                     continue;
                 };
-                let dependent = if from.is_empty() {
-                    "the project".to_string()
-                } else {
-                    format!("`{from}`")
-                };
-                out.entry(target).or_insert_with(|| {
-                    format!(
-                        "{dependent} depends on it as {spec:?}, which npm installs from that spec"
-                    )
-                });
+                note(target, reason, override_only);
             }
         }
     }
@@ -423,16 +583,20 @@ pub(crate) fn npm_link_source_identity(lock: &Value, link: &Value) -> Option<(St
     let version = source.get("version")?.as_str()?;
     let name = match source.get("name").and_then(Value::as_str) {
         Some(name) => name.to_string(),
-        None => {
-            let mut segments = resolved.rsplit('/');
-            let base = segments.next().unwrap_or(resolved);
-            match segments.next() {
-                Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
-                _ => base.to_string(),
-            }
-        }
+        None => name_from_folder(resolved),
     };
     Some((name, version.to_string()))
+}
+
+/// A package's name from its folder path, as npm's `nameFromFolder` reads
+/// it: the last segment, keeping an `@scope/` parent.
+fn name_from_folder(path: &str) -> String {
+    let mut segments = path.rsplit('/');
+    let base = segments.next().unwrap_or(path);
+    match segments.next() {
+        Some(scope) if scope.starts_with('@') => format!("{scope}/{base}"),
+        _ => base.to_string(),
+    }
 }
 
 /// Every `packages` key installed beneath a package that ships its own
@@ -1140,5 +1304,265 @@ mod tests {
         assert_eq!(split_selector("left-pad@1"), ("left-pad", Some("1")));
         assert_eq!(split_selector("@s/pad"), ("@s/pad", None));
         assert_eq!(split_selector("@s/pad@^2"), ("@s/pad", Some("^2")));
+    }
+
+    /// The #1965 lock: `foo` (a `file:` tarball) depends on left-pad by a
+    /// registry range, and the lock records a registry-looking `resolved`
+    /// for it whatever the root overrides it to.
+    fn overridden_range_lock(left_pad_resolved: &str) -> Value {
+        lock(json!({
+            "": { "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+            "node_modules/foo": {
+                "version": "1.0.0",
+                "resolved": "file:foo-1.0.0.tgz",
+                "dependencies": { "left-pad": "^1.3.0" }
+            },
+            "node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": left_pad_resolved,
+                "integrity": "sha512-XI5MPzVNApjAyhQzphX8BkmKsKUxD4LdyK24iZeQGinBN9yTQT3bFlCBy/aVx2HrNcqQGsdot8ghrjyrvMCoEA=="
+            }
+        }))
+    }
+
+    fn range_manifest(overrides: Value) -> NpmOverrides {
+        NpmOverrides::from_manifest(&json!({
+            "name": "app",
+            "dependencies": {
+                "foo": "file:foo-1.0.0.tgz",
+                "url-pad": REGISTRY_TGZ,
+                "reg-pad": "1.3.0"
+            },
+            "overrides": overrides
+        }))
+    }
+
+    #[test]
+    fn issue_1965_an_override_of_a_registry_edge_to_a_url_is_non_registry() {
+        // Fresh lock, after a hosted redirect, and after a vendored rewire:
+        // npm installs the override spec, never the lock's `resolved`.
+        for resolved in [
+            REGISTRY_TGZ,
+            "https://patch.socket.dev/npm/left-pad/-/left-pad-1.3.0.tgz",
+            "file:.socket/vendor/npm/0123/left-pad-1.3.0.tgz",
+        ] {
+            let lock = overridden_range_lock(resolved);
+            for overrides in [
+                json!({ "left-pad": REGISTRY_TGZ }),
+                json!({ "left-pad": "http://example.test/left-pad-1.3.0.tgz" }),
+                json!({ "left-pad": { ".": REGISTRY_TGZ } }),
+                json!({ "left-pad": "$url-pad" }),
+                json!({ "foo": { "left-pad": REGISTRY_TGZ } }),
+                json!({ "foo@1.0.0": { "left-pad": REGISTRY_TGZ } }),
+                json!({ "left-pad@^1.3.0": REGISTRY_TGZ }),
+                json!({ "left-pad": "github:someone/left-pad" }),
+                json!({ "left-pad": "git+https://example.test/left-pad.git" }),
+                json!({ "left-pad": "file:../left-pad" }),
+                json!({ "left-pad": "./vendor/left-pad-1.3.0.tgz" }),
+                json!({ "left-pad": "npm:other@https://example.test/x.tgz" }),
+            ] {
+                let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+                let reason = found.get("node_modules/left-pad");
+                assert!(reason.is_some(), "{overrides} / {resolved}: {found:?}");
+                assert!(
+                    reason.unwrap().contains("override"),
+                    "{overrides}: {reason:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_1965_registry_and_no_op_overrides_of_a_registry_edge_stay_registry() {
+        let lock = overridden_range_lock(REGISTRY_TGZ);
+        for overrides in [
+            json!({}),
+            json!({ "left-pad": "1.3.0" }),
+            json!({ "left-pad": "^1.3.0" }),
+            json!({ "left-pad": "latest" }),
+            json!({ "left-pad": "npm:left-pad@1.3.0" }),
+            json!({ "left-pad": "$reg-pad" }),
+            json!({ "left-pad": "*" }),
+            json!({ "left-pad": "" }),
+            json!({ "left-pad": { "nested": REGISTRY_TGZ } }),
+            // Rules that don't apply to the edge.
+            json!({ "right-pad": REGISTRY_TGZ }),
+            json!({ "other": { "left-pad": REGISTRY_TGZ } }),
+            json!({ "foo@2.0.0": { "left-pad": REGISTRY_TGZ } }),
+            // A closer no-op shadows a farther URL rule, as in npm.
+            json!({ "left-pad": REGISTRY_TGZ, "foo": { "left-pad": "*" } }),
+            json!({ "left-pad": REGISTRY_TGZ, "foo": { "left-pad": "1.3.0" } }),
+            // A selector for a different spec, with only registry values
+            // anywhere for the package.
+            json!({ "left-pad@1.2.0": "1.3.0" }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+            assert!(
+                !found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+            // The `file:` dependent itself always counts.
+            assert!(found.contains_key("node_modules/foo"), "{found:?}");
+        }
+    }
+
+    #[test]
+    fn issue_1965_an_unclear_override_that_may_swap_in_a_url_keeps_the_edge() {
+        // npm's choice isn't modelled exactly here, and one candidate is a
+        // URL, so the copy is left unpatched and reported, never attested.
+        let lock = overridden_range_lock(REGISTRY_TGZ);
+        for overrides in [
+            // A target selector other than the edge's own spec.
+            json!({ "left-pad@^1": REGISTRY_TGZ }),
+            json!({ "left-pad@>=1.0.0": "github:someone/left-pad" }),
+            // A range selector on the dependent around a URL rule.
+            json!({ "foo@^1": { "left-pad": REGISTRY_TGZ } }),
+            // Two equally close rules that disagree.
+            json!({
+                "foo": { "left-pad": "1.3.0" },
+                "foo@1.0.0": { "left-pad": REGISTRY_TGZ }
+            }),
+            // An unresolvable `$` reference beside a URL rule.
+            json!({ "left-pad": "$missing", "left-pad@^1": REGISTRY_TGZ }),
+        ] {
+            let found = npm_non_registry_entries(&lock, &range_manifest(overrides.clone()));
+            assert!(
+                found.contains_key("node_modules/left-pad"),
+                "{overrides}: {found:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_url_override_scoped_to_a_workspace_member_is_non_registry() {
+        // The Bugbot probe: npm reaches a workspace member through the
+        // root's link edge, so a rule keyed by the member's name scopes to
+        // its dependencies, hoisted or nested. Members are found by their
+        // `name` field, their link entry's key, or their folder name.
+        let lock_with = |member: Value| {
+            lock(json!({
+                "": { "name": "root", "workspaces": ["packages/*"] },
+                "packages/app": member,
+                "node_modules/app": { "resolved": "packages/app", "link": true },
+                "packages/app/node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": REGISTRY_TGZ
+                },
+                "node_modules/other": {
+                    "version": "1.0.0",
+                    "resolved": REGISTRY_TGZ,
+                    "dependencies": { "left-pad": "^1.0.0" }
+                },
+                "node_modules/left-pad": { "version": "1.3.0", "resolved": REGISTRY_TGZ }
+            }))
+        };
+        let deps = json!({ "left-pad": "^1.3.0" });
+        for member in [
+            json!({ "name": "app", "version": "2.0.0", "dependencies": deps }),
+            json!({ "version": "2.0.0", "dependencies": deps }),
+        ] {
+            let lock = lock_with(member.clone());
+            for (scope, flagged) in [
+                ("app", true),
+                ("app@2.0.0", true),
+                ("app@3.0.0", false),
+                ("other-member", false),
+            ] {
+                let found = npm_non_registry_entries(
+                    &lock,
+                    &NpmOverrides::from_manifest(&json!({
+                        "overrides": { scope: { "left-pad": REGISTRY_TGZ } }
+                    })),
+                );
+                assert_eq!(
+                    found.contains_key("packages/app/node_modules/left-pad"),
+                    flagged,
+                    "{scope} / {member}: {found:?}"
+                );
+                // `other`'s hoisted copy is outside the member's subtree.
+                assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_workspace_member_is_named_as_npm_names_it() {
+        // The second Bugbot probe: a scoped member without a `name` field
+        // keeps its `@scope/` folder, and the root workspace link names it
+        // even when a nested alias link to the same folder sorts first.
+        let left_pad = json!({ "version": "1.3.0", "resolved": REGISTRY_TGZ });
+        let deps = json!({ "left-pad": "^1.3.0" });
+        let scoped = lock(json!({
+            "": { "workspaces": ["packages/*"] },
+            "packages/@s/app": { "version": "1.0.0", "dependencies": deps },
+            "packages/@s/app/node_modules/left-pad": left_pad,
+        }));
+        let aliased = lock(json!({
+            "": { "workspaces": ["packages/*"] },
+            "node_modules/a/node_modules/alias": { "resolved": "packages/app", "link": true },
+            "node_modules/app": { "resolved": "packages/app", "link": true },
+            "packages/app": { "version": "1.0.0", "dependencies": deps },
+            "packages/app/node_modules/left-pad": left_pad,
+        }));
+        for (lock, key, scope, flagged) in [
+            (
+                &scoped,
+                "packages/@s/app/node_modules/left-pad",
+                "@s/app",
+                true,
+            ),
+            (
+                &scoped,
+                "packages/@s/app/node_modules/left-pad",
+                "app",
+                false,
+            ),
+            (&aliased, "packages/app/node_modules/left-pad", "app", true),
+            (
+                &aliased,
+                "packages/app/node_modules/left-pad",
+                "alias",
+                false,
+            ),
+        ] {
+            let found = npm_non_registry_entries(
+                lock,
+                &NpmOverrides::from_manifest(&json!({
+                    "overrides": { scope: { "left-pad": REGISTRY_TGZ } }
+                })),
+            );
+            assert_eq!(found.contains_key(key), flagged, "{scope}: {found:?}");
+        }
+    }
+
+    #[test]
+    fn issue_1965_a_url_override_of_a_nested_registry_edge_names_its_copy() {
+        // The overridden copy is nested under its dependent; only that copy
+        // is marked, not a hoisted registry copy of the same package.
+        let lock = lock(json!({
+            "": { "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" } },
+            "node_modules/a": {
+                "version": "1.0.0",
+                "resolved": REGISTRY_TGZ,
+                "dependencies": { "left-pad": "^1.0.0" }
+            },
+            "node_modules/a/node_modules/left-pad": {
+                "version": "1.3.0",
+                "resolved": REGISTRY_TGZ
+            },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": REGISTRY_TGZ }
+        }));
+        let found = npm_non_registry_entries(
+            &lock,
+            &NpmOverrides::from_manifest(&json!({
+                "dependencies": { "a": "^1.0.0", "left-pad": "^1.3.0" },
+                "overrides": { "a": { "left-pad": REGISTRY_TGZ } }
+            })),
+        );
+        assert!(
+            found.contains_key("node_modules/a/node_modules/left-pad"),
+            "{found:?}"
+        );
+        assert!(!found.contains_key("node_modules/left-pad"), "{found:?}");
     }
 }
