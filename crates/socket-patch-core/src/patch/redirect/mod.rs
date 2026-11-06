@@ -8831,7 +8831,47 @@ fn rewrite_maven_pom(
         // skipped rather than reported redirected. A versionless profile
         // declaration takes the managed version, so the pin covers it.
         let (profiled, matches): (Vec<_>, Vec<_>) = live.into_iter().partition(|m| m.in_profile);
-        let profile_version = profiled.iter().find_map(|m| m.version_text.as_deref());
+        // One that resolves anything but the suffixed pin (its own literal
+        // or `${property}`, or what a profile's `<properties>` make of it)
+        // overrides the pin whenever its profile is active, and VEX never
+        // attests such a pin: none is written. A profile's management
+        // overrides only a pin management governs — the one written when no
+        // live direct declaration carries a version.
+        if let Some(served) = suffixed_version.as_deref() {
+            let pin_managed = !matches
+                .iter()
+                .any(|m| m.version_text.is_some() && !idx.dep(m.idx).managed);
+            if let Some((d, version)) =
+                idx.profile_bypass(&group_id, &artifact_id, served, pin_managed)
+            {
+                result.warnings.push(RewriteWarning {
+                    code: "redirect_maven_profile_dependency_unpatched".into(),
+                    detail: format!(
+                        "{}:{} <version>{}</version> inside <profiles>{} resolves {version}, not \
+                         the suffixed {served}; while that profile is active it overrides any \
+                         pin, so pom.xml was left as it is and the dep is not counted as \
+                         redirected",
+                        d.group.as_deref().unwrap_or_default(),
+                        d.artifact.as_deref().unwrap_or_default(),
+                        d.version_text.as_deref().unwrap_or_default(),
+                        if d.managed {
+                            " (<dependencyManagement>)"
+                        } else {
+                            ""
+                        },
+                    ),
+                });
+                continue;
+            }
+        }
+        // Past that check, a versioned profile declaration beside a live one
+        // takes (or cannot override) the suffixed pin; it is still reported
+        // when nothing live is pinned, or on the legacy same-GAV path.
+        let report_profiles = suffixed_version.is_none() || matches.is_empty();
+        let profile_version = profiled
+            .iter()
+            .find_map(|m| m.version_text.as_deref())
+            .filter(|_| report_profiles);
         if let Some(profile_version) = profile_version {
             result.warnings.push(RewriteWarning {
                 code: "redirect_maven_profile_dependency_unpatched".into(),
@@ -8875,7 +8915,7 @@ fn rewrite_maven_pom(
             });
             continue;
         }
-        if profile_version.is_none() {
+        if profile_version.is_none() && report_profiles {
             if let Some(shadow) = idx.placeholder_shadow(&group_id, &artifact_id, true) {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_profile_dependency_unpatched".into(),
@@ -10316,20 +10356,104 @@ mod tests {
                 r.warnings
             );
 
+            // Beside a top-level declaration the pin would be overridden
+            // whenever the profile is active, and VEX never attests it:
+            // nothing is written either (#2026 review).
             let both = pom_with_dep("\n      <version>1.7.36</version>", "")
                 .replace("</project>\n", &profile(version));
             let files = BTreeMap::from([("pom.xml".to_string(), both)]);
             let r = rewrite_registry_redirect(&files, &[maven_override()]);
-            let out = r.files.get("pom.xml").expect("top-level pinned");
-            assert!(
-                out.contains(&format!("<version>{version}</version>")),
-                "{out}"
+            assert!(r.files.is_empty(), "{version}: {:?}", r.files);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_profile_dependency_unpatched"],
+                "{version}"
             );
+        }
+    }
+
+    /// The versions a `<profiles>` declaration may resolve are read as VEX
+    /// discovery reads them (its own profile's `<properties>`, then every
+    /// combination of profiles'), and a pin is written only when none of
+    /// them bypasses it: a profile's `<dependencyManagement>` bypasses only
+    /// a pin management governs (the one written when no live direct
+    /// declaration carries a version), and a versionless profile
+    /// declaration takes the pin.
+    #[test]
+    fn maven_profile_versions_are_weighed_before_pinning() {
+        let pom = |top: &str, profiles: &str| {
+            format!(
+                "<project>\n  <dependencies>\n    {top}\n  </dependencies>\n  \
+                 <profiles>{profiles}</profiles>\n</project>\n"
+            )
+        };
+        let dep = |v: Option<&str>| {
+            let v = v.map_or(String::new(), |v| format!("<version>{v}</version>"));
+            format!(
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>{v}\
+                 </dependency>"
+            )
+        };
+        let profile = |id: &str, props: &str, body: &str| {
+            format!("<profile><id>{id}</id><properties>{props}</properties>{body}</profile>")
+        };
+        let direct = |v: Option<&str>| format!("<dependencies>{}</dependencies>", dep(v));
+        let managed = |v: Option<&str>| {
+            format!(
+                "<dependencyManagement><dependencies>{}</dependencies></dependencyManagement>",
+                dep(v)
+            )
+        };
+        let own_pin = format!("<v>{MAVEN_SUFFIXED}</v>");
+        let refused = [
+            // A profile's management, where management governs the pin.
+            pom(&dep(None), &profile("p", "", &managed(Some("1.7.36")))),
+            // Its own profile's property resolves the pin, but another
+            // profile active with it redefines that property.
+            pom(
+                &dep(Some("1.7.36")),
+                &format!(
+                    "{}{}",
+                    profile("p", &own_pin, &direct(Some("${v}"))),
+                    profile("q", "<v>1.7.36</v>", "")
+                ),
+            ),
+        ];
+        for pom in &refused {
+            let files = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            assert!(r.files.is_empty(), "{pom}: {:?}", r.files);
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_maven_profile_dependency_unpatched"],
+                "{pom}"
+            );
+        }
+        let pinned = [
+            // A profile's management under a direct pin.
+            pom(
+                &dep(Some("1.7.36")),
+                &profile("p", "", &managed(Some("1.7.36"))),
+            ),
+            // Versionless: it takes the pin.
+            pom(&dep(Some("1.7.36")), &profile("p", "", &direct(None))),
+            // Its own profile's property resolves the pin, and nothing
+            // else redefines it.
+            pom(
+                &dep(Some("1.7.36")),
+                &profile("p", &own_pin, &direct(Some("${v}"))),
+            ),
+        ];
+        for pom in &pinned {
+            let files = BTreeMap::from([("pom.xml".to_string(), pom.clone())]);
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
             assert!(
-                warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
-                "{version}: {:?}",
+                !warning_codes(&r).contains(&"redirect_maven_profile_dependency_unpatched"),
+                "{pom}: {:?}",
                 r.warnings
             );
+            let out = r.files.get("pom.xml").expect("pinned");
+            assert!(out.contains(MAVEN_SUFFIXED), "{out}");
         }
     }
 
@@ -10806,8 +10930,8 @@ mod tests {
 
     /// A versioned `<profiles>` declaration through an undefined coordinate
     /// property may be the GA while its profile is active: reported like a
-    /// literal profile declaration (#683), pinned beside a top-level
-    /// literal and skipped when it is the only declaration.
+    /// literal profile declaration (#683), and skipped beside a top-level
+    /// literal too, since that pin would never be attested (#2026 review).
     #[test]
     fn maven_pom_undefined_coordinate_property_in_a_profile_is_reported() {
         let profile = "<profiles><profile><id>p</id><dependencies><dependency>\
@@ -10816,7 +10940,7 @@ mod tests {
         for (top, pinned) in [
             (
                 "<dependencies><dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId><version>1.7.36</version></dependency></dependencies>",
-                true,
+                false,
             ),
             ("", false),
         ] {

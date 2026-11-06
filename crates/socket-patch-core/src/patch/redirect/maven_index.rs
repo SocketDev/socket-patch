@@ -7,7 +7,7 @@
 //! not once per dependency.
 
 use crate::formats::maven::{
-    is_executable_classifier, may_shadow, CoordinateAlternative, PomScope,
+    interpolate_strict, is_executable_classifier, may_shadow, CoordinateAlternative, PomScope,
 };
 use crate::formats::xml::{child_text, children, elements, Element};
 
@@ -29,6 +29,14 @@ pub(super) struct IndexedDep {
     /// it ([`PomScope::coordinate_alternatives`], as VEX discovery reads
     /// it).
     pub(super) coordinate_alternatives: Vec<CoordinateAlternative>,
+    /// Inside a `<dependencyManagement>`.
+    pub(super) managed: bool,
+    /// Every version the build may resolve for it, as VEX discovery reads
+    /// one ([`PomScope::resolve_in_build`]): with no profile active but the
+    /// one holding it, then each combination of profiles whose
+    /// `<properties>` move it (as written where one leaves it unresolved).
+    /// Empty when it has no `<version>`.
+    pub(super) build_versions: Vec<String>,
 }
 
 /// One live `<repository>`.
@@ -136,15 +144,26 @@ impl PomIndex {
         user: &std::collections::BTreeMap<String, String>,
     ) -> Result<PomIndex, String> {
         let mut scope = PomScope::with_user_properties(pom, user)?;
-        // Profile `<properties>` may move a `${…}` coordinate, as VEX
-        // discovery reads it (one it cannot read fails closed there).
+        // Profile `<properties>` may move a `${…}` coordinate or version, as
+        // VEX discovery reads it (one it cannot read fails closed there).
         scope.read_profiles();
         let masked = &scope.masked;
+        let managed = elements(masked, "dependencyManagement")?;
         let deps = scope
             .dependencies()?
             .into_iter()
             .map(|d| IndexedDep {
                 coordinate_alternatives: scope.coordinate_alternatives(&d),
+                managed: managed
+                    .iter()
+                    .any(|m| d.element.start >= m.start && d.element.start < m.end),
+                build_versions: d.version_text.as_deref().map_or_else(Vec::new, |text| {
+                    let (base, alternatives) =
+                        scope.resolve_in_build(text, d.element.start, interpolate_strict);
+                    std::iter::once(base.unwrap_or_else(|| text.to_string()))
+                        .chain(alternatives.into_iter().map(|a| a.value))
+                        .collect()
+                }),
                 group: d.group,
                 artifact: d.artifact,
                 version_inner: d.version_inner,
@@ -278,6 +297,42 @@ impl PomIndex {
                     )
                 })
             })
+        })
+    }
+
+    /// A `<profiles>` declaration of `group:artifact`'s main jar (literal,
+    /// or through a coordinate property this pom does not define,
+    /// [`may_shadow`]) and a version it may resolve other than `served`
+    /// ([`IndexedDep::build_versions`]: its own profile's `<properties>`,
+    /// or any combination of profiles'), as VEX discovery weighs one: an
+    /// active profile's `<dependencies>` merge over the pom's own, so it
+    /// overrides any pin, and its `<dependencyManagement>` overrides one
+    /// only where management governs the pin (`pin_managed`). A pom /
+    /// sources / javadoc typed one carries no code, and one without a
+    /// version takes the pin.
+    pub(super) fn profile_bypass(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: &str,
+        pin_managed: bool,
+    ) -> Option<(&IndexedDep, &str)> {
+        self.deps.iter().find_map(|d| {
+            let (Some(g), Some(a)) = (d.group.as_deref(), d.artifact.as_deref()) else {
+                return None;
+            };
+            let main_jar = d.classifier.is_none()
+                && !d
+                    .type_text
+                    .as_deref()
+                    .is_some_and(|t| matches!(t, "pom" | "java-source" | "javadoc"))
+                && ((g == group && a == artifact)
+                    || may_shadow((g, a), d.type_text.as_deref(), None, (group, artifact)));
+            if !d.in_profile || !main_jar || (d.managed && !pin_managed) {
+                return None;
+            }
+            let version = d.build_versions.iter().find(|v| *v != served)?;
+            Some((d, version.as_str()))
         })
     }
 
@@ -427,6 +482,8 @@ impl PomIndex {
             group_text: Some(group.to_string()),
             artifact_text: Some(artifact.to_string()),
             coordinate_alternatives: Vec::new(),
+            managed: true,
+            build_versions: vec![version.to_string()],
         });
     }
 

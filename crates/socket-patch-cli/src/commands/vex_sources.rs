@@ -283,9 +283,9 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              another version, or its <properties> redefine a groupId / artifactId property so \
              the pin names another package or another declaration names this one; the wiring \
              itself is intact, so re-running `scan` does not change this (drop that profile \
-             <version> or property or set it to the pin; for a moved version, `scan --mode \
-             vendored` may re-patch it, but neither mode wires a pin whose groupId / artifactId \
-             a profile can move)",
+             <version> or property or set it to the pin; `scan --mode vendored` rewrites a \
+             literal profile <version>, but neither mode wires a pin a profile's <properties> \
+             can move, and hosted `scan` now writes no pin a profile bypasses)",
         ),
         UnattestedKind::MavenConfigOverride => (
             NOTE_MAVEN_CONFIG_OVERRIDE,
