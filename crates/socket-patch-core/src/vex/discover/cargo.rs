@@ -221,10 +221,14 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         for patch in patch_entries(doc) {
             if let Some(reg) = patch.registry {
                 let name = patch.name.to_string();
-                decls
-                    .entry(name)
-                    .or_default()
-                    .push(Decl::patch(CARGO_TOML, patch.source, reg));
+                // An entry cargo ignores (a crates.io URL table replaces
+                // `[patch.crates-io]`; the config redefines the key) is
+                // Socket's wiring still (the ref stays) but pins nothing.
+                let mut decl = Decl::patch(CARGO_TOML, patch.source, reg);
+                decl.live = shadow
+                    .as_ref()
+                    .is_none_or(|s| s.why(patch.source, patch.key, None).is_none());
+                decls.entry(name).or_default().push(decl);
             }
         }
         decls
@@ -995,7 +999,7 @@ fn beside_the_pin(
     let patch_pins: Vec<(&str, String)> = regs
         .iter()
         .filter_map(|d| match &d.source {
-            DeclSource::Patch(table) => Some((table.as_str(), d.socket_uuid()?)),
+            DeclSource::Patch(table) if d.live => Some((table.as_str(), d.socket_uuid()?)),
             _ => None,
         })
         .collect();
@@ -2442,6 +2446,36 @@ mod tests {
         p.write("Cargo.lock", lock(&pkgs));
         p.write(".cargo/config.toml", registry_block(UUID_A));
         p
+    }
+
+    /// Review on #2019 (round 2, fixed here where `Shadow` lives): a
+    /// `[patch.crates-io]` Socket pin that cargo ignores (a crates.io URL
+    /// table replaces it) pins no declaration: the member's crates.io
+    /// declaration is unpinned, so the ref is not attested.
+    #[tokio::test]
+    async fn a_shadowed_patch_pin_pins_no_declaration() {
+        let patch = format!(
+            "serde = \"1\"\n\n[patch.crates-io]\nserde = {{ registry = \"socket-patch-{UUID_A}\" }}\n"
+        );
+        let p = mixed_workspace(&patch, "serde = \"1\"", &[]);
+        let out = run(&p).await;
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+        let shadowed = format!(
+            "{patch}\n[patch.\"https://github.com/rust-lang/crates.io-index\"]\nother = {{ path = \"other\" }}\n"
+        );
+        let p = mixed_workspace(&shadowed, "serde = \"1\"", &[]);
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(
+            out.unattested
+                .iter()
+                .any(|u| u.kind == UnattestedKind::CargoUnpinnedDeclaration),
+            "{:#?}",
+            out.unattested
+        );
     }
 
     /// The one unattested mark of `out`, asserted to be the hosted serde
