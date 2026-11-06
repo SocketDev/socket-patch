@@ -167,6 +167,24 @@ pub fn symlink_refusal(linked: &str) -> Refusal {
     }
 }
 
+/// The refusal for a candidate read through a link: the file itself
+/// ([`symlink_refusal`]), or, on disk, a directory on its path that links
+/// out of the repository root, so a rewrite would land outside it.
+fn linked_read_refusal(view: &ProjectView<'_>, rel: &str) -> Refusal {
+    if matches!(view, ProjectView::Memory(_)) || view.is_symlink(rel) {
+        return symlink_refusal(rel);
+    }
+    Refusal {
+        code: SYMLINK_REFUSAL.to_string(),
+        message: format!(
+            "{rel} is reached through a symbolic link that leaves the repository root; \
+             socket-patch does not read or rewrite project files outside it — replace the \
+             link with a regular directory (or run socket-patch in the directory it points \
+             to) and re-run; nothing was written"
+        ),
+    }
+}
+
 /// The refusal for a symlinked `bun.lockb` (checked before any takeover
 /// changes wiring).
 pub fn bun_lockb_symlink_refusal() -> Refusal {
@@ -402,11 +420,19 @@ impl CandidateFiles {
                     self.undecodable_reads.push(rel.to_string());
                     None
                 }
-                // A candidate linked out of the repository root: the bound
-                // refuses the read, but the package manager still honors
-                // the file, so it is a symlinked rewrite target the guard
-                // refuses, never an absent one.
-                Err(e) if crate::utils::repo_root::is_refused_read(&e) && view.is_symlink(rel) => {
+                // A candidate whose real path leaves the repository root
+                // (the file itself, or a directory on its path, is a link
+                // out of it; a candidate name never climbs): the bound
+                // refuses the read, but the package manager still follows
+                // the link, so the guard refuses it, never takes it for
+                // absent. Install state under `node_modules/` (a linked
+                // `node_modules` is a common layout) is no rewrite target:
+                // only a link of the file itself counts there.
+                Err(e)
+                    if crate::utils::repo_root::is_refused_read(&e)
+                        && (view.is_symlink(rel)
+                            || !rel.split('/').any(|segment| segment == "node_modules")) =>
+                {
                     self.symlinked_reads.push(rel.to_string());
                     None
                 }
@@ -3654,14 +3680,14 @@ pub fn guard(
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
-    // In memory, every linked candidate; on disk, those linked out of the
-    // repository root, whose reads the bound refused.
+    // In memory, every linked candidate; on disk, those whose real path
+    // leaves the repository root, whose reads the bound refused.
     if let Some(linked) = done
         .symlinked_reads
         .iter()
         .find(|rel| file_ecosystem(rel).is_some_and(|eco| candidate_ecosystems.contains(eco)))
     {
-        return Some(symlink_refusal(linked));
+        return Some(linked_read_refusal(view, linked));
     }
     let ProjectView::Memory(project) = view else {
         return None;
@@ -3723,6 +3749,44 @@ mod tests {
             matches!(hosted.loaded, Loaded::Invalid(_)),
             "{:?}",
             hosted.loaded
+        );
+    }
+
+    /// A disk candidate whose real path leaves the repository root, as
+    /// the file itself or through a directory link on its path, is
+    /// recorded as a linked read (refused by the guard), never as absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_candidates_linked_out_of_the_repository_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("uv.lock"), "version = 1\n").unwrap();
+        std::fs::write(outside.join("sub/package-lock.json"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("uv.lock"), repo.join("uv.lock")).unwrap();
+        std::os::unix::fs::symlink(outside.join("sub"), repo.join("sub")).unwrap();
+        let view = ProjectView::Disk(&repo);
+        let mut out = CandidateFiles::default();
+        for rel in ["uv.lock", "sub/package-lock.json"] {
+            assert!(!out.read(&view, &BTreeSet::new(), rel).await, "{rel}");
+        }
+        assert_eq!(out.symlinked_reads, ["uv.lock", "sub/package-lock.json"]);
+        assert!(out.files.is_empty());
+        let file = linked_read_refusal(&view, "uv.lock");
+        assert_eq!(file.code, SYMLINK_REFUSAL);
+        assert!(
+            file.message.contains("uv.lock is a symbolic link"),
+            "{}",
+            file.message
+        );
+        let dir = linked_read_refusal(&view, "sub/package-lock.json");
+        assert_eq!(dir.code, SYMLINK_REFUSAL);
+        assert!(
+            dir.message.contains("leaves the repository root"),
+            "{}",
+            dir.message
         );
     }
 
