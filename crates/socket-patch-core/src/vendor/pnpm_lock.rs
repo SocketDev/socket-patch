@@ -80,11 +80,12 @@ use crate::formats::pnpm::lines::{
     unquote_value, yaml_key, yaml_key_like, YamlBlock,
 };
 use crate::formats::pnpm::plan::{match_key, KeyMatch, Target};
+use crate::formats::pnpm::sniff_lock_grammar;
 use crate::formats::pnpm::workspace;
 use crate::formats::pnpm::{vendored_npm_uuids, PnpmLockGrammar};
 
 const PACKAGE_JSON: &str = "package.json";
-use crate::utils::line_endings::{to_lf, LineEndings};
+use crate::utils::line_endings::LineEndings;
 use crate::utils::pnpm_workspace::{governing_workspace_file, PNPM_WORKSPACE};
 
 /// Refusal code for a workspace member whose pnpm settings live in an
@@ -178,11 +179,10 @@ impl PnpmDialect {
     }
 
     /// The grammar of a lock this dialect rewrites: one the vendored target
-    /// takes ([`Target::check_lock`]) and this dialect splices.
+    /// rewrites ([`sniff_lock_grammar`]: 5.4, 6.0 and 9.0, the grammars its
+    /// rekey was captured against; N16) and this dialect splices.
     pub(super) fn check_lock(self, text: &str) -> Result<PnpmLockGrammar, String> {
-        let grammar = Target::Vendored
-            .check_lock(text)?
-            .unwrap_or(PnpmLockGrammar::V9);
+        let grammar = sniff_lock_grammar(text)?;
         match (self, grammar) {
             (Self::V9, PnpmLockGrammar::V9)
             | (Self::Legacy, PnpmLockGrammar::V54 | PnpmLockGrammar::V60) => Ok(grammar),
@@ -417,7 +417,7 @@ impl NpmLockBackend for PnpmBackend {
             .render(&pkg)
             .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
         // An env document ahead of the project lock is carried over verbatim.
-        // Each file is written back in its own line endings (`lf_text`).
+        // Each file is written back in its own line endings (`read_pnpm_text`).
         let lock_out = format!("{lock_prefix}{}", lock.lines().join("\n"));
         let ws_out = ws_edit.new_text.as_deref().map(|t| ws_eol.restore(t));
         let ws_was = ws_text.as_deref().map(|t| ws_eol.restore(t));
@@ -485,7 +485,7 @@ struct PnpmProject {
     /// Everything ahead of the project document, written back verbatim.
     lock_prefix: String,
     /// The line endings the lock and the workspace file are written back
-    /// with; their texts here are LF ([`lf_text`]).
+    /// with; their texts here are LF ([`read_pnpm_text`]).
     lock_eol: LineEndings,
     ws_text: Option<String>,
     ws_eol: LineEndings,
@@ -584,15 +584,9 @@ async fn read_project(
     {
         return Err(Box::new(refused(refusal.0, refusal.1)));
     }
-    let lock_text = match read_regular_to_string(&project_root.join(PNPM_LOCK)).await {
-        Ok(text) => text,
-        Err(e) => {
-            return Err(Box::new(refused(
-                "vendor_lockfile_missing",
-                format!("cannot read {PNPM_LOCK}: {e} — run `pnpm install` first"),
-            )));
-        }
-    };
+    let (lock_text, lock_eol) = read_pnpm_text(project_root, PNPM_LOCK)
+        .await
+        .map_err(|e| read_refusal(PNPM_LOCK, e, "run `pnpm install` first"))?;
     let grammar = match dialect.check_lock(&lock_text) {
         Ok(grammar) => grammar,
         Err(detail) => {
@@ -602,7 +596,6 @@ async fn read_project(
             )));
         }
     };
-    let (lock_text, lock_eol) = lf_text(PNPM_LOCK, lock_text)?;
     if dialect == PnpmDialect::Legacy {
         return Ok(PnpmProject {
             pkg_bytes,
@@ -645,18 +638,16 @@ async fn read_project(
     // encoding, permissions, a FIFO) must refuse — treating it as absent
     // would route into the create path, which OVERWRITES the user's
     // workspace definition with the root-only scaffold.
-    let (ws_text, ws_eol) = match read_regular_to_string(&project_root.join(PNPM_WORKSPACE)).await {
-        Ok(text) => lf_text(PNPM_WORKSPACE, text).map(|(t, eol)| (Some(t), eol))?,
+    let (ws_text, ws_eol) = match read_pnpm_text(project_root, PNPM_WORKSPACE).await {
+        Ok((text, eol)) => (Some(text), eol),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, LineEndings::None),
         Err(e) => {
-            return Err(Box::new(refused(
-                "vendor_lockfile_missing",
-                format!(
-                    "cannot read {PNPM_WORKSPACE}: {e} — vendoring mirrors the override \
-                         into it (pnpm >= 11 reads overrides from pnpm-workspace.yaml); fix \
-                         the file and retry"
-                ),
-            )));
+            return Err(read_refusal(
+                PNPM_WORKSPACE,
+                e,
+                "vendoring mirrors the override into it (pnpm >= 11 reads overrides from \
+                 pnpm-workspace.yaml); fix the file and retry",
+            ))
         }
     };
     // A workspace member with its own lock (`sharedWorkspaceLockfile:
@@ -696,23 +687,55 @@ async fn read_project(
     })
 }
 
-/// A pnpm file's text with LF line endings, and the endings it is written
-/// back with. A CRLF file (a Windows autocrlf checkout) is read and edited
-/// like its LF twin and written back CRLF, as hosted mode's byte splices
-/// keep it (divergences N15). A file that mixes endings is refused: no one
-/// ending writes it back byte-faithfully.
-fn lf_text(file: &str, text: String) -> Result<(String, LineEndings), Box<VendorOutcome>> {
+/// A pnpm file mixing CRLF and LF (see [`read_pnpm_text`]).
+#[derive(Debug)]
+struct MixedEndings(&'static str);
+
+impl std::fmt::Display for MixedEndings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} mixes CRLF and LF line endings, which this rewriter cannot write back \
+             byte-faithfully — normalize the file to one line ending and retry",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for MixedEndings {}
+
+/// Read `file` under `root` as every vendored pnpm reader does (vendoring,
+/// its pre-flight and the revert): its text with LF line endings, and the
+/// endings it is written back with. A CRLF file (a Windows autocrlf
+/// checkout) is edited like its LF twin and written back CRLF, as hosted
+/// mode's byte splices keep it (divergences N15). A file that mixes endings
+/// is an error ([`is_mixed`]): no one ending writes it back byte-faithfully,
+/// so vendoring refuses it and the revert fails before any write.
+async fn read_pnpm_text(root: &Path, file: &'static str) -> std::io::Result<(String, LineEndings)> {
+    let text = read_regular_to_string(&root.join(file)).await?;
     match LineEndings::of(&text) {
-        LineEndings::Mixed => Err(Box::new(refused(
-            "vendor_lockfile_crlf_unsupported",
-            format!(
-                "{file} mixes CRLF and LF line endings, which this rewriter cannot write \
-                 back byte-faithfully — normalize the file to one line ending and retry"
-            ),
-        ))),
+        LineEndings::Mixed => Err(std::io::Error::other(MixedEndings(file))),
         LineEndings::Crlf => Ok((text.replace("\r\n", "\n"), LineEndings::Crlf)),
         eol => Ok((text, eol)),
     }
+}
+
+/// Whether a [`read_pnpm_text`] error is a mixed-ending file.
+fn is_mixed(e: &std::io::Error) -> bool {
+    e.get_ref().is_some_and(|inner| inner.is::<MixedEndings>())
+}
+
+/// The vendoring refusal for a [`read_pnpm_text`] error other than a
+/// missing file: `vendor_lockfile_crlf_unsupported` for mixed endings, else
+/// `vendor_lockfile_missing` with `remedy`.
+fn read_refusal(file: &str, e: std::io::Error, remedy: &str) -> Box<VendorOutcome> {
+    Box::new(match is_mixed(&e) {
+        true => refused("vendor_lockfile_crlf_unsupported", e.to_string()),
+        false => refused(
+            "vendor_lockfile_missing",
+            format!("cannot read {file}: {e} — {remedy}"),
+        ),
+    })
 }
 
 /// `(prefix, project document)` of a v9 lock ([`split_project_document`]),
@@ -968,30 +991,58 @@ pub(super) async fn revert_pnpm_dialect(
             return blocked;
         }
     }
-    // A v9 lock whose documents are not pnpm's layout cannot be reverted
-    // without guessing which document holds the wiring: fail before any
-    // surface is touched (the dry run too, so the preview never advertises
-    // a revert the wet run refuses) instead of reverting package.json and
-    // the workspace file around a lock left wired to the artifact.
-    let mut lock_text: Option<std::io::Result<String>> = None;
-    if dialect == PnpmDialect::V9
-        && entry
+    // Read the lock and the workspace file the records touch up front, as
+    // vendoring reads them ([`read_pnpm_text`]), and fail before any surface
+    // is touched (the dry run too, so the preview never advertises a revert
+    // the wet run refuses) when one mixes CRLF and LF, or when a v9 lock's
+    // documents are not pnpm's layout: neither can be reverted without
+    // guessing, and reverting package.json and the workspace file around a
+    // lock left wired to the artifact would desync them.
+    let touches = |kind: fn(&str) -> bool| {
+        entry
             .wiring
             .iter()
-            .any(|r| r.file != PACKAGE_JSON && dialect.allows_revert_file(&r.file))
+            .any(|r| dialect.allows_revert_file(&r.file) && kind(&r.file))
+    };
+    let read = |file| read_pnpm_text(project_root, file);
+    let lock_read = match touches(|f| f != PACKAGE_JSON) {
+        true => Some(read(PNPM_LOCK).await),
+        false => None,
+    };
+    let ws_read = match touches(|f| f == PNPM_WORKSPACE) {
+        true => Some(read(PNPM_WORKSPACE).await),
+        false => None,
+    };
+    for e in [&lock_read, &ws_read]
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_ref().err())
     {
-        let read = read_regular_to_string(&project_root.join(PNPM_LOCK)).await;
-        if let Ok(text) = &read {
-            if let Err(why) = split_v9_lock(text) {
-                return RevertOutcome::failed(format!(
-                    "{why}, so the vendored wiring of {} cannot be located; nothing was \
-                     reverted — restore the vendored {PNPM_LOCK} (or re-lock it with pnpm) \
-                     and re-run the revert",
-                    entry.base_purl
-                ));
-            }
+        if is_mixed(e) {
+            return RevertOutcome::failed(format!("{e}; nothing was reverted"));
         }
-        lock_text = Some(read);
+    }
+    let mut lock_prefix = String::new();
+    let mut lock_lines: Option<Vec<String>> = None;
+    if let Some(Ok((text, _))) = &lock_read {
+        // The wiring lives in the project document; an env document ahead
+        // of it is written back verbatim.
+        let (prefix, project) = match dialect {
+            PnpmDialect::V9 => match split_v9_lock(text) {
+                Ok(split) => split,
+                Err(why) => {
+                    return RevertOutcome::failed(format!(
+                        "{why}, so the vendored wiring of {} cannot be located; nothing was \
+                         reverted — restore the vendored {PNPM_LOCK} (or re-lock it with \
+                         pnpm) and re-run the revert",
+                        entry.base_purl
+                    ))
+                }
+            },
+            PnpmDialect::Legacy => ("", text.as_str()),
+        };
+        lock_prefix = prefix.to_string();
+        lock_lines = Some(split_lines(project));
     }
     if dry_run {
         return RevertOutcome::ok();
@@ -1001,7 +1052,6 @@ pub(super) async fn revert_pnpm_dialect(
     // Partition by file through the allowlist (fail-closed skip+warning on
     // anything else — see REVERT_ALLOWLIST's security note).
     let mut touches_pkg = false;
-    let mut touches_lock = false;
     for rec in &entry.wiring {
         if !dialect.allows_revert_file(&rec.file) {
             outcome.warnings.push(VendorWarning::new(
@@ -1013,49 +1063,23 @@ pub(super) async fn revert_pnpm_dialect(
             ));
             continue;
         }
-        if rec.file == PACKAGE_JSON {
-            touches_pkg = true;
-        } else {
-            touches_lock = true;
-        }
+        touches_pkg |= rec.file == PACKAGE_JSON;
     }
 
-    // Load both surfaces up front (fail-closed on unparseable; a missing
-    // file degrades to a warning and the artifact removal still proceeds).
-    let mut lock_lines: Option<Vec<String>> = None;
-    let mut lock_prefix = String::new();
-    let mut lock_eol = LineEndings::None;
-    if touches_lock {
-        let read = match lock_text {
-            Some(read) => read,
-            None => read_regular_to_string(&project_root.join(PNPM_LOCK)).await,
-        };
-        match read {
-            // The wiring lives in the project document; an env document
-            // ahead of it is written back verbatim, in the lock's own line
-            // endings (N15).
-            Ok(text) => {
-                lock_eol = LineEndings::of(&text);
-                let text = to_lf(&text);
-                let (prefix, project) = match dialect {
-                    PnpmDialect::V9 => match split_v9_lock(&text) {
-                        Ok(split) => split,
-                        Err(why) => return RevertOutcome::failed(why),
-                    },
-                    PnpmDialect::Legacy => ("", &*text),
-                };
-                lock_prefix = prefix.to_string();
-                lock_lines = Some(split_lines(project));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                outcome.warnings.push(VendorWarning::new(
-                    "vendor_lockfile_missing",
-                    format!("{PNPM_LOCK} is missing; lock fragments cannot be restored"),
-                ));
-            }
-            Err(e) => return RevertOutcome::failed(format!("cannot read {PNPM_LOCK}: {e}")),
+    // A missing lock degrades to a warning and the artifact removal still
+    // proceeds; an unreadable one fails.
+    let lock_eol = match lock_read {
+        Some(Ok((_, eol))) => eol,
+        Some(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            outcome.warnings.push(VendorWarning::new(
+                "vendor_lockfile_missing",
+                format!("{PNPM_LOCK} is missing; lock fragments cannot be restored"),
+            ));
+            LineEndings::None
         }
-    }
+        Some(Err(e)) => return RevertOutcome::failed(format!("cannot read {PNPM_LOCK}: {e}")),
+        None => LineEndings::None,
+    };
     let mut pkg_state: Option<(Value, JsonLayout)> = None;
     if touches_pkg {
         match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
@@ -1186,9 +1210,10 @@ pub(super) async fn revert_pnpm_dialect(
                 && build_approvals::is_ws_kind(&r.kind)
         })
         .collect();
-    if ws_rec.is_some() || !ws_approvals.is_empty() {
+    if let Some(read) = ws_read.filter(|_| ws_rec.is_some() || !ws_approvals.is_empty()) {
         if let Err(e) = revert_workspace(
             project_root,
+            read,
             ws_rec,
             &ws_approvals,
             entry,
@@ -1217,9 +1242,11 @@ pub(super) async fn revert_pnpm_dialect(
 /// out of a file we edited (restoring the taken-over value, and dropping an
 /// `overrides:` section we created once it empties). Drift ⇒ warning, left
 /// alone. Build approvals vendoring added (`approvals`) are taken out too.
-/// `Err` is a genuine write failure.
+/// `read` is the file as [`read_pnpm_text`] read it (LF, with the endings
+/// it is written back in). `Err` is a genuine read or write failure.
 async fn revert_workspace(
     project_root: &Path,
+    read: std::io::Result<(String, LineEndings)>,
     rec: Option<&WiringRecord>,
     approvals: &[&WiringRecord],
     entry: &VendorEntry,
@@ -1235,8 +1262,8 @@ async fn revert_workspace(
     };
     let entry_uuid = entry.uuid.as_str();
     let path = project_root.join(PNPM_WORKSPACE);
-    let text = match read_regular_to_string(&path).await {
-        Ok(t) => t,
+    let (text, eol) = match read {
+        Ok(read) => read,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // ALREADY CONVERGED: for an Added override (no recorded
             // original) the reverted state is "no override" — a missing
@@ -1253,10 +1280,6 @@ async fn revert_workspace(
         }
         Err(e) => return Err(format!("cannot read {PNPM_WORKSPACE}: {e}")),
     };
-    // A CRLF file (an autocrlf checkout of what vendoring wrote) is read
-    // like its LF twin and written back CRLF (N15).
-    let eol = LineEndings::of(&text);
-    let text = to_lf(&text).into_owned();
 
     // Fast path: a file we created that is still byte-identical to the
     // scaffold we wrote → delete it (byte-restore to "no file").
@@ -1417,11 +1440,6 @@ impl EditCtx<'_> {
     /// binding is load-bearing.
     fn is_ours(&self, value: &str) -> bool {
         vendor_value_is_for(value, self.name, self.version)
-    }
-
-    /// [`target_key`] of a packages/snapshots key for this release.
-    pub(super) fn target_key(&self, key: &str) -> Option<bool> {
-        target_key(key, self.name, self.version)
     }
 
     /// The per-importer `specifier:` spelling: re-relativized for nested
@@ -1803,26 +1821,28 @@ fn check_rewritable_refs_with(
         }
     }
     // The positions the checks below read: from the index, the earliest
-    // position each refusal can hold at; by the scan, every one.
-    let scanned;
-    let (snapshot_refs, importer_refs): (Box<dyn Iterator<Item = SnapshotCandidate> + '_>, _) =
-        match index {
-            Some(index) => (
-                Box::new(
-                    index
-                        .snapshot_ref_candidates(&reg_key, name, version)
-                        .into_iter(),
-                ),
-                index.importer_ref_candidates(&reg_key, name, version),
+    // position each refusal can hold at; by the scan, every one, read
+    // lazily so the scan stops at the first refusal.
+    type Refs<'a, T> = Box<dyn Iterator<Item = T> + 'a>;
+    let (snapshot_refs, importer_refs): (Refs<SnapshotCandidate>, Refs<ImporterRef>) = match index {
+        Some(index) => (
+            Box::new(
+                index
+                    .snapshot_ref_candidates(&reg_key, name, version)
+                    .into_iter(),
             ),
-            None => {
-                scanned = importer_deps(lines);
-                (
-                    Box::new(snapshot_positions(lines)),
-                    scanned.iter().collect(),
-                )
-            }
-        };
+            Box::new(
+                index
+                    .importer_ref_candidates(&reg_key, name, version)
+                    .into_iter()
+                    .map(ImporterDep::as_ref),
+            ),
+        ),
+        None => (
+            Box::new(snapshot_positions(lines)),
+            Box::new(importer_refs(lines)),
+        ),
+    };
     for candidate in snapshot_refs {
         match candidate {
             SnapshotCandidate::Key(header) => {
@@ -1846,23 +1866,18 @@ fn check_rewritable_refs_with(
         }
     }
     for entry in importer_refs {
-        let dep = entry.dep.as_str();
-        let Some(v) = entry.ver.as_deref().map(unquote_value) else {
+        let Some(v) = entry.ver.map(unquote_value) else {
             continue;
         };
         if v == reg_key || v.starts_with(&key_peer_prefix) {
             return refuse("an aliased importer version", v);
         }
-        if dep == name && v.starts_with(&val_peer_prefix) {
+        if entry.dep == name && v.starts_with(&val_peer_prefix) {
             return refuse("a peer-suffixed importer version", v);
         }
         // pnpm spells the default catalog `'catalog:'` (quoted) and named
         // ones `catalog:<name>` (bare).
-        if let Some(s) = entry
-            .spec
-            .as_deref()
-            .filter(|_| dep == name && v == version)
-        {
+        if let Some(s) = entry.spec.filter(|_| entry.dep == name && v == version) {
             if unquote_value(s).starts_with("catalog:") {
                 return refuse_catalog(&format!("importer `{}` specifier", entry.importer), s);
             }
@@ -1887,27 +1902,33 @@ fn snapshot_positions(lines: &[String]) -> impl Iterator<Item = SnapshotCandidat
         })
 }
 
-/// Every importer's [`DepEntry`]s, in lock order.
-fn importer_deps(lines: &[String]) -> Vec<ImporterDep> {
-    let Some((start, end)) = section_bounds(lines, "importers") else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let mut i = start + 1;
-    while let Some(importer) = next_block(lines, i, end) {
-        out.extend(
-            dep_entries(lines, importer.header + 1, importer.end, 6)
-                .into_iter()
-                .map(|e| ImporterDep {
-                    importer: importer.key.clone(),
-                    dep: e.dep,
-                    spec: e.spec.map(|(_, s)| s),
-                    ver: e.ver.map(|(_, v)| v),
-                }),
-        );
-        i = importer.end;
-    }
-    out
+/// One importer dep entry as the ref gate reads it ([`ImporterDep`],
+/// borrowed).
+struct ImporterRef<'a> {
+    importer: &'a str,
+    dep: &'a str,
+    spec: Option<&'a str>,
+    ver: Option<&'a str>,
+}
+
+/// Every importer's [`DepEntry`]s, in lock order, read lazily.
+fn importer_refs(lines: &[String]) -> impl Iterator<Item = ImporterRef<'_>> {
+    let blocks = section_bounds(lines, "importers").into_iter();
+    blocks
+        .flat_map(move |(start, end)| {
+            std::iter::successors(next_block(lines, start + 1, end), move |b| {
+                next_block(lines, b.end, end)
+            })
+        })
+        .flat_map(move |importer| {
+            let key = parse_key_line(&lines[importer.header], 2).map_or("", |(key, ..)| key);
+            dep_entries(lines, importer.header + 1, importer.end, 6).map(move |e| ImporterRef {
+                importer: key,
+                dep: e.dep,
+                spec: e.spec.map(|(_, s)| s),
+                ver: e.ver.map(|(_, v)| v),
+            })
+        })
 }
 
 // ───────────────────────── package.json override ─────────────────────────
@@ -2371,48 +2392,58 @@ pub(super) fn overrides_record(
 
 /// One dependency entry with nested `specifier:` / `version:` fields (each
 /// with its line): a v9 importer dep (key at 6, fields at 8) or a legacy
-/// 6.0 root dep (2 / 4).
-pub(super) struct DepEntry {
-    pub(super) dep: String,
-    pub(super) spec: Option<(usize, String)>,
-    pub(super) ver: Option<(usize, String)>,
+/// 6.0 root dep (2 / 4). Borrowed from the lines.
+pub(super) struct DepEntry<'l> {
+    pub(super) dep: &'l str,
+    pub(super) spec: Option<(usize, &'l str)>,
+    pub(super) ver: Option<(usize, &'l str)>,
 }
 
-/// Every [`DepEntry`] keyed at `indent` in `[start, end)`, in order. A key
-/// with an inline value is not one; unknown fields are skipped.
+impl DepEntry<'_> {
+    /// `(specifier line, specifier, version line, version)`, owned so the
+    /// caller can rewrite the lines; `None` unless both fields are present.
+    pub(super) fn pair(&self) -> Option<(usize, String, usize, String)> {
+        let ((si, spec), (vi, ver)) = (self.spec?, self.ver?);
+        Some((si, spec.to_string(), vi, ver.to_string()))
+    }
+}
+
+/// Every [`DepEntry`] keyed at `indent` in `[start, end)`, in order, read
+/// lazily. A key with an inline value is not one; unknown fields are
+/// skipped.
 pub(super) fn dep_entries(
     lines: &[String],
     start: usize,
     end: usize,
     indent: usize,
-) -> Vec<DepEntry> {
-    let mut out = Vec::new();
+) -> impl Iterator<Item = DepEntry<'_>> {
     let mut k = start;
-    while k < end {
-        let Some((dep, _repr, "")) = parse_key_line(&lines[k], indent) else {
+    std::iter::from_fn(move || {
+        while k < end {
             k += 1;
-            continue;
-        };
-        let mut entry = DepEntry {
-            dep: dep.to_string(),
-            spec: None,
-            ver: None,
-        };
-        k += 1;
-        while let Some((field, _repr, value)) = lines[..end]
-            .get(k)
-            .and_then(|l| parse_key_line(l, indent + 2))
-        {
-            match field {
-                "specifier" => entry.spec = Some((k, value.to_string())),
-                "version" => entry.ver = Some((k, value.to_string())),
-                _ => {}
+            let Some((dep, _repr, "")) = parse_key_line(&lines[k - 1], indent) else {
+                continue;
+            };
+            let mut entry = DepEntry {
+                dep,
+                spec: None,
+                ver: None,
+            };
+            while let Some((field, _repr, value)) = lines[..end]
+                .get(k)
+                .and_then(|l| parse_key_line(l, indent + 2))
+            {
+                match field {
+                    "specifier" => entry.spec = Some((k, value)),
+                    "version" => entry.ver = Some((k, value)),
+                    _ => {}
+                }
+                k += 1;
             }
-            k += 1;
+            return Some(entry);
         }
-        out.push(entry);
-    }
-    out
+        None
+    })
 }
 
 /// Edit 2: every importer's dep entry for the exact `name@version` —
@@ -2432,12 +2463,13 @@ fn edit_importers<L: EditLines>(
         let importer_key = importer.key;
         // Dep entries sit at 6-space indent under the 4-space dep-type
         // headers; their fields at 8.
-        for entry in dep_entries(lines.read(), importer.header + 1, importer.end, 6) {
-            let (Some((si, old_spec)), Some((vi, old_ver))) = (entry.spec, entry.ver) else {
-                continue;
-            };
+        let pairs: Vec<_> = dep_entries(lines.read(), importer.header + 1, importer.end, 6)
+            .filter(|entry| entry.dep == ctx.name)
+            .filter_map(|entry| entry.pair())
+            .collect();
+        for (si, old_spec, vi, old_ver) in pairs {
             let target = old_ver == ctx.version || (old_ver != ctx.spec && ctx.is_ours(&old_ver));
-            if entry.dep != ctx.name || !target {
+            if !target {
                 continue;
             }
             let importer_spec = ctx.spec_for_importer(&importer_key);
@@ -2445,7 +2477,7 @@ fn edit_importers<L: EditLines>(
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_IMPORTER_DEP.to_string(),
                 action: WiringAction::Rewritten,
-                key: Some(format!("{importer_key}|{}", entry.dep)),
+                key: Some(format!("{importer_key}|{}", ctx.name)),
                 original: (!ctx.is_ours(&old_ver))
                     .then(|| serde_json::json!({ "specifier": old_spec, "version": old_ver })),
                 new: Some(serde_json::json!({
@@ -2474,12 +2506,11 @@ fn edit_packages<L: EditLines>(
     let bounds = lines.bounds("packages").ok_or("no packages: section")?;
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-    let matches = target_blocks(lines, "packages", bounds, ctx.name, ctx.version)?;
-
     // The first registry-or-ours block is the one rewritten (every path
     // below returns).
-    if let Some(block) = matches.into_iter().next() {
-        let is_ours_key = ctx.target_key(&block.key) == Some(true);
+    if let Some((block, is_ours_key)) =
+        target_block(lines, "packages", bounds, ctx.name, ctx.version)?
+    {
         let original_lines: Vec<String> = lines.read()[block.header..block.end].to_vec();
         let expected_resolution = format!(
             "    resolution: {{integrity: {}, tarball: {}}}",
@@ -2556,11 +2587,10 @@ fn edit_snapshot_rekey<L: EditLines>(
     };
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-    let matches = target_blocks(lines, "snapshots", bounds, ctx.name, ctx.version)?;
-
     // The first registry-or-ours block decides (every path below returns).
-    if let Some(block) = matches.into_iter().next() {
-        let is_ours_key = ctx.target_key(&block.key) == Some(true);
+    if let Some((block, is_ours_key)) =
+        target_block(lines, "snapshots", bounds, ctx.name, ctx.version)?
+    {
         if block.key == new_key {
             return Ok(false); // in sync
         }
@@ -2671,10 +2701,11 @@ fn edit_snapshot_refs<L: EditLines>(
 }
 
 /// The blocks of `section` (`[start, end)`, its current bounds) whose key is
-/// a [`target_key`] of `name@version`, in lock order — the only blocks the
-/// packages/snapshots edits act on. From the index while the lines are the
-/// memoized split (its candidates are a superset, filtered by the same
-/// predicate), else by the scan.
+/// a [`target_key`] of `name@version`, each with that classification (`true`:
+/// a rekey), in lock order — the only blocks the packages/snapshots edits
+/// act on. From the index while the lines are the memoized split (its
+/// candidates are a superset, filtered by the same predicate), else by the
+/// scan.
 fn matching_blocks<L: EditLines>(
     lines: &L,
     section: &str,
@@ -2682,52 +2713,49 @@ fn matching_blocks<L: EditLines>(
     end: usize,
     name: &str,
     version: &str,
-) -> Vec<YamlBlock> {
-    let keep = |key: &str| target_key(key, name, version).is_some();
+) -> Vec<(YamlBlock, bool)> {
+    let classify = |block: YamlBlock| Some((target_key(&block.key, name, version)?, block));
     if let Some(section) = lines.index().and_then(|index| index.section(section)) {
         return section
             .candidates(name, version)
             .into_iter()
-            .filter(|block| keep(&block.key))
-            .map(IndexedBlock::to_block)
+            .filter_map(|block| classify(block.to_block()))
+            .map(|(rekeyed, block)| (block, rekeyed))
             .collect();
     }
     let lines = lines.read();
-    let mut found = Vec::new();
-    let mut i = start + 1;
-    while let Some(block) = next_block(lines, i, end) {
-        i = block.end;
-        if keep(&block.key) {
-            found.push(block);
-        }
-    }
-    found
+    let blocks = std::iter::successors(next_block(lines, start + 1, end), |b| {
+        next_block(lines, b.end, end)
+    });
+    blocks
+        .filter_map(classify)
+        .map(|(rekeyed, block)| (block, rekeyed))
+        .collect()
 }
 
-/// [`matching_blocks`], failing closed on a half-drifted lock: when the
-/// section carries BOTH the registry entry and a rekey of it, a rekey would
-/// splice a DUPLICATE mapping key (pnpm refuses to parse those) and surgery
-/// cannot decide which block carries the truth.
-pub(super) fn target_blocks<L: EditLines>(
+/// The block the packages/snapshots edit rewrites: the first
+/// [`matching_blocks`] entry, with whether it is a rekey already made.
+/// Fails closed on a half-drifted lock: when the section carries BOTH the
+/// registry entry and a rekey of it, a rekey would splice a DUPLICATE
+/// mapping key (pnpm refuses to parse those) and surgery cannot decide
+/// which block carries the truth.
+pub(super) fn target_block<L: EditLines>(
     lines: &L,
     section: &str,
     (start, end): (usize, usize),
     name: &str,
     version: &str,
-) -> Result<Vec<YamlBlock>, String> {
+) -> Result<Option<(YamlBlock, bool)>, String> {
     let matches = matching_blocks(lines, section, start, end, name, version);
-    let rekeyed = |want| move |b: &&YamlBlock| target_key(&b.key, name, version) == Some(want);
-    match (
-        matches.iter().find(rekeyed(false)),
-        matches.iter().any(|b| rekeyed(true)(&b)),
-    ) {
-        (Some(registry), true) => Err(format!(
+    let registry = matches.iter().find(|(_, rekeyed)| !rekeyed);
+    if let Some((registry, _)) = registry.filter(|_| matches.iter().any(|(_, rekeyed)| *rekeyed)) {
+        return Err(format!(
             "{section} section carries BOTH `{}` and a vendored `file:` rekey of it (a \
              half-edited lock); run `pnpm install` to re-resolve it, then re-vendor",
             registry.key
-        )),
-        _ => Ok(matches),
+        ));
     }
+    Ok(matches.into_iter().next())
 }
 
 // ─────────────────────── memoized split + section index ────────────────────
@@ -2918,12 +2946,12 @@ impl SectionIndex {
             let at = index.blocks.len();
             let key = block.key.strip_prefix('/').unwrap_or(&block.key);
             index.by_key.entry(key.to_string()).or_default().push(at);
-            for (p, _) in format!("@{}", block.key).match_indices("@file:") {
-                index
-                    .by_file_prefix
-                    .entry(block.key[..p.saturating_sub(1)].to_string())
-                    .or_default()
-                    .push(at);
+            // A bare `file:` key files under `""`, a `name@file:` one under `name`.
+            let bare = block.key.starts_with("file:").then_some(0);
+            let named = block.key.match_indices("@file:").map(|(p, _)| p);
+            for p in bare.into_iter().chain(named) {
+                let prefix = block.key[..p].to_string();
+                index.by_file_prefix.entry(prefix).or_default().push(at);
             }
             index.blocks.push(IndexedBlock {
                 header: block.header,
@@ -2965,6 +2993,17 @@ struct ImporterDep {
     dep: String,
     spec: Option<String>,
     ver: Option<String>,
+}
+
+impl ImporterDep {
+    fn as_ref(&self) -> ImporterRef<'_> {
+        ImporterRef {
+            importer: &self.importer,
+            dep: &self.dep,
+            spec: self.spec.as_deref(),
+            ver: self.ver.as_deref(),
+        }
+    }
 }
 
 /// A position the snapshot scan of [`check_rewritable_refs`] may refuse
@@ -3062,8 +3101,15 @@ impl LockIndex {
             }
         }
 
-        index.importer_deps = importer_deps(lines);
-        index.importer_deps.retain(|entry| entry.ver.is_some());
+        index.importer_deps = importer_refs(lines)
+            .filter(|entry| entry.ver.is_some())
+            .map(|e| ImporterDep {
+                importer: e.importer.to_string(),
+                dep: e.dep.to_string(),
+                spec: e.spec.map(str::to_string),
+                ver: e.ver.map(str::to_string),
+            })
+            .collect();
         for (at, entry) in index.importer_deps.iter().enumerate() {
             let (dep, v) = (
                 &entry.dep,
@@ -3415,9 +3461,7 @@ impl DepPair<'_> {
         warnings: &mut Vec<VendorWarning>,
     ) {
         let (rec, key, label) = (self.rec, self.key, self.label);
-        let entry = dep_entries(lines, start, end, indent)
-            .into_iter()
-            .find(|e| e.dep == self.dep);
+        let entry = dep_entries(lines, start, end, indent).find(|e| e.dep == self.dep);
         let Some((Some((si, live_spec)), Some((vi, live_ver)))) = entry.map(|e| (e.spec, e.ver))
         else {
             return self.removed(warnings);
@@ -3431,13 +3475,13 @@ impl DepPair<'_> {
         }
         let original = rec.original.as_ref();
         if original.is_some()
-            && field(original, "specifier") == Some(&live_spec)
-            && field(original, "version") == Some(&live_ver)
+            && field(original, "specifier") == Some(live_spec)
+            && field(original, "version") == Some(live_ver)
         {
             return;
         }
-        let ours = field(rec.new.as_ref(), "version") == Some(&live_ver)
-            || parse_vendor_path(&live_ver)
+        let ours = field(rec.new.as_ref(), "version") == Some(live_ver)
+            || parse_vendor_path(live_ver)
                 .is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
             return warnings.push(drifted(format!(
@@ -5999,6 +6043,57 @@ snapshots:
         format!("---\n{env}\n---\n{project}")
     }
 
+    /// N15 on pnpm 11's two-document lock: vendored, then checked out with
+    /// autocrlf (`---\r` separators), the lock reverts to its CRLF bytes.
+    /// Review finding: the revert's document check read the raw CRLF text,
+    /// refused `---\r` as a marker line, and failed every such revert.
+    #[tokio::test]
+    async fn crlf_two_document_lock_reverts() {
+        let before = two_doc(ENV_DOC_CONFIG_DEP, P1_BEFORE_LOCK);
+        let fx = fixture_with(P1_BEFORE_PKG, &before).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let crlf = fx.read(PNPM_LOCK).await.replace('\n', "\r\n");
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &crlf)
+            .await
+            .unwrap();
+        let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(fx.read(PNPM_LOCK).await, before.replace('\n', "\r\n"));
+    }
+
+    /// Review finding: a revert met a lock or workspace file that MIXES CRLF
+    /// and LF and wrote it back all-LF. It now fails before any write, dry
+    /// run included, as vendoring refuses such a file: every surface and the
+    /// artifact stay as they are.
+    #[tokio::test]
+    async fn mixed_line_ending_revert_fails_before_any_write() {
+        for file in [PNPM_LOCK, PNPM_WORKSPACE] {
+            let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let mixed = fx.read(file).await.replacen('\n', "\r\n", 1);
+            tokio::fs::write(fx.root().join(file), &mixed)
+                .await
+                .unwrap();
+            let pkg = fx.read(PACKAGE_JSON).await;
+            for dry_run in [true, false] {
+                let outcome = revert_pnpm(&entry, fx.root(), dry_run).await;
+                assert!(!outcome.success, "{file}");
+                let error = outcome.error.unwrap_or_default();
+                assert!(
+                    error.contains(&format!("{file} mixes CRLF and LF")),
+                    "{error}"
+                );
+            }
+            assert_eq!(fx.read(file).await, mixed, "{file} left alone");
+            assert_eq!(fx.read(PACKAGE_JSON).await, pkg, "{file}: nothing reverted");
+            assert!(
+                fx.root().join(fx.rel_tgz()).exists(),
+                "{file}: artifact kept"
+            );
+        }
+    }
+
     /// #466: vendoring a two-document lock edits the PROJECT document only —
     /// byte-for-byte the single-document oracle — and leaves the env
     /// document untouched, even when a config dependency shares the
@@ -6403,7 +6498,12 @@ snapshots:
 
         // Future versions: the fix is an allowlisted-emitting pnpm or a
         // newer build, never "pnpm >= 9" (the user's pnpm already is).
-        for head in ["lockfileVersion: '9.1'\n", "lockfileVersion: '10.0'\n"] {
+        // An unparseable major (review finding) is not "old" either.
+        for head in [
+            "lockfileVersion: '9.1'\n",
+            "lockfileVersion: '10.0'\n",
+            "lockfileVersion: 'v10'\n",
+        ] {
             let err = sniff_lock_grammar(head).unwrap_err();
             assert!(err.contains("update socket-patch"), "{err}");
             assert!(!err.contains("re-lock with pnpm >= 9"), "{err}");
@@ -9821,19 +9921,13 @@ snapshots:
         let lines = split_lines(
             "      dep:\n        specifier: ^1.0.0\n        engines: whatever\n        version: 1.0.0\n      other:\n      inline: 1.0.0",
         );
-        let entries = dep_entries(&lines, 0, lines.len(), 6);
-        let got: Vec<_> = entries
-            .iter()
-            .map(|e| (e.dep.as_str(), e.spec.clone(), e.ver.clone()))
+        let got: Vec<_> = dep_entries(&lines, 0, lines.len(), 6)
+            .map(|e| (e.dep, e.spec, e.ver))
             .collect();
         assert_eq!(
             got,
             vec![
-                (
-                    "dep",
-                    Some((1, "^1.0.0".to_string())),
-                    Some((3, "1.0.0".to_string()))
-                ),
+                ("dep", Some((1, "^1.0.0")), Some((3, "1.0.0"))),
                 ("other", None, None),
             ],
             "fields end at the first non-field line; an inline value is no entry"

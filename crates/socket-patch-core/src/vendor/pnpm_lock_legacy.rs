@@ -65,8 +65,8 @@ use super::common::refused;
 use super::path::parse_vendor_path;
 use super::pnpm_lock::{
     dep_entries, drifted, lines_value, lock_has_target_package, ref_record_blocks, removed,
-    revert_block, revert_overrides_line, target_blocks, target_key, vendor_value_is_for, DepPair,
-    DepRef, EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    revert_block, revert_overrides_line, target_block, vendor_value_is_for, DepPair, DepRef,
+    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -415,16 +415,15 @@ fn check_rewritable_refs(lines: &[String], ctx: &Ctx<'_>) -> Result<(), String> 
             .iter()
             .filter_map(|line| parse_key_line(line, 2))
             .filter(|(_, _, value)| !value.is_empty())
-            .map(|(dep, _, value)| (dep.to_string(), value.to_string()));
+            .map(|(dep, _, value)| (dep, value));
         let nested = dep_entries(lines, start + 1, end, 2)
-            .into_iter()
             .filter_map(|entry| Some((entry.dep, entry.ver?.1)));
         for (dep, value) in bare.chain(nested) {
             if value == reg_key || value.starts_with(&key_peer_prefix) {
-                return refuse("an aliased root dependency", &value);
+                return refuse("an aliased root dependency", value);
             }
             if dep == ctx.name && value.starts_with(&val_peer_prefix) {
-                return refuse("a peer-suffixed root dependency", &value);
+                return refuse("a peer-suffixed root dependency", value);
             }
         }
     }
@@ -578,11 +577,12 @@ fn edit_root_deps_v60(
         let Some((start, end)) = section_bounds(lines, section) else {
             continue;
         };
-        for entry in dep_entries(lines, start + 1, end, 2) {
-            let (Some((si, old_spec)), Some((vi, old_ver))) = (entry.spec, entry.ver) else {
-                continue;
-            };
-            if entry.dep != ctx.name || !(old_ver == ctx.version || ctx.is_ours(&old_ver)) {
+        let pairs: Vec<_> = dep_entries(lines, start + 1, end, 2)
+            .filter(|entry| entry.dep == ctx.name)
+            .filter_map(|entry| entry.pair())
+            .collect();
+        for (si, old_spec, vi, old_ver) in pairs {
+            if !(old_ver == ctx.version || ctx.is_ours(&old_ver)) {
                 continue;
             }
             hit = true;
@@ -593,7 +593,7 @@ fn edit_root_deps_v60(
                 file: PNPM_LOCK.to_string(),
                 kind: KIND_LOCK_ROOT_DEP_PAIR.to_string(),
                 action: WiringAction::Rewritten,
-                key: Some(format!("{section}|{}", entry.dep)),
+                key: Some(format!("{section}|{}", ctx.name)),
                 original: (!ctx.is_ours(&old_ver))
                     .then(|| serde_json::json!({ "specifier": old_spec, "version": old_ver })),
                 new: Some(serde_json::json!({
@@ -621,11 +621,11 @@ fn edit_packages(
     let bounds = section_bounds(lines, "packages").ok_or("no packages: section")?;
     let reg_key = ctx.reg_key();
     let new_key = ctx.new_key();
-    let matches = target_blocks(&*lines, "packages", bounds, ctx.name, ctx.version)?;
     // The first registry-or-ours block is the one rewritten (every path
     // below returns).
-    if let Some(block) = matches.into_iter().next() {
-        let is_ours_key = target_key(&block.key, ctx.name, ctx.version) == Some(true);
+    if let Some((block, is_ours_key)) =
+        target_block(&*lines, "packages", bounds, ctx.name, ctx.version)?
+    {
         let original_lines: Vec<String> = lines[block.header..block.end].to_vec();
         let expected_resolution = format!(
             "    resolution: {{integrity: {}, tarball: {}}}",

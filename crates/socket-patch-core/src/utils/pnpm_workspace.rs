@@ -890,36 +890,54 @@ fn lockfile_off(setting: impl Fn(&str, &str) -> Option<PnpmSetting>) -> Option<S
 /// The pnpm major whose settings reading applies to the project at `view`
 /// (see [`lockfile_disabled`]).
 async fn pnpm_major(view: &ProjectView<'_>) -> Option<u32> {
+    let texts = read_texts(view, &[MODULES_YAML, "package.json", PNPM_LOCK]).await;
+    pnpm_major_from(|rel| texts.get(rel).cloned())
+}
+
+/// The pnpm major the project at `view` pins ([`pinned_pnpm_major`]).
+pub(crate) async fn pinned_pnpm_major_in(view: &ProjectView<'_>) -> Option<u32> {
+    let texts = read_texts(view, &[MODULES_YAML, "package.json"]).await;
+    pinned_pnpm_major(|rel| texts.get(rel).cloned())
+}
+
+/// The readable files of `rels` under `view`, by path.
+async fn read_texts<'r>(view: &ProjectView<'_>, rels: &[&'r str]) -> BTreeMap<&'r str, String> {
     let mut texts = BTreeMap::new();
-    for rel in [MODULES_YAML, "package.json", PNPM_LOCK] {
+    for &rel in rels {
         if let Ok(text) = view.read_text(rel).await {
             texts.insert(rel, text);
         }
     }
-    pnpm_major_from(|rel| texts.get(rel).cloned())
+    texts
 }
 
 /// The installed pnpm's record of the project.
 pub(crate) const MODULES_YAML: &str = "node_modules/.modules.yaml";
 
-/// The pnpm major whose settings reading applies to a project whose files
-/// `read` returns by project-relative path: the one that installed it
-/// ([`MODULES_YAML`]), else the one package.json pins, else what the root
-/// lock's grammar implies (`pnpm_settings_major`).
-pub(crate) fn pnpm_major_from(read: impl Fn(&str) -> Option<String>) -> Option<u32> {
-    use crate::patch::redirect::upstream::npm::{
-        modules_yaml_pnpm_major, package_json_pnpm_major, pnpm_settings_major,
-    };
-    let pinned = read(MODULES_YAML)
+/// The pnpm major a project pins, from its files as `read` returns them by
+/// project-relative path: the one that installed it ([`MODULES_YAML`]),
+/// else the one package.json's `packageManager` names.
+pub(crate) fn pinned_pnpm_major(read: impl Fn(&str) -> Option<String>) -> Option<u32> {
+    use crate::patch::redirect::upstream::npm::{modules_yaml_pnpm_major, package_json_pnpm_major};
+    let modules = read(MODULES_YAML);
+    modules
         .as_deref()
         .and_then(modules_yaml_pnpm_major)
         .or_else(|| {
             read("package.json")
                 .as_deref()
                 .and_then(package_json_pnpm_major)
-        });
+        })
+}
+
+/// The pnpm major whose settings reading applies to a project whose files
+/// `read` returns by project-relative path: the one it pins
+/// ([`pinned_pnpm_major`]), else what the root lock's grammar implies
+/// (`pnpm_settings_major`).
+pub(crate) fn pnpm_major_from(read: impl Fn(&str) -> Option<String>) -> Option<u32> {
+    let pinned = pinned_pnpm_major(&read);
     let lock = read(PNPM_LOCK).unwrap_or_default();
-    pnpm_settings_major(&lock, pinned)
+    crate::patch::redirect::upstream::npm::pnpm_settings_major(&lock, pinned)
 }
 
 /// What pnpm does with its `lockfile` setting off, for the refusals and

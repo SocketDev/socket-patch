@@ -4,7 +4,9 @@
 //! they agree on:
 //!
 //! * which lock versions each target's edit has fixtures for
-//!   ([`Target::check_lock`]);
+//!   ([`hosted_refuses_lock`]; vendored takes the grammars its rekey was
+//!   captured against, [`super::sniff_lock_grammar`], and refuses the rest,
+//!   target-specifically: divergences N16);
 //! * how a lock key names a patched `name@version` ([`match_key`]): the
 //!   registry entry with its peer suffix, or the entry a vendored rewire
 //!   already rekeyed;
@@ -17,8 +19,12 @@
 //! artifact and mirrors the override pnpm cross-checks.
 
 use super::grammar;
-use super::{sniff_lock_grammar, PnpmLockGrammar};
+
+use std::collections::BTreeMap;
+
+use crate::constants::npm_family::{PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::text::strip_bom;
+use crate::utils::pnpm_workspace::pinned_pnpm_major;
 use crate::vendor::npm_common::tgz_rel_leaf;
 
 /// Where a rewired entry points.
@@ -32,73 +38,77 @@ pub(crate) enum Target {
     Vendored,
 }
 
-impl Target {
-    /// Whether this target's edit can rewrite a lock with `text`'s head,
-    /// and in which grammar (`None`: the hosted splice reads every
-    /// grammar the same way). Hosted takes every lock but pnpm 1's early
-    /// shrinkwrap (shrinkwrapVersion 3 without a minor version), whose
-    /// installers drop registry tarball URLs whatever the frozen flag says
-    /// (verified with pnpm 1.0.0). Vendored takes the grammars its rekey was
-    /// captured against (5.4, 6.0, 9.0): another version's `file:` override
-    /// shape has no pnpm-blessed fixture, so it is refused,
-    /// target-specifically (divergences N16).
-    pub(crate) fn check_lock(self, text: &str) -> Result<Option<PnpmLockGrammar>, String> {
-        if self == Target::Vendored {
-            return sniff_lock_grammar(text).map(Some);
-        }
-        let field = |name: &str| strip_bom(text).lines().find_map(|l| l.strip_prefix(name));
-        let early = field("shrinkwrapVersion:")
-            .is_some_and(|v| v.trim().trim_matches(['\'', '"']) == "3")
-            && !field("shrinkwrapMinorVersion:")
-                .is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0));
-        if early {
-            return Err("early pnpm 1 shrinkwrapVersion 3 without a minor version".into());
-        }
-        Ok(None)
-    }
+/// Whether the hosted splice refuses a lock: pnpm 1's early shrinkwrap
+/// (shrinkwrapVersion 3 without a minor version), whose installers drop
+/// registry tarball URLs whatever the frozen flag says (verified with pnpm
+/// 1.0.0). Hosted takes every other lock version (divergences N16).
+pub(crate) fn hosted_refuses_lock(text: &str) -> bool {
+    let field = |name: &str| strip_bom(text).lines().find_map(|l| l.strip_prefix(name));
+    field("shrinkwrapVersion:").is_some_and(|v| v.trim().trim_matches(['\'', '"']) == "3")
+        && !field("shrinkwrapMinorVersion:")
+            .is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0))
+}
 
+impl Target {
     /// Whether this target's edit repoints a registry instance whose key
-    /// carries `suffix` after `name@version`. Hosted splices every peer
-    /// context it can parse (pnpm 5's `_peer@1` or balanced `(peer@1)`
-    /// groups); vendored rekeys the plain entry only, since a peer-suffixed
-    /// rekey has no fixture and would dangle.
+    /// carries `suffix` after `name@version`.
     pub(crate) fn repoints(self, suffix: &str) -> bool {
-        if self == Target::Vendored || suffix.is_empty() || suffix.starts_with('_') {
-            return suffix.is_empty() || self == Target::Hosted;
-        }
-        let mut depth = 0usize;
-        for c in suffix.chars() {
-            match c {
-                '(' => depth += 1,
-                ')' if depth > 0 => depth -= 1,
-                _ if depth == 0 => return false,
-                _ => {}
+        match self {
+            // The rekey moves the plain entry only: a peer-suffixed rekey
+            // has no fixture and would dangle.
+            Target::Vendored => suffix.is_empty(),
+            // The splice repoints every peer context it can parse: none,
+            // pnpm 5's `_peer@1`, or balanced `(peer@1)` groups.
+            Target::Hosted if suffix.is_empty() || suffix.starts_with('_') => true,
+            Target::Hosted => {
+                let mut depth = 0usize;
+                for c in suffix.chars() {
+                    match c {
+                        '(' => depth += 1,
+                        ')' if depth > 0 => depth -= 1,
+                        _ if depth == 0 => return false,
+                        _ => {}
+                    }
+                }
+                depth == 0
             }
         }
-        depth == 0
     }
 }
-/// The pnpm locks among `keys` (root-relative paths) a planner rewrites, in
-/// their order: every `pnpm-lock.yaml`, and a pnpm <= 2 `shrinkwrap.yaml`
-/// only when no `pnpm-lock.yaml` sits beside it. pnpm never reads a
-/// `shrinkwrap.yaml` it has a `pnpm-lock.yaml` for, so that one is
-/// SHADOWED (owner decision on divergence N11): never rewritten, never part
-/// of the all-or-nothing gate (debris in it cannot refuse a dependency),
-/// and only swept for stale Socket identities by lockfile discovery.
-pub(crate) fn planned_locks<'k>(keys: &[&'k String]) -> Vec<&'k String> {
-    // `dir` keeps its trailing `/` (empty at the root).
-    let shadowed = |key: &str| {
-        key.strip_suffix("shrinkwrap.yaml").is_some_and(|dir| {
-            keys.iter()
-                .any(|k| k.strip_suffix("pnpm-lock.yaml") == Some(dir))
-        })
+
+/// The lock pnpm reads in a directory holding `pnpm-lock.yaml` (`lock`)
+/// and/or a pnpm <= 2 `shrinkwrap.yaml` (`shrinkwrap`), given the pnpm major
+/// the project pins ([`pinned_pnpm_major`]); the other one is SHADOWED
+/// (owner decision on divergence N11): never rewritten, never part of the
+/// all-or-nothing gate (debris in it cannot refuse a dependency), only swept
+/// for stale Socket identities by lockfile discovery. pnpm 1 / 2 read only
+/// `shrinkwrap.yaml`; pnpm >= 3 read only `pnpm-lock.yaml`. With no pin,
+/// `pnpm-lock.yaml` governs (pnpm <= 2 never writes one).
+pub(crate) fn governing_pnpm_lock(
+    lock: bool,
+    shrinkwrap: bool,
+    pinned_major: Option<u32>,
+) -> Option<&'static str> {
+    let pnpm_1_or_2 = pinned_major.is_some_and(|major| major <= 2);
+    let governs = shrinkwrap && (!lock || pnpm_1_or_2);
+    (governs.then_some(PNPM_SHRINKWRAP_LEGACY)).or(lock.then_some(PNPM_LOCK))
+}
+
+/// The pnpm locks of a hosted run's `files` (root-relative paths) a planner
+/// rewrites, in key order: per directory, the [`governing_pnpm_lock`], read
+/// with the evidence `files` holds for that directory.
+pub(crate) fn planned_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
+    let planned = |key: &&String| {
+        let leaf = key.rsplit('/').next().unwrap_or(key);
+        // `dir` keeps its trailing `/` (empty at the root).
+        let in_dir = |rel: &str| format!("{}{rel}", &key[..key.len() - leaf.len()]);
+        let pinned = pinned_pnpm_major(|rel| files.get(&in_dir(rel)).cloned());
+        let has = |rel: &str| files.contains_key(&in_dir(rel));
+        matches!(leaf, PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY)
+            && governing_pnpm_lock(has(PNPM_LOCK), has(PNPM_SHRINKWRAP_LEGACY), pinned)
+                == Some(leaf)
     };
-    let planned = |key: &&String| match key.rsplit('/').next() {
-        Some("pnpm-lock.yaml") => true,
-        Some("shrinkwrap.yaml") => !shadowed(key),
-        _ => false,
-    };
-    keys.iter().copied().filter(planned).collect()
+    files.keys().filter(planned).collect()
 }
 
 /// How one `packages:` / `snapshots:` key names a patched release.
@@ -136,6 +146,7 @@ pub(crate) fn match_key<'k>(key: &'k str, name: &str, version: &str) -> Option<K
 
 #[cfg(test)]
 mod tests {
+    use super::super::{sniff_lock_grammar, PnpmLockGrammar};
     use super::*;
 
     const ART: &str = ".socket/vendor/npm/0b8d2c3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e/left-pad-1.3.0.tgz";
@@ -182,24 +193,74 @@ mod tests {
         );
     }
 
-    /// N11 (owner decision): a `shrinkwrap.yaml` with a `pnpm-lock.yaml`
-    /// beside it is shadowed; one without is planned.
+    /// N11 (owner decision): of a directory's `pnpm-lock.yaml` and
+    /// `shrinkwrap.yaml`, the one the pinned pnpm major reads governs and
+    /// the other is shadowed (review finding: pnpm 1 / 2 read only the
+    /// shrinkwrap).
     #[test]
-    fn a_pnpm_lock_shadows_its_sibling_shrinkwrap() {
-        let keys: Vec<String> = [
-            "a/pnpm-lock.yaml",
-            "a/shrinkwrap.yaml",
-            "b/shrinkwrap.yaml",
-            "package.json",
-            "pnpm-lock.yaml",
-            "shrinkwrap.yaml",
-        ]
-        .map(String::from)
-        .into();
-        let refs: Vec<&String> = keys.iter().collect();
+    fn the_pinned_pnpm_major_picks_the_governing_lock() {
+        // No pin: `pnpm-lock.yaml` governs a pair, and each lone lock itself.
+        assert_eq!(governing_pnpm_lock(true, true, None), Some(PNPM_LOCK));
         assert_eq!(
-            planned_locks(&refs),
-            ["a/pnpm-lock.yaml", "b/shrinkwrap.yaml", "pnpm-lock.yaml"]
+            governing_pnpm_lock(false, true, None),
+            Some(PNPM_SHRINKWRAP_LEGACY)
+        );
+        assert_eq!(governing_pnpm_lock(false, false, Some(2)), None);
+        // pnpm 1 / 2 read only `shrinkwrap.yaml`; pnpm >= 3 only the lock.
+        assert_eq!(
+            governing_pnpm_lock(true, true, Some(2)),
+            Some(PNPM_SHRINKWRAP_LEGACY)
+        );
+        assert_eq!(governing_pnpm_lock(true, true, Some(3)), Some(PNPM_LOCK));
+        assert_eq!(governing_pnpm_lock(true, false, Some(1)), Some(PNPM_LOCK));
+
+        let files = |pin: Option<&str>| {
+            let mut files: BTreeMap<String, String> = [
+                "a/pnpm-lock.yaml",
+                "a/shrinkwrap.yaml",
+                "b/shrinkwrap.yaml",
+                "pnpm-lock.yaml",
+                "shrinkwrap.yaml",
+            ]
+            .into_iter()
+            .map(|k| (k.to_string(), String::new()))
+            .collect();
+            if let Some(pin) = pin {
+                let pkg = format!(r#"{{"packageManager": "pnpm@{pin}"}}"#);
+                files.insert("package.json".into(), pkg);
+            }
+            files
+        };
+        let planned = |files: &BTreeMap<String, String>| {
+            planned_locks(files)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        // No evidence, or pnpm >= 3: each `pnpm-lock.yaml` shadows its
+        // sibling shrinkwrap.
+        for pin in [None, Some("9.15.0")] {
+            assert_eq!(
+                planned(&files(pin)),
+                ["a/pnpm-lock.yaml", "b/shrinkwrap.yaml", "pnpm-lock.yaml"],
+                "{pin:?}"
+            );
+        }
+        // pnpm 2 pinned at the root: there `shrinkwrap.yaml` governs and the
+        // stray `pnpm-lock.yaml` is shadowed; `a/` has no evidence of its own.
+        assert_eq!(
+            planned(&files(Some("2.25.7"))),
+            ["a/pnpm-lock.yaml", "b/shrinkwrap.yaml", "shrinkwrap.yaml"]
+        );
+        // The install record outranks package.json.
+        let mut record = files(Some("9.15.0"));
+        record.insert(
+            "node_modules/.modules.yaml".into(),
+            "packageManager: pnpm@2.25.7\n".into(),
+        );
+        assert_eq!(
+            planned(&record).last().map(String::as_str),
+            Some("shrinkwrap.yaml")
         );
     }
 
@@ -229,13 +290,9 @@ mod tests {
             ("lockfileVersion: '10.0'\n", None),
             ("shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9\n", None),
         ] {
-            assert_eq!(Target::Hosted.check_lock(head), Ok(None), "{head}");
-            assert_eq!(
-                Target::Vendored.check_lock(head).ok().flatten(),
-                vendored,
-                "{head}"
-            );
+            assert!(!hosted_refuses_lock(head), "{head}");
+            assert_eq!(sniff_lock_grammar(head).ok(), vendored, "{head}");
         }
-        assert!(Target::Hosted.check_lock("shrinkwrapVersion: 3\n").is_err());
+        assert!(hosted_refuses_lock("shrinkwrapVersion: 3\n"));
     }
 }

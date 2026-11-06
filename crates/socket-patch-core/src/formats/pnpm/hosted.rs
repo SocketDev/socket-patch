@@ -11,7 +11,7 @@ use serde_json::Value;
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
-use super::plan::{match_key, planned_locks, KeyMatch, Target};
+use super::plan::{hosted_refuses_lock, match_key, planned_locks, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
@@ -52,7 +52,7 @@ impl<'f> PnpmLockState<'f> {
         let mut state = PnpmLockState {
             path,
             text: Cow::Borrowed(text),
-            early_shrinkwrap: Target::Hosted.check_lock(text).is_err(),
+            early_shrinkwrap: hosted_refuses_lock(text),
             entries: Vec::new(),
             sorted: Vec::new(),
             pending: Vec::new(),
@@ -119,12 +119,8 @@ impl<'f> PnpmLockState<'f> {
             let start = self
                 .sorted
                 .partition_point(|&i| self.norm_key(i) < prefix.as_str());
-            out.extend(
-                self.sorted[start..]
-                    .iter()
-                    .take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str()))
-                    .copied(),
-            );
+            let rest = self.sorted[start..].iter();
+            out.extend(rest.take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str())));
         }
         out.sort_unstable();
         out.dedup();
@@ -184,10 +180,11 @@ pub(crate) fn plan_hosted(
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     // A pnpm lock lives at the project root or at any nested path (e.g. Rush
     // repos keep them under `common/config/rush/`); every such files-map key
-    // is rewritten under the same grammar, except a `shrinkwrap.yaml` a
-    // `pnpm-lock.yaml` shadows ([`planned_locks`]). Deterministic order:
+    // is rewritten under the same grammar, except the one of a
+    // `pnpm-lock.yaml` / `shrinkwrap.yaml` pair pnpm never reads
+    // ([`planned_locks`]). Deterministic order:
     // BTreeMap iterates keys sorted, so goldens are stable across every lock.
-    let lock_keys = planned_locks(&files.keys().collect::<Vec<_>>());
+    let lock_keys = planned_locks(files);
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }

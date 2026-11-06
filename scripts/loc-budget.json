@@ -17,7 +17,7 @@
         "crates/socket-patch-core/src/utils/pipenv.rs",
         "crates/socket-patch-core/src/crawlers/deno_crawler.rs"
       ],
-      "max": 31201
+      "max": 31206
     },
     "lock-writers": {
       "paths": [
@@ -30,7 +30,7 @@
         "crates/socket-patch-core/src/vendor/npm_origin.rs",
         "crates/socket-patch-core/src/vendor/test_support"
       ],
-      "max": 88093
+      "max": 88115
     }
   }
 }

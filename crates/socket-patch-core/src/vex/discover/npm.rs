@@ -58,6 +58,7 @@ use super::{
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{NPM_LOCKS, PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
+use crate::formats::pnpm::plan::governing_pnpm_lock;
 use crate::formats::pnpm::{
     classify_pnpm_key, entry_bundled, entry_field, pnpm_registry_key, Bundled, PnpmDocument,
     PnpmKey, PnpmLock, PnpmPackage,
@@ -627,14 +628,13 @@ fn entry_ref(
 /// ## Files
 ///
 /// * `pnpm-lock.yaml` at the root.
-/// * `shrinkwrap.yaml` (pnpm 1 / 2) ONLY when there is no `pnpm-lock.yaml`:
-///   pnpm >= 3 never reads it (it migrates it to `pnpm-lock.yaml` once), and
-///   pnpm <= 2 never writes `pnpm-lock.yaml`, so a pair means one of them is
-///   migration debris — the same call `lock_inventory` makes (it reads
-///   shrinkwrap.yaml only on `vendor_lockfile_missing`). The hosted rewriter
-///   edits both when both exist, so the live one is covered either way; a
-///   stale shrinkwrap left carrying a Socket url must not attest from the
-///   lockfile basis after `pnpm-lock.yaml` was reverted.
+/// * `shrinkwrap.yaml` (pnpm 1 / 2) ONLY when there is no `pnpm-lock.yaml`,
+///   or the project pins pnpm 1 / 2: pnpm >= 3 never reads it (it migrates
+///   it to `pnpm-lock.yaml` once), and pnpm <= 2 reads nothing else, so a
+///   pair means one of them is migration debris. The choice is the hosted
+///   planner's (`formats::pnpm::plan::governing_pnpm_lock`, N11): the
+///   other file is never rewritten, and a stale Socket url left in it must
+///   not attest from the lockfile basis.
 /// * Rush (`rush.json` present): `common/config/rush/pnpm-lock.yaml` and every
 ///   `common/config/subspaces/<name>/pnpm-lock.yaml` — the only non-root
 ///   locks in scope, exactly the set `scan --mode hosted` collects and
@@ -701,15 +701,20 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view, false).await
     };
     let disabled = disabled.as_deref();
-    let root_lock = ctx.exists(PNPM_LOCK).await;
-    if root_lock {
-        extract_pnpm_lock(ctx, PNPM_LOCK, disabled, out).await;
-        // pnpm never reads the debris shrinkwrap: the patches it still names
-        // are recognized as NOT wired (module docs, rule 11), so a ledger
-        // record its stale Socket url alone keeps "mentioned" is dead.
-        ctx.recognize_ignored(PNPM_SHRINKWRAP_LEGACY).await;
-    } else {
-        extract_pnpm_lock(ctx, PNPM_SHRINKWRAP_LEGACY, disabled, out).await;
+    // The lock pnpm reads, as the hosted planner picks it
+    // (`formats::pnpm::plan::governing_pnpm_lock`, N11). pnpm never reads
+    // the other one: the patches it still names are recognized as NOT
+    // wired (module docs, rule 11), so a ledger record its stale Socket
+    // url alone keeps "mentioned" is dead.
+    let pinned = crate::utils::pnpm_workspace::pinned_pnpm_major_in(&ctx.view).await;
+    let (lock, shrinkwrap) = (PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY);
+    let both = (ctx.exists(lock).await, ctx.exists(shrinkwrap).await);
+    if let Some(governing) = governing_pnpm_lock(both.0, both.1, pinned) {
+        extract_pnpm_lock(ctx, governing, disabled, out).await;
+        if both == (true, true) {
+            let shadowed = if governing == lock { shrinkwrap } else { lock };
+            ctx.recognize_ignored(shadowed).await;
+        }
     }
     if rush {
         // The common lock, then each subspace's, sorted for deterministic
@@ -3573,6 +3578,15 @@ mod tests {
         assert_eq!(
             out.recognized_files(UUID_A, WiringMode::Hosted),
             vec![std::path::Path::new("shrinkwrap.yaml")]
+        );
+        // N11 review finding: a project that pins pnpm 1 / 2 installs from
+        // `shrinkwrap.yaml`, so there it is the lock that attests and the
+        // stray `pnpm-lock.yaml` is the shadowed one, as the hosted planner
+        // picks them (`plan::governing_pnpm_lock`).
+        with_lock.write("package.json", r#"{"packageManager": "pnpm@2.25.7"}"#);
+        assert_refs(
+            &run(&with_lock).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
         );
     }
 

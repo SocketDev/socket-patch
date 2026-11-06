@@ -28424,6 +28424,26 @@ packages:
             "{:?}",
             r.warnings
         );
+        // A project pinning pnpm 2 installs from `shrinkwrap.yaml` (review
+        // finding): it is rewritten and the stray `pnpm-lock.yaml` is the
+        // shadowed one, so debris in it refuses nothing.
+        let pnpm2 = r#"{"packageManager": "pnpm@2.25.7"}"#.to_string();
+        let r = run(&[
+            ("package.json", pnpm2),
+            (
+                "pnpm-lock.yaml",
+                lock.replace("left-pad@1.3.0:", "left-pad@1.3.0)(:"),
+            ),
+            ("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0")),
+        ]);
+        assert_eq!(
+            r.files.keys().collect::<Vec<_>>(),
+            ["shrinkwrap.yaml"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.files["shrinkwrap.yaml"].contains(url));
+        assert!(r.refused_pnpm_uuids.is_empty(), "{:?}", r.warnings);
         // The only pnpm lock: rewritten as before.
         let r = run(&[("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0"))]);
         assert!(r.files["shrinkwrap.yaml"].contains(url), "{:?}", r.warnings);

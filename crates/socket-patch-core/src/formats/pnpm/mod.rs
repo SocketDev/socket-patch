@@ -293,17 +293,20 @@ pub fn sniff_lock_grammar(text: &str) -> Result<PnpmLockGrammar, String> {
         Some("5.4") => Ok(PnpmLockGrammar::V54),
         Some("6.0") => Ok(PnpmLockGrammar::V60),
         v => {
-            let major = v.and_then(|v| v.split('.').next()?.parse::<u32>().ok());
+            // An old (or missing) version is fixed by upgrading pnpm; a newer or
+            // unreadable one means pnpm outgrew this build.
+            let major = v.map(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+            let old = matches!(major, None | Some(Some(..9)));
             let v = v.map_or("no lockfileVersion in its head".into(), |v| {
                 format!("lockfileVersion {v}")
             });
-            Err(match major {
-                Some(m) if m >= 9 => format!(
+            Err(match old {
+                false => format!(
                     "{PNPM_LOCK} has {v}; this socket-patch build supports \
                      lockfileVersions 5.4, 6.0, and 9.0 — re-lock with a pnpm release that \
                      emits one of them, or update socket-patch"
                 ),
-                _ => format!(
+                true => format!(
                     "{PNPM_LOCK} has {v}; supported versions are 5.4 (pnpm 7), 6.0 \
                      (pnpm 8), and 9.0 (pnpm >= 9) — re-lock with pnpm >= 9"
                 ),
@@ -1026,9 +1029,7 @@ mod tests {
         assert_eq!(lock_version_major(&format!("\u{feff}{v9}")), Some(9));
         assert!(may_need_store_flag(&format!("\u{feff}{v52}")));
         assert!(may_need_store_flag(&format!("\u{feff}{shrinkwrap}")));
-        assert!(plan::Target::Hosted
-            .check_lock("\u{feff}shrinkwrapVersion: 3\n")
-            .is_err());
+        assert!(plan::hosted_refuses_lock("\u{feff}shrinkwrapVersion: 3\n"));
         // Exactly one BOM is encoding; a second one is content, as for pnpm.
         assert!(!is_pnpm_lock_text(
             "\u{feff}\u{feff}lockfileVersion: '9.0'\n"
