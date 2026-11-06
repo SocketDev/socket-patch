@@ -80,8 +80,139 @@ class CountSourceTest(unittest.TestCase):
             "mod shipped;\n"
         )
         fc = count(src)
-        self.assertEqual(fc.test_mods, [("tests", None), ("x_tests", "x_tests.rs")])
+        self.assertEqual(fc.test_mods, [("tests", None, ()), ("x_tests", "x_tests.rs", ())])
         self.assertEqual(fc.code, 1)
+
+    # Review findings on #2001.
+
+    def test_cfg_test_struct_field_does_not_swallow_following_code(self):
+        src = (
+            "struct S {\n"
+            "    #[cfg(test)]\n"
+            "    probe: HashMap<String, u32>,\n"
+            "    real: u32,\n"
+            "}\n"
+            "fn shipped() {}\n"
+        )
+        fc = count(src)
+        self.assertEqual(fc.code, 4)
+        self.assertEqual(fc.test, 2)
+
+    def test_cfg_test_pub_field_last_without_comma(self):
+        src = "struct S {\n    real: u32,\n    #[cfg(test)]\n    pub probe: u32\n}\nfn shipped() {}\n"
+        self.assertEqual(count(src).code, 4)
+
+    def test_cfg_test_enum_variant_and_match_arm(self):
+        src = (
+            "enum E {\n"
+            "    A,\n"
+            "    #[cfg(test)]\n"
+            "    B { x: u8 },\n"
+            "    C,\n"
+            "}\n"
+            "fn f(e: E) -> u8 {\n"
+            "    match e {\n"
+            "        #[cfg(test)]\n"
+            "        E::B { .. } => 1,\n"
+            "        _ => 0,\n"
+            "    }\n"
+            "}\n"
+        )
+        fc = count(src)
+        self.assertEqual(fc.code, 9)
+        self.assertEqual(fc.test, 4)
+
+    def test_cfg_test_fn_param(self):
+        src = "fn f(\n    a: u8,\n    #[cfg(test)] b: u8,\n) -> u8 {\n    a\n}\nfn g() {}\n"
+        self.assertEqual(count(src).code, 6)
+
+    def test_cfg_test_braced_use_consumes_its_semicolon(self):
+        src = "#[cfg(test)]\nuse a::{\n    b,\n    c,\n};\nfn shipped() {}\n"
+        fc = count(src)
+        self.assertEqual(fc.code, 1)
+        self.assertEqual(fc.test, 5)
+
+    def test_cfg_all_with_test_not_first_and_not_test(self):
+        src = (
+            "#[cfg(all(unix, test))]\nfn a() {}\n"
+            "#[cfg(all(unix, all(windows, test)))]\nfn b() {}\n"
+            "#[cfg(all(unix, not(test)))]\nfn shipped() {}\n"
+            "#[cfg(any(test, test))]\nfn c() {}\n"
+        )
+        self.assertEqual(count(src).code, 2)
+
+    def test_file_level_cfg_test(self):
+        src = "//! helpers\n#![cfg(test)]\n\nfn a() {}\nmod nested;\n"
+        fc = count(src)
+        self.assertTrue(fc.test_file)
+        self.assertEqual(fc.code, 0)
+        src = "#![cfg(not(test))]\nfn a() {}\n"
+        self.assertFalse(count(src).test_file)
+        self.assertEqual(count(src).code, 2)
+
+    def test_path_attr_after_other_attrs(self):
+        src = (
+            "#[cfg(test)]\n"
+            '#[path = "x_tests.rs"]\n'
+            "#[allow(dead_code)]\n"
+            "mod x_tests;\n"
+        )
+        self.assertEqual(count(src).test_mods, [("x_tests", "x_tests.rs", ())])
+
+    def test_inline_test_mod_records_nested_file_modules(self):
+        src = (
+            "#[cfg(test)]\n"
+            "mod support {\n"
+            "    mod fixtures;\n"
+            "    pub mod inner {\n"
+            '        #[path = "h.rs"]\n'
+            "        mod helpers;\n"
+            "    }\n"
+            "}\n"
+        )
+        self.assertEqual(
+            count(src).test_mods,
+            [("fixtures", None, ("support",)), ("helpers", "h.rs", ("support", "inner"))],
+        )
+
+
+class ResolveModuleTest(unittest.TestCase):
+    def setUp(self):
+        self.saved = loc_budget.is_file
+        self.files = set()
+        loc_budget.is_file = lambda p: p in self.files
+
+    def tearDown(self):
+        loc_budget.is_file = self.saved
+
+    def test_path_attr_is_relative_to_the_declaring_files_dir(self):
+        # Rust resolves an out-of-line #[path] against the declaring file's
+        # directory, even for a non-mod.rs file.
+        self.files = {"src/a/x_tests.rs", "src/a/x/x_tests.rs"}
+        self.assertEqual(
+            loc_budget.resolve_module("src/a/x.rs", "t", "x_tests.rs", ()), "src/a/x_tests.rs"
+        )
+
+    def test_inline_module_path(self):
+        self.files = {"src/a/x/support/fixtures.rs", "src/a/support/fixtures.rs"}
+        self.assertEqual(
+            loc_budget.resolve_module("src/a/x.rs", "fixtures", None, ("support",)),
+            "src/a/x/support/fixtures.rs",
+        )
+        self.assertEqual(
+            loc_budget.resolve_module("src/a/mod.rs", "fixtures", None, ("support",)),
+            "src/a/support/fixtures.rs",
+        )
+
+
+class RustFilesTest(unittest.TestCase):
+    def test_paths_with_spaces_survive(self):
+        saved = loc_budget.subprocess.check_output
+        loc_budget.subprocess.check_output = lambda *a, **k: "a b/c.rs\0x/tests/t.rs\0d.rs\0"
+        try:
+            self.assertEqual(loc_budget.rust_files(), ["a b/c.rs", "d.rs"])
+        finally:
+            loc_budget.subprocess.check_output = saved
 
 
 class ModeTest(unittest.TestCase):
@@ -94,7 +225,7 @@ class ModeTest(unittest.TestCase):
                 "g": {"paths": ["a/"], "exclude": ["a/skip/"], "max": 10},
             }
         }
-        loc_budget.count_repo = lambda: {"a/x.rs": 8, "a/y.rs": 5, "a/skip/z.rs": 100, "b/w.rs": 1}
+        loc_budget.count_repo = lambda groups=None: {"a/x.rs": 8, "a/y.rs": 5, "a/skip/z.rs": 100, "b/w.rs": 1}
 
     def tearDown(self):
         loc_budget.load_budget, loc_budget.count_repo = self.saved
@@ -123,6 +254,41 @@ class ModeTest(unittest.TestCase):
         code, out = self.run_main()
         self.assertEqual(code, 0)
         self.assertNotIn("::warning", out)
+        self.assertIn("all groups                     13", out)
+
+    def test_files_lists_one_group(self):
+        code, out = self.run_main("--files", "g")
+        self.assertEqual(code, 0)
+        self.assertIn("      8  a/x.rs", out)
+        self.assertIn("     13  total", out)
+
+    def test_files_with_an_unknown_group_is_a_usage_error(self):
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as cm:
+            loc_budget.main(["--files", "nope"])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("unknown group 'nope'", err.getvalue())
+
+
+class InScopeTest(unittest.TestCase):
+    def test_reads_group_files_siblings_and_declarers_only(self):
+        files = [
+            "c/src/lib.rs",
+            "c/src/a/mod.rs",
+            "c/src/a/g/mod.rs",
+            "c/src/a/g/x.rs",
+            "c/src/a/g/deep/y.rs",
+            "c/src/a/sib.rs",
+            "c/src/other/z.rs",
+            "d/src/lib.rs",
+        ]
+        groups = {"g": {"paths": ["c/src/a/g/"], "max": 1}}
+        self.assertEqual(
+            loc_budget.in_scope(files, groups),
+            ["c/src/lib.rs", "c/src/a/mod.rs", "c/src/a/g/mod.rs", "c/src/a/g/x.rs", "c/src/a/g/deep/y.rs"],
+        )
 
 
 class BudgetFileTest(unittest.TestCase):
