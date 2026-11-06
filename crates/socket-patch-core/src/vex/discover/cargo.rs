@@ -126,6 +126,14 @@
 //! config), and a `[patch."<crates.io URL>"]` table in the manifest
 //! replaces `[patch.crates-io]` wholesale — both leave the lock looking
 //! exactly like live Socket wiring.
+//! A `[patch.<source>]` entry replaces the crate only in declarations from
+//! `<source>`, so a ref whose build may also compile a copy of the version
+//! the wiring does not reach — a live declaration (root or member) from
+//! another registry, a `registry-index` or git that may select the version
+//! and that no `[patch]` table pointing at this copy redirects, or a
+//! same-version lock entry from any source — stays a ref but is marked
+//! [`super::UnattestedKind::CargoPatchBypassed`] ([`patch_bypassed`]); the
+//! members are read for this whenever a `[patch]` wires a Socket copy.
 //! A `.socket/cargo-patches/` path (the retired redirect backend) carries no
 //! uuid and is not a ref. Socket-shaped entries in a `.cargo/config.toml`
 //! that cargo ignores (because `.cargo/config` exists) are diagnosed, never
@@ -174,8 +182,13 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let mut manifests: Vec<(String, DocumentMut)> = Vec::new();
     if let Some(doc) = root {
         let root_pins = manifest_has_socket_pin(&doc);
+        // A vendored copy wired in the root or the config is weighed against
+        // every member's declarations ([`patch_bypassed`]).
+        let vendored = std::iter::once(&doc)
+            .chain(config.iter().map(|(_, c)| c))
+            .any(|d| !socket_copies(d).is_empty());
         manifests.push((CARGO_TOML.to_string(), doc));
-        manifests.extend(read_members(ctx, &lock, root_pins, out).await);
+        manifests.extend(read_members(ctx, &lock, root_pins, vendored, out).await);
     }
     let manifest: Option<&DocumentMut> = manifests.first().map(|(_, doc)| doc);
 
@@ -219,6 +232,16 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if let Some(decls) = &decls {
         unresolved_manifest_pins(ctx, &lock, decls, &definitions, out);
     }
+    let wired: Vec<(String, VendorRef)> = manifest
+        .into_iter()
+        .chain(config.iter().map(|(_, doc)| doc))
+        .flat_map(socket_copies)
+        .collect();
+    let bypass = Bypass {
+        lock: &lock,
+        decls: decls.as_ref(),
+        wired: &wired,
+    };
     if let Some(doc) = manifest {
         // Cargo drops a manifest crates.io `[patch]` item that the project
         // config redefines under the same key (any version), and a
@@ -253,25 +276,22 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                     format!("{file} redefines `[patch]` key `{key}`, which replaces it in cargo")
                 })
         };
-        vendored_from_patches(ctx, CARGO_TOML, doc, &lock, &shadowed, out).await;
+        vendored_from_patches(ctx, CARGO_TOML, doc, &lock, &shadowed, &bypass, out).await;
     }
     if let Some((file, doc)) = &config {
-        vendored_from_patches(ctx, file, doc, &lock, &|_| None, out).await;
+        vendored_from_patches(ctx, file, doc, &lock, &|_| None, &bypass, out).await;
     }
-    let wired: Vec<VendorRef> = manifest
-        .into_iter()
-        .chain(config.iter().map(|(_, doc)| doc))
-        .flat_map(socket_copies)
-        .collect();
-    unattributed_tags(&lock, &wired, out);
+    let copies: Vec<VendorRef> = wired.into_iter().map(|(_, v)| v).collect();
+    unattributed_tags(&lock, &copies, out);
 }
 
-/// Every Socket copy a file's `[patch]` tables point at.
-fn socket_copies(doc: &DocumentMut) -> Vec<VendorRef> {
+/// Every Socket copy a file's `[patch]` tables point at, with the
+/// `[patch.<source>]` table pointing at it.
+fn socket_copies(doc: &DocumentMut) -> Vec<(String, VendorRef)> {
     patch_entries(doc)
         .into_iter()
-        .filter_map(|e| e.path.and_then(vendor_ref))
-        .filter(|v| v.eco == "cargo")
+        .filter_map(|e| Some((e.source.to_string(), e.path.and_then(vendor_ref)?)))
+        .filter(|(_, v)| v.eco == "cargo")
         .collect()
 }
 
@@ -359,14 +379,20 @@ async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Op
 /// Socket-sourced package, or an unparseable one (no ref either way). With
 /// no lock, a member matters only when some manifest carries a
 /// `socket-patch-` pin (a lockless pin, [`UnlockedPin`]); the walk has the
-/// texts, so the parse is skipped otherwise.
+/// texts, so the parse is skipped otherwise. `vendored` (the root manifest
+/// or the config wires a Socket copy through `[patch]`, whose lock entries
+/// are sourceless) always reads them, whatever the lock: a member's
+/// declaration from a source the `[patch]` does not redirect bypasses the
+/// copy ([`patch_bypassed`]).
 async fn read_members(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
     root_pins: bool,
+    vendored: bool,
     out: &mut Discovery,
 ) -> Vec<(String, DocumentMut)> {
     let lockless = match lock {
+        _ if vendored => false,
         Lock::Parsed(_) if has_socket_sourced(ctx, lock) => false,
         Lock::Parsed(_) | Lock::Unparseable => return Vec::new(),
         Lock::Absent => true,
@@ -1223,6 +1249,124 @@ async fn copy_tag(ctx: &DiscoverCtx<'_>, artifact_rel: &str, out: &mut Discovery
     }
 }
 
+/// What a vendored copy is weighed against for copies its `[patch]` wiring
+/// does not redirect ([`patch_bypassed`]).
+struct Bypass<'a> {
+    lock: &'a Lock,
+    /// Every declaration in the root and member manifests (`None`: no
+    /// usable root manifest).
+    decls: Option<&'a Decls>,
+    /// Every Socket copy the manifest and config `[patch]` tables point at,
+    /// with the `[patch.<source>]` table pointing at it.
+    wired: &'a [(String, VendorRef)],
+}
+
+/// Mark the vendored ref `purl` (the copy `vref` of `name`@`version`)
+/// [`UnattestedKind::CargoPatchBypassed`] when the build may also compile
+/// a copy of that version its wiring does not reach. A `[patch.<source>]`
+/// entry replaces the crate only in declarations from `<source>` (v5
+/// `vendor` writes `[patch.crates-io]`), so either of these builds
+/// unpatched bytes:
+///
+/// * a live dependency declaration (the root's or a workspace member's)
+///   from another registry, a `registry-index` or git, whose requirement
+///   may select `version`, unless it is a registry dependency that a
+///   `[patch]` table pointing at this copy redirects ([`Decl::patched_by`]):
+///   cargo resolves it as a separate package, maybe at this very version;
+/// * a `Cargo.lock` entry of `name` at exactly `version` with a source
+///   (any registry or git; a Socket patch server's is hosted wiring, a ref
+///   of its own): that copy is already locked beside the vendored one.
+///
+/// A path declaration (the user's own fork) is left alone, as the lock's
+/// copy claim leaves its sourceless entry alone; a `socket-patch-*`
+/// registry dependency is hosted wiring, weighed there. The ref stays
+/// (rollback, remove and the ledgers still see the wiring), but nothing
+/// attests it.
+fn patch_bypassed(
+    ctx: &DiscoverCtx<'_>,
+    bypass: &Bypass<'_>,
+    vref: &VendorRef,
+    name: &str,
+    version: &str,
+    purl: &str,
+    out: &mut Discovery,
+) {
+    let redirected = |d: &Decl| {
+        bypass
+            .wired
+            .iter()
+            .any(|(table, v)| v.uuid == vref.uuid && v.leaf == vref.leaf && d.patched_by(table))
+    };
+    let declared: Vec<&Decl> = bypass
+        .decls
+        .and_then(|d| d.get(name))
+        .into_iter()
+        .flatten()
+        .filter(|d| d.live)
+        .filter(|d| match &d.source {
+            DeclSource::Registry => !d.socket_shaped() && !redirected(d),
+            DeclSource::RegistryIndex(_) | DeclSource::Git => true,
+            DeclSource::Path | DeclSource::Patch(_) => false,
+        })
+        .filter(|d| cargo_req_selects(d.version.as_deref(), version, &[]) != CargoReqMatch::NotOurs)
+        .collect();
+    let locked = bypass
+        .lock
+        .packages()
+        .iter()
+        .filter(|p| p.name == name && p.version == version)
+        .find_map(|p| {
+            p.source
+                .as_deref()
+                .filter(|s| source_uuid(ctx, s).is_none())
+        });
+    let redirects = format!(
+        "which no [patch] entry pointing at {} redirects",
+        vref.artifact_rel
+    );
+    let (file, detail) = match (declared.first(), locked) {
+        (Some(first), _) => {
+            let evidence = locked.map_or_else(String::new, |source| {
+                format!("; {CARGO_LOCK} also locks {name} {version} from {source}")
+            });
+            let declared = declared
+                .iter()
+                .map(|d| {
+                    let req = d
+                        .version
+                        .as_deref()
+                        .map_or_else(|| "with no version".to_string(), |v| format!("{v:?}"));
+                    format!("{} declares {name} {req} from {}", d.file, d.origin())
+                })
+                .collect::<Vec<_>>()
+                .join(", and ");
+            (
+                first.file.as_str(),
+                format!(
+                    "{declared}, {redirects}: cargo resolves that declaration as a separate \
+                     package, so the crate declaring it builds an unpatched {name} that the \
+                     requirement allows to be {version}{evidence}"
+                ),
+            )
+        }
+        (None, Some(source)) => (
+            CARGO_LOCK,
+            format!(
+                "{CARGO_LOCK} also locks {name} {version} from {source}, {redirects}: cargo \
+                 builds that copy unpatched beside the vendored one"
+            ),
+        ),
+        (None, None) => return,
+    };
+    out.unattested(
+        purl,
+        &vref.uuid,
+        file,
+        detail,
+        UnattestedKind::CargoPatchBypassed,
+    );
+}
+
 /// Vendored refs from one file's `[patch]` tables. `shadowed` names why
 /// cargo ignores an entry (a higher-precedence item replaces it), if so.
 async fn vendored_from_patches(
@@ -1231,6 +1375,7 @@ async fn vendored_from_patches(
     doc: &DocumentMut,
     lock: &Lock,
     shadowed: &(dyn Fn(&CargoPatchEntry<'_>) -> Option<String> + Sync),
+    bypass: &Bypass<'_>,
     out: &mut Discovery,
 ) {
     for entry in patch_entries(doc) {
@@ -1343,6 +1488,7 @@ async fn vendored_from_patches(
                 continue;
             }
         }
+        patch_bypassed(ctx, bypass, &vref, name, version, &purl, out);
         out.push(PatchedRef::vendored(purl, &vref, file, None));
     }
 }
@@ -3413,6 +3559,229 @@ mod tests {
                     out.diagnostics
                 );
             }
+        }
+    }
+
+    // ── vendored: copies the [patch] does not redirect ───────────────
+
+    const MY_CORP: &str = "registry+https://my-corp.example/index";
+
+    /// A v5-vendored workspace: the root wires cfg-if 1.0.4 to the tagged
+    /// copy for patch A through `[patch.crates-io]` (plus `root_extra`
+    /// appended to the root manifest) and declares it from crates.io; the
+    /// member `crates/a` declares it with `member_dep`. The lock holds the
+    /// tagged copy plus `extra` entries `(version, source)`.
+    fn vendored_workspace(member_dep: &str, root_extra: &str, extra: &[(&str, &str)]) -> Project {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "[workspace]\nmembers = [\"crates/*\"]\n\n{}\n[patch.crates-io]\n\
+                 cfg-if-socket-aaaaaaaa = {{ package = \"cfg-if\", path = \"{rel}\" }}\n\
+                 {root_extra}\n",
+                manifest("cfg-if = \"1\"")
+            ),
+        );
+        p.write(
+            "crates/a/Cargo.toml",
+            format!(
+                "[package]\nname = \"a\"\nversion = \"0.1.0\"\n\n[dependencies]\n{member_dep}\n"
+            ),
+        );
+        let tagged = crate::vendor::cargo_tag::tag_version("1.0.4", UUID_A);
+        let mut pkgs = vec![("cfg-if", tagged.as_str(), None, None)];
+        pkgs.extend(
+            extra
+                .iter()
+                .map(|(v, s)| ("cfg-if", *v, Some(*s), Some(CKSUM))),
+        );
+        p.write("Cargo.lock", lock(&pkgs));
+        p
+    }
+
+    /// The one unattested mark of `out`, asserted to be the vendored
+    /// cfg-if ref's [`UnattestedKind::CargoPatchBypassed`] naming `file`.
+    fn bypassed_mark<'a>(out: &'a Discovery, file: &str) -> &'a Unattested {
+        assert_eq!(out.unattested.len(), 1, "{:#?}", out.unattested);
+        let u = &out.unattested[0];
+        assert_eq!(u.kind, UnattestedKind::CargoPatchBypassed);
+        assert_eq!(
+            (u.purl.as_str(), u.uuid.as_str()),
+            ("pkg:cargo/cfg-if@1.0.4", UUID_A)
+        );
+        assert_eq!(u.file, std::path::PathBuf::from(file));
+        u
+    }
+
+    /// REGRESSION: `[patch.crates-io]` redirects only crates.io
+    /// declarations. A member that declares cfg-if from another registry or
+    /// from git, at a requirement the patched 1.0.4 satisfies, resolves its
+    /// own unpatched copy, which may be that very version. The vendored ref
+    /// stays (rollback / remove find it, the ledger claim lives) but is not
+    /// attested, naming the member.
+    #[tokio::test]
+    async fn a_member_from_another_source_bypasses_the_vendored_copy() {
+        for (member, origin) in [
+            (
+                "cfg-if = { version = \"1\", registry = \"my-corp\" }",
+                "from registry `my-corp`",
+            ),
+            (
+                "fork = { package = \"cfg-if\", version = \"=1.0.4\", registry = \"my-corp\" }",
+                "from registry `my-corp`",
+            ),
+            (
+                "cfg-if = { git = \"https://example.com/cfg-if\" }",
+                "from a git repository",
+            ),
+            (
+                "cfg-if = { version = \"1\", registry-index = \"sparse+https://my-corp.example/index/\" }",
+                "from the registry index sparse+https://my-corp.example/index/",
+            ),
+        ] {
+            let p = vendored_workspace(member, "", &[]);
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+            );
+            assert!(
+                out.diagnostics.is_empty(),
+                "{member}: {:#?}",
+                out.diagnostics
+            );
+            assert_eq!(
+                out.vendored_claim(
+                    "pkg:cargo/cfg-if@1.0.4",
+                    UUID_A,
+                    &vendor_path(UUID_A, "cfg-if-1.0.4")
+                ),
+                Some(true),
+                "{member}"
+            );
+            let u = bypassed_mark(&out, "crates/a/Cargo.toml");
+            assert!(
+                u.detail.contains("crates/a/Cargo.toml declares cfg-if")
+                    && u.detail.contains(origin)
+                    && !u.detail.contains("also locks"),
+                "{member}: {}",
+                u.detail
+            );
+        }
+    }
+
+    /// The lock already holds a same-version cfg-if from another source
+    /// (another registry, git, even crates.io) beside the vendored copy:
+    /// cargo builds that copy unpatched whoever declares it, so the mark
+    /// names the lock entry. A copy at another version is no such evidence.
+    #[tokio::test]
+    async fn a_same_version_lock_entry_from_any_source_bypasses_the_vendored_copy() {
+        for source in [MY_CORP, "git+https://example.com/cfg-if#abc123", CRATES_IO] {
+            let p = vendored_workspace("cfg-if = \"1\"", "", &[("1.0.4", source)]);
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+            );
+            let u = bypassed_mark(&out, "Cargo.lock");
+            assert!(
+                u.detail
+                    .contains(&format!("Cargo.lock also locks cfg-if 1.0.4 from {source}")),
+                "{source}: {}",
+                u.detail
+            );
+        }
+        let p = vendored_workspace("cfg-if = \"1\"", "", &[("0.1.10", MY_CORP)]);
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+        );
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+    }
+
+    /// What the `[patch]` wiring redirects stays attested: a member
+    /// declaring cfg-if from crates.io, under any spelling, and a
+    /// declaration from elsewhere whose requirement excludes the patched
+    /// version, or a registry dependency whose `[patch.<registry>]` table
+    /// also points at the same copy; and a `[workspace.dependencies]`
+    /// template from another registry that no manifest inherits. A user's
+    /// own path fork is the documented exception (see
+    /// `a_same_version_fork_beside_the_tagged_copy_is_ignored`).
+    #[tokio::test]
+    async fn declarations_the_patch_redirects_keep_the_vendored_copy_attested() {
+        let rel = vendor_path(UUID_A, "cfg-if-1.0.4");
+        let covered = format!("\n[patch.my-corp]\ncfg-if = {{ path = \"{rel}\" }}\n");
+        let template = "\n[workspace.dependencies]\n\
+             cfg-if = { version = \"1\", registry = \"my-corp\" }\n";
+        for (member, root_extra) in [
+            ("cfg-if = \"1\"", ""),
+            ("cfg-if = \"=1.0.4\"", ""),
+            ("cfg-if = { version = \"1\", registry = \"crates-io\" }", ""),
+            ("alias = { package = \"cfg-if\", version = \"1.0\" }", ""),
+            ("cfg-if = { version = \"0.1\", registry = \"my-corp\" }", ""),
+            (
+                "cfg-if = { version = \"1\", registry = \"my-corp\" }",
+                covered.as_str(),
+            ),
+            ("cfg-if = { path = \"../fork\" }", ""),
+            ("cfg-if = \"1\"", template),
+        ] {
+            let p = vendored_workspace(member, root_extra, &[]);
+            let out = run(&p).await;
+            assert!(
+                out.refs.iter().any(|r| r.purl == "pkg:cargo/cfg-if@1.0.4"
+                    && r.uuid == UUID_A
+                    && r.mode == WiringMode::Vendored),
+                "{member}: {:#?}",
+                out.refs
+            );
+            assert!(out.unattested.is_empty(), "{member}: {:#?}", out.unattested);
+        }
+    }
+
+    /// The pre-v5 wiring in the project config redirects only crates.io
+    /// too: a member's git declaration bypasses it the same way.
+    #[tokio::test]
+    async fn a_member_from_git_bypasses_the_config_wired_copy() {
+        let p = Project::new();
+        p.write(
+            ".cargo/config.toml",
+            patch_config(&[("cfg-if", &vendor_path(UUID_A, "cfg-if-1.0.4"))]),
+        );
+        workspace_with_member(&p, "cfg-if = { git = \"https://example.com/cfg-if\" }");
+        p.write("Cargo.lock", lock(&[("cfg-if", "1.0.4", None, None)]));
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+        );
+        bypassed_mark(&out, "crates/a/Cargo.toml");
+    }
+
+    /// REGRESSION (member gate): a vendored project's lock has no
+    /// Socket-sourced package (the copy's entry is sourceless), and a
+    /// lockless one has no `socket-patch-` pin, so the member walk must
+    /// not hinge on either: the members are read whenever a `[patch]`
+    /// wires a Socket copy, lock or no lock.
+    #[tokio::test]
+    async fn members_are_read_for_a_vendored_copy_without_a_socket_lock_entry() {
+        for with_lock in [true, false] {
+            let p = vendored_workspace(
+                "cfg-if = { version = \"1\", registry = \"my-corp\" }",
+                "",
+                &[],
+            );
+            if !with_lock {
+                std::fs::remove_file(p.root().join("Cargo.lock")).unwrap();
+            }
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+            );
+            bypassed_mark(&out, "crates/a/Cargo.toml");
         }
     }
 }
