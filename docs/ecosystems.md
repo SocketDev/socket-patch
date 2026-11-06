@@ -881,7 +881,12 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
-  *mismatch* fails.
+  *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
+  (and drops any line an earlier run wrote for that suffixed version) and warns
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
+  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
+  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
+  Maven 3.9.4 or later.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

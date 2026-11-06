@@ -8693,6 +8693,22 @@ fn rewrite_maven_pom(
             .as_ref()
             .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
         let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
+        if let Some(suffixed) = suffixed_version.as_deref().filter(|_| bad_checksum_hashes) {
+            // No pin is written for the suffixed version, so none may stay
+            // either: an earlier release wrote such a grant's hash mangled
+            // (lowercased base64), and Maven fails the build on a line
+            // whose hash does not match. Dropped whether or not the version
+            // pin lands this run (a re-run with the pin present too).
+            for ext in ["jar", "pom"] {
+                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    suffixed,
+                    None,
+                    ext,
+                ));
+            }
+        }
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
@@ -9306,37 +9322,28 @@ pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, us
 }
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
-/// line). Dedupe by the `-Dkey=` prefix: an arg whose key is already present is
-/// left untouched (existing value wins). Returns the merged text + any conflict
-/// messages (a pre-existing SAME key with a DIFFERENT value). Twin of the TS
-/// `mergeMvnConfig`.
+/// line). A setting is present when Maven 3.9+ reads it from the file
+/// ([`crate::formats::maven::maven_config_line_properties`], the reader
+/// discovery's [`trusted_checksums::config_enforces`] uses: `-Dk=v`,
+/// `--define k=v`, indented or quoted lines, the last definition winning).
+/// A present setting is left untouched (existing value wins); a different
+/// value is reported as a conflict. Returns the merged text + those
+/// conflict messages. Twin of the TS `mergeMvnConfig`.
 fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
-    let lines: Vec<&str> = if existing.is_empty() {
-        vec![]
-    } else {
-        existing.split('\n').collect()
-    };
+    let present = crate::formats::maven::maven_config_line_properties(existing);
     let mut conflicts = vec![];
-    let key_of =
-        |line: &str| -> Option<String> { line.find('=').map(|eq| line[..=eq].to_string()) };
-    let mut present: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for line in &lines {
-        if let Some(key) = key_of(line) {
-            present.insert(key, (*line).to_string());
-        }
-    }
     let mut appended: Vec<&str> = vec![];
     for arg in MVN_CONFIG_ARGS {
-        let key = key_of(arg).expect("every MVN_CONFIG_ARGS entry contains '='");
-        match present.get(&key) {
-            None => {
-                appended.push(arg);
-                present.insert(key, (*arg).to_string());
-            }
-            Some(existing_line) if existing_line.trim() != *arg => {
+        let (key, value) = arg
+            .strip_prefix("-D")
+            .and_then(|def| def.split_once('='))
+            .expect("every MVN_CONFIG_ARGS entry is -Dkey=value");
+        match present.get(key) {
+            None => appended.push(arg),
+            Some(existing_value) if existing_value != value => {
                 conflicts.push(format!(
-                    "{coordinate}: {MVN_CONFIG} already sets {key} to a different value ({}); leaving it as-is",
-                    existing_line.trim()
+                    "{coordinate}: {MVN_CONFIG} already sets -D{key}= to a different value \
+                     (-D{key}={existing_value}); leaving it as-is"
                 ));
             }
             Some(_) => {}
@@ -10927,6 +10934,38 @@ mod tests {
         );
         assert!(!config.contains("originAware=false"), "ours NOT written");
         assert!(warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"));
+    }
+
+    /// The writer sees a user setting in every spelling Maven 3.9+ reads
+    /// (the reader discovery judges enforcement with): an indented line,
+    /// `--define k=v`, `-D k=v`, a quoted argument. Appending ours after
+    /// one would silently override the user's value (the later line wins).
+    #[test]
+    fn maven_config_conflict_in_any_spelling_keeps_the_user_value() {
+        for user in [
+            "  -Daether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define=aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "\"-Daether.trustedChecksumsSource.summaryFile.originAware=true\"",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>1.7.36</version>", ""),
+            );
+            files.insert(".mvn/maven.config".to_string(), format!("{user}\n"));
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let config = r.files.get(".mvn/maven.config").expect("config");
+            assert!(!config.contains("originAware=false"), "{user}: {config}");
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"),
+                "{user}"
+            );
+            assert!(
+                !trusted_checksums::config_enforces(config),
+                "{user}: the user's originAware=true still governs"
+            );
+        }
     }
 
     /// Legacy same-GAV fallback (no suffixed version): only the repository is
@@ -30337,6 +30376,34 @@ mod owned_pin_generation_matrix {
                 .any(|w| w.code == "redirect_maven_trusted_checksums_invalid_hash"),
             "{:?}",
             result.warnings
+        );
+
+        // An earlier release wrote such a grant's hash mangled for the same
+        // suffixed version: a re-run (the version pin already present) and
+        // a fresh pin both drop it, since Maven fails on a mismatched line.
+        let mut wired = clean.clone();
+        let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja=");
+        wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+        let (rerun, _) = plan(&wired, &bad);
+        assert!(
+            !rerun
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            rerun.get(MVN_CHECKSUMS)
+        );
+        let mut fresh = pom_project();
+        fresh.insert(
+            MVN_CHECKSUMS.to_string(),
+            clean[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja="),
+        );
+        let (fresh, _) = plan(&fresh, &bad);
+        assert!(
+            !fresh
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            fresh.get(MVN_CHECKSUMS)
         );
     }
 

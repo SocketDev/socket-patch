@@ -90,10 +90,12 @@ pub(crate) fn config_enforces(config: &str) -> bool {
         && get(ORIGIN_AWARE_KEY).is_some_and(|v| !v.eq_ignore_ascii_case("true"))
 }
 
-/// Whether any setting hosted mode writes is present in `config` (read as
-/// [`config_enforces`] reads it), whatever its value.
+/// Whether any setting hosted mode writes is present in `config`, whatever
+/// its value, in any spelling some Maven reads (a whole line, or a token of
+/// the pre-3.9 whitespace split): the rollback's "leftover settings"
+/// warning keys on presence, not on enforcement.
 pub(crate) fn config_has_written_settings(config: &str) -> bool {
-    let props = maven_config_line_properties(config);
+    let props = crate::formats::maven::maven_config_properties(config);
     CONFIG_ARGS
         .iter()
         .filter_map(|arg| arg.strip_prefix("-D")?.split_once('='))
@@ -547,7 +549,10 @@ mod tests {
         assert!(config_has_written_settings(&format!(
             "-D{SWITCH_KEY}=false"
         )));
-        assert!(!config_has_written_settings(&format!("-B {switch_line}")));
+        // Presence, not enforcement: a token joined onto a longer line is
+        // still a leftover the rollback warns about.
+        assert!(config_has_written_settings(&format!("-B {switch_line}")));
+        assert!(!config_has_written_settings(&format!("# {switch_line}")));
     }
 
     #[test]

@@ -57,7 +57,10 @@
 //! `<sha256>  <g-path>/<a>/<v>/<a>-<v>.jar` under the SUFFIXED version, made
 //! effective by `-Daether.artifactResolver.postProcessor.trustedChecksums=true`
 //! in `.mvn/maven.config`. That jar line becomes
-//! [`LockIntegrity::Sha256Hex`] (only while the resolver switch is on).
+//! [`LockIntegrity::Sha256Hex`] only while Maven enforces the file
+//! ([`crate::formats::maven::trusted_checksums::enforced`]: every setting
+//! hosted writes, read as Maven 3.9+ reads `maven.config`, and no wrapper
+//! pinning a Maven older than 3.9.4).
 //! `integrity_required` is FALSE: the rewriter writes checksums only when
 //! both hashes are known, and the suffixed version itself is the
 //! fail-closed pin (no other repository serves it; the Socket repository is
