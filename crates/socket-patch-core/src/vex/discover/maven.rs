@@ -118,7 +118,7 @@ use super::{
 };
 use crate::formats::maven::{
     is_executable_classifier, is_maven_coordinate, is_maven_version_text, maven_config_properties,
-    may_shadow, parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
+    may_name, may_shadow, parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
 use crate::utils::digest::sha256_hex;
@@ -233,6 +233,17 @@ async fn extract_hosted(
         else {
             continue;
         };
+        // A pom spelling that is itself a Socket pin is pom.xml wiring:
+        // pin detection keeps its ref and reports the -D override
+        // (`MavenConfigOverride`) instead.
+        if dep
+            .version
+            .as_deref()
+            .and_then(split_socket_version)
+            .is_some()
+        {
+            continue;
+        }
         out.diag(
             DIAG_REF_UNATTRIBUTABLE,
             POM,
@@ -736,7 +747,8 @@ fn main_jar_declarations<'a>(
 
 /// The executable classifier copies of `group:artifact` (tests, a native
 /// or JDK-specific build; not `sources` / `javadoc`) that `in_scope` keeps,
-/// with their classifier.
+/// with their classifier. A groupId or artifactId that is a property this
+/// pom does not define may be this GA ([`may_name`]), so it counts too.
 fn classifier_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -744,7 +756,9 @@ fn classifier_declarations<'a>(
     in_scope: impl Fn(&PomDep) -> bool + 'a,
 ) -> impl Iterator<Item = (&'a PomDep, &'a str)> + 'a {
     deps.iter()
-        .filter(move |d| in_scope(d) && d.group == group && d.artifact == artifact)
+        .filter(move |d| {
+            in_scope(d) && may_name(&d.group, group) && may_name(&d.artifact, artifact)
+        })
         .filter_map(|d| {
             let classifier = d.classifier.as_deref()?;
             is_executable_classifier(classifier).then_some((d, classifier))
@@ -1241,6 +1255,14 @@ mod tests {
             ),
             // No version this pom gives it (a parent's): fail closed.
             (classified("tests", None), String::new()),
+            // A coordinate property this pom does not define may be the GA.
+            (
+                "<dependency><groupId>${undefined.group}</groupId>\
+                 <artifactId>slf4j-api</artifactId><version>1.7.36</version>\
+                 <classifier>tests</classifier></dependency>\n"
+                    .to_string(),
+                String::new(),
+            ),
         ];
         for (deps, managed) in &unattested {
             let out = run(&project(deps, managed)).await;
@@ -1689,6 +1711,14 @@ mod tests {
                 "--define slf4j.version=1.7.30\n".to_string(),
                 Expect::Overridden,
             ),
+            // The build config swaps one Socket pin for another: the pom's
+            // pin is still pom.xml wiring, so no config-only diagnostic.
+            (
+                pin.as_str(),
+                &by_prop,
+                format!("-Dslf4j.version={}\n", suffixed(UUID_B)),
+                Expect::Overridden,
+            ),
             // The build config alone supplies the pin.
             (
                 "1.7.36",
@@ -1736,6 +1766,12 @@ mod tests {
                         assert_eq!(u.kind, UnattestedKind::MavenConfigOverride, "{what}");
                         assert!(u.detail.contains(".mvn/maven.config"), "{}", u.detail);
                     }
+                    assert!(
+                        !out.diagnostics
+                            .iter()
+                            .any(|d| d.detail.contains("only through")),
+                        "{what}"
+                    );
                 }
                 Expect::ConfigOnly | Expect::NoRef => {
                     assert_refs(&out, &[]);
