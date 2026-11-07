@@ -621,10 +621,17 @@ pub async fn read_candidate_files(
     // and yarn classic rewriters read it as advisory input only: no
     // rewriter edits it, so a link or an unreadable in-memory entry is left
     // out (the rewriters then keep their conservative reading) rather than
-    // refused.
+    // refused. Beside a root `pnpm-lock.yaml` / `shrinkwrap.yaml` pair its
+    // `packageManager` pin decides which of the two pnpm reads
+    // (`formats::pnpm::plan::planned_locks`), as vendored mode and
+    // discovery read it, when no `node_modules/.modules.yaml` records the
+    // installed major (a fresh clone).
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
         && (NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
-            || out.files.contains_key("yarn.lock"))
+            || out.files.contains_key("yarn.lock")
+            || ROOT_PNPM_LOCKS
+                .iter()
+                .all(|lock| out.files.contains_key(*lock)))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
@@ -4330,6 +4337,40 @@ mod tests {
             "{:?}",
             read.files.keys()
         );
+    }
+
+    #[tokio::test]
+    async fn a_pnpm_lock_pair_reads_the_package_manager_pin() {
+        // pnpm 2 pinned in package.json, no install record: pnpm reads
+        // shrinkwrap.yaml, so the planner must see the pin to leave the
+        // stray pnpm-lock.yaml alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let manifest = r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#;
+        std::fs::write(root.join("package.json"), manifest).unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 5.4\n").unwrap();
+        std::fs::write(
+            root.join("shrinkwrap.yaml"),
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            crate::formats::pnpm::plan::planned_locks(&read.files),
+            vec!["shrinkwrap.yaml"]
+        );
+
+        // One pnpm lock alone governs whatever the pin: no manifest read.
+        std::fs::remove_file(root.join("shrinkwrap.yaml")).unwrap();
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert!(!read.files.contains_key("package.json"));
     }
 
     #[tokio::test]
