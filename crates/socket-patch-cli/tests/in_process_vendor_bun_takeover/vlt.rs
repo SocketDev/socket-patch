@@ -11,8 +11,7 @@
 //!    the hosted rewrite, and `rollback` (the upstream restore) lands on
 //!    the registry lock;
 //! 3. refusals fire BEFORE the other mode is reverted: the complete vlt
-//!    vendored preflight in front of a hosted revert, and the hosted
-//!    artifact preflight in front of a vendored revert.
+//!    vendored preflight in front of a hosted revert.
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -469,42 +468,6 @@ async fn vlt_vendored_preflight_refuses_before_the_hosted_revert() {
         "[scan --dry-run] the preview names the refusal: {env:#}"
     );
     assert_intact("scan --mode vendored --dry-run");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn vlt_hosted_artifact_preflight_refuses_before_the_vendored_revert() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-    write_project(root);
-    seed_manifest(root);
-    let (code, env, _) = vendor(root, &[]);
-    assert_eq!(code, 0, "{env:#}");
-    std::fs::remove_file(root.join(".socket/manifest.json")).unwrap();
-    let lock = hosted::read(root, "vlt-lock.json");
-    let pkg = hosted::read(root, "package.json");
-    let state = std::fs::read(root.join(".socket/vendor/state.json")).unwrap();
-
-    let server = MockServer::start().await;
-    hosted::mock_discovery(&server).await;
-    hosted::mock_reference(&server).await;
-    hosted::mock_view(&server).await;
-    hosted::mock_artifact_with(&server, ResponseTemplate::new(404)).await;
-    let (_, env, stderr) = scan(root, &server, "hosted", &[]);
-    assert!(
-        hosted::warning_codes(&env).contains(&hosted::UNVERIFIABLE.to_string()),
-        "{env:#}\n{stderr}"
-    );
-    assert_eq!(
-        hosted::read(root, "vlt-lock.json"),
-        lock,
-        "the vendored wiring stays"
-    );
-    assert_eq!(hosted::read(root, "package.json"), pkg);
-    assert_eq!(
-        std::fs::read(root.join(".socket/vendor/state.json")).unwrap(),
-        state
-    );
-    assert!(root.join(rel()).join("index.js").is_file());
 }
 
 /// A vendor that fails after the takeover's upstream restore (here a

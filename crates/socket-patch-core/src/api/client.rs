@@ -509,12 +509,6 @@ impl ApiClient {
         self
     }
 
-    /// The User-Agent-only client for grant-tokenized artifact URLs, where
-    /// the Socket bearer must never be sent.
-    pub(crate) fn plain_http(&self) -> &reqwest::Client {
-        &self.plain
-    }
-
     /// The run-level breaker's consecutive-failure count (tests).
     #[cfg(test)]
     pub(crate) fn vendor_outage_count(&self) -> u32 {
