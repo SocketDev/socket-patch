@@ -72,7 +72,7 @@ pub(crate) use self::npm::{
     NpmLockEntry, NpmLockNode, NpmLockSection,
 };
 #[cfg(test)]
-pub(crate) use self::npm_family::inventory_npm_lock;
+pub(crate) use self::npm_family::{inventory_npm_lock, inventory_npm_trees};
 pub(crate) use self::pypi::pipfile_lock_entries;
 pub use self::recover::recover_lock_entry;
 pub use self::view::{DiskSnapshot, MemoryEntry, MemoryProject, ProjectView, ReadSet};
@@ -167,6 +167,11 @@ pub struct LockfileEntry {
     pub integrity: LockIntegrity,
     /// See [`SourceKind`].
     pub source_kind: SourceKind,
+    /// The instance is from pnpm 11+'s env lockfile document (config
+    /// dependencies, installed outside `node_modules`): its own install
+    /// tree, which never displaces a project instance of the same package
+    /// in the collapsed view ([`dedup_prefer_integrity`]).
+    pub pnpm_env: bool,
 }
 
 impl LockfileEntry {
@@ -181,6 +186,7 @@ impl LockfileEntry {
         LockfileEntry {
             ecosystem: "npm",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             name,
             version,
             purl,
@@ -307,14 +313,9 @@ async fn union_views_in(
     let every = instances == Instances::Every;
     let mut out: Vec<LockfileEntry> = Vec::new();
     let mut unsupported: Vec<UnsupportedNpmLayout> = Vec::new();
-    let npm = if every {
-        npm_family::inventory_npm_lock_raw_in(view).await
-    } else {
-        npm_family::inventory_npm_lock_in(view).await
-    };
-    match npm {
-        Ok(Some((_, entries))) => out.extend(entries),
-        Ok(None) => {}
+    match npm_family::inventory_npm_trees_raw_in(view).await {
+        Ok(entries) if every => out.extend(entries),
+        Ok(entries) => out.extend(dedup_prefer_integrity(entries)),
         Err(diag) => unsupported.push(diag),
     }
     unsupported.extend(gem::unsupported_gem_layout_in(view).await);
@@ -349,20 +350,23 @@ async fn union_views_in(
     (out, unsupported)
 }
 
-/// Collapse duplicate (name, version) instances, preferring one that
-/// carries a verifier. Each view applies it ONCE, at its public boundary,
-/// over its `*_raw` body (collapsing is associative over concatenation —
-/// the first verifier-bearing instance wins, else the first — so a union of
-/// raw sub-views collapses to what collapsing each sub-view first would).
+/// Collapse duplicate (name, version) instances, preferring a project
+/// instance over a pnpm env-lockfile one ([`LockfileEntry::pnpm_env`]: a
+/// config dependency never stands in for the project's own copy, whose
+/// `resolved` url ledger liveness reads), then one that carries a
+/// verifier. Each view applies it ONCE, at its public boundary, over its
+/// `*_raw` body (collapsing is associative over concatenation — the first
+/// most-preferred instance wins — so a union of raw sub-views collapses to
+/// what collapsing each sub-view first would).
 fn dedup_prefer_integrity(raw: Vec<LockfileEntry>) -> Vec<LockfileEntry> {
+    let rank = |e: &LockfileEntry| (!e.pnpm_env, e.integrity != LockIntegrity::None);
     let mut seen: HashMap<(String, String), usize> = HashMap::new();
     let mut out: Vec<LockfileEntry> = Vec::new();
     for entry in raw {
         let key = (entry.name.clone(), entry.version.clone());
         match seen.get(&key) {
             Some(&i) => {
-                if out[i].integrity == LockIntegrity::None && entry.integrity != LockIntegrity::None
-                {
+                if rank(&entry) > rank(&out[i]) {
                     out[i] = entry;
                 }
             }

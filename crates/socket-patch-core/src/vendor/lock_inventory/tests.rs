@@ -741,8 +741,9 @@ packages:
     )
     .await;
 
-    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
-    assert_eq!(flavor, NpmLockFlavor::Pnpm);
+    // No lock is routed (Rush's are no flavor's), and both are read.
+    assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
     // Union across the common lock and the subspace lock.
     assert_eq!(entry(&entries, "left-pad").version, "1.3.0");
     assert_eq!(entry(&entries, "only-in-subspace").version, "9.9.9");
@@ -754,12 +755,15 @@ async fn rush_json_without_any_lock_yields_none() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
     assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
+    assert!(inventory_npm_trees(tmp.path()).await.unwrap().is_empty());
 }
 
+/// Lock-model divergence N12: Rush's locks are their own install trees,
+/// read whenever `rush.json` is present — beside a root lock too, as
+/// hosted mode and lockfile discovery read them. Before, a root lock
+/// shadowed them (this test pinned "the root lock wins").
 #[tokio::test]
-async fn root_pnpm_lock_wins_over_rush_fallback() {
-    // A plain pnpm project that also happens to carry a stray rush.json
-    // must route through the normal root-lock path, never the fallback.
+async fn rush_locks_are_read_beside_the_root_lock() {
     let tmp = tempfile::tempdir().unwrap();
     write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
@@ -776,13 +780,163 @@ packages:
     )
     .await;
 
-    let (flavor, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    // The routed lock keeps its flavor and holds only its own entries
+    // (code-review finding 9: Rush's are no flavor's).
+    let (flavor, routed) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::Pnpm);
+    assert!(!routed.iter().any(|e| e.name == "only-in-common"));
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
     assert!(entries.iter().any(|e| e.name == "left-pad"));
     assert!(
-        !entries.iter().any(|e| e.name == "only-in-common"),
-        "the root lock must win; the rush fallback must not run: {entries:?}"
+        entries.iter().any(|e| e.name == "only-in-common"),
+        "the Rush common lock is read beside the root lock: {entries:?}"
     );
+
+    // Beside another family's lock too.
+    tokio::fs::remove_file(tmp.path().join("pnpm-lock.yaml"))
+        .await
+        .unwrap();
+    write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+    let (flavor, routed) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(flavor, NpmLockFlavor::PackageLock);
+    assert!(!routed.iter().any(|e| e.name == "only-in-common"));
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
+    assert!(
+        entries.iter().any(|e| e.name == "only-in-common"),
+        "{entries:?}"
+    );
+    // The project union lists them too.
+    assert!(inventory_project(tmp.path())
+        .await
+        .iter()
+        .any(|e| e.name == "only-in-common"));
+
+    // Without rush.json they are not Rush's.
+    tokio::fs::remove_file(tmp.path().join("rush.json"))
+        .await
+        .unwrap();
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
+    assert!(
+        !entries.iter().any(|e| e.name == "only-in-common"),
+        "{entries:?}"
+    );
+}
+
+/// Code-review finding 4: the env document's registry instance of a
+/// release comes first in the lock and may carry the only verifier (the
+/// project's hosted instance loses its pin under `lockfile=false`), but a
+/// config dependency never stands in for the project's own copy: the
+/// collapsed view keeps the project's hosted instance, and the
+/// every-instance view (ledger liveness) keeps both.
+#[tokio::test]
+async fn env_document_instances_never_displace_project_instances() {
+    let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
+    let url =
+        format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/{uuid}/left-pad-1.3.0.tgz");
+    let lock = format!(
+        "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      \
+         left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  \
+         left-pad@1.3.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n\n---\n\
+         lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+         resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n"
+    );
+    for lockfile_off in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", &lock).await;
+        if lockfile_off {
+            write(tmp.path(), ".npmrc", "lockfile=false\n").await;
+        }
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        let left = entry(&entries, "left-pad");
+        assert_eq!(
+            left.resolved.as_deref(),
+            Some(url.as_str()),
+            "{lockfile_off}"
+        );
+        assert!(!left.pnpm_env, "{lockfile_off}");
+        let every: Vec<_> = inventory_project_every_lock(tmp.path())
+            .await
+            .into_iter()
+            .filter(|e| e.name == "left-pad")
+            .map(|e| (e.pnpm_env, e.resolved))
+            .collect();
+        assert_eq!(
+            every,
+            [(true, None), (false, Some(url.clone()))],
+            "{lockfile_off}"
+        );
+    }
+}
+
+/// Lock-model divergence N14: with pnpm's `lockfile` setting off, pnpm
+/// never reads the lock, so a Socket-hosted pin in it is no lockfile
+/// basis. Lockfile discovery keeps the ref and withholds its pin; the
+/// inventory keeps the entry (and its hosted url) and drops its
+/// integrity, so nothing fetches or verifies against it. Registry entries
+/// keep theirs. Before, the inventory ignored the setting. Rush runs pnpm
+/// with settings of its own, so its locks are untouched (as in discovery).
+#[tokio::test]
+async fn pnpm_lockfile_off_withholds_hosted_pins() {
+    let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
+    let url =
+        format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/tok/{uuid}/left-pad-1.3.0.tgz");
+    let lock = format!(
+        "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+         resolution: {{integrity: sha512-PATCHED==, tarball: {url}}}\n\n  \
+         right-pad@2.0.0:\n    resolution: {{integrity: sha512-UPSTREAM==}}\n"
+    );
+    let integrity = |entries: &[LockfileEntry], name: &str| entry(entries, name).integrity.clone();
+    for (setting, withheld) in [
+        (None, false),
+        (Some((".npmrc", "lockfile=false\n")), true),
+        (Some(("pnpm-workspace.yaml", "lockfile: false\n")), true),
+        (Some((".npmrc", "lockfile=true\n")), false),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "pnpm-lock.yaml", &lock).await;
+        if let Some((file, text)) = setting {
+            write(tmp.path(), file, text).await;
+        }
+        let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+        let left = entry(&entries, "left-pad");
+        assert_eq!(left.resolved.as_deref(), Some(url.as_str()), "{setting:?}");
+        assert_eq!(
+            integrity(&entries, "left-pad"),
+            if withheld {
+                LockIntegrity::None
+            } else {
+                LockIntegrity::Sri("sha512-PATCHED==".into())
+            },
+            "{setting:?}"
+        );
+        assert_eq!(
+            integrity(&entries, "right-pad"),
+            LockIntegrity::Sri("sha512-UPSTREAM==".into()),
+            "{setting:?}"
+        );
+    }
+
+    // Rush: the setting is not Rush's, so its lock keeps the pin.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+    write(tmp.path(), ".npmrc", "lockfile=false\n").await;
+    write_nested(tmp.path(), "common/config/rush/pnpm-lock.yaml", &lock).await;
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
+    assert_eq!(
+        integrity(&entries, "left-pad"),
+        LockIntegrity::Sri("sha512-PATCHED==".into())
+    );
+
+    // A directory named rush.json is not Rush (the gate discovery shares,
+    // `is_rush`), so the root lock still loses the pin.
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), "rush.json/placeholder", "").await;
+    write(tmp.path(), ".npmrc", "lockfile=false\n").await;
+    write(tmp.path(), "pnpm-lock.yaml", &lock).await;
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
+    assert_eq!(integrity(&entries, "left-pad"), LockIntegrity::None);
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(integrity(&entries, "left-pad"), LockIntegrity::None);
 }
 
 /// The inventory twin of discovery's
@@ -841,11 +995,9 @@ packages:
 /// The sorted package names the npm-family inventory lists through `view`
 /// (empty when it lists none).
 async fn npm_inventory_names(view: &ProjectView<'_>) -> Vec<String> {
-    let entries = super::npm_family::inventory_npm_lock_in(view)
+    let entries = super::npm_family::inventory_npm_trees_raw_in(view)
         .await
-        .unwrap()
-        .map(|(_, entries)| entries)
-        .unwrap_or_default();
+        .unwrap();
     let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
     names.sort();
     names
@@ -1524,6 +1676,7 @@ async fn lookup_matches_cargo_and_golang_purls() {
         LockfileEntry {
             ecosystem: "cargo",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             name: "serde".into(),
             version: "1.0.200".into(),
             purl: "pkg:cargo/serde@1.0.200".into(),
@@ -1533,6 +1686,7 @@ async fn lookup_matches_cargo_and_golang_purls() {
         LockfileEntry {
             ecosystem: "golang",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             name: "github.com/x/y".into(),
             version: "v1.0.0".into(),
             purl: "pkg:golang/github.com/x/y@v1.0.0".into(),
@@ -3114,7 +3268,8 @@ fn pnpm_resolution_tokens_cover_maps_the_grammar_refuses() {
     let lock = format!(
         "lockfileVersion: '9.0'\n\npackages:\n\n  x@1.0.0:\n    resolution:\n      tarball: {url}\n      nested:\n        a: b\n\n  y@1.0.0:\n    resolution: {{integrity: sha512-a}}\n    resolution: {{tarball: '{url}'}}\n\n  z@1.0.0:\n    resolution: {{integrity: sha512-z,\n      tarball: \"{url}\"}}\n\n  ok@1.0.0:\n    resolution: {{integrity: sha512-ok}}\n"
     );
-    let packages = crate::formats::pnpm::pnpm_packages(&lock);
+    let parsed = crate::formats::pnpm::PnpmLock::parse(&lock);
+    let packages = parsed.packages();
     let by_key = |key: &str| packages.iter().find(|p| p.key == key).unwrap();
     for key in ["x@1.0.0", "y@1.0.0", "z@1.0.0"] {
         let package = by_key(key);
@@ -3918,6 +4073,7 @@ async fn lookup_matches_by_purl_identity() {
     let entry = |ecosystem: &'static str, name: &str, version: &str| LockfileEntry {
         ecosystem,
         source_kind: SourceKind::Unspecified,
+        pnpm_env: false,
         name: name.into(),
         version: version.into(),
         purl: format!("pkg:{ecosystem}/{name}@{version}"),

@@ -4,7 +4,7 @@
 //! rewriter's pnpm leg).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 
@@ -44,6 +44,9 @@ struct PnpmLockState<'f> {
     pending: Vec<(std::ops::Range<usize>, String)>,
     spliced: std::collections::HashSet<usize>,
     changed: bool,
+    /// [`vendored_packages`] of `text`, computed on the first unmatched dep
+    /// and dropped when [`PnpmLockState::materialize`] replaces `text`.
+    vendored: Option<HashSet<(String, String)>>,
 }
 
 impl<'f> PnpmLockState<'f> {
@@ -57,6 +60,7 @@ impl<'f> PnpmLockState<'f> {
             pending: Vec::new(),
             spliced: Default::default(),
             changed: false,
+            vendored: None,
         };
         state.reindex();
         state
@@ -78,6 +82,17 @@ impl<'f> PnpmLockState<'f> {
         let mut sorted: Vec<usize> = (0..self.entries.len()).collect();
         sorted.sort_by(|&a, &b| self.norm_key(a).cmp(self.norm_key(b)).then(a.cmp(&b)));
         self.sorted = sorted;
+    }
+
+    /// Whether the lock vendors `fname@version` ([`vendored_packages`]).
+    /// Read from `text` without folding `pending` in: a resolution splice
+    /// never touches a packages key or a `name:` / `version:` line (see
+    /// the type docs), so the answer is the post-splice lock's.
+    fn vendors(&mut self, fname: &str, version: &str) -> bool {
+        let text: &str = &self.text;
+        self.vendored
+            .get_or_insert_with(|| vendored_packages(text))
+            .contains(&(fname.to_string(), version.to_string()))
     }
 
     fn entry(&self, i: usize) -> pnpm::Entry<'_> {
@@ -147,6 +162,7 @@ impl<'f> PnpmLockState<'f> {
         out.push_str(&self.text[cursor..]);
         self.text = Cow::Owned(out);
         self.spliced.clear();
+        self.vendored = None;
         self.reindex();
         #[cfg(debug_assertions)]
         debug_assert_eq!(
@@ -338,44 +354,14 @@ pub(crate) fn plan_hosted(
         // is named as such: `socket-patch vendor` removes the registry
         // resolution this grammar looks for (v9 respells the packages key
         // `<name>@file:.socket/vendor/…`; v5/v6 rekey it to a bare `file:`
-        // key but keep the `<name>@<version>: file:…` overrides line), so
-        // the generic not-locked wording would send users on a wild-goose
-        // `pnpm install` when the real path is a mode switch. Fail-closed
-        // either way: nothing is rewritten for the dep.
+        // key with a `name:` line), so the generic not-locked wording would
+        // send users on a wild-goose `pnpm install` when the real path is a
+        // mode switch. Fail-closed either way: nothing is rewritten for the
+        // dep.
         if !matched_any {
-            let v9_vendored_key = format!("{fname}@file:");
-            let override_key = format!("{fname}@{}", dep.version);
-            // Scanned over the post-splice text, so fold pending splices in.
-            for lock in locks.iter_mut() {
-                lock.materialize();
-            }
-            let vendored = locks.iter().any(|lock| {
-                lock.text.lines().any(|line| {
-                    let t = line.trim_start();
-                    let t = t.strip_prefix('\'').unwrap_or(t);
-                    // v9 packages/snapshots key (leading `/` in v6 spelling).
-                    // The vendor backend always writes the RELATIVE
-                    // `file:.socket/vendor/…` spelling here, so anchoring on
-                    // it keeps a user's own `file:` dep of the same name
-                    // from being misreported as vendored.
-                    let key = t.strip_prefix('/').unwrap_or(t);
-                    if key
-                        .strip_prefix(&v9_vendored_key)
-                        .is_some_and(|rest| rest.starts_with(".socket/vendor/"))
-                    {
-                        return true;
-                    }
-                    // overrides / root-dep line: `<name>@<version>: file:…`
-                    // (pnpm <=8 absolutizes the value, so only the
-                    // `.socket/vendor/` tail is stable enough to match).
-                    t.strip_prefix(&override_key)
-                        .map(|rest| rest.strip_prefix('\'').unwrap_or(rest))
-                        .and_then(|rest| rest.strip_prefix(':'))
-                        .is_some_and(|rest| {
-                            rest.contains("file:") && rest.contains(".socket/vendor/")
-                        })
-                })
-            });
+            let vendored = locks
+                .iter_mut()
+                .any(|lock| lock.vendors(&fname, &dep.version));
             if vendored {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_vendored".into(),
@@ -402,6 +388,35 @@ pub(crate) fn plan_hosted(
             result.files.insert(key.clone(), content);
         }
     }
+}
+
+/// The `(name, version)` of every packages entry of `text` the vendor
+/// backends rekeyed: v9's `<name>@file:<artifact>` key or legacy's bare
+/// `file:<artifact>` key with a `name:` line, each with its `version:`
+/// line, whose path is this project's vendored npm artifact
+/// ([`crate::origin::vendor_ref`]: root-anchored, canonical uuid,
+/// traversal-safe leaf) — the one rule lockfile discovery reads vendored
+/// pnpm keys with. A user's own `file:` dep of the same name, a
+/// `../.socket/vendor/…` path from another checkout, and an `overrides:`
+/// line alone (pnpm mirrors it from package.json whether or not anything
+/// matches) are not vendoring.
+fn vendored_packages(text: &str) -> HashSet<(String, String)> {
+    use super::{classify_pnpm_key, PnpmKey};
+    let lock = super::PnpmLock::parse_keys(text);
+    lock.packages()
+        .iter()
+        .filter_map(|package| {
+            let (name, path) = match classify_pnpm_key(package.key) {
+                PnpmKey::V9File { name, path } => (name.trim_start_matches('/'), path),
+                PnpmKey::LegacyFile { path } => (pnpm::entry_field(&package.entry, "name")?, path),
+                PnpmKey::Registry { .. } | PnpmKey::Other => return None,
+            };
+            let version = pnpm::entry_field(&package.entry, "version")?;
+            crate::origin::vendor_ref(path)
+                .filter(|v| v.eco == "npm")
+                .map(|_| (name.to_string(), version.to_string()))
+        })
+        .collect()
 }
 
 /// Test-only reference for the residual gate: every instance of this exact

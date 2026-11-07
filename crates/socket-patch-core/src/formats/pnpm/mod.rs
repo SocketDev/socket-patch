@@ -33,12 +33,14 @@ pub(crate) mod workspace;
 
 pub use version::{matches_file_id_build_keys, root_only_workspace_breaks_add};
 
+pub use grammar::PnpmDocument;
 pub(crate) use grammar::{
     entry_bundled, entry_field, is_pnpm_lock_text, Bundled, Entry, Resolution,
 };
 pub(crate) use hosted::plan_hosted;
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::text::strip_bom;
@@ -58,6 +60,9 @@ pub(crate) struct PnpmPackage<'a> {
     /// The entry's `resolution:` map; `None` when it has none or the
     /// grammar refuses it (duplicate keys, nested values, aliases).
     pub(crate) resolution: Option<Resolution<'a>>,
+    /// The lock document the entry is in ([`grammar::documents`]): the
+    /// project lock or pnpm 11+'s env lockfile, each its own install tree.
+    pub(crate) document: PnpmDocument,
 }
 
 impl<'a> PnpmPackage<'a> {
@@ -78,19 +83,43 @@ impl<'a> PnpmPackage<'a> {
     }
 }
 
-/// Every `packages:` entry of a pnpm lock text, in lock order — the ONE
-/// entry walk the inventory, lockfile discovery and repair share. Every
-/// entry is returned (registry, rekeyed vendored, hosted, directory, git);
-/// each consumer applies its own key and resolution rules.
-pub(crate) fn pnpm_packages(text: &str) -> Vec<PnpmPackage<'_>> {
+/// Every `packages:` entry of a pnpm lock text, in lock order, each tagged
+/// with its document — the ONE entry walk every reader shares (through
+/// [`PnpmLock::packages`]). Every entry is returned (registry, rekeyed
+/// vendored, hosted, directory, git); each consumer applies its own key
+/// and resolution rules.
+fn pnpm_packages(text: &str, resolve: Resolve) -> Vec<PnpmPackage<'_>> {
+    let documents = grammar::documents(text);
     grammar::entries(text)
         .into_iter()
-        .map(|entry| PnpmPackage {
-            key: grammar::unquote(entry.key.trim()),
-            resolution: grammar::resolution(&entry),
-            entry,
+        .map(|entry| {
+            // Tag by the KEY line: an entry with an empty body (its key the
+            // last line of a document) has its body offset on the next
+            // document's `---` line, or at the end of the text.
+            let key_at = entry.key.as_ptr() as usize - text.as_ptr() as usize;
+            PnpmPackage {
+                key: grammar::unquote(entry.key.trim()),
+                resolution: match resolve {
+                    Resolve::Yes => grammar::resolution(&entry),
+                    Resolve::No => None,
+                },
+                document: documents
+                    .iter()
+                    .find(|(span, _)| span.contains(&key_at))
+                    .map_or(PnpmDocument::Project, |(_, kind)| *kind),
+                entry,
+            }
         })
         .collect()
+}
+
+/// Whether [`pnpm_packages`] parses each entry's `resolution:` map.
+#[derive(Clone, Copy)]
+enum Resolve {
+    Yes,
+    /// Keys and bodies only: the store crawler's hot path
+    /// ([`InstalledPackages::from_lock_text`]) never reads a resolution.
+    No,
 }
 
 /// The `(integrity, tarball)` of one recorded `packages:` block — a
@@ -99,7 +128,7 @@ pub(crate) fn pnpm_packages(text: &str) -> Vec<PnpmPackage<'_>> {
 /// entry with a flat resolution.
 pub(crate) fn fragment_resolution(block: &[String]) -> Option<(Option<String>, Option<String>)> {
     let text = format!("packages:\n{}\n", block.join("\n"));
-    let packages = pnpm_packages(&text);
+    let packages = pnpm_packages(&text, Resolve::Yes);
     let [package] = packages.as_slice() else {
         return None;
     };
@@ -368,16 +397,21 @@ pub(crate) fn check_v9_lock_version(text: &str) -> Result<(), String> {
 // ── the model ──
 
 /// One pnpm lock, parsed once (see the module docs).
+///
+/// Every document is read. pnpm 11+ writes its env lockfile
+/// (`configDependencies`, `packageManagerDependencies`) as a first
+/// document; its entries are installed too (into pnpm's config store, not
+/// `node_modules`), so they are part of the lock, tagged
+/// [`PnpmDocument::Env`]: a reader that keeps install trees apart
+/// (lockfile discovery's contests) reads the env document as a tree of its
+/// own ([`PnpmPackage::document`]).
 pub struct PnpmLock<'t> {
     text: &'t str,
-    /// The project document ([`grammar::main_document`]): pnpm 11+ writes
-    /// its env lockfile (`configDependencies`, `packageManagerDependencies`)
-    /// as a first document whose packages the install never links (#1949).
-    doc: &'t str,
-    /// Entries of the project document only, with offsets into `text`.
+    /// Every document's entries, with offsets into `text`.
     packages: Vec<PnpmPackage<'t>>,
-    /// [`vendored_npm_uuids`] of the project document.
-    vendored: HashSet<String>,
+    /// [`vendored_npm_uuids`] of the whole lock, computed on first use (the
+    /// store crawler never asks).
+    vendored: OnceLock<HashSet<String>>,
 }
 
 /// One `packages:` entry whose resolution names a tarball — a candidate
@@ -392,18 +426,21 @@ pub(crate) struct PnpmTarballRef<'p> {
 impl<'t> PnpmLock<'t> {
     /// Parse a lock text (any content: a non-pnpm text has no entries).
     pub fn parse(text: &'t str) -> Self {
-        let doc = grammar::main_document(strip_bom(text));
-        // `doc` is a suffix of `text`: parse the whole text so offsets stay
-        // relative to it, and keep the entries that start in `doc`.
-        let doc_start = text.len() - doc.len();
         PnpmLock {
             text,
-            doc,
-            packages: pnpm_packages(text)
-                .into_iter()
-                .filter(|p| p.entry.offset >= doc_start)
-                .collect(),
-            vendored: vendored_npm_uuids(doc),
+            packages: pnpm_packages(text, Resolve::Yes),
+            vendored: OnceLock::new(),
+        }
+    }
+
+    /// [`PnpmLock::parse`] without the resolution maps (every
+    /// [`PnpmPackage::resolution`] is `None`), for a reader of keys and
+    /// entry fields only.
+    fn parse_keys(text: &'t str) -> Self {
+        PnpmLock {
+            text,
+            packages: pnpm_packages(text, Resolve::No),
+            vendored: OnceLock::new(),
         }
     }
 
@@ -416,23 +453,40 @@ impl<'t> PnpmLock<'t> {
         is_pnpm_lock_text(self.text)
     }
 
-    /// Every `packages:` entry, in lock order.
+    /// Every `packages:` entry of every document, in lock order, each
+    /// tagged with its [`PnpmDocument`].
     pub(crate) fn packages(&self) -> &[PnpmPackage<'t>] {
         &self.packages
     }
 
+    /// The entries of one document kind, in lock order.
+    pub(crate) fn packages_of(
+        &self,
+        document: PnpmDocument,
+    ) -> impl Iterator<Item = &PnpmPackage<'t>> {
+        self.packages.iter().filter(move |p| p.document == document)
+    }
+
+    /// The document kinds the lock has entries in, project first.
+    pub(crate) fn documents(&self) -> Vec<PnpmDocument> {
+        let mut kinds: Vec<PnpmDocument> = self.packages.iter().map(|p| p.document).collect();
+        kinds.sort();
+        kinds.dedup();
+        kinds
+    }
+
     fn has_packages_section(&self) -> bool {
-        self.doc
+        self.text
             .lines()
             .any(|l| l.trim_end_matches('\r') == "packages:")
     }
 
     /// The registry inventory: one entry per plain-registry packages key
-    /// (every key generation, [`pnpm_registry_key`]), flow and block
-    /// resolutions, CRLF included. A resolution the grammar refuses leaves
-    /// the entry listed without a verifier; our own vendored tarballs are
-    /// not registry dependencies and are dropped. `None` when the lock has
-    /// no `packages:` section.
+    /// (every key generation, [`pnpm_registry_key`]) of every document,
+    /// flow and block resolutions, CRLF included. A resolution the grammar
+    /// refuses leaves the entry listed without a verifier; our own vendored
+    /// tarballs are not registry dependencies and are dropped. `None` when
+    /// the lock has no `packages:` section.
     pub fn entries(&self) -> Option<Vec<LockfileEntry>> {
         if !self.has_packages_section() {
             return None;
@@ -453,12 +507,10 @@ impl<'t> PnpmLock<'t> {
             if tarball.is_some_and(|t| parse_vendor_path(t).is_some()) {
                 continue;
             }
-            out.push(LockfileEntry::npm(
-                name,
-                version,
-                tarball.and_then(http_url),
-                integrity,
-            ));
+            let mut entry =
+                LockfileEntry::npm(name, version, tarball.and_then(http_url), integrity);
+            entry.pnpm_env = package.document == PnpmDocument::Env;
+            out.push(entry);
         }
         Some(out)
     }
@@ -504,7 +556,9 @@ impl<'t> PnpmLock<'t> {
     /// package.json even when nothing matches it). CRLF locks read like LF
     /// ones.
     pub fn vendored_in_use(&self, uuid: &str) -> bool {
-        self.vendored.contains(uuid)
+        self.vendored
+            .get_or_init(|| vendored_npm_uuids(self.text))
+            .contains(uuid)
     }
 }
 
@@ -524,54 +578,42 @@ pub(crate) struct InstalledPackages {
 impl InstalledPackages {
     /// Read a current lockfile in any lock generation (v5.4 `/name/1.0.0`,
     /// v6 `/name@1.0.0`, v9 `name@1.0.0` keys; a non-registry entry by its
-    /// `name:` / `version:` fields, or a v9 key's name). `None` when the
-    /// text is not a pnpm lock, or holds an entry whose package cannot be
-    /// named — the caller must then keep every store entry.
+    /// `name:` / `version:` fields, the last of each winning, or a v9 key's
+    /// name), through [`PnpmLock`]'s entry walk. `None` when the text is not
+    /// a pnpm lock, or holds an entry whose package cannot be named — the
+    /// caller must then keep every store entry.
+    ///
+    /// Every document counts. pnpm writes the current lockfile as the
+    /// project lock alone (the env lockfile lives only in `pnpm-lock.yaml`,
+    /// and config dependencies install into `node_modules/.pnpm-config`, not
+    /// the virtual store), so a second document is not expected here; if
+    /// one appears, its entries keep their store entries too, the side that
+    /// never hides an installed package.
     pub(crate) fn from_lock_text(text: &str) -> Option<Self> {
         if !grammar::is_pnpm_lock_text(text) {
             return None;
         }
-        // One line walk (the scan reads this on every run, for every
-        // package of the install): two-space `packages:` keys and their
-        // four-space `name:` / `version:` fields, nothing else.
+        // Keys and `name:` / `version:` lines only: the scan reads this on
+        // every run, for every package of the install.
+        let lock = PnpmLock::parse_keys(text);
         let mut out = Self::default();
-        let mut entries = 0usize;
-        let mut in_packages = false;
-        let mut current: Option<(&str, Option<&str>, Option<&str>)> = None;
-        let mut finish = |entry: Option<(&str, Option<&str>, Option<&str>)>, out: &mut Self| {
-            let Some((key, field_name, field_version)) = entry else {
-                return Some(());
-            };
-            entries += 1;
-            out.insert_entry(key, field_name, field_version)
-        };
-        for raw in grammar::main_document(strip_bom(text)).split('\n') {
-            let line = raw.strip_suffix('\r').unwrap_or(raw);
-            if !line.is_empty() && !line.starts_with([' ', '#']) {
-                finish(current.take(), &mut out)?;
-                in_packages = line == "packages:";
-                continue;
-            }
-            if !in_packages {
-                continue;
-            }
-            if let Some((key, _, _)) = lines::parse_key_line(line, 2) {
-                finish(current.take(), &mut out)?;
-                current = Some((key, None, None));
-            } else if let (Some(entry), Some((field, _, value))) =
-                (current.as_mut(), lines::parse_key_line(line, 4))
-            {
-                let value = Some(grammar::unquote(value.trim())).filter(|v| !v.is_empty());
-                match field {
-                    "name" => entry.1 = value,
-                    "version" => entry.2 = value,
-                    _ => {}
+        for package in lock.packages() {
+            let (mut name, mut version) = (None, None);
+            for line in package.entry.body.split('\n') {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if let Some((field, _, value)) = lines::parse_key_line(line, 4) {
+                    let value = Some(grammar::unquote(value.trim())).filter(|v| !v.is_empty());
+                    match field {
+                        "name" => name = value,
+                        "version" => version = value,
+                        _ => {}
+                    }
                 }
             }
+            out.insert_entry(package.key, name, version)?;
         }
-        finish(current.take(), &mut out)?;
         // A lock listing no package at all says nothing about the store.
-        (entries > 0).then_some(out)
+        (!lock.packages().is_empty()).then_some(out)
     }
 
     /// Record one `packages:` entry; `None` when its package cannot be
@@ -768,12 +810,15 @@ mod tests {
         assert!(!PnpmLock::parse(importers).resolves("left-pad", "1.3.0"));
     }
 
-    /// #1949: a pnpm 11+ lock's env document (config dependencies the
-    /// install never links) is not part of the inventory: `entries()`,
-    /// `resolves()`, the vendored uuids and `InstalledPackages` all read
-    /// the project document alone, and agree with each other.
+    /// pnpm 11+'s env document is part of the lock (owner decision,
+    /// lock-model divergence N4; this reverses #1949's skip): pnpm installs
+    /// its config dependencies, and the hosted planner and the v9 vendored
+    /// in-use check already read it. `entries()`, `resolves()`, the
+    /// vendored uuids and `InstalledPackages` all read both documents and
+    /// agree with each other; every entry is tagged with its document, so
+    /// discovery keeps the env document a tree of its own.
     #[test]
-    fn env_document_is_not_in_the_inventory() {
+    fn env_document_is_read_as_its_own_tree() {
         let env = format!(
             "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {{integrity: sha512-c}}\n\n  b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz}}\n    version: 1.0.0\n\n"
         );
@@ -792,17 +837,44 @@ mod tests {
                 .collect();
             assert_eq!(
                 names,
-                [("left-pad".to_string(), "1.3.0".to_string())],
+                [
+                    ("cfg-dep".to_string(), "2.0.0".to_string()),
+                    ("left-pad".to_string(), "1.3.0".to_string())
+                ],
                 "{text:?}"
             );
             assert!(lock.resolves("left-pad", "1.3.0"));
-            assert!(!lock.resolves("cfg-dep", "2.0.0"));
-            assert!(!lock.vendored_in_use(UUID));
-            assert!(lock.packages().iter().all(|p| p.entry.offset >= env.len()));
+            assert!(lock.resolves("cfg-dep", "2.0.0"));
+            assert!(lock.vendored_in_use(UUID));
+            let tagged: Vec<_> = lock
+                .packages()
+                .iter()
+                .map(|p| (p.key, p.document))
+                .collect();
+            assert_eq!(
+                tagged,
+                [
+                    ("cfg-dep@2.0.0", PnpmDocument::Env),
+                    (
+                        format!("b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz").as_str(),
+                        PnpmDocument::Env
+                    ),
+                    ("left-pad@1.3.0", PnpmDocument::Project),
+                ],
+                "{text:?}"
+            );
+            assert_eq!(lock.documents(), [PnpmDocument::Project, PnpmDocument::Env]);
             let installed = InstalledPackages::from_lock_text(&text).unwrap();
             assert!(installed.contains("left-pad", "1.3.0"));
-            assert!(!installed.contains("cfg-dep", "2.0.0"));
+            assert!(installed.contains("cfg-dep", "2.0.0"));
+            assert!(installed.contains("b", "1.0.0"));
         }
+        // One document: the project, whatever its importers say.
+        let lone = env.trim_start_matches("---\n");
+        assert!(PnpmLock::parse(lone)
+            .packages()
+            .iter()
+            .all(|p| p.document == PnpmDocument::Project));
         // Offsets still index the whole text.
         let text = format!("{env}{project}");
         let lock = PnpmLock::parse(&text);
@@ -811,6 +883,91 @@ mod tests {
             &text[entry.offset..entry.offset + entry.body.len()],
             entry.body
         );
+    }
+
+    /// N4: before, the readers took the text after the LAST `---` as the
+    /// project, so a lock with an extra document chose its own "project"
+    /// and hid the rest; now every document is read. The env document is
+    /// the FIRST one, when its importers say so, as pnpm and the vendored
+    /// planners' `split_project_document` read it: an env-shaped LATER
+    /// document is a project one, so it cannot opt out of the project
+    /// tree's contests (code-review finding 2).
+    #[test]
+    fn documents_are_identified_by_position_and_content() {
+        let env = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {integrity: sha512-c}\n";
+        let project = |dep: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      {dep}:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  {dep}@1.0.0:\n    resolution: {{integrity: sha512-x}}\n"
+            )
+        };
+        let kinds = |text: &str| -> Vec<(String, PnpmDocument)> {
+            PnpmLock::parse(text)
+                .packages()
+                .iter()
+                .map(|p| (p.key.to_string(), p.document))
+                .collect()
+        };
+        let own = |pairs: &[(&str, PnpmDocument)]| -> Vec<(String, PnpmDocument)> {
+            pairs.iter().map(|(k, d)| (k.to_string(), *d)).collect()
+        };
+        use PnpmDocument::{Env, Project};
+        // An env-shaped document after the project is a project one.
+        let swapped = format!("---\n{}---\n{env}", project("a"));
+        assert_eq!(
+            kinds(&swapped),
+            own(&[("a@1.0.0", Project), ("cfg-dep@2.0.0", Project)])
+        );
+        assert!(!PnpmLock::parse(&swapped).documents().contains(&Env));
+        // A first document that is not the env document is a project one,
+        // and its entries are no longer skipped.
+        let two = format!("---\n{}---\n{}", project("a"), project("b"));
+        assert_eq!(
+            kinds(&two),
+            own(&[("a@1.0.0", Project), ("b@1.0.0", Project)])
+        );
+        // A third document is read too, CRLF and a BOM included.
+        let three = format!("---\n{env}---\n{}---\n{}", project("a"), project("b"));
+        for text in [
+            three.clone(),
+            three.replace('\n', "\r\n"),
+            format!("\u{feff}{three}"),
+        ] {
+            assert_eq!(
+                kinds(&text),
+                own(&[
+                    ("cfg-dep@2.0.0", Env),
+                    ("a@1.0.0", Project),
+                    ("b@1.0.0", Project)
+                ]),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// An entry is tagged by its KEY line (code-review finding 5): a key
+    /// whose body is empty — the last line of the env document, right
+    /// before `---` — has its body offset on the separator, in no document.
+    #[test]
+    fn an_entry_with_an_empty_body_keeps_its_document() {
+        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n";
+        let project = "---\nlockfileVersion: '9.0'\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n\n  b@1.0.0:";
+        let text = format!("{env}{project}");
+        for text in [text.clone(), text.replace('\n', "\r\n")] {
+            let tagged: Vec<_> = PnpmLock::parse(&text)
+                .packages()
+                .iter()
+                .map(|p| (p.key, p.document))
+                .collect();
+            assert_eq!(
+                tagged,
+                [
+                    ("cfg-dep@2.0.0", PnpmDocument::Env),
+                    ("a@1.0.0", PnpmDocument::Project),
+                    ("b@1.0.0", PnpmDocument::Project),
+                ],
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
@@ -965,5 +1122,285 @@ mod tests {
         assert!(!may_need_store_flag("lockfileVersion: '6.0'\n"));
         assert!(!may_need_store_flag("lockfileVersion: '9.0'\n"));
         assert!(!may_need_store_flag("packages: {}\n"));
+    }
+}
+
+/// ARCHITECTURE GUARD: outside `formats/pnpm`, pnpm lock entries are READ
+/// through [`PnpmLock`] (one walk, every document tagged), never through
+/// the grammar's raw entry walk or a hand-rolled `packages:` line walk.
+/// Writers that splice by byte range or line position keep their own
+/// walk; each such use is allowlisted below with a label and a count, so
+/// a new reader in the same file still fails.
+#[cfg(test)]
+mod architecture_tests {
+    use std::path::{Path, PathBuf};
+
+    /// `(root-relative file, uses, why)`.
+    const WRITERS: &[(&str, usize, &str)] = &[
+        (
+            "patch/redirect/upstream/npm.rs",
+            2,
+            "hosted unwind (`restore_pnpm_locks`): splices each pin's \
+             resolution byte range back to the registry spelling",
+        ),
+        (
+            "vendor/pnpm_lock.rs",
+            3,
+            "v9 vendored planner: preflight and splices over line blocks \
+             (`lock_has_target_package`, `edit_packages`, `LockIndex`)",
+        ),
+        (
+            "vendor/pnpm_lock_legacy.rs",
+            6,
+            "5.4 / 6.0 vendored planner: preflight, splices and revert over \
+             line blocks",
+        ),
+    ];
+
+    /// Whether one production line reads pnpm entries outside the model.
+    fn raw_walk(line: &str) -> bool {
+        let code = line.trim_start();
+        if code.starts_with("//") {
+            return false;
+        }
+        [
+            "grammar::entries(",
+            "pnpm::entries(",
+            "pnpm_grammar::entries(",
+            "pnpm_packages(",
+            "== \"packages:\"",
+        ]
+        .iter()
+        .any(|needle| code.contains(needle))
+            || (code.contains("\"packages\")")
+                && (code.contains("bounds(") || code.contains("SectionIndex::build(")))
+    }
+
+    /// The lines of `text` outside `#[cfg(test)]` / `#[cfg(all(test, …))]`
+    /// items: an out-of-line `mod name;` declaration drops that line only,
+    /// an inline item (`mod tests { … }`, a helper `fn`) drops through its
+    /// closing brace, so production code after either is still scanned.
+    fn production(text: &str) -> Vec<&str> {
+        let lines: Vec<&str> = text.split('\n').collect();
+        let deltas = brace_deltas(text);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let attr = lines[i].trim_start();
+            if !(attr.starts_with("#[cfg(test)]") || attr.starts_with("#[cfg(all(test")) {
+                out.push(lines[i]);
+                i += 1;
+                continue;
+            }
+            // Skip the gated item's other attributes, then the item.
+            i += 1;
+            while i < lines.len() && lines[i].trim_start().starts_with("#[") {
+                i += 1;
+            }
+            let mut depth = 0i64;
+            let mut opened = false;
+            while i < lines.len() {
+                let (open, close) = deltas[i];
+                let line = lines[i];
+                i += 1;
+                depth += open - close;
+                opened |= open > 0;
+                if (!opened && line.trim_end().ends_with(';')) || (opened && depth <= 0) {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Per line of `text` (split on `\n`), the `{` and `}` in code: outside
+    /// comments and string, raw string and char literals, which may span
+    /// lines.
+    fn brace_deltas(text: &str) -> Vec<(i64, i64)> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut out = vec![(0i64, 0i64)];
+        let mut i = 0;
+        let ident = |c: char| c.is_alphanumeric() || c == '_';
+        // Advance past `n` chars, opening a new line entry at each `\n`.
+        let step = |out: &mut Vec<(i64, i64)>, i: &mut usize, n: usize| {
+            for _ in 0..n {
+                if chars.get(*i) == Some(&'\n') {
+                    out.push((0, 0));
+                }
+                *i += 1;
+            }
+        };
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            } else if c == '/' && next == Some('*') {
+                let mut depth = 0;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        step(&mut out, &mut i, 2);
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        step(&mut out, &mut i, 2);
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        step(&mut out, &mut i, 1);
+                    }
+                }
+            } else if c == 'r'
+                && matches!(next, Some('"' | '#'))
+                && (i == 0 || !ident(chars[i - 1]) || chars[i - 1] == 'b')
+            {
+                let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
+                if chars.get(i + 1 + hashes) != Some(&'"') {
+                    step(&mut out, &mut i, 1);
+                    continue;
+                }
+                step(&mut out, &mut i, 2 + hashes);
+                while i < chars.len() {
+                    let closes = chars[i] == '"'
+                        && chars[i + 1..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|&&h| h == '#')
+                            .count()
+                            == hashes;
+                    if closes {
+                        step(&mut out, &mut i, 1 + hashes);
+                        break;
+                    }
+                    step(&mut out, &mut i, 1);
+                }
+            } else if c == '"' {
+                step(&mut out, &mut i, 1);
+                while i < chars.len() && chars[i] != '"' {
+                    let n = if chars[i] == '\\' { 2 } else { 1 };
+                    step(&mut out, &mut i, n);
+                }
+                step(&mut out, &mut i, 1);
+            } else if c == '\'' && next == Some('\\') {
+                // An escaped char literal (`'\''`, `'\u{7b}'`).
+                step(&mut out, &mut i, 2);
+                while i < chars.len() && chars[i] != '\'' {
+                    step(&mut out, &mut i, 1);
+                }
+                step(&mut out, &mut i, 1);
+            } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
+                step(&mut out, &mut i, 3);
+            } else {
+                let last = out.last_mut().expect("one entry per line");
+                match c {
+                    '{' => last.0 += 1,
+                    '}' => last.1 += 1,
+                    _ => {}
+                }
+                step(&mut out, &mut i, 1);
+            }
+        }
+        out
+    }
+
+    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn pnpm_entries_are_read_through_the_model() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rs_files(&src, &mut files);
+        let mut found: Vec<(String, usize)> = Vec::new();
+        for path in files {
+            let rel = path
+                .strip_prefix(&src)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.starts_with("formats/pnpm/") || rel.ends_with("tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace("\r\n", "\n");
+            let uses = production(&text)
+                .into_iter()
+                .filter(|l| raw_walk(l))
+                .count();
+            if uses > 0 {
+                found.push((rel, uses));
+            }
+        }
+        found.sort();
+        let mut allowed: Vec<(String, usize)> = WRITERS
+            .iter()
+            .map(|(rel, uses, _)| (rel.to_string(), *uses))
+            .collect();
+        allowed.sort();
+        assert_eq!(
+            found, allowed,
+            "pnpm lock entries read outside formats/pnpm: read them through \
+             PnpmLock::packages (a reader), or allowlist a writer that needs \
+             byte or line positions in WRITERS with its reason"
+        );
+    }
+
+    #[test]
+    fn raw_walk_needles() {
+        assert!(raw_walk("    for entry in pnpm::entries(&text) {"));
+        assert!(raw_walk("        in_packages = line == \"packages:\";"));
+        assert!(raw_walk(
+            "    let (s, e) = section_bounds(lines, \"packages\").unwrap();"
+        ));
+        assert!(!raw_walk("    // pnpm::entries(&text)"));
+        assert!(!raw_walk("    lock.get(\"packages\")"));
+        assert!(!raw_walk("    for p in PnpmLock::parse(t).packages() {"));
+    }
+
+    /// Code-review finding 1: an out-of-line test module declared near the
+    /// top of a file (`crawlers/npm_crawler.rs`, `patch/redirect/mod.rs`,
+    /// `vendor/mod.rs` do) used to end the scan there, so a raw walk deep
+    /// in the file went unseen. Only the gated items are dropped now.
+    #[test]
+    fn production_drops_only_test_gated_items() {
+        let src = "use a;\n#[cfg(test)]\nmod oracle;\n#[cfg(all(test, unix))]\n#[path = \"x.rs\"]\nmod x_tests;\n\
+                   #[cfg(test)]\nfn helper() {\n    let s = \"}\";\n    let c = '{';\n    if true { pnpm::entries(t); }\n}\n\
+                   fn reader<'a>(t: &'a str) {\n    for e in pnpm::entries(t) {}\n}\n\
+                   #[cfg(test)]\nmod tests {\n    fn t() { pnpm::entries(\"{\"); }\n    \
+                   const S: &str = \"a {\n{ b\";\n    const R: &str = r#\"{\"{\n\"#;\n    /* { */\n}\n\
+                   fn after() { let x = line == \"packages:\"; }\n";
+        let kept = production(src);
+        assert_eq!(kept.iter().filter(|l| raw_walk(l)).count(), 2, "{kept:#?}");
+        assert!(kept.iter().all(|l| !l.contains("mod oracle")));
+        assert!(kept.iter().any(|l| l.contains("fn after()")));
+        assert!(kept.iter().all(|l| !l.contains("fn helper")));
+        // The real files that declare test modules early keep their late
+        // production code.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        for (rel, late) in [
+            ("crawlers/npm_crawler.rs", "fn is_safe_npm_component("),
+            ("patch/redirect/mod.rs", "fn rewrite_golang_target("),
+            ("vendor/mod.rs", "pub async fn vendored_purl_keys("),
+        ] {
+            let text = std::fs::read_to_string(src.join(rel))
+                .unwrap()
+                .replace("\r\n", "\n");
+            assert!(
+                production(&text).iter().any(|l| l.starts_with(late)),
+                "{rel}: production code before its test module was not scanned"
+            );
+        }
     }
 }
