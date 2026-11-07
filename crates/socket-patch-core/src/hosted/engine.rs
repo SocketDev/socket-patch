@@ -7,26 +7,23 @@
 //!
 //! 1. [`build_candidates`] — reference grants → rewriter overrides.
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
-//! 3. vlt artifact preflight ([`super::vlt`]) + [`withhold_everywhere`].
-//! 4. (caller) the apply lock and the vendored→hosted takeover.
-//! 5. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
+//! 3. (caller) the apply lock and the vendored→hosted takeover.
+//! 4. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
 //!    and [`yarn_berry_manifest_targets`] → (caller) served npm manifests.
-//! 6. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
+//! 5. [`rewrite`] — the rewriters, the pnpm `trustLockfile` and npm
 //!    `allow-remote` auto-configs, and the per-ecosystem confirmation.
-//! 7. [`guard`] — the symlink / unreadable-file refusal before any write.
+//! 6. [`guard`] — the symlink / unreadable-file refusal before any write.
 //!
 //! Nothing here writes, spawns, reads the environment or touches the
-//! network: every host effect (locking, probes, record fetches, the commit
-//! of the rewritten files) stays with the caller.
+//! network: every host effect (locking, record fetches, the commit of the
+//! rewritten files) stays with the caller.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::{
-    RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL, VLT_LOCK,
-};
+use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
@@ -37,12 +34,13 @@ use crate::patch::redirect::npmrc::{
 use crate::patch::redirect::presence::groups_present;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
 use crate::patch::redirect::{
-    artifact_url_spellings, rewrite_registry_redirect_withholding_vlt, DepOverride, FileEdit,
+    artifact_url_spellings, rewrite_registry_redirect_with_host, DepOverride, FileEdit,
     RewriteResult, RewriteWarning,
 };
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::utils::redact::url_host;
+use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -321,22 +319,6 @@ pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> 
         && view.is_symlink("bun.lockb")
 }
 
-/// Drop the deps the vlt preflight withheld from every rewriter, recording
-/// each as skipped.
-pub fn withhold_everywhere(
-    candidates: &mut Vec<Candidate>,
-    withheld_everywhere: &BTreeMap<String, String>,
-    skipped: &mut Vec<SkippedPatch>,
-) {
-    if withheld_everywhere.is_empty() {
-        return;
-    }
-    for (uuid, purl) in withheld_everywhere {
-        skipped.push(SkippedPatch::new(purl, uuid, super::vlt::WITHHELD_REASON));
-    }
-    candidates.retain(|c| !withheld_everywhere.contains_key(&c.dep.patch_uuid));
-}
-
 /// The project's candidate files as the rewriters read them.
 #[derive(Debug, Clone, Default)]
 pub struct CandidateFiles {
@@ -434,17 +416,6 @@ impl CandidateFiles {
             }
             None => false,
         }
-    }
-}
-
-/// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
-fn rush_repo(view: &ProjectView<'_>) -> bool {
-    match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
-            let cwd = view.disk_root().expect("a disk view has a root");
-            cwd.join("rush.json").is_file()
-        }
-        ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
 
@@ -904,17 +875,14 @@ pub async fn read_candidate_files(
     // common/config/subspaces/<name>/. Added under their repo-relative
     // keys — the pnpm rewriter is basename-generalized, so nested keys are
     // rewritten in place, and the write-back is path-generic.
-    if rush_repo(view) {
-        if out.read(view, unreadable, RUSH_COMMON_LOCK_REL).await {
-            out.rush_lock_keys.push(RUSH_COMMON_LOCK_REL.to_string());
-        }
-        // Sorted by name: deterministic output.
-        if let Ok(entries) = view.list_dir(RUSH_SUBSPACES_DIR).await {
-            for entry in entries.into_iter().filter(|e| e.is_dir) {
-                let key = format!("{RUSH_SUBSPACES_DIR}/{}/pnpm-lock.yaml", entry.name);
-                if out.read(view, unreadable, &key).await {
-                    out.rush_lock_keys.push(key);
-                }
+    // The gate and the lock list are the ones lockfile discovery and the
+    // lock inventory use: sorted by name, real directories only (a
+    // symlinked `common/...` dir could point the write at another
+    // repository), traversal-safe subspace names.
+    if is_rush(*view).await {
+        for key in rush_lock_rels(*view).await {
+            if out.read(view, unreadable, &key).await {
+                out.rush_lock_keys.push(key);
             }
         }
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
@@ -1892,9 +1860,6 @@ fn rush_repo_state_present(view: &ProjectView<'_>, rel: &str) -> bool {
 enum ProbeStep {
     Decided(bool),
     Needles(Vec<String>),
-    /// [`Self::Needles`], searched in every final text but `vlt-lock.json`
-    /// (a dep withheld from the vlt rewrite).
-    NeedlesOutsideVlt(Vec<String>),
 }
 
 /// The substrings whose presence in a final text confirms `dep`'s redirect —
@@ -1927,15 +1892,12 @@ pub fn candidate_presence_needles(dep: &DepOverride) -> Vec<String> {
 /// Rewrite the candidate files for `candidates`, plan the install-policy
 /// auto-configs, and confirm which redirects the final files pin.
 ///
-/// `python_metadata` maps a wheel's artifact URL to its fetched METADATA;
-/// `withheld_from_vlt` are the uuids the vlt preflight kept out of the vlt
-/// rewrite.
+/// `python_metadata` maps a wheel's artifact URL to its fetched METADATA.
 pub async fn rewrite(
     view: &ProjectView<'_>,
     read: CandidateFiles,
     candidates: &[Candidate],
     python_metadata: BTreeMap<String, String>,
-    withheld_from_vlt: &BTreeSet<String>,
     options: RewriteOptions<'_>,
 ) -> Rewritten {
     // The run must never leave wiring that lockfile discovery — what `vex`,
@@ -1947,10 +1909,7 @@ pub async fn rewrite(
     // least one candidate, so this ends. A staged takeover is never dropped
     // (see [`RewriteOptions::takeover_uuids`]): its vendored wiring is
     // reverted in the overlay, and its pin keeps the rewriters' verdict.
-    let exempt: BTreeSet<String> = withheld_from_vlt
-        .union(&options.takeover_uuids)
-        .cloned()
-        .collect();
+    let exempt: BTreeSet<String> = options.takeover_uuids.clone();
     let mut kept: Vec<Candidate> = candidates.to_vec();
     let mut unattributed: Vec<SkippedPatch> = Vec::new();
     loop {
@@ -1959,7 +1918,6 @@ pub async fn rewrite(
             read.clone(),
             &kept,
             python_metadata.clone(),
-            withheld_from_vlt,
             options.clone(),
         )
         .await;
@@ -2049,9 +2007,8 @@ async fn constraints_link_warnings(
 /// bundled or user-patched copy the rewriters knowingly left on the
 /// registry (`bundled_skipped_uuids`, a yarn `npm:` alias entry in
 /// `alias_skipped_entries`, or a bundled copy in vlt's store; all are
-/// warned and kept out of the in-run VEX), or one withheld from
-/// the vlt rewrite while a sibling lock takes it, and a wet vendored→hosted
-/// takeover whose vendored wiring the caller already reverted (both in
+/// warned and kept out of the in-run VEX), and a wet vendored→hosted
+/// takeover whose vendored wiring the caller already reverted (in
 /// `exempt`). Which unreachable copies should block a redirect is the
 /// copy-source policy (audit B16), not decided here.
 ///
@@ -2368,7 +2325,6 @@ async fn rewrite_once(
     read: CandidateFiles,
     candidates: &[Candidate],
     python_metadata: BTreeMap<String, String>,
-    withheld_from_vlt: &BTreeSet<String>,
     options: RewriteOptions<'_>,
 ) -> Rewritten {
     let CandidateFiles {
@@ -2430,15 +2386,13 @@ async fn rewrite_once(
         // Pure CPU over every lock text (the independent rewriter groups
         // run concurrently inside), so it runs on the blocking pool rather
         // than on a runtime worker; `files` comes back for the probe below.
-        let withheld = withheld_from_vlt.clone();
         tokio::task::spawn_blocking(move || {
-            let rewrite = rewrite_registry_redirect_withholding_vlt(
+            let rewrite = rewrite_registry_redirect_with_host(
                 &files,
                 &rewrite_overrides,
                 &python_metadata,
                 pipenv_major,
                 bun_lockb,
-                &withheld,
                 &gradle_unreadable,
                 &yarn_outer,
                 &cargo_outer,
@@ -2451,13 +2405,12 @@ async fn rewrite_once(
             Err(e) => panic!("hosted rewrite task failed: {e}"),
         })
     } else {
-        let rewrite = rewrite_registry_redirect_withholding_vlt(
+        let rewrite = rewrite_registry_redirect_with_host(
             &files,
             &rewrite_overrides,
             &python_metadata,
             pipenv_major,
             bun_lockb,
-            withheld_from_vlt,
             &gradle_unreadable,
             &yarn_outer,
             &cargo_outer,
@@ -2594,7 +2547,7 @@ async fn rewrite_once(
         .filter(|k| !crate::patch::redirect::sbt::is_synthetic_key(k))
         .cloned()
         .collect();
-    let confirmed = confirm(&files, &rewrite, candidates, binary_bun, withheld_from_vlt);
+    let confirmed = confirm(&files, &rewrite, candidates, binary_bun);
     npm_warnings.extend(npm_deno_lock(view, &overrides, &confirmed));
     Rewritten {
         files,
@@ -3286,7 +3239,6 @@ fn confirm(
     rewrite: &RewriteResult,
     candidates: &[Candidate],
     binary_bun: bool,
-    withheld_from_vlt: &BTreeSet<String>,
 ) -> Vec<(String, String)> {
     use crate::patch::redirect::pdm_drives;
     // A `pdm.lock` that is NOT the PyPI install driver (a `uv.lock` or
@@ -3296,10 +3248,6 @@ fn confirm(
     // drive, pypi confirmation keys off `confirmed_pdm_uuids`, so dropping
     // the file is always safe.
     let pdm_inactive = files.contains_key("pdm.lock") && !pdm_drives(files);
-    // Likewise a `vlt-lock.json` the vlt rewrite was withheld from (its
-    // artifact failed the preflight beside another npm-family lock) may
-    // still hold an earlier run's pin: only the sibling lock this run
-    // rewrote can confirm that dep.
     // The yarn berry pin's `package.json` `resolutions` entry is only half of
     // it — the URL-keyed `yarn.lock` entry is what installs — so a hosted URL
     // left in the manifest (an earlier run, a refused rewrite) proves
@@ -3475,46 +3423,23 @@ fn confirm(
                         .any(|(_, text)| needles.iter().any(|n| text.contains(n.as_str()))),
                 );
             }
-            let needles = candidate_presence_needles(&c.dep);
-            if withheld_from_vlt.contains(uuid) {
-                ProbeStep::NeedlesOutsideVlt(needles)
-            } else {
-                ProbeStep::Needles(needles)
-            }
+            ProbeStep::Needles(candidate_presence_needles(&c.dep))
         })
         .collect();
-    let groups = |outside_vlt: bool| -> Vec<&[String]> {
-        steps
-            .iter()
-            .filter_map(|step| match step {
-                ProbeStep::Needles(needles) if !outside_vlt => Some(needles.as_slice()),
-                ProbeStep::NeedlesOutsideVlt(needles) if outside_vlt => Some(needles.as_slice()),
-                _ => None,
-            })
-            .collect()
-    };
-    let mut present = groups_present(&needle_texts, &groups(false)).into_iter();
-    let outside_vlt_groups = groups(true);
-    let mut present_outside_vlt = if outside_vlt_groups.is_empty() {
-        Vec::new()
-    } else {
-        let texts: Vec<&String> = final_texts
-            .iter()
-            .filter(|(name, _)| *name != VLT_LOCK && !is_gradle_file(name))
-            .map(|(_, text)| *text)
-            .collect();
-        groups_present(&texts, &outside_vlt_groups)
-    }
-    .into_iter();
+    let groups: Vec<&[String]> = steps
+        .iter()
+        .filter_map(|step| match step {
+            ProbeStep::Needles(needles) => Some(needles.as_slice()),
+            ProbeStep::Decided(_) => None,
+        })
+        .collect();
+    let mut present = groups_present(&needle_texts, &groups).into_iter();
     candidates
         .iter()
         .zip(&steps)
         .filter(|(_, step)| match step {
             ProbeStep::Decided(keep) => *keep,
             ProbeStep::Needles(_) => present
-                .next()
-                .expect("one presence answer per needle group"),
-            ProbeStep::NeedlesOutsideVlt(_) => present_outside_vlt
                 .next()
                 .expect("one presence answer per needle group"),
         })
@@ -3674,6 +3599,7 @@ pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::npm_family::RUSH_COMMON_LOCK_REL;
     use crate::vendor::lock_inventory::MemoryProject;
 
     /// In memory as on disk, a go.work go cannot parse reaches the
@@ -4138,15 +4064,7 @@ mod tests {
         let unreadable = BTreeSet::from([".cargo/config".to_string()]);
         let read = read_candidate_files(&view, &unreadable, &candidates).await;
         assert_eq!(read.unreadable_reads, vec![".cargo/config"]);
-        let done = rewrite(
-            &view,
-            read,
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
         assert_eq!(
             guard(&view, &done, &candidates).unwrap().code,
             UNREADABLE_REFUSAL
@@ -4216,15 +4134,7 @@ mod tests {
         for view in [ProjectView::Disk(tmp.path()), ProjectView::Memory(&memory)] {
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert_eq!(read.undecodable_reads, vec!["requirements.txt"]);
-            let done = rewrite(
-                &view,
-                read,
-                &candidates,
-                BTreeMap::new(),
-                &BTreeSet::new(),
-                options(),
-            )
-            .await;
+            let done = rewrite(&view, read, &candidates, BTreeMap::new(), options()).await;
             let refusal = guard(&view, &done, &candidates).expect("refused");
             assert_eq!(refusal.code, UNREADABLE_REFUSAL);
             assert!(
@@ -4237,15 +4147,7 @@ mod tests {
             let (cargo_selected, cargo_refs) = cargo_reference("u-2");
             let cargo = build_candidates(&cargo_selected, &cargo_refs, &mut Vec::new());
             let read = read_candidate_files(&view, &BTreeSet::new(), &cargo).await;
-            let done = rewrite(
-                &view,
-                read,
-                &cargo,
-                BTreeMap::new(),
-                &BTreeSet::new(),
-                options(),
-            )
-            .await;
+            let done = rewrite(&view, read, &cargo, BTreeMap::new(), options()).await;
             assert!(guard(&view, &done, &cargo).is_none());
         }
     }
@@ -4334,7 +4236,6 @@ mod tests {
             &RewriteResult::default(),
             std::slice::from_ref(&candidate),
             false,
-            &BTreeSet::new(),
         );
         assert!(none.is_empty(), "{none:?}");
         // The lock pin itself still confirms.
@@ -4350,7 +4251,6 @@ mod tests {
             &RewriteResult::default(),
             std::slice::from_ref(&candidate),
             false,
-            &BTreeSet::new(),
         );
         assert_eq!(confirmed.len(), 1, "{confirmed:?}");
     }
@@ -4395,13 +4295,7 @@ mod tests {
         files.insert("package.json".to_string(), manifest.clone());
         let run = |files: &BTreeMap<String, String>| {
             let rewrite = rewrite_registry_redirect(files, std::slice::from_ref(&candidate.dep));
-            let confirmed = confirm(
-                files,
-                &rewrite,
-                std::slice::from_ref(&candidate),
-                false,
-                &BTreeSet::new(),
-            );
+            let confirmed = confirm(files, &rewrite, std::slice::from_ref(&candidate), false);
             (rewrite, confirmed)
         };
         let (first, confirmed) = run(&files);
@@ -4522,15 +4416,7 @@ mod tests {
         };
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(view, unreadable, &candidates).await;
-        let done = rewrite(
-            view,
-            read.clone(),
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
 
@@ -4791,6 +4677,53 @@ snapshots:
         assert!(detail.contains(PNPM_TRUST_RUSH_MIXED_NOTE), "{detail}");
     }
 
+    /// Hosted pins the Rush locks lockfile discovery reads
+    /// (`rush_lock_rels`): a subspace dir whose name is not a safe path
+    /// segment is skipped, as is every lock under a symlinked
+    /// `common/config/subspaces` (it could point the write at another
+    /// repository).
+    #[tokio::test]
+    async fn rush_locks_are_the_ones_discovery_reads() {
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        rush.insert_text(
+            "common/config/subspaces/ok/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        rush.insert_text(
+            "common/config/subspaces/a:b/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        rush.insert_text(
+            "common/config/subspaces/a\\b/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        let (read, _) = npm_rewrite(&ProjectView::Memory(&rush), &BTreeSet::new()).await;
+        assert_eq!(
+            read.rush_lock_keys,
+            [
+                RUSH_COMMON_LOCK_REL,
+                "common/config/subspaces/ok/pnpm-lock.yaml"
+            ]
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(outside.path().join("x")).unwrap();
+            std::fs::write(outside.path().join("x/pnpm-lock.yaml"), LEFT_PAD_V9_LOCK).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("rush.json"), "{}").unwrap();
+            std::fs::create_dir_all(tmp.path().join("common/config/rush")).unwrap();
+            std::fs::write(tmp.path().join(RUSH_COMMON_LOCK_REL), LEFT_PAD_V9_LOCK).unwrap();
+            std::os::unix::fs::symlink(outside.path(), tmp.path().join("common/config/subspaces"))
+                .unwrap();
+            let (read, _) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert_eq!(read.rush_lock_keys, [RUSH_COMMON_LOCK_REL]);
+        }
+    }
+
     /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
     /// splices nothing on a re-run, yet its `rush install` still needs the
     /// Rush remedy — the re-run re-issues it (and still writes nothing).
@@ -5009,15 +4942,7 @@ snapshots:
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
             assert!(read.files.contains_key("package.json"));
-            let done = rewrite(
-                &view,
-                read,
-                &candidates,
-                BTreeMap::new(),
-                &BTreeSet::new(),
-                options,
-            )
-            .await;
+            let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
             let skipped = done
                 .rewrite
                 .warnings
@@ -5113,15 +5038,7 @@ snapshots:
                 prior_discovery: None,
             };
             let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
-            let done = rewrite(
-                &view,
-                read,
-                &candidates,
-                BTreeMap::new(),
-                &BTreeSet::new(),
-                options,
-            )
-            .await;
+            let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
             assert!(
                 done.rewrite.binary_files.contains_key("bun.lockb"),
                 "{:?}",
@@ -5290,15 +5207,7 @@ snapshots:
         };
         let candidates = vec![gradle_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
-        let done = rewrite(
-            view,
-            read.clone(),
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
 
@@ -5695,15 +5604,7 @@ snapshots:
         let view = ProjectView::Disk(root);
         let candidates = vec![left_pad_candidate()];
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
-        rewrite(
-            &view,
-            read,
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await
+        rewrite(&view, read, &candidates, BTreeMap::new(), options).await
     }
 
     /// Lockfile discovery of `root` as the management commands make it.
@@ -5911,15 +5812,7 @@ snapshots:
         let candidates = vec![candidate];
         let view = ProjectView::Memory(&p);
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
-        let done = rewrite(
-            &view,
-            read,
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
         assert_eq!(done.confirmed.len(), 1, "{:?}", done.rewrite.warnings);
         assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
         let lockless: Vec<&RewriteWarning> = done
@@ -5965,15 +5858,7 @@ snapshots:
         };
         let candidates = vec![gem_candidate()];
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
-        let done = rewrite(
-            view,
-            read.clone(),
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
 
@@ -6168,15 +6053,7 @@ snapshots:
                 let candidates = vec![candidate];
                 let view = ProjectView::Memory(&p);
                 let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
-                let done = rewrite(
-                    &view,
-                    read,
-                    &candidates,
-                    BTreeMap::new(),
-                    &BTreeSet::new(),
-                    options,
-                )
-                .await;
+                let done = rewrite(&view, read, &candidates, BTreeMap::new(), options).await;
                 let ctx = format!("{label} ({eol:?})");
                 assert!(
                     done.unattributed.is_empty(),
@@ -6572,15 +6449,7 @@ snapshots:
         };
         let candidates = is_number_candidates();
         let read = read_candidate_files(view, &BTreeSet::new(), &candidates).await;
-        let done = rewrite(
-            view,
-            read.clone(),
-            &candidates,
-            BTreeMap::new(),
-            &BTreeSet::new(),
-            options,
-        )
-        .await;
+        let done = rewrite(view, read.clone(), &candidates, BTreeMap::new(), options).await;
         (read, done)
     }
 

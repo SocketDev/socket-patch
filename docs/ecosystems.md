@@ -688,10 +688,9 @@ segment, or a URL segment equal to the lock's scalar `registry`) are redirected,
 peer and modifier variant of the `name@version` included. Instances under a named alias,
 a scoped registry or jsr stay untouched (`redirect_vlt_custom_registry_skipped`) and keep
 the run's `--vex` from attesting the package. `options` is never edited: vlt fails `vlt
-ci` on any change there. Before anything is written, each artifact is fetched the way
-vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, raw body hashed); vlt
-fails `EINTEGRITY` on a content-encoded response, so such a dependency is withheld
-(`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci` cannot install.
+ci` on any change there. vlt hashes the raw response body against the pinned sha512, so
+the patch server sends artifacts unencoded (`Cache-Control: no-transform`); the scan
+itself never downloads them.
 
 **Hosted: which lock confirms.** vlt drives a project when its install state
 (`node_modules/.vlt-lock.json` or `node_modules/.vlt/`) is present or no other npm-family
@@ -881,7 +880,12 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
-  *mismatch* fails.
+  *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
+  (and drops any line an earlier run wrote for that suffixed version) and warns
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
+  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
+  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
+  Maven 3.9.4 or later.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or

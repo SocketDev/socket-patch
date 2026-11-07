@@ -69,6 +69,7 @@ use crate::formats::gem::hosted::{
     refresh_merged_gem_lock_remote,
 };
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
+use crate::formats::maven::trusted_checksums::{self, CONFIG_ARGS as MVN_CONFIG_ARGS};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -109,7 +110,6 @@ mod state;
 pub mod upstream;
 pub mod vlt;
 pub mod vlt_heal;
-pub mod vlt_preflight;
 pub mod yarnrc;
 /// Hosted-artifact leaf ownership rule, shared with `vex`'s bun lockfile
 /// discovery (which recovers a URL tuple's version from that leaf).
@@ -597,13 +597,12 @@ pub fn rewrite_registry_redirect_with_pipenv_version(
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
 ) -> RewriteResult {
-    rewrite_registry_redirect_withholding_vlt(
+    rewrite_registry_redirect_with_host(
         files,
         overrides,
         artifact_metadata,
         pipenv_major,
         bun_lockb_present,
-        &std::collections::BTreeSet::new(),
         &std::collections::BTreeSet::new(),
         &yarnrc::OuterYarnMirror::default(),
         &CratesIoSource::Registry,
@@ -670,20 +669,17 @@ fn withhold_pypi_platform_wheels<'a>(
     withhold(overrides, &refused)
 }
 
-/// [`rewrite_registry_redirect_with_pipenv_version`] with the patch uuids
-/// in `vlt_withheld` kept out of the vlt rewrite only: their artifact
-/// failed vlt's preflight while another npm-family lock may be the one the
-/// project installs from. `gradle_unreadable` are the Gradle build files
+/// [`rewrite_registry_redirect_with_pipenv_version`] with the inputs only
+/// the host can resolve. `gradle_unreadable` are the Gradle build files
 /// the host found but could not read as text: the Gradle planner refuses
 /// the build rather than take them for absent.
 #[allow(clippy::too_many_arguments)]
-pub fn rewrite_registry_redirect_withholding_vlt(
+pub fn rewrite_registry_redirect_with_host(
     files: &BTreeMap<String, String>,
     overrides: &[DepOverride],
     artifact_metadata: &BTreeMap<String, String>,
     pipenv_major: Option<u32>,
     bun_lockb_present: bool,
-    vlt_withheld: &std::collections::BTreeSet<String>,
     gradle_unreadable: &std::collections::BTreeSet<String>,
     yarn_outer: &yarnrc::OuterYarnMirror,
     cargo_outer: &CratesIoSource,
@@ -704,11 +700,9 @@ pub fn rewrite_registry_redirect_withholding_vlt(
     // rewriters too (see `pipenv::rewrite`).
     pipenv::rewrite(files, &overrides, pipenv_major, &mut result);
     let overrides = withhold(&overrides, &result.refused_pipenv_uuids);
-    let vlt_overrides = withhold(&overrides, vlt_withheld);
     let groups = rewriter_groups(
         files,
         &overrides,
-        &vlt_overrides,
         bun_lockb_present,
         artifact_metadata,
         gradle_unreadable,
@@ -730,13 +724,11 @@ type RewriterGroup<'a> = Box<dyn Fn(&mut RewriteResult) + Send + Sync + 'a>;
 /// rewriter's confirmations, `rewrite_uv_lock` the python lock sets and a
 /// metadata file an earlier python rewriter may have written) or the
 /// withholding prefix's. Every group sees the full withheld override slice,
-/// exactly as the serial chain did; the vlt rewriter sees `vlt_overrides`,
-/// that slice minus the vlt-withheld uuids.
+/// exactly as the serial chain did.
 #[allow(clippy::too_many_arguments)]
 fn rewriter_groups<'a>(
     files: &'a BTreeMap<String, String>,
     overrides: &'a [DepOverride],
-    vlt_overrides: &'a [DepOverride],
     bun_lockb_present: bool,
     artifact_metadata: &'a BTreeMap<String, String>,
     gradle_unreadable: &'a std::collections::BTreeSet<String>,
@@ -751,9 +743,7 @@ fn rewriter_groups<'a>(
             rewrite_yarn_berry_with_manifests(files, overrides, artifact_metadata, result);
             rewrite_bun_lock(files, overrides, result);
         }),
-        Box::new(move |result| {
-            vlt::rewrite_vlt_lock(files, vlt_overrides, bun_lockb_present, result)
-        }),
+        Box::new(move |result| vlt::rewrite_vlt_lock(files, overrides, bun_lockb_present, result)),
         Box::new(move |result| {
             requirements::rewrite(files, overrides, result);
             rewrite_hatch(files, overrides, result);
@@ -8476,77 +8466,12 @@ pub(crate) fn no_maven_or_gradle(files: &BTreeMap<String, String>) -> bool {
     !files.contains_key("pom.xml") && !gradle::gradle_build_present(files)
 }
 
-/// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
-/// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
-/// line. `failIfMissing=false` so a dependency without a committed checksum
-/// still resolves (only a MISMATCH fails); origin-unaware so one checksum
-/// matches the artifact from any repository.
-const MVN_CONFIG_ARGS: &[&str] = &[
-    TRUSTED_CHECKSUMS_ON,
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
-    "-Daether.trustedChecksumsSource.summaryFile=true",
-    "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
-    "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
-];
-
-/// The resolver switch (the first [`MVN_CONFIG_ARGS`] line) that makes the
-/// checksums file an enforced pin; without it the file is inert.
-pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
-    "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
-
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 /// The Maven Wrapper's settings file. Read only, never edited: its
 /// `distributionUrl` names the Maven release the project builds with, so the
 /// rewriter can tell when the Trusted Checksums files it writes are inert.
 pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.properties";
-
-/// The first Maven release that enforces the `.mvn/*` Trusted Checksums
-/// files (#258). 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`
-/// in `maven.config`, so the summary file is never found; 3.9.2 / 3.9.3
-/// ignore `checksumAlgorithms=SHA-256` and check SHA-1 only. Older lines have
-/// no Trusted Checksums post-processor at all.
-const TRUSTED_CHECKSUMS_MIN_MAVEN: [u32; 3] = [3, 9, 4];
-
-/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
-/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
-/// for a missing key or any other distribution (e.g. mvnd), which then goes
-/// unwarned.
-fn maven_wrapper_version(props: &str) -> Option<String> {
-    props.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('!') {
-            return None;
-        }
-        let rest = line.strip_prefix("distributionUrl")?;
-        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
-            return None;
-        }
-        let value = rest
-            .trim_start()
-            .strip_prefix(['=', ':'])
-            .unwrap_or(rest)
-            .trim();
-        let file = value.rsplit('/').next()?;
-        let version = file
-            .strip_prefix("apache-maven-")?
-            .strip_suffix(".zip")
-            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
-            .strip_suffix("-bin")?;
-        (!version.is_empty()).then(|| version.to_string())
-    })
-}
-
-/// Whether Maven `version` enforces the Trusted Checksums files (≥ 3.9.4;
-/// pre-release suffixes such as `-rc-6` compare as their release).
-fn maven_enforces_trusted_checksums(version: &str) -> bool {
-    let mut parts = [0u32; 3];
-    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
-        *slot = part.parse().unwrap_or(0);
-    }
-    parts >= TRUSTED_CHECKSUMS_MIN_MAVEN
-}
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -8744,8 +8669,35 @@ fn rewrite_maven_pom(
             .clone()
             .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
-        let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
-        let jar_sha256 = dep.integrity.sha256.clone();
+        // The jar and served-pom sha256 a Trusted Checksums pin needs, as
+        // the bare lowercase hex Maven compares; a grant hash of any other
+        // shape (an SRI base64 digest, a truncated hex) writes no pin.
+        let checksum_hashes = dep
+            .integrity
+            .sha256
+            .as_deref()
+            .zip(ov.identifiers.maven_pom_sha256.as_deref())
+            .map(|(jar, pom)| (bare_sha256_hex(jar), bare_sha256_hex(pom)));
+        let bad_checksum_hashes = checksum_hashes
+            .as_ref()
+            .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
+        let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
+        if let Some(suffixed) = suffixed_version.as_deref().filter(|_| bad_checksum_hashes) {
+            // No pin is written for the suffixed version, so none may stay
+            // either: an earlier release wrote such a grant's hash mangled
+            // (lowercased base64), and Maven fails the build on a line
+            // whose hash does not match. Dropped whether or not the version
+            // pin lands this run (a re-run with the pin present too).
+            for ext in ["jar", "pom"] {
+                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    suffixed,
+                    None,
+                    ext,
+                ));
+            }
+        }
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
@@ -9099,7 +9051,7 @@ fn rewrite_maven_pom(
             });
         }
 
-        if jar_sha256.is_some() && pom_sha256.is_some() {
+        if checksum_hashes.is_some() {
             pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
                 &group_id,
                 &artifact_id,
@@ -9193,7 +9145,17 @@ fn rewrite_maven_pom(
         // Trusted Checksums: only when BOTH the jar sha256 and the served pom
         // sha256 are known. Two entries per dep — the jar and the pom — under
         // the SUFFIXED version's local-repo path.
-        if let (Some(jar), Some(pom_hash)) = (&jar_sha256, &pom_sha256) {
+        if bad_checksum_hashes {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_trusted_checksums_invalid_hash".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id}: the grant's sha256 is not 64 hex digits; \
+                     no Trusted Checksums pin written to {MVN_CHECKSUMS} (the -socket \
+                     version suffix still pins the patched artifact)"
+                ),
+            });
+        }
+        if let Some((jar, pom_hash)) = &checksum_hashes {
             let (merged, conflicts) =
                 merge_mvn_config(&mvn_config, &format!("{group_id}:{artifact_id}"));
             for conflict in conflicts {
@@ -9227,7 +9189,7 @@ fn rewrite_maven_pom(
                     None,
                     "jar",
                 ),
-                bare_sha256_hex(jar),
+                jar.clone(),
             ));
             checksum_entries.push((
                 crate::vendor::jvm::layout::artifact_path(
@@ -9237,7 +9199,7 @@ fn rewrite_maven_pom(
                     None,
                     "pom",
                 ),
-                bare_sha256_hex(pom_hash),
+                pom_hash.clone(),
             ));
         }
     }
@@ -9250,32 +9212,21 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    // LF-normalized, so the drop check and the filter below split lines the
-    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
-    let existing_checksums = files
-        .get(MVN_CHECKSUMS)
-        .map(|text| text.replace("\r\n", "\n"))
-        .unwrap_or_default();
-    let names_dropped_path = |line: &str| {
-        line.split_once("  ")
-            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
-    };
-    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
-    if !checksum_entries.is_empty() || drops_checksums {
-        let action = if files.contains_key(MVN_CHECKSUMS) {
+    // Every line this run does not own (another path's entry in any
+    // spelling, a comment, an unparseable line) keeps its bytes and place.
+    let existing_checksums = files.get(MVN_CHECKSUMS).map(String::as_str);
+    let merged_checksums = trusted_checksums::edit(
+        existing_checksums.unwrap_or_default(),
+        |path| checksum_drops.iter().any(|d| d == path),
+        &checksum_entries,
+    );
+    if merged_checksums != existing_checksums.unwrap_or_default() {
+        let action = if existing_checksums.is_some() {
             "rewritten"
         } else {
             "added"
         };
-        let kept: String = existing_checksums
-            .split('\n')
-            .filter(|l| !names_dropped_path(l))
-            .collect::<Vec<_>>()
-            .join("\n");
-        result.files.insert(
-            MVN_CHECKSUMS.into(),
-            merge_checksums(&kept, &checksum_entries),
-        );
+        result.files.insert(MVN_CHECKSUMS.into(), merged_checksums);
         result.edits.push(FileEdit {
             path: MVN_CHECKSUMS.into(),
             kind: "redirect_maven_trusted_checksums".into(),
@@ -9293,17 +9244,15 @@ fn rewrite_maven_pom(
     // re-scan of an already-pinned project warns as well.
     let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
     let pin_in_place = final_text(MVN_CONFIG)
-        .is_some_and(|c| c.lines().any(|l| l.trim() == TRUSTED_CHECKSUMS_ON))
+        .is_some_and(|c| trusted_checksums::config_enforces(c))
         && final_text(MVN_CHECKSUMS).is_some_and(|c| {
-            pinned_jar_paths.iter().any(|p| {
-                c.lines()
-                    .any(|l| l.split_whitespace().nth(1) == Some(p.as_str()))
-            })
+            let pinned = trusted_checksums::pinned(c);
+            pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
         });
     if let Some(version) = files
         .get(MVN_WRAPPER_PROPERTIES)
-        .and_then(|props| maven_wrapper_version(props))
-        .filter(|v| pin_in_place && !maven_enforces_trusted_checksums(v))
+        .and_then(|props| trusted_checksums::wrapper_maven_version(props))
+        .filter(|v| pin_in_place && !trusted_checksums::maven_enforces(v))
     {
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_trusted_checksums_unenforced".into(),
@@ -9362,37 +9311,28 @@ pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, us
 }
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
-/// line). Dedupe by the `-Dkey=` prefix: an arg whose key is already present is
-/// left untouched (existing value wins). Returns the merged text + any conflict
-/// messages (a pre-existing SAME key with a DIFFERENT value). Twin of the TS
-/// `mergeMvnConfig`.
+/// line). A setting is present when Maven 3.9+ reads it from the file
+/// ([`crate::formats::maven::maven_config_line_properties`], the reader
+/// discovery's [`trusted_checksums::config_enforces`] uses: `-Dk=v`,
+/// `--define k=v`, indented or quoted lines, the last definition winning).
+/// A present setting is left untouched (existing value wins); a different
+/// value is reported as a conflict. Returns the merged text + those
+/// conflict messages. Twin of the TS `mergeMvnConfig`.
 fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
-    let lines: Vec<&str> = if existing.is_empty() {
-        vec![]
-    } else {
-        existing.split('\n').collect()
-    };
+    let present = crate::formats::maven::maven_config_line_properties(existing);
     let mut conflicts = vec![];
-    let key_of =
-        |line: &str| -> Option<String> { line.find('=').map(|eq| line[..=eq].to_string()) };
-    let mut present: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for line in &lines {
-        if let Some(key) = key_of(line) {
-            present.insert(key, (*line).to_string());
-        }
-    }
     let mut appended: Vec<&str> = vec![];
     for arg in MVN_CONFIG_ARGS {
-        let key = key_of(arg).expect("every MVN_CONFIG_ARGS entry contains '='");
-        match present.get(&key) {
-            None => {
-                appended.push(arg);
-                present.insert(key, (*arg).to_string());
-            }
-            Some(existing_line) if existing_line.trim() != *arg => {
+        let (key, value) = arg
+            .strip_prefix("-D")
+            .and_then(|def| def.split_once('='))
+            .expect("every MVN_CONFIG_ARGS entry is -Dkey=value");
+        match present.get(key) {
+            None => appended.push(arg),
+            Some(existing_value) if existing_value != value => {
                 conflicts.push(format!(
-                    "{coordinate}: {MVN_CONFIG} already sets {key} to a different value ({}); leaving it as-is",
-                    existing_line.trim()
+                    "{coordinate}: {MVN_CONFIG} already sets -D{key}= to a different value \
+                     (-D{key}={existing_value}); leaving it as-is"
                 ));
             }
             Some(_) => {}
@@ -9409,35 +9349,6 @@ fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
         format!("{existing}\n")
     };
     (format!("{base}{}\n", appended.join("\n")), conflicts)
-}
-
-/// Merge trusted-checksum entries into `.mvn/checksums/checksums.sha256` (GNU
-/// coreutils format: `<sha256-hex><TWO spaces><local-repo-relative path>`).
-/// Parse existing entries, replace/add by path, re-sort by path, trailing
-/// newline. A malformed line (no double-space separator) is dropped. Twin of
-/// the TS `mergeChecksums`.
-fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
-    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
-    if !existing.is_empty() {
-        for line in existing.split('\n') {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(sep) = line.find("  ") {
-                by_path.insert(line[sep + 2..].to_string(), line[..sep].to_string());
-            }
-        }
-    }
-    for (path, sha256) in entries {
-        by_path.insert(path.clone(), sha256.clone());
-    }
-    // BTreeMap iterates keys in sorted (byte) order — matching JS's default
-    // sort on the ASCII paths.
-    let body: Vec<String> = by_path
-        .iter()
-        .map(|(path, sha)| format!("{sha}  {path}"))
-        .collect();
-    format!("{}\n", body.join("\n"))
 }
 
 // ── golang (go.mod fork-replace + go.sum pin) ────────────────────────────────
@@ -10959,33 +10870,38 @@ mod tests {
     #[test]
     fn maven_wrapper_version_parses_distribution_url() {
         assert_eq!(
-            maven_wrapper_version(&maven_wrapper("3.9.3")).as_deref(),
+            trusted_checksums::wrapper_maven_version(&maven_wrapper("3.9.3")).as_deref(),
             Some("3.9.3")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
             )
             .as_deref(),
             Some("3.9.2")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
             )
             .as_deref(),
             Some("4.0.0-rc-6")
         );
-        assert_eq!(maven_wrapper_version("wrapperVersion=3.3.2\n"), None);
         assert_eq!(
-            maven_wrapper_version("distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"),
+            trusted_checksums::wrapper_maven_version("wrapperVersion=3.3.2\n"),
             None
         );
-        assert!(!maven_enforces_trusted_checksums("3.9.3"));
-        assert!(maven_enforces_trusted_checksums("3.9.4"));
-        assert!(maven_enforces_trusted_checksums("3.10.0-rc-1"));
-        assert!(maven_enforces_trusted_checksums("4.0.0"));
-        assert!(!maven_enforces_trusted_checksums("3.8.9"));
+        assert_eq!(
+            trusted_checksums::wrapper_maven_version(
+                "distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"
+            ),
+            None
+        );
+        assert!(!trusted_checksums::maven_enforces("3.9.3"));
+        assert!(trusted_checksums::maven_enforces("3.9.4"));
+        assert!(trusted_checksums::maven_enforces("3.10.0-rc-1"));
+        assert!(trusted_checksums::maven_enforces("4.0.0"));
+        assert!(!trusted_checksums::maven_enforces("3.8.9"));
     }
 
     #[test]
@@ -11007,6 +10923,38 @@ mod tests {
         );
         assert!(!config.contains("originAware=false"), "ours NOT written");
         assert!(warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"));
+    }
+
+    /// The writer sees a user setting in every spelling Maven 3.9+ reads
+    /// (the reader discovery judges enforcement with): an indented line,
+    /// `--define k=v`, `-D k=v`, a quoted argument. Appending ours after
+    /// one would silently override the user's value (the later line wins).
+    #[test]
+    fn maven_config_conflict_in_any_spelling_keeps_the_user_value() {
+        for user in [
+            "  -Daether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define=aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "\"-Daether.trustedChecksumsSource.summaryFile.originAware=true\"",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>1.7.36</version>", ""),
+            );
+            files.insert(".mvn/maven.config".to_string(), format!("{user}\n"));
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let config = r.files.get(".mvn/maven.config").expect("config");
+            assert!(!config.contains("originAware=false"), "{user}: {config}");
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"),
+                "{user}"
+            );
+            assert!(
+                !trusted_checksums::config_enforces(config),
+                "{user}: the user's originAware=true still governs"
+            );
+        }
     }
 
     /// Legacy same-GAV fallback (no suffixed version): only the repository is
@@ -13613,13 +13561,12 @@ mod tests {
         )
         .is_err());
         // The full chain drives it too.
-        let mut r = rewrite_registry_redirect_withholding_vlt(
+        let mut r = rewrite_registry_redirect_with_host(
             &BTreeMap::from([("yarn.lock".to_string(), classic_lock_two_entries())]),
             std::slice::from_ref(&ovr),
             &BTreeMap::new(),
             None,
             false,
-            &std::collections::BTreeSet::new(),
             &std::collections::BTreeSet::new(),
             &refusing[3],
             &CratesIoSource::Registry,
@@ -30365,8 +30312,124 @@ mod owned_pin_generation_matrix {
         let (repinned, _) = plan(&wired, &maven(B, tok));
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        // The file stays CRLF: nothing is normalized to LF.
+        assert!(
+            checksums
+                .split_inclusive('\n')
+                .all(|line| line.ends_with("\r\n")),
+            "{checksums:?}"
+        );
         let (_, again) = plan(&repinned, &maven(B, tok));
         assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A user's checksums lines survive the pin and the re-pin byte for
+    /// byte, in any spelling `sha256sum`-style tools write (one space, a
+    /// `*` binary marker, a tab) and as comments or stray text. The hosted
+    /// merge used to re-parse the file on two spaces and silently drop
+    /// every line it could not split that way.
+    #[test]
+    fn maven_checksums_merge_keeps_every_user_line() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let h = "0123456789abcdef".repeat(4);
+        let user = [
+            "# team pins".to_string(),
+            format!("{h} com/acme/single/1.0/single-1.0.jar"),
+            format!("{h} *com/acme/binary/1.0/binary-1.0.jar"),
+            format!("{h}\tcom/acme/tab/1.0/tab-1.0.jar"),
+            format!("{h}  com/acme/canonical/1.0/canonical-1.0.jar"),
+            "not a checksum line".to_string(),
+        ];
+        let mut files = pom_project();
+        files.insert(MVN_CHECKSUMS.into(), format!("{}\n", user.join("\n")));
+        let (wired, result) = plan(&files, &maven(A, tok));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        for (stage, tree) in [("pin", &wired), ("re-pin", &repinned)] {
+            let checksums = &tree[MVN_CHECKSUMS];
+            let lines: Vec<&str> = checksums.lines().collect();
+            for line in &user {
+                assert!(
+                    lines.contains(&line.as_str()),
+                    "{stage} lost {line:?}:\n{checksums}"
+                );
+            }
+            assert_eq!(lines.len(), user.len() + 2, "{stage}:\n{checksums}");
+        }
+        assert!(repinned[MVN_CHECKSUMS].contains("3.12.0-socket.bbbbbbbb"));
+        assert!(!repinned[MVN_CHECKSUMS].contains("socket.aaaaaaaa"));
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A superseded generation's checksum line goes on re-pin whatever its
+    /// hash holds (a past writer's SRI or truncated digest included), and a
+    /// grant whose hash is not 64 hex digits writes no checksum line at all.
+    #[test]
+    fn maven_checksums_owned_lines_go_whatever_their_hash() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (clean, _) = plan(&pom_project(), &maven(A, tok));
+        for stale in ["sha256-q83vEjRWeJA=", "a".repeat(63).as_str()] {
+            let mut wired = clean.clone();
+            let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), stale);
+            wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+            let (repinned, _) = plan(&wired, &maven(B, tok));
+            let checksums = &repinned[MVN_CHECKSUMS];
+            assert!(
+                !checksums.contains("socket.aaaaaaaa"),
+                "{stale}: {checksums}"
+            );
+            assert_eq!(checksums.lines().count(), 2, "{stale}: {checksums}");
+        }
+
+        let mut bad = maven(A, tok);
+        bad.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let (wired, result) = plan(&pom_project(), &bad);
+        assert!(
+            wired["pom.xml"].contains("3.12.0-socket.aaaaaaaa"),
+            "the version pin still lands"
+        );
+        assert!(
+            !wired.contains_key(MVN_CHECKSUMS),
+            "{:?}",
+            wired.get(MVN_CHECKSUMS)
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_trusted_checksums_invalid_hash"),
+            "{:?}",
+            result.warnings
+        );
+
+        // An earlier release wrote such a grant's hash mangled for the same
+        // suffixed version: a re-run (the version pin already present) and
+        // a fresh pin both drop it, since Maven fails on a mismatched line.
+        let mut wired = clean.clone();
+        let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja=");
+        wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+        let (rerun, _) = plan(&wired, &bad);
+        assert!(
+            !rerun
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            rerun.get(MVN_CHECKSUMS)
+        );
+        let mut fresh = pom_project();
+        fresh.insert(
+            MVN_CHECKSUMS.to_string(),
+            clean[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja="),
+        );
+        let (fresh, _) = plan(&fresh, &bad);
+        assert!(
+            !fresh
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            fresh.get(MVN_CHECKSUMS)
+        );
     }
 
     /// #266: a rotated grant token (same uuid, new token path segment)
