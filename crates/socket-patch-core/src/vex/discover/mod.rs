@@ -627,6 +627,13 @@ pub enum UnattestedKind {
     /// declaration from its own source as a separate package, so the crate
     /// declaring it builds an unpatched copy, possibly of this version.
     CargoUnpinnedDeclaration,
+    /// A vendored Cargo copy that a `[patch.<source>]` entry wires (in v5,
+    /// the root's `[patch.crates-io]`) beside a copy of the crate from a
+    /// source that entry does not redirect: a declaration (the root's or a
+    /// workspace member's) from another registry or git whose requirement
+    /// accepts the patched version, or a same-version `Cargo.lock` entry
+    /// from any source. Cargo builds that copy unpatched.
+    CargoPatchBypassed,
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

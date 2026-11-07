@@ -236,6 +236,10 @@ const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// the crate that names no Socket registry, which cargo resolves as a
 /// separate, unpatched package (`vex::Unattested`).
 const NOTE_CARGO_UNPINNED_DECLARATION: &str = "vex_cargo_unpinned_declaration";
+/// Omission tag and note: a vendored Cargo copy beside a copy of the crate
+/// from a source its `[patch]` entry does not redirect (another registry,
+/// git), which cargo builds unpatched (`vex::Unattested`).
+const NOTE_CARGO_PATCH_BYPASSED: &str = "vex_cargo_patch_bypassed";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -275,6 +279,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         UnattestedKind::CargoUnpinnedDeclaration => (
             NOTE_CARGO_UNPINNED_DECLARATION,
             "not attested while that declaration stands",
+        ),
+        UnattestedKind::CargoPatchBypassed => (
+            NOTE_CARGO_PATCH_BYPASSED,
+            "not attested while that copy can build beside the vendored one; the vendored \
+             wiring itself is intact (the warning above says how to clear it)",
         ),
     }
 }
@@ -1816,6 +1825,55 @@ mod tests {
                         "re-run `socket-patch scan` to pin it too; not attested while that \
                          declaration stands"
                     )),
+            "{:?}",
+            gated.notes
+        );
+    }
+
+    /// A vendored Cargo copy beside a copy of the crate its `[patch]`
+    /// entry does not redirect is omitted as `vex_cargo_patch_bypassed`,
+    /// the note naming that copy and the remedy.
+    #[tokio::test]
+    async fn a_vendored_cargo_copy_beside_a_bypassing_source_is_gated() {
+        const PURL: &str = "pkg:cargo/serde@1.0.1";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(PURL.into(), record(U1));
+        let vref = vendor_ref(&format!(".socket/vendor/cargo/{U1}/serde-1.0.1")).unwrap();
+        let mut found = discovery(vec![PatchedRef::vendored(
+            PURL.into(),
+            &vref,
+            "Cargo.toml",
+            None,
+        )]);
+        found.unattested.push(socket_patch_core::vex::Unattested {
+            purl: PURL.into(),
+            uuid: U1.into(),
+            file: "crates/a/Cargo.toml".into(),
+            detail: "crates/a/Cargo.toml declares serde \"1\" from registry `my-corp`".into(),
+            kind: UnattestedKind::CargoPatchBypassed,
+        });
+        let gated = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest,
+                vendor: VendorState::new(),
+                redirect: None,
+                discovery: found,
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(gated.gated, vec![failed(PURL, NOTE_CARGO_PATCH_BYPASSED)]);
+        assert!(
+            gated
+                .notes
+                .iter()
+                .any(|n| n.code == NOTE_CARGO_PATCH_BYPASSED
+                    && n.detail.contains("from registry `my-corp`")
+                    && n.detail.contains("says how to clear it")),
             "{:?}",
             gated.notes
         );
