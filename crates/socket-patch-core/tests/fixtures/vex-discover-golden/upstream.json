@@ -1,4 +1,154 @@
 {
+  "upstream/uv-0.2/0.1.45": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "upstream/uv-0.2/0.2.15": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "upstream/uv-0.2/0.2.16": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "upstream/uv-0.2/0.2.18": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "upstream/uv-0.2/0.2.34": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
+  "upstream/uv-0.2/0.2.5": {
+    "refs": [],
+    "diagnostics": [],
+    "recognized": [],
+    "unlocked_pins": [],
+    "elsewhere": [
+      {
+        "purl": "pkg:pypi/isodate@0.6.1",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/python-dateutil@2.9.0.post0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/six@1.17.0",
+        "file": "uv.lock"
+      },
+      {
+        "purl": "pkg:pypi/urllib3@1.26.18",
+        "file": "uv.lock"
+      }
+    ],
+    "live_claims": []
+  },
   "upstream/uv-explicit-extra": {
     "refs": [],
     "diagnostics": [],
