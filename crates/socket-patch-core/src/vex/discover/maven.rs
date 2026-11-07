@@ -120,8 +120,9 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_executable_classifier, is_maven_coordinate, is_maven_version_text, maven_config_properties,
-    may_name, may_shadow, parse_pom_with, split_socket_version, Pom, PomDep, PomRepo,
+    is_executable_variant, is_main_jar, is_maven_coordinate, is_maven_version_text, is_variant,
+    maven_config_properties, may_name, may_shadow, parse_pom_with, split_socket_version,
+    variant_label, Pom, PomDep, PomRepo,
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
 use crate::vendor::jvm::layout;
@@ -707,23 +708,28 @@ fn build_version(d: &PomDep) -> Option<&str> {
     d.build_version.as_deref()
 }
 
-/// Every GA with a versioned, classifier-less declaration Maven always
-/// reads: the candidates for a pin.
+/// Every GA with a versioned declaration that is not a variant
+/// ([`is_variant`]) Maven always reads: the candidates for a pin.
 fn live_gas(deps: &[PomDep]) -> BTreeSet<(String, String)> {
     deps.iter()
-        .filter(|d| !d.in_profile && d.classifier.is_none() && d.version.is_some())
+        .filter(|d| {
+            !d.in_profile
+                && !is_variant(d.type_text.as_deref(), d.classifier.as_deref())
+                && d.version.is_some()
+        })
         .map(|d| (d.group.clone(), d.artifact.clone()))
         .collect()
 }
 
-/// The classifier-less declarations `in_scope` keeps that may be
-/// `group:artifact`'s main jar: its own, plus every one whose groupId or
-/// artifactId is a property this pom does not define and may be this GA
-/// (#683, [`may_shadow`](crate::formats::maven::may_shadow)) — its version
-/// then takes part in Maven's precedence, unseen under the literal key. A
-/// classifier variant (`sources`, `tests`, a native build) is its own
-/// artifact, managed apart from the main jar: it neither pins nor shadows
-/// it ([`classifier_declarations`]).
+/// The declarations `in_scope` keeps that may be `group:artifact`'s main
+/// jar: its own, plus every one whose groupId or artifactId is a property
+/// this pom does not define and may be this GA (#683,
+/// [`may_shadow`](crate::formats::maven::may_shadow)) — its version then
+/// takes part in Maven's precedence, unseen under the literal key. A
+/// variant ([`is_variant`]: a classifier such as `sources`, `tests` or a
+/// native build, or a type such as `test-jar`) is its own artifact,
+/// managed apart from the main jar: it neither pins nor shadows it
+/// ([`classifier_declarations`]).
 fn main_jar_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -732,7 +738,7 @@ fn main_jar_declarations<'a>(
 ) -> impl Iterator<Item = &'a PomDep> + 'a {
     deps.iter().filter(move |d| {
         in_scope(d)
-            && d.classifier.is_none()
+            && !is_variant(d.type_text.as_deref(), d.classifier.as_deref())
             && ((d.group == group && d.artifact == artifact)
                 || may_shadow(
                     (&d.group, &d.artifact),
@@ -743,10 +749,12 @@ fn main_jar_declarations<'a>(
     })
 }
 
-/// The executable classifier copies of `group:artifact` (tests, a native
-/// or JDK-specific build; not `sources` / `javadoc`) that `in_scope` keeps,
-/// with their classifier. A groupId or artifactId that is a property this
-/// pom does not define may be this GA ([`may_name`]), so it counts too.
+/// The executable variants of `group:artifact` ([`is_variant`] and
+/// [`is_executable_variant`]: tests, `test-jar`, a native or JDK-specific
+/// build; not `sources` / `javadoc`) that `in_scope` keeps, with the label
+/// they are reported by ([`variant_label`]). A groupId or artifactId that
+/// is a property this pom does not define may be this GA ([`may_name`]),
+/// so it counts too.
 fn classifier_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -758,8 +766,8 @@ fn classifier_declarations<'a>(
             in_scope(d) && may_name(&d.group, group) && may_name(&d.artifact, artifact)
         })
         .filter_map(|d| {
-            let classifier = d.classifier.as_deref()?;
-            is_executable_classifier(classifier).then_some((d, classifier))
+            let (t, c) = (d.type_text.as_deref(), d.classifier.as_deref());
+            (is_variant(t, c) && is_executable_variant(t, c)).then(|| (d, variant_label(t, c)))
         })
 }
 
@@ -840,15 +848,16 @@ fn bypasses(
     found
 }
 
-/// Why the first executable classifier copy of `group:artifact` — live or
-/// inside `<profiles>` — runs code the wiring does not serve, if one does.
-/// A classifier copy is its own coordinate: the classifier-less pin does
-/// not retarget it. Its version is its own `<version>`, else a
-/// `<dependencyManagement>` entry with the same classifier (Maven keys
-/// management by classifier); a profile's entry overrides the live one
-/// while that profile is active, and with no live entry the version comes
-/// from outside this pom (fail closed). A hosted copy is fine only at the
-/// pin itself ([`Wiring::Hosted`]); a vendored one never is.
+/// Why the first executable variant of `group:artifact`
+/// ([`classifier_declarations`]) — live or inside `<profiles>` — runs code
+/// the wiring does not serve, if one does. A variant is its own
+/// coordinate: the main-jar pin does not retarget it. Its version is its
+/// own `<version>`, else a `<dependencyManagement>` entry with the same
+/// classifier and type (Maven keys management by both); a profile's entry
+/// overrides the live one while that profile is active, and with no live
+/// entry the version comes from outside this pom (fail closed). A hosted
+/// copy is fine only at the pin itself ([`Wiring::Hosted`]); a vendored one
+/// never is.
 fn unpatched_classifier_copy(
     deps: &[PomDep],
     group: &str,
@@ -863,11 +872,18 @@ fn unpatched_classifier_copy(
     // Each entry carries whether it names `group:artifact` literally: one
     // reached only through an undefined property ([`may_name`]) may manage
     // another GA, so it never stands in for this copy's version alone.
-    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
+    let ty = |d: &PomDep| -> String {
+        d.type_text
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or("jar")
+            .to_string()
+    };
+    let managed = |copy: &PomDep, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
         classifier_declarations(deps, group, artifact, move |d| {
             d.managed && d.in_profile == in_profile
         })
-        .filter(|(_, c)| *c == classifier)
+        .filter(|(m, _)| m.classifier == copy.classifier && ty(m) == ty(copy))
         .map(|(d, _)| {
             let literal = d.group == group && d.artifact == artifact;
             (build_version(d), in_profile, literal)
@@ -878,7 +894,7 @@ fn unpatched_classifier_copy(
         let resolved: Vec<(Option<&str>, bool)> = match build_version(d) {
             Some(version) => vec![(Some(version), false)],
             None => {
-                let mut live = managed(classifier, false);
+                let mut live = managed(d, false);
                 // Without a live entry that surely manages this GA, the
                 // version may come from outside this pom: fail closed.
                 if !live.iter().any(|(_, _, literal)| *literal) {
@@ -886,11 +902,7 @@ fn unpatched_classifier_copy(
                 }
                 // A profile entry with no `<version>` (scope or exclusions
                 // only) overrides no version.
-                live.extend(
-                    managed(classifier, true)
-                        .into_iter()
-                        .filter(|(v, _, _)| v.is_some()),
-                );
+                live.extend(managed(d, true).into_iter().filter(|(v, _, _)| v.is_some()));
                 live.into_iter().map(|(v, p, _)| (v, p)).collect()
             }
         };
@@ -919,9 +931,6 @@ fn unpatched_classifier_copy(
     })
 }
 
-/// `<type>`s whose artifact carries no code onto a classpath.
-const NON_CODE_TYPES: &[&str] = &["pom", "java-source", "javadoc"];
-
 /// Why a `<profiles>` declaration of `group:artifact`'s main jar
 /// ([`main_jar_declarations`]) moves it off `pinned` whenever that profile
 /// is active, for the first such one: a version other than the pin. A
@@ -930,8 +939,8 @@ const NON_CODE_TYPES: &[&str] = &["pom", "java-source", "javadoc"];
 /// what management governs, which `pin_managed` (no live direct version)
 /// says. Activation is not evaluated, so every profile counts, as in
 /// vendored mode. A declaration without a version takes the live one and
-/// moves nothing, and a pom (or sources / javadoc) typed one carries no
-/// code.
+/// moves nothing, and a `pom` typed one carries no code (a `java-source` /
+/// `javadoc` typed one is a non-executable variant, never a main jar).
 fn profile_override(
     deps: &[PomDep],
     group: &str,
@@ -940,11 +949,7 @@ fn profile_override(
     pin_managed: bool,
 ) -> Option<String> {
     main_jar_declarations(deps, group, artifact, |d| d.in_profile)
-        .filter(|d| {
-            !d.type_text
-                .as_deref()
-                .is_some_and(|t| NON_CODE_TYPES.contains(&t))
-        })
+        .filter(|d| is_main_jar(d.type_text.as_deref(), d.classifier.as_deref()))
         .filter(|d| !d.managed || pin_managed)
         .find_map(|d| {
             let version = build_version(d).filter(|v| *v != pinned)?;
@@ -1369,6 +1374,14 @@ mod tests {
                      <artifactId>slf4j-api</artifactId><version>{pin}</version>\
                      <classifier>tests</classifier></dependency>\n"
                 ),
+            ),
+            // A type implying an executable classifier (the vendored
+            // reactor's rule): `test-jar` is the `tests` jar.
+            (
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 <version>1.7.36</version><type>test-jar</type></dependency>\n"
+                    .to_string(),
+                String::new(),
             ),
         ];
         for (deps, managed) in &unattested {
@@ -1958,11 +1971,13 @@ mod tests {
             ),
             // Management that governs: the live pin is managed too.
             (&managed_pin, mgmt(&ga(Some("1.7.36"))), profile_kind),
-            // A code-carrying type is not the pin's coordinate either.
+            // A code-carrying type is not the pin's coordinate either: it
+            // is an executable variant (`test-jar` is the `tests` jar, see
+            // `is_variant` / `is_executable_variant`).
             (
                 &direct_pin,
                 deps(&typed("test-jar", Some("1.7.36"))),
-                profile_kind,
+                classifier_kind,
             ),
             // An executable classifier copy off the pin: its own version,
             // none at all, or a classifier-keyed managed one.

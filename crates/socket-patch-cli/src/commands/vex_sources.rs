@@ -240,6 +240,10 @@ const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 /// through a `${property}` that `.mvn/maven.config` redefines, so the build resolves
 /// another version (`vex::Unattested`).
 const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
+/// Omission tag and note: a NuGet Socket source's id is also locked at a
+/// version other than the patched one, which that source cannot serve
+/// (`vex::Unattested`).
+const NOTE_NUGET_LOCK_OTHER_VERSION: &str = "vex_nuget_lock_other_version";
 /// Omission tag and note: a hosted sbt pin whose bytes the build provably
 /// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
 /// dropping the load-time verifier, or current evidence
@@ -299,6 +303,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while .mvn/maven.config redefines the property it is spelled \
              through; the wiring itself is intact, so re-running `scan` does not change this \
              (drop that -D from .mvn/maven.config, or write the pinned version literally)",
+        ),
+        UnattestedKind::NugetLockOtherVersion => (
+            NOTE_NUGET_LOCK_OTHER_VERSION,
+            "not attested until every target framework locks only the patched version (align \
+             them on it, restore, and re-run `scan` / `vendor`)",
         ),
         UnattestedKind::SbtPinBypassed => (
             NOTE_SBT_PIN_BYPASSED,
