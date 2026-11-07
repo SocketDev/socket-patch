@@ -926,6 +926,17 @@ async fn pnpm_lockfile_off_withholds_hosted_pins() {
         integrity(&entries, "left-pad"),
         LockIntegrity::Sri("sha512-PATCHED==".into())
     );
+
+    // A directory named rush.json is not Rush (the gate discovery shares,
+    // `is_rush`), so the root lock still loses the pin.
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), "rush.json/placeholder", "").await;
+    write(tmp.path(), ".npmrc", "lockfile=false\n").await;
+    write(tmp.path(), "pnpm-lock.yaml", &lock).await;
+    let entries = inventory_npm_trees(tmp.path()).await.unwrap();
+    assert_eq!(integrity(&entries, "left-pad"), LockIntegrity::None);
+    let (_, entries) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
+    assert_eq!(integrity(&entries, "left-pad"), LockIntegrity::None);
 }
 
 /// The inventory twin of discovery's

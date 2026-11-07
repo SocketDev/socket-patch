@@ -19,7 +19,7 @@ use super::dedup_prefer_integrity;
 use super::npm::inventory_package_lock_in;
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_pnpm_member_locks_in,
-    inventory_rush_pnpm_locks_in,
+    inventory_rush_pnpm_locks_in, is_rush,
 };
 use super::view::ProjectView;
 use super::vlt::inventory_vlt_in;
@@ -52,7 +52,7 @@ pub(crate) async fn inventory_npm_lock(
     project_root: &Path,
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     let view = ProjectView::Disk(project_root);
-    let rush = view.exists("rush.json").await;
+    let rush = is_rush(view).await;
     inventory_npm_lock_raw_in(&view, rush)
         .await
         .map(|found| found.map(|(flavor, raw)| (flavor, dedup_prefer_integrity(raw))))
@@ -77,7 +77,7 @@ pub(crate) async fn inventory_npm_trees(
 pub(super) async fn inventory_npm_trees_raw_in(
     view: &ProjectView<'_>,
 ) -> Result<Vec<LockfileEntry>, UnsupportedNpmLayout> {
-    let rush = view.exists("rush.json").await;
+    let rush = is_rush(*view).await;
     let mut out = inventory_npm_lock_raw_in(view, rush)
         .await?
         .map(|(_, entries)| entries)
@@ -90,7 +90,7 @@ pub(super) async fn inventory_npm_trees_raw_in(
 
 /// The routed lock's guarded instances ([`inventory_npm_lock`] before its
 /// collapse). With pnpm's `lockfile` setting off ([`lockfile_disabled`];
-/// not under Rush, `rush` being whether `rush.json` exists, which runs
+/// not under Rush, `rush` being [`is_rush`], the gate discovery shares, which runs
 /// pnpm with settings of its own, as in lockfile discovery's
 /// `extract_pnpm`), pnpm neither reads nor writes the root or member
 /// locks, so a Socket-hosted pin in them is no lockfile basis. Discovery
