@@ -1,0 +1,94 @@
+version = 1
+
+[[distribution]]
+name = "isodate"
+version = "0.6.1"
+source = "registry+https://pypi.org/simple"
+
+[distribution.sdist]
+url = "https://files.pythonhosted.org/packages/db/7a/c0a56c7d56c7fa723988f122fa1f1ccf8c5c4ccc48efad0d214b49e5b1af/isodate-0.6.1.tar.gz"
+hash = "sha256:48c5881de7e8b0a0d648cb024c8062dc84e7b840ed81e864c7614fd3c127bde9"
+size = 28443
+
+[[distribution.wheel]]
+url = "https://files.pythonhosted.org/packages/b6/85/7882d311924cbcfc70b1890780763e36ff0b140c7e51c110fc59a532f087/isodate-0.6.1-py2.py3-none-any.whl"
+hash = "sha256:0751eece944162659049d35f4f549ed815792b38793f07cf73381c1c87cbed96"
+size = 41722
+
+[[distribution.dependencies]]
+name = "six"
+version = "1.17.0"
+source = "registry+https://pypi.org/simple"
+
+[[distribution]]
+name = "proj"
+version = "0.1.0"
+source = "editable+file:///project"
+
+[distribution.sdist]
+url = "file:///project"
+
+[[distribution.dependencies]]
+name = "isodate"
+version = "0.6.1"
+source = "registry+https://pypi.org/simple"
+
+[[distribution.dependencies]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = "registry+https://pypi.org/simple"
+
+[[distribution.dependencies]]
+name = "urllib3"
+version = "1.26.18"
+source = "registry+https://pypi.org/simple"
+
+[[distribution]]
+name = "python-dateutil"
+version = "2.9.0.post0"
+source = "registry+https://pypi.org/simple"
+
+[distribution.sdist]
+url = "https://files.pythonhosted.org/packages/66/c0/0c8b6ad9f17a802ee498c46e004a0eb49bc148f2fd230864601a86dcf6db/python-dateutil-2.9.0.post0.tar.gz"
+hash = "sha256:37dd54208da7e1cd875388217d5e00ebd4179249f90fb72437e91a35459a0ad3"
+size = 342432
+
+[[distribution.wheel]]
+url = "https://files.pythonhosted.org/packages/ec/57/56b9bcc3c9c6a792fcbaf139543cee77261f3651ca9da0c93f5c1221264b/python_dateutil-2.9.0.post0-py2.py3-none-any.whl"
+hash = "sha256:a8b2bc7bffae282281c8140a97d3aa9c14da0b136dfe83f850eea9a5f7470427"
+size = 229892
+
+[[distribution.dependencies]]
+name = "six"
+version = "1.17.0"
+source = "registry+https://pypi.org/simple"
+
+[[distribution]]
+name = "six"
+version = "1.17.0"
+source = "registry+https://pypi.org/simple"
+
+[distribution.sdist]
+url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz"
+hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81"
+size = 34031
+
+[[distribution.wheel]]
+url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl"
+hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274"
+size = 11050
+
+[[distribution]]
+name = "urllib3"
+version = "1.26.18"
+source = "registry+https://pypi.org/simple"
+
+[distribution.sdist]
+url = "https://files.pythonhosted.org/packages/0c/39/64487bf07df2ed854cc06078c27c0d0abc59bd27b32232876e403c333a08/urllib3-1.26.18.tar.gz"
+hash = "sha256:f8ecc1bba5667413457c529ab955bf8c67b45db799d159066261719e328580a0"
+size = 305687
+
+[[distribution.wheel]]
+url = "https://files.pythonhosted.org/packages/b0/53/aa91e163dcfd1e5b82d8a890ecf13314e3e149c05270cc644581f77f17fd/urllib3-1.26.18-py2.py3-none-any.whl"
+hash = "sha256:34b97092d7e0a3a8cf7cd10e386f401b3737364026c45e622aa02903dffe0f07"
+size = 143835

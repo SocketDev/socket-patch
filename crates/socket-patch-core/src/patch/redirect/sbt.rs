@@ -371,6 +371,10 @@ pub fn rewrite_sbt(
                 &doc.findings.override_build_repos,
             ),
             (&mut findings.dependency_lock, &doc.findings.dependency_lock),
+            (
+                &mut findings.onload_assignment,
+                &doc.findings.onload_assignment,
+            ),
         ] {
             mine.extend(theirs.iter().cloned());
             mine.sort();
@@ -504,6 +508,16 @@ pub fn rewrite_sbt(
                 "{} reassign(s) resolvers (`:=` or `~=`), which can drop socket-patch's \
                  repository; use `+=` instead",
                 findings.resolvers_assignment.join(", ")
+            ),
+        ))
+    } else if !findings.onload_assignment.is_empty() {
+        Some((
+            "redirect_sbt_onload_assignment",
+            format!(
+                "{} reassign(s) onLoad without keeping its previous value, which drops \
+                 socket-patch's load-time verifier and resolver order; compose instead \
+                 (`Global / onLoad := (Global / onLoad).value andThen ...`)",
+                findings.onload_assignment.join(", ")
             ),
         ))
     } else if !findings.dependency_lock.is_empty() {
@@ -1159,5 +1173,52 @@ mod tests {
             rerun.warnings.is_empty() && rerun.confirmed_sbt_uuids.contains(&pin.uuid),
             "{rerun:?}"
         );
+    }
+
+    /// An `onLoad` reassignment that drops the generated installer refuses
+    /// a new pin and keeps an existing one unconfirmed, like a
+    /// `dependencyOverrides` one; a composition that keeps it does not.
+    #[test]
+    fn an_onload_reassignment_refuses_the_pin() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/sbt/redirect/basic"
+        );
+        let doc = std::fs::read_to_string(format!("{dir}/resolution.json")).unwrap();
+        let (files, overrides) = basic_case(Some(&doc));
+        let mut first = RewriteResult::default();
+        rewrite_sbt(&files, &overrides, &mut first);
+        let wired = first.files[HOSTED_FILE].clone();
+        let codes = |r: &RewriteResult| -> Vec<String> {
+            r.warnings.iter().map(|w| w.code.clone()).collect()
+        };
+        for existing in [false, true] {
+            let mut edited = files.clone();
+            edited
+                .get_mut(BUILD_SBT)
+                .unwrap()
+                .push_str("\nGlobal / onLoad := identity\n");
+            if existing {
+                edited.insert(HOSTED_FILE.to_string(), wired.clone());
+            }
+            let mut result = RewriteResult::default();
+            rewrite_sbt(&edited, &overrides, &mut result);
+            assert!(
+                codes(&result).contains(&"redirect_sbt_onload_assignment".to_string())
+                    && result.confirmed_sbt_uuids.is_empty(),
+                "{existing}: {result:?}"
+            );
+            let mut composed = files.clone();
+            composed
+                .get_mut(BUILD_SBT)
+                .unwrap()
+                .push_str("\nGlobal / onLoad := (Global / onLoad).value andThen (s => s)\n");
+            let mut result = RewriteResult::default();
+            rewrite_sbt(&composed, &overrides, &mut result);
+            assert!(
+                !codes(&result).contains(&"redirect_sbt_onload_assignment".to_string()),
+                "{existing}: {result:?}"
+            );
+        }
     }
 }

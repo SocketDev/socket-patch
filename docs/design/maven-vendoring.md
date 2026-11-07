@@ -165,6 +165,27 @@ files receive an apply line for `.socket/gradle/socket-patch.settings.gradle`.
 Settings plugin and buildscript classpaths receive an in-block exclusive
 repository entry because those classpaths resolve before the apply line runs.
 
+Because lockfiles stay unchanged, a lock that pins the patched module at
+another version wins over the vendored GAV: Gradle resolves the locked version
+or fails lock validation. Every lock file of every project of the build is
+read (`gradle.lockfile`, `buildscript-gradle.lockfile`,
+`settings-gradle.lockfile`, the legacy `gradle/dependency-locks/`, and a custom
+`lockFile` set as a literal `file(…)` in a project's own build script). The
+following are degraded: an entry at a version no vendored row serves
+(`gradle_lock_overrides_vendored`; another vendored version of the same module
+is served), a settings classpath entry whose settings script lacks the in-block
+entry for it (`gradle_settings_lock_unrouted`; liveness requires the committed
+entry), a lock file that cannot be read (`gradle_lock_unreadable`), and a
+custom `lockFile` that cannot be followed (`gradle_custom_lock_file`). The
+patch is still applied, and `vex` does not attest it.
+
+`vex` liveness re-plans over the committed tree but judges only the committed
+files: a re-plan that would still write a settings file (an apply line of any
+wired build, an in-block entry), the index, the derived `maven-metadata.xml`,
+the script or the verification file means that wiring is missing, and the
+entry is not attested (`gradle_wiring_uncommitted`). The `.gitattributes` and
+`.gitignore` files are not read by Gradle and do not count.
+
 The script, the index, the derived metadata and the `.gitattributes` files are
 owned text and are compared line-ending blind, so a `core.autocrlf` checkout
 passes `--check` and reverts clean. `.socket/gradle/.gitattributes` (`* -text`,

@@ -1,0 +1,35 @@
+{
+  "groups": {
+    "lock-readers": {
+      "paths": [
+        "crates/socket-patch-core/src/formats/",
+        "crates/socket-patch-core/src/vex/discover/",
+        "crates/socket-patch-core/src/vendor/lock_inventory/",
+        "crates/socket-patch-core/src/vendor/npm_origin.rs",
+        "crates/socket-patch-core/src/gradle/",
+        "crates/socket-patch-core/src/utils/python_lock.rs",
+        "crates/socket-patch-core/src/utils/poetry_lock.rs",
+        "crates/socket-patch-core/src/utils/pdm_lock.rs",
+        "crates/socket-patch-core/src/utils/requirements.rs",
+        "crates/socket-patch-core/src/utils/lock_fragments.rs",
+        "crates/socket-patch-core/src/utils/hatch.rs",
+        "crates/socket-patch-core/src/utils/pipenv.rs",
+        "crates/socket-patch-core/src/crawlers/deno_crawler.rs"
+      ],
+      "max": 30462
+    },
+    "lock-writers": {
+      "paths": [
+        "crates/socket-patch-core/src/patch/redirect/",
+        "crates/socket-patch-core/src/hosted/",
+        "crates/socket-patch-core/src/vendor/"
+      ],
+      "exclude": [
+        "crates/socket-patch-core/src/vendor/lock_inventory/",
+        "crates/socket-patch-core/src/vendor/npm_origin.rs",
+        "crates/socket-patch-core/src/vendor/test_support"
+      ],
+      "max": 88362
+    }
+  }
+}

@@ -5,8 +5,9 @@
 //!
 //! The suffixed tree path carries no full uuid, so the generated file is no
 //! `.socket/vendor/<eco>/<uuid>/` reference: a vendored sbt pin is attested
-//! through the vendor ledger `vendor` writes, and the extractor diagnoses
-//! what would make that attestation a lie. Each cell vendors for real
+//! through the vendor ledger `vendor` writes, and only when the extractor
+//! finds nothing that would make that attestation a lie (the hosted sbt
+//! evidence gate). Each cell vendors for real
 //! (`vendor` over the sbt 1.13.0 probe build, the installed jar in an
 //! isolated Coursier cache), drops `.socket/manifest.json`, and runs
 //! `vex --offline` (the ledger embeds the record):
@@ -14,12 +15,14 @@
 //! | cell | state | expected |
 //! |---|---|---|
 //! | a | after `sbt update` (the evidence resolves the suffixed version from the tree) | attested, no sbt diagnostic |
-//! | b | before `sbt update` (the evidence still resolves the base version) | `sbt_resolution_unverified` |
+//! | b | before `sbt update` (the evidence still resolves the base version) | `sbt_resolution_unverified`, `vex_sbt_resolution_unverified`, not attested |
 //! | c | a tree jar tampered | `vendored_tree_missing`, not attested |
 //! | d | the generated file edited | `sbt_owned_file_modified` |
 //! | e | no ledger | nothing attested; the tree check still runs |
+//! | f | after `sbt update`, then a `dependencyOverrides :=` | `vex_sbt_resolution_unverified` naming it, not attested |
+//! | g | before `sbt update`, the manifest back (same or another uuid) | `vex_sbt_resolution_unverified`, not attested |
 
-use crate::common::envelope::all_codes;
+use crate::common::envelope::{all_codes, warning_codes};
 use crate::common::git_sha256;
 
 use std::path::{Path, PathBuf};
@@ -42,6 +45,8 @@ const CENTRAL: &str = "repo1.maven.org/maven2";
 const MEMBER: &str = "META-INF/NOTICE.txt";
 const VULN: &str = "GHSA-sbtv-test-xxxx";
 const VENDORED_FILE: &str = "socket-patch-vendor.sbt";
+/// A manifest uuid other than the vendored one.
+const OTHER_UUID: &str = "9e8d7c6b-5a49-4382-9f0e-2a3b4c5d6e7f";
 
 fn tree_jar(proj: &Path) -> PathBuf {
     proj.join(".socket/vendor/maven2/com/google/code/gson/gson")
@@ -69,6 +74,8 @@ struct Fx {
     _tmp: tempfile::TempDir,
     proj: PathBuf,
     home: SbtHome,
+    /// The manifest `vendor` ran with.
+    manifest: Value,
 }
 
 impl Fx {
@@ -111,6 +118,7 @@ impl Fx {
             _tmp: tmp,
             proj,
             home,
+            manifest,
         };
         let (code, env) = fx.run(&["vendor"]);
         assert_eq!(code, Some(0), "vendor: {env}");
@@ -118,6 +126,17 @@ impl Fx {
         assert!(tree_jar(&fx.proj).is_file());
         std::fs::remove_file(fx.proj.join(".socket/manifest.json")).unwrap();
         fx
+    }
+
+    /// Put the manifest back, its gson record filed under `uuid`.
+    fn restore_manifest(&self, uuid: &str) {
+        let mut manifest = self.manifest.clone();
+        manifest["patches"][GSON.purl()]["uuid"] = uuid.into();
+        std::fs::write(
+            self.proj.join(".socket/manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     /// What `sbt update` records after vendoring.
@@ -197,6 +216,17 @@ fn attested(doc: Option<&Value>) -> bool {
         })
 }
 
+/// The details of the top-level warnings coded `code`.
+fn warning_details(env: &Value, code: &str) -> Vec<String> {
+    env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == code)
+        .filter_map(|w| w["detail"].as_str().map(str::to_string))
+        .collect()
+}
+
 const SBT_DIAGS: &[&str] = &[
     "sbt_resolution_unverified",
     "vendored_tree_missing",
@@ -220,11 +250,66 @@ fn sbt_vendored_vex_attests_after_sbt_update() {
 #[test]
 fn sbt_vendored_vex_before_sbt_update_is_unverified() {
     let fx = Fx::vendored();
-    let (_, env, _) = fx.vex();
+    let (_, env, doc) = fx.vex();
+    let got = all_codes(&env);
     assert!(
-        all_codes(&env).contains(&"sbt_resolution_unverified".to_string()),
+        got.contains(&"sbt_resolution_unverified".to_string()),
         "{env}"
     );
+    assert!(
+        got.contains(&"vex_sbt_resolution_unverified".to_string()),
+        "{env}"
+    );
+    assert!(
+        !attested(doc.as_ref()),
+        "an unverified resolution is never attested: {doc:?}"
+    );
+}
+
+#[test]
+fn sbt_vendored_vex_withholds_under_an_overrides_reassignment() {
+    let fx = Fx::vendored();
+    fx.sbt_update();
+    // Dated back to its old time, the edit stays older than the evidence
+    // however slow the run (staleness would withhold the pin too).
+    let build = fx.proj.join("build.sbt");
+    let dated = std::fs::metadata(&build).unwrap().modified().unwrap();
+    let mut text = std::fs::read_to_string(&build).unwrap();
+    text.push_str("ThisBuild / dependencyOverrides := Seq()\n");
+    std::fs::write(&build, text).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&build)
+        .unwrap()
+        .set_modified(dated)
+        .unwrap();
+    let (_, env, doc) = fx.vex();
+    let details = warning_details(&env, "vex_sbt_resolution_unverified");
+    assert!(
+        details.iter().any(|d| d.contains("`dependencyOverrides`")),
+        "{env}"
+    );
+    assert!(
+        !attested(doc.as_ref()),
+        "an overrides reassignment replaces the pin: {doc:?}"
+    );
+}
+
+/// #2008 review: the manifest still records gson, under the vendored uuid
+/// or another one (the vendor entry, not the candidate's uuid, is what the
+/// vendored basis attests). Before `sbt update` neither attests.
+#[test]
+fn sbt_vendored_vex_with_a_manifest_still_needs_evidence() {
+    let fx = Fx::vendored();
+    for uuid in [UUID, OTHER_UUID] {
+        fx.restore_manifest(uuid);
+        let (_, env, doc) = fx.vex();
+        assert!(
+            warning_codes(&env).contains(&"vex_sbt_resolution_unverified".to_string()),
+            "{uuid}: {env}"
+        );
+        assert!(!attested(doc.as_ref()), "{uuid}: {doc:?}");
+    }
 }
 
 #[test]

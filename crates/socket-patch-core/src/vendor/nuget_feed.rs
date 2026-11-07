@@ -1473,13 +1473,14 @@ async fn revert_config_record(
 /// Whether the project-root config `file` (a recorded wiring basename)
 /// still names the vendored feed dir `uuid_dir_rel`. An unsafe or
 /// unreadable file answers yes: when in doubt the lock pin is kept with
-/// the config that may route to it.
+/// the config that may route to it. A backslashed or entity-escaped
+/// spelling counts ([`crate::utils::path_spelling::mentions_path`]).
 async fn config_references(project_root: &Path, file: &str, uuid_dir_rel: &str) -> bool {
     if !is_safe_single_segment(file) {
         return true;
     }
     match read_regular_to_string(&project_root.join(file)).await {
-        Ok(text) => text.contains(uuid_dir_rel),
+        Ok(text) => crate::utils::path_spelling::mentions_path(&text, uuid_dir_rel),
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }

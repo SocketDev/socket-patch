@@ -94,12 +94,10 @@ const VENDORED_INDEX_REL: &str = vendored::INDEX_REL;
 const VERIFICATION_REL: &str = vendored::VERIFICATION_REL;
 const WRAPPER_PROPERTIES_REL: &str = "gradle/wrapper/gradle-wrapper.properties";
 
-/// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
-/// of any build). Gradle resolves that classpath before any settings
-/// script runs, so the hosted script can never pin what it locks.
-pub fn is_settings_lock(rel: &str) -> bool {
-    rel.rsplit('/').next() == Some("settings-gradle.lockfile")
-}
+/// Whether `rel` is a settings-classpath lock. Gradle resolves that
+/// classpath before any settings script runs, so the hosted script can
+/// never pin what it locks.
+pub use crate::gradle::locks::is_settings_lock;
 
 /// Whether `files` (root-relative) hold a root Gradle settings or build
 /// script.

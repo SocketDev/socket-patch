@@ -1080,10 +1080,23 @@ fn allowed_file(file: &str, kind: &str) -> bool {
 /// directory although `original` did not. The merge keeps elements it did
 /// not record (a user's added sibling), and one of those may be a copy of
 /// the vendored requirement: reporting the revert complete would delete a
-/// wheel that line still installs from.
-pub(super) fn still_references_artifact(restored: &str, original: &str, uuid: &str) -> bool {
-    let needle = format!("vendor/pypi/{uuid}");
-    restored.contains(&needle) && !original.contains(&needle)
+/// wheel that line still installs from. `needle` is
+/// [`artifact_needle_rel`]'s path, matched in every spelling; its case rule is
+/// the caller's (a keep folds case, a refusal folds it only where the disk
+/// does).
+pub(super) fn still_references_artifact(
+    restored: &str,
+    original: &str,
+    needle: &crate::utils::path_spelling::PathNeedle,
+) -> bool {
+    needle.found_in(restored) && !needle.found_in(original)
+}
+
+/// The uuid-dir path [`still_references_artifact`] looks for (the
+/// `{root:uri}/` / `file:///<abs>/` prefix a pyproject spells varies, so
+/// it starts below `.socket/`).
+pub(super) fn artifact_needle_rel(uuid: &str) -> String {
+    format!("vendor/pypi/{uuid}")
 }
 
 /// Whether `name` (PEP 503) left the live lock `text` altogether: no unit
@@ -1520,7 +1533,11 @@ pub(super) async fn revert_python_locks(
                     record.file
                 ),
             ));
-        } else if still_references_artifact(&restored, original, &entry.uuid) {
+        } else if still_references_artifact(
+            &restored,
+            original,
+            &crate::utils::path_spelling::PathNeedle::keep(&artifact_needle_rel(&entry.uuid)),
+        ) {
             warnings.push(VendorWarning::new(
                 "vendor_lock_entry_drifted",
                 format!(
@@ -1586,6 +1603,7 @@ pub(super) async fn revert_python_locks(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::path_spelling::PathNeedle;
 
     const LOCK: &str = "# original\nlock-version = \"1.0\"\n\n[[packages]]\nname = \"one\"\nversion = \"1\"\nwheels = [{url = \"https://example.test/one.whl\", hashes = {sha256 = \"one\"}}]\n\n[[packages]]\nname = \"two\"\nversion = \"2\"\nwheels = [{url = \"https://example.test/two.whl\", hashes = {sha256 = \"two\"}}]\n";
 
@@ -2290,10 +2308,38 @@ mod tests {
         let live = "dependencies = [\"six @ file:///p/.socket/vendor/pypi/u/six.whl ; python_version >= '3.8'\", \"six @ file:///p/.socket/vendor/pypi/u/six.whl\"]\n";
         let (restored, drifted) = restore_document(live, original, new).unwrap();
         assert!(!drifted, "{restored}");
-        assert!(still_references_artifact(&restored, original, "u"));
-        assert!(!still_references_artifact(original, original, "u"));
+        let needle = |uuid: &str| PathNeedle::keep(&artifact_needle_rel(uuid));
+        assert!(still_references_artifact(&restored, original, &needle("u")));
+        assert!(!still_references_artifact(original, original, &needle("u")));
         // Another patch's artifact (a stacked vendoring) is not this one's.
-        assert!(!still_references_artifact(&restored, original, "v"));
+        assert!(!still_references_artifact(
+            &restored,
+            original,
+            &needle("v")
+        ));
+    }
+
+    /// A leftover copy spelled with backslashes (a Windows checkout) or
+    /// `\/` escapes is still the artifact: the revert must not report itself
+    /// complete and delete the wheel that line installs from.
+    #[test]
+    fn leftover_artifact_reference_is_detected_in_any_spelling() {
+        let uuid = "11111111-2222-4333-8444-555555555555";
+        let original = "dependencies = [\"six==1.16.0\"]\n";
+        let needle = PathNeedle::keep(&artifact_needle_rel(uuid));
+        for leftover in [
+            format!("dependencies = [\"six @ file:///C:\\\\p\\\\.socket\\\\vendor\\\\pypi\\\\{uuid}\\\\six.whl\"]\n"),
+            format!("dependencies = [\"six @ file:///p/.socket\\/vendor\\/pypi\\/{uuid}\\/six.whl\"]\n"),
+            format!("dependencies = [\"six @ file:///p/.socket\\vendor\\pypi\\{uuid}\\six.whl\"]\n"),
+        ] {
+            assert!(still_references_artifact(&leftover, original, &needle), "{leftover}");
+        }
+        let other = PathNeedle::keep(&artifact_needle_rel("99999999-2222-4333-8444-555555555555"));
+        let leftover = format!(
+            "x = \"{}\"",
+            format!(".socket/vendor/pypi/{uuid}/six.whl").replace('/', "\\\\")
+        );
+        assert!(!still_references_artifact(&leftover, original, &other));
     }
 
     /// Appending to (or prepending to) a recorded array of strings keeps the

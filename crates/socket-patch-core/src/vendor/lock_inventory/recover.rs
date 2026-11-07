@@ -21,11 +21,15 @@ use super::{http_url, LockIntegrity, LockfileEntry, SourceKind};
 /// ledger entry's wiring `original` fragments (and `entry.lock` for cargo),
 /// as a fetchable [`LockfileEntry`].
 ///
-/// This is the rebuild path for artifacts that are referenced by the rewired
-/// lockfile but missing on disk: the live lockfile no longer carries the
-/// registry resolution (it points at `.socket/vendor/...`), but `--revert`'s
-/// restore data does. golang is deliberately absent — go.sum is never
-/// rewired, so the standard [`super::inventory_project`]/[`super::lookup`] path covers it.
+/// The live lockfile no longer carries the registry resolution of a
+/// vendored package (it points at `.socket/vendor/...`), but `--revert`'s
+/// restore data does. The one consumer is the CLI's lock-refusal gate,
+/// which only asks whether a verifiable resolution exists: nothing
+/// downloads the returned `resolved` (vendored bytes come from the patch
+/// service), and a fragment recorded over a hosted pin would carry the
+/// patched artifact's URL and hash, never a pristine source. golang is
+/// deliberately absent — go.sum is never rewired, so the standard
+/// [`super::inventory_project`]/[`super::lookup`] path covers it.
 ///
 /// SECURITY: state.json is committed and tamper-able. Recovered URLs go
 /// through the same http(s)-only gate as inventoried ones, recovered hashes

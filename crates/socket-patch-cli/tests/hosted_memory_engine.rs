@@ -1043,13 +1043,10 @@ async fn result_serializes_with_the_contract_keys() {
     }
 }
 
-/// A vlt project: the engine has no network for the artifact preflight the
-/// disk flow runs, so every in-scope dep is judged as `--offline` judges
-/// it. vlt drives here, so the dep is withheld from every rewriter
-/// (`redirect_vlt_artifact_unverifiable`) and nothing is written. The
-/// warning quotes the artifact URL with its grant-token level redacted.
+/// A vlt project: the engine pins the hosted artifact in `vlt-lock.json`
+/// exactly as the disk flow does (no artifact is fetched by either).
 #[tokio::test]
-async fn a_vlt_project_is_withheld_as_offline() {
+async fn a_vlt_project_is_pinned() {
     const VLT_FIXTURE: &str = "redirect/npm/vlt/basic";
     let server = MockServer::start().await;
     let patches = patches_from_overrides(
@@ -1057,29 +1054,22 @@ async fn a_vlt_project_is_withheld_as_offline() {
         None,
     );
     mount_api(&server, &patches).await;
-    let files = fixture_files(&fixtures_root().join(VLT_FIXTURE).join("input"));
+    let fixture = fixtures_root().join(VLT_FIXTURE);
+    let files = fixture_files(&fixture.join("input"));
 
     let output = run_engine(&server, build_input(&files, &[], options(false))).await;
 
     let project = &output.projects[0];
-    assert!(project.error.is_none(), "the vlt root is scanned");
-    assert!(project.redirected.is_empty(), "nothing is pinned");
-    assert!(project
-        .skipped
+    assert!(project.error.is_none(), "{:?}", project.error);
+    assert_eq!(project.redirected.len(), 1, "{:?}", project.skipped);
+    assert!(project.skipped.is_empty(), "{:?}", project.skipped);
+    let expected = std::fs::read_to_string(fixture.join("expected/vlt-lock.json")).unwrap();
+    let changed: Vec<(&str, &str)> = output
+        .changed_files
         .iter()
-        .any(|s| s.reason == "redirect_vlt_artifact_unverifiable"));
-    let warnings = project.redirect["warnings"].as_array().unwrap();
-    let detail = warnings
-        .iter()
-        .find(|w| w["code"] == "redirect_vlt_artifact_unverifiable")
-        .and_then(|w| w["detail"].as_str())
-        .expect("the preflight warning is reported");
-    assert!(
-        detail.contains("/patch/npm/<redacted>/")
-            && detail.contains(": offline; nothing was written"),
-        "the offline refusal quotes the redacted URL"
-    );
-    assert!(output.changed_files.is_empty());
+        .map(|f| (f.path.as_str(), f.content.as_str()))
+        .collect();
+    assert_eq!(changed, vec![("vlt-lock.json", expected.as_str())]);
 }
 
 const GEM_BASIC_FIXTURE: &str = "redirect/gem/bundler/basic";
