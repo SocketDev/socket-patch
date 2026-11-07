@@ -208,6 +208,12 @@ jobs:
       - name: Python — test native installer harnesses
         run: python3 -B -m unittest discover -s scripts/tests -v
 
+      - name: Rust — lock model size budget
+        # Annotates, never fails: a bug fix elsewhere may add lines to these
+        # files. The lock-model PRs lower the budget as they delete code
+        # (docs/design/lock-model-unification.md#size-budget).
+        run: python3 -B scripts/loc-budget.py --warn
+
       - name: Shell — shellcheck the curl|sh installer
         # shellcheck is pre-installed on ubuntu-latest.
         run: shellcheck --shell=sh scripts/install.sh
@@ -2919,8 +2925,7 @@ jobs:
               --ignored --nocapture --test-threads=4 2>&1 | tee hosted-e2e.log || status=$?
             echo "::endgroup::"
             if [ "$status" -eq 0 ]; then
-              # The vlt leg (probe-driven: the clean refusal while the artifact
-              # is content-encoded, the full install proof once it is not).
+              # The vlt leg: the hosted pin and the fresh-checkout install proof.
               python3 scripts/check-vlt-legs.py \
                 --manifest crates/socket-patch-cli/tests/vlt-leg-manifest.json hosted-e2e.log
               exit $?

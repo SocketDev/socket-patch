@@ -877,8 +877,7 @@ async fn run_redirect_selected_untracked(
     // its walk does not read is added: a Rush lock's and a root
     // `shrinkwrap.yaml`'s patched entries (the in-memory engine reads both
     // too). Each such package is a skip event, as the consent gate reports
-    // it. Before the vlt preflight, so a withheld artifact is never
-    // downloaded.
+    // it.
     if !common.allow_patch_conflicts {
         let mut read: Vec<(&str, String)> = Vec::new();
         for rel in [
@@ -899,23 +898,6 @@ async fn run_redirect_selected_untracked(
         }
     }
 
-    // vlt artifact preflight: before any takeover or rewrite (dry runs
-    // included), each in-scope artifact is fetched as vlt fetches it. A
-    // failure while vlt drives withholds the dep from every rewriter;
-    // otherwise only from the vlt rewrite.
-    let vlt_preflight = {
-        let deps: Vec<(&str, &DepOverride)> = candidates
-            .iter()
-            .filter(|c| c.dep.ecosystem == "npm")
-            .map(|c| (c.purl.as_str(), &c.dep))
-            .collect();
-        vlt::artifact_preflight(common, api_client, &deps).await
-    };
-    engine::withhold_everywhere(
-        &mut candidates,
-        &vlt_preflight.withheld_everywhere,
-        &mut skipped,
-    );
     // A NEW row the lockfiles already pin on the patch server these
     // references name (not a configured one, so the recorded view's
     // discovery could not see it) is ALREADY: decided here, before the lock
@@ -1286,20 +1268,12 @@ async fn run_redirect_selected_untracked(
         .then(|| (read.clone(), python_metadata.clone()));
     // A retracted takeover rewrites again without it (see below).
     let takeover_metadata = takeover.is_staged().then(|| python_metadata.clone());
-    let mut done = engine::rewrite(
-        &view,
-        read,
-        &candidates,
-        python_metadata,
-        &vlt_preflight.withheld_from_vlt,
-        rewrite_options(),
-    )
-    .await;
+    let mut done =
+        engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()).await;
 
     // The rollout gate (§5.2): every write-free check has run — grants,
-    // purl/url, vlt preflight, takeover refusals, wheel metadata, and the
-    // rewrite above, whose confirmation probe proves a NEW row would be
-    // pinned. Only then is the budget spent; deferred rows leave the
+    // purl/url, takeover refusals, wheel metadata, and the rewrite above,
+    // whose confirmation probe proves a NEW row would be pinned. Only then is the budget spent; deferred rows leave the
     // rewrite set, which is rewritten again without them.
     if let (Some(gate), Some((read, python_metadata))) = (rollout.as_mut(), second_pass) {
         let eligible: std::collections::HashSet<(String, String)> = done
@@ -1319,15 +1293,8 @@ async fn run_redirect_selected_untracked(
         let before = candidates.len();
         candidates.retain(|c| !deferred.contains(&(sel_purl(c), c.dep.patch_uuid.clone())));
         if candidates.len() != before {
-            done = engine::rewrite(
-                &view,
-                read,
-                &candidates,
-                python_metadata,
-                &vlt_preflight.withheld_from_vlt,
-                rewrite_options(),
-            )
-            .await;
+            done =
+                engine::rewrite(&view, read, &candidates, python_metadata, rewrite_options()).await;
         }
     }
     // A staged takeover the rewrite did not pin must not happen: undo every
@@ -1359,7 +1326,6 @@ async fn run_redirect_selected_untracked(
             read,
             &candidates,
             takeover_metadata.clone().unwrap_or_default(),
-            &vlt_preflight.withheld_from_vlt,
             rewrite_options(),
         )
         .await;
@@ -1582,7 +1548,6 @@ async fn run_redirect_selected_untracked(
                     .get(lock_key)
                     .or_else(|| done.files.get(lock_key))
                     .map(String::as_str),
-                preflight: &vlt_preflight,
                 records: &records,
                 confirmed: &confirmed,
                 confirmed_vlt: &rewrite.confirmed_vlt_uuids,
@@ -1758,7 +1723,6 @@ async fn run_redirect_selected_untracked(
     // rewriter's own warnings first (e.g. `no package-lock.json`), then the
     // record, package-manager, stale-install, takeover and prune warnings.
     let mut engine_warnings = rewrite.warnings.clone();
-    engine_warnings.extend(vlt_preflight.warnings.iter().cloned());
     engine_warnings.extend(record_warnings);
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
@@ -2262,9 +2226,6 @@ fn describe_skip_reason(reason: &str) -> String {
             "hosted mode cannot pin it where vendored mode wired it, so it stays vendored \
              (see the warning)"
                 .into()
-        }
-        "redirect_vlt_artifact_unverifiable" => {
-            "vlt could not verify the hosted artifact (see the warning)".into()
         }
         "redirect_unattributable" => {
             "lockfile discovery could not attribute its pin to one package version, so \
@@ -3836,10 +3797,6 @@ mod tests {
         assert_eq!(
             describe_skip_reason("redirect_bun_lockb_invalid"),
             describe_skip_reason("redirect_bun_lock_unsupported")
-        );
-        assert_eq!(
-            describe_skip_reason("redirect_vlt_artifact_unverifiable"),
-            "vlt could not verify the hosted artifact (see the warning)"
         );
         assert_eq!(
             describe_skip_reason("redirect_vlt_lock_unsupported"),

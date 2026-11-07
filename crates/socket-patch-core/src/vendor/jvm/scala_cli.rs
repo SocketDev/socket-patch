@@ -233,6 +233,76 @@ pub fn wired_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusa
     Ok(indexed && ours(ROOT_FILE, ROOT_BYTES) && ours(GUARD_REL, GUARD_BYTES))
 }
 
+/// Why the committed files of the project at `root` (served by `read`)
+/// let scala-cli resolve the patch at `c` from somewhere other than the
+/// tree, though [`wired_checked`] finds the wiring: `vex` liveness only.
+/// `vendor --check` and the revert / prune reference tests keep the plain
+/// wiring test, so the patch stays managed. The tree keeps the upstream
+/// GAV and wins only by being found first:
+///
+/// - `scala_cli_tree_uncommitted`: the index lacks a row for the patch's
+///   jar or pom, or the committed file is missing or does not hash to its
+///   row. Coursier reads a module's pom from the first repository that has
+///   one, so without the tree's pom the next repository (Central) serves
+///   the module, and its unpatched jar with it.
+/// - `scala_cli_repository_shadowed`: the gate's conditions
+///   (`coursier_gate::vendored_bypass`): an input declares a repository,
+///   which scala-cli consults before the tree, or pins the patched group
+///   to a direct `url=`, or Bloop evidence newer than every input and the
+///   wiring resolved the GAV outside the tree. `vendor` refuses these, but
+///   only liveness sees them arise afterwards.
+///
+/// A re-plan would rewrite neither: it writes the tree from the patch's
+/// bytes, and never edits a user input. So only the files on disk are
+/// judged here, never what a re-plan would write.
+pub fn attestable_checked(
+    root: &std::path::Path,
+    read: ReadFn<'_>,
+    c: &Coords<'_>,
+) -> Result<(), JvmRefusal> {
+    let not_attestable = |reason: &str, detail: String| JvmRefusal {
+        code: "vendor_jvm_shape_unsupported",
+        detail: format!("reason: {reason}: {detail}"),
+    };
+    let rows = coursier_tree::patch_rows(read, c)?;
+    let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
+    let dir = coursier_tree::tree_dir(c);
+    let restore = "restore .socket/vendor/coursier from version control or re-run socket-patch \
+                   vendor";
+    let (jar, pom, _) = coursier_tree::committed(read, c).ok_or_else(|| {
+        not_attestable(
+            "scala_cli_tree_uncommitted",
+            format!(
+                "{dir} lacks the jar or pom of {gav}, so scala-cli may resolve it past the \
+                 vendored tree; {restore}"
+            ),
+        )
+    })?;
+    for (ext, bytes) in [("jar", jar), ("pom", pom)] {
+        let file = format!("{}-{}.{ext}", c.artifact_id, c.version);
+        let row = rows
+            .iter()
+            .find(|r| r.rel.rsplit_once('/').is_some_and(|(_, leaf)| leaf == file));
+        if row.is_none_or(|r| r.sha256 != super::sha256_hex(&bytes)) {
+            return Err(not_attestable(
+                "scala_cli_tree_uncommitted",
+                format!(
+                    "{INDEX_REL} does not vouch for {dir}/{file} (no row of patch {}, or \
+                     another sha256), so scala-cli may resolve {gav} past the vendored tree; \
+                     {restore}",
+                    c.uuid
+                ),
+            ));
+        }
+    }
+    if let Some(why) =
+        super::coursier_gate::vendored_bypass(root, c.group_id, c.artifact_id, c.version)
+    {
+        return Err(not_attestable("scala_cli_repository_shadowed", why));
+    }
+    Ok(())
+}
+
 /// The committed tree bytes of the patch at `c`.
 pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<CommittedTree> {
     coursier_tree::committed(read, c)
@@ -542,5 +612,127 @@ mod tests {
         }
         let bad = fs(&[(INDEX_REL, "#nope\n")]);
         assert!(wired_checked(&bad, &p.coords()).is_err());
+    }
+
+    /// VEX liveness judges the committed files a build reads, not the
+    /// wiring test alone: a tree pom gone (Coursier then reads the module
+    /// from the next repository, Central's unpatched jar with it), a tree
+    /// file the index no longer vouches for, or a repository directive
+    /// added since vendoring withholds attestation with its reason, while
+    /// `vendor --check`'s reference test and the revert / prune reference
+    /// test still see the wiring.
+    #[tokio::test]
+    async fn liveness_needs_the_committed_tree_and_no_shadowing_repository() {
+        use super::super::apply::{check_entry, entry_references, entry_wired_checked};
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        populate(
+            root,
+            &[
+                (PROJECT_FILE, "//> using scala 3.3.6\n"),
+                ("main.scala", "x\n"),
+            ],
+        );
+        let mut ledger = BTreeMap::new();
+        let p = patch("config", UUID, b"PATCHED");
+        vendor(root, Shape::ScalaCli, &p, &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap().clone();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+        check_entry(root, &entry, None).unwrap();
+
+        let tree = root.join(coursier_tree::tree_dir(&p.coords()));
+        let reason = |want: &str| {
+            let err = entry_wired_checked(root, &entry).unwrap_err();
+            assert!(err.contains(&format!("reason: {want}:")), "{err}");
+            // Still wired for every other caller.
+            let read = |rel: &str| super::super::apply::read_project_file(root, rel);
+            assert_eq!(wired_checked(&read, &p.coords()), Ok(true));
+            assert!(entry_references(root, &entry));
+        };
+        let pom = tree.join("config-1.4.3.pom");
+        let pom_bytes = std::fs::read(&pom).unwrap();
+        std::fs::remove_file(&pom).unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&pom, b"<project><relocation/></project>\n").unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&pom, &pom_bytes).unwrap();
+        // An index edited to drop the pom row no longer vouches for it.
+        let index = root.join(INDEX_REL);
+        let index_bytes = std::fs::read(&index).unwrap();
+        let kept: String = String::from_utf8(index_bytes.clone())
+            .unwrap()
+            .lines()
+            .filter(|l| !l.contains(".pom\t"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        std::fs::write(&index, kept).unwrap();
+        reason("scala_cli_tree_uncommitted");
+        std::fs::write(&index, &index_bytes).unwrap();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+
+        // A repository another input declares is consulted before the tree.
+        std::fs::write(
+            root.join("main.scala"),
+            "//> using repository https://repo.example.com/maven2\nx\n",
+        )
+        .unwrap();
+        reason("scala_cli_repository_shadowed");
+        check_entry(root, &entry, None).unwrap();
+        std::fs::write(root.join("main.scala"), "x\n").unwrap();
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+
+        // Bloop evidence of a build after vendoring (it lists the root
+        // file), newer than every input, resolving the GAV outside the
+        // tree: a command-line `-r` or a repository declared elsewhere won.
+        let ws = root.canonicalize().unwrap();
+        let sources: Vec<_> = [PROJECT_FILE, "main.scala", ROOT_FILE]
+            .iter()
+            .map(|f| ws.join(f))
+            .collect();
+        let bloop = |jar: &std::path::Path| {
+            serde_json::json!({ "version": "1.4.0", "project": {
+                "name": "proj_0123456789", "directory": ws.join(".scala-build"),
+                "workspaceDir": ws, "sources": sources, "dependencies": [], "classpath": [],
+                "resolution": { "modules": [{ "organization": "com.typesafe", "name": "config",
+                    "version": "1.4.3", "artifacts": [{ "name": "config", "path": jar }] }] },
+                "tags": ["library"],
+            } })
+            .to_string()
+        };
+        let ev = ws
+            .join(crate::crawlers::scala_evidence::BLOOP_DIR)
+            .join("proj_0123456789.json");
+        std::fs::create_dir_all(ev.parent().unwrap()).unwrap();
+        let date = |path: &std::path::Path, at: std::time::SystemTime| {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(at)
+                .unwrap()
+        };
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let write_evidence = |jar: &std::path::Path, at: std::time::SystemTime| {
+            std::fs::write(&ev, bloop(jar)).unwrap();
+            for s in &sources {
+                date(s, past);
+            }
+            date(&ev, at);
+        };
+        let cached = ws.join("cache/config-1.4.3.jar");
+        write_evidence(&cached, past + std::time::Duration::from_secs(60));
+        reason("scala_cli_repository_shadowed");
+        // Older than an input, it proves nothing either way.
+        write_evidence(&cached, past - std::time::Duration::from_secs(60));
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
+        // Resolved from the tree, it is the patch.
+        write_evidence(
+            &ws.join(coursier_tree::tree_dir(&p.coords()))
+                .join("config-1.4.3.jar"),
+            past + std::time::Duration::from_secs(60),
+        );
+        assert_eq!(entry_wired_checked(root, &entry), Ok(true));
     }
 }

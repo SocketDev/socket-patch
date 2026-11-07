@@ -14,10 +14,8 @@ use crate::hosted::engine::{
     self, Candidate, CandidateFiles, Refusal, RewriteOptions, SkippedPatch,
 };
 use crate::hosted::npm_manifest::HostedClassicArtifact;
-use crate::hosted::vlt::Preflight;
 use crate::patch::redirect::npmrc::OuterAllowRemote;
 use crate::patch::redirect::yarnrc::OuterYarnMirror;
-use crate::patch::redirect::DepOverride;
 use crate::utils::purl::strip_purl_qualifiers;
 use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject, ProjectView};
 use crate::vendor::VendorState;
@@ -162,10 +160,6 @@ pub(crate) struct Planned {
     /// `(artifact url, sha512)` of every npm tarball a yarn classic pin
     /// reads (its sha1, #558, and its package.json, #591).
     pub(crate) npm_classic: Vec<(String, String)>,
-    /// The vlt artifact preflight, judged offline (no network here, so
-    /// every in-scope dep is withheld instead of pinned: `--offline`
-    /// parity).
-    pub(crate) vlt_preflight: Preflight,
 }
 
 /// Everything up to the wheel-metadata fetch. `unreadable` are the paths
@@ -186,20 +180,7 @@ pub(crate) async fn plan(
     if engine::bun_lockb_symlinked(&view, &candidates) {
         return Err(engine::bun_lockb_symlink_refusal());
     }
-    let vlt_preflight = {
-        let deps: Vec<(&str, &DepOverride)> = candidates
-            .iter()
-            .filter(|c| c.dep.ecosystem == "npm")
-            .map(|c| (c.purl.as_str(), &c.dep))
-            .collect();
-        crate::hosted::vlt::offline(&view, &deps).await
-    };
-    engine::withhold_everywhere(
-        &mut candidates,
-        &vlt_preflight.withheld_everywhere,
-        &mut skipped,
-    );
-    let mut pre_warnings = vlt_preflight.warnings.clone();
+    let mut pre_warnings = Vec::new();
     refuse_takeovers(&project, &mut candidates, &mut skipped, &mut pre_warnings);
 
     let read = if candidates.is_empty() {
@@ -238,7 +219,6 @@ pub(crate) async fn plan(
         wheels,
         npm_manifests,
         npm_classic,
-        vlt_preflight,
     })
 }
 
@@ -279,7 +259,6 @@ pub(crate) async fn rewrite(
         wheels,
         npm_manifests,
         npm_classic,
-        vlt_preflight,
     } = planned;
     let skipped_before = skipped.clone();
     let mut python_metadata: BTreeMap<String, String> = BTreeMap::new();
@@ -363,7 +342,6 @@ pub(crate) async fn rewrite(
         read,
         &candidates,
         python_metadata,
-        &vlt_preflight.withheld_from_vlt,
         RewriteOptions {
             dry_run: options.dry_run,
             targets_pipenv_lock,

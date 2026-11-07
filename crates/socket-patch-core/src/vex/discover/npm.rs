@@ -71,7 +71,7 @@ use crate::formats::pnpm::{
 use crate::formats::text::strip_bom;
 use crate::patch::redirect::NpmUserPatches;
 use crate::utils::digest::is_sri_pin;
-use crate::vendor::lock_inventory::pnpm::rush_lock_rels;
+use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
 use crate::vendor::lock_inventory::{
     npm_lock_bundled_nodes, npm_lock_legacy_mirror_nodes, npm_lock_located_nodes, LockIntegrity,
     NpmLockNode,
@@ -791,7 +791,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // pnpm's `lockfile` setting off (#1074): pnpm reads neither the root
     // lock nor a member's, so their hosted pins keep no lockfile basis.
     // Rush runs pnpm with a workspace and `.npmrc` of its own.
-    let rush = ctx.exists("rush.json").await;
+    let rush = is_rush(ctx.view).await;
     let disabled = if rush {
         None
     } else {
@@ -4470,6 +4470,28 @@ packages:
             "{:#?}",
             out.diagnostics
         );
+    }
+
+    /// Discovery's Rush gate is hosted mode's: a dangling `rush.json` link
+    /// is not a Rush monorepo (Rush cannot load it, and hosted never pins
+    /// Rush's locks there), so the common lock is not attested.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pnpm_rush_gate_ignores_a_dangling_rush_json() {
+        let common = hosted_rewrite(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\npackages:\n\n  ms@1.3.0:\n    resolution: {integrity: sha512-UP==}\n",
+            &[pnpm_override("ms", UUID_A, None)],
+        );
+        let p = Project::new();
+        p.write("common/config/rush/pnpm-lock.yaml", &common);
+        std::os::unix::fs::symlink("missing.json", p.root().join("rush.json")).unwrap();
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        std::fs::remove_file(p.root().join("rush.json")).unwrap();
+        p.write("rush.json", "{}");
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:npm/ms@1.3.0", UUID_A, WiringMode::Hosted)]);
     }
 
     /// Rush without subspaces reads the common lock alone; a subspace dir

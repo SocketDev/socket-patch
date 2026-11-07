@@ -24,6 +24,7 @@ use crate::gradle::dsl::{
 };
 use crate::gradle::graph::{filter_claims_group, DeclKind, ScriptGraph, Site};
 use crate::gradle::selector::{admits, gradle_version_cmp, parse_selector, Selector};
+use crate::gradle::{locks, parent_rel};
 
 use super::super::state::{WiringAction, WiringRecord};
 use super::{
@@ -258,6 +259,26 @@ pub fn plan(
     list: ListFn<'_>,
     patch: &JvmPatch<'_>,
 ) -> Result<JvmPlan, JvmRefusal> {
+    plan_as(read, list, patch, Committed::OrPlanned)
+}
+
+/// Which settings wiring a check may count as routing the GAV.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Committed {
+    /// What the checkout holds, or what this plan writes: vendoring, where
+    /// the plan's own in-block entries will be committed.
+    OrPlanned,
+    /// Only what the checkout holds: liveness ([`wired`]) re-plans, and a
+    /// re-plan that would still add an entry proves nothing routed.
+    Only,
+}
+
+fn plan_as(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    patch: &JvmPatch<'_>,
+    committed: Committed,
+) -> Result<JvmPlan, JvmRefusal> {
     if super::wrapper_version(read, "gradle").is_some_and(|v| v < (6, 8, 0)) {
         return Err(shape_refusal(
             "gradle_below_6_8",
@@ -337,6 +358,7 @@ pub fn plan(
     };
     let graph = ScriptGraph::collect(&text, list, "", &[]);
     check_graph(&graph, &undecodable.borrow(), patch, &mut warnings)?;
+    check_locks(read, list, &graph, patch, committed, &mut warnings);
 
     let mut targets = vec![root];
     if let Some(bs) = read_buildsrc(read)? {
@@ -627,14 +649,79 @@ pub fn plan(
         writes.push(text_write(VERIFICATION_REL, new.into_bytes()));
     }
 
+    let tree_files = super::tree_files(&writes);
+    let writes = finish_writes(read, writes);
+    if committed == Committed::Only {
+        // The committed verification file already pins the patched jar
+        // (in Gradle's own form, say): a re-plan rewriting it in ours adds
+        // no wiring.
+        let jar_sha = sha256_hex(patch.jar);
+        let verified = read(VERIFICATION_REL)
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .is_some_and(|text| text.contains(&format!("value=\"{jar_sha}\"")));
+        let counted: Vec<FileWrite> = writes
+            .iter()
+            .filter(|w| !(verified && w.rel == VERIFICATION_REL))
+            .cloned()
+            .collect();
+        uncommitted_wiring(&counted, g, a, v, &mut warnings);
+    }
     Ok(JvmPlan {
-        tree_files: super::tree_files(&writes),
-        writes: finish_writes(read, writes),
+        tree_files,
+        writes,
         records,
         warnings,
         jar_rel: format!("{tree_dir}/{jar_name}"),
         tree_dir,
     })
+}
+
+/// Owned files that only keep the wiring intact through git (EOL
+/// conversion, an ignored `*.jar`); Gradle never reads them, so a missing
+/// one changes nothing this checkout resolves.
+const GIT_HYGIENE: &[&str] = &[
+    GITATTRIBUTES_REL,
+    GITIGNORE_REL,
+    SCRIPT_GITATTRIBUTES_REL,
+    VENDOR_GITATTRIBUTES_REL,
+];
+
+/// Liveness ([`Committed::Only`]): a re-plan over the committed tree that
+/// still writes wiring proves that wiring is not committed, and the build
+/// may resolve another copy. Every pending write counts except the tree
+/// itself (rebuilt from the committed bytes; the script checks its hashes
+/// against the index, whose writes do count) and [`GIT_HYGIENE`]: the
+/// settings files (apply lines of every wired build, in-block
+/// `buildscript` / `pluginManagement` entries), the index, the derived
+/// `maven-metadata.xml`, the script and `gradle/verification-metadata.xml`
+/// (unless the committed file already pins the patched jar's sha256 in
+/// some form: Gradle's `--write-verification-metadata` rewrites the entry
+/// its own way, and the caller drops that write before this check).
+fn uncommitted_wiring(
+    writes: &[FileWrite],
+    g: &str,
+    a: &str,
+    v: &str,
+    warnings: &mut Vec<JvmWarning>,
+) {
+    let pending: Vec<&str> = writes
+        .iter()
+        .filter(|w| !w.tree && !GIT_HYGIENE.contains(&w.rel.as_str()))
+        .map(|w| w.rel.as_str())
+        .collect();
+    if let Some(first) = pending.first() {
+        warnings.push(degraded(
+            "gradle_wiring_uncommitted",
+            format!(
+                "{first}{} lacks wiring a re-plan would write for {g}:{a}:{v}, so the build may \
+                 resolve a copy other than the vendored one; re-run `socket-patch vendor`",
+                match pending.len() {
+                    1 => String::new(),
+                    n => format!(" (and {} more)", n - 1),
+                }
+            ),
+        ));
+    }
 }
 
 /// The whole-graph checks: Android / KMP and a user `exclusiveContent`
@@ -772,6 +859,207 @@ fn check_graph(
         ));
     }
     Ok(())
+}
+
+/// Gradle dependency locks: every lock file of every project of every
+/// build (`gradle.lockfile`, `buildscript-gradle.lockfile`,
+/// `settings-gradle.lockfile`, the legacy `gradle/dependency-locks/`
+/// files), from the lock inventory hosted discovery checks too
+/// ([`ScriptGraph::read_locks`]), plus every custom `lockFile` location
+/// the graph can follow. Vendoring leaves locks unchanged, so a lock entry
+/// of the patched GA wins over the vendored GAV: Gradle resolves the
+/// locked version (or fails lock validation). Each finding below is
+/// degraded, which also withholds VEX attestation ([`wired`] re-plans and
+/// requires no degraded warning):
+///
+/// - `gradle_lock_overrides_vendored`: an entry at a version no vendored
+///   row serves (neither this patch's nor another vendored version of the
+///   GA in the index, which the same script routes);
+/// - `gradle_settings_lock_unrouted`: a settings-classpath entry whose
+///   build's settings script does not hold the in-block `exclusiveContent`
+///   entry for that GAV in every block that needs one;
+/// - `gradle_lock_unreadable`: a listed lock file (or a followed custom
+///   one) that cannot be read as UTF-8 text: unreadable, refused (outside
+///   the checkout), missing, or not UTF-8; its entries are unknown;
+/// - `gradle_custom_lock_file`: a `lockFile` location the graph cannot
+///   follow ([`crate::gradle::graph::CustomLockFile::path`]).
+///
+/// The mapping from the hosted rules (`vex::discover::gradle`): hosted
+/// pins a suffixed version, so a lock must name the suffix (below the base
+/// is invalid, above it an unattested upstream release). Vendored keeps the
+/// ORIGINAL GAV, so a lock entry is served only at a vendored version; any
+/// other version, above or below, is a build that does not consume the
+/// patch. Hosted rejects every settings-classpath lock of the GA because
+/// its script runs after that classpath resolves; vendored instead routes
+/// that classpath with in-block entries, so a settings lock is accepted
+/// only when the settings script holds them: when vendoring, as committed
+/// or as this plan writes them ([`Committed::OrPlanned`]); for liveness,
+/// as committed ([`Committed::Only`]). Anything else is rejected, as
+/// hosted would.
+///
+/// Scope: a lock file names the configurations of its own project that
+/// resolve the GA, so only entries of the GA count; a project that locks
+/// the GA at another version does resolve it there, and hosted withholds
+/// the whole build for one such lock too. A lock file Gradle ignores (its
+/// project never enables locking) cannot be told apart statically, so it
+/// counts.
+fn check_locks(
+    read: ReadFn<'_>,
+    list: ListFn<'_>,
+    graph: &ScriptGraph,
+    patch: &JvmPatch<'_>,
+    committed: Committed,
+    warnings: &mut Vec<JvmWarning>,
+) {
+    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+    let text = |rel: &str| read(rel).and_then(|bytes| dsl::decode(&bytes));
+    let mut lock_files = graph.read_locks(list, &text);
+    let mut unfollowed = Vec::new();
+    for c in graph.custom_lock_files() {
+        match c.path {
+            // Set explicitly, so expected to exist: a missing one is
+            // unreadable too (fail closed).
+            // A path already listed (the default name, or reached from two
+            // scripts) is checked once.
+            Some(path) if lock_files.iter().any(|(rel, _)| *rel == path) => {}
+            Some(path) => {
+                let state = text(&path).map(|t| locks::parse(&t));
+                lock_files.push((path, state));
+            }
+            None => unfollowed.push(format!("{}:{}", c.script, c.line)),
+        }
+    }
+    let prefix = format!("{g}:{a}:");
+    let vendored: BTreeSet<String> = read(INDEX_REL)
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|index| index_rows(&index))
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| {
+            let gav = row.split('\t').next()?;
+            gav.strip_prefix(&prefix).map(str::to_string)
+        })
+        .collect();
+    let served = |w: &str| w == v || vendored.contains(w);
+
+    let (mut overrides, mut unrouted, mut unreadable) = (Vec::new(), Vec::new(), Vec::new());
+    for (rel, state) in &lock_files {
+        let Some(state) = state else {
+            unreadable.push(rel.clone());
+            continue;
+        };
+        let settings = locks::is_settings_lock(rel);
+        for e in state.entries_of(g, a) {
+            if !served(&e.version) {
+                overrides.push(format!(
+                    "{rel}:{} locks {g}:{a} at {} for {}, not the vendored {v}",
+                    e.line,
+                    e.version,
+                    if e.confs.is_empty() {
+                        "its configuration".to_string()
+                    } else {
+                        e.confs.join(",")
+                    }
+                ));
+                break;
+            }
+            let planned = committed == Committed::OrPlanned && e.version == v;
+            if settings && !settings_routes(graph, parent_rel(rel), g, a, &e.version, planned) {
+                unrouted.push(format!(
+                    "{rel}:{} locks {g}:{a}:{} on the settings classpath",
+                    e.line, e.version
+                ));
+                break;
+            }
+        }
+    }
+    let first_of = |found: &[String]| {
+        found.first().map(|first| match found.len() {
+            1 => first.clone(),
+            n => format!("{first} (and {} more)", n - 1),
+        })
+    };
+    if let Some(found) = first_of(&overrides) {
+        warnings.push(degraded(
+            "gradle_lock_overrides_vendored",
+            format!(
+                "{found}; Gradle resolves the locked version (or fails lock validation), so \
+                 that build does not consume the patched {g}:{a}:{v}; lock {v} or vendor the \
+                 locked version"
+            ),
+        ));
+    }
+    if let Some(found) = first_of(&unrouted) {
+        warnings.push(degraded(
+            "gradle_settings_lock_unrouted",
+            format!(
+                "{found}, and that build's settings script does not route it to the vendored \
+                 repository (no in-block entry in its `buildscript` or `pluginManagement` \
+                 repositories); that classpath resolves before the apply line runs"
+            ),
+        ));
+    }
+    if let Some(found) = first_of(&unreadable) {
+        warnings.push(degraded(
+            "gradle_lock_unreadable",
+            format!(
+                "{found} cannot be read as UTF-8 text (missing, unreadable, outside the \
+                 checkout, or not UTF-8), so whether it locks {g}:{a} at another version is \
+                 unknown"
+            ),
+        ));
+    }
+    if let Some(found) = first_of(&unfollowed) {
+        warnings.push(degraded(
+            "gradle_custom_lock_file",
+            format!(
+                "{found} sets a custom dependency-lock file (`lockFile`) that cannot be \
+                 followed statically, so whether it locks {g}:{a} at another version than the \
+                 vendored {v} is unknown"
+            ),
+        ));
+    }
+}
+
+/// Whether the settings script of the build at `dir` routes `g:a:w` on its
+/// own classpath: every block that needs an in-block entry for the GAV
+/// (`buildscript`, and `pluginManagement` when it has settings `plugins{}`)
+/// holds it, and at least one does. `planned`: an entry this plan adds
+/// counts (see [`Committed`]).
+fn settings_routes(
+    graph: &ScriptGraph,
+    dir: &str,
+    g: &str,
+    a: &str,
+    w: &str,
+    planned: bool,
+) -> bool {
+    let Some(script) = graph
+        .builds
+        .iter()
+        .find(|b| b.dir == dir)
+        .and_then(|b| b.settings.as_deref())
+        .and_then(|rel| graph.scripts.iter().find(|s| s.rel == rel))
+    else {
+        return false;
+    };
+    let coords = Coords {
+        group_id: g,
+        artifact_id: a,
+        version: w,
+        uuid: "",
+    };
+    let kotlin = script.dsl == Dsl::Kotlin;
+    let mut routed = false;
+    for scope in ["pluginManagement", "buildscript"] {
+        match scoped_in_block_entry(&script.text, kotlin, &prefix_of(dir), &coords, scope) {
+            InBlock::Unneeded => {}
+            InBlock::Present => routed = true,
+            InBlock::Edited { .. } if planned => routed = true,
+            InBlock::Edited { .. } | InBlock::Unwired(_) => return false,
+        }
+    }
+    routed
 }
 
 /// `../` once per segment of `dir`: the script path from that build.
@@ -1223,7 +1511,11 @@ pub fn references_checked(read: ReadFn<'_>, c: &Coords<'_>) -> Option<bool> {
 
 /// The liveness proof `vex` needs for this layout: `c` is
 /// [`references`]d, the script is ours (line endings aside), and a re-plan
-/// over the committed tree is refused nowhere and degraded nowhere.
+/// over the committed tree is refused nowhere and degraded nowhere. The
+/// re-plan runs as [`Committed::Only`]: it counts only committed in-block
+/// entries, and any wiring it would still write degrades it
+/// ([`uncommitted_wiring`]), so a pending write never stands in for a
+/// missing committed one.
 pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
     if !references(read, c) || !is_ours(read(SCRIPT_REL).as_deref(), SCRIPT) {
         return false;
@@ -1249,7 +1541,7 @@ pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
         extra_artifacts: &extras,
         patched_members: &patched,
     };
-    plan(read, list, &patch).is_ok_and(|p| {
+    plan_as(read, list, &patch, Committed::Only).is_ok_and(|p| {
         p.warnings.iter().all(|w| {
             w.code != DEGRADED
                 // Added by the caller from the upstream chain; `--check`
@@ -3107,6 +3399,38 @@ mod tests {
         assert_idempotent(&files, &p);
     }
 
+    /// Review on #2004 (round 2): Gradle's own `--write-verification-metadata`
+    /// (the remedy `verification_parent_chain_unhandled` names) rewrites
+    /// the jar entry in its own form with the same patched hash. A pending
+    /// verification-file write never makes the build resolve another copy
+    /// (a missing or wrong hash fails verification instead), so it does
+    /// not withhold liveness.
+    #[test]
+    fn a_regenerated_verification_entry_keeps_the_wiring_live() {
+        let before = format!(
+            "{VM_HEAD}{}{VM_TAIL}",
+            vm_component(
+                "com.google.code.gson",
+                "gson",
+                "2.10.1",
+                &[("gson-2.10.1.jar", "old"), ("gson-2.10.1.pom", "pomsha")]
+            ),
+        );
+        let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+        let p = JvmPatch {
+            upstream_pom: GSON_POM,
+            ..patch()
+        };
+        let plan = run(&files, &p).unwrap();
+        let after = applied(&files, &plan);
+        assert!(live_in(&after, &p));
+        let vm = String::from_utf8(after[VERIFICATION_REL].clone()).unwrap();
+        let regenerated = vm.replace("origin=\"socket-patch\"", "origin=\"Generated by Gradle\"");
+        assert_ne!(regenerated, vm);
+        let after = with_files(&after, &[(VERIFICATION_REL, &regenerated)]);
+        assert!(live_in(&after, &p));
+    }
+
     /// #646 review: a `core.autocrlf` checkout converts the verification
     /// file vendored with LF; the revert still takes the patched jar hash
     /// (and any other recorded entry) out, in the file's own newline,
@@ -4657,5 +4981,429 @@ mod tests {
             .extend_from_slice(b"// x\n");
         assert!(!live(&edited));
         assert!(references(&|r: &str| edited.get(r).cloned(), &p.coords()));
+    }
+
+    const LOCK_AT: &str = "com.google.code.gson:gson:2.10.1=compileClasspath,runtimeClasspath\n";
+    const LOCK_ABOVE: &str = "com.google.code.gson:gson:2.11.0=compileClasspath,runtimeClasspath\n";
+    const LOCK_BELOW: &str = "com.google.code.gson:gson:2.9.0=runtimeClasspath\n";
+
+    fn live_in(files: &BTreeMap<String, Vec<u8>>, p: &JvmPatch<'_>) -> bool {
+        wired(
+            &|r: &str| files.get(r).cloned(),
+            &|d: &str| list_of(files, d),
+            &p.coords(),
+        )
+    }
+
+    fn with_files(
+        base: &BTreeMap<String, Vec<u8>>,
+        extra: &[(&str, &str)],
+    ) -> BTreeMap<String, Vec<u8>> {
+        let mut out = base.clone();
+        for (rel, text) in extra {
+            out.insert(rel.to_string(), text.as_bytes().to_vec());
+        }
+        out
+    }
+
+    /// The degraded reasons of `plan`, in order.
+    fn degraded_reasons(plan: &JvmPlan) -> Vec<String> {
+        plan.warnings
+            .iter()
+            .filter(|w| w.code == DEGRADED)
+            .filter_map(|w| {
+                Some(
+                    w.detail
+                        .strip_prefix("reason: ")?
+                        .split(':')
+                        .next()?
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// `files` vendored with `p`.
+    fn vendored_with(
+        files: &BTreeMap<String, Vec<u8>>,
+        p: &JvmPatch<'_>,
+    ) -> BTreeMap<String, Vec<u8>> {
+        let plan = run(files, p).unwrap();
+        applied(files, &plan)
+    }
+
+    fn app_build() -> BTreeMap<String, Vec<u8>> {
+        fs(&[
+            ("settings.gradle", "include 'app'\n"),
+            (
+                "app/build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+            ),
+        ])
+    }
+
+    /// A dependency lock of the build that pins the patched GA at another
+    /// version than the vendored one wins over the vendored GAV: Gradle
+    /// resolves the locked version, so liveness (and the planner) withhold
+    /// attestation. Every lock kind of every project of the build counts;
+    /// a lock at the vendored version, another GA's lock and a nested build
+    /// the root does not include do not. A settings-classpath lock is
+    /// accepted only where the settings script routes it (see
+    /// `settings_lock_needs_the_committed_in_block_entry`); here it does
+    /// not, so it is rejected as hosted rejects it.
+    #[test]
+    fn lock_at_another_version_withholds_liveness() {
+        let p = patch();
+        let after = vendored_with(&app_build(), &p);
+        assert!(live_in(&after, &p));
+        let other = "org.x:y:1=runtimeClasspath\nempty=\n";
+        const OVERRIDES: Option<&str> = Some("gradle_lock_overrides_vendored");
+        for (rel, text, reason) in [
+            ("app/gradle.lockfile", LOCK_AT, None),
+            ("app/gradle.lockfile", other, None),
+            ("app/gradle.lockfile", LOCK_ABOVE, OVERRIDES),
+            ("app/gradle.lockfile", LOCK_BELOW, OVERRIDES),
+            ("gradle.lockfile", LOCK_ABOVE, OVERRIDES),
+            ("app/buildscript-gradle.lockfile", LOCK_ABOVE, OVERRIDES),
+            (
+                "settings-gradle.lockfile",
+                LOCK_AT,
+                Some("gradle_settings_lock_unrouted"),
+            ),
+            ("settings-gradle.lockfile", LOCK_ABOVE, OVERRIDES),
+            (
+                "app/gradle/dependency-locks/runtimeClasspath.lockfile",
+                "com.google.code.gson:gson:2.11.0\n",
+                OVERRIDES,
+            ),
+            // A nested build the root does not include governs nothing.
+            ("samples/demo/gradle.lockfile", LOCK_ABOVE, None),
+        ] {
+            let locked = with_files(&after, &[(rel, text)]);
+            assert_eq!(live_in(&locked, &p), reason.is_none(), "{rel}: {text}");
+            assert_eq!(
+                wired_checked(
+                    &|r: &str| locked.get(r).cloned(),
+                    &|d: &str| list_of(&locked, d),
+                    &p.coords()
+                ),
+                Ok(reason.is_none()),
+                "{rel}: {text}"
+            );
+            let replan = run(&locked, &p).unwrap();
+            assert_eq!(
+                degraded_reasons(&replan),
+                reason.into_iter().collect::<Vec<_>>(),
+                "{rel}: {text}"
+            );
+            assert!(
+                replan
+                    .warnings
+                    .iter()
+                    .all(|w| w.code != DEGRADED || w.detail.contains(rel)),
+                "{rel}"
+            );
+            // A lock never stops the vendoring itself.
+            assert!(replan.writes.is_empty(), "{rel}");
+        }
+        // Two locks at the vendored version and one above: still not live.
+        assert!(!live_in(
+            &with_files(
+                &after,
+                &[
+                    ("gradle.lockfile", LOCK_AT),
+                    ("app/gradle.lockfile", LOCK_ABOVE)
+                ]
+            ),
+            &p
+        ));
+    }
+
+    /// A settings-classpath lock at the vendored version is accepted only
+    /// when the settings script holds the in-block `exclusiveContent` entry
+    /// for the GAV. Vendoring counts the entry it writes; liveness counts
+    /// only the committed file, never a re-plan that would add it.
+    #[test]
+    fn settings_lock_needs_the_committed_in_block_entry() {
+        let p = patch();
+        let files = with_files(
+            &app_build(),
+            &[
+                (
+                    "settings.gradle",
+                    "buildscript { dependencies { classpath 'com.google.code.gson:gson:2.10.1' } }\ninclude 'app'\n",
+                ),
+                ("settings-gradle.lockfile", LOCK_AT),
+            ],
+        );
+        let plan = run(&files, &p).unwrap();
+        assert_eq!(degraded_reasons(&plan), Vec::<String>::new());
+        let after = applied(&files, &plan);
+        let entry = in_block_line(false, "", &p.coords());
+        let settings = String::from_utf8(after["settings.gradle"].clone()).unwrap();
+        assert_eq!(settings.matches(&entry).count(), 1, "{settings}");
+        assert!(live_in(&after, &p));
+        // Locked at another version: rejected like any lock.
+        let above = with_files(&after, &[("settings-gradle.lockfile", LOCK_ABOVE)]);
+        assert!(!live_in(&above, &p));
+        // The committed entry is gone: a re-plan would write it again, but
+        // nothing routes that classpath now.
+        let stripped = with_files(
+            &after,
+            &[("settings.gradle", &settings.replace(&entry, ""))],
+        );
+        assert!(!run(&stripped, &p).unwrap().writes.is_empty());
+        assert!(!live_in(&stripped, &p));
+        let liveness_reasons = |files: &BTreeMap<String, Vec<u8>>| {
+            degraded_reasons(
+                &plan_as(
+                    &|r: &str| files.get(r).cloned(),
+                    &|d: &str| list_of(files, d),
+                    &p,
+                    Committed::Only,
+                )
+                .unwrap(),
+            )
+        };
+        assert_eq!(
+            liveness_reasons(&stripped),
+            ["gradle_settings_lock_unrouted", "gradle_wiring_uncommitted"]
+        );
+        // Without the lock the classpath is still unrouted: the pending
+        // in-block write alone withholds it.
+        let mut unlocked = stripped.clone();
+        unlocked.remove("settings-gradle.lockfile");
+        assert!(!live_in(&unlocked, &p));
+        assert_eq!(liveness_reasons(&unlocked), ["gradle_wiring_uncommitted"]);
+    }
+
+    /// Two vendored versions of one GA (the index is keyed by GAV, and the
+    /// script routes each): a lock at the other vendored version is served,
+    /// not an override; a lock at a version neither serves overrides both.
+    #[test]
+    fn two_vendored_versions_of_a_ga_do_not_override_each_other() {
+        let v1 = patch();
+        let v2 = JvmPatch {
+            version: "2.11.0",
+            uuid: "6f708192-a3b4-4c5d-8e6f-708192a3b4c5",
+            jar: b"PATCHED-JAR-2",
+            ..patch()
+        };
+        let files = fs(&[
+            ("settings.gradle", "include 'app', 'tools'\n"),
+            (
+                "app/build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+            ),
+            (
+                "tools/build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.11.0' }\n",
+            ),
+        ]);
+        let after = vendored_with(&vendored_with(&files, &v1), &v2);
+        let locked = with_files(
+            &after,
+            &[
+                ("app/gradle.lockfile", LOCK_AT),
+                ("tools/gradle.lockfile", LOCK_ABOVE),
+            ],
+        );
+        assert!(live_in(&locked, &v1));
+        assert!(live_in(&locked, &v2));
+        let unserved = with_files(
+            &locked,
+            &[(
+                "tools/gradle.lockfile",
+                "com.google.code.gson:gson:2.12.0=runtimeClasspath\n",
+            )],
+        );
+        assert!(!live_in(&unserved, &v1));
+        assert!(!live_in(&unserved, &v2));
+    }
+
+    /// A lock file the listing shows but that cannot be read as UTF-8 text
+    /// (an I/O error, a refused symlink out of the checkout, non-UTF-8
+    /// bytes) fails closed, with its own reason.
+    #[test]
+    fn unreadable_lock_files_fail_closed() {
+        let p = patch();
+        let after = vendored_with(&app_build(), &p);
+        let mut bad = after.clone();
+        bad.insert("app/gradle.lockfile".into(), b"\xff\xfe\n".to_vec());
+        assert!(!live_in(&bad, &p));
+        assert_eq!(
+            degraded_reasons(&run(&bad, &p).unwrap()),
+            ["gradle_lock_unreadable"]
+        );
+        // Listed, but the reader refuses it.
+        let listed = with_files(&after, &[("app/gradle.lockfile", LOCK_AT)]);
+        let read = |r: &str| {
+            (r != "app/gradle.lockfile")
+                .then(|| listed.get(r).cloned())
+                .flatten()
+        };
+        let list = |d: &str| list_of(&listed, d);
+        assert!(!wired(&read, &list, &p.coords()));
+        let plan = plan(&read, &list, &p).unwrap();
+        assert_eq!(degraded_reasons(&plan), ["gradle_lock_unreadable"]);
+        assert!(plan.warnings[0].detail.contains("app/gradle.lockfile"));
+    }
+
+    /// A custom `lockFile` location the graph can follow (a literal
+    /// `file(…)` in the project's own build script) is read and checked
+    /// like any lock, and fails closed when missing; one it cannot follow
+    /// withholds attestation.
+    #[test]
+    fn custom_lock_file_is_followed_when_static() {
+        let p = patch();
+        let after = vendored_with(&app_build(), &p);
+        let custom = with_files(
+            &after,
+            &[(
+                "app/build.gradle",
+                "dependencyLocking { lockFile = file('locks/app.lockfile') }\n\
+                 dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+            )],
+        );
+        let at = with_files(&custom, &[("app/locks/app.lockfile", LOCK_AT)]);
+        assert!(live_in(&at, &p));
+        assert_eq!(
+            degraded_reasons(&run(&at, &p).unwrap()),
+            Vec::<String>::new()
+        );
+        let above = with_files(&custom, &[("app/locks/app.lockfile", LOCK_ABOVE)]);
+        assert!(!live_in(&above, &p));
+        assert_eq!(
+            degraded_reasons(&run(&above, &p).unwrap()),
+            ["gradle_lock_overrides_vendored"]
+        );
+        // A custom path that is the default lock is checked once.
+        let default = with_files(
+            &after,
+            &[
+                (
+                    "app/build.gradle",
+                    "dependencyLocking { lockFile = file('gradle.lockfile') }\n\
+                     dependencies { implementation 'com.google.code.gson:gson:2.10.1' }\n",
+                ),
+                ("app/gradle.lockfile", LOCK_ABOVE),
+            ],
+        );
+        let plan = run(&default, &p).unwrap();
+        assert_eq!(degraded_reasons(&plan), ["gradle_lock_overrides_vendored"]);
+        assert!(
+            !plan.warnings[0].detail.contains("more)"),
+            "{}",
+            plan.warnings[0].detail
+        );
+        assert!(!live_in(&custom, &p));
+        assert_eq!(
+            degraded_reasons(&run(&custom, &p).unwrap()),
+            ["gradle_lock_unreadable"]
+        );
+        let unfollowed = with_files(
+            &after,
+            &[(
+                "build.gradle",
+                "subprojects { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            )],
+        );
+        assert!(!live_in(&unfollowed, &p));
+        assert_eq!(
+            degraded_reasons(&run(&unfollowed, &p).unwrap()),
+            ["gradle_custom_lock_file"]
+        );
+    }
+
+    /// Liveness judges the committed wiring, never what a re-plan would
+    /// write: with no lock at all, a settings classpath on the GA whose
+    /// in-block entry is gone, a settings `plugins{}` block added since
+    /// vendoring, a `buildSrc` or included build that lost its apply line,
+    /// a deleted derived `maven-metadata.xml`, a verification file without
+    /// the patched hashes and an index row whose hash no longer matches
+    /// the tree each withhold attestation. The git hygiene files are not
+    /// wiring Gradle reads, so a missing one does not. Vendoring's own
+    /// first run still counts the entries it writes.
+    #[test]
+    fn liveness_judges_committed_wiring_not_a_replan() {
+        let p = patch();
+        let settings =
+            "buildscript { dependencies { classpath 'com.google.code.gson:gson:2.10.1' } }\n\
+                        includeBuild('tools')\ninclude 'app'\n";
+        let verification = format!("{VM_HEAD}{VM_TAIL}");
+        let files = with_files(
+            &app_build(),
+            &[
+                ("settings.gradle", settings),
+                ("tools/build.gradle", ""),
+                ("buildSrc/build.gradle", ""),
+                (VERIFICATION_REL, &verification),
+            ],
+        );
+        let plan = run(&files, &p).unwrap();
+        assert_eq!(degraded_reasons(&plan), Vec::<String>::new());
+        let after = applied(&files, &plan);
+        assert!(live_in(&after, &p));
+        let text = |rel: &str| String::from_utf8(after[rel].clone()).unwrap();
+        let entry = in_block_line(false, "", &p.coords());
+        let committed = text("settings.gradle");
+        assert_eq!(committed.matches(&entry).count(), 1, "{committed}");
+        let metadata = derived_metadata_rel("com.google.code.gson", "gson");
+        let index = text(INDEX_REL);
+        let jar_sha = sha256_hex(p.jar);
+        assert!(index.contains(&jar_sha));
+        let tampered_index = index.replace(&jar_sha, &"0".repeat(64));
+        let plugins = format!("plugins {{ id 'com.example.p' version '1' }}\n{committed}");
+        let mut cases: Vec<(&str, BTreeMap<String, Vec<u8>>)> = vec![
+            (
+                "settings in-block entry",
+                with_files(
+                    &after,
+                    &[("settings.gradle", &committed.replace(&entry, ""))],
+                ),
+            ),
+            (
+                "settings plugins added",
+                with_files(&after, &[("settings.gradle", &plugins)]),
+            ),
+            (
+                "included build apply line",
+                with_files(&after, &[("tools/settings.gradle", "")]),
+            ),
+            (
+                "buildSrc apply line",
+                with_files(&after, &[("buildSrc/settings.gradle", "")]),
+            ),
+            (
+                "verification hashes",
+                with_files(&after, &[(VERIFICATION_REL, &verification)]),
+            ),
+            (
+                "index hash",
+                with_files(&after, &[(INDEX_REL, &tampered_index)]),
+            ),
+        ];
+        let mut no_metadata = after.clone();
+        no_metadata.remove(&metadata);
+        cases.push(("derived metadata", no_metadata));
+        for (what, broken) in &cases {
+            assert!(
+                references(&|r: &str| broken.get(r).cloned(), &p.coords()),
+                "{what}"
+            );
+            // Vendoring there repairs it.
+            assert!(!run(broken, &p).unwrap().writes.is_empty(), "{what}");
+        }
+        let masked: Vec<&str> = cases
+            .iter()
+            .filter(|(_, broken)| live_in(broken, &p))
+            .map(|(what, _)| *what)
+            .collect();
+        assert_eq!(masked, Vec::<&str>::new());
+        for hygiene in [GITIGNORE_REL, GITATTRIBUTES_REL, VENDOR_GITATTRIBUTES_REL] {
+            let mut missing = after.clone();
+            missing.remove(hygiene);
+            assert!(live_in(&missing, &p), "{hygiene}");
+        }
     }
 }
