@@ -7,8 +7,8 @@
 //! not once per dependency.
 
 use crate::formats::maven::{
-    interpolate_strict, is_executable_classifier, is_executable_variant, is_variant, may_shadow,
-    variant_label, CoordinateAlternative, PomScope,
+    interpolate_strict, is_executable_classifier, is_executable_variant, is_variant, may_name,
+    may_shadow, variant_label, CoordinateAlternative, PomScope,
 };
 use crate::formats::xml::{child_text, children, elements, Element};
 
@@ -243,7 +243,8 @@ impl PomIndex {
     /// it: a live versioned declaration of it (the one a pin is written
     /// into) then names another package, or another declaration then names
     /// its main jar (as [`may_shadow`] reads one) at a version other than
-    /// `served`, or literally one of its executable classifier copies
+    /// `served`, or one of its executable classifier copies (literally, or
+    /// through a property this pom does not define, [`may_name`])
     /// (`test-jar` is the `tests` copy) off `served` or with no version of
     /// its own. A main jar without a version takes the pin.
     pub(super) fn retargeted(
@@ -286,7 +287,13 @@ impl PomIndex {
                             || may_shadow((&r.group, &r.artifact), None, None, (group, artifact)))
                             && r.version.is_some()
                     }
-                    Some(c) => literal && is_executable_classifier(c),
+                    // A coordinate still holding a property this pom does
+                    // not define may be this copy, as discovery weighs it.
+                    Some(c) => {
+                        may_name(&r.group, group)
+                            && may_name(&r.artifact, artifact)
+                            && is_executable_classifier(c)
+                    }
                 };
                 (names && r.version.as_deref() != served).then(|| {
                     format!(

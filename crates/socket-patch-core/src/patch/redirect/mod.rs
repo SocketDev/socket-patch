@@ -11037,6 +11037,18 @@ mod tests {
                 ),
                 "<h>org.slf4j</h>",
             ),
+            // ... or a classifier copy the profile leaves on a property this
+            // pom does not define, which may be the GA (as discovery weighs
+            // it, #2026 review).
+            (
+                "<h>org.other</h>",
+                format!(
+                    "{pinned}<dependency><groupId>${{h}}</groupId><artifactId>slf4j-api\
+                     </artifactId><version>1.7.30</version><classifier>tests</classifier>\
+                     </dependency>"
+                ),
+                "<h>${parent.g}</h>",
+            ),
         ] {
             let mut files = BTreeMap::new();
             files.insert("pom.xml".to_string(), pom(props, &deps, profile));

@@ -2273,8 +2273,8 @@ impl Reactor {
     /// pin, so its local root is not pinned. A classifier copy is its own
     /// coordinate, which no pin reaches: an executable one is warned about
     /// as `classifier_declared`, as `rewrite_declarations` does (`sources` /
-    /// `javadoc` never run), and any other `<type>` but `jar` is not the
-    /// g:a's jar. Text that can never
+    /// `javadoc` never run; `test-jar` is the `tests` copy), and any other
+    /// `<type>` but `jar` is not the g:a's jar. Text that can never
     /// read the g:a, whatever its properties say ([`may_interpolate_to`]),
     /// is ruled out first, before any inheritor or profile is read.
     fn warn_property_coordinates(
@@ -2295,7 +2295,16 @@ impl Reactor {
             ) else {
                 continue;
             };
-            let classifier = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
+            let type_text = doc.child_text(dep, "type").filter(|t| !t.is_empty());
+            // `test-jar` is the `tests` classifier copy, as discovery and
+            // the hosted rewriter map it.
+            let classifier = match (
+                type_text.as_deref(),
+                doc.child_text(dep, "classifier").filter(|c| !c.is_empty()),
+            ) {
+                (Some("test-jar"), None) => Some("tests".to_string()),
+                (_, classifier) => classifier,
+            };
             if !doc.has_property_coordinate(dep)
                 || doc.pin_at(dep).is_some()
                 || classifier
@@ -2303,9 +2312,9 @@ impl Reactor {
                     .is_some_and(|c| !is_executable_classifier(c))
                 || !may_interpolate_to(&g, patch.group_id)
                 || !may_interpolate_to(&a, patch.artifact_id)
-                || doc
-                    .child_text(dep, "type")
-                    .is_some_and(|t| !t.is_empty() && t != "jar")
+                || type_text
+                    .as_deref()
+                    .is_some_and(|t| t != "jar" && t != "test-jar")
             {
                 continue;
             }
@@ -6479,31 +6488,37 @@ mod tests {
     /// root (#2026 review).
     #[test]
     fn a_profile_retargeting_a_classifier_copy_warns() {
-        let copy = "<dependency><groupId>${lib.group}</groupId>\
+        let classified = "<dependency><groupId>${lib.group}</groupId>\
                     <artifactId>commons-text</artifactId><version>1.10.0</version>\
                     <classifier>tests</classifier></dependency>";
-        let files = fs(&[
-            (
-                "pom.xml",
-                &root_with(
-                    "<lib.group>org.other</lib.group>",
-                    "<lib.group>org.apache.commons</lib.group>",
+        // `test-jar` is the `tests` copy too.
+        let test_jar = "<dependency><groupId>${lib.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version>\
+                    <type>test-jar</type></dependency>";
+        for copy in [classified, test_jar] {
+            let files = fs(&[
+                (
+                    "pom.xml",
+                    &root_with(
+                        "<lib.group>org.other</lib.group>",
+                        "<lib.group>org.apache.commons</lib.group>",
+                    ),
                 ),
-            ),
-            (
-                "a/pom.xml",
-                &module("a", &format!("{}{copy}", dep("1.10.0"))),
-            ),
-            ("b/pom.xml", &module("b", "")),
-        ]);
-        let plan = run(&files).unwrap();
-        assert_eq!(reasons(&plan), ["classifier_declared"]);
-        assert!(
-            plan.warnings[0].detail.contains("profile corp"),
-            "{:?}",
-            plan.warnings
-        );
-        assert!(root_pinned(&plan, &files));
+                (
+                    "a/pom.xml",
+                    &module("a", &format!("{}{copy}", dep("1.10.0"))),
+                ),
+                ("b/pom.xml", &module("b", "")),
+            ]);
+            let plan = run(&files).unwrap();
+            assert_eq!(reasons(&plan), ["classifier_declared"], "{copy}");
+            assert!(
+                plan.warnings[0].detail.contains("profile corp"),
+                "{:?}",
+                plan.warnings
+            );
+            assert!(root_pinned(&plan, &files));
+        }
     }
 
     fn attestable(files: &Fs) -> (bool, bool) {
