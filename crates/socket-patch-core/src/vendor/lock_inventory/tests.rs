@@ -3766,9 +3766,10 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// * the vendored backends and `repair` take their bytes from the patch
 ///   service by patch uuid (`vendor::service_fetch::fetch_verified_archive`),
 ///   verified against the service's own digest;
-/// * `recover_lock_entry`'s one production caller is the CLI's
-///   `pristine_fetch_is_verifiable`, a yes/no gate on which lock-text
-///   refusals to report; it fetches nothing (the CLI pins that side);
+/// * `recover_lock_entry`'s one production caller is
+///   `vendor::refusals::pristine_fetch_is_verifiable`, a yes/no gate on
+///   which lock-text refusals to report; it fetches nothing (the CLI has
+///   no reference at all, and pins that side);
 /// * the only registry downloads are the hosted → vendored takeover's
 ///   upstream restore (`patch::redirect::upstream::client`), which
 ///   re-resolves the entry from the registry's own metadata and never
@@ -3868,6 +3869,11 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
         "vendor/lock_inventory/mod.rs",
         "recover_lock_entry",
         "pub use self::recover::recover_lock_entry;",
+    ),
+    (
+        "vendor/refusals.rs",
+        "recover_lock_entry",
+        "Some(le) => lock_inventory::recover_lock_entry(project_root, le)",
     ),
 ];
 
