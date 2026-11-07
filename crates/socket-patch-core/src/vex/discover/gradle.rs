@@ -55,7 +55,7 @@ use super::{
 };
 use crate::gradle::locks;
 use crate::patch::redirect::gradle::{
-    apply_line_digest, graph_of, index_digest, is_settings_lock, lockfile_paths, parse_index,
+    apply_line_digest, graph_of, index_digest, is_settings_lock, key_list, parse_index,
     settings_targets, GradleFiles, PinnedRowChecks, HOSTED_INDEX_REL, HOSTED_SCRIPT,
     HOSTED_SCRIPT_REL, MAX_ROUNDS,
 };
@@ -105,12 +105,15 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             .custom_lock_file()
             .map(|rel| format!("{rel} sets a custom dependency-lock file (`lockFile`)"))
     });
-    let locks: Vec<(String, locks::LockState)> = lockfile_paths(&graph, &files)
+    // The shared lock inventory (`ScriptGraph::read_locks`, also the
+    // vendored backend's). The listing is the keys of `files`, so every
+    // listed lock reads; `read_build` leaves an unreadable one out.
+    let list = |dir: &str| key_list(&files, dir);
+    let read = |rel: &str| files.get(rel).cloned();
+    let locks: Vec<(String, locks::LockState)> = graph
+        .read_locks(&list, &read)
         .into_iter()
-        .filter_map(|rel| {
-            let state = locks::parse(files.get(&rel)?);
-            Some((rel, state))
-        })
+        .filter_map(|(rel, state)| Some((rel, state?)))
         .collect();
     let pinned_checks = PinnedRowChecks::new(&files, &graph);
     for row in rows {
