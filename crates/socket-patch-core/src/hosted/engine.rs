@@ -319,6 +319,137 @@ pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> 
         && view.is_symlink("bun.lockb")
 }
 
+/// Skip reason of an npm candidate withheld because the project patches
+/// that package itself ([`withhold_user_patched`]): the code the CLI's
+/// consent gate reports for the same packages.
+pub const USER_PATCH_CONFLICT: &str = "user_patch_conflict";
+
+/// The pnpm and yarn locks [`withhold_user_patched`] reads when `files`
+/// does not already hold them.
+const USER_PATCH_LOCKS: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "shrinkwrap.yaml",
+    "yarn.lock",
+    crate::constants::npm_family::RUSH_COMMON_LOCK_REL,
+];
+
+/// The locks a disk scan reads on top of the CLI consent gate's walk for
+/// the user-patch gate ([`withhold_user_patched_by`]): a root
+/// `shrinkwrap.yaml`, and a Rush monorepo's pnpm locks — the common lock
+/// and every subspace's, through the same safe listing lockfile discovery
+/// uses ([`rush_lock_rels`]). The in-memory engine reads the subspace locks
+/// as candidate files, so leaving them out on disk would pin a package the
+/// in-memory engine withholds. Outside Rush only the common lock path is
+/// tried, as before (a missing file is simply not read).
+pub async fn user_patch_supplement_lock_rels(view: ProjectView<'_>) -> Vec<String> {
+    let mut rels = if is_rush(view).await {
+        rush_lock_rels(view).await
+    } else {
+        vec![crate::constants::npm_family::RUSH_COMMON_LOCK_REL.to_string()]
+    };
+    rels.push("shrinkwrap.yaml".to_string());
+    rels
+}
+
+/// Withhold from every rewriter each npm candidate whose package the
+/// project patches itself with pnpm (`patchedDependencies`), yarn (a
+/// `patch:` descriptor) or patch-package, recording each as skipped
+/// ([`USER_PATCH_CONFLICT`]). The package manager applies the user's
+/// diff on top of whatever tarball the lock names, so a hosted pin either
+/// fails the install once the diff no longer applies or installs bytes
+/// that are neither the user's package nor the Socket patch. The
+/// evidence is [`UserPatchIndex::npm_family_in`], which `vex` discovery
+/// reads too, over `files` (the candidate texts already read: a member's
+/// own pnpm lock) and the root pnpm, yarn and Rush locks. npm's and Bun's
+/// own `patchedDependencies` are not read here: their rewriters skip such
+/// a package per resolution (#711, #367). `allow` is the caller's explicit
+/// consent (the CLI's `--allow-patch-conflicts`): nothing is withheld.
+/// Returns one [`USER_PATCH_CONFLICT`] warning per withheld candidate,
+/// with the skip's detail.
+///
+/// [`UserPatchIndex::npm_family_in`]: crate::patch::user_patches::UserPatchIndex::npm_family_in
+pub async fn withhold_user_patched(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+    allow: bool,
+) -> Vec<RewriteWarning> {
+    if allow || !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        return Vec::new();
+    }
+    let mut read: Vec<(String, String)> = Vec::new();
+    for rel in USER_PATCH_LOCKS {
+        if files.contains_key(rel) {
+            continue;
+        }
+        if let Ok(text) = view.read_text(rel).await {
+            read.push((rel.to_string(), text));
+        }
+    }
+    let locks: Vec<(&str, &str)> = files
+        .iter()
+        .chain(read.iter().map(|(rel, text)| (rel, text)))
+        .filter(|(rel, _)| {
+            matches!(
+                rel.rsplit('/').next(),
+                Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
+            )
+        })
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    withhold_user_patched_by(&index, candidates, skipped)
+}
+
+/// [`withhold_user_patched`] by evidence the caller already holds: the
+/// disk flow passes what its consent gate's walk did not read (a Rush
+/// lock), [`UserPatchIndex::from_locks`], instead of walking the project
+/// a second time.
+///
+/// [`UserPatchIndex::from_locks`]: crate::patch::user_patches::UserPatchIndex::from_locks
+pub fn withhold_user_patched_by(
+    index: &crate::patch::user_patches::UserPatchIndex,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<RewriteWarning> {
+    let mut warnings = Vec::new();
+    if index.is_empty() {
+        return warnings;
+    }
+    candidates.retain(|c| {
+        if c.dep.ecosystem != "npm" {
+            return true;
+        }
+        let sources = index.conflicts(&c.purl);
+        if sources.is_empty() {
+            return true;
+        }
+        let detail = user_patched_detail(&c.purl, &sources);
+        warnings.push(warning(USER_PATCH_CONFLICT, detail.clone()));
+        skipped.push(SkippedPatch {
+            detail: Some(detail),
+            ..SkippedPatch::new(&c.purl, &c.dep.patch_uuid, USER_PATCH_CONFLICT)
+        });
+        false
+    });
+    warnings
+}
+
+/// [`withhold_user_patched`]'s skip detail.
+fn user_patched_detail(purl: &str, sources: &[String]) -> String {
+    format!(
+        "{purl}: {} declares a patch the project applies to this package itself (pnpm \
+         `patchedDependencies`, a yarn `patch:` descriptor, or a patch-package patch); the \
+         package manager applies it on top of whatever tarball the lock names, so pinning the \
+         hosted patch would stack the two (or fail every install once the user's diff no \
+         longer applies). It is left unchanged and stays without the Socket patch: fold the \
+         Socket fix into your own patch, or remove the user patch and re-run (the CLI's \
+         explicit `--allow-patch-conflicts` wires it anyway)",
+        sources.join(", ")
+    )
+}
+
 /// The project's candidate files as the rewriters read them.
 #[derive(Debug, Clone, Default)]
 pub struct CandidateFiles {
@@ -4587,6 +4718,29 @@ snapshots:
     /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
     /// splices nothing on a re-run, yet its `rush install` still needs the
     /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    /// The disk scan's user-patch supplement reads every Rush subspace lock,
+    /// as the in-memory engine does through its candidate files, and only
+    /// the common lock path outside Rush.
+    #[tokio::test]
+    async fn user_patch_supplement_reads_rush_subspace_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("common/config/subspaces/web")).unwrap();
+        let disk = ProjectView::Disk(tmp.path());
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [RUSH_COMMON_LOCK_REL, "shrinkwrap.yaml"]
+        );
+        std::fs::write(tmp.path().join("rush.json"), "{}").unwrap();
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [
+                RUSH_COMMON_LOCK_REL,
+                "common/config/subspaces/web/pnpm-lock.yaml",
+                "shrinkwrap.yaml"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
         let mut first = MemoryProject::new();

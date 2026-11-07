@@ -175,6 +175,9 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         }
         return None;
     }
+    if let Some(need) = user_patch_need(rel) {
+        return Some(need);
+    }
     let rush = root_files.contains("rush.json");
     if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_file(rel, "pnpm-lock.yaml")) {
         return Some(Need::Text);
@@ -198,6 +201,28 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         }
     }
     None
+}
+
+/// What the engine's user-patch walk
+/// ([`crate::patch::user_patches::UserPatchIndex::npm_family_in`]) needs
+/// of the nested file `rel`, outside the directories it never enters:
+/// which directories are workspace members, and which a `--patch-dir`
+/// names, is only known from content, so every file it could read is
+/// selected by name. A `package.json`, `pnpm-workspace.yaml`,
+/// `pnpm-lock.yaml` or `yarn.lock` is read (text); a patch-package file
+/// counts by its name alone (present). With every such file selected, a
+/// patch directory the engine finds no `.patch` file in holds none.
+fn user_patch_need(rel: &str) -> Option<Need> {
+    use crate::patch::user_patches::WALK_SKIP;
+    let (dir, base) = split_path(rel);
+    if dir.split('/').any(|seg| WALK_SKIP.contains(&seg)) {
+        return None;
+    }
+    match base {
+        "package.json" | "pnpm-workspace.yaml" | "pnpm-lock.yaml" | "yarn.lock" => Some(Need::Text),
+        _ if base.ends_with(".patch") => Some(Need::Present),
+        _ => None,
+    }
 }
 
 /// What a pnpm workspace root (one with a `pnpm-workspace.yaml`) needs of
