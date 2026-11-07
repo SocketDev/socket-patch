@@ -621,6 +621,23 @@ pub enum UnattestedKind {
     /// resolution (Bun), so hosted and vendored mode leave the package
     /// unwired and never confirm it.
     UserPatchedDependency,
+    /// A Go `replace` the workspace go resolves keeps from the build: that
+    /// `go.work` (an ancestor's, or one `GOWORK` names) is not the root's,
+    /// overrides the replace, does not `use` its module, or another member
+    /// replaces the same module elsewhere — exactly where the hosted and
+    /// vendored writers refuse to write one.
+    GoWorkspaceOverride,
+}
+
+impl UnattestedKind {
+    /// Whether the mark bypasses only the wiring in its own file: another
+    /// file's live ref of the same patch still reaches the build (a root
+    /// go.mod mirroring a go.work replace go never reads). Every other
+    /// kind shows a copy the build may run unpatched, which withholds the
+    /// patch however many files wire it.
+    pub fn file_scoped(self) -> bool {
+        matches!(self, UnattestedKind::GoWorkspaceOverride)
+    }
 }
 
 /// A ref discovery emits (so rollback, remove and list find the wiring,

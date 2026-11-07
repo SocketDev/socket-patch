@@ -1,9 +1,9 @@
 //! Hermetic vlt hosted-mode fixtures shared by the redirect, rollback,
 //! symlink, get and covgap suites: a vlt project (`vlt-lock.json`, an
 //! installed importer copy, optionally vlt's store and hidden lock), the
-//! wiremock API (discovery, the grant, the patch view) plus the artifact
-//! route the vlt preflight fetches, and a scrubbed subprocess runner that
-//! reads the `--json` envelope back.
+//! wiremock API (discovery, the grant, the patch view) plus an artifact
+//! route (counted, so a suite can assert the scan never fetches it), and a
+//! scrubbed subprocess runner that reads the `--json` envelope back.
 //!
 //! Include with `#[path = "vlt_hosted_common/mod.rs"] mod vlt_hosted_common;`.
 
@@ -35,7 +35,6 @@ pub const LEGACY_ID: &str = "·npm·left-pad@1.3.0";
 pub const EMPTY_SEGMENT_ID: &str = "··left-pad@1.3.0";
 
 pub const ADVISORY: &str = "redirect_vlt_reinstall_required";
-pub const UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
 
 pub const ADVISORY_NOTHING_STALE: &str = "vlt-lock.json pins Socket-patched packages; fresh \
      checkouts install them with `vlt ci` or `vlt install --frozen-lockfile`. Note: `vlt update` \
@@ -61,8 +60,8 @@ pub fn advisory_cleanup_skipped(n: usize) -> String {
 pub fn advisory_undeterminable(n: usize) -> String {
     format!(
         "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
-         installed copies (node_modules is a link, or no patch record or artifact was \
-         available); run `vlt ci` to be sure the patched packages are installed."
+         installed copies (node_modules is a link, or no patch record was available); run \
+         `vlt ci` to be sure the patched packages are installed."
     )
 }
 

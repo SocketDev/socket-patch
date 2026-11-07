@@ -146,9 +146,9 @@ pub(super) async fn inventory_npm_lock_raw_in(
             }
             // Rush monorepos have no root package.json/lock pair; their
             // single pnpm source-of-truth lives under common/config/rush/.
-            // The flavor probe (root-relative) can't see it, so fall back
-            // explicitly when the root lock is absent but rush.json is
-            // present.
+            // The flavor probe (root-relative) can't see it, so every
+            // refusal that got this far falls back to Rush's locks, which
+            // read nothing outside a Rush monorepo (no rush.json).
             let rush = inventory_rush_pnpm_locks_in(view).await;
             return Ok((!rush.is_empty()).then(|| (NpmLockFlavor::Pnpm, guard_npm(rush))));
         }
