@@ -1944,6 +1944,59 @@ mod tests {
         );
     }
 
+    /// A drifted entry in a `\/`-escaping lock that still routes composer
+    /// at the artifact keeps it: the keep-check matches the escaped
+    /// spelling, so the revert never deletes a dir the lock installs from.
+    #[tokio::test]
+    async fn drifted_escaped_slash_lock_still_naming_the_artifact_keeps_it() {
+        let lock = lock_value("psr/log", "3.0.2", false);
+        let (dir, blobs, installed, record) = fixture(&lock).await;
+        let root = dir.path();
+        let text = String::from_utf8(composer_json_bytes(&lock).unwrap()).unwrap();
+        tokio::fs::write(root.join(COMPOSER_LOCK), text.replace('/', "\\/"))
+            .await
+            .unwrap();
+        let (result, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, PURL, false).await);
+        assert!(result.success, "{:?}", result.error);
+        let vendored = tokio::fs::read_to_string(root.join(COMPOSER_LOCK))
+            .await
+            .unwrap();
+        assert!(vendored.contains(&format!(".socket\\/vendor\\/composer\\/{UUID}\\/")));
+
+        // A hand edit put the registry dist back (drift: the wired dist is
+        // gone) but moved the vendored path into `source`, which a
+        // `--prefer-source` install still reads.
+        let mut wired: Value = serde_json::from_str(&vendored).unwrap();
+        let url = wired["packages"][0]["dist"]["url"].clone();
+        wired["packages"][0]["dist"] = lock["packages"][0]["dist"].clone();
+        wired["packages"][0]["source"] = serde_json::json!({"type": "path", "url": url});
+        let drifted = String::from_utf8(composer_json_bytes(&wired).unwrap())
+            .unwrap()
+            .replace('/', "\\/");
+        assert!(!drifted.contains(&format!("/vendor/composer/{UUID}")));
+        tokio::fs::write(root.join(COMPOSER_LOCK), &drifted)
+            .await
+            .unwrap();
+
+        let outcome = revert_composer(&entry.unwrap(), root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            root.join(format!(".socket/vendor/composer/{UUID}"))
+                .is_dir(),
+            "the escaped lock still installs from the artifact"
+        );
+    }
+
     /// A lock mixing CRLF and LF keeps every line outside the vendored
     /// entry as it was, and reverts byte-identically.
     #[tokio::test]
