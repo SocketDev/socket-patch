@@ -164,9 +164,7 @@ pub fn gate(
     Some(bundler)
 }
 
-/// Runs in every suite that includes this module (no `#[cfg(test)]`: an
-/// integration crate does not set it, so the gate would compile the test
-/// out).
+/// Runs in every suite that includes this module.
 mod bundler_e2e_selftest {
     use super::*;
 
