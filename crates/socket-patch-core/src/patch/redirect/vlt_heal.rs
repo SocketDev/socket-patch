@@ -9,7 +9,7 @@
 //! reinstall (an optional node), and nothing outside the project root is
 //! ever touched.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -19,7 +19,6 @@ use crate::manifest::schema::PatchRecord;
 use crate::origin::hosted_patch_uuid;
 use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
 use crate::patch::file_hash::compute_file_git_sha256;
-use crate::patch::package::read_archive_bytes_to_map_strict;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, is_registry_package_name, sniff_lock, split_dep_id, DepIdKind, LockSniff,
@@ -94,8 +93,6 @@ pub struct Target<'a> {
     /// node is gone or the slot is null).
     pub lock_sha512: Option<&'a str>,
     pub record: Option<&'a PatchRecord>,
-    /// The artifact bytes the preflight downloaded.
-    pub artifact: Option<&'a [u8]>,
     /// Slot [0] of the node, see [`reinstalls_after_removal`].
     pub flags: Option<u64>,
 }
@@ -314,62 +311,10 @@ async fn record_check(dir: &Path, record: &PatchRecord, expected: Expected) -> B
     }
 }
 
-/// The regular files under `dir` (its own `node_modules/` excluded) by
-/// `/`-joined relative path; `Err(true)` when a link or special file is
-/// present (never an extracted artifact), `Err(false)` when unreadable.
-fn installed_files(dir: &Path) -> Result<BTreeMap<String, Vec<u8>>, bool> {
-    let mut out = BTreeMap::new();
-    let walk = walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|e| !(e.depth() == 1 && e.file_name() == "node_modules"));
-    for entry in walk {
-        let entry = entry.map_err(|_| false)?;
-        if entry.depth() == 0 || entry.file_type().is_dir() {
-            continue;
-        }
-        if !entry.file_type().is_file() {
-            return Err(true);
-        }
-        let rel = entry.path().strip_prefix(dir).map_err(|_| false)?;
-        let key = rel
-            .components()
-            .map(|c| c.as_os_str().to_str())
-            .collect::<Option<Vec<_>>>()
-            .ok_or(false)?
-            .join("/");
-        out.insert(key, std::fs::read(entry.path()).map_err(|_| false)?);
-    }
-    Ok(out)
-}
-
-fn artifact_check(dir: &Path, artifact: &[u8]) -> ByteCheck {
-    let Ok(expected) = read_archive_bytes_to_map_strict(artifact) else {
-        return ByteCheck::Unknown;
-    };
-    let installed = match installed_files(dir) {
-        Ok(files) => files,
-        Err(true) => return ByteCheck::Mismatch,
-        Err(false) => return ByteCheck::Unknown,
-    };
-    let expected: BTreeMap<String, Vec<u8>> = expected
-        .into_iter()
-        .filter(|(path, _)| path != "node_modules" && !path.starts_with("node_modules/"))
-        .collect();
-    if expected == installed {
-        ByteCheck::Match
-    } else {
-        ByteCheck::Mismatch
-    }
-}
-
 async fn bytes_check(dir: &Path, target: &Target<'_>, expected: Expected) -> ByteCheck {
-    if let Some(record) = target.record.filter(|r| !r.files.is_empty()) {
-        return record_check(dir, record, expected).await;
-    }
-    match (expected, target.artifact) {
-        (Expected::Patched, Some(artifact)) => artifact_check(dir, artifact),
-        _ => ByteCheck::Unknown,
+    match target.record.filter(|r| !r.files.is_empty()) {
+        Some(record) => record_check(dir, record, expected).await,
+        None => ByteCheck::Unknown,
     }
 }
 
@@ -535,13 +480,12 @@ mod tests {
         .unwrap();
     }
 
-    fn target<'a>(record: Option<&'a PatchRecord>, artifact: Option<&'a [u8]>) -> Target<'a> {
+    fn target(record: Option<&PatchRecord>) -> Target<'_> {
         Target {
             dep_id: ID,
             name: "left-pad",
             lock_sha512: Some(LOCK_SHA),
             record,
-            artifact,
             flags: Some(0),
         }
     }
@@ -551,19 +495,6 @@ mod tests {
         classify_target(&state, root, target, expected).await
     }
 
-    fn tarball(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        let mut builder = tar::Builder::new(gz);
-        for (name, data) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_size(data.len() as u64);
-            header.set_mode(0o644);
-            header.set_cksum();
-            builder.append_data(&mut header, name, *data).unwrap();
-        }
-        builder.into_inner().unwrap().finish().unwrap()
-    }
-
     #[tokio::test]
     async fn rule_a_hidden_lock_integrity_differs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -571,7 +502,7 @@ mod tests {
         hidden(tmp.path(), Some("sha512-UPSTREAM"));
         let rec = record();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Stale
         );
     }
@@ -583,7 +514,7 @@ mod tests {
         hidden(tmp.path(), None);
         let rec = record();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Stale
         );
     }
@@ -595,12 +526,12 @@ mod tests {
         hidden(tmp.path(), Some(LOCK_SHA));
         let rec = record();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Stale
         );
         std::fs::remove_file(tmp.path().join(VLT_HIDDEN_LOCK_REL)).unwrap();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Stale
         );
     }
@@ -612,108 +543,45 @@ mod tests {
         hidden(tmp.path(), Some(LOCK_SHA));
         let rec = record();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Healthy
         );
         std::fs::remove_file(tmp.path().join(VLT_HIDDEN_LOCK_REL)).unwrap();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Healthy,
             "a tree without a hidden lock is judged by its bytes"
         );
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Pristine).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Pristine).await,
             TargetState::Stale,
             "patched bytes are stale once the pin is restored"
         );
         store(tmp.path(), ID, PRISTINE);
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Pristine).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Pristine).await,
             TargetState::Healthy
         );
     }
 
     #[tokio::test]
-    async fn undeterminable_without_hidden_lock_record_or_artifact() {
+    async fn undeterminable_without_hidden_lock_or_record() {
         let tmp = tempfile::tempdir().unwrap();
         store(tmp.path(), ID, PATCHED);
         assert_eq!(
-            classify(tmp.path(), &target(None, None), Expected::Patched).await,
+            classify(tmp.path(), &target(None), Expected::Patched).await,
             TargetState::Undeterminable
         );
         hidden(tmp.path(), Some(LOCK_SHA));
         assert_eq!(
-            classify(tmp.path(), &target(None, None), Expected::Patched).await,
+            classify(tmp.path(), &target(None), Expected::Patched).await,
             TargetState::Healthy,
             "a parsed hidden lock that agrees decides alone"
         );
         std::fs::write(tmp.path().join(VLT_HIDDEN_LOCK_REL), b"{not json").unwrap();
         assert_eq!(
-            classify(tmp.path(), &target(None, None), Expected::Pristine).await,
+            classify(tmp.path(), &target(None), Expected::Pristine).await,
             TargetState::Undeterminable
-        );
-    }
-
-    #[tokio::test]
-    async fn no_record_compares_against_the_artifact_bytes() {
-        let tmp = tempfile::tempdir().unwrap();
-        store(tmp.path(), ID, PATCHED);
-        let dir = package_dir(tmp.path(), ID, "left-pad");
-        std::fs::create_dir_all(dir.join("node_modules/dep")).unwrap();
-        std::fs::write(dir.join("node_modules/dep/x.js"), b"ignored").unwrap();
-        let good = tarball(&[
-            ("package/index.js", PATCHED),
-            ("package/package.json", b"{\"name\":\"left-pad\"}"),
-        ]);
-        let bad = tarball(&[
-            ("package/index.js", PRISTINE),
-            ("package/package.json", b"{\"name\":\"left-pad\"}"),
-        ]);
-        assert_eq!(
-            classify(tmp.path(), &target(None, Some(&good)), Expected::Patched).await,
-            TargetState::Healthy
-        );
-        assert_eq!(
-            classify(tmp.path(), &target(None, Some(&bad)), Expected::Patched).await,
-            TargetState::Stale
-        );
-        std::fs::write(dir.join("extra.js"), b"x").unwrap();
-        assert_eq!(
-            classify(tmp.path(), &target(None, Some(&good)), Expected::Patched).await,
-            TargetState::Stale,
-            "an extra installed file is not the artifact"
-        );
-        assert_eq!(
-            classify(
-                tmp.path(),
-                &target(None, Some(b"not a tarball")),
-                Expected::Patched
-            )
-            .await,
-            TargetState::Undeterminable
-        );
-    }
-
-    #[tokio::test]
-    async fn bundled_node_modules_in_the_artifact_are_not_compared() {
-        let tmp = tempfile::tempdir().unwrap();
-        store(tmp.path(), ID, PATCHED);
-        let dir = package_dir(tmp.path(), ID, "left-pad");
-        std::fs::create_dir_all(dir.join("node_modules/x")).unwrap();
-        std::fs::write(dir.join("node_modules/x/index.js"), b"bundled").unwrap();
-        let bundling = tarball(&[
-            ("package/index.js", PATCHED),
-            ("package/package.json", b"{\"name\":\"left-pad\"}"),
-            ("package/node_modules/x/index.js", b"bundled"),
-        ]);
-        assert_eq!(
-            classify(
-                tmp.path(),
-                &target(None, Some(&bundling)),
-                Expected::Patched
-            )
-            .await,
-            TargetState::Healthy
         );
     }
 
@@ -722,12 +590,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let rec = record();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Healthy
         );
         std::fs::create_dir_all(tmp.path().join(VLT_STORE_DIR)).unwrap();
         assert_eq!(
-            classify(tmp.path(), &target(Some(&rec), None), Expected::Patched).await,
+            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
             TargetState::Healthy
         );
     }
@@ -754,13 +622,7 @@ mod tests {
             let rec = record();
             let state = read_install_state(&project).await;
             assert_eq!(
-                classify_target(
-                    &state,
-                    &project,
-                    &target(Some(&rec), None),
-                    Expected::Patched
-                )
-                .await,
+                classify_target(&state, &project, &target(Some(&rec)), Expected::Patched).await,
                 TargetState::Undeterminable,
                 "{linked}"
             );

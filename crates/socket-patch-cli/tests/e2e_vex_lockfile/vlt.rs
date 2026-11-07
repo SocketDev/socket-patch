@@ -8,9 +8,9 @@
 //! (`lockfileVersion: 1` tilde ids, `0` legacy `·npm·` ids, and the
 //! version-less `··` ids):
 //!
-//! * hosted — the REAL `scan --mode hosted` (a wiremock patch API that also
-//!   serves the artifact the vlt preflight fetches, so the hosted URL is on
-//!   the mock origin and `vex` gets it as `--patch-server-url`) rewrites the
+//! * hosted — the REAL `scan --mode hosted` (a wiremock patch API whose
+//!   granted artifact URL is on the mock origin, so `vex` gets it as
+//!   `--patch-server-url`) rewrites the
 //!   lock over an importer copy; then vlt's installed state is staged (the
 //!   importer copy and `node_modules/.vlt/<DepID>/node_modules/left-pad`)
 //!   and, with the manifest deleted:

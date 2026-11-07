@@ -1,6 +1,5 @@
 //! Hosted vlt legs (DESIGN §3, §8.2): the rewrite through the CLI, the
-//! artifact preflight, the warm-tree heal with its advisory, and the in-run
-//! VEX exclusion. Every run is the scrubbed subprocess binary, so the
+//! warm-tree heal with its advisory, and the in-run VEX exclusion. Every run is the scrubbed subprocess binary, so the
 //! `--json` envelope is read back and no parent env is mutated.
 
 use std::path::Path;
@@ -49,7 +48,7 @@ async fn assert_rewrites(era: Era, expected_warnings: &[&str]) {
     assert_eq!(warning_detail(&doc, ADVISORY), ADVISORY_NOTHING_STALE);
     // v5: the lock pin is the whole record — no redirect ledger.
     assert_no_ledger(tmp.path());
-    assert_eq!(artifact_requests(&server).await, 1);
+    assert_eq!(artifact_requests(&server).await, 0);
 }
 
 #[tokio::test]
@@ -160,11 +159,7 @@ async fn scan_redirect_vlt_peer_instances() {
         )
     );
     assert_no_ledger(tmp.path());
-    assert_eq!(
-        artifact_requests(&server).await,
-        1,
-        "one GET per distinct artifact URL"
-    );
+    assert_eq!(artifact_requests(&server).await, 0);
 }
 
 #[tokio::test]
@@ -214,202 +209,7 @@ async fn scan_redirect_vlt_sibling_package_lock_vlt_installed_does_not_confirm_r
     assert_no_ledger(tmp.path());
 }
 
-// ── artifact preflight ───────────────────────────────────────────────────
-
-async fn assert_preflight_refuses(response: ResponseTemplate, reason: &str) {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-    mock_artifact_with(&server, response).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let lock = read(tmp.path(), "vlt-lock.json");
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-
-    assert_eq!(redirected(&doc), 0, "{doc:#}");
-    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-    assert!(!ledger_path(tmp.path()).exists(), "nothing is written");
-    assert_eq!(
-        warning_detail(&doc, UNVERIFIABLE),
-        format!(
-            "vlt would fail to verify {}: {reason}; nothing was written for {PURL}",
-            redacted_artifact_url(&server)
-        )
-    );
-    assert_eq!(skipped_reasons(&doc), [UNVERIFIABLE]);
-    assert!(!warning_codes(&doc).contains(&ADVISORY.to_string()));
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_content_encoding_refused() {
-    assert_preflight_refuses(
-        ResponseTemplate::new(200)
-            .insert_header("content-encoding", "gzip")
-            .set_body_bytes(gzip(&patched_tarball())),
-        "content-encoding gzip",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_identity_passes() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_view(&server).await;
-    mock_artifact_with(
-        &server,
-        ResponseTemplate::new(200)
-            .insert_header("content-encoding", "identity")
-            .set_body_bytes(patched_tarball()),
-    )
-    .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-
-    assert_eq!(redirected(&doc), 1);
-    assert!(!warning_codes(&doc).contains(&UNVERIFIABLE.to_string()));
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_sha512_mismatch() {
-    assert_preflight_refuses(
-        ResponseTemplate::new(200).set_body_bytes(b"other bytes".to_vec()),
-        "sha512 mismatch",
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_http_404() {
-    assert_preflight_refuses(ResponseTemplate::new(404), "http 404").await;
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_http_500() {
-    assert_preflight_refuses(ResponseTemplate::new(500), "http 500").await;
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_fetch_error() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    let url = format!("http://127.0.0.1:9{}", artifact_path());
-    mock_reference_at(&server, &url, &sha512_sri(&patched_tarball())).await;
-    mock_view(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let lock = read(tmp.path(), "vlt-lock.json");
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-
-    assert_eq!(redirected(&doc), 0);
-    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-    let detail = warning_detail(&doc, UNVERIFIABLE);
-    let redacted = url.replace(&format!("/{TOKEN}/"), "/<redacted>/");
-    assert!(
-        detail.starts_with(&format!(
-            "vlt would fail to verify {redacted}: fetch error "
-        )) && detail.ends_with(&format!("; nothing was written for {PURL}")),
-        "the fetch-error refusal quotes the redacted URL"
-    );
-    assert!(
-        !detail.contains(TOKEN),
-        "the grant token never reaches the warning"
-    );
-}
-
-async fn redirect_chain(hops: usize) -> (Value, tempfile::TempDir) {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_view(&server).await;
-    for hop in 0..hops {
-        Mock::given(method("GET"))
-            .and(path(format!("/hop/{hop}")))
-            .respond_with(
-                ResponseTemplate::new(302)
-                    .insert_header("location", format!("{}/hop/{}", server.uri(), hop + 1)),
-            )
-            .mount(&server)
-            .await;
-    }
-    Mock::given(method("GET"))
-        .and(path(format!("/hop/{hops}")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(patched_tarball()))
-        .mount(&server)
-        .await;
-    mock_reference_at(
-        &server,
-        &format!("{}/hop/0", server.uri()),
-        &sha512_sri(&patched_tarball()),
-    )
-    .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-    (doc, tmp)
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_redirect_chain_10_passes() {
-    let (doc, _tmp) = redirect_chain(10).await;
-    assert_eq!(redirected(&doc), 1, "{doc:#}");
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_redirect_chain_11_fails() {
-    let (doc, _tmp) = redirect_chain(11).await;
-    assert_eq!(redirected(&doc), 0);
-    assert!(warning_detail(&doc, UNVERIFIABLE).contains(": fetch error "));
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_one_get_per_distinct_url() {
-    let server = MockServer::start().await;
-    mock_all(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let ids = [
-        TILDE_ID,
-        "~npm~left-pad@1.3.0~peer.2",
-        "~npm~left-pad@1.3.0~peer.3",
-    ];
-    let nodes: Vec<String> = ids.iter().map(|id| registry_node(id)).collect();
-    std::fs::write(tmp.path().join("vlt-lock.json"), lock_with(Era::V1, &nodes)).unwrap();
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &["--dry-run"], &[]);
-    assert_eq!(redirected(&doc), 1);
-    assert_eq!(artifact_requests(&server).await, 1);
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_dry_run_still_preflights_writes_nothing() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_artifact_with(
-        &server,
-        ResponseTemplate::new(200)
-            .insert_header("content-encoding", "gzip")
-            .set_body_bytes(gzip(&patched_tarball())),
-    )
-    .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let lock = read(tmp.path(), "vlt-lock.json");
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &["--dry-run"], &[]);
-
-    assert_eq!(artifact_requests(&server).await, 1);
-    assert_eq!(redirected(&doc), 0);
-    assert!(warning_codes(&doc).contains(&UNVERIFIABLE.to_string()));
-    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-    assert!(!tmp.path().join(".socket").exists());
-}
+// ── no artifact fetch ────────────────────────────────────────────────────
 
 async fn gzip_artifact_server() -> MockServer {
     let server = MockServer::start().await;
@@ -426,99 +226,36 @@ async fn gzip_artifact_server() -> MockServer {
     server
 }
 
+/// The scan pins the hosted artifact without downloading it, dry or wet,
+/// even from a server that would content-encode it: the patch server sends
+/// archives with `Cache-Control: no-transform`, and `vlt ci` verifies the
+/// lock's sha512 against the bytes it receives.
 #[tokio::test]
-async fn scan_redirect_vlt_artifact_failed_dep_withheld_from_every_rewriter() {
-    let server = gzip_artifact_server().await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_installed_vlt_project(tmp.path(), PRISTINE);
-    std::fs::write(tmp.path().join("package-lock.json"), package_lock()).unwrap();
+async fn scan_redirect_vlt_pins_without_fetching_the_artifact() {
+    for dry_run in [false, true] {
+        let server = gzip_artifact_server().await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_vlt_project(tmp.path(), Era::V1);
+        let lock = read(tmp.path(), "vlt-lock.json");
+        let extra: &[&str] = if dry_run { &["--dry-run"] } else { &[] };
 
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
+        let (_, doc) = scan_hosted(tmp.path(), &server, extra, &[]);
 
-    assert_eq!(redirected(&doc), 0);
-    assert_eq!(read(tmp.path(), "package-lock.json"), package_lock());
-    assert_eq!(
-        read(tmp.path(), "vlt-lock.json"),
-        lock_with(Era::V1, &[registry_node(TILDE_ID)])
-    );
-    assert!(store_dir(tmp.path(), TILDE_ID).exists());
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_ambiguous_withholds_vlt_only() {
-    let server = gzip_artifact_server().await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    std::fs::write(tmp.path().join("package-lock.json"), package_lock()).unwrap();
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
-
-    assert_eq!(
-        redirected(&doc),
-        1,
-        "package-lock.json still confirms: {doc:#}"
-    );
-    assert!(read(tmp.path(), "package-lock.json").contains(&artifact_url(&server)));
-    assert_eq!(
-        read(tmp.path(), "vlt-lock.json"),
-        lock_with(Era::V1, &[registry_node(TILDE_ID)])
-    );
-    assert_eq!(
-        warning_detail(&doc, UNVERIFIABLE),
-        format!(
-            "vlt would fail to verify {}: content-encoding gzip; vlt-lock.json was not changed \
-             for {PURL}",
-            redacted_artifact_url(&server)
-        )
-    );
-    assert!(skipped_reasons(&doc).is_empty(), "{doc:#}");
-}
-
-/// A package-lock.json that lists only the root: the npm rewriter has
-/// nothing to pin.
-fn package_lock_without_dep() -> String {
-    r#"{
-  "name": "consumer",
-  "version": "0.0.0",
-  "lockfileVersion": 3,
-  "requires": true,
-  "packages": {
-    "": { "name": "consumer", "version": "0.0.0" }
-  }
-}
-"#
-    .to_string()
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_ambiguous_earlier_pin_is_not_confirmed() {
-    let server = gzip_artifact_server().await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let pinned = lock_with(Era::V1, &[pinned_node(TILDE_ID, &server)]);
-    std::fs::write(tmp.path().join("vlt-lock.json"), &pinned).unwrap();
-    std::fs::write(
-        tmp.path().join("package-lock.json"),
-        package_lock_without_dep(),
-    )
-    .unwrap();
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
-
-    assert_eq!(
-        redirected(&doc),
-        0,
-        "the earlier run's vlt pin alone confirms nothing: {doc:#}"
-    );
-    assert_eq!(read(tmp.path(), "vlt-lock.json"), pinned);
-    assert_eq!(
-        warning_detail(&doc, UNVERIFIABLE),
-        format!(
-            "vlt would fail to verify {}: content-encoding gzip; {PURL} was left pinned by an \
-             earlier run and `vlt ci` will fail until the artifact verifies",
-            redacted_artifact_url(&server)
-        )
-    );
+        assert_eq!(redirected(&doc), 1, "dry_run={dry_run}: {doc:#}");
+        assert_eq!(artifact_requests(&server).await, 0, "dry_run={dry_run}");
+        assert!(
+            skipped_reasons(&doc).is_empty(),
+            "dry_run={dry_run}: {doc:#}"
+        );
+        if dry_run {
+            assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
+        } else {
+            assert_eq!(
+                read(tmp.path(), "vlt-lock.json"),
+                lock_with(Era::V1, &[pinned_node(TILDE_ID, &server)])
+            );
+        }
+    }
 }
 
 /// REGRESSION (#471): `bund` bundles left-pad@1.3.0, which vlt unpacks
@@ -569,11 +306,12 @@ async fn scan_redirect_vlt_bundled_store_copy_warns() {
 
 /// A real `node_modules/.vlt` store with no hidden lock (0.0.0-1 and
 /// 0.0.0-32 write none) is vlt's install state too: vlt drives beside a
-/// package-lock.json, so there is no sibling warning and a failed preflight
-/// withholds the dep from every rewriter.
+/// package-lock.json, so there is no sibling warning and the vlt pin
+/// confirms.
 #[tokio::test]
 async fn scan_redirect_vlt_store_dir_without_hidden_lock_drives() {
-    let server = gzip_artifact_server().await;
+    let server = MockServer::start().await;
+    mock_all(&server).await;
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_project(tmp.path(), Era::V1);
     install_store(tmp.path(), TILDE_ID, PRISTINE);
@@ -581,19 +319,14 @@ async fn scan_redirect_vlt_store_dir_without_hidden_lock_drives() {
 
     let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
 
-    assert_eq!(redirected(&doc), 0, "{doc:#}");
+    assert_eq!(redirected(&doc), 1, "{doc:#}");
     assert!(
         !warning_codes(&doc).contains(&"redirect_vlt_sibling_lockfiles".to_string()),
         "{doc:#}"
     );
-    assert_eq!(skipped_reasons(&doc), [UNVERIFIABLE]);
-    assert_eq!(read(tmp.path(), "package-lock.json"), package_lock());
     assert_eq!(
-        warning_detail(&doc, UNVERIFIABLE),
-        format!(
-            "vlt would fail to verify {}: content-encoding gzip; nothing was written for {PURL}",
-            redacted_artifact_url(&server)
-        )
+        read(tmp.path(), "vlt-lock.json"),
+        lock_with(Era::V1, &[pinned_node(TILDE_ID, &server)])
     );
 }
 
@@ -686,106 +419,11 @@ async fn scan_redirect_vlt_not_driving_refused_dep_is_not_confirmed_by_the_sibli
     assert_no_ledger(tmp.path());
 }
 
-const VENDORED_UUID: &str = "11111111-2222-4333-8444-555555555555";
-
-/// A vlt project whose left-pad is vendored (§3.4 D19 dir node) and
-/// claimed by a `flavor: "vlt"` vendored ledger entry.
-fn write_vlt_vendored_project(root: &Path) -> (String, Vec<u8>) {
-    write_package_json(root);
-    install_importer(root, PATCHED);
-    let dir = format!(".socket/vendor/npm/{VENDORED_UUID}/{NAME}-{VERSION}/node_modules/{NAME}");
-    let lock = lock_with(
-        Era::V1,
-        &[format!(
-            "\"file~.socket+vendor+npm+{VENDORED_UUID}+{NAME}-{VERSION}+node__modules+{NAME}\": \
-             [0,\"{NAME}\",null,\"{dir}\"]"
-        )],
-    );
-    std::fs::write(root.join("vlt-lock.json"), &lock).unwrap();
-    let state = serde_json::json!({
-        "version": 1,
-        "entries": { PURL: {
-            "ecosystem": "npm",
-            "basePurl": PURL,
-            "uuid": VENDORED_UUID,
-            "artifact": { "path": format!(".socket/vendor/npm/{VENDORED_UUID}/{NAME}-{VERSION}") },
-            "wiring": [],
-            "flavor": "vlt"
-        }}
-    });
-    std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
-    let state = serde_json::to_vec_pretty(&state).unwrap();
-    std::fs::write(root.join(".socket/vendor/state.json"), &state).unwrap();
-    (lock, state)
-}
-
-/// Vendored → hosted (§4.10): the takeover restores the registry node this
-/// run pins, so the artifact is probed through the vendored node BEFORE the
-/// revert; a failure keeps the package vendored (never reverted), with or
-/// without another npm-family lock, wet or dry.
 #[tokio::test]
-async fn scan_redirect_vlt_vendored_takeover_preflights_before_the_revert() {
-    for (sibling, dry_run) in [(false, false), (false, true), (true, false)] {
-        let server = gzip_artifact_server().await;
-        let tmp = tempfile::tempdir().unwrap();
-        let (lock, state) = write_vlt_vendored_project(tmp.path());
-        if sibling {
-            std::fs::write(tmp.path().join("package-lock.json"), package_lock()).unwrap();
-        }
-        let mut extra = vec!["--no-npm-allow-remote-config"];
-        if dry_run {
-            extra.push("--dry-run");
-        }
-
-        let (_, doc) = scan_hosted(tmp.path(), &server, &extra, &[]);
-
-        let leg = format!("sibling={sibling} dry_run={dry_run}: {doc:#}");
-        assert_eq!(artifact_requests(&server).await, 1, "{leg}");
-        assert_eq!(redirected(&doc), 0, "{leg}");
-        assert_eq!(skipped_reasons(&doc), [UNVERIFIABLE], "{leg}");
-        assert!(
-            !warning_codes(&doc)
-                .iter()
-                .any(|c| c.contains("revert") || c.contains("takeover")),
-            "no takeover is attempted: {leg}"
-        );
-        assert_eq!(read(tmp.path(), "vlt-lock.json"), lock, "{leg}");
-        assert_eq!(
-            std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
-            state,
-            "{leg}"
-        );
-        if sibling {
-            assert_eq!(
-                read(tmp.path(), "package-lock.json"),
-                package_lock(),
-                "{leg}"
-            );
-        }
-    }
-
-    let server = MockServer::start().await;
-    mock_all(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_vendored_project(tmp.path());
-    let (_, doc) = scan_hosted(tmp.path(), &server, &["--dry-run"], &[]);
-    assert_eq!(
-        artifact_requests(&server).await,
-        1,
-        "a verifying artifact is probed too: {doc:#}"
-    );
-    assert!(
-        !warning_codes(&doc).contains(&UNVERIFIABLE.to_string()),
-        "{doc:#}"
-    );
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_get_uuid_driver() {
+async fn get_uuid_hosted_pins_vlt_without_fetching_the_artifact() {
     let server = gzip_artifact_server().await;
     let tmp = tempfile::tempdir().unwrap();
     write_vlt_project(tmp.path(), Era::V1);
-    let lock = read(tmp.path(), "vlt-lock.json");
     let cwd = tmp.path().to_str().unwrap().to_string();
     let uri = server.uri();
 
@@ -810,128 +448,12 @@ async fn scan_redirect_vlt_artifact_get_uuid_driver() {
     );
 
     assert_eq!(code, 0, "{doc:#}\n{stderr}");
-    assert_eq!(artifact_requests(&server).await, 1);
-    assert_eq!(redirected(&doc), 0);
-    assert!(warning_codes(&doc).contains(&UNVERIFIABLE.to_string()));
-    assert_eq!(read(tmp.path(), "vlt-lock.json"), lock);
-}
-
-fn pnpm_lock() -> String {
-    format!(
-        "lockfileVersion: '9.0'\n\nimporters:\n  .:\n    dependencies:\n      {NAME}:\n        \
-         specifier: {VERSION}\n        version: {VERSION}\n\npackages:\n  {NAME}@{VERSION}:\n    \
-         resolution: {{integrity: {UPSTREAM_SHA512}}}\n\nsnapshots:\n  {NAME}@{VERSION}: {{}}\n"
-    )
-}
-
-fn bun_lock() -> String {
-    format!(
-        "{{\n  \"lockfileVersion\": 1,\n  \"packages\": {{\n    \"{NAME}\": [\"{NAME}@{VERSION}\", \
-         \"\", {{}}, \"{UPSTREAM_SHA512}\"],\n  }}\n}}\n"
-    )
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_no_preflight_without_vlt_lock() {
-    for (lock, text) in [
-        ("package-lock.json", package_lock()),
-        ("pnpm-lock.yaml", pnpm_lock()),
-        ("bun.lock", bun_lock()),
-    ] {
-        let server = MockServer::start().await;
-        mock_all(&server).await;
-        let tmp = tempfile::tempdir().unwrap();
-        write_package_json(tmp.path());
-        install_importer(tmp.path(), PRISTINE);
-        std::fs::write(tmp.path().join(lock), text).unwrap();
-
-        let (_, doc) = scan_hosted(tmp.path(), &server, &["--no-npm-allow-remote-config"], &[]);
-
-        assert_eq!(redirected(&doc), 1, "{lock}: {doc:#}");
-        assert!(
-            read(tmp.path(), lock).contains(&artifact_url(&server)),
-            "{lock}"
-        );
-        assert_eq!(artifact_requests(&server).await, 0, "{lock}");
-        assert!(
-            !warning_codes(&doc)
-                .iter()
-                .any(|c| c.starts_with("redirect_vlt_")),
-            "{lock}: {doc:#}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_proxy_honored() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_view(&server).await;
-    mock_artifact(&server).await;
-    let url = format!("http://vlt-artifact.invalid{}", artifact_path());
-    mock_reference_at(&server, &url, &sha512_sri(&patched_tarball())).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let proxy = server.uri();
-
-    let (_, doc) = scan_hosted(
-        tmp.path(),
-        &server,
-        &[],
-        &[
-            ("HTTP_PROXY", proxy.as_str()),
-            ("http_proxy", proxy.as_str()),
-            ("NO_PROXY", "127.0.0.1,localhost"),
-            ("no_proxy", "127.0.0.1,localhost"),
-        ],
-    );
-
+    assert_eq!(artifact_requests(&server).await, 0);
     assert_eq!(redirected(&doc), 1, "{doc:#}");
-    assert_eq!(artifact_requests(&server).await, 1);
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_already_pinned_failure_left_pinned() {
-    let server = gzip_artifact_server().await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-    let pinned = lock_with(Era::V1, &[pinned_node(TILDE_ID, &server)]);
-    std::fs::write(tmp.path().join("vlt-lock.json"), &pinned).unwrap();
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-
-    assert_eq!(redirected(&doc), 0, "neither confirmed nor attested");
     assert_eq!(
         read(tmp.path(), "vlt-lock.json"),
-        pinned,
-        "nothing is reverted"
+        lock_with(Era::V1, &[pinned_node(TILDE_ID, &server)])
     );
-    assert_eq!(
-        warning_detail(&doc, UNVERIFIABLE),
-        format!(
-            "vlt would fail to verify {}: content-encoding gzip; {PURL} was left pinned by an \
-             earlier run and `vlt ci` will fail until the artifact verifies",
-            redacted_artifact_url(&server)
-        )
-    );
-}
-
-#[tokio::test]
-async fn scan_redirect_vlt_artifact_no_bearer_on_artifact_request() {
-    let server = MockServer::start().await;
-    mock_all(&server).await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_vlt_project(tmp.path(), Era::V1);
-
-    scan_hosted(tmp.path(), &server, &[], &[]);
-
-    let requests = server.received_requests().await.unwrap();
-    let (artifact, api): (Vec<_>, Vec<_>) = requests
-        .iter()
-        .partition(|r| r.url.path() == artifact_path());
-    assert_eq!(artifact.len(), 1);
-    assert!(artifact[0].headers.get("authorization").is_none());
-    assert!(api.iter().any(|r| r.headers.get("authorization").is_some()));
 }
 
 // ── warm-tree heal ───────────────────────────────────────────────────────
@@ -981,8 +503,10 @@ async fn scan_redirect_vlt_heal_rule_c_no_hidden_lock_with_record() {
     assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
 }
 
+/// Without a hidden lock or a patch record, the installed copy cannot be
+/// judged: it is kept, and the advisory says to run `vlt ci`.
 #[tokio::test]
-async fn scan_redirect_vlt_heal_rule_c_no_record_uses_artifact_bytes() {
+async fn scan_redirect_vlt_heal_rule_c_no_record_is_undeterminable() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
     mock_reference(&server).await;
@@ -995,21 +519,12 @@ async fn scan_redirect_vlt_heal_rule_c_no_record_uses_artifact_bytes() {
     let tmp = tempfile::tempdir().unwrap();
     write_installed_vlt_project(tmp.path(), PRISTINE);
     std::fs::remove_file(tmp.path().join("node_modules/.vlt-lock.json")).unwrap();
-    let healthy = tempfile::tempdir().unwrap();
-    write_installed_vlt_project(healthy.path(), PATCHED);
-    std::fs::remove_file(healthy.path().join("node_modules/.vlt-lock.json")).unwrap();
 
     let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-    let (_, healthy_doc) = scan_hosted(healthy.path(), &server, &[], &[]);
 
     assert!(warning_codes(&doc).contains(&"record_fetch_failed".to_string()));
-    assert!(!store_dir(tmp.path(), TILDE_ID).exists());
-    assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
-    assert!(store_dir(healthy.path(), TILDE_ID).exists());
-    assert_eq!(
-        warning_detail(&healthy_doc, ADVISORY),
-        ADVISORY_NOTHING_STALE
-    );
+    assert!(store_dir(tmp.path(), TILDE_ID).exists());
+    assert_eq!(warning_detail(&doc, ADVISORY), advisory_undeterminable(1));
 }
 
 /// A warm install of `nodes` (each `(DepID, flags)`) holding `index`, with

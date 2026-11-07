@@ -68,7 +68,9 @@ pub(crate) async fn sweep_orphan_vendor_dirs_where(
     if candidates.is_empty() {
         return out;
     }
-    let references = crate::commands::vendored_backend::repair::scan_vendor_references(cwd).await;
+    // Keep-vs-delete: any case counts, as in the revert keep-checks.
+    let references =
+        crate::commands::vendored_backend::repair::scan_vendor_references_any_case(cwd).await;
     let wired: HashSet<(&str, &str)> = references
         .iter()
         .map(|(eco, uuid, _path)| (eco.as_str(), uuid.as_str()))

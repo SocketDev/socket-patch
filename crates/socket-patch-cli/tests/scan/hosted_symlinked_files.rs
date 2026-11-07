@@ -576,8 +576,8 @@ async fn hosted_refuses_symlinked_vlt_lock_before_ledger_write() {
     assert_refused_untouched(code, &doc, &root, "vlt-lock.json", &target, &lock_before);
 }
 
-/// A FIFO planted as `vlt-lock.json` is skipped by the preflight read and
-/// the candidate read alike: the scan returns and never probes an artifact.
+/// A FIFO planted as `vlt-lock.json` is skipped by the candidate read: the
+/// scan returns and never fetches an artifact.
 #[tokio::test]
 async fn hosted_scan_returns_with_fifo_vlt_lock() {
     use vlt_hosted_common as vlt;

@@ -1,6 +1,5 @@
 pub(crate) mod agent_download;
 pub mod apply;
-pub(crate) mod bun_preflight;
 pub(crate) mod composer_hints;
 pub(crate) mod context;
 pub(crate) mod fetch_stage;
@@ -23,7 +22,6 @@ pub mod vex;
 pub(crate) mod vex_consumed;
 pub(crate) mod vex_sources;
 pub(crate) mod vlt_heal;
-pub(crate) mod vlt_preflight;
 
 use std::path::Path;
 

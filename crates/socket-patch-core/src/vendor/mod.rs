@@ -99,6 +99,7 @@ pub(crate) mod pypi_requirements;
 mod pypi_uv;
 mod pypi_wheel;
 pub mod redownload;
+pub mod refusals;
 pub mod registry_fetch;
 pub(crate) mod reuse;
 pub(crate) mod revert;

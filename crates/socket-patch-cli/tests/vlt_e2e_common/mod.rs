@@ -1705,24 +1705,6 @@ impl PatchService {
             .await;
     }
 
-    /// Serve `t`'s artifact gzip-encoded, as patch.socket.dev did before
-    /// the `no-transform` fix.
-    pub async fn serve_artifact_gzip_encoded(&self, t: &PatchTarget) {
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&t.tgz).unwrap();
-        Mock::given(method("GET"))
-            .and(path(t.artifact_path()))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .insert_header("content-type", "application/octet-stream")
-                    .insert_header("content-encoding", "gzip")
-                    .set_body_bytes(enc.finish().unwrap()),
-            )
-            .with_priority(1)
-            .mount(&self.server)
-            .await;
-    }
-
     pub async fn artifact_hits(&self, t: &PatchTarget) -> usize {
         self.server
             .received_requests()
