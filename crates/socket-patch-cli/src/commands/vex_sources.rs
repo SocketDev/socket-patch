@@ -232,6 +232,13 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a pnpm lock pins the patch, but a
+/// `pnpm-lock.<branch>.yaml` exists, which pnpm installs from instead when
+/// `gitBranchLockfile` is on; its presence withholds (`vex::Unattested`).
+const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
+/// Omission tag and note: an npm or Bun pin's package is one the project
+/// patches itself (`patchedDependencies`, `vex::Unattested`).
+const NOTE_NPM_PATCHED_DEPENDENCY: &str = "vex_npm_patched_dependency";
 /// Omission tag and note: a vendored sbt pin the build's local resolution
 /// evidence does not verify, or under a build-wide blocker
 /// (`vex::Unattested`, `UnattestedKind::SbtResolutionUnverified`).
@@ -291,6 +298,22 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::PnpmGitBranchLock => (
+            NOTE_PNPM_GIT_BRANCH_LOCKFILE,
+            "not attested while any branch lock exists (or the members that could hold one \
+             cannot be listed), whatever gitBranchLockfile says; the wiring itself is intact, \
+             so re-running `scan` / `vendor` does not change this (fold the branch locks in \
+             with `pnpm install --merge-git-branch-lockfiles`, turn gitBranchLockfile off and \
+             delete the `pnpm-lock.<branch>.yaml` files, or make the workspace's `packages` \
+             listable)",
+        ),
+        UnattestedKind::UserPatchedDependency => (
+            NOTE_NPM_PATCHED_DEPENDENCY,
+            "not attested while the project patches the package itself (fold the Socket fix \
+             into your own patch, or remove the `patchedDependencies` entry and re-run); an \
+             npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
+             `socket-patch rollback <uuid>` restores the registry entry",
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,
@@ -502,7 +525,9 @@ pub(crate) async fn plan(
     // Wired, but a build bypasses the pin (`Unattested`: a Gradle lock
     // above the hosted base resolves the newer upstream release, a pnpm
     // bundled copy, a deno.lock copy, an npm shrinkwrap with no
-    // package-lock.json twin, which npm >= 12 ignores): the ref keeps
+    // package-lock.json twin, which npm >= 12 ignores, a pnpm lock
+    // `gitBranchLockfile` bypasses, a package the project patches itself):
+    // the ref keeps
     // rollback, remove, list and the ledgers' liveness working, and the
     // patch is omitted.
     // A file-scoped mark (a Go replace the workspace keeps from the build)
@@ -1929,6 +1954,37 @@ mod tests {
         .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
         assert!(live.hosted.contains_key(PURL));
+    }
+
+    /// Each npm-family bypass (#556 branch locks, #711 / #367 user patches)
+    /// is omitted under its own tag, distinct from every other kind's.
+    #[test]
+    fn npm_family_unattested_kinds_have_their_own_tags() {
+        let kinds = [
+            UnattestedKind::LockAboveBase,
+            UnattestedKind::BundledCopy,
+            UnattestedKind::DenoLock,
+            UnattestedKind::NpmShrinkwrapOnly,
+            UnattestedKind::MavenReactorRoot,
+            UnattestedKind::MavenClassifierUnpatched,
+            UnattestedKind::PnpmGitBranchLock,
+            UnattestedKind::UserPatchedDependency,
+        ];
+        let tags: std::collections::BTreeSet<&str> =
+            kinds.iter().map(|k| unattested_note(*k).0).collect();
+        assert_eq!(tags.len(), kinds.len(), "{tags:?}");
+        assert_eq!(
+            unattested_note(UnattestedKind::PnpmGitBranchLock).0,
+            "vex_pnpm_git_branch_lockfile"
+        );
+        assert_eq!(
+            unattested_note(UnattestedKind::UserPatchedDependency).0,
+            "vex_npm_patched_dependency"
+        );
+        // Review (#2010): a pre-#711 pin breaks `npm ci` (EPATCHFAILED)
+        // until it is rolled back, as hosted's warning says.
+        let remedy = unattested_note(UnattestedKind::UserPatchedDependency).1;
+        assert!(remedy.contains("socket-patch rollback"), "{remedy}");
     }
 
     /// A hosted Go ref of `uuid` in `file`, and the Go workspace mark on it.
