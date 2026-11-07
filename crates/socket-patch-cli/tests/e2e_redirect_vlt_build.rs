@@ -52,8 +52,8 @@ fn assert_restored_lock(fx: &Fixture, before: &[u8]) {
 
 // ── drivers and fresh checkouts ───────────────────────────────────────────
 
-/// `scan --mode hosted --vex`: the lock pins the artifact (one preflight
-/// GET), in-run VEX attests it unless a lock-level warning withholds it,
+/// `scan --mode hosted --vex`: the lock pins the artifact (never fetched by
+/// the scan), in-run VEX attests it unless a lock-level warning withholds it,
 /// and a fresh checkout's locked install lands the patched bytes with the
 /// lock byte-stable.
 #[tokio::test(flavor = "multi_thread")]
@@ -69,7 +69,11 @@ async fn vlt_pinned_matrix_hosted_scan_fresh_ci() {
     fx.assert_lock_warnings(&doc);
     fx.assert_in_run_vex(&out, fx.t(), fx.in_run_vex_attests());
     assert_pinned(&fx.proj, &fx.svc, fx.t());
-    assert_eq!(fx.svc.artifact_hits(fx.t()).await, 1, "one preflight GET");
+    assert_eq!(
+        fx.svc.artifact_hits(fx.t()).await,
+        0,
+        "the scan fetches no artifact"
+    );
     fx.assert_fresh_locked_install("fresh-ci");
     fx.leg.ran();
 }
@@ -365,8 +369,9 @@ async fn vlt_pinned_matrix_hosted_heal_rule_c_no_hidden_lock() {
     fx.leg.ran();
 }
 
-/// Heal rule (c) with no patch record (the view route fails): the
-/// preflight-downloaded artifact bytes decide.
+/// Heal rule (c) with no patch record (the view route fails) and no hidden
+/// lock: the installed copies cannot be judged, so they are kept and the
+/// advisory says to run `vlt ci`.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_hosted_heal_rule_c_no_record() {
@@ -384,15 +389,11 @@ async fn vlt_pinned_matrix_hosted_heal_rule_c_no_record() {
         .mount(&fx.svc.server)
         .await;
     let ids = fx.store_ids(fx.t());
-    let snap = fx.snapshot(&fx.proj, &ids);
     let doc = fx.scan(&[]);
-    fx.assert_advisory(&doc, &advisory_invalidated(ids.len()));
+    fx.assert_advisory(&doc, &advisory_undeterminable(ids.len()));
     for id in &ids {
-        assert!(!store_entry(&fx.proj, id).exists(), "{id} invalidated");
+        assert!(store_entry(&fx.proj, id).exists(), "{id} kept");
     }
-    snap.assert_same(&fx.snapshot(&fx.proj, &ids), "the artifact-bytes heal");
-    fx.vlt_ok(&fx.proj, &["install"]);
-    assert_eq!(state(&fx.proj, fx.t()), State::Patched);
     fx.leg.ran();
 }
 
@@ -1094,28 +1095,6 @@ async fn vlt_pinned_matrix_hosted_registry_from_user_config() {
     assert_eq!(doc["summary"]["applied"], 1, "{doc:#}");
     assert_pinned(&fx.proj, &fx.svc, fx.t());
     fx.assert_fresh_locked_install("fresh-user");
-    fx.leg.ran();
-}
-
-/// The artifact comes back `Content-Encoding: gzip` (patch.socket.dev
-/// before the `no-transform` fix): refused, nothing written.
-#[tokio::test(flavor = "multi_thread")]
-#[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
-async fn vlt_pinned_matrix_hosted_content_encoding_refused() {
-    let Some(leg) = hosted_leg("content_encoding_refused") else {
-        return;
-    };
-    let fx = Fixture::build(leg, Shape::left_pad()).await;
-    fx.svc.serve_artifact_gzip_encoded(fx.t()).await;
-    let out = socket_api(&fx.proj, &fx.svc, &["scan", "--mode", "hosted"], &[]);
-    let doc = out.json();
-    let detail = warning_detail(&doc, UNVERIFIABLE);
-    assert!(
-        detail.contains("content-encoding gzip") && detail.contains("nothing was written"),
-        "{detail}"
-    );
-    assert_eq!(lock_bytes(&fx.proj), fx.lock_before, "no lock write");
-    assert!(fx.ledger().is_none(), "no ledger");
     fx.leg.ran();
 }
 

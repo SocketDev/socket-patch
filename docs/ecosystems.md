@@ -688,10 +688,9 @@ segment, or a URL segment equal to the lock's scalar `registry`) are redirected,
 peer and modifier variant of the `name@version` included. Instances under a named alias,
 a scoped registry or jsr stay untouched (`redirect_vlt_custom_registry_skipped`) and keep
 the run's `--vex` from attesting the package. `options` is never edited: vlt fails `vlt
-ci` on any change there. Before anything is written, each artifact is fetched the way
-vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, raw body hashed); vlt
-fails `EINTEGRITY` on a content-encoded response, so such a dependency is withheld
-(`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci` cannot install.
+ci` on any change there. vlt hashes the raw response body against the pinned sha512, so
+the patch server sends artifacts unencoded (`Cache-Control: no-transform`); the scan
+itself never downloads them.
 
 **Hosted: which lock confirms.** vlt drives a project when its install state
 (`node_modules/.vlt-lock.json` or `node_modules/.vlt/`) is present or no other npm-family
