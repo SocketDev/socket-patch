@@ -239,6 +239,12 @@ const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
 /// Omission tag and note: an npm or Bun pin's package is one the project
 /// patches itself (`patchedDependencies`, `vex::Unattested`).
 const NOTE_NPM_PATCHED_DEPENDENCY: &str = "vex_npm_patched_dependency";
+/// Omission tag and note: a hosted sbt pin whose bytes the build provably
+/// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
+/// dropping the load-time verifier, or current evidence
+/// resolving another version or other bytes), so the downloaded copy
+/// proves nothing (`vex::Unattested`).
+const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
 /// Omission tag for a Go patch whose replace the `go.work` in effect
 /// overrides, ignores or rejects (#393, #458, #531): the reason of `vex`'s
 /// own go.mod gate, and the note of a discovered hosted or vendored ref the
@@ -296,6 +302,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              into your own patch, or remove the `patchedDependencies` entry and re-run); an \
              npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
              `socket-patch rollback <uuid>` restores the registry entry",
+        ),
+        UnattestedKind::SbtPinBypassed => (
+            NOTE_SBT_PIN_BYPASSED,
+            "not attested while the build bypasses the pin, even from the copy under \
+             `.socket/sbt-hosted`; the wiring itself is intact, so re-running `scan` does not \
+             change this (fix the build, then run `sbt update`)",
         ),
         UnattestedKind::GoWorkspaceOverride => (
             GO_WORKSPACE_OVERRIDE,
