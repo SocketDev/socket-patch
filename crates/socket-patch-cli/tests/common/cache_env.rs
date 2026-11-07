@@ -75,7 +75,7 @@ use std::process::Command;
 /// Each entry is seeded only when the variable is not already set and the
 /// default directory actually exists, which makes it a no-op on machines
 /// (and CI runners) that do not use the version manager in question.
-const TOOLCHAIN_ROOTS: &[(&str, &str)] = &[
+pub(crate) const TOOLCHAIN_ROOTS: &[(&str, &str)] = &[
     ("RUSTUP_HOME", ".rustup"),
     ("RBENV_ROOT", ".rbenv"),
     ("PYENV_ROOT", ".pyenv"),
@@ -299,7 +299,7 @@ pub fn scrub_ambient_bun_tool_env(cmd: &mut Command) {
 }
 
 /// The names of the PARENT environment, read once.
-fn parent_var_names() -> Vec<OsString> {
+pub(crate) fn parent_var_names() -> Vec<OsString> {
     std::env::vars_os().map(|(k, _)| k).collect()
 }
 
@@ -308,7 +308,11 @@ fn parent_var_names() -> Vec<OsString> {
 /// result against the same snapshot of the parent env the scrub saw:
 /// in-process tests in the same binary mirror flags into the env
 /// (`--offline` sets `SOCKET_OFFLINE`), so two separate reads race.
-fn scrub_parent_vars(cmd: &mut Command, parent: Vec<OsString>, ambient: fn(&str) -> bool) {
+pub(crate) fn scrub_parent_vars(
+    cmd: &mut Command,
+    parent: Vec<OsString>,
+    ambient: fn(&str) -> bool,
+) {
     for k in parent {
         if ambient(&k.to_string_lossy()) {
             cmd.env_remove(&k);
@@ -345,7 +349,7 @@ pub fn scrub_ambient_vlt_env(cmd: &mut Command) {
 }
 
 /// [`is_ambient_vlt_var`] minus `SOCKET_*`.
-fn is_ambient_vlt_tool_var(name: &str) -> bool {
+pub(crate) fn is_ambient_vlt_tool_var(name: &str) -> bool {
     !name.starts_with("SOCKET_") && is_ambient_vlt_var(name)
 }
 
@@ -354,288 +358,4 @@ fn is_ambient_vlt_tool_var(name: &str) -> bool {
 /// and removing them again would undo the opt-outs it forces on.
 pub fn scrub_ambient_vlt_tool_env(cmd: &mut Command) {
     scrub_parent_vars(cmd, parent_var_names(), is_ambient_vlt_tool_var);
-}
-
-// ── Self-tests ────────────────────────────────────────────────────────
-//
-// Integration-test crates do not get `cfg(test)`, so — exactly as in
-// `common/mod.rs` — these must stay ungated to run at all. They are pure
-// env/path arithmetic, so they cost nothing in the binaries that pick this
-// module up.
-mod cache_env_selftests {
-    use super::*;
-
-    /// The names the bun suites' hermeticity depends on — the registry
-    /// overrides that reproduced the false negative, bun's auth and cache
-    /// knobs, the CLI's own surface — are covered; the hermetic switch, the
-    /// toolchain vars and look-alike prefixes (`BUNDLE_*`) survive.
-    #[test]
-    fn ambient_bun_scrub_covers_the_registry_and_config_overrides() {
-        for name in [
-            "BUN_CONFIG_REGISTRY",
-            "BUN_CONFIG_TOKEN",
-            "BUN_INSTALL",
-            "BUN_INSTALL_CACHE_DIR",
-            "BUN_RUNTIME_TRANSPILER_CACHE_PATH",
-            "npm_config_registry",
-            "NPM_CONFIG_REGISTRY",
-            "Npm_Config_Registry",
-            "npm_config__auth",
-            "npm_config_cache",
-            "SOCKET_API_TOKEN",
-            "SOCKET_DRY_RUN",
-            "VIRTUAL_ENV",
-        ] {
-            assert!(is_ambient_bun_var(name), "{name} must be scrubbed");
-        }
-        for name in [
-            "SOCKET_NO_CONFIG",
-            "PATH",
-            "HOME",
-            "BUNDLE_PATH",
-            "BUNDLE_USER_HOME",
-            "npm_lifecycle_event",
-            "XDG_CONFIG_HOME",
-            "RUSTUP_HOME",
-        ] {
-            assert!(!is_ambient_bun_var(name), "{name} must survive the scrub");
-        }
-    }
-
-    /// The scrub removes exactly the parent variables the predicate names:
-    /// nothing else is touched, and no matching parent variable is missed.
-    #[test]
-    fn ambient_bun_scrub_removes_only_matching_parent_vars() {
-        let parent = parent_var_names();
-        let mut cmd = Command::new("true");
-        scrub_parent_vars(&mut cmd, parent.clone(), is_ambient_bun_var);
-        let removed: Vec<String> = cmd
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name.to_string_lossy().into_owned())
-            .collect();
-        for name in &removed {
-            assert!(
-                is_ambient_bun_var(name),
-                "{name} was removed but is not an ambient bun var"
-            );
-        }
-        for name in &parent {
-            let name = name.to_string_lossy();
-            if is_ambient_bun_var(&name) {
-                assert!(
-                    removed.iter().any(|r| *r == name),
-                    "{name} is set in the parent env but was not scrubbed"
-                );
-            }
-        }
-        assert!(
-            cmd.get_envs().all(|(_, value)| value.is_none()),
-            "the scrub only removes; it seeds nothing"
-        );
-    }
-
-    #[test]
-    fn ambient_vlt_scrub_covers_vlt_config_and_keeps_the_harness_gates() {
-        for name in [
-            "VLT_REGISTRY",
-            "VLT_REGISTRIES",
-            "VLT_CACHE",
-            "VLT_STORE_LINKER",
-            "VLT_TELEMETRY",
-            "npm_config_registry",
-            "NPM_CONFIG_REGISTRY",
-            "SOCKET_API_TOKEN",
-            "SOCKET_NO_VLT_INSTALL_CLEANUP",
-            "SOCKET_PATCH_BUN_E2E_JS",
-            "VIRTUAL_ENV",
-        ] {
-            assert!(is_ambient_vlt_var(name), "{name} must be scrubbed");
-        }
-        for name in [
-            "SOCKET_NO_CONFIG",
-            "SOCKET_PATCH_VLT_E2E_JS",
-            "SOCKET_PATCH_VLT_E2E_VERSION",
-            "SOCKET_PATCH_VLT_E2E_REQUIRED",
-            "SOCKET_PATCH_VLT_E2E_STORE_LINKER",
-            "PATH",
-            "HOME",
-            "XDG_CONFIG_HOME",
-            "NODE_OPTIONS_X",
-        ] {
-            assert!(!is_ambient_vlt_var(name), "{name} must survive the scrub");
-        }
-    }
-
-    /// The CLI-child variant keeps every `SOCKET_*`, so it never undoes
-    /// the opt-outs `hermetic::command` forces on, and still strips the
-    /// vlt, npm and Python config.
-    #[test]
-    fn ambient_vlt_tool_scrub_leaves_socket_vars_to_the_hermetic_builder() {
-        for name in [
-            "SOCKET_TELEMETRY_DISABLED",
-            "SOCKET_NO_UPDATE_CHECK",
-            "SOCKET_NO_CONFIG",
-            "SOCKET_API_TOKEN",
-        ] {
-            assert!(!is_ambient_vlt_tool_var(name), "{name} must survive");
-        }
-        for name in ["VLT_REGISTRY", "npm_config_registry", "VIRTUAL_ENV"] {
-            assert!(is_ambient_vlt_tool_var(name), "{name} must be scrubbed");
-        }
-    }
-
-    #[test]
-    fn ambient_vlt_scrub_removes_only_matching_parent_vars() {
-        let parent = parent_var_names();
-        let mut cmd = Command::new("true");
-        scrub_parent_vars(&mut cmd, parent.clone(), is_ambient_vlt_var);
-        let removed: Vec<String> = cmd
-            .get_envs()
-            .filter(|(_, value)| value.is_none())
-            .map(|(name, _)| name.to_string_lossy().into_owned())
-            .collect();
-        for name in &removed {
-            assert!(is_ambient_vlt_var(name), "{name} was removed");
-        }
-        for name in &parent {
-            let name = name.to_string_lossy();
-            if is_ambient_vlt_var(&name) {
-                assert!(removed.iter().any(|r| *r == name), "{name} kept");
-            }
-        }
-    }
-
-    /// The variables whose whole point is that they outrank `HOME`. A future
-    /// edit that drops one would silently restore the leak this module
-    /// exists to close, and nothing else in the suite would notice.
-    const MUST_PIN: &[&str] = &[
-        "HOME",
-        "GOCACHE",
-        "GOMODCACHE",
-        "GOPATH",
-        "COREPACK_HOME",
-        "PNPM_HOME",
-        "CARGO_HOME",
-        "npm_config_cache",
-        "YARN_CACHE_FOLDER",
-        "BUN_INSTALL_CACHE_DIR",
-        "PIP_CACHE_DIR",
-        "UV_CACHE_DIR",
-        "GEM_SPEC_CACHE",
-        "NUGET_PACKAGES",
-    ];
-
-    #[test]
-    fn every_leak_prone_var_is_pinned() {
-        let pinned = overrides();
-        for want in MUST_PIN {
-            assert!(
-                pinned.iter().any(|(var, _)| var == want),
-                "{want} is no longer pinned by cache_env::overrides(); package-manager \
-                 caches will leak into the home directory of whoever runs the suite"
-            );
-        }
-    }
-
-    #[test]
-    fn every_override_lands_inside_the_sandbox() {
-        let root = cache_root();
-        for (var, path) in overrides() {
-            assert!(
-                path.starts_with(&root),
-                "{var} points outside the cache sandbox: {} is not under {}",
-                path.display(),
-                root.display()
-            );
-        }
-    }
-
-    #[test]
-    fn no_override_points_into_the_real_home() {
-        let Some(real) = real_home() else {
-            return;
-        };
-        // A machine whose TMPDIR is itself inside the home directory has no
-        // way to satisfy this; the sandbox is still a dedicated directory, so
-        // skip rather than fail.
-        if cache_root().starts_with(&real) {
-            return;
-        }
-        for (var, path) in overrides() {
-            assert!(
-                !path.starts_with(&real),
-                "{var} still resolves inside the real home: {}",
-                path.display()
-            );
-        }
-    }
-
-    #[test]
-    fn isolate_applies_the_overrides_to_a_command() {
-        let mut cmd = Command::new("true");
-        isolate(&mut cmd);
-        let applied: Vec<(String, Option<String>)> = cmd
-            .get_envs()
-            .map(|(k, v)| {
-                (
-                    k.to_string_lossy().into_owned(),
-                    v.map(|v| v.to_string_lossy().into_owned()),
-                )
-            })
-            .collect();
-        for (var, path) in overrides() {
-            let seen = applied
-                .iter()
-                .find(|(name, _)| name == var)
-                .unwrap_or_else(|| panic!("isolate() did not set {var}"));
-            assert_eq!(
-                seen.1.as_deref(),
-                Some(path.to_string_lossy().as_ref()),
-                "isolate() set {var} to the wrong path"
-            );
-        }
-        assert!(
-            sandbox_home().is_dir(),
-            "isolate() must create the sandbox home so tools that require \
-             an existing $HOME can start"
-        );
-    }
-
-    #[test]
-    fn toolchain_roots_are_only_seeded_when_they_exist() {
-        // The preservation pass must never invent a path. Whatever it seeds
-        // has to be a directory that is really there under the real home,
-        // and it must leave a variable the caller already exported alone.
-        let Some(real) = real_home() else {
-            return;
-        };
-        let mut cmd = Command::new("true");
-        isolate(&mut cmd);
-        let applied: Vec<(String, Option<PathBuf>)> = cmd
-            .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(PathBuf::from)))
-            .collect();
-        for (var, relative) in TOOLCHAIN_ROOTS {
-            let Some((_, value)) = applied.iter().find(|(name, _)| name == var) else {
-                continue;
-            };
-            if std::env::var_os(var).is_some() {
-                // Already exported by the caller: inherited untouched, so it
-                // must not appear in the command's explicit env at all.
-                panic!("{var} was already set in the parent env; isolate() must not override it");
-            }
-            let value = value.as_ref().expect("seeded roots always have a value");
-            assert_eq!(
-                value,
-                &real.join(relative),
-                "{var} was seeded to something other than its default under the real home"
-            );
-            assert!(
-                value.is_dir(),
-                "{var} was seeded to a path that does not exist: {}",
-                value.display()
-            );
-        }
-    }
 }
