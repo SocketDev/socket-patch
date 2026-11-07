@@ -23,6 +23,131 @@ a version without a non-empty section in this file.
 
 ## [Unreleased]
 
+## [5.1.0] — 2026-11-06
+
+### Added
+
+- **RubyGems.**
+  - **Agent mode patches gems with native (C) extensions for real.** When
+    `apply` (or `scan` / `get --mode agent`) patches a gem whose patch changes
+    native-extension sources (such as `ext/**/*.c` or an `extconf.rb`), it
+    now rebuilds the gem's extensions with RubyGems' own builder, the step
+    `gem pristine --extensions` runs, using the Ruby that owns the gem home.
+    Both the copy under `extensions/<platform>/<abi>/` and the copy under the
+    gem's `lib/` are rebuilt, so Ruby stops loading the stale install-time
+    `.so` / `.bundle`. A build that fails puts the original sources and build
+    back (`native_extension_build_failed`), and a copy that can't be rebuilt
+    in place (a precompiled platform gem, a Bundler git checkout, no matching
+    Ruby) is refused with `native_extensions_unsupported` before anything is
+    written. Sources an earlier release patched without a rebuild are rebuilt
+    on the next `apply` (`native_extension_rebuilt` warning). `vex` and
+    `apply --check` attest such a patch only once its rebuild is recorded,
+    and otherwise report `native_extension_not_rebuilt`. `rollback` and
+    `remove` restore the original build. Callers that compile the extension
+    themselves can opt out with `--no-gem-native-rebuild` (env
+    `SOCKET_NO_GEM_NATIVE_REBUILD`): the sources are written without a
+    rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does
+    not attest them. Hosted copies are unaffected, since RubyGems compiles
+    the patched gem itself (#1996, #1998).
+
+### Fixed
+
+- **RubyGems.**
+  - With Bundler 4.1 `override "other", with: "gem", in: "parent"`, hosted
+    `rollback` and `remove` treat the override target as transitive and give
+    back the original lock and Gemfile byte for byte, instead of writing a
+    new exact `gem "gem", "x.y.z"` pin that blocked later upgrades (#1989,
+    #1991).
+  - Gemspec directives and development dependencies are read as Ruby code:
+    `=begin`/`=end` blocks, heredoc bodies and `__END__` data are skipped, so
+    a commented-out dev dependency no longer adds a bogus requirement and a
+    heredoc no longer refuses the Gemfile (#1932, #1936).
+- **npm family.**
+  - pnpm workspace globs with brace sets and character classes
+    (`packages/{a,b}`, `packages/[ab]*`) are read the way pnpm reads them in
+    every mode instead of being refused or read as every directory; shapes
+    pnpm reads its own way (extglobs, `[!a]`, a `+` after a class, stepped or
+    punctuation-spanning brace ranges) are still refused, and commented
+    importer lines in `pnpm-lock.yaml` are ignored (#1846, #1863).
+  - Quoted values, YAML escapes and duplicate keys in `pnpm-workspace.yaml`,
+    `.yarnrc.yml` and `.modules.yaml` decode one way, as pnpm reads them, so
+    settings such as `modulesDir` or `lockfileDir` no longer resolve to
+    different paths depending on the command (#1918, #1973).
+  - yarn classic's `.yarnrc` is read as yarn 1.22 reads the whole file:
+    `--modules-folder 'deps'` no longer sends the crawler to a folder yarn
+    never installs into, and a file yarn can't parse sets nothing (#1901,
+    #1915).
+  - A malformed `package.json` `workspaces` field (a non-string item, `null`,
+    the wrong type) is judged the same way everywhere; the Bun member walk
+    falls back to `bun.lock` instead of reading no members (#1900, #1971).
+  - `apply` and `rollback` no longer touch package copies inside a store
+    nested in another store's entry, which `scan` never reports, and keep
+    the peer-variant copies of a project that lives under `~/.bun`,
+    `~/.deno` or `~/.vlt` (#1899, #1986).
+  - Hosted npm warns `redirect_npm_omit_lockfile_registry_resolved` when any
+    npm config layer sets `omit-lockfile-registry-resolved`, which makes the
+    next `npm install` drop the hosted URL and fail with `EINTEGRITY`, and
+    names where it is set and the remedies (#1871, #1872).
+- **PyPI.**
+  - A requirements line pinned through an environment variable
+    (`six==${SIXV}`) is refused by `vendor` with
+    `pypi_requirement_env_templated`, and `vendor --check` and `vex` read it
+    as possibly installing any release, so the patch is no longer attested
+    while `pip install -r` can install the unpatched one (#1873, #1874).
+  - A hosted scan of a Python project with no lockfile the rewriters read now
+    warns `redirect_pypi_no_lockfile`, naming the files looked for and the
+    project's own lock command, instead of passing silently (#638, #1885).
+  - After a hosted rollback, a vendored rollback or `vendor --revert` of a
+    requirements-file pin, the reinstall advisory covers pip and names the
+    requirements files to reinstall from (#1953, #1954).
+  - The hosted Pipenv stale-install warning ends with the same runnable
+    remedy as vendored mode and never prints an option-like package name
+    into a shell command (#1878, #1883).
+  - A `poetry.lock` in an old format (0, 1.0, 1.1) keeps its "written by
+    Poetry < 1.4" warnings and refusals even when a hand-merged header claims
+    a newer Poetry (#1847, #1865).
+- **Go.** In a go 1.16 (unpruned) module where a dependency imports a fork
+  that the root `go.mod` replaces with the patched module, `apply`,
+  `apply --check`, hosted mode and `vex` read the module graph to tell
+  whether the patch is really built, instead of reporting it applied while
+  `go build` linked the unpatched code (#1840, #1843).
+- **Maven.** A Maven 4 root that builds its subdirectories implicitly
+  (model 4.1.0, `pom` packaging, no `<subprojects>`) is treated as a reactor
+  by hosted mode, `vex` and the Maven cache scope, not only by vendored mode,
+  so a root-only pin is no longer attested while a module keeps its own
+  version (#1809, #1886).
+- **Vendoring.**
+  - Vendored dry runs leave already-vendored patches out of the "Would
+    download and vendor" headline and list them as skipped, matching the wet
+    run and the JSON (#1850, #1856).
+  - Run from a workspace member with no lockfile of its own, a vendored
+    `scan`, `get` or `vendor` names the lock that installs the member and
+    where to run from (#1904, #1913).
+  - npm package-lock packages installed from a URL or git spec, and workspace
+    members, are refused before their patch is downloaded; dry runs preview
+    them as refused and they no longer hold a `--max-new-patches` rollout
+    slot (#1976, #1977).
+  - In a vlt project, `vendor` no longer requests service downloads for
+    packages it then refuses (#1909, #1947).
+- **General.**
+  - The nested-project remedy quotes its path for the shell it prints for,
+    including Windows and `%` (#1859, #1884).
+  - Patch and vendor download errors read the same on every path (size
+    limit, HTTP status with a bounded body excerpt), and artifact downloads
+    log under `--debug` (#1869, #1870).
+
+### Maintenance
+
+- Code consolidation with no output change: one lock-rewrite driver for
+  Poetry and PDM (#1898) and module sweeps across the CLI and core
+  (#1855, #1864, #1875, #1884, #1892, #1897, #1903, #1907, #1914, #1920,
+  #1923, #1929, #1939, #1948, #1967, #1975, #1985, #1990).
+- Test and CI infrastructure: shared test env guard, docker harness, PTY
+  runner, `copy_tree` and apply fixtures; hermetic children scrub color
+  variables; failing tests are annotated in CI; offline bun.lockb rollback
+  mock and a Windows venv layout in the PyPI fixture (#1891, #1890, #1905,
+  #1944, #1955, #1964, #1972, #1978, #1988, #1994).
+
 ## [5.0.1] — 2026-10-13
 
 ### Fixed
