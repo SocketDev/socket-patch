@@ -239,6 +239,10 @@ const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
 /// Omission tag and note: an npm or Bun pin's package is one the project
 /// patches itself (`patchedDependencies`, `vex::Unattested`).
 const NOTE_NPM_PATCHED_DEPENDENCY: &str = "vex_npm_patched_dependency";
+/// Omission tag and note: a NuGet Socket source's id is also locked at a
+/// version other than the patched one, which that source cannot serve
+/// (`vex::Unattested`).
+const NOTE_NUGET_LOCK_OTHER_VERSION: &str = "vex_nuget_lock_other_version";
 /// Omission tag and note: a hosted sbt pin whose bytes the build provably
 /// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
 /// dropping the load-time verifier, or current evidence
@@ -302,6 +306,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              into your own patch, or remove the `patchedDependencies` entry and re-run); an \
              npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
              `socket-patch rollback <uuid>` restores the registry entry",
+        ),
+        UnattestedKind::NugetLockOtherVersion => (
+            NOTE_NUGET_LOCK_OTHER_VERSION,
+            "not attested until every target framework locks only the patched version (align \
+             them on it, restore, and re-run `scan` / `vendor`)",
         ),
         UnattestedKind::SbtPinBypassed => (
             NOTE_SBT_PIN_BYPASSED,
