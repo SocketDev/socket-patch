@@ -596,18 +596,26 @@ impl GoWorkspace {
     /// The member whose directory is `dir`, matched as go matches a module
     /// root against the `use` list.
     pub fn member_at(&self, dir: &Path) -> Option<&Member> {
-        let key = same_dir_key(dir);
-        self.members.iter().find(|m| same_dir_key(&m.dir) == key)
+        self.member_at_in(PathSpace::Disk, dir)
+    }
+
+    fn member_at_in(&self, paths: PathSpace<'_>, dir: &Path) -> Option<&Member> {
+        let key = paths.key(dir);
+        self.members.iter().find(|m| paths.key(&m.dir) == key)
     }
 
     /// The members inside `root`, with their `root`-relative directory
     /// (`""` for `root` itself, forward slashes).
     pub fn members_within(&self, root: &Path) -> Vec<(String, &Member)> {
-        let base = same_dir_key(root);
+        self.members_within_in(PathSpace::Disk, root)
+    }
+
+    fn members_within_in(&self, paths: PathSpace<'_>, root: &Path) -> Vec<(String, &Member)> {
+        let base = paths.key(root);
         self.members
             .iter()
             .filter_map(|m| {
-                let rel = same_dir_key(&m.dir).strip_prefix(&base).ok()?.to_path_buf();
+                let rel = paths.key(&m.dir).strip_prefix(&base).ok()?.to_path_buf();
                 Some((rel.to_string_lossy().replace('\\', "/"), m))
             })
             .collect()
@@ -808,8 +816,13 @@ impl GoWorkspace {
     /// `root` (`ci.work`) is not: go doesn't read `root/go.work` then, so
     /// a replace written there would do nothing (#1810).
     pub fn rooted_at(&self, root: &Path) -> bool {
+        self.rooted_at_in(PathSpace::Disk, root)
+    }
+
+    /// [`GoWorkspace::rooted_at`] in `paths`.
+    pub fn rooted_at_in(&self, paths: PathSpace<'_>, root: &Path) -> bool {
         self.work_file.file_name() == Some(std::ffi::OsStr::new("go.work"))
-            && same_dir_key(self.work_dir()) == same_dir_key(root)
+            && paths.key(self.work_dir()) == paths.key(root)
     }
 
     /// Which file holds the Socket replace of `module` for the project at
@@ -855,14 +868,26 @@ impl GoWorkspace {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
-        let display = display_path(project_root, &self.work_file);
+        self.work_conflict_in(PathSpace::Disk, project_root, module, version, ours)
+    }
+
+    /// [`GoWorkspace::work_conflict`] in `paths`.
+    pub fn work_conflict_in(
+        &self,
+        paths: PathSpace<'_>,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
+        let display = paths.display(project_root, &self.work_file);
         if let Some(member) = self.main_module(module) {
             return Some(WorkspaceConflict::MainModule {
                 work_file: display,
-                member: display_path(project_root, &member.dir),
+                member: paths.display(project_root, &member.dir),
             });
         }
-        let our_target = lexical_target(self.work_dir(), ours);
+        let our_target = paths.target(self.work_dir(), ours);
         let applies = |e: &ReplaceEntry| {
             e.module == module
                 && !e.socket_owned()
@@ -871,7 +896,7 @@ impl GoWorkspace {
         if let Some(w) = self
             .replaces()
             .into_iter()
-            .find(|w| applies(w) && lexical_target(self.work_dir(), w) != our_target)
+            .find(|w| applies(w) && paths.target(self.work_dir(), w) != our_target)
         {
             return Some(WorkspaceConflict::WorkReplace {
                 work_file: display,
@@ -886,11 +911,11 @@ impl GoWorkspace {
                 .unwrap_or_default();
             if let Some(other) = replaces
                 .iter()
-                .find(|e| applies(e) && lexical_target(&member.dir, e) != our_target)
+                .find(|e| applies(e) && paths.target(&member.dir, e) != our_target)
             {
                 return Some(WorkspaceConflict::MemberOverridden {
                     work_file: display,
-                    member: display_path(project_root, &member.dir),
+                    member: paths.display(project_root, &member.dir),
                     target: target_display(other),
                 });
             }
@@ -908,19 +933,31 @@ impl GoWorkspace {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
-        let display = display_path(project_root, &self.work_file);
+        self.conflict_in(PathSpace::Disk, project_root, module, version, ours)
+    }
+
+    /// [`GoWorkspace::conflict`] in `paths`.
+    pub fn conflict_in(
+        &self,
+        paths: PathSpace<'_>,
+        project_root: &Path,
+        module: &str,
+        version: &str,
+        ours: &ReplaceEntry,
+    ) -> Option<WorkspaceConflict> {
+        let display = paths.display(project_root, &self.work_file);
         if let Some(member) = self.main_module(module) {
             return Some(WorkspaceConflict::MainModule {
                 work_file: display,
-                member: display_path(project_root, &member.dir),
+                member: paths.display(project_root, &member.dir),
             });
         }
-        let own = self.member_at(project_root);
+        let own = self.member_at_in(paths, project_root);
         // With no go.mod there is no file to write, even when the workspace
         // already replaces the module the same way (#1810).
-        if own.is_none() && !project_root.join("go.mod").exists() {
+        if own.is_none() && !paths.exists(&project_root.join("go.mod")) {
             let members: Vec<String> = self
-                .members_within(project_root)
+                .members_within_in(paths, project_root)
                 .into_iter()
                 .map(|(dir, _)| dir)
                 .filter(|dir| !dir.is_empty())
@@ -928,10 +965,11 @@ impl GoWorkspace {
             return Some(WorkspaceConflict::NoModule {
                 work_file: display,
                 members: members.join(", "),
-                own_work: !self.rooted_at(project_root) && project_root.join("go.work").is_file(),
+                own_work: !self.rooted_at_in(paths, project_root)
+                    && paths.is_file(&project_root.join("go.work")),
             });
         }
-        let our_target = lexical_target(own.map_or(project_root, |m| &m.dir), ours);
+        let our_target = paths.target(own.map_or(project_root, |m| &m.dir), ours);
 
         // go reads go.work's replace for this exact version, then its
         // version-less one, before any member's; a go.work replace of
@@ -945,10 +983,10 @@ impl GoWorkspace {
                     .find(|w| w.module == module && w.version.is_none())
             });
         if let Some(w) = effective {
-            return (lexical_target(self.work_dir(), w) != our_target).then(|| {
+            return (paths.target(self.work_dir(), w) != our_target).then(|| {
                 if w.socket_owned() {
                     WorkspaceConflict::WorkHosted {
-                        work_dir: display_path(project_root, self.work_dir()),
+                        work_dir: paths.display(project_root, self.work_dir()),
                         work_file: display,
                         target: target_display(w),
                     }
@@ -964,12 +1002,8 @@ impl GoWorkspace {
         if own.is_none() {
             return Some(WorkspaceConflict::NotAMember { work_file: display });
         }
-        let project = same_dir_key(project_root);
-        for member in self
-            .members
-            .iter()
-            .filter(|m| same_dir_key(&m.dir) != project)
-        {
+        let project = paths.key(project_root);
+        for member in self.members.iter().filter(|m| paths.key(&m.dir) != project) {
             let replaces = member
                 .go_mod
                 .as_deref()
@@ -983,14 +1017,13 @@ impl GoWorkspace {
                     .iter()
                     .find(|e| e.module == module && e.version.is_none())
             });
-            let Some(other) = applied.filter(|e| lexical_target(&member.dir, e) != our_target)
-            else {
+            let Some(other) = applied.filter(|e| paths.target(&member.dir, e) != our_target) else {
                 continue;
             };
             let (work_file, work_dir, member, target) = (
                 display,
-                display_path(project_root, self.work_dir()),
-                display_path(project_root, &member.dir),
+                paths.display(project_root, self.work_dir()),
+                paths.display(project_root, &member.dir),
                 target_display(other),
             );
             return Some(match exact {
@@ -1215,6 +1248,76 @@ pub fn in_root_dir(dir: &str) -> Option<String> {
             .collect::<Vec<_>>()
             .join("/"),
     )
+}
+
+/// Where the paths of a [`GoWorkspace`] live, for the checks that compare
+/// them ([`GoWorkspace::conflict_in`], [`GoWorkspace::work_conflict_in`]).
+#[derive(Debug, Clone, Copy)]
+pub enum PathSpace<'a> {
+    /// On disk: matched as go matches them (absolute,
+    /// symlinks resolved), files probed on the filesystem.
+    Disk,
+    /// An in-memory project: every path is relative to the project root
+    /// and compared lexically, and `files` (root-relative, normalized) are
+    /// the files that exist. Neither the filesystem nor the process's
+    /// working directory is consulted, so the answer is the same on every
+    /// host.
+    Memory { files: &'a BTreeSet<PathBuf> },
+}
+
+impl PathSpace<'_> {
+    /// The key two spellings of one directory share.
+    fn key(self, dir: &Path) -> PathBuf {
+        match self {
+            PathSpace::Disk => same_dir_key(dir),
+            PathSpace::Memory { .. } => {
+                crate::utils::relpath::normalize_lexically_keeping_escapes(dir)
+            }
+        }
+    }
+
+    fn exists(self, path: &Path) -> bool {
+        match self {
+            PathSpace::Disk => path.exists(),
+            PathSpace::Memory { files } => files.contains(&self.key(path)),
+        }
+    }
+
+    fn is_file(self, path: &Path) -> bool {
+        match self {
+            PathSpace::Disk => path.is_file(),
+            PathSpace::Memory { files } => files.contains(&self.key(path)),
+        }
+    }
+
+    /// [`display_path`].
+    pub(crate) fn display(self, project_root: &Path, path: &Path) -> String {
+        match self {
+            PathSpace::Disk => display_path(project_root, path),
+            PathSpace::Memory { .. } => {
+                let path = self.key(path);
+                match path.strip_prefix(self.key(project_root)) {
+                    Ok(rel) if !rel.as_os_str().is_empty() => {
+                        rel.to_string_lossy().replace('\\', "/")
+                    }
+                    Ok(_) => ".".to_string(),
+                    Err(_) => path.to_string_lossy().replace('\\', "/"),
+                }
+            }
+        }
+    }
+
+    /// [`lexical_target`].
+    fn target(self, go_mod_dir: &Path, entry: &ReplaceEntry) -> String {
+        match (self, &entry.path) {
+            (PathSpace::Disk, _) => lexical_target(go_mod_dir, entry),
+            (PathSpace::Memory { .. }, Some(path)) => self
+                .key(&go_mod_dir.join(path.replace('\\', "/")))
+                .to_string_lossy()
+                .into_owned(),
+            (PathSpace::Memory { .. }, None) => target_display(entry),
+        }
+    }
 }
 
 /// A directory as go matches a module root against the workspace's `use`

@@ -228,7 +228,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
             //    survive Rush's generated-workspace install (installs run
             //    from common/temp). Point the user at hosted mode, which
             //    edits the lock in place.
-            if view.exists("rush.json").await {
+            if crate::vendor::lock_inventory::pnpm::is_rush(*view).await {
                 return Err((
                     "vendor_rush_unsupported",
                     format!(
@@ -1777,6 +1777,17 @@ mod tests {
             detail.contains("common/config/rush/pnpm-lock.yaml"),
             "{detail}"
         );
+    }
+
+    /// The probe's Rush gate is the shared one: a directory named
+    /// `rush.json` (or a dangling link) is not a Rush monorepo, so the
+    /// refusal is the missing-lock one.
+    #[tokio::test]
+    async fn a_rush_json_directory_is_not_rush() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("rush.json")).unwrap();
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_ne!(code, "vendor_rush_unsupported");
     }
 
     #[tokio::test]
