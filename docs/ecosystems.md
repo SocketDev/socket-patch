@@ -880,7 +880,12 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
-  *mismatch* fails.
+  *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
+  (and drops any line an earlier run wrote for that suffixed version) and warns
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
+  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
+  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
+  Maven 3.9.4 or later.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
@@ -1196,7 +1201,12 @@ then a re-run re-verifies the pin and records the build's new dependency
 digest; a build that now declares the GA newer than the patched base is
 refused (`redirect_sbt_pin_declared_newer`: roll the patch back, or declare
 the base again). `rollback` / `remove` restore the file
-offline. The full code list is in
+offline. `vex` attests a pin that post-wiring evidence verifies, or else from
+the copy sbt downloaded into `.socket/sbt-hosted/`, but never one whose bytes
+the build provably does not use: a `dependencyOverrides` reassignment, an
+`onLoad` reassignment that drops the generated load-time verifier, or
+evidence recorded after the wiring that still resolves the base version or other bytes
+(`vex_sbt_pin_bypassed`). The full code list is in
 [`CLI_CONTRACT.md`](../crates/socket-patch-cli/CLI_CONTRACT.md) (**Hosted
 sbt**).
 
@@ -1542,9 +1552,12 @@ Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,
 otherwise (`GOWORK` unset, empty or `auto`) the nearest `go.work` at or
 above the project. A relative `GOWORK` makes go fail
 (`invalid GOWORK: not an absolute path`), so socket-patch writes nothing for
-it and attests nothing. `vex` reads only the project's own `go.work`: when
-`GOWORK` names any other file, it attests none of the project's Go patches
-and reports each as `patched_ref_invalid`.
+it and attests nothing. `vex` reads the same workspace, members outside the
+project included: a Socket replace that workspace overrides, ignores or
+rejects (the check the writers run before writing one), or one in the
+project's own `go.work` while go builds another, stays listed, so `list`,
+`rollback` and `remove` find it, but is not attested
+(`go_workspace_override`).
 
 `GOFLAGS` is read the same way (the environment, then the `go env -w`
 file). A `-modfile` in it that names any file other than the project's

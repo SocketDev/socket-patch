@@ -1354,19 +1354,159 @@ impl ScriptGraph {
     /// The first script setting a custom dependency-lock file location
     /// (`lockFile = …` / `lockFile.set(…)`).
     pub fn custom_lock_file(&self) -> Option<String> {
-        self.scripts.iter().find_map(|s| {
-            let toks = dsl::tokens(&s.text, s.dsl);
-            (0..toks.len())
-                .any(|i| {
-                    is_ident(toks.get(i), "lockFile")
-                        && ((is_punct(toks.get(i + 1), b'=') && !is_punct(toks.get(i + 2), b'='))
-                            || (is_punct(toks.get(i + 1), b'.')
-                                && is_ident(toks.get(i + 2), "set")
-                                && is_punct(toks.get(i + 3), b'(')))
-                })
-                .then(|| s.rel.clone())
-        })
+        self.custom_lock_files()
+            .into_iter()
+            .next()
+            .map(|c| c.script)
     }
+
+    /// Every custom dependency-lock file location (`lockFile = …` /
+    /// `lockFile.set(…)`), in script order. See [`CustomLockFile::path`]
+    /// for when the location can be followed.
+    pub fn custom_lock_files(&self) -> Vec<CustomLockFile> {
+        let mut out = Vec::new();
+        for s in &self.scripts {
+            let toks = dsl::tokens(&s.text, s.dsl);
+            // A project's own build script: `file(…)` resolves against it.
+            let project_dir = (s.kind == ScriptKind::Build)
+                .then(|| {
+                    self.builds
+                        .iter()
+                        .flat_map(|b| &b.projects)
+                        .find(|p| p.build_script.as_deref() == Some(s.rel.as_str()))
+                        .map(|p| p.dir.clone())
+                })
+                .flatten();
+            // Blocks that configure other projects resolve `file(…)`
+            // against those: `allprojects { … }`, `subprojects { … }`,
+            // `configure(<projects>) { … }`, `project(':x') { … }` (also
+            // `project(':x').afterEvaluate { … }`) and the per-project
+            // hooks (`gradle.beforeProject { … }`, `afterProject`). The
+            // block must open right after the name and its argument list
+            // (or one `.method`), so `implementation(project(':lib'))`
+            // followed by the script's next block is not one.
+            const FOREIGN: [&str; 6] = [
+                "allprojects",
+                "subprojects",
+                "configure",
+                "project",
+                "beforeProject",
+                "afterProject",
+            ];
+            let foreign: Vec<(usize, usize)> = (0..toks.len())
+                .filter(|&i| FOREIGN.iter().any(|name| is_ident(toks.get(i), name)))
+                .filter_map(|i| {
+                    // Skip the whole argument list, however long, so a
+                    // named-argument call (`project(path: ':a', …) {`)
+                    // still counts.
+                    let mut after = if is_punct(toks.get(i + 1), b'(') {
+                        matching_close(&toks, i + 1)? + 1
+                    } else {
+                        i + 1
+                    };
+                    if is_punct(toks.get(after), b'.')
+                        && matches!(
+                            toks.get(after + 1).map(|t| &t.tok),
+                            Some(dsl::Tok::Ident(_))
+                        )
+                    {
+                        after += 2;
+                    }
+                    let open = Some(after).filter(|&j| is_punct(toks.get(j), b'{'))?;
+                    matching_close(&toks, open).map(|c| (open, c))
+                })
+                .collect();
+            for i in 0..toks.len() {
+                if !is_ident(toks.get(i), "lockFile") {
+                    continue;
+                }
+                let value = if is_punct(toks.get(i + 1), b'=') && !is_punct(toks.get(i + 2), b'=') {
+                    i + 2
+                } else if is_punct(toks.get(i + 1), b'.')
+                    && is_ident(toks.get(i + 2), "set")
+                    && is_punct(toks.get(i + 3), b'(')
+                {
+                    i + 4
+                } else {
+                    continue;
+                };
+                let path = project_dir
+                    .as_deref()
+                    .filter(|_| !foreign.iter().any(|(o, c)| i > *o && i < *c))
+                    .and_then(|dir| {
+                        let arg = file_call_arg(&toks, value)?;
+                        resolve_rel("", dir, &arg)
+                    });
+                out.push(CustomLockFile {
+                    script: s.rel.clone(),
+                    line: line_of(&s.text, toks[i].start),
+                    path,
+                });
+            }
+        }
+        out
+    }
+
+    /// Every lock file of every build ([`Self::lockfile_paths`]) with its
+    /// parsed content: `None` for a file the listing shows that `read`
+    /// cannot give as text (unreadable, not UTF-8, refused). The one lock
+    /// inventory the hosted and vendored backends both check.
+    pub fn read_locks(
+        &self,
+        list: ListFn<'_>,
+        read: TextReadFn<'_>,
+    ) -> Vec<(String, Option<locks::LockState>)> {
+        self.lockfile_paths(list)
+            .into_iter()
+            .map(|rel| {
+                let state = read(&rel).map(|text| locks::parse(&text));
+                (rel, state)
+            })
+            .collect()
+    }
+}
+
+/// A custom dependency-lock file location ([`ScriptGraph::custom_lock_files`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomLockFile {
+    /// The script that sets it.
+    pub script: String,
+    /// 1-based line of `lockFile`.
+    pub line: usize,
+    /// The lock file, relative to the graph's read root, when the value is
+    /// `file('<path>')` with a literal path (or `"$projectDir/<path>"`) in
+    /// a project's own build script, outside any `allprojects`,
+    /// `subprojects`, `configure` or `project(…)` block, and the path stays
+    /// inside the read root. `None`: it cannot be followed statically.
+    pub path: Option<String>,
+}
+
+/// The path argument of `file(<string>)` at `toks[at..]`, the call
+/// closing the value: a literal, or a `"$projectDir/…"` /
+/// `"${projectDir}/…"` string with no other interpolation (made
+/// project-relative).
+fn file_call_arg(toks: &[Token], at: usize) -> Option<String> {
+    if !is_ident(toks.get(at), "file")
+        || !is_punct(toks.get(at + 1), b'(')
+        || !is_punct(toks.get(at + 3), b')')
+        || is_punct(toks.get(at + 4), b'.')
+    {
+        return None;
+    }
+    if let Some(lit) = literal_of(toks.get(at + 2)) {
+        return Some(lit.to_string());
+    }
+    let Some(Token {
+        tok: Tok::Str { value, .. },
+        ..
+    }) = toks.get(at + 2)
+    else {
+        return None;
+    };
+    let rest = value
+        .strip_prefix("$projectDir/")
+        .or_else(|| value.strip_prefix("${projectDir}/"))?;
+    (!rest.contains('$') && !rest.contains('\\')).then(|| rest.to_string())
 }
 
 /// The subproject relation of a directory to an ancestor build: whether
@@ -2655,6 +2795,86 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
             "dependencyLocking { lockAllConfigurations() }\nif (lockFile == null) {}\n",
         )]);
         assert_eq!(g.custom_lock_file(), None);
+
+        // The location is followed only from a project's own build script,
+        // as a literal (or `$projectDir/`) `file(…)` inside the root.
+        let path_of = |files: &[(&str, &str)]| -> Vec<Option<String>> {
+            graph(files)
+                .custom_lock_files()
+                .into_iter()
+                .map(|c| c.path)
+                .collect()
+        };
+        let lock = |v: &str| format!("dependencyLocking {{ lockFile = {v} }}\n");
+        for (value, want) in [
+            ("file('locks/app.lockfile')", Some("app/locks/app.lockfile")),
+            (
+                "file(\"$projectDir/locks/x.lockfile\")",
+                Some("app/locks/x.lockfile"),
+            ),
+            ("file(\"${projectDir}/x.lockfile\")", Some("app/x.lockfile")),
+            ("file('../shared.lockfile')", Some("shared.lockfile")),
+            ("file('../../outside.lockfile')", None),
+            ("file('/abs/x.lockfile')", None),
+            ("file(\"$rootDir/x.lockfile\")", None),
+            ("file(name)", None),
+            ("file('x.lockfile').absoluteFile", None),
+            ("layout.projectDirectory.file('x.lockfile')", None),
+        ] {
+            let text = lock(value);
+            let files = [
+                ("settings.gradle", "include 'app'\n"),
+                ("app/build.gradle", text.as_str()),
+            ];
+            assert_eq!(path_of(&files), vec![want.map(str::to_string)], "{value}");
+        }
+        let kts = [(
+            "build.gradle.kts",
+            "dependencyLocking { lockFile.set(file(\"gradle/x.lockfile\")) }\n",
+        )];
+        assert_eq!(path_of(&kts), vec![Some("gradle/x.lockfile".to_string())]);
+        // Configuring other projects, or from an applied script: unfollowed.
+        for text in [
+            "subprojects { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "allprojects { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "project(':app') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "project(path: ':app', configuration: 'default') { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "project(':app').afterEvaluate { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "configure(allprojects) { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "configure(subprojects.findAll { it.name != 'x' }) { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "gradle.beforeProject { dependencyLocking { lockFile = file('x.lockfile') } }\n",
+            "gradle.afterProject { p -> dependencyLocking { lockFile = file('x.lockfile') } }\n",
+        ] {
+            let files = [
+                ("settings.gradle", "include 'app'\n"),
+                ("build.gradle", text),
+            ];
+            assert_eq!(path_of(&files), vec![None], "{text}");
+        }
+        // A project DEPENDENCY before the script's own block is not a block
+        // configuring that project.
+        for text in [
+            "dependencies { implementation(project(\":lib\")) }\ndependencyLocking { lockFile.set(file(\"locks/app.lockfile\")) }\n",
+            "dependencies {\n  implementation project(':lib')\n}\ndependencyLocking { lockFile = file('locks/app.lockfile') }\n",
+        ] {
+            let files = [
+                ("settings.gradle", "include 'app', 'lib'\n"),
+                ("app/build.gradle", text),
+            ];
+            assert_eq!(
+                path_of(&files),
+                vec![Some("app/locks/app.lockfile".to_string())],
+                "{text}"
+            );
+        }
+        let applied = [
+            ("build.gradle", "apply from: 'locks.gradle'\n"),
+            (
+                "locks.gradle",
+                "dependencyLocking { lockFile = file('x.lockfile') }\n",
+            ),
+        ];
+        assert_eq!(path_of(&applied), vec![None]);
 
         let g = graph(&[
             (
