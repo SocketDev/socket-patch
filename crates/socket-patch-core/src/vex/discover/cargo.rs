@@ -1435,7 +1435,7 @@ impl Shadow {
         let own = path.map(same_path_key);
         self.config_keys
             .iter()
-            .find(|(_, k, p)| k == key && *p != own)
+            .find(|(_, k, p)| k == key && !(p.is_some() && *p == own))
             .map(|(file, k, _)| {
                 format!("{file} redefines `[patch]` key `{k}`, which replaces it in cargo")
             })
