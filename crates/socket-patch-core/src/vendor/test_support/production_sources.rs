@@ -210,6 +210,25 @@ fn matching_close(b: &[u8], kind: &[Kind], open: usize) -> usize {
     b.len().saturating_sub(1)
 }
 
+/// Index of the innermost `{` still open at `at`, over code bytes only, or
+/// `None` at the top level.
+fn enclosing_brace(b: &[u8], kind: &[Kind], at: usize) -> Option<usize> {
+    let mut open = Vec::new();
+    for (j, &c) in b.iter().enumerate().take(at) {
+        if kind[j] != Kind::Code {
+            continue;
+        }
+        match c {
+            b'{' => open.push(j),
+            b'}' => {
+                open.pop();
+            }
+            _ => {}
+        }
+    }
+    open.pop()
+}
+
 /// End (exclusive) of the item starting at `start`: its first `;` outside
 /// brackets, or its first top-level `{…}` block (plus a `;` right after).
 /// An item never reaches past the bracket that encloses it, and one in a
@@ -296,11 +315,24 @@ pub fn strip_test_items(src: &str) -> String {
             continue;
         }
         if inner {
-            // `#![cfg(test)]`: the whole file (module) is test-only.
-            return src
-                .bytes()
-                .map(|c| if c == b'\n' { '\n' } else { ' ' })
-                .collect();
+            // `#![cfg(test)]`: the module it sits in is test-only. At the
+            // top level that is the whole file; inside an inline
+            // `mod x { … }` only that module's body, so production code
+            // after it is still scanned.
+            match enclosing_brace(b, &kind, i) {
+                None => {
+                    return src
+                        .bytes()
+                        .map(|c| if c == b'\n' { '\n' } else { ' ' })
+                        .collect();
+                }
+                Some(brace) => {
+                    let end = matching_close(b, &kind, brace);
+                    blank(&mut out, brace + 1, end);
+                    i = end;
+                    continue;
+                }
+            }
         }
         // The item: past whitespace, comments and further attributes.
         let mut j = close + 1;
@@ -389,6 +421,17 @@ mod tests {
         assert!(strip_test_items("#![cfg(test)]\nfn z() {}\n")
             .trim()
             .is_empty());
+        // Review (#2017): an inner test cfg in an inline module blanks only
+        // that module's body, never the production code after it.
+        let out = strip_test_items(
+            "fn a() { kept_a(); }\nmod t {\n    #![cfg(test)]\n    fn gone() { download(); }\n}\n\
+             fn b() { kept_b(); }\n",
+        );
+        assert!(!out.contains("gone"), "{out}");
+        for kept in ["kept_a", "kept_b"] {
+            assert!(out.contains(kept), "{kept}: {out}");
+        }
+        assert_eq!(out.lines().count(), 6, "{out}");
         // `any(test, …)` also builds outside tests.
         assert!(
             strip_test_items("#[cfg(any(test, feature = \"x\"))]\nfn k() {}\n").contains("fn k")
