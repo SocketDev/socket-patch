@@ -240,6 +240,10 @@ const NOTE_SBT_RESOLUTION_UNVERIFIED: &str = "vex_sbt_resolution_unverified";
 /// missing or modified (`vex::Unattested`,
 /// `UnattestedKind::SbtVendoredTreeMissing`).
 const NOTE_SBT_VENDORED_TREE_MISSING: &str = "vex_sbt_vendored_tree_missing";
+/// Omission tag and note: a NuGet Socket source's id is also locked at a
+/// version other than the patched one, which that source cannot serve
+/// (`vex::Unattested`).
+const NOTE_NUGET_LOCK_OTHER_VERSION: &str = "vex_nuget_lock_other_version";
 /// Omission tag and note: a hosted sbt pin whose bytes the build provably
 /// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
 /// dropping the load-time verifier, or current evidence
@@ -298,6 +302,11 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_SBT_VENDORED_TREE_MISSING,
             "not attested while the committed tree differs from the pin (restore \
              `.socket/vendor/maven2` from version control, or re-run `socket-patch vendor`)",
+        ),
+        UnattestedKind::NugetLockOtherVersion => (
+            NOTE_NUGET_LOCK_OTHER_VERSION,
+            "not attested until every target framework locks only the patched version (align \
+             them on it, restore, and re-run `scan` / `vendor`)",
         ),
         UnattestedKind::SbtPinBypassed => (
             NOTE_SBT_PIN_BYPASSED,

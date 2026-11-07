@@ -174,10 +174,14 @@ async fn keep_older_vendored_patch(
     };
     if let Some(kept) = lookup_entry(&state.entries, purl).filter(|e| e.uuid != uuid) {
         let root = common.project_root();
+        // Still in force, not attestable: a JVM tree that is still wired
+        // or referenced (an executable classifier copy beside it, say) is
+        // kept; only a provably dead one gives way.
         if crate::commands::discover_wiring(common, &root)
             .await
-            .vendor_entry_live(&root, kept)
+            .vendor_entry_liveness(&root, kept)
             .await
+            != Some(false)
         {
             return Some(VendorOutcome::Refused {
                 code,
@@ -1334,7 +1338,18 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
-            failure = vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()).err();
+            match vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()) {
+                Ok(None) => {}
+                // Intact and wired, but `vex` will not attest it: a
+                // declaration may still build the base. Re-vendoring cannot
+                // clear that, so it warns rather than fails (the unattested
+                // references rule).
+                Ok(Some(why)) => env.warnings.push(RunWarning {
+                    code: "vendor_jvm_unattested".into(),
+                    detail: format!("{key}: {why}; vex does not attest it"),
+                }),
+                Err(e) => failure = Some(e),
+            }
         }
         // The npm check names the exact unwired lock entry, so it runs
         // before the generic liveness rule below.
@@ -8150,6 +8165,54 @@ mod unused_vendored_manifest_keys_tests {
         assert_eq!(
             keys_for(&patches, "composer", "pkg:composer/psr/log@3.0.2.0"),
             vec!["pkg:composer/psr/log@3.0.2".to_string()]
+        );
+    }
+}
+
+/// The CLI side of core's `lock_pinned_locations_never_drive_a_download`
+/// (see its docs for what the check does and does not catch). Core's
+/// registry downloads (`registry_fetch::download`,
+/// `maven_repo::fetch_registry_bytes`) are `pub(crate)`, so the compiler
+/// already keeps the CLI from calling them (a by-name scan here would
+/// only meet the CLI's own `download` locals). What is pinned is the
+/// public `recover_lock_entry`: the CLI has no reference to it (its one
+/// production caller is core's `vendor::refusals::pristine_fetch_is_verifiable`
+/// yes/no gate), so any new CLI reference fails here.
+#[cfg(test)]
+mod lock_download_guard_tests {
+    use socket_patch_core::vendor::test_support::production_sources::{
+        production_sources, references,
+    };
+
+    const PINNED_REFERENCES: &[(&str, &str, &str)] = &[];
+
+    #[test]
+    fn lock_pinned_locations_never_drive_a_download() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: Vec<(String, &str, String)> = Vec::new();
+        for file in production_sources(&src) {
+            let code = file.code();
+            let lines: Vec<&str> = file.text.lines().collect();
+            for (line, _) in references(&code, "recover_lock_entry") {
+                found.push((
+                    file.rel.clone(),
+                    "recover_lock_entry",
+                    lines[line - 1].trim().to_string(),
+                ));
+            }
+        }
+        found.sort();
+        let mut expected: Vec<(String, &str, String)> = PINNED_REFERENCES
+            .iter()
+            .map(|(rel, name, line)| (rel.to_string(), *name, line.to_string()))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            found, expected,
+            "a production reference to `recover_lock_entry` was added, removed or changed. \
+             Its recovered `resolved`/`integrity` may be a Socket-hosted (patched) artifact's: \
+             never download them as a pristine source; re-check the site, then update \
+             PINNED_REFERENCES"
         );
     }
 }

@@ -8795,9 +8795,9 @@ fn rewrite_maven_pom(
         // (sources, tests, a native build) is its own artifact — managed and
         // resolved apart from the main jar — so it is left alone, and the
         // main jar's literal-vs-depMgmt decision is made without it.
-        let (variants, live): (Vec<_>, Vec<_>) = all_matches
-            .into_iter()
-            .partition(|m| m.classifier.is_some());
+        let (variants, live): (Vec<_>, Vec<_>) = all_matches.into_iter().partition(|m| {
+            crate::formats::maven::is_variant(m.type_text.as_deref(), m.classifier.as_deref())
+        });
         // A variant that carries code onto a classpath (tests, a native
         // build, a JDK-specific jar) at the patched release would keep the
         // unpatched bytes there while the GA counts as redirected and VEX
@@ -8812,8 +8812,14 @@ fn rewrite_maven_pom(
                 || crate::formats::maven::split_socket_version(v)
                     .is_some_and(|(base, _)| base == dep.version);
             if names_release {
-                let classifier = variant.classifier.as_deref().unwrap_or_default();
-                let executable = !matches!(classifier, "sources" | "javadoc");
+                let classifier = crate::formats::maven::variant_label(
+                    variant.type_text.as_deref(),
+                    variant.classifier.as_deref(),
+                );
+                let executable = crate::formats::maven::is_executable_variant(
+                    variant.type_text.as_deref(),
+                    variant.classifier.as_deref(),
+                );
                 executable_variant |= executable;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_classifier_unsupported".into(),
@@ -10371,6 +10377,16 @@ mod tests {
             );
             assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
         }
+        // A type implying an executable classifier (`test-jar` is the
+        // `tests` jar) is the same copy, as the vendored reactor judges it.
+        let typed = pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+            "  </dependencies>",
+            "    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n      <type>test-jar</type>\n    </dependency>\n  </dependencies>",
+        );
+        let files = BTreeMap::from([("pom.xml".to_string(), typed)]);
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(r.files.is_empty(), "test-jar: {:?}", r.files);
+        assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
     }
 
     /// Fail-closed literal pin: the `<version>` is rewritten to the suffixed

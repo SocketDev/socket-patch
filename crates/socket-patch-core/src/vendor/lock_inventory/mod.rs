@@ -6,14 +6,23 @@
 //! * `scan` / `get` supplement their installed-tree crawl with lockfile-only
 //!   entries (discovery on fresh clones and partial installs), warning that
 //!   those packages are not yet installed;
-//! * `vendor` fetches the pristine artifact for a lockfile-resolved package
-//!   with no installed copy ([`super::registry_fetch`]), verifying the bytes
-//!   against the integrity the lock records — FAIL-CLOSED: an entry whose
-//!   lock carries no content verifier is never fetched;
-//! * `repair` recovers ledger entries ([`recover_lock_entry`]);
+//! * `vendor` asks whether a package with no installed copy is resolved by
+//!   the lock with a content verifier (the CLI's lock-refusal gate), and
+//!   names the lock-resolvable packages an offline run could not vendor;
+//! * [`recover_lock_entry`] answers the same question from a ledger
+//!   entry's pre-vendor fragments;
 //! * ledger liveness (`vex::discover`) reads EVERY lock's instance
 //!   ([`inventory_project_every_lock`]) as evidence that a package resolves
 //!   from somewhere other than its patch.
+//!
+//! None of these DOWNLOADS what an entry pins. A Socket-hosted entry is
+//! listed as the package it replaces, with the hosted artifact's URL and
+//! the PATCHED artifact's hash for some formats (composer, gem, npm-family
+//! tarball pins), so its `resolved`/`integrity` must never be taken for a
+//! pristine source: vendored bytes come from the patch service by patch
+//! uuid, and a hosted → vendored takeover re-resolves the upstream entry
+//! from registry metadata. `tests::lock_pinned_locations_never_drive_a_download`
+//! (and the CLI's twin) pins this.
 //!
 //! # Layout
 //!
