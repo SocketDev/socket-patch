@@ -605,6 +605,8 @@ struct WireFindings {
     override_build_repos: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     dependency_lock: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    onload_assignment: Vec<String>,
 }
 
 type GavPaths = ((String, String, String), BTreeSet<PathBuf>);
@@ -687,6 +689,7 @@ impl ResolutionDoc {
                     resolvers_assignment: f.resolvers_assignment.clone(),
                     override_build_repos: f.override_build_repos.clone(),
                     dependency_lock: f.dependency_lock.clone(),
+                    onload_assignment: f.onload_assignment.clone(),
                 }
             }),
             artifact_sha256: self.artifact_sha256.clone().into_iter().collect(),
@@ -744,6 +747,7 @@ impl ResolutionDoc {
                 resolvers_assignment: f.resolvers_assignment,
                 override_build_repos: f.override_build_repos,
                 dependency_lock: f.dependency_lock,
+                onload_assignment: f.onload_assignment,
             },
             artifact_sha256: wire.artifact_sha256.into_iter().collect(),
             declared_deps: wire
