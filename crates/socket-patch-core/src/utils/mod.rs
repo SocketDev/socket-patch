@@ -20,6 +20,7 @@ pub mod lock_fragments;
 pub mod notice;
 pub(crate) mod npm_range;
 pub(crate) mod package_manager;
+pub mod path_spelling;
 pub mod pdm_lock;
 pub(crate) mod pep440;
 pub mod pipenv;

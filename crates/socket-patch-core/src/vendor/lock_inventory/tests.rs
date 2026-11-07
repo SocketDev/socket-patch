@@ -928,6 +928,230 @@ async fn pnpm_lockfile_off_withholds_hosted_pins() {
     );
 }
 
+/// The inventory twin of discovery's
+/// `pnpm_rush_without_subspaces_and_unsafe_subspace_names`: a subspace dir
+/// whose name is not a safe path segment is never read, so the inventory
+/// lists no package that discovery skips.
+#[tokio::test]
+async fn rush_skips_unsafe_subspace_names() {
+    // Memory: every platform, both unsafe spellings.
+    let mut project = MemoryProject::new();
+    project.insert_text("rush.json", RUSH_JSON);
+    project.insert_text(RUSH_COMMON_LOCK, PNPM_LOCK);
+    project.insert_text("common/config/subspaces/a:b/pnpm-lock.yaml", OUTSIDE_LOCK);
+    project.insert_text("common/config/subspaces/a\\b/pnpm-lock.yaml", OUTSIDE_LOCK);
+    let names = npm_inventory_names(&ProjectView::Memory(&project)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    assert!(!names.contains(&"only-outside".to_string()), "{names:?}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    // `:` is not a legal Windows path character: Unix only.
+    if cfg!(unix) {
+        write_nested(
+            tmp.path(),
+            "common/config/subspaces/a:b/pnpm-lock.yaml",
+            OUTSIDE_LOCK,
+        )
+        .await;
+    }
+    let snapshot = DiskSnapshot::new(tmp.path());
+    for view in [
+        ProjectView::Disk(tmp.path()),
+        ProjectView::Snapshot(&snapshot),
+    ] {
+        let names = npm_inventory_names(&view).await;
+        assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"only-outside".to_string()),
+            "an unsafe subspace name must not be read: {names:?}"
+        );
+    }
+}
+
+const RUSH_JSON: &str = r#"{"rushVersion":"5.0.0"}"#;
+const RUSH_COMMON_LOCK: &str = "common/config/rush/pnpm-lock.yaml";
+/// A lock whose only package marks a read the inventory must not make.
+const OUTSIDE_LOCK: &str = "lockfileVersion: '9.0'
+
+packages:
+
+  only-outside@1.0.0:
+    resolution: {integrity: sha512-outside==}
+";
+
+/// The sorted package names the npm-family inventory lists through `view`
+/// (empty when it lists none).
+async fn npm_inventory_names(view: &ProjectView<'_>) -> Vec<String> {
+    let entries = super::npm_family::inventory_npm_trees_raw_in(view)
+        .await
+        .unwrap();
+    let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+    names.sort();
+    names
+}
+
+// The inventory's `rush.json` gate is discovery's (`exists_no_follow`
+// through the view), pinned by the four `rush_gate_*` tests below.
+
+/// A rush.json only in a Snapshot's overlay counts.
+#[tokio::test]
+async fn rush_gate_sees_the_snapshot_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    let snapshot = DiskSnapshot::new(tmp.path());
+    snapshot.overlay("rush.json", RUSH_JSON.as_bytes());
+    let names = npm_inventory_names(&ProjectView::Snapshot(&snapshot)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// The gate probes through the view, so a tracked snapshot's recording
+/// stays reusable and covers `rush.json`.
+#[tokio::test]
+async fn rush_gate_keeps_the_recording_reusable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    let tracked = DiskSnapshot::tracked(tmp.path());
+    tracked.begin_recording();
+    let names = npm_inventory_names(&ProjectView::Snapshot(&tracked)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    let reads = tracked
+        .end_recording()
+        .expect("the rush gate must not read around the view");
+    assert!(!reads.is_empty());
+}
+
+/// A dangling rush.json symlink is not Rush (Rush cannot load it): hosted
+/// mode's gate, which discovery and the inventory share.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_gate_ignores_a_dangling_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    std::os::unix::fs::symlink("missing.json", tmp.path().join("rush.json")).unwrap();
+    assert!(!super::pnpm::is_rush(ProjectView::Disk(tmp.path())).await);
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// An implied in-memory directory named rush.json is not Rush either; a
+/// link to a regular rush.json is.
+#[tokio::test]
+async fn rush_gate_ignores_a_memory_implied_dir() {
+    let mut project = MemoryProject::new();
+    project.insert_present("rush.json/placeholder");
+    project.insert_text(RUSH_COMMON_LOCK, PNPM_LOCK);
+    assert!(!super::pnpm::is_rush(ProjectView::Memory(&project)).await);
+    let names = npm_inventory_names(&ProjectView::Memory(&project)).await;
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// On disk a symlink to a regular rush.json counts, as hosted's
+/// `is_file` gate always counted it.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_gate_counts_a_link_to_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "real-rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    std::os::unix::fs::symlink("real-rush.json", tmp.path().join("rush.json")).unwrap();
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// The member-lock reader skips a Rush monorepo on the same gate as
+/// discovery (which reads Rush's locks there, never the members').
+#[tokio::test]
+async fn rush_member_locks_gate_matches_discovery() {
+    let mut project = MemoryProject::new();
+    project.insert_text("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    project.insert_text(".npmrc", "shared-workspace-lockfile=false\n");
+    project.insert_text("packages/a/package.json", "{}");
+    project.insert_text("packages/a/pnpm-lock.yaml", OUTSIDE_LOCK);
+    let view = ProjectView::Memory(&project);
+    assert!(
+        !super::pnpm::inventory_pnpm_member_locks_in(&view)
+            .await
+            .is_empty(),
+        "the fixture must list a member lock without rush.json"
+    );
+    // An implied directory named rush.json is not Rush: members still count.
+    project.insert_present("rush.json/placeholder");
+    let view = ProjectView::Memory(&project);
+    assert!(!super::pnpm::inventory_pnpm_member_locks_in(&view)
+        .await
+        .is_empty());
+    let mut project = project.clone();
+    project.remove("rush.json/placeholder");
+    project.insert_text("rush.json", RUSH_JSON);
+    let view = ProjectView::Memory(&project);
+    let members = super::pnpm::inventory_pnpm_member_locks_in(&view).await;
+    assert!(members.is_empty(), "{members:?}");
+}
+
+/// Rush's lock dirs are read only through real directories: a symlinked
+/// `common`, `common/config`, `common/config/rush` or
+/// `common/config/subspaces` could point the read at another repository.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_refuses_symlinked_lock_dirs() {
+    use std::os::unix::fs::symlink;
+    let outside = tempfile::tempdir().unwrap();
+    write_nested(outside.path(), "rush/pnpm-lock.yaml", OUTSIDE_LOCK).await;
+    write_nested(outside.path(), "subspaces/x/pnpm-lock.yaml", OUTSIDE_LOCK).await;
+    write_nested(
+        outside.path(),
+        "common/config/rush/pnpm-lock.yaml",
+        OUTSIDE_LOCK,
+    )
+    .await;
+    let rels = |root: &Path| {
+        let root = root.to_path_buf();
+        async move { super::pnpm::rush_lock_rels(ProjectView::Disk(&root)).await }
+    };
+
+    // A symlinked subspaces dir: the real common lock alone.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    symlink(
+        outside.path().join("subspaces"),
+        tmp.path().join("common/config/subspaces"),
+    )
+    .unwrap();
+    assert_eq!(rels(tmp.path()).await, vec![RUSH_COMMON_LOCK.to_string()]);
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    assert!(!names.contains(&"only-outside".to_string()), "{names:?}");
+
+    // A symlinked common/config/rush: no common lock.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    tokio::fs::create_dir_all(tmp.path().join("common/config"))
+        .await
+        .unwrap();
+    symlink(
+        outside.path().join("rush"),
+        tmp.path().join("common/config/rush"),
+    )
+    .unwrap();
+    assert!(rels(tmp.path()).await.is_empty());
+    assert!(npm_inventory_names(&ProjectView::Disk(tmp.path()))
+        .await
+        .is_empty());
+
+    // A symlinked `common`: nothing under it.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    symlink(outside.path().join("common"), tmp.path().join("common")).unwrap();
+    assert!(rels(tmp.path()).await.is_empty());
+    assert!(npm_inventory_names(&ProjectView::Disk(tmp.path()))
+        .await
+        .is_empty());
+}
+
 // ── yarn classic ──────────────────────────────────────────────────────
 
 const YARN_CLASSIC: &str = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.
@@ -2382,7 +2606,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
             inventory_yarn_berry(&root).await,
             inventory_bun(&root).await,
             inventory_vlt(&root).await,
-            inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
+            inventory_pnpm_lock_rel_in(&ProjectView::Disk(&root), "shrinkwrap.yaml").await,
             gem_remotes(&root).await,
         )
     };

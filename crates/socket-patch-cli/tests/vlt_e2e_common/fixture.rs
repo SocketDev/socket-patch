@@ -22,7 +22,6 @@ pub const UUID_USX: &str = "d4d4d4d4-4444-4444-8444-444444444444";
 pub const UUID_FSEVENTS: &str = "e5e5e5e5-5555-4555-8555-555555555555";
 
 pub const ADVISORY: &str = "redirect_vlt_reinstall_required";
-pub const UNVERIFIABLE: &str = "redirect_vlt_artifact_unverifiable";
 pub const OPTIONAL_KEPT: &str = "socket-patch does not remove them because `vlt install` does not \
      reinstall a removed optional dependency. Run `vlt ci` (or delete node_modules and run `vlt \
      install`). vlt 0.0.0-30 … 1.0.4 install no optional dependency from the lock of a \
@@ -42,6 +41,14 @@ pub fn invalidated_head(n: usize) -> String {
 
 pub fn advisory_invalidated(n: usize) -> String {
     format!("{}{VLT_UPDATE_NOTE}", invalidated_head(n))
+}
+
+pub fn advisory_undeterminable(n: usize) -> String {
+    format!(
+        "vlt-lock.json pins Socket-patched packages, but socket-patch could not check {n} \
+         installed copies (node_modules is a link, or no patch record was available); run \
+         `vlt ci` to be sure the patched packages are installed."
+    )
 }
 
 pub fn advisory_cleanup_skipped(n: usize) -> String {

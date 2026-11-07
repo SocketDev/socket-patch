@@ -18,14 +18,15 @@
 //! was the user's). The `.mvn` files are removed only when they hold
 //! nothing but what hosted mode writes; otherwise the resolver lines stay
 //! and a warning says so (whether they pre-existed is not recorded).
-//! Checksum lines keep the file's remaining order (the rewriter re-sorted
-//! and dropped malformed lines; that is not recoverable).
+//! Every other checksums line keeps its bytes and place (the rewriter
+//! leaves them so too; see `trusted_checksums::edit`).
 
 use std::collections::BTreeMap;
 
 use regex::Regex;
 
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
+use crate::formats::maven::trusted_checksums;
 use crate::patch::redirect::{
     generation, maven_repositories_with_id, maven_tag_inner_range, maven_tag_text_in,
     remove_maven_repository, MAVEN_DEPENDENCY_BLOCK_RE, MVN_CHECKSUMS, MVN_CONFIG, MVN_CONFIG_ARGS,
@@ -409,27 +410,22 @@ async fn restore_mvn(
     let Ok(Some(sums)) = view.read(&sums_rel).await else {
         return;
     };
-    let path_of = |line: &str| {
-        line.trim_end_matches('\r')
-            .split_once("  ")
-            .map(|(_, p)| p.to_string())
-    };
-    let kept: Vec<&str> = sums
-        .split('\n')
-        .filter(|line| {
-            !path_of(line).is_some_and(|p| checksum_dirs.iter().any(|d| p.starts_with(d.as_str())))
-        })
-        .collect();
-    let rest = kept.join("\n");
+    let rest = trusted_checksums::edit(
+        &sums,
+        |p| checksum_dirs.iter().any(|d| p.starts_with(d.as_str())),
+        &[],
+    );
     if rest == sums {
         return;
     }
     let config = view.read(&config_rel).await.ok().flatten();
     let written_config = format!("{}\n", MVN_CONFIG_ARGS.join("\n"));
-    let has_resolver_lines = config.as_deref().is_some_and(|c| {
-        c.lines()
-            .any(|l| MVN_CONFIG_ARGS.contains(&l.trim_end_matches('\r')))
-    });
+    // Whether settings hosted mode may have written are left over, read as
+    // `trusted_checksums::config_enforces` reads them but by presence: a
+    // partial or switched-off set is still lines the user may want gone.
+    let has_resolver_lines = config
+        .as_deref()
+        .is_some_and(trusted_checksums::config_has_written_settings);
     if rest.trim().is_empty() {
         view.remove(&sums_rel);
         if config.as_deref() == Some(written_config.as_str()) {
@@ -439,11 +435,10 @@ async fn restore_mvn(
     } else {
         view.write(&sums_rel, rest.clone());
     }
-    let other_hosted = rest.lines().any(|l| {
-        path_of(l).is_some_and(|p| {
-            p.split('/')
-                .any(|seg| crate::formats::maven::split_socket_version(seg).is_some())
-        })
+    let other_hosted = trusted_checksums::entries(&rest).any(|e| {
+        e.path
+            .split('/')
+            .any(|seg| crate::formats::maven::split_socket_version(seg).is_some())
     });
     if has_resolver_lines && !other_hosted {
         result.warnings.push((
@@ -862,5 +857,64 @@ mod tests {
         assert_eq!(outcome.pins[0].status, PinStatus::Restored);
         assert_eq!(after[".mvn/checksums/checksums.sha256"], other);
         assert!(after.contains_key(".mvn/maven.config"));
+    }
+
+    /// The pin's lines go whatever hash a past writer left on them (an SRI
+    /// or truncated digest): the unwind must not stop early and leave them.
+    #[tokio::test]
+    async fn checksums_unwind_drops_owned_lines_whatever_their_hash() {
+        let sums = fixture("basic", "expected", ".mvn/checksums/checksums.sha256")
+            .replace(&"c".repeat(64), "sha256-q83vEjRWeJA=")
+            .replace(&"d".repeat(64), &"d".repeat(40));
+        let files = vec![
+            ("pom.xml", fixture("basic", "expected", "pom.xml")),
+            (
+                ".mvn/maven.config",
+                fixture("basic", "expected", ".mvn/maven.config"),
+            ),
+            (".mvn/checksums/checksums.sha256", sums),
+        ];
+        let (outcome, after) = run(&files).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert!(
+            !after.contains_key(".mvn/checksums/checksums.sha256"),
+            "{:?}",
+            after.get(".mvn/checksums/checksums.sha256")
+        );
+        assert!(!after.contains_key(".mvn/maven.config"));
+    }
+
+    /// The unwind reads the checksums file as the rewriter does: the pin's
+    /// lines go in any spelling a tool rewrote them to, every other line
+    /// (one space, a `*` marker, a comment) keeps its bytes and CRLF, and
+    /// a resolver switch in another spelling still counts as left behind.
+    #[tokio::test]
+    async fn checksums_unwind_reads_every_spelling_and_keeps_crlf() {
+        let other = format!(
+            "# team pins\r\n{} zz/other/1.0/other-1.0.jar\r\n{} *aa/first/1.0/first-1.0.jar\r\n",
+            "e".repeat(64),
+            "f".repeat(64)
+        );
+        let ours = fixture("basic", "expected", ".mvn/checksums/checksums.sha256")
+            .replace("  ", " *")
+            .replace('\n', "\r\n");
+        let config = "-Daether.artifactResolver.postProcessor.trustedChecksums\r\n";
+        let files = vec![
+            ("pom.xml", fixture("basic", "expected", "pom.xml")),
+            (".mvn/maven.config", config.to_string()),
+            (".mvn/checksums/checksums.sha256", format!("{other}{ours}")),
+        ];
+        let (outcome, after) = run(&files).await;
+        assert_eq!(outcome.pins[0].status, PinStatus::Restored);
+        assert_eq!(after[".mvn/checksums/checksums.sha256"], other);
+        assert_eq!(after[".mvn/maven.config"], config);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|(code, _)| *code == "maven_trusted_checksums_left"),
+            "{:?}",
+            outcome.warnings
+        );
     }
 }
