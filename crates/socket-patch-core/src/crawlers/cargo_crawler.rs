@@ -328,6 +328,16 @@ async fn source_roots(options: &CrawlerOptions) -> (Vec<PathBuf>, bool) {
         return (Vec::new(), false);
     }
 
+    // Inside a git checkout, a `.cargo/config(.toml)` above the repository
+    // root is never read, yet cargo merges it, and it may replace crates.io
+    // with a directory source; the registry cache would then not be what
+    // cargo builds from. Crawl nothing (fail closed), so `vex`, `scan` and
+    // `rollback` never verify or restore a registry copy the build may not
+    // use; `apply` refuses the same layout (`cargo_config_outside_root`).
+    if crate::vendor::cargo_config::config_above_repo(&options.cwd).is_some() {
+        return (Vec::new(), false);
+    }
+
     // Cargo project: crawl what cargo builds from. A config that
     // replaces crates.io with a directory source (`cargo vendor`) names
     // that directory, wherever it is; without one, cargo reads the
@@ -779,6 +789,49 @@ mod tests {
             paths.is_empty(),
             "non-Rust project's vendor/ must not be scanned as cargo sources, got {paths:?}"
         );
+    }
+
+    /// Inside a git checkout, a `.cargo/config.toml` above the repository
+    /// root (which may replace crates.io) is never read, so a project
+    /// crawl yields no source roots rather than falling through to the
+    /// registry cache; a `--global` crawl is unaffected.
+    #[tokio::test]
+    async fn test_cargo_config_above_repo_yields_no_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("app");
+        tokio::fs::create_dir_all(app.join(".git")).await.unwrap();
+        tokio::fs::create_dir_all(app.join("vendor")).await.unwrap();
+        tokio::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n")
+            .await
+            .unwrap();
+        tokio::fs::create_dir_all(dir.path().join(".cargo"))
+            .await
+            .unwrap();
+        tokio::fs::write(
+            dir.path().join(".cargo").join("config.toml"),
+            "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+        )
+        .await
+        .unwrap();
+
+        let crawler = CargoCrawler::new();
+        let options = CrawlerOptions {
+            cwd: app.clone(),
+            global: false,
+            global_prefix: None,
+        };
+        let paths = crawler.get_crate_source_paths(&options).await.unwrap();
+        assert!(paths.is_empty(), "{paths:?}");
+
+        let custom = dir.path().join("registry-src");
+        tokio::fs::create_dir_all(&custom).await.unwrap();
+        let global = CrawlerOptions {
+            cwd: app,
+            global: false,
+            global_prefix: Some(custom.clone()),
+        };
+        let paths = crawler.get_crate_source_paths(&global).await.unwrap();
+        assert_eq!(paths, vec![custom]);
     }
 
     /// A `Cargo.lock` alone (no `Cargo.toml`) is still a Rust project, so
