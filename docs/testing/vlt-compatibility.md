@@ -40,7 +40,7 @@ socket-patch alike.
 | Layer | Where | What it proves |
 |---|---|---|
 | Unit and golden | `socket-patch-core` lib tests; `tests/redirect_golden.rs` (`npm/vlt/*`, shared with depscan's TS rewriter), `tests/redirect_golden_reverse_replay.rs`, `tests/vlt_locks.rs` (captured locks of every era, and vendored wiring byte for byte against what real `vlt ci`, `vlt install --frozen-lockfile` and `vlt install <new>` keep on 1.2.0, 1.0.10, 1.0.4, 1.0.0-rc.32 and 1.0.0-rc.14) | DepID codec, collation (`tests/fixtures/vlt/collation-golden.json`), the node-line grammar, the hosted slot rewrite and its slot revert, vendored lock surgery and its inverse, lock inventory, VEX discovery |
-| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair::repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, … (the 3-OS `test` job) | every code of the vlt support, the artifact preflight against a wiremock server, the heal, takeovers, repair, the CLI surface |
+| Hermetic suites | `in_process_redirect`, `in_process_vendor`, `in_process_rollback_hosted`, `in_process_vendor_bun_takeover`, `repair::repair_vendor_flavors_e2e`, `e2e_vex_lockfile`, … (the 3-OS `test` job) | every code of the vlt support, the heal, takeovers, repair, the CLI surface |
 | Real-vlt capstones | the five binaries below plus the vlt legs of `e2e_hosted_production` / `e2e_vendored_production` | real installs: `vlt ci` and frozen installs of patched locks, byte-stable locks, integrity enforcement, the heal on a warm tree, re-saves, upgrades, the hardlinked global store |
 | Native backtest | `scripts/backtest-vlt.py` | the production service end to end, per release, mode and project shape, against an oracle of the documented boundaries |
 
@@ -61,11 +61,9 @@ asserted and each named test or row exists.
   `scripts/tests/test_ci_vlt_rows.py` (run by `lint-ecosystems`) pins the rows.
 - **Required:** `hosted-e2e` installs vlt 1.2.0 the same way, runs
   `vlt_pinned_matrix_production_hosted_install_proof` inside the production
-  suite (probe-driven: the clean refusal while patch.socket.dev re-encodes the
-  artifact, the full install proof once it does not) and
-  `vlt_pinned_matrix_production_vendored_install_proof`, both through the leg
-  checker. `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED` stays unset until the
-  serve fix is verified.
+  suite (the scan pins the hosted artifact and a fresh checkout's `vlt ci`
+  installs it) and `vlt_pinned_matrix_production_vendored_install_proof`, both
+  through the leg checker.
 - **Advisory:** `.github/workflows/vlt-compatibility.yml` (path-filtered pull
   requests and pushes to main, nightly, and `workflow_dispatch` with
   `versions` / `shapes` / `modes`). A path-filtered workflow cannot be a
@@ -111,11 +109,10 @@ python3 scripts/backtest-vlt.py --cli target/debug/socket-patch \
 
 The backtest writes `captures/<vlt>-<mode>-<shape>/{result.json,cli-output.json,tree/,logs/}`
 and `summary.{json,md}`, and exits non-zero when any cell's verdict differs
-from the oracle. While patch.socket.dev re-encodes the artifact, hosted cells
-record `blocked-by-server-encoding`, and only when the cell's own probe saw a
-non-identity `Content-Encoding` and the CLI refused cleanly. A blocked cell
-must carry only `redirect_vlt_artifact_unverifiable`: the withheld dependency
-never reaches a rewriter, so its lock-level and vendored codes are not due.
+from the oracle. While patch.socket.dev re-encodes the artifact, must-patch
+hosted cells record `blocked-by-server-encoding`, and only when the cell's own
+probe saw a non-identity `Content-Encoding`. A blocked cell never runs the CLI
+(vlt would fail `EINTEGRITY` on whatever it pinned), so no codes are due.
 `--identity-mirror` previews the hosted proof through a loopback mirror that
 fetches the artifact un-encoded (never an import source). `--serve-probe` is
 the watchdog's probe, `--canary-checks` the canary's watchdogs, and
@@ -220,7 +217,7 @@ samples them per OS).
 
 | Binary | Suite | Legs |
 |---|---|---|
-| `e2e_redirect_vlt_build` | `hosted` | `scan_fresh_ci`, `frozen_dead_registry`, `ordinary_install_stable`, `get_uuid_fresh_ci`, `tamper_cold_eintegrity`, `rollback_byte_exact`, `rerun_noop`, `warm_tree_invalidates`, `no_cleanup_stays_stale`, `heal_rule_b_hidden_lock_without_node`, `heal_rule_c_no_hidden_lock`, `heal_rule_c_no_record`, `scoped`, `peer_workspace_instances`, `peer_rekey_rollback`, `install_newdep_preserves`, `update_drops`, `resave_install_rollback`, `resave_crlf_rollback`, `resave_update_rollback`, `crlf_lock`, `mirror_registries_npm`, `scalar_registry`, `named_alias_untouched`, `scoped_registry_untouched`, `jsr_untouched`, `default_registry_alias`, `registry_from_env`, `registry_from_user_config`, `content_encoding_refused`, `old_lockfile_ignored`, `warm_cache_hazard`, `idempotence`, `manifestless_vex`, `ts_written_lock`, `optional_dependency_heal`, `then_vendored_optional_takeover`, `platform_optional_skipped` |
+| `e2e_redirect_vlt_build` | `hosted` | `scan_fresh_ci`, `frozen_dead_registry`, `ordinary_install_stable`, `get_uuid_fresh_ci`, `tamper_cold_eintegrity`, `rollback_byte_exact`, `rerun_noop`, `warm_tree_invalidates`, `no_cleanup_stays_stale`, `heal_rule_b_hidden_lock_without_node`, `heal_rule_c_no_hidden_lock`, `heal_rule_c_no_record`, `scoped`, `peer_workspace_instances`, `peer_rekey_rollback`, `install_newdep_preserves`, `update_drops`, `resave_install_rollback`, `resave_crlf_rollback`, `resave_update_rollback`, `crlf_lock`, `mirror_registries_npm`, `scalar_registry`, `named_alias_untouched`, `scoped_registry_untouched`, `jsr_untouched`, `default_registry_alias`, `registry_from_env`, `registry_from_user_config`, `old_lockfile_ignored`, `warm_cache_hazard`, `idempotence`, `manifestless_vex`, `ts_written_lock`, `optional_dependency_heal`, `then_vendored_optional_takeover`, `platform_optional_skipped` |
 | `e2e_vendor_vlt_build` | `vendored` | `scan_fresh_ci`, `get_auto_fresh_ci`, `get_service_fresh_ci`, `durability`, `workspace_member_selfref`, `alias_selfref`, `peer_root_selfref`, `peer_member_selfref`, `single_peer_context`, `optional_warm_reinstall`, `dep_with_deps`, `hostile_gitignore`, `autocrlf_checkout`, `bin_bearing`, `package_json_devdeps_patch`, `repair_rebuilds`, `idempotency`, `revert_byte_exact`, `resave_install_revert`, `resave_uninstall_revert`, `resave_crlf_revert`, `dependency_bumped_rescan`, `dependency_uninstalled_rescan`, `tamper_planted_file`, `tamper_file_content`, `tamper_payload_package_json`, `tamper_symlink_outside`, `tamper_deleted_gitignore`, `tamper_lock_file_node_path`, `transitive_refused`, `legacy_lockfile_warning`, `absent_version_refused`, `lockless_reinstall`, `manifestless_vex` |
 | `mode_migration_vlt` | `migration` | `vendored_then_hosted`, `hosted_then_vendored`, `dry_run_parity`, `scoped_unwind_one_of_two`, `rollback_from_mixed`, `agent_apply_yields_to_vendored`, `agent_apply_after_hosted`, `hosted_scan_keeps_agent_patched_tree`, `agent_rollback_after_takeovers`, `pm_switch_npm_to_vlt`, `pm_switch_vlt_to_npm`, `flavor_changed`, `upgrade_hosted`, `upgrade_vendored` |
 | `e2e_safety_vlt` | `safety` | `linux_auto`, `explicit_hardlink`, `private_copies`, `cross_device_cache`, `agent_rollback`, `peer_fanout`, `hosted_heal`, `vendored_build`, `vendor_revert_and_repair`, `layout_note` |

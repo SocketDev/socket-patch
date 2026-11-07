@@ -70,7 +70,6 @@ on:
       - 'crates/socket-patch-cli/src/commands/vendor.rs'
       - 'crates/socket-patch-cli/src/commands/vendored_backend/**'
       - 'crates/socket-patch-cli/src/commands/get.rs'
-      - 'crates/socket-patch-cli/src/commands/vlt_preflight.rs'
       - 'crates/socket-patch-cli/src/commands/scan/**'
       - 'crates/socket-patch-cli/src/commands/vex*'
       - 'crates/socket-patch-cli/tests/common/**'
@@ -466,10 +465,10 @@ jobs:
         # minutes (EAI_NONAME) while the service is up; see the action.
         uses: ./.github/actions/pin-socket-hosts
       - name: Backtest against production
-        # Every hosted cell probes the artifact first; it records
-        # blocked-by-server-encoding only when that probe saw a non-identity
-        # Content-Encoding and the CLI refused cleanly. Any other failure is an
-        # error.
+        # Every hosted cell probes the artifact first; a must-patch cell
+        # records blocked-by-server-encoding (without running the CLI) only
+        # when that probe saw a non-identity Content-Encoding. Any other
+        # failure is an error.
         shell: bash
         env:
           VLT_TEST_VERSION: ${{ matrix.vlt }}

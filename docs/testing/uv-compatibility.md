@@ -17,7 +17,7 @@ managers.
 |-------|--------|----------|
 | `requirements.txt`, including uv-generated hash continuations | Exact version pins become direct artifact URLs with the patched SHA-256. Extras and markers are retained; hashes for the replaced artifact are removed. | Requirements refer to a committed wheel under `.socket/vendor/pypi/` with its hash. |
 | `uv.lock`, native `version = 1`, `[[package]]` | The package source and artifact entry agree on the hosted URL and hash. A paired `pyproject.toml` receives the corresponding uv source configuration. | The package source refers to the committed wheel. The paired `pyproject.toml` records that source. |
-| `uv.lock`, experimental `[[distribution]]` (uv 0.1.45–0.2.34) | Follows the entry's own shape: `direct+` string or `{ url = … }` table source, `[[distribution.wheel]]` sub-table or inline `wheels` entry, and source-qualified dependency references where the lock carries them. | Refused (`pypi_uv_legacy_lock_unsupported`): the experimental grammar cannot carry a portable local wheel — through 0.2.6 a relative path source does not parse, and on 0.2.17–0.2.34 `--locked` rejects it while `uv lock` and plain `uv sync` absolutize it. Use uv 0.2.35 or newer. |
+| `uv.lock`, experimental `[[distribution]]` (uv 0.1.45–0.2.34) | Follows the entry's own shape: `direct+` string or `{ url = … }` table source, `[[distribution.wheel]]` sub-table or inline `wheels` entry, and source-qualified dependency references where the lock carries them. Rollback restores the entry in the same shape (round-tripped on real uv 0.1.45, 0.2.5, 0.2.15, 0.2.16, 0.2.18 and 0.2.34 locks). Refused: an entry with an sdist and inline `dependencies` when no other registry entry shows their order (it changed at 0.2.23), and, for inline artifacts, a project `exclude-newer` setting, which uv 0.2.12–0.2.27 apply without recording. | Refused (`pypi_uv_legacy_lock_unsupported`): the experimental grammar cannot carry a portable local wheel — through 0.2.6 a relative path source does not parse, and on 0.2.17–0.2.34 `--locked` rejects it while `uv lock` and plain `uv sync` absolutize it. Use uv 0.2.35 or newer. |
 | `*.py.lock` with its PEP 723 `*.py` script | Rewrites the lock and the script's uv source metadata together. | Rewrites the lock and script metadata together and commits the patched wheel. |
 | `pylock.toml` and `pylock.<name>.toml`, PEP 751 `lock-version = "1.0"` | Uses one `archive` URL with the patched SHA-256. | Uses one `archive` path with the committed wheel's SHA-256. |
 
@@ -60,8 +60,21 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   string source and silently ignore the lock (`--frozen` / `--locked` fail,
   an ordinary `uv sync` still installs the patch via the pyproject source),
   and 0.2.6–0.2.17 ignore an unexpected `[[distribution.wheel]]` and try to
-  build the direct wheel URL as a source archive. The `[[distribution]]`
-  grammar is hosted-only: vendored native wiring is refused with
+  build the direct wheel URL as a source archive. The hosted unwind
+  (`rollback`, `remove`, and `scan` dropping a pin) restores the registry
+  entry in the shape the entry itself carries. Measured with real binaries
+  (macOS arm64, CPython 3.11): every release from 0.1.45 to 0.2.34 records
+  each file of a release that the project's `requires-python` admits, on
+  every platform (releases up to somewhere between 0.2.19 and 0.2.25 record
+  every wheel; later ones drop the wheels `requires-python` excludes), so a
+  pure-Python 3 release is re-derivable. uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
+  `dependencies` and 0.2.23–0.2.34 after them, which only another registry
+  entry carrying both shows. `uv lock` takes no `exclude-newer` through
+  0.2.5, takes `--exclude-newer` from 0.2.6, and from 0.2.12 also
+  `UV_EXCLUDE_NEWER` and `exclude-newer` in `[tool.uv]` or a project or user
+  `uv.toml`. It records the cutoff only from 0.2.28 (at the lock's top level,
+  under `[options]` from 0.2.34). The `[[distribution]]` grammar is
+  hosted-only: vendored native wiring is refused with
   `pypi_uv_legacy_lock_unsupported`. The refusal is kept because no spelling of
   a committed wheel is stable across that era: through 0.2.6 a relative path
   source cannot be parsed at all (`path+<rel>` is an invalid URL, `path+file:`
