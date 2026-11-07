@@ -625,6 +625,17 @@ pub enum UnattestedKind {
     /// Socket patch alone; hosted and vendored mode leave the package
     /// unwired unless the user explicitly consents.
     UserPatchedDependency,
+    /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
+    /// build's local evidence does not verify, or under a build-wide
+    /// blocker (stale or partial evidence, a `dependencyOverrides` /
+    /// `resolvers` reassignment, a `build.sbt.lock`): the same conditions
+    /// that withhold a hosted sbt ref's lock pin. The vendor ledger, not a
+    /// ref, carries this wiring, so the mark stands alone.
+    SbtResolutionUnverified,
+    /// A vendored sbt pin whose committed `.socket/vendor/maven2` tree file
+    /// is missing or does not hash to the pinned sha256: sbt's load-time
+    /// check fails the build closed, so no copy is the patch.
+    SbtVendoredTreeMissing,
     /// A NuGet Socket source whose mapped id a governed `packages.lock.json`
     /// also locks at a version other than the patched one: the mapping
     /// routes every version of the id to a source that serves only the
@@ -663,8 +674,9 @@ impl UnattestedKind {
 /// A ref discovery emits (so rollback, remove and list find the wiring,
 /// and the ledgers' liveness gates still see it wired) that must not be
 /// attested: the files show a build that may run a copy the pin does not
-/// reach ([`UnattestedKind`]). The CLI's VEX plan omits every candidate of
-/// `(purl, uuid)` with `detail`. Unlike a contest
+/// reach ([`UnattestedKind`]). A vendored sbt pin is marked with no ref
+/// beside it (its vendor ledger entry is the claim). The CLI's VEX plan
+/// omits every candidate of `(purl, uuid)` with `detail`. Unlike a contest
 /// ([`Discovery::unpatched_copy`], [`Discovery::contest_across_locks`]),
 /// this never drops the ref, so `vendor --check` and `scan` keep treating
 /// the wiring as live — the right answer when re-running `scan` / `vendor`
@@ -751,7 +763,10 @@ pub struct Discovery {
     /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
     /// always empty once discovery returns (folded into `unpatched_copies`).
     pub unidentified_copies: Vec<UnidentifiedCopy>,
-    /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
+    /// Wired patches that must not be attested ([`Unattested`]): a ref in
+    /// `refs` whose wiring a build bypasses, or a vendored sbt pin whose
+    /// claim is its vendor ledger entry (no ref at all). Consumers match a
+    /// mark by `(purl, uuid)`, never by a ref.
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
     /// always empty once discovery returns (folded into `unattested`).
@@ -1421,8 +1436,10 @@ impl Discovery {
         });
     }
 
-    /// Record that the ref `(purl, uuid)` is wired but bypassed by the
-    /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
+    /// Record that patch `uuid` is wired for `purl` but must not be
+    /// attested, for the reason `file` shows ([`Unattested`]). Pushed
+    /// beside the ref itself, or, for a vendored sbt pin (whose claim is
+    /// the vendor ledger's, not a ref's), alone.
     pub(crate) fn unattested(
         &mut self,
         purl: &str,
