@@ -28392,9 +28392,121 @@ packages:
                     .replace("version: 1.3.0", "version: 1.2.0"),
                 "redirect_pnpm_entry_not_found",
             ),
+            // Lock-model 2b: the hint reads the key with the planning core's
+            // `match_key`, the rule the vendored planner rekeys by, so the
+            // artifact leaf names the release and the `version:` line is not
+            // consulted. Before, a rekey without a `version:` line was "not
+            // found" and one whose leaf names another release but whose
+            // `version:` line matched was "vendored".
+            (
+                "a rekey without a version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"))
+                    .replace("    version: 1.3.0\n", ""),
+                "redirect_pnpm_entry_vendored",
+            ),
+            (
+                "another release's artifact under this version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "a sibling checkout's artifact",
+                v9(&format!("../.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
         ] {
             assert_eq!(codes(&lock), vec![want], "{case}");
         }
+    }
+
+    /// Divergence N11 (owner decision, lock-model 2b): a pnpm <= 2
+    /// `shrinkwrap.yaml` beside a `pnpm-lock.yaml` is shadowed. pnpm reads
+    /// only the `pnpm-lock.yaml`, so the hosted planner never rewrites the
+    /// shrinkwrap and leaves it out of the all-or-nothing gate: debris in it
+    /// (a key the splice cannot repoint, or pnpm 1's early shrinkwrap head)
+    /// no longer refuses the dependency in every lock. A `shrinkwrap.yaml`
+    /// that is the only pnpm lock is still rewritten.
+    #[test]
+    fn pnpm_shrinkwrap_beside_a_pnpm_lock_is_shadowed() {
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let ovr = npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==");
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+                    resolution: {integrity: sha512-OLD==}\n";
+        let shrinkwrap = |head: &str, key: &str| {
+            format!(
+                "{head}\n\npackages:\n\n  {key}:\n    resolution: {{integrity: sha512-OLD==}}\n"
+            )
+        };
+        let supported = "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9";
+        let run = |files: &[(&str, String)]| {
+            let files: BTreeMap<String, String> = files
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            rewrite_registry_redirect(&files, std::slice::from_ref(&ovr))
+        };
+        for (case, shrink) in [
+            ("a plain entry", shrinkwrap(supported, "/left-pad/1.3.0")),
+            (
+                "an unparseable key",
+                shrinkwrap(supported, "/left-pad/1.3.0)("),
+            ),
+            (
+                "an early shrinkwrap",
+                shrinkwrap("shrinkwrapVersion: 3", "/left-pad/1.3.0"),
+            ),
+        ] {
+            let r = run(&[
+                ("pnpm-lock.yaml", lock.to_string()),
+                ("shrinkwrap.yaml", shrink),
+            ]);
+            assert_eq!(
+                r.files.keys().collect::<Vec<_>>(),
+                ["pnpm-lock.yaml"],
+                "{case}: only the governing lock is written: {:?}",
+                r.warnings
+            );
+            assert!(r.files["pnpm-lock.yaml"].contains(url), "{case}");
+            assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
+            assert!(r.refused_pnpm_uuids.is_empty(), "{case}");
+            assert!(r.edits.iter().all(|e| e.path == "pnpm-lock.yaml"), "{case}");
+        }
+        // A nested `shrinkwrap.yaml` is shadowed only by its own sibling.
+        let r = run(&[
+            ("pnpm-lock.yaml", lock.to_string()),
+            (
+                "sub/shrinkwrap.yaml",
+                shrinkwrap(supported, "/left-pad/1.3.0"),
+            ),
+        ]);
+        assert!(
+            r.files.contains_key("sub/shrinkwrap.yaml"),
+            "{:?}",
+            r.warnings
+        );
+        // A project pinning pnpm 2 installs from `shrinkwrap.yaml` (review
+        // finding): it is rewritten and the stray `pnpm-lock.yaml` is the
+        // shadowed one, so debris in it refuses nothing.
+        let pnpm2 = r#"{"packageManager": "pnpm@2.25.7"}"#.to_string();
+        let r = run(&[
+            ("package.json", pnpm2),
+            (
+                "pnpm-lock.yaml",
+                lock.replace("left-pad@1.3.0:", "left-pad@1.3.0)(:"),
+            ),
+            ("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0")),
+        ]);
+        assert_eq!(
+            r.files.keys().collect::<Vec<_>>(),
+            ["shrinkwrap.yaml"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.files["shrinkwrap.yaml"].contains(url));
+        assert!(r.refused_pnpm_uuids.is_empty(), "{:?}", r.warnings);
+        // The only pnpm lock: rewritten as before.
+        let r = run(&[("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0"))]);
+        assert!(r.files["shrinkwrap.yaml"].contains(url), "{:?}", r.warnings);
     }
 
     /// A classic-lock block whose first line is not a `key:` line

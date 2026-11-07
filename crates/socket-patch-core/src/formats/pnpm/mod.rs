@@ -28,6 +28,7 @@ pub(crate) mod grammar;
 pub(crate) mod hosted;
 pub(crate) mod lines;
 pub(crate) mod modules_yaml;
+pub(crate) mod plan;
 mod version;
 pub(crate) mod workspace;
 
@@ -286,28 +287,31 @@ fn head_lock_version(text: &str) -> Option<String> {
 /// looping them back to "re-lock with pnpm >= 9" would hand them the lock
 /// they have.
 pub fn sniff_lock_grammar(text: &str) -> Result<PnpmLockGrammar, String> {
-    match head_lock_version(text).as_deref() {
+    let version = head_lock_version(text);
+    match version.as_deref() {
         Some("9.0") => Ok(PnpmLockGrammar::V9),
         Some("5.4") => Ok(PnpmLockGrammar::V54),
         Some("6.0") => Ok(PnpmLockGrammar::V60),
-        Some(v) => {
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; supported versions are 5.4 \
-                     (pnpm 7), 6.0 (pnpm 8), and 9.0 (pnpm >= 9) — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
+        v => {
+            // An old (or missing) version is fixed by upgrading pnpm; a newer or
+            // unreadable one means pnpm outgrew this build.
+            let major = v.map(|v| v.split('.').next().and_then(|m| m.parse::<u32>().ok()));
+            let old = matches!(major, None | Some(Some(..9)));
+            let v = v.map_or("no lockfileVersion in its head".into(), |v| {
+                format!("lockfileVersion {v}")
+            });
+            Err(match old {
+                false => format!(
+                    "{PNPM_LOCK} has {v}; this socket-patch build supports \
                      lockfileVersions 5.4, 6.0, and 9.0 — re-lock with a pnpm release that \
                      emits one of them, or update socket-patch"
                 ),
+                true => format!(
+                    "{PNPM_LOCK} has {v}; supported versions are 5.4 (pnpm 7), 6.0 \
+                     (pnpm 8), and 9.0 (pnpm >= 9) — re-lock with pnpm >= 9"
+                ),
             })
         }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; supported versions are 5.4, \
-             6.0, and 9.0 — re-lock with pnpm >= 9"
-        )),
     }
 }
 
@@ -355,43 +359,6 @@ pub fn is_shrinkwrap_lock(text: &str) -> bool {
     strip_bom(text)
         .lines()
         .any(|line| line.starts_with("shrinkwrapVersion:"))
-}
-
-/// The lockfileVersion the v9 vendored planner splices.
-const V9_LOCK_VERSION: &str = "9.0";
-
-/// `lockfileVersion: '9.0'` head check (accept pnpm's single quotes plus
-/// double-quoted/bare spellings) — the v9 vendored planner's own guard.
-/// The flavor router sniffs with [`sniff_lock_grammar`] instead, whose
-/// allowlist also routes the legacy 5.4/6.0 grammars to their planner;
-/// this check only fires if a non-9.0 lock reaches the v9 planner directly.
-pub(crate) fn check_v9_lock_version(text: &str) -> Result<(), String> {
-    match head_lock_version(text) {
-        Some(v) if v == V9_LOCK_VERSION => Ok(()),
-        Some(v) => {
-            // The remedy must point the right way: 5.x (pnpm 7) / 6.x
-            // (pnpm 8) locks predate the v9 grammar and upgrading pnpm
-            // re-locks them, but a HIGHER version means the user's pnpm
-            // already outgrew this build — telling them "re-lock with
-            // pnpm >= 9" would loop them back to the lock they have.
-            let major = v.split('.').next().and_then(|m| m.parse::<u32>().ok());
-            Err(match major {
-                Some(m) if m < 9 => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; only {V9_LOCK_VERSION} is \
-                     supported — re-lock with pnpm >= 9"
-                ),
-                _ => format!(
-                    "{PNPM_LOCK} has lockfileVersion {v}; this socket-patch build supports \
-                     lockfileVersion {V9_LOCK_VERSION} — re-lock with a pnpm release \
-                     that emits it, or update socket-patch"
-                ),
-            })
-        }
-        None => Err(format!(
-            "{PNPM_LOCK} has no lockfileVersion in its head; only \
-             {V9_LOCK_VERSION} is supported — re-lock with pnpm >= 9"
-        )),
-    }
 }
 
 // ── the model ──
@@ -1046,11 +1013,6 @@ mod tests {
                 may_need_store_flag(plain),
                 "{plain}"
             );
-            assert_eq!(
-                check_v9_lock_version(&bom),
-                check_v9_lock_version(plain),
-                "{plain}"
-            );
             let keys = |text: &str| {
                 PnpmLock::parse(text).entries().map(|e| {
                     e.into_iter()
@@ -1067,9 +1029,7 @@ mod tests {
         assert_eq!(lock_version_major(&format!("\u{feff}{v9}")), Some(9));
         assert!(may_need_store_flag(&format!("\u{feff}{v52}")));
         assert!(may_need_store_flag(&format!("\u{feff}{shrinkwrap}")));
-        assert!(grammar::unsupported_early_shrinkwrap(
-            "\u{feff}shrinkwrapVersion: 3\n"
-        ));
+        assert!(plan::hosted_refuses_lock("\u{feff}shrinkwrapVersion: 3\n"));
         // Exactly one BOM is encoding; a second one is content, as for pnpm.
         assert!(!is_pnpm_lock_text(
             "\u{feff}\u{feff}lockfileVersion: '9.0'\n"
@@ -1146,14 +1106,15 @@ mod architecture_tests {
         (
             "vendor/pnpm_lock.rs",
             3,
-            "v9 vendored planner: preflight and splices over line blocks \
-             (`lock_has_target_package`, `edit_packages`, `LockIndex`)",
+            "vendored planner (both dialects): the shared lookup and rekey \
+             over line blocks (`lock_has_target_package`, `edit_packages`, \
+             `LockIndex`), keys read with `plan::match_key`",
         ),
         (
             "vendor/pnpm_lock_legacy.rs",
-            6,
-            "5.4 / 6.0 vendored planner: preflight, splices and revert over \
-             line blocks",
+            4,
+            "5.4 / 6.0 dialect: its ref gate, sorted rekey, dep-ref edit and \
+             revert over line blocks",
         ),
     ];
 

@@ -13,21 +13,6 @@ use crate::formats::text::strip_bom;
 
 use super::lines::ENV_DOC_IMPORTER_FIELDS;
 
-/// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
-/// unconditionally drops registry tarball URLs on install. Its frozen flag
-/// cannot preserve this redirect (verified with pnpm 1.0.0).
-pub(crate) fn unsupported_early_shrinkwrap(content: &str) -> bool {
-    let content = strip_bom(content);
-    let version = content
-        .lines()
-        .find_map(|line| line.strip_prefix("shrinkwrapVersion:"));
-    let minor = content
-        .lines()
-        .find_map(|line| line.strip_prefix("shrinkwrapMinorVersion:"));
-    version.is_some_and(|v| v.trim().trim_matches(['\'', '"']) == "3")
-        && !minor.is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0))
-}
-
 pub(crate) struct Entry<'a> {
     pub key: &'a str,
     pub body: &'a str,
@@ -268,23 +253,6 @@ pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a 
         return None;
     }
     Some(suffix)
-}
-
-pub(crate) fn supported_suffix(suffix: &str) -> bool {
-    if suffix.is_empty() || suffix.starts_with('_') {
-        return true;
-    }
-    let mut depth = 0usize;
-    for c in suffix.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ')' => return false,
-            _ if depth == 0 => return false,
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 pub(crate) struct Resolution<'a> {
