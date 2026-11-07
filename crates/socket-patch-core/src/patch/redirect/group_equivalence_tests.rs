@@ -133,7 +133,6 @@ fn assert_same_with_metadata(
         let groups = rewriter_groups(
             files,
             &overrides,
-            &overrides,
             bun_lockb_present,
             python_metadata,
             &no_gradle_unreadable,

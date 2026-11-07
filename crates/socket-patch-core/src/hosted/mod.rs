@@ -9,7 +9,7 @@
 //!   ancestor directory governs the project).
 //! - [`guidance`] — the pnpm `trustLockfile` / npm `allow-remote`
 //!   auto-config planners and their warning texts.
-//! - [`vlt`] — the vlt artifact preflight.
+//! - [`vlt`] — the vlt install-state and `bun.lockb` presence checks.
 //! - [`sbt_reads`] — the sbt resolution evidence a Maven candidate of an
 //!   sbt build is gated on.
 //! - [`memory`] — the engine over an in-memory repository (no filesystem,

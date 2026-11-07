@@ -1,10 +1,13 @@
 //! The root `pom.xml` reader (repositories and dependencies, see
 //! [`parse_pom`]), the Maven coordinate grammars and the hosted
-//! `<base>-socket.<hex8>` version split. Pure: text in, structure out.
+//! `<base>-socket.<hex8>` version split, and the Trusted Checksums files
+//! ([`trusted_checksums`]). Pure: text in, structure out.
 
 use std::collections::BTreeMap;
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
+
+pub(crate) mod trusted_checksums;
 
 // ── pure reader ──
 
@@ -502,14 +505,35 @@ pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
 /// the file on whitespace instead, so a `-Dk=v` token that only that reading
 /// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
 pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> {
-    // Java's `String.trim`: every char up to U+0020, nothing beyond.
-    fn trim(s: &str) -> &str {
-        s.trim_matches(|c: char| c <= ' ')
+    let mut props = maven_config_line_properties(config);
+    let tokens = config
+        .lines()
+        .filter(|line| !java_trim(line).starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
+    let mut legacy = BTreeMap::new();
+    for (k, v) in tokens {
+        if !k.is_empty() && !props.contains_key(k) {
+            legacy.insert(k.to_string(), v.to_string());
+        }
     }
+    props.extend(legacy);
+    props
+}
+
+/// Java's `String.trim`: every char up to U+0020, nothing beyond.
+fn java_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c <= ' ')
+}
+
+/// [`maven_config_properties`] as Maven 3.9+ alone reads it: only the
+/// argument a whole line holds, never a token of the older whitespace split.
+pub(crate) fn maven_config_line_properties(config: &str) -> BTreeMap<String, String> {
+    let trim = java_trim;
     fn unquote(s: &str) -> &str {
         s.strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .map_or(s, trim)
+            .map_or(s, java_trim)
     }
     let mut args = config
         .lines()
@@ -539,18 +563,6 @@ pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> 
             props.insert(k.to_string(), v.to_string());
         }
     }
-    let tokens = config
-        .lines()
-        .filter(|line| !trim(line).starts_with('#'))
-        .flat_map(str::split_whitespace)
-        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
-    let mut legacy = BTreeMap::new();
-    for (k, v) in tokens {
-        if !k.is_empty() && !props.contains_key(k) {
-            legacy.insert(k.to_string(), v.to_string());
-        }
-    }
-    props.extend(legacy);
     props
 }
 
