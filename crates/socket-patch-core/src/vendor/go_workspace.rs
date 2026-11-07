@@ -799,6 +799,12 @@ impl GoWorkspace {
             .members
             .iter()
             .any(|m| paths.key(&m.dir) != own && m.lists(module));
+        // In memory a root go.mod can exist with no text the caller holds
+        // (a link, an unreadable file): it is still the root's module, so a
+        // root go.work doesn't `use` keeps go.mod and [`GoWorkspace::conflict`]
+        // refuses it, as on disk.
+        let root_has_go_mod = root_has_go_mod
+            || (self.files.is_some() && !root_is_member && paths.exists(&root.join("go.mod")));
         let shared = !root_has_go_mod || (root_is_member && (ours_here || listed_elsewhere));
         if shared {
             ReplaceHost::GoWork
@@ -2332,7 +2338,33 @@ mod tests {
                 ),
                 "{root:?}"
             );
+            // The rewriter holds no text for an unreadable root go.mod, but
+            // it is the root's module all the same: go.mod hosts the replace,
+            // so `conflict` (not a member) refuses it.
+            assert_eq!(
+                ws.replace_host(Path::new(""), false, DEP),
+                ReplaceHost::GoMod,
+                "{root:?}"
+            );
         }
+        // A root module go.work uses still shares go.work's replace.
+        let used = "go 1.21
+
+use (
+	.
+	./b
+)
+";
+        let mut reader = MapFiles::new(&[
+            ("go.mod", None),
+            ("go.work", Some(used)),
+            ("b/go.mod", Some(b)),
+        ]);
+        let (ws, _) = read_memory(used, &mut reader).await;
+        assert_eq!(
+            ws.replace_host(Path::new(""), false, DEP),
+            ReplaceHost::GoWork
+        );
         // No go.mod at all: nowhere to go.
         let mut reader = MapFiles::new(&[("go.work", Some(work))]);
         let (ws, _) = read_memory(work, &mut reader).await;
