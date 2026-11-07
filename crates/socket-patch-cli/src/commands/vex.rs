@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
@@ -325,6 +326,32 @@ impl VexGenError {
             }
         }
     }
+}
+
+/// Check whether a workspace VEX run should refuse Cargo patches: a
+/// `.cargo/config` / `config.toml` sits above the repository root (stat
+/// only; it is never read), and cargo merges it into the build, so it may
+/// replace crates.io with another source while VEX verifies the shared
+/// registry cache. Returns `None` for a global run, a run without Cargo
+/// patches or a project that is no Cargo project.
+fn cargo_config_outside_root_vex(common: &GlobalArgs, manifest: &PatchManifest) -> Option<String> {
+    let cwd = &common.cwd;
+    if common.is_global()
+        || !common.ecosystem_selected(Ecosystem::Cargo)
+        || !manifest
+            .patches
+            .keys()
+            .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        || !(cwd.join("Cargo.toml").is_file() || cwd.join("Cargo.lock").is_file())
+    {
+        return None;
+    }
+    socket_patch_core::vendor::cargo_config::config_above_repo(cwd).map(|why| {
+        format!(
+            "{why}: it may replace crates.io with another source, so the registry copy VEX \
+             would verify may not be what cargo builds"
+        )
+    })
 }
 
 pub async fn run(args: VexArgs) -> i32 {
@@ -682,6 +709,20 @@ async fn generate_vex(
         Err(reason) => return Err(fail(common, params, "product_undetected", reason).await),
     };
 
+    // A cargo config above the repository root is never read in a
+    // workspace run; it may move crates.io elsewhere, so Cargo patches
+    // are refused instead of verifying the registry cache blind (the same
+    // gate `apply` runs).
+    let cargo_config_refused = cargo_config_outside_root_vex(common, manifest);
+    if let Some(ref why) = cargo_config_refused {
+        note_warning(warnings, common, "cargo_config_outside_root", why.clone());
+    }
+    let cargo_refused = |purl: &str| {
+        cargo_config_refused.is_some()
+            && purl.starts_with("pkg:cargo/")
+            && manifest.patches.contains_key(purl)
+    };
+
     // The help text promises "PURL/identifier", so an arbitrary string is
     // accepted — but the OpenVEX spec types the product `@id` as an IRI, and
     // strict consumers (vexctl et al.) may reject or mis-key a bare name.
@@ -742,16 +783,20 @@ async fn generate_vex(
             applied: manifest
                 .patches
                 .keys()
-                .filter(|purl| !mirror_refused(purl))
+                .filter(|purl| !mirror_refused(purl) && !cargo_refused(purl))
                 .cloned()
                 .collect(),
             failed: manifest
                 .patches
                 .keys()
-                .filter(|purl| mirror_refused(purl))
+                .filter(|purl| mirror_refused(purl) || cargo_refused(purl))
                 .map(|purl| FailedPatch {
                     purl: purl.clone(),
-                    reason: "mirror_overrides_source".into(),
+                    reason: if mirror_refused(purl) {
+                        "mirror_overrides_source".into()
+                    } else {
+                        "cargo_config_outside_root".into()
+                    },
                 })
                 .collect(),
             vendored,
@@ -894,6 +939,24 @@ async fn generate_vex(
         }
         outcome
     };
+
+    // A cargo config above the repository root moves any Cargo patches from
+    // applied to failed: the crawler inspected the registry cache, but cargo
+    // may build from elsewhere (a directory source). The same gate `apply`
+    // runs.
+    if cargo_config_refused.is_some() {
+        let cargo_purls: Vec<String> = outcome
+            .applied
+            .iter()
+            .filter(|purl| purl.starts_with("pkg:cargo/"))
+            .cloned()
+            .collect();
+        outcome.applied.retain(|purl| !purl.starts_with("pkg:cargo/"));
+        outcome.failed.extend(cargo_purls.into_iter().map(|purl| FailedPatch {
+            purl,
+            reason: "cargo_config_outside_root".into(),
+        }));
+    }
 
     // In-run `scan --mode hosted --vex`: the bytes of deps THAT RUN confirmed
     // redirected live on the patch server until the next install, so their
@@ -2137,6 +2200,10 @@ fn omission_phrase(reason: &str) -> &'static str {
         WIRING_CONFLICT => {
             "the lockfiles wire this package to different patches, so which one the build \
              installs cannot be determined"
+        }
+        "cargo_config_outside_root" => {
+            "a cargo config above the repository root may replace crates.io with another \
+             source, so the registry copy cannot be verified"
         }
         _ => "the patch could not be verified",
     }
