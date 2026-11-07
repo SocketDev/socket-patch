@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::{RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR, VLT_HIDDEN_LOCK_REL};
+use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
@@ -40,6 +40,7 @@ use crate::patch::redirect::{
 use crate::utils::pnpm_workspace::governing_workspace_file;
 use crate::utils::purl::purl_parts;
 use crate::utils::redact::url_host;
+use crate::vendor::lock_inventory::pnpm::{is_rush, rush_lock_rels};
 use crate::vendor::lock_inventory::{bun_text_lock_drives, MemoryEntry, ProjectView};
 
 use super::guidance::{
@@ -415,17 +416,6 @@ impl CandidateFiles {
             }
             None => false,
         }
-    }
-}
-
-/// Whether the project is a Rush monorepo (disk: `rush.json` is a file).
-fn rush_repo(view: &ProjectView<'_>) -> bool {
-    match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
-            let cwd = view.disk_root().expect("a disk view has a root");
-            cwd.join("rush.json").is_file()
-        }
-        ProjectView::Memory(project) => project.contains("rush.json"),
     }
 }
 
@@ -881,17 +871,14 @@ pub async fn read_candidate_files(
     // common/config/subspaces/<name>/. Added under their repo-relative
     // keys — the pnpm rewriter is basename-generalized, so nested keys are
     // rewritten in place, and the write-back is path-generic.
-    if rush_repo(view) {
-        if out.read(view, unreadable, RUSH_COMMON_LOCK_REL).await {
-            out.rush_lock_keys.push(RUSH_COMMON_LOCK_REL.to_string());
-        }
-        // Sorted by name: deterministic output.
-        if let Ok(entries) = view.list_dir(RUSH_SUBSPACES_DIR).await {
-            for entry in entries.into_iter().filter(|e| e.is_dir) {
-                let key = format!("{RUSH_SUBSPACES_DIR}/{}/pnpm-lock.yaml", entry.name);
-                if out.read(view, unreadable, &key).await {
-                    out.rush_lock_keys.push(key);
-                }
+    // The gate and the lock list are the ones lockfile discovery and the
+    // lock inventory use: sorted by name, real directories only (a
+    // symlinked `common/...` dir could point the write at another
+    // repository), traversal-safe subspace names.
+    if is_rush(*view).await {
+        for key in rush_lock_rels(*view).await {
+            if out.read(view, unreadable, &key).await {
+                out.rush_lock_keys.push(key);
             }
         }
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm") {
@@ -3608,6 +3595,7 @@ pub fn warning(code: &str, detail: impl Into<String>) -> RewriteWarning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::npm_family::RUSH_COMMON_LOCK_REL;
     use crate::vendor::lock_inventory::MemoryProject;
 
     /// In memory as on disk, a go.work go cannot parse reaches the
@@ -4548,6 +4536,53 @@ snapshots:
         let detail = pnpm_trust_detail(&done);
         assert!(detail.contains("--store-dir"), "{detail}");
         assert!(detail.contains(PNPM_TRUST_RUSH_MIXED_NOTE), "{detail}");
+    }
+
+    /// Hosted pins the Rush locks lockfile discovery reads
+    /// (`rush_lock_rels`): a subspace dir whose name is not a safe path
+    /// segment is skipped, as is every lock under a symlinked
+    /// `common/config/subspaces` (it could point the write at another
+    /// repository).
+    #[tokio::test]
+    async fn rush_locks_are_the_ones_discovery_reads() {
+        let mut rush = MemoryProject::new();
+        rush.insert_text("rush.json", r#"{ "rushVersion": "5.100.0" }"#);
+        rush.insert_text(RUSH_COMMON_LOCK_REL, LEFT_PAD_V9_LOCK);
+        rush.insert_text(
+            "common/config/subspaces/ok/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        rush.insert_text(
+            "common/config/subspaces/a:b/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        rush.insert_text(
+            "common/config/subspaces/a\\b/pnpm-lock.yaml",
+            LEFT_PAD_V9_LOCK,
+        );
+        let (read, _) = npm_rewrite(&ProjectView::Memory(&rush), &BTreeSet::new()).await;
+        assert_eq!(
+            read.rush_lock_keys,
+            [
+                RUSH_COMMON_LOCK_REL,
+                "common/config/subspaces/ok/pnpm-lock.yaml"
+            ]
+        );
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(outside.path().join("x")).unwrap();
+            std::fs::write(outside.path().join("x/pnpm-lock.yaml"), LEFT_PAD_V9_LOCK).unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("rush.json"), "{}").unwrap();
+            std::fs::create_dir_all(tmp.path().join("common/config/rush")).unwrap();
+            std::fs::write(tmp.path().join(RUSH_COMMON_LOCK_REL), LEFT_PAD_V9_LOCK).unwrap();
+            std::os::unix::fs::symlink(outside.path(), tmp.path().join("common/config/subspaces"))
+                .unwrap();
+            let (read, _) = npm_rewrite(&ProjectView::Disk(tmp.path()), &BTreeSet::new()).await;
+            assert_eq!(read.rush_lock_keys, [RUSH_COMMON_LOCK_REL]);
+        }
     }
 
     /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
