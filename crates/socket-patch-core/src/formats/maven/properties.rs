@@ -109,6 +109,14 @@ pub(crate) fn interpolate_lenient(value: &str, lookup: &dyn Fn(&str) -> Option<S
     expand(value, lookup, &mut Vec::new(), &lookups, true).unwrap_or_else(|| value.to_string())
 }
 
+/// [`interpolate_lenient`] as an [`Interpolate`] (it always gives a text).
+pub(crate) fn interpolate_keeping(
+    value: &str,
+    lookup: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    Some(interpolate_lenient(value, lookup))
+}
+
 fn expand(
     value: &str,
     lookup: &dyn Fn(&str) -> Option<String>,
@@ -183,19 +191,25 @@ pub(crate) struct Definitions {
     pub(crate) profiles: Vec<usize>,
 }
 
-/// Every nonempty combination of the profiles that may change what
-/// `value` interpolates to — those defining a name reachable from it
+/// Every nonempty combination of the profiles that may change what any of
+/// `values` interpolates to — those defining a name reachable from one
 /// through any definition ([`Definitions`]) — smallest first, each sorted:
 /// Maven activates any number of profiles together, so a value two
-/// profiles move only jointly is caught. Empty when no profile can change
-/// it. `None` when more than [`MAX_COMBINED_PROFILES`] may, or the walk
-/// exceeds its bound: the caller fails closed.
+/// profiles move only jointly is caught, and the texts of one declaration
+/// (its groupId, artifactId and version) are read under the same
+/// combinations. Empty when no profile can change them. `None` when more
+/// than [`MAX_COMBINED_PROFILES`] may, or the walk exceeds its bound: the
+/// caller fails closed.
 pub(crate) fn profile_combinations(
-    value: &str,
+    values: &[&str],
     defs: &dyn Fn(&str) -> Definitions,
 ) -> Option<Vec<Vec<usize>>> {
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut queue: Vec<String> = references(value).map(str::to_string).collect();
+    let mut queue: Vec<String> = values
+        .iter()
+        .flat_map(|v| references(v))
+        .map(str::to_string)
+        .collect();
     let mut relevant: BTreeSet<usize> = BTreeSet::new();
     while let Some(name) = queue.pop() {
         if !seen.insert(name.clone()) {
@@ -350,15 +364,15 @@ mod tests {
             },
         };
         assert_eq!(
-            profile_combinations("${v}", &defs),
+            profile_combinations(&["${v}"], &defs),
             Some(vec![vec![0], vec![1], vec![0, 1]])
         );
-        assert_eq!(profile_combinations("1.0", &defs), Some(vec![]));
+        assert_eq!(profile_combinations(&["1.0"], &defs), Some(vec![]));
         let many = |_: &str| Definitions {
             texts: vec![],
             profiles: (0..=MAX_COMBINED_PROFILES).collect(),
         };
-        assert_eq!(profile_combinations("${v}", &many), None);
+        assert_eq!(profile_combinations(&["${v}"], &many), None);
     }
 
     #[test]
