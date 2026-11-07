@@ -329,6 +329,12 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         Err((_, error)) => return RevertOutcome::failed(error),
     };
     let mut edits = BTreeMap::new();
+    // A leftover reference FAILS this revert, and a miss lets the wheel be
+    // deleted: every escape, separator and case spelling counts, as in the
+    // pylock revert.
+    let needle = crate::utils::path_spelling::PathNeedle::keep(
+        &super::pypi_lock::artifact_needle_rel(&entry.uuid),
+    );
     for record in entry
         .wiring
         .iter()
@@ -347,11 +353,7 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
         };
         match super::pypi_lock::restore_document(live, original, new) {
             Ok((restored, false))
-                if !super::pypi_lock::still_references_artifact(
-                    &restored,
-                    original,
-                    &entry.uuid,
-                ) =>
+                if !super::pypi_lock::still_references_artifact(&restored, original, &needle) =>
             {
                 edits.insert(record.file.clone(), restored);
             }

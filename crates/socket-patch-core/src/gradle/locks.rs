@@ -20,6 +20,13 @@ pub const LOCKFILE_NAMES: &[&str] = &[
     "settings-gradle.lockfile",
 ];
 
+/// Whether `rel` is a settings-classpath lock (`settings-gradle.lockfile`
+/// of any build): it locks what the settings script's own classpath
+/// resolves, before the script runs.
+pub fn is_settings_lock(rel: &str) -> bool {
+    rel.rsplit('/').next() == Some("settings-gradle.lockfile")
+}
+
 /// The legacy per-configuration lock directory, relative to a project.
 pub const LEGACY_LOCK_DIR: &str = "gradle/dependency-locks";
 

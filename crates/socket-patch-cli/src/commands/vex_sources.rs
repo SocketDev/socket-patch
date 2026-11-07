@@ -240,6 +240,12 @@ const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 /// through a `${property}` that `.mvn/maven.config` redefines, so the build resolves
 /// another version (`vex::Unattested`).
 const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
+/// Omission tag and note: a hosted sbt pin whose bytes the build provably
+/// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
+/// dropping the load-time verifier, or current evidence
+/// resolving another version or other bytes), so the downloaded copy
+/// proves nothing (`vex::Unattested`).
+const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
 /// Omission tag for a Go patch whose replace the `go.work` in effect
 /// overrides, ignores or rejects (#393, #458, #531): the reason of `vex`'s
 /// own go.mod gate, and the note of a discovered hosted or vendored ref the
@@ -293,6 +299,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while .mvn/maven.config redefines the property it is spelled \
              through; the wiring itself is intact, so re-running `scan` does not change this \
              (drop that -D from .mvn/maven.config, or write the pinned version literally)",
+        ),
+        UnattestedKind::SbtPinBypassed => (
+            NOTE_SBT_PIN_BYPASSED,
+            "not attested while the build bypasses the pin, even from the copy under \
+             `.socket/sbt-hosted`; the wiring itself is intact, so re-running `scan` does not \
+             change this (fix the build, then run `sbt update`)",
         ),
         UnattestedKind::GoWorkspaceOverride => (
             GO_WORKSPACE_OVERRIDE,
