@@ -1415,9 +1415,20 @@ fn same_patch_source(a: &str, b: &str) -> bool {
     if is_crates_io_source(a) || is_crates_io_source(b) {
         return is_crates_io_source(a) && is_crates_io_source(b);
     }
-    // A URL table compares as an index (host case, a trailing `/`); a
-    // registry name verbatim.
-    let norm = |s: &str| index_key(s).unwrap_or_else(|| s.trim().to_string());
+    // A URL table compares as cargo's `CanonicalUrl` spells it (host case,
+    // a trailing `/` or `.git`, a GitHub path's case; `sparse+` kept as
+    // another source); a registry name verbatim.
+    let norm = |s: &str| {
+        let t = s.trim();
+        let key = if t.starts_with("sparse+") {
+            index_key(t)
+        } else if t.contains("://") {
+            git_key(t.strip_prefix("registry+").unwrap_or(t))
+        } else {
+            None
+        };
+        key.unwrap_or_else(|| t.to_string())
+    };
     norm(a) == norm(b)
 }
 
@@ -4348,6 +4359,23 @@ mod tests {
         assert!(s
             .why("https://my-corp.example/index", "cfg-if", Some("vendor/x"))
             .is_some());
+        // A canonical-equivalent git table (Bugbot on a7611ef).
+        let config: toml_edit::DocumentMut =
+            "[patch.\"https://GitHub.com/Corp/Fork.git/\"]\ncfg-if = { git = \"https://example.com/f\" }\n"
+                .parse()
+                .unwrap();
+        let cfg2 = (".cargo/config.toml", config);
+        let s2 = super::Shadow::new(&manifest, Some(&cfg2));
+        assert!(s2
+            .why("https://github.com/corp/fork", "cfg-if", Some("vendor/x"))
+            .is_some());
+        assert!(s2
+            .why(
+                "sparse+https://github.com/corp/fork",
+                "cfg-if",
+                Some("vendor/x")
+            )
+            .is_none());
         // The half-migrated shape: the same path is the same wiring.
         assert!(s
             .why("https://my-corp.example/index", "cfg-if", Some("../fork"))
