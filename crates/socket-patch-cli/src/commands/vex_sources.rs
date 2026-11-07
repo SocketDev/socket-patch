@@ -233,7 +233,8 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
 /// Omission tag and note: a hosted Maven pin's GA is also declared inside
-/// `<profiles>` at another version, which overrides the pin whenever that
+/// `<profiles>` at another version, or a profile's `<properties>` move
+/// the pin's `${property}` version, which overrides the pin whenever that
 /// profile is active (`vex::Unattested`).
 const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 /// Omission tag and note: a hosted (or pre-v5 vendored) Maven pin is spelled
@@ -302,9 +303,10 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::MavenProfileUnpatched => (
             NOTE_MAVEN_PROFILE_UNPATCHED,
-            "not attested while a profile declares it at another version; the wiring itself is \
-             intact, so re-running `scan` does not change this (drop that profile <version> or \
-             set it to the pin, or re-patch with `scan --mode vendored`)",
+            "not attested while a profile declares it at, or its <properties> move it to, \
+             another version; the wiring itself is intact, so re-running `scan` does not change \
+             this (drop that profile <version> or property or set it to the pin, or re-patch \
+             with `scan --mode vendored`)",
         ),
         UnattestedKind::MavenConfigOverride => (
             NOTE_MAVEN_CONFIG_OVERRIDE,

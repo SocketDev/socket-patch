@@ -54,14 +54,18 @@
 //! pin (a profile's `<dependencyManagement>` only where management governs
 //! the pin): the rewriter leaves it as written, and whenever that profile
 //! is active it overrides the pin (vendored mode treats every profile as
-//! live and rewrites it too). A `${property}` version is resolved one
-//! level from the root `<properties>` — the pin as the pom spells it — and
-//! again with `.mvn/maven.config`'s `-D` user properties first, as the
-//! build resolves it (Maven's order; `${project.*}` stays the model's): a
-//! pin the build config moves keeps the ref but marks it unattested, and a
-//! Socket version only the build config supplies is diagnosed, never a
-//! ref (hosted mode never writes one; rollback / remove never edit
-//! `.mvn/maven.config`).
+//! live and rewrites it too). A `${property}` version is interpolated
+//! through every property it names (the vendored reactor's interpolator:
+//! at most 16 deep, a cycle never resolves) from the root `<properties>` —
+//! the pin as the pom spells it — and again with `.mvn/maven.config`'s
+//! `-D` user properties first at every level, as the build resolves it
+//! (Maven's order; `${project.*}` stays the model's): a pin the build
+//! config moves keeps the ref but marks it unattested, and a Socket
+//! version only the build config supplies is diagnosed, never a ref
+//! (hosted mode never writes one; rollback / remove never edit
+//! `.mvn/maven.config`). A pin the build resolves but that any profile's
+//! (or set of profiles') `<properties>` make resolve anything else keeps
+//! the ref unattested too, as a profile declaration does.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
 //! Trusted Checksums — `.mvn/checksums/checksums.sha256` lines
@@ -107,7 +111,8 @@
 //! (plugin classpaths) are not project resolution and are skipped silently;
 //! `<profiles>` are only read when activated, so a Socket repository or pin
 //! there is diagnosed, never a ref, and a profile declaration of a pinned
-//! GA at another version withholds the pin's attestation. Submodule poms
+//! GA at another version, or a profile's `<properties>` that move the
+//! pin's `${property}`, withholds the pin's attestation. Submodule poms
 //! and parent poms are not read (root-only). Gradle builds are discovered
 //! by `gradle.rs` (the hosted index) and the vendored JVM backend's own
 //! probes.
@@ -708,6 +713,18 @@ fn build_version(d: &PomDep) -> Option<&str> {
     d.build_version.as_deref()
 }
 
+/// Every version the build may resolve for `d` (`None` when it has no
+/// `<version>`): [`build_version`], then each version a combination of
+/// active profiles' `<properties>` moves it to
+/// ([`PomDep::version_alternatives`]).
+fn resolutions(d: &PomDep) -> impl Iterator<Item = Option<&str>> {
+    std::iter::once(build_version(d)).chain(
+        d.version_alternatives
+            .iter()
+            .map(|a| Some(a.value.as_str())),
+    )
+}
+
 /// Every GA with a versioned declaration that is not a variant
 /// ([`is_variant`]) Maven always reads: the candidates for a pin.
 fn live_gas(deps: &[PomDep]) -> BTreeSet<(String, String)> {
@@ -869,9 +886,18 @@ fn unpatched_classifier_copy(
         Wiring::Hosted => Some(pinned),
         Wiring::Vendored => None,
     };
-    // Each entry carries whether it names `group:artifact` literally: one
-    // reached only through an undefined property ([`may_name`]) may manage
-    // another GA, so it never stands in for this copy's version alone.
+    // Each version a declaration may resolve, flagged when a profile gives
+    // it: the declaration's own profile, or one whose `<properties>` move
+    // it (every resolution after the first).
+    fn flagged(d: &PomDep, in_profile: bool) -> Vec<(Option<&str>, bool)> {
+        resolutions(d)
+            .enumerate()
+            .map(|(i, v)| (v, in_profile || i > 0))
+            .collect()
+    }
+    // Each entry also carries whether it names `group:artifact` literally:
+    // one reached only through an undefined property ([`may_name`]) may
+    // manage another GA, so it never stands in for this copy's version alone.
     let ty = |d: &PomDep| -> String {
         d.type_text
             .as_deref()
@@ -884,15 +910,17 @@ fn unpatched_classifier_copy(
             d.managed && d.in_profile == in_profile
         })
         .filter(|(m, _)| m.classifier == copy.classifier && ty(m) == ty(copy))
-        .map(|(d, _)| {
+        .flat_map(|(d, _)| {
             let literal = d.group == group && d.artifact == artifact;
-            (build_version(d), in_profile, literal)
+            flagged(d, in_profile)
+                .into_iter()
+                .map(move |(v, p)| (v, p, literal))
         })
         .collect()
     };
     classifier_declarations(deps, group, artifact, |d| !d.managed).find_map(|(d, classifier)| {
         let resolved: Vec<(Option<&str>, bool)> = match build_version(d) {
-            Some(version) => vec![(Some(version), false)],
+            Some(_) => flagged(d, false),
             None => {
                 let mut live = managed(d, false);
                 // Without a live entry that surely manages this GA, the
@@ -941,6 +969,14 @@ fn unpatched_classifier_copy(
 /// vendored mode. A declaration without a version takes the live one and
 /// moves nothing, and a `pom` typed one carries no code (a `java-source` /
 /// `javadoc` typed one is a non-executable variant, never a main jar).
+/// Every version a profile's `<properties>` may give the declaration
+/// counts too ([`PomDep::version_alternatives`]).
+///
+/// The same holds for a live declaration that resolves `pinned` through a
+/// property some profile's `<properties>` redefine (or one it names, or
+/// several profiles together) to another version: Maven merges an active
+/// profile's properties over the pom's own before it interpolates.
+/// Vendored mode refuses to pin over such a property (`version_override`).
 fn profile_override(
     deps: &[PomDep],
     group: &str,
@@ -948,11 +984,10 @@ fn profile_override(
     pinned: &str,
     pin_managed: bool,
 ) -> Option<String> {
-    main_jar_declarations(deps, group, artifact, |d| d.in_profile)
+    main_jar_declarations(deps, group, artifact, |_| true)
         .filter(|d| is_main_jar(d.type_text.as_deref(), d.classifier.as_deref()))
         .filter(|d| !d.managed || pin_managed)
         .find_map(|d| {
-            let version = build_version(d).filter(|v| *v != pinned)?;
             let section = if d.managed {
                 "<dependencyManagement> "
             } else {
@@ -967,6 +1002,29 @@ fn profile_override(
                     d.group, d.artifact
                 )
             };
+            if !d.in_profile {
+                // Off the pin as built, it is no pin (or another bypass).
+                if build_version(d) != Some(pinned) {
+                    return None;
+                }
+                // The smallest combination of profiles that moves it.
+                let moved = d.version_alternatives.first()?;
+                let declared = d.version_text.as_deref().unwrap_or_default();
+                let value = if !matches!(moved.by, crate::formats::maven::MovedBy::Profiles(_)) {
+                    "resolve a version this reader cannot work out".to_string()
+                } else if moved.value.contains("${") {
+                    format!("nothing it can resolve ({})", moved.value)
+                } else {
+                    moved.value.clone()
+                };
+                return Some(format!(
+                    "{POM}: {section}{named} <version>{declared}</version> resolves the \
+                     patched {pinned}, but the <properties> of {} make it {value}; whenever that \
+                     applies Maven resolves it instead of the pin",
+                    moved.by
+                ));
+            }
+            let version = resolutions(d).find_map(|v| v.filter(|v| *v != pinned))?;
             Some(format!(
                 "{POM}: a <profiles> {section}declaration of {named} carries \
                  <version>{version}</version>, not the patched {pinned}; whenever that profile \
@@ -2060,6 +2118,225 @@ mod tests {
         }
     }
 
+    /// Whether `out` attests `purl`: a ref no unattested entry withholds.
+    fn attests(out: &Discovery, purl: &str) -> bool {
+        out.refs.iter().any(|r| {
+            r.purl == purl
+                && !out
+                    .unattested
+                    .iter()
+                    .any(|u| u.purl == r.purl && u.uuid == r.uuid)
+        })
+    }
+
+    /// A hosted project pinning slf4j-api through `decl` (a
+    /// `<dependencies>` / `<dependencyManagement>` block), with the root
+    /// `<properties>` `props` and one `<profile>` per entry of `profiles`
+    /// (each a profile body).
+    fn property_project(props: &str, decl: &str, profiles: &[&str]) -> Project {
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let profiles: String = profiles
+            .iter()
+            .enumerate()
+            .map(|(i, body)| format!("<profile><id>p{i}</id>\n{body}</profile>\n"))
+            .collect();
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<properties>{props}</properties>\n{decl}<repositories>\n{repo}</repositories>\n\
+                 <profiles>\n{profiles}</profiles>\n"
+            )),
+        );
+        p
+    }
+
+    fn direct_decl(version: &str) -> String {
+        format!(
+            "<dependencies>\n{}</dependencies>\n",
+            dep("org.slf4j", "slf4j-api", Some(version))
+        )
+    }
+
+    /// A pin spelled through a property is what Maven resolves only while
+    /// no active profile's `<properties>` redefines that property (or one
+    /// it names) to anything else: Maven merges an active profile's
+    /// properties over the pom's own before it interpolates the
+    /// `<version>`. Vendored mode refuses to pin over such a property
+    /// (`version_override`), so the ref stays (rollback / remove / list
+    /// find it) but is never attested. User properties
+    /// (`.mvn/maven.config`) win over every profile's.
+    #[tokio::test]
+    async fn profile_properties_redefining_a_pin_property_are_not_attested() {
+        let pin = suffixed(UUID_A);
+        let v = |value: &str| format!("<slf4j.version>{value}</slf4j.version>");
+        let w = |value: &str| format!("<w>{value}</w>");
+        let in_props = |s: String| format!("<properties>{s}</properties>");
+        let direct = direct_decl("${slf4j.version}");
+        let managed = format!(
+            "<dependencyManagement><dependencies>\n{}</dependencies></dependencyManagement>\n\
+             <dependencies>\n{}</dependencies>\n",
+            dep("org.slf4j", "slf4j-api", Some("${slf4j.version}")),
+            dep("org.slf4j", "slf4j-api", None),
+        );
+        let withheld = [
+            // The base release.
+            (v(&pin), &direct, vec![in_props(v("1.7.36"))]),
+            (v(&pin), &managed, vec![in_props(v("1.7.36"))]),
+            // Through a property the pin's property names.
+            (v("${w}") + &w(&pin), &direct, vec![in_props(w("1.7.30"))]),
+            // A value this pom cannot resolve, or a cycle.
+            (v(&pin), &direct, vec![in_props(v("${undefined}"))]),
+            (v(&pin), &direct, vec![in_props(v("${slf4j.version}"))]),
+            // Two profiles that move the pin only together.
+            (
+                v(&pin) + &w(&pin),
+                &direct,
+                vec![in_props(v("${w}")), in_props(w("1.7.36"))],
+            ),
+        ];
+        for (root, decl, profiles) in &withheld {
+            let profiles: Vec<&str> = profiles.iter().map(String::as_str).collect();
+            let out = run(&property_project(root, decl, &profiles)).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(
+                out.unattested.len(),
+                1,
+                "{root} {profiles:?}: {:?}",
+                out.unattested
+            );
+            let u = &out.unattested[0];
+            assert_eq!(
+                u.kind,
+                UnattestedKind::MavenProfileUnpatched,
+                "{profiles:?}"
+            );
+            assert!(
+                u.detail.contains("org.slf4j:slf4j-api") && u.detail.contains("<properties>"),
+                "{}",
+                u.detail
+            );
+        }
+
+        for (root, profile, config) in [
+            // The pin itself, or an unrelated property.
+            (v(&pin), in_props(v(&pin)), None),
+            (v(&pin), in_props("<x>1</x>".to_string()), None),
+            (v("${w}") + &w(&pin), in_props(w(&pin)), None),
+            // A user property wins over every profile's.
+            (
+                v(&pin),
+                in_props(v("1.7.36")),
+                Some(format!("-Dslf4j.version={pin}\n")),
+            ),
+        ] {
+            let p = property_project(&root, &direct, &[&profile]);
+            if let Some(config) = &config {
+                p.write(".mvn/maven.config", config);
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert!(
+                attests(&out, FX_PURL),
+                "{root} {profile}: {:?}",
+                out.unattested
+            );
+        }
+    }
+
+    /// A `<profiles>` declaration's `${property}` version reads its own
+    /// profile's `<properties>` first: that profile is active whenever the
+    /// declaration applies.
+    #[tokio::test]
+    async fn profile_declaration_reads_its_own_profile_properties() {
+        let pin = suffixed(UUID_A);
+        let profile = |value: &str| {
+            format!(
+                "<properties><slf4j.version>{value}</slf4j.version></properties>\n\
+                 <dependencies>\n{}</dependencies>\n",
+                dep("org.slf4j", "slf4j-api", Some("${slf4j.version}"))
+            )
+        };
+        let direct = direct_decl(&pin);
+        for (root, own, attested) in [
+            // The root resolves the pin, the profile the base release.
+            (pin.as_str(), "1.7.36", false),
+            // The root resolves the base release, the profile the pin.
+            ("1.7.36", pin.as_str(), true),
+        ] {
+            let p = property_project(
+                &format!("<slf4j.version>{root}</slf4j.version>"),
+                &direct,
+                &[&profile(own)],
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(
+                attests(&out, FX_PURL),
+                attested,
+                "{own}: {:?}",
+                out.unattested
+            );
+        }
+    }
+
+    /// A `${property}` version resolves through every property it names,
+    /// with user properties first at each level, as Maven interpolates; a
+    /// cycle, or a chain deeper than the vendored reactor follows, is
+    /// never a pin.
+    #[tokio::test]
+    async fn version_property_resolves_through_nested_properties() {
+        let pin = suffixed(UUID_A);
+        // `<p0>${p1}</p0>` ... `<p{links-1}>{end}</p{links-1}>`.
+        let chain = |links: usize, end: &str| -> String {
+            (0..links)
+                .map(|i| {
+                    let value = if i + 1 == links {
+                        end.to_string()
+                    } else {
+                        format!("${{p{}}}", i + 1)
+                    };
+                    format!("<p{i}>{value}</p{i}>")
+                })
+                .collect()
+        };
+        let split = format!(
+            "<p0>${{p1}}-socket.${{p2}}</p0><p1>1.7.36</p1><p2>{}</p2>",
+            &UUID_A[..8]
+        );
+        let user_pin = format!("-Dp1={pin}\n");
+        for (props, config, attested) in [
+            (chain(2, &pin), None, true),
+            (chain(3, &pin), None, true),
+            (split, None, true),
+            // The deepest chain the vendored reactor resolves, and one more.
+            (chain(16, &pin), None, true),
+            (chain(17, &pin), None, false),
+            // A user property redefines a nested one: off the pin, or onto
+            // a Socket version only the build config supplies (never a
+            // pom.xml ref).
+            (chain(2, &pin), Some("-Dp1=1.7.36\n"), false),
+            (chain(2, "1.7.36"), Some(user_pin.as_str()), false),
+            // A cycle.
+            ("<p0>${p1}</p0><p1>${p0}</p1>".to_string(), None, false),
+            ("<p0>${p0}</p0>".to_string(), None, false),
+        ] {
+            let p = property_project(&props, &direct_decl("${p0}"), &[]);
+            if let Some(config) = config {
+                p.write(".mvn/maven.config", config);
+            }
+            let out = run(&p).await;
+            assert_eq!(
+                attests(&out, FX_PURL),
+                attested,
+                "{props} {config:?}: {:?} {:?} {:?}",
+                out.refs,
+                out.unattested,
+                out.diagnostics
+            );
+        }
+    }
+
     /// A versioned declaration whose coordinate is a property this pom
     /// does not define may be the pinned GA, so the pin is not attested
     /// past it (#683).
@@ -2327,6 +2604,254 @@ mod tests {
             let kinds: Vec<_> = out.unattested.iter().map(|u| u.kind).collect();
             assert_eq!(kinds, kind.into_iter().collect::<Vec<_>>(), "{extra}");
         }
+    }
+
+    /// The same for a profile's `<properties>` that move a `${property}`
+    /// version of the vendored GA off the vendored version.
+    #[tokio::test]
+    async fn vendored_ref_under_profile_properties_is_not_attested() {
+        for (version, attested) in [("1.10.1", false), ("1.10.0", true)] {
+            let p = vendored_project(UUID_A);
+            let wired = std::fs::read_to_string(p.root().join("pom.xml"))
+                .expect("read pom")
+                .replace("<version>1.10.0</version>", "<version>${ct}</version>");
+            let at = wired.rfind("</project>").expect("project close");
+            p.write(
+                "pom.xml",
+                format!(
+                    "{}<properties><ct>1.10.0</ct></properties>\n<profiles><profile><id>p</id>\
+                     <properties><ct>{version}</ct></properties></profile></profiles>\n{}",
+                    &wired[..at],
+                    &wired[at..]
+                ),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(V_PURL, UUID_A, WiringMode::Vendored)]);
+            assert_eq!(
+                attests(&out, V_PURL),
+                attested,
+                "{version}: {:?}",
+                out.unattested
+            );
+        }
+    }
+
+    /// A `${project.version}` is the project's own `<version>`, which may
+    /// itself be spelled through a property (`${revision}`, Maven's
+    /// CI-friendly versions): a profile or a `-D` user property that
+    /// redefines that property moves the model reference too.
+    #[tokio::test]
+    async fn model_references_move_with_the_properties_they_are_spelled_through() {
+        let pin = suffixed(UUID_A);
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let project = |revision: &str, profile: &str| {
+            let p = Project::new();
+            p.write(
+                "pom.xml",
+                format!(
+                    "<?xml version=\"1.0\"?>\n<project>\n<modelVersion>4.0.0</modelVersion>\n\
+                     <groupId>com.example</groupId><artifactId>app</artifactId>\
+                     <version>${{revision}}</version>\n\
+                     <properties><revision>{revision}</revision></properties>\n\
+                     <dependencies>\n{}</dependencies>\n<repositories>\n{repo}</repositories>\n\
+                     <profiles><profile><id>ci</id>{profile}</profile></profiles>\n</project>\n",
+                    dep("org.slf4j", "slf4j-api", Some("${project.version}")),
+                ),
+            );
+            p
+        };
+        // A profile that redefines what the project version is spelled
+        // through moves the pin.
+        let out = run(&project(
+            &pin,
+            "<properties><revision>1.7.36</revision></properties>",
+        ))
+        .await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(
+            out.unattested[0].kind,
+            UnattestedKind::MavenProfileUnpatched
+        );
+        // One that keeps it does not.
+        let out = run(&project(
+            &pin,
+            &format!("<properties><revision>{pin}</revision></properties>"),
+        ))
+        .await;
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+        // A Socket version only `-Drevision=` supplies is no pom.xml ref.
+        let p = project("1.7.36", "");
+        p.write(".mvn/maven.config", format!("-Drevision={pin}\n"));
+        let out = run(&p).await;
+        assert!(!attests(&out, FX_PURL), "{:?}", out.refs);
+        assert!(
+            out.diagnostics.iter().any(
+                |d| d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains(".mvn/maven.config")
+            ),
+            "{:?}",
+            out.diagnostics
+        );
+    }
+
+    /// Review on #2020 (round 2): a property defined twice is Maven's LAST
+    /// definition; a profile declaration's coordinates read its own
+    /// profile's `<properties>` as its version does; a profile is named by
+    /// its own `<id>`, not one nested in it.
+    #[tokio::test]
+    async fn duplicate_properties_profile_coordinates_and_profile_ids() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version><slf4j.version>1.7.36</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[],
+        );
+        let out = run(&p).await;
+        assert!(!attests(&out, FX_PURL), "{:?}", out.refs);
+
+        let p = property_project(
+            "<g>org.other</g>",
+            &direct_decl(&pin),
+            &[
+                "<properties><g>org.slf4j</g></properties>\n<dependencies>\n\
+               <dependency><groupId>${g}</groupId><artifactId>slf4j-api</artifactId>\
+               <version>1.7.30</version></dependency>\n</dependencies>\n",
+            ],
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(!attests(&out, FX_PURL), "{:?}", out.unattested);
+
+        let repo = hosted_repo(&format!("socket-patch-{UUID_A}"), &registry_url(UUID_A));
+        let p = Project::new();
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "<properties><v>{pin}</v></properties>\n{}<repositories>\n{repo}</repositories>\n\
+                 <profiles><profile><repositories><repository><id>mirror</id>\
+                 <url>https://example.test/m2</url></repository></repositories>\
+                 <id>ci</id><properties><v>1.7.30</v></properties></profile></profiles>\n",
+                direct_decl("${v}"),
+            )),
+        );
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("profile ci") && !detail.contains("mirror"),
+            "{detail}"
+        );
+    }
+
+    /// A profile property written with attributes (`combine.self`) or
+    /// whitespace in its tag is still a definition Maven reads.
+    #[tokio::test]
+    async fn profile_properties_with_attributes_are_read() {
+        let pin = suffixed(UUID_A);
+        for profile in [
+            "<properties><slf4j.version combine.self=\"override\">1.7.36</slf4j.version></properties>",
+            "<properties><slf4j.version >1.7.36</slf4j.version ></properties>",
+            "<properties>\n<slf4j.version\n>1.7.36</slf4j.version></properties>",
+        ] {
+            let p = property_project(
+                &format!("<slf4j.version a=\"b\">{pin}</slf4j.version>"),
+                &direct_decl("${slf4j.version}"),
+                &[profile],
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+            assert!(!attests(&out, FX_PURL), "{profile}: {:?}", out.unattested);
+        }
+    }
+
+    /// A nested `${…}` in a profile's value reads that profile's own
+    /// properties first, as Maven merges the whole profile before it
+    /// interpolates: a profile that keeps the pin through its own
+    /// property does not withhold it.
+    #[tokio::test]
+    async fn profile_values_resolve_through_their_own_profile() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version><w>1.7.36</w>"),
+            &direct_decl("${slf4j.version}"),
+            &[&format!(
+                "<properties><slf4j.version>${{w}}</slf4j.version><w>{pin}</w></properties>"
+            )],
+        );
+        let out = run(&p).await;
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+    }
+
+    /// A profile `<properties>` this reader cannot parse withholds a
+    /// `${property}` pin (fail closed) instead of failing the whole pom; a
+    /// literal pin, which no property moves, is still attested.
+    #[tokio::test]
+    async fn unreadable_profile_properties_withhold_only_property_pins() {
+        let pin = suffixed(UUID_A);
+        let broken = "<properties><slf4j.version>1.7.36</properties>";
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[broken],
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(
+            out.unattested[0].kind,
+            UnattestedKind::MavenProfileUnpatched
+        );
+        let p = property_project("", &direct_decl(&pin), &[broken]);
+        let out = run(&p).await;
+        assert!(
+            attests(&out, FX_PURL),
+            "{:?} {:?}",
+            out.unattested,
+            out.diagnostics
+        );
+    }
+
+    /// Profiles that each keep the pin, however many and however deep the
+    /// chain they spell it through, never withhold it: every combination
+    /// is checked, not a capped cross product.
+    #[tokio::test]
+    async fn many_profiles_that_keep_the_pin_are_attested() {
+        let pin = suffixed(UUID_A);
+        // `<p0>${p1}</p0>` ... `<p4>{pin}</p4>`.
+        let chain: String = (0..5)
+            .map(|i| match i {
+                4 => format!("<p4>{pin}</p4>"),
+                i => format!("<p{i}>${{p{}}}</p{i}>", i + 1),
+            })
+            .collect();
+        let profile = format!("<properties>{chain}</properties>");
+        let profiles = [profile.as_str(); 5];
+        let p = property_project(&chain, &direct_decl("${p0}"), &profiles);
+        let out = run(&p).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        assert!(attests(&out, FX_PURL), "{:?}", out.unattested);
+    }
+
+    /// The withheld statement names the profiles that move the pin and
+    /// the version they move it to.
+    #[tokio::test]
+    async fn profile_property_detail_names_the_profile_and_version() {
+        let pin = suffixed(UUID_A);
+        let p = property_project(
+            &format!("<slf4j.version>{pin}</slf4j.version>"),
+            &direct_decl("${slf4j.version}"),
+            &[
+                "<properties><x>1</x></properties>",
+                "<properties><slf4j.version>1.7.30</slf4j.version></properties>",
+            ],
+        );
+        let out = run(&p).await;
+        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("profile p1") && detail.contains("1.7.30") && !detail.contains("p0"),
+            "{detail}"
+        );
     }
 
     /// Review on #2005 (round 2): a `-D` property `.mvn/maven.config` alone
