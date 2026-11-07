@@ -240,6 +240,14 @@ const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 /// through a `${property}` that `.mvn/maven.config` redefines, so the build resolves
 /// another version (`vex::Unattested`).
 const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
+/// Omission tag and note: a vendored sbt pin the build's local resolution
+/// evidence does not verify, or under a build-wide blocker
+/// (`vex::Unattested`, `UnattestedKind::SbtResolutionUnverified`).
+const NOTE_SBT_RESOLUTION_UNVERIFIED: &str = "vex_sbt_resolution_unverified";
+/// Omission tag and note: a vendored sbt pin's committed tree file is
+/// missing or modified (`vex::Unattested`,
+/// `UnattestedKind::SbtVendoredTreeMissing`).
+const NOTE_SBT_VENDORED_TREE_MISSING: &str = "vex_sbt_vendored_tree_missing";
 /// Omission tag and note: a NuGet Socket source's id is also locked at a
 /// version other than the patched one, which that source cannot serve
 /// (`vex::Unattested`).
@@ -304,6 +312,17 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              through; the wiring itself is intact, so re-running `scan` does not change this \
              (drop that -D from .mvn/maven.config, or write the pinned version literally)",
         ),
+        UnattestedKind::SbtResolutionUnverified => (
+            NOTE_SBT_RESOLUTION_UNVERIFIED,
+            "not attested while that holds (the detail names the remedy, or that there is \
+             none); the wiring itself is intact, so `vendor --check` and `scan` still treat it \
+             as live",
+        ),
+        UnattestedKind::SbtVendoredTreeMissing => (
+            NOTE_SBT_VENDORED_TREE_MISSING,
+            "not attested while the committed tree differs from the pin (restore \
+             `.socket/vendor/maven2` from version control, or re-run `socket-patch vendor`)",
+        ),
         UnattestedKind::NugetLockOtherVersion => (
             NOTE_NUGET_LOCK_OTHER_VERSION,
             "not attested until every target framework locks only the patched version (align \
@@ -321,6 +340,39 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
              itself is intact, so re-running `scan` / `vendor` does not change this",
         ),
     }
+}
+
+/// The [`Unattested`](socket_patch_core::vex::Unattested) mark discovery
+/// put on patch `uuid` for `purl`'s package, if any.
+fn unattested_mark<'d>(
+    discovery: &'d Discovery,
+    purl: &str,
+    uuid: &str,
+) -> Option<&'d socket_patch_core::vex::Unattested> {
+    let pkg = canonical_base_purl(purl);
+    discovery
+        .unattested
+        .iter()
+        .find(|u| u.uuid == uuid && PurlKey::same(&u.purl, &pkg))
+}
+
+/// Omit `key` for the mark `u`: its `failed[]` entry and the note naming
+/// why and the remedy.
+fn gate_unattested(
+    key: &str,
+    u: &socket_patch_core::vex::Unattested,
+    gated: &mut Vec<FailedPatch>,
+    notes: &mut Vec<PlanNote>,
+) {
+    let (code, remedy) = unattested_note(u.kind);
+    gated.push(failed(key, code));
+    notes.push(PlanNote {
+        code,
+        detail: format!(
+            "{key}: patch {} is wired, but {}; {remedy}",
+            u.uuid, u.detail
+        ),
+    });
 }
 
 /// One hosted-basis view purl's wiring (see [`Plan::hosted`]).
@@ -516,15 +568,7 @@ pub(crate) async fn plan(
                 first
             }
         };
-        let (code, remedy) = unattested_note(u.kind);
-        gated.push(failed(&c.key, code));
-        notes.push(PlanNote {
-            code,
-            detail: format!(
-                "{}: patch {} is wired, but {}; {remedy}",
-                c.key, c.uuid, u.detail
-            ),
-        });
+        gate_unattested(&c.key, u, &mut gated, &mut notes);
         false
     });
     for (key, old_uuid, wired) in &superseded {
@@ -557,6 +601,7 @@ pub(crate) async fn plan(
                 continue;
             }
         }
+        let mut took_over = false;
         let basis = if let Some(vref) = cand
             .discovered
             .iter()
@@ -593,6 +638,7 @@ pub(crate) async fn plan(
                 cand.uuid = hosted.uuid.clone();
                 cand.record = Some(hosted);
                 cand.vendor_entry = None;
+                took_over = true;
                 Basis::Hosted {
                     lockfile_basis: false,
                 }
@@ -628,6 +674,21 @@ pub(crate) async fn plan(
         } else {
             Basis::Installed
         };
+        // The vendored basis attests the ENTRY's patch, which need not be
+        // the candidate's uuid (a manifest record under another uuid keeps
+        // the key; a vendored sbt pin has no ref to swap it in): its mark
+        // is checked against what is actually attested.
+        // Likewise the hosted-over-vendored takeover attests the redirect
+        // ledger's uuid, swapped in after the early gate ran.
+        let attested = match &basis {
+            Basis::Vendored(entry) => Some((entry.base_purl.as_str(), entry.uuid.as_str())),
+            Basis::Hosted { .. } if took_over => Some((cand.key.as_str(), cand.uuid.as_str())),
+            _ => None,
+        };
+        if let Some(u) = attested.and_then(|(purl, uuid)| unattested_mark(&discovery, purl, uuid)) {
+            gate_unattested(&cand.key, u, &mut gated, &mut notes);
+            continue;
+        }
         based.push((cand, basis));
     }
 
@@ -1647,6 +1708,29 @@ mod tests {
         let dead = plan(&common(tmp.path()), mk(), &[], &RunApiClient::new()).await;
         assert!(dead.view.patches.is_empty());
         assert_eq!(dead.gated, vec![failed(key, VENDOR_UNWIRED)]);
+
+        // The takeover attests the redirect ledger's uuid, swapped in after
+        // the early mark gate ran: a mark on it still gates.
+        let mut marked = mk();
+        marked
+            .discovery
+            .unattested
+            .push(socket_patch_core::vex::Unattested {
+                purl: key.into(),
+                uuid: U2.into(),
+                file: "package-lock.json".into(),
+                detail: "package-lock.json bypasses it".into(),
+                kind: UnattestedKind::LockAboveBase,
+            });
+        let gated = plan(
+            &common(tmp.path()),
+            marked,
+            &[key.to_string()],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty(), "{:?}", gated.view.patches);
+        assert_eq!(gated.gated, vec![failed(key, NOTE_LOCK_ABOVE_BASE)]);
     }
 
     /// Core discover rule 11 through the plan: a vendor ledger entry and a
