@@ -563,6 +563,69 @@ pub(crate) fn may_shadow(
         && may_name(dep_artifact, artifact)
 }
 
+/// The classifiers whose jars never run on a classpath: `sources` and
+/// `javadoc`. Every other classifier copy of a patched GA (tests, a native
+/// or JDK-specific build) carries code, so it must resolve the patched
+/// release too. The hosted rewriter, VEX discovery and the vendored
+/// reactor's attestation share this rule.
+pub(crate) const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
+
+/// Whether a `<classifier>` copy of a GA carries code onto a classpath
+/// (see [`NON_EXECUTABLE_CLASSIFIERS`]).
+pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
+    !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
+}
+
+/// Whether a declaration of a GA is a sibling copy of its main jar that
+/// Maven resolves apart from it (and that the main-jar pin does not
+/// reach): a classifier, or a type other than `jar` / `pom`. The `<type>`
+/// a `${...}` leaves unknown counts. The hosted rewriter, VEX discovery and
+/// the vendored reactor share this rule with [`is_executable_variant`].
+pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    classifier.is_some_and(|c| !c.is_empty())
+        || type_text.is_some_and(|t| !t.is_empty() && t != "jar" && t != "pom")
+}
+
+/// The label a variant ([`is_variant`]) is reported by: its classifier,
+/// else its type.
+pub(crate) fn variant_label<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> &'a str {
+    classifier
+        .filter(|c| !c.is_empty())
+        .or(type_text)
+        .unwrap_or_default()
+}
+
+/// Whether a declaration of a GA's main jar: untyped or `jar`-typed, with
+/// no classifier.
+pub(crate) fn is_main_jar(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    type_text.is_none_or(|t| t.is_empty() || t == "jar") && classifier.is_none_or(str::is_empty)
+}
+
+/// Whether a declaration of a GA that is not its main jar
+/// ([`is_main_jar`]) is a copy that carries code onto a classpath. Maven
+/// derives a classifier from some types (`test-jar` is the `tests` jar,
+/// `ejb-client` the `client` one, `java-source` / `javadoc` the
+/// non-executable ones), so a type counts like the classifier it implies.
+/// Of the rest only `pom` holds no code; every other type (`ejb`,
+/// `maven-plugin`, `bundle`, an unknown or `${...}` one) is executable.
+pub(crate) fn is_executable_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    let type_text = type_text.filter(|t| !t.is_empty()).unwrap_or("jar");
+    let implied = match type_text {
+        "test-jar" => Some("tests"),
+        "ejb-client" => Some("client"),
+        "java-source" => Some("sources"),
+        "javadoc" => Some("javadoc"),
+        _ => None,
+    };
+    match classifier.filter(|c| !c.is_empty()).or(implied) {
+        Some(c) => is_executable_classifier(c),
+        None => type_text != "pom",
+    }
+}
+
 fn is_property_name(name: &str) -> bool {
     !name.is_empty()
         && name
