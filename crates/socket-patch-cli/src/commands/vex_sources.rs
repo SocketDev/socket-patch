@@ -228,10 +228,18 @@ const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 /// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
 /// module's own `<version>` may override it (`vex::Unattested`).
 const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
-/// Omission tag and note: a hosted Maven pin's GA also has an executable
-/// classifier copy at another version, which the pin does not reach
+/// Omission tag and note: a hosted (or pre-v5 vendored) Maven pin's GA also
+/// has an executable classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a hosted Maven pin's GA is also declared inside
+/// `<profiles>` at another version, which overrides the pin whenever that
+/// profile is active (`vex::Unattested`).
+const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
+/// Omission tag and note: a hosted (or pre-v5 vendored) Maven pin is spelled
+/// through a `${property}` that `.mvn/maven.config` redefines, so the build resolves
+/// another version (`vex::Unattested`).
+const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
 /// Omission tag and note: a vendored sbt pin the build's local resolution
 /// evidence does not verify, or under a build-wide blocker
 /// (`vex::Unattested`, `UnattestedKind::SbtResolutionUnverified`).
@@ -291,6 +299,18 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::MavenProfileUnpatched => (
+            NOTE_MAVEN_PROFILE_UNPATCHED,
+            "not attested while a profile declares it at another version; the wiring itself is \
+             intact, so re-running `scan` does not change this (drop that profile <version> or \
+             set it to the pin, or re-patch with `scan --mode vendored`)",
+        ),
+        UnattestedKind::MavenConfigOverride => (
+            NOTE_MAVEN_CONFIG_OVERRIDE,
+            "not attested while .mvn/maven.config redefines the property it is spelled \
+             through; the wiring itself is intact, so re-running `scan` does not change this \
+             (drop that -D from .mvn/maven.config, or write the pinned version literally)",
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,

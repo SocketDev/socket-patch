@@ -44,9 +44,15 @@ pub(crate) struct PomRepo {
 pub(crate) struct PomDep {
     pub(crate) group: String,
     pub(crate) artifact: String,
-    /// Trimmed literal version, `${prop}` resolved from the root
-    /// `<properties>` when possible; `None` when the declaration has none.
+    /// Trimmed literal version, `${prop}` resolved (one level) from the
+    /// root `<properties>` when possible: the version the pom itself
+    /// spells, which the hosted rewriter writes and rolls back. `None` when
+    /// the declaration has none.
     pub(crate) version: Option<String>,
+    /// [`Self::version`] as the build resolves it: `${prop}` resolved from
+    /// the build's user properties first (`.mvn/maven.config`'s `-D`),
+    /// else the root `<properties>` — Maven's own lookup order.
+    pub(crate) build_version: Option<String>,
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
     pub(crate) classifier: Option<String>,
@@ -72,6 +78,11 @@ pub(crate) struct PomScope {
     profiles: Vec<Element>,
     /// The root `<properties>` (see [`properties`]).
     properties: BTreeMap<String, String>,
+    /// [`Self::properties`] with the build's user properties laid over
+    /// them, except `project.*` / `pom.*`, which Maven reads from the model
+    /// before any user property: what a `${name}` version resolves to in
+    /// the build.
+    build_properties: BTreeMap<String, String>,
     /// [`Self::properties`] plus the `${project.*}` model references a
     /// coordinate may name (see [`model_refs`]).
     coordinate_refs: BTreeMap<String, String>,
@@ -87,8 +98,8 @@ impl PomScope {
 
     /// [`Self::new`], with the user properties the build passes Maven
     /// (`.mvn/maven.config`'s `-D`, see [`maven_config_properties`]): they
-    /// override a same-named pom property when a coordinate is
-    /// interpolated, as Maven's model interpolator reads them after the
+    /// override a same-named pom property when a coordinate or a version is
+    /// interpolated, as Maven's model interpolator looks them up before the
     /// model's own.
     pub(crate) fn with_user_properties(
         raw: &str,
@@ -107,12 +118,18 @@ impl PomScope {
         .concat();
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
+        let mut build_properties = properties.clone();
+        build_properties.extend(
+            user.iter()
+                .filter(|(k, _)| !is_model_reference(k))
+                .map(|(k, v)| (k.clone(), v.clone())),
+        );
         let mut coordinate_refs = properties.clone();
         coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
         // A `project.*` / `pom.*` reference names the model, whatever a
         // same-named property says; the deprecated bare form yields to one.
         for (name, value) in model_refs(&masked, &coordinate_refs.clone())? {
-            if name.starts_with("project.") || name.starts_with("pom.") {
+            if is_model_reference(&name) {
                 coordinate_refs.insert(name, value);
             } else {
                 coordinate_refs.entry(name).or_insert(value);
@@ -123,6 +140,7 @@ impl PomScope {
             ignored,
             profiles,
             properties,
+            build_properties,
             coordinate_refs,
         })
     }
@@ -251,7 +269,12 @@ pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Resu
             artifact,
             version: dep
                 .version_text
-                .map(|v| resolve_property(&v, &scope.properties)),
+                .as_deref()
+                .map(|v| resolve_property(v, &scope.properties)),
+            build_version: dep
+                .version_text
+                .as_deref()
+                .map(|v| resolve_property(v, &scope.build_properties)),
             classifier: dep.classifier,
             type_text: dep.type_text,
             managed: inside(dep.element.start, &managed),
@@ -576,6 +599,12 @@ pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
     !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
 }
 
+/// A `project.*` / `pom.*` reference: Maven reads it from the model, ahead
+/// of any user or pom property of the same name.
+fn is_model_reference(name: &str) -> bool {
+    name.starts_with("project.") || name.starts_with("pom.")
+}
+
 /// Whether a declaration of a GA is a sibling copy of its main jar that
 /// Maven resolves apart from it (and that the main-jar pin does not
 /// reach): a classifier, or a type other than `jar` / `pom`. The `<type>`
@@ -806,6 +835,72 @@ mod tests {
         let deps = scope.dependencies().unwrap();
         assert_eq!(deps[0].group.as_deref(), Some("com.acme"));
         assert!(!scope.coordinate_refs.contains_key("project.version"));
+    }
+
+    /// Maven's model interpolator reads user properties (`.mvn/maven.config`'s
+    /// `-D`) before the pom's own `<properties>`, for a `<version>` just as
+    /// for a coordinate: `-Dv=1.0` makes `${v}` the base release whatever
+    /// the pom defines.
+    #[test]
+    fn version_property_reads_user_properties_first() {
+        let pom = "<project><properties><v>1.0-socket.77777777</v><w>2</w></properties>\
+                   <dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${w}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>c</artifactId><version>${u}</version></dependency>\
+                   </dependencies></project>";
+        let versions = |user: &[(&str, &str)]| {
+            let user = user
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            super::parse_pom_with(pom, &user)
+                .unwrap()
+                .deps
+                .into_iter()
+                .map(|d| (d.version.unwrap(), d.build_version.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let both = |v: &str| (v.to_string(), v.to_string());
+        assert_eq!(
+            versions(&[]),
+            [both("1.0-socket.77777777"), both("2"), both("${u}")]
+        );
+        assert_eq!(
+            versions(&[("v", "1.0"), ("u", "3")]),
+            [
+                ("1.0-socket.77777777".to_string(), "1.0".to_string()),
+                both("2"),
+                ("${u}".to_string(), "3".to_string()),
+            ],
+            "the build's user property wins over the pom's and defines one it lacks; \
+             `version` keeps what the pom spells"
+        );
+    }
+
+    /// Maven reads `${project.*}` / `${pom.*}` from the model before any
+    /// user property: `-Dproject.version=` does not move a dependency
+    /// version written through the model.
+    #[test]
+    fn model_reference_version_ignores_user_properties() {
+        let pom = "<project><version>1</version><dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${project.version}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${pom.version}</version></dependency>\
+                   </dependencies></project>";
+        let user = [
+            ("project.version".to_string(), "9".to_string()),
+            ("pom.version".to_string(), "9".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let deps = super::parse_pom_with(pom, &user).unwrap().deps;
+        for d in &deps {
+            assert_eq!(d.build_version, d.version, "{d:?}");
+            assert!(
+                d.build_version.as_deref().is_some_and(|v| v != "9"),
+                "{d:?}"
+            );
+        }
     }
 
     #[test]
