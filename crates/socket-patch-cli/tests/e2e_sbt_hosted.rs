@@ -430,6 +430,109 @@ fn hosted_vex_without_evidence_is_unverified() {
     );
 }
 
+/// The suffixed copy sbt downloads into `.socket/sbt-hosted` at load.
+fn write_installed_copy(project: &Path) -> PathBuf {
+    let copy = project
+        .join(HOSTED_REPO_REL)
+        .join("com/google/code/gson/gson")
+        .join(SV);
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join(format!("gson-{SV}.jar")), JAR).unwrap();
+    std::fs::write(copy.join(format!("gson-{SV}.pom")), POM).unwrap();
+    copy
+}
+
+/// `(attested, vex_sbt_pin_bypassed, envelope)` of a `vex` run over
+/// `project`.
+fn vex_verdict(home: &SbtHome, project: &Path) -> (bool, bool, serde_json::Value) {
+    let api = Api::start();
+    api.grant(UUID, GROUP, ARTIFACT, BASE);
+    let (_, json) = vex(home, project, &api.server.uri());
+    let doc = std::fs::read_to_string(project.join("vex.json")).unwrap_or_default();
+    let bypassed = all_codes(&json).contains(&"vex_sbt_pin_bypassed".to_string());
+    (doc.contains("\"not_affected\""), bypassed, json)
+}
+
+/// An unverified pin (no evidence) keeps the installed-copy basis: the
+/// suffixed copy sbt downloaded into `.socket/sbt-hosted` at load attests
+/// it. A `dependencyOverrides` reassignment replaces the generated override
+/// where it applies, so the same copy proves nothing about what the build
+/// runs: the patch is omitted with `vex_sbt_pin_bypassed`. A `resolvers`
+/// reassignment does not: the override still forces the Socket-only
+/// version and sbt's load-time verifier checks its bytes, so that build
+/// runs the pinned bytes or fails — unless an `onLoad` reassignment drops
+/// the installer that verifier lives in, which withdraws the pin too.
+#[test]
+fn hosted_vex_installed_copy_is_withdrawn_by_an_overrides_reassignment() {
+    for (edit, withdrawn) in [
+        (None, false),
+        (Some("dependencyOverrides := Seq()\n"), true),
+        (Some("resolvers := Seq(Resolver.mavenLocal)\n"), false),
+        // Dropping the generated installer removes that verifier.
+        (
+            Some("resolvers := Seq(Resolver.mavenLocal)\nGlobal / onLoad := identity\n"),
+            true,
+        ),
+        (
+            Some("Global / onLoad := (Global / onLoad).value andThen (s => s)\n"),
+            false,
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = SbtHome::new(tmp.path());
+        let project = committed_project(tmp.path());
+        if let Some(edit) = edit {
+            let mut build = std::fs::read_to_string(project.join("build.sbt")).unwrap();
+            build.push_str(edit);
+            std::fs::write(project.join("build.sbt"), build).unwrap();
+        }
+        write_installed_copy(&project);
+        let (attested, bypassed, json) = vex_verdict(&home, &project);
+        assert!(
+            all_codes(&json).contains(&"sbt_resolution_unverified".to_string()),
+            "{edit:?}: {json}"
+        );
+        assert_eq!(
+            (attested, bypassed),
+            (!withdrawn, withdrawn),
+            "{edit:?}: {json}"
+        );
+    }
+}
+
+/// Post-wiring evidence that verifies the pin is never overruled by a
+/// static reading of the build: `sbt.override.build.repos=true` (no
+/// evidence blocker, so the lockfile basis stands) or a self-referencing
+/// `dependencyOverrides :=` (an evidence blocker, so the installed copy
+/// attests).
+#[test]
+fn hosted_vex_never_withdraws_a_pin_current_evidence_verifies() {
+    for (file, edit) in [
+        (".sbtopts", "-Dsbt.override.build.repos=true\n"),
+        (
+            "build.sbt",
+            "dependencyOverrides := dependencyOverrides.value\n",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = SbtHome::new(tmp.path());
+        let project = evidence_project(tmp.path());
+        let mut text = std::fs::read_to_string(project.join(file)).unwrap_or_default();
+        text.push_str(edit);
+        std::fs::write(project.join(file), text).unwrap();
+        std::fs::write(project.join(HOSTED_FILE), expected_file(&project)).unwrap();
+        let copy = write_installed_copy(&project);
+        post_update_evidence(
+            &project,
+            &std::fs::canonicalize(&copy)
+                .unwrap()
+                .join(format!("gson-{SV}.jar")),
+        );
+        let (attested, bypassed, json) = vex_verdict(&home, &project);
+        assert!(attested && !bypassed, "{file}: {json}");
+    }
+}
+
 /// What `sbt update` records after wiring: `b` resolves the pinned version,
 /// its jar at `jar` (absolute), dated after the generated file.
 fn post_update_evidence(project: &Path, jar: &Path) {

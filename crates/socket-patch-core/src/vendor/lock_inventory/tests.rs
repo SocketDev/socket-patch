@@ -785,6 +785,232 @@ packages:
     );
 }
 
+/// The inventory twin of discovery's
+/// `pnpm_rush_without_subspaces_and_unsafe_subspace_names`: a subspace dir
+/// whose name is not a safe path segment is never read, so the inventory
+/// lists no package that discovery skips.
+#[tokio::test]
+async fn rush_skips_unsafe_subspace_names() {
+    // Memory: every platform, both unsafe spellings.
+    let mut project = MemoryProject::new();
+    project.insert_text("rush.json", RUSH_JSON);
+    project.insert_text(RUSH_COMMON_LOCK, PNPM_LOCK);
+    project.insert_text("common/config/subspaces/a:b/pnpm-lock.yaml", OUTSIDE_LOCK);
+    project.insert_text("common/config/subspaces/a\\b/pnpm-lock.yaml", OUTSIDE_LOCK);
+    let names = npm_inventory_names(&ProjectView::Memory(&project)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    assert!(!names.contains(&"only-outside".to_string()), "{names:?}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    // `:` is not a legal Windows path character: Unix only.
+    if cfg!(unix) {
+        write_nested(
+            tmp.path(),
+            "common/config/subspaces/a:b/pnpm-lock.yaml",
+            OUTSIDE_LOCK,
+        )
+        .await;
+    }
+    let snapshot = DiskSnapshot::new(tmp.path());
+    for view in [
+        ProjectView::Disk(tmp.path()),
+        ProjectView::Snapshot(&snapshot),
+    ] {
+        let names = npm_inventory_names(&view).await;
+        assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"only-outside".to_string()),
+            "an unsafe subspace name must not be read: {names:?}"
+        );
+    }
+}
+
+const RUSH_JSON: &str = r#"{"rushVersion":"5.0.0"}"#;
+const RUSH_COMMON_LOCK: &str = "common/config/rush/pnpm-lock.yaml";
+/// A lock whose only package marks a read the inventory must not make.
+const OUTSIDE_LOCK: &str = "lockfileVersion: '9.0'
+
+packages:
+
+  only-outside@1.0.0:
+    resolution: {integrity: sha512-outside==}
+";
+
+/// The sorted package names the npm-family inventory lists through `view`
+/// (empty when it lists none).
+async fn npm_inventory_names(view: &ProjectView<'_>) -> Vec<String> {
+    let entries = super::npm_family::inventory_npm_lock_in(view)
+        .await
+        .unwrap()
+        .map(|(_, entries)| entries)
+        .unwrap_or_default();
+    let mut names: Vec<String> = entries.into_iter().map(|e| e.name).collect();
+    names.sort();
+    names
+}
+
+// The inventory's `rush.json` gate is discovery's (`exists_no_follow`
+// through the view), pinned by the four `rush_gate_*` tests below.
+
+/// A rush.json only in a Snapshot's overlay counts.
+#[tokio::test]
+async fn rush_gate_sees_the_snapshot_overlay() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    let snapshot = DiskSnapshot::new(tmp.path());
+    snapshot.overlay("rush.json", RUSH_JSON.as_bytes());
+    let names = npm_inventory_names(&ProjectView::Snapshot(&snapshot)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// The gate probes through the view, so a tracked snapshot's recording
+/// stays reusable and covers `rush.json`.
+#[tokio::test]
+async fn rush_gate_keeps_the_recording_reusable() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    let tracked = DiskSnapshot::tracked(tmp.path());
+    tracked.begin_recording();
+    let names = npm_inventory_names(&ProjectView::Snapshot(&tracked)).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    let reads = tracked
+        .end_recording()
+        .expect("the rush gate must not read around the view");
+    assert!(!reads.is_empty());
+}
+
+/// A dangling rush.json symlink is not Rush (Rush cannot load it): hosted
+/// mode's gate, which discovery and the inventory share.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_gate_ignores_a_dangling_symlink() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    std::os::unix::fs::symlink("missing.json", tmp.path().join("rush.json")).unwrap();
+    assert!(!super::pnpm::is_rush(ProjectView::Disk(tmp.path())).await);
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// An implied in-memory directory named rush.json is not Rush either; a
+/// link to a regular rush.json is.
+#[tokio::test]
+async fn rush_gate_ignores_a_memory_implied_dir() {
+    let mut project = MemoryProject::new();
+    project.insert_present("rush.json/placeholder");
+    project.insert_text(RUSH_COMMON_LOCK, PNPM_LOCK);
+    assert!(!super::pnpm::is_rush(ProjectView::Memory(&project)).await);
+    let names = npm_inventory_names(&ProjectView::Memory(&project)).await;
+    assert!(!names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// On disk a symlink to a regular rush.json counts, as hosted's
+/// `is_file` gate always counted it.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_gate_counts_a_link_to_a_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "real-rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    std::os::unix::fs::symlink("real-rush.json", tmp.path().join("rush.json")).unwrap();
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+}
+
+/// The member-lock reader skips a Rush monorepo on the same gate as
+/// discovery (which reads Rush's locks there, never the members').
+#[tokio::test]
+async fn rush_member_locks_gate_matches_discovery() {
+    let mut project = MemoryProject::new();
+    project.insert_text("pnpm-workspace.yaml", "packages:\n  - packages/*\n");
+    project.insert_text(".npmrc", "shared-workspace-lockfile=false\n");
+    project.insert_text("packages/a/package.json", "{}");
+    project.insert_text("packages/a/pnpm-lock.yaml", OUTSIDE_LOCK);
+    let view = ProjectView::Memory(&project);
+    assert!(
+        !super::pnpm::inventory_pnpm_member_locks_in(&view)
+            .await
+            .is_empty(),
+        "the fixture must list a member lock without rush.json"
+    );
+    // An implied directory named rush.json is not Rush: members still count.
+    project.insert_present("rush.json/placeholder");
+    let view = ProjectView::Memory(&project);
+    assert!(!super::pnpm::inventory_pnpm_member_locks_in(&view)
+        .await
+        .is_empty());
+    let mut project = project.clone();
+    project.remove("rush.json/placeholder");
+    project.insert_text("rush.json", RUSH_JSON);
+    let view = ProjectView::Memory(&project);
+    let members = super::pnpm::inventory_pnpm_member_locks_in(&view).await;
+    assert!(members.is_empty(), "{members:?}");
+}
+
+/// Rush's lock dirs are read only through real directories: a symlinked
+/// `common`, `common/config`, `common/config/rush` or
+/// `common/config/subspaces` could point the read at another repository.
+#[cfg(unix)]
+#[tokio::test]
+async fn rush_refuses_symlinked_lock_dirs() {
+    use std::os::unix::fs::symlink;
+    let outside = tempfile::tempdir().unwrap();
+    write_nested(outside.path(), "rush/pnpm-lock.yaml", OUTSIDE_LOCK).await;
+    write_nested(outside.path(), "subspaces/x/pnpm-lock.yaml", OUTSIDE_LOCK).await;
+    write_nested(
+        outside.path(),
+        "common/config/rush/pnpm-lock.yaml",
+        OUTSIDE_LOCK,
+    )
+    .await;
+    let rels = |root: &Path| {
+        let root = root.to_path_buf();
+        async move { super::pnpm::rush_lock_rels(ProjectView::Disk(&root)).await }
+    };
+
+    // A symlinked subspaces dir: the real common lock alone.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, PNPM_LOCK).await;
+    symlink(
+        outside.path().join("subspaces"),
+        tmp.path().join("common/config/subspaces"),
+    )
+    .unwrap();
+    assert_eq!(rels(tmp.path()).await, vec![RUSH_COMMON_LOCK.to_string()]);
+    let names = npm_inventory_names(&ProjectView::Disk(tmp.path())).await;
+    assert!(names.contains(&"left-pad".to_string()), "{names:?}");
+    assert!(!names.contains(&"only-outside".to_string()), "{names:?}");
+
+    // A symlinked common/config/rush: no common lock.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    tokio::fs::create_dir_all(tmp.path().join("common/config"))
+        .await
+        .unwrap();
+    symlink(
+        outside.path().join("rush"),
+        tmp.path().join("common/config/rush"),
+    )
+    .unwrap();
+    assert!(rels(tmp.path()).await.is_empty());
+    assert!(npm_inventory_names(&ProjectView::Disk(tmp.path()))
+        .await
+        .is_empty());
+
+    // A symlinked `common`: nothing under it.
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
+    symlink(outside.path().join("common"), tmp.path().join("common")).unwrap();
+    assert!(rels(tmp.path()).await.is_empty());
+    assert!(npm_inventory_names(&ProjectView::Disk(tmp.path()))
+        .await
+        .is_empty());
+}
+
 // ── yarn classic ──────────────────────────────────────────────────────
 
 const YARN_CLASSIC: &str = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.
@@ -2237,7 +2463,7 @@ async fn fifo_lockfiles_fail_fast_instead_of_wedging() {
             inventory_yarn_berry(&root).await,
             inventory_bun(&root).await,
             inventory_vlt(&root).await,
-            inventory_pnpm_lock_at(&root.join("shrinkwrap.yaml")).await,
+            inventory_pnpm_lock_rel_in(&ProjectView::Disk(&root), "shrinkwrap.yaml").await,
             gem_remotes(&root).await,
         )
     };
@@ -2737,6 +2963,26 @@ async fn bun_binary_hosted_pins_inventory_as_their_registry_package() {
     let minimist = entry(&entries, "minimist");
     assert_eq!(minimist.resolved, None);
     assert_eq!(minimist.integrity, LockIntegrity::None);
+}
+
+/// A composer.lock saved with a UTF-8 BOM inventories past it, as lockfile
+/// discovery and the vendored backend read it; before, the whole lock
+/// vanished from the inventory. A second BOM is content (unparseable).
+#[tokio::test]
+async fn composer_lock_with_a_bom_inventories_its_entries() {
+    let lock = r#"{"packages": [{"name": "good/pkg", "version": "1.0.0",
+        "dist": {"type": "zip", "url": "https://example.com/p.zip",
+                 "shasum": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}]}"#;
+    let bom = crate::formats::text::BOM;
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "composer.lock", &format!("{bom}{lock}")).await;
+    let entries = inventory_composer_lock(tmp.path()).await.unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0].purl, "pkg:composer/good/pkg@1.0.0");
+    assert!(matches!(entries[0].integrity, LockIntegrity::Sha1Hex(_)));
+
+    write(tmp.path(), "composer.lock", &format!("{bom}{bom}{lock}")).await;
+    assert!(inventory_composer_lock(tmp.path()).await.is_none());
 }
 
 /// composer.lock packages missing a name or version are skipped, and
@@ -3733,4 +3979,155 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
     assert_ne!(warnings[0].1, "probe detail text");
     assert_ne!(warnings[1].1, "probe detail text");
     assert_eq!(warnings[2].1, "probe detail text");
+}
+
+/// The guard that keeps Socket's PATCHED bytes from ever standing in for a
+/// pristine upstream artifact. This inventory (and [`recover_lock_entry`])
+/// lists a Socket-hosted entry as the package it replaces, with the hosted
+/// artifact's URL as `resolved` and the patched artifact's hash as
+/// `integrity` (composer's dist sha1, a gem's CHECKSUMS sha256, an npm
+/// hosted tarball's SRI). That is safe only because no code downloads
+/// what a lock pins:
+///
+/// * the vendored backends and `repair` take their bytes from the patch
+///   service by patch uuid (`vendor::service_fetch::fetch_verified_archive`),
+///   verified against the service's own digest;
+/// * `recover_lock_entry`'s one production caller is
+///   `vendor::refusals::pristine_fetch_is_verifiable`, a yes/no gate on
+///   which lock-text refusals to report; it fetches nothing (the CLI has
+///   no reference at all, and pins that side);
+/// * the only registry downloads are the hosted → vendored takeover's
+///   upstream restore (`patch::redirect::upstream::client`), which
+///   re-resolves the entry from the registry's own metadata and never
+///   reads the hosted pin's URL or hash, and the JVM backend's Maven
+///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
+///   coordinates and checked against the upstream checksum files.
+///
+/// [`PINNED_REFERENCES`] lists every production reference to those three
+/// functions in this crate, by file and line text. What the check catches:
+/// any new reference by name — a call through any path, a method call, a
+/// `use` (an alias must name the original once), a re-export, or the
+/// function passed as a value — in any file, allowlisted or not. What it
+/// does not: a call reached through a function value or wrapper an
+/// existing pinned line already hands out (a new caller of
+/// `upstream::client`'s own methods, say), code generated by a macro, and
+/// an edit that keeps a pinned line's text while changing what feeds it.
+/// Those stay a review matter: read the pristine source from the
+/// registry, never from a lock entry that might be Socket-hosted.
+const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "crate::vendor::registry_fetch::download(&self.http, url).await",
+    ),
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "let bytes = self.download(&dist.tarball).await?;",
+    ),
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "let zip = self.download(&format!(\"{base}.zip\")).await?;",
+    ),
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "let go_mod = self.download(&format!(\"{base}.mod\")).await?;",
+    ),
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "let bytes = self.download(&url).await?;",
+    ),
+    // `get_text`: registry metadata documents.
+    (
+        "patch/redirect/upstream/client.rs",
+        "download",
+        "let bytes = self.download(url).await?;",
+    ),
+    // The self-update's own `download` module and timeout field (name
+    // collisions: it fetches socket-patch's release binary, no lock pin).
+    (
+        "update/download.rs",
+        "download",
+        ".timeout(timeouts.download)",
+    ),
+    ("update/mod.rs", "download", "pub mod download;"),
+    (
+        "update/mod.rs",
+        "download",
+        "download::sweep_stale_stages(dest_dir);",
+    ),
+    (
+        "update/mod.rs",
+        "download",
+        "let staged = download::download_and_stage(",
+    ),
+    ("update/release.rs", "download", "pub download: Duration,"),
+    (
+        "update/release.rs",
+        "download",
+        "download: Duration::from_secs(300),",
+    ),
+    ("update/release.rs", "download", "download: budget,"),
+    (
+        "patch/jvm_jar.rs",
+        "fetch_registry_bytes",
+        "let bytes = crate::vendor::maven_repo::fetch_registry_bytes(",
+    ),
+    (
+        "vendor/maven_repo.rs",
+        "fetch_registry_bytes",
+        "match fetch_registry_bytes(&url, super::registry_fetch::MAX_DOWNLOAD_BYTES).await {",
+    ),
+    (
+        "vendor/maven_repo.rs",
+        "fetch_registry_bytes",
+        "fetch_registry_bytes(",
+    ),
+    (
+        "vendor/maven_repo.rs",
+        "fetch_registry_bytes",
+        "fetch_registry_bytes(url, MAX_POM_BYTES as u64).await",
+    ),
+    (
+        "vendor/lock_inventory/mod.rs",
+        "recover_lock_entry",
+        "pub use self::recover::recover_lock_entry;",
+    ),
+    (
+        "vendor/refusals.rs",
+        "recover_lock_entry",
+        "Some(le) => lock_inventory::recover_lock_entry(project_root, le)",
+    ),
+];
+
+#[test]
+fn lock_pinned_locations_never_drive_a_download() {
+    use crate::vendor::test_support::production_sources::{production_sources, references};
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found: Vec<(String, &str, String)> = Vec::new();
+    for file in production_sources(&src) {
+        let code = file.code();
+        let lines: Vec<&str> = file.text.lines().collect();
+        for name in ["download", "fetch_registry_bytes", "recover_lock_entry"] {
+            for (line, _) in references(&code, name) {
+                found.push((file.rel.clone(), name, lines[line - 1].trim().to_string()));
+            }
+        }
+    }
+    found.sort();
+    let mut expected: Vec<(String, &str, String)> = PINNED_REFERENCES
+        .iter()
+        .map(|(rel, name, line)| (rel.to_string(), *name, line.to_string()))
+        .collect();
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "a production reference to a registry download or to `recover_lock_entry` was added, \
+         removed or changed. A download must never take its URL or hash from a lock entry, \
+         which may be Socket-hosted (patched bytes); re-check the site against this test's \
+         docs, then update PINNED_REFERENCES"
+    );
 }

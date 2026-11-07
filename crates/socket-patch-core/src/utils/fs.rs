@@ -88,6 +88,48 @@ pub(crate) async fn is_dir(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the file system holding `path` resolves names ASCII
+/// case-insensitively, probed by looking `path` up with the case of its
+/// last component flipped: the same file answers yes. `false` when that
+/// cannot be shown (`path` missing, no ASCII letter in its name, a distinct
+/// file under the flipped name).
+pub async fn folds_case(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let flipped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    if flipped == name {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (
+        tokio::fs::symlink_metadata(path).await,
+        tokio::fs::symlink_metadata(path.with_file_name(&flipped)).await,
+    ) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        // No stable file id on stable Rust here; Windows file systems fold
+        // case, and a second, distinct entry under the flipped name is
+        // practically never there.
+        a.file_type() == b.file_type()
+    }
+}
+
 /// Blocking twin of [`list_dir_entries`] for walkers that run whole on the
 /// blocking pool (one hop per crawl instead of one per filesystem call).
 ///

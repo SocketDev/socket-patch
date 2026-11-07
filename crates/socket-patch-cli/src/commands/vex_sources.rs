@@ -84,7 +84,7 @@ use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState}
 use socket_patch_core::vex::discover::{
     vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
 };
-use socket_patch_core::vex::{FailedPatch, UnattestedKind};
+use socket_patch_core::vex::{FailedPatch, Unattested, UnattestedKind};
 
 use crate::args::GlobalArgs;
 use crate::ui::plural;
@@ -232,6 +232,30 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a vendored sbt pin the build's local resolution
+/// evidence does not verify, or under a build-wide blocker
+/// (`vex::Unattested`, `UnattestedKind::SbtResolutionUnverified`).
+const NOTE_SBT_RESOLUTION_UNVERIFIED: &str = "vex_sbt_resolution_unverified";
+/// Omission tag and note: a vendored sbt pin's committed tree file is
+/// missing or modified (`vex::Unattested`,
+/// `UnattestedKind::SbtVendoredTreeMissing`).
+const NOTE_SBT_VENDORED_TREE_MISSING: &str = "vex_sbt_vendored_tree_missing";
+/// Omission tag and note: a NuGet Socket source's id is also locked at a
+/// version other than the patched one, which that source cannot serve
+/// (`vex::Unattested`).
+const NOTE_NUGET_LOCK_OTHER_VERSION: &str = "vex_nuget_lock_other_version";
+/// Omission tag and note: a hosted sbt pin whose bytes the build provably
+/// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
+/// dropping the load-time verifier, or current evidence
+/// resolving another version or other bytes), so the downloaded copy
+/// proves nothing (`vex::Unattested`).
+const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
+/// Omission tag for a Go patch whose replace the `go.work` in effect
+/// overrides, ignores or rejects (#393, #458, #531): the reason of `vex`'s
+/// own go.mod gate, and the note of a discovered hosted or vendored ref the
+/// governing workspace keeps from the build (`vex::Unattested`,
+/// `UnattestedKind::GoWorkspaceOverride`).
+pub(crate) const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -268,7 +292,67 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
         ),
+        UnattestedKind::SbtResolutionUnverified => (
+            NOTE_SBT_RESOLUTION_UNVERIFIED,
+            "not attested while that holds (the detail names the remedy, or that there is \
+             none); the wiring itself is intact, so `vendor --check` and `scan` still treat it \
+             as live",
+        ),
+        UnattestedKind::SbtVendoredTreeMissing => (
+            NOTE_SBT_VENDORED_TREE_MISSING,
+            "not attested while the committed tree differs from the pin (restore \
+             `.socket/vendor/maven2` from version control, or re-run `socket-patch vendor`)",
+        ),
+        UnattestedKind::NugetLockOtherVersion => (
+            NOTE_NUGET_LOCK_OTHER_VERSION,
+            "not attested until every target framework locks only the patched version (align \
+             them on it, restore, and re-run `scan` / `vendor`)",
+        ),
+        UnattestedKind::SbtPinBypassed => (
+            NOTE_SBT_PIN_BYPASSED,
+            "not attested while the build bypasses the pin, even from the copy under \
+             `.socket/sbt-hosted`; the wiring itself is intact, so re-running `scan` does not \
+             change this (fix the build, then run `sbt update`)",
+        ),
+        UnattestedKind::GoWorkspaceOverride => (
+            GO_WORKSPACE_OVERRIDE,
+            "not attested while the Go workspace in effect keeps it from the build; the wiring \
+             itself is intact, so re-running `scan` / `vendor` does not change this",
+        ),
     }
+}
+
+/// The [`Unattested`](socket_patch_core::vex::Unattested) mark discovery
+/// put on patch `uuid` for `purl`'s package, if any.
+fn unattested_mark<'d>(
+    discovery: &'d Discovery,
+    purl: &str,
+    uuid: &str,
+) -> Option<&'d socket_patch_core::vex::Unattested> {
+    let pkg = canonical_base_purl(purl);
+    discovery
+        .unattested
+        .iter()
+        .find(|u| u.uuid == uuid && PurlKey::same(&u.purl, &pkg))
+}
+
+/// Omit `key` for the mark `u`: its `failed[]` entry and the note naming
+/// why and the remedy.
+fn gate_unattested(
+    key: &str,
+    u: &socket_patch_core::vex::Unattested,
+    gated: &mut Vec<FailedPatch>,
+    notes: &mut Vec<PlanNote>,
+) {
+    let (code, remedy) = unattested_note(u.kind);
+    gated.push(failed(key, code));
+    notes.push(PlanNote {
+        code,
+        detail: format!(
+            "{key}: patch {} is wired, but {}; {remedy}",
+            u.uuid, u.detail
+        ),
+    });
 }
 
 /// One hosted-basis view purl's wiring (see [`Plan::hosted`]).
@@ -421,24 +505,50 @@ pub(crate) async fn plan(
     // package-lock.json twin, which npm >= 12 ignores): the ref keeps
     // rollback, remove, list and the ledgers' liveness working, and the
     // patch is omitted.
-    cands.retain(|c| {
+    // A file-scoped mark (a Go replace the workspace keeps from the build)
+    // bypasses only its own file's ref: another file's live ref of the
+    // same patch attests on its own basis, without the bypassed one.
+    // Purls some candidate attests through a ref no mark bypasses: a
+    // lockfile-only candidate left with nothing but file-scoped bypassed
+    // refs of the same purl (a stale pin the workspace keeps from the
+    // build) is then dropped, never both attested and reported skipped.
+    let live_purls: Vec<String> = cands
+        .iter()
+        .filter(|c| c.discovered.iter().any(|r| !bypassed_ref(&discovery, r)))
+        .map(|c| canonical_base_purl(&c.key))
+        .collect();
+    cands.retain_mut(|c| {
         let pkg = canonical_base_purl(&c.key);
-        let Some(u) = discovery
+        let marks: Vec<&Unattested> = discovery
             .unattested
             .iter()
-            .find(|u| u.uuid == c.uuid && PurlKey::same(&u.purl, &pkg))
-        else {
+            .filter(|u| u.uuid == c.uuid && PurlKey::same(&u.purl, &pkg))
+            .collect();
+        let Some(&first) = marks.first() else {
             return true;
         };
-        let (code, remedy) = unattested_note(u.kind);
-        gated.push(failed(&c.key, code));
-        notes.push(PlanNote {
-            code,
-            detail: format!(
-                "{}: patch {} is wired, but {}; {remedy}",
-                c.key, c.uuid, u.detail
-            ),
-        });
+        let u = match marks.iter().find(|u| !u.kind.file_scoped()) {
+            Some(u) => *u,
+            None => {
+                c.discovered.retain(|r| !bypassed_ref(&discovery, r));
+                if !c.discovered.is_empty() {
+                    return true;
+                }
+                if c.lockfile_only && live_purls.iter().any(|p| PurlKey::same(p, &pkg)) {
+                    notes.push(PlanNote {
+                        code: unattested_note(first.kind).0,
+                        detail: format!(
+                            "{}: patch {}'s wiring is bypassed ({}); another patch's live \
+                             wiring of the same package is attested",
+                            c.key, c.uuid, first.detail
+                        ),
+                    });
+                    return false;
+                }
+                first
+            }
+        };
+        gate_unattested(&c.key, u, &mut gated, &mut notes);
         false
     });
     for (key, old_uuid, wired) in &superseded {
@@ -471,6 +581,7 @@ pub(crate) async fn plan(
                 continue;
             }
         }
+        let mut took_over = false;
         let basis = if let Some(vref) = cand
             .discovered
             .iter()
@@ -507,6 +618,7 @@ pub(crate) async fn plan(
                 cand.uuid = hosted.uuid.clone();
                 cand.record = Some(hosted);
                 cand.vendor_entry = None;
+                took_over = true;
                 Basis::Hosted {
                     lockfile_basis: false,
                 }
@@ -542,6 +654,21 @@ pub(crate) async fn plan(
         } else {
             Basis::Installed
         };
+        // The vendored basis attests the ENTRY's patch, which need not be
+        // the candidate's uuid (a manifest record under another uuid keeps
+        // the key; a vendored sbt pin has no ref to swap it in): its mark
+        // is checked against what is actually attested.
+        // Likewise the hosted-over-vendored takeover attests the redirect
+        // ledger's uuid, swapped in after the early gate ran.
+        let attested = match &basis {
+            Basis::Vendored(entry) => Some((entry.base_purl.as_str(), entry.uuid.as_str())),
+            Basis::Hosted { .. } if took_over => Some((cand.key.as_str(), cand.uuid.as_str())),
+            _ => None,
+        };
+        if let Some(u) = attested.and_then(|(purl, uuid)| unattested_mark(&discovery, purl, uuid)) {
+            gate_unattested(&cand.key, u, &mut gated, &mut notes);
+            continue;
+        }
         based.push((cand, basis));
     }
 
@@ -717,7 +844,15 @@ fn build_candidates(
 /// disagreeing wiring (`<uuid> (<file>), …`) for the note.
 fn wiring_conflicts(discovery: &Discovery) -> BTreeMap<String, String> {
     let mut by_pkg: BTreeMap<&str, BTreeMap<&str, BTreeSet<String>>> = BTreeMap::new();
-    for r in &discovery.refs {
+    // A ref whose file the build never reads wires nothing it installs.
+    // The root go.mod is the exception: a `GOWORK=off` build from the root
+    // reads it (cf. `ReplaceHost::mirrors_root_go_mod`), so a different
+    // patch there still disagrees with the go.work that overrides it.
+    for r in discovery
+        .refs
+        .iter()
+        .filter(|r| r.source_file == std::path::Path::new("go.mod") || !bypassed_ref(discovery, r))
+    {
         by_pkg
             .entry(r.purl.as_str())
             .or_default()
@@ -741,6 +876,17 @@ fn wiring_conflicts(discovery: &Discovery) -> BTreeMap<String, String> {
             (pkg.to_string(), wiring.join(", "))
         })
         .collect()
+}
+
+/// Whether a file-scoped [`Unattested`] mark ([`UnattestedKind::file_scoped`])
+/// covers `r`: the same patch and package, in the same file.
+fn bypassed_ref(discovery: &Discovery, r: &PatchedRef) -> bool {
+    discovery.unattested.iter().any(|u| {
+        u.kind.file_scoped()
+            && u.uuid == r.uuid
+            && u.file == r.source_file
+            && PurlKey::same(&u.purl, &canonical_base_purl(&r.purl))
+    })
 }
 
 /// Attach every lockfile reference (except those of `conflicts`' packages,
@@ -1542,6 +1688,29 @@ mod tests {
         let dead = plan(&common(tmp.path()), mk(), &[], &RunApiClient::new()).await;
         assert!(dead.view.patches.is_empty());
         assert_eq!(dead.gated, vec![failed(key, VENDOR_UNWIRED)]);
+
+        // The takeover attests the redirect ledger's uuid, swapped in after
+        // the early mark gate ran: a mark on it still gates.
+        let mut marked = mk();
+        marked
+            .discovery
+            .unattested
+            .push(socket_patch_core::vex::Unattested {
+                purl: key.into(),
+                uuid: U2.into(),
+                file: "package-lock.json".into(),
+                detail: "package-lock.json bypasses it".into(),
+                kind: UnattestedKind::LockAboveBase,
+            });
+        let gated = plan(
+            &common(tmp.path()),
+            marked,
+            &[key.to_string()],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty(), "{:?}", gated.view.patches);
+        assert_eq!(gated.gated, vec![failed(key, NOTE_LOCK_ABOVE_BASE)]);
     }
 
     /// Core discover rule 11 through the plan: a vendor ledger entry and a
@@ -1760,6 +1929,106 @@ mod tests {
         .await;
         assert!(live.gated.is_empty(), "{:?}", live.gated);
         assert!(live.hosted.contains_key(PURL));
+    }
+
+    /// A hosted Go ref of `uuid` in `file`, and the Go workspace mark on it.
+    fn go_ref(purl: &str, uuid: &str, file: &str) -> PatchedRef {
+        PatchedRef::hosted(
+            purl.to_string(),
+            uuid.to_string(),
+            file,
+            None,
+            Some(LockIntegrity::GoH1("h1:x".into())),
+            true,
+        )
+    }
+
+    fn go_bypass(purl: &str, uuid: &str, file: &str) -> socket_patch_core::vex::Unattested {
+        socket_patch_core::vex::Unattested {
+            purl: purl.into(),
+            uuid: uuid.into(),
+            file: file.into(),
+            detail: format!("go builds the workspace of ../ci/go.work, never this {file}"),
+            kind: UnattestedKind::GoWorkspaceOverride,
+        }
+    }
+
+    /// Review finding 1: a Go workspace mark bypasses only its own file. A
+    /// root go.work replace go never reads does not withhold the patch the
+    /// root go.mod's mirror of it wires, which attests on its own basis;
+    /// alone, the bypassed ref is omitted with `go_workspace_override`.
+    #[tokio::test]
+    async fn a_go_workspace_mark_withholds_only_its_own_file() {
+        const PURL: &str = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut redirect = RedirectState::new();
+        redirect.records.insert(PURL.into(), record(U1));
+        let sources = |discovery: Discovery| Sources {
+            manifest: PatchManifest::new(),
+            vendor: VendorState::new(),
+            redirect: Some(redirect.clone()),
+            discovery,
+        };
+        let mut both = discovery(vec![
+            go_ref(PURL, U1, "go.work"),
+            go_ref(PURL, U1, "go.mod"),
+        ]);
+        both.unattested.push(go_bypass(PURL, U1, "go.work"));
+        let live = plan(
+            &common(tmp.path()),
+            sources(both),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(live.gated.is_empty(), "{:?}", live.gated);
+        let wiring = &live.hosted[PURL];
+        assert_eq!(wiring.refs.len(), 1, "{:?}", wiring.refs);
+        assert_eq!(wiring.refs[0].source_file, Path::new("go.mod"));
+
+        let mut alone = discovery(vec![go_ref(PURL, U1, "go.work")]);
+        alone.unattested.push(go_bypass(PURL, U1, "go.work"));
+        let gated = plan(
+            &common(tmp.path()),
+            sources(alone),
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(gated.gated, vec![failed(PURL, GO_WORKSPACE_OVERRIDE)]);
+    }
+
+    /// Review finding 4: Socket's own go.work replace overriding a leftover
+    /// member pin of another patch is what the build links (as `vex`'s
+    /// go.mod gate holds): the overridden pin is withheld, never a wiring
+    /// conflict that also withholds the go.work patch.
+    #[tokio::test]
+    async fn a_bypassed_leftover_pin_is_no_wiring_conflict() {
+        const PURL: &str = "pkg:golang/github.com/foo/bar@v1.4.2";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut redirect = RedirectState::new();
+        redirect.records.insert(PURL.into(), record(U1));
+        let mut found = discovery(vec![
+            go_ref(PURL, U1, "go.work"),
+            go_ref(PURL, U2, "app/go.mod"),
+        ]);
+        found.unattested.push(go_bypass(PURL, U2, "app/go.mod"));
+        let sources = Sources {
+            manifest: PatchManifest::new(),
+            vendor: VendorState::new(),
+            redirect: Some(redirect),
+            discovery: found,
+        };
+        let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
+        assert_eq!(plan.hosted[PURL].uuid, U1);
+        // Review on #2011 (round 2): the attested purl is never also
+        // reported skipped for its stale, bypassed leftover pin.
+        assert!(
+            !plan.gated.iter().any(|f| PurlKey::same(&f.purl, PURL)),
+            "{:?}",
+            plan.gated
+        );
     }
 
     /// Ledger-only records with no wiring anywhere are gated, except the

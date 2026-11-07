@@ -228,7 +228,7 @@ pub(crate) async fn detect_npm_lock_flavor_in(
             //    survive Rush's generated-workspace install (installs run
             //    from common/temp). Point the user at hosted mode, which
             //    edits the lock in place.
-            if view.exists("rush.json").await {
+            if crate::vendor::lock_inventory::pnpm::is_rush(*view).await {
                 return Err((
                     "vendor_rush_unsupported",
                     format!(
@@ -786,16 +786,24 @@ pub async fn lock_text_refusals(
 /// rule): npm 12 installs from package-lock.json beside a committed
 /// npm-shrinkwrap.json, so a mention in either lock can be the one an
 /// install resolves through.
+///
+/// `Some(false)` lets a revert delete the artifact, so every spelling of
+/// the path counts ([`crate::utils::path_spelling::PathNeedle::keep`]): `\/` JSON escapes, backslashed
+/// Windows separators, `\u` escapes, and any ASCII case. A committed lock
+/// is installed on case-folding disks (macOS, Windows) too, where a
+/// re-cased path does resolve to this artifact, so a case-sensitive CI
+/// disk must not delete it.
 pub(super) async fn lock_text_mentions_uuid(
     project_root: &Path,
     names: &[&str],
     uuid: &str,
 ) -> Option<bool> {
-    let needle = format!(".socket/vendor/npm/{uuid}/");
+    let needle =
+        crate::utils::path_spelling::PathNeedle::keep(&format!(".socket/vendor/npm/{uuid}/"));
     let mut any_readable = false;
     for name in names {
         if let Ok(text) = read_regular_to_string(&project_root.join(name)).await {
-            if text.contains(&needle) {
+            if needle.found_in(&text) {
                 return Some(true);
             }
             any_readable = true;
@@ -1186,6 +1194,70 @@ mod tests {
 
     use super::*;
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
+
+    /// The post-restore and unwired-revert gates delete the artifact on
+    /// `Some(false)`, so a `\/`-escaped or backslashed spelling of the uuid
+    /// dir must read as a mention; another uuid's dir must not.
+    #[tokio::test]
+    async fn lock_text_mention_matches_every_spelling_of_the_uuid_dir() {
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        let path = format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz");
+        for (text, want) in [
+            (format!("\"resolved\": \"file:{path}\""), true),
+            (
+                format!("\"resolved\": \"file:{}\"", path.replace('/', "\\/")),
+                true,
+            ),
+            (
+                format!("\"resolved\": \"file:{}\"", path.replace('/', "\\")),
+                true,
+            ),
+            (
+                format!("\"resolved\": \"file:{}\"", path.replace('/', "\\\\")),
+                true,
+            ),
+            (
+                format!(
+                    "\"resolved\": \"{}\"",
+                    path.replace(uuid, "55555555-4444-4444-8444-444444444444")
+                ),
+                false,
+            ),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("package-lock.json"), &text).unwrap();
+            assert_eq!(
+                lock_text_mentions_uuid(dir.path(), &["package-lock.json"], uuid).await,
+                Some(want),
+                "{text}"
+            );
+        }
+    }
+
+    /// Review on #2022 (round 2): `Some(false)` lets the revert delete the
+    /// artifact, and a committed lock is installed on case-folding disks
+    /// too, so a re-cased reference counts on every disk.
+    #[tokio::test]
+    async fn lock_text_mention_folds_case_on_every_disk() {
+        let uuid = "44444444-4444-4444-8444-444444444444";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".socket")).unwrap();
+        let folds = crate::utils::fs::folds_case(&dir.path().join(".socket")).await;
+        let recased = format!(
+            ".Socket/Vendor/NPM/{}/left-pad-1.3.0.tgz",
+            uuid.to_ascii_uppercase()
+        );
+        std::fs::write(
+            dir.path().join("package-lock.json"),
+            format!("\"resolved\": \"file:{recased}\""),
+        )
+        .unwrap();
+        let _ = folds;
+        assert_eq!(
+            lock_text_mentions_uuid(dir.path(), &["package-lock.json"], uuid).await,
+            Some(true)
+        );
+    }
 
     #[test]
     fn project_root_location_reads_as_a_place() {
@@ -1769,6 +1841,17 @@ mod tests {
             detail.contains("common/config/rush/pnpm-lock.yaml"),
             "{detail}"
         );
+    }
+
+    /// The probe's Rush gate is the shared one: a directory named
+    /// `rush.json` (or a dangling link) is not a Rush monorepo, so the
+    /// refusal is the missing-lock one.
+    #[tokio::test]
+    async fn a_rush_json_directory_is_not_rush() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("rush.json")).unwrap();
+        let (code, _) = detect_npm_lock_flavor(tmp.path()).await.unwrap_err();
+        assert_ne!(code, "vendor_rush_unsupported");
     }
 
     #[tokio::test]

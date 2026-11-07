@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::formats::composer::ComposerLock;
+use crate::vendor::common::parse_json_manifest;
 
 use super::view::ProjectView;
 use super::{dedup_prefer_integrity, LockfileEntry};
@@ -38,6 +39,8 @@ pub(super) async fn inventory_composer_lock_raw_in(
     view: &ProjectView<'_>,
 ) -> Option<Vec<LockfileEntry>> {
     let bytes = view.read_bytes("composer.lock").await.ok()?;
-    let doc: Value = serde_json::from_slice(&bytes).ok()?;
+    // Past one leading BOM, as lockfile discovery and the vendored backend
+    // read it: a BOM lock is otherwise inventoried as no lock at all.
+    let doc: Value = parse_json_manifest(&bytes).ok()?;
     Some(ComposerLock::from_doc(&doc).entries())
 }
