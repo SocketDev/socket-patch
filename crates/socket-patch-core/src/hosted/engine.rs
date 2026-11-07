@@ -333,6 +333,24 @@ const USER_PATCH_LOCKS: [&str; 4] = [
     crate::constants::npm_family::RUSH_COMMON_LOCK_REL,
 ];
 
+/// The locks a disk scan reads on top of the CLI consent gate's walk for
+/// the user-patch gate ([`withhold_user_patched_by`]): a root
+/// `shrinkwrap.yaml`, and a Rush monorepo's pnpm locks — the common lock
+/// and every subspace's, through the same safe listing lockfile discovery
+/// uses ([`rush_lock_rels`]). The in-memory engine reads the subspace locks
+/// as candidate files, so leaving them out on disk would pin a package the
+/// in-memory engine withholds. Outside Rush only the common lock path is
+/// tried, as before (a missing file is simply not read).
+pub async fn user_patch_supplement_lock_rels(view: ProjectView<'_>) -> Vec<String> {
+    let mut rels = if is_rush(view).await {
+        rush_lock_rels(view).await
+    } else {
+        vec![crate::constants::npm_family::RUSH_COMMON_LOCK_REL.to_string()]
+    };
+    rels.push("shrinkwrap.yaml".to_string());
+    rels
+}
+
 /// Withhold from every rewriter each npm candidate whose package the
 /// project patches itself with pnpm (`patchedDependencies`), yarn (a
 /// `patch:` descriptor) or patch-package, recording each as skipped
@@ -4700,6 +4718,29 @@ snapshots:
     /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
     /// splices nothing on a re-run, yet its `rush install` still needs the
     /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    /// The disk scan's user-patch supplement reads every Rush subspace lock,
+    /// as the in-memory engine does through its candidate files, and only
+    /// the common lock path outside Rush.
+    #[tokio::test]
+    async fn user_patch_supplement_reads_rush_subspace_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("common/config/subspaces/web")).unwrap();
+        let disk = ProjectView::Disk(tmp.path());
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [RUSH_COMMON_LOCK_REL, "shrinkwrap.yaml"]
+        );
+        std::fs::write(tmp.path().join("rush.json"), "{}").unwrap();
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [
+                RUSH_COMMON_LOCK_REL,
+                "common/config/subspaces/web/pnpm-lock.yaml",
+                "shrinkwrap.yaml"
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
         let mut first = MemoryProject::new();
