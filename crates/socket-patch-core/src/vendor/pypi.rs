@@ -18,6 +18,7 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::{ApplyResult, PatchSources};
 use crate::utils::fs::{atomic_write_artifact, read_regular_to_bytes, read_regular_to_string};
 use crate::utils::group_commit::{self, GroupCommit};
+use crate::utils::path_spelling::PathNeedle;
 use crate::utils::purl::{parse_pypi_purl, strip_purl_qualifiers};
 use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::toml_edit_ext::has_table;
@@ -2718,16 +2719,14 @@ async fn superseded_entry(
         return None;
     }
     let files = superseded_files(&prev, flavor)?;
-    let needle = format!(".socket/vendor/pypi/{}/", prev.uuid);
-    for file in &files {
-        if read_regular_to_string(&project_root.join(file))
-            .await
-            .is_ok_and(|text| text.contains(&needle))
-        {
-            return Some(prev);
-        }
-    }
-    None
+    // Lifts a refusal, so case is folded only where the disk folds it.
+    let needle =
+        super::common::refusal_needle(project_root, &format!(".socket/vendor/pypi/{}/", prev.uuid))
+            .await;
+    super::common::first_file_naming(project_root, files.iter().map(String::as_str), &needle)
+        .await
+        .is_some()
+        .then_some(prev)
 }
 
 /// Every project file a superseded entry's revert may write: the files its
@@ -2867,17 +2866,17 @@ async fn unwire_superseded(
         },
     )
     .await;
-    let needle = format!(".socket/vendor/pypi/{}/", prev.uuid);
-    let mut residual = None;
-    for (file, _) in &snapshot {
-        if read_regular_to_string(&project_root.join(file))
-            .await
-            .is_ok_and(|text| text.contains(&needle))
-        {
-            residual = Some(file.clone());
-            break;
-        }
-    }
+    // A residual reference in any spelling (`\/`-escaped, backslashed, any
+    // case) must refuse: past this point the old uuid dir is swept as
+    // stale, and a committed file is installed on case-folding disks too.
+    let needle = PathNeedle::keep(&format!(".socket/vendor/pypi/{}/", prev.uuid));
+    let residual = super::common::first_file_naming(
+        project_root,
+        snapshot.iter().map(|(file, _)| file.as_str()),
+        &needle,
+    )
+    .await;
+    let needle = needle.rel();
     let why = if !reverted.success {
         Some(
             reverted
@@ -3014,6 +3013,7 @@ async fn guard_unwired_pypi_revert(
     uuid: &str,
     uuid_dir_rel: &str,
 ) -> Option<RevertOutcome> {
+    // A miss deletes the artifact: every spelling in any case counts.
     let clause = pypi_reference_clause(project_root, uuid, &[]).await?;
     let detail = format!(
         "refusing to remove {uuid_dir_rel}: the ledger entry records no pre-vendor wiring to \
@@ -3042,7 +3042,7 @@ async fn guard_unwired_pypi_revert(
 /// it. `vendor --check` reports it for an entry nothing installs from any
 /// more, so the verdict doesn't claim no file references the dir (#1374).
 pub async fn pypi_reference(project_root: &Path, uuid: &str) -> Option<String> {
-    pypi_reference_clause(project_root, uuid, &[]).await
+    pypi_refusal_clause(project_root, uuid).await
 }
 
 /// The in-use probe behind [`guard_unwired_pypi_revert`] and the
@@ -3063,9 +3063,28 @@ pub async fn pypi_reference(project_root: &Path, uuid: &str) -> Option<String> {
 /// that cannot be read, or a listed file (a symlink included — lstat only,
 /// so an unreadable target is still probed) that exists but cannot be read
 /// all block the deletion, because none of them can prove the absence of a
-/// reference.
+/// reference. The mention matches every spelling of the uuid dir in any
+/// case ([`PathNeedle::keep`]): this form gates the post-restore KEEP.
 async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -> Option<String> {
-    let needle = format!(".socket/vendor/pypi/{uuid}/");
+    let needle = PathNeedle::keep(&format!(".socket/vendor/pypi/{uuid}/"));
+    pypi_reference_clause_for(project_root, &needle, skip).await
+}
+
+/// [`pypi_reference_clause`] for a report (`vendor --check`): every
+/// spelling, but case folded only where the disk folds it
+/// ([`super::common::refusal_needle`]). Never a deletion gate.
+async fn pypi_refusal_clause(project_root: &Path, uuid: &str) -> Option<String> {
+    let needle =
+        super::common::refusal_needle(project_root, &format!(".socket/vendor/pypi/{uuid}/")).await;
+    pypi_reference_clause_for(project_root, &needle, &[]).await
+}
+
+/// The probe behind [`pypi_reference_clause`] and [`pypi_refusal_clause`].
+async fn pypi_reference_clause_for(
+    project_root: &Path,
+    needle: &PathNeedle,
+    skip: &[&str],
+) -> Option<String> {
     let mut names: Vec<String> = [
         "pyproject.toml",
         "hatch.toml",
@@ -3155,7 +3174,9 @@ async fn pypi_reference_clause(project_root: &Path, uuid: &str, skip: &[&str]) -
         // UTF-16 `pip freeze >` output is still probed instead of failing
         // closed on every revert with no way out.
         match read_regular_to_bytes(&path).await {
-            Ok(bytes) if probe_text(&bytes).contains(&needle) => {
+            // Any spelling of the path counts (a backslashed Windows
+            // requirement line, a `\/`-escaped Pipfile.lock).
+            Ok(bytes) if needle.found_in(&probe_text(&bytes)) => {
                 return Some(format!("{name} still resolves through it"));
             }
             Ok(_) => {}
@@ -7021,6 +7042,35 @@ wheels = [
         }
     }
 
+    /// Review on #2022 (round 2): the unwired-revert guard's miss deletes
+    /// the wheel, and a committed lock is installed on case-folding disks
+    /// too, so a re-cased reference refuses on every disk.
+    #[tokio::test]
+    async fn unwired_python_entry_revert_refuses_on_a_recased_reference() {
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl");
+        let recased = format!(
+            ".Socket/Vendor/PyPI/{}/six-1.16.0-py2.py3-none-any.whl",
+            UUID.to_ascii_uppercase()
+        );
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        tokio::fs::write(
+            root.join("pylock.toml"),
+            format!("lock-version = \"1.0\"\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = {{ path = \"{recased}\" }}\n"),
+        )
+        .await
+        .unwrap();
+        let wheel = root.join(&rel_wheel);
+        tokio::fs::create_dir_all(wheel.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&wheel, b"wheel bytes").await.unwrap();
+        let entry = revert_entry("python-lock", &rel_wheel, Vec::new());
+        let outcome = revert_pypi(&entry, root, false).await;
+        assert!(!outcome.success, "{outcome:?}");
+        assert!(wheel.is_file(), "the artifact must survive");
+    }
+
     /// Nothing references the artifact any more (the user re-locked by
     /// hand): an unwired entry's revert is a plain orphan cleanup and may
     /// proceed — the guard is about live references, not about wiring.
@@ -10795,6 +10845,57 @@ wheels = [{url = "https://files.pythonhosted.org/six.whl", hash = "sha256:upstre
             );
             assert!(fx.root.join(&first.artifact.path).is_file(), "{flavor}");
         }
+    }
+
+    /// Review on #2022: after unwinding the older uuid's wiring, a residual
+    /// reference to its dir in a backslashed or `\/`-escaped spelling still
+    /// refuses the re-vendor. Proceeding would let `vendor` sweep the old
+    /// uuid dir as stale while that line still installs from it.
+    #[tokio::test]
+    async fn superseding_uuid_refuses_over_an_escaped_residual_reference() {
+        let mut residual_refusals = 0;
+        for (flavor, files) in superseding_flavors() {
+            for spell in ["\\", "\\/", "\\\\"] {
+                let fx = e2e_fixture().await;
+                swap_to_lock_flavor(&fx, &files).await;
+                let sources = PatchSources::blobs_only(&fx.blobs);
+                let VendorOutcome::Done { result, entry, .. } =
+                    vendor_six(&fx, &sources, None).await
+                else {
+                    panic!("{flavor}: first vendor must be Done");
+                };
+                assert!(result.success, "{flavor}: {:?}", result.error);
+                let first = entry.expect("entry on success");
+                save_ledger_entry(&fx.root, &first).await;
+                // A hand-added comment naming the old uuid dir, outside
+                // anything the wiring recorded.
+                let (name, _) = files[0];
+                let wired = tokio::fs::read_to_string(fx.root.join(name)).await.unwrap();
+                let residual = format!(".socket/vendor/pypi/{UUID}/six.whl").replace('/', spell);
+                touch(&fx.root, name, &format!("{wired}# mirror: {residual}\n")).await;
+
+                let outcome = vendor_six_as_opts(&fx, &sources, SUPERSEDING_UUID, false).await;
+                let error = match &outcome {
+                    VendorOutcome::Refused { detail, .. } => detail.clone(),
+                    VendorOutcome::Done { result, .. } if !result.success => {
+                        result.error.clone().unwrap_or_default()
+                    }
+                    other => panic!("{flavor} {spell:?}: expected a refusal, got {other:?}"),
+                };
+                // A flavor whose revert reads the added comment as drift
+                // refuses for that reason instead; both keep the old dir.
+                assert!(
+                    error.contains("still references") || error.contains("changed since"),
+                    "{flavor} {spell:?}: {error}"
+                );
+                residual_refusals += usize::from(error.contains("still references"));
+                assert!(fx.root.join(&first.artifact.path).is_file(), "{flavor}");
+            }
+        }
+        assert!(
+            residual_refusals > 0,
+            "the residual-reference refusal itself must be exercised"
+        );
     }
 
     /// A snapshot file that cannot be written back is named in the failure

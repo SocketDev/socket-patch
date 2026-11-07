@@ -232,6 +232,12 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a hosted sbt pin whose bytes the build provably
+/// does not use (a `dependencyOverrides` reassignment, an `onLoad` one
+/// dropping the load-time verifier, or current evidence
+/// resolving another version or other bytes), so the downloaded copy
+/// proves nothing (`vex::Unattested`).
+const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
 /// Omission tag for a Go patch whose replace the `go.work` in effect
 /// overrides, ignores or rejects (#393, #458, #531): the reason of `vex`'s
 /// own go.mod gate, and the note of a discovered hosted or vendored ref the
@@ -273,6 +279,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::SbtPinBypassed => (
+            NOTE_SBT_PIN_BYPASSED,
+            "not attested while the build bypasses the pin, even from the copy under \
+             `.socket/sbt-hosted`; the wiring itself is intact, so re-running `scan` does not \
+             change this (fix the build, then run `sbt update`)",
         ),
         UnattestedKind::GoWorkspaceOverride => (
             GO_WORKSPACE_OVERRIDE,

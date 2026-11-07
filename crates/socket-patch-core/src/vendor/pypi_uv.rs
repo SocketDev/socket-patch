@@ -893,8 +893,10 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
         .unwrap_or(false);
     // Every artifact-routing fragment embeds the uuid dir path — the
     // ALREADY-CONVERGED probes below key on it (see the LIVENESS CONTRACT
-    // on `RevertOutcome::drift_skipped`).
+    // on `RevertOutcome::drift_skipped`). A surviving reference keeps the
+    // artifact (drift), so `probe` matches every spelling in any case.
     let needle = format!(".socket/vendor/pypi/{}", entry.uuid);
+    let probe = crate::utils::path_spelling::PathNeedle::keep(&needle);
     // REMOVED, not drift (#1140): `uv remove <pkg>` drops the dependency
     // together with every fragment that routed through the wheel. When
     // neither file names this entry's uuid any more, a record whose written
@@ -999,7 +1001,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             // root `requires-dist` can equal the user's overrides) would
             // otherwise splice the wrong array or fake convergence.
             "uv_lock_requires_dev" | "uv_lock_manifest_constraints" => {
-                match revert_array_elements(&lock_text, &rec.kind, new_text, original_text, &needle)
+                match revert_array_elements(&lock_text, &rec.kind, new_text, original_text, &probe)
                 {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
@@ -1058,7 +1060,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                             // uuid dir anywhere in the lock, satisfies it.
                             // A reshaped fragment that still routes through
                             // the artifact stays drift (fail-closed).
-                            if !lock_text.contains(new) && !lock_text.contains(&needle) {
+                            if !lock_text.contains(new) && !probe.found_in(&lock_text) {
                                 continue;
                             }
                             warnings.push(drifted("uv.lock"));
@@ -1074,7 +1076,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                     &rec.kind,
                     new_text,
                     original_text,
-                    &needle,
+                    &probe,
                 ) {
                     ArrayRevert::Reverted(t) => lock_text = t,
                     ArrayRevert::Converged => {}
@@ -1102,7 +1104,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
                         // longer referencing this entry's uuid dir satisfies
                         // it (a hand-restored pyproject). A reshaped line
                         // still routing through the artifact stays drift.
-                        if !pyproject_text.contains(&needle) {
+                        if !probe.found_in(&pyproject_text) {
                             continue;
                         }
                         warnings.push(drifted("pyproject.toml"));
@@ -1192,10 +1194,7 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
     // Never write a half-reverted pair: a lock that still routes through
     // the uuid dir after pyproject.toml stopped declaring any route to it
     // is what `uv sync --locked` rejects. Keep both files instead.
-    if !drift_kept
-        && lock_text.to_ascii_lowercase().contains(&needle_lower)
-        && !pyproject_text.to_ascii_lowercase().contains(&needle_lower)
-    {
+    if !drift_kept && probe.found_in(&lock_text) && !probe.found_in(&pyproject_text) {
         drift_kept = true;
         warnings.push(VendorWarning::new(
             "vendor_lock_entry_drifted",
@@ -1474,7 +1473,7 @@ fn revert_array_elements(
     kind: &str,
     new: Option<&str>,
     orig: Option<&str>,
-    needle: &str,
+    needle: &crate::utils::path_spelling::PathNeedle,
 ) -> ArrayRevert {
     let (Some(new), Some(orig)) = (new, orig) else {
         return ArrayRevert::Drift;
@@ -1517,7 +1516,7 @@ fn revert_array_elements(
     } else if new_els.len() == old_els.len() + 1 && new_els[..old_els.len()] == old_els[..] {
         edits.push((new_els[old_els.len()].clone(), None));
     }
-    if edits.is_empty() || edits.iter().any(|(ours, _)| !ours.contains(needle)) {
+    if edits.is_empty() || edits.iter().any(|(ours, _)| !needle.found_in(ours)) {
         return ArrayRevert::Drift;
     }
 
@@ -1549,7 +1548,7 @@ fn revert_array_elements(
             }
             // Our element was edited in place and still routes through the
             // artifact: drift, fail-closed.
-            None if live.iter().any(|el| el.contains(needle)) => return ArrayRevert::Drift,
+            None if live.iter().any(|el| needle.found_in(el)) => return ArrayRevert::Drift,
             // Our element is gone and nothing else in the array routes
             // through the artifact: that element's reverted state holds.
             None => {}
