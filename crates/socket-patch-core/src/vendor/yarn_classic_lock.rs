@@ -850,7 +850,7 @@ pub(super) fn revert_recorded_block(
     let orig_lines = rec.original.as_ref().and_then(json_to_lines);
     let ours = |lines: &[String]| {
         vendor_field(lines)
-            .and_then(parse_vendor_path)
+            .and_then(super::path::parse_vendor_locator)
             .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid)
     };
     let edit = {

@@ -564,6 +564,11 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
             crate::utils::fs::read_regular_to_string_sync(&pkg_path.join("package.json")).ok()?;
         let pkg: serde_json::Value = serde_json::from_str(&text).ok()?;
         let real = std::fs::canonicalize(&pkg_path).ok()?;
+        // Once per package, not per dependency.
+        let bound = crate::utils::repo_root::ReadBoundary::upward(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &real,
+        );
         let map = |field: &str| pkg.get(field).and_then(serde_json::Value::as_object);
         let optional = map("optionalDependencies");
         let overrides = project_overrides(&project);
@@ -577,14 +582,16 @@ async fn unresolved_npm_dependency(pkg_path: &Path) -> Option<String> {
         required
             .chain(optional)
             .filter(|((name, _), _)| crate::vendor::npm_common::is_safe_npm_name(name))
-            .find(|((name, spec), optional)| match node_resolve(&real, name) {
-                None => !optional,
-                Some(_) if forces(&overrides, owner, name) => false,
-                Some(copy) => spec
-                    .as_str()
-                    .and_then(declared_npm_range)
-                    .is_some_and(|range| !copy_admitted(&copy, range)),
-            })
+            .find(
+                |((name, spec), optional)| match node_resolve(&bound, &real, name) {
+                    None => !optional,
+                    Some(_) if forces(&overrides, owner, name) => false,
+                    Some(copy) => spec
+                        .as_str()
+                        .and_then(declared_npm_range)
+                        .is_some_and(|range| !copy_admitted(&copy, range)),
+                },
+            )
             .map(|((name, _), _)| name.clone())
     })
     .await
@@ -686,11 +693,19 @@ fn forces(overrides: &[(Option<String>, String)], owner: Option<&str>, name: &st
 /// The copy of the package `name` node resolves from the package directory
 /// `from`: `<dir>/node_modules/<name>` for the nearest of `from` and its
 /// ancestors that is not itself a `node_modules` directory.
-fn node_resolve(from: &Path, name: &str) -> Option<PathBuf> {
+///
+/// Inside a git checkout a copy above its root is never read: `None`, so
+/// the dependency is unresolved rather than verified from outside.
+fn node_resolve(
+    bound: &crate::utils::repo_root::ReadBoundary,
+    from: &Path,
+    name: &str,
+) -> Option<PathBuf> {
     from.ancestors()
         .filter(|dir| dir.file_name().is_none_or(|n| n != "node_modules"))
         .map(|dir| dir.join("node_modules").join(name))
         .find(|copy| copy.exists())
+        .filter(|copy| bound.contains(copy))
 }
 
 /// The registry semver range of a `dependencies` value: the value itself,
@@ -763,6 +778,30 @@ mod tests {
     use crate::hash::git_sha256::compute_git_sha256_from_bytes;
     use crate::manifest::schema::{PatchFileInfo, PatchRecord};
     use std::collections::HashMap;
+
+    /// Node resolution never verifies from a copy above the repository
+    /// root; without a checkout it resolves as before.
+    #[test]
+    fn node_resolve_stays_in_the_repository() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let from = outer.join("repo/node_modules/a");
+        std::fs::create_dir_all(&from).unwrap();
+        std::fs::create_dir_all(outer.join("node_modules/dep")).unwrap();
+        std::fs::create_dir_all(outer.join("repo/.git")).unwrap();
+        let bound = |from: &Path| {
+            crate::utils::repo_root::ReadBoundary::upward(
+                crate::utils::repo_root::ReadScope::Workspace,
+                from,
+            )
+        };
+        assert_eq!(node_resolve(&bound(&from), &from, "dep"), None);
+        std::fs::remove_dir(outer.join("repo/.git")).unwrap();
+        assert_eq!(
+            node_resolve(&bound(&from), &from, "dep"),
+            Some(outer.join("node_modules/dep"))
+        );
+    }
 
     fn record_with_one_file(after_hash: &str) -> PatchRecord {
         let mut files = HashMap::new();

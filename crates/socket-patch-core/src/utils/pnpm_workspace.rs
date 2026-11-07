@@ -795,17 +795,38 @@ pub async fn git_branch_locks(view: &ProjectView<'_>) -> Option<GitBranchLocks> 
     let mut setting = pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1);
     if setting.is_none() {
         if let Some(file) = governing_file(view) {
-            let workspace = read_regular_to_string(&file).await.ok();
-            let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
-                .await
-                .ok();
-            setting =
+            // Above the repository root nothing is read, so the setting is
+            // unknowable: fail closed, as if it were on, so writers refuse
+            // rather than pin a lock pnpm may not read.
+            let readable = view.disk_root().is_some_and(|root| {
+                crate::utils::repo_root::upward_readable(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    root,
+                    &file,
+                )
+            });
+            setting = if readable {
+                let workspace = read_regular_to_string(&file).await.ok();
+                let npmrc = read_regular_to_string(&file.with_file_name(".npmrc"))
+                    .await
+                    .ok();
                 pnpm_setting(workspace.as_deref(), npmrc.as_deref(), KEYS.0, KEYS.1).map(|found| {
                     PnpmSetting {
                         source: format!("{} (at {})", found.source, file.display()),
                         ..found
                     }
-                });
+                })
+            } else {
+                Some(PnpmSetting {
+                    value: "true".to_string(),
+                    source: format!(
+                        "{} (above the repository root, never read, so `gitBranchLockfile` \
+                         may be on)",
+                        file.display()
+                    ),
+                    yaml: true,
+                })
+            };
         }
     }
     if setting.is_none() {
@@ -974,7 +995,17 @@ fn governing_file(view: &ProjectView<'_>) -> Option<PathBuf> {
 /// canonical, minus Windows' verbatim prefix (see
 /// [`without_verbatim_prefix`]), because refusals and warnings show it to
 /// the user.
+///
+/// A file above the repository root (a workspace run's upward bound) is
+/// never read and fails closed as governing, unless it sits in the home
+/// directory or above it, which never governs a checkout (the home rule
+/// of [`crate::utils::repo_root::ReadBoundary::marker_above`]).
 pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
+    governing_workspace_file_with(project_root, crate::utils::repo_root::home().as_deref())
+}
+
+/// [`governing_workspace_file`] with the home directory injected.
+fn governing_workspace_file_with(project_root: &Path, home: Option<&Path>) -> Option<PathBuf> {
     if std::fs::symlink_metadata(project_root.join(PNPM_WORKSPACE)).is_ok() {
         return None;
     }
@@ -985,6 +1016,19 @@ pub fn governing_workspace_file(project_root: &Path) -> Option<PathBuf> {
         .skip(1)
         .find(|dir| dir.join(PNPM_WORKSPACE).is_file())?;
     let file = dir.join(PNPM_WORKSPACE);
+    // Above the repository root the file is never read: fail closed, as a
+    // member, like an unreadable one (callers do not read it either, see
+    // [`crate::utils::repo_root::upward_readable`]).
+    if !crate::utils::repo_root::upward_readable(
+        crate::utils::repo_root::ReadScope::Workspace,
+        &canonical,
+        &file,
+    ) {
+        if crate::utils::repo_root::at_or_above_home(dir, home) {
+            return None;
+        }
+        return Some(without_verbatim_prefix(file));
+    }
     let rel: Vec<String> = canonical
         .strip_prefix(dir)
         .ok()?
@@ -1038,6 +1082,29 @@ pub fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review finding 6: a `pnpm-workspace.yaml` above the repository
+    /// root fails closed as governing (unread), except in the home
+    /// directory or above it, which never governs a checkout.
+    #[test]
+    fn a_workspace_file_above_the_repository_honours_the_home_rule() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let app = outer.join("repo/app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::create_dir_all(outer.join("repo/.git")).unwrap();
+        let file = outer.join(PNPM_WORKSPACE);
+        std::fs::write(&file, "packages:\n  - other\n").unwrap();
+        assert_eq!(
+            governing_workspace_file_with(&app, None),
+            Some(without_verbatim_prefix(file.clone()))
+        );
+        assert_eq!(governing_workspace_file_with(&app, Some(&outer)), None);
+        assert_eq!(
+            governing_workspace_file_with(&app, Some(Path::new("/nonexistent/home"))),
+            Some(without_verbatim_prefix(file))
+        );
+    }
     use crate::formats::pnpm::workspace::package_globs;
 
     /// An environment lookup over `vars` alone.

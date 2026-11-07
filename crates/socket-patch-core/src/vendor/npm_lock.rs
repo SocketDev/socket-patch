@@ -4495,6 +4495,47 @@ mod tests {
         );
     }
 
+    /// N5: an entry repointed at a SIBLING checkout's vendored copy of the
+    /// same patch (`file:../.socket/vendor/npm/<our uuid>/…`) is that
+    /// project's wiring, not ours: the revert leaves it byte-for-byte and
+    /// keeps our artifact, instead of claiming it by its uuid and restoring
+    /// our recorded original over it.
+    #[tokio::test]
+    async fn revert_never_claims_a_sibling_checkouts_vendor_path() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let sibling = format!("file:../.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"]["resolved"] = json!(sibling);
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        let after = fx.read_lock().await;
+        assert_eq!(
+            after["packages"]["node_modules/left-pad"], live["packages"]["node_modules/left-pad"],
+            "the sibling's wiring is never rewritten"
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the artifact is kept while an entry is left alone"
+        );
+    }
+
     /// #665: the user dropped the patched dependency (`npm uninstall
     /// left-pad`), so npm deleted every lock entry the wiring recorded and
     /// nothing in the lock resolves through the artifact any more. That is
