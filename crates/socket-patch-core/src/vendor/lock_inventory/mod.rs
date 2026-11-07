@@ -95,7 +95,7 @@ use self::{
     gem::gem_remotes,
     npm::inventory_package_lock,
     npm_family::finalize_npm,
-    pnpm::{inventory_pnpm_lock, inventory_pnpm_lock_at},
+    pnpm::{inventory_pnpm_lock, inventory_pnpm_lock_rel_in},
     pypi::{is_public_pypi_url, python_lock_inventory, socket_reference_coords},
     recover::pure_wheel_from_uv_unit,
     vlt::inventory_vlt,
