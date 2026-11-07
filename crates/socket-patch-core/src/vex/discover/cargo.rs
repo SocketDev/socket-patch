@@ -1217,6 +1217,9 @@ fn unresolved_manifest_pins(
                     "cargo builds it from {}, whatever `registry` says",
                     d.origin()
                 )
+            } else if matches!(d.source, DeclSource::Patch(_)) {
+                "cargo ignores that `[patch]` entry (a crates.io URL table or the project config replaces it)"
+                    .to_string()
             } else {
                 "no manifest inherits that `[workspace.dependencies]` entry".to_string()
             };
@@ -1395,15 +1398,27 @@ fn socket_copies(doc: &DocumentMut) -> Vec<WiredCopy> {
 
 /// Why cargo ignores a root-manifest `[patch]` entry, if it does: a
 /// `[patch."<crates.io URL>"]` table replaces `[patch.crates-io]`
-/// wholesale, and a project-config crates.io `[patch]` item with the same
-/// key replaces the manifest's (unless it wires the same path, the
+/// wholesale, and a project-config `[patch]` item for the same source and
+/// key replaces the manifest's (unless both wire the same path, the
 /// half-migrated shape attested through the config). Config entries are
 /// never shadowed.
 struct Shadow {
     /// The manifest's `[patch."<crates.io URL>"]` table keys.
     aliases: Vec<String>,
-    /// The config's crates.io `[patch]` items: (file, key, path).
-    config_keys: Vec<(&'static str, String, Option<String>)>,
+    /// The config's `[patch]` items: (file, source table, key, path).
+    config_keys: Vec<(&'static str, String, String, Option<String>)>,
+}
+
+/// Whether two `[patch.<source>]` table names patch the same source:
+/// crates.io under any spelling, else the same name or URL.
+fn same_patch_source(a: &str, b: &str) -> bool {
+    if is_crates_io_source(a) || is_crates_io_source(b) {
+        return is_crates_io_source(a) && is_crates_io_source(b);
+    }
+    // A URL table compares as an index (host case, a trailing `/`); a
+    // registry name verbatim.
+    let norm = |s: &str| index_key(s).unwrap_or_else(|| s.trim().to_string());
+    norm(a) == norm(b)
 }
 
 impl Shadow {
@@ -1411,10 +1426,14 @@ impl Shadow {
         let config_keys = config
             .into_iter()
             .flat_map(|(file, doc)| {
-                patch_entries(doc)
-                    .into_iter()
-                    .filter(|e| is_crates_io_source(e.source))
-                    .map(move |e| (*file, e.key.to_string(), e.path.map(same_path_key)))
+                patch_entries(doc).into_iter().map(move |e| {
+                    (
+                        *file,
+                        e.source.to_string(),
+                        e.key.to_string(),
+                        e.path.map(same_path_key),
+                    )
+                })
             })
             .collect();
         Shadow {
@@ -1424,19 +1443,20 @@ impl Shadow {
     }
 
     fn why(&self, table: &str, key: &str, path: Option<&str>) -> Option<String> {
-        if !is_crates_io_source(table) {
-            return None;
-        }
         if let (true, Some(alias)) = (table == "crates-io", self.aliases.first()) {
             return Some(format!(
                 "the `[patch.\"{alias}\"]` table replaces `[patch.crates-io]` in cargo"
             ));
         }
+        // Only an identical path is the same wiring: two path-less items (a
+        // registry pin and a git fork, say) are not.
         let own = path.map(same_path_key);
         self.config_keys
             .iter()
-            .find(|(_, k, p)| k == key && *p != own)
-            .map(|(file, k, _)| {
+            .find(|(_, src, k, p)| {
+                k == key && same_patch_source(src, table) && (own.is_none() || *p != own)
+            })
+            .map(|(file, _, k, _)| {
                 format!("{file} redefines `[patch]` key `{k}`, which replaces it in cargo")
             })
     }
@@ -4298,6 +4318,40 @@ mod tests {
             "{:#?}",
             out.diagnostics
         );
+    }
+
+    /// REVIEW (Bugbot on #2024): a config item for the same key replaces
+    /// the manifest's `[patch]` item in cargo whatever the source table and
+    /// whether or not either wires a path: a path-less config git fork
+    /// shadows a path-less manifest registry pin, and a `[patch.my-corp]`
+    /// config item shadows the manifest's `[patch.my-corp]` copy.
+    #[test]
+    fn config_items_shadow_pathless_and_named_source_entries() {
+        let manifest: toml_edit::DocumentMut = "[package]\nname = \"x\"\n".parse().unwrap();
+        let config: toml_edit::DocumentMut = "[patch.crates-io]\n\
+             cfg-if-socket-aaaaaaaa = { package = \"cfg-if\", git = \"https://example.com/f\" }\n\
+             [patch.my-corp]\n\
+             cfg-if = { git = \"https://example.com/f\" }\n\
+             [patch.\"https://My-Corp.example/index/\"]\n\
+             cfg-if = { path = \"../fork\" }\n"
+            .parse()
+            .unwrap();
+        let cfg = (".cargo/config.toml", config);
+        let s = super::Shadow::new(&manifest, Some(&cfg));
+        // A path-less registry pin under the same key: shadowed.
+        assert!(s.why("crates-io", "cfg-if-socket-aaaaaaaa", None).is_some());
+        // The same key under another source: not.
+        assert!(s.why("other", "cfg-if-socket-aaaaaaaa", None).is_none());
+        // A named non-crates.io table: shadowed.
+        assert!(s.why("my-corp", "cfg-if", Some("vendor/x")).is_some());
+        // A URL table, compared as an index.
+        assert!(s
+            .why("https://my-corp.example/index", "cfg-if", Some("vendor/x"))
+            .is_some());
+        // The half-migrated shape: the same path is the same wiring.
+        assert!(s
+            .why("https://my-corp.example/index", "cfg-if", Some("../fork"))
+            .is_none());
     }
 
     /// REVIEW: a `registry-index` declaration is redirected by a
