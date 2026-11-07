@@ -19,6 +19,7 @@ use socket_patch_core::utils::purl::{canonical_purl, normalize_purl, strip_purl_
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{Target, TargetKind};
 use socket_patch_core::vendor::load_state;
+use socket_patch_core::vendor::refusals::VendorRefusal;
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
@@ -31,18 +32,14 @@ use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
     filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
     record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
-    unwind_new_blobs, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
-    write_all_patch_blobs, DetachedDownload, PatchAction, VendorRefusals, ALREADY_IN_MANIFEST,
-    BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    unwind_new_blobs, vendored_download_refusals, warn_if_manifest_gitignored,
+    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
+    ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
 };
 use crate::commands::apply::ApplyRunReport;
-use crate::commands::bun_preflight::{bun_vendor_preflight, BunVendorRefusal};
-use crate::commands::vlt_preflight::{
-    vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
-};
 use crate::ecosystem_dispatch::{crawl_ecosystems, find_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     usage_error, Command as JsonCommand, Envelope, EnvelopeError, PatchAction as EventAction,
@@ -2265,9 +2262,10 @@ async fn run_get_hosted(
 /// `prefetched` is the `get <uuid>` path's already-fetched view: it resolved
 /// the identifier by fetching it (with the possibly-proxy-fallback client)
 /// and the engine serves the record from it instead of fetching again. That
-/// path also refuses a Bun project BEFORE the engine, with the contract's
-/// exact pre-record envelope, so a refused run writes nothing at all; the
-/// search path lets the engine record the refusal per patch and still runs
+/// path also raises any vendored refusal of that patch BEFORE the engine
+/// (see [`vendored_download_refusals`]), with the contract's exact
+/// pre-record envelope, so a refused run writes nothing at all; the search
+/// path lets the download phase record the refusal per patch and still runs
 /// the vendor step (scan parity).
 #[allow(clippy::too_many_arguments)]
 async fn run_get_vendored(
@@ -2290,22 +2288,29 @@ async fn run_get_vendored(
             preview.record_into(&mut env);
             emit(&env);
         } else if !args.common.silent {
-            println!("{}", format_dry_run("download and vendor", selected.len()));
-            preview.print_refusals();
+            preview.print_human();
         }
         return 0;
     }
 
-    // The uuid path's Bun preflight, run ONCE here and handed to the download
-    // phase below (which otherwise runs its own): the pre-record refusal
-    // shape is this path's, so it owns the read.
-    let mut bun_refusal: Option<BunVendorRefusal> = None;
-    let mut vlt_refusals: Vec<(String, VltVendorRefusal)> = Vec::new();
-    if let Some(patch) = prefetched {
-        // Bun preflight (see `BunVendorRefusal`): refuse BEFORE the engine
-        // and the vendor step, so the tree stays exactly as it was (no
-        // `.socket/` is created on a fresh project). The already-fetched
-        // patch is the only network traffic of a refused run.
+    // Download phase — records in memory, blobs never persisted, the nested
+    // apply structurally never runs (save_only): the vendor step IS the
+    // persistence.
+    let params = get_download_params(
+        args, /*save_only=*/ true, /*persist_blobs=*/ false,
+    );
+    let prefetched_views: HashMap<String, PatchResponse> = prefetched
+        .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
+        .unwrap_or_default();
+    // Boxed: the futures embed the narrowing + fetch loop, and `run`'s poll
+    // frame must fit Windows' 1 MiB main-thread stack.
+    let download: DetachedDownload = if let Some(patch) = prefetched {
+        // The uuid path judges the project ONCE here (see
+        // `vendored_download_refusals`) and hands the refusals to the
+        // download phase: a refusal is raised BEFORE the engine and the
+        // vendor step, so the tree stays exactly as it was (no `.socket/`
+        // is created on a fresh project). The already-fetched patch is the
+        // only network traffic of a refused run.
         //
         // JSON: `status: "error"` with `error: {code: <vendor code>,
         // message: <detail>}` and the patch's `failed` event (same
@@ -2313,24 +2318,19 @@ async fn run_get_vendored(
         //
         // Human: `Error (<code>): <detail>` on stderr — an error, so it is
         // exempt from `--silent` like every other `Error (…)` line here.
-        bun_refusal = bun_vendor_preflight(&args.common.project_root(), selected).await;
-        let ledger = load_state(&args.common.project_root()).await;
-        vlt_refusals = vlt_vendor_preflight_selected(
-            &args.common.cwd,
+        let vendor_state = load_state(&args.common.project_root()).await;
+        let refusals = Box::pin(vendored_download_refusals(
+            &params,
             selected,
-            ledger.as_ref().map(|s| &s.entries),
-        )
+            vendor_state.as_ref().map(|s| &s.entries),
+            None,
+        ))
         .await;
-        let refusal = bun_refusal
-            .as_ref()
-            .filter(|r| r.applies_to(&patch.purl))
-            .map(|r| (&r.code, &r.detail))
-            .or_else(|| vlt_refusal_for(&vlt_refusals, &patch.purl).map(|r| (&r.code, &r.detail)));
-        if let Some((code, detail)) = refusal {
+        if let Some(VendorRefusal { code, detail }) = refusals.get(&patch.purl) {
             // Same failure telemetry as the vendor-step Err arm below: this
             // run exits 1 without vendoring anything.
             socket_patch_core::telemetry::track_patch_vendor_failed(
-                &detail,
+                detail,
                 args.common.dry_run,
                 telemetry,
             )
@@ -2352,32 +2352,13 @@ async fn run_get_vendored(
             }
             return 1;
         }
-    }
-
-    // Download phase — records in memory, blobs never persisted, the nested
-    // apply structurally never runs (save_only): the vendor step IS the
-    // persistence. Boxed: the future embeds the narrowing + fetch loop, and
-    // `run`'s poll frame must fit Windows' 1 MiB main-thread stack.
-    let params = get_download_params(
-        args, /*save_only=*/ true, /*persist_blobs=*/ false,
-    );
-    let prefetched_views: HashMap<String, PatchResponse> = prefetched
-        .map(|p| HashMap::from([(p.uuid.clone(), p.clone())]))
-        .unwrap_or_default();
-    let download: DetachedDownload = if prefetched.is_some() {
-        // The preflight above already read the lock: hand its outcome down.
-        let vendor_state = load_state(&args.common.project_root()).await;
         Box::pin(download_patch_records_preflighted(
             selected,
             &params,
             api_client,
             prefetched_views,
             vendor_state,
-            VendorRefusals {
-                bun: bun_refusal.as_ref(),
-                vlt: &vlt_refusals,
-            },
-            None,
+            &refusals,
         ))
         .await
     } else {
@@ -4819,6 +4800,50 @@ mod tests {
         assert_eq!(
             json["events"][0]["error"], "could not fetch details",
             "json={json}"
+        );
+    }
+
+    /// The download phase refuses what the vendor engine would before it
+    /// fetches a view: a v1 package-lock project refuses every npm patch
+    /// with the backend's code, and no view is requested.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn download_patch_records_v1_package_lock_refuses_before_any_view() {
+        use wiremock::MockServer;
+
+        let _env = EnvVarGuard::scrub(&["SOCKET_PROXY_URL"]);
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"covgap-v1":"1.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("package-lock.json"),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":1,"dependencies":{}}"#,
+        )
+        .unwrap();
+        let uuid = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+        let purl = "pkg:npm/covgap-v1@1.0.0";
+        let selected = vec![mk_patch(uuid, purl, "free", "2024-01-01")];
+
+        let (code, json, records) =
+            download_patch_records(&selected, &detached_params(tmp.path()), &server.uri()).await;
+
+        assert_eq!(code, 1, "json={json}");
+        assert!(records.is_empty());
+        assert_eq!(json["events"][0]["action"], "failed", "json={json}");
+        assert_eq!(
+            json["events"][0]["errorCode"], "vendor_lockfile_version_unsupported",
+            "json={json}"
+        );
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert!(
+            requests
+                .iter()
+                .all(|r| !r.url.path().contains("/patches/view/")),
+            "a refused patch's view is never fetched: {requests:?}"
         );
     }
 

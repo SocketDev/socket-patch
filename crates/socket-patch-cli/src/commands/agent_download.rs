@@ -18,6 +18,9 @@ use socket_patch_core::patch::apply_lock::{LockError, LockGuard};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
+use socket_patch_core::vendor::refusals::{
+    vendor_refusals, LedgerLoad, RefusalScope, VendorRefusal, VendorRefusals,
+};
 use socket_patch_core::vendor::{load_state, lookup_entry, VendorEntry, VendorState};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,11 +28,7 @@ use std::time::Duration;
 
 use crate::args::GlobalArgs;
 use crate::commands::apply::ApplyRunReport;
-use crate::commands::bun_preflight::{bun_vendor_preflight_with_ledger, BunVendorRefusal};
 use crate::commands::lock_cli::lock_failure;
-use crate::commands::vlt_preflight::{
-    vlt_refusal_for, vlt_vendor_preflight_selected, VltVendorRefusal,
-};
 use crate::ecosystem_dispatch::{find_all_packages_for_rollback, partition_purls};
 use crate::json_envelope::{
     Command as EnvelopeCommand, Envelope, EnvelopeError, PatchAction as EventAction, PatchEvent,
@@ -747,152 +746,81 @@ pub(crate) const BLOB_WRITE_FAILED: &str = "blob_write_failed";
 /// already records at the same uuid (agent mode still re-applies it).
 pub(crate) const ALREADY_IN_MANIFEST: &str = "already_in_manifest";
 
-/// The vendored-mode preflight verdicts the download phase refuses by
-/// (Bun's project-level one, vlt's per purl); agent downloads pass none.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct VendorRefusals<'a> {
-    pub(crate) bun: Option<&'a BunVendorRefusal>,
-    pub(crate) vlt: &'a [(String, VltVendorRefusal)],
+/// `selected` as the `(purl, uuid)` pairs the vendor refusals judge.
+pub(crate) fn selection_pairs(selected: &[PatchSearchResult]) -> Vec<(&str, &str)> {
+    selected
+        .iter()
+        .map(|s| (s.purl.as_str(), s.uuid.as_str()))
+        .collect()
 }
 
-impl VendorRefusals<'_> {
-    fn for_purl(&self, purl: &str) -> Option<(&'static str, &str)> {
-        self.bun
-            .filter(|r| r.applies_to(purl))
-            .map(|r| (r.code, r.detail.as_str()))
-            .or_else(|| vlt_refusal_for(self.vlt, purl).map(|r| (r.code, r.detail.as_str())))
-    }
-}
-
-/// Selected purls the vendor backend will refuse on the project's lock
-/// text alone, with the backend's `(code, detail)`.
-pub(crate) type LockRefusals = HashMap<String, (&'static str, String)>;
-
-/// The lock-text refusals of the vendored download phase (see
-/// [`socket_patch_core::vendor::lock_text_refusals`]: the npm
-/// package-lock / pnpm / yarn classic / yarn berry gates and cargo's
-/// locked-version gate, through [`unclaimed_lock_text_refusals`]), over the
-/// patches the phase would otherwise fetch a view for — past the Bun
-/// refusal and the ledger's idempotency skip, which take precedence in the
-/// fetch loop. A purl the lockfiles pin hosted is left to the vendor loop:
-/// its takeover restores the upstream lock entry first, and the restore
-/// rewrites the very text the gates read. The one exception is a hosted
-/// gem the takeover would refuse ([`gem_takeover_refusals_for`]), which
-/// is refused here with the takeover's code instead of after its fetch.
+/// Every refusal the vendored download phase raises before it fetches a
+/// view: [`vendor_refusals`] over the selection, plus a hosted gem the
+/// takeover would refuse (#775, [`gem_takeover_refusals_for`]), refused
+/// here with the takeover's code instead of after its fetch. The download
+/// phase only runs online (`--offline` refuses `get` and `scan` before it),
+/// so the gem's dry-run restore may resolve the registry entry. `prior` is
+/// scan's npm crawl, when the caller has it (the installed-copy lookup
+/// reuses it).
 ///
 /// [`gem_takeover_refusals_for`]: crate::commands::vendor::gem_takeover_refusals_for
-///
-/// Only a package the vendor loop would hand to its backend is refused
-/// here (see [`crate::commands::vendor::lock_refusals_reaching_backend`]):
-/// one installed on disk, or one the lockfile resolves to a verifiable
-/// registry source. A package with neither — absent from the lock and not
-/// installed — never reaches its backend: the loop reports it `skipped` /
-/// `package_not_installed`, and so it still does. `prior` is scan's npm
-/// crawl, when the caller has it (the installed-copy lookup reuses it).
-pub(crate) async fn lock_text_refusals_for(
+pub(crate) async fn vendored_download_refusals(
     params: &DownloadParams,
     selected: &[PatchSearchResult],
-    ledger: &VendorState,
-    bun_refusal: Option<&BunVendorRefusal>,
+    ledger: LedgerLoad<'_>,
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
-) -> LockRefusals {
+) -> VendorRefusals {
     let cwd = params.cwd.as_path();
     let origins =
         crate::commands::hosted_unwind::patch_server_origins_of(params.patch_server_url.as_deref());
     let pins = hosted_pins(cwd, origins.clone()).await;
-    let claimed = claimed_purls(&pins);
-    let fetchable: Vec<&PatchSearchResult> = selected
-        .iter()
-        .filter(|sr| bun_refusal.filter(|r| r.applies_to(&sr.purl)).is_none())
-        .filter(|sr| {
-            detached_ledger_record(RecordStore::Ledger(&ledger.entries), &sr.purl, &sr.uuid)
-                .is_none()
-        })
-        .collect();
-    let mut refusals = unclaimed_lock_text_refusals(
+    let options = params.crawler_options();
+    let installed = crate::commands::vendor::installed_lookup(&options, prior);
+    let mut refusals = vendor_refusals(
         cwd,
-        &fetchable,
-        &claimed,
+        &selection_pairs(selected),
         ledger,
-        params.crawler_options(),
-        prior,
+        &RefusalScope {
+            hosted_pins: &pins,
+            installed: &installed,
+        },
     )
     .await;
-    // A hosted gem the takeover will refuse (#775) is refused here too, so
-    // its view is never fetched for a package the run cannot vendor. The
-    // download phase only runs online (`--offline` refuses `get` and `scan`
-    // before it), so the dry-run restore may resolve the registry entry.
-    refusals.extend(
-        crate::commands::vendor::gem_takeover_refusals_for(
-            cwd,
-            fetchable
-                .iter()
-                .filter(|sr| claimed.contains(&PurlKey::new(&sr.purl)))
-                .map(|sr| sr.purl.as_str()),
-            &pins,
-            false,
-            origins,
-        )
-        .await,
-    );
+    let claimed = claimed_purls(&pins);
+    let empty = HashMap::new();
+    let entries = ledger.unwrap_or(&empty);
+    let takeovers: Vec<&str> = selected
+        .iter()
+        .filter(|sr| {
+            !refusals.contains_key(&sr.purl)
+                && claimed.contains(&PurlKey::new(&sr.purl))
+                && detached_ledger_record(RecordStore::Ledger(entries), &sr.purl, &sr.uuid)
+                    .is_none()
+        })
+        .map(|sr| sr.purl.as_str())
+        .collect();
+    let gem = crate::commands::vendor::gem_takeover_refusals_for(
+        cwd,
+        takeovers.into_iter(),
+        &pins,
+        false,
+        origins,
+    )
+    .await;
+    for (purl, (code, detail)) in gem {
+        refusals
+            .entry(purl)
+            .or_insert(VendorRefusal { code, detail });
+    }
     refusals
 }
 
-/// The lock-text half of [`lock_text_refusals_for`], shared with the
-/// vendored dry-run preview and rollout plan (`scan/vendor_flow.rs`) so the
-/// dry run and the wet run refuse exactly the same purls (#1976): the
-/// purls of `selected` the vendor backend refuses on the project's lock
-/// text alone ([`socket_patch_core::vendor::lock_text_refusals`]), leaving
-/// out a purl the lockfiles pin hosted (`claimed`: its takeover restores
-/// the upstream entry first), one the ledger's idempotency skip settles
-/// ([`detached_ledger_record`]), and one the vendor loop would never hand
-/// to its backend ([`crate::commands::vendor::lock_refusals_reaching_backend`];
-/// `options` and `prior` drive its installed-copy lookup).
-pub(crate) async fn unclaimed_lock_text_refusals(
-    cwd: &Path,
-    selected: &[&PatchSearchResult],
-    claimed: &std::collections::HashSet<PurlKey>,
-    ledger: &VendorState,
-    options: CrawlerOptions,
-    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
-) -> LockRefusals {
-    let candidates: Vec<(&str, &str)> = selected
-        .iter()
-        .filter(|sr| !claimed.contains(&PurlKey::new(&sr.purl)))
-        .filter(|sr| {
-            detached_ledger_record(RecordStore::Ledger(&ledger.entries), &sr.purl, &sr.uuid)
-                .is_none()
-        })
-        .map(|sr| (sr.purl.as_str(), sr.uuid.as_str()))
-        .collect();
-    if candidates.is_empty() {
-        return LockRefusals::new();
-    }
-    let refused = socket_patch_core::vendor::lock_text_refusals(cwd, &candidates).await;
-    crate::commands::vendor::lock_refusals_reaching_backend(
-        cwd,
-        refused,
-        &ledger.entries,
-        |purls| async move { crate::commands::vendor::installed_purls(&options, &purls, prior).await },
-    )
-    .await
-}
-
-/// The purl keys the project's lockfiles pin hosted (a patch-server
-/// tarball, Socket's own or one of `origins`): the purls whose vendored
-/// run is a hosted → vendored takeover.
-/// The fetch-phase gate ([`lock_text_refusals_for`]) and the scan preview
+/// The project's hosted pins: the purls whose vendored run is a hosted →
+/// vendored takeover (a patch-server tarball, Socket's own or one of
+/// `origins`). The download phase and the scan preview
 /// (`scan/vendor_flow.rs`) both read the takeovers through here, so the dry
 /// run and the wet run agree on which purls they are.
-pub(crate) async fn hosted_claimed_purls(
-    cwd: &Path,
-    origins: Vec<String>,
-) -> std::collections::HashSet<PurlKey> {
-    claimed_purls(&hosted_pins(cwd, origins).await)
-}
-
-/// The project's hosted pins (see [`hosted_claimed_purls`]).
-async fn hosted_pins(
+pub(crate) async fn hosted_pins(
     cwd: &Path,
     origins: Vec<String>,
 ) -> Vec<socket_patch_core::patch::redirect::upstream::HostedPin> {
@@ -908,7 +836,7 @@ async fn hosted_pins(
 }
 
 /// The purl keys of `pins`.
-fn claimed_purls(
+pub(crate) fn claimed_purls(
     pins: &[socket_patch_core::patch::redirect::upstream::HostedPin],
 ) -> std::collections::HashSet<PurlKey> {
     pins.iter().map(|pin| PurlKey::new(&pin.purl)).collect()
@@ -931,7 +859,7 @@ pub(crate) fn detached_ledger_record<'a>(
 }
 
 /// The fetch loop both download engines share: installed-release
-/// narrowing, the caller's Bun and vlt refusals, the per-store skip
+/// narrowing, the caller's vendored refusals, the per-store skip
 /// decision, the view fetch (served from `prefetched` when the narrowing or
 /// the caller already holds the view), the no-applicable-files guardrail,
 /// optional blob persistence, and every per-patch failure record. Every
@@ -943,8 +871,7 @@ pub(crate) async fn fetch_selected_patches(
     api_client: &ApiClient,
     store: RecordStore<'_>,
     blobs_dir: Option<&Path>,
-    refusals: VendorRefusals<'_>,
-    lock_refusals: &LockRefusals,
+    refusals: &VendorRefusals,
     mut prefetched: HashMap<String, PatchResponse>,
 ) -> FetchBatch {
     let quiet = params.quiet();
@@ -990,8 +917,8 @@ pub(crate) async fn fetch_selected_patches(
 
     // The view GETs the loop below makes — every patch past the refusal
     // and the ledger skip whose view is not already held in `prefetched`
-    // (the same three checks, in the loop's order, over inputs the loop
-    // never mutates) — run concurrently ahead of it, at most
+    // (the same checks, in the loop's order, over inputs the loop never
+    // mutates) — run concurrently ahead of it, at most
     // `api_concurrency` in flight, and come back in selection order. The
     // loop takes the next one where it would await the request, and each
     // request's `--debug` lines print there too, so stdout, the per-patch
@@ -1000,9 +927,8 @@ pub(crate) async fn fetch_selected_patches(
     let to_fetch: Vec<&str> = selected
         .iter()
         .filter(|sr| {
-            refusals.for_purl(&sr.purl).is_none()
+            !refusals.contains_key(&sr.purl)
                 && detached_ledger_record(store, &sr.purl, &sr.uuid).is_none()
-                && !lock_refusals.contains_key(&sr.purl)
                 && !held.remove(sr.uuid.as_str())
         })
         .map(|sr| sr.uuid.as_str())
@@ -1020,9 +946,11 @@ pub(crate) async fn fetch_selected_patches(
         // Refusal FIRST (the dry-run preview's precedence): a preserved
         // ledger can name this exact uuid after `rollback --preserve-state`
         // unwired it, so UUID equality alone never exempts a purl — the
-        // lock-derived exemption inside `applies_to` decides. Code-tagged so
-        // a `--silent` operator can grep the stable code.
-        if let Some((code, detail)) = refusals.for_purl(purl) {
+        // refusals' own lock-derived exemption decides. The backend refuses
+        // the package before it reads the patch, so its view is never
+        // fetched (nor, downstream, its pristine source). Code-tagged so a
+        // `--silent` operator can grep the stable code.
+        if let Some(VendorRefusal { code, detail }) = refusals.get(purl) {
             batch.fail(
                 params.json,
                 Some(format!("[error] {purl} ({code}): {detail}")),
@@ -1044,21 +972,6 @@ pub(crate) async fn fetch_selected_patches(
             // account.
             batch.reused.push((purl.to_string(), record));
             batch.skipped += 1;
-            continue;
-        }
-
-        // Lock-text refusal (see `lock_text_refusals_for`): the vendor
-        // backend refuses this package on the project's lock alone, so its
-        // view is never fetched (nor, downstream, its pristine source) —
-        // reported with the backend's code and words, as the Bun refusal is.
-        if let Some((code, detail)) = lock_refusals.get(purl) {
-            batch.fail(
-                params.json,
-                Some(format!("[error] {purl} ({code}): {detail}")),
-                (purl, uuid),
-                code,
-                detail,
-            );
             continue;
         }
 
@@ -1263,7 +1176,7 @@ fn release_warnings(warnings: Vec<String>) -> Vec<RunWarning> {
 pub(crate) const RELEASE_NARROWING: &str = "release_narrowing";
 
 /// [`download_patch_records_with`], handing `prior` (scan's npm crawl of
-/// the untouched tree) to the lock-text refusals' installed-copy lookup.
+/// the untouched tree) to the refusals' installed-copy lookup.
 pub(crate) async fn download_patch_records_reusing(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
@@ -1271,32 +1184,22 @@ pub(crate) async fn download_patch_records_reusing(
     prefetched: HashMap<String, PatchResponse>,
     prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
 ) -> DetachedDownload {
-    // The ledger load outcome is handed to the preflight AS a result: an
+    // The ledger load outcome is handed to the refusals AS a result: an
     // unreadable ledger must surface as `vendor_state_unreadable` from the
     // one refusal this phase emits (fail closed, nothing exempt), not be
-    // flattened into an empty ledger that then reports a Bun lock remedy.
-    // For the classification below it degrades to empty (no detached entry
-    // to reuse — the vendor step reports the corruption itself).
+    // flattened into an empty ledger that then reports a lock remedy. For
+    // the classification below it degrades to empty (no detached entry to
+    // reuse — the vendor step reports the corruption itself). This phase
+    // feeds the vendor engine, so it refuses what the engine would BEFORE
+    // fetching: otherwise the view is downloaded for nothing, and a package
+    // resolvable only through an unreadable lock inventory is misreported
+    // as `package_not_installed` instead of the real code.
     let vendor_state = load_state(&params.project_root()).await;
-    // Bun preflight (see `BunVendorRefusal`): this phase feeds the vendor
-    // engine, so it must refuse the same projects BEFORE fetching —
-    // otherwise the view is downloaded for nothing and a package
-    // resolvable only through the unreadable bun.lockb inventory is
-    // misreported as `package_not_installed` instead of the real
-    // `vendor_bun_*` code. npm-only, so release narrowing (PyPI / RubyGems /
-    // Maven variants) cannot change its verdict.
-    let bun_refusal = bun_vendor_preflight_with_ledger(
-        &params.cwd,
+    let refusals = vendored_download_refusals(
+        params,
         selected,
         vendor_state.as_ref().map(|s| &s.entries),
-    )
-    .await;
-    // The vlt twin: every lock-, manifest- and ledger-decidable vlt refusal
-    // (see `crate::commands::vlt_preflight`), per purl.
-    let vlt_refusals = vlt_vendor_preflight_selected(
-        &params.cwd,
-        selected,
-        vendor_state.as_ref().map(|s| &s.entries),
+        prior,
     )
     .await;
     download_patch_records_preflighted(
@@ -1305,33 +1208,24 @@ pub(crate) async fn download_patch_records_reusing(
         api_client,
         prefetched,
         vendor_state,
-        VendorRefusals {
-            bun: bun_refusal.as_ref(),
-            vlt: &vlt_refusals,
-        },
-        prior,
+        &refusals,
     )
     .await
 }
 
 /// [`download_patch_records_with`] after its two reads: the caller's own
-/// ledger load and Bun preflight outcome. The `get <uuid>` path runs the
-/// preflight itself (it owns the pre-record refusal shape) and hands the
-/// UNFILTERED outcome down, so the lock is read once per run and the
-/// refused-but-exempt case still reaches the per-purl `applies_to` gate.
+/// ledger load and [`vendored_download_refusals`] outcome. The `get <uuid>`
+/// path computes the refusals itself (it owns the pre-record refusal
+/// shape) and hands them down, so the project is judged once per run.
 pub(crate) async fn download_patch_records_preflighted(
     selected: &[PatchSearchResult],
     params: &DownloadParams,
     api_client: &ApiClient,
     prefetched: HashMap<String, PatchResponse>,
     vendor_state: std::io::Result<VendorState>,
-    refusals: VendorRefusals<'_>,
-    prior: Option<&crate::ecosystem_dispatch::NpmCrawlSnapshot>,
+    refusals: &VendorRefusals,
 ) -> DetachedDownload {
     let vendor_state = vendor_state.unwrap_or_default();
-    let lock_refusals =
-        lock_text_refusals_for(params, selected, &vendor_state, refusals.bun, prior).await;
-
     let blobs_dir = params.socket_dir().join("blobs");
     let batch = fetch_selected_patches(
         selected,
@@ -1340,7 +1234,6 @@ pub(crate) async fn download_patch_records_preflighted(
         RecordStore::Ledger(&vendor_state.entries),
         params.persist_blobs.then_some(blobs_dir.as_path()),
         refusals,
-        &lock_refusals,
         prefetched,
     )
     .await;
@@ -1789,9 +1682,9 @@ pub async fn download_and_apply_patches_into(
         }
     };
 
-    // No Bun preflight here: this is the agent (manifest) engine, and
+    // No vendored refusals here: this is the agent (manifest) engine, and
     // agent/save-only flows keep their record-only intent. The vendored
-    // download phase (`download_patch_records_with`) runs its own.
+    // download phase (`download_patch_records_with`) computes its own.
     let blobs_dir = socket_dir.join("blobs");
     let batch = fetch_selected_patches(
         selected,
@@ -1799,8 +1692,7 @@ pub async fn download_and_apply_patches_into(
         run.api_client,
         RecordStore::Manifest(&manifest),
         params.persist_blobs.then_some(blobs_dir.as_path()),
-        VendorRefusals::default(),
-        &HashMap::new(),
+        &VendorRefusals::new(),
         HashMap::new(),
     )
     .await;

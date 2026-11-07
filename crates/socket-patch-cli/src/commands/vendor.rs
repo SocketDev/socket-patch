@@ -20,6 +20,7 @@
 //! CLI_CONTRACT.md "Ownership, state, and reversal".
 
 use clap::Args;
+use futures_util::future::BoxFuture;
 use futures_util::StreamExt;
 use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::constants::SOCKET_DIR;
@@ -36,6 +37,7 @@ use socket_patch_core::utils::group_commit::{CommittedFile, GroupCommit};
 use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::socket_dir::remove_tree_and_prune;
+use socket_patch_core::vendor::refusals::{RefusalScope, VendorRefusals};
 use socket_patch_core::vendor::{
     self, ecosystem_dir_for_purl, load_state, lock_inventory, lookup_entry, lookup_entry_kv,
     save_state, save_state_shared, PackageSource, RevertOpts, RevertOutcome, VendorEntry,
@@ -49,7 +51,6 @@ use std::time::Duration;
 
 use crate::args::{apply_env_toggles, GlobalArgs};
 use crate::commands::apply::{representative_file, result_to_event, variant_matches_installed};
-use crate::commands::bun_preflight::bun_vendor_preflight_pairs;
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendor_orphans::{
     orphan_label, orphan_removal_failed, orphan_removed_event, orphan_still_wired,
@@ -61,7 +62,6 @@ use crate::commands::vendored_backend::{
 use crate::commands::vex::{
     generate_vex_from_manifest_path, generate_vex_without_manifest, ManifestlessVex, VexEmbedArgs,
 };
-use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_pairs};
 use crate::ecosystem_dispatch::{
     find_packages_for_rollback_reusing, npm_paths_by_identity, npm_paths_by_identity_in,
     partition_purls, NpmCrawlSnapshot,
@@ -2732,25 +2732,6 @@ async fn sweep_stale_artifact(
     );
 }
 
-pub(crate) async fn pristine_fetch_is_verifiable(
-    project_root: &Path,
-    inventory: &[lock_inventory::LockfileEntry],
-    purl: &str,
-    ledger_entry: Option<&VendorEntry>,
-) -> bool {
-    let verifiable =
-        |e: &lock_inventory::LockfileEntry| e.integrity != lock_inventory::LockIntegrity::None;
-    if lock_inventory::lookup(inventory, purl).is_some_and(verifiable) {
-        return true;
-    }
-    match ledger_entry {
-        Some(le) => lock_inventory::recover_lock_entry(project_root, le)
-            .await
-            .is_ok_and(|e| verifiable(&e)),
-        None => false,
-    }
-}
-
 pub(crate) async fn installed_purls(
     options: &CrawlerOptions,
     purls: &[String],
@@ -2779,37 +2760,13 @@ pub(crate) async fn installed_purls(
     installed
 }
 
-pub(crate) async fn lock_refusals_reaching_backend<F, Fut>(
-    cwd: &Path,
-    mut refused: HashMap<String, (&'static str, String)>,
-    ledger: &HashMap<String, VendorEntry>,
-    installed: F,
-) -> HashMap<String, (&'static str, String)>
-where
-    F: FnOnce(Vec<String>) -> Fut,
-    Fut: std::future::Future<Output = HashSet<String>>,
-{
-    if refused.is_empty() {
-        return refused;
-    }
-    let inventory = lock_inventory::inventory_project(cwd).await;
-    let mut unresolved: Vec<String> = Vec::new();
-    for purl in refused.keys() {
-        if !pristine_fetch_is_verifiable(cwd, &inventory, purl, lookup_entry(ledger, purl)).await {
-            unresolved.push(purl.clone());
-        }
-    }
-    if unresolved.is_empty() {
-        return refused;
-    }
-    unresolved.sort();
-    let installed = installed(unresolved.clone()).await;
-    for purl in unresolved {
-        if !installed.contains(&purl) {
-            refused.remove(&purl);
-        }
-    }
-    refused
+/// [`installed_purls`] as the installed-copy lookup of a
+/// [`RefusalScope`]: `prior` is scan's npm crawl, when the caller has it.
+pub(crate) fn installed_lookup<'a>(
+    options: &'a CrawlerOptions,
+    prior: Option<&'a NpmCrawlSnapshot>,
+) -> impl Fn(Vec<String>) -> BoxFuture<'a, HashSet<String>> + Send + Sync + 'a {
+    move |purls| Box::pin(async move { installed_purls(options, &purls, prior).await })
 }
 
 enum StagedSource {
@@ -2914,7 +2871,8 @@ enum CandidateVerdict<'a> {
     /// Several variants match a package with nothing installed to probe
     /// and none recorded: `vendor_variant_ambiguous`.
     Ambiguous,
-    /// A Bun, vlt or linked-vendor-dir refusal, with the engine's code and
+    /// A [`socket_patch_core::vendor::refusals::vendor_refusals`] or
+    /// linked-vendor-dir refusal, with the engine's code and
     /// detail. Raised before the takeover, so a live hosted pin stays.
     Refuse { code: &'static str, detail: String },
     /// The candidate reaches its takeover and backend. `superseded`: its
@@ -2936,8 +2894,10 @@ struct CandidateGates<'a> {
     /// Purls already failed this run (`vendor_ledger_entry_missing`); a
     /// sibling variant's group must not bring them back.
     refused: &'a HashSet<String>,
-    bun_refusal: Option<&'a crate::commands::bun_preflight::BunVendorRefusal>,
-    vlt_refusals: &'a [(String, crate::commands::vlt_preflight::VltVendorRefusal)],
+    /// [`socket_patch_core::vendor::refusals::vendor_refusals`] over the
+    /// run's records, raised before the takeover so a live hosted pin
+    /// stays.
+    refusals: &'a VendorRefusals,
     /// Whether the lockfiles still pin the purl hosted.
     hosted_pinned: &'a dyn Fn(&str) -> bool,
 }
@@ -3006,13 +2966,7 @@ impl<'a> CandidateGates<'a> {
                 return CandidateVerdict::Ambiguous;
             }
         }
-        if let Some(refusal) = self.bun_refusal.filter(|r| r.applies_to(candidate)) {
-            return CandidateVerdict::Refuse {
-                code: refusal.code,
-                detail: refusal.detail.clone(),
-            };
-        }
-        if let Some(refusal) = vlt_refusal_for(self.vlt_refusals, candidate) {
+        if let Some(refusal) = self.refusals.get(candidate) {
             return CandidateVerdict::Refuse {
                 code: refusal.code,
                 detail: refusal.detail.clone(),
@@ -3358,25 +3312,6 @@ pub(crate) async fn vendor_records_reusing(
 
     let vendored_at = now_rfc3339();
 
-    // Bun vendored preflight (see `crate::commands::bun_preflight`), run
-    // ONCE per run over the in-scope records and consulted per candidate
-    // BEFORE the hosted→vendored takeover: the takeover reverts a hosted
-    // purl's lockfile edits first, so a bun refusal the engine would raise
-    // afterwards (pre-v2 text `workspace:` lock, unsupported project) must
-    // be raised before it, or the purl ends up unpatched in both modes.
-    // A purl the ledger wires at the record's uuid is exempt.
-    let bun_pairs: Vec<(&str, &str)> = vendorable
-        .iter()
-        .filter_map(|p| records.get(p).map(|r| (p.as_str(), r.uuid.as_str())))
-        .collect();
-    let bun_refusal = bun_vendor_preflight_pairs(&common.cwd, &bun_pairs, Ok(&state.entries)).await;
-    // The vlt twin (see `crate::commands::vlt_preflight`): every refusal
-    // the vlt backend can decide from the lock, the package.json files,
-    // the ledger and the installed copy, consulted per candidate before
-    // the takeover below reverts a live hosted redirect.
-    let vlt_refusals =
-        vlt_vendor_preflight_pairs(&common.cwd, &bun_pairs, Ok(&state.entries)).await;
-
     // Release-variant grouping (pypi `?artifact_id=`, gem `?platform=`):
     // the crawler emits base purls; match the manifest's qualified variants
     // against the installed distribution via the first-file probe.
@@ -3409,15 +3344,37 @@ pub(crate) async fn vendor_records_reusing(
             .find(|pin| PurlKey::same(&pin.purl, purl))
     };
 
-    // Yarn berry / npm package-lock takeover preflight (see
-    // `socket_patch_core::vendor::yarn_berry_vendor_preflight` and
-    // `npm_lock_vendor_preflight`): the backend's project-level refusals
-    // (berry: mixed line endings in yarn.lock or package.json, cacheKey,
-    // `.yarnrc.yml` compressionLevel; package-lock: a lock that is not
-    // v2/v3, #659), computed at
+    // Every refusal the engine can decide before a download (see
+    // `vendor::refusals`), computed once per run over the in-scope records
+    // and consulted per candidate BEFORE the hosted→vendored takeover: the
+    // takeover reverts a hosted purl's lockfile edits first, so a refusal
+    // the backend would raise afterwards must be raised before it, or the
+    // purl ends up unpatched in both modes.
+    let refusal_pairs: Vec<(&str, &str)> = vendorable
+        .iter()
+        .filter_map(|p| records.get(p).map(|r| (p.as_str(), r.uuid.as_str())))
+        .collect();
+    let crawler_options = common.crawler_options();
+    let installed = installed_lookup(&crawler_options, prior);
+    let refusals = vendor::refusals::vendor_refusals(
+        &common.cwd,
+        &refusal_pairs,
+        Ok(&state.entries),
+        &RefusalScope {
+            hosted_pins: &hosted_pins,
+            installed: &installed,
+        },
+    )
+    .await;
+
+    // Yarn berry takeover preflight (see
+    // `socket_patch_core::vendor::yarn_berry_vendor_preflight`): the
+    // backend's project-level refusals (mixed line endings in yarn.lock or
+    // package.json, cacheKey, `.yarnrc.yml` compressionLevel), computed at
     // most once per run and only when a hosted-claimed npm purl reaches the
     // takeover below, which must refuse such a purl BEFORE reverting its
-    // hosted edits.
+    // hosted edits. The package-lock project refusal (#659) is one of
+    // `refusals`, so it is raised before the takeover too.
     let npm_takeover_refusal: tokio::sync::OnceCell<Option<(&'static str, String)>> =
         tokio::sync::OnceCell::new();
     let pipenv_version = tokio::sync::OnceCell::new();
@@ -3458,8 +3415,7 @@ pub(crate) async fn vendor_records_reusing(
         force,
         records,
         refused: &fetch_failed,
-        bun_refusal: bun_refusal.as_ref(),
-        vlt_refusals: &vlt_refusals,
+        refusals: &refusals,
         hosted_pinned: &hosted_pinned,
     };
     // Candidates the loop refuses as `vendor_variant_ambiguous`, joined to
@@ -3599,20 +3555,8 @@ pub(crate) async fn vendor_records_reusing(
                 }
                 if candidate.starts_with("pkg:npm/") {
                     let project = npm_takeover_refusal
-                        .get_or_init(|| async {
-                            match socket_patch_core::vendor::yarn_berry_vendor_preflight(
-                                &common.cwd,
-                            )
-                            .await
-                            {
-                                Some(refusal) => Some(refusal),
-                                None => {
-                                    socket_patch_core::vendor::npm_lock_vendor_preflight(
-                                        &common.cwd,
-                                    )
-                                    .await
-                                }
-                            }
+                        .get_or_init(|| {
+                            socket_patch_core::vendor::yarn_berry_vendor_preflight(&common.cwd)
                         })
                         .await
                         .clone();
@@ -5384,21 +5328,40 @@ mod plan_gate_tests {
         ));
     }
 
-    /// Gates with no preflight refusals, no hosted pins and no `--force`.
+    /// Gates with no vendored refusals, no hosted pins and no `--force`.
     pub(super) fn gates<'a>(
         root: &'a Path,
         records: &'a HashMap<String, PatchRecord>,
         refused: &'a HashSet<String>,
     ) -> CandidateGates<'a> {
+        static NONE: VendorRefusals = VendorRefusals::new();
         CandidateGates {
             cwd: root,
             force: false,
             records,
             refused,
-            bun_refusal: None,
-            vlt_refusals: &[],
+            refusals: &NONE,
             hosted_pinned: &|_| false,
         }
+    }
+
+    /// [`vendor::refusals::vendor_refusals`] over `pairs` with an empty
+    /// ledger and no hosted pins.
+    pub(super) async fn refusals_of(root: &Path, pairs: &[(&str, &str)]) -> VendorRefusals {
+        let empty = HashMap::new();
+        let nothing_installed = |_: Vec<String>| -> BoxFuture<'static, HashSet<String>> {
+            Box::pin(async { HashSet::new() })
+        };
+        vendor::refusals::vendor_refusals(
+            root,
+            pairs,
+            Ok(&empty),
+            &RefusalScope {
+                hosted_pins: &[],
+                installed: &nothing_installed,
+            },
+        )
+        .await
     }
 
     /// The download plan runs every record through its backend's own gate:
@@ -5537,8 +5500,51 @@ mod plan_gate_tests {
     /// the vlt preflight refuses it and so does the loop (#1909). The plan
     /// must leave it out: a grant can start a server-side build and counts
     /// against quota.
+    /// The plan judges every refusal the engine decides before a download,
+    /// not only the npm flavor gates: a v1 package-lock project's package
+    /// is never planned.
     #[tokio::test]
-    async fn the_plan_leaves_out_a_package_the_vlt_preflight_refuses() {
+    async fn the_plan_leaves_out_a_package_a_v1_package_lock_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let purl = "pkg:npm/left-pad@1.3.0";
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"name":"app","version":"1.0.0","dependencies":{"left-pad":"1.3.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("package-lock.json"),
+            r#"{"name":"app","version":"1.0.0","lockfileVersion":1,"dependencies":{}}"#,
+        )
+        .unwrap();
+        let installed = root.join("node_modules/left-pad");
+        std::fs::create_dir_all(&installed).unwrap();
+        let all_packages = vec![(purl.to_string(), StagedSource::Installed(installed))];
+        let records = HashMap::from([(purl.to_string(), record(UUID_A))]);
+        let refusals = refusals_of(root, &[(purl, UUID_A)]).await;
+        assert_eq!(refusals[purl].code, "vendor_lockfile_version_unsupported");
+        let none = HashSet::new();
+        let gates = CandidateGates {
+            refusals: &refusals,
+            ..gates(root, &records, &none)
+        };
+        let plan = plan_service_downloads(
+            &gates,
+            &VendorState::default(),
+            &all_packages,
+            &HashMap::new(),
+            (
+                &tokio::sync::OnceCell::new(),
+                &vendor::pypi::InstalledSiteListings::default(),
+            ),
+        )
+        .await;
+        assert!(plan.is_empty(), "the refused package is never planned");
+    }
+
+    #[tokio::test]
+    async fn the_plan_leaves_out_a_package_vlt_refuses() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let purl = "pkg:npm/left-pad@1.3.0";
@@ -5560,13 +5566,13 @@ mod plan_gate_tests {
         let records = HashMap::from([(purl.to_string(), record(UUID_A))]);
         let pairs = [(purl, UUID_A)];
         let none = HashSet::new();
-        let plan = |vlt_refusals: Vec<_>| {
+        let plan = |refusals: VendorRefusals| {
             let none = &none;
             let all_packages = &all_packages;
             let records = &records;
             async move {
                 let gates = CandidateGates {
-                    vlt_refusals: &vlt_refusals,
+                    refusals: &refusals,
                     ..gates(root, records, none)
                 };
                 plan_service_downloads(
@@ -5585,12 +5591,8 @@ mod plan_gate_tests {
                 .collect::<Vec<_>>()
             }
         };
-        let empty = HashMap::new();
-
         std::fs::write(store.join("package.json"), r#"{"name":"left-pad"}"#).unwrap();
-        let vlt =
-            crate::commands::vlt_preflight::vlt_vendor_preflight_pairs(root, &pairs, Ok(&empty))
-                .await;
+        let vlt = refusals_of(root, &pairs).await;
         assert!(vlt.is_empty(), "{vlt:?}");
         assert_eq!(plan(vlt).await, vec![UUID_A.to_string()]);
 
@@ -5599,10 +5601,8 @@ mod plan_gate_tests {
             r#"{"name":"left-pad","bundleDependencies":["x"]}"#,
         )
         .unwrap();
-        let vlt =
-            crate::commands::vlt_preflight::vlt_vendor_preflight_pairs(root, &pairs, Ok(&empty))
-                .await;
-        assert_eq!(vlt[0].1.code, "vendor_bundled_deps_unsupported");
+        let vlt = refusals_of(root, &pairs).await;
+        assert_eq!(vlt[purl].code, "vendor_bundled_deps_unsupported");
         assert!(
             plan(vlt).await.is_empty(),
             "the vlt-refused package is never planned"

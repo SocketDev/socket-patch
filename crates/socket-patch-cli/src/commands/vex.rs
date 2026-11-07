@@ -31,8 +31,8 @@ use socket_patch_core::vex::{
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
 use crate::commands::vex_sources::{
-    self, Plan, RunApiClient, Sources, RECORD_MISMATCH, RECORD_UNAVAILABLE, REDIRECT_UNWIRED,
-    VENDOR_UNWIRED, WIRING_CONFLICT,
+    self, Plan, RunApiClient, Sources, GO_WORKSPACE_OVERRIDE, RECORD_MISMATCH, RECORD_UNAVAILABLE,
+    REDIRECT_UNWIRED, VENDOR_UNWIRED, WIRING_CONFLICT,
 };
 use crate::ecosystem_dispatch::{find_manifest_package_copies_reusing, JvmScope};
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning};
@@ -1958,10 +1958,6 @@ fn join_and(items: &[&str]) -> String {
     }
 }
 
-/// Omission tag for a Go patch whose go.mod replace the `go.work` in effect
-/// overrides, ignores or rejects (#393, #458, #531).
-const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
-
 /// Omission tag for a global Go patch while a tool built from the unpatched
 /// module with `go install` remains (#422).
 const GO_INSTALLED_TOOL_STALE: &str = socket_patch_core::utils::go_installed_tools::STALE_WARNING;
@@ -2096,6 +2092,10 @@ fn omission_phrase(reason: &str) -> &'static str {
              against"
         }
         "stale_install" => "the installed copy is not patched",
+        "native_extension_not_rebuilt" => {
+            "the patched native-extension sources were not compiled into the extension Ruby \
+             loads; run socket-patch apply to rebuild it"
+        }
         DEPENDENCY_NOT_INSTALLED => {
             "the patched package.json declares a dependency that is not installed beside \
              the package"
@@ -2126,8 +2126,9 @@ fn omission_phrase(reason: &str) -> &'static str {
              package any more"
         }
         GO_WORKSPACE_OVERRIDE => {
-            "the go.work in effect overrides, ignores or conflicts with its go.mod replace, \
-             so the build does not link the patched module"
+            "the Go workspace in effect keeps its replace from the build (overrides, ignores \
+             or rejects it, or go builds from a go.work other than the one holding it), so \
+             the build does not link the patched module; the run warning names which"
         }
         GO_INSTALLED_TOOL_STALE => {
             "a tool installed with `go install` was built from the unpatched module and keeps \

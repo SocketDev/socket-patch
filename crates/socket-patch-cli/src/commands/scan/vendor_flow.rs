@@ -22,6 +22,7 @@ use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
 use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry, TelemetryAuth};
 use socket_patch_core::utils::purl_key::PurlKey;
+use socket_patch_core::vendor::refusals::{vendor_refusals, RefusalScope, VendorRefusal};
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -32,13 +33,11 @@ use crate::commands::agent_download::tag_mode;
 use crate::commands::agent_download::{
     download_patch_records_reusing, DetachedDownload, DownloadParams,
 };
-use crate::commands::bun_preflight::bun_vendor_preflight_with_ledger;
 use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
 };
 use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
-use crate::commands::vlt_preflight::{vlt_refusal_for, vlt_vendor_preflight_selected};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{
     Command as EnvelopeCommand, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning,
@@ -173,12 +172,43 @@ impl VendorPreview {
         }
     }
 
-    /// Human rendering of the preview's refusals and symlink advisories:
-    /// the count line above it still says "would download and vendor", so
-    /// name what the wet run would refuse and why. Shared by `scan --mode
-    /// vendored --dry-run` and `get … --mode vendored --dry-run` so the two
-    /// cannot drift. Callers gate it on `--silent`.
-    pub(crate) fn print_refusals(&self) {
+    /// How many rows the ledger already holds at their uuid.
+    pub(crate) fn in_sync_count(&self) -> usize {
+        self.rows
+            .iter()
+            .filter(|r| matches!(r.verdict, PreviewVerdict::AlreadyVendored))
+            .count()
+    }
+
+    /// The human `--dry-run` headline: every row, less the ones the wet
+    /// run would refuse or skip as already vendored (#1850).
+    fn dry_run_line(&self) -> String {
+        super::render::dry_run_line(super::render::Plan::Vendor {
+            total: self.rows.len(),
+            refused: self.refused_count(),
+            in_sync: self.in_sync_count(),
+        })
+    }
+
+    /// Human rendering of the preview: the headline, then a `[skip] …
+    /// (already vendored)` line for each in-sync row (stderr, the wet
+    /// run's line and stream), a `[would-refuse]` line naming what the wet
+    /// run would refuse and why, and the symlink advisories. Shared by
+    /// `scan --mode vendored --dry-run` and `get … --mode vendored
+    /// --dry-run` so the two cannot drift. Callers gate it on `--silent`.
+    pub(crate) fn print_human(&self) {
+        println!("{}", self.dry_run_line());
+        for row in &self.rows {
+            if matches!(row.verdict, PreviewVerdict::AlreadyVendored) {
+                eprintln!(
+                    "{}",
+                    crate::commands::agent_download::format_record_skip(
+                        &row.purl,
+                        "already vendored"
+                    )
+                );
+            }
+        }
         for row in &self.rows {
             if let PreviewVerdict::WouldRefuse { code, detail } = &row.verdict {
                 println!("  [would-refuse] {} ({code}): {detail}", row.purl);
@@ -195,26 +225,21 @@ impl VendorPreview {
 /// Dry-run preview for `scan --mode vendored` (and `get … --mode vendored
 /// --dry-run`): classify each selected patch against the vendor ledger
 /// without writing anything or touching the network beyond discovery
-/// (see [`PreviewVerdict`]): would-refuse for npm purls the wet run's Bun,
-/// vlt or npm package-lock preflight
-/// ([`crate::commands::bun_preflight::BunVendorRefusal`],
-/// [`crate::commands::vlt_preflight`], [`npm_lock_refusal`]) would refuse
-/// before any download, or whose hosted pnpm pin the takeover would fail
-/// to replace ([`hosted_pnpm_refusals`]: the pnpm backend's lock-text
-/// refusal, #853), or whose lock entry the backend refuses on the lock
-/// text alone ([`lock_text_refusals`]: a package-lock entry installed from
-/// a URL or git spec, a workspace member, #1976), and would-refuse for
-/// PyPI purls the PyPI backend's wiring guards refuse ([`pypi_refusals`],
-/// #891), plus the gem hosted→vendored takeover refusals
-/// ([`crate::commands::vendor::gem_takeover_preview_refusals`]). The preview stays a ledger
-/// classification otherwise (engine refusals outside the preflights are
-/// not predicted), and a would-refuse never flips the run's status or exit
-/// code. The preflights (the only disk access besides the ledger; the PyPI
-/// one may also probe `pipenv --version` and list Hatch environments, as
-/// the wet run's guards do; the lock-text gates read the lock, the
-/// manifest and, for a refused package the lock does not resolve to a
-/// registry source, the installed tree) run only when the selection holds
-/// an npm, PyPI or cargo purl.
+/// (see [`PreviewVerdict`]): would-refuse for every purl the wet run
+/// refuses before any download
+/// ([`socket_patch_core::vendor::refusals::vendor_refusals`]: the npm
+/// flavor gates, the package-lock project refusal, a hosted pnpm pin's
+/// takeover (#853) and the npm / cargo lock-text gates, #1976), for PyPI
+/// purls the PyPI backend's wiring guards refuse ([`pypi_refusals`],
+/// #891), and for the gem hosted→vendored takeover refusals
+/// ([`crate::commands::vendor::gem_takeover_preview_refusals`]). The
+/// preview stays a ledger classification otherwise (engine refusals outside
+/// these are not predicted), and a would-refuse never flips the run's
+/// status or exit code. The refusals are the only disk access besides the
+/// ledger (the PyPI one may also probe `pipenv --version` and list Hatch
+/// environments, as the wet run's guards do; the lock-text gates read the
+/// lock, the manifest and, for a refused package the lock does not resolve
+/// to a registry source, the installed tree).
 ///
 /// The one answer to "which selected patches would the wet run refuse?":
 /// the dry-run rows and the rollout planning pass
@@ -244,20 +269,40 @@ async fn preview_vendor_with(
     origins: &[String],
     takeover_refusals: &HashMap<String, (&'static str, String)>,
 ) -> VendorPreview {
-    // The ledger load outcome reaches the preflight AS a result, so an
+    // The ledger load outcome reaches the refusals AS a result, so an
     // unreadable ledger previews as `vendor_state_unreadable` rather than
     // as an empty ledger.
     let state = load_state(cwd).await;
-    let refusal =
-        bun_vendor_preflight_with_ledger(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
-    let vlt_refusals =
-        vlt_vendor_preflight_selected(cwd, selected, state.as_ref().map(|s| &s.entries)).await;
-    let npm_lock_refusal = npm_lock_refusal(cwd, selected).await;
+    // Hosted pins matter only to the ecosystems whose refusals are scoped
+    // by them; discovery is skipped for any other selection.
+    let pins = if selected.iter().any(|p| {
+        ["pkg:npm/", "pkg:cargo/", "pkg:pypi/"]
+            .iter()
+            .any(|prefix| p.purl.starts_with(prefix))
+    }) {
+        crate::commands::agent_download::hosted_pins(cwd, origins.to_vec()).await
+    } else {
+        Vec::new()
+    };
+    let options = socket_patch_core::crawlers::CrawlerOptions {
+        cwd: cwd.to_path_buf(),
+        global: false,
+        global_prefix: None,
+    };
+    let installed = crate::commands::vendor::installed_lookup(&options, None);
+    let refusals = vendor_refusals(
+        cwd,
+        &crate::commands::agent_download::selection_pairs(selected),
+        state.as_ref().map(|s| &s.entries),
+        &RefusalScope {
+            hosted_pins: &pins,
+            installed: &installed,
+        },
+    )
+    .await;
     let state = state.unwrap_or_default();
-    let pnpm_refusals = hosted_pnpm_refusals(cwd, selected, origins, &state).await;
-    let lock_text_refusals =
-        lock_text_refusals(cwd, selected, origins, &state, npm_lock_refusal.is_some()).await;
-    let pypi_refusals = pypi_refusals(cwd, selected, origins, takeover_refusals).await;
+    let claimed = crate::commands::agent_download::claimed_purls(&pins);
+    let pypi_refusals = pypi_refusals(cwd, selected, origins, &claimed, takeover_refusals).await;
     let refuse = |code: &str, detail: &str| PreviewVerdict::WouldRefuse {
         code: code.to_string(),
         detail: detail.to_string(),
@@ -268,24 +313,8 @@ async fn preview_vendor_with(
             let verdict = match lookup_entry(&state.entries, &p.purl) {
                 // Refusal takes priority: a preserved ledger can name this
                 // UUID even after rollback has removed its live wiring.
-                _ if refusal.as_ref().is_some_and(|r| r.applies_to(&p.purl)) => {
-                    let r = refusal.as_ref().expect("checked by the guard");
-                    refuse(r.code, &r.detail)
-                }
-                _ if vlt_refusal_for(&vlt_refusals, &p.purl).is_some() => {
-                    let r = vlt_refusal_for(&vlt_refusals, &p.purl).expect("checked by the guard");
-                    refuse(r.code, &r.detail)
-                }
-                _ if pnpm_refusals.contains_key(&p.purl) => {
-                    let (code, detail) = &pnpm_refusals[&p.purl];
-                    refuse(code, detail)
-                }
-                _ if p.purl.starts_with("pkg:npm/") && npm_lock_refusal.is_some() => {
-                    let (code, detail) = npm_lock_refusal.as_ref().expect("checked by the guard");
-                    refuse(code, detail)
-                }
-                _ if lock_text_refusals.contains_key(&p.purl) => {
-                    let (code, detail) = &lock_text_refusals[&p.purl];
+                _ if refusals.contains_key(&p.purl) => {
+                    let VendorRefusal { code, detail } = &refusals[&p.purl];
                     refuse(code, detail)
                 }
                 _ if takeover_refusals.contains_key(&p.purl) => {
@@ -331,11 +360,13 @@ async fn preview_vendor_with(
 /// asked again, and neither is one with a live hosted pin: the wet run
 /// restores its upstream entry before the backend runs, so its guards
 /// would judge text this preview never stages (as for the takeovers of
-/// every ecosystem but pnpm, see [`hosted_pnpm_refusals`]).
+/// every ecosystem but pnpm, whose takeover refusal is one of
+/// [`socket_patch_core::vendor::refusals::vendor_refusals`]).
 async fn pypi_refusals(
     cwd: &Path,
     selected: &[PatchSearchResult],
     origins: &[String],
+    claimed: &HashSet<PurlKey>,
     takeover_refusals: &HashMap<String, (&'static str, String)>,
 ) -> HashMap<String, (&'static str, String)> {
     let pypi: Vec<&PatchSearchResult> = selected
@@ -345,8 +376,6 @@ async fn pypi_refusals(
     if pypi.is_empty() {
         return HashMap::new();
     }
-    let claimed =
-        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
     let candidates: Vec<(&str, &str)> = pypi
         .into_iter()
         .filter(|p| !claimed.contains(&PurlKey::new(&p.purl)))
@@ -393,100 +422,6 @@ pub(crate) fn merge_vendor_envelope(env: &mut Envelope, venv: Envelope) {
     {
         env.mark_partial_failure();
     }
-}
-
-/// The npm package-lock backend's project-level refusal (a lock that is
-/// not v2/v3, see [`socket_patch_core::vendor::npm_lock_vendor_preflight`]),
-/// which refuses every npm purl of the project before any download or
-/// takeover. Read only when the selection holds an npm purl.
-async fn npm_lock_refusal(
-    cwd: &Path,
-    selected: &[PatchSearchResult],
-) -> Option<(&'static str, String)> {
-    if !selected.iter().any(|p| p.purl.starts_with("pkg:npm/")) {
-        return None;
-    }
-    socket_patch_core::vendor::npm_lock_vendor_preflight(cwd).await
-}
-
-/// The purls of `selected` the vendor backend refuses on the project's
-/// lock and manifest text alone, with the backend's `(code, detail)`: the
-/// npm package-lock, pnpm, yarn classic and yarn berry per-entry gates and
-/// cargo's locked-version gate. These are the refusals the wet run's
-/// download phase raises before it fetches a view, read through the same
-/// [`crate::commands::agent_download::unclaimed_lock_text_refusals`] (same
-/// hosted-pin, ledger and reaches-the-backend scope), so the preview and
-/// the rollout plan name them too (#1976): an npm package installed from a
-/// URL or git spec, or a workspace member, otherwise previews as vendorable
-/// and takes a `--max-new-patches` slot on every run. npm purls are not
-/// asked when `npm_lock_refused` (the project-level package-lock refusal
-/// already refuses every one of them).
-async fn lock_text_refusals(
-    cwd: &Path,
-    selected: &[PatchSearchResult],
-    origins: &[String],
-    state: &VendorState,
-    npm_lock_refused: bool,
-) -> HashMap<String, (&'static str, String)> {
-    let gated: Vec<&PatchSearchResult> = selected
-        .iter()
-        .filter(|p| {
-            (p.purl.starts_with("pkg:npm/") && !npm_lock_refused)
-                || p.purl.starts_with("pkg:cargo/")
-        })
-        .collect();
-    if gated.is_empty() {
-        return HashMap::new();
-    }
-    let claimed =
-        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
-    let options = socket_patch_core::crawlers::CrawlerOptions {
-        cwd: cwd.to_path_buf(),
-        global: false,
-        global_prefix: None,
-    };
-    crate::commands::agent_download::unclaimed_lock_text_refusals(
-        cwd, &gated, &claimed, state, options, None,
-    )
-    .await
-}
-
-/// The lock-text refusals a hosted → vendored takeover of `selected` meets
-/// in a pnpm project (#853), keyed by the selected purl: each npm purl the
-/// lockfiles pin hosted (see [`crate::commands::agent_download::hosted_claimed_purls`])
-/// and the ledger does not already hold at this uuid, refused by the pnpm
-/// backend on the project's lock and manifest text
-/// ([`socket_patch_core::vendor::pnpm_takeover_lock_text_refusals`]). The
-/// wet takeover reaches the same refusal after its restore and rolls the
-/// restore back, so the hosted pin stays. Discovery runs only when the
-/// selection holds an npm purl and the project has a pnpm lock.
-async fn hosted_pnpm_refusals(
-    cwd: &Path,
-    selected: &[PatchSearchResult],
-    origins: &[String],
-    state: &VendorState,
-) -> HashMap<String, (&'static str, String)> {
-    let npm = |p: &&PatchSearchResult| p.purl.starts_with("pkg:npm/");
-    if !selected.iter().any(|p| npm(&p))
-        || tokio::fs::metadata(cwd.join("pnpm-lock.yaml"))
-            .await
-            .is_err()
-    {
-        return HashMap::new();
-    }
-    let claimed =
-        crate::commands::agent_download::hosted_claimed_purls(cwd, origins.to_vec()).await;
-    let candidates: Vec<(&str, &str)> = selected
-        .iter()
-        .filter(npm)
-        .filter(|p| claimed.contains(&PurlKey::new(&p.purl)))
-        .filter(|p| lookup_entry(&state.entries, &p.purl).is_none_or(|e| e.uuid != p.uuid))
-        .map(|p| (p.purl.as_str(), p.uuid.as_str()))
-        .collect();
-    if candidates.is_empty() {
-        return HashMap::new();
-    }
-    socket_patch_core::vendor::pnpm_takeover_lock_text_refusals(cwd, &candidates).await
 }
 
 /// Everything the vendor step takes: the in-memory `records` to vendor
@@ -1531,6 +1466,50 @@ mod preview_tests {
         assert_eq!(v["summary"]["skipped"], 2);
         assert_eq!(v["status"], "success");
         assert_eq!(preview.refused_count(), 1);
+    }
+
+    /// #1850: the human dry-run headline, shared by `scan` and `get`,
+    /// leaves out what the JSON records as `already_vendored`, so it
+    /// never offers to vendor a patch the wet run skips as in sync.
+    #[tokio::test]
+    async fn preview_headline_leaves_out_already_vendored() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_entry(tmp.path(), NPM, UUID);
+        let in_sync =
+            preview_vendor_with(tmp.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        assert_eq!(in_sync.in_sync_count(), 1);
+        assert_eq!(
+            in_sync.dry_run_line(),
+            "[dry-run] Would download and vendor 0 of 1 patch (1 already vendored). \
+             No changes made."
+        );
+
+        let other = "pkg:npm/preview-new@1.0.0";
+        let mixed = preview_vendor_with(
+            tmp.path(),
+            &[sel(UUID, NPM), sel(UUID, other), sel(UUID, PYPI)],
+            &[],
+            &HashMap::from([(
+                PYPI.to_string(),
+                ("vendor_test_refusal", "refused".to_string()),
+            )]),
+        )
+        .await;
+        assert_eq!(
+            mixed.dry_run_line(),
+            "[dry-run] Would download and vendor 1 of 3 patches (1 already vendored, \
+             1 would be refused). No changes made."
+        );
+
+        // Nothing in sync: the plain headline.
+        let fresh = tempfile::tempdir().unwrap();
+        let plain =
+            preview_vendor_with(fresh.path(), &[sel(UUID, NPM)], &[], &HashMap::new()).await;
+        assert_eq!(plain.in_sync_count(), 0);
+        assert_eq!(
+            plain.dry_run_line(),
+            "[dry-run] Would download and vendor 1 patch. No changes made."
+        );
     }
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";

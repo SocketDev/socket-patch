@@ -308,25 +308,7 @@ mod tests {
     // Env-mutating tests below are serialized: XDG_DATA_HOME / HOME /
     // SOCKET_NO_CONFIG are process-global and shared with other suites.
 
-    fn with_env(pairs: &[(&str, Option<&str>)], f: impl FnOnce()) {
-        let saved: Vec<(&str, Option<String>)> = pairs
-            .iter()
-            .map(|&(k, _)| (k, std::env::var(k).ok()))
-            .collect();
-        for &(k, v) in pairs {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-        f();
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
-    }
+    use crate::test_env::with_env;
 
     #[test]
     #[serial_test::serial]

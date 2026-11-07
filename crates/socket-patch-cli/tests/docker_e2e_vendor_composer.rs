@@ -46,9 +46,6 @@
 
 #![cfg(feature = "docker-e2e")]
 
-#[allow(clippy::duplicate_mod)]
-#[path = "common/fs_tree.rs"]
-mod fs_tree;
 #[path = "common/cache_env.rs"]
 mod cache_env;
 #[path = "composer_e2e_common/mod.rs"]
@@ -57,6 +54,9 @@ mod composer_e2e_common;
 mod docker_common;
 #[path = "docker_vendor_common/mod.rs"]
 mod docker_vendor_common;
+#[allow(clippy::duplicate_mod)]
+#[path = "common/fs_tree.rs"]
+mod fs_tree;
 #[path = "vex_e2e_common/mod.rs"]
 mod vex_e2e_common;
 

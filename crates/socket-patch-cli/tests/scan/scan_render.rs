@@ -674,6 +674,45 @@ async fn scan_human_vendored_dry_run_names_would_refuse_records() {
     );
 }
 
+/// #1850: on a project already vendored at this uuid, the human
+/// `--mode vendored --dry-run` says so instead of offering to download and
+/// vendor the patch: the headline leaves it out, as the JSON's
+/// `already_vendored` row and the wet run's "nothing to do" do, and the
+/// wet run's `[skip] … (already vendored)` line names it.
+#[tokio::test]
+async fn scan_human_vendored_dry_run_skips_already_vendored() {
+    let mock = MockServer::start().await;
+    mount_batch_one(&mock, MINIMIST, UUID, "free", &[], false).await;
+    mount_by_package(&mock, MINIMIST, UUID, serde_json::json!({})).await;
+    let tmp = minimist_project(b"x\n");
+    seed_vendored_entry(tmp.path(), MINIMIST);
+    let ledger = std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap();
+
+    let (code, stdout, stderr) = run_scan_api(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains(
+            "[dry-run] Would download and vendor 0 of 1 patch (1 already vendored). \
+             No changes made."
+        ),
+        "the headline must not count the in-sync patch as work; got {stdout:?}"
+    );
+    assert!(
+        stderr.contains(&format!("  [skip] {MINIMIST} (already vendored)")),
+        "the in-sync patch is named as skipped; stderr={stderr:?}"
+    );
+    assert!(!stdout.contains("[would-refuse]"), "{stdout:?}");
+    assert_eq!(
+        std::fs::read(tmp.path().join(".socket/vendor/state.json")).unwrap(),
+        ledger,
+        "a dry run writes nothing"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Report-only runs, agent-mode applies, GC and wiring warnings
 // ---------------------------------------------------------------------------

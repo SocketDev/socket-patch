@@ -688,10 +688,9 @@ segment, or a URL segment equal to the lock's scalar `registry`) are redirected,
 peer and modifier variant of the `name@version` included. Instances under a named alias,
 a scoped registry or jsr stay untouched (`redirect_vlt_custom_registry_skipped`) and keep
 the run's `--vex` from attesting the package. `options` is never edited: vlt fails `vlt
-ci` on any change there. Before anything is written, each artifact is fetched the way
-vlt fetches it (`accept-encoding: gzip;q=1.0, identity;q=0.5`, raw body hashed); vlt
-fails `EINTEGRITY` on a content-encoded response, so such a dependency is withheld
-(`redirect_vlt_artifact_unverifiable`) instead of pinning a lock `vlt ci` cannot install.
+ci` on any change there. vlt hashes the raw response body against the pinned sha512, so
+the patch server sends artifacts unencoded (`Cache-Control: no-transform`); the scan
+itself never downloads them.
 
 **Hosted: which lock confirms.** vlt drives a project when its install state
 (`node_modules/.vlt-lock.json` or `node_modules/.vlt/`) is present or no other npm-family
@@ -881,7 +880,12 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   ([MNG-8182](https://issues.apache.org/jira/browse/MNG-8182)). The args are
   `originAware=false` and `failIfMissing=false`, so one checksum matches the artifact
   from any repository and a dependency with no committed checksum still resolves — only a
-  *mismatch* fails.
+  *mismatch* fails. A grant whose sha256 is not 64 hex digits writes no checksum line
+  (and drops any line an earlier run wrote for that suffixed version) and warns
+  `redirect_maven_trusted_checksums_invalid_hash`. `vex` attests a pin's checksum only
+  when `maven.config` enforces the file as Maven 3.9+ reads it (all five settings above
+  with the values hosted writes; `failIfMissing` aside) and the wrapper, if any, pins
+  Maven 3.9.4 or later.
 * **A Maven project's scan is scoped to its dependency graph.** The Maven local
   repository is shared by every project on the machine, so in project mode (no
   `--global` / `--global-prefix`) a Maven build's crawl (a `pom.xml`, no Gradle or
@@ -1543,9 +1547,12 @@ Every Go path (`apply`, `vendor`, `scan --mode hosted`, `vex`, `list`,
 otherwise (`GOWORK` unset, empty or `auto`) the nearest `go.work` at or
 above the project. A relative `GOWORK` makes go fail
 (`invalid GOWORK: not an absolute path`), so socket-patch writes nothing for
-it and attests nothing. `vex` reads only the project's own `go.work`: when
-`GOWORK` names any other file, it attests none of the project's Go patches
-and reports each as `patched_ref_invalid`.
+it and attests nothing. `vex` reads the same workspace, members outside the
+project included: a Socket replace that workspace overrides, ignores or
+rejects (the check the writers run before writing one), or one in the
+project's own `go.work` while go builds another, stays listed, so `list`,
+`rollback` and `remove` find it, but is not attested
+(`go_workspace_override`).
 
 `GOFLAGS` is read the same way (the environment, then the `go env -w`
 file). A `-modfile` in it that names any file other than the project's
@@ -1705,6 +1712,35 @@ Important limits:
 
 The implemented hosted shape and fresh-checkout behavior are exercised by
 [`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
+
+## Ruby gems: native extensions
+
+Some gem fixes change only a C extension's sources (`ext/**/*.c`, `*.h`, `extconf.rb`). Ruby
+never loads those sources: it loads the shared object RubyGems compiled when it installed the
+gem. How each mode gets the patched code running:
+
+| Mode | What happens |
+|---|---|
+| Hosted | Bundler installs the patched `.gem` from the patch registry, and RubyGems compiles it like any registry gem. A precompiled platform gem (`x86_64-linux`) is refused with `redirect_gem_platform_unsupported`. |
+| Vendored | Refused with `native_extensions_unsupported`: Bundler builds no extensions for path-sourced gems. |
+| Agent (`apply`) | The patched sources are written, then the extension is rebuilt in place with RubyGems' builder, the step `gem pristine --extensions` runs, against the Ruby that owns the install. |
+
+An agent-mode rebuild needs a compiler toolchain and the Ruby headers (`ruby-dev` /
+`ruby-devel` on Linux distributions, the Xcode command line tools on macOS), the same
+requirements as `gem install` for that gem. When the build fails, `apply` puts the original
+sources and build back and fails that package with `native_extension_build_failed`, showing the
+tail of the build output. When it can't rebuild at all (a precompiled platform gem, a Bundler git
+checkout, or no matching Ruby), nothing is written and the package fails with
+`native_extensions_unsupported`. Use hosted mode for those.
+
+A tool that compiles the extension itself after `apply` (as the patches evaluation harness does)
+passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sources are written
+without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
+
+`apply` keeps the install-time build in `.socket-patch-native-orig/` inside the gem directory, so
+`rollback` restores it without recompiling, and records what it built in
+`.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
+installed extension: after `gem pristine` or a reinstall, run `apply` again.
 
 ## Supported platforms
 

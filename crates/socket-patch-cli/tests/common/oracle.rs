@@ -4,7 +4,7 @@
 //! all declare `mod common` pull this file in on its own with
 //! `#[path = "../common/oracle.rs"] mod oracle;`, so every test target
 //! uses the one `binary()` and the one `git_sha256` that
-//! `common::oracle_selftests` pins.
+//! `common_selftests.rs` pins.
 
 #![allow(dead_code)]
 
