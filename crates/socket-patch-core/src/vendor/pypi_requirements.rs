@@ -923,9 +923,11 @@ pub(super) async fn revert_requirements(
 
     // Residual-reference sweep over the reverted contents: a leftover line
     // pointing at the (about to be deleted) uuid dir would break installs.
+    // The warning KEEPS the artifact, so every spelling in any case counts.
     let needle = format!(".socket/vendor/pypi/{}", entry.uuid);
+    let probe = crate::utils::path_spelling::PathNeedle::keep(&needle);
     for (file, content) in &reverted {
-        if content.contains(&needle) {
+        if probe.found_in(content) {
             warnings.push(VendorWarning::new(
                 "vendor_revert_residual_reference",
                 format!("{file} still references {needle} after revert"),

@@ -78,7 +78,10 @@
 //! `<sha256>  <g-path>/<a>/<v>/<a>-<v>.jar` under the SUFFIXED version, made
 //! effective by `-Daether.artifactResolver.postProcessor.trustedChecksums=true`
 //! in `.mvn/maven.config`. That jar line becomes
-//! [`LockIntegrity::Sha256Hex`] (only while the resolver switch is on).
+//! [`LockIntegrity::Sha256Hex`] only while Maven enforces the file
+//! ([`crate::formats::maven::trusted_checksums::enforced`]: every setting
+//! hosted writes, read as Maven 3.9+ reads `maven.config`, and no wrapper
+//! pinning a Maven older than 3.9.4).
 //! `integrity_required` is FALSE: the rewriter writes checksums only when
 //! both hashes are known, and the suffixed version itself is the
 //! fail-closed pin (no other repository serves it; the Socket repository is
@@ -128,11 +131,11 @@ use super::{
     DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::formats::maven::{
-    is_executable_classifier, is_maven_coordinate, is_maven_version_text, maven_config_properties,
-    may_name, may_shadow, parse_pom_with, split_socket_version, MovedBy, Pom, PomDep, PomRepo,
+    is_executable_variant, is_main_jar, is_maven_coordinate, is_maven_version_text, is_variant,
+    maven_config_properties, may_name, may_shadow, parse_pom_with, split_socket_version,
+    variant_label, MovedBy, Pom, PomDep, PomRepo,
 };
-use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, TRUSTED_CHECKSUMS_ON};
-use crate::utils::digest::sha256_hex;
+use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
 use crate::vendor::jvm::layout;
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::maven_repo::{sha1_sidecar_matches, VENDOR_REPO_URL_PREFIX};
@@ -441,38 +444,28 @@ async fn extract_hosted(
 }
 
 /// `path -> sha256 hex` from `.mvn/checksums/checksums.sha256`, or empty
-/// when `config` (`.mvn/maven.config`'s text, read once by [`extract`])
-/// does not switch the trusted-checksums resolver on (the file is then
-/// inert and pins nothing). Malformed lines are skipped, like the
-/// rewriter's own merge.
+/// when Maven does not enforce it: `config` (`.mvn/maven.config`'s text,
+/// read once by [`extract`]) lacks a setting it reads the file by, or the
+/// Maven Wrapper pins a Maven older than 3.9.4. Judged by the hosted
+/// rewriter's own rule, and only a line Maven checks attests
+/// (`formats::maven::trusted_checksums`).
 async fn trusted_checksums(
     ctx: &DiscoverCtx<'_>,
     config: Option<&str>,
     out: &mut Discovery,
 ) -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
+    use crate::formats::maven::trusted_checksums::{enforced, pinned};
     let Some(config) = config else {
-        return map;
+        return BTreeMap::new();
     };
-    if !config
-        .split_whitespace()
-        .any(|arg| arg == TRUSTED_CHECKSUMS_ON)
-    {
-        return map;
+    let wrapper = ctx.read_text(MVN_WRAPPER_PROPERTIES, out).await;
+    if !enforced(config, wrapper.as_deref()) {
+        return BTreeMap::new();
     }
-    let Some(text) = ctx.read_text(MVN_CHECKSUMS, out).await else {
-        return map;
-    };
-    for line in text.lines() {
-        let Some((hash, path)) = line.trim().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let path = path.trim_start().trim_start_matches('*').trim_end();
-        if let Some(hash) = sha256_hex(hash).filter(|_| !path.is_empty()) {
-            map.insert(path.to_string(), hash);
-        }
-    }
-    map
+    ctx.read_text(MVN_CHECKSUMS, out)
+        .await
+        .map(|text| pinned(&text))
+        .unwrap_or_default()
 }
 
 // ── vendored ─────────────────────────────────────────────────────────────
@@ -738,23 +731,28 @@ fn resolutions(d: &PomDep) -> impl Iterator<Item = Option<&str>> {
     )
 }
 
-/// Every GA with a versioned, classifier-less declaration Maven always
-/// reads: the candidates for a pin.
+/// Every GA with a versioned declaration that is not a variant
+/// ([`is_variant`]) Maven always reads: the candidates for a pin.
 fn live_gas(deps: &[PomDep]) -> BTreeSet<(String, String)> {
     deps.iter()
-        .filter(|d| !d.in_profile && d.classifier.is_none() && d.version.is_some())
+        .filter(|d| {
+            !d.in_profile
+                && !is_variant(d.type_text.as_deref(), d.classifier.as_deref())
+                && d.version.is_some()
+        })
         .map(|d| (d.group.clone(), d.artifact.clone()))
         .collect()
 }
 
-/// The classifier-less declarations `in_scope` keeps that may be
-/// `group:artifact`'s main jar: its own, plus every one whose groupId or
-/// artifactId is a property this pom does not define and may be this GA
-/// (#683, [`may_shadow`](crate::formats::maven::may_shadow)) — its version
-/// then takes part in Maven's precedence, unseen under the literal key. A
-/// classifier variant (`sources`, `tests`, a native build) is its own
-/// artifact, managed apart from the main jar: it neither pins nor shadows
-/// it ([`classifier_declarations`]).
+/// The declarations `in_scope` keeps that may be `group:artifact`'s main
+/// jar: its own, plus every one whose groupId or artifactId is a property
+/// this pom does not define and may be this GA (#683,
+/// [`may_shadow`](crate::formats::maven::may_shadow)) — its version then
+/// takes part in Maven's precedence, unseen under the literal key. A
+/// variant ([`is_variant`]: a classifier such as `sources`, `tests` or a
+/// native build, or a type such as `test-jar`) is its own artifact,
+/// managed apart from the main jar: it neither pins nor shadows it
+/// ([`classifier_declarations`]).
 fn main_jar_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -763,7 +761,7 @@ fn main_jar_declarations<'a>(
 ) -> impl Iterator<Item = &'a PomDep> + 'a {
     deps.iter().filter(move |d| {
         in_scope(d)
-            && d.classifier.is_none()
+            && !is_variant(d.type_text.as_deref(), d.classifier.as_deref())
             && ((d.group == group && d.artifact == artifact)
                 || may_shadow(
                     (&d.group, &d.artifact),
@@ -774,10 +772,12 @@ fn main_jar_declarations<'a>(
     })
 }
 
-/// The executable classifier copies of `group:artifact` (tests, a native
-/// or JDK-specific build; not `sources` / `javadoc`) that `in_scope` keeps,
-/// with their classifier. A groupId or artifactId that is a property this
-/// pom does not define may be this GA ([`may_name`]), so it counts too.
+/// The executable variants of `group:artifact` ([`is_variant`] and
+/// [`is_executable_variant`]: tests, `test-jar`, a native or JDK-specific
+/// build; not `sources` / `javadoc`) that `in_scope` keeps, with the label
+/// they are reported by ([`variant_label`]). A groupId or artifactId that
+/// is a property this pom does not define may be this GA ([`may_name`]),
+/// so it counts too.
 fn classifier_declarations<'a>(
     deps: &'a [PomDep],
     group: &'a str,
@@ -789,8 +789,8 @@ fn classifier_declarations<'a>(
             in_scope(d) && may_name(&d.group, group) && may_name(&d.artifact, artifact)
         })
         .filter_map(|d| {
-            let classifier = d.classifier.as_deref()?;
-            is_executable_classifier(classifier).then_some((d, classifier))
+            let (t, c) = (d.type_text.as_deref(), d.classifier.as_deref());
+            (is_variant(t, c) && is_executable_variant(t, c)).then(|| (d, variant_label(t, c)))
         })
 }
 
@@ -965,15 +965,16 @@ fn pin_retargeted(
         })
 }
 
-/// Why the first executable classifier copy of `group:artifact` — live or
-/// inside `<profiles>` — runs code the wiring does not serve, if one does.
-/// A classifier copy is its own coordinate: the classifier-less pin does
-/// not retarget it. Its version is its own `<version>`, else a
-/// `<dependencyManagement>` entry with the same classifier (Maven keys
-/// management by classifier); a profile's entry overrides the live one
-/// while that profile is active, and with no live entry the version comes
-/// from outside this pom (fail closed). A hosted copy is fine only at the
-/// pin itself ([`Wiring::Hosted`]); a vendored one never is.
+/// Why the first executable variant of `group:artifact`
+/// ([`classifier_declarations`]) — live or inside `<profiles>` — runs code
+/// the wiring does not serve, if one does. A variant is its own
+/// coordinate: the main-jar pin does not retarget it. Its version is its
+/// own `<version>`, else a `<dependencyManagement>` entry with the same
+/// classifier and type (Maven keys management by both); a profile's entry
+/// overrides the live one while that profile is active, and with no live
+/// entry the version comes from outside this pom (fail closed). A hosted
+/// copy is fine only at the pin itself ([`Wiring::Hosted`]); a vendored one
+/// never is.
 fn unpatched_classifier_copy(
     deps: &[PomDep],
     group: &str,
@@ -997,11 +998,18 @@ fn unpatched_classifier_copy(
     // Each entry also carries whether it names `group:artifact` literally:
     // one reached only through an undefined property ([`may_name`]) may
     // manage another GA, so it never stands in for this copy's version alone.
-    let managed = |classifier: &str, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
+    let ty = |d: &PomDep| -> String {
+        d.type_text
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .unwrap_or("jar")
+            .to_string()
+    };
+    let managed = |copy: &PomDep, in_profile: bool| -> Vec<(Option<&str>, bool, bool)> {
         classifier_declarations(deps, group, artifact, move |d| {
             d.managed && d.in_profile == in_profile
         })
-        .filter(|(_, c)| *c == classifier)
+        .filter(|(m, _)| m.classifier == copy.classifier && ty(m) == ty(copy))
         .flat_map(|(d, _)| {
             let literal = d.group == group && d.artifact == artifact;
             flagged(d, in_profile)
@@ -1014,7 +1022,7 @@ fn unpatched_classifier_copy(
         let resolved: Vec<(Option<&str>, bool)> = match build_version(d) {
             Some(_) => flagged(d, false),
             None => {
-                let mut live = managed(classifier, false);
+                let mut live = managed(d, false);
                 // Without a live entry that surely manages this GA, the
                 // version may come from outside this pom: fail closed.
                 if !live.iter().any(|(_, _, literal)| *literal) {
@@ -1022,11 +1030,7 @@ fn unpatched_classifier_copy(
                 }
                 // A profile entry with no `<version>` (scope or exclusions
                 // only) overrides no version.
-                live.extend(
-                    managed(classifier, true)
-                        .into_iter()
-                        .filter(|(v, _, _)| v.is_some()),
-                );
+                live.extend(managed(d, true).into_iter().filter(|(v, _, _)| v.is_some()));
                 live.into_iter().map(|(v, p, _)| (v, p)).collect()
             }
         };
@@ -1055,9 +1059,6 @@ fn unpatched_classifier_copy(
     })
 }
 
-/// `<type>`s whose artifact carries no code onto a classpath.
-const NON_CODE_TYPES: &[&str] = &["pom", "java-source", "javadoc"];
-
 /// Why a `<profiles>` declaration of `group:artifact`'s main jar
 /// ([`main_jar_declarations`]) moves it off `pinned` whenever that profile
 /// is active, for the first such one: a version other than the pin. A
@@ -1066,9 +1067,10 @@ const NON_CODE_TYPES: &[&str] = &["pom", "java-source", "javadoc"];
 /// what management governs, which `pin_managed` (no live direct version)
 /// says. Activation is not evaluated, so every profile counts, as in
 /// vendored mode. A declaration without a version takes the live one and
-/// moves nothing, and a pom (or sources / javadoc) typed one carries no
-/// code. Every version a profile's `<properties>` may give the
-/// declaration counts too ([`PomDep::version_alternatives`]).
+/// moves nothing, and a `pom` typed one carries no code (a `java-source` /
+/// `javadoc` typed one is a non-executable variant, never a main jar).
+/// Every version a profile's `<properties>` may give the declaration
+/// counts too ([`PomDep::version_alternatives`]).
 ///
 /// The same holds for a live declaration that resolves `pinned` through a
 /// property some profile's `<properties>` redefine (or one it names, or
@@ -1083,11 +1085,7 @@ fn profile_override(
     pin_managed: bool,
 ) -> Option<String> {
     main_jar_declarations(deps, group, artifact, |_| true)
-        .filter(|d| {
-            !d.type_text
-                .as_deref()
-                .is_some_and(|t| NON_CODE_TYPES.contains(&t))
-        })
+        .filter(|d| is_main_jar(d.type_text.as_deref(), d.classifier.as_deref()))
         .filter(|d| !d.managed || pin_managed)
         .find_map(|d| {
             let section = if d.managed {
@@ -1236,11 +1234,12 @@ mod tests {
             assert!(out.diagnostics.is_empty(), "{case}: {:?}", out.diagnostics);
             let r = &out.refs[0];
             assert_eq!(r.source_file, std::path::PathBuf::from("pom.xml"), "{case}");
-            assert_eq!(
-                r.locked_integrity,
-                Some(LockIntegrity::Sha256Hex(FX_JAR_SHA.into())),
-                "{case}"
-            );
+            // mvn-config-merge keeps the user's `originAware=true`, under
+            // which Maven reads a per-repository summary file, not this one:
+            // its checksums pin nothing.
+            let integrity =
+                (case != "mvn-config-merge").then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into()));
+            assert_eq!(r.locked_integrity, integrity, "{case}");
             assert!(!r.integrity_required, "{case}");
             assert!(r.lockfile_basis_ok(), "{case}");
             assert!(
@@ -1298,6 +1297,78 @@ mod tests {
             out.refs[0].lockfile_basis_ok(),
             "maven never requires a pin"
         );
+    }
+
+    /// Integrity attests only what Maven enforces, judged by the hosted
+    /// rewriter's own rule: every `maven.config` setting Maven reads the
+    /// summary file by, each a whole-line argument (CRLF and a bare `-Dk`
+    /// switch count); no wrapper Maven older than 3.9.4; and a jar line in
+    /// the exact lowercase `<sha256>  <path>` shape. A tolerated spelling
+    /// (one space, a `*` marker, uppercase hex) is a line Maven skips or
+    /// fails on, so it pins nothing.
+    #[tokio::test]
+    async fn checksums_attest_only_what_maven_enforces() {
+        use crate::formats::maven::trusted_checksums::{CONFIG_ARGS, SWITCH_KEY};
+        let jar = "org/slf4j/slf4j-api/1.7.36-socket.77777777/slf4j-api-1.7.36-socket.77777777.jar";
+        let all = CONFIG_ARGS.join("\n");
+        let switch = format!("-D{SWITCH_KEY}=true");
+        let wrapper = |v: &str| {
+            format!("distributionUrl=https://repo/apache-maven/{v}/apache-maven-{v}-bin.zip\n")
+        };
+        let line = format!("{FX_JAR_SHA}  {jar}\n");
+        let upper = FX_JAR_SHA.to_uppercase();
+        for (config, wrapper, sums, attests) in [
+            (
+                CONFIG_ARGS.join("\r\n"),
+                None,
+                format!("{FX_JAR_SHA}  {jar}\r\n"),
+                true,
+            ),
+            (
+                all.replace(&switch, &format!("-D{SWITCH_KEY}")),
+                None,
+                format!("# pins\n{FX_JAR_SHA}  {jar}"),
+                true,
+            ),
+            (all.clone(), Some(wrapper("3.9.4")), line.clone(), true),
+            (all.clone(), Some(wrapper("3.9.3")), line.clone(), false),
+            (switch.clone(), None, line.clone(), false),
+            (
+                all.replace(&switch, &format!("-B {switch}")),
+                None,
+                line.clone(),
+                false,
+            ),
+            (
+                all.replace("originAware=false", "originAware=true"),
+                None,
+                line.clone(),
+                false,
+            ),
+            (
+                format!("{all}\n-D{SWITCH_KEY}=false"),
+                None,
+                line.clone(),
+                false,
+            ),
+            (all.clone(), None, format!("{FX_JAR_SHA} {jar}\n"), false),
+            (all.clone(), None, format!("{FX_JAR_SHA} *{jar}\n"), false),
+            (all.clone(), None, format!("{upper}  {jar}\n"), false),
+        ] {
+            let p = fixture("basic");
+            p.write(".mvn/maven.config", config.clone());
+            if let Some(props) = &wrapper {
+                p.write(".mvn/wrapper/maven-wrapper.properties", props.clone());
+            }
+            p.write(".mvn/checksums/checksums.sha256", sums.clone());
+            let out = run(&p).await;
+            assert_refs(&out, &[(FX_PURL, FX_UUID, WiringMode::Hosted)]);
+            assert_eq!(
+                out.refs[0].locked_integrity,
+                attests.then(|| LockIntegrity::Sha256Hex(FX_JAR_SHA.into())),
+                "{config:?} / {wrapper:?} / {sums:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1469,6 +1540,14 @@ mod tests {
                      <artifactId>slf4j-api</artifactId><version>{pin}</version>\
                      <classifier>tests</classifier></dependency>\n"
                 ),
+            ),
+            // A type implying an executable classifier (the vendored
+            // reactor's rule): `test-jar` is the `tests` jar.
+            (
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 <version>1.7.36</version><type>test-jar</type></dependency>\n"
+                    .to_string(),
+                String::new(),
             ),
         ];
         for (deps, managed) in &unattested {
@@ -2058,11 +2137,13 @@ mod tests {
             ),
             // Management that governs: the live pin is managed too.
             (&managed_pin, mgmt(&ga(Some("1.7.36"))), profile_kind),
-            // A code-carrying type is not the pin's coordinate either.
+            // A code-carrying type is not the pin's coordinate either: it
+            // is an executable variant (`test-jar` is the `tests` jar, see
+            // `is_variant` / `is_executable_variant`).
             (
                 &direct_pin,
                 deps(&typed("test-jar", Some("1.7.36"))),
-                profile_kind,
+                classifier_kind,
             ),
             // An executable classifier copy off the pin: its own version,
             // none at all, or a classifier-keyed managed one.

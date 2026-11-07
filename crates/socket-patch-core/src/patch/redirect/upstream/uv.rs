@@ -52,8 +52,26 @@
 //!   release has none and is kept (#411);
 //! * the metadata's `[tool.uv.sources].<name> = { url }` is removed.
 //!
-//! uv 0.2 `[[distribution]]` locks are refused (their artifact grammar
-//! changed across 0.2.x releases).
+//! uv 0.2 `[[distribution]]` locks (uv 0.1.45–0.2.34) come back the same
+//! way, in the grammar the hosted rewrite wrote the entry in — the one the
+//! entry itself carried (`utils::python_lock`'s shared detectors): its
+//! source keeps its spelling (`"direct+<url>"` back to `"registry+<R>"`,
+//! uv ≤ 0.2.17, or `{ url }` back to `{ registry }`), and its artifacts
+//! their grammar (`[distribution.sdist]` / `[[distribution.wheel]]`
+//! sub-tables ahead of the entry's other sub-tables, uv ≤ 0.2.5, or inline
+//! `sdist` / `wheels`). Every one of those uv releases records each file of
+//! a release its `requires-python` admits, whatever the platform, so a
+//! pure-Python 3 release re-derives faithfully. Two things are not in the
+//! lock and are refused when unknown: where uv 0.2.18–0.2.22 (before) and
+//! 0.2.23–0.2.34 (after) put an `sdist` beside inline `dependencies`, read
+//! off another registry entry carrying both; and an `exclude-newer` cutoff,
+//! which uv 0.2.12–0.2.27 apply from the project's or user's settings or
+//! `UV_EXCLUDE_NEWER` without recording it (0.2.28–0.2.33 record it at the
+//! lock's top level). One passed only on the command line leaves no trace.
+//! Dependents' references, inline or `[[distribution.dependencies]]`
+//! tables, get the registry source back in the spelling they carry. Those
+//! locks have no `[manifest]` or `[package.metadata]` for the rewrite to
+//! touch.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,7 +83,10 @@ use super::pypi::{
 };
 use super::{by_uuid, read_or_refuse, refuse_all_in, Ctx, FormatResult, HostedPin, View};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
-use crate::utils::python_lock::{paired_metadata_path, preserve_line_endings, UvSource};
+use crate::utils::python_lock::{
+    distribution_artifact_tables, distribution_sdist_before_dependencies, paired_metadata_path,
+    preserve_line_endings, table_likes, UvSource,
+};
 use crate::vendor::common::pep508_name;
 
 /// One hosted entry of a lock.
@@ -78,6 +99,7 @@ struct Hit {
 }
 
 /// How the lock's other registry packages record their artifacts.
+#[derive(Clone)]
 struct Shape {
     /// The one registry index they name.
     registry: String,
@@ -93,8 +115,10 @@ struct Shape {
     datetime: bool,
     /// `wheels` puts one entry per line.
     multiline: bool,
-    /// pylock: artifacts are standard tables (`[[packages.wheels]]`,
-    /// `[packages.sdist]`), as `pip lock` writes them, not inline ones.
+    /// Artifacts are standard tables, not inline ones: pylock
+    /// `[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` writes
+    /// them, or uv ≤ 0.2.5's `[[distribution.wheel]]` /
+    /// `[distribution.sdist]`.
     tables: bool,
     /// With `tables`: `hashes` is a sub-table (`[packages.wheels.hashes]`).
     hash_tables: bool,
@@ -323,13 +347,6 @@ async fn restore_lock(
             result.refuse(&hit.uuid, format!("{rel}: {why}"));
         }
     };
-    if collection == "distribution" {
-        return refuse_hits(
-            result,
-            "uv 0.2 `[[distribution]]` locks changed their artifact grammar across releases; \
-             which one this lock follows is not derivable",
-        );
-    }
     let version_ok = if pep751 {
         doc.get("lock-version").and_then(Item::as_str) == Some("1.0")
     } else {
@@ -338,23 +355,8 @@ async fn restore_lock(
     if !version_ok {
         return refuse_hits(result, "unsupported lock version");
     }
-    let options = doc.get("options").and_then(Item::as_table_like);
-    let global_cutoff = options.and_then(|o| {
-        o.iter()
-            .map(|(k, _)| k)
-            .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
-    });
-    // A per-package cutoff (#1604) filters only the packages it names, and
-    // one of `false` exempts its package from the global cutoff.
-    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
     for hit in &hits {
-        let key = if cutoffs.is_some_and(|c| names_package(c, &hit.name)) {
-            "exclude-newer-package"
-        } else if let Some(key) =
-            global_cutoff.filter(|_| !cutoffs.is_some_and(|c| exempts(c, &hit.name)))
-        {
-            key
-        } else {
+        let Some(key) = lock_cutoff(&doc, &hit.name) else {
             continue;
         };
         result.refuse(
@@ -369,6 +371,40 @@ async fn restore_lock(
         Ok(shape) => shape,
         Err(why) => return refuse_hits(result, &why),
     };
+    let packages = doc
+        .get(collection)
+        .and_then(Item::as_array_of_tables)
+        .expect("lock_shape found the package array");
+    // uv 0.2 `[[distribution]]` locks: each hit's artifact grammar (the
+    // one the rewrite wrote it in), and where this uv writes an `sdist`
+    // beside inline `dependencies`.
+    let legacy: BTreeMap<String, Legacy> = if collection == "distribution" {
+        let skip: BTreeSet<usize> = hits.iter().map(|h| h.index).collect();
+        let sdist_before_dependencies =
+            distribution_sdist_before_dependencies(packages, |i| skip.contains(&i));
+        hits.iter()
+            .map(|h| {
+                let legacy = Legacy {
+                    tables: distribution_artifact_tables(packages, h.index),
+                    sdist_before_dependencies,
+                };
+                (h.uuid.clone(), legacy)
+            })
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
+    let distribution_inline = legacy.values().any(|l| !l.tables);
+    if distribution_inline {
+        // uv 0.2.12–0.2.27 apply an `exclude-newer` cutoff from the
+        // project's or the user's settings, or the environment, without
+        // recording it in the lock (uv ≤ 0.2.5, the sub-table grammar,
+        // apply none). Those are the best evidence of the cutoff the lock
+        // was made under; one passed only on the command line leaves none.
+        if let Err(why) = distribution_cutoff(view, rel).await {
+            return refuse_hits(result, &why);
+        }
+    }
     if pep751 && pip_compiled(&doc, &text, &shape) {
         // Without uv's command line (`--no-header`, or a header replaced by
         // `UV_CUSTOM_COMPILE_COMMAND`) its filter flags are unknowable.
@@ -489,6 +525,14 @@ async fn restore_lock(
         let Some(release) = released.get(&(hit.name.clone(), hit.version.clone())) else {
             continue;
         };
+        let legacy = legacy.get(&hit.uuid).copied();
+        let shape = match legacy {
+            Some(legacy) => Shape {
+                tables: legacy.tables,
+                ..shape.clone()
+            },
+            None => shape.clone(),
+        };
         let artifacts = match render_artifacts(release, &shape) {
             Ok(artifacts) => artifacts,
             Err(why) => {
@@ -505,7 +549,7 @@ async fn restore_lock(
         let restore = if pep751 {
             restore_pylock_entry(&mut doc, hit, &shape, artifacts)
         } else {
-            restore_uv_entry(&mut doc, hit, &shape, artifacts, ctx)
+            restore_uv_entry(&mut doc, collection, legacy, hit, &shape, artifacts, ctx)
                 .and_then(|()| restore_requirements(&mut doc, hit, metadata.as_ref(), &styles, ctx))
         };
         if let Err(why) = restore {
@@ -615,23 +659,12 @@ impl SiblingRegistry<'_> {
     }
 }
 
-/// A package's `wheels` and `sdist` artifact tables, in either PEP 751
-/// spelling: inline (`wheels = [{ … }]`, as uv writes them) or standard
-/// tables (`[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` does).
+/// A package's `wheels` and `sdist` artifact tables, in either spelling:
+/// inline (`wheels = [{ … }]`, as uv writes them) or standard tables
+/// (`[[packages.wheels]]` / `[packages.sdist]`, as `pip lock` does, and uv
+/// ≤ 0.2.5's `[[distribution.wheel]]` / `[distribution.sdist]`).
 fn artifact_tables(package: &toml_edit::Table) -> Vec<&dyn TableLike> {
-    let mut tables: Vec<&dyn TableLike> = Vec::new();
-    match package.get("wheels") {
-        Some(Item::Value(Value::Array(wheels))) => tables.extend(
-            wheels
-                .iter()
-                .filter_map(Value::as_inline_table)
-                .map(|t| t as &dyn TableLike),
-        ),
-        Some(Item::ArrayOfTables(wheels)) => {
-            tables.extend(wheels.iter().map(|t| t as &dyn TableLike))
-        }
-        _ => {}
-    }
+    let mut tables = table_likes(package.get("wheels").or_else(|| package.get("wheel")));
     tables.extend(package.get("sdist").and_then(Item::as_table_like));
     tables
 }
@@ -683,6 +716,29 @@ fn pip_compiled(doc: &DocumentMut, text: &str, shape: &Shape) -> bool {
 /// Whether the uv environment variable `name` is set to a value.
 fn env_set(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|v| !v.is_empty())
+}
+
+/// `Err(why)` when a uv setting sets the `exclude-newer` cutoff that uv
+/// 0.2.12–0.2.27 apply to the `[[distribution]]` lock `rel` without
+/// recording it: the project's (`uv.toml`, else a pyproject's `[tool.uv]`,
+/// in the lock's directory or above), the user's or the system's
+/// `uv.toml`, or `UV_EXCLUDE_NEWER`.
+async fn distribution_cutoff(view: &mut View<'_>, rel: &str) -> Result<(), String> {
+    let consequence = "which uv 0.2.12–0.2.27 apply to a `[[distribution]]` lock without \
+                       recording it, so which release files the lock kept is not derivable";
+    if std::env::var_os("UV_EXCLUDE_NEWER").is_some_and(|v| !v.is_empty() && v != "false") {
+        return Err(format!(
+            "`UV_EXCLUDE_NEWER` is set in this environment, {consequence}"
+        ));
+    }
+    let project = pip_settings(view, rel).await?;
+    let global = global_uv_settings(&|name| std::env::var_os(name), cfg!(windows)).await?;
+    for (path, settings) in project.iter().chain(&global) {
+        if let Some(key) = crate::utils::python_lock::sets_exclude_newer(settings) {
+            return Err(format!("{path} sets uv `{key}`, {consequence}"));
+        }
+    }
+    Ok(())
 }
 
 /// Whether a header command line is `uv pip compile`'s. uv records global
@@ -879,6 +935,26 @@ fn names_package(item: &Item, name: &str) -> bool {
             .any(|v| v == ":all:" || canonicalize_pypi_name(v) == name),
         _ => false,
     }
+}
+
+/// The `exclude-newer` option uv recorded in lock `doc` that filters
+/// canonical package `name`'s release files by upload time, if any: a
+/// per-package `exclude-newer-package` naming it (#1604), else a global
+/// cutoff it is not exempted from. uv 0.2.28–0.2.33 record the global
+/// cutoff at the lock's top level, later releases under `[options]`. The
+/// unwind cannot tell which files such a cutoff kept, so it refuses the
+/// pin, and the hosted rewrite refuses to write one it could not unwind.
+pub(crate) fn lock_cutoff<'a>(doc: &'a DocumentMut, name: &str) -> Option<&'a str> {
+    let options = doc.get("options").and_then(Item::as_table_like);
+    let global = options
+        .into_iter()
+        .chain(Some(doc.as_table() as &dyn TableLike))
+        .find_map(crate::utils::python_lock::sets_exclude_newer);
+    let cutoffs = options.and_then(|o| o.get("exclude-newer-package"));
+    if cutoffs.is_some_and(|c| names_package(c, name)) {
+        return Some("exclude-newer-package");
+    }
+    global.filter(|_| !cutoffs.is_some_and(|c| exempts(c, name)))
 }
 
 /// Whether a per-package cutoff table exempts `name` from the global
@@ -1194,7 +1270,7 @@ fn lock_shape(
             .get("wheels")
             .and_then(Item::as_array)
             .is_none_or(|a| a.to_string().contains('\n'));
-        let tables = match package.get("wheels") {
+        let tables = match package.get("wheels").or_else(|| package.get("wheel")) {
             Some(Item::ArrayOfTables(wheels)) => !wheels.is_empty(),
             Some(Item::Value(Value::Array(wheels))) if !wheels.is_empty() => false,
             _ => package.get("sdist").is_some_and(Item::is_table),
@@ -1423,60 +1499,172 @@ fn inline_source(registry: &str) -> Value {
         .expect("a registry source renders as TOML")
 }
 
+/// Point `source` back at `registry`, in its own spelling, when it routes
+/// `hit` to its hosted artifact: `{ url }` (or a `[….source]` table)
+/// becomes `{ registry }`, and uv 0.2's string `"direct+<url>"` becomes
+/// `"registry+<registry>"`. `false` when it names something else.
+fn restore_source(source: &mut Item, hit: &Hit, registry: &str, ctx: &Ctx<'_>) -> bool {
+    if let Item::Value(value) = source {
+        return restore_source_value(value, hit, registry, ctx);
+    }
+    let names_hit = UvSource::of_item(source)
+        .and_then(UvSource::url)
+        .is_some_and(|url| names_hosted(url, hit, ctx));
+    let Some(table) = source.as_table_mut().filter(|_| names_hit) else {
+        return false;
+    };
+    table.clear();
+    table.insert("registry", toml_edit::value(registry));
+    true
+}
+
+/// [`restore_source`] of a `source` value (a string or an inline table).
+fn restore_source_value(source: &mut Value, hit: &Hit, registry: &str, ctx: &Ctx<'_>) -> bool {
+    let Some(parsed) = UvSource::of_value(source) else {
+        return false;
+    };
+    if !parsed.url().is_some_and(|url| names_hosted(url, hit, ctx)) {
+        return false;
+    }
+    let restored = match parsed {
+        UvSource::Str(_) => Value::from(format!("registry+{registry}")),
+        UvSource::Table(_) => inline_source(registry),
+    };
+    replace_keeping_decor(source, restored);
+    true
+}
+
+/// Whether `url` is `hit`'s hosted artifact.
+fn names_hosted(url: &str, hit: &Hit, ctx: &Ctx<'_>) -> bool {
+    ctx.hosted_uuid(url).is_some_and(|u| u == hit.uuid)
+}
+
 /// Replace `item`'s value, keeping its decor.
 fn replace_keeping_decor(slot: &mut Value, mut value: Value) {
     *value.decor_mut() = slot.decor().clone();
     *slot = value;
 }
 
+/// How a uv 0.2 `[[distribution]]` hit is laid out (see
+/// [`distribution_artifact_tables`] and
+/// [`distribution_sdist_before_dependencies`]).
+#[derive(Clone, Copy)]
+struct Legacy {
+    tables: bool,
+    sdist_before_dependencies: Option<bool>,
+}
+
 /// The package entry itself, and every dependent reference to it.
 fn restore_uv_entry(
     doc: &mut DocumentMut,
+    collection: &str,
+    legacy: Option<Legacy>,
     hit: &Hit,
     shape: &Shape,
     (sdist, wheels): (Option<Item>, Option<Item>),
     ctx: &Ctx<'_>,
 ) -> Result<(), String> {
     let package = doc
-        .get_mut("package")
+        .get_mut(collection)
         .and_then(Item::as_array_of_tables_mut)
         .and_then(|p| p.get_mut(hit.index))
         .ok_or("the package entry vanished")?;
-    match package.get_mut("source").and_then(Item::as_value_mut) {
-        Some(slot) => replace_keeping_decor(slot, inline_source(&shape.registry)),
-        None => return Err("the package source is not an inline table".to_string()),
+    let source = package
+        .get_mut("source")
+        .ok_or("the package entry has no `source`")?;
+    if !restore_source(source, hit, &shape.registry, ctx) {
+        return Err("the package `source` no longer names the hosted artifact".to_string());
     }
+    // uv 0.2.18–0.2.22 write `sdist` before inline `dependencies`,
+    // 0.2.23–0.2.34 after them.
+    let inline_dependencies = package
+        .get("dependencies")
+        .is_some_and(|d| d.as_array().is_some());
+    let sdist_before_dependencies = match legacy {
+        Some(legacy) if sdist.is_some() && inline_dependencies => {
+            legacy.sdist_before_dependencies.ok_or(
+                "no other registry package of the lock carries both an `sdist` and inline \
+                 `dependencies`, which uv 0.2.18–0.2.22 and 0.2.23–0.2.34 order differently, so \
+                 where the entry's `sdist` goes is not derivable",
+            )?
+        }
+        _ => false,
+    };
     for key in ["sdist", "wheels", "wheel", "archive"] {
         package.remove(key);
     }
     if let Some(sdist) = sdist {
         package.insert("sdist", sdist);
     }
+    let tables = legacy.is_some_and(|l| l.tables);
     if let Some(wheels) = wheels {
-        package.insert("wheels", wheels);
+        // uv ≤ 0.2.5 names its wheel sub-tables `[[distribution.wheel]]`.
+        package.insert(if tables { "wheel" } else { "wheels" }, wheels);
+    }
+    if tables {
+        // uv ≤ 0.2.5 write an entry's `[distribution.sdist]` and
+        // `[[distribution.wheel]]` before its `[[distribution.dependencies]]`
+        // (and every other sub-table), and a new sub-table renders where
+        // its key sits.
+        let rank = |key: &str| match key {
+            "sdist" => 0,
+            "wheel" => 1,
+            _ => 2,
+        };
+        package.sort_values_by(|a, _, b, _| rank(a.get()).cmp(&rank(b.get())));
+    } else if sdist_before_dependencies {
+        move_before(package, "sdist", "dependencies");
     }
     package.remove("metadata");
     restore_refs(doc.as_item_mut(), hit, &shape.registry, ctx);
     Ok(())
 }
 
-/// Dependents' `{ name, source = { url } }` references back to the registry.
+/// Move `key` right before `anchor` in `table`'s key order.
+fn move_before(table: &mut toml_edit::Table, key: &str, anchor: &str) {
+    let order: Vec<String> = table
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| k != key)
+        .flat_map(|k| {
+            if k == anchor {
+                vec![key.to_string(), k]
+            } else {
+                vec![k]
+            }
+        })
+        .collect();
+    let rank = |k: &str| order.iter().position(|o| o == k);
+    table.sort_values_by(|a, _, b, _| rank(a.get()).cmp(&rank(b.get())));
+}
+
+/// Dependents' references back to the registry: inline `{ name, source }`
+/// tables, and uv 0.2's `[[distribution.dependencies]]` tables.
 fn restore_refs(item: &mut Item, hit: &Hit, registry: &str, ctx: &Ctx<'_>) {
     match item {
         Item::Value(value) => restore_ref_value(value, hit, registry, ctx),
-        Item::Table(table) => {
-            for (_, item) in table.iter_mut() {
-                restore_refs(item, hit, registry, ctx);
-            }
-        }
+        Item::Table(table) => restore_ref_table(table, hit, registry, ctx),
         Item::ArrayOfTables(tables) => {
             for table in tables.iter_mut() {
-                for (_, item) in table.iter_mut() {
-                    restore_refs(item, hit, registry, ctx);
-                }
+                restore_ref_table(table, hit, registry, ctx);
             }
         }
         Item::None => {}
+    }
+}
+
+fn restore_ref_table(table: &mut toml_edit::Table, hit: &Hit, registry: &str, ctx: &Ctx<'_>) {
+    let names_hit = table
+        .get("name")
+        .and_then(Item::as_str)
+        .is_some_and(|n| canonicalize_pypi_name(n) == hit.name);
+    if names_hit {
+        if let Some(source) = table.get_mut("source") {
+            restore_source(source, hit, registry, ctx);
+        }
+    }
+    for (_, item) in table.iter_mut() {
+        restore_refs(item, hit, registry, ctx);
     }
 }
 
@@ -1492,16 +1680,9 @@ fn restore_ref_value(value: &mut Value, hit: &Hit, registry: &str, ctx: &Ctx<'_>
                 .get("name")
                 .and_then(Value::as_str)
                 .is_some_and(|n| canonicalize_pypi_name(n) == hit.name);
-            let hosted = table
-                .get("source")
-                .and_then(Value::as_inline_table)
-                .and_then(|s| s.get("url"))
-                .and_then(Value::as_str)
-                .and_then(|u| ctx.hosted_uuid(u))
-                .is_some_and(|u| u == hit.uuid);
-            if names_hit && hosted {
-                if let Some(slot) = table.get_mut("source") {
-                    replace_keeping_decor(slot, inline_source(registry));
+            if names_hit {
+                if let Some(source) = table.get_mut("source") {
+                    restore_source_value(source, hit, registry, ctx);
                 }
             }
             for (_, value) in table.iter_mut() {

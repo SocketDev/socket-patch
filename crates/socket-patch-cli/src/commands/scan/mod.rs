@@ -1070,15 +1070,18 @@ pub(super) async fn classify_overlap_takeover_with(
             Some(uuid) => liveness.redirect_record(&purl, uuid).await,
             None => discovery.wires_package(&purl, WiringMode::Hosted),
         };
+        // `None`: undecided (a JVM pom that cannot be read, or a tree still
+        // referenced without attestable wiring) — neither live nor dead.
         let vendored_live = match vendor_by_purl.get(&PurlKey::new(&purl)) {
-            Some(entry) => liveness.vendor_entry(entry).await,
-            None => false,
+            Some(entry) => liveness.vendor_entry_state(entry).await,
+            None => Some(false),
         };
         match (hosted_live, vendored_live) {
-            (true, false) => out.redirect.push(purl),
-            (false, true) => out.vendored.push(purl),
-            // Both (a half-migrated lock naming both) or neither (no rewire /
-            // unreadable) does not prove a single direction — stay silent.
+            (true, Some(false)) => out.redirect.push(purl),
+            (false, Some(true)) => out.vendored.push(purl),
+            // Both (a half-migrated lock naming both), neither (no rewire)
+            // or an undecided vendored side (unreadable) does not prove a
+            // single direction — stay silent.
             _ => {}
         }
     }
@@ -4669,6 +4672,118 @@ mod tests {
             takeover.redirect.is_empty() && takeover.vendored.is_empty(),
             "{takeover:?}"
         );
+    }
+
+    // ---- maven: an undecided vendored claim is not a dead one -------------
+
+    const MAVEN_PURL: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
+    /// The vendored patch: another uuid than the hosted pin's, so its
+    /// suffixed version tells the two wirings apart.
+    const MAVEN_VENDORED_UUID: &str = "5c0ffee0-1d3a-4f6b-8c2d-7e5a9b1c3d5f";
+
+    fn maven_dep(version: &str) -> String {
+        format!(
+            "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+             <version>{version}</version></dependency>"
+        )
+    }
+
+    /// A root pom pinning slf4j-api to the hosted [`TAKEOVER_UUID`] patch,
+    /// with `extra` (a `<build>` section) inside the project.
+    async fn write_maven_hosted_pom(root: &Path, extra: &str) {
+        let pom = format!(
+            "<?xml version=\"1.0\"?>\n<project xmlns=\"http://maven.apache.org/POM/4.0.0\">\n  \
+             <modelVersion>4.0.0</modelVersion>\n  <groupId>com.example</groupId>\n  \
+             <artifactId>app</artifactId>\n  <version>1.0.0</version>\n  \
+             <dependencies>\n    {}\n  </dependencies>\n  <repositories>\n    <repository>\n      \
+             <id>socket-patch-{TAKEOVER_UUID}</id>\n      \
+             <url>https://patch.socket.dev/patch-registry/maven/11111111-2222-4333-8444-555555555555/{TAKEOVER_UUID}/maven2</url>\n      \
+             <releases>\n        <enabled>true</enabled>\n        \
+             <checksumPolicy>fail</checksumPolicy>\n      </releases>\n    </repository>\n  \
+             </repositories>\n  {extra}\n</project>\n",
+            maven_dep(&format!("1.7.36-socket.{}", &TAKEOVER_UUID[..8])),
+        );
+        tokio::fs::write(root.join("pom.xml"), pom).await.unwrap();
+    }
+
+    /// A vendored ledger whose one entry is a Maven reactor vendoring of
+    /// slf4j-api at [`MAVEN_VENDORED_UUID`].
+    async fn write_maven_vendor_ledger(root: &Path) {
+        let sv = format!("1.7.36-socket.{}", &MAVEN_VENDORED_UUID[..8]);
+        let state = serde_json::json!({
+            "version": 1,
+            "entries": {
+                MAVEN_PURL: {
+                    "ecosystem": "maven",
+                    "basePurl": MAVEN_PURL,
+                    "uuid": MAVEN_VENDORED_UUID,
+                    "artifact": {
+                        "path": format!(
+                            ".socket/vendor/maven2/org/slf4j/slf4j-api/{sv}/slf4j-api-{sv}.jar"
+                        ),
+                    },
+                    "wiring": [{
+                        "file": "pom.xml",
+                        "kind": "maven_pom_fragment",
+                        "action": "added",
+                    }],
+                },
+            },
+        });
+        let dir = root.join(".socket/vendor");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(
+            dir.join("state.json"),
+            serde_json::to_string_pretty(&state).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A vendored Maven claim the reader cannot decide — a project file it
+    /// cannot read, or the vendored version left only where the build may
+    /// still resolve it from the tree (a build plugin's dependencies) —
+    /// is neither live nor dead: the `scan --prune` GC keeps it, so the
+    /// takeover classifier must not report it superseded (and tell the
+    /// user to remove it). Only a claim nothing references any more is.
+    #[tokio::test]
+    async fn maven_takeover_stays_silent_on_an_undecided_vendored_claim() {
+        let vendored = format!("1.7.36-socket.{}", &MAVEN_VENDORED_UUID[..8]);
+        let plugin = format!(
+            "<build><plugins><plugin><groupId>p</groupId><artifactId>p</artifactId>\
+             <dependencies>{}</dependencies></plugin></plugins></build>",
+            maven_dep(&vendored)
+        );
+        // Control: nothing references the vendored version — superseded.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_maven_vendor_ledger(root).await;
+        write_maven_hosted_pom(root, "").await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(
+            takeover.redirect,
+            vec![MAVEN_PURL.to_string()],
+            "{takeover:?}"
+        );
+
+        // Left only in a build plugin's dependencies.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_maven_vendor_ledger(root).await;
+        write_maven_hosted_pom(root, &plugin).await;
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(takeover, OverlapTakeover::default());
+
+        // A Maven config the reader cannot read (a directory).
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write_maven_vendor_ledger(root).await;
+        write_maven_hosted_pom(root, "").await;
+        tokio::fs::create_dir_all(root.join(".mvn/maven.config"))
+            .await
+            .unwrap();
+        let takeover = classify_overlap_takeover(&common_at(root), root).await;
+        assert_eq!(takeover, OverlapTakeover::default());
     }
 
     // ---- takeover DIRECTION follows the live lock, not the command ---------

@@ -34,7 +34,7 @@ use crate::formats::sbt::build::{
     declared_projects, source_kind, SourceKind, BUILD_PROPERTIES, BUILD_SBT,
 };
 use crate::formats::sbt::evidence::{classify_path, is_meta_record, ResolutionDoc};
-use crate::formats::sbt::owned_file::{HOSTED_FILE, VENDORED_FILE};
+use crate::formats::sbt::owned_file::{is_foreign, HOSTED_FILE, VENDORED_FILE};
 use crate::formats::sbt::JvmResolution;
 use crate::utils::fs::read_regular_to_bytes_sync;
 
@@ -81,6 +81,17 @@ pub struct SbtEvidence {
     /// A generated file ([`HOSTED_FILE`] / [`VENDORED_FILE`]) is newer than
     /// the newest evidence: sbt has not resolved since the last wiring.
     pub wiring_newer: bool,
+    /// Each library evidence file's date: its root-relative path (as its
+    /// evidence ids name it) to the newer of its own and its sibling
+    /// `inputs`' modification time. One record can then be judged against
+    /// the wiring and the sources, where [`Self::stale`] and
+    /// [`Self::wiring_newer`] judge whole projects or the whole build.
+    pub record_dates: std::collections::BTreeMap<String, SystemTime>,
+    /// The newest generated file's modification time.
+    pub generated: Option<SystemTime>,
+    /// The newest build source's modification time (what [`Self::stale`]
+    /// compares against).
+    pub newest_source: Option<SystemTime>,
 }
 
 /// The evidence under `root`, `None` when there is none (or a cap was hit,
@@ -131,6 +142,11 @@ pub fn scan(root: &Path) -> Result<SbtEvidence, String> {
             continue;
         }
         newer(&mut out.newest_evidence, *modified);
+        if let Some(at) = *modified {
+            let file = output.clone().unwrap_or_else(|| rel.clone());
+            let date = out.record_dates.entry(file).or_insert(at);
+            *date = (*date).max(at);
+        }
         newer(
             per_project
                 .entry((record.project, record.project_is_id))
@@ -147,6 +163,8 @@ pub fn scan(root: &Path) -> Result<SbtEvidence, String> {
             .is_some_and(|s| oldest_project.is_some_and(|o| s > o));
         out.wiring_newer = walk.generated.is_some_and(|g| g > newest);
     }
+    out.generated = walk.generated;
+    out.newest_source = walk.newest_source;
     Ok(out)
 }
 
@@ -513,17 +531,30 @@ impl Walk<'_> {
     }
 
     /// A non-evidence file above any `target/`: a build source, or a
-    /// generated file (dated only).
+    /// generated file (dated only). A file under a generated name without
+    /// socket-patch's header is not ours: sbt loads it like any root
+    /// `*.sbt`, so it is a build definition
+    /// (`formats::sbt::build::scan_build_sources` reads it as one). One
+    /// that cannot be read keeps the generated file's treatment.
     fn file(&mut self, rel: &str, meta: &std::fs::Metadata) -> Result<(), String> {
-        if rel == HOSTED_FILE || rel == VENDORED_FILE {
-            newer(&mut self.generated, meta.modified().ok());
-            return Ok(());
-        }
-        let Some(kind) = source_kind(rel) else {
-            return Ok(());
-        };
-        let Some(bytes) = self.read(rel, meta, false)? else {
-            return Ok(());
+        let (kind, bytes) = if rel == HOSTED_FILE || rel == VENDORED_FILE {
+            match self.read(rel, meta, false).ok().flatten() {
+                Some(bytes) if is_foreign(&String::from_utf8_lossy(&bytes)) => {
+                    (SourceKind::Definition, bytes)
+                }
+                _ => {
+                    newer(&mut self.generated, meta.modified().ok());
+                    return Ok(());
+                }
+            }
+        } else {
+            let Some(kind) = source_kind(rel) else {
+                return Ok(());
+            };
+            let Some(bytes) = self.read(rel, meta, false)? else {
+                return Ok(());
+            };
+            (kind, bytes)
         };
         if matches!(
             kind,
@@ -634,3 +665,36 @@ pub(crate) fn stage_fixture(from: &Path, to: &Path) {
 
 #[cfg(test)]
 mod tests;
+
+/// Helpers for tests that stage sbt evidence on disk (this module's and
+/// `vex::discover::sbt`'s).
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::path::Path;
+    use std::time::SystemTime;
+
+    /// Date `path` at `t`.
+    pub(crate) fn set_mtime(path: &Path, t: SystemTime) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    /// The `file:` URI sbt writes for `path`: `file:///C:/x` on Windows (a
+    /// backslash is no URI separator, and an invalid JSON escape). `path`
+    /// must not be a verbatim (`\\?\`) path, which sbt never records.
+    pub(crate) fn file_uri(path: &Path) -> String {
+        let text = path
+            .to_string_lossy()
+            .replace('\\', "/")
+            .replace(' ', "%20");
+        if text.starts_with('/') {
+            format!("file://{text}")
+        } else {
+            format!("file:///{text}")
+        }
+    }
+}

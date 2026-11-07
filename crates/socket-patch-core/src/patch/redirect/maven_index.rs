@@ -7,7 +7,8 @@
 //! not once per dependency.
 
 use crate::formats::maven::{
-    interpolate_strict, is_executable_classifier, may_shadow, CoordinateAlternative, PomScope,
+    interpolate_strict, is_executable_classifier, is_executable_variant, is_variant, may_shadow,
+    variant_label, CoordinateAlternative, PomScope,
 };
 use crate::formats::xml::{child_text, children, elements, Element};
 
@@ -348,22 +349,33 @@ impl PomIndex {
     /// `<dependencyManagement>` entry with the same classifier (Maven keys
     /// management by classifier; a profile's entry while that profile is
     /// active), and with no live entry the version comes from outside this
-    /// pom. A `test-jar` typed declaration has no classifier and is refused
-    /// as an unsupported packaging (or a profile bypass) instead.
+    /// pom. A type counts like the classifier it implies
+    /// ([`is_executable_variant`]: a `test-jar` is the `tests` jar), and the
+    /// copy is reported by its label ([`variant_label`]).
     pub(super) fn unserved_classifier_copy(
         &self,
         group: &str,
         artifact: &str,
         served: &str,
     ) -> Option<(&str, Option<&str>)> {
-        let copies = |managed: bool| {
+        // Keyed as Maven keys management: by classifier and type.
+        fn key(d: &IndexedDep) -> (Option<&str>, Option<&str>) {
+            (
+                d.classifier.as_deref().filter(|c| !c.is_empty()),
+                d.type_text
+                    .as_deref()
+                    .filter(|t| !t.is_empty() && *t != "jar"),
+            )
+        }
+        let copies = move |managed: bool| {
             self.deps.iter().filter_map(move |d| {
-                let c = d.classifier.as_deref()?;
+                let (t, c) = (d.type_text.as_deref(), d.classifier.as_deref());
                 (d.managed == managed
                     && d.group.as_deref() == Some(group)
                     && d.artifact.as_deref() == Some(artifact)
-                    && is_executable_classifier(c))
-                .then_some((d, c))
+                    && is_variant(t, c)
+                    && is_executable_variant(t, c))
+                .then(|| (d, variant_label(t, c)))
             })
         };
         // Every version a declaration may resolve (`None`: it has none).
@@ -379,7 +391,7 @@ impl PomIndex {
             } else {
                 let entries = |in_profile: bool| {
                     copies(true)
-                        .filter(move |(m, c)| *c == classifier && m.in_profile == in_profile)
+                        .filter(move |(m, _)| key(m) == key(d) && m.in_profile == in_profile)
                         .flat_map(|(m, _)| versions(m))
                 };
                 let mut live: Vec<Option<&str>> = entries(false).collect();
