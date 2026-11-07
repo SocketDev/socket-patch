@@ -123,10 +123,23 @@ impl<'t> UvSource<'t> {
     /// `package`'s `source`; `None` when absent or neither a string nor a
     /// table.
     pub(crate) fn of(package: &'t dyn TableLike) -> Option<Self> {
-        let source = package.get("source")?;
+        Self::of_item(package.get("source")?)
+    }
+
+    /// A `source` item: a string, or an inline or standard table.
+    pub(crate) fn of_item(source: &'t Item) -> Option<Self> {
         match source.as_str() {
             Some(s) => Some(Self::Str(s)),
             None => source.as_table_like().map(Self::Table),
+        }
+    }
+
+    /// A `source` value: a string or an inline table.
+    pub(crate) fn of_value(source: &'t Value) -> Option<Self> {
+        match source {
+            Value::String(s) => Some(Self::Str(s.value())),
+            Value::InlineTable(t) => Some(Self::Table(t)),
+            _ => None,
         }
     }
 
@@ -162,6 +175,73 @@ impl<'t> UvSource<'t> {
             Self::Table(table) => table.contains_key("registry") || table.contains_key("url"),
         }
     }
+}
+
+/// Whether the uv 0.2 `[[distribution]]` entry `index` of `packages` keeps
+/// its artifacts in uv ≤ 0.2.5's `[distribution.sdist]` /
+/// `[[distribution.wheel]]` sub-tables rather than inline `sdist` /
+/// `wheels` (uv 0.2.6 and later). The entry's own artifacts decide — on a
+/// hosted pin, the ones the rewrite wrote in the grammar it chose — and an
+/// entry with none takes any other entry's. The hosted rewrite and the
+/// hosted unwind both read the grammar here.
+///
+/// uv 0.2.17 parses an unexpected `[[distribution.wheel]]` but ignores it,
+/// then treats the direct wheel URL as a source archive ("Unsupported
+/// archive type: …whl"), so the shape must be the lock's own.
+pub(crate) fn distribution_artifact_tables(packages: &ArrayOfTables, index: usize) -> bool {
+    let tables = |p: &Table| {
+        p.get("wheel").is_some_and(Item::is_array_of_tables)
+            || p.get("sdist").is_some_and(Item::is_table)
+    };
+    let has_artifacts = |p: &Table| {
+        ["wheel", "wheels", "sdist"]
+            .iter()
+            .any(|k| p.contains_key(k))
+    };
+    match packages.get(index) {
+        Some(own) if has_artifacts(own) => tables(own),
+        _ => packages.iter().any(tables),
+    }
+}
+
+/// Where the uv 0.2 `[[distribution]]` grammar writes an entry's inline
+/// `sdist` relative to an inline `dependencies` array, as the lock's
+/// registry entries other than `skip` show it: `Some(true)` before it
+/// (uv 0.2.18–0.2.22), `Some(false)` after it (uv 0.2.23–0.2.34), `None`
+/// when no such entry carries both. Nothing else in the lock tells those
+/// releases apart, and a hosted entry has lost its `sdist`, so the hosted
+/// unwind can restore one with both only from this evidence (and the
+/// hosted rewrite refuses an entry whose unwind would lack it).
+pub(crate) fn distribution_sdist_before_dependencies(
+    packages: &ArrayOfTables,
+    skip: impl Fn(usize) -> bool,
+) -> Option<bool> {
+    packages.iter().enumerate().find_map(|(i, p)| {
+        if skip(i) || UvSource::of(p).and_then(UvSource::registry).is_none() {
+            return None;
+        }
+        let at = |key: &str| p.iter().position(|(k, _)| k == key);
+        let inline_dependencies = p
+            .get("dependencies")
+            .is_some_and(|d| d.as_array().is_some());
+        match (at("sdist"), at("dependencies")) {
+            (Some(sdist), Some(dependencies)) if inline_dependencies => Some(sdist < dependencies),
+            _ => None,
+        }
+    })
+}
+
+/// The `exclude-newer` cutoff a uv project setting sets (`[tool.uv]` of a
+/// `pyproject.toml`, or the top level of a `uv.toml`): uv 0.2.12–0.2.27
+/// apply it when they lock without recording it in a `[[distribution]]`
+/// lock, so which of a release's files that lock kept is not derivable.
+/// `exclude-newer-package` is not such a cutoff: those uv releases predate
+/// it and ignore the key, and a later uv records it in the lock.
+pub(crate) fn sets_exclude_newer(settings: &dyn TableLike) -> Option<&str> {
+    settings
+        .iter()
+        .map(|(k, _)| k)
+        .find(|k| k.starts_with("exclude-newer") && *k != "exclude-newer-package")
 }
 
 /// A uv package's install location: `source = { url | path }`, or the uv
@@ -794,7 +874,6 @@ struct PythonLockPlan {
 
 fn plan_python_lock_rewrite(
     document: &DocumentMut,
-    text: &str,
     name: &str,
     version: &str,
     artifact: ArtifactSource<'_>,
@@ -851,18 +930,7 @@ fn plan_python_lock_rewrite(
     // still write string sources but already use inline `sdist = { … }` /
     // `wheels = [ … ]` instead of the `[distribution.sdist]` /
     // `[[distribution.wheel]]` tables of uv ≤0.2.5.
-    // uv 0.2.17 parses an unexpected `[[distribution.wheel]]` but ignores it,
-    // then treats the direct wheel URL as a source archive ("Unsupported
-    // archive type: …whl"). Decide from the entry's own artifact keys, then
-    // from any sibling entry in the document.
-    let legacy_artifact_tables = legacy
-        && (package.get("wheel").is_some_and(Item::is_array_of_tables)
-            || package.get("sdist").is_some_and(Item::is_table)
-            || (package.get("wheel").is_none()
-                && package.get("wheels").is_none()
-                && package.get("sdist").is_none()
-                && (text.contains("[[distribution.wheel]]")
-                    || text.contains("[distribution.sdist]"))));
+    let legacy_artifact_tables = legacy && distribution_artifact_tables(packages, index);
     if !pep751
         && !original_source.as_ref().is_some_and(|source| {
             source_identity(source).is_some_and(|(kind, value)| {
@@ -877,6 +945,24 @@ fn plan_python_lock_rewrite(
     }
     if pep751 && (package.contains_key("vcs") || package.contains_key("directory")) {
         return Ok(None);
+    }
+    // uv 0.2.18–0.2.22 write an entry's `sdist` before its inline
+    // `dependencies`, 0.2.23–0.2.34 after them. The rewrite drops the sdist,
+    // so the unwind can put it back only where another registry entry shows
+    // it; refuse an entry it could not restore.
+    if legacy
+        && package.contains_key("sdist")
+        && package
+            .get("dependencies")
+            .is_some_and(|d| d.as_array().is_some())
+        && distribution_sdist_before_dependencies(packages, |i| i == index).is_none()
+    {
+        return Err(format!(
+            "no other registry package of this uv 0.2 `[[distribution]]` lock carries both an \
+             `sdist` and inline `dependencies`, which uv 0.2.18–0.2.22 and 0.2.23–0.2.34 order \
+             differently, so rollback could not restore {name}=={version}'s entry; re-lock \
+             with uv >=0.2.35"
+        ));
     }
     // An entry resolved from a direct URL (uv.lock `source = { url }`, a
     // pylock `archive = { url }`) is the user's own source choice unless it
@@ -952,6 +1038,15 @@ pub(crate) struct PythonLockSession {
 /// A dep [`PythonLockSession::plan`] settled as rewritable.
 pub(crate) struct PlannedPythonLockRewrite(PythonLockPlan);
 
+impl PlannedPythonLockRewrite {
+    /// The entry is in a uv 0.2 `[[distribution]]` lock with inline
+    /// artifacts (uv 0.2.6–0.2.34), the releases that can apply an
+    /// `exclude-newer` cutoff (see [`sets_exclude_newer`]).
+    pub(crate) fn distribution_inline_artifacts(&self) -> bool {
+        self.0.legacy && !self.0.legacy_artifact_tables
+    }
+}
+
 impl PythonLockSession {
     pub(crate) fn new(text: &str) -> Self {
         Self {
@@ -961,20 +1056,17 @@ impl PythonLockSession {
         }
     }
 
-    /// [`rewrite_python_lock`]'s refusal / not-applicable verdict, where
-    /// `text` is the session's current rendering.
+    /// [`rewrite_python_lock`]'s refusal / not-applicable verdict on the
+    /// session's current document.
     pub(crate) fn plan(
         &self,
-        text: &str,
         name: &str,
         version: &str,
         artifact: ArtifactSource<'_>,
     ) -> Result<Option<PlannedPythonLockRewrite>, String> {
         let document = self.document.as_ref().map_err(String::clone)?;
-        Ok(
-            plan_python_lock_rewrite(document, text, name, version, artifact)?
-                .map(PlannedPythonLockRewrite),
-        )
+        Ok(plan_python_lock_rewrite(document, name, version, artifact)?
+            .map(PlannedPythonLockRewrite))
     }
 
     /// [`check_python_lock_source_scope`] on the current rendering.
@@ -1032,7 +1124,7 @@ pub fn rewrite_python_lock(
     let mut document: DocumentMut = text
         .parse()
         .map_err(|error| format!("invalid Python lock: {error}"))?;
-    let Some(plan) = plan_python_lock_rewrite(&document, text, name, version, artifact)? else {
+    let Some(plan) = plan_python_lock_rewrite(&document, name, version, artifact)? else {
         return Ok(None);
     };
     apply_python_lock_plan(&mut document, plan, version, artifact, sha256);
@@ -1173,6 +1265,37 @@ pub fn paired_metadata_path(lock: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry the rewrite does not apply to (a non-registry, non-direct
+    /// string source) is not applicable, not refused: the sdist-order
+    /// refusal only judges entries the rewrite would change.
+    #[test]
+    fn a_not_applicable_distribution_entry_is_not_refused_for_its_sdist() {
+        let lock = "version = 1\nrequires-python = \">=3.9\"\n\n[[distribution]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nsource = \"git+https://github.com/urllib3/urllib3?rev=1.26.18#abc\"\nsdist = { url = \"https://example.test/urllib3-1.26.18.tar.gz\", hash = \"sha256:aa\" }\ndependencies = [{ name = \"idna\" }]\n";
+        let session = PythonLockSession::new(lock);
+        let planned = session.plan(
+            "urllib3",
+            "1.26.18",
+            ArtifactSource::Url("https://patch.test/urllib3-1.26.18-py3-none-any.whl"),
+        );
+        assert!(matches!(planned, Ok(None)), "{:?}", planned.err());
+    }
+
+    /// `exclude-newer-package` names packages (or exempts them with `false`);
+    /// uv 0.2 ignores it, so it is not the global cutoff that blocks a
+    /// `[[distribution]]` rewrite.
+    #[test]
+    fn exclude_newer_package_is_not_a_global_cutoff() {
+        let table = |text: &str| text.parse::<toml_edit::DocumentMut>().unwrap();
+        let per_package = table("exclude-newer-package = { six = \"2024-01-01\" }\n");
+        assert_eq!(sets_exclude_newer(per_package.as_table()), None);
+        let exempt = table("exclude-newer-package = { six = false }\n");
+        assert_eq!(sets_exclude_newer(exempt.as_table()), None);
+        let global = table(
+            "exclude-newer-package = { six = false }\nexclude-newer = \"2024-01-01T00:00:00Z\"\n",
+        );
+        assert_eq!(sets_exclude_newer(global.as_table()), Some("exclude-newer"));
+    }
 
     #[test]
     fn script_locks_pair_with_their_script_and_uv_lock_with_pyproject() {
@@ -1341,6 +1464,55 @@ wheels = [{ url = "https://pypi.org/urllib3-2.0.0-py3-none-any.whl", hash = "sha
             .unwrap();
         assert!(package.get("wheels").is_none());
         assert_eq!(package["sdist"]["url"].as_str(), Some(url));
+    }
+
+    /// The grammar detectors both hosted directions share: an entry's own
+    /// artifacts decide its grammar before any other entry's, and the
+    /// `sdist` / inline `dependencies` order comes only from registry
+    /// entries other than the skipped ones.
+    #[test]
+    fn distribution_grammar_reads_the_entry_before_its_siblings() {
+        let doc: DocumentMut = r#"version = 1
+[[distribution]]
+name = "inline"
+version = "1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/inline-1.tar.gz" }
+dependencies = [{ name = "bare" }]
+[[distribution]]
+name = "tables"
+version = "1"
+source = "registry+https://pypi.org/simple"
+[[distribution.wheel]]
+url = "https://files.pythonhosted.org/tables-1-py3-none-any.whl"
+[[distribution]]
+name = "bare"
+version = "1"
+source = "registry+https://pypi.org/simple"
+[[distribution]]
+name = "hosted"
+version = "1"
+source = { url = "https://patch.socket.dev/hosted-1-py3-none-any.whl" }
+dependencies = [{ name = "bare" }]
+sdist = { url = "https://patch.socket.dev/hosted-1.tar.gz" }
+"#
+        .parse()
+        .unwrap();
+        let packages = doc["distribution"].as_array_of_tables().unwrap();
+        assert!(!distribution_artifact_tables(packages, 0));
+        assert!(distribution_artifact_tables(packages, 1));
+        // No artifacts of its own: any entry's sub-tables decide.
+        assert!(distribution_artifact_tables(packages, 2));
+        // `inline` shows `sdist` before `dependencies`; `hosted` (not a
+        // registry entry) shows the reverse and is never evidence.
+        assert_eq!(
+            distribution_sdist_before_dependencies(packages, |_| false),
+            Some(true)
+        );
+        assert_eq!(
+            distribution_sdist_before_dependencies(packages, |i| i == 0),
+            None
+        );
     }
 
     #[test]

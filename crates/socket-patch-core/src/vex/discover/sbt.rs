@@ -11,8 +11,17 @@
 //! verifies it: every version sbt recorded for the GA is the pinned
 //! `<base>-socket.<hex8>`, and every artifact file recorded for it hashes to
 //! one of the pin's sha256s, the jar's among them. Otherwise the diagnostic
-//! `sbt_resolution_unverified`, and the ref stays unattested (it must still
-//! be verified against an installed copy).
+//! `sbt_resolution_unverified`, and the ref keeps only the installed-copy
+//! basis (the suffixed copy under `.socket/sbt-hosted`, which only the
+//! hosted file downloads).
+//!
+//! That copy proves sbt loaded the hosted file once, not that the build
+//! resolves it. Where the build provably does not use the pinned bytes
+//! ([`bypass`]: a `dependencyOverrides` reassignment replacing the
+//! generated override, or evidence dated after the wiring and the sources
+//! still resolving the base version, or other bytes) and no such evidence
+//! verifies the pin, the ref is also marked [`Unattested`]
+//! (`SbtPinBypassed`), so no basis attests it.
 //!
 //! The check is on content, not location, like the generated file's own
 //! load-time verifier: Ivy legitimately serves a second checkout from the
@@ -29,18 +38,20 @@
 //! pin only because `sbt update` has not run since. A memory view has no
 //! committed tree to hash, so it reports none missing.
 //!
-//! [`Unattested`]: super::Unattested
-//!
 //! A generated file socket-patch cannot parse strictly is
 //! `sbt_owned_file_modified` (a foreign file under the name is not ours and
 //! is ignored).
+//!
+//! [`Unattested`]: super::Unattested
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use super::{DiscoverCtx, Discovery, PatchedRef, UnattestedKind, DIAG_REF_INVALID};
+use crate::formats::sbt::build::BuildFindings;
 use crate::formats::sbt::owned_file::{
-    parse, OwnedFileError, SbtFileMode, SbtPin, HOSTED_FILE, VENDORED_FILE, VENDORED_REPO_REL,
+    parse, OwnedFileError, SbtFileMode, SbtPin, HOSTED_FILE, HOSTED_REPO_REL, VENDORED_FILE,
+    VENDORED_REPO_REL,
 };
 use crate::formats::sbt::JvmResolution;
 use crate::utils::purl::maven_purl;
@@ -59,44 +70,241 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if hosted.is_none() && vendored.is_none() {
         return;
     }
-    // The resolution evidence is sbt's own output tree: only a disk has one.
-    let (res, blocker) = match ctx.disk_root() {
-        Some(root) => evidence(root).await,
-        None => (None, None),
+    // The resolution evidence is sbt's own output tree, and the build
+    // sources are a walk: only a disk has either.
+    let build = match ctx.disk_root() {
+        Some(root) => build_state(root).await,
+        None => BuildState::default(),
     };
-    let blocker = blocker.as_deref();
     let mut hashes = Hashes::default();
     if let Some(text) = hosted {
         if let Some(pins) = strict(SbtFileMode::Hosted, &text, out) {
             for pin in pins {
-                hosted_ref(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
+                hosted_ref(ctx, &pin, &build, &mut hashes, out).await;
             }
         }
     }
     if let Some(text) = vendored {
         if let Some(pins) = strict(SbtFileMode::Vendored, &text, out) {
+            let (res, blocker) = (build.res.as_ref(), build.blocker.as_deref());
             for pin in pins {
-                vendored_check(ctx, &pin, res.as_ref(), blocker, &mut hashes, out).await;
+                vendored_check(ctx, &pin, res, blocker, &mut hashes, out).await;
             }
         }
     }
 }
 
-/// The build's resolution evidence, read off disk (`None` when there is
-/// none), and why it cannot vouch for any pin even where it shows one
-/// ([`evidence_blocker`]).
-async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
+/// What the build's local state says about every pin.
+#[derive(Debug, Default)]
+struct BuildState {
+    /// The build's resolution evidence (`None` when there is none).
+    res: Option<JvmResolution>,
+    /// Why the evidence cannot vouch for any pin even where it shows one
+    /// ([`evidence_blocker`]).
+    blocker: Option<String>,
+    /// A build edit dropping the generated override or installer
+    /// ([`pin_dropped`]), read off the build sources whether or not any
+    /// evidence exists.
+    dropped: Option<String>,
+    /// The hosted pin repository as sbt's evidence spells it (canonical,
+    /// `<root>/.socket/sbt-hosted/maven2`).
+    repo: Option<PathBuf>,
+    /// The evidence files dated after the generated files and every build
+    /// source: each one records what its project resolves now, with the
+    /// pin in place. An older record (a project or cross build not
+    /// re-resolved since) proves nothing about the pin either way.
+    current: BTreeSet<String>,
+    /// Every record is [`Self::current`] and every declared project has
+    /// one: only then does evidence verifying a pin speak for the whole
+    /// build, and so overrule a build edit dropping it ([`bypass`]).
+    whole: bool,
+}
+
+/// The build's state under `root`: its sources scanned once, its evidence
+/// read (`sbt_evidence::discover`'s rule: no evidence file, no evidence).
+async fn build_state(root: &Path) -> BuildState {
     let root = root.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let Some(e) = crate::crawlers::sbt_evidence::discover(&root) else {
-            return (None, None);
+        let Ok(e) = crate::crawlers::sbt_evidence::scan(&root) else {
+            return BuildState::default();
         };
+        let findings = crate::formats::sbt::build::scan_build_sources(&e.build_sources);
+        let dropped = pin_dropped(&findings);
+        let repo = std::fs::canonicalize(&root)
+            .ok()
+            .map(|c| crate::crawlers::sbt_evidence::strip_verbatim(&c).join(HOSTED_REPO_REL));
+        if e.files.is_empty() {
+            return BuildState {
+                dropped,
+                repo,
+                ..BuildState::default()
+            };
+        }
         let res = crate::crawlers::sbt_evidence::resolution(&e);
-        let blocker = res.as_ref().and_then(|res| evidence_blocker(&e, res));
-        (res, blocker)
+        let blocker = res
+            .as_ref()
+            .and_then(|res| evidence_blocker(&e, res, &findings));
+        let since = e.generated.max(e.newest_source);
+        let current: BTreeSet<String> = e
+            .record_dates
+            .iter()
+            .filter(|(_, at)| since.is_none_or(|s| **at > s))
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        let whole = current.len() == e.record_dates.len()
+            && res.as_ref().is_some_and(|res| {
+                crate::formats::sbt::build::declared_projects(&e.build_sources).is_some_and(
+                    |declared| declared.values().all(|dir| res.projects_seen.contains(dir)),
+                )
+            });
+        BuildState {
+            res,
+            blocker,
+            dropped,
+            repo,
+            current,
+            whole,
+        }
     })
     .await
     .unwrap_or_default()
+}
+
+/// A build edit that drops what makes the pin hold (both a blocker of the
+/// evidence and, with no current evidence verifying the pin, a bypass of
+/// it): a `dependencyOverrides` reassignment replaces the generated
+/// override where it applies, and an `onLoad` reassignment that does not
+/// keep the previous value drops the generated installer, whose `update`
+/// verifier fails a build that does not resolve the pinned bytes and whose
+/// resolver order serves the pin repository first. Without the installer,
+/// nothing stops another repository's copy or a forced version from
+/// building silently.
+fn pin_dropped(findings: &BuildFindings) -> Option<String> {
+    if !findings.overrides_assignment.is_empty() {
+        return Some(format!(
+            "{} reassign(s) `dependencyOverrides`, which replaces the pin where it applies",
+            findings.overrides_assignment.join(", ")
+        ));
+    }
+    (!findings.onload_assignment.is_empty()).then(|| {
+        format!(
+            "{} reassign(s) `onLoad` without keeping its previous value, which drops \
+             socket-patch's load-time verifier and resolver order",
+            findings.onload_assignment.join(", ")
+        )
+    })
+}
+
+/// `res` cut down to `pin`'s GA as the [`BuildState::current`] records
+/// show it: each version by its current records only, and the pinned
+/// version's artifact files only while every record resolving that version
+/// is current (an artifact path names no record).
+fn current_view(res: &JvmResolution, pin: &SbtPin, current: &BTreeSet<String>) -> JvmResolution {
+    let ga = (pin.group.clone(), pin.artifact.clone());
+    let is_current = |id: &String| {
+        id.rsplit_once(':')
+            .is_some_and(|(record, _)| current.contains(record))
+    };
+    let mut view = JvmResolution::default();
+    let Some(versions) = res.modules.get(&ga) else {
+        return view;
+    };
+    for (version, ids) in versions {
+        let now: BTreeSet<String> = ids.iter().filter(|id| is_current(id)).cloned().collect();
+        if !now.is_empty() {
+            view.modules
+                .entry(ga.clone())
+                .or_default()
+                .insert(version.clone(), now);
+        }
+    }
+    let key = (pin.group.clone(), pin.artifact.clone(), pin.sv.clone());
+    let pinned_ids = versions.get(&pin.sv);
+    if pinned_ids.is_some_and(|ids| !ids.is_empty() && ids.iter().all(is_current)) {
+        if let Some(paths) = res.artifacts.get(&key) {
+            view.artifacts.insert(key, paths.clone());
+        }
+    }
+    view
+}
+
+/// Why the build provably does not use `pin`'s bytes, whatever copy is
+/// installed, or `None`. Current evidence that verifies the pin ([`verify`]
+/// over [`current_view`]) wins, over a build edit too when it covers the
+/// whole build ([`BuildState::whole`]): a project not re-resolved since
+/// the edit may be the one it applies to. Otherwise: a build edit dropping
+/// the pin ([`pin_dropped`]: the override replaced, or the load-time
+/// verifier and resolver order removed), or current evidence judged
+/// exactly as the hosted rewriter re-checks an existing pin
+/// (`formats::sbt::gate::check_existing`): the GA's base version (the
+/// override shadowed), or the pinned version from outside the pin
+/// repository with bytes that are not pinned. An artifact that cannot be
+/// read now proves nothing. (Another forced version is no proof to either:
+/// the load-time verifier fails that `update`.)
+///
+/// A `resolvers` reassignment or `sbt.override.build.repos` is no bypass on
+/// its own: the override still forces the Socket-only version, and the
+/// load-time verifier fails `update` on any other version or unpinned
+/// bytes, so such a build runs the pinned bytes or fails. (Without that
+/// verifier, an `onLoad` reassignment is the bypass.)
+async fn bypass(pin: &SbtPin, build: &BuildState, hashes: &mut Hashes) -> Option<String> {
+    use crate::formats::sbt::gate::{check_existing, GateRefusal, GateWarning};
+    let now = build
+        .res
+        .as_ref()
+        .map(|res| current_view(res, pin, &build.current));
+    if let Some(now) = &now {
+        if (build.dropped.is_none() || build.whole) && verify(pin, Some(now), hashes).await.is_ok()
+        {
+            return None;
+        }
+    }
+    if let Some(why) = &build.dropped {
+        return Some(why.clone());
+    }
+    let (now, repo) = (now?, build.repo.as_deref()?);
+    let key = (pin.group.clone(), pin.artifact.clone(), pin.sv.clone());
+    let mut known = BTreeMap::new();
+    for path in now.artifacts.get(&key).into_iter().flatten() {
+        known.insert(path.clone(), hashes.of(path).await);
+    }
+    let pinned = |path: &Path| {
+        known
+            .get(path)
+            .cloned()
+            .flatten()
+            .is_none_or(|got| got == pin.jar_sha256 || got == pin.pom_sha256)
+    };
+    let ga = format!("{}:{}", pin.group, pin.artifact);
+    match check_existing(
+        Some(&now),
+        &pin.group,
+        &pin.artifact,
+        &pin.sv,
+        repo,
+        &pinned,
+    ) {
+        Err(GateRefusal::ResolvedElsewhere { paths }) => Some(format!(
+            "the build's current resolution evidence resolves {ga}:{} from {}, outside the \
+             pin repository and not the pinned bytes",
+            pin.sv,
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+        Err(_) => None,
+        Ok(warnings) => warnings.into_iter().find_map(|w| match w {
+            GateWarning::OverrideShadowed { evidence } => Some(format!(
+                "the build's current resolution evidence still resolves {ga} at its base \
+                 version in {}, not the pinned {}",
+                evidence.join(", "),
+                pin.sv
+            )),
+            GateWarning::MetaBuildOnly => None,
+        }),
+    }
 }
 
 /// The build-wide conditions under which evidence showing the pin is not
@@ -104,15 +312,15 @@ async fn evidence(root: &Path) -> (Option<JvmResolution>, Option<String>) {
 /// new pin on): a build source newer than some project's evidence, a
 /// declared project with no evidence (only part of the build resolved), a
 /// project definition that cannot be read statically, a build source
-/// reassigning `dependencyOverrides` (it replaces the generated override
-/// where it applies) or `resolvers`, or a `build.sbt.lock`. Each reason
-/// names its own remedy (or that there is none), so a reader can relay it
-/// as is.
+/// dropping the pin ([`pin_dropped`]) or reassigning `resolvers`, or a
+/// `build.sbt.lock`. Each reason names its own remedy (or that there is
+/// none), so a reader can relay it as is.
 fn evidence_blocker(
     e: &crate::crawlers::sbt_evidence::SbtEvidence,
     res: &JvmResolution,
+    findings: &BuildFindings,
 ) -> Option<String> {
-    use crate::formats::sbt::build::{declared_projects, scan_build_sources};
+    use crate::formats::sbt::build::declared_projects;
     if e.stale {
         return Some(
             "a build source changed after the last `sbt update`; run `sbt update`".to_string(),
@@ -138,14 +346,13 @@ fn evidence_blocker(
             missing.join(", ")
         ));
     }
-    let findings = scan_build_sources(&e.build_sources);
-    if !findings.overrides_assignment.is_empty() {
-        return Some(format!(
-            "{} reassign(s) or filter(s) `dependencyOverrides` (`:=`, `~=` or `--=`), which can \
-             replace or drop the pin where it applies; keep the setting's existing entries \
-             (append with `+=` / `++=`)",
-            findings.overrides_assignment.join(", ")
-        ));
+    if let Some(why) = pin_dropped(findings) {
+        let remedy = if findings.overrides_assignment.is_empty() {
+            "keep its previous value (compose with `(Global / onLoad).value andThen ...`)"
+        } else {
+            "keep the setting's existing entries (append with `+=` / `++=`)"
+        };
+        return Some(format!("{why}; {remedy}"));
     }
     if !findings.resolvers_assignment.is_empty() {
         return Some(format!(
@@ -289,8 +496,7 @@ async fn verify(
 async fn hosted_ref(
     ctx: &DiscoverCtx<'_>,
     pin: &SbtPin,
-    res: Option<&JvmResolution>,
-    blocker: Option<&str>,
+    build: &BuildState,
     hashes: &mut Hashes,
     out: &mut Discovery,
 ) {
@@ -320,6 +526,7 @@ async fn hosted_ref(
         );
         return;
     }
+    let (res, blocker) = (build.res.as_ref(), build.blocker.as_deref());
     let locked = match verify_with(pin, res, blocker, hashes).await {
         Ok(()) => Some(LockIntegrity::Sha256Hex(pin.jar_sha256.clone())),
         Err(why) => {
@@ -331,6 +538,22 @@ async fn hosted_ref(
             None
         }
     };
+    // Unverified, the ref still attests from the installed copy; where the
+    // build provably does not apply the pin, from nothing. A pin the
+    // evidence verifies is never withdrawn.
+    let bypassed = match &locked {
+        Some(_) => None,
+        None => bypass(pin, build, hashes).await,
+    };
+    if let Some(why) = bypassed {
+        out.unattested(
+            &purl,
+            &pin.uuid,
+            HOSTED_FILE,
+            why,
+            UnattestedKind::SbtPinBypassed,
+        );
+    }
     out.push(PatchedRef::hosted(
         purl,
         pin.uuid.clone(),
@@ -477,23 +700,33 @@ mod tests {
         all.projects_seen = [".", "core", "app"].map(String::from).into();
         let mut core_only = all.clone();
         core_only.projects_seen.remove("app");
+        let blocker = |e: &SbtEvidence, res: &JvmResolution| {
+            let findings = crate::formats::sbt::build::scan_build_sources(&e.build_sources);
+            evidence_blocker(e, res, &findings)
+        };
 
-        assert_eq!(evidence_blocker(&e(&[], false), &all), None);
-        let why = evidence_blocker(&e(&[], false), &core_only).unwrap();
+        assert_eq!(blocker(&e(&[], false), &all), None);
+        let why = blocker(&e(&[], false), &core_only).unwrap();
         assert!(why.contains("app"), "{why}");
-        let why = evidence_blocker(&e(&[], true), &all).unwrap();
+        let why = blocker(&e(&[], true), &all).unwrap();
         assert!(why.contains("sbt update"), "{why}");
         let overrides = [(
             "app/build.sbt",
             "dependencyOverrides := Seq(\"org.apache.commons\" % \"commons-text\" % \"1.9\")\n",
         )];
-        let why = evidence_blocker(&e(&overrides, false), &all).unwrap();
+        let why = blocker(&e(&overrides, false), &all).unwrap();
         assert!(why.contains("app/build.sbt:1"), "{why}");
         let resolvers = [("app/build.sbt", "resolvers := Nil\n")];
-        let why = evidence_blocker(&e(&resolvers, false), &all).unwrap();
+        let why = blocker(&e(&resolvers, false), &all).unwrap();
         assert!(why.contains("`resolvers`"), "{why}");
+        let onload = [("app/build.sbt", "Global / onLoad := identity\n")];
+        let why = blocker(&e(&onload, false), &all).unwrap();
+        assert!(
+            why.contains("app/build.sbt:1") && why.contains("`onLoad`"),
+            "{why}"
+        );
         let lock = [("build.sbt.lock", "{}\n")];
-        let why = evidence_blocker(&e(&lock, false), &all).unwrap();
+        let why = blocker(&e(&lock, false), &all).unwrap();
         assert!(why.contains("build.sbt.lock"), "{why}");
     }
 
@@ -778,6 +1011,306 @@ mod tests {
             out.unattested[0].detail.contains("read from memory"),
             "{:?}",
             out.unattested[0]
+        );
+    }
+
+    /// One record `rel` resolving lang3 at `v` (its id `rel:compile`), with
+    /// `artifact` as the pinned version's file.
+    fn record(r: &mut JvmResolution, rel: &str, v: &str, artifact: Option<&Path>) {
+        let ga = (
+            "org.apache.commons".to_string(),
+            "commons-lang3".to_string(),
+        );
+        r.modules
+            .entry(ga.clone())
+            .or_default()
+            .entry(v.to_string())
+            .or_default()
+            .insert(format!("{rel}:compile"));
+        if let Some(p) = artifact {
+            r.artifacts
+                .entry((ga.0, ga.1, v.to_string()))
+                .or_default()
+                .insert(p.to_path_buf());
+        }
+    }
+
+    /// The installed-copy fallback is withdrawn only on proof: a
+    /// `dependencyOverrides` reassignment, or a record dated after the
+    /// wiring and the sources (judged as the hosted rewriter re-checks a
+    /// pin) showing the base version or other bytes, and never while such a
+    /// record verifies the pin. A record older than the wiring (a project
+    /// or cross build not re-resolved since) proves nothing.
+    #[tokio::test]
+    async fn bypass_needs_proof_from_current_records() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let jar = tmp.path().join("x.jar");
+        std::fs::write(&jar, b"patched").unwrap();
+        let sha = hex::encode(Sha256::digest(b"patched"));
+        let evil = tmp.path().join("evil.jar");
+        std::fs::write(&evil, b"evil").unwrap();
+        let gone = tmp.path().join("gone.jar");
+        let p = pin(&sha);
+        let mut h = Hashes::default();
+        let state = |res: JvmResolution, current: &[&str]| BuildState {
+            res: Some(res),
+            repo: Some(repo.clone()),
+            current: current.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        };
+        let dropped = Some("build.sbt:1 reassign(s) `dependencyOverrides`".to_string());
+
+        assert_eq!(bypass(&p, &BuildState::default(), &mut h).await, None);
+        let edited = BuildState {
+            dropped: dropped.clone(),
+            ..Default::default()
+        };
+        let why = bypass(&p, &edited, &mut h).await.unwrap();
+        assert!(why.contains("build.sbt:1"), "{why}");
+
+        // A current record verifying the pin wins over the edit when the
+        // evidence covers the whole build.
+        let mut verified = JvmResolution::default();
+        record(&mut verified, "b/target/out", SV, Some(&jar));
+        let verified_edited = BuildState {
+            dropped: dropped.clone(),
+            whole: true,
+            ..state(verified.clone(), &["b/target/out"])
+        };
+        assert_eq!(bypass(&p, &verified_edited, &mut h).await, None);
+        // Not when another project was not re-resolved since the edit (it
+        // may be the one the edit applies to): the edit is proof.
+        let mut partial = verified.clone();
+        record(&mut partial, "a/target/out", "3.11", None);
+        let partial_edited = BuildState {
+            dropped: dropped.clone(),
+            ..state(partial, &["b/target/out"])
+        };
+        let why = bypass(&p, &partial_edited, &mut h).await.unwrap();
+        assert!(why.contains("build.sbt:1"), "{why}");
+        // A stale record of another project beside it changes nothing.
+        let mut mixed = verified.clone();
+        record(&mut mixed, "a/target/out", "3.11", None);
+        assert_eq!(
+            bypass(&p, &state(mixed.clone(), &["b/target/out"]), &mut h).await,
+            None
+        );
+        // Current, it shows the build resolving the base.
+        let why = bypass(&p, &state(mixed, &["a/target/out", "b/target/out"]), &mut h)
+            .await
+            .unwrap();
+        assert!(
+            why.contains("base version") && why.contains("a/target/out"),
+            "{why}"
+        );
+        // Another version a project forces is judged as the rewriter does:
+        // no proof (sbt's load-time verifier fails that `update`).
+        let mut forced = JvmResolution::default();
+        record(&mut forced, "a/target/out", "3.12", None);
+        assert_eq!(
+            bypass(&p, &state(forced, &["a/target/out"]), &mut h).await,
+            None
+        );
+
+        // Other bytes at the pinned version, outside the pin repository.
+        let mut elsewhere = JvmResolution::default();
+        record(&mut elsewhere, "b/target/out", SV, Some(&evil));
+        let why = bypass(&p, &state(elsewhere.clone(), &["b/target/out"]), &mut h)
+            .await
+            .unwrap();
+        assert!(why.contains("not the pinned bytes"), "{why}");
+        assert_eq!(bypass(&p, &state(elsewhere, &[]), &mut h).await, None);
+        // A recorded file that is gone, or no resolution of the GA, proves
+        // nothing.
+        let mut evicted = JvmResolution::default();
+        record(&mut evicted, "b/target/out", SV, Some(&gone));
+        assert_eq!(
+            bypass(&p, &state(evicted, &["b/target/out"]), &mut h).await,
+            None
+        );
+        assert_eq!(
+            bypass(&p, &state(JvmResolution::default(), &[]), &mut h).await,
+            None
+        );
+    }
+
+    /// A hosted file pinning `ga` (`group`, `artifact`, `base`) at the root
+    /// of `root`, an sbt build.
+    fn write_hosted(root: &Path, group: &str, artifact: &str, base: &str) {
+        use crate::formats::sbt::owned_file::{render, SbtLine, SbtOwnedFile};
+        let pin = SbtPin {
+            group: group.into(),
+            artifact: artifact.into(),
+            base: base.into(),
+            sv: format!("{base}-socket.abcdef12"),
+            ..pin(&"b".repeat(64))
+        };
+        let file = render(&SbtOwnedFile {
+            mode: SbtFileMode::Hosted,
+            line: SbtLine::Sbt1,
+            crlf: false,
+            pins: [(UUID.to_string(), pin)].into(),
+        })
+        .unwrap();
+        std::fs::write(root.join(HOSTED_FILE), file).unwrap();
+    }
+
+    /// The build's own evidence: of the 1.9.9 test-compile build (root
+    /// aggregating `a`, `b`, `c`; only `b` resolves gson 2.8.9), wired
+    /// with a gson pin after `b` last resolved, and every other project
+    /// re-resolved since. `b`'s record predates the pin, so its 2.8.9 is
+    /// no proof, however fresh the other projects' records are; once `b`
+    /// resolves again with the pin in place and still shows 2.8.9, it is.
+    #[tokio::test]
+    async fn a_record_older_than_the_pin_never_withdraws_it() {
+        use std::time::{Duration, SystemTime};
+        const PURL: &str = "pkg:maven/com.google.code.gson/gson@2.8.9";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("x");
+        crate::crawlers::sbt_evidence::stage_fixture(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/sbt/evidence/1.9.9/test-compile"),
+            &root,
+        );
+        write_hosted(&root, "com.google.code.gson", "gson", "2.8.9");
+        let now = SystemTime::now();
+        set_mtime(&root.join(HOSTED_FILE), now - Duration::from_secs(1800));
+        let output = |project: &str| {
+            root.join(project)
+                .join("target/scala-2.12/update/update_cache_2.12/output")
+        };
+        for project in ["", "a", "c"] {
+            set_mtime(&output(project), now);
+        }
+        let out = super::super::discover_patched_refs(&root).await;
+        assert!(
+            out.refs.iter().any(|r| r.uuid == UUID && r.purl == PURL),
+            "{:?}",
+            out.refs
+        );
+        assert!(out.unattested.is_empty(), "{:?}", out.unattested);
+
+        set_mtime(&output("b"), now);
+        let out = super::super::discover_patched_refs(&root).await;
+        let [u] = out.unattested.as_slice() else {
+            panic!("{:?}", out.unattested);
+        };
+        assert_eq!(u.kind, UnattestedKind::SbtPinBypassed);
+        assert!(u.detail.contains("b/target"), "{}", u.detail);
+    }
+
+    /// A hosted file at the root of an sbt build with no evidence (a fresh
+    /// clone), over `build_sbt`.
+    fn hosted_build(build_sbt: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("project")).unwrap();
+        std::fs::write(root.join("project/build.properties"), "sbt.version=1.9.9\n").unwrap();
+        std::fs::write(root.join("build.sbt"), build_sbt).unwrap();
+        write_hosted(root, "org.apache.commons", "commons-lang3", "3.11");
+        tmp
+    }
+
+    const LANG3: &str =
+        "libraryDependencies += \"org.apache.commons\" % \"commons-lang3\" % \"3.11\"\n";
+
+    /// The unattested mark on the hosted lang3 ref discovery finds in
+    /// `root`, if any (the ref itself always stays).
+    async fn mark(root: &Path) -> Option<super::super::Unattested> {
+        const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.11";
+        let out = super::super::discover_patched_refs(root).await;
+        assert!(
+            out.refs.iter().any(|r| r.uuid == UUID && r.purl == PURL),
+            "the ref stays: {:?}",
+            out.refs
+        );
+        assert!(out.unattested.len() <= 1, "{:?}", out.unattested);
+        let u = out.unattested.into_iter().next()?;
+        assert_eq!(
+            (u.kind, u.uuid.as_str(), u.purl.as_str(), u.file.as_path()),
+            (
+                UnattestedKind::SbtPinBypassed,
+                UUID,
+                PURL,
+                Path::new(HOSTED_FILE)
+            )
+        );
+        Some(u)
+    }
+
+    /// With no evidence, only a `dependencyOverrides` reassignment withdraws
+    /// the installed-copy basis: it replaces the generated override. A
+    /// `resolvers` reassignment or `sbt.override.build.repos` leaves the
+    /// override forcing the Socket-only version and the load-time verifier
+    /// checking its bytes, so the build runs the pinned bytes or fails.
+    #[tokio::test]
+    async fn only_an_overrides_reassignment_withdraws_without_evidence() {
+        assert!(mark(hosted_build(LANG3).path()).await.is_none());
+        let edited = hosted_build(&format!(
+            "{LANG3}dependencyOverrides := Seq(\"org.apache.commons\" % \"commons-lang3\" % \"3.11\")\n"
+        ));
+        let u = mark(edited.path()).await.unwrap();
+        assert!(
+            u.detail.contains("build.sbt:2") && u.detail.contains("`dependencyOverrides`"),
+            "{}",
+            u.detail
+        );
+        let resolvers = hosted_build(&format!("{LANG3}resolvers := Nil\n"));
+        assert!(mark(resolvers.path()).await.is_none());
+        let repos = hosted_build(LANG3);
+        std::fs::write(
+            repos.path().join(".sbtopts"),
+            "-Dsbt.override.build.repos=true\n",
+        )
+        .unwrap();
+        assert!(mark(repos.path()).await.is_none());
+    }
+
+    /// An `onLoad` reassignment that drops the generated installer removes
+    /// the verifier (and the resolver order) the resolver and forced-version
+    /// decisions rely on: like a `dependencyOverrides` reassignment, it
+    /// withdraws the installed-copy basis and blocks the lockfile basis. A
+    /// composition that keeps the installer does neither.
+    #[tokio::test]
+    async fn an_onload_reassignment_withdraws_like_an_overrides_one() {
+        let dropped = hosted_build(&format!("{LANG3}Global / onLoad := identity\n"));
+        let u = mark(dropped.path()).await.unwrap();
+        assert!(
+            u.detail.contains("build.sbt:2") && u.detail.contains("`onLoad`"),
+            "{}",
+            u.detail
+        );
+        let kept = hosted_build(&format!(
+            "{LANG3}Global / onLoad := (Global / onLoad).value andThen (s => s)\n"
+        ));
+        assert!(mark(kept.path()).await.is_none());
+        // The same edit with a resolvers reassignment: still the onLoad one.
+        let both = hosted_build(&format!(
+            "{LANG3}resolvers := Nil\nonLoad in Global ~= (_ => identity)\n"
+        ));
+        assert!(mark(both.path())
+            .await
+            .unwrap()
+            .detail
+            .contains("build.sbt:3"));
+    }
+
+    /// A file under the vendored name that socket-patch did not write is a
+    /// root definition sbt loads like any other: its reassignment counts.
+    #[tokio::test]
+    async fn a_foreign_generated_name_is_scanned_as_a_build_source() {
+        let tmp = hosted_build(LANG3);
+        std::fs::write(
+            tmp.path().join(VENDORED_FILE),
+            "dependencyOverrides := Seq()\n",
+        )
+        .unwrap();
+        let u = mark(tmp.path()).await.unwrap();
+        assert!(
+            u.detail.contains("socket-patch-vendor.sbt:1"),
+            "{}",
+            u.detail
         );
     }
 }
