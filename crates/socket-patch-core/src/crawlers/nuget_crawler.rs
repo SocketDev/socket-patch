@@ -847,6 +847,7 @@ fn locate_libraries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
 
     #[test]
     fn test_parse_legacy_dir_name() {
@@ -1449,10 +1450,8 @@ mod tests {
     async fn test_nuget_home_env_var() {
         // Test that NUGET_PACKAGES env var is respected
         let custom = "/tmp/test-nuget-packages";
-        std::env::set_var("NUGET_PACKAGES", custom);
-        let home = nuget_home();
-        assert_eq!(home, Some(PathBuf::from(custom)));
-        std::env::remove_var("NUGET_PACKAGES");
+        let _env = EnvGuard::set("NUGET_PACKAGES", custom);
+        assert_eq!(nuget_home(), Some(PathBuf::from(custom)));
     }
 
     /// Regression: NuGet itself treats an empty `NUGET_PACKAGES` as unset
@@ -1463,13 +1462,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_nuget_home_empty_env_var_falls_back_to_default() {
-        let prev = std::env::var("NUGET_PACKAGES").ok();
-        std::env::set_var("NUGET_PACKAGES", "");
+        let _env = EnvGuard::set("NUGET_PACKAGES", "");
         let home = nuget_home().expect("a home directory");
-        match prev {
-            Some(v) => std::env::set_var("NUGET_PACKAGES", v),
-            None => std::env::remove_var("NUGET_PACKAGES"),
-        }
         assert!(
             home.ends_with(Path::new(".nuget").join("packages")),
             "empty NUGET_PACKAGES must fall back to ~/.nuget/packages, got {home:?}"
@@ -1886,6 +1880,17 @@ mod tests {
         }
     }
 
+    /// Crawls `cwd` in project mode with the global packages folder
+    /// NuGet would restore into (search root 3) pointed at an empty
+    /// directory, so the result never depends on the host's
+    /// `~/.nuget/packages` or on a parallel test's `NUGET_PACKAGES` /
+    /// `HOME` (#2023). Env is process-global: callers are `#[serial]`.
+    async fn crawl_local(cwd: &Path) -> Vec<CrawledPackage> {
+        let empty = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("NUGET_PACKAGES", empty.path());
+        NuGetCrawler.crawl_all(&local(cwd)).await
+    }
+
     fn purls_of(packages: &[CrawledPackage]) -> Vec<String> {
         let mut purls: Vec<String> = packages.iter().map(|p| p.purl.clone()).collect();
         purls.sort();
@@ -1975,6 +1980,7 @@ mod tests {
     /// No scope, so today's walk: a solution root (its projects' restores
     /// may sit deeper than one level), and a project not restored yet.
     #[tokio::test]
+    #[serial_test::serial]
     async fn solution_roots_and_unrestored_projects_keep_the_walk() {
         let every = [
             "pkg:nuget/newtonsoft.json@12.0.1",
@@ -1990,7 +1996,7 @@ mod tests {
             .await
             .unwrap();
         write_assets(&solution.join("App"), &cache, app_libraries()).await;
-        let crawled = NuGetCrawler.crawl_all(&local(&solution)).await;
+        let crawled = crawl_local(&solution).await;
         assert_eq!(purls_of(&crawled), every);
 
         // A project whose assets file has no `libraries` object.
@@ -2008,7 +2014,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every);
     }
 
@@ -2016,6 +2022,7 @@ mod tests {
     /// packages are never dropped: a sub-project two levels down with no
     /// restore, and one whose assets file has no `libraries`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn an_uncovered_sub_project_keeps_the_walk() {
         let every = [
             "pkg:nuget/newtonsoft.json@12.0.1",
@@ -2035,7 +2042,7 @@ mod tests {
             .await
             .unwrap();
         write_assets(&app, &cache, app_libraries()).await;
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every, "unrestored sub-project");
 
         let obj = tests.join("obj");
@@ -2043,7 +2050,7 @@ mod tests {
         tokio::fs::write(obj.join("project.assets.json"), r#"{"version": 3}"#)
             .await
             .unwrap();
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every, "assets without libraries");
     }
 
