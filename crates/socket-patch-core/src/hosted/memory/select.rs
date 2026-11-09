@@ -150,8 +150,9 @@ fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
 }
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
-/// for.
-fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
+/// for. `user_patches` says whether npm is selected, so the files only the
+/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all.
+fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Option<Need> {
     if rel == BUN_LOCKB {
         return Some(Need::Binary);
     }
@@ -173,7 +174,15 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         if crate::utils::pnpm_workspace::is_git_branch_lock_name(rel) {
             return Some(Need::Present);
         }
+        // A patch-package file of a `--patch-dir .` (see
+        // [`user_patch_need`]).
+        if user_patches && rel.ends_with(".patch") {
+            return Some(Need::Present);
+        }
         return None;
+    }
+    if let Some(need) = user_patch_need(rel).filter(|_| user_patches) {
+        return Some(need);
     }
     let rush = root_files.contains("rush.json");
     if rush && (rel == RUSH_COMMON_LOCK_REL || is_rush_subspace_file(rel, "pnpm-lock.yaml")) {
@@ -198,6 +207,32 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         }
     }
     None
+}
+
+/// What the engine's user-patch walk
+/// ([`crate::patch::user_patches::UserPatchIndex::npm_family_in`]) needs
+/// of the nested file `rel`, outside the directories it never enters:
+/// which directories are workspace members, and which a `--patch-dir`
+/// names, is only known from content, so every file it could read is
+/// selected by name. A `package.json`, `pnpm-workspace.yaml`,
+/// `pnpm-lock.yaml` or `yarn.lock` is read (text); a patch-package file
+/// counts by its name alone (present), in every directory, including
+/// those the walk never enters (a `--patch-dir target/patches`) and the
+/// root ([`classify`]). With every such file selected, a patch directory
+/// the engine finds no `.patch` file in holds none.
+fn user_patch_need(rel: &str) -> Option<Need> {
+    use crate::patch::user_patches::WALK_SKIP;
+    let (dir, base) = split_path(rel);
+    if base.ends_with(".patch") {
+        return Some(Need::Present);
+    }
+    if dir.split('/').any(|seg| WALK_SKIP.contains(&seg)) {
+        return None;
+    }
+    match base {
+        "package.json" | "pnpm-workspace.yaml" | "pnpm-lock.yaml" | "yarn.lock" => Some(Need::Text),
+        _ => None,
+    }
 }
 
 /// What a pnpm workspace root (one with a `pnpm-workspace.yaml`) needs of
@@ -433,10 +468,17 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
+    // The user-patch walk only protects npm packages: without npm, its
+    // nested manifests and `.patch` files would only count against the
+    // session's file and byte limits.
+    let user_patches = options
+        .ecosystems
+        .as_deref()
+        .is_none_or(|list| list.iter().any(|e| e == "npm"));
     let mut needs: BTreeMap<String, Need> = BTreeMap::new();
     for (root, files) in &per_root {
         for rel in files {
-            let Some(need) = classify(rel, files) else {
+            let Some(need) = classify(rel, files, user_patches) else {
                 continue;
             };
             let full = join_root(root, rel);
@@ -625,6 +667,65 @@ mod tests {
         assert_eq!(s.present_only, vec![".pnp.cjs", "pnpm-lock.feature.yaml"]);
         assert_eq!(s.symlinks, vec!["pnpm-workspace.yaml"]);
         assert_eq!(s.ignored_count, 2);
+    }
+
+    /// A patch-package directory anywhere (`--patch-dir .`, or one under a
+    /// directory the user-patch walk never enters) has its `.patch` files
+    /// selected, so the engine never reads the gap as "no patches".
+    #[test]
+    fn patch_package_files_are_selected_in_every_directory() {
+        let entries = vec![
+            blob("package.json"),
+            blob("package-lock.json"),
+            blob("left-pad+1.3.0.patch"),
+            blob("target/patches/left-pad+1.3.0.patch"),
+            blob(".venv/patches/a+1.0.0.patch"),
+            blob("patches/b+1.0.0.patch"),
+            blob("target/notes.txt"),
+        ];
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(
+            s.present_only,
+            vec![
+                ".venv/patches/a+1.0.0.patch",
+                "left-pad+1.3.0.patch",
+                "patches/b+1.0.0.patch",
+                "target/patches/left-pad+1.3.0.patch"
+            ]
+        );
+    }
+
+    /// Final review (#2018): without npm, the user-patch walk never runs,
+    /// so its nested manifests and `.patch` files (a `debian/patches`
+    /// series) are not fetched against the session's limits.
+    #[test]
+    fn user_patch_files_are_not_selected_without_npm() {
+        let entries = vec![
+            blob("poetry.lock"),
+            blob("pyproject.toml"),
+            blob("fix+1.0.0.patch"),
+            blob("debian/patches/a+1.0.0.patch"),
+            blob("docs/example/package.json"),
+        ];
+        let s = select_paths(
+            &entries,
+            &SelectOptions {
+                ecosystems: Some(vec!["pypi".into()]),
+                ..SelectOptions::default()
+            },
+        );
+        assert!(s.present_only.is_empty(), "{:?}", s.present_only);
+        assert!(
+            !s.fetch_text.iter().any(|f| f.ends_with("package.json")),
+            "{:?}",
+            s.fetch_text
+        );
+        let all = select_paths(&entries, &SelectOptions::default());
+        assert!(
+            all.present_only.iter().any(|f| f.ends_with(".patch")),
+            "{:?}",
+            all.present_only
+        );
     }
 
     /// #975: a nested root's PnP loader is judged by the `nodeLinker` of the

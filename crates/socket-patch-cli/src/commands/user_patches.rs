@@ -1,7 +1,7 @@
 //! The CLI consent gate. --yes, --force, UUID selection and socket.yml do
 //! not grant permission to combine a Socket patch with a project's own patch.
 
-use socket_patch_core::patch::user_patches::UserPatchIndex;
+use socket_patch_core::patch::user_patches::{ReadScope, UserPatchIndex};
 
 use crate::args::GlobalArgs;
 use crate::json_envelope::{Command, Envelope, EnvelopeError, PatchAction, PatchEvent};
@@ -25,11 +25,12 @@ fn any_detectable<'a>(common: &GlobalArgs, mut purls: impl Iterator<Item = &'a s
 }
 
 pub(crate) async fn inspect(common: &GlobalArgs) -> UserPatchIndex {
-    if common.is_global() {
-        // A local checkout does not govern a separately selected global tree.
-        UserPatchIndex::default()
-    } else {
-        UserPatchIndex::discover(&common.cwd).await
+    match common.read_scope() {
+        // A local checkout does not govern a separately selected global
+        // tree, so a global run inspects no project (it would read one
+        // with no repository bound, `ReadScope::Global`).
+        ReadScope::Global => UserPatchIndex::default(),
+        scope @ ReadScope::Workspace => UserPatchIndex::discover_scoped(&common.cwd, scope).await,
     }
 }
 

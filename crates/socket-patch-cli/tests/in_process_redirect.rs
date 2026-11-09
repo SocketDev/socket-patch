@@ -2836,6 +2836,64 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
     vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
+/// A package a Rush subspace lock records as patched (its pnpm
+/// `patchedDependencies`) is the user's own: the consent gate's walk never
+/// reads a Rush lock, so the hosted disk flow's supplement withholds it
+/// from every lock (a `user_patch_conflict` skip, exit 0, nothing written)
+/// unless `--allow-patch-conflicts` is passed.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_withholds_a_package_a_rush_lock_records_as_patched() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    let subspace = tmp
+        .path()
+        .join("common/config/subspaces/frontend/pnpm-lock.yaml");
+    let patched = rush_pnpm_lock(NAME).replacen(
+        "\nimporters:",
+        &format!(
+            "\npatchedDependencies:\n  {NAME}@{VERSION}:\n    hash: abc\n    path: patches/{NAME}.patch\n\nimporters:"
+        ),
+        1,
+    );
+    std::fs::write(&subspace, &patched).unwrap();
+    let rels = [
+        "common/config/rush/pnpm-lock.yaml",
+        "common/config/subspaces/frontend/pnpm-lock.yaml",
+    ];
+    let before: Vec<String> = rels
+        .iter()
+        .map(|rel| std::fs::read_to_string(tmp.path().join(rel)).unwrap())
+        .collect();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "a user-patch skip alone exits 0");
+    for (rel, before) in rels.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read_to_string(tmp.path().join(rel)).unwrap(),
+            before,
+            "{rel}: the user-patched package is left on its registry entry"
+        );
+    }
+
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.common.allow_patch_conflicts = true;
+    let code = run(args).await;
+    assert_eq!(code, 0, "the consented run succeeds");
+    for rel in rels {
+        let lock = std::fs::read_to_string(tmp.path().join(rel)).unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "{rel}: --allow-patch-conflicts pins the package; got:\n{lock}"
+        );
+    }
+}
+
 /// Run the built `socket-patch` binary as a subprocess against `api_url`
 /// (a wiremock server) so we can parse the `--json` envelope's `warnings`
 /// array — the in-process `run` writes JSON to the process stdout, which a

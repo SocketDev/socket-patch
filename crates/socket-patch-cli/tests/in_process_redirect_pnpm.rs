@@ -3431,3 +3431,75 @@ async fn issue_1268_member_lock_still_hosted_keeps_trust_without_warning() {
         "the workspace file is left as it was"
     );
 }
+
+/// A package the project patches itself with pnpm's `patchedDependencies`
+/// is never pinned by default (the consent gate skips it), and only the
+/// explicit `--allow-patch-conflicts` override pins it. pnpm then applies
+/// the user's diff on top of the hosted tarball, so the install never runs
+/// the Socket patch alone: lockfile discovery keeps the pin as a ref (so
+/// `rollback` restores it) but marks it unattested, and `vex` omits it.
+#[tokio::test]
+#[serial]
+async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
+    use socket_patch_core::vex::discover::{
+        discover_patched_refs_with, DiscoverOptions, UnattestedKind,
+    };
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let workspace = format!(
+        "packages:\n  - '.'\npatchedDependencies:\n  {NAME}@{VERSION}: patches/{NAME}.patch\n"
+    );
+    std::fs::write(tmp.path().join("pnpm-workspace.yaml"), &workspace).unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    // Default: skipped, nothing written.
+    let code = run(hosted_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "a user-patch skip alone exits 0");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine,
+        "the user-patched package is left on its registry entry"
+    );
+
+    // Explicit consent: pinned.
+    let mut args = hosted_args(tmp.path(), server.uri());
+    args.common.allow_patch_conflicts = true;
+    let code = run(args).await;
+    assert_eq!(code, 0, "the consented run succeeds");
+    let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "--allow-patch-conflicts pins the package; got:\n{lock}"
+    );
+
+    // ...but the pin is never attested while pnpm stacks the user's patch.
+    let out = discover_patched_refs_with(
+        tmp.path(),
+        &DiscoverOptions {
+            patch_server_origins: vec!["http://patch.test".to_string()],
+        },
+    )
+    .await;
+    assert!(
+        out.refs.iter().any(|r| r.purl == PURL && r.uuid == UUID),
+        "the pin stays a ref: {:?}",
+        out.refs
+    );
+    let marked: Vec<_> = out
+        .unattested
+        .iter()
+        .filter(|u| u.kind == UnattestedKind::UserPatchedDependency)
+        .map(|u| (u.purl.as_str(), u.uuid.as_str()))
+        .collect();
+    assert_eq!(marked, [(PURL, UUID)], "{:#?}", out.unattested);
+    assert!(
+        out.unattested[0].detail.contains("pnpm-workspace.yaml"),
+        "{}",
+        out.unattested[0].detail
+    );
+}
