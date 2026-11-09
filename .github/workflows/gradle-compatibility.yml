@@ -345,6 +345,19 @@ jobs:
             echo "SOCKET_PATCH_MAVEN_E2E_REQUIRED=1"
           } >> "$GITHUB_ENV"
 
+      - name: Restore the Gradle ${{ matrix.gradle }} distribution
+        # ci.yml's e2e legs save this pinned zip from main (every version
+        # on Linux, 8.14.3 on Windows); restoring it keeps a github.com
+        # release outage from failing these legs. See the matching step
+        # there. Restore only: saving every OS x version here would add
+        # ~1 GB of near-duplicate zips to the repo's cache.
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
+          key: gradle-dist-${{ matrix.gradle }}-${{ runner.os }}-${{ hashFiles('scripts/install-gradle.sh') }}
+
       - name: Install Gradle ${{ matrix.gradle }}
         shell: bash
         env:

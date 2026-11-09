@@ -1847,6 +1847,25 @@ jobs:
           if [ "$RUNNER_OS" = Windows ]; then launcher="${launcher}.cmd"; fi
           echo "SOCKET_PATCH_MAVEN_E2E_MVN=$launcher" >> "$GITHUB_ENV"
 
+      - name: Restore the Gradle ${{ matrix.gradle }} distribution
+        # Both of install-gradle.sh's origins are served by github.com
+        # releases (services.gradle.org redirects there). On 2026-11-09
+        # those returned 504 for minutes at a time, longer than curl's
+        # ~30 s of retries, and failed 9 gradle legs of the nightly (run
+        # 42568829044); the 9.8.0 legs run in the merge queue too. The zip
+        # is pinned by sha256, which the script checks on a restored copy
+        # as well, so cache it per version. Saved from main only.
+        id: gradle-dist-cache
+        if: matrix.gradle != ''
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        # A miss only means downloading the zip.
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
+          # The script holds the pins: a changed pin starts a fresh key.
+          key: gradle-dist-${{ matrix.gradle }}-${{ runner.os }}-${{ hashFiles('scripts/install-gradle.sh') }}
+
       - name: Install Gradle ${{ matrix.gradle }}
         if: matrix.gradle != ''
         shell: bash
@@ -1854,6 +1873,19 @@ jobs:
           GRADLE_VERSION: ${{ matrix.gradle }}
         # Pinned digest, GitHub-release origin: see the script.
         run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Save the Gradle ${{ matrix.gradle }} distribution
+        if: >-
+          matrix.gradle != ''
+          && github.ref == 'refs/heads/main'
+          && steps.gradle-dist-cache.outputs.cache-hit != 'true'
+          && steps.gradle-dist-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        # Several legs share a version: the first save of a key wins and
+        # the others only log a warning, as the action does for any taken key.
+        with:
+          path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
+          key: ${{ steps.gradle-dist-cache.outputs.cache-primary-key }}
 
       - name: Setup .NET SDK
         if: matrix.dotnet != ''
