@@ -981,8 +981,10 @@ fn overlap_from_states(
 /// them to right now — the truth source for takeover direction.
 ///
 /// Both directions are proved by lockfile discovery with the same liveness
-/// rules `vex` gates attestations on (core `Discovery::redirect_record_live`
-/// / `Discovery::vendor_entry_live`). `redirect` holds the overlap PURLs the
+/// rules `vex` gates attestations on (core `Discovery::redirect_record_verdict`
+/// / `Discovery::vendor_entry_live`); a hosted record on a patch server this
+/// run was not given (`RecordLiveness::Undecided`) counts as wired, since the
+/// wiring is still there. `redirect` holds the overlap PURLs the
 /// lock routes to the hosted patch server (the vendored ledger entry is
 /// stale); `vendored` holds those it routes to a committed
 /// `.socket/vendor/<eco>/<uuid>` artifact.
@@ -1067,7 +1069,7 @@ pub(super) async fn classify_overlap_takeover_with(
     let mut liveness = LedgerLiveness::new(cwd, discovery, None);
     for purl in overlap {
         let hosted_live = match redirect_uuid_by_purl.get(&PurlKey::new(&purl)) {
-            Some(uuid) => liveness.redirect_record(&purl, uuid).await,
+            Some(uuid) => liveness.redirect_record_retained(&purl, uuid).await,
             None => discovery.wires_package(&purl, WiringMode::Hosted),
         };
         // `None`: undecided (a JVM pom that cannot be read, or a tree still
@@ -1394,8 +1396,9 @@ async fn gradle_scan(
 /// pin names the purl (`redirect_state`, the lockfiles' hosted state — see
 /// [`crate::commands::hosted_state_from_pins`]) AND lockfile discovery
 /// proves the current lockfile still routes it to that hosted patch — core
-/// `Discovery::redirect_record_live`, the same liveness rule `vex` gates
-/// hosted attestations on.
+/// `Discovery::redirect_record_verdict`, the same liveness rule `vex` gates
+/// hosted attestations on, keeping a record on a patch server this run was
+/// not given (`RecordLiveness::Undecided`): its wiring is still retained.
 ///
 /// Deliberately NOT routed through [`classify_overlap_takeover`]: that
 /// classifier keys on purls present in BOTH ledgers, so hosted-only wiring
@@ -1438,7 +1441,7 @@ pub(super) async fn hosted_wiring_retained_purls(
     let mut liveness = LedgerLiveness::new(cwd, &discovery, None);
     let mut out = Vec::new();
     for (purl, uuid) in candidates {
-        if liveness.redirect_record(&purl, uuid).await {
+        if liveness.redirect_record_retained(&purl, uuid).await {
             out.push(purl);
         }
     }

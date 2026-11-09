@@ -722,6 +722,7 @@ mod tests {
             resolved: None,
             integrity: LockIntegrity::None,
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
         }
     }
 

@@ -171,7 +171,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   from its legacy mirror, alias nodes included) and rewires both locks in npm
   12's dual-lock state. Majors 6–12 are measured in
   [npm compatibility](testing/npm-compatibility.md).
-- **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2),
+- **pnpm** — hosted rewriting supports legacy `shrinkwrap.yaml` (pnpm 1/2; never
+  rewritten beside a `pnpm-lock.yaml`, which pnpm >= 3 reads instead; a
+  project pinning pnpm 1/2 keeps `shrinkwrap.yaml` and leaves the stray lock),
   lockfileVersion 5.x (pnpm 3–7), 6.0 (pnpm 8), and 9.0 (pnpm 9–12).
   Early pnpm 1 locks with shrinkwrapVersion 3 and no positive minor version
   are refused because those installers discard hosted URLs; the tested

@@ -1299,15 +1299,14 @@ fn pnpm_registry_is_own(registry: Option<&str>) -> bool {
 /// env lockfile document ahead of the project lock (only pnpm >= 11
 /// writes one, so its `.npmrc` pnpm settings are ignored).
 pub(crate) fn pnpm_settings_major(text: &str, pm_major: Option<u32>) -> Option<u32> {
-    use crate::formats::pnpm::grammar::{is_pnpm_lock_text, main_document};
+    use crate::formats::pnpm::grammar::{documents, PnpmDocument};
     use crate::formats::pnpm::lock_version_major;
 
     let legacy_lock = lock_version_major(text).is_some_and(|major| major < 9)
         || text
             .lines()
             .any(|line| line.starts_with("shrinkwrapVersion:"));
-    let main = main_document(text);
-    let env_document = is_pnpm_lock_text(&text[..text.len() - main.len()]);
+    let env_document = documents(text).iter().any(|(_, k)| *k == PnpmDocument::Env);
     pm_major
         .or(legacy_lock.then_some(8))
         .or(env_document.then_some(11))
@@ -1527,17 +1526,17 @@ fn pnpm_include_tarball(
 /// URL can still appear with it off, under a second registry). With no
 /// bare one, a tarball pnpm could have derived proves it on. `None`: no
 /// such resolution (an unconventional URL is recorded either way). Only
-/// the main document counts: pnpm 11+'s env lockfile document records its
+/// the project documents count: pnpm 11+'s env lockfile document records its
 /// resolutions bare whatever the setting.
 fn pnpm_lock_tarball_evidence(
     text: &str,
     registry: impl Fn(&str) -> Option<String>,
     is_hosted: impl Fn(&str) -> bool,
 ) -> Option<bool> {
-    use crate::formats::pnpm::{classify_pnpm_key, grammar::main_document, pnpm_packages, PnpmKey};
+    use crate::formats::pnpm::{classify_pnpm_key, PnpmDocument, PnpmKey, PnpmLock};
 
     let mut derived = false;
-    for package in pnpm_packages(main_document(text)) {
+    for package in PnpmLock::parse(text).packages_of(PnpmDocument::Project) {
         let PnpmKey::Registry { name, version } = classify_pnpm_key(package.key) else {
             continue;
         };
@@ -1895,7 +1894,7 @@ pub(crate) async fn restore_pnpm_locks(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
-    use crate::formats::pnpm::grammar as pnpm;
+    use crate::formats::pnpm::{grammar as pnpm, PnpmDocument, PnpmLock};
 
     let mut result = FormatResult::default();
     let pins = by_uuid(pins);
@@ -1905,8 +1904,9 @@ pub(crate) async fn restore_pnpm_locks(
         };
         // (resolution range, uuid, name, version, rebuilt-without-integrity)
         let mut hits: Vec<(std::ops::Range<usize>, String, String, String)> = Vec::new();
-        for entry in pnpm::entries(&text) {
-            let Some(resolution) = pnpm::resolution(&entry) else {
+        let lock = PnpmLock::parse(&text);
+        for package in lock.packages() {
+            let (entry, Some(resolution)) = (&package.entry, &package.resolution) else {
                 continue;
             };
             let Some(uuid) = resolution.tarball().and_then(|t| ctx.hosted_uuid(t)) else {
@@ -1966,10 +1966,15 @@ pub(crate) async fn restore_pnpm_locks(
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         // (uuid, name@version whose `tarball:` only the guessed setting decided)
         let mut handled: Vec<(String, Option<String>)> = Vec::new();
-        for entry in pnpm::entries(&text) {
-            let Some(resolution) = pnpm::resolution(&entry) else {
+        for package in lock.packages() {
+            let Some(resolution) = &package.resolution else {
                 continue;
             };
+            // pnpm 11+ records the env lockfile document's resolutions bare
+            // whatever `lockfileIncludeTarballUrl` says (see
+            // `pnpm_tarball_policy`): only a URL it cannot derive gets
+            // `tarball:` there.
+            let in_env = package.document == PnpmDocument::Env;
             let Some((_, uuid, name, version)) = hits.iter().find(|(r, ..)| *r == resolution.range)
             else {
                 continue;
@@ -1991,13 +1996,15 @@ pub(crate) async fn restore_pnpm_locks(
             // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
             // a URL it cannot derive from the registry (#557).
             let derived = policy.derives_tarball(name, version, &dist.tarball, found.from_project);
-            let restored = if policy.always || !derived {
+            let restored = if (policy.always && !in_env) || !derived {
                 resolution.rewrite(integrity, &dist.tarball)
             } else {
                 resolution.restore(integrity)
             };
-            // A URL pnpm records anyway is no guess.
-            let guessed = (policy.guess.is_some() && derived).then(|| format!("{name}@{version}"));
+            // A URL pnpm records anyway is no guess, and neither is an env
+            // document entry.
+            let guessed =
+                (policy.guess.is_some() && derived && !in_env).then(|| format!("{name}@{version}"));
             splices.push((resolution.range.clone(), restored));
             handled.push((uuid.clone(), guessed));
         }
@@ -3852,6 +3859,13 @@ mod tests {
         // A lone leading `---` marker is no env document.
         let marker_only = format!("---\n{}", lock(""));
         assert!(include(&marker_only, None, Some(RC_ON), None));
+        // Neither is an env-shaped document AFTER the project one: pnpm
+        // writes the env document first.
+        let env_last = format!("---\n{}{env}", lock(""));
+        assert_eq!(super::pnpm_settings_major(&pinned_only, None), Some(11));
+        assert_eq!(super::pnpm_settings_major(&env_last, None), None);
+        // Its bare entry is project evidence: the setting is off.
+        assert!(!include(&env_last, None, Some(RC_ON), None));
         // A bare entry in the main document still proves it off.
         let bare = "  b@2.0.0:\n    resolution: {integrity: sha512-B==}\n";
         assert!(!include(

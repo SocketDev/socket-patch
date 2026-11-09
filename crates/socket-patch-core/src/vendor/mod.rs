@@ -990,8 +990,8 @@ pub async fn lock_text_refusals(
 /// deletes; a gate that depended on it would make this under-predict, and
 /// the wet run still refuses. Yarn's restores rewrite key and checksum
 /// text, and legacy pnpm 7/8 locks (5.4 / 6.0) are not lock-text gated at
-/// all, so neither is predicted here: a CRLF legacy lock, an override
-/// conflict or an unsupported legacy entry previews `would_vendor` while
+/// all, so neither is predicted here: a mixed line-ending legacy lock, an
+/// override conflict or an unsupported legacy entry previews `would_vendor` while
 /// the wet takeover refuses it (keeping the hosted pin, #963) — a known
 /// preview gap the contract names.
 pub async fn pnpm_takeover_lock_text_refusals(
@@ -2237,9 +2237,14 @@ mod pnpm_takeover_lock_text_refusal_tests {
         tmp
     }
 
+    /// Divergences N15: a CRLF hosted lock (an autocrlf checkout) takes over
+    /// like its LF twin; only a lock mixing CRLF and LF is refused.
     #[tokio::test]
-    async fn crlf_hosted_pnpm_lock_is_refused() {
+    async fn only_a_mixed_line_ending_hosted_pnpm_lock_is_refused() {
         let tmp = project("pnpm-lock.yaml", &HOSTED_V9.replace('\n', "\r\n"));
+        let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
+        assert!(refused.is_empty(), "{refused:?}");
+        let tmp = project("pnpm-lock.yaml", &HOSTED_V9.replacen('\n', "\r\n", 1));
         let refused = pnpm_takeover_lock_text_refusals(tmp.path(), &[(PURL, UUID)]).await;
         assert_eq!(
             refused.get(PURL).map(|(code, _)| *code),
@@ -2267,8 +2272,8 @@ mod pnpm_takeover_lock_text_refusal_tests {
     }
 
     /// A known preview gap (CLI_CONTRACT, #853): a legacy pnpm 7/8 lock
-    /// (5.4 / 6.0) is not lock-text gated, so even a CRLF one the wet
-    /// takeover refuses (`vendor_lockfile_crlf_unsupported`) previews
+    /// (5.4 / 6.0) is not lock-text gated, so even one the wet takeover
+    /// refuses (a mixed line-ending lock, `vendor_lockfile_crlf_unsupported`) previews
     /// `would_vendor`. The wet run's refusal keeps the hosted pin (#963).
     #[tokio::test]
     async fn legacy_pnpm_project_is_out_of_scope() {
