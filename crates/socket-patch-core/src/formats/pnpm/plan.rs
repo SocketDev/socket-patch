@@ -100,13 +100,19 @@ pub(crate) fn governing_pnpm_lock(
 pub(crate) fn planned_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
     let planned = |key: &&String| {
         let leaf = key.rsplit('/').next().unwrap_or(key);
+        if !matches!(leaf, PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY) {
+            return false;
+        }
         // `dir` keeps its trailing `/` (empty at the root).
         let in_dir = |rel: &str| format!("{}{rel}", &key[..key.len() - leaf.len()]);
-        let pinned = pinned_pnpm_major(|rel| files.get(&in_dir(rel)).cloned());
         let has = |rel: &str| files.contains_key(&in_dir(rel));
-        matches!(leaf, PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY)
-            && governing_pnpm_lock(has(PNPM_LOCK), has(PNPM_SHRINKWRAP_LEGACY), pinned)
-                == Some(leaf)
+        let both = (has(PNPM_LOCK), has(PNPM_SHRINKWRAP_LEGACY));
+        // The pin decides only between the two, so it is read only then.
+        let pinned = match both {
+            (true, true) => pinned_pnpm_major(|rel| files.get(&in_dir(rel)).cloned()),
+            _ => None,
+        };
+        governing_pnpm_lock(both.0, both.1, pinned) == Some(leaf)
     };
     files.keys().filter(planned).collect()
 }

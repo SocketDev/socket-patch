@@ -812,9 +812,13 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // the other one: the patches it still names are recognized as NOT
     // wired (module docs, rule 11), so a ledger record its stale Socket
     // url alone keeps "mentioned" is dead.
-    let pinned = crate::utils::pnpm_workspace::pinned_pnpm_major_in(&ctx.view).await;
     let (lock, shrinkwrap) = (PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY);
     let both = (ctx.exists(lock).await, ctx.exists(shrinkwrap).await);
+    // The pin decides only between the two, so it is read only then.
+    let pinned = match both {
+        (true, true) => crate::utils::pnpm_workspace::pinned_pnpm_major_in(&ctx.view).await,
+        _ => None,
+    };
     if let Some(governing) = governing_pnpm_lock(both.0, both.1, pinned) {
         extract_pnpm_lock(ctx, governing, disabled, out).await;
         read.push(governing.to_string());

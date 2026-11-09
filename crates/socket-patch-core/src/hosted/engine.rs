@@ -2693,8 +2693,19 @@ fn pnpm_trust(
         .count();
     // The locks pnpm installs the project from: the root lock, plus each
     // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
-    // lock is never one: rush installs it from common/temp.
-    let governing: Vec<&str> = std::iter::once("pnpm-lock.yaml")
+    // lock is never one: rush installs it from common/temp. The root lock
+    // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
+    // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
+    // config.
+    let planned = crate::formats::pnpm::plan::planned_locks(files);
+    let root_lock = [
+        crate::constants::npm_family::PNPM_LOCK,
+        crate::constants::npm_family::PNPM_SHRINKWRAP_LEGACY,
+    ]
+    .into_iter()
+    .find(|lock| planned.iter().any(|key| key.as_str() == *lock))
+    .unwrap_or(crate::constants::npm_family::PNPM_LOCK);
+    let governing: Vec<&str> = std::iter::once(root_lock)
         .chain(member_lock_keys.iter().map(String::as_str))
         .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();
@@ -3334,9 +3345,24 @@ fn confirm(
         name.ends_with("/pom.xml")
             || maven_reactor_refused && (name == "pom.xml" || name.starts_with(".mvn/"))
     };
+    // A pnpm lock pnpm does not read (a `shrinkwrap.yaml` beside a
+    // `pnpm-lock.yaml`, or the reverse under a pnpm 1 / 2 pin, N11) is
+    // never rewritten, so a Socket URL an earlier run left in it pins
+    // nothing either.
+    let planned_pnpm = crate::formats::pnpm::plan::planned_locks(files);
+    let is_shadowed_pnpm = |name: &str| {
+        matches!(
+            name.rsplit('/').next(),
+            Some(
+                crate::constants::npm_family::PNPM_LOCK
+                    | crate::constants::npm_family::PNPM_SHRINKWRAP_LEGACY
+            )
+        ) && !planned_pnpm.iter().any(|planned| planned.as_str() == name)
+    };
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .filter(|(name, _)| !is_shadowed_pnpm(name))
         .filter(|(name, _)| !is_npm_manifest(name))
         .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
@@ -4577,6 +4603,72 @@ mod tests {
             "{:?}",
             read.files.keys()
         );
+    }
+
+    /// N11 review: under a pnpm 1 / 2 pin `shrinkwrap.yaml` governs, so a
+    /// stray v9 `pnpm-lock.yaml` an earlier run redirected is no heal root
+    /// and plans no `trustLockfile` write for a lock pnpm never reads.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_is_no_heal_root() {
+        let redirected = LEFT_PAD_V9_LOCK.replace(
+            "resolution: {integrity: sha512-UPSTREAM==}",
+            &format!(
+                "resolution: {{integrity: sha512-PATCHED==, tarball: {}}}",
+                left_pad_url()
+            ),
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("pnpm-lock.yaml", redirected.as_str());
+        p.insert_text(
+            "shrinkwrap.yaml",
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        );
+        p.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#,
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            !done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+
+        // Without the pin, pnpm-lock.yaml governs and the heal plans it.
+        p.insert_text("package.json", r#"{"name":"app"}"#);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+    }
+
+    /// N11 review: a shadowed `shrinkwrap.yaml` still carrying an earlier
+    /// run's Socket URL confirms nothing when the governing
+    /// `pnpm-lock.yaml` no longer pins the package. It used to confirm by
+    /// substring, and only the attribution gate then dropped the dependency
+    /// as `redirect_unattributable`, blaming the project's lockfiles.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_confirms_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\npackages:\n  other@1.0.0:\n    \
+             resolution: {integrity: sha512-OTHER==}\n",
+        );
+        p.insert_text(
+            "shrinkwrap.yaml",
+            format!(
+                "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9\npackages:\n  /left-pad/1.3.0:\n    \
+                 resolution:\n      integrity: sha512-PATCHED==\n      tarball: {}\n",
+                left_pad_url()
+            )
+            .as_str(),
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
     }
 
     #[tokio::test]

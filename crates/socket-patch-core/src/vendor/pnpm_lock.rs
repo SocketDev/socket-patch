@@ -550,7 +550,8 @@ pub(super) async fn git_branch_lock_refusal(
 }
 
 /// Read the pair, refusing (before any write) a file that is missing,
-/// unreadable, not the shape the surgery has fixtures for, or CRLF.
+/// unreadable, not the shape the surgery has fixtures for, or that mixes
+/// CRLF and LF line endings ([`read_pnpm_text`]).
 async fn read_project(
     project_root: &Path,
     dialect: PnpmDialect,
@@ -584,8 +585,12 @@ async fn read_project(
     // pnpm 1 / 2 read only `shrinkwrap.yaml`, whose grammar the rekey has no
     // fixture for: there `pnpm-lock.yaml` is stray, and wiring it would
     // patch nothing pnpm installs (N11, the choice hosted and discovery make).
+    // The pin matters only beside a shrinkwrap, so it is read only then.
     let shrinkwrap = view.exists_no_follow(PNPM_SHRINKWRAP_LEGACY).await;
-    let pinned = crate::utils::pnpm_workspace::pinned_pnpm_major_in(&view).await;
+    let pinned = match shrinkwrap {
+        true => crate::utils::pnpm_workspace::pinned_pnpm_major_in(&view).await,
+        false => None,
+    };
     if governing_pnpm_lock(true, shrinkwrap, pinned) == Some(PNPM_SHRINKWRAP_LEGACY) {
         let why = "the project pins pnpm 1 / 2, which installs from shrinkwrap.yaml and ignores \
                    pnpm-lock.yaml; vendored mode does not write that grammar — upgrade pnpm \
@@ -703,29 +708,51 @@ async fn read_project(
 /// endings it is written back with. A CRLF file (a Windows autocrlf
 /// checkout) is edited like its LF twin and written back CRLF, as hosted
 /// mode's byte splices keep it (divergences N15). A file that mixes endings
-/// is an `Unsupported` error, which no read of a regular file returns: no
-/// one ending writes it back byte-faithfully, so vendoring refuses it and
-/// the revert fails before any write.
+/// is a [`MixedLineEndings`] error ([`is_mixed_line_endings`]): no one
+/// ending writes it back byte-faithfully, so vendoring refuses it and the
+/// revert fails before any write.
 async fn read_pnpm_text(root: &Path, file: &str) -> std::io::Result<(String, LineEndings)> {
     let text = read_regular_to_string(&root.join(file)).await?;
     match LineEndings::of(&text) {
         LineEndings::Mixed => Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
+            std::io::ErrorKind::InvalidData,
+            MixedLineEndings(format!(
                 "{file} mixes CRLF and LF line endings, which this rewriter cannot write back \
                  byte-faithfully — normalize the file to one line ending and retry"
-            ),
+            )),
         )),
-        LineEndings::Crlf => Ok((text.replace("\r\n", "\n"), LineEndings::Crlf)),
+        LineEndings::Crlf => Ok((
+            crate::utils::line_endings::to_lf(&text).into_owned(),
+            LineEndings::Crlf,
+        )),
         eol => Ok((text, eol)),
     }
+}
+
+/// [`read_pnpm_text`]'s error for a file that mixes line endings, told
+/// apart from an OS read error by its type, not its `io::ErrorKind`.
+#[derive(Debug)]
+struct MixedLineEndings(String);
+
+impl std::fmt::Display for MixedLineEndings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for MixedLineEndings {}
+
+/// Whether `e` is [`read_pnpm_text`]'s mixed-line-ending refusal.
+fn is_mixed_line_endings(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<MixedLineEndings>())
 }
 
 /// The vendoring refusal for a [`read_pnpm_text`] error other than a
 /// missing file: `vendor_lockfile_crlf_unsupported` for mixed endings, else
 /// `vendor_lockfile_missing` with `remedy`.
 fn read_refusal(file: &str, e: std::io::Error, remedy: &str) -> Box<VendorOutcome> {
-    Box::new(match e.kind() == std::io::ErrorKind::Unsupported {
+    Box::new(match is_mixed_line_endings(&e) {
         true => refused("vendor_lockfile_crlf_unsupported", e.to_string()),
         false => refused(
             "vendor_lockfile_missing",
@@ -1014,7 +1041,7 @@ pub(super) async fn revert_pnpm_dialect(
         .flatten()
         .filter_map(|r| r.as_ref().err())
     {
-        if e.kind() == std::io::ErrorKind::Unsupported {
+        if is_mixed_line_endings(e) {
             return RevertOutcome::failed(format!("{e}; nothing was reverted"));
         }
     }
