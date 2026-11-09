@@ -2,12 +2,12 @@
 //!
 //! vlt never refreshes a store entry it already holds: after the lock is
 //! repointed, `vlt install` keeps `node_modules/.vlt/<DepID>` and the
-//! hidden lock as they are. A store entry whose bytes are not the ones the
-//! lock now pins is invalidated (the entry plus `node_modules/.vlt-lock.json`)
-//! so the next install extracts the pinned artifact. An entry whose state
-//! cannot be determined is never removed, nor is one vlt would not
-//! reinstall (an optional node), and nothing outside the project root is
-//! ever touched.
+//! hidden lock as they are. A store entry the hidden lock does not record
+//! at the integrity the lock now pins is invalidated (the entry plus
+//! `node_modules/.vlt-lock.json`) so the next install extracts the pinned
+//! artifact. An entry whose state cannot be determined is never removed,
+//! nor is one vlt would not reinstall (an optional node), and nothing
+//! outside the project root is ever touched.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -15,35 +15,17 @@ use std::path::{Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR};
-use crate::manifest::schema::PatchRecord;
 use crate::origin::hosted_patch_uuid;
-use crate::patch::apply::{is_safe_relative_subpath, normalize_file_path};
-use crate::patch::file_hash::compute_file_git_sha256;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, is_registry_package_name, sniff_lock, split_dep_id, DepIdKind, LockSniff,
 };
-
-/// The installed state a target should be in: patched after a redirect,
-/// pristine after a rollback or remove.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Expected {
-    Patched,
-    Pristine,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetState {
     Healthy,
     Stale,
     Undeterminable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ByteCheck {
-    Match,
-    Mismatch,
-    Unknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +74,6 @@ pub struct Target<'a> {
     /// Slot [2] of the node in the final `vlt-lock.json` (`None` when the
     /// node is gone or the slot is null).
     pub lock_sha512: Option<&'a str>,
-    pub record: Option<&'a PatchRecord>,
     /// Slot [0] of the node, see [`reinstalls_after_removal`].
     pub flags: Option<u64>,
 }
@@ -104,9 +85,6 @@ pub struct LedgerTarget {
     pub purl: String,
     pub dep_id: String,
     pub name: String,
-    /// Always `None`: v5 keeps no hosted ledger to read a record from, so
-    /// the heal judges the installed copy against the lock's own pins.
-    pub record: Option<PatchRecord>,
     /// Slot [0] of the node in the pre-restore lock.
     pub flags: Option<u64>,
 }
@@ -273,58 +251,16 @@ fn package_dir(root: &Path, dep_id: &str, name: &str) -> PathBuf {
     dir
 }
 
-async fn file_hash(path: &Path) -> Result<Option<String>, ()> {
-    match compute_file_git_sha256(path).await {
-        Ok(hash) => Ok(Some(hash)),
-        Err(e) if crate::patch::apply::is_missing_path(&e) => Ok(None),
-        Err(_) => Err(()),
-    }
-}
-
-async fn record_check(dir: &Path, record: &PatchRecord, expected: Expected) -> ByteCheck {
-    let mut unknown = false;
-    for (file, info) in &record.files {
-        let rel = normalize_file_path(file);
-        if !is_safe_relative_subpath(rel) {
-            return ByteCheck::Unknown;
-        }
-        let Ok(current) = file_hash(&dir.join(rel)).await else {
-            unknown = true;
-            continue;
-        };
-        let want = match expected {
-            Expected::Patched => &info.after_hash,
-            Expected::Pristine => &info.before_hash,
-        };
-        let matches = match current.as_deref() {
-            None => want.is_empty(),
-            Some(hash) => hash == want.as_str(),
-        };
-        if !matches {
-            return ByteCheck::Mismatch;
-        }
-    }
-    if unknown {
-        ByteCheck::Unknown
-    } else {
-        ByteCheck::Match
-    }
-}
-
-async fn bytes_check(dir: &Path, target: &Target<'_>, expected: Expected) -> ByteCheck {
-    match target.record.filter(|r| !r.files.is_empty()) {
-        Some(record) => record_check(dir, record, expected).await,
-        None => ByteCheck::Unknown,
-    }
-}
-
-/// Is `target`'s store entry stale against `expected`, healthy, or
-/// impossible to judge? The module doc states the rules.
+/// Is `target`'s store entry stale against the pin `target` names (the
+/// lock's slot [2]), healthy, or impossible to judge? The hidden lock
+/// records the integrity of what vlt installed for each DepID, so it
+/// decides: a missing node or another integrity is stale, the pinned one
+/// healthy. Without a readable hidden lock nothing proves which bytes the
+/// entry holds.
 pub async fn classify_target(
     state: &InstallState,
     root: &Path,
     target: &Target<'_>,
-    expected: Expected,
 ) -> TargetState {
     match state.store {
         StoreState::Absent => return TargetState::Healthy,
@@ -338,24 +274,15 @@ pub async fn classify_target(
     if !tokio::fs::metadata(&dir).await.is_ok_and(|m| m.is_dir()) {
         return TargetState::Healthy;
     }
-    let bytes = bytes_check(&dir, target, expected).await;
-    if let HiddenLock::Parsed(nodes) = &state.hidden {
-        match nodes.get(target.dep_id) {
-            None => return TargetState::Stale,
-            Some(node) => {
-                if node.get(2).and_then(Value::as_str) != target.lock_sha512 {
-                    return TargetState::Stale;
-                }
-            }
-        }
-    }
-    if bytes == ByteCheck::Mismatch {
-        return TargetState::Stale;
-    }
-    if !matches!(state.hidden, HiddenLock::Parsed(_)) && bytes == ByteCheck::Unknown {
+    let HiddenLock::Parsed(nodes) = &state.hidden else {
         return TargetState::Undeterminable;
+    };
+    match nodes.get(target.dep_id) {
+        Some(node) if node.get(2).and_then(Value::as_str) == target.lock_sha512 => {
+            TargetState::Healthy
+        }
+        _ => TargetState::Stale,
     }
-    TargetState::Healthy
 }
 
 async fn remove_entry(path: &Path) -> std::io::Result<()> {
@@ -409,8 +336,7 @@ pub async fn invalidate(root: &Path, state: &InstallState, stale: &[String]) -> 
 
 /// The Socket-hosted vlt nodes of `lock` (read BEFORE a restore rewrites
 /// it) that stand for one of `purls` — the ledger-free rollback heal's
-/// targets. No patch record rides along (v5 keeps no hosted ledger), so the
-/// heal judges each installed copy against the lock's own pins.
+/// targets, each judged against the lock's own pins.
 pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<LedgerTarget> {
     let wanted: Vec<PurlKey> = purls.iter().map(|p| PurlKey::new(p)).collect();
     socket_owned_instances(lock, origins)
@@ -423,7 +349,6 @@ pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<Led
                 purl: purls[at].clone(),
                 dep_id: instance.dep_id,
                 name: instance.name,
-                record: None,
                 flags: instance.flags,
             })
         })
@@ -433,32 +358,11 @@ pub fn lock_targets(lock: &str, origins: &[String], purls: &[String]) -> Vec<Led
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hash::git_sha256::compute_git_sha256_from_bytes;
-    use crate::manifest::schema::PatchFileInfo;
-    use std::collections::HashMap;
 
     const ID: &str = "~npm~left-pad@1.3.0";
     const PRISTINE: &[u8] = b"module.exports = 'pristine'\n";
     const PATCHED: &[u8] = b"module.exports = 'patched'\n";
     const LOCK_SHA: &str = "sha512-PATCHED";
-
-    fn record() -> PatchRecord {
-        PatchRecord {
-            uuid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
-            exported_at: String::new(),
-            files: HashMap::from([(
-                "package/index.js".to_string(),
-                PatchFileInfo {
-                    before_hash: compute_git_sha256_from_bytes(PRISTINE),
-                    after_hash: compute_git_sha256_from_bytes(PATCHED),
-                },
-            )]),
-            vulnerabilities: HashMap::new(),
-            description: String::new(),
-            license: String::new(),
-            tier: String::new(),
-        }
-    }
 
     fn store(root: &Path, id: &str, index: &[u8]) -> PathBuf {
         let dir = package_dir(root, id, "left-pad");
@@ -480,19 +384,18 @@ mod tests {
         .unwrap();
     }
 
-    fn target(record: Option<&PatchRecord>) -> Target<'_> {
+    fn target() -> Target<'static> {
         Target {
             dep_id: ID,
             name: "left-pad",
             lock_sha512: Some(LOCK_SHA),
-            record,
             flags: Some(0),
         }
     }
 
-    async fn classify(root: &Path, target: &Target<'_>, expected: Expected) -> TargetState {
+    async fn classify(root: &Path, target: &Target<'_>) -> TargetState {
         let state = read_install_state(root).await;
-        classify_target(&state, root, target, expected).await
+        classify_target(&state, root, target).await
     }
 
     #[tokio::test]
@@ -500,11 +403,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         store(tmp.path(), ID, PATCHED);
         hidden(tmp.path(), Some("sha512-UPSTREAM"));
-        let rec = record();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Stale
-        );
+        assert_eq!(classify(tmp.path(), &target()).await, TargetState::Stale);
     }
 
     #[tokio::test]
@@ -512,75 +411,31 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         store(tmp.path(), ID, PATCHED);
         hidden(tmp.path(), None);
-        let rec = record();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Stale
-        );
+        assert_eq!(classify(tmp.path(), &target()).await, TargetState::Stale);
     }
 
     #[tokio::test]
-    async fn rule_c_bytes_mismatch_whatever_the_hidden_lock_says() {
-        let tmp = tempfile::tempdir().unwrap();
-        store(tmp.path(), ID, PRISTINE);
-        hidden(tmp.path(), Some(LOCK_SHA));
-        let rec = record();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Stale
-        );
-        std::fs::remove_file(tmp.path().join(VLT_HIDDEN_LOCK_REL)).unwrap();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Stale
-        );
-    }
-
-    #[tokio::test]
-    async fn healthy_patched_and_pristine_trees() {
-        let tmp = tempfile::tempdir().unwrap();
-        store(tmp.path(), ID, PATCHED);
-        hidden(tmp.path(), Some(LOCK_SHA));
-        let rec = record();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Healthy
-        );
-        std::fs::remove_file(tmp.path().join(VLT_HIDDEN_LOCK_REL)).unwrap();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Healthy,
-            "a tree without a hidden lock is judged by its bytes"
-        );
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Pristine).await,
-            TargetState::Stale,
-            "patched bytes are stale once the pin is restored"
-        );
-        store(tmp.path(), ID, PRISTINE);
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Pristine).await,
-            TargetState::Healthy
-        );
-    }
-
-    #[tokio::test]
-    async fn undeterminable_without_hidden_lock_or_record() {
+    async fn a_hidden_lock_at_the_pin_is_healthy_and_none_is_undeterminable() {
         let tmp = tempfile::tempdir().unwrap();
         store(tmp.path(), ID, PATCHED);
         assert_eq!(
-            classify(tmp.path(), &target(None), Expected::Patched).await,
+            classify(tmp.path(), &target()).await,
             TargetState::Undeterminable
         );
         hidden(tmp.path(), Some(LOCK_SHA));
+        assert_eq!(classify(tmp.path(), &target()).await, TargetState::Healthy);
+        let pristine = Target {
+            lock_sha512: Some("sha512-UPSTREAM"),
+            ..target()
+        };
         assert_eq!(
-            classify(tmp.path(), &target(None), Expected::Patched).await,
-            TargetState::Healthy,
-            "a parsed hidden lock that agrees decides alone"
+            classify(tmp.path(), &pristine).await,
+            TargetState::Stale,
+            "the patched entry is stale once the pin is restored"
         );
         std::fs::write(tmp.path().join(VLT_HIDDEN_LOCK_REL), b"{not json").unwrap();
         assert_eq!(
-            classify(tmp.path(), &target(None), Expected::Pristine).await,
+            classify(tmp.path(), &target()).await,
             TargetState::Undeterminable
         );
     }
@@ -588,16 +443,9 @@ mod tests {
     #[tokio::test]
     async fn an_uninstalled_target_is_healthy() {
         let tmp = tempfile::tempdir().unwrap();
-        let rec = record();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Healthy
-        );
+        assert_eq!(classify(tmp.path(), &target()).await, TargetState::Healthy);
         std::fs::create_dir_all(tmp.path().join(VLT_STORE_DIR)).unwrap();
-        assert_eq!(
-            classify(tmp.path(), &target(Some(&rec)), Expected::Patched).await,
-            TargetState::Healthy
-        );
+        assert_eq!(classify(tmp.path(), &target()).await, TargetState::Healthy);
     }
 
     #[cfg(unix)]
@@ -619,10 +467,9 @@ mod tests {
                     .unwrap();
             }
             hidden(&real_root, Some("sha512-UPSTREAM"));
-            let rec = record();
             let state = read_install_state(&project).await;
             assert_eq!(
-                classify_target(&state, &project, &target(Some(&rec)), Expected::Patched).await,
+                classify_target(&state, &project, &target()).await,
                 TargetState::Undeterminable,
                 "{linked}"
             );
@@ -799,7 +646,7 @@ mod tests {
 
     /// The rollback heal's only target source (the ledger-driven
     /// `ledger_targets` is gone): every Socket-owned instance of a wanted
-    /// purl, peer contexts included, with its slot [0] flags and no record.
+    /// purl, peer contexts included, with its slot [0] flags.
     #[test]
     fn lock_targets_name_every_owned_instance_of_the_purls() {
         let lock = r#"{
@@ -834,9 +681,7 @@ mod tests {
                 ),
             ]
         );
-        assert!(targets
-            .iter()
-            .all(|t| t.name == "left-pad" && t.record.is_none()));
+        assert!(targets.iter().all(|t| t.name == "left-pad"));
         assert!(lock_targets("\u{feff}{}", &[], &purls).is_empty());
     }
 

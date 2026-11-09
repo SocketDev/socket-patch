@@ -51,7 +51,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::api::client::PatchApi;
-use crate::api::types::{PatchResponse, PatchSearchResult};
+use crate::api::types::PatchSearchResult;
 use crate::crawlers::Ecosystem;
 use crate::utils::cargo_workspace::member_manifests_in_memory;
 use crate::vendor::lock_inventory::{
@@ -1246,21 +1246,6 @@ async fn engine(
     }
     phases.mark("rollout");
 
-    let record_uuids: BTreeSet<String> = if options.dry_run {
-        BTreeSet::new()
-    } else {
-        rewritten
-            .iter()
-            .flat_map(|(_, r)| r.done.confirmed.iter().map(|(_, u)| u.clone()))
-            .collect()
-    };
-    let records: BTreeMap<String, Option<PatchResponse>> = if record_uuids.is_empty() {
-        BTreeMap::new()
-    } else {
-        discover::fetch_records(&provider, &record_uuids).await
-    };
-    phases.mark("records");
-
     let mut changed: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut changed_binary: BTreeMap<String, (String, Vec<u8>)> = BTreeMap::new();
     let mut results: BTreeMap<usize, ProjectResult> = BTreeMap::new();
@@ -1269,7 +1254,6 @@ async fn engine(
         let mut result = finish_root(
             state,
             done,
-            &records,
             options.dry_run,
             &mut changed,
             &mut changed_binary,
@@ -1452,11 +1436,10 @@ fn select_with_policy(
     offers
 }
 
-/// Records → the project's result and changed files.
+/// The rewrite → the project's result and changed files.
 fn finish_root(
     state: &mut RootState,
     done: Rewritten,
-    records: &BTreeMap<String, Option<PatchResponse>>,
     dry_run: bool,
     changed: &mut BTreeMap<String, (String, String)>,
     changed_binary: &mut BTreeMap<String, (String, Vec<u8>)>,
@@ -1479,17 +1462,6 @@ fn finish_root(
         ..
     } = done;
     let root = state.root.clone();
-    // No ledger keeps the records; the fetch mirrors the disk flow's, so a
-    // record the API cannot serve warns the same way.
-    let mut record_warnings: Vec<crate::patch::redirect::RewriteWarning> = Vec::new();
-    if !dry_run {
-        for (purl, uuid) in &confirmed {
-            match records.get(uuid) {
-                Some(Some(_)) => {}
-                _ => record_warnings.push(crate::hosted::engine::record_fetch_failed_warning(purl)),
-            }
-        }
-    }
 
     let mut project_changes: Vec<(String, String)> = Vec::new();
     for (rel, content) in &rewrite.files {
@@ -1562,7 +1534,6 @@ fn finish_root(
 
     // One typed list in the envelope's order; JSON only at the boundary.
     let mut warnings = rewrite.warnings.clone();
-    warnings.extend(record_warnings);
     warnings.extend(rush_warnings);
     warnings.extend(pnpm_warnings);
     warnings.extend(npm_warnings);
@@ -1660,11 +1631,9 @@ mod tests {
         let mut changed = BTreeMap::new();
         let mut changed_binary = BTreeMap::new();
         let mut warnings = Vec::new();
-        let records = BTreeMap::new();
         let first = finish_root(
             &mut state("", MemoryProject::new()),
             rewritten(&[("crates/b/Cargo.toml", "A")]),
-            &records,
             false,
             &mut changed,
             &mut changed_binary,
@@ -1675,7 +1644,6 @@ mod tests {
         let second = finish_root(
             &mut state("crates/b", MemoryProject::new()),
             rewritten(&[("Cargo.toml", "B"), ("Cargo.lock", "L")]),
-            &records,
             false,
             &mut changed,
             &mut changed_binary,
@@ -1693,7 +1661,6 @@ mod tests {
         let same = finish_root(
             &mut state("crates/b", MemoryProject::new()),
             rewritten(&[("Cargo.toml", "A")]),
-            &records,
             true,
             &mut changed,
             &mut changed_binary,
@@ -1716,7 +1683,6 @@ mod tests {
         let result = finish_root(
             &mut state("web", MemoryProject::new()),
             done,
-            &BTreeMap::new(),
             true,
             &mut changed,
             &mut changed_binary,

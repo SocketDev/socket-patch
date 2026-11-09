@@ -5,8 +5,7 @@
 use std::path::Path;
 
 use serde_json::Value;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{MockServer, ResponseTemplate};
 
 use crate::vlt_hosted_common::*;
 
@@ -489,8 +488,10 @@ async fn scan_redirect_vlt_heal_rule_b_hidden_lock_without_node() {
     assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
 }
 
+/// Without a hidden lock nothing records which bytes the store entry
+/// holds: it is kept, and the advisory says to run `vlt ci`.
 #[tokio::test]
-async fn scan_redirect_vlt_heal_rule_c_no_hidden_lock_with_record() {
+async fn scan_redirect_vlt_heal_rule_c_no_hidden_lock_is_undeterminable() {
     let server = MockServer::start().await;
     mock_all(&server).await;
     let tmp = tempfile::tempdir().unwrap();
@@ -499,30 +500,7 @@ async fn scan_redirect_vlt_heal_rule_c_no_hidden_lock_with_record() {
 
     let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
 
-    assert!(!store_dir(tmp.path(), TILDE_ID).exists());
-    assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
-}
-
-/// Without a hidden lock or a patch record, the installed copy cannot be
-/// judged: it is kept, and the advisory says to run `vlt ci`.
-#[tokio::test]
-async fn scan_redirect_vlt_heal_rule_c_no_record_is_undeterminable() {
-    let server = MockServer::start().await;
-    mock_discovery(&server).await;
-    mock_reference(&server).await;
-    mock_artifact(&server).await;
-    Mock::given(method("GET"))
-        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&server)
-        .await;
-    let tmp = tempfile::tempdir().unwrap();
-    write_installed_vlt_project(tmp.path(), PRISTINE);
-    std::fs::remove_file(tmp.path().join("node_modules/.vlt-lock.json")).unwrap();
-
-    let (_, doc) = scan_hosted(tmp.path(), &server, &[], &[]);
-
-    assert!(warning_codes(&doc).contains(&"record_fetch_failed".to_string()));
+    assert!(!warning_codes(&doc).contains(&"record_fetch_failed".to_string()));
     assert!(store_dir(tmp.path(), TILDE_ID).exists());
     assert_eq!(warning_detail(&doc, ADVISORY), advisory_undeterminable(1));
 }
@@ -692,6 +670,9 @@ fn mkfifo(path: &Path) {
     assert!(status.success());
 }
 
+/// A hidden lock that is a FIFO or a symlink is never read (nor followed),
+/// so nothing records which bytes the store entry holds: the entry and the
+/// hidden lock are kept, and the advisory says to run `vlt ci`.
 #[cfg(unix)]
 #[tokio::test]
 async fn scan_redirect_vlt_heal_hidden_lock_fifo_or_symlink() {
@@ -704,9 +685,9 @@ async fn scan_redirect_vlt_heal_hidden_lock_fifo_or_symlink() {
     std::fs::remove_file(&hidden).unwrap();
     mkfifo(&hidden);
     let (_, doc) = scan_hosted(fifo.path(), &server, &[], &[]);
-    assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
-    assert!(std::fs::symlink_metadata(&hidden).is_err());
-    assert!(!store_dir(fifo.path(), TILDE_ID).exists());
+    assert_eq!(warning_detail(&doc, ADVISORY), advisory_undeterminable(1));
+    assert!(std::fs::symlink_metadata(&hidden).is_ok());
+    assert!(store_dir(fifo.path(), TILDE_ID).exists());
 
     let linked = tempfile::tempdir().unwrap();
     write_installed_vlt_project(linked.path(), PRISTINE);
@@ -715,9 +696,13 @@ async fn scan_redirect_vlt_heal_hidden_lock_fifo_or_symlink() {
     std::fs::rename(&hidden, &target).unwrap();
     std::os::unix::fs::symlink(&target, &hidden).unwrap();
     let (_, doc) = scan_hosted(linked.path(), &server, &[], &[]);
-    assert_eq!(warning_detail(&doc, ADVISORY), advisory_invalidated(1));
-    assert!(std::fs::symlink_metadata(&hidden).is_err());
-    assert!(target.exists(), "only the link is removed");
+    assert_eq!(warning_detail(&doc, ADVISORY), advisory_undeterminable(1));
+    assert!(
+        std::fs::symlink_metadata(&hidden).is_ok(),
+        "the link is kept"
+    );
+    assert!(target.exists());
+    assert!(store_dir(linked.path(), TILDE_ID).exists());
 }
 
 #[cfg(unix)]

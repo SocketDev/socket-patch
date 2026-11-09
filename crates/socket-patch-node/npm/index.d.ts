@@ -35,11 +35,12 @@ export interface PatchProvider {
   searchPatchesBatch(request: { components: { purl: string }[] }): Promise<ProviderResult<BatchSearchResponse>>
   searchPatchesByPackage(request: { purl: string }): Promise<ProviderResult<SearchResponse>>
   fetchRegistryReferences(request: { uuids: string[] }): Promise<ProviderResult<{ results: Record<string, PackageVendorResult> }>>
-  fetchPatch(request: { uuid: string }): Promise<ProviderResult<PatchResponse | null>>
+  // Ignored: the engine no longer fetches patch views. Optional so existing providers still type-check.
+  fetchPatch?(request: { uuid: string }): Promise<ProviderResult<PatchResponse | null>>
   downloadArtifact(request: { url: string; maxBytes: number }): Promise<ProviderResult<Buffer>>
 }
 // Providers MUST resolve (never reject); the JS loader wraps provider methods so a thrown/rejected call becomes {ok:false, kind:'other'}.
-// A 'not_found' failure mirrors the HTTP API's 404 per method: searchPatchesByPackage => no patches, fetchRegistryReferences => no references, fetchPatch => null, searchPatchesBatch and downloadArtifact => error.
+// A 'not_found' failure mirrors the HTTP API's 404 per method: searchPatchesByPackage => no patches, fetchRegistryReferences => no references, searchPatchesBatch and downloadArtifact => error.
 
 export interface HostedScanLimits { maxFileBytes?: number /*20 MiB*/; maxTotalBytes?: number /*64 MiB*/; maxFiles?: number /*2000*/; maxPurls?: number /*20000*/; maxProjects?: number /*200*/; maxArtifactBytes?: number /*32 MiB*/ }
 export interface HostedScanSessionOptions {

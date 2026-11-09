@@ -219,7 +219,7 @@ test('streamed session redirects the package-lock fixture', async () => {
   assert.equal(result.stats.patchesRedirected, 1)
   assert.equal(calls.searchPatchesBatch, 1)
   assert.equal(calls.fetchRegistryReferences, 1)
-  assert.ok(calls.fetchPatch >= 1)
+  assert.equal(calls.fetchPatch, 0, 'patch views are never fetched')
 })
 
 test('dry run previews the lockfile without patch fetches', async () => {
@@ -432,10 +432,6 @@ test('not_found failures map per method like the HTTP API 404', async () => {
   assert.equal(references.calls.fetchRegistryReferences, 1)
   assert.equal(references.project.error, undefined)
   assert.deepEqual(references.project.redirected, [])
-
-  const patch = await run({ fetchPatch: notFound })
-  assert.ok(patch.calls.fetchPatch >= 1)
-  assert.equal(patch.project.error, undefined)
 
   const batch = await run({ searchPatchesBatch: notFound })
   assert.equal(batch.project.error?.code, 'patch_lookup_failed')

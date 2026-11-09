@@ -2,42 +2,128 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::crawlers::PythonCrawler;
+use socket_patch_core::hosted::wheel_record::{
+    fetch_patched_wheel_record, judge_installed_wheel, WheelRecord,
+};
 use socket_patch_core::manifest::schema::PatchRecord;
+use socket_patch_core::patch::redirect::DepOverride;
 use socket_patch_core::utils::purl::{purl_parts, strip_purl_qualifiers};
-use socket_patch_core::vex::verify::judge_installed_record;
+use socket_patch_core::vex::verify::{judge_installed_record, InstalledRecordJudgment};
 
-use super::StaleInstallOutcome;
+use super::{StaleInstallOutcome, ViewFallback};
+
+/// What an installed copy of one confirmed patch is judged against.
+enum Evidence<'a> {
+    /// An agent-mode manifest record of the same patch: its `afterHash`
+    /// map, already local.
+    Local(&'a PatchRecord),
+    /// The patched wheel the lock now pins, fetched on the first installed
+    /// copy found (`Some(None)` once that fetch failed).
+    Wheel {
+        dep: &'a DepOverride,
+        sha256: &'a str,
+        fetched: Option<Option<WheelRecord>>,
+    },
+    /// No wheel to judge by: an sdist pin, no pinned sha256, or `--offline`.
+    Unavailable,
+}
+
+impl Evidence<'_> {
+    /// `None` when this evidence cannot judge the copy in `site`: there is
+    /// no wheel, its download failed, or the copy is another build.
+    async fn judge(
+        &mut self,
+        api: &ApiClient,
+        site: &std::path::Path,
+    ) -> Option<InstalledRecordJudgment> {
+        match self {
+            Evidence::Local(record) => Some(judge_installed_record(site, record).await),
+            Evidence::Wheel {
+                dep,
+                sha256,
+                fetched,
+            } => {
+                if fetched.is_none() {
+                    *fetched =
+                        Some(fetch_patched_wheel_record(api, &dep.artifact_url, sha256).await);
+                }
+                match fetched {
+                    Some(Some(record)) => judge_installed_wheel(site, record).await,
+                    _ => None,
+                }
+            }
+            Evidence::Unavailable => None,
+        }
+    }
+}
 
 /// A lock rewrite cannot prove a warm virtualenv has installed the wheel.
 /// Use the project's own venv discovery (`--global`/`--global-prefix` use
 /// the crawler's global paths), and inspect every interpreter rather than
 /// deduplicating by package name.
-/// Missing/unreadable files are not positive evidence of stale bytes.
+///
+/// Each installed copy is judged against an agent-mode manifest record of
+/// the same patch when one exists, else against the patched wheel's own
+/// `RECORD` ([`socket_patch_core::hosted::wheel_record`]), downloaded only
+/// when a copy is installed. When that cannot judge it (an sdist pin, a
+/// failed download, a copy of another build, `--offline`) and no other
+/// variant proved the copy patched, the patch's view record judges it
+/// ([`ViewFallback`]); a copy that record cannot judge either is reported
+/// in `unjudged_purls`. Missing/unreadable files are not positive evidence
+/// of stale bytes.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn stale_install_warnings(
     common: &crate::args::GlobalArgs,
+    api_client: &ApiClient,
     confirmed: &[(String, String)],
     pipenv_uuids: &BTreeSet<String>,
     // The run's final Pipfile.lock text: the remedy's `pipenv sync`
     // arguments follow the categories that pin each package.
     pipenv_lock: Option<&str>,
-    // This run's fetched records MERGED with the ledger's persisted ones
-    // (the caller hands the post-merge ledger map), looked up by uuid.
-    records: &BTreeMap<String, PatchRecord>,
+    // The overrides the rewrite pinned: each patch's wheel URL and sha256.
+    overrides: &[DepOverride],
+    // The agent-mode manifest's records, looked up by uuid.
+    local_records: &BTreeMap<String, PatchRecord>,
+    views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     let mut out = StaleInstallOutcome::default();
     let pipenv_lock: Option<serde_json::Value> = pipenv_lock.and_then(|text| {
         serde_json::from_str(socket_patch_core::formats::text::strip_bom(text)).ok()
     });
-    let candidates: Vec<_> = confirmed
+    let mut candidates: Vec<(&String, &str, Evidence<'_>)> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:pypi/"))
-        .filter_map(|(purl, uuid)| {
-            records
+        .map(|(purl, uuid)| {
+            let local = local_records
                 .values()
-                .find(|record| &record.uuid == uuid)
-                .filter(|record| !record.files.is_empty())
-                .map(|record| (purl, record))
+                .find(|record| &record.uuid == uuid && !record.files.is_empty());
+            let wheel = || {
+                // `--offline` downloads nothing, so there is no wheel to judge by.
+                if common.offline {
+                    return None;
+                }
+                let dep = overrides.iter().find(|dep| {
+                    dep.ecosystem == "pypi"
+                        && &dep.patch_uuid == uuid
+                        && dep
+                            .artifact_url
+                            .split(['?', '#'])
+                            .next()
+                            .is_some_and(|path| path.ends_with(".whl"))
+                })?;
+                Some(Evidence::Wheel {
+                    dep,
+                    sha256: dep.integrity.sha256.as_deref()?,
+                    fetched: None,
+                })
+            };
+            let evidence = match local {
+                Some(record) => Evidence::Local(record),
+                None => wheel().unwrap_or(Evidence::Unavailable),
+            };
+            (purl, uuid.as_str(), evidence)
         })
         .collect();
     if candidates.is_empty() {
@@ -94,6 +180,17 @@ pub(super) async fn stale_install_warnings(
         purls: BTreeSet<String>,
         patched: bool,
         stale: bool,
+        /// Some variant had no evidence at all (see `unjudged_purls`).
+        unjudged: bool,
+    }
+    impl Judgment {
+        fn record(&mut self, judged: InstalledRecordJudgment) {
+            if judged.patched {
+                self.patched = true;
+            } else if judged.stale_evidence {
+                self.stale = true;
+            }
+        }
     }
     // Python distributions share site-packages, so the key must include
     // the package identity. Any matching artifact variant can prove this
@@ -105,34 +202,54 @@ pub(super) async fn stale_install_warnings(
     // (candidate, site) order.
     let bases: Vec<String> = candidates
         .iter()
-        .map(|(purl, _)| strip_purl_qualifiers(purl).to_string())
+        .map(|(purl, _, _)| strip_purl_qualifiers(purl).to_string())
         .collect();
     let mut found_per_site = Vec::with_capacity(paths.len());
     for site in &paths {
         found_per_site.push(crawler.find_each_by_purl(site, &bases).await);
     }
-    for (index, (purl, record)) in candidates.into_iter().enumerate() {
-        if pipenv_uuids.contains(&record.uuid) {
-            pipenv_purls.insert(purl.clone());
+    // Copies the candidate's own evidence could not judge, for the view
+    // fallback below.
+    let mut pending = Vec::new();
+    for (index, (purl, uuid, evidence)) in candidates.iter_mut().enumerate() {
+        if pipenv_uuids.contains(*uuid) {
+            pipenv_purls.insert((*purl).clone());
         }
         for found in &found_per_site {
             let Some(pkg) = &found[index] else {
                 continue;
             };
-            let judgment: &mut Judgment = judgments
-                .entry((pkg.path.clone(), pkg.name.clone(), pkg.version.clone()))
-                .or_default();
-            judgment.purls.insert(purl.clone());
-            let judged = judge_installed_record(&pkg.path, record).await;
-            if judged.patched {
-                judgment.patched = true;
-            } else if judged.stale_evidence {
-                judgment.stale = true;
+            let key = (pkg.path.clone(), pkg.name.clone(), pkg.version.clone());
+            let judgment: &mut Judgment = judgments.entry(key.clone()).or_default();
+            judgment.purls.insert((*purl).clone());
+            match evidence.judge(api_client, &pkg.path).await {
+                Some(judged) => judgment.record(judged),
+                None => pending.push((key, *uuid)),
             }
         }
     }
+    // Unless another variant already proved the copy patched, the patch's
+    // view record judges it.
+    for (key, uuid) in pending {
+        let Some(judgment) = judgments.get_mut(&key) else {
+            continue;
+        };
+        if judgment.patched {
+            continue;
+        }
+        match views.record(uuid).await {
+            Some(record) => judgment.record(judge_installed_record(&key.0, record).await),
+            None => judgment.unjudged = true,
+        }
+    }
     for ((site, _, version), judgment) in judgments {
-        if judgment.patched || !judgment.stale {
+        if judgment.patched {
+            continue;
+        }
+        if !judgment.stale {
+            if judgment.unjudged {
+                out.unjudged_purls.extend(judgment.purls);
+            }
             continue;
         }
         for purl in judgment.purls {
@@ -189,6 +306,15 @@ mod tests {
     use socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes;
     use socket_patch_core::manifest::schema::PatchFileInfo;
 
+    /// A client nothing answers: these tests judge by local records only.
+    fn offline_api() -> ApiClient {
+        ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: "http://127.0.0.1:1".into(),
+            api_token: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
+        })
+    }
+
     fn record(uuid: &str, file: &str, patched: &[u8]) -> PatchRecord {
         PatchRecord {
             uuid: uuid.to_string(),
@@ -233,8 +359,17 @@ mod tests {
             ("one".into(), record("first-uuid", "first.py", b"patched")),
             ("two".into(), record("second-uuid", "second.py", b"patched")),
         ]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([first.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         assert!(out.warnings[0]["detail"]
@@ -249,8 +384,17 @@ mod tests {
             "variant".into(),
         ));
         ledger.insert("three".into(), record("variant", "first.py", b"upstream"));
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert!(out.stale_purls.is_empty());
         assert!(out.warnings.is_empty());
     }
@@ -288,8 +432,17 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
@@ -301,8 +454,17 @@ mod tests {
 
         // Patched in the env: nothing to warn about.
         std::fs::write(site.join("six.py"), b"patched").unwrap();
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert!(out.warnings.is_empty());
     }
 
@@ -325,8 +487,17 @@ mod tests {
         let purl = "pkg:pypi/six@1.16.0";
         let confirmed = vec![(purl.to_string(), "six-uuid".to_string())];
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
-        let out =
-            stale_install_warnings(&common, &confirmed, &BTreeSet::new(), None, &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &BTreeSet::new(),
+            None,
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings[0]["code"], "redirect_pypi_stale_install");
     }
@@ -353,7 +524,17 @@ mod tests {
         let pipenv = BTreeSet::from(["six-uuid".to_string()]);
         let text =
             r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {"file": "x"}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(text), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(text),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         let lock: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -392,7 +573,17 @@ mod tests {
         // #790: a named category reaches the hosted remedy too.
         let docs =
             r#"{"_meta": {"pipfile-spec": 6}, "default": {"requests": {}}, "docs": {"six": {}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(docs), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(docs),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
             detail.contains("-y six && pipenv sync --categories \"docs\"`"),
@@ -457,7 +648,17 @@ mod tests {
         let ledger = BTreeMap::from([("k".into(), record("six-uuid", "six.py", b"patched"))]);
         let pipenv = BTreeSet::from(["six-uuid".to_string()]);
         let lock = r#"{"_meta": {"pipfile-spec": 6}, "default": {}, "develop": {"six": {}}}"#;
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.stale_purls, BTreeSet::from([purl.to_string()]));
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
@@ -487,7 +688,17 @@ mod tests {
         std::fs::create_dir_all(&dist).unwrap();
         std::fs::write(dist.join("METADATA"), "Name: six\nVersion: 1.16.0\n").unwrap();
         std::fs::write(venv_site.join("six.py"), b"upstream").unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
@@ -507,7 +718,17 @@ mod tests {
         // counts as installed: the usual remedy replaces the venv's copy.
         let base_dist = base_site.join("six-1.16.0.dist-info");
         std::fs::write(base_dist.join("METADATA"), "Name: six\nVersion: 1.15.0\n").unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
@@ -525,12 +746,225 @@ mod tests {
             "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\n[tool.hatch.envs.default]\npath = \".venv\"\n",
         )
         .unwrap();
-        let out = stale_install_warnings(&common, &confirmed, &pipenv, Some(lock), &ledger).await;
+        let out = stale_install_warnings(
+            &common,
+            &offline_api(),
+            &confirmed,
+            &pipenv,
+            Some(lock),
+            &[],
+            &ledger,
+            &mut ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1);
         let detail = out.warnings[0]["detail"].as_str().unwrap();
         assert!(
             detail.contains("pipenv run pip install --no-deps --ignore-installed"),
             "{detail}"
         );
+    }
+
+    /// The view fallback's fixture: an installed `six 1.16.0` (upstream
+    /// bytes, `py3-none-any` metadata) in a custom site, a confirmed patch
+    /// whose grant pins `artifact` (a wheel URL the server answers with
+    /// `wheel_status`, or an sdist), and a view of the patch answering
+    /// `view_status`.
+    struct FallbackFixture {
+        _tmp: tempfile::TempDir,
+        common: crate::args::GlobalArgs,
+        server: wiremock::MockServer,
+        api: ApiClient,
+        overrides: Vec<DepOverride>,
+        confirmed: Vec<(String, String)>,
+    }
+
+    const SIX: &str = "pkg:pypi/six@1.16.0";
+    const SIX_WHEEL_TAGS: &str = "Wheel-Version: 1.0\nTag: py3-none-any\n";
+
+    fn six_wheel(module: &[u8]) -> Vec<u8> {
+        use base64::Engine as _;
+        use sha2::{Digest as _, Sha256};
+        use std::io::Write as _;
+        let b64 = |bytes: &[u8]| {
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(bytes))
+        };
+        let record = format!(
+            "six.py,sha256={},{}\nsix-1.16.0.dist-info/RECORD,,\n",
+            b64(module),
+            module.len()
+        );
+        let mut out = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut out);
+            let options = zip::write::SimpleFileOptions::default();
+            for (name, body) in [
+                ("six.py", module),
+                ("six-1.16.0.dist-info/WHEEL", SIX_WHEEL_TAGS.as_bytes()),
+                ("six-1.16.0.dist-info/RECORD", record.as_bytes()),
+            ] {
+                zip.start_file(name, options).unwrap();
+                zip.write_all(body).unwrap();
+            }
+            zip.finish().unwrap();
+        }
+        out.into_inner()
+    }
+
+    async fn fallback_fixture(
+        artifact: &str,
+        wheel_status: u16,
+        view_status: u16,
+    ) -> FallbackFixture {
+        use sha2::{Digest as _, Sha256};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        let tmp = tempfile::tempdir().unwrap();
+        let site = tmp.path().join("site-packages");
+        let dist = site.join("six-1.16.0.dist-info");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("WHEEL"), SIX_WHEEL_TAGS).unwrap();
+        std::fs::write(site.join("six.py"), b"upstream").unwrap();
+        let common = crate::args::GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            global_prefix: Some(site),
+            ..Default::default()
+        };
+
+        let server = wiremock::MockServer::start().await;
+        let wheel = six_wheel(b"patched");
+        Mock::given(method("GET"))
+            .and(path(format!("/{artifact}")))
+            .respond_with(ResponseTemplate::new(wheel_status).set_body_bytes(wheel.clone()))
+            .mount(&server)
+            .await;
+        let view = record("six-uuid", "six.py", b"patched");
+        let files: serde_json::Map<String, serde_json::Value> = view
+            .files
+            .iter()
+            .map(|(path, info)| {
+                (
+                    path.clone(),
+                    serde_json::json!({
+                        "beforeHash": info.before_hash,
+                        "afterHash": info.after_hash,
+                    }),
+                )
+            })
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/patch/view/six-uuid"))
+            .respond_with(
+                ResponseTemplate::new(view_status).set_body_json(serde_json::json!({
+                    "uuid": "six-uuid",
+                    "purl": SIX,
+                    "publishedAt": "Thu, 17 Sep 2026 00:00:00 GMT",
+                    "files": files,
+                    "vulnerabilities": {},
+                    "description": "",
+                    "license": "MIT",
+                    "tier": "free",
+                })),
+            )
+            .mount(&server)
+            .await;
+        let api = ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            route: socket_patch_core::api::client::ApiRoute::Proxy,
+        });
+        let overrides = vec![serde_json::from_value(serde_json::json!({
+            "ecosystem": "pypi",
+            "name": "six",
+            "version": "1.16.0",
+            "token": "t",
+            "patchUuid": "six-uuid",
+            "artifactUrl": format!("{}/{artifact}", server.uri()),
+            "integrity": { "sha256": hex::encode(Sha256::digest(&wheel)) },
+        }))
+        .unwrap()];
+        FallbackFixture {
+            _tmp: tmp,
+            common,
+            server,
+            api,
+            overrides,
+            confirmed: vec![(SIX.to_string(), "six-uuid".to_string())],
+        }
+    }
+
+    impl FallbackFixture {
+        async fn probe(&self) -> StaleInstallOutcome {
+            let mut views = ViewFallback::new(&self.api, self.common.offline);
+            stale_install_warnings(
+                &self.common,
+                &self.api,
+                &self.confirmed,
+                &BTreeSet::new(),
+                None,
+                &self.overrides,
+                &BTreeMap::new(),
+                &mut views,
+            )
+            .await
+        }
+
+        async fn requests(&self, part: &str) -> usize {
+            self.server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .filter(|request| request.url.path().contains(part))
+                .count()
+        }
+    }
+
+    /// No wheel to judge by (its download fails, or the pin is an sdist):
+    /// the patch's view record judges the copy, fetched once.
+    #[tokio::test]
+    async fn without_a_wheel_the_view_record_judges_the_copy() {
+        for artifact in ["six-1.16.0-py3-none-any.whl", "six-1.16.0.tar.gz"] {
+            let wheel_status = if artifact.ends_with(".whl") { 500 } else { 200 };
+            let fixture = fallback_fixture(artifact, wheel_status, 200).await;
+            let out = fixture.probe().await;
+            assert_eq!(
+                out.stale_purls,
+                BTreeSet::from([SIX.to_string()]),
+                "{artifact}"
+            );
+            assert_eq!(out.warnings.len(), 1, "{artifact}");
+            assert!(out.unjudged_purls.is_empty(), "{artifact}");
+            assert_eq!(fixture.requests("/view/").await, 1, "{artifact}");
+        }
+    }
+
+    /// Neither a wheel nor a view record (the view fetch fails too, or
+    /// `--offline` fetches nothing): the copy is unjudged, never healthy.
+    #[tokio::test]
+    async fn without_a_wheel_or_a_view_the_copy_is_unjudged() {
+        let fixture = fallback_fixture("six-1.16.0-py3-none-any.whl", 500, 500).await;
+        let out = fixture.probe().await;
+        assert!(out.warnings.is_empty() && out.stale_purls.is_empty());
+        assert_eq!(out.unjudged_purls, BTreeSet::from([SIX.to_string()]));
+        assert_eq!(fixture.requests("/view/").await, 1);
+
+        let mut fixture = fallback_fixture("six-1.16.0-py3-none-any.whl", 200, 200).await;
+        fixture.common.offline = true;
+        let out = fixture.probe().await;
+        assert!(out.warnings.is_empty() && out.stale_purls.is_empty());
+        assert_eq!(out.unjudged_purls, BTreeSet::from([SIX.to_string()]));
+        assert_eq!(fixture.requests("/").await, 0, "--offline fetches nothing");
+    }
+
+    /// The patched wheel judges the copy: no view is fetched.
+    #[tokio::test]
+    async fn a_judging_wheel_fetches_no_view() {
+        let fixture = fallback_fixture("six-1.16.0-py3-none-any.whl", 200, 200).await;
+        let out = fixture.probe().await;
+        assert_eq!(out.stale_purls, BTreeSet::from([SIX.to_string()]));
+        assert!(out.unjudged_purls.is_empty());
+        assert_eq!(fixture.requests(".whl").await, 1);
+        assert_eq!(fixture.requests("/view/").await, 0);
     }
 }

@@ -33,6 +33,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 #[allow(clippy::duplicate_mod)]
 #[path = "common/fs_tree.rs"]
 mod fs_tree;
+#[path = "common/patched_wheel.rs"]
+mod patched_wheel;
 
 #[path = "common/hermetic.rs"]
 mod hermetic;
@@ -546,17 +548,22 @@ async fn hatchling_build_backend_does_not_veto_the_pdm_lock_redirect() {
         "pyproject untouched"
     );
     assert_no_ledger(tmp.path());
-    // Confirmed despite the hatch backend: the record was fetched.
-    let views = server
-        .received_requests()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter(|r| r.url.path().ends_with(&format!("/patches/view/{UUID}")))
+    // Confirmed despite the hatch backend: an idempotent re-scan reports
+    // the hosted pin.
+    let (code, json) = scan_json(tmp.path(), &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    let pinned = json["events"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|e| {
+            e["details"]["mode"] == "hosted"
+                && (e["action"] == "applied" || e["action"] == "verified")
+        })
         .count();
     assert_eq!(
-        views, 1,
-        "the pdm redirect must be confirmed despite the hatch backend"
+        pinned, 1,
+        "the pdm redirect must be confirmed despite the hatch backend: {json}"
     );
     assert_manifestless_vex(tmp.path(), LOCK);
 
@@ -708,7 +715,7 @@ fn stale_warning(json: &serde_json::Value) -> bool {
 
 /// Lay `urllib3 1.26.18` with `bytes` as its `response.py` into `site`.
 fn install_urllib3(site: &Path, bytes: &[u8]) {
-    std::fs::create_dir_all(site.join("urllib3-1.26.18.dist-info")).unwrap();
+    patched_wheel::install_wheel_metadata(site, "urllib3-1.26.18.dist-info");
     std::fs::create_dir_all(site.join("urllib3")).unwrap();
     std::fs::write(site.join("urllib3").join("response.py"), bytes).unwrap();
 }
@@ -725,6 +732,20 @@ async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
     for pep582 in [false, true] {
         let server = MockServer::start().await;
         mock_api(&server).await;
+        // The patched wheel the stale-install probe judges against.
+        let wheel = patched_wheel::build(
+            "urllib3-1.26.18.dist-info",
+            &[("urllib3/response.py", PATCHED)],
+        );
+        patched_wheel::mount_grant(
+            &server,
+            ORG,
+            UUID,
+            PURL,
+            "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl",
+            wheel,
+        )
+        .await;
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("app");
         std::fs::create_dir_all(&root).unwrap();
@@ -764,4 +785,69 @@ async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
         assert!(!stale_warning(&json), "pep582={pep582}: {json}");
         assert_eq!(json["vex"]["statements"], 1, "pep582={pep582}: {json}");
     }
+}
+
+/// The patched wheel cannot be downloaded: the stale-install probe falls
+/// back to the patch's view record, fetched once, and still flags the warm
+/// upstream copy; once the env holds the patched bytes, the same fallback
+/// finds it patched.
+#[tokio::test]
+async fn pdm_stale_probe_falls_back_to_the_view_when_the_wheel_fails() {
+    const WHEEL_PATH: &str = "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let wheel = patched_wheel::build(
+        "urllib3-1.26.18.dist-info",
+        &[("urllib3/response.py", PATCHED)],
+    );
+    patched_wheel::mount_grant(&server, ORG, UUID, PURL, WHEEL_PATH, wheel).await;
+    Mock::given(method("GET"))
+        .and(path(WHEEL_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    write_project(&root, LOCK);
+    let venv = tmp.path().join("pdm-venvs").join("app-AbCd-3.12");
+    std::fs::create_dir_all(&venv).unwrap();
+    std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    let python = if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    };
+    std::fs::write(root.join(".pdm-python"), python.display().to_string()).unwrap();
+    let site = if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.12").join("site-packages")
+    };
+    install_urllib3(&site, UPSTREAM);
+    let views = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains("/patches/view/"))
+            .count()
+    };
+
+    let (code, json) = scan_json(&root, &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    assert!(stale_warning(&json), "{json}");
+    assert_eq!(
+        views().await,
+        1,
+        "one view, for the purl the wheel could not judge"
+    );
+
+    install_urllib3(&site, PATCHED);
+    let (code, json) = scan_json(&root, &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    assert!(!stale_warning(&json), "{json}");
+    assert_eq!(views().await, 2);
 }

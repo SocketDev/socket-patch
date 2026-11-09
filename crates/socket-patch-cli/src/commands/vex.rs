@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use socket_patch_core::api::client::ApiClient;
-use socket_patch_core::manifest::schema::{PatchManifest, PatchRecord};
+use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
@@ -172,13 +172,14 @@ impl VexEmbedArgs {
             compact: self.vex_compact,
             assume_applied: Vec::new(),
             known_stale: Vec::new(),
+            unjudged: Vec::new(),
             hosted_gem_mirror_refused: false,
             hosted_gem_mirror_check: false,
             // Embedded callers skip VEX entirely under `--dry-run`.
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: None,
-            hosted_records: Default::default(),
+            hosted_uuids: Vec::new(),
         }
     }
 }
@@ -205,6 +206,12 @@ pub(crate) struct VexBuildParams {
     /// Hosted probes positively identified unpatched installed bytes. These
     /// PURLs cannot be attested by another interpreter or --no-verify.
     pub known_stale: Vec<String>,
+    /// Hosted probes found an installed copy but nothing to judge it by: no
+    /// archive or patched wheel to compare, and the patch's view record
+    /// could not be fetched (or `--offline`). These PURLs are withheld
+    /// (`stale_install_unverified`) whatever `assume_applied`, another
+    /// interpreter's copy or --no-verify would say.
+    pub unjudged: Vec<String>,
     /// Embedded hosted scan refused gem routing because a Bundler mirror
     /// captures a patch source. Rediscovered hosted gem pins (including older
     /// pins outside this scan's candidates) then require verified installed
@@ -232,12 +239,12 @@ pub(crate) struct VexBuildParams {
     /// choice and order are unchanged. Ignored when taken with other crawler
     /// options. The standalone `vex` passes `None` and walks the tree.
     pub npm_prior: Option<crate::ecosystem_dispatch::NpmCrawlSnapshot>,
-    /// Embedded hosted `scan --vex` only: the patch records THIS RUN
-    /// fetched for the pins it confirmed, keyed by purl. v5 hosted mode
-    /// keeps no ledger, so these are the in-run attestation's hosted
-    /// records (the post-install standalone `vex` fetches them from the
-    /// API instead). Empty everywhere else.
-    pub hosted_records: std::collections::BTreeMap<String, PatchRecord>,
+    /// Embedded hosted `scan --vex` only: the uuids of the pins THIS RUN
+    /// confirmed. v5 hosted mode keeps no ledger, so the plan fetches their
+    /// records as the in-run attestation's hosted records (the post-install
+    /// standalone `vex` finds them through the lockfiles instead). Empty
+    /// everywhere else.
+    pub hosted_uuids: Vec<String>,
     /// The run's API client (see [`RunApiClient`]): seeded by a host
     /// command, else built at most once when the plan must fetch records.
     /// Telemetry reads its route when it exists.
@@ -368,12 +375,13 @@ pub async fn run(args: VexArgs) -> i32 {
         compact: args.compact,
         assume_applied: Vec::new(),
         known_stale: Vec::new(),
+        unjudged: Vec::new(),
         hosted_gem_mirror_refused: false,
         hosted_gem_mirror_check: false,
         dry_run: args.common.dry_run,
         product_flag: "--product",
         npm_prior: None,
-        hosted_records: Default::default(),
+        hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
     };
 
@@ -596,6 +604,10 @@ async fn yarn_classic_lock_dependency_gaps(
 /// whose patch changes `package.json`, which could not be read to check
 /// the dependencies the lock installs beside it (#1538).
 const DEPENDENCY_MANIFEST_UNVERIFIABLE: &str = "dependency_manifest_unverifiable";
+
+/// Omission tag: an in-run hosted probe found an installed copy it could
+/// not judge (see [`VexBuildParams::unjudged`]).
+const STALE_INSTALL_UNVERIFIED: &str = "stale_install_unverified";
 
 /// Largest patched `package.json` blob [`patched_blob`] reads.
 const MAX_PATCHED_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
@@ -943,6 +955,34 @@ async fn generate_vex(
                 .map(|purl| FailedPatch {
                     purl: purl.clone(),
                     reason: "stale_install".to_string(),
+                }),
+        );
+    }
+    // A copy no hosted probe could judge is never attested. A failure
+    // already recorded (positive stale evidence above, or this run's own
+    // verification) keeps its more specific reason.
+    if !params.unjudged.is_empty() {
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        let unjudged: std::collections::HashSet<&str> = params
+            .unjudged
+            .iter()
+            .map(|purl| strip_purl_qualifiers(purl))
+            .collect();
+        let is_unjudged = |purl: &str| unjudged.contains(strip_purl_qualifiers(purl));
+        outcome.applied.retain(|purl| !is_unjudged(purl));
+        let failed: std::collections::HashSet<String> = outcome
+            .failed
+            .iter()
+            .map(|failure| failure.purl.clone())
+            .collect();
+        outcome.failed.extend(
+            manifest
+                .patches
+                .keys()
+                .filter(|purl| is_unjudged(purl) && !failed.contains(*purl))
+                .map(|purl| FailedPatch {
+                    purl: purl.clone(),
+                    reason: STALE_INSTALL_UNVERIFIED.to_string(),
                 }),
         );
     }
@@ -1818,21 +1858,13 @@ async fn generate_vex_from_manifest_path_inner(
     for diag in &discovery.diagnostics {
         note_warning(warnings, common, diag.code, diag.detail.clone());
     }
-    // This run's hosted records (embedded hosted `scan --vex`) join a
-    // pre-v5 ledger's as the hosted record source, newest wins.
-    let redirect = if params.hosted_records.is_empty() {
-        redirect
-    } else {
-        let mut state =
-            redirect.unwrap_or_else(socket_patch_core::patch::redirect::RedirectState::new);
-        state.records.extend(params.hosted_records.clone());
-        Some(state)
-    };
     let sources = Sources {
         manifest: manifest_file.unwrap_or_else(PatchManifest::new),
         vendor,
         redirect,
         discovery,
+        // Their records join a pre-v5 ledger's as the hosted record source.
+        hosted_uuids: params.hosted_uuids.clone(),
     };
     if sources.is_empty() {
         // A discovery diagnostic (an unparseable lock, a rejected reference)
@@ -2092,6 +2124,11 @@ fn omission_phrase(reason: &str) -> &'static str {
              against"
         }
         "stale_install" => "the installed copy is not patched",
+        STALE_INSTALL_UNVERIFIED => {
+            "the hosted scan found an installed copy but could not check it: there was no \
+             installed archive or patched wheel to compare, and the patch record could not be \
+             fetched"
+        }
         "native_extension_not_rebuilt" => {
             "the patched native-extension sources were not compiled into the extension Ruby \
              loads; run socket-patch apply to rebuild it"
@@ -2315,6 +2352,7 @@ mod tests {
             "vendor_artifact_missing",
             "vendor_manifest_unverifiable",
             "stale_install",
+            STALE_INSTALL_UNVERIFIED,
             "mirror_overrides_source",
             DEPENDENCY_NOT_INSTALLED,
             DEPENDENCY_MANIFEST_UNVERIFIABLE,
@@ -2576,12 +2614,13 @@ mod npm_prior_tests {
             compact: false,
             assume_applied: Vec::new(),
             known_stale: Vec::new(),
+            unjudged: Vec::new(),
             hosted_gem_mirror_refused: false,
             hosted_gem_mirror_check: false,
             dry_run: false,
             product_flag: "--vex-product",
             npm_prior: prior,
-            hosted_records: Default::default(),
+            hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
         };
         let manifest_path = common.resolved_manifest_path();
@@ -2655,6 +2694,7 @@ mod npm_prior_tests {
 mod mirror_refusal_tests {
     use super::*;
     use crate::commands::vex_sources::HostedWiring;
+    use socket_patch_core::manifest::schema::PatchRecord;
     use std::collections::{BTreeMap, HashSet};
 
     /// The current scan can refuse routing while VEX rediscovers an older pin
@@ -2852,6 +2892,99 @@ mod mirror_refusal_tests {
                 assert_eq!(summary.failed[0].purl, gem);
                 assert_eq!(summary.failed[0].reason, "mirror_overrides_source");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod unjudged_tests {
+    use super::*;
+    use crate::commands::vex_sources::HostedWiring;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use std::collections::{BTreeMap, HashSet};
+
+    /// A copy the in-run hosted probes could not judge is withheld as
+    /// `stale_install_unverified`, whatever `assume_applied` or
+    /// `--no-verify` say; positive stale evidence keeps `stale_install`.
+    #[tokio::test]
+    async fn unjudged_installs_are_withheld_even_when_assumed_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            no_telemetry: true,
+            ..Default::default()
+        };
+        let purls = [
+            "pkg:pypi/judged@1.0.0",
+            "pkg:pypi/unjudged@1.0.0",
+            "pkg:gem/both@1.0.0",
+        ];
+        for no_verify in [false, true] {
+            let mut view = PatchManifest::new();
+            for (index, purl) in purls.iter().enumerate() {
+                let record: PatchRecord = serde_json::from_value(serde_json::json!({
+                    "uuid": format!("00000000-0000-4000-8000-00000000000{index}"),
+                    "exportedAt": "2026-01-01T00:00:00Z",
+                    "files": {"m.py": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+                    "vulnerabilities": {format!("GHSA-unjudged-000{index}"): {"cves": [format!("CVE-2026-200{index}")], "summary": "test", "severity": "high", "description": "test"}},
+                    "description": "test", "license": "MIT", "tier": "free"
+                }))
+                .unwrap();
+                view.patches.insert(purl.to_string(), record);
+            }
+            let hosted = BTreeMap::from(purls.map(|purl| {
+                (
+                    purl.to_string(),
+                    HostedWiring {
+                        uuid: view.patches[purl].uuid.clone(),
+                        refs: Vec::new(),
+                    },
+                )
+            }));
+            let plan = Plan {
+                view,
+                vendor_entries: HashMap::new(),
+                redirected: purls.map(str::to_string).to_vec(),
+                lockfile_basis: purls
+                    .map(str::to_string)
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+                hosted,
+                gated: Vec::new(),
+                notes: Vec::new(),
+            };
+            let mut params = VexEmbedArgs {
+                vex: Some(tmp.path().join(format!("{no_verify}.json"))),
+                vex_product: Some("pkg:generic/test@1.0.0".into()),
+                vex_no_verify: no_verify,
+                ..Default::default()
+            }
+            .to_build_params(None);
+            params.assume_applied = purls.map(str::to_string).to_vec();
+            params.known_stale = vec![purls[2].to_string()];
+            params.unjudged = vec![format!("{}?artifact_id=x", purls[1]), purls[2].to_string()];
+            let summary = generate_vex(&common, &params, plan, &mut Vec::new())
+                .await
+                .unwrap_or_else(|err| panic!("{}: {}", err.code, err.message));
+            assert_eq!(summary.statements, 1, "no_verify={no_verify}");
+            let doc = serde_json::to_string(&summary.doc).unwrap();
+            assert!(doc.contains(purls[0]), "{doc}");
+            assert!(!doc.contains(purls[1]) && !doc.contains(purls[2]), "{doc}");
+            let mut failed: Vec<(&str, &str)> = summary
+                .failed
+                .iter()
+                .map(|f| (f.purl.as_str(), f.reason.as_str()))
+                .collect();
+            failed.sort();
+            assert_eq!(
+                failed,
+                [
+                    (purls[2], "stale_install"),
+                    (purls[1], STALE_INSTALL_UNVERIFIED),
+                ],
+                "no_verify={no_verify}"
+            );
         }
     }
 }
