@@ -131,7 +131,7 @@
 //! that cargo ignores (because `.cargo/config` exists) are diagnosed, never
 //! read.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use toml_edit::{DocumentMut, Item, TableLike};
 
@@ -219,7 +219,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         .map(|(_, doc)| registry_definitions(doc).into_iter().collect())
         .unwrap_or_default();
 
-    hosted_from_lock(ctx, &lock, decls.as_ref(), &definitions, out);
+    hosted_from_lock(ctx, &lock, &manifests, decls.as_ref(), &definitions, out);
     unpatched_twins(ctx, &lock, out);
     if let Some(decls) = &decls {
         unresolved_manifest_pins(ctx, &lock, decls, &definitions, out);
@@ -555,7 +555,7 @@ fn manifest_declarations(manifests: &[(String, DocumentMut)]) -> Decls {
                 .map(move |d| (file.as_str(), d))
         })
         .collect();
-    let inherited: Vec<&str> = entries
+    let inherited: BTreeSet<&str> = entries
         .iter()
         .filter(|(_, d)| d.inherits)
         .map(|(_, d)| d.key.as_str())
@@ -701,6 +701,7 @@ fn source_uuid(ctx: &DiscoverCtx<'_>, source: &str) -> Option<String> {
 fn hosted_from_lock(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
+    manifests: &[(String, DocumentMut)],
     decls: Option<&Decls>,
     definitions: &BTreeMap<String, String>,
     out: &mut Discovery,
@@ -766,7 +767,7 @@ fn hosted_from_lock(
             .any(|d| d.registry.as_deref() == Some(reg.as_str()))
         {
             out.push(lock_ref);
-            beside_the_pin(ctx, lock, pkg, &purl, &uuid, regs, out);
+            beside_the_pin(ctx, lock, manifests, pkg, &purl, &uuid, regs, out);
             continue;
         }
         let others: Vec<(&str, String)> = regs
@@ -869,9 +870,11 @@ fn route(d: &Decl, patch_pins: &[(&str, String)], version: &str, others: &[Strin
 /// When the lock already holds a same-version copy from another source,
 /// [`unpatched_twins`] withholds the ref and names that entry (#679), so
 /// nothing is added here.
+#[allow(clippy::too_many_arguments)]
 fn beside_the_pin(
     ctx: &DiscoverCtx<'_>,
     lock: &Lock,
+    manifests: &[(String, DocumentMut)],
     pkg: &LockedPackage,
     purl: &str,
     uuid: &str,
@@ -938,10 +941,31 @@ fn beside_the_pin(
                 .version
                 .as_deref()
                 .map_or_else(|| "with no version".to_string(), |v| format!("{v:?}"));
-            format!("{} declares {} {req} from {}", d.file, pkg.name, d.origin())
+            // A `path` / `git` / `registry-index` overrides a Socket
+            // registry named beside it: say so, or the note reads as if the
+            // registry were missing (review on #2019).
+            let beside = match d.registry.as_deref() {
+                Some(reg)
+                    if reg.starts_with(PIN_NAME_PREFIX) && d.source != DeclSource::Registry =>
+                {
+                    format!(", which overrides its registry = \"{reg}\"")
+                }
+                _ => String::new(),
+            };
+            format!(
+                "{} declares {} {req} from {}{beside}",
+                d.file,
+                pkg.name,
+                d.origin()
+            )
         })
         .collect::<Vec<_>>()
         .join(", and ");
+    let (that, each) = if unpinned.len() == 1 {
+        ("that declaration", "the crate declaring it")
+    } else {
+        ("those declarations", "each crate declaring one")
+    };
     // What a re-scan can do: the hosted rewriter pins a crates.io
     // declaration whose requirement selects only the patched version among
     // the locked ones, and refuses every other kind.
@@ -976,23 +1000,48 @@ fn beside_the_pin(
             Some(format!("{}'s declaration ({why})", d.file))
         })
         .collect();
-    let remedy = if refused.is_empty() {
-        "re-run `socket-patch scan` to pin it too".to_string()
-    } else {
+    // Every declaration may pass on its own and the rewriter still refuse
+    // the dependency over another one (the pin's own requirement matching
+    // another locked version, a `path` template nobody inherits): it skips
+    // the whole dependency on the first refusal, so ask its planner, dry,
+    // over the same manifests (review on #2019).
+    let planner_refusal = || {
+        let texts: Vec<(String, String)> = manifests
+            .iter()
+            .map(|(file, doc)| (file.clone(), doc.to_string()))
+            .collect();
+        crate::patch::redirect::plan_cargo_tomls(
+            &texts,
+            &pkg.name,
+            &pkg.version,
+            &others,
+            &hosted_pin_name(uuid),
+        )
+        .err()
+    };
+    let remedy = if !refused.is_empty() {
         format!(
             "`socket-patch scan` cannot pin {}, so change that declaration or roll the \
              patch back",
             refused.join(", or ")
         )
+    } else if let Some((file, why)) = planner_refusal() {
+        format!(
+            "`socket-patch scan` cannot pin {} ({file}: {why}), so change that declaration \
+             or roll the patch back",
+            pkg.name
+        )
+    } else {
+        "re-run `socket-patch scan` to pin it too".to_string()
     };
     out.unattested(
         purl,
         uuid,
         &first.file,
         format!(
-            "{declared}, not registry \"{}\": cargo resolves that declaration as a \
-             separate package, so the crate declaring it builds an unpatched {} that the \
-             requirement allows to be {}; {remedy}",
+            "{declared}, not registry \"{}\": cargo resolves {that} as a separate \
+             package, so {each} builds an unpatched {} that the requirement allows to be \
+             {}; {remedy}",
             hosted_pin_name(uuid),
             pkg.name,
             pkg.version
@@ -2227,6 +2276,24 @@ mod tests {
                 u.detail
             );
         }
+        // Review on #2019 (round 3): every unpinned declaration passes on
+        // its own, but the rewriter refuses the dependency over the PIN's
+        // own requirement (`"1"` also matches the crates.io 1.0.200), so a
+        // re-scan pins nothing.
+        let p = mixed_workspace(
+            &pinned("serde", "1", UUID_A),
+            "serde = \"=1.0.1\"",
+            &[("1.0.200", CRATES_IO)],
+        );
+        let out = run(&p).await;
+        let u = unpinned_mark(&out, "crates/a/Cargo.toml");
+        assert!(
+            u.detail.contains("cannot pin serde (Cargo.toml:")
+                && u.detail.contains("roll the patch back")
+                && !u.detail.contains("re-run `socket-patch scan`"),
+            "{}",
+            u.detail
+        );
     }
 
     /// A declaration that names the Socket registry but also a `path`,
@@ -2249,7 +2316,14 @@ mod tests {
                 &out,
                 &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
             );
-            unpinned_mark(&out, "crates/a/Cargo.toml");
+            let u = unpinned_mark(&out, "crates/a/Cargo.toml");
+            assert!(
+                u.detail.contains(&format!(
+                    "which overrides its registry = \"socket-patch-{UUID_A}\""
+                )),
+                "{extra}: {}",
+                u.detail
+            );
 
             let p = Project::new();
             p.write("Cargo.toml", manifest(&member));
