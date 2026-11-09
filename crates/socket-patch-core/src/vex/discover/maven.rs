@@ -1104,11 +1104,19 @@ fn profile_override(
             };
             if !d.in_profile {
                 // Off the pin as built, it is no pin (or another bypass).
-                if build_version(d) != Some(pinned) {
+                // One this pom leaves unresolved (a parent pom's property)
+                // may be the pin.
+                let built = build_version(d)?;
+                let unresolved = built.contains("${");
+                if built != pinned && !unresolved {
                     return None;
                 }
-                // The smallest combination of profiles that moves it.
-                let moved = d.version_alternatives.first()?;
+                // The smallest combination of profiles that moves it: for
+                // an unresolved one, to a version this pom does give.
+                let moved = d
+                    .version_alternatives
+                    .iter()
+                    .find(|a| a.value != pinned && !(unresolved && a.value.contains("${")))?;
                 let declared = d.version_text.as_deref().unwrap_or_default();
                 let value = if !matches!(moved.by, crate::formats::maven::MovedBy::Profiles(_)) {
                     "resolve a version this reader cannot work out".to_string()
@@ -1118,9 +1126,14 @@ fn profile_override(
                     moved.value.clone()
                 };
                 return Some(format!(
-                    "{POM}: {section}{named} <version>{declared}</version> resolves the \
+                    "{POM}: {section}{named} <version>{declared}</version> {} the \
                      patched {pinned}, but the <properties> of {} make it {value}; whenever that \
                      applies Maven resolves it instead of the pin",
+                    if unresolved {
+                        "may resolve"
+                    } else {
+                        "resolves"
+                    },
                     moved.by
                 ));
             }
@@ -3093,7 +3106,15 @@ mod tests {
     /// version of the vendored GA off the vendored version.
     #[tokio::test]
     async fn vendored_ref_under_profile_properties_is_not_attested() {
-        for (version, attested) in [("1.10.1", false), ("1.10.0", true)] {
+        // `root` is the pom's own `<properties>`; none leaves `${ct}` to a
+        // parent pom this reader never sees, which may give the vendored
+        // version, while the profile's value is known.
+        for (root, version, attested) in [
+            ("<properties><ct>1.10.0</ct></properties>", "1.10.1", false),
+            ("<properties><ct>1.10.0</ct></properties>", "1.10.0", true),
+            ("", "1.10.1", false),
+            ("", "1.10.0", true),
+        ] {
             let p = vendored_project(UUID_A);
             let wired = std::fs::read_to_string(p.root().join("pom.xml"))
                 .expect("read pom")
@@ -3102,7 +3123,7 @@ mod tests {
             p.write(
                 "pom.xml",
                 format!(
-                    "{}<properties><ct>1.10.0</ct></properties>\n<profiles><profile><id>p</id>\
+                    "{}{root}\n<profiles><profile><id>p</id>\
                      <properties><ct>{version}</ct></properties></profile></profiles>\n{}",
                     &wired[..at],
                     &wired[at..]
@@ -3113,7 +3134,7 @@ mod tests {
             assert_eq!(
                 attests(&out, V_PURL),
                 attested,
-                "{version}: {:?}",
+                "{root:?} {version}: {:?}",
                 out.unattested
             );
         }

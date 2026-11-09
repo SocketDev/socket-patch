@@ -176,7 +176,8 @@ struct ProfileProperties {
 /// classpaths, `<pluginRepositories>` / `<distributionManagement>` plugin
 /// and deploy repositories; `<profiles>` apply only when activated. Shared
 /// by the VEX reader ([`parse_pom`]) and the hosted rewriter, so the
-/// rewriter edits exactly the markup VEX later attests.
+/// rewriter edits exactly the markup VEX later attests. Only the VEX
+/// reader weighs profile `<properties>` ([`Self::read_profiles`]).
 #[derive(Debug)]
 pub(crate) struct PomScope {
     /// The pom with comments and CDATA blanked byte-for-byte.
@@ -332,7 +333,17 @@ impl PomScope {
             .unwrap_or_else(|| text.to_string());
         match self.resolve_in_build(text, pos, interpolate_strict) {
             (Some(build), alternatives) => (spelled, build, alternatives),
-            (None, _) => (spelled, text.to_string(), Vec::new()),
+            // Unresolved here (a parent pom this reader never sees may
+            // define it): the build version stays as written, but a value
+            // some profiles give it is still one the build may resolve.
+            (None, alternatives) => (
+                spelled,
+                text.to_string(),
+                alternatives
+                    .into_iter()
+                    .filter(|a| a.value != text)
+                    .collect(),
+            ),
         }
     }
 
@@ -544,10 +555,15 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
     /// `<groupId>` / `<artifactId>` with every `${prop}` the build defines
-    /// with no profile active (user properties, the project model, the
-    /// root `<properties>`) interpolated
-    /// ([`PomScope::interpolate_coordinate`]); an undefined one stays as
-    /// written, so [`may_name`] can tell it apart.
+    /// (user properties, the project model, the root `<properties>`)
+    /// interpolated ([`PomScope::interpolate_coordinate`]); an undefined
+    /// one stays as written, so [`may_name`] can tell it apart. No profile
+    /// is active but, for a `<profiles>` declaration, its own, whose
+    /// `<properties>` count only once [`PomScope::read_profiles`] has run:
+    /// the VEX reader runs it, the hosted rewriter does not, so a profile
+    /// declaration whose coordinates only its own profile's `<properties>`
+    /// define is the pinned GA to VEX (which then withholds the pin) and
+    /// not to the rewriter.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
     /// The trimmed `<groupId>` / `<artifactId>` text as written.
@@ -735,10 +751,12 @@ fn profile_properties(
             .iter()
             .find(|p| props.start >= p.start && props.start < p.end)
             .copied();
+        // Maven names a profile without an `<id>` `default`, as the
+        // vendored reactor does.
         let id = holder
             .and_then(|p| direct_child_text(p.inner(text), "id"))
             .filter(|id| !id.is_empty())
-            .unwrap_or_else(|| format!("#{}", out.len() + 1));
+            .unwrap_or_else(|| "default".to_string());
         let mut map = BTreeMap::new();
         read_properties(props.inner(text), &mut map)?;
         out.push(ProfileProperties {
