@@ -1594,13 +1594,16 @@ fn relocated_pnpm_virtual_store_sync(nm: &Path) -> Option<PathBuf> {
 /// one elsewhere (a home rc's folder) may be shared with other projects,
 /// and patching it would patch them too. `None` for the default location,
 /// which the walks find by name. The path keeps the project's spelling.
-fn relocated_yarn_pnpm_store_sync(nm: &Path) -> Option<PathBuf> {
+fn relocated_yarn_pnpm_store_sync(
+    scope: crate::utils::repo_root::ReadScope,
+    nm: &Path,
+) -> Option<PathBuf> {
     if nm.file_name() != Some(OsStr::new("node_modules")) || !is_dir_sync(nm) {
         return None;
     }
     let (abs_project, project) = crate::utils::relpath::ancestors_keeping_spelling(nm.parent()?)
         .find(|(abs, _)| abs.join("yarn.lock").is_file())?;
-    let store = super::pkg_managers::active_yarn_pnpm_store(&abs_project)?;
+    let store = super::pkg_managers::active_yarn_pnpm_store(scope, &abs_project)?;
     let (Ok(real_store), Ok(real_project)) = (
         std::fs::canonicalize(store),
         std::fs::canonicalize(&abs_project),
@@ -2665,7 +2668,14 @@ fn find_node_dirs_sync(base: &Path, segments: &[&str]) -> Vec<PathBuf> {
 // ---------------------------------------------------------------------------
 
 /// NPM ecosystem crawler for discovering packages in `node_modules`.
-pub struct NpmCrawler;
+///
+/// It carries its run's read scope ([`NpmCrawler::for_options`]): a
+/// global run's lookups (a relocated yarn store's settings) read
+/// anywhere, a workspace run's stay inside the repository root.
+#[derive(Debug, Clone, Copy)]
+pub struct NpmCrawler {
+    scope: crate::utils::repo_root::ReadScope,
+}
 
 /// One still-unresolved `find_by_purls` lookup.
 ///
@@ -2688,9 +2698,36 @@ struct Target {
 }
 
 impl NpmCrawler {
-    /// Create a new `NpmCrawler`.
+    /// A crawler for a workspace (project) run.
     pub fn new() -> Self {
-        Self
+        Self::with_scope(crate::utils::repo_root::ReadScope::Workspace)
+    }
+
+    /// A crawler for a run whose scope is `scope`.
+    pub fn with_scope(scope: crate::utils::repo_root::ReadScope) -> Self {
+        Self { scope }
+    }
+
+    /// A crawler for the run `options` describes: global under
+    /// `--global` / `--global-prefix`, else workspace.
+    pub fn for_options(options: &CrawlerOptions) -> Self {
+        Self::with_scope(options.read_scope())
+    }
+
+    /// The one scope source is the crawler's own: a crawler built for a
+    /// workspace run must never crawl a global run's options (its
+    /// lookups would be bounded where the run is not).
+    fn debug_assert_scope_of(&self, options: &CrawlerOptions) {
+        debug_assert!(
+            self.scope == crate::utils::repo_root::ReadScope::Global
+                || options.read_scope() == crate::utils::repo_root::ReadScope::Workspace,
+            "a workspace NpmCrawler crawls global options; build it with NpmCrawler::for_options"
+        );
+    }
+
+    /// The run's read scope.
+    pub fn scope(&self) -> crate::utils::repo_root::ReadScope {
+        self.scope
     }
 
     // ------------------------------------------------------------------
@@ -2706,8 +2743,10 @@ impl NpmCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> Result<Vec<PathBuf>, std::io::Error> {
+        self.debug_assert_scope_of(options);
         let options = options.clone();
-        Ok(run_walk(move || Self::node_modules_paths_sync(&options)).await)
+        let scope = self.scope;
+        Ok(run_walk(move || Self::node_modules_paths_sync(scope, &options)).await)
     }
 
     /// Crawl all discovered `node_modules` and return every package found.
@@ -2744,12 +2783,17 @@ impl NpmCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
+        self.debug_assert_scope_of(options);
         let options = options.clone();
-        run_walk(move || Self::crawl_all_sync(&options)).await
+        let scope = self.scope;
+        run_walk(move || Self::crawl_all_sync(scope, &options)).await
     }
 
-    fn crawl_all_sync(options: &CrawlerOptions) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
-        let nm_paths = Self::node_modules_paths_sync(options);
+    fn crawl_all_sync(
+        scope: crate::utils::repo_root::ReadScope,
+        options: &CrawlerOptions,
+    ) -> (Vec<CrawledPackage>, Vec<PathBuf>) {
+        let nm_paths = Self::node_modules_paths_sync(scope, options);
         // Yarn's relocated pnpm-linker store (#859), walked once, from the
         // first root of its project, after that root's own entries like
         // the stores found by name.
@@ -2757,7 +2801,7 @@ impl NpmCrawler {
         let roots: Vec<(&PathBuf, Option<PathBuf>)> = nm_paths
             .iter()
             .map(|nm| {
-                let store = relocated_yarn_pnpm_store_sync(nm)
+                let store = relocated_yarn_pnpm_store_sync(scope, nm)
                     .filter(|store| seen_stores.insert(store.clone()));
                 (nm, store)
             })
@@ -2855,6 +2899,7 @@ impl NpmCrawler {
         // probed there and drives the descent (see
         // `resolve_pending_targets`).
         let node_modules_path = node_modules_path.to_path_buf();
+        let scope = self.scope;
         Ok(run_walk(move || {
             let mut result: HashMap<String, Vec<CrawledPackage>> = HashMap::new();
 
@@ -2864,8 +2909,13 @@ impl NpmCrawler {
             // installed here, and probing every entry of a large monorepo
             // store for them would add a readdir+stat storm to every
             // apply/rollback run).
-            let pending =
-                Self::resolve_pending_targets(&node_modules_path, pending, &mut result, true);
+            let pending = Self::resolve_pending_targets(
+                scope,
+                &node_modules_path,
+                pending,
+                &mut result,
+                true,
+            );
 
             // Pass 2 — unfiltered fallback, only for targets pass 1 could not
             // resolve: a target can physically exist ONLY inside another
@@ -2877,7 +2927,13 @@ impl NpmCrawler {
             // every store entry for just the leftovers; the common all-
             // resolved case never reaches this pass, so its perf is intact.
             if !pending.is_empty() {
-                Self::resolve_pending_targets(&node_modules_path, pending, &mut result, false);
+                Self::resolve_pending_targets(
+                    scope,
+                    &node_modules_path,
+                    pending,
+                    &mut result,
+                    false,
+                );
             }
 
             result
@@ -2918,6 +2974,7 @@ impl NpmCrawler {
     /// — folding matches into `result` and the unmatched-name store filter
     /// — is then replayed sequentially in queue order.
     fn resolve_pending_targets(
+        scope: crate::utils::repo_root::ReadScope,
         node_modules_path: &Path,
         mut pending: Vec<Target>,
         result: &mut HashMap<String, Vec<CrawledPackage>>,
@@ -2932,11 +2989,12 @@ impl NpmCrawler {
         let mut visited = HashSet::new();
         // The root's relocated Yarn pnpm-linker store (#859), contributed
         // by the root's visit like a store found there by name.
-        let mut yarn_store = relocated_yarn_pnpm_store_sync(node_modules_path).map(|store| {
-            NestedNodeModules::StoreEntries(StoreEntry::from_dirs(
-                Self::list_npm_store_entries_sync(&store, false),
-            ))
-        });
+        let mut yarn_store =
+            relocated_yarn_pnpm_store_sync(scope, node_modules_path).map(|store| {
+                NestedNodeModules::StoreEntries(StoreEntry::from_dirs(
+                    Self::list_npm_store_entries_sync(&store, false),
+                ))
+            });
         while !level.is_empty() {
             // A bundled node_modules may link back to an ancestor (or to
             // another already-visited tree). Keep the first/root-first
@@ -3415,7 +3473,10 @@ impl NpmCrawler {
     // ------------------------------------------------------------------
 
     /// Blocking body of [`Self::get_node_modules_paths`].
-    fn node_modules_paths_sync(options: &CrawlerOptions) -> Vec<PathBuf> {
+    fn node_modules_paths_sync(
+        scope: crate::utils::repo_root::ReadScope,
+        options: &CrawlerOptions,
+    ) -> Vec<PathBuf> {
         if options.global || options.global_prefix.is_some() {
             if let Some(ref custom) = options.global_prefix {
                 if is_deno_npm_cache_root(custom) {
@@ -3427,16 +3488,19 @@ impl NpmCrawler {
                 }
                 return pnpm_isolated_global_install_roots(custom);
             }
-            return NpmCrawler.get_global_node_modules_paths();
+            return NpmCrawler::with_scope(scope).get_global_node_modules_paths();
         }
 
-        Self::find_local_node_modules_dirs(&options.cwd)
+        Self::find_local_node_modules_dirs(scope, &options.cwd)
     }
 
     /// Find `node_modules` directories within the project root.
     /// Recursively searches for workspace `node_modules` but stays within the
     /// project.
-    fn find_local_node_modules_dirs(start_path: &Path) -> Vec<PathBuf> {
+    fn find_local_node_modules_dirs(
+        scope: crate::utils::repo_root::ReadScope,
+        start_path: &Path,
+    ) -> Vec<PathBuf> {
         let mut results = Vec::new();
         let listing = list_dir_sync(start_path);
 
@@ -3458,7 +3522,7 @@ impl NpmCrawler {
         // `node_modules` of its entries are not importers of their own.
         let stores: Vec<PathBuf> = results
             .iter()
-            .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+            .filter_map(|nm| relocated_yarn_pnpm_store_sync(scope, nm))
             .filter_map(|store| std::fs::canonicalize(store).ok())
             .collect();
         if !stores.is_empty() {
@@ -4456,8 +4520,11 @@ impl StoreLayout {
 /// store entry). Callers write through the hardened per-file pipeline,
 /// which breaks content-store hardlinks per copy — CoW safety holds for
 /// every copy independently.
-pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
-    find_store_peer_variant_copies_reusing(pkg_path, &mut HashSet::new()).await
+pub async fn find_store_peer_variant_copies(
+    scope: crate::utils::repo_root::ReadScope,
+    pkg_path: &Path,
+) -> Vec<PathBuf> {
+    find_store_peer_variant_copies_reusing(scope, pkg_path, &mut HashSet::new()).await
 }
 
 /// Discover candidate stores for every input path, but enumerate a
@@ -4465,6 +4532,7 @@ pub async fn find_store_peer_variant_copies(pkg_path: &Path) -> Vec<PathBuf> {
 /// aggregate expansion. Alias ancestry can expose additional stores even
 /// when the input's canonical package was already seen.
 async fn find_store_peer_variant_copies_reusing(
+    scope: crate::utils::repo_root::ReadScope,
     pkg_path: &Path,
     scanned: &mut HashSet<(PathBuf, StoreLayout, String, String)>,
 ) -> Vec<PathBuf> {
@@ -4571,7 +4639,7 @@ async fn find_store_peer_variant_copies_reusing(
         let yarn_stores = run_walk(move || {
             projects
                 .iter()
-                .filter_map(|nm| relocated_yarn_pnpm_store_sync(nm))
+                .filter_map(|nm| relocated_yarn_pnpm_store_sync(scope, nm))
                 .filter(|store| {
                     std::fs::canonicalize(store).is_ok_and(|real| canonical.starts_with(real))
                 })
@@ -4690,7 +4758,10 @@ async fn find_store_peer_variant_copies_reusing(
 /// to apply's [`find_store_peer_variant_copies`] fan-out, but each variant
 /// is what some dependent loads, so a check of "every installed copy"
 /// (`vex`) must see them too.
-pub async fn with_store_peer_variant_copies(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+pub async fn with_store_peer_variant_copies(
+    scope: crate::utils::repo_root::ReadScope,
+    paths: Vec<PathBuf>,
+) -> Vec<PathBuf> {
     let mut seen: HashSet<PathBuf> = HashSet::new();
     for path in &paths {
         seen.insert(tokio::fs::canonicalize(path).await.unwrap_or(path.clone()));
@@ -4700,7 +4771,7 @@ pub async fn with_store_peer_variant_copies(paths: Vec<PathBuf>) -> Vec<PathBuf>
     // by a store's first scan. Sharing scan state therefore loses no copy.
     let mut scanned = HashSet::new();
     for path in &paths {
-        for copy in find_store_peer_variant_copies_reusing(path, &mut scanned).await {
+        for copy in find_store_peer_variant_copies_reusing(scope, path, &mut scanned).await {
             let canonical = tokio::fs::canonicalize(&copy).await.unwrap_or(copy.clone());
             if seen.insert(canonical) {
                 out.push(copy);
@@ -4851,7 +4922,11 @@ mod tests {
     async fn tracked_store_expansion(paths: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<PathBuf>) {
         VARIANT_STORE_SCANS
             .scope(std::cell::RefCell::new(Vec::new()), async {
-                let expanded = with_store_peer_variant_copies(paths).await;
+                let expanded = with_store_peer_variant_copies(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    paths,
+                )
+                .await;
                 let scans = VARIANT_STORE_SCANS.with(|scans| scans.borrow().clone());
                 (expanded, scans)
             })
@@ -5968,7 +6043,12 @@ mod tests {
             .stack_size(256 * 1024)
             .build()
             .unwrap();
-        let found = pool.install(|| NpmCrawler::find_local_node_modules_dirs(&root));
+        let found = pool.install(|| {
+            NpmCrawler::find_local_node_modules_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &root,
+            )
+        });
         assert_eq!(found, expected);
     }
 
@@ -6287,7 +6367,11 @@ mod tests {
             .unwrap();
         let primary = &found["pkg:npm/foo@1.0.0"][0].path;
         assert_eq!(primary, &nm.join("foo"));
-        assert_eq!(find_store_peer_variant_copies(primary).await, vec![twin]);
+        assert_eq!(
+            find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, primary)
+                .await,
+            vec![twin]
+        );
     }
 
     /// vlt fan-out gates: every real copy whose DepID decodes to the
@@ -6330,7 +6414,11 @@ mod tests {
         std::os::unix::fs::symlink(&primary, nm.join("foo")).unwrap();
 
         for start in [primary.clone(), nm.join("foo")] {
-            let mut got = find_store_peer_variant_copies(&start).await;
+            let mut got = find_store_peer_variant_copies(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &start,
+            )
+            .await;
             got.sort();
             let mut want = twins.to_vec();
             want.sort();
@@ -6429,7 +6517,11 @@ mod tests {
 
         // Standalone apply/rollback discovery gets a fresh scan and still
         // excludes only its own primary copy.
-        let copies = find_store_peer_variant_copies(&inputs[0]).await;
+        let copies = find_store_peer_variant_copies(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &inputs[0],
+        )
+        .await;
         assert_eq!(copies.len(), 1);
         assert_ne!(
             copies[0].canonicalize().unwrap(),
@@ -6581,7 +6673,8 @@ mod tests {
         assert_eq!(found["pkg:npm/@babel/code-frame@7.0.0"][0].path, frame);
 
         assert_eq!(
-            find_store_peer_variant_copies(&number).await,
+            find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, &number)
+                .await,
             vec![number_twin.clone()]
         );
     }
@@ -6624,14 +6717,22 @@ mod tests {
             .unwrap();
         assert_eq!(copy_paths(&found, &purl), vec![nm.join("left-pad")]);
 
-        let mut variants = find_store_peer_variant_copies(&nm.join("left-pad")).await;
+        let mut variants = find_store_peer_variant_copies(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &nm.join("left-pad"),
+        )
+        .await;
         variants.sort();
         let mut want = vec![alias.clone(), scoped_alias.clone()];
         want.sort();
         assert_eq!(variants, want);
 
         // VEX's every-installed-copy set sees the alias entries too.
-        let mut all = with_store_peer_variant_copies(vec![nm.join("left-pad")]).await;
+        let mut all = with_store_peer_variant_copies(
+            crate::utils::repo_root::ReadScope::Workspace,
+            vec![nm.join("left-pad")],
+        )
+        .await;
         all.sort();
         let mut want = vec![nm.join("left-pad"), alias.clone(), scoped_alias.clone()];
         want.sort();
@@ -6736,9 +6837,12 @@ mod tests {
                 "{store_name}: resolver walked a nested store: {found:?}"
             );
             assert!(
-                !find_store_peer_variant_copies(&outer)
-                    .await
-                    .contains(&nested_twin),
+                !find_store_peer_variant_copies(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &outer
+                )
+                .await
+                .contains(&nested_twin),
                 "{store_name}: peer fan-out walked a nested store"
             );
         }
@@ -6779,7 +6883,11 @@ mod tests {
                 entry_nm.join(".pnpm/@s+outer@1.0.0(react@18.2.0)/node_modules/@s/outer");
             write_pkg(&nested_twin, "@s/outer", "1.0.0");
 
-            let copies = find_store_peer_variant_copies(&outer).await;
+            let copies = find_store_peer_variant_copies(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &outer,
+            )
+            .await;
             assert!(
                 !copies.contains(&nested_twin),
                 "{outer_entry_nm}: peer fan-out walked a nested store: {copies:?}"
@@ -6807,7 +6915,11 @@ mod tests {
             write_pkg(&primary, "a", "1.0.0");
             write_pkg(&twin, "a", "1.0.0");
 
-            let copies = find_store_peer_variant_copies(&primary).await;
+            let copies = find_store_peer_variant_copies(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &primary,
+            )
+            .await;
             assert!(
                 copies.contains(&twin),
                 "{project}: peer fan-out dropped the project's store: {copies:?}"
@@ -6881,13 +6993,19 @@ mod tests {
                 "{store_rel}"
             );
 
-            let mut variants = find_store_peer_variant_copies(&foo).await;
+            let mut variants =
+                find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, &foo)
+                    .await;
             variants.sort();
             assert_eq!(variants, vec![foo_twin.clone()], "{store_rel}");
             // From a direct dep's importer link into the store too.
             link_dir(&foo, &nm.join("foo"));
             assert_eq!(
-                find_store_peer_variant_copies(&nm.join("foo")).await,
+                find_store_peer_variant_copies(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &nm.join("foo")
+                )
+                .await,
                 vec![foo_twin.clone()],
                 "{store_rel}"
             );
@@ -6920,7 +7038,11 @@ mod tests {
         let twin = inner_store.join("foo@1.0.0(react@16.14.0)/node_modules/foo");
         write_pkg(&primary, "foo", "1.0.0");
         write_pkg(&twin, "foo", "1.0.0");
-        assert_eq!(find_store_peer_variant_copies(&primary).await, vec![twin]);
+        assert_eq!(
+            find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, &primary)
+                .await,
+            vec![twin]
+        );
     }
 
     /// A relocated store counts only when it sits strictly below the
@@ -7282,7 +7404,11 @@ mod tests {
             assert_eq!(got, want, "{purl}");
         }
 
-        assert_eq!(find_store_peer_variant_copies(primary).await, twins);
+        assert_eq!(
+            find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, primary)
+                .await,
+            twins
+        );
     }
 
     /// #366 / #405: Bun's isolated linker keeps every package in
@@ -7772,7 +7898,8 @@ mod tests {
         );
         assert_eq!(paths("pkg:npm/left-pad@1.1.0"), vec![churned.clone()]);
         assert_eq!(
-            find_store_peer_variant_copies(&number).await,
+            find_store_peer_variant_copies(crate::utils::repo_root::ReadScope::Workspace, &number)
+                .await,
             vec![stale_number.clone()]
         );
 
@@ -8066,8 +8193,130 @@ mod tests {
         .await;
         // The fan-out from the importer link reaches the same store.
         assert_eq!(
-            find_store_peer_variant_copies(&nm.join("is-odd")).await,
+            find_store_peer_variant_copies(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("is-odd")
+            )
+            .await,
             Vec::<PathBuf>::new()
+        );
+    }
+
+    /// A yarn project inside a git checkout whose `nodeLinker: pnpm` and
+    /// `pnpmStoreFolder` come from a `.yarnrc.yml` ABOVE the checkout. A
+    /// global run reads that rc (it is unbounded), so its crawl, its
+    /// resolver, its peer fan-out and the shared-store write guard all see
+    /// the relocated store. A workspace run never reads it, so none of
+    /// them sees the store: the transitive copy is not found, and the
+    /// guard refuses the link into it as a source outside every
+    /// `node_modules` tree.
+    #[tokio::test]
+    async fn global_scope_reads_a_yarn_store_configured_above_the_repository() {
+        use crate::utils::repo_root::ReadScope;
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo = outer.join("repo");
+        let root = repo.join("proj");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("yarn.lock"), "").unwrap();
+        std::fs::write(
+            outer.join(".yarnrc.yml"),
+            "nodeLinker: pnpm\npnpmStoreFolder: repo/proj/store\n",
+        )
+        .unwrap();
+        let store = root.join("store");
+        let nm = root.join("node_modules");
+        let odd_entry = store.join("is-odd-npm-3.0.1-3e1a2b4c5d");
+        write_pkg(&odd_entry.join("package"), "is-odd", "3.0.1");
+        link_own_package(&odd_entry, "is-odd");
+        let number_entry = store.join("is-number-npm-6.0.0-9f8e7d6c5b");
+        let number = number_entry.join("package");
+        write_pkg(&number, "is-number", "6.0.0");
+        link_own_package(&number_entry, "is-number");
+        let twin_entry = store.join("is-number-npm-6.0.0-0a1b2c3d4e");
+        let number_twin = twin_entry.join("package");
+        write_pkg(&number_twin, "is-number", "6.0.0");
+        link_own_package(&twin_entry, "is-number");
+        link_dir(&number, &odd_entry.join("node_modules/is-number"));
+        std::fs::create_dir_all(&nm).unwrap();
+        link_dir(&odd_entry.join("package"), &nm.join("is-odd"));
+        let purls = vec!["pkg:npm/is-number@6.0.0".to_string()];
+
+        // Global: unbounded.
+        assert_eq!(
+            relocated_yarn_pnpm_store_sync(ReadScope::Global, &nm),
+            Some(store.clone())
+        );
+        let found = NpmCrawler::with_scope(ReadScope::Global)
+            .find_by_purls(&nm, &purls)
+            .await
+            .unwrap();
+        let mut got: Vec<PathBuf> = found["pkg:npm/is-number@6.0.0"]
+            .iter()
+            .map(|p| p.path.clone())
+            .collect();
+        got.sort();
+        let mut want = vec![number.clone(), number_twin.clone()];
+        want.sort();
+        assert_eq!(got, want);
+        assert_eq!(
+            find_store_peer_variant_copies(ReadScope::Global, &number).await,
+            vec![number_twin.clone()]
+        );
+        // Review finding 4: `apply --check` (and `vex`) expand copies with
+        // the run's scope, so a global check sees what a global apply
+        // writes.
+        assert_eq!(
+            with_store_peer_variant_copies(ReadScope::Global, vec![number.clone()]).await,
+            vec![number.clone(), number_twin.clone()]
+        );
+        assert_eq!(
+            with_store_peer_variant_copies(ReadScope::Workspace, vec![number.clone()]).await,
+            vec![number.clone()]
+        );
+        assert_eq!(
+            crate::patch::shared_store::shared_store_of(ReadScope::Global, &nm.join("is-odd"))
+                .await,
+            None,
+            "a link into the yarn store is an installed copy"
+        );
+        let global = CrawlerOptions {
+            cwd: root.clone(),
+            global: false,
+            global_prefix: Some(nm.clone()),
+        };
+        let crawled = NpmCrawler::for_options(&global).crawl_all(&global).await;
+        // The store-only transitive copy (one per purl).
+        assert!(
+            crawled
+                .iter()
+                .any(|p| p.purl == "pkg:npm/is-number@6.0.0" && p.path.starts_with(&store)),
+            "{crawled:?}"
+        );
+
+        // Workspace: the rc above the checkout is never read.
+        assert_eq!(
+            relocated_yarn_pnpm_store_sync(ReadScope::Workspace, &nm),
+            None
+        );
+        let found = NpmCrawler::with_scope(ReadScope::Workspace)
+            .find_by_purls(&nm, &purls)
+            .await
+            .unwrap();
+        assert!(found
+            .get("pkg:npm/is-number@6.0.0")
+            .is_none_or(Vec::is_empty));
+        assert!(
+            find_store_peer_variant_copies(ReadScope::Workspace, &number)
+                .await
+                .is_empty()
+        );
+        assert!(
+            crate::patch::shared_store::shared_store_of(ReadScope::Workspace, &nm.join("is-odd"))
+                .await
+                .is_some(),
+            "unknown store: the link is refused as a source outside every node_modules tree"
         );
     }
 
@@ -8126,7 +8375,10 @@ mod tests {
             let member_nm = root.join("packages").join("a").join("node_modules");
             std::fs::create_dir_all(&member_nm).unwrap();
             assert_eq!(
-                relocated_yarn_pnpm_store_sync(&member_nm),
+                relocated_yarn_pnpm_store_sync(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &member_nm
+                ),
                 Some(store.clone()),
                 "{folder}: member"
             );
@@ -8138,7 +8390,8 @@ mod tests {
             .unwrap();
             std::fs::create_dir_all(root.join("../shared")).unwrap();
             assert!(
-                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                relocated_yarn_pnpm_store_sync(crate::utils::repo_root::ReadScope::Workspace, &nm)
+                    .is_none(),
                 "{folder}: outside the project"
             );
 
@@ -8149,7 +8402,8 @@ mod tests {
             )
             .unwrap();
             assert!(
-                relocated_yarn_pnpm_store_sync(&nm).is_none(),
+                relocated_yarn_pnpm_store_sync(crate::utils::repo_root::ReadScope::Workspace, &nm)
+                    .is_none(),
                 "{folder}: node-modules linker"
             );
         }
@@ -8824,7 +9078,10 @@ mod tests {
                     }
                 }
             }
-            NpmCrawler::find_local_node_modules_dirs(&project)
+            NpmCrawler::find_local_node_modules_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &project,
+            )
         };
         let want = vec![project.join("specific")];
         for (project_rc, repo_rc) in [
@@ -8893,7 +9150,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let probe = root.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(NpmCrawler::find_local_node_modules_dirs(&probe));
+            let _ = tx.send(NpmCrawler::find_local_node_modules_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &probe,
+            ));
         });
         let roots = rx
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -8948,7 +9208,10 @@ mod tests {
         // Neither a stray file nor a dir without `node_modules` is a root.
         std::fs::write(v11.join("stray"), "").unwrap();
         std::fs::create_dir_all(v11.join("empty")).unwrap();
-        let roots = NpmCrawler::node_modules_paths_sync(&global_prefix_options(&v11));
+        let roots = NpmCrawler::node_modules_paths_sync(
+            crate::utils::repo_root::ReadScope::Global,
+            &global_prefix_options(&v11),
+        );
         assert_eq!(roots, vec![a, b, c]);
     }
 
@@ -8970,7 +9233,10 @@ mod tests {
         write_pnpm_global_install(&nm_v2, "aaa", true, true);
         std::fs::write(nm_v2.join(".modules.yaml"), "layoutVersion: 5\n").unwrap();
         for root in [legacy, npm, v1, nm_v2] {
-            let roots = NpmCrawler::node_modules_paths_sync(&global_prefix_options(&root));
+            let roots = NpmCrawler::node_modules_paths_sync(
+                crate::utils::repo_root::ReadScope::Global,
+                &global_prefix_options(&root),
+            );
             assert_eq!(roots, vec![root]);
         }
     }
@@ -8988,7 +9254,7 @@ mod tests {
             let v11 = tmp.path().join("global").join("v11");
             let a = write_pnpm_global_install(&v11, "aaa", direct_first, true);
             let b = write_pnpm_global_install(&v11, "bbb", !direct_first, true);
-            let crawler = NpmCrawler::new();
+            let crawler = NpmCrawler::with_scope(crate::utils::repo_root::ReadScope::Global);
             let purl = "pkg:npm/left-pad@1.3.0".to_string();
             let mut real: Vec<PathBuf> = Vec::new();
             for root in crawler

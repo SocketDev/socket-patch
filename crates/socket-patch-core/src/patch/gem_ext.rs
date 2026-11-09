@@ -1127,7 +1127,9 @@ fn list_inputs(scope: &NativeScope) -> String {
 /// native extension when the record changes a build input (see the module
 /// docs). A record without native inputs is applied exactly as
 /// [`apply_package_patch`] applies it.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_gem_package_patch(
+    read_scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -1139,8 +1141,16 @@ pub async fn apply_gem_package_patch(
     let (scope, copy) = scope_of(pkg_path, files).await;
     let plain = || async {
         GemApplied {
-            result: apply_package_patch(package_key, pkg_path, files, sources, dry_run, policy)
-                .await,
+            result: apply_package_patch(
+                read_scope,
+                package_key,
+                pkg_path,
+                files,
+                sources,
+                dry_run,
+                policy,
+            )
+            .await,
             warning: None,
         }
     };
@@ -1238,8 +1248,16 @@ pub async fn apply_gem_package_patch(
         .await
     };
 
-    let mut result =
-        apply_package_patch(package_key, pkg_path, files, sources, dry_run, policy).await;
+    let mut result = apply_package_patch(
+        read_scope,
+        package_key,
+        pkg_path,
+        files,
+        sources,
+        dry_run,
+        policy,
+    )
+    .await;
     if dry_run {
         // The build is not one made from these sources (the marker check
         // above), so a real run rebuilds it. With every source already

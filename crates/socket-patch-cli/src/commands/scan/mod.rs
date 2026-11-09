@@ -2231,7 +2231,7 @@ async fn run_scan(
     // The socket.yml root/ecosystem/package filters, after the flags
     // (which only narrow further) and after the prune-universe capture.
     if policy.judges_nested_roots() && args.common.ecosystem_selected(Ecosystem::Npm) {
-        let nm_roots = socket_patch_core::crawlers::NpmCrawler::new()
+        let nm_roots = socket_patch_core::crawlers::NpmCrawler::for_options(&crawler_options)
             .get_node_modules_paths(&crawler_options)
             .await
             .unwrap_or_default();

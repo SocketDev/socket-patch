@@ -614,7 +614,7 @@ pub(crate) async fn nested_project_skips(
     // keeps the package the root's, whatever copy the crawl kept.
     // An unreadable tree keeps every candidate the root's (the backend
     // then reports it), rather than dropping a package the root installs.
-    let crawler = socket_patch_core::crawlers::NpmCrawler::new();
+    let crawler = socket_patch_core::crawlers::NpmCrawler::for_options(options);
     let wanted: Vec<String> = candidates.keys().cloned().collect();
     let Ok(nm_roots) = crawler.get_node_modules_paths(options).await else {
         return Default::default();
