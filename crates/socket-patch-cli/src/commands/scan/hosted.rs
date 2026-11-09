@@ -551,7 +551,9 @@ async fn gem_stale_install_warnings(
             j.project_local,
             folded_cache.as_deref(),
         ));
-        out.stale_purls.insert(j.purl.clone());
+        // Every variant installed in this dir: VEX matches its exemptions
+        // qualifier-insensitively, so one left out would re-exempt the dir.
+        out.stale_purls.extend(j.purls.iter().cloned());
     }
 
     // Pass 3: standalone vendor/cache staleness — a committed archive whose
@@ -3355,6 +3357,39 @@ mod tests {
             out.unjudged_purls,
             std::collections::BTreeSet::from([GEM_PURL.to_string()]),
             "a copy nothing judged is never reported healthy"
+        );
+    }
+
+    /// Platform variants of one gem share its installed dir: a stale dir
+    /// marks every variant stale, since the same-run VEX exempts purls
+    /// qualifier-insensitively and one left out would re-exempt the dir.
+    #[tokio::test]
+    async fn gem_stale_dir_marks_every_variant_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let variant = format!("{GEM_PURL}?platform=ruby");
+        let confirmed = vec![
+            (GEM_PURL.to_string(), GEM_UUID.to_string()),
+            (variant.clone(), "variant-uuid".to_string()),
+        ];
+        let shas = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from(["0".repeat(64)]),
+        )]);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &confirmed,
+            &std::collections::BTreeMap::new(),
+            &shas,
+            &mut super::ViewFallback::offline(),
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "one dir, one warning");
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string(), variant])
         );
     }
 

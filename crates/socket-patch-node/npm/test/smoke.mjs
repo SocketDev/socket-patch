@@ -433,7 +433,6 @@ test('not_found failures map per method like the HTTP API 404', async () => {
   assert.equal(references.project.error, undefined)
   assert.deepEqual(references.project.redirected, [])
 
-
   const batch = await run({ searchPatchesBatch: notFound })
   assert.equal(batch.project.error?.code, 'patch_lookup_failed')
   assert.match(batch.project.error.message, /not_found/)
