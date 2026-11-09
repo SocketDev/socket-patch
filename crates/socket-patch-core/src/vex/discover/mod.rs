@@ -620,6 +620,21 @@ pub enum UnattestedKind {
     /// `.mvn/maven.config` redefines (`-D`, which Maven reads before the
     /// pom's `<properties>`): the build resolves that version, not the pin.
     MavenConfigOverride,
+    /// A pnpm lock's pin while any `pnpm-lock.<branch>.yaml` exists (#556),
+    /// whatever pnpm's `gitBranchLockfile` setting says (discovery reads no
+    /// environment, so the setting cannot be decided), or while the members
+    /// that install from their own lock cannot be listed to rule one out:
+    /// with the setting on, pnpm installs a branch from its own lock, which
+    /// no wiring reaches, so hosted mode withholds these locks and vendored
+    /// mode refuses the project.
+    PnpmGitBranchLock,
+    /// An npm or Bun pin of a package the project patches itself
+    /// (`patchedDependencies`, npm's lock-entry `patched` record; npm
+    /// #711, `bun patch` #367): the package manager applies the user's
+    /// diff on top of the locked tarball (npm) or keys it to another
+    /// resolution (Bun), so hosted and vendored mode leave the package
+    /// unwired and never confirm it.
+    UserPatchedDependency,
     /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
     /// build's local evidence does not verify, or under a build-wide
     /// blocker (stale or partial evidence, a `dependencyOverrides` /
@@ -696,6 +711,10 @@ pub enum CopyTarget {
     NpmName(String),
     /// Every ref.
     Any,
+    /// Exactly the ref of this canonical base purl wiring this patch uuid:
+    /// a mark for one ref that applies only if that ref survives every
+    /// contest.
+    Ref { purl: String, uuid: String },
 }
 
 /// A copy some build installs where no Socket wiring reaches, recorded by
@@ -725,6 +744,7 @@ impl UnwiredCopy {
                 .and_then(|(_, version)| npm_purl(name, version))
                 .is_some_and(|p| PurlKey::same(&p, &r.purl)),
             CopyTarget::Any => true,
+            CopyTarget::Ref { purl, uuid } => *uuid == r.uuid && PurlKey::same(purl, &r.purl),
         }
     }
 }
