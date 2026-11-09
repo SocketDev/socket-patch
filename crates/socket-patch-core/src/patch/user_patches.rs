@@ -392,7 +392,28 @@ impl UserPatchIndex {
         ecosystem: &'static str,
     ) -> Option<String> {
         let rel = file.view_rel();
-        match view.read_text(&rel).await {
+        // An ancestor workspace file or a member outside the project root:
+        // the walk's own [`Bound`] already admitted it, so read it straight
+        // from disk. The view's reads stay inside the project root (or the
+        // repository), which would silently drop this evidence and fail
+        // open.
+        let outside_root = file.rel.is_absolute()
+            || matches!(
+                file.rel.components().next(),
+                Some(std::path::Component::ParentDir)
+            );
+        // Ask for the disk root only then: a snapshot takes that as a read
+        // around its overlay.
+        let outside = if outside_root {
+            view.disk_root_reading([&file.rel])
+        } else {
+            None
+        };
+        let read = match outside {
+            Some(root) => read_regular_to_string(&root.join(&file.rel)).await,
+            None => view.read_text(&rel).await,
+        };
+        match read {
             Ok(text) => Some(strip_bom(&text).to_owned()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             // An in-memory link has no content to read: the engine refuses

@@ -45,16 +45,28 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     lock_files.sort();
     lock_files.dedup();
     let mut locks: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
     for rel in lock_files {
-        if let Some(text) = ctx.read_advisory_text(&rel).await {
-            locks.push((rel, text));
+        // An unreadable lock protects every npm package, as in the hosted
+        // engine and the disk scan, so the three never disagree.
+        match ctx.view.read_text(&rel).await {
+            Ok(text) => locks.push((rel, text)),
+            Err(_)
+                if matches!(
+                    ctx.view,
+                    crate::vendor::lock_inventory::ProjectView::Memory(_)
+                ) && ctx.view.is_symlink(&rel) => {}
+            Err(e) => unreadable.push((rel, e)),
         }
     }
     let locks: Vec<(&str, &str)> = locks
         .iter()
         .map(|(rel, text)| (rel.as_str(), text.as_str()))
         .collect();
-    let index = UserPatchIndex::npm_family_in(&ctx.view, &locks).await;
+    let mut index = UserPatchIndex::npm_family_in(&ctx.view, &locks).await;
+    for (rel, e) in &unreadable {
+        index.unreadable_lock(rel, e);
+    }
     if index.is_empty() {
         return;
     }

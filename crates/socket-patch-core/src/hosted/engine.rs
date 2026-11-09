@@ -404,6 +404,9 @@ pub async fn withhold_user_patched(
         }
         match view.read_text(rel).await {
             Ok(text) => read.push((rel.to_string(), text)),
+            // An in-memory link: the engine refuses a linked file on its
+            // own, as the walk's `read_view` leaves it to.
+            Err(_) if matches!(view, ProjectView::Memory(_)) && view.is_symlink(rel) => {}
             Err(e) => unreadable.push((rel, e)),
         }
     }
