@@ -345,12 +345,35 @@ jobs:
             echo "SOCKET_PATCH_MAVEN_E2E_REQUIRED=1"
           } >> "$GITHUB_ENV"
 
+      - name: Restore the Gradle ${{ matrix.gradle }} distribution
+        # ci.yml's e2e legs save this pinned zip from main; restoring it
+        # keeps a github.com release outage from failing these legs. See
+        # the matching step there.
+        id: gradle-dist-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
+          key: gradle-dist-${{ matrix.gradle }}-${{ runner.os }}
+
       - name: Install Gradle ${{ matrix.gradle }}
         shell: bash
         env:
           GRADLE_VERSION: ${{ matrix.gradle }}
         # Pinned digest, GitHub-release origin: see the script.
         run: scripts/install-gradle.sh "$GRADLE_VERSION" "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Save the Gradle ${{ matrix.gradle }} distribution
+        # The nightly saves the macOS and Windows zips ci.yml never fetches.
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.gradle-dist-cache.outputs.cache-hit != 'true'
+          && steps.gradle-dist-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
+          key: ${{ steps.gradle-dist-cache.outputs.cache-primary-key }}
 
       - name: Run the ${{ matrix.mode }} suites
         shell: bash

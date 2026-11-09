@@ -9,7 +9,9 @@
 # alone answering HTTP 500 for ~30 s used to fail a merge-queue leg. It is
 # only tried after the release download fails. The sha256 is pinned below
 # (from https://gradle.org/release-checksums/), so no checksum fetch can fail
-# either; a version without a pin fails closed.
+# either; a version without a pin fails closed. A zip already at
+# <dir>/gradle-<version>-bin.zip (CI restores one from the actions cache)
+# is used without any download when it matches that pin.
 #
 # Prints (stdout):
 #   SOCKET_PATCH_GRADLE_E2E_GRADLE=<launcher path>
@@ -36,25 +38,40 @@ esac
 mkdir -p "$DIR"
 zip="$DIR/gradle-$VERSION-bin.zip"
 file="gradle-$VERSION-bin.zip"
+
+# python, not sha256sum: the macOS runners have only shasum.
+verify() {
+  python -c 'import hashlib, sys; d = hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(); sys.exit(0 if d == sys.argv[2] else "sha256 mismatch: got " + d)' "$zip" "$sha"
+}
+
 fetched=""
+if [ -f "$zip" ]; then
+  if verify; then
+    echo "install-gradle.sh: using the cached $file" >&2
+    fetched=1
+  else
+    rm -f "$zip"
+  fi
+fi
 # --ssl-revoke-best-effort: Windows curl (schannel) otherwise fails when the
 # CA's revocation endpoint is unreachable.
-for url in \
-  "https://github.com/gradle/gradle-distributions/releases/download/v$VERSION/$file" \
-  "https://services.gradle.org/distributions/$file"; do
-  if curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$zip"; then
-    fetched=1
-    break
-  fi
-  echo "install-gradle.sh: download from $url failed" >&2
-done
+if [ -z "$fetched" ]; then
+  for url in \
+    "https://github.com/gradle/gradle-distributions/releases/download/v$VERSION/$file" \
+    "https://services.gradle.org/distributions/$file"; do
+    if curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort "$url" -o "$zip"; then
+      fetched=1
+      break
+    fi
+    echo "install-gradle.sh: download from $url failed" >&2
+  done
+fi
 if [ -z "$fetched" ]; then
   echo "install-gradle.sh: every origin failed for Gradle $VERSION" >&2
   exit 1
 fi
 
-# python, not sha256sum: the macOS runners have only shasum.
-python -c 'import hashlib, sys; d = hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest(); sys.exit(0 if d == sys.argv[2] else "sha256 mismatch: got " + d)' "$zip" "$sha"
+verify
 unzip -q "$zip" -d "$DIR"
 launcher="$DIR/gradle-$VERSION/bin/gradle"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) launcher="$launcher.bat" ;; esac
