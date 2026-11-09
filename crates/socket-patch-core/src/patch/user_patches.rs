@@ -1008,29 +1008,8 @@ impl UserPatchIndex {
 }
 
 /// Which project files a run may read, chosen once from the CLI mode
-/// (never inferred from the filesystem). The same shape as #2025's
-/// `utils::repo_root::ReadScope`, which replaces it when the two meet.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReadScope {
-    /// A project run (the default `--cwd` project): project files are read
-    /// only inside the git repository root.
-    Workspace,
-    /// A global run (`--global` / `--global-prefix`): files are read
-    /// wherever they live on the system.
-    Global,
-}
-
-impl ReadScope {
-    /// The scope of a run whose global flag (`--global` or
-    /// `--global-prefix`) is `global`.
-    pub fn of_global(global: bool) -> Self {
-        if global {
-            ReadScope::Global
-        } else {
-            ReadScope::Workspace
-        }
-    }
-}
+/// (never inferred from the filesystem): #2025's shared scope.
+pub use crate::utils::repo_root::ReadScope;
 
 /// What a [`UserPatchIndex::walk`] reads.
 #[derive(Clone, Copy, PartialEq, Eq)]

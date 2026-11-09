@@ -471,12 +471,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     // The same PnP gate `apply` runs: a PnP tree hides every npm copy, so
     // without it each npm patch would read as not installed and pass calm.
     if matches!(
-        detect_npm_pkg_manager(&args.common.cwd),
+        detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd),
         NpmPkgManager::YarnBerryPnP
     ) && eco_in_local_scope(&args.common, Ecosystem::Npm)
         && manifest_targets_npm(&tree)
     {
         return refuse_yarn_pnp(args);
+    }
+    // The same cargo gate `apply` runs (see [`cargo_config_outside_root`]).
+    if let Some(why) = cargo_config_outside_root(args, &tree) {
+        return refuse_cargo_config_outside_root(args, &why, &[]);
     }
     let mut in_sync: Vec<String> = Vec::new();
     let mut not_installed: Vec<String> = Vec::new();
@@ -948,6 +952,52 @@ pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent
 /// True when the manifest records at least one npm patch — the only kind a
 /// PnP layout can block (a polyglot repo's pypi/gem/go patches live outside
 /// `node_modules` and apply fine).
+/// The refusal code of [`cargo_config_outside_root`].
+const CARGO_CONFIG_OUTSIDE_ROOT: &str = "cargo_config_outside_root";
+
+/// Why a workspace apply cannot patch this project's Cargo crates: a
+/// `.cargo/config` / `config.toml` sits above the repository root (stat
+/// only; it is never read), and cargo merges it into the build, so it may
+/// replace crates.io with another source while apply patches the shared
+/// registry cache. `None` for a global run, a run without Cargo patches
+/// or a project that is no Cargo project.
+fn cargo_config_outside_root(args: &ApplyArgs, manifest: &PatchManifest) -> Option<String> {
+    let cwd = &args.common.cwd;
+    if !eco_in_local_scope(&args.common, Ecosystem::Cargo)
+        || !manifest
+            .patches
+            .keys()
+            .any(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Cargo))
+        || !(cwd.join("Cargo.toml").is_file() || cwd.join("Cargo.lock").is_file())
+    {
+        return None;
+    }
+    socket_patch_core::vendor::cargo_config::config_above_repo(cwd).map(|why| {
+        format!(
+            "{why}: it may replace crates.io with another source, so the registry copy apply \
+             patches may not be what cargo builds; move the settings into the repository's \
+             .cargo/config.toml (or run with --global to patch the registry cache anyway)"
+        )
+    })
+}
+
+/// Print the [`cargo_config_outside_root`] refusal and return the exit
+/// code.
+fn refuse_cargo_config_outside_root(args: &ApplyArgs, why: &str, skipped: &[PatchEvent]) -> i32 {
+    if args.common.json {
+        let mut env = Envelope::new(Command::Apply);
+        env.dry_run = args.common.dry_run;
+        for skip in skipped {
+            env.record(skip.clone());
+        }
+        env.mark_error(EnvelopeError::new(CARGO_CONFIG_OUTSIDE_ROOT, why));
+        println!("{}", env.to_pretty_json());
+    } else {
+        eprintln!("Error: {why}");
+    }
+    1
+}
+
 fn manifest_targets_npm(manifest: &PatchManifest) -> bool {
     manifest
         .patches
@@ -1061,7 +1111,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
         // filter excluding npm never touches it.
         if eco_in_local_scope(&args.common, Ecosystem::Npm)
             && matches!(
-                detect_npm_pkg_manager(&args.common.cwd),
+                detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd),
                 NpmPkgManager::YarnBerryPnP
             )
         {
@@ -1388,7 +1438,17 @@ pub(crate) async fn run_locked(
     // informational note; the substantive safety is core's rename-over
     // write (`utils::fs::atomic_write_bytes` never touches the store's
     // shared inode).
-    match detect_npm_pkg_manager(&args.common.cwd) {
+    // A cargo config above the repository root is never read in a
+    // workspace run; it may move crates.io elsewhere, so the Cargo patches
+    // refuse instead of patching the registry cache blind.
+    if let Some(why) = cargo_config_outside_root(&args, &manifest) {
+        let code = refuse_cargo_config_outside_root(&args, &why, &user_patch_skips);
+        return ApplyRunReport {
+            skipped: user_patch_skips,
+            ..ApplyRunReport::run_failure(code, CARGO_CONFIG_OUTSIDE_ROOT, why)
+        };
+    }
+    match detect_npm_pkg_manager(args.common.read_scope(), &args.common.cwd) {
         NpmPkgManager::YarnBerryPnP => {
             if eco_in_local_scope(&args.common, Ecosystem::Npm) && manifest_targets_npm(&manifest) {
                 let code = refuse_yarn_pnp_with_skips(&args, &user_patch_skips);
@@ -1512,6 +1572,7 @@ pub(crate) async fn run_locked(
                 });
                 cache_warnings.extend(
                     socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                        args.common.read_scope(),
                         &args.common.cwd,
                         rewritten.map(|r| r.package_key.as_str()),
                     )
@@ -2712,6 +2773,7 @@ async fn apply_patches_inner(
                     // extension, or is refused with nothing written (#1996).
                     let result = if Ecosystem::from_purl(purl) == Some(Ecosystem::Gem) {
                         let applied = gem_ext::apply_gem_package_patch(
+                            args.common.read_scope(),
                             variant_purl,
                             pkg_path,
                             &patch.files,
@@ -2735,6 +2797,7 @@ async fn apply_patches_inner(
                         applied.result
                     } else {
                         apply_package_patch(
+                            args.common.read_scope(),
                             variant_purl,
                             pkg_path,
                             &patch.files,
@@ -2892,6 +2955,7 @@ async fn apply_patches_inner(
                         }
                         None => {
                             apply_package_patch(
+                                args.common.read_scope(),
                                 purl,
                                 pkg_path,
                                 &patch.files,
@@ -3423,6 +3487,7 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
                 }
                 attempted = true;
                 let mut result = apply_package_patch(
+                    args.common.read_scope(),
                     variant,
                     &dir,
                     &files,
@@ -3443,6 +3508,7 @@ async fn apply_maven_base(m: &MavenBase<'_>) -> MavenApplied {
             if copy_attempted && !absent.is_empty() {
                 attempted = true;
                 let result = apply_package_patch(
+                    args.common.read_scope(),
                     variant,
                     copy,
                     &absent,
@@ -3742,6 +3808,58 @@ mod tests {
     use socket_patch_core::patch::apply::{
         AppliedVia as CoreAppliedVia, ApplyResult, VerifyResult, VerifyStatus,
     };
+
+    /// Review finding 3: a workspace apply of Cargo patches refuses when a
+    /// `.cargo/config.toml` above the repository root (never read) may
+    /// replace crates.io; a global run, or one without it, does not.
+    #[test]
+    fn cargo_patches_refuse_under_a_cargo_config_above_the_repository() {
+        #[derive(clap::Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            args: ApplyArgs,
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = std::fs::canonicalize(tmp.path()).unwrap();
+        let app = outer.join("repo");
+        std::fs::create_dir_all(app.join(".git")).unwrap();
+        std::fs::write(app.join("Cargo.toml"), "[package]\nname = \"app\"\n").unwrap();
+        let record: socket_patch_core::manifest::schema::PatchRecord =
+            serde_json::from_value(serde_json::json!({
+                "uuid": "11111111-1111-4111-8111-111111111111",
+                "exportedAt": "",
+                "files": {},
+                "vulnerabilities": {},
+                "description": "",
+                "license": "",
+                "tier": "free",
+            }))
+            .unwrap();
+        let mut manifest = PatchManifest::default();
+        manifest
+            .patches
+            .insert("pkg:cargo/serde@1.0.0".to_string(), record);
+        let parse = |extra: &[&str]| {
+            let cwd = app.display().to_string();
+            let mut argv = vec!["t", "--cwd", cwd.as_str()];
+            argv.extend_from_slice(extra);
+            <Wrap as clap::Parser>::try_parse_from(argv).unwrap().args
+        };
+        assert_eq!(cargo_config_outside_root(&parse(&[]), &manifest), None);
+        std::fs::create_dir_all(outer.join(".cargo")).unwrap();
+        std::fs::write(
+            outer.join(".cargo/config.toml"),
+            "[source.crates-io]\nreplace-with = \"v\"\n[source.v]\ndirectory = \"vendor\"\n",
+        )
+        .unwrap();
+        let why = cargo_config_outside_root(&parse(&[]), &manifest).unwrap();
+        assert!(why.contains(".cargo/config.toml"), "{why}");
+        assert!(why.contains("outside the repository"), "{why}");
+        assert_eq!(
+            cargo_config_outside_root(&parse(&["--global"]), &manifest),
+            None
+        );
+    }
 
     /// A new-file collision's empty expected hash reads `(new file)` in the
     /// verbose summary; a real hash is shown as is.
