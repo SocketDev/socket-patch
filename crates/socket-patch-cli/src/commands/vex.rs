@@ -1044,6 +1044,11 @@ async fn generate_vex(
                      {version} is ignored and the build links the unpatched module",
                     entry.module
                 ),
+                Some(Selection::Unproven) => format!(
+                    "nothing shows the build selects {} {version}: {}",
+                    entry.module,
+                    socket_patch_core::vendor::go_build_list::UNPROVEN_REASON
+                ),
                 Some(Selection::Unknown)
                     if socket_patch_core::vendor::go_workspace::resolve(&root)
                         != socket_patch_core::vendor::go_workspace::GoWork::None =>
