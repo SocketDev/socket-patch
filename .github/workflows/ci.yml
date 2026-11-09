@@ -1613,8 +1613,9 @@ jobs:
         # setup-ruby downloads the prebuilt Ruby from a github.com release
         # and gives up after ~1 min of retries. On 2026-11-09 (nightly run
         # 42568829044) a ~4 min release-CDN 504 outage failed two gem legs
-        # and hosted-e2e here. Pause and try once more; a second failure
-        # is not a blip.
+        # and hosted-e2e here. Try once more, with setup-ruby's own ~1 min
+        # of retries again; a second failure is not a blip. (Attempt 2
+        # must be the very next step: test_merge_queue_fail_fast.py.)
         id: setup-ruby
         if: matrix.suite == 'e2e_gem' || matrix.bundler != ''
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
@@ -1635,11 +1636,6 @@ jobs:
           # (and cannot install bundler 1.x at all).
           bundler: 'none'
           bundler-cache: false
-
-      - name: Setup Ruby (pause before attempt 2)
-        if: (matrix.suite == 'e2e_gem' || matrix.bundler != '') && steps.setup-ruby.outcome != 'success'
-        shell: bash
-        run: sleep 60
 
       - name: Setup Ruby (attempt 2)
         if: (matrix.suite == 'e2e_gem' || matrix.bundler != '') && steps.setup-ruby.outcome != 'success'
@@ -2897,7 +2893,7 @@ jobs:
         run: scripts/pip-install-retry.sh uv && uv --version
 
       - name: Setup Ruby (attempt 1)
-        # Capped, paused and retried once, as in the e2e job.
+        # Capped and retried once, as in the e2e job.
         id: setup-ruby
         if: steps.gate.outputs.run == 'true'
         uses: ruby/setup-ruby@319994f95fa847cf3fb3cd3dbe89f6dcde9f178f # v1.295.0
@@ -2909,10 +2905,6 @@ jobs:
           # blips; setup-ruby's own install is a single bare `gem install`.
           bundler: 'none'
           bundler-cache: false
-
-      - name: Setup Ruby (pause before attempt 2)
-        if: (steps.gate.outputs.run == 'true') && steps.setup-ruby.outcome != 'success'
-        run: sleep 60
 
       - name: Setup Ruby (attempt 2)
         if: (steps.gate.outputs.run == 'true') && steps.setup-ruby.outcome != 'success'
