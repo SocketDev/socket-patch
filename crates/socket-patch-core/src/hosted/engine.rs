@@ -2210,7 +2210,7 @@ async fn unattributed_pins(
         for c in discovery.unpatched_copies.iter().filter(|c| {
             c.purl == r.purl
                 && c.file == r.source_file
-                && c.part == r.part
+                && r.part.withheld_by(c.part)
                 && matches!(
                     c.file.file_name().and_then(|n| n.to_str()),
                     Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
