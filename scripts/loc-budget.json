@@ -2,6 +2,7 @@
   "groups": {
     "lock-readers": {
       "paths": [
+        "crates/socket-patch-core/src/origin.rs",
         "crates/socket-patch-core/src/formats/",
         "crates/socket-patch-core/src/vex/discover/",
         "crates/socket-patch-core/src/vendor/lock_inventory/",
