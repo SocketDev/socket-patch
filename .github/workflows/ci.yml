@@ -461,16 +461,21 @@ jobs:
           go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
-      - name: Restore vexctl (macOS)
+      - name: Restore vexctl
         # The macOS compile below took a median 110s (max 168s) of every
         # macOS `test` job and is the step's only network flake source
-        # (sum.golang.org resets). Its output depends only on the vexctl
-        # version, the Go toolchain and the runner, so it is cached under
-        # exactly those. Saved from main only, like the cargo cache.
+        # (sum.golang.org resets). On Linux and Windows the release
+        # download is the only network step, and github.com release
+        # downloads return 504 for minutes at a time (2026-11-09 05:43 and
+        # 06:11 UTC), longer than curl's retries wait. The binary depends
+        # only on the vexctl version, the Go toolchain and the runner, so
+        # it is cached under exactly those. Saved from main only, like the
+        # cargo cache.
         id: vexctl-cache
-        if: needs.release-readiness.outputs.reuse != 'true' && runner.os == 'macOS'
+        if: needs.release-readiness.outputs.reuse != 'true'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
-        # Capped like `Cache cargo`: a miss only means compiling vexctl.
+        # Capped like `Cache cargo`: a miss only means fetching or
+        # compiling vexctl.
         timeout-minutes: 5
         continue-on-error: true
         with:
@@ -516,8 +521,11 @@ jobs:
             *) asset='' ;;
           esac
           if [ -n "$asset" ]; then
-            curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort -o "$dir/$bin" \
-              "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/$asset"
+            # A restored binary is checked against the same sha256.
+            if [ "$CACHE_HIT" != true ] || [ ! -f "$dir/$bin" ]; then
+              curl -fsSL --retry 5 --retry-all-errors --ssl-revoke-best-effort -o "$dir/$bin" \
+                "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/$asset"
+            fi
             echo "$sha  $dir/$bin" | sha256sum -c -
             chmod +x "$dir/$bin"
             "$dir/$bin" version
@@ -540,10 +548,9 @@ jobs:
           "$dir/vexctl" version
           echo "$dir" >> "$GITHUB_PATH"
 
-      - name: Save vexctl (macOS)
+      - name: Save vexctl
         if: >-
           needs.release-readiness.outputs.reuse != 'true'
-          && runner.os == 'macOS'
           && github.ref == 'refs/heads/main'
           && steps.vexctl-cache.outputs.cache-hit != 'true'
           && steps.vexctl-cache.outcome == 'success'
@@ -667,6 +674,8 @@ jobs:
     timeout-minutes: 35
     permissions:
       contents: read
+    env:
+      VEXCTL_VERSION: v0.3.0
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -714,22 +723,49 @@ jobs:
           go-version: '1.24.13' # exact: bump deliberately (#1645)
           cache: false
 
+      - name: Restore vexctl
+        # Cached like `test`'s vexctl so a github.com release outage
+        # doesn't fail this required job. Saved from main by shard 1.
+        id: vexctl-cache
+        if: needs.release-readiness.outputs.reuse != 'true'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/vexctl-bin
+          key: vexctl-${{ env.VEXCTL_VERSION }}-${{ runner.os }}-${{ runner.arch }}-coverage
+
       - name: Install vexctl
         if: needs.release-readiness.outputs.reuse != 'true'
         # The v0.3.0 Linux release binary, as in `test`'s vexctl step.
         env:
-          VEXCTL_VERSION: v0.3.0
           VEXCTL_SHA256_LINUX_AMD64: cd7f8b57d20642166ed4eb3dd1fd849bbb30bbd7c5b9f5b0316b6003b57ceaba
+          CACHE_HIT: ${{ steps.vexctl-cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           dir="$RUNNER_TEMP/vexctl-bin"
           mkdir -p "$dir"
-          curl -fsSL --retry 5 --retry-all-errors -o "$dir/vexctl" \
-            "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/vexctl-linux-amd64"
+          # A restored binary is checked against the same sha256.
+          if [ "$CACHE_HIT" != true ] || [ ! -f "$dir/vexctl" ]; then
+            curl -fsSL --retry 5 --retry-all-errors -o "$dir/vexctl" \
+              "https://github.com/openvex/vexctl/releases/download/$VEXCTL_VERSION/vexctl-linux-amd64"
+          fi
           echo "$VEXCTL_SHA256_LINUX_AMD64  $dir/vexctl" | sha256sum -c -
           chmod +x "$dir/vexctl"
           "$dir/vexctl" version
           echo "$dir" >> "$GITHUB_PATH"
+
+      - name: Save vexctl
+        if: >-
+          needs.release-readiness.outputs.reuse != 'true'
+          && github.ref == 'refs/heads/main'
+          && matrix.shard == 1
+          && steps.vexctl-cache.outputs.cache-hit != 'true'
+          && steps.vexctl-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/vexctl-bin
+          key: ${{ steps.vexctl-cache.outputs.cache-primary-key }}
 
       - name: Run tests with coverage
         if: needs.release-readiness.outputs.reuse != 'true'
