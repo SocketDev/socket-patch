@@ -2538,7 +2538,7 @@ fn cargo_manifest_package_id(
 /// in either the git-index or the sparse spelling. Compared the way cargo's
 /// `CanonicalUrl` does: host casing, a trailing `/` and a `.git` suffix do
 /// not make a different source (and github paths are case-insensitive).
-fn is_crates_io_source(source: &str) -> bool {
+pub(crate) fn is_crates_io_source(source: &str) -> bool {
     let url = source.trim();
     let url = url
         .strip_prefix("registry+")
