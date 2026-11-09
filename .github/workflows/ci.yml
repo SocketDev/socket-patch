@@ -218,6 +218,20 @@ jobs:
         # shellcheck is pre-installed on ubuntu-latest.
         run: shellcheck --shell=sh scripts/install.sh
 
+      - name: Shell — retry the installer's release downloads
+        # The three installer steps below fetch real release assets from
+        # github.com, and install.sh's `curl -fsSL` makes one attempt, so
+        # any release-CDN 504 failed this job (and ci-ok with it): twice on
+        # 2026-11-09 alone. curl reads $CURL_HOME/.curlrc, so the steps
+        # that run install.sh point CURL_HOME here and retry transient
+        # errors (timeouts, 408/429/5xx) with exponential backoff, ~2 min
+        # in all; a 404 or a checksum mismatch still fails at once. This
+        # stays out of install.sh itself: install.socket.dev serves a
+        # byte-for-byte copy of it (installer-drift.yml).
+        run: |
+          mkdir -p "$RUNNER_TEMP/curl-retry"
+          printf 'retry = 7\n' > "$RUNNER_TEMP/curl-retry/.curlrc"
+
       - name: Shell — run the installer end to end
         # shellcheck proves the script parses; this proves it installs. The
         # script is what install.socket.dev/patch serves and what the README
@@ -227,7 +241,7 @@ jobs:
         # Installs the LATEST RELEASE, not this checkout — on a version-bump PR
         # that is deliberately the previous version.
         run: |
-          sh scripts/install.sh
+          CURL_HOME="$RUNNER_TEMP/curl-retry" sh scripts/install.sh
           command -v socket-patch
           socket-patch --version
 
@@ -240,6 +254,7 @@ jobs:
         run: |
           SOCKET_PATCH_BASE_URL=https://github.com/SocketDev/socket-patch/releases \
           SOCKET_PATCH_INSTALL_DIR="$RUNNER_TEMP/alt-origin" \
+          CURL_HOME="$RUNNER_TEMP/curl-retry" \
             sh scripts/install.sh
           "$RUNNER_TEMP/alt-origin/socket-patch" --version
 
@@ -257,6 +272,7 @@ jobs:
           echo "install.socket.dev reports latest=$latest"
           SOCKET_PATCH_BASE_URL=https://install.socket.dev/patch/SocketDev/socket-patch/releases \
           SOCKET_PATCH_INSTALL_DIR="$RUNNER_TEMP/socket-origin" \
+          CURL_HOME="$RUNNER_TEMP/curl-retry" \
             sh scripts/install.sh
           installed=$("$RUNNER_TEMP/socket-origin/socket-patch" --version | awk '{print $NF}')
           if [ "$installed" != "$latest" ]; then
