@@ -1292,52 +1292,22 @@ fn rewrite_npm_lock(
     // would still stack the user's diff on the hosted bytes. Each present
     // lock is parsed ONCE, here, and the parse is handed to its rewrite;
     // only a lock that spells `"patched"` at all is walked for the gate.
-    let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
-        files.get("package.json").map(String::as_str),
-        None,
-    );
+    let mut user_patches =
+        NpmUserPatches::from_manifest(files.get("package.json").map(String::as_str));
     let parsed: Vec<(&str, Option<Value>)> = present
         .iter()
         .map(|lockfile| (*lockfile, parse_json_text(&files[*lockfile]).ok()))
         .collect();
-    let lock_patched: Vec<(String, String, &str, String)> = parsed
-        .iter()
-        .filter(|(lockfile, _)| files[*lockfile].contains("\"patched\""))
-        .filter_map(|(lockfile, lock)| Some((*lockfile, lock.as_ref()?)))
-        .flat_map(|(lockfile, lock)| {
-            npm_lock_entries(lock)
-                .into_iter()
-                .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
-                .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
-                .filter_map(|e| {
-                    let version = e.node.version?.to_string();
-                    Some((
-                        e.node.name.to_string(),
-                        version,
-                        lockfile,
-                        e.key.to_string(),
-                    ))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    for (lockfile, lock) in &parsed {
+        if let (Some(lock), true) = (lock, files[*lockfile].contains("\"patched\"")) {
+            user_patches.add_lock(lockfile, lock);
+        }
+    }
     let npm: Vec<&DepOverride> = npm
         .into_iter()
         .filter(|dep| {
             let fname = full_name(dep);
-            let source = if let Some(key) = crate::vendor::bun_lock_text::patched_dependency_key(
-                &user_patched,
-                &fname,
-                &dep.version,
-                &dep.artifact_url,
-            ) {
-                format!("package.json `patchedDependencies` has `{key}`")
-            } else if let Some((_, _, lockfile, key)) = lock_patched
-                .iter()
-                .find(|(name, version, _, _)| *name == fname && *version == dep.version)
-            {
-                format!("{lockfile} entry `{key}` carries npm's `patched` record")
-            } else {
+            let Some(source) = user_patches.source(&fname, &dep.version, &dep.artifact_url) else {
                 return true;
             };
             // A lock an earlier (pre-#711) hosted run already pinned keeps
@@ -1428,6 +1398,91 @@ pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
          `socket-patch scan --mode agent`",
         packages.join(", ")
     )
+}
+
+/// The packages a project patches itself with npm 12's native `npm patch`
+/// (#711), as the hosted npm rewriter's gate reads them: a root
+/// `package.json` `patchedDependencies` key, or the non-null `patched`
+/// record npm writes on a lock's `packages` dependency entry (lockfileVersion
+/// 4) in any present npm lock. npm applies that diff to every install of the
+/// package, whichever lock names it. `vex` discovery reads the same
+/// evidence, so it never attests a pin hosted mode refuses, and reads Bun's
+/// (`bun patch`, #367: the same manifest key, or the copy `bun.lock`
+/// mirrors, [`NpmUserPatches::add_mirrored_keys`]) through it too.
+#[derive(Debug, Default)]
+pub(crate) struct NpmUserPatches {
+    /// The `patchedDependencies` keys: the root manifest's, then any only a
+    /// lock mirrors.
+    keys: Vec<String>,
+    /// `(key, lockfile)` of each key only a lock mirrors.
+    mirrored: Vec<(String, String)>,
+    /// `(name, version, lockfile, entry key)` of every lock entry carrying
+    /// a `patched` record.
+    locked: Vec<(String, String, String, String)>,
+}
+
+impl NpmUserPatches {
+    /// The root `package.json`'s `patchedDependencies` keys (none when
+    /// `manifest` is absent or unparseable).
+    pub(crate) fn from_manifest(manifest: Option<&str>) -> Self {
+        NpmUserPatches {
+            keys: crate::vendor::bun_lock_text::patched_dependency_keys(manifest, None),
+            ..Self::default()
+        }
+    }
+
+    /// Add the `patchedDependencies` keys the text lock `lockfile`
+    /// (`bun.lock`) mirrors at its top that the manifest does not have.
+    pub(crate) fn add_mirrored_keys(&mut self, lockfile: &str, lock: &str) {
+        for key in crate::vendor::bun_lock_text::patched_dependency_keys(None, Some(lock)) {
+            if !self.keys.contains(&key) {
+                self.mirrored.push((key.clone(), lockfile.to_string()));
+                self.keys.push(key);
+            }
+        }
+    }
+
+    /// Add the `patched` records of the parsed npm lock `lockfile`.
+    pub(crate) fn add_lock(&mut self, lockfile: &str, lock: &Value) {
+        let patched = npm_lock_entries(lock)
+            .into_iter()
+            .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
+            .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
+            .filter_map(|e| {
+                let version = e.node.version?.to_string();
+                Some((
+                    e.node.name.to_string(),
+                    version,
+                    lockfile.to_string(),
+                    e.key.to_string(),
+                ))
+            });
+        self.locked.extend(patched);
+    }
+
+    /// Why `name@version` counts as patched by the project itself, for a
+    /// warning or diagnostic, when it does. `target` is what the wiring
+    /// resolves the package to (the hosted URL, or the vendored tarball
+    /// path): a `patchedDependencies` key naming exactly it is no conflict
+    /// ([`crate::vendor::bun_lock_text::patched_dependency_key`]).
+    pub(crate) fn source(&self, name: &str, version: &str, target: &str) -> Option<String> {
+        if let Some(key) =
+            crate::vendor::bun_lock_text::patched_dependency_key(&self.keys, name, version, target)
+        {
+            let file = self
+                .mirrored
+                .iter()
+                .find(|(k, _)| k == key)
+                .map_or("package.json", |(_, lockfile)| lockfile.as_str());
+            return Some(format!("{file} `patchedDependencies` has `{key}`"));
+        }
+        self.locked
+            .iter()
+            .find(|(n, v, _, _)| n == name && v == version)
+            .map(|(_, _, lockfile, key)| {
+                format!("{lockfile} entry `{key}` carries npm's `patched` record")
+            })
+    }
 }
 
 /// Leave `dep` on its registry entry because the project patches it with
