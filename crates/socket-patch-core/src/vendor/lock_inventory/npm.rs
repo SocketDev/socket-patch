@@ -13,7 +13,6 @@ use crate::constants::npm_family::NPM_LOCKS;
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::npm_common::declares_bundled_deps;
 use crate::vendor::npm_origin::legacy_packages_key;
-use crate::vendor::path::parse_vendor_path;
 
 use super::view::ProjectView;
 use super::{http_url, LockIntegrity, LockfileEntry};
@@ -440,7 +439,7 @@ pub(super) async fn inventory_package_lock_in(
         // Our own vendored spec: not a registry dependency.
         if node
             .resolved
-            .is_some_and(|r| parse_vendor_path(r).is_some())
+            .is_some_and(|r| crate::vendor::path::recognize_vendor_path_anywhere(r).is_some())
         {
             continue;
         }

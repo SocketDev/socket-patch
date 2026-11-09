@@ -504,7 +504,9 @@ impl<'t> PnpmLock<'t> {
                 .map(|i| LockIntegrity::Sri(i.to_string()))
                 .unwrap_or(LockIntegrity::None);
             let tarball = resolution.and_then(|r| r.tarball());
-            if tarball.is_some_and(|t| parse_vendor_path(t).is_some()) {
+            if tarball
+                .is_some_and(|t| crate::vendor::path::recognize_vendor_path_anywhere(t).is_some())
+            {
                 continue;
             }
             let mut entry =

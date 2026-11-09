@@ -682,13 +682,13 @@ fn ga_versions(
 
 fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
     let mut map: BTreeMap<(String, String), GaVersions> = BTreeMap::new();
-    // A classifier variant (`sources`, `tests`, a native build) is its own
-    // artifact, managed apart from the main jar: its version neither pins
-    // nor shadows the main jar's.
-    for dep in deps
-        .iter()
-        .filter(|d| !d.in_profile && d.classifier.is_none())
-    {
+    // A variant (a classifier: `sources`, `tests`, a native build; or a
+    // type such as `test-jar`) is its own artifact, managed apart from the
+    // main jar: its version neither pins nor shadows the main jar's.
+    for dep in deps.iter().filter(|d| {
+        !d.in_profile
+            && !crate::formats::maven::is_variant(d.type_text.as_deref(), d.classifier.as_deref())
+    }) {
         let Some(version) = &dep.version else {
             continue;
         };
@@ -703,11 +703,6 @@ fn group_by_ga(deps: &[PomDep]) -> BTreeMap<(String, String), GaVersions> {
     }
     map
 }
-
-/// The classifiers whose jars never run on a classpath. Every other
-/// classifier copy of a pinned GA (tests, a native or JDK-specific build)
-/// executes, so it must resolve the patched release too.
-const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
 
 /// The first live executable classifier copy of `group:artifact` that does
 /// not resolve `pinned`, with the version it resolves (`None` when this pom
@@ -724,18 +719,34 @@ fn unpatched_executable_classifier<'a>(
     deps.iter()
         .filter(of_ga)
         .filter(|d| !d.managed)
-        .filter_map(|d| {
-            let classifier = d.classifier.as_deref()?;
-            (!NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)).then_some((d, classifier))
+        .filter(|d| {
+            let (t, c) = (d.type_text.as_deref(), d.classifier.as_deref());
+            crate::formats::maven::is_variant(t, c)
+                && crate::formats::maven::is_executable_variant(t, c)
         })
-        .find_map(|(d, classifier)| {
+        .find_map(|d| {
+            // Management is keyed by type and classifier too.
             let version = d.version.as_deref().or_else(|| {
                 deps.iter()
                     .filter(of_ga)
-                    .find(|m| m.managed && m.classifier.as_deref() == Some(classifier))
+                    .find(|m| {
+                        let ty = |t: &Option<String>| {
+                            t.as_deref()
+                                .filter(|t| !t.is_empty())
+                                .unwrap_or("jar")
+                                .to_string()
+                        };
+                        m.managed
+                            && m.classifier == d.classifier
+                            && ty(&m.type_text) == ty(&d.type_text)
+                    })
                     .and_then(|m| m.version.as_deref())
             });
-            (version != Some(pinned)).then_some((classifier, version))
+            let label = crate::formats::maven::variant_label(
+                d.type_text.as_deref(),
+                d.classifier.as_deref(),
+            );
+            (version != Some(pinned)).then_some((label, version))
         })
 }
 
@@ -1120,6 +1131,14 @@ mod tests {
             ),
             // No version this pom gives it (a parent's): fail closed.
             (classified("tests", None), String::new()),
+            // A type implying an executable classifier (the vendored
+            // reactor's rule): `test-jar` is the `tests` jar.
+            (
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 <version>1.7.36</version><type>test-jar</type></dependency>\n"
+                    .to_string(),
+                String::new(),
+            ),
         ];
         for (deps, managed) in &unattested {
             let out = run(&project(deps, managed)).await;

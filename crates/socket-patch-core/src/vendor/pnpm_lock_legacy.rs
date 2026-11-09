@@ -62,11 +62,11 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::read_regular_to_string;
 
 use super::common::refused;
-use super::path::parse_vendor_path;
+use super::path::parse_vendor_path_or_machine_absolute;
 use super::pnpm_lock::{
     dep_field_lines, drifted, lines_value, merge_live_dep_refs, ref_record_blocks, removed,
-    revert_overrides_line, same_modulo_dep_refs, value_lines, vendor_value_is_for, DepRef, EditCtx,
-    PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    revert_overrides_line, same_modulo_dep_refs, value_lines, DepRef, EditCtx, PnpmDialect,
+    KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -175,11 +175,12 @@ impl Ctx<'_> {
     }
 
     /// Does `value` point at OUR vendored tarball for THIS name@version
-    /// (any uuid, relative or the machine-absolute specifier spelling —
-    /// `parse_vendor_path` anchors on `.socket/vendor/` anywhere in the
-    /// string)?
+    /// (any uuid; root-relative, or the machine-absolute specifier spelling
+    /// pnpm <= 8 records — never a relative `../` escape)?
     fn is_ours(&self, value: &str) -> bool {
-        vendor_value_is_for(value, self.name, self.version)
+        parse_vendor_path_or_machine_absolute(value).is_some_and(|p| {
+            p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(self.name, self.version)
+        })
     }
 
     /// The peer-suffix marker this grammar appends to a version/key
@@ -985,7 +986,7 @@ fn revert_value_line(
             .as_ref()
             .and_then(Value::as_str)
             .is_some_and(|new| rest == new || rest == yaml_value(new))
-            || parse_vendor_path(unquote_value(rest))
+            || parse_vendor_path_or_machine_absolute(unquote_value(rest))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
@@ -1061,7 +1062,8 @@ fn revert_root_dep_pair(
             .and_then(|n| n.get("version"))
             .and_then(Value::as_str);
         let ours = Some(live_ver.as_str()) == new_ver
-            || parse_vendor_path(&live_ver).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+            || parse_vendor_path_or_machine_absolute(&live_ver)
+                .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "root dep `{key}` was re-resolved since vendoring ({live_ver}); left alone"
@@ -1131,8 +1133,8 @@ fn revert_package_block(
             continue;
         }
         let live: Vec<String> = lines[block.header..block.end].to_vec();
-        let key_is_ours =
-            parse_vendor_path(new_key).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        let key_is_ours = parse_vendor_path_or_machine_absolute(new_key)
+            .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if live != new_lines && !key_is_ours {
             warnings.push(drifted(format!(
                 "packages entry `{new_key}` was changed since vendoring; left alone"
@@ -1214,6 +1216,7 @@ fn revert_pkg_dep_ref(
         entry_uuid,
         label: "dep ref",
         dep_maps_only: true,
+        parse: parse_vendor_path_or_machine_absolute,
     };
     for (header, block_end) in ref_record_blocks(lines, start, end, pkg_key) {
         if target.restore_in(lines, header, block_end, dirty, warnings) {
