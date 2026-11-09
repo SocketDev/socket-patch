@@ -228,6 +228,7 @@ pub(crate) mod sbt;
 pub use sbt::{
     DIAG_SBT_OWNED_FILE_MODIFIED, DIAG_SBT_RESOLUTION_UNVERIFIED, DIAG_VENDORED_TREE_MISSING,
 };
+pub(crate) mod user_patched;
 pub(crate) mod vlt;
 pub(crate) mod yarn;
 
@@ -656,12 +657,15 @@ pub enum UnattestedKind {
     /// no wiring reaches, so hosted mode withholds these locks and vendored
     /// mode refuses the project.
     PnpmGitBranchLock,
-    /// An npm or Bun pin of a package the project patches itself
-    /// (`patchedDependencies`, npm's lock-entry `patched` record; npm
-    /// #711, `bun patch` #367): the package manager applies the user's
-    /// diff on top of the locked tarball (npm) or keys it to another
-    /// resolution (Bun), so hosted and vendored mode leave the package
-    /// unwired and never confirm it.
+    /// An npm-family pin of a package the project patches itself: npm's
+    /// and Bun's `patchedDependencies` and npm's lock-entry `patched`
+    /// record (npm #711, `bun patch` #367), pnpm's `patchedDependencies`,
+    /// a yarn berry `patch:` descriptor, or a patch-package patch
+    /// ([`user_patched`]). The package manager applies the user's diff on
+    /// top of the locked tarball (npm, pnpm, yarn, patch-package) or keys
+    /// it to another resolution (Bun), so the install never runs the
+    /// Socket patch alone; hosted and vendored mode leave the package
+    /// unwired unless the user explicitly consents.
     UserPatchedDependency,
     /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
     /// build's local evidence does not verify, or under a build-wide
@@ -1638,6 +1642,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
     vlt::extract(&ctx, &mut out).await;
+    user_patched::extract(&ctx, &mut out).await;
     ctx.ecosystem = "cargo";
     cargo::extract(&ctx, &mut out).await;
     ctx.ecosystem = "golang";

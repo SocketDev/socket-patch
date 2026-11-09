@@ -247,8 +247,9 @@ const NOTE_CARGO_PATCH_BYPASSED: &str = "vex_cargo_patch_bypassed";
 /// `pnpm-lock.<branch>.yaml` exists, which pnpm installs from instead when
 /// `gitBranchLockfile` is on; its presence withholds (`vex::Unattested`).
 const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
-/// Omission tag and note: an npm or Bun pin's package is one the project
-/// patches itself (`patchedDependencies`, `vex::Unattested`).
+/// Omission tag and note: an npm-family pin's package is one the project
+/// patches itself (npm / Bun / pnpm `patchedDependencies`, a yarn `patch:`
+/// descriptor, a patch-package patch; `vex::Unattested`).
 const NOTE_NPM_PATCHED_DEPENDENCY: &str = "vex_npm_patched_dependency";
 /// Omission tag and note: a vendored sbt pin the build's local resolution
 /// evidence does not verify, or under a build-wide blocker
@@ -330,10 +331,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::UserPatchedDependency => (
             NOTE_NPM_PATCHED_DEPENDENCY,
-            "not attested while the project patches the package itself (fold the Socket fix \
-             into your own patch, or remove the `patchedDependencies` entry and re-run); an \
-             npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
-             `socket-patch rollback <uuid>` restores the registry entry",
+            "not attested while the project patches the package itself, even when it was \
+             wired with `--allow-patch-conflicts` (fold the Socket fix into your own patch, or \
+             remove your patch: the `patchedDependencies` entry, the yarn `patch:` descriptor \
+             or the patch-package file, and re-run); an npm pin an earlier hosted run wrote \
+             fails `npm ci` with `EPATCHFAILED` until `socket-patch rollback <uuid>` restores \
+             the registry entry",
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,
