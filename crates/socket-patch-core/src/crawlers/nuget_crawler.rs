@@ -847,6 +847,7 @@ fn locate_libraries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_env::EnvGuard;
 
     #[test]
     fn test_parse_legacy_dir_name() {
@@ -1449,10 +1450,8 @@ mod tests {
     async fn test_nuget_home_env_var() {
         // Test that NUGET_PACKAGES env var is respected
         let custom = "/tmp/test-nuget-packages";
-        std::env::set_var("NUGET_PACKAGES", custom);
-        let home = nuget_home();
-        assert_eq!(home, Some(PathBuf::from(custom)));
-        std::env::remove_var("NUGET_PACKAGES");
+        let _env = EnvGuard::set("NUGET_PACKAGES", custom);
+        assert_eq!(nuget_home(), Some(PathBuf::from(custom)));
     }
 
     /// Regression: NuGet itself treats an empty `NUGET_PACKAGES` as unset
@@ -1463,13 +1462,8 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_nuget_home_empty_env_var_falls_back_to_default() {
-        let prev = std::env::var("NUGET_PACKAGES").ok();
-        std::env::set_var("NUGET_PACKAGES", "");
+        let _env = EnvGuard::set("NUGET_PACKAGES", "");
         let home = nuget_home().expect("a home directory");
-        match prev {
-            Some(v) => std::env::set_var("NUGET_PACKAGES", v),
-            None => std::env::remove_var("NUGET_PACKAGES"),
-        }
         assert!(
             home.ends_with(Path::new(".nuget").join("packages")),
             "empty NUGET_PACKAGES must fall back to ~/.nuget/packages, got {home:?}"
@@ -1886,6 +1880,27 @@ mod tests {
         }
     }
 
+    /// The one package [`crawl_local`]'s global packages folder holds.
+    const GLOBAL_ONLY: &str = "pkg:nuget/global.only@1.0.0";
+
+    /// Crawls `cwd` in project mode with the global packages folder
+    /// NuGet would restore into (search root 3) pointed at a tempdir that
+    /// holds only [`GLOBAL_ONLY`], so the result never reads the host's
+    /// `~/.nuget/packages` or a parallel test's `NUGET_PACKAGES` / `HOME`
+    /// (#2023), and an unscoped walk visibly includes root 3 while a
+    /// scoped crawl visibly leaves it out. Env is process-global: callers
+    /// are `#[serial]`.
+    async fn crawl_local(cwd: &Path) -> Vec<CrawledPackage> {
+        let global = tempfile::tempdir().unwrap();
+        let pkg = global.path().join("global.only").join("1.0.0");
+        tokio::fs::create_dir_all(&pkg).await.unwrap();
+        tokio::fs::write(pkg.join("global.only.nuspec"), "<package/>")
+            .await
+            .unwrap();
+        let _env = EnvGuard::set("NUGET_PACKAGES", global.path());
+        NuGetCrawler.crawl_all(&local(cwd)).await
+    }
+
     fn purls_of(packages: &[CrawledPackage]) -> Vec<String> {
         let mut purls: Vec<String> = packages.iter().map(|p| p.purl.clone()).collect();
         purls.sort();
@@ -1897,6 +1912,7 @@ mod tests {
     /// Red on main (serilog and the unresolved newtonsoft version were
     /// crawled).
     #[tokio::test]
+    #[serial_test::serial]
     async fn restored_project_crawls_only_its_resolved_packages() {
         let dir = tempfile::tempdir().unwrap();
         let cache = shared_cache(dir.path()).await;
@@ -1907,7 +1923,7 @@ mod tests {
             .unwrap();
         write_assets(&app, &cache, app_libraries()).await;
 
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), ["pkg:nuget/newtonsoft.json@13.0.3"]);
     }
 
@@ -1915,6 +1931,7 @@ mod tests {
     /// produced for the same packages (name, version, purl and path), so
     /// every consumer of the crawl sees the same identity as before.
     #[tokio::test]
+    #[serial_test::serial]
     async fn located_rows_equal_the_walks_rows_for_resolved_packages() {
         let dir = tempfile::tempdir().unwrap();
         let cache = shared_cache(dir.path()).await;
@@ -1930,8 +1947,7 @@ mod tests {
             .filter(|p| p.purl == "pkg:nuget/newtonsoft.json@13.0.3")
             .map(|p| (p.name, p.version, p.purl, p.path))
             .collect();
-        let located: Vec<_> = NuGetCrawler
-            .crawl_all(&local(&app))
+        let located: Vec<_> = crawl_local(&app)
             .await
             .into_iter()
             .map(|p| (p.name, p.version, p.purl, p.path))
@@ -1941,6 +1957,7 @@ mod tests {
 
     /// Sub-project restores, at any depth, join the root project's scope.
     #[tokio::test]
+    #[serial_test::serial]
     async fn sub_project_restores_join_the_scope() {
         let dir = tempfile::tempdir().unwrap();
         let cache = shared_cache(dir.path()).await;
@@ -1962,7 +1979,7 @@ mod tests {
         )
         .await;
 
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(
             purls_of(&crawled),
             [
@@ -1975,8 +1992,10 @@ mod tests {
     /// No scope, so today's walk: a solution root (its projects' restores
     /// may sit deeper than one level), and a project not restored yet.
     #[tokio::test]
+    #[serial_test::serial]
     async fn solution_roots_and_unrestored_projects_keep_the_walk() {
         let every = [
+            GLOBAL_ONLY,
             "pkg:nuget/newtonsoft.json@12.0.1",
             "pkg:nuget/newtonsoft.json@13.0.3",
             "pkg:nuget/serilog@3.1.1",
@@ -1990,7 +2009,7 @@ mod tests {
             .await
             .unwrap();
         write_assets(&solution.join("App"), &cache, app_libraries()).await;
-        let crawled = NuGetCrawler.crawl_all(&local(&solution)).await;
+        let crawled = crawl_local(&solution).await;
         assert_eq!(purls_of(&crawled), every);
 
         // A project whose assets file has no `libraries` object.
@@ -2008,7 +2027,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every);
     }
 
@@ -2016,8 +2035,10 @@ mod tests {
     /// packages are never dropped: a sub-project two levels down with no
     /// restore, and one whose assets file has no `libraries`.
     #[tokio::test]
+    #[serial_test::serial]
     async fn an_uncovered_sub_project_keeps_the_walk() {
         let every = [
+            GLOBAL_ONLY,
             "pkg:nuget/newtonsoft.json@12.0.1",
             "pkg:nuget/newtonsoft.json@13.0.3",
             "pkg:nuget/serilog@3.1.1",
@@ -2035,7 +2056,7 @@ mod tests {
             .await
             .unwrap();
         write_assets(&app, &cache, app_libraries()).await;
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every, "unrestored sub-project");
 
         let obj = tests.join("obj");
@@ -2043,13 +2064,14 @@ mod tests {
         tokio::fs::write(obj.join("project.assets.json"), r#"{"version": 3}"#)
             .await
             .unwrap();
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(purls_of(&crawled), every, "assets without libraries");
     }
 
     /// The project-local `packages/` folder is the project's own, so it
     /// is still walked in full when the shared roots are scoped.
     #[tokio::test]
+    #[serial_test::serial]
     async fn project_local_packages_folder_is_still_walked() {
         let dir = tempfile::tempdir().unwrap();
         let cache = shared_cache(dir.path()).await;
@@ -2064,7 +2086,7 @@ mod tests {
             .unwrap();
         write_assets(&app, &cache, app_libraries()).await;
 
-        let crawled = NuGetCrawler.crawl_all(&local(&app)).await;
+        let crawled = crawl_local(&app).await;
         assert_eq!(
             purls_of(&crawled),
             [
