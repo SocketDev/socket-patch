@@ -1045,43 +1045,50 @@ fn uuid_on_a_foreign_host_is_not_a_hosted_reference() {
             assert_eq!(env["error"]["code"], "manifest_not_found", "{cell}: {env}");
             assert_eq!(request_count(&rt, &server), 0, "{cell}: network call");
 
-            // DOCUMENTED FALLBACK (vex_sources `redirect_record_live`): a
-            // uuid the discovery allowlist does not recognize is judged by
-            // the ledger's raw-text fallback, which accepts ANY host so a
-            // staging patch server used without `--patch-server-url` keeps
-            // working. The fallback never trusts the look-alike lock's pin:
-            // with verification on it attests only an installed tree that
-            // hashes to the record. (`--no-verify` trusts the ledger by
-            // definition — CLI_CONTRACT.md, "Patch hosts (manifest-less
-            // VEX)".)
+            // FAIL CLOSED (`Discovery::redirect_record_verdict`,
+            // `RecordLiveness::Undecided`): a pre-v5 redirect-ledger record
+            // whose lock entry resolves from a hosted-shaped url on an
+            // origin this run was not given (a staging patch server used
+            // without `--patch-server-url`, or a look-alike host) is never
+            // attested — not even by an installed tree that hashes to the
+            // record, not even under `--no-verify` — and is reported as
+            // `redirect_unwired` (CLI_CONTRACT.md, "Patch hosts
+            // (manifest-less VEX)"). Pass `--patch-server-url` for a
+            // non-production patch server.
             write_redirect_ledger(cwd, flavor, record(UUID));
-            let (code, env) = vex_json(cwd, &["--offline"]);
-            assert_omitted(
-                cwd,
-                code,
-                &env,
-                "package_not_found",
-                &format!("{cell} + ledger, not installed"),
-            );
-            install(cwd, b"tampered bytes\n");
-            let (code, env) = vex_json(cwd, &["--offline"]);
-            assert_omitted(
-                cwd,
-                code,
-                &env,
-                "hash_mismatch",
-                &format!("{cell} + ledger, tampered"),
-            );
-            install(cwd, PATCHED);
-            let (code, env) = vex_json(cwd, &["--offline"]);
-            assert_attested(
-                cwd,
-                code,
-                &env,
-                UUID,
-                "redirected",
-                &format!("{cell} + ledger, verified"),
-            );
+            for (state, bytes) in [
+                ("not installed", None),
+                ("tampered", Some(&b"tampered bytes\n"[..])),
+                ("hashes to the record", Some(PATCHED)),
+            ] {
+                if let Some(bytes) = bytes {
+                    install(cwd, bytes);
+                }
+                for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+                    let (code, env) = vex_json(cwd, extra);
+                    assert_omitted(
+                        cwd,
+                        code,
+                        &env,
+                        "redirect_unwired",
+                        &format!("{cell} + ledger, {state} {extra:?}"),
+                    );
+                    if !origin.contains('@') {
+                        // The note names the cause and the remedy.
+                        assert!(
+                            env["warnings"]
+                                .as_array()
+                                .is_some_and(|w| w.iter().any(|w| {
+                                    w["code"] == "vex_claim_unwired"
+                                        && w["detail"]
+                                            .as_str()
+                                            .is_some_and(|d| d.contains("--patch-server-url"))
+                                })),
+                            "{cell} + ledger, {state}: {env}"
+                        );
+                    }
+                }
+            }
         }
     }
 }

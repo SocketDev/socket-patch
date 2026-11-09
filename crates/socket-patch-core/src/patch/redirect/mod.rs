@@ -2142,60 +2142,21 @@ fn rewrite_cargo_with(
         }
         let other_versions =
             cargo_lock_other_versions(cargo_lock.as_deref(), &dep.name, &dep.version);
-        // The root manifest's `[workspace.dependencies]` verdicts feed its
-        // members' `workspace = true` inheritors.
-        let mut root_workspace: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
-        let mut toml_plans: Vec<(usize, CargoTomlPlan)> = Vec::new();
-        let mut excluded: Vec<(String, String)> = Vec::new();
-        let mut refused: Option<(String, String)> = None;
-        for (i, (path, text)) in manifests.iter().enumerate() {
-            match plan_cargo_toml(
-                text,
-                path,
-                &dep.name,
-                &dep.version,
-                &other_versions,
-                &reg,
-                &root_workspace,
-            ) {
-                Ok(plan) => {
-                    if let Err(reason) = validate_cargo_toml_pins(
-                        &plan.content,
-                        &dep.name,
-                        &dep.version,
-                        &other_versions,
-                        &reg,
-                        &plan.workspace,
-                        &root_workspace,
-                    ) {
-                        refused = Some((path.clone(), reason));
-                        break;
-                    }
-                    if path == "Cargo.toml" {
-                        root_workspace = plan.workspace.clone();
-                    }
-                    excluded.extend(plan.excluded.iter().map(|req| (path.clone(), req.clone())));
-                    if plan.found {
-                        toml_plans.push((i, plan));
-                    }
+        let (toml_plans, excluded) =
+            match plan_cargo_tomls(&manifests, &dep.name, &dep.version, &other_versions, &reg) {
+                Ok(planned) => planned,
+                Err((path, reason)) => {
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_cargo_toml_dep_unrewritable".into(),
+                        detail: format!(
+                            "{} in {path} cannot be pinned ({reason}); dependency skipped \
+                             (nothing rewritten)",
+                            dep.name
+                        ),
+                    });
+                    continue;
                 }
-                Err(reason) => {
-                    refused = Some((path.clone(), reason));
-                    break;
-                }
-            }
-        }
-        if let Some((path, reason)) = refused {
-            result.warnings.push(RewriteWarning {
-                code: "redirect_cargo_toml_dep_unrewritable".into(),
-                detail: format!(
-                    "{} in {path} cannot be pinned ({reason}); dependency skipped \
-                     (nothing rewritten)",
-                    dep.name
-                ),
-            });
-            continue;
-        }
+            };
         // Declared, but no declaration's requirement accepts the patched
         // version: cargo resolves each to another version, so a pin cannot
         // reach the locked one (the TS twin's requirement-coverage refusal).
@@ -3634,7 +3595,7 @@ fn validate_cargo_toml_pins(
     Ok(())
 }
 
-struct CargoTomlPlan {
+pub(crate) struct CargoTomlPlan {
     content: String,
     edits: Vec<FileEdit>,
     /// `false` when every occurrence already carried our registry (idempotent
@@ -3776,6 +3737,58 @@ fn cargo_lock_other_versions(lock: Option<&str>, crate_name: &str, version: &str
     let mut versions = lock.locked_versions(crate_name);
     versions.retain(|v| v != version);
     versions
+}
+
+/// The Cargo.toml half of a hosted pin of `crate_name`@`version` to
+/// registry `reg` across `manifests` (root `Cargo.toml` first, then the
+/// members, as `(path, text)`): each manifest's plan (by index) that found
+/// a declaration, and every requirement that excludes the version, by
+/// path — or the first refusal, `(path, reason)`, which skips the whole
+/// dependency. `vex` discovery runs it dry to say whether a re-scan can
+/// pin a declaration it found unpinned.
+#[allow(clippy::type_complexity)]
+pub(crate) fn plan_cargo_tomls(
+    manifests: &[(String, String)],
+    crate_name: &str,
+    version: &str,
+    other_versions: &[String],
+    reg: &str,
+) -> Result<(Vec<(usize, CargoTomlPlan)>, Vec<(String, String)>), (String, String)> {
+    // The root manifest's `[workspace.dependencies]` verdicts feed its
+    // members' `workspace = true` inheritors.
+    let mut root_workspace: BTreeMap<String, CargoWorkspaceEntry> = BTreeMap::new();
+    let mut toml_plans: Vec<(usize, CargoTomlPlan)> = Vec::new();
+    let mut excluded: Vec<(String, String)> = Vec::new();
+    for (i, (path, text)) in manifests.iter().enumerate() {
+        let plan = plan_cargo_toml(
+            text,
+            path,
+            crate_name,
+            version,
+            other_versions,
+            reg,
+            &root_workspace,
+        )
+        .map_err(|reason| (path.clone(), reason))?;
+        validate_cargo_toml_pins(
+            &plan.content,
+            crate_name,
+            version,
+            other_versions,
+            reg,
+            &plan.workspace,
+            &root_workspace,
+        )
+        .map_err(|reason| (path.clone(), reason))?;
+        if path == "Cargo.toml" {
+            root_workspace = plan.workspace.clone();
+        }
+        excluded.extend(plan.excluded.iter().map(|req| (path.clone(), req.clone())));
+        if plan.found {
+            toml_plans.push((i, plan));
+        }
+    }
+    Ok((toml_plans, excluded))
 }
 
 /// `Err` carries the refusal reason: an occurrence exists that cannot be
