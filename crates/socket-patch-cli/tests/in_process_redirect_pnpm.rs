@@ -3016,8 +3016,7 @@ async fn hosted_pnpm_file_tarball_copy_is_named() {
 /// lockfile document) and the project document installs only a `file:`
 /// copy of the same `name@version`. The scan pins the config dependency,
 /// and names the project's copy with `redirect_copy_unpatched`, since a
-/// VEX statement covers the release, not one install tree. Before, the
-/// env pin's copy check compared trees, so the copy went unnamed.
+/// VEX statement covers the release, not one install tree.
 #[tokio::test]
 #[serial]
 async fn hosted_pnpm_config_dependency_names_the_projects_file_copy() {

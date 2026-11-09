@@ -28635,8 +28635,8 @@ packages:
                 legacy_overrides_only,
                 "redirect_pnpm_entry_not_found",
             ),
-            // Code-review finding 3: another version vendored is not this
-            // one (the dep's version is simply not locked).
+            // Another version vendored is not this one (the dep's version
+            // is simply not locked).
             (
                 "another version vendored",
                 v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz"))
@@ -28646,9 +28646,7 @@ packages:
             // Lock-model 2b: the hint reads the key with the planning core's
             // `match_key`, the rule the vendored planner rekeys by, so the
             // artifact leaf names the release and the `version:` line is not
-            // consulted. Before, a rekey without a `version:` line was "not
-            // found" and one whose leaf names another release but whose
-            // `version:` line matched was "vendored".
+            // consulted.
             (
                 "a rekey without a version line",
                 v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"))
@@ -28675,7 +28673,7 @@ packages:
     /// only the `pnpm-lock.yaml`, so the hosted planner never rewrites the
     /// shrinkwrap and leaves it out of the all-or-nothing gate: debris in it
     /// (a key the splice cannot repoint, or pnpm 1's early shrinkwrap head)
-    /// no longer refuses the dependency in every lock. A `shrinkwrap.yaml`
+    /// refuses nothing. A `shrinkwrap.yaml`
     /// that is the only pnpm lock is still rewritten.
     #[test]
     fn pnpm_shrinkwrap_beside_a_pnpm_lock_is_shadowed() {

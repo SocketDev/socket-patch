@@ -6075,11 +6075,10 @@ async fn pnpm_rollback_keeps_tarball_under_workspace_include_tarball_url() {
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
 }
 
-/// #2009 review: pnpm 11+ records a config dependency bare in the env
-/// lockfile document even under `lockfileIncludeTarballUrl`, so a rollback
-/// of a pin in both documents gives the project entry its `tarball:` back
-/// and leaves the env entry bare. It used to write the project document's
-/// `tarball:` into the env entry too, a lock pnpm never writes.
+/// pnpm 11+ records a config dependency bare in the env lockfile document
+/// even under `lockfileIncludeTarballUrl`, so a rollback of a pin in both
+/// documents gives the project entry its `tarball:` back and leaves the env
+/// entry bare.
 #[tokio::test]
 #[serial]
 async fn pnpm_rollback_keeps_the_env_document_bare_under_include_tarball_url() {

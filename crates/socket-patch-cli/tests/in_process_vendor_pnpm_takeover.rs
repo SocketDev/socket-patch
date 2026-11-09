@@ -533,8 +533,7 @@ async fn scan_vendored_over_hosted_pnpm_plain_dep_still_takes_over() {
 
 /// Lock-model 2b (divergence N15): a CRLF `pnpm-lock.yaml` (a
 /// `core.autocrlf` checkout) takes over like its LF twin, and the vendored
-/// lock keeps its CRLF endings. It used to be refused
-/// (`vendor_lockfile_crlf_unsupported`) and keep the hosted pin.
+/// lock keeps its CRLF endings.
 #[tokio::test(flavor = "multi_thread")]
 async fn scan_vendored_over_hosted_pnpm_crlf_lock_takes_over_and_stays_crlf() {
     let server = MockServer::start().await;

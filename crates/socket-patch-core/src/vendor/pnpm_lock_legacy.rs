@@ -59,7 +59,6 @@ use serde_json::Value;
 
 use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
-use crate::utils::fs::read_regular_to_string;
 
 use super::common::refused;
 use super::path::parse_vendor_path_or_machine_absolute;
@@ -76,7 +75,7 @@ use crate::formats::pnpm::lines::{
     next_block, parse_key_line, section_bounds, split_lines, unquote_value, yaml_key,
     yaml_key_like, yaml_value,
 };
-use crate::formats::pnpm::{PnpmLock, PnpmLockGrammar};
+use crate::formats::pnpm::PnpmLockGrammar;
 
 /// The [`VendorEntry::flavor`] string legacy wirings are stamped with.
 /// Distinct from the v9 backend's `"pnpm"` so an older binary (which has no
@@ -330,11 +329,7 @@ pub(crate) async fn preflight_packages(
 /// (the `overrides:` declaration alone never counts); `None` when
 /// undeterminable — callers keep the entry, fail-safe.
 pub async fn pnpm_legacy_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
-        .await
-        .ok()?;
-    PnpmDialect::Legacy.check_lock(&text).ok()?;
-    Some(PnpmLock::parse(&text).vendored_in_use(&entry.uuid))
+    PnpmDialect::Legacy.entry_in_use(entry, project_root).await
 }
 
 impl LegacyLock {

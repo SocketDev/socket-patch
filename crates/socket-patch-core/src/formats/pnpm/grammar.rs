@@ -242,9 +242,11 @@ pub(crate) fn entry_bundled<'a>(entry: &Entry<'a>) -> Option<Bundled<'a>> {
 pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a str> {
     let key = unquote(key);
     let key = key.strip_prefix('/').unwrap_or(key);
+    // `name@version` or `name/version`, without allocating either.
     let suffix = key
-        .strip_prefix(&format!("{name}@{version}"))
-        .or_else(|| key.strip_prefix(&format!("{name}/{version}")))?;
+        .strip_prefix(name)?
+        .strip_prefix(['@', '/'])?
+        .strip_prefix(version)?;
     if suffix
         .chars()
         .next()

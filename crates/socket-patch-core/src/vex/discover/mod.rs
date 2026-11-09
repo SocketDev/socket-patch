@@ -1320,9 +1320,9 @@ impl Discovery {
                 .iter()
                 .find(|c| c.purl == r.purl && c.file == r.source_file && r.part.withheld_by(c.part))
                 .cloned();
-            let file = r.source_file.to_string_lossy().into_owned();
-            let label = r.part.label(&file);
             if let Some(c) = copy {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let label = r.part.label(&file);
                 let entry = if c.part == r.part {
                     ""
                 } else {
@@ -1347,6 +1347,8 @@ impl Discovery {
                     e.file == r.source_file && e.part == TreePart::File && e.covers(&r.purl)
                 });
             if registry {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let label = r.part.label(&file);
                 self.diag(
                     DIAG_REF_UNATTRIBUTABLE,
                     &file,
@@ -1499,6 +1501,14 @@ impl Discovery {
     /// never leaves it attested in its place. The project twin counts
     /// wherever an extractor put it (`refs`, `shadowed` or `rewirable`).
     fn drop_env_twins(&mut self) {
+        let lists = [&self.refs, &self.shadowed, &self.rewirable];
+        if !lists
+            .into_iter()
+            .flatten()
+            .any(|r| r.part == TreePart::PnpmEnv)
+        {
+            return;
+        }
         let project: HashSet<(PathBuf, String, String, WiringMode)> =
             [&self.refs, &self.shadowed, &self.rewirable]
                 .into_iter()

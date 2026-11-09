@@ -90,7 +90,10 @@ impl<'a> PnpmPackage<'a> {
 /// vendored, hosted, directory, git); each consumer applies its own key
 /// and resolution rules.
 fn pnpm_packages(text: &str, resolve: Resolve) -> Vec<PnpmPackage<'_>> {
-    let documents = grammar::documents(text);
+    let documents = match resolve {
+        Resolve::Yes => grammar::documents(text),
+        Resolve::No => Vec::new(),
+    };
     grammar::entries(text)
         .into_iter()
         .map(|entry| {
@@ -118,8 +121,9 @@ fn pnpm_packages(text: &str, resolve: Resolve) -> Vec<PnpmPackage<'_>> {
 #[derive(Clone, Copy)]
 enum Resolve {
     Yes,
-    /// Keys and bodies only: the store crawler's hot path
-    /// ([`InstalledPackages::from_lock_text`]) never reads a resolution.
+    /// Keys and bodies only, every entry tagged `Project`: the store
+    /// crawler's hot path ([`InstalledPackages::from_lock_text`]) reads
+    /// neither a resolution nor a document.
     No,
 }
 
@@ -436,10 +440,10 @@ impl<'t> PnpmLock<'t> {
 
     /// The document kinds the lock has entries in, project first.
     pub(crate) fn documents(&self) -> Vec<PnpmDocument> {
-        let mut kinds: Vec<PnpmDocument> = self.packages.iter().map(|p| p.document).collect();
-        kinds.sort();
-        kinds.dedup();
-        kinds
+        [PnpmDocument::Project, PnpmDocument::Env]
+            .into_iter()
+            .filter(|kind| self.packages.iter().any(|p| p.document == *kind))
+            .collect()
     }
 
     fn has_packages_section(&self) -> bool {
@@ -660,6 +664,10 @@ pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
 mod tests {
     use super::*;
 
+    /// pnpm 11's env lockfile document for config dependency
+    /// `cfg-dep@2.0.0`, up to its packages entry's key line.
+    const ENV_DOC_HEAD: &str = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n";
+
     /// #1197: the current lockfile's packages, by name and version, in the
     /// shapes real pnpm 7.33.7 / 8.15.9 / 10–12 write after an upgrade
     /// (`left-pad` 1.3.0 → 1.2.0), plus non-registry entries.
@@ -789,7 +797,7 @@ mod tests {
     #[test]
     fn env_document_is_read_as_its_own_tree() {
         let env = format!(
-            "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {{integrity: sha512-c}}\n\n  b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz}}\n    version: 1.0.0\n\n"
+            "---\n{ENV_DOC_HEAD}    resolution: {{integrity: sha512-c}}\n\n  b@file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/b-1.0.0.tgz}}\n    version: 1.0.0\n\n"
         );
         let project = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-x}\n";
         for text in [
@@ -860,10 +868,10 @@ mod tests {
     /// the FIRST one, when its importers say so, as pnpm and the vendored
     /// planners' `split_project_document` read it: an env-shaped LATER
     /// document is a project one, so it cannot opt out of the project
-    /// tree's contests (code-review finding 2).
+    /// tree's contests.
     #[test]
     fn documents_are_identified_by_position_and_content() {
-        let env = "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n    resolution: {integrity: sha512-c}\n";
+        let env = &format!("{ENV_DOC_HEAD}    resolution: {{integrity: sha512-c}}\n");
         let project = |dep: &str| {
             format!(
                 "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      {dep}:\n        specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  {dep}@1.0.0:\n    resolution: {{integrity: sha512-x}}\n"
@@ -887,8 +895,7 @@ mod tests {
             own(&[("a@1.0.0", Project), ("cfg-dep@2.0.0", Project)])
         );
         assert!(!PnpmLock::parse(&swapped).documents().contains(&Env));
-        // A first document that is not the env document is a project one,
-        // and its entries are no longer skipped.
+        // A first document that is not the env document is a project one.
         let two = format!("---\n{}---\n{}", project("a"), project("b"));
         assert_eq!(
             kinds(&two),
@@ -913,12 +920,12 @@ mod tests {
         }
     }
 
-    /// An entry is tagged by its KEY line (code-review finding 5): a key
+    /// An entry is tagged by its KEY line: a key
     /// whose body is empty — the last line of the env document, right
     /// before `---` — has its body offset on the separator, in no document.
     #[test]
     fn an_entry_with_an_empty_body_keeps_its_document() {
-        let env = "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      cfg-dep:\n        specifier: 2.0.0\n        version: 2.0.0\n\npackages:\n\n  cfg-dep@2.0.0:\n";
+        let env = format!("---\n{ENV_DOC_HEAD}");
         let project = "---\nlockfileVersion: '9.0'\n\npackages:\n\n  a@1.0.0:\n    resolution: {integrity: sha512-x}\n\n  b@1.0.0:";
         let text = format!("{env}{project}");
         for text in [text.clone(), text.replace('\n', "\r\n")] {
@@ -1095,16 +1102,10 @@ mod tests {
 /// a new reader in the same file still fails.
 #[cfg(test)]
 mod architecture_tests {
-    use std::path::{Path, PathBuf};
+    use crate::vendor::test_support::production_sources::production_sources;
 
     /// `(root-relative file, uses, why)`.
     const WRITERS: &[(&str, usize, &str)] = &[
-        (
-            "patch/redirect/upstream/npm.rs",
-            2,
-            "hosted unwind (`restore_pnpm_locks`): splices each pin's \
-             resolution byte range back to the registry spelling",
-        ),
         (
             "vendor/pnpm_lock.rs",
             3,
@@ -1139,171 +1140,18 @@ mod architecture_tests {
                 && (code.contains("bounds(") || code.contains("SectionIndex::build(")))
     }
 
-    /// The lines of `text` outside `#[cfg(test)]` / `#[cfg(all(test, …))]`
-    /// items: an out-of-line `mod name;` declaration drops that line only,
-    /// an inline item (`mod tests { … }`, a helper `fn`) drops through its
-    /// closing brace, so production code after either is still scanned.
-    fn production(text: &str) -> Vec<&str> {
-        let lines: Vec<&str> = text.split('\n').collect();
-        let deltas = brace_deltas(text);
-        let mut out = Vec::new();
-        let mut i = 0;
-        while i < lines.len() {
-            let attr = lines[i].trim_start();
-            if !(attr.starts_with("#[cfg(test)]") || attr.starts_with("#[cfg(all(test")) {
-                out.push(lines[i]);
-                i += 1;
-                continue;
-            }
-            // Skip the gated item's other attributes, then the item.
-            i += 1;
-            while i < lines.len() && lines[i].trim_start().starts_with("#[") {
-                i += 1;
-            }
-            let mut depth = 0i64;
-            let mut opened = false;
-            while i < lines.len() {
-                let (open, close) = deltas[i];
-                let line = lines[i];
-                i += 1;
-                depth += open - close;
-                opened |= open > 0;
-                if (!opened && line.trim_end().ends_with(';')) || (opened && depth <= 0) {
-                    break;
-                }
-            }
-        }
-        out
-    }
-
-    /// Per line of `text` (split on `\n`), the `{` and `}` in code: outside
-    /// comments and string, raw string and char literals, which may span
-    /// lines.
-    fn brace_deltas(text: &str) -> Vec<(i64, i64)> {
-        let chars: Vec<char> = text.chars().collect();
-        let mut out = vec![(0i64, 0i64)];
-        let mut i = 0;
-        let ident = |c: char| c.is_alphanumeric() || c == '_';
-        // Advance past `n` chars, opening a new line entry at each `\n`.
-        let step = |out: &mut Vec<(i64, i64)>, i: &mut usize, n: usize| {
-            for _ in 0..n {
-                if chars.get(*i) == Some(&'\n') {
-                    out.push((0, 0));
-                }
-                *i += 1;
-            }
-        };
-        while i < chars.len() {
-            let c = chars[i];
-            let next = chars.get(i + 1).copied();
-            if c == '/' && next == Some('/') {
-                while i < chars.len() && chars[i] != '\n' {
-                    i += 1;
-                }
-            } else if c == '/' && next == Some('*') {
-                let mut depth = 0;
-                while i < chars.len() {
-                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
-                        depth += 1;
-                        step(&mut out, &mut i, 2);
-                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
-                        depth -= 1;
-                        step(&mut out, &mut i, 2);
-                        if depth == 0 {
-                            break;
-                        }
-                    } else {
-                        step(&mut out, &mut i, 1);
-                    }
-                }
-            } else if c == 'r'
-                && matches!(next, Some('"' | '#'))
-                && (i == 0 || !ident(chars[i - 1]) || chars[i - 1] == 'b')
-            {
-                let hashes = chars[i + 1..].iter().take_while(|&&h| h == '#').count();
-                if chars.get(i + 1 + hashes) != Some(&'"') {
-                    step(&mut out, &mut i, 1);
-                    continue;
-                }
-                step(&mut out, &mut i, 2 + hashes);
-                while i < chars.len() {
-                    let closes = chars[i] == '"'
-                        && chars[i + 1..]
-                            .iter()
-                            .take(hashes)
-                            .filter(|&&h| h == '#')
-                            .count()
-                            == hashes;
-                    if closes {
-                        step(&mut out, &mut i, 1 + hashes);
-                        break;
-                    }
-                    step(&mut out, &mut i, 1);
-                }
-            } else if c == '"' {
-                step(&mut out, &mut i, 1);
-                while i < chars.len() && chars[i] != '"' {
-                    let n = if chars[i] == '\\' { 2 } else { 1 };
-                    step(&mut out, &mut i, n);
-                }
-                step(&mut out, &mut i, 1);
-            } else if c == '\'' && next == Some('\\') {
-                // An escaped char literal (`'\''`, `'\u{7b}'`).
-                step(&mut out, &mut i, 2);
-                while i < chars.len() && chars[i] != '\'' {
-                    step(&mut out, &mut i, 1);
-                }
-                step(&mut out, &mut i, 1);
-            } else if c == '\'' && chars.get(i + 2) == Some(&'\'') {
-                step(&mut out, &mut i, 3);
-            } else {
-                let last = out.last_mut().expect("one entry per line");
-                match c {
-                    '{' => last.0 += 1,
-                    '}' => last.1 += 1,
-                    _ => {}
-                }
-                step(&mut out, &mut i, 1);
-            }
-        }
-        out
-    }
-
-    fn rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
-        for entry in std::fs::read_dir(dir).expect("read src dir") {
-            let path = entry.expect("dir entry").path();
-            if path.is_dir() {
-                rs_files(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
-            }
-        }
-    }
-
     #[test]
     fn pnpm_entries_are_read_through_the_model() {
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        rs_files(&src, &mut files);
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut found: Vec<(String, usize)> = Vec::new();
-        for path in files {
-            let rel = path
-                .strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
-            if rel.starts_with("formats/pnpm/") || rel.ends_with("tests.rs") {
+        // Test-only files and items are left out by the shared reader.
+        for file in production_sources(&src) {
+            if file.rel.starts_with("formats/pnpm/") {
                 continue;
             }
-            let text = std::fs::read_to_string(&path)
-                .unwrap()
-                .replace("\r\n", "\n");
-            let uses = production(&text)
-                .into_iter()
-                .filter(|l| raw_walk(l))
-                .count();
+            let uses = file.text.lines().filter(|l| raw_walk(l)).count();
             if uses > 0 {
-                found.push((rel, uses));
+                found.push((file.rel, uses));
             }
         }
         found.sort();
@@ -1330,40 +1178,5 @@ mod architecture_tests {
         assert!(!raw_walk("    // pnpm::entries(&text)"));
         assert!(!raw_walk("    lock.get(\"packages\")"));
         assert!(!raw_walk("    for p in PnpmLock::parse(t).packages() {"));
-    }
-
-    /// Code-review finding 1: an out-of-line test module declared near the
-    /// top of a file (`crawlers/npm_crawler.rs`, `patch/redirect/mod.rs`,
-    /// `vendor/mod.rs` do) used to end the scan there, so a raw walk deep
-    /// in the file went unseen. Only the gated items are dropped now.
-    #[test]
-    fn production_drops_only_test_gated_items() {
-        let src = "use a;\n#[cfg(test)]\nmod oracle;\n#[cfg(all(test, unix))]\n#[path = \"x.rs\"]\nmod x_tests;\n\
-                   #[cfg(test)]\nfn helper() {\n    let s = \"}\";\n    let c = '{';\n    if true { pnpm::entries(t); }\n}\n\
-                   fn reader<'a>(t: &'a str) {\n    for e in pnpm::entries(t) {}\n}\n\
-                   #[cfg(test)]\nmod tests {\n    fn t() { pnpm::entries(\"{\"); }\n    \
-                   const S: &str = \"a {\n{ b\";\n    const R: &str = r#\"{\"{\n\"#;\n    /* { */\n}\n\
-                   fn after() { let x = line == \"packages:\"; }\n";
-        let kept = production(src);
-        assert_eq!(kept.iter().filter(|l| raw_walk(l)).count(), 2, "{kept:#?}");
-        assert!(kept.iter().all(|l| !l.contains("mod oracle")));
-        assert!(kept.iter().any(|l| l.contains("fn after()")));
-        assert!(kept.iter().all(|l| !l.contains("fn helper")));
-        // The real files that declare test modules early keep their late
-        // production code.
-        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        for (rel, late) in [
-            ("crawlers/npm_crawler.rs", "fn is_safe_npm_component("),
-            ("patch/redirect/mod.rs", "fn rewrite_golang_target("),
-            ("vendor/mod.rs", "pub async fn vendored_purl_keys("),
-        ] {
-            let text = std::fs::read_to_string(src.join(rel))
-                .unwrap()
-                .replace("\r\n", "\n");
-            assert!(
-                production(&text).iter().any(|l| l.starts_with(late)),
-                "{rel}: production code before its test module was not scanned"
-            );
-        }
     }
 }

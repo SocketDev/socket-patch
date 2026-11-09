@@ -1894,7 +1894,7 @@ pub(crate) async fn restore_pnpm_locks(
     files: &[String],
     ctx: &Ctx<'_>,
 ) -> FormatResult {
-    use crate::formats::pnpm::grammar as pnpm;
+    use crate::formats::pnpm::{grammar as pnpm, PnpmDocument, PnpmLock};
 
     let mut result = FormatResult::default();
     let pins = by_uuid(pins);
@@ -1904,8 +1904,9 @@ pub(crate) async fn restore_pnpm_locks(
         };
         // (resolution range, uuid, name, version, rebuilt-without-integrity)
         let mut hits: Vec<(std::ops::Range<usize>, String, String, String)> = Vec::new();
-        for entry in pnpm::entries(&text) {
-            let Some(resolution) = pnpm::resolution(&entry) else {
+        let lock = PnpmLock::parse(&text);
+        for package in lock.packages() {
+            let (entry, Some(resolution)) = (&package.entry, &package.resolution) else {
                 continue;
             };
             let Some(uuid) = resolution.tarball().and_then(|t| ctx.hosted_uuid(t)) else {
@@ -1965,22 +1966,15 @@ pub(crate) async fn restore_pnpm_locks(
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         // (uuid, name@version whose `tarball:` only the guessed setting decided)
         let mut handled: Vec<(String, Option<String>)> = Vec::new();
-        // pnpm 11+ records the env lockfile document's resolutions bare
-        // whatever `lockfileIncludeTarballUrl` says (see
-        // `pnpm_tarball_policy`): only a URL it cannot derive gets
-        // `tarball:` there.
-        let env_spans: Vec<std::ops::Range<usize>> = pnpm::documents(&text)
-            .into_iter()
-            .filter(|(_, document)| *document == pnpm::PnpmDocument::Env)
-            .map(|(span, _)| span)
-            .collect();
-        for entry in pnpm::entries(&text) {
-            let Some(resolution) = pnpm::resolution(&entry) else {
+        for package in lock.packages() {
+            let Some(resolution) = &package.resolution else {
                 continue;
             };
-            let in_env = env_spans
-                .iter()
-                .any(|span| span.contains(&resolution.range.start));
+            // pnpm 11+ records the env lockfile document's resolutions bare
+            // whatever `lockfileIncludeTarballUrl` says (see
+            // `pnpm_tarball_policy`): only a URL it cannot derive gets
+            // `tarball:` there.
+            let in_env = package.document == PnpmDocument::Env;
             let Some((_, uuid, name, version)) = hits.iter().find(|(r, ..)| *r == resolution.range)
             else {
                 continue;
@@ -3866,7 +3860,7 @@ mod tests {
         let marker_only = format!("---\n{}", lock(""));
         assert!(include(&marker_only, None, Some(RC_ON), None));
         // Neither is an env-shaped document AFTER the project one: pnpm
-        // writes the env document first (code-review finding 2).
+        // writes the env document first.
         let env_last = format!("---\n{}{env}", lock(""));
         assert_eq!(super::pnpm_settings_major(&pinned_only, None), Some(11));
         assert_eq!(super::pnpm_settings_major(&env_last, None), None);

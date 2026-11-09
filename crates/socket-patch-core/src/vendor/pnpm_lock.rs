@@ -893,18 +893,29 @@ pub(super) async fn preflight_packages_dialect(
 /// `None`: cannot determine (missing/unreadable/unsupported lock) —
 /// callers must keep the entry, fail-safe.
 pub async fn pnpm_entry_in_use(entry: &VendorEntry, project_root: &Path) -> Option<bool> {
-    let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
-        .await
-        .ok()?;
-    if PnpmDialect::V9.check_lock(&text).is_err() {
-        return None;
+    PnpmDialect::V9.entry_in_use(entry, project_root).await
+}
+
+impl PnpmDialect {
+    /// Whether `entry`'s artifact is still consumed by a lock this dialect
+    /// reads: `None` when the lock is missing, unreadable or another
+    /// dialect's (callers keep the entry, fail-safe).
+    pub(super) async fn entry_in_use(
+        self,
+        entry: &VendorEntry,
+        project_root: &Path,
+    ) -> Option<bool> {
+        let text = read_regular_to_string(&project_root.join(PNPM_LOCK))
+            .await
+            .ok()?;
+        self.check_lock(&text).ok()?;
+        // Every `packages:`/`snapshots:` block key resolving into
+        // `.socket/vendor/npm/<uuid>/` — the format model's one walk
+        // ([`vendored_npm_uuids`], CRLF read like LF), collected once per
+        // lock bytes: a revert pass probes once per ledger entry.
+        let vendored = IN_USE_MEMO.parse_infallible(text.as_bytes(), || vendored_npm_uuids(&text));
+        Some(vendored.contains(&entry.uuid))
     }
-    // Every `packages:`/`snapshots:` block key resolving into
-    // `.socket/vendor/npm/<uuid>/` — the format model's one walk
-    // ([`vendored_npm_uuids`], CRLF read like LF), collected once per lock
-    // bytes: a revert pass probes once per ledger entry.
-    let vendored = IN_USE_MEMO.parse_infallible(text.as_bytes(), || vendored_npm_uuids(&text));
-    Some(vendored.contains(&entry.uuid))
 }
 
 /// FAIL-CLOSED revert guard for a ledger entry with NO wiring records,
@@ -3850,11 +3861,7 @@ fn dep_map_refs(block: &[String]) -> Vec<(usize, &str, &str, &str)> {
 /// unwound on its own) — keeps that live value, so the lock stays
 /// resolvable whichever entry is unwound first. With `live == new` this is
 /// `original` verbatim.
-pub(super) fn merge_live_dep_refs(
-    original: &[String],
-    new: &[String],
-    live: &[String],
-) -> Vec<String> {
+fn merge_live_dep_refs(original: &[String], new: &[String], live: &[String]) -> Vec<String> {
     let values = |block| -> HashMap<&str, &str> {
         dep_map_refs(block)
             .into_iter()
@@ -3876,7 +3883,7 @@ pub(super) fn merge_live_dep_refs(
 
 /// Are two blocks equal up to their dependency-ref VALUES (what
 /// [`merge_live_dep_refs`] may change)?
-pub(super) fn same_modulo_dep_refs(a: &[String], b: &[String]) -> bool {
+fn same_modulo_dep_refs(a: &[String], b: &[String]) -> bool {
     let (refs_a, refs_b) = (dep_map_refs(a), dep_map_refs(b));
     a.len() == b.len()
         && refs_a.len() == refs_b.len()
@@ -3986,7 +3993,7 @@ pub(super) fn lines_value(lines: &[String]) -> Value {
     Value::Array(lines.iter().map(|l| Value::String(l.clone())).collect())
 }
 
-pub(super) fn value_lines(v: &Value) -> Option<Vec<String>> {
+fn value_lines(v: &Value) -> Option<Vec<String>> {
     v.as_array().map(|a| {
         a.iter()
             .filter_map(Value::as_str)
@@ -5792,7 +5799,7 @@ snapshots:
     /// Divergences N15: a CRLF pnpm-lock.yaml (a Windows autocrlf checkout)
     /// is wired like its LF twin and keeps its CRLF endings, as hosted
     /// mode's byte splices keep them, and the revert restores the CRLF
-    /// bytes. Vendoring used to refuse it (`vendor_lockfile_crlf_unsupported`).
+    /// bytes.
     #[tokio::test]
     async fn crlf_lock_is_wired_like_its_lf_twin_and_stays_crlf() {
         let crlf_lock = P1_BEFORE_LOCK.replace('\n', "\r\n");
@@ -6124,9 +6131,8 @@ snapshots:
     }
 
     /// N15 on pnpm 11's two-document lock: vendored, then checked out with
-    /// autocrlf (`---\r` separators), the lock reverts to its CRLF bytes.
-    /// Review finding: the revert's document check read the raw CRLF text,
-    /// refused `---\r` as a marker line, and failed every such revert.
+    /// autocrlf (`---\r` separators), the lock reverts to its CRLF bytes:
+    /// the document check reads the LF form, so `---\r` is a separator.
     #[tokio::test]
     async fn crlf_two_document_lock_reverts() {
         let before = two_doc(ENV_DOC_CONFIG_DEP, P1_BEFORE_LOCK);
@@ -6141,10 +6147,9 @@ snapshots:
         assert_eq!(fx.read(PNPM_LOCK).await, before.replace('\n', "\r\n"));
     }
 
-    /// Review finding: a revert met a lock or workspace file that MIXES CRLF
-    /// and LF and wrote it back all-LF. It now fails before any write, dry
-    /// run included, as vendoring refuses such a file: every surface and the
-    /// artifact stay as they are.
+    /// A revert over a lock or workspace file that MIXES CRLF and LF fails
+    /// before any write, dry run included, as vendoring refuses such a
+    /// file: every surface and the artifact stay as they are.
     #[tokio::test]
     async fn mixed_line_ending_revert_fails_before_any_write() {
         for file in [PNPM_LOCK, PNPM_WORKSPACE] {
@@ -6578,7 +6583,7 @@ snapshots:
 
         // Future versions: the fix is an allowlisted-emitting pnpm or a
         // newer build, never "pnpm >= 9" (the user's pnpm already is).
-        // An unparseable major (review finding) is not "old" either.
+        // An unparseable major is not "old" either.
         for head in [
             "lockfileVersion: '9.1'\n",
             "lockfileVersion: '10.0'\n",
@@ -7452,7 +7457,7 @@ snapshots:
     /// N15 for pnpm-workspace.yaml: a CRLF file (Windows autocrlf checkout)
     /// is read like its LF twin, so the existing `overrides:` section is found
     /// and extended (never a DUPLICATE section, which pnpm rejects), and the
-    /// file keeps its CRLF endings. Vendoring used to refuse the file.
+    /// file keeps its CRLF endings.
     #[tokio::test]
     async fn crlf_workspace_file_gains_the_override_in_its_own_section() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -9969,9 +9974,8 @@ snapshots:
         // Lock-model 2b (divergence N5, vendored planner): the planner reads
         // its own rekeyed keys with the planning core's `match_key`
         // (`origin::vendor_ref`, root-anchored), as hosted mode and discovery
-        // do. Before, `parse_vendor_path` found the anchor anywhere, so a
-        // sibling checkout's `../.socket/vendor/…` rekey was "ours" and got
-        // rekeyed into this project's artifact.
+        // do, so a sibling checkout's `../.socket/vendor/…` rekey is not
+        // ours.
         let art = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
         let target = |key: &str| target_key(key, "left-pad", "1.3.0");
         assert_eq!(target(&format!("left-pad@file:{art}")), Some(true));

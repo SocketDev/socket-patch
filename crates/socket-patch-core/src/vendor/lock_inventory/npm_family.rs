@@ -106,26 +106,25 @@ async fn inventory_npm_lock_raw_in(
 ) -> Result<Option<(NpmLockFlavor, Vec<LockfileEntry>)>, UnsupportedNpmLayout> {
     let mut found = inventory_npm_router_lock_raw_in(view).await?;
     if let Some((NpmLockFlavor::Pnpm | NpmLockFlavor::PnpmLegacy, entries)) = &mut found {
-        if !rush && lockfile_disabled(view, false).await.is_some() {
-            withhold_hosted_pins(entries);
+        // The settings are read only for a lock that pins something.
+        if !rush && entries.iter().any(is_hosted) && lockfile_disabled(view, false).await.is_some()
+        {
+            for entry in entries.iter_mut().filter(|e| is_hosted(e)) {
+                entry.integrity = LockIntegrity::None;
+            }
         }
     }
     Ok(found)
 }
 
-/// Drop the integrity of every entry resolving from Socket's patch server
-/// (see [`inventory_npm_lock_raw_in`]).
-fn withhold_hosted_pins(entries: &mut [LockfileEntry]) {
-    for entry in entries {
-        if entry
-            .resolved
-            .as_deref()
-            .and_then(|url| hosted_patch_uuid(url, &[]))
-            .is_some()
-        {
-            entry.integrity = LockIntegrity::None;
-        }
-    }
+/// Whether `entry` resolves from Socket's patch server (see
+/// [`inventory_npm_lock_raw_in`]).
+fn is_hosted(entry: &LockfileEntry) -> bool {
+    entry
+        .resolved
+        .as_deref()
+        .and_then(|url| hosted_patch_uuid(url, &[]))
+        .is_some()
 }
 
 /// The lock the npm flavor router picks, with its fallbacks (see

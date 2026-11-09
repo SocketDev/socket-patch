@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
+use crate::constants::npm_family::{PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY, VLT_HIDDEN_LOCK_REL};
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
@@ -2706,14 +2706,11 @@ fn pnpm_trust(
     // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
     // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
     // config.
-    let planned = crate::formats::pnpm::plan::planned_locks(files);
-    let root_lock = [
-        crate::constants::npm_family::PNPM_LOCK,
-        crate::constants::npm_family::PNPM_SHRINKWRAP_LEGACY,
-    ]
-    .into_iter()
-    .find(|lock| planned.iter().any(|key| key.as_str() == *lock))
-    .unwrap_or(crate::constants::npm_family::PNPM_LOCK);
+    let shadowed = crate::formats::pnpm::plan::shadowed_locks(files);
+    let root_lock = match shadowed.iter().any(|key| key.as_str() == PNPM_LOCK) {
+        true => PNPM_SHRINKWRAP_LEGACY,
+        false => PNPM_LOCK,
+    };
     let governing: Vec<&str> = std::iter::once(root_lock)
         .chain(member_lock_keys.iter().map(String::as_str))
         .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
@@ -3358,20 +3355,11 @@ fn confirm(
     // `pnpm-lock.yaml`, or the reverse under a pnpm 1 / 2 pin, N11) is
     // never rewritten, so a Socket URL an earlier run left in it pins
     // nothing either.
-    let planned_pnpm = crate::formats::pnpm::plan::planned_locks(files);
-    let is_shadowed_pnpm = |name: &str| {
-        matches!(
-            name.rsplit('/').next(),
-            Some(
-                crate::constants::npm_family::PNPM_LOCK
-                    | crate::constants::npm_family::PNPM_SHRINKWRAP_LEGACY
-            )
-        ) && !planned_pnpm.iter().any(|planned| planned.as_str() == name)
-    };
+    let shadowed_pnpm = crate::formats::pnpm::plan::shadowed_locks(files);
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
-        .filter(|(name, _)| !is_shadowed_pnpm(name))
+        .filter(|(name, _)| !shadowed_pnpm.contains(name))
         .filter(|(name, _)| !is_npm_manifest(name))
         .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
@@ -4614,7 +4602,7 @@ mod tests {
         );
     }
 
-    /// N11 review: under a pnpm 1 / 2 pin `shrinkwrap.yaml` governs, so a
+    /// N11: under a pnpm 1 / 2 pin `shrinkwrap.yaml` governs, so a
     /// stray v9 `pnpm-lock.yaml` an earlier run redirected is no heal root
     /// and plans no `trustLockfile` write for a lock pnpm never reads.
     #[tokio::test]
@@ -4653,11 +4641,9 @@ mod tests {
         );
     }
 
-    /// N11 review: a shadowed `shrinkwrap.yaml` still carrying an earlier
-    /// run's Socket URL confirms nothing when the governing
-    /// `pnpm-lock.yaml` no longer pins the package. It used to confirm by
-    /// substring, and only the attribution gate then dropped the dependency
-    /// as `redirect_unattributable`, blaming the project's lockfiles.
+    /// N11: a shadowed `shrinkwrap.yaml` still carrying an earlier run's
+    /// Socket URL confirms nothing (and so is no `redirect_unattributable`
+    /// skip) when the governing `pnpm-lock.yaml` does not pin the package.
     #[tokio::test]
     async fn a_shadowed_pnpm_lock_confirms_nothing() {
         let mut p = MemoryProject::new();

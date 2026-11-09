@@ -753,23 +753,22 @@ packages:
 async fn rush_json_without_any_lock_yields_none() {
     // rush.json but no common/subspace lock at all: nothing to inventory.
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
     assert!(inventory_npm_lock(tmp.path()).await.unwrap().is_none());
     assert!(inventory_npm_trees(tmp.path()).await.unwrap().is_empty());
 }
 
 /// Lock-model divergence N12: Rush's locks are their own install trees,
 /// read whenever `rush.json` is present — beside a root lock too, as
-/// hosted mode and lockfile discovery read them. Before, a root lock
-/// shadowed them (this test pinned "the root lock wins").
+/// hosted mode and lockfile discovery read them.
 #[tokio::test]
 async fn rush_locks_are_read_beside_the_root_lock() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
     write(tmp.path(), "pnpm-lock.yaml", PNPM_LOCK).await;
     write_nested(
         tmp.path(),
-        "common/config/rush/pnpm-lock.yaml",
+        RUSH_COMMON_LOCK,
         "lockfileVersion: '9.0'
 
 packages:
@@ -781,7 +780,7 @@ packages:
     .await;
 
     // The routed lock keeps its flavor and holds only its own entries
-    // (code-review finding 9: Rush's are no flavor's).
+    // (Rush's are no flavor's).
     let (flavor, routed) = inventory_npm_lock(tmp.path()).await.unwrap().unwrap();
     assert_eq!(flavor, NpmLockFlavor::Pnpm);
     assert!(!routed.iter().any(|e| e.name == "only-in-common"));
@@ -822,7 +821,7 @@ packages:
     );
 }
 
-/// Code-review finding 4: the env document's registry instance of a
+/// The env document's registry instance of a
 /// release comes first in the lock and may carry the only verifier (the
 /// project's hosted instance loses its pin under `lockfile=false`), but a
 /// config dependency never stands in for the project's own copy: the
@@ -873,7 +872,7 @@ async fn env_document_instances_never_displace_project_instances() {
 /// basis. Lockfile discovery keeps the ref and withholds its pin; the
 /// inventory keeps the entry (and its hosted url) and drops its
 /// integrity, so nothing fetches or verifies against it. Registry entries
-/// keep theirs. Before, the inventory ignored the setting. Rush runs pnpm
+/// keep theirs. Rush runs pnpm
 /// with settings of its own, so its locks are untouched (as in discovery).
 #[tokio::test]
 async fn pnpm_lockfile_off_withholds_hosted_pins() {
@@ -918,9 +917,9 @@ async fn pnpm_lockfile_off_withholds_hosted_pins() {
 
     // Rush: the setting is not Rush's, so its lock keeps the pin.
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "rush.json", r#"{"rushVersion":"5.0.0"}"#).await;
+    write(tmp.path(), "rush.json", RUSH_JSON).await;
     write(tmp.path(), ".npmrc", "lockfile=false\n").await;
-    write_nested(tmp.path(), "common/config/rush/pnpm-lock.yaml", &lock).await;
+    write_nested(tmp.path(), RUSH_COMMON_LOCK, &lock).await;
     let entries = inventory_npm_trees(tmp.path()).await.unwrap();
     assert_eq!(
         integrity(&entries, "left-pad"),

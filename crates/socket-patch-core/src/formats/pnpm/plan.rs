@@ -98,23 +98,44 @@ pub(crate) fn governing_pnpm_lock(
 /// rewrites, in key order: per directory, the [`governing_pnpm_lock`], read
 /// with the evidence `files` holds for that directory.
 pub(crate) fn planned_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
-    let planned = |key: &&String| {
-        let leaf = key.rsplit('/').next().unwrap_or(key);
-        if !matches!(leaf, PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY) {
-            return false;
-        }
-        // `dir` keeps its trailing `/` (empty at the root).
-        let in_dir = |rel: &str| format!("{}{rel}", &key[..key.len() - leaf.len()]);
-        let has = |rel: &str| files.contains_key(&in_dir(rel));
-        let both = (has(PNPM_LOCK), has(PNPM_SHRINKWRAP_LEGACY));
-        // The pin decides only between the two, so it is read only then.
-        let pinned = match both {
-            (true, true) => pinned_pnpm_major(|rel| files.get(&in_dir(rel)).cloned()),
-            _ => None,
-        };
-        governing_pnpm_lock(both.0, both.1, pinned) == Some(leaf)
+    files.keys().filter(|key| governs(files, key)).collect()
+}
+
+/// The pnpm locks of `files` pnpm does not read (the complement of
+/// [`planned_locks`]): never rewritten, and a Socket URL left in one pins
+/// nothing.
+pub(crate) fn shadowed_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
+    files
+        .keys()
+        .filter(|key| is_pnpm_lock_key(key) && !governs(files, key))
+        .collect()
+}
+
+/// Whether root-relative `key` names a `pnpm-lock.yaml` or `shrinkwrap.yaml`.
+fn is_pnpm_lock_key(key: &str) -> bool {
+    matches!(
+        key.rsplit('/').next(),
+        Some(PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY)
+    )
+}
+
+/// Whether the pnpm lock `key` is its directory's [`governing_pnpm_lock`],
+/// read with the evidence `files` holds for that directory.
+fn governs(files: &BTreeMap<String, String>, key: &str) -> bool {
+    if !is_pnpm_lock_key(key) {
+        return false;
+    }
+    let leaf = key.rsplit('/').next().unwrap_or(key);
+    // `dir` keeps its trailing `/` (empty at the root).
+    let in_dir = |rel: &str| format!("{}{rel}", &key[..key.len() - leaf.len()]);
+    let has = |rel: &str| files.contains_key(&in_dir(rel));
+    let both = (has(PNPM_LOCK), has(PNPM_SHRINKWRAP_LEGACY));
+    // The pin decides only between the two, so it is read only then.
+    let pinned = match both {
+        (true, true) => pinned_pnpm_major(|rel| files.get(&in_dir(rel)).cloned()),
+        _ => None,
     };
-    files.keys().filter(planned).collect()
+    governing_pnpm_lock(both.0, both.1, pinned) == Some(leaf)
 }
 
 /// How one `packages:` / `snapshots:` key names a patched release.
@@ -199,10 +220,9 @@ mod tests {
         );
     }
 
-    /// N11 (owner decision): of a directory's `pnpm-lock.yaml` and
-    /// `shrinkwrap.yaml`, the one the pinned pnpm major reads governs and
-    /// the other is shadowed (review finding: pnpm 1 / 2 read only the
-    /// shrinkwrap).
+    /// N11: of a directory's `pnpm-lock.yaml` and `shrinkwrap.yaml`, the
+    /// one the pinned pnpm major reads governs and the other is shadowed
+    /// (pnpm 1 / 2 read only the shrinkwrap).
     #[test]
     fn the_pinned_pnpm_major_picks_the_governing_lock() {
         // No pin: `pnpm-lock.yaml` governs a pair, and each lone lock itself.

@@ -3415,13 +3415,11 @@ mod tests {
     }
 
     /// pnpm 11+'s env lockfile document is read as an install tree of its
-    /// own (owner decision, lock-model divergence N4). Before, discovery
-    /// skipped it (#1949), so a Socket wiring of a config dependency was
-    /// no ref although the hosted planner writes it. Now it is a ref, but
-    /// one the project document of the same lock withholds when it resolves
-    /// the same release from the registry (rewirable), a `file:` copy
-    /// (shadowed) or a bundled copy (unattested): a VEX statement covers the
-    /// release, not one tree (owner decision on #2009). The env document's
+    /// own (divergence N4): a Socket wiring of a config dependency is a
+    /// ref, but one the project document of the same lock withholds when it
+    /// resolves the same release from the registry (rewirable), a `file:`
+    /// copy (shadowed) or a bundled copy (unattested): a VEX statement
+    /// covers the release, not one tree (owner decision). The env document's
     /// entries never contest the project document's refs; its wiring does
     /// not exempt the project document from contesting another lock; and
     /// it contests no other lock's ref.
@@ -3496,8 +3494,7 @@ mod tests {
                     Withheld::Unattested => &out.refs,
                 };
                 assert_eq!(withheld.len(), 1, "{case}: {out:#?}");
-                // The real lock path, with the tree carried beside it
-                // (code-review finding 6: no pseudo path).
+                // The real lock path, with the tree carried beside it.
                 assert_eq!(
                     (
                         withheld[0].purl.as_str(),
@@ -3581,7 +3578,7 @@ mod tests {
         assert!(out.contested.is_empty(), "{:#?}", out.contested);
 
         // Wired in both documents, the pins differing: ONE ref, the project
-        // document's (code-review finding 6: no twin refs of one file).
+        // document's.
         let env_wired = wired.replace(SRI, "sha512-ENVPIN==");
         let p = Project::new();
         p.write(
@@ -4326,7 +4323,7 @@ mod tests {
             out.recognized_files(UUID_A, WiringMode::Hosted),
             vec![std::path::Path::new("shrinkwrap.yaml")]
         );
-        // N11 review finding: a project that pins pnpm 1 / 2 installs from
+        // N11: a project that pins pnpm 1 / 2 installs from
         // `shrinkwrap.yaml`, so there it is the lock that attests and the
         // stray `pnpm-lock.yaml` is the shadowed one, as the hosted planner
         // picks them (`plan::governing_pnpm_lock`).
