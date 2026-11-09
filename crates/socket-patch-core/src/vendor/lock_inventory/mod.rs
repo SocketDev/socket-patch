@@ -411,7 +411,7 @@ mod architecture_tests {
     const PURE_READER: &str = "// ── pure reader ──";
     /// Anything that reads content, does I/O, or applies the hosted-origin
     /// policy.
-    const IMPURE: [&str; 9] = [
+    const IMPURE: [&str; 12] = [
         "tokio::fs",
         "std::fs",
         "read_regular_",
@@ -419,6 +419,9 @@ mod architecture_tests {
         "OpenOptions",
         "hosted_patch_uuid",
         "hosted_patch_url_uuids",
+        "hosted_uuid(",
+        "OriginPolicy",
+        "crate::origin::",
         "async fn",
         ".await",
     ];

@@ -157,6 +157,23 @@ pub async fn read_config_chain(project_root: &Path) -> Vec<ChainConfig> {
     read_config_chain_with(project_root, cargo_home.as_deref()).await
 }
 
+/// Inside a git checkout, why the config chain is incomplete: a
+/// `.cargo/config` or `.cargo/config.toml` exists above the repository
+/// root (stat only, never read), and cargo merges its `[patch]` and
+/// source settings too. Writers refuse on it.
+pub fn config_above_repo(project_root: &Path) -> Option<String> {
+    let bound = crate::utils::repo_root::upward_bound(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project_root,
+    )?;
+    let marker = bound.marker_above(&[".cargo/config", ".cargo/config.toml"])?;
+    Some(format!(
+        "cargo merges {} into this build: {}",
+        marker.display(),
+        bound.marker_refusal(&marker)
+    ))
+}
+
 /// [`read_config_chain`] with an explicit `$CARGO_HOME`.
 pub async fn read_config_chain_with(
     project_root: &Path,
@@ -165,8 +182,13 @@ pub async fn read_config_chain_with(
     let root = fs::canonicalize(project_root)
         .await
         .unwrap_or_else(|_| project_root.to_path_buf());
+    // Inside a git checkout, a config above its root is never read
+    // ([`config_above_repo`] names one for the writers to refuse on).
+    let bound =
+        crate::utils::repo_root::upward_bound(crate::utils::repo_root::ReadScope::Workspace, &root);
     let mut dirs: Vec<(PathBuf, PathBuf, bool)> = root
         .ancestors()
+        .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
         .map(|dir| (dir.join(".cargo"), dir.to_path_buf(), dir == root))
         .collect();
     if let Some(cargo_home) = cargo_home {

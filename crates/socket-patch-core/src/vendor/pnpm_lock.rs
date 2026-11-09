@@ -3600,6 +3600,7 @@ fn revert_snapshot_ref(
         entry_uuid,
         label: "snapshot ref",
         dep_maps_only: false,
+        parse: parse_vendor_path,
     };
     for (header, block_end) in ref_record_blocks(lines, start, end, snapshot_key) {
         if target.restore_in(lines, header, block_end, dirty, warnings) {
@@ -3677,6 +3678,9 @@ pub(super) struct DepRef<'a> {
     /// Only look inside `dependencies:` / `optionalDependencies:` maps (the
     /// legacy edit's scope; the v9 edit rewrites any 6-space key).
     pub(super) dep_maps_only: bool,
+    /// The ownership parse: [`parse_vendor_path`], or for pnpm <= 8 locks
+    /// [`super::path::parse_vendor_path_or_machine_absolute`].
+    pub(super) parse: fn(&str) -> Option<super::path::VendorPathParts>,
 }
 
 impl DepRef<'_> {
@@ -3713,7 +3717,7 @@ impl DepRef<'_> {
             return true;
         }
         let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
-            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
+            || (self.parse)(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "{} `{}` was re-resolved since vendoring ({rest}); left alone",

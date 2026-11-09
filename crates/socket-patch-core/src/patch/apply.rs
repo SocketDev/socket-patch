@@ -912,6 +912,7 @@ async fn chown_blocking(
 /// still reports the package as applied (see
 /// [`store_copies`](crate::patch::store_copies)).
 pub async fn apply_package_patch(
+    scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -919,8 +920,8 @@ pub async fn apply_package_patch(
     dry_run: bool,
     policy: MismatchPolicy,
 ) -> ApplyResult {
-    crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
-        apply_package_patch_at(package_key, &path, files, sources, dry_run, policy).await
+    crate::patch::store_copies::fan_out(scope, package_key, pkg_path, |path| async move {
+        apply_package_patch_at(scope, package_key, &path, files, sources, dry_run, policy).await
     })
     .await
 }
@@ -1064,6 +1065,7 @@ pub async fn needs_npm_bin_rewrite(
 /// The single-copy apply engine behind [`apply_package_patch`]: verifies
 /// and patches the package at exactly the one `pkg_path` it is given.
 async fn apply_package_patch_at(
+    scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -1088,6 +1090,7 @@ async fn apply_package_patch_at(
     // project using it. Refused in every state, dry run and already-patched
     // included, so this project never records the shared copy as its patch.
     if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+        scope,
         pkg_path,
         files.keys().map(String::as_str),
     )
@@ -2063,6 +2066,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:golang/example.com/x@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2114,6 +2118,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2150,6 +2155,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2191,6 +2197,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2223,6 +2230,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2269,6 +2277,7 @@ mod tests {
         let sources = PatchSources::blobs_only(blobs_dir.path());
         let run = || {
             apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/test@1.0.0",
                 pkg_dir.path(),
                 &files,
@@ -2326,6 +2335,7 @@ mod tests {
                 .await
                 .unwrap();
             let result = apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/test@1.0.0",
                 pkg_dir.path(),
                 &files,
@@ -2356,6 +2366,7 @@ mod tests {
             .await
             .unwrap();
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2382,6 +2393,7 @@ mod tests {
             .unwrap();
         for policy in [MismatchPolicy::Warn, MismatchPolicy::Strict] {
             let result = apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/test@1.0.0",
                 pkg_dir.path(),
                 &files,
@@ -2410,6 +2422,7 @@ mod tests {
 
         // Without force: should fail (NotFound for non-new file)
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2422,6 +2435,7 @@ mod tests {
 
         // With force: should succeed by skipping the missing file
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2451,6 +2465,7 @@ mod tests {
             );
         }
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/lodash@4.17.20",
             pkg_dir.path(),
             &files,
@@ -2806,6 +2821,7 @@ mod tests {
         );
         let blobs = tempfile::tempdir().unwrap();
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:maven/g/a@1.0",
             pkg,
             &files,
@@ -2883,6 +2899,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:cargo/mycrate@1.0.0",
             pkg,
             &files,
@@ -2970,6 +2987,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -3021,6 +3039,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -3143,6 +3162,7 @@ mod tests {
                     },
                 );
                 let result = apply_package_patch(
+                    crate::utils::repo_root::ReadScope::Workspace,
                     "pkg:npm/evil@1.0.0",
                     &pkg,
                     &files,
@@ -3212,6 +3232,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/evil@1.0.0",
             &pkg,
             &files,
@@ -3299,6 +3320,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             &pkg_dir,
             &files,
@@ -3357,6 +3379,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             &pkg_dir,
             &files,
@@ -3401,6 +3424,7 @@ mod tests {
 
         let sources = PatchSources::blobs_only(&blobs_dir);
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/x@1.0.0",
             &pkg_dir,
             &files,
@@ -3622,9 +3646,16 @@ mod tests {
             let (_root, [a, b], key, blobs, files, original, _patched) = shared_store_fixture(pdm);
             let sources = PatchSources::blobs_only(&blobs);
             for dry_run in [true, false] {
-                let result =
-                    apply_package_patch(purl, &a, &files, &sources, dry_run, MismatchPolicy::Warn)
-                        .await;
+                let result = apply_package_patch(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    purl,
+                    &a,
+                    &files,
+                    &sources,
+                    dry_run,
+                    MismatchPolicy::Warn,
+                )
+                .await;
                 assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
                 let err = result.error.unwrap_or_default();
                 assert!(
@@ -3646,6 +3677,7 @@ mod tests {
         let (_root, [a, _b], key, blobs, files, _original, patched) = shared_store_fixture(false);
         std::fs::write(a.join(key), &patched).unwrap();
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/left-pad@1.3.0",
             &a,
             &files,
@@ -3711,8 +3743,16 @@ mod tests {
         ] {
             for policy in [MismatchPolicy::Warn, MismatchPolicy::Force] {
                 for dry_run in [true, false] {
-                    let result =
-                        apply_package_patch(purl, &pkg, &files, &sources, dry_run, policy).await;
+                    let result = apply_package_patch(
+                        crate::utils::repo_root::ReadScope::Workspace,
+                        purl,
+                        &pkg,
+                        &files,
+                        &sources,
+                        dry_run,
+                        policy,
+                    )
+                    .await;
                     assert!(!result.success, "{}: must refuse", pkg.display());
                     let err = result.error.unwrap_or_default();
                     assert!(
@@ -3752,6 +3792,7 @@ mod tests {
             },
         );
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/left-pad@1.3.0",
             &nm.join("left-pad"),
             &files,
@@ -3963,6 +4004,7 @@ mod tests {
         );
 
         let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/pkg@1.0.0",
             site.path(),
             &files,
@@ -4076,6 +4118,7 @@ mod tests {
             .unwrap();
         let sources = PatchSources::blobs_only(blobs.path());
         let res = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/crlfbin@1.0.0",
             pkg.path(),
             &files,
@@ -4092,6 +4135,7 @@ mod tests {
         );
 
         let again = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/crlfbin@1.0.0",
             pkg.path(),
             &files,
@@ -4119,6 +4163,7 @@ mod tests {
         .await
         .unwrap();
         let res = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/crlfbin@1.0.0",
             pkg.path(),
             &files,
@@ -4158,6 +4203,7 @@ mod tests {
         .await
         .unwrap();
         let res = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/crlfbin@1.0.0",
             pkg.path(),
             &files,
@@ -4202,6 +4248,7 @@ mod tests {
         let sources = PatchSources::blobs_only(blobs.path());
         let apply = || {
             apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/crlfbin@1.0.0",
                 &pkg,
                 &files,
@@ -4269,6 +4316,7 @@ mod tests {
                     .await
             );
             let res = apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 purl,
                 &pkg,
                 &files,
@@ -4329,6 +4377,7 @@ mod tests {
             let sources = PatchSources::blobs_only(blobs.path());
             let apply = || {
                 apply_package_patch(
+                    crate::utils::repo_root::ReadScope::Workspace,
                     "pkg:npm/crlfbin@1.0.0",
                     &pkg,
                     &files,
@@ -4358,6 +4407,7 @@ mod tests {
             );
 
             let rolled = crate::patch::rollback::rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/crlfbin@1.0.0",
                 &pkg,
                 &files,
@@ -4385,6 +4435,7 @@ mod tests {
             .await
             .unwrap();
         let res = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/crlfbin@1.0.0",
             pkg.path(),
             &files,
@@ -4411,6 +4462,7 @@ mod tests {
             .await
             .unwrap();
         let res = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/crlfbin@1.0.0",
             pkg.path(),
             &files,

@@ -1558,6 +1558,10 @@ async fn classic_outside_root_copy_under_another_name_is_named_and_not_attested(
         return;
     }
     let tmp = tempfile::tempdir().unwrap();
+    // The copy sits outside the project but inside its repository (a
+    // monorepo sibling): a project file outside the repository root is
+    // never read at all, so its name could not be read from it.
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
     let proj = tmp.path().join("proj");
     let copy = tmp.path().join("ext").join("lpdir");
     std::fs::create_dir_all(&copy).unwrap();
