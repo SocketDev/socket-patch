@@ -33,11 +33,10 @@ pub(super) struct IndexedDep {
     /// Inside a `<dependencyManagement>`.
     pub(super) managed: bool,
     /// Every version the build may resolve for it, as VEX discovery reads
-    /// one ([`PomScope::resolve_version`]): with no profile active but the
+    /// one ([`PomScope::build_versions`]): with no profile active but the
     /// one holding it, then each combination of profiles whose
     /// `<properties>` move it (as written where one leaves it unresolved).
-    /// Empty when it has no `<version>`, and for a live declaration that is
-    /// no classifier copy, whose versions no check reads.
+    /// Empty when it has no `<version>`.
     pub(super) build_versions: Vec<String>,
 }
 
@@ -159,18 +158,12 @@ impl PomIndex {
                 managed: managed
                     .iter()
                     .any(|m| d.element.start >= m.start && d.element.start < m.end),
-                build_versions: d
-                    .version_text
-                    .as_deref()
-                    .filter(|_| {
-                        d.in_profile || is_variant(d.type_text.as_deref(), d.classifier.as_deref())
-                    })
-                    .map_or_else(Vec::new, |text| {
-                        let (_, build, alternatives) = scope.resolve_version(text, d.element.start);
-                        std::iter::once(build)
-                            .chain(alternatives.into_iter().map(|a| a.value))
-                            .collect()
-                    }),
+                build_versions: d.version_text.as_deref().map_or_else(Vec::new, |text| {
+                    let (build, alternatives) = scope.build_versions(text, d.element.start);
+                    std::iter::once(build)
+                        .chain(alternatives.into_iter().map(|a| a.value))
+                        .collect()
+                }),
                 group: d.group,
                 artifact: d.artifact,
                 version_inner: d.version_inner,

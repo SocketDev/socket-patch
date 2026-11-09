@@ -2292,8 +2292,9 @@ impl Reactor {
             };
             let type_text = doc.child_text(dep, "type").filter(|t| !t.is_empty());
             let classifier_text = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
-            // Mapped as discovery and the hosted rewriter map it (the type
-            // check below drops any other literal type).
+            // `test-jar` is the `tests` copy ([`classpath_copy`]); the type
+            // check below drops any other literal type but `jar`, even with
+            // an explicit classifier.
             let classifier = classpath_copy(type_text.as_deref(), classifier_text.as_deref())
                 .flatten()
                 .map(str::to_string);

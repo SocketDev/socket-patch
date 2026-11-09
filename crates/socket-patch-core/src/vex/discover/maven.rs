@@ -45,16 +45,28 @@
 //! a ref (rollback / remove find it) but marked unattested: a module's
 //! own literal `<version>` overrides it, and only the root pom is read here
 //! (the rewriter refuses such roots, #261). A `${property}` version is
-//! read twice: as the pom spells it (the root `<properties>`, what the
-//! rewriter writes and rolls back) and as the build resolves it
-//! (`.mvn/maven.config`'s `-D` user properties first, Maven's order). A
-//! Socket version only the build config supplies is diagnosed, never a
-//! ref (hosted mode never writes one; rollback / remove never edit
-//! `.mvn/maven.config`). Every pin is then weighed by [`bypasses`]: an
-//! executable classifier copy, a `<profiles>` declaration, profile
-//! `<properties>` that move its version or its `${property}` coordinates,
-//! or a `-D` override that makes the build resolve anything else keeps
-//! the ref but marks it unattested.
+//! interpolated through every property it names (at most 16 deep; a cycle
+//! or an undefined name never resolves to a pin) twice: as the pom spells
+//! it (the root `<properties>`, what the rewriter writes and rolls back)
+//! and as the build resolves it (`.mvn/maven.config`'s `-D` user
+//! properties first, Maven's order). A Socket version only the build
+//! config supplies is diagnosed, never a ref (hosted mode never writes
+//! one; rollback / remove never edit `.mvn/maven.config`).
+//!
+//! Every pin is then weighed by [`bypasses`], and each way the build may
+//! resolve something else keeps the ref but marks it unattested:
+//! - an executable classifier copy (anything but `sources` / `javadoc`),
+//!   live or in a profile, at another version or none in this pom;
+//! - a `<profiles>` declaration of the main jar at another version (a
+//!   profile's `<dependencyManagement>` only where management governs the
+//!   pin); every profile counts, as vendored mode treats every profile
+//!   as live;
+//! - profile `<properties>` (any combination of profiles) that move the
+//!   pin's `${property}` version, or a `${property}` groupId / artifactId
+//!   so the pin names another package or another declaration names this
+//!   one (a coordinate property this pom cannot resolve may name
+//!   anything);
+//! - a `-D` user property that moves the pin's `${property}` version.
 //!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
 //! Trusted Checksums — `.mvn/checksums/checksums.sha256` lines
@@ -1554,6 +1566,7 @@ mod tests {
                 &out,
                 UnattestedKind::MavenClassifierUnpatched,
                 &["org.slf4j:slf4j-api:"],
+                &format!("{deps} {managed}"),
             );
         }
 
@@ -2044,6 +2057,7 @@ mod tests {
                             &out,
                             UnattestedKind::MavenConfigOverride,
                             &[".mvn/maven.config"],
+                            &what,
                         );
                     }
                     assert!(
@@ -2158,7 +2172,12 @@ mod tests {
         ];
         for (live, profile, kind) in &unattested {
             let out = run(&project(live, profile)).await;
-            assert_withheld(&out, *kind, &["org.slf4j:slf4j-api", "<profiles>"]);
+            assert_withheld(
+                &out,
+                *kind,
+                &["org.slf4j:slf4j-api", "<profiles>"],
+                &format!("{live} {profile}"),
+            );
         }
 
         let attested = [
@@ -2209,16 +2228,24 @@ mod tests {
 
     /// `out` finds the hosted slf4j-api pin for `UUID_A` but withholds it:
     /// exactly one unattested entry, of `kind`, for that pin, whose detail
-    /// names every one of `needles`.
+    /// names every one of `needles` (`case` names the case in a failure).
     #[track_caller]
-    fn assert_withheld(out: &Discovery, kind: UnattestedKind, needles: &[&str]) {
+    fn assert_withheld(out: &Discovery, kind: UnattestedKind, needles: &[&str], case: &str) {
         assert_refs(out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
-        assert_eq!(out.unattested.len(), 1, "{:?}", out.unattested);
+        assert_eq!(out.unattested.len(), 1, "{case}: {:?}", out.unattested);
         let u = &out.unattested[0];
-        assert_eq!(u.kind, kind, "{}", u.detail);
-        assert_eq!((u.purl.as_str(), u.uuid.as_str()), (FX_PURL, UUID_A));
+        assert_eq!(u.kind, kind, "{case}: {}", u.detail);
+        assert_eq!(
+            (u.purl.as_str(), u.uuid.as_str()),
+            (FX_PURL, UUID_A),
+            "{case}"
+        );
         for needle in needles {
-            assert!(u.detail.contains(needle), "{needle:?}: {}", u.detail);
+            assert!(
+                u.detail.contains(needle),
+                "{case}: {needle:?}: {}",
+                u.detail
+            );
         }
     }
 
@@ -2298,6 +2325,7 @@ mod tests {
                 &out,
                 UnattestedKind::MavenProfileUnpatched,
                 &["org.slf4j:slf4j-api", "<properties>"],
+                &format!("{root} {decl} {profiles:?}"),
             );
         }
 
@@ -3166,7 +3194,7 @@ mod tests {
             "<properties><revision>1.7.36</revision></properties>",
         ))
         .await;
-        assert_withheld(&out, UnattestedKind::MavenProfileUnpatched, &[]);
+        assert_withheld(&out, UnattestedKind::MavenProfileUnpatched, &[], "");
         // One that keeps it does not.
         let out = run(&project(
             &pin,
@@ -3289,7 +3317,7 @@ mod tests {
             &[broken],
         );
         let out = run(&p).await;
-        assert_withheld(&out, UnattestedKind::MavenProfileUnpatched, &[]);
+        assert_withheld(&out, UnattestedKind::MavenProfileUnpatched, &[], "");
         let p = property_project("", &direct_decl(&pin), &[broken]);
         let out = run(&p).await;
         assert!(

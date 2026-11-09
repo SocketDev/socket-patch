@@ -317,24 +317,26 @@ impl PomScope {
     /// The `<version>` text of the declaration at `pos`, resolved as
     /// [`PomDep::version`], [`PomDep::build_version`] and
     /// [`PomDep::version_alternatives`] describe.
-    pub(crate) fn resolve_version(
-        &self,
-        text: &str,
-        pos: usize,
-    ) -> (String, String, Vec<Alternative>) {
+    fn resolve_version(&self, text: &str, pos: usize) -> (String, String, Vec<Alternative>) {
         if !text.contains("${") {
             return (text.to_string(), text.to_string(), Vec::new());
         }
         let own = self.own_profile(pos);
         let spelled = interpolate_strict(text, &|name| self.lookup(name, &own, false))
             .unwrap_or_else(|| text.to_string());
+        let (build, alternatives) = self.build_versions(text, pos);
+        (spelled, build, alternatives)
+    }
+
+    /// [`PomDep::build_version`] and [`PomDep::version_alternatives`] of
+    /// the `<version>` text of the declaration at `pos`.
+    pub(crate) fn build_versions(&self, text: &str, pos: usize) -> (String, Vec<Alternative>) {
         match self.resolve_in_build(text, pos) {
-            (Some(build), alternatives) => (spelled, build, alternatives),
+            (Some(build), alternatives) => (build, alternatives),
             // Unresolved here (a parent pom this reader never sees may
             // define it): the build version stays as written, but a value
             // some profiles give it is still one the build may resolve.
             (None, alternatives) => (
-                spelled,
                 text.to_string(),
                 alternatives
                     .into_iter()
