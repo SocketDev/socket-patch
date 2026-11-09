@@ -3620,6 +3620,31 @@ mod tests {
             out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
             Some(true)
         );
+        // The dropped twin leaves no diagnostic of its own behind.
+        assert!(
+            out.diagnostics
+                .iter()
+                .all(|d| !d.detail.contains("(env lockfile)")),
+            "{:#?}",
+            out.diagnostics
+        );
+
+        // Wired in both documents, the env document bundling a copy: its
+        // twin is dropped before any mark, so the project ref (whose tree
+        // the env document's copies never reach) is attested.
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "{}{}",
+                env(&format!("{env_wired}{bundle}")),
+                project(&wired)
+            ),
+        );
+        let out = p.discover().await;
+        assert_refs(&out, &hosted);
+        assert_eq!(out.refs[0].part, TreePart::File);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
 
         // The env document's registry entry contests no other lock's ref.
         let npm_lock = format!(
