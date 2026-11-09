@@ -104,6 +104,12 @@ a version without a non-empty section in this file.
     refuse: pnpm pins while `gitBranchLockfile` is on and a branch lock
     exists (`vex_pnpm_git_branch_lockfile`), and npm or Bun packages the
     project patches itself (`vex_npm_patched_dependency`) (#2010).
+  - A registry dependency that the root `package.json` `overrides` send to a
+    tarball URL, git or path spec (npm installs that spec, not the lock's
+    `resolved`) is skipped by hosted mode with
+    `redirect_npm_non_registry_entry_skipped`, refused by vendored mode,
+    and no longer attested by `vex`, including overrides scoped to a
+    workspace member (#1965, #1966).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -131,6 +137,12 @@ a version without a non-empty section in this file.
     `apply --check`, hosted mode and `vex` read the module graph to tell
     whether the patch is really built, instead of reporting it applied
     while `go build` linked the unpatched code (#1840, #1843).
+  - In a go 1.16-or-older module where a downgrade left the old version's
+    `go.sum` lines behind, `apply`, `apply --check`, hosted mode and `vex`
+    use the version the module graph selects instead of the highest
+    `go.sum` line. When the module cache can't answer, they fail closed:
+    `apply` refuses with a remedy, `apply --check` reports drift, and the
+    patch is not pinned or attested (#1862, #1893).
   - `vex` reads the `go.work` that governs the project (`GOWORK`, else the
     nearest one at or above it, with members anywhere), as hosted and
     vendored modes already did, and no longer attests a Socket replace the
@@ -233,7 +245,9 @@ a version without a non-empty section in this file.
   (#2001), and the Socket-origin classifier moves into one module (#2002).
   Test fixes: PDM e2e compat pins bounded by release, a Windows-only
   scala-cli liveness test, NuGet walk tests isolated from the host cache
-  (#2034, #2035, #2037).
+  (#2034, #2035, #2037); CI retries `setup-ruby` and `setup-deno` once
+  on a release-CDN error (#2041, #2042), `lint-ecosystems` installs retry
+  release 504s, and `vexctl` is cached on every OS (#2040, #2039).
 
 ## [5.0.1] — 2026-10-13
 
