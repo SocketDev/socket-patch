@@ -340,7 +340,7 @@ pub(super) fn mark_user_patched(
         return;
     };
     out.unwired_copy(UnwiredCopy {
-        scope: Some(r.source_file.clone()),
+        scope: Some((r.source_file.clone(), r.part)),
         target: CopyTarget::Ref {
             purl: r.purl.clone(),
             uuid: r.uuid.clone(),
@@ -865,18 +865,25 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// be listed (`why`), so a member's `pnpm-lock.<branch>.yaml` cannot be
 /// ruled out. See [`unattest_git_branch_lock`].
 fn unattest_unlisted_branch_locks(file: &str, why: &str, out: &mut Discovery) {
-    out.unwired_copy(UnwiredCopy {
-        scope: Some(PathBuf::from(file)),
-        target: CopyTarget::Any,
-        file: PathBuf::from(file),
-        detail: format!(
-            "its pin is in {file}, but a pnpm branch lock cannot be ruled out: {why}; with \
-             `gitBranchLockfile` on, pnpm installs a git branch from its own \
-             `pnpm-lock.<branch>.yaml` rather than {file}"
-        ),
-        kind: UnattestedKind::PnpmGitBranchLock,
-    });
+    for part in BRANCH_LOCK_PARTS {
+        out.unwired_copy(UnwiredCopy {
+            scope: Some((PathBuf::from(file), part)),
+            target: CopyTarget::Any,
+            file: PathBuf::from(file),
+            detail: format!(
+                "its pin is in {file}, but a pnpm branch lock cannot be ruled out: {why}; with \
+                 `gitBranchLockfile` on, pnpm installs a git branch from its own \
+                 `pnpm-lock.<branch>.yaml` rather than {file}"
+            ),
+            kind: UnattestedKind::PnpmGitBranchLock,
+        });
+    }
 }
+
+/// Every install tree of a pnpm lock: a branch lock replaces the whole
+/// file, its env lockfile document included, so a branch-lock mark covers
+/// the refs of both documents.
+const BRANCH_LOCK_PARTS: [TreePart; 2] = [TreePart::File, TreePart::PnpmEnv];
 
 /// Mark every ref of the pnpm lock `file` [`UnattestedKind::PnpmGitBranchLock`]
 /// because `branch_locks` (root-relative `pnpm-lock.<branch>.yaml` files)
@@ -896,19 +903,21 @@ fn unattest_git_branch_lock(file: &str, branch_locks: &[String], out: &mut Disco
         .find(|lock| Path::new(lock.as_str()).parent() == Some(dir))
         .or(branch_locks.first())
         .map_or(file, String::as_str);
-    out.unwired_copy(UnwiredCopy {
-        scope: Some(PathBuf::from(file)),
-        target: CopyTarget::Any,
-        file: PathBuf::from(shown),
-        detail: format!(
-            "its pin is in {file} while the pnpm branch lock(s) {} exist: with \
-             `gitBranchLockfile` on, pnpm installs a git branch from its own \
-             `pnpm-lock.<branch>.yaml` rather than {file}, and a branch lock's presence \
-             withholds the statement whatever the setting says",
-            branch_locks.join(", ")
-        ),
-        kind: UnattestedKind::PnpmGitBranchLock,
-    });
+    for part in BRANCH_LOCK_PARTS {
+        out.unwired_copy(UnwiredCopy {
+            scope: Some((PathBuf::from(file), part)),
+            target: CopyTarget::Any,
+            file: PathBuf::from(shown),
+            detail: format!(
+                "its pin is in {file} while the pnpm branch lock(s) {} exist: with \
+                 `gitBranchLockfile` on, pnpm installs a git branch from its own \
+                 `pnpm-lock.<branch>.yaml` rather than {file}, and a branch lock's presence \
+                 withholds the statement whatever the setting says",
+                branch_locks.join(", ")
+            ),
+            kind: UnattestedKind::PnpmGitBranchLock,
+        });
+    }
 }
 
 /// One pnpm lock at root-relative `file` (see [`extract_pnpm`]).
