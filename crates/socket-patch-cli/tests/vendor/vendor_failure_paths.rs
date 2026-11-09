@@ -794,8 +794,11 @@ async fn vendor_refuses_a_symlinked_lock_instead_of_replacing_it() {
         }
         let link = fx.root().join(linked);
         let original = std::fs::read(&link).unwrap();
-        let shared = tempfile::tempdir().unwrap();
-        let target = shared.path().join(linked);
+        // The link target stays inside the project: one outside the
+        // repository root is never read at all (a refusal of its own).
+        let shared = fx.root().join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let target = shared.join(linked);
         std::fs::rename(&link, &target).unwrap();
         std::os::unix::fs::symlink(&target, &link).unwrap();
 

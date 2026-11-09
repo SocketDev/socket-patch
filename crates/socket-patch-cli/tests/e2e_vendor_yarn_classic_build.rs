@@ -1051,7 +1051,9 @@ fn yarn_classic_vendor_refuses_a_symlinked_lock() {
 
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
-    let shared = tmp.path().join("shared");
+    // The link target stays inside the project: one outside the
+    // repository root is never read at all (a refusal of its own).
+    let shared = proj.join("shared");
     std::fs::create_dir_all(&proj).unwrap();
     std::fs::create_dir_all(&shared).unwrap();
     std::fs::write(

@@ -237,7 +237,7 @@ mod tests {
                 "snapshot: {layout:?}"
             );
             assert_eq!(
-                detect_npm_pkg_manager(root),
+                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
                 NpmPkgManager::Pnpm,
                 "{layout:?}"
             );
@@ -250,7 +250,7 @@ mod tests {
             // Without the loader it is a plain pnpm install in deps/.
             std::fs::remove_file(root.join(".pnp.cjs")).unwrap();
             assert_eq!(
-                detect_npm_pkg_manager(root),
+                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
                 NpmPkgManager::Pnpm,
                 "{layout:?}"
             );
@@ -269,12 +269,21 @@ mod tests {
             (".npmrc", "modules-dir=deps\n", "deps/x/package.json"),
         );
         assert!(!installed_store(root));
-        assert_eq!(detect_npm_pkg_manager(root), NpmPkgManager::YarnBerryPnP);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+            NpmPkgManager::YarnBerryPnP
+        );
 
         std::fs::create_dir_all(root.join("deps/.pnpm")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(root), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+            NpmPkgManager::Pnpm
+        );
         std::fs::write(root.join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(root), NpmPkgManager::YarnBerryPnP);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+            NpmPkgManager::YarnBerryPnP
+        );
     }
 
     /// A modules dir both configured and holding an install record is

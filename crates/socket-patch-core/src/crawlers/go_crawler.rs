@@ -301,9 +301,11 @@ fn go_sum_scope(cwd: &Path) -> Option<Vec<(String, String)>> {
 
 /// Whether the go command would build `cwd` in workspace mode (or refuses
 /// to build it over an invalid `GOWORK`), resolved as go resolves it.
+/// Only a local (workspace) crawl asks ([`GoCrawler::crawl_all`] skips the
+/// `go.sum` scope under `--global` / `--global-prefix`).
 fn workspace_in_effect(cwd: &Path) -> bool {
     !matches!(
-        crate::vendor::go_workspace::resolve(cwd),
+        crate::vendor::go_workspace::resolve_in(crate::utils::repo_root::ReadScope::Workspace, cwd),
         crate::vendor::go_workspace::GoWork::None
     )
 }

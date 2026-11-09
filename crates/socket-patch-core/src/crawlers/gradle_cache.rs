@@ -900,13 +900,20 @@ fn has_settings(dir: &Path) -> bool {
 /// the cwd itself and, when it has no settings script, the nearest ancestor
 /// that has one (Gradle searches upwards for the settings of a
 /// subproject). Empty when the cwd has no Gradle marker.
-pub fn build_roots(cwd: &Path) -> Vec<PathBuf> {
+pub fn build_roots(scope: crate::utils::repo_root::ReadScope, cwd: &Path) -> Vec<PathBuf> {
     if !layout::has_build(cwd, BuildTool::Gradle) {
         return Vec::new();
     }
     let mut roots = vec![cwd.to_path_buf()];
     if !has_settings(cwd) {
-        if let Some(up) = cwd.ancestors().skip(1).find(|d| has_settings(d)) {
+        // Settings above the repository root are never read: that build
+        // reads as absent (the crawler is a reader).
+        if let Some(up) = cwd
+            .ancestors()
+            .skip(1)
+            .find(|d| has_settings(d))
+            .filter(|up| crate::utils::repo_root::upward_readable(scope, cwd, up))
+        {
             roots.push(up.to_path_buf());
         }
     }
@@ -932,7 +939,8 @@ pub fn script_graph(root: &Path, init: &InitScripts) -> ScriptGraph {
 /// wins over not declared.
 pub fn maven_local(cwd: &Path, home: Option<&GradleHome>) -> MavenLocal {
     let mut verdict = MavenLocal::NotDeclared;
-    for root in build_roots(cwd) {
+    // Per-project (a global crawl never asks for a build's m2 gate).
+    for root in build_roots(crate::utils::repo_root::ReadScope::Workspace, cwd) {
         let init = match home {
             Some(home) => init_scripts_for_build(home, &root),
             None => InitScripts {
@@ -959,7 +967,8 @@ pub fn maven_local(cwd: &Path, home: Option<&GradleHome>) -> MavenLocal {
 /// discovery.
 pub fn locked_gavs(cwd: &Path) -> BTreeSet<Gav> {
     let mut out = BTreeSet::new();
-    for root in build_roots(cwd) {
+    // Per-project (a global crawl never asks for a build's m2 gate).
+    for root in build_roots(crate::utils::repo_root::ReadScope::Workspace, cwd) {
         let graph = script_graph(&root, &InitScripts::default());
         let read = fs_text_read(&root);
         for rel in graph.lockfile_paths(&fs_list(&root)) {

@@ -476,8 +476,11 @@ pub fn foreign_dep_origins<'a>(
     dep_origins(deps)
         .into_iter()
         .filter(|origin| {
-            let known = std::iter::once(format!("https://{}", super::SOCKET_PATCH_SERVER_HOST))
-                .chain(configured.iter().cloned());
+            let known = std::iter::once(format!(
+                "https://{}",
+                crate::origin::SOCKET_PATCH_SERVER_HOST
+            ))
+            .chain(configured.iter().cloned());
             !known
                 .into_iter()
                 .any(|k| dep_origins_of_url(&k).as_deref() == Some(origin.as_str()))
@@ -768,7 +771,7 @@ impl Ctx<'_> {
     /// The hosted patch uuid `url` names, under the same host allowlist
     /// discovery applies.
     pub(crate) fn hosted_uuid(&self, url: &str) -> Option<String> {
-        super::hosted_patch_uuid(url, self.origins)
+        crate::origin::hosted_patch_uuid(url, self.origins)
     }
 }
 

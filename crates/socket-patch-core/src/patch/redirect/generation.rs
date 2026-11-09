@@ -51,7 +51,7 @@ pub(crate) fn hosted_pin_name(uuid: &str) -> String {
 /// `socket-patch-vendor-<canonical-uuid>` (maven's vendored repository id).
 /// No trimming: the rewriter must never treat a user's padded pin as its
 /// own, while lockfile discovery trims at its call site
-/// (`vex::discover::socket_patch_name_uuid`).
+/// (`origin::socket_patch_name_uuid`).
 pub(crate) fn pin_name_uuid(name: &str, vendored: bool) -> Option<&str> {
     let prefix = if vendored {
         VENDOR_PIN_NAME_PREFIX

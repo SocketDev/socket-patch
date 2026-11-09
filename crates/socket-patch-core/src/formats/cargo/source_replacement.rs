@@ -112,6 +112,7 @@ pub fn crates_io_source(layers: &[ConfigLayer<'_>]) -> CratesIoSource {
 /// exist) or `.cargo/config.toml`, deepest first, then `$CARGO_HOME`'s when
 /// no ancestor already named it. `exists` is the caller's file probe.
 pub fn config_layer_paths(
+    scope: crate::utils::repo_root::ReadScope,
     cwd: &Path,
     cargo_home: Option<&Path>,
     exists: impl Fn(&Path) -> bool,
@@ -124,7 +125,13 @@ pub fn config_layer_paths(
     };
     let mut layers = Vec::new();
     let mut dirs_seen: Vec<PathBuf> = Vec::new();
+    // Inside a git checkout a config above its root is never read
+    // (writers refuse on [`crate::vendor::cargo_config::config_above_repo`]).
+    let bound = crate::utils::repo_root::upward_bound(scope, cwd);
     for ancestor in cwd.ancestors() {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            break;
+        }
         let dot_cargo = ancestor.join(".cargo");
         if let Some(file) = pick(&dot_cargo) {
             layers.push((file, ancestor.to_path_buf()));
@@ -278,6 +285,7 @@ mod tests {
         ];
         let exists = |p: &Path| present.iter().any(|q| Path::new(q) == p);
         let got = config_layer_paths(
+            crate::utils::repo_root::ReadScope::Workspace,
             Path::new("/ws/m"),
             Some(Path::new("/home/u/.cargo")),
             exists,
@@ -298,6 +306,7 @@ mod tests {
         );
         // $CARGO_HOME inside the ancestor chain is read once.
         let got = config_layer_paths(
+            crate::utils::repo_root::ReadScope::Workspace,
             Path::new("/home/u/proj"),
             Some(Path::new("/home/u/.cargo")),
             exists,
