@@ -26,7 +26,7 @@ pub(crate) const MAX_COMBINED_PROFILES: usize = 8;
 
 /// A `project.*` / `pom.*` reference: Maven reads it from the model, ahead
 /// of any user or pom property of the same name.
-pub(crate) fn is_model_reference(name: &str) -> bool {
+fn is_model_reference(name: &str) -> bool {
     name.starts_with("project.") || name.starts_with("pom.")
 }
 
@@ -189,6 +189,26 @@ fn references(text: &str) -> impl Iterator<Item = &str> {
 pub(crate) struct Definitions {
     pub(crate) texts: Vec<String>,
     pub(crate) profiles: Vec<usize>,
+}
+
+impl Definitions {
+    /// The one definition that fixes `${name}` whatever profiles are
+    /// active, read first as [`lookup_property`] reads it: a model
+    /// reference the model answers, else a user property.
+    pub(crate) fn fixed(
+        name: &str,
+        model: &dyn Fn(&str) -> Option<String>,
+        user: &BTreeMap<String, String>,
+    ) -> Option<Definitions> {
+        is_model_reference(name)
+            .then(|| model(name))
+            .flatten()
+            .or_else(|| user.get(name).cloned())
+            .map(|v| Definitions {
+                texts: vec![v],
+                profiles: Vec::new(),
+            })
+    }
 }
 
 /// Every nonempty combination of the profiles that may change what any of

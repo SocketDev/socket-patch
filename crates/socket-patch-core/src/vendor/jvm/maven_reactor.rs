@@ -12,7 +12,7 @@ use std::ops::Range;
 use serde_json::{json, Value};
 
 use crate::formats::maven::{
-    interpolate_keeping, interpolate_strict, is_executable_classifier, is_model_reference,
+    classpath_copy, interpolate_keeping, interpolate_strict, is_executable_classifier,
     lookup_property, maven_config_properties as cli_properties, profile_combinations, Definitions,
     Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
 };
@@ -2012,15 +2012,10 @@ impl Reactor {
             })
             .collect();
         let definitions = |name: &str| {
-            if let Some(v) = is_model_reference(name)
-                .then(|| self.model_ref(reader, name))
-                .flatten()
-                .or_else(|| self.cli_props.get(name).cloned())
+            if let Some(fixed) =
+                Definitions::fixed(name, &|n| self.model_ref(reader, n), &self.cli_props)
             {
-                return Definitions {
-                    texts: vec![v],
-                    profiles: Vec::new(),
-                };
+                return fixed;
             }
             let mut d = Definitions::default();
             d.texts.extend(
@@ -2296,15 +2291,12 @@ impl Reactor {
                 continue;
             };
             let type_text = doc.child_text(dep, "type").filter(|t| !t.is_empty());
-            // `test-jar` is the `tests` classifier copy, as discovery and
-            // the hosted rewriter map it.
-            let classifier = match (
-                type_text.as_deref(),
-                doc.child_text(dep, "classifier").filter(|c| !c.is_empty()),
-            ) {
-                (Some("test-jar"), None) => Some("tests".to_string()),
-                (_, classifier) => classifier,
-            };
+            let classifier_text = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
+            // Mapped as discovery and the hosted rewriter map it (the type
+            // check below drops any other literal type).
+            let classifier = classpath_copy(type_text.as_deref(), classifier_text.as_deref())
+                .flatten()
+                .map(str::to_string);
             if !doc.has_property_coordinate(dep)
                 || doc.pin_at(dep).is_some()
                 || classifier
@@ -2320,17 +2312,7 @@ impl Reactor {
                 continue;
             }
             let (here_g, here_a) = (resolve(&g), resolve(&a));
-            let here_g = if g.contains("${") {
-                here_g
-            } else {
-                Some(g.clone())
-            };
-            let here_a = if a.contains("${") {
-                here_a
-            } else {
-                Some(a.clone())
-            };
-            let why = match (&here_g, &here_a) {
+            let (reason, detail) = match (&here_g, &here_a) {
                 (Some(hg), Some(ha)) if hg == patch.group_id && ha == patch.artifact_id => {
                     continue;
                 }
@@ -2370,7 +2352,6 @@ impl Reactor {
                     )
                 }
             };
-            let (reason, detail) = why;
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
             if let Some(classifier) = classifier {
                 warnings.push(degraded(
@@ -6216,11 +6197,7 @@ mod tests {
             "raise",
             "<w>1.11.0</w>",
         );
-        let files = fs(&[
-            ("pom.xml", &root),
-            ("a/pom.xml", &a),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(&root, &a);
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
         let detail = &plan.warnings[0].detail;
@@ -6267,14 +6244,31 @@ mod tests {
         );
         match profile {
             "" => root,
-            p => root.replace(
-                "  <modules>",
-                &format!(
-                    "  <profiles><profile><id>corp</id><properties>{p}</properties>\
-                     </profile></profiles>\n  <modules>"
-                ),
-            ),
+            p => with_corp_profile(&root, p),
         }
+    }
+
+    /// `root` with a profile `corp` whose `<properties>` are `props`, before
+    /// its `<modules>`: also how a profile is added to a vendored reactor
+    /// later.
+    fn with_corp_profile(root: &str, props: &str) -> String {
+        root.replace(
+            "  <modules>",
+            &format!(
+                "  <profiles><profile><id>corp</id><properties>{props}</properties>\
+                 </profile></profiles>\n  <modules>"
+            ),
+        )
+    }
+
+    /// The `a` / `b` reactor under `root`, module `a`'s pom being `a` and
+    /// `b` declaring nothing.
+    fn reactor(root: &str, a: &str) -> Fs {
+        fs(&[
+            ("pom.xml", root),
+            ("a/pom.xml", a),
+            ("b/pom.xml", &module("b", "")),
+        ])
     }
 
     /// A declaration whose `${...}` groupId a profile redefines names
@@ -6292,11 +6286,7 @@ mod tests {
             "<ct.group>org.other</ct.group>",
             "<ct.group>${nope}</ct.group>",
         ] {
-            let files = fs(&[
-                ("pom.xml", &root_with(props, profile)),
-                ("a/pom.xml", &a),
-                ("b/pom.xml", &module("b", "")),
-            ]);
+            let files = reactor(&root_with(props, profile), &a);
             let plan = run(&files).unwrap();
             assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
             assert!(
@@ -6311,18 +6301,10 @@ mod tests {
         }
 
         // A vendored reactor a profile is added to later is not attestable.
-        let files = fs(&[
-            ("pom.xml", &root_with(props, "")),
-            ("a/pom.xml", &a),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(&root_with(props, ""), &a);
         let (_, mut after) = vendor(&files);
         assert_eq!(attestable(&after), (true, true));
-        let root = text(&after, "pom.xml").replace(
-            "  <modules>",
-            "  <profiles><profile><id>corp</id><properties><ct.group>org.other</ct.group>\
-             </properties></profile></profiles>\n  <modules>",
-        );
+        let root = with_corp_profile(&text(&after, "pom.xml"), "<ct.group>org.other</ct.group>");
         after.insert("pom.xml".to_string(), root.into_bytes());
         assert_eq!(attestable(&after), (true, false));
 
@@ -6372,11 +6354,7 @@ mod tests {
             ("<lib.group>org.third</lib.group>", false),
             ("<x>org.apache.commons</x>", false),
         ] {
-            let files = fs(&[
-                ("pom.xml", &root_with(props, profile)),
-                ("a/pom.xml", &a),
-                ("b/pom.xml", &module("b", "")),
-            ]);
+            let files = reactor(&root_with(props, profile), &a);
             let plan = run(&files).unwrap();
             if warned {
                 assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
@@ -6404,14 +6382,8 @@ mod tests {
                 other("<version>1.9</version><type>${t}</type>")
             ),
         );
-        let files = fs(&[
-            (
-                "pom.xml",
-                &root_with(props, "<lib.group>org.apache.commons</lib.group>"),
-            ),
-            ("a/pom.xml", &typed),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let to_commons = "<lib.group>org.apache.commons</lib.group>";
+        let files = reactor(&root_with(props, to_commons), &typed);
         let plan = run(&files).unwrap();
         assert_eq!(
             reasons(&plan),
@@ -6422,36 +6394,20 @@ mod tests {
         assert!(!root_pinned(&plan, &files));
 
         // No version of its own: the pin applies, so the root stays pinned.
-        let files = fs(&[
-            (
-                "pom.xml",
-                &root_with(props, "<lib.group>org.apache.commons</lib.group>"),
-            ),
-            (
-                "a/pom.xml",
-                &module("a", &format!("{}{}", dep("1.10.0"), other(""))),
-            ),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(
+            &root_with(props, to_commons),
+            &module("a", &format!("{}{}", dep("1.10.0"), other(""))),
+        );
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["coordinates_overridden"]);
         assert!(root_pinned(&plan, &files));
 
         // Vendored first, the profile added later: not attestable; a user
         // property fixing the group keeps it attestable.
-        let files = fs(&[
-            ("pom.xml", &root_with(props, "")),
-            ("a/pom.xml", &a),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(&root_with(props, ""), &a);
         let (_, after) = vendor(&files);
         assert_eq!(attestable(&after), (true, true));
-        let profiled = text(&after, "pom.xml").replace(
-            "  <modules>",
-            "  <profiles><profile><id>corp</id><properties>\
-             <lib.group>org.apache.commons</lib.group></properties></profile></profiles>\n  \
-             <modules>",
-        );
+        let profiled = with_corp_profile(&text(&after, "pom.xml"), to_commons);
         let mut later = after.clone();
         later.insert("pom.xml".to_string(), profiled.into_bytes());
         assert_eq!(attestable(&later), (true, false));
@@ -6464,8 +6420,7 @@ mod tests {
 
     /// Coordinates whose text can never read the patched g:a (`${g}:guava`)
     /// are not weighed, however many profiles redefine `g`: more than are
-    /// combined would otherwise fail closed and unpin the root (#2026
-    /// review). The same text naming commons-text does fail closed.
+    /// combined would otherwise fail closed and unpin the root. The same text naming commons-text does fail closed.
     #[test]
     fn many_profiles_on_an_unrelated_coordinate_are_not_weighed() {
         let profiles: String = (0..=MAX_COMBINED_PROFILES)
@@ -6490,20 +6445,12 @@ mod tests {
                 ),
             )
         };
-        let files = fs(&[
-            ("pom.xml", &root),
-            ("a/pom.xml", &named("guava")),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(&root, &named("guava"));
         let plan = run(&files).unwrap();
         assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
         assert!(root_pinned(&plan, &files));
 
-        let files = fs(&[
-            ("pom.xml", &root),
-            ("a/pom.xml", &named("commons-text")),
-            ("b/pom.xml", &module("b", "")),
-        ]);
+        let files = reactor(&root, &named("commons-text"));
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["coordinates_overridden"]);
         assert!(!root_pinned(&plan, &files));
@@ -6512,7 +6459,7 @@ mod tests {
     /// A classifier copy a profile retargets onto the patched g:a is its
     /// own coordinate, which no pin reaches: warned about as
     /// `classifier_declared`, like a literal one, without unpinning the
-    /// root (#2026 review).
+    /// root.
     #[test]
     fn a_profile_retargeting_a_classifier_copy_warns() {
         let classified = "<dependency><groupId>${lib.group}</groupId>\
@@ -6523,20 +6470,13 @@ mod tests {
                     <artifactId>commons-text</artifactId><version>1.10.0</version>\
                     <type>test-jar</type></dependency>";
         for copy in [classified, test_jar] {
-            let files = fs(&[
-                (
-                    "pom.xml",
-                    &root_with(
-                        "<lib.group>org.other</lib.group>",
-                        "<lib.group>org.apache.commons</lib.group>",
-                    ),
+            let files = reactor(
+                &root_with(
+                    "<lib.group>org.other</lib.group>",
+                    "<lib.group>org.apache.commons</lib.group>",
                 ),
-                (
-                    "a/pom.xml",
-                    &module("a", &format!("{}{copy}", dep("1.10.0"))),
-                ),
-                ("b/pom.xml", &module("b", "")),
-            ]);
+                &module("a", &format!("{}{copy}", dep("1.10.0"))),
+            );
             let plan = run(&files).unwrap();
             assert_eq!(reasons(&plan), ["classifier_declared"], "{copy}");
             assert!(

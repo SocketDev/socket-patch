@@ -7,8 +7,8 @@
 //! not once per dependency.
 
 use crate::formats::maven::{
-    interpolate_strict, is_executable_classifier, is_executable_variant, is_variant, may_name,
-    may_shadow, variant_label, CoordinateAlternative, PomScope,
+    classpath_copy, is_executable_classifier, is_executable_variant, is_variant, management_key,
+    may_name, may_shadow, variant_label, CoordinateAlternative, PomScope,
 };
 use crate::formats::xml::{child_text, children, elements, Element};
 
@@ -33,10 +33,11 @@ pub(super) struct IndexedDep {
     /// Inside a `<dependencyManagement>`.
     pub(super) managed: bool,
     /// Every version the build may resolve for it, as VEX discovery reads
-    /// one ([`PomScope::resolve_in_build`]): with no profile active but the
+    /// one ([`PomScope::resolve_version`]): with no profile active but the
     /// one holding it, then each combination of profiles whose
     /// `<properties>` move it (as written where one leaves it unresolved).
-    /// Empty when it has no `<version>`.
+    /// Empty when it has no `<version>`, and for a live declaration that is
+    /// no classifier copy, whose versions no check reads.
     pub(super) build_versions: Vec<String>,
 }
 
@@ -158,13 +159,18 @@ impl PomIndex {
                 managed: managed
                     .iter()
                     .any(|m| d.element.start >= m.start && d.element.start < m.end),
-                build_versions: d.version_text.as_deref().map_or_else(Vec::new, |text| {
-                    let (base, alternatives) =
-                        scope.resolve_in_build(text, d.element.start, interpolate_strict);
-                    std::iter::once(base.unwrap_or_else(|| text.to_string()))
-                        .chain(alternatives.into_iter().map(|a| a.value))
-                        .collect()
-                }),
+                build_versions: d
+                    .version_text
+                    .as_deref()
+                    .filter(|_| {
+                        d.in_profile || is_variant(d.type_text.as_deref(), d.classifier.as_deref())
+                    })
+                    .map_or_else(Vec::new, |text| {
+                        let (_, build, alternatives) = scope.resolve_version(text, d.element.start);
+                        std::iter::once(build)
+                            .chain(alternatives.into_iter().map(|a| a.value))
+                            .collect()
+                    }),
                 group: d.group,
                 artifact: d.artifact,
                 version_inner: d.version_inner,
@@ -254,31 +260,29 @@ impl PomIndex {
         served: Option<&str>,
     ) -> Option<String> {
         self.deps.iter().find_map(|d| {
-            let written = format!(
-                "{}:{}",
-                d.group_text.as_deref().unwrap_or_default(),
-                d.artifact_text.as_deref().unwrap_or_default()
-            );
+            let written = || {
+                format!(
+                    "{}:{}",
+                    d.group_text.as_deref().unwrap_or_default(),
+                    d.artifact_text.as_deref().unwrap_or_default()
+                )
+            };
             if d.group.as_deref() == Some(group) && d.artifact.as_deref() == Some(artifact) {
                 let moved = d.coordinate_alternatives.first()?;
                 return (!d.in_profile && d.classifier.is_none() && d.version_text.is_some()).then(
                     || {
                         format!(
-                            "{written} names {group}:{artifact}, but the <properties> of {} \
-                             make it {}:{}",
-                            moved.by, moved.group, moved.artifact
+                            "{} names {group}:{artifact}, but the <properties> of {} make it \
+                             {}:{}",
+                            written(),
+                            moved.by,
+                            moved.group,
+                            moved.artifact
                         )
                     },
                 );
             }
-            let classifier = match (d.type_text.as_deref(), d.classifier.as_deref()) {
-                (None | Some("jar"), c) => c,
-                (Some(t), c) if t.contains("${") => c,
-                (Some("test-jar"), None) => Some("tests"),
-                // An explicit classifier names the copy whatever the type.
-                (Some(_), Some(c)) => Some(c),
-                _ => return None,
-            };
+            let classifier = classpath_copy(d.type_text.as_deref(), d.classifier.as_deref())?;
             d.coordinate_alternatives.iter().find_map(|r| {
                 let literal = r.group == group && r.artifact == artifact;
                 let names = match classifier {
@@ -297,8 +301,9 @@ impl PomIndex {
                 };
                 (names && r.version.as_deref() != served).then(|| {
                     format!(
-                        "{written}{} declares {}:{} at <version>{}</version> under the \
+                        "{}{} declares {}:{} at <version>{}</version> under the \
                          <properties> of {}",
+                        written(),
                         classifier.map_or(String::new(), |c| format!(" (classifier {c})")),
                         r.group,
                         r.artifact,
@@ -365,14 +370,8 @@ impl PomIndex {
         artifact: &str,
         served: &str,
     ) -> Option<(&str, Option<&str>)> {
-        // Keyed as Maven keys management: by classifier and type.
         fn key(d: &IndexedDep) -> (Option<&str>, Option<&str>) {
-            (
-                d.classifier.as_deref().filter(|c| !c.is_empty()),
-                d.type_text
-                    .as_deref()
-                    .filter(|t| !t.is_empty() && *t != "jar"),
-            )
+            management_key(d.type_text.as_deref(), d.classifier.as_deref())
         }
         let copies = move |managed: bool| {
             self.deps.iter().filter_map(move |d| {

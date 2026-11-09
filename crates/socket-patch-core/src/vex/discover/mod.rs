@@ -615,24 +615,24 @@ pub enum UnattestedKind {
     /// #261): a module's own literal `<version>` overrides it, and only the
     /// root pom is read, so the reactor may build the upstream jar.
     MavenReactorRoot,
-    /// A Maven pin whose GA also has an executable classifier copy (live
-    /// or inside `<profiles>`) (`tests`, a native build; not `sources` / `javadoc`) at another
-    /// version: the classifier-less pin does not retarget it and the grant
-    /// serves only the main jar, so the build runs the public classifier jar.
+    /// A Maven pin (hosted, or the pre-v5 single-pom vendored repository)
+    /// whose GA also has an executable classifier copy (`tests`, a native
+    /// build; not `sources` / `javadoc`), live or inside `<profiles>`, at
+    /// another version: the classifier-less pin does not retarget it and
+    /// the grant serves only the main jar, so the build runs the public
+    /// classifier jar.
     MavenClassifierUnpatched,
     /// A Maven pin (hosted, or the pre-v5 single-pom vendored repository)
-    /// whose GA a `<profiles>` declaration of the root pom gives another
-    /// version (the base release, another release, an
-    /// unresolved `${property}`), or whose `${property}` version a
-    /// profile's `<properties>` redefine (directly or through a property
-    /// it names) to another or an unresolvable version: whenever that
-    /// profile is active it overrides the pin, so the build resolves the
-    /// unpatched jar.
+    /// that some profile overrides whenever it is active: a `<profiles>`
+    /// declaration of the GA at another version, profile `<properties>`
+    /// that move the pin's `${property}` version, or ones that move a
+    /// `${property}` groupId / artifactId so the pin names another package
+    /// or another declaration names this one.
     MavenProfileUnpatched,
-    /// A hosted (or pre-v5 vendored) Maven pin the root pom spells through a
-    /// `${property}` that
-    /// `.mvn/maven.config` redefines (`-D`, which Maven reads before the
-    /// pom's `<properties>`): the build resolves that version, not the pin.
+    /// A Maven pin (hosted, or the pre-v5 single-pom vendored repository)
+    /// the root pom spells through a `${property}` that `.mvn/maven.config`
+    /// redefines (`-D`, which Maven reads before the pom's `<properties>`):
+    /// the build resolves that version, not the pin.
     MavenConfigOverride,
     /// A pnpm lock's pin while any `pnpm-lock.<branch>.yaml` exists (#556),
     /// whatever pnpm's `gitBranchLockfile` setting says (discovery reads no

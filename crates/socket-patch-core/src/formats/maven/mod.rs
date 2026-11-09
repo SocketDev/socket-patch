@@ -8,9 +8,8 @@ mod properties;
 use std::collections::BTreeMap;
 
 pub(crate) use properties::{
-    interpolate_keeping, interpolate_strict, is_model_reference, lookup_property,
-    profile_combinations, Definitions, Interpolate, PomLayer, MAX_COMBINED_PROFILES,
-    MAX_INTERPOLATION_DEPTH,
+    interpolate_keeping, interpolate_strict, lookup_property, profile_combinations, Definitions,
+    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
 };
 use properties::{interpolate_lenient, read_properties};
 
@@ -298,15 +297,8 @@ impl PomScope {
     /// otherwise the root's, every profile's (each but `own`, which is
     /// always active, may be the one read) and a bare model reference.
     fn definitions(&self, name: &str, own: &[usize]) -> Definitions {
-        if let Some(v) = is_model_reference(name)
-            .then(|| self.model_ref(name))
-            .flatten()
-            .or_else(|| self.user.get(name).cloned())
-        {
-            return Definitions {
-                texts: vec![v],
-                profiles: Vec::new(),
-            };
+        if let Some(fixed) = Definitions::fixed(name, &|n| self.model_ref(n), &self.user) {
+            return fixed;
         }
         let mut d = Definitions::default();
         d.texts.extend(self.properties.get(name).cloned());
@@ -325,14 +317,18 @@ impl PomScope {
     /// The `<version>` text of the declaration at `pos`, resolved as
     /// [`PomDep::version`], [`PomDep::build_version`] and
     /// [`PomDep::version_alternatives`] describe.
-    fn resolve_version(&self, text: &str, pos: usize) -> (String, String, Vec<Alternative>) {
+    pub(crate) fn resolve_version(
+        &self,
+        text: &str,
+        pos: usize,
+    ) -> (String, String, Vec<Alternative>) {
         if !text.contains("${") {
             return (text.to_string(), text.to_string(), Vec::new());
         }
         let own = self.own_profile(pos);
         let spelled = interpolate_strict(text, &|name| self.lookup(name, &own, false))
             .unwrap_or_else(|| text.to_string());
-        match self.resolve_in_build(text, pos, interpolate_strict) {
+        match self.resolve_in_build(text, pos) {
             (Some(build), alternatives) => (spelled, build, alternatives),
             // Unresolved here (a parent pom this reader never sees may
             // define it): the build version stays as written, but a value
@@ -348,22 +344,16 @@ impl PomScope {
         }
     }
 
-    /// What `text` (written in the declaration at `pos`) resolves to in the
-    /// build with no profile active but the one holding it, through
-    /// `interpolate` ([`interpolate_strict`] for a version), and each other
-    /// value a combination of active profiles gives it
-    /// ([`profile_combinations`], the vendored reactor's too), the
-    /// smallest combination first; a combination `interpolate` cannot
-    /// resolve gives the text as written. Fails closed: when the
+    /// What the version `text` (written in the declaration at `pos`)
+    /// resolves to in the build with no profile active but the one holding
+    /// it ([`interpolate_strict`]), and each other value a combination of
+    /// active profiles gives it ([`profile_combinations`], the vendored
+    /// reactor's too), the smallest combination first; a combination that
+    /// cannot resolve it gives the text as written. Fails closed: when the
     /// combinations cannot be enumerated or a profile's `<properties>` is
     /// unreadable, the text as written is an alternative.
-    pub(crate) fn resolve_in_build(
-        &self,
-        text: &str,
-        pos: usize,
-        interpolate: Interpolate,
-    ) -> (Option<String>, Vec<Alternative>) {
-        let (mut base, readings) = self.resolve_all_in_build(&[(text, interpolate)], pos);
+    fn resolve_in_build(&self, text: &str, pos: usize) -> (Option<String>, Vec<Alternative>) {
+        let (mut base, readings) = self.resolve_all_in_build(&[(text, interpolate_strict)], pos);
         let mut alternatives: Vec<Alternative> = Vec::new();
         for (mut values, by) in readings {
             let value = values.remove(0).unwrap_or_else(|| text.to_string());
@@ -496,6 +486,9 @@ impl PomScope {
     /// make of it is [`Self::coordinate_alternatives`]' job, which every
     /// coordinate check weighs.
     fn interpolate_coordinate(&self, text: &str, pos: usize) -> String {
+        if !text.contains("${") {
+            return text.to_string();
+        }
         let own = self.own_profile(pos);
         interpolate_lenient(text, &|name| self.lookup(name, &own, true))
     }
@@ -960,6 +953,36 @@ pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> b
         || type_text.is_some_and(|t| !t.is_empty() && t != "jar" && t != "pom")
 }
 
+/// Which copy of its GA a declaration's `<type>` / `<classifier>` read as
+/// when a profile moves its coordinates: `Some(None)` the main jar,
+/// `Some(Some(c))` the classifier copy `c`, `None` no jar on the classpath.
+/// `test-jar` is the `tests` copy, an explicit classifier names the copy
+/// whatever the type, and a `${…}` type may be `jar`.
+pub(crate) fn classpath_copy<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> Option<Option<&'a str>> {
+    match (type_text, classifier) {
+        (None | Some("jar"), c) => Some(c),
+        (Some(t), c) if t.contains("${") => Some(c),
+        (Some("test-jar"), None) => Some(Some("tests")),
+        (Some(_), Some(c)) => Some(Some(c)),
+        _ => None,
+    }
+}
+
+/// How Maven keys a `<dependencyManagement>` entry besides its GA: by
+/// classifier and type, an empty or `jar` type being the default.
+pub(crate) fn management_key<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        classifier.filter(|c| !c.is_empty()),
+        type_text.filter(|t| !t.is_empty() && *t != "jar"),
+    )
+}
+
 /// The label a variant ([`is_variant`]) is reported by: its classifier,
 /// else its type.
 pub(crate) fn variant_label<'a>(
@@ -1036,6 +1059,14 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::PomScope;
+
+    /// `.mvn/maven.config`-style user properties from `(name, value)` pairs.
+    fn user_props(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
 
     #[test]
     fn scope_skips_comments_and_plugin_sections_and_flags_profiles() {
@@ -1202,11 +1233,7 @@ mod tests {
                    <dependency><groupId>g</groupId><artifactId>c</artifactId><version>${u}</version></dependency>\
                    </dependencies></project>";
         let versions = |user: &[(&str, &str)]| {
-            let user = user
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            super::parse_pom_with(pom, &user)
+            super::parse_pom_with(pom, &user_props(user))
                 .unwrap()
                 .deps
                 .into_iter()
@@ -1239,12 +1266,7 @@ mod tests {
                    <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${project.version}</version></dependency>\
                    <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${pom.version}</version></dependency>\
                    </dependencies></project>";
-        let user = [
-            ("project.version".to_string(), "9".to_string()),
-            ("pom.version".to_string(), "9".to_string()),
-        ]
-        .into_iter()
-        .collect();
+        let user = user_props(&[("project.version", "9"), ("pom.version", "9")]);
         let deps = super::parse_pom_with(pom, &user).unwrap().deps;
         for d in &deps {
             assert_eq!(d.build_version, d.version, "{d:?}");
@@ -1268,11 +1290,10 @@ mod tests {
                  <dependency><groupId>g</groupId><artifactId>a</artifactId>\
                  <version>{text}</version></dependency></dependencies></project>"
             );
-            let user = user
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            let dep = super::parse_pom_with(&pom, &user).unwrap().deps.remove(0);
+            let dep = super::parse_pom_with(&pom, &user_props(user))
+                .unwrap()
+                .deps
+                .remove(0);
             assert!(dep.version_alternatives.is_empty(), "{props}");
             (dep.version.unwrap(), dep.build_version.unwrap())
         };
@@ -1342,11 +1363,7 @@ mod tests {
                 "<project><version>9</version><properties>{props}</properties>\
                  <dependencies>{deps}</dependencies><profiles>{profiles}</profiles></project>"
             );
-            let user = user
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            super::parse_pom_with(&pom, &user)
+            super::parse_pom_with(&pom, &user_props(user))
                 .unwrap()
                 .deps
                 .into_iter()
@@ -1448,7 +1465,7 @@ mod tests {
              <properties><revision>2</revision></properties></profile></profiles></project>",
             dep("${project.version}")
         );
-        let user = [("revision".to_string(), "3".to_string())].into();
+        let user = user_props(&[("revision", "3")]);
         for (user, built, alternatives) in [
             (BTreeMap::new(), "1", vec![moved("2", &["ci"])]),
             (user, "3", vec![]),
@@ -1518,11 +1535,7 @@ mod tests {
                 "<project><groupId>org.self</groupId><properties>{props}</properties>\
                  <dependencies>{deps}</dependencies><profiles>{profiles}</profiles></project>"
             );
-            let user = user
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
-            super::parse_pom_with(&pom, &user)
+            super::parse_pom_with(&pom, &user_props(user))
                 .unwrap()
                 .deps
                 .into_iter()
