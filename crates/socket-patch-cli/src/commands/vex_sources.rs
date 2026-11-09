@@ -44,7 +44,10 @@
 //!   whatever raw text survives. Only for a uuid no read file mentions
 //!   (formats no extractor reads, patch servers outside the host allowlist)
 //!   does the ledger's own recorded wiring decide — only files that PIN the
-//!   resolution, never a leftover registry definition; a vendor entry
+//!   resolution, never a leftover registry definition — and a hosted
+//!   record whose lock entry or recorded wiring routes the uuid through a
+//!   hosted-shaped url on an origin this run was not given is never
+//!   attested (core `RecordLiveness::Undecided`, fail closed); a vendor entry
 //!   recording no wiring (repair's reconstruction) probes its ecosystem's
 //!   root locks; a lock inventory entry resolving the purl elsewhere is
 //!   dead. A reverted lockfile plus a leftover ledger or artifact must not
@@ -82,7 +85,7 @@ use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
-    vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
+    vendor_ref, Discovery, LedgerLiveness, PatchedRef, RecordLiveness, WiringMode,
 };
 use socket_patch_core::vex::{FailedPatch, Unattested, UnattestedKind};
 
@@ -665,9 +668,14 @@ pub(crate) async fn plan(
                 continue;
             }
         } else if cand.redirected {
-            let live = assumed.contains(strip_purl_qualifiers(&cand.key))
-                || liveness.redirect_record(&cand.key, &cand.uuid).await;
-            if live {
+            let verdict = if assumed.contains(strip_purl_qualifiers(&cand.key)) {
+                RecordLiveness::Live
+            } else {
+                liveness
+                    .redirect_record_verdict(&cand.key, &cand.uuid)
+                    .await
+            };
+            if verdict.attests() {
                 Basis::Hosted {
                     lockfile_basis: false,
                 }
@@ -676,6 +684,9 @@ pub(crate) async fn plan(
                 // purl: verify it as the agent-mode patch it now is.
                 Basis::Installed
             } else {
+                if verdict == RecordLiveness::Undecided {
+                    notes.push(foreign_origin_note(&cand.key, &cand.uuid));
+                }
                 notes.extend(dead_claim_notes(
                     &discovery,
                     &cand.key,
@@ -1099,6 +1110,20 @@ fn dead_claim_notes(
         });
     }
     notes
+}
+
+/// Why a hosted-ledger record whose wiring resolves from a patch server
+/// this run was not given ([`RecordLiveness::Undecided`]) is not attested:
+/// fail closed, and say how a staging server is admitted.
+fn foreign_origin_note(key: &str, uuid: &str) -> PlanNote {
+    PlanNote {
+        code: NOTE_CLAIM_UNWIRED,
+        detail: format!(
+            "{key}: the hosted ledger records patch {uuid}, but its wiring resolves it from a \
+             patch server this run was not given; pass --patch-server-url for a non-production \
+             patch server; not attested"
+        ),
+    }
 }
 
 /// A local record for `uuid` (manifest, then redirect ledger, then vendor

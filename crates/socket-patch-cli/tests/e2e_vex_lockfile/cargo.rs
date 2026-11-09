@@ -913,48 +913,36 @@ fn cargo_hosted_f_spoofed_references_never_attest() {
     let run = fx.vex(&["--proxy-url", &api.uri()]);
     assert_nothing_discovered(&run, "foreign host");
     assert_eq!(api.hits(), 0, "a foreign-host uuid is never even fetched");
-    // DELIBERATE (the staging fallback): a uuid on a host outside the
-    // allowlist is not a lockfile reference, but it is not "recognized"
-    // either, so a redirect-ledger record for it falls back to the ledger's
-    // own recorded wiring files — which still name it — so that a staging
-    // `scan --mode hosted` run without `--patch-server-url` keeps
-    // attesting. Hash verification still judges the copy the build
-    // consumes (the foreign registry's): nothing is installed here, so the
-    // default run omits it; only `--no-verify`, which trusts the ledger's
-    // record by definition, attests.
+    // FAIL CLOSED: a redirect-ledger record whose recorded wiring routes
+    // the uuid through a hosted-shaped url on an origin this run was not
+    // given (here the `Cargo.lock` `sparse+` source and the
+    // `.cargo/config.toml` index) is never attested — whatever is
+    // installed, with or without `--no-verify` — and is reported as
+    // `redirect_unwired` (core `RecordLiveness::Undecided`; CLI_CONTRACT.md,
+    // "Patch hosts (manifest-less VEX)"). A staging patch server needs
+    // `--patch-server-url`, below.
     write_redirect_ledger(&fx, CARGO_PURL, cargo_record(U), CARGO_HOSTED_EDITS);
-    let run = fx.vex(&["--offline"]);
-    assert_omitted(
-        &run,
-        CARGO_PURL,
-        "package_not_found",
-        "foreign host + ledger",
-    );
-    fx.install_crate(SOCKET_CARGO_SRC, PATCHED_RS);
-    let run = fx.vex(&["--offline"]);
-    assert_omitted(
-        &run,
-        CARGO_PURL,
-        "package_not_found",
-        "foreign host + ledger: Socket's copy is not what this lock builds",
-    );
-    fx.install_crate("evil.example-0123456789abcdef", PRISTINE_RS);
-    let run = fx.vex(&["--offline"]);
-    assert_eq!(
-        run.code,
-        Some(1),
-        "foreign registry's pristine copy: {}",
-        run.env
-    );
-    let run = fx.vex(&["--offline", "--no-verify"]);
-    assert_attested(
-        &fx,
-        &run,
-        CARGO_PURL,
-        U,
-        "redirected",
-        "staging fallback, --no-verify",
-    );
+    for (state, install) in [
+        ("not installed", None),
+        ("Socket's patched copy", Some(SOCKET_CARGO_SRC)),
+        (
+            "the foreign registry's patched copy",
+            Some("evil.example-0123456789abcdef"),
+        ),
+    ] {
+        if let Some(src) = install {
+            fx.install_crate(src, PATCHED_RS);
+        }
+        for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+            let run = fx.vex(extra);
+            assert_omitted(
+                &run,
+                CARGO_PURL,
+                "redirect_unwired",
+                &format!("foreign host + ledger, {state} {extra:?}"),
+            );
+        }
+    }
 
     // The same foreign origin configured as the operator's patch server.
     let fx = Fx::new();
