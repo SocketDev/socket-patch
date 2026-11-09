@@ -445,7 +445,10 @@ async fn dispatch_find(
         eco = Ecosystem::Npm,
         options = options,
         silent = silent,
-        crawler = NpmRootsCrawler { roots: npm_roots },
+        crawler = NpmRootsCrawler {
+            roots: npm_roots,
+            crawler: NpmCrawler::for_options(options),
+        },
         get_paths = get_node_modules_paths,
         using_label = "global npm packages",
         err_label = "npm packages",
@@ -760,7 +763,10 @@ async fn dispatch_find_with_npm_links(
     let npm_roots = match prior.and_then(|p| p.roots_for(options)) {
         _ if wanted.is_empty() => None,
         Some(roots) => Some(roots.to_vec()),
-        None => NpmCrawler.get_node_modules_paths(options).await.ok(),
+        None => NpmCrawler::for_options(options)
+            .get_node_modules_paths(options)
+            .await
+            .ok(),
     };
     let mut found = dispatch_find(
         partitioned,
@@ -988,6 +994,8 @@ fn merge_each_copy(
 /// an earlier crawl's roots when it has them.
 struct NpmRootsCrawler<'a> {
     roots: Option<&'a [PathBuf]>,
+    /// The crawler for the run's options, carrying its read scope.
+    crawler: NpmCrawler,
 }
 
 impl NpmRootsCrawler<'_> {
@@ -997,7 +1005,7 @@ impl NpmRootsCrawler<'_> {
     ) -> Result<Vec<PathBuf>, std::io::Error> {
         match self.roots {
             Some(roots) => Ok(roots.to_vec()),
-            None => NpmCrawler.get_node_modules_paths(options).await,
+            None => self.crawler.get_node_modules_paths(options).await,
         }
     }
 
@@ -1006,7 +1014,7 @@ impl NpmRootsCrawler<'_> {
         node_modules_path: &std::path::Path,
         purls: &[String],
     ) -> Result<HashMap<String, Vec<CrawledPackage>>, std::io::Error> {
-        NpmCrawler.find_by_purls(node_modules_path, purls).await
+        self.crawler.find_by_purls(node_modules_path, purls).await
     }
 }
 
@@ -1027,7 +1035,7 @@ pub(crate) async fn npm_paths_by_identity(
     if purls.is_empty() {
         return HashMap::new();
     }
-    let installed = NpmCrawler::new().crawl_all(options).await;
+    let installed = NpmCrawler::for_options(options).crawl_all(options).await;
     npm_paths_by_identity_in(&installed, purls)
 }
 
@@ -1107,7 +1115,8 @@ pub async fn find_manifest_package_copies_reusing(
     // includes them (#603).
     for (purl, paths) in copies.iter_mut() {
         if purl.starts_with("pkg:npm/") {
-            *paths = with_store_peer_variant_copies(std::mem::take(paths)).await;
+            *paths =
+                with_store_peer_variant_copies(common.read_scope(), std::mem::take(paths)).await;
         }
     }
     // A Bun store entry nothing links any more (Bun never prunes `.bun`)
@@ -1209,10 +1218,14 @@ impl JvmScope {
         let probe_env = env.clone();
         let probe = move || {
             let gate = m2_gate(&cwd, &probe_env);
-            let metadata = gradle_cache::build_roots(&cwd)
-                .into_iter()
-                .map(|root| root.join("gradle").join("verification-metadata.xml"))
-                .find(|p| p.is_file());
+            // A global run returned above: this is a project run.
+            let metadata = gradle_cache::build_roots(
+                socket_patch_core::utils::repo_root::ReadScope::Workspace,
+                &cwd,
+            )
+            .into_iter()
+            .map(|root| root.join("gradle").join("verification-metadata.xml"))
+            .find(|p| p.is_file());
             (gate, metadata)
         };
         // Script reads and stats: off the async workers.
@@ -1384,7 +1397,11 @@ async fn crawl_every_ecosystem(
     let (npm, pypi, cargo, gems, golang, maven, composer, nuget, deno) =
         if walk_pool::fd_limit_is_tight() {
             (
-                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)).await,
+                crawl!(
+                    Ecosystem::Npm,
+                    NpmCrawler::for_options(options).crawl_all_with_roots(options)
+                )
+                .await,
                 crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)).await,
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)).await,
                 crawl!(
@@ -1400,7 +1417,10 @@ async fn crawl_every_ecosystem(
             )
         } else {
             tokio::join!(
-                crawl!(Ecosystem::Npm, NpmCrawler.crawl_all_with_roots(options)),
+                crawl!(
+                    Ecosystem::Npm,
+                    NpmCrawler::for_options(options).crawl_all_with_roots(options)
+                ),
                 crawl!(Ecosystem::Pypi, PythonCrawler::new().crawl_all(options)),
                 crawl!(Ecosystem::Cargo, CargoCrawler.crawl_all(options)),
                 crawl!(
@@ -2554,11 +2574,14 @@ mod tests {
         };
         assert_eq!(
             snapshot.roots,
-            NpmCrawler.get_node_modules_paths(&options).await.unwrap()
+            NpmCrawler::for_options(&options)
+                .get_node_modules_paths(&options)
+                .await
+                .unwrap()
         );
         assert_eq!(
             pairs(snapshot.packages_for(&options).unwrap()),
-            pairs(&NpmCrawler.crawl_all(&options).await)
+            pairs(&NpmCrawler::for_options(&options).crawl_all(&options).await)
         );
         assert_eq!(pairs(&snapshot.packages), pairs(&packages[..npm_count]));
         assert!(snapshot.roots.len() >= 2, "roots={:?}", snapshot.roots);
@@ -2804,7 +2827,10 @@ mod tests {
                 serial.extend(pkgs);
             }};
         }
-        serial!(Ecosystem::Npm, NpmCrawler.crawl_all(&options).await);
+        serial!(
+            Ecosystem::Npm,
+            NpmCrawler::for_options(&options).crawl_all(&options).await
+        );
         serial!(
             Ecosystem::Pypi,
             PythonCrawler::new().crawl_all(&options).await

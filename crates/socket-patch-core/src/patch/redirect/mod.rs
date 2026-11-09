@@ -6591,6 +6591,9 @@ fn plan_python_metadata_with(
         detail: format!("{metadata_path}: {detail}"),
     };
     source_scope().map_err(unsupported)?;
+    if let Some(why) = files.get(UV_ANCESTOR_OUTSIDE_KEY) {
+        return Err(unsupported(why.clone()));
+    }
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
     let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
         let (rel, text) = value.split_once('\n')?;
@@ -6824,9 +6827,10 @@ fn rewrite_uv_lock(
             // Every patched artifact is a wheel, which uv refuses to
             // install under no-binary (#1603).
             let no_binary = match (&planned, uv_pip_settings) {
-                (Ok(Some(_)), Some(settings)) => {
-                    upstream::pylock_no_binary(original, &dep.name, settings)
-                }
+                (Ok(Some(_)), Some(settings)) => files
+                    .get(UV_ANCESTOR_OUTSIDE_KEY)
+                    .cloned()
+                    .or_else(|| upstream::pylock_no_binary(original, &dep.name, settings)),
                 _ => None,
             };
             if let Some(why) = no_binary {
@@ -7174,6 +7178,11 @@ pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sou
 /// packages already (`packageSourceMapping`, which NuGet merges too).
 pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
 
+/// The synthetic candidate key present, holding the reason, when NuGet
+/// would also merge a parent config above the repository root, which is
+/// never read ([`crate::vendor::nuget_config::Inherited::outside`]).
+pub const NUGET_INHERITED_OUTSIDE_KEY: &str = "<socket-patch:nuget-inherited-outside>";
+
 /// A config with no sources, the base of a fresh one when the inherited
 /// configs dropped nuget.org.
 const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
@@ -7187,6 +7196,12 @@ const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<c
 ///
 /// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
+
+/// The synthetic candidate key present, holding the reason, when uv may
+/// apply a settings file above the repository root, which is never read
+/// ([`crate::utils::python_script::uv_config_above_repo`]): every uv
+/// project, script and `uv pip` lock wiring refuses.
+pub const UV_ANCESTOR_OUTSIDE_KEY: &str = "<socket-patch:uv-ancestor-outside>";
 
 /// The uv settings `uv pip` reads for a PEP 751 lock in the root
 /// ([`upstream::root_uv_settings`]), with the settings file above the root
@@ -7398,6 +7413,16 @@ fn rewrite_nuget(
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_lock_other_version".into(),
                 detail,
+            });
+            continue;
+        }
+        // A parent config above the repository root is merged by NuGet but
+        // never read here, so the sources and mappings this edit must
+        // account for are unknown: skip rather than guess.
+        if let Some(why) = files.get(NUGET_INHERITED_OUTSIDE_KEY) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_inherited_config_outside_root".into(),
+                detail: format!("{why}; {} not redirected", dep.name),
             });
             continue;
         }
@@ -7709,97 +7734,6 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
         .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
     let token = before.rsplit('/').next().unwrap_or("");
     (!token.is_empty()).then(|| token.to_string())
-}
-
-/// Public host of Socket's patch server: the origin every production hosted
-/// artifact / registry URL is served from (`https://patch.socket.dev/patch/…`,
-/// `…/patch-registry/…`), and the root of the Go module namespace
-/// [`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`].
-pub const SOCKET_PATCH_SERVER_HOST: &str = "patch.socket.dev";
-
-/// The Socket patch uuid a lockfile-recorded HOSTED reference names, or
-/// `None` when `url` is not a Socket-hosted patch URL — the inverse of the
-/// rewriters, used by `vex`'s manifest-less lockfile discovery.
-///
-/// Recognition is deliberately strict, because the answer decides whether a
-/// committed (tamper-able) lockfile line becomes an attestation input:
-///
-/// * the ORIGIN must be Socket's patch server (`https://` +
-///   [`SOCKET_PATCH_SERVER_HOST`]) or one of `extra_origins` — the
-///   operator's `--patch-server-url` deployment, compared on scheme + host +
-///   port. A uuid inside any other host's URL is a user's own dependency
-///   source, never a patch reference;
-/// * no userinfo — a Socket-written URL never carries credentials;
-/// * the uuid is the LAST path segment passing the canonical-uuid grammar:
-///   hosted URLs carry the grant token in the level before the uuid
-///   (`…/patch/npm/<name>/<ver>/<token>/<uuid>/<leaf>`,
-///   `…/patch-registry/<eco>/<token>/<uuid>/…`), and grant tokens may
-///   themselves be uuid-shaped, so "the first uuid" would elect the token.
-///
-/// Every spelling the lock formats record the same URL in is accepted: a
-/// `#fragment` (yarn classic `#<sha1>`, pip `#sha256=`) and a `?query` are
-/// ignored; `\/`-escaped slashes (older composer locks) are unescaped; a
-/// wholly percent-encoded URL (yarn berry's `__archiveUrl=` binding) is
-/// decoded; a cargo source-kind prefix (`sparse+`, `registry+`) is dropped.
-/// Path segments are percent-decoded AFTER splitting, so an encoded `/`
-/// can never manufacture a segment.
-pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> {
-    hosted_patch_url_uuids(url, extra_origins)?.pop()
-}
-
-/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
-/// (the grant token first when it is uuid-shaped, the patch uuid last), or
-/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
-/// exact acceptance rules, without electing one segment. `vex` discovery
-/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
-/// the malformed or rejected shapes whose "last uuid" is not a patch.
-pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
-    use crate::patch::path_safety::is_canonical_uuid;
-    use crate::utils::purl::percent_decode_purl_component;
-
-    let unescaped = url.trim().replace("\\/", "/");
-    let lower = unescaped.to_ascii_lowercase();
-    let decoded = if lower.starts_with("https%3a%2f%2f") || lower.starts_with("http%3a%2f%2f") {
-        percent_decode_purl_component(&unescaped).into_owned()
-    } else {
-        unescaped
-    };
-    // `sparse+https://…` / `registry+https://…` (Cargo.lock `source`).
-    let (scheme, _) = decoded.split_once("://")?;
-    let text = match scheme.rsplit_once('+') {
-        Some((kind, _)) if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) => {
-            &decoded[kind.len() + 1..]
-        }
-        _ => decoded.as_str(),
-    };
-    let parsed = reqwest::Url::parse(text).ok()?;
-    if !matches!(parsed.scheme(), "https" | "http")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return None;
-    }
-    let socket_host = parsed.scheme() == "https"
-        && parsed.host_str() == Some(SOCKET_PATCH_SERVER_HOST)
-        && parsed.port_or_known_default() == Some(443);
-    let configured = extra_origins.iter().any(|origin| {
-        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
-            o.scheme() == parsed.scheme()
-                && o.host_str().is_some()
-                && o.host_str() == parsed.host_str()
-                && o.port_or_known_default() == parsed.port_or_known_default()
-        })
-    });
-    if !socket_host && !configured {
-        return None;
-    }
-    Some(
-        parsed
-            .path_segments()?
-            .map(|segment| percent_decode_purl_component(segment).into_owned())
-            .filter(|segment| is_canonical_uuid(segment))
-            .collect(),
-    )
 }
 
 /// A dep's Socket index URL as a regex source with the per-request rotating
@@ -21406,6 +21340,87 @@ mod tests {
         assert!(!r.files.contains_key("package.json"));
     }
 
+    /// #1965: `foo` depends on left-pad by a registry range and the root
+    /// `overrides` swap it for a remote tarball url, so npm installs that
+    /// url whatever the lock's (registry-looking) `resolved` says. The
+    /// rewriter must skip the entry loudly and keep it out of the VEX.
+    #[test]
+    fn issue_1965_a_registry_edge_overridden_to_a_url_is_unredirected() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+                "node_modules/foo": {
+                    "version": "1.0.0",
+                    "resolved": "file:foo-1.0.0.tgz",
+                    "dependencies": { "left-pad": "^1.3.0" }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let files_with = |manifest_overrides: Value| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({
+                    "name": "app",
+                    "dependencies": { "foo": "file:foo-1.0.0.tgz" },
+                    "overrides": manifest_overrides
+                })
+                .to_string(),
+            );
+            files
+        };
+        for manifest_overrides in [
+            json!({ "left-pad": url }),
+            json!({ "foo": { "left-pad": url } }),
+            json!({ "left-pad": "github:someone/left-pad" }),
+        ] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            let skipped = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_npm_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{manifest_overrides}: {:?}", r.warnings));
+            assert!(
+                skipped.detail.contains("overrides"),
+                "the warning names the override: {}",
+                skipped.detail
+            );
+            assert!(
+                r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                "{manifest_overrides}: the skipped copy keeps the patch out of the in-run VEX"
+            );
+        }
+        // Control: a registry override (or none) still redirects.
+        for manifest_overrides in [json!({}), json!({ "left-pad": "1.3.0" })] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+            assert_eq!(
+                rewritten["packages"]["node_modules/left-pad"]["resolved"],
+                "http://patch.test/lp.tgz",
+                "{manifest_overrides}"
+            );
+        }
+    }
+
     #[test]
     fn npm_non_registry_entries_are_skipped_with_loud_warning() {
         let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
@@ -24378,8 +24393,13 @@ packages:
     }
 
     /// The engine's [`GO_WORKSPACE_KEY`] for an in-memory go.work whose
-    /// members are `(dir, go.mod)` pairs (`.` for the root module).
-    fn go_workspace_key(work_extra: &str, members: &[(&str, &str)]) -> (String, String) {
+    /// members are `(dir, go.mod)` pairs (`.` for the root module), in a
+    /// project with a root go.mod when `root_go_mod`.
+    fn go_workspace_key(
+        work_extra: &str,
+        members: &[(&str, &str)],
+        root_go_mod: bool,
+    ) -> (String, String) {
         use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         let hosted = HostedGoWorkspace {
@@ -24411,6 +24431,10 @@ packages:
                         })
                         .collect(),
                 ),
+                files: Some(memory_go_files(
+                    members.iter().map(|(dir, _)| *dir),
+                    root_go_mod,
+                )),
             }),
             modfile: None,
             module_graph: None,
@@ -24421,6 +24445,29 @@ packages:
         )
     }
 
+    /// The files an in-memory workspace of the `use` members `dirs` holds,
+    /// as [`crate::vendor::go_workspace::read_memory`] lists them: go.work,
+    /// the root go.mod when the project has one (`root_go_mod`, whether or
+    /// not `.` is a member) and each in-root member's go.mod.
+    fn memory_go_files<'a>(
+        dirs: impl IntoIterator<Item = &'a str>,
+        root_go_mod: bool,
+    ) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut files = std::collections::BTreeSet::from(["go.work".into()]);
+        if root_go_mod {
+            files.insert("go.mod".into());
+        }
+        for dir in dirs {
+            files.extend(crate::vendor::go_workspace::in_root_dir(dir).map(
+                |dir| match dir.as_str() {
+                    "" => "go.mod".into(),
+                    dir => format!("{dir}/go.mod").into(),
+                },
+            ));
+        }
+        files
+    }
+
     /// [`go_workspace_key`] plus the root go.work itself as a candidate
     /// file, as the engine reads it when go.work sits at the root.
     fn with_root_go_work(
@@ -24428,7 +24475,7 @@ packages:
         work_extra: &str,
         members: &[(&str, &str)],
     ) {
-        let (k, v) = go_workspace_key(work_extra, members);
+        let (k, v) = go_workspace_key(work_extra, members, files.contains_key("go.mod"));
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         files.insert(k, v);
         files.insert(
@@ -24457,8 +24504,11 @@ packages:
             ("\nreplace github.com/foo/bar => ./fork\n", ""),
         ] {
             let mut files = files.clone();
-            let (k, v) =
-                go_workspace_key(work, &[(".", &root), ("b", &go_member("v1.4.2", other))]);
+            let (k, v) = go_workspace_key(
+                work,
+                &[(".", &root), ("b", &go_member("v1.4.2", other))],
+                true,
+            );
             files.insert(k, v);
             let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
             assert!(out.files.is_empty(), "{work}{other}: {:?}", out.files);
@@ -24476,6 +24526,7 @@ packages:
         let (k, v) = go_workspace_key(
             "\nreplace github.com/foo/bar v1.0.0 => ./fork\n",
             &[(".", &root), ("b", &go_member("v1.4.2", ""))],
+            true,
         );
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -24491,7 +24542,7 @@ packages:
         let ovr = golang_override();
         let mut files = golang_files();
         let root = files["go.mod"].clone();
-        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.files.is_empty());
@@ -24501,7 +24552,7 @@ packages:
         let bare = "module example.com/app\n\ngo 1.21\n";
         let mut files = BTreeMap::new();
         files.insert("go.mod".to_string(), bare.to_string());
-        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
@@ -24634,6 +24685,7 @@ packages:
                     member("../out", None),
                 ],
                 graph: None,
+                files: Some(memory_go_files([".", "../out"], true)),
             }),
             modfile: None,
             module_graph: None,
@@ -27714,6 +27766,31 @@ packages:
         assert_eq!(nuget_catch_all(&r.files["nuget.config"]), ["nuget.org"]);
     }
 
+    /// A parent config above the repository root, which the engine never
+    /// reads, skips the dep with a warning and writes nothing.
+    #[test]
+    fn nuget_inherited_config_outside_the_repository_skips_the_dep() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org".to_string(),
+        );
+        files.insert(
+            NUGET_INHERITED_OUTSIDE_KEY.to_string(),
+            "NuGet also merges /x/nuget.config, which is outside the repository root".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_nuget_inherited_config_outside_root"]
+        );
+    }
+
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget
     /// redirect up front: landing the source + mapping while the lock kept
     /// the upstream contentHash would NU1403 every restore, with the ledger
@@ -29788,129 +29865,6 @@ mod hatch_tests {
         let second = rewrite_registry_redirect(&result.files, &[patch()]);
         assert!(second.confirmed_hatch_uuids.contains("test-uuid"));
         assert!(second.files.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod hosted_patch_uuid_tests {
-    //! `hosted_patch_uuid` is the trust gate between a committed lockfile
-    //! line and a VEX attestation input: pin the accepted spellings AND the
-    //! rejections (foreign hosts, credentials, non-canonical tokens).
-    use super::*;
-
-    const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
-    /// A uuid-SHAPED grant token: the fixtures use them, and production
-    /// tokens are not guaranteed otherwise — the LAST uuid segment must win.
-    const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
-
-    fn none() -> Vec<String> {
-        Vec::new()
-    }
-
-    #[test]
-    fn artifact_and_registry_shapes_yield_the_patch_uuid_not_the_token() {
-        for url in [
-            format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
-            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
-            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/"),
-            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/gems/rack-2.2.3.gem"),
-            format!("https://patch.socket.dev/patch-registry/maven/{TOKEN}/{UUID}/maven2"),
-            format!("https://patch.socket.dev/patch-registry/nuget/{TOKEN}/{UUID}/index.json"),
-            format!("sparse+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
-            format!("registry+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
-        ] {
-            assert_eq!(
-                hosted_patch_uuid(&url, &none()).as_deref(),
-                Some(UUID),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn lock_format_spellings_are_normalized() {
-        let url = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
-        // yarn classic `#<sha1>`, pip/hatch `#sha256=`, a stray query.
-        for spelled in [
-            format!("{url}#0123456789abcdef0123456789abcdef01234567"),
-            format!("{url}#sha256=abc"),
-            format!("{url}?x=1"),
-            // composer's `\/`-escaped slashes.
-            url.replace('/', "\\/"),
-            // yarn berry's percent-encoded `__archiveUrl=` binding value.
-            url.replace(':', "%3A").replace('/', "%2F"),
-            format!("  {url}  "),
-        ] {
-            assert_eq!(
-                hosted_patch_uuid(&spelled, &none()).as_deref(),
-                Some(UUID),
-                "{spelled}"
-            );
-        }
-    }
-
-    #[test]
-    fn foreign_hosts_credentials_and_plain_http_are_refused() {
-        for url in [
-            format!("https://registry.npmjs.org/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://patch.socket.dev.evil.example/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://evil.example/patch.socket.dev/{TOKEN}/{UUID}/x.tgz"),
-            format!("http://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://patch.socket.dev:8443/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://user:pw@patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("git+ssh://patch.socket.dev/{UUID}"),
-            format!("file:.socket/vendor/npm/{UUID}/x.tgz"),
-            format!("patch.socket.dev/gopatch/{UUID}"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
-        }
-    }
-
-    #[test]
-    fn non_canonical_segments_are_not_patch_uuids() {
-        for url in [
-            // Placeholder tokens (fixtures use `uuid`, `tok`, `some-uuid`).
-            "https://patch.socket.dev/patch/npm/tok/uuid/x.tgz".to_string(),
-            // Uppercase is not the canonical grammar.
-            format!(
-                "https://patch.socket.dev/patch/npm/tok/{}/x.tgz",
-                UUID.to_ascii_uppercase()
-            ),
-            // A uuid only in the query / fragment is not a path level.
-            format!("https://patch.socket.dev/patch/npm/x.tgz?u={UUID}"),
-            format!("https://patch.socket.dev/patch/npm/x.tgz#{UUID}"),
-            // An encoded `/` cannot split a segment into a uuid.
-            format!("https://patch.socket.dev/patch/npm/tok%2F{UUID}/x.tgz"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
-        }
-    }
-
-    #[test]
-    fn configured_patch_server_origin_is_accepted_exactly() {
-        let origins = vec!["http://127.0.0.1:4545/some/base".to_string()];
-        let url = format!("http://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz");
-        assert_eq!(hosted_patch_uuid(&url, &origins).as_deref(), Some(UUID));
-        // Same host, other port / scheme: a different origin.
-        for other in [
-            format!("http://127.0.0.1:4546/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&other, &origins), None, "{other}");
-        }
-        // The default host stays accepted alongside the override, and a
-        // malformed override is ignored rather than widening the allowlist.
-        let default = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz");
-        assert_eq!(hosted_patch_uuid(&default, &origins).as_deref(), Some(UUID));
-        assert_eq!(hosted_patch_uuid(&url, &["not a url".to_string()]), None);
-    }
-
-    /// The Go hosted namespace lives on the same host the URL allowlist
-    /// pins — the two spellings of "Socket's patch server" cannot drift.
-    #[test]
-    fn go_module_namespace_is_on_the_patch_server_host() {
-        assert!(crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX
-            .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
     }
 }
 

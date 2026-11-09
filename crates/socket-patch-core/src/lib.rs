@@ -7,6 +7,7 @@ pub mod hash;
 pub mod hosted;
 pub mod ledgers;
 pub mod manifest;
+pub mod origin;
 pub mod patch;
 pub mod policy;
 pub mod rollout;

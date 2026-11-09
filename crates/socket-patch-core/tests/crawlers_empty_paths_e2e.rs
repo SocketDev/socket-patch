@@ -68,7 +68,7 @@ async fn npm_crawler_find_by_purls_with_empty_purls_returns_empty_map() {
     .await
     .unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
 
     // Positive control: the package IS discoverable on this exact path,
     // so an empty result below can ONLY be caused by the empty PURL list.
@@ -105,7 +105,7 @@ async fn npm_crawler_find_by_purls_with_nonexistent_node_modules_returns_empty()
     .await
     .unwrap();
 
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
     let purl = "pkg:npm/lodash@4.17.21".to_string();
 
     // Positive control: same PURL resolves against the real tree.
@@ -129,7 +129,7 @@ async fn npm_crawler_find_by_purls_with_nonexistent_node_modules_returns_empty()
 
 #[tokio::test]
 async fn npm_crawler_crawl_all_with_no_packages_returns_empty() {
-    let crawler = NpmCrawler;
+    let crawler = NpmCrawler::default();
 
     // Positive control: a populated local node_modules yields the package.
     let populated = tempfile::tempdir().unwrap();

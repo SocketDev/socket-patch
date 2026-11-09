@@ -78,7 +78,7 @@
 //!    panic, never `unwrap` on file data, bound every recursion.
 //! 4. **Hosted identity** comes ONLY from [`DiscoverCtx::hosted_uuid`] (the
 //!    Socket host allowlist + last-canonical-uuid-segment rule of
-//!    [`crate::patch::redirect::hosted_patch_uuid`]) — except identities
+//!    [`crate::origin::hosted_patch_uuid`]) — except identities
 //!    that are not URLs: Go's `patch.socket.dev/gopatch/<uuid>` module path
 //!    ([`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`]) and the
 //!    `socket-patch-<uuid>` registry / repository / source names
@@ -187,15 +187,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::crawlers::Ecosystem;
-use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment};
+use crate::patch::path_safety::is_canonical_uuid;
 use crate::utils::purl_key::canonical_base_purl;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX;
 use crate::vendor::lock_inventory::{
     inventory_project_every_lock, lookup, LockIntegrity, LockfileEntry, SourceKind,
 };
-use crate::vendor::path::{ecosystem_dir_for_purl, leaf_to_purl, ECOSYSTEM_DIRS, VENDOR_DIR};
+use crate::vendor::path::{ecosystem_dir_for_purl, ECOSYSTEM_DIRS, VENDOR_DIR};
 use crate::vendor::state::VendorEntry;
+
+use crate::origin::OriginPolicy;
+// The origin helpers the extractors use, re-exported so they import every
+// identity helper from here (the architecture guard below bans
+// `crate::origin::` in extractor files: hosted identity comes only from
+// `DiscoverCtx::hosted_uuid`).
+pub(crate) use crate::origin::{
+    mentions_vendor_dir, names_vendor_dir, npm_vendored_tarball_names, root_anchored_spelling,
+    socket_patch_name_uuid, LocateOpts, Located, Wired, SOCKET_PATCH_SERVER_HOST,
+};
+pub use crate::origin::{
+    strip_leaf_suffix, vendor_ref, vendor_ref_decorated, vendor_uuid_dir, vendored_leaf_purl,
+    VendorRef,
+};
 
 pub(crate) mod bun;
 pub(crate) mod cargo;
@@ -1654,8 +1668,7 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
     for rel in &stray.ignored {
         let mentions = match ctx.view.read_bytes(rel).await {
             Ok(bytes) => {
-                !socket_identities(&String::from_utf8_lossy(&bytes), ctx.patch_server_origins)
-                    .is_empty()
+                !socket_identities(&String::from_utf8_lossy(&bytes), &ctx.origin).is_empty()
             }
             Err(_) => false,
         };
@@ -1688,7 +1701,8 @@ pub(crate) struct DiscoverCtx<'a> {
     /// Where the guarded reads read from: the root on disk, a per-run
     /// snapshot of it, or an in-memory project.
     pub(crate) view: crate::vendor::lock_inventory::ProjectView<'a>,
-    patch_server_origins: &'a [String],
+    /// The host policy [`Self::hosted_uuid`] and [`Self::locate`] classify under.
+    origin: OriginPolicy<'a>,
     /// Root-relative lock files the package manager never reads here (a
     /// workspace member's stray lock, see [`ignore_member_stray_locks`]):
     /// the guarded reads see them as absent.
@@ -1698,8 +1712,6 @@ pub(crate) struct DiscoverCtx<'a> {
     /// scratch `Discovery` (a file parsed only to explain it) still counts.
     /// A `Mutex` keeps the ctx `Sync` across the extractors' `.await`s.
     recognized: Mutex<BTreeSet<Recognized>>,
-    /// The hosts a Socket-hosted url can name (see [`DiscoverCtx::hosted_uuid`]).
-    hosted_hosts: std::sync::OnceLock<BTreeSet<String>>,
     /// The ecosystem the running extractor reads for (set by
     /// [`discover_with_ctx`] between extractors), tagging [`Self::read`].
     ecosystem: &'static str,
@@ -1721,10 +1733,9 @@ impl<'a> DiscoverCtx<'a> {
     ) -> Self {
         DiscoverCtx {
             view,
-            patch_server_origins,
+            origin: OriginPolicy::new(patch_server_origins),
             ignored: Vec::new(),
             recognized: Mutex::new(BTreeSet::new()),
-            hosted_hosts: std::sync::OnceLock::new(),
             ecosystem: "",
             read: Mutex::new(BTreeSet::new()),
         }
@@ -1770,7 +1781,7 @@ impl<'a> DiscoverCtx<'a> {
     /// Record every Socket identity `text` (the content of root-relative
     /// `rel`) mentions — see [`socket_identities`].
     fn recognize_text(&self, rel: &str, text: &str) {
-        let found = socket_identities(text, self.patch_server_origins);
+        let found = socket_identities(text, &self.origin);
         if found.is_empty() {
             return;
         }
@@ -1831,31 +1842,14 @@ impl<'a> DiscoverCtx<'a> {
         }
     }
 
-    /// The patch uuid of a Socket-HOSTED url, or `None` for anything else
-    /// (see [`crate::patch::redirect::hosted_patch_uuid`] for the accepted
-    /// spellings and the host allowlist).
-    ///
-    /// A plain url ([`plain_url_domain`]) on any other host is answered
-    /// without parsing it: every lock entry's registry url comes through
-    /// here.
+    /// [`OriginPolicy::hosted_uuid`] under this run's origins.
     pub(crate) fn hosted_uuid(&self, url: &str) -> Option<String> {
-        if let Some(host) = plain_url_domain(url) {
-            let hosts = self.hosted_hosts.get_or_init(|| {
-                let mut hosts =
-                    BTreeSet::from([crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()]);
-                hosts.extend(self.patch_server_origins.iter().filter_map(|o| {
-                    reqwest::Url::parse(o.trim())
-                        .ok()?
-                        .host_str()
-                        .map(str::to_string)
-                }));
-                hosts
-            });
-            if !hosts.contains(&host) {
-                return None;
-            }
-        }
-        crate::patch::redirect::hosted_patch_uuid(url, self.patch_server_origins)
+        self.origin.hosted_uuid(url)
+    }
+
+    /// [`OriginPolicy::locate`] under this run's origins.
+    pub(crate) fn locate(&self, s: &str, opts: LocateOpts) -> Located {
+        self.origin.locate(s, opts)
     }
 
     /// Whether `rel` exists (lstat — a dangling symlink still "exists", the
@@ -1986,62 +1980,6 @@ impl<'a> DiscoverCtx<'a> {
 
 // ── identity helpers ─────────────────────────────────────────────────────
 
-/// The host of `url` when it is a PLAIN `http(s)` url — printable ASCII
-/// only, no `%`, `\\` or userinfo, a DNS name of letters, digits, `.` and
-/// `-` whose last label starts with a letter — lowercased, which is then
-/// exactly what [`crate::patch::redirect::hosted_patch_url_uuids`]'s url
-/// parse would call its host (no decoding, IDNA mapping or IP-address
-/// reading applies to such a name). `None` for anything else, which takes
-/// the full parse.
-fn plain_url_domain(url: &str) -> Option<String> {
-    let url = url.trim();
-    if !url
-        .bytes()
-        .all(|b| b.is_ascii_graphic() && b != b'%' && b != b'\\')
-    {
-        return None;
-    }
-    let (scheme, rest) = url.split_once("://")?;
-    // `sparse+https://…` / `registry+https://…`, as the parse strips it.
-    let scheme = match scheme.rsplit_once('+') {
-        Some((kind, scheme))
-            if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) =>
-        {
-            scheme
-        }
-        _ => scheme,
-    };
-    if !scheme.eq_ignore_ascii_case("https") && !scheme.eq_ignore_ascii_case("http") {
-        return None;
-    }
-    let authority = rest.split(['/', '?', '#']).next()?;
-    let host = match authority.rsplit_once(':') {
-        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
-        Some(_) => return None,
-        None => authority,
-    };
-    let last = host.strip_suffix('.').unwrap_or(host).rsplit('.').next()?;
-    let plain = !host.is_empty()
-        && !rest.starts_with('/')
-        && host
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
-        && last.starts_with(|c: char| c.is_ascii_alphabetic())
-        && !host
-            .split('.')
-            .any(|label| label.len() >= 4 && label[..4].eq_ignore_ascii_case("xn--"));
-    plain.then(|| host.to_ascii_lowercase())
-}
-
-/// The uuid of a Socket-owned registry / repository / source NAME:
-/// `socket-patch-<uuid>` (cargo `[registries.*]` + Cargo.toml `registry =`,
-/// maven `<repository><id>`, nuget `<add key>`) or, with
-/// `vendored = true`, `socket-patch-vendor-<uuid>` (maven's vendored repo
-/// id). Exact grammar only — a suffix or a non-canonical uuid is not ours.
-pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<String> {
-    crate::patch::redirect::generation::pin_name_uuid(name.trim(), vendored).map(str::to_string)
-}
-
 /// Every Socket patch identity `text` MENTIONS, by wiring mode — the sweep
 /// behind rule 11, run over the content of every file discovery reads. It is
 /// deliberately a superset of what any extractor accepts (it must recognize
@@ -2055,7 +1993,7 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 ///   ids, `§` in legacy ids), since a vlt node key may be its only mention;
 /// * [`WiringMode::Hosted`]: every canonical-uuid path segment of a url on
 ///   an accepted patch-server origin
-///   ([`crate::patch::redirect::hosted_patch_url_uuids`]: plain,
+///   ([`crate::origin::hosted_patch_url_uuids`]: plain,
 ///   `sparse+` / `registry+` prefixed, or a wholly percent-encoded berry
 ///   `__archiveUrl`), and every canonical-uuid segment of a
 ///   `patch.socket.dev/gopatch/…` Go module path.
@@ -2069,9 +2007,10 @@ pub(crate) fn socket_patch_name_uuid(name: &str, vendored: bool) -> Option<Strin
 ///
 /// Memoized by content ([`IdentityMemo`]): one scan runs several
 /// discoveries over mostly byte-identical lockfiles, and this sweep is the
-/// largest per-file cost after parsing.
-fn socket_identities(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
-    IdentityMemo::sweep(text, origins)
+/// largest per-file cost after parsing. The host matcher is the policy's
+/// own ([`OriginPolicy::host_finder`]), built once per run.
+fn socket_identities(text: &str, policy: &OriginPolicy<'_>) -> BTreeSet<(String, WiringMode)> {
+    IdentityMemo::sweep(text, policy)
 }
 
 /// The process-wide memo behind [`socket_identities`]: the sweep's result
@@ -2099,12 +2038,12 @@ impl IdentityMemo {
         ENTRIES.get_or_init(|| Mutex::new(std::collections::VecDeque::new()))
     }
 
-    fn sweep(text: &str, origins: &[String]) -> IdentitySet {
+    fn sweep(text: &str, policy: &OriginPolicy<'_>) -> IdentitySet {
         if text.len() < Self::MIN_LEN {
-            return socket_identities_inner(text, origins);
+            return socket_identities_inner(text, policy);
         }
         use sha2::Digest as _;
-        let mut origin_key = origins.to_vec();
+        let mut origin_key = policy.origins().to_vec();
         origin_key.sort();
         origin_key.dedup();
         let key: IdentityKey = (sha2::Sha256::digest(text.as_bytes()).into(), origin_key);
@@ -2116,7 +2055,7 @@ impl IdentityMemo {
         if let Some((_, found)) = lock().iter().find(|(k, _)| *k == key) {
             return found.clone();
         }
-        let found = socket_identities_inner(text, origins);
+        let found = socket_identities_inner(text, policy);
         let mut entries = lock();
         if !entries.iter().any(|(k, _)| *k == key) {
             if entries.len() == Self::CAPACITY {
@@ -2132,14 +2071,17 @@ impl IdentityMemo {
 /// rules as discovery's sweep (the upstream restore's "does anything in
 /// this file still need the hosted-side setting" probe).
 pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<String> {
-    socket_identities(text, origins)
+    socket_identities(text, &OriginPolicy::new(origins))
         .into_iter()
         .filter(|(_, mode)| *mode == WiringMode::Hosted)
         .map(|(uuid, _)| uuid)
         .collect()
 }
 
-fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
+fn socket_identities_inner(
+    text: &str,
+    policy: &OriginPolicy<'_>,
+) -> BTreeSet<(String, WiringMode)> {
     use aho_corasick::AhoCorasick;
 
     let mut found = BTreeSet::new();
@@ -2192,17 +2134,7 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
 
     // Cheap pre-filter: only a token naming an accepted host (any ASCII
     // case) can be ours.
-    let mut hosts = vec![crate::patch::redirect::SOCKET_PATCH_SERVER_HOST.to_string()];
-    hosts.extend(origins.iter().filter_map(|o| {
-        reqwest::Url::parse(o.trim())
-            .ok()?
-            .host_str()
-            .map(str::to_ascii_lowercase)
-    }));
-    let host_finder = AhoCorasick::builder()
-        .ascii_case_insensitive(true)
-        .build(&hosts)
-        .expect("literal host patterns");
+    let host_finder = policy.host_finder();
     static SEPARATORS: std::sync::OnceLock<AhoCorasick> = std::sync::OnceLock::new();
     let separators = SEPARATORS.get_or_init(|| {
         AhoCorasick::builder()
@@ -2218,7 +2150,7 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
         if !host_finder.is_match(&bytes[start..end]) {
             continue;
         }
-        let uuids = crate::patch::redirect::hosted_patch_url_uuids(&norm[start..end], origins);
+        let uuids = crate::origin::hosted_patch_url_uuids(&norm[start..end], policy.origins());
         for uuid in uuids.into_iter().flatten() {
             found.insert((uuid, WiringMode::Hosted));
         }
@@ -2271,269 +2203,6 @@ fn token_end(bytes: &[u8], from: usize, extra: &[u8]) -> usize {
         end += 1;
     }
     end
-}
-
-/// A vendored artifact reference recovered from a wiring string.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VendorRef {
-    /// Vendor ecosystem dir (`npm`, `cargo`, `pypi`, …).
-    pub eco: String,
-    pub uuid: String,
-    /// The natural leaf, lock-format suffixes stripped ([`strip_leaf_suffix`]),
-    /// forward-slashed, no trailing slash.
-    pub leaf: String,
-    /// `.socket/vendor/<eco>/<uuid>/<leaf>` — the root-relative artifact path.
-    pub artifact_rel: String,
-}
-
-/// Recover a vendored artifact reference from a lockfile/config string that
-/// points into THIS project's `.socket/vendor/`: `file:` / `./` / bare
-/// spellings, backslashed Windows spellings, and `\/`-escaped JSON text.
-///
-/// Stricter than [`crate::vendor::parse_vendor_path`] (which finds the anchor
-/// anywhere, for the orphan sweep): the anchor must START the path. A
-/// `../.socket/vendor/…` or absolute spelling points the package manager at
-/// an artifact OUTSIDE the project root, and verifying the root's same-named
-/// artifact instead would attest bytes the build never consumes. Callers
-/// whose format legitimately prefixes the project root (hatch
-/// `{root:uri}/`, maven `file://${project.basedir}/`, pnpm-legacy absolute
-/// importer paths) strip that exact prefix first.
-///
-/// The leaf must be a traversal-safe relative path, taken LITERALLY: npm,
-/// pnpm, bun, composer, bundler, go, cargo, maven, nuget and every pypi
-/// lock read the string as a file path, so a leaf carrying `#` or `::` is
-/// rejected (`None`) rather than cut — `…/foo-1.0.0.tgz#evil.tgz` is a file
-/// of that literal name, which npm installs while the cut leaf would verify
-/// the good `foo-1.0.0.tgz` beside it. The formats whose grammar DEFINES
-/// those decorations use [`vendor_ref_decorated`] instead.
-pub fn vendor_ref(s: &str) -> Option<VendorRef> {
-    vendor_ref_with(s, false)
-}
-
-/// [`vendor_ref`] for the formats that decorate a vendored path: yarn
-/// classic `#<sha1>`, berry `#./…::hash=…` fragments and `::locator=…`
-/// bindings, and url-form pip / Hatch references (`file:…#sha256=…`,
-/// `{root:uri}/…#sha256=…`). The leaf keeps only its natural name — the
-/// decorations ([`strip_leaf_suffix`]) are cut before the literal-path
-/// checks.
-pub fn vendor_ref_decorated(s: &str) -> Option<VendorRef> {
-    vendor_ref_with(s, true)
-}
-
-fn vendor_ref_with(s: &str, decorated: bool) -> Option<VendorRef> {
-    let rest = root_anchored_vendor_rest(s)?;
-    let mut it = rest.splitn(3, '/');
-    let eco = it.next()?;
-    let uuid = it.next()?;
-    let leaf_raw = it.next()?;
-    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) {
-        return None;
-    }
-    let leaf = if decorated {
-        strip_leaf_suffix(leaf_raw)
-    } else if leaf_raw.contains('#') || leaf_raw.contains("::") {
-        return None;
-    } else {
-        leaf_raw
-    };
-    let leaf = leaf.trim_end_matches('/');
-    if leaf.is_empty() || !is_safe_multi_segment(leaf) {
-        return None;
-    }
-    Some(VendorRef {
-        eco: eco.to_string(),
-        uuid: uuid.to_string(),
-        leaf: leaf.to_string(),
-        artifact_rel: format!("{VENDOR_DIR}/{eco}/{uuid}/{leaf}"),
-    })
-}
-
-/// `(eco, uuid)` for a root-anchored string that ends AT the uuid dir
-/// (`.socket/vendor/nuget/<uuid>`, a maven repository url's path) — the
-/// shapes [`vendor_ref`] rejects for having no leaf.
-pub fn vendor_uuid_dir(s: &str) -> Option<(String, String)> {
-    let rest = root_anchored_vendor_rest(s)?;
-    let (eco, uuid) = rest.trim_end_matches('/').split_once('/')?;
-    if !ECOSYSTEM_DIRS.contains(&eco) || !is_canonical_uuid(uuid) {
-        return None;
-    }
-    Some((eco.to_string(), uuid.to_string()))
-}
-
-/// Whether `s` is a vendored artifact path [`vendor_ref`] rejects ONLY for
-/// a `#` / `::` in its leaf (what [`vendor_ref_decorated`] would have cut):
-/// to a literal-path format that names another file, which extractors
-/// diagnose rather than skip silently.
-pub(crate) fn is_decorated_vendor_path(s: &str) -> bool {
-    vendor_ref(s).is_none() && vendor_ref_decorated(s).is_some()
-}
-
-/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`, one
-/// `./`, backslash and `\/` normalization), or `None`.
-fn root_anchored_vendor_rest(s: &str) -> Option<String> {
-    let norm = s.trim().replace("\\/", "/").replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    norm.strip_prefix(&format!("{VENDOR_DIR}/"))
-        .map(str::to_string)
-}
-
-/// Cut the lock-format decorations off a vendored leaf: everything from the
-/// first `#` (yarn classic `#<sha1>`, berry `#./<path>::hash=…`, pip/hatch
-/// `#sha256=…`) or `::` (berry `::locator=…`).
-pub fn strip_leaf_suffix(leaf: &str) -> &str {
-    let cut = [leaf.find('#'), leaf.find("::")]
-        .into_iter()
-        .flatten()
-        .min()
-        .unwrap_or(leaf.len());
-    &leaf[..cut]
-}
-
-/// The canonical base purl a vendored leaf names (see
-/// [`crate::vendor::path`]'s leaf table), suffixes stripped and pypi names
-/// canonicalized. `None` when the leaf is not a recognizable artifact name.
-pub fn vendored_leaf_purl(eco: &str, leaf: &str) -> Option<String> {
-    leaf_to_purl(eco, strip_leaf_suffix(leaf).trim_end_matches('/'))
-        .map(|purl| canonical_base_purl(&purl))
-}
-
-// ── shared extractor helpers ─────────────────────────────────────────────
-
-/// How a lock format spells a vendored leaf: literally ([`vendor_ref`]) or
-/// with `#` / `::` decorations after it ([`vendor_ref_decorated`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LeafGrammar {
-    /// The string is a file path: a `#` / `::` belongs to the leaf.
-    Literal,
-    /// The format defines `#` / `::` decorations after the leaf (yarn
-    /// classic / berry, url-form pip and Hatch references).
-    Decorated,
-}
-
-/// What [`DiscoverCtx::locate`] computes for one wiring string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LocateOpts {
-    pub(crate) grammar: LeafGrammar,
-    /// [`LeafGrammar::Literal`] only: also report a vendored path whose leaf
-    /// carries a decoration ([`is_decorated_vendor_path`]) — the npm, pnpm
-    /// and bun extractors diagnose it; composer and the pypi readers do not
-    /// check it.
-    pub(crate) decorated_check: bool,
-}
-
-impl LocateOpts {
-    /// A literal path, decorated leaves reported (npm, pnpm, bun).
-    pub(crate) const LITERAL_CHECKED: Self = LocateOpts {
-        grammar: LeafGrammar::Literal,
-        decorated_check: true,
-    };
-    /// A literal path, decorated leaves not checked (composer, pypi locks,
-    /// bare pip / Hatch paths).
-    pub(crate) const LITERAL: Self = LocateOpts {
-        grammar: LeafGrammar::Literal,
-        decorated_check: false,
-    };
-    /// A decorated spelling (yarn, url-form pip / Hatch references).
-    pub(crate) const DECORATED: Self = LocateOpts {
-        grammar: LeafGrammar::Decorated,
-        decorated_check: false,
-    };
-}
-
-/// Where one lockfile / config string points — every identity decision an
-/// extractor takes from it, computed once. Each extractor keeps its own
-/// decision ORDER over the fields.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Located {
-    /// The root-anchored vendored artifact the string names, read with the
-    /// requested [`LeafGrammar`].
-    pub(crate) vendored: Option<VendorRef>,
-    /// The patch uuid of a Socket-hosted url ([`DiscoverCtx::hosted_uuid`]),
-    /// computed eagerly: it needs an http(s) url on an allowed origin while
-    /// `vendored` needs the string to START at `.socket/vendor/`, so at most
-    /// one of the two is ever set.
-    pub(crate) hosted: Option<String>,
-    /// [`is_decorated_vendor_path`] when [`LocateOpts::decorated_check`] is
-    /// set (Literal grammar only), else `false`.
-    pub(crate) decorated_leaf: bool,
-}
-
-impl DiscoverCtx<'_> {
-    /// Classify `s` (see [`Located`]).
-    pub(crate) fn locate(&self, s: &str, opts: LocateOpts) -> Located {
-        let vendored = match opts.grammar {
-            LeafGrammar::Literal => vendor_ref(s),
-            LeafGrammar::Decorated => vendor_ref_decorated(s),
-        };
-        let decorated_leaf = opts.decorated_check
-            && opts.grammar == LeafGrammar::Literal
-            && is_decorated_vendor_path(s);
-        Located {
-            vendored,
-            hosted: self.hosted_uuid(s),
-            decorated_leaf,
-        }
-    }
-}
-
-/// The Socket wiring a lock location carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Wired {
-    Hosted(String),
-    Vendored(VendorRef),
-}
-
-impl Wired {
-    pub(crate) fn uuid(&self) -> &str {
-        match self {
-            Wired::Hosted(uuid) => uuid,
-            Wired::Vendored(vref) => &vref.uuid,
-        }
-    }
-
-    /// The same patch artifact: the same hosted uuid, or the same vendored
-    /// artifact path.
-    pub(crate) fn same_artifact(&self, other: &Wired) -> bool {
-        match (self, other) {
-            (Wired::Hosted(a), Wired::Hosted(b)) => a == b,
-            (Wired::Vendored(a), Wired::Vendored(b)) => a.artifact_rel == b.artifact_rel,
-            _ => false,
-        }
-    }
-}
-
-/// Whether `s` points into SOME `.socket/vendor/` tree, any anchoring
-/// (backslashes folded) — a Socket-shaped string whose rejection is worth a
-/// diagnostic (cargo `[patch]` paths, gem remotes, composer path dists,
-/// maven repository urls).
-pub(crate) fn names_vendor_dir(s: &str) -> bool {
-    s.replace('\\', "/").contains(&format!("{VENDOR_DIR}/"))
-}
-
-/// [`names_vendor_dir`] that also folds JSON / TOML `\/` escapes (the pypi
-/// readers).
-pub(crate) fn mentions_vendor_dir(s: &str) -> bool {
-    s.replace("\\/", "/")
-        .replace('\\', "/")
-        .contains(&format!("{VENDOR_DIR}/"))
-}
-
-/// Whether `s` STARTS at this project's `.socket/vendor/` after the `file:`
-/// / `./` spellings [`vendor_ref_decorated`] accepts (yarn's rule; `\/` is
-/// not folded).
-pub(crate) fn root_anchored_spelling(s: &str) -> bool {
-    let norm = s.trim().replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    norm.starts_with(&format!("{VENDOR_DIR}/"))
-}
-
-/// Whether vendored artifact `vref` is the npm tarball the vendor backends
-/// write for `purl` (`[@scope/]<name>-<version>.tgz` in the npm vendor dir)
-/// — the leaf rule the npm, pnpm and yarn extractors share.
-pub(crate) fn npm_vendored_tarball_names(vref: &VendorRef, purl: &str) -> bool {
-    vref.eco == "npm" && vendored_leaf_purl("npm", &vref.leaf).as_deref() == Some(purl)
 }
 
 /// Parse a JSON document read from root-relative `file`; `Err` carries the
@@ -3002,7 +2671,9 @@ pub async fn vendored_wiring_in_files(root: &Path, files: &[&str], eco: &str, uu
                 .await
                 .iter()
                 .any(|resolution| {
-                    crate::vendor::parse_vendor_path(resolution)
+                    // A nested `sub/bun.lockb` resolves from `sub/`.
+                    let base = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    crate::vendor::path::parse_vendor_path_from(base, resolution)
                         .is_some_and(|p| p.eco == eco && p.uuid == uuid)
                 })
             {
@@ -3105,8 +2776,10 @@ pub async fn hosted_wiring_in_files(root: &Path, files: &[&str], uuid: &str) -> 
                 .await
                 .iter()
                 .any(|resolution| {
+                    // Any vendored spelling, ours or a sibling's, is not
+                    // hosted wiring.
                     resolution.contains(uuid)
-                        && crate::vendor::parse_vendor_path(resolution).is_none()
+                        && crate::vendor::path::recognize_vendor_path_anywhere(resolution).is_none()
                 })
             {
                 return true;
@@ -3366,9 +3039,14 @@ pub(crate) mod testing {
 
         /// A project rooted at `sub/` inside the throwaway directory, so a
         /// fixture can write files beside it (`../ext/…`) without leaving
-        /// the tempdir (#1516).
+        /// the tempdir (#1516). The throwaway directory is the git
+        /// checkout, so what lies beside the project is inside the
+        /// repository root that bounds every read.
         pub(crate) fn nested(sub: &str) -> Self {
             let dir = tempfile::tempdir().expect("create tempdir");
+            if !sub.is_empty() {
+                std::fs::create_dir_all(dir.path().join(".git")).expect("create .git");
+            }
             let root = dir.path().join(sub);
             std::fs::create_dir_all(&root).expect("create project root");
             Project {
@@ -3659,138 +3337,6 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(discovery.vendor_entry_in_use(root, &entry).await, None);
-    }
-
-    #[test]
-    fn vendor_ref_strips_lock_suffixes_and_requires_a_root_anchor() {
-        let a = UUID_A;
-        for spelled in [
-            format!("file:.socket/vendor/npm/{a}/left-pad-1.3.0.tgz"),
-            format!("file:./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz"),
-            format!("./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz"),
-            format!(".socket/vendor/npm/{a}/left-pad-1.3.0.tgz"),
-            format!(".socket\\vendor\\npm\\{a}\\left-pad-1.3.0.tgz"),
-            format!(".socket\\/vendor\\/npm\\/{a}\\/left-pad-1.3.0.tgz"),
-            // yarn classic `#<sha1>`, berry fragment + locator, pip `#sha256=`.
-            format!("file:./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz#0123abcd"),
-            format!(
-                "./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz#./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz::hash=abc123&locator=app%40workspace%3A."
-            ),
-            format!("./.socket/vendor/npm/{a}/left-pad-1.3.0.tgz::locator=app%40workspace%3A."),
-        ] {
-            let decorated = spelled.contains('#') || spelled.contains("::");
-            // The literal-path reader refuses a decorated leaf outright: to
-            // npm / pnpm / bun / … it names a DIFFERENT file.
-            assert_eq!(vendor_ref(&spelled).is_none(), decorated, "{spelled}");
-            let v = vendor_ref_decorated(&spelled).unwrap_or_else(|| panic!("{spelled}"));
-            assert_eq!(v.eco, "npm", "{spelled}");
-            assert_eq!(v.uuid, a, "{spelled}");
-            assert_eq!(v.leaf, "left-pad-1.3.0.tgz", "{spelled}");
-            assert_eq!(
-                v.artifact_rel,
-                format!(".socket/vendor/npm/{a}/left-pad-1.3.0.tgz"),
-                "{spelled}"
-            );
-        }
-        // Dir-shaped leaves keep their nesting, trailing slash dropped.
-        let v = vendor_ref(&format!(
-            "./.socket/vendor/golang/{a}/github.com/foo/bar@v1.2.3/"
-        ))
-        .unwrap();
-        assert_eq!(v.leaf, "github.com/foo/bar@v1.2.3");
-    }
-
-    #[test]
-    fn vendor_ref_rejects_escapes_foreign_anchors_and_bad_uuids() {
-        let a = UUID_A;
-        for bad in [
-            // The package manager would read OUTSIDE the project root.
-            format!("../.socket/vendor/npm/{a}/x-1.0.0.tgz"),
-            format!("file:../.socket/vendor/npm/{a}/x-1.0.0.tgz"),
-            format!("/abs/project/.socket/vendor/npm/{a}/x-1.0.0.tgz"),
-            format!("sub/.socket/vendor/npm/{a}/x-1.0.0.tgz"),
-            // Traversal inside the leaf.
-            format!(".socket/vendor/npm/{a}/../../../etc/passwd"),
-            format!(".socket/vendor/npm/{a}/a//b.tgz"),
-            // No leaf / uuid-dir only / unknown eco / non-canonical uuid.
-            format!(".socket/vendor/npm/{a}"),
-            format!(".socket/vendor/npm/{a}/"),
-            format!(".socket/vendor/jsr/{a}/x-1.0.0.tgz"),
-            format!(".socket/vendor/npm/{}/x-1.0.0.tgz", a.to_ascii_uppercase()),
-            ".socket/vendor/npm/not-a-uuid/x-1.0.0.tgz".to_string(),
-            "https://registry.npmjs.org/x/-/x-1.0.0.tgz".to_string(),
-        ] {
-            assert_eq!(vendor_ref(&bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn vendor_uuid_dir_accepts_only_the_bare_uuid_dir() {
-        let a = UUID_A;
-        assert_eq!(
-            vendor_uuid_dir(&format!(".socket/vendor/nuget/{a}")),
-            Some(("nuget".to_string(), a.to_string()))
-        );
-        assert_eq!(
-            vendor_uuid_dir(&format!("./.socket/vendor/maven/{a}/")),
-            Some(("maven".to_string(), a.to_string()))
-        );
-        assert_eq!(
-            vendor_uuid_dir(&format!(".socket/vendor/nuget/{a}/x.nupkg")),
-            None
-        );
-        assert_eq!(
-            vendor_uuid_dir(&format!("../.socket/vendor/nuget/{a}")),
-            None
-        );
-        assert_eq!(vendor_uuid_dir(".socket/vendor/nuget/nope"), None);
-    }
-
-    #[test]
-    fn vendored_leaf_purl_strips_and_canonicalizes() {
-        assert_eq!(
-            vendored_leaf_purl("npm", "@scope/pkg-1.2.3.tgz#deadbeef").as_deref(),
-            Some("pkg:npm/@scope/pkg@1.2.3")
-        );
-        assert_eq!(
-            vendored_leaf_purl(
-                "pypi",
-                "Python_Dateutil-2.8.2-py2.py3-none-any.whl#sha256=ab"
-            )
-            .as_deref(),
-            Some("pkg:pypi/python-dateutil@2.8.2")
-        );
-        assert_eq!(
-            vendored_leaf_purl("cargo", "serde-1.0.0/").as_deref(),
-            Some("pkg:cargo/serde@1.0.0")
-        );
-        assert_eq!(vendored_leaf_purl("npm", "not-a-tarball"), None);
-    }
-
-    #[test]
-    fn socket_patch_names_are_exact() {
-        assert_eq!(
-            socket_patch_name_uuid(&format!("socket-patch-{UUID_A}"), false).as_deref(),
-            Some(UUID_A)
-        );
-        assert_eq!(
-            socket_patch_name_uuid(&format!("socket-patch-vendor-{UUID_A}"), true).as_deref(),
-            Some(UUID_A)
-        );
-        // The hosted grammar never matches the vendored id and vice versa.
-        assert_eq!(
-            socket_patch_name_uuid(&format!("socket-patch-vendor-{UUID_A}"), false),
-            None
-        );
-        assert_eq!(
-            socket_patch_name_uuid(&format!("socket-patch-{UUID_A}"), true),
-            None
-        );
-        assert_eq!(
-            socket_patch_name_uuid(&format!("socket-patch-{UUID_A}-x"), false),
-            None
-        );
-        assert_eq!(socket_patch_name_uuid("socket-patch-nope", false), None);
     }
 
     #[test]
@@ -4655,15 +4201,16 @@ mod tests {
     fn socket_identities_recognize_every_spelling_and_nothing_else() {
         let a = UUID_A;
         let t = TOKEN;
+        let none = OriginPolicy::new(&[]);
         let hosted = |text: &str| {
-            socket_identities(text, &[])
+            socket_identities(text, &none)
                 .into_iter()
                 .filter(|(_, m)| *m == WiringMode::Hosted)
                 .map(|(u, _)| u)
                 .collect::<Vec<_>>()
         };
         let vendored = |text: &str| {
-            socket_identities(text, &[])
+            socket_identities(text, &none)
                 .into_iter()
                 .filter(|(_, m)| *m == WiringMode::Vendored)
                 .map(|(u, _)| u)
@@ -4740,17 +4287,20 @@ mod tests {
             ".socket/vendor/npm/not-a-uuid/x.tgz".to_string(),
             "https://patch.socket.dev/patch/npm/x/1.0.0/tok/placeholder/x.tgz".to_string(),
         ] {
-            assert!(socket_identities(&text, &[]).is_empty(), "{text}");
+            assert!(socket_identities(&text, &none).is_empty(), "{text}");
         }
         // A configured patch-server origin counts only when configured.
         let staging =
             format!("\"resolved\": \"http://127.0.0.1:4545/patch/npm/x/1/{t}/{a}/x.tgz\"");
-        assert!(socket_identities(&staging, &[]).is_empty());
+        assert!(socket_identities(&staging, &none).is_empty());
         assert_eq!(
-            socket_identities(&staging, &["http://127.0.0.1:4545".to_string()])
-                .into_iter()
-                .map(|(u, _)| u)
-                .collect::<Vec<_>>(),
+            socket_identities(
+                &staging,
+                &OriginPolicy::new(&["http://127.0.0.1:4545".to_string()])
+            )
+            .into_iter()
+            .map(|(u, _)| u)
+            .collect::<Vec<_>>(),
             both
         );
     }
@@ -4772,7 +4322,7 @@ mod tests {
         };
         let staging = ["http://127.0.0.1:4545".to_string()];
         let uuids = |text: &str, origins: &[String]| {
-            socket_identities(text, origins)
+            socket_identities(text, &OriginPolicy::new(origins))
                 .into_iter()
                 .map(|(u, m)| (u, m == WiringMode::Hosted))
                 .collect::<BTreeSet<_>>()
@@ -4800,103 +4350,26 @@ mod tests {
         ];
         assert_eq!(uuids(&lock(a), &twice), uuids(&lock(a), &staging));
         assert_eq!(
-            socket_identities(&lock(a), &staging),
-            socket_identities_inner(&lock(a), &staging)
+            socket_identities(&lock(a), &OriginPolicy::new(&staging)),
+            socket_identities_inner(&lock(a), &OriginPolicy::new(&staging))
         );
     }
 
-    /// [`DiscoverCtx::hosted_uuid`]'s plain-url shortcut answers exactly
-    /// what the full parse does, for plain urls on other hosts and for
-    /// every spelling it must leave to the parse.
+    /// The ctx classifies under the origins it was built with: a url on a
+    /// configured `--patch-server-url` origin is hosted for that run only
+    /// (the classifier itself is tested in `crate::origin`).
     #[test]
-    fn hosted_uuid_shortcut_agrees_with_the_full_parse() {
-        let (a, t) = (UUID_A, TOKEN);
-        let path = format!("/patch/npm/x/1.0.0/{t}/{a}/x-1.0.0.tgz");
-        let hosts = [
-            "patch.socket.dev",
-            "PATCH.Socket.DEV",
-            "patch.socket.dev.",
-            "patch.socket.dev:443",
-            "patch.socket.dev:8443",
-            "patch.socket.dev:",
-            "registry.npmjs.org",
-            "registry.npmjs.org:443",
-            "127.0.0.1:4545",
-            "127.0.0.1",
-            "0x7f.0.0.1:4545",
-            "127.1:4545",
-            "[::1]:4545",
-            "staging.example.com:8443",
-            "Staging.Example.COM:8443",
-            "staging.example.com",
-            "xn--stging-bua.example.com",
-            "user@patch.socket.dev",
-            "user:pw@registry.npmjs.org",
-            "patch%2esocket.dev",
-            "patch.soc\tket.dev",
-            "patch.socket.dev\\",
-            "foo.123",
-            "foo.0x1f",
-            "",
-        ];
-        let urls: Vec<String> = hosts
-            .iter()
-            .flat_map(|host| {
-                [
-                    format!("https://{host}{path}"),
-                    format!("http://{host}{path}"),
-                    format!("HTTPS://{host}{path}"),
-                    format!("sparse+https://{host}{path}"),
-                    format!("git+https://{host}{path}"),
-                    format!("https:///{host}{path}"),
-                    format!("https://{host}?q={path}"),
-                    format!("  https://{host}{path}  "),
-                    format!("https://{host}"),
-                ]
-            })
-            .chain([
-                format!("https:\\/\\/patch.socket.dev{}", path.replace('/', "\\/")),
-                format!("https%3A%2F%2Fpatch.socket.dev{}", path.replace('/', "%2F")),
-                "file:x.tgz".to_string(),
-                "npm:x@1.0.0".to_string(),
-                "https://".to_string(),
-            ])
-            .collect();
-        for origins in [
-            vec![],
-            vec!["http://127.0.0.1:4545".to_string()],
-            vec![
-                "https://staging.example.com:8443".to_string(),
-                "http://[::1]:4545".to_string(),
-                "https://xn--stging-bua.example.com".to_string(),
-            ],
-        ] {
-            let ctx = DiscoverCtx::with_origins(Path::new("/nonexistent"), &origins);
-            for url in &urls {
-                assert_eq!(
-                    ctx.hosted_uuid(url),
-                    crate::patch::redirect::hosted_patch_uuid(url, &origins),
-                    "{url} under {origins:?}"
-                );
-            }
-            assert_eq!(
-                ctx.hosted_uuid(&format!("https://patch.socket.dev{path}"))
-                    .as_deref(),
-                Some(a)
-            );
-        }
+    fn ctx_hosted_uuid_honours_the_runs_configured_origins() {
+        let root = Path::new("/nonexistent");
+        let staging = ["http://127.0.0.1:4545".to_string()];
+        let url = format!("http://127.0.0.1:4545/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let ctx = DiscoverCtx::with_origins(root, &staging);
+        assert_eq!(ctx.hosted_uuid(&url).as_deref(), Some(UUID_A));
         assert_eq!(
-            plain_url_domain("https://Registry.NPMJS.org/x"),
-            Some("registry.npmjs.org".into())
+            ctx.hosted_uuid("https://registry.npmjs.org/x/-/x-1.0.0.tgz"),
+            None
         );
-        for not_plain in [
-            "https://127.0.0.1/x",
-            "https://a%2eb.com/x",
-            "https://u@a.com/x",
-            "https://xn--a.com/x",
-        ] {
-            assert_eq!(plain_url_domain(not_plain), None, "{not_plain}");
-        }
+        assert_eq!(DiscoverCtx::with_origins(root, &[]).hosted_uuid(&url), None);
     }
 
     /// The claim API: a recognized uuid is decided by the refs alone (live
@@ -5095,6 +4568,10 @@ mod tests {
             "OpenOptions",
             "hosted_patch_uuid(",
             "hosted_patch_url_uuids(",
+            // The policy itself, and the origin module (its helpers come
+            // re-exported from this module; `npm_origin::` is unrelated).
+            "OriginPolicy",
+            "crate::origin::",
             // The file-reading entry points of the shared readers an
             // extractor imports (the lock inventory, the writers' config
             // readers): each reads content outside the recognizing ctx.
