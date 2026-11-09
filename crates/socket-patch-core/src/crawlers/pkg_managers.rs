@@ -95,7 +95,10 @@ pub enum NpmPkgManager {
 /// linker (v1.3.2+ default) populates `node_modules/.bun/` which
 /// superficially resembles pnpm's `.pnpm/` content store. The
 /// lockfile filename disambiguates cleanly.
-pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
+pub fn detect_npm_pkg_manager(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+) -> NpmPkgManager {
     // 1. yarn-berry PnP — highest priority because it determines
     //    whether the npm crawler can find anything at all. Yarn 3+
     //    emits `.pnp.cjs`; Yarn 2.x emitted `.pnp.js` (renamed to
@@ -104,7 +107,7 @@ pub fn detect_npm_pkg_manager(project_root: &Path) -> NpmPkgManager {
     //    mean "packages aren't on disk" — refuse rather than silently
     //    fall through to Unknown (a Yarn 2 PnP tree has no
     //    `node_modules/`, so it would otherwise escape the refusal).
-    if live_pnp_marker(project_root, |m| project_root.join(m).is_file()).is_some() {
+    if live_pnp_marker(scope, project_root, |m| project_root.join(m).is_file()).is_some() {
         // Carve-out: pnpm has its OWN PnP mode (`node-linker=pnp` in
         // `.npmrc`) which also writes a `.pnp.cjs` loader at the root
         // — but unlike yarn-berry the packages are real directories in
@@ -183,6 +186,9 @@ pub(crate) struct YarnEnv {
     /// `injectEnvironmentFiles` ([`Self::with_env_files`]): they win over
     /// `vars`, as yarn applies them over its environment (#1611).
     pub env_files: EnvFiles,
+    /// The read scope of the run (from its CLI mode): a workspace run
+    /// never reads an rc or env file above the repository root.
+    pub scope: crate::utils::repo_root::ReadScope,
 }
 
 /// The dotenv files a yarn run injects, read on the first `${NAME}`
@@ -196,7 +202,7 @@ pub(crate) struct EnvFiles {
 }
 
 impl YarnEnv {
-    pub(crate) fn current() -> Self {
+    pub(crate) fn current(scope: crate::utils::repo_root::ReadScope) -> Self {
         Self {
             // Yarn takes the last `yarn_node_linker` spelling in the
             // environment (each one overwrites the setting) but the first
@@ -208,14 +214,18 @@ impl YarnEnv {
             home: crate::utils::fs::home_dir(),
             vars: None,
             env_files: Default::default(),
+            scope,
         }
     }
 
     /// [`Self::current`] for a yarn run in `project_root`: with the
     /// variables of the project's `injectEnvironmentFiles` (#1611).
-    pub(crate) fn for_project(project_root: &Path) -> Self {
+    pub(crate) fn for_project(
+        scope: crate::utils::repo_root::ReadScope,
+        project_root: &Path,
+    ) -> Self {
         let env_list = yarn_env_key(std::env::vars_os(), "YARN_INJECT_ENVIRONMENT_FILES", true);
-        Self::current().with_env_files(project_root, env_list.as_deref())
+        Self::current(scope).with_env_files(project_root, env_list.as_deref())
     }
 
     /// This environment with the variables yarn 4 injects for a run in
@@ -239,9 +249,26 @@ impl YarnEnv {
             let Some((start, env_list)) = &self.env_files.run else {
                 return Default::default();
             };
-            let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+            // Inside a git checkout neither an rc file nor an env file
+            // above its root is read: what it would inject is missing.
+            // The home folder's rc file and the env files beside it are
+            // machine-level, read as before.
+            let bound = crate::utils::repo_root::upward_bound(self.scope, start);
+            let within = |path: &Path| {
+                bound.as_ref().is_none_or(|b| b.contains(path))
+                    || self
+                        .home
+                        .as_deref()
+                        .is_some_and(|home| path.parent() == Some(home))
+            };
+            let read = |path: &Path| {
+                within(path)
+                    .then(|| crate::utils::fs::read_regular_to_string_sync(path).ok())
+                    .flatten()
+            };
             let mut rcs: Vec<(PathBuf, String)> = start
                 .ancestors()
+                .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
                 .filter_map(|dir| Some((dir.to_path_buf(), read(&dir.join(&self.rc_filename))?)))
                 .collect();
             if let Some(home) = &self.home {
@@ -271,6 +298,7 @@ impl YarnEnv {
             home: None,
             vars: Some(Default::default()),
             env_files: Default::default(),
+            scope: crate::utils::repo_root::ReadScope::Workspace,
         }
     }
 
@@ -352,8 +380,11 @@ pub(crate) fn rc_node_linker(rc: &str, env: &YarnEnv) -> Option<String> {
 /// the closest winning), else the home folder's rc file. The rc file name
 /// is `YARN_RC_FILENAME` when set. `None` when nothing sets it: yarn berry
 /// then uses its default linker, `pnp`.
-pub fn yarn_node_linker(project_root: &Path) -> Option<String> {
-    yarn_node_linker_in(project_root, &YarnEnv::for_project(project_root))
+pub fn yarn_node_linker(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+) -> Option<String> {
+    yarn_node_linker_in(project_root, &YarnEnv::for_project(scope, project_root))
 }
 
 pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<String> {
@@ -361,12 +392,22 @@ pub(crate) fn yarn_node_linker_in(project_root: &Path, env: &YarnEnv) -> Option<
         return Some(env.resolve_linker(linker));
     }
     let start = std::path::absolute(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let bound = crate::utils::repo_root::upward_bound(env.scope, &start);
     start
         .ancestors()
+        .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
         .find_map(|dir| {
             let rc =
                 crate::utils::fs::read_regular_to_string_sync(&dir.join(&env.rc_filename)).ok()?;
             rc_node_linker(&rc, env)
+        })
+        // An rc file above the repository root is never read, and may set
+        // the linker: fail closed with a value no linker has, which reads
+        // as PnP (see [`YarnEnv::resolve_linker`]) and names the file.
+        .or_else(|| {
+            let bound = bound.as_ref()?;
+            let marker = bound.marker_above(&[env.rc_filename.as_str()])?;
+            Some(format!("<unread: {}>", bound.marker_refusal(&marker)))
         })
         .or_else(|| env.home_node_linker())
 }
@@ -396,8 +437,23 @@ pub(crate) fn yarn_pnpm_store_folder_in(project_root: &Path, env: &YarnEnv) -> O
         crate::formats::yarn::rc::raw_setting(&rc, "pnpmStoreFolder")
             .map(|raw| expand(&raw).map(|value| dir.join(value)))
     };
+    // An rc file above the repository root is never read: the store it
+    // may name is unknown, so none is admitted.
+    let bound = crate::utils::repo_root::upward_bound(env.scope, &start);
+    if bound
+        .as_ref()
+        .and_then(|b| b.marker_above(&[env.rc_filename.as_str()]))
+        .is_some()
+        && !start
+            .ancestors()
+            .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
+            .any(|dir| from_rc(dir).is_some())
+    {
+        return None;
+    }
     let found = start
         .ancestors()
+        .take_while(|dir| bound.as_ref().is_none_or(|b| b.contains(dir)))
         .find_map(from_rc)
         .or_else(|| env.home.as_deref().and_then(from_rc));
     match found {
@@ -409,8 +465,11 @@ pub(crate) fn yarn_pnpm_store_folder_in(project_root: &Path, env: &YarnEnv) -> O
 /// The store of an active yarn berry pnpm-linker install of the project at
 /// `project_root` ([`yarn_pnpm_store_folder_in`]), or `None` when the
 /// linker yarn resolves there ([`yarn_node_linker_in`]) is not `pnpm`.
-pub(crate) fn active_yarn_pnpm_store(project_root: &Path) -> Option<PathBuf> {
-    let env = YarnEnv::for_project(project_root);
+pub(crate) fn active_yarn_pnpm_store(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+) -> Option<PathBuf> {
+    let env = YarnEnv::for_project(scope, project_root);
     if yarn_node_linker_in(project_root, &env).as_deref() != Some("pnpm") {
         return None;
     }
@@ -449,12 +508,18 @@ pub fn yarn_linker_is_pnp(linker: Option<&str>) -> bool {
 /// always counts ([`effective_yarn_linker`]).
 /// Every `PNP_MARKERS` decision goes through here or
 /// [`live_pnp_marker_with`].
-pub fn live_pnp_marker(project_root: &Path, exists: impl Fn(&str) -> bool) -> Option<&'static str> {
+pub fn live_pnp_marker(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+    exists: impl Fn(&str) -> bool,
+) -> Option<&'static str> {
     live_pnp_marker_with(
         || {
             let lock =
                 crate::utils::fs::read_regular_to_string_sync(&project_root.join("yarn.lock"));
-            effective_yarn_linker(lock.ok().as_deref(), || yarn_node_linker(project_root))
+            effective_yarn_linker(lock.ok().as_deref(), || {
+                yarn_node_linker(scope, project_root)
+            })
         },
         exists,
     )
@@ -529,7 +594,9 @@ impl YarnPnpLoader {
     /// `node-linker=pnp` tree is not). A loader file that cannot be read
     /// contributes nothing, so it never vouches for a patch.
     pub fn detect(project_root: &Path) -> Option<Self> {
-        if detect_npm_pkg_manager(project_root) != NpmPkgManager::YarnBerryPnP {
+        if detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, project_root)
+            != NpmPkgManager::YarnBerryPnP
+        {
             return None;
         }
         let texts = crate::constants::npm_family::PNP_MARKERS
@@ -875,6 +942,7 @@ mod tests {
             home: None,
             vars: Some(Default::default()),
             env_files: Default::default(),
+            scope: crate::utils::repo_root::ReadScope::Workspace,
         }
     }
 
@@ -1045,14 +1113,20 @@ mod tests {
     #[test]
     fn unknown_for_empty_dir() {
         let d = tempfile::tempdir().unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     #[test]
     fn npm_for_bare_node_modules() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Npm
+        );
     }
 
     #[test]
@@ -1060,14 +1134,20 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Pnpm
+        );
     }
 
     #[test]
     fn pnpm_via_pnpm_dir() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Pnpm
+        );
     }
 
     #[test]
@@ -1075,7 +1155,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::YarnClassic);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::YarnClassic
+        );
     }
 
     /// yarn.lock without an installed node_modules is "fresh
@@ -1084,7 +1167,10 @@ mod tests {
     fn yarn_classic_requires_installed_node_modules() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     #[test]
@@ -1092,7 +1178,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1105,7 +1191,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1115,7 +1201,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Bun
+        );
     }
 
     #[test]
@@ -1123,7 +1212,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Bun
+        );
     }
 
     /// `bun.lock` without an installed `node_modules/` is a fresh
@@ -1132,7 +1224,10 @@ mod tests {
     fn bun_requires_installed_node_modules() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     /// Bun's isolated linker (v1.3.2+ default) creates
@@ -1144,7 +1239,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Bun
+        );
     }
 
     /// yarn-berry beats bun (PnP is a structural override of
@@ -1156,7 +1254,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1171,7 +1269,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.loader.mjs"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1186,7 +1284,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1200,7 +1298,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Pnpm
+        );
     }
 
     /// bun is checked before yarn-classic too: a `bun.lock` plus a
@@ -1211,7 +1312,10 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Bun
+        );
     }
 
     /// Robustness: a malformed layout where `node_modules` is a regular
@@ -1224,7 +1328,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("node_modules"), "not a dir").unwrap();
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     /// The bun-before-pnpm precedence must hold for the *binary* legacy
@@ -1237,7 +1344,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         std::fs::write(d.path().join("bun.lockb"), b"").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Bun);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Bun
+        );
     }
 
     /// yarn-berry PnP outranks bun via the ESM loader marker as well as
@@ -1252,7 +1362,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1268,7 +1378,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join(".pnp.js"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1284,7 +1394,7 @@ mod tests {
         std::fs::write(d.path().join("bun.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1315,7 +1425,10 @@ mod tests {
         )
         .unwrap();
         std::fs::write(d.path().join("node_modules/.modules.yaml"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Pnpm
+        );
     }
 
     /// The pnpm-PnP carve-out must stay fail-closed: a project carrying
@@ -1330,7 +1443,7 @@ mod tests {
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1345,7 +1458,7 @@ mod tests {
         std::fs::write(d.path().join(".pnp.cjs"), "").unwrap();
         std::fs::write(d.path().join("pnpm-lock.yaml"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1357,7 +1470,10 @@ mod tests {
     fn pnp_js_as_dir_does_not_trigger_pnp() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join(".pnp.js")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     /// Layout assumption: detection is *install*-based, not
@@ -1369,7 +1485,10 @@ mod tests {
     fn npm_lockfile_without_node_modules_is_unknown() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("package-lock.json"), "{}").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     /// Robustness: a malformed pnpm marker where `.modules.yaml` is a
@@ -1380,7 +1499,10 @@ mod tests {
     fn modules_yaml_as_dir_does_not_trigger_pnpm() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.modules.yaml")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Npm
+        );
     }
 
     /// Layout assumption: `node_modules` reached through a symlink to a
@@ -1396,14 +1518,20 @@ mod tests {
         std::fs::create_dir_all(&real).unwrap();
         std::os::unix::fs::symlink(&real, d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("yarn.lock"), "").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::YarnClassic);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::YarnClassic
+        );
     }
 
     #[test]
     fn vlt_via_store_dir() {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Vlt);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Vlt
+        );
     }
 
     #[test]
@@ -1411,7 +1539,10 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Vlt);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Vlt
+        );
     }
 
     /// A committed `vlt-lock.json` is not install state: the tree beside it
@@ -1420,13 +1551,22 @@ mod tests {
     fn vlt_lockfile_without_vlt_install_state_falls_through() {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
 
         std::fs::create_dir_all(d.path().join("node_modules")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Npm
+        );
 
         std::fs::create_dir_all(d.path().join("node_modules/.pnpm")).unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Pnpm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Pnpm
+        );
     }
 
     #[test]
@@ -1436,7 +1576,7 @@ mod tests {
         std::fs::create_dir_all(d.path().join("node_modules/.vlt")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt-lock.json"), "{}").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(d.path()),
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
             NpmPkgManager::YarnBerryPnP
         );
     }
@@ -1458,7 +1598,7 @@ mod tests {
                 std::fs::create_dir_all(d.path().join(marker)).unwrap();
             }
             assert_eq!(
-                detect_npm_pkg_manager(d.path()),
+                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
                 NpmPkgManager::Vlt,
                 "{marker}"
             );
@@ -1471,7 +1611,10 @@ mod tests {
         std::fs::write(d.path().join("node_modules"), "not a dir").unwrap();
         std::fs::write(d.path().join("vlt-lock.json"), "{}").unwrap();
         std::fs::write(d.path().join("vlt.json"), "{}").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Unknown);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Unknown
+        );
     }
 
     /// Robustness: `.vlt` as a regular file, and the hidden lock as a
@@ -1481,6 +1624,9 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(d.path().join("node_modules/.vlt-lock.json")).unwrap();
         std::fs::write(d.path().join("node_modules/.vlt"), "not a dir").unwrap();
-        assert_eq!(detect_npm_pkg_manager(d.path()), NpmPkgManager::Npm);
+        assert_eq!(
+            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, d.path()),
+            NpmPkgManager::Npm
+        );
     }
 }

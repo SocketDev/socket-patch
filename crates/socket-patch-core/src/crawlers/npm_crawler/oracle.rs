@@ -79,7 +79,7 @@ impl LegacyNpmCrawler {
         let mut seen = HashSet::new();
 
         let nm_paths = if options.global || options.global_prefix.is_some() {
-            NpmCrawler::new()
+            NpmCrawler::for_options(options)
                 .get_node_modules_paths(options)
                 .await
                 .unwrap_or_default()

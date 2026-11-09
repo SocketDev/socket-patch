@@ -2,48 +2,72 @@
 //! Rush's pnpm locks: Rush's lock enumeration and the registry view over the
 //! format's model ([`crate::formats::pnpm::PnpmLock`]).
 
-use std::path::Path;
-
 use crate::constants::npm_family::{PNPM_LOCK, RUSH_COMMON_LOCK_REL, RUSH_SUBSPACES_DIR};
 use crate::formats::pnpm::PnpmLock;
 use crate::patch::path_safety::is_safe_single_segment;
-use crate::utils::fs::read_regular_to_string;
 
 use super::view::ProjectView;
 use super::LockfileEntry;
 
 // ── file selection ──
 
+/// Whether the project is a Rush monorepo: a regular `rush.json` file at
+/// the root, probed through the view (on disk a link to a file counts; a
+/// dangling link, a directory or, in memory, an implied directory does
+/// not, since Rush cannot load any of them). The one gate hosted mode,
+/// the vendor flavor probe, lockfile discovery and every lock-inventory
+/// reader share, so they agree on which locks a Rush project installs
+/// from. Hosted mode's gate is the ground truth it was taken from.
+pub(crate) async fn is_rush(view: ProjectView<'_>) -> bool {
+    view.is_file("rush.json")
+}
+
 /// A Rush monorepo's pnpm locks, root-relative, in lockfile discovery's
-/// order: the single source-of-truth lock
-/// ([`RUSH_COMMON_LOCK_REL`]), then every subspace's
-/// `common/config/subspaces/<name>/pnpm-lock.yaml`, sorted by name — real
-/// directories only (a symlinked subspace dir could point the read outside
-/// the project) with traversal-safe UTF-8 names. Stat / list only; whether
-/// the project IS a Rush monorepo (`rush.json`) is the caller's check.
+/// order: the single source-of-truth lock ([`RUSH_COMMON_LOCK_REL`]), then
+/// every subspace's `common/config/subspaces/<name>/pnpm-lock.yaml`, sorted
+/// by name. Every directory on the way is a real one, never a symlink that
+/// could point the read at another repository: `common`, `common/config`
+/// and `common/config/rush` for the common lock (else it is left out);
+/// `common`, `common/config`, `common/config/subspaces` and each subspace
+/// dir for the subspace locks (else they are). Subspace names must be
+/// traversal-safe UTF-8 segments. Stat / list only; whether the project IS
+/// a Rush monorepo is the caller's [`is_rush`] check.
 pub(crate) async fn rush_lock_rels(view: ProjectView<'_>) -> Vec<String> {
-    let mut names: Vec<String> = view
-        .list_dir(RUSH_SUBSPACES_DIR)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|entry| entry.is_dir && is_safe_single_segment(&entry.name))
-        .map(|entry| entry.name)
-        .collect();
-    names.sort();
-    let mut rels = vec![RUSH_COMMON_LOCK_REL.to_string()];
+    let mut rels = Vec::new();
+    if !has_symlinked_dir(view, RUSH_COMMON_LOCK_DIR) {
+        rels.push(RUSH_COMMON_LOCK_REL.to_string());
+    }
+    if has_symlinked_dir(view, RUSH_SUBSPACES_DIR) {
+        return rels;
+    }
+    // The listing is sorted by name; `is_dir` does not follow links.
     rels.extend(
-        names
+        view.list_dir(RUSH_SUBSPACES_DIR)
+            .await
+            .unwrap_or_default()
             .into_iter()
-            .map(|name| format!("{RUSH_SUBSPACES_DIR}/{name}/{PNPM_LOCK}")),
+            .filter(|entry| entry.is_dir && is_safe_single_segment(&entry.name))
+            .map(|entry| format!("{RUSH_SUBSPACES_DIR}/{}/{PNPM_LOCK}", entry.name)),
     );
     rels
+}
+
+/// The directory holding [`RUSH_COMMON_LOCK_REL`].
+const RUSH_COMMON_LOCK_DIR: &str = "common/config/rush";
+
+/// Whether root-relative directory `dir` or any directory above it (below
+/// the root) is a symlink.
+fn has_symlinked_dir(view: ProjectView<'_>, dir: &str) -> bool {
+    dir.match_indices('/')
+        .map(|(at, _)| &dir[..at])
+        .chain([dir])
+        .any(|rel| view.is_symlink(rel))
 }
 
 // ── registry view ──
 
 #[cfg(test)]
-pub(super) async fn inventory_pnpm_lock(root: &Path) -> Option<Vec<LockfileEntry>> {
+pub(super) async fn inventory_pnpm_lock(root: &std::path::Path) -> Option<Vec<LockfileEntry>> {
     inventory_pnpm_lock_in(&ProjectView::Disk(root)).await
 }
 
@@ -51,20 +75,15 @@ pub(super) async fn inventory_pnpm_lock_in(view: &ProjectView<'_>) -> Option<Vec
     inventory_pnpm_lock_rel_in(view, PNPM_LOCK).await
 }
 
-/// [`inventory_pnpm_lock_at`] for a project-relative lock path.
+/// Inventory a project-relative `pnpm-lock.yaml` (the root lock, a
+/// member's, or a Rush common / subspace lock) through the view:
+/// [`PnpmLock::entries`], `None` when the lock is unreadable or has no
+/// `packages:` section.
 pub(super) async fn inventory_pnpm_lock_rel_in(
     view: &ProjectView<'_>,
     rel: &str,
 ) -> Option<Vec<LockfileEntry>> {
     let text = view.read_text(rel).await.ok()?;
-    pnpm_lock_text_inventory(&text)
-}
-
-/// Inventory a specific `pnpm-lock.yaml` (path given explicitly so the Rush
-/// fallback can point it at `common/config/rush/…` and subspace locks):
-/// [`PnpmLock::entries`], `None` when the lock has no `packages:` section.
-pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<LockfileEntry>> {
-    let text = read_regular_to_string(lock_path).await.ok()?;
     pnpm_lock_text_inventory(&text)
 }
 
@@ -75,7 +94,7 @@ pub(super) async fn inventory_pnpm_lock_at(lock_path: &Path) -> Option<Vec<Lockf
 /// instead). A member lock that cannot be read adds nothing.
 pub(super) async fn inventory_pnpm_member_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
     use crate::utils::pnpm_workspace::{member_locks, MemberLocks};
-    if view.is_file("rush.json") {
+    if is_rush(*view).await {
         return Vec::new();
     }
     let MemberLocks::PerMember(keys) = member_locks(view).await else {
@@ -102,67 +121,25 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// `common/config/subspaces/<name>/pnpm-lock.yaml`. `rush install` copies
 /// the source lock into common/temp and runs pnpm there.
 ///
-/// Only called (via [`inventory_npm_lock`]) when there is NO root lock but
-/// `rush.json` is present, so it never shadows a plain pnpm project. The
-/// subspace directory is read sorted for deterministic output. Missing
-/// files/dirs are skipped fail-soft; the caller drops the whole result when
-/// it comes back empty.
+/// The last fallback of [`super::npm_family::inventory_npm_lock_raw_in`]:
+/// reached whenever the npm-family flavor probe refuses the project (any
+/// refusal but the PnP ones, which propagate) and no earlier fallback (the
+/// out-of-family root pnpm lock, a live sibling lock, pnpm <= 2's
+/// `shrinkwrap.yaml`, the members' own locks) returned entries — typically
+/// no root lock at all, where the probe refuses with
+/// `vendor_rush_unsupported` or `vendor_lockfile_missing`. Outside a Rush
+/// monorepo ([`is_rush`]) it reads nothing. The locks are the ones lockfile
+/// discovery reads ([`rush_lock_rels`]), each read through the view.
+/// Missing files/dirs are skipped fail-soft; the caller drops the whole
+/// result when it comes back empty.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
-    let project = match view {
-        ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
-            let project_root = view.disk_root().expect("a disk view has a root");
-            return inventory_rush_pnpm_locks(project_root).await;
-        }
-        ProjectView::Memory(project) => *project,
-    };
-    if !project.contains("rush.json") {
+    if !is_rush(*view).await {
         return Vec::new();
     }
     let mut out = Vec::new();
-    if let Some(entries) = inventory_pnpm_lock_rel_in(view, RUSH_COMMON_LOCK_REL).await {
-        out.extend(entries);
-    }
-    for (name, is_dir) in project.children(RUSH_SUBSPACES_DIR) {
-        if !is_dir {
-            continue;
-        }
-        let rel = format!("{RUSH_SUBSPACES_DIR}/{name}/{PNPM_LOCK}");
+    for rel in rush_lock_rels(*view).await {
         if let Some(entries) = inventory_pnpm_lock_rel_in(view, &rel).await {
             out.extend(entries);
-        }
-    }
-    out
-}
-
-async fn inventory_rush_pnpm_locks(project_root: &Path) -> Vec<LockfileEntry> {
-    if tokio::fs::metadata(project_root.join("rush.json"))
-        .await
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-
-    // The single source-of-truth lock.
-    let common_lock = project_root.join(RUSH_COMMON_LOCK_REL);
-    if let Some(entries) = inventory_pnpm_lock_at(&common_lock).await {
-        out.extend(entries);
-    }
-
-    // Per-subspace locks, sorted for determinism.
-    let subspaces_dir = project_root.join(RUSH_SUBSPACES_DIR);
-    if let Ok(mut read_dir) = tokio::fs::read_dir(&subspaces_dir).await {
-        let mut subspace_dirs: Vec<std::path::PathBuf> = Vec::new();
-        while let Ok(Some(entry)) = read_dir.next_entry().await {
-            if entry.file_type().await.is_ok_and(|t| t.is_dir()) {
-                subspace_dirs.push(entry.path());
-            }
-        }
-        subspace_dirs.sort();
-        for dir in subspace_dirs {
-            if let Some(entries) = inventory_pnpm_lock_at(&dir.join(PNPM_LOCK)).await {
-                out.extend(entries);
-            }
         }
     }
     out

@@ -3069,6 +3069,7 @@ pub(crate) async fn rollback_patches_inner(
                 for path in &found {
                     for copy in
                         socket_patch_core::crawlers::npm_crawler::find_store_peer_variant_copies(
+                            common.read_scope(),
                             path,
                         )
                         .await
@@ -3277,6 +3278,7 @@ pub(crate) async fn rollback_patches_inner(
                 Some(r) => r,
                 None => {
                     let mut result = rollback_package_patch(
+                        common.read_scope(),
                         purl,
                         pkg_path,
                         &patch.files,
@@ -3318,6 +3320,7 @@ pub(crate) async fn rollback_patches_inner(
             // isolated-store entry, #1084) is restored here, or fails the
             // run and keeps the record, before the record is dropped.
             match socket_patch_core::patch::rollback::rollback_store_copies_holding_patch(
+                common.read_scope(),
                 purl,
                 pkg_path,
                 files,
@@ -3400,6 +3403,7 @@ pub(crate) async fn rollback_patches_inner(
     if !common.dry_run {
         warnings.extend(
             socket_patch_core::utils::cargo_build_cache::invalidate_project(
+                common.read_scope(),
                 &common.cwd,
                 results
                     .iter()
@@ -3817,8 +3821,15 @@ async fn rollback_maven_target(
             }
         }
     }
-    let mut result =
-        rollback_package_patch(&target.purl, &target.dir, files, blobs_path, common.dry_run).await;
+    let mut result = rollback_package_patch(
+        common.read_scope(),
+        &target.purl,
+        &target.dir,
+        files,
+        blobs_path,
+        common.dry_run,
+    )
+    .await;
     if !result.success || common.dry_run {
         return result;
     }

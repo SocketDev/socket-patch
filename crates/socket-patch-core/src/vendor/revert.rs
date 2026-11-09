@@ -235,6 +235,47 @@ mod tests {
         assert_eq!(outcome.warnings.len(), 1, "the drift warning is kept");
     }
 
+    /// The keep-check reads every spelling a lock may give the uuid dir: an
+    /// older composer.lock's `\/`-escaped JSON slashes, single and doubled
+    /// Windows backslashes, `./` / `file:` prefixes. A plain text match
+    /// missed them and deleted an artifact the lock still installs from.
+    #[tokio::test]
+    async fn drift_keeps_while_a_live_file_names_the_uuid_dir_in_any_spelling() {
+        let policy = KeepPolicy::OnDriftWhileReferenced(&["composer.lock"]);
+        let rel = rel("composer");
+        let spellings = [
+            format!(
+                "{{\"dist\": {{\"type\": \"path\", \"url\": \"{}\\/psr\\/log@3.0.2\"}}}}",
+                rel.replace('/', "\\/")
+            ),
+            format!("{{\"url\": \"{}\\psr\"}}", rel.replace('/', "\\")),
+            format!("{{\"url\": \"{}\\\\psr\"}}", rel.replace('/', "\\\\")),
+            format!("{{\"url\": \"./{rel}/psr\"}}"),
+            format!("{{\"url\": \"file:{rel}/psr\"}}"),
+        ];
+        for lock in spellings {
+            let dir = project("composer");
+            std::fs::write(dir.path().join("composer.lock"), &lock).unwrap();
+            let outcome = finish(drifted(), dir.path(), &rel, wet(), policy).await;
+            assert!(outcome.success && outcome.kept_artifact, "{lock}");
+            assert!(dir.path().join(&rel).is_dir(), "{lock}");
+        }
+
+        // Another uuid's dir, in any spelling, is no reference to this one.
+        let other = rel.replace(UUID, "99999999-2222-4333-8444-555555555555");
+        for lock in [
+            format!("{{\"url\": \"{}\\/psr\"}}", other.replace('/', "\\/")),
+            format!("{{\"url\": \"{}\\psr\"}}", other.replace('/', "\\")),
+            format!("{{\"url\": \"{other}/psr\"}}"),
+        ] {
+            let dir = project("composer");
+            std::fs::write(dir.path().join("composer.lock"), &lock).unwrap();
+            let outcome = finish(drifted(), dir.path(), &rel, wet(), policy).await;
+            assert!(outcome.success && !outcome.kept_artifact, "{lock}");
+            assert!(!dir.path().join(&rel).exists(), "{lock}");
+        }
+    }
+
     #[tokio::test]
     async fn npm_family_keeps_a_removed_entry_while_a_lock_names_the_uuid() {
         let policy = policies()[2];

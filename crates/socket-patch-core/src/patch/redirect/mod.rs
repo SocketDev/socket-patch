@@ -69,6 +69,7 @@ use crate::formats::gem::hosted::{
     refresh_merged_gem_lock_remote,
 };
 use crate::formats::gem::{lock_lists_direct_dependency, locked_specs as gem_locked_specs};
+use crate::formats::maven::trusted_checksums::{self, CONFIG_ARGS as MVN_CONFIG_ARGS};
 #[cfg(test)]
 use crate::formats::pnpm::hosted::pnpm_unrewritten_instances;
 use crate::formats::pnpm::plan_hosted;
@@ -1291,52 +1292,22 @@ fn rewrite_npm_lock(
     // would still stack the user's diff on the hosted bytes. Each present
     // lock is parsed ONCE, here, and the parse is handed to its rewrite;
     // only a lock that spells `"patched"` at all is walked for the gate.
-    let user_patched = crate::vendor::bun_lock_text::patched_dependency_keys(
-        files.get("package.json").map(String::as_str),
-        None,
-    );
+    let mut user_patches =
+        NpmUserPatches::from_manifest(files.get("package.json").map(String::as_str));
     let parsed: Vec<(&str, Option<Value>)> = present
         .iter()
         .map(|lockfile| (*lockfile, parse_json_text(&files[*lockfile]).ok()))
         .collect();
-    let lock_patched: Vec<(String, String, &str, String)> = parsed
-        .iter()
-        .filter(|(lockfile, _)| files[*lockfile].contains("\"patched\""))
-        .filter_map(|(lockfile, lock)| Some((*lockfile, lock.as_ref()?)))
-        .flat_map(|(lockfile, lock)| {
-            npm_lock_entries(lock)
-                .into_iter()
-                .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
-                .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
-                .filter_map(|e| {
-                    let version = e.node.version?.to_string();
-                    Some((
-                        e.node.name.to_string(),
-                        version,
-                        lockfile,
-                        e.key.to_string(),
-                    ))
-                })
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    for (lockfile, lock) in &parsed {
+        if let (Some(lock), true) = (lock, files[*lockfile].contains("\"patched\"")) {
+            user_patches.add_lock(lockfile, lock);
+        }
+    }
     let npm: Vec<&DepOverride> = npm
         .into_iter()
         .filter(|dep| {
             let fname = full_name(dep);
-            let source = if let Some(key) = crate::vendor::bun_lock_text::patched_dependency_key(
-                &user_patched,
-                &fname,
-                &dep.version,
-                &dep.artifact_url,
-            ) {
-                format!("package.json `patchedDependencies` has `{key}`")
-            } else if let Some((_, _, lockfile, key)) = lock_patched
-                .iter()
-                .find(|(name, version, _, _)| *name == fname && *version == dep.version)
-            {
-                format!("{lockfile} entry `{key}` carries npm's `patched` record")
-            } else {
+            let Some(source) = user_patches.source(&fname, &dep.version, &dep.artifact_url) else {
                 return true;
             };
             // A lock an earlier (pre-#711) hosted run already pinned keeps
@@ -1427,6 +1398,91 @@ pub fn npm_deno_lock_detail(packages: &[String], how: &str) -> String {
          `socket-patch scan --mode agent`",
         packages.join(", ")
     )
+}
+
+/// The packages a project patches itself with npm 12's native `npm patch`
+/// (#711), as the hosted npm rewriter's gate reads them: a root
+/// `package.json` `patchedDependencies` key, or the non-null `patched`
+/// record npm writes on a lock's `packages` dependency entry (lockfileVersion
+/// 4) in any present npm lock. npm applies that diff to every install of the
+/// package, whichever lock names it. `vex` discovery reads the same
+/// evidence, so it never attests a pin hosted mode refuses, and reads Bun's
+/// (`bun patch`, #367: the same manifest key, or the copy `bun.lock`
+/// mirrors, [`NpmUserPatches::add_mirrored_keys`]) through it too.
+#[derive(Debug, Default)]
+pub(crate) struct NpmUserPatches {
+    /// The `patchedDependencies` keys: the root manifest's, then any only a
+    /// lock mirrors.
+    keys: Vec<String>,
+    /// `(key, lockfile)` of each key only a lock mirrors.
+    mirrored: Vec<(String, String)>,
+    /// `(name, version, lockfile, entry key)` of every lock entry carrying
+    /// a `patched` record.
+    locked: Vec<(String, String, String, String)>,
+}
+
+impl NpmUserPatches {
+    /// The root `package.json`'s `patchedDependencies` keys (none when
+    /// `manifest` is absent or unparseable).
+    pub(crate) fn from_manifest(manifest: Option<&str>) -> Self {
+        NpmUserPatches {
+            keys: crate::vendor::bun_lock_text::patched_dependency_keys(manifest, None),
+            ..Self::default()
+        }
+    }
+
+    /// Add the `patchedDependencies` keys the text lock `lockfile`
+    /// (`bun.lock`) mirrors at its top that the manifest does not have.
+    pub(crate) fn add_mirrored_keys(&mut self, lockfile: &str, lock: &str) {
+        for key in crate::vendor::bun_lock_text::patched_dependency_keys(None, Some(lock)) {
+            if !self.keys.contains(&key) {
+                self.mirrored.push((key.clone(), lockfile.to_string()));
+                self.keys.push(key);
+            }
+        }
+    }
+
+    /// Add the `patched` records of the parsed npm lock `lockfile`.
+    pub(crate) fn add_lock(&mut self, lockfile: &str, lock: &Value) {
+        let patched = npm_lock_entries(lock)
+            .into_iter()
+            .filter(|e| e.section == NpmLockSection::Packages && e.is_dependency())
+            .filter(|e| e.value.get("patched").is_some_and(|p| !p.is_null()))
+            .filter_map(|e| {
+                let version = e.node.version?.to_string();
+                Some((
+                    e.node.name.to_string(),
+                    version,
+                    lockfile.to_string(),
+                    e.key.to_string(),
+                ))
+            });
+        self.locked.extend(patched);
+    }
+
+    /// Why `name@version` counts as patched by the project itself, for a
+    /// warning or diagnostic, when it does. `target` is what the wiring
+    /// resolves the package to (the hosted URL, or the vendored tarball
+    /// path): a `patchedDependencies` key naming exactly it is no conflict
+    /// ([`crate::vendor::bun_lock_text::patched_dependency_key`]).
+    pub(crate) fn source(&self, name: &str, version: &str, target: &str) -> Option<String> {
+        if let Some(key) =
+            crate::vendor::bun_lock_text::patched_dependency_key(&self.keys, name, version, target)
+        {
+            let file = self
+                .mirrored
+                .iter()
+                .find(|(k, _)| k == key)
+                .map_or("package.json", |(_, lockfile)| lockfile.as_str());
+            return Some(format!("{file} `patchedDependencies` has `{key}`"));
+        }
+        self.locked
+            .iter()
+            .find(|(n, v, _, _)| n == name && v == version)
+            .map(|(_, _, lockfile, key)| {
+                format!("{lockfile} entry `{key}` carries npm's `patched` record")
+            })
+    }
 }
 
 /// Leave `dep` on its registry entry because the project patches it with
@@ -6535,6 +6591,9 @@ fn plan_python_metadata_with(
         detail: format!("{metadata_path}: {detail}"),
     };
     source_scope().map_err(unsupported)?;
+    if let Some(why) = files.get(UV_ANCESTOR_OUTSIDE_KEY) {
+        return Err(unsupported(why.clone()));
+    }
     let project_file = |rel: &str| files.get(rel).map(String::as_str);
     let ancestor = files.get(UV_ANCESTOR_CONFIG_KEY).and_then(|value| {
         let (rel, text) = value.split_once('\n')?;
@@ -6747,9 +6806,16 @@ fn rewrite_uv_lock(
         .iter()
         .any(|(path, _)| is_pep751_lock_name(path))
         .then(|| pylock_uv_settings(files));
+    // The project settings' `exclude-newer`, which a `[[distribution]]`
+    // lock does not record (read once, as the unwind reads them).
+    let project_cutoff = distribution_project_cutoff(&pylock_uv_settings(files));
     for (path, original) in locks {
         let mut content = original.clone();
         let mut session = PythonLockSession::new(original);
+        // The cutoff a uv lock records, which the unwind refuses to undo.
+        let lock_doc = (!is_pep751_lock_name(path))
+            .then(|| original.parse::<toml_edit::DocumentMut>().ok())
+            .flatten();
         let pipenv_reads = pipenv_reads_pylock(path, |rel| files.contains_key(rel));
         // Pipenv installs the pylocks it reads, and reads no uv setting.
         let uv_pip_settings = pip_settings
@@ -6757,13 +6823,14 @@ fn rewrite_uv_lock(
             .filter(|_| is_pep751_lock_name(path) && !pipenv_reads);
         for &(dep, sha256) in &usable {
             let artifact = ArtifactSource::Url(&dep.artifact_url);
-            let planned = session.plan(&content, &dep.name, &dep.version, artifact);
+            let planned = session.plan(&dep.name, &dep.version, artifact);
             // Every patched artifact is a wheel, which uv refuses to
             // install under no-binary (#1603).
             let no_binary = match (&planned, uv_pip_settings) {
-                (Ok(Some(_)), Some(settings)) => {
-                    upstream::pylock_no_binary(original, &dep.name, settings)
-                }
+                (Ok(Some(_)), Some(settings)) => files
+                    .get(UV_ANCESTOR_OUTSIDE_KEY)
+                    .cloned()
+                    .or_else(|| upstream::pylock_no_binary(original, &dep.name, settings)),
                 _ => None,
             };
             if let Some(why) = no_binary {
@@ -6776,6 +6843,12 @@ fn rewrite_uv_lock(
                 });
                 continue;
             }
+            let lock_cutoff = lock_doc.as_ref().and_then(|doc| {
+                upstream::lock_cutoff(
+                    doc,
+                    &crate::crawlers::python_crawler::canonicalize_pypi_name(&dep.name),
+                )
+            });
             let plan = match planned {
                 Ok(Some(_)) if pipenv_reads => {
                     result
@@ -6784,6 +6857,35 @@ fn rewrite_uv_lock(
                     result.warnings.push(pipenv_pylock_refusal(path, dep));
                     continue;
                 }
+                Ok(Some(_)) if lock_cutoff.is_some() => {
+                    result
+                        .refused_python_lock_uuids
+                        .insert(dep.patch_uuid.clone());
+                    result.warnings.push(RewriteWarning {
+                        code: "redirect_uv_lock_unsupported".into(),
+                        detail: format!(
+                            "{path}: the lock's `{}` option filters {}'s release files by \
+                             upload time, so rollback could not tell which files to restore; \
+                             re-lock without it to redirect this package",
+                            lock_cutoff.unwrap_or_default(),
+                            dep.name
+                        ),
+                    });
+                    continue;
+                }
+                Ok(Some(plan)) if plan.distribution_inline_artifacts() => match &project_cutoff {
+                    Some(why) => {
+                        result
+                            .refused_python_lock_uuids
+                            .insert(dep.patch_uuid.clone());
+                        result.warnings.push(RewriteWarning {
+                            code: "redirect_uv_lock_unsupported".into(),
+                            detail: format!("{path}: {why}"),
+                        });
+                        continue;
+                    }
+                    None => plan,
+                },
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
                     result.warnings.push(RewriteWarning {
@@ -6869,6 +6971,24 @@ fn rewrite_uv_lock(
             result.files.insert(path.clone(), content);
         }
     }
+}
+
+/// Why a uv 0.2 `[[distribution]]` lock with inline artifacts may not be
+/// restorable once rewritten: the project's uv settings (`settings`, as
+/// [`pylock_uv_settings`] finds them: `uv.toml`, else the pyproject's
+/// `[tool.uv]`, else the settings file above the root, as uv and the
+/// unwind read them) set an `exclude-newer` cutoff, which uv 0.2.12–0.2.27
+/// apply without recording it in the lock, so the unwind could not tell
+/// which release files it kept.
+fn distribution_project_cutoff(settings: &[(String, toml_edit::Table)]) -> Option<String> {
+    settings.iter().find_map(|(file, table)| {
+        let key = crate::utils::python_lock::sets_exclude_newer(table)?;
+        Some(format!(
+            "{file} sets uv `{key}`, which uv 0.2.12–0.2.27 apply to a `[[distribution]]` lock \
+             without recording it, so rollback could not tell which release files the lock \
+             kept; re-lock with uv >=0.2.35"
+        ))
+    })
 }
 
 // ── composer.lock ────────────────────────────────────────────────────────────
@@ -7058,6 +7178,11 @@ pub const NUGET_INHERITED_SOURCES_KEY: &str = "<socket-patch:nuget-inherited-sou
 /// packages already (`packageSourceMapping`, which NuGet merges too).
 pub const NUGET_INHERITED_MAPPING_KEY: &str = "<socket-patch:nuget-inherited-mapping>";
 
+/// The synthetic candidate key present, holding the reason, when NuGet
+/// would also merge a parent config above the repository root, which is
+/// never read ([`crate::vendor::nuget_config::Inherited::outside`]).
+pub const NUGET_INHERITED_OUTSIDE_KEY: &str = "<socket-patch:nuget-inherited-outside>";
+
 /// A config with no sources, the base of a fresh one when the inherited
 /// configs dropped nuget.org.
 const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
@@ -7071,6 +7196,12 @@ const EMPTY_NUGET_CONFIG: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<c
 ///
 /// [`find_ancestor_uv_config`]: crate::utils::python_script::find_ancestor_uv_config
 pub const UV_ANCESTOR_CONFIG_KEY: &str = "<socket-patch:uv-ancestor-config>";
+
+/// The synthetic candidate key present, holding the reason, when uv may
+/// apply a settings file above the repository root, which is never read
+/// ([`crate::utils::python_script::uv_config_above_repo`]): every uv
+/// project, script and `uv pip` lock wiring refuses.
+pub const UV_ANCESTOR_OUTSIDE_KEY: &str = "<socket-patch:uv-ancestor-outside>";
 
 /// The uv settings `uv pip` reads for a PEP 751 lock in the root
 /// ([`upstream::root_uv_settings`]), with the settings file above the root
@@ -7282,6 +7413,16 @@ fn rewrite_nuget(
             result.warnings.push(RewriteWarning {
                 code: "redirect_nuget_lock_other_version".into(),
                 detail,
+            });
+            continue;
+        }
+        // A parent config above the repository root is merged by NuGet but
+        // never read here, so the sources and mappings this edit must
+        // account for are unknown: skip rather than guess.
+        if let Some(why) = files.get(NUGET_INHERITED_OUTSIDE_KEY) {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_nuget_inherited_config_outside_root".into(),
+                detail: format!("{why}; {} not redirected", dep.name),
             });
             continue;
         }
@@ -7593,97 +7734,6 @@ pub fn grant_token_path_segment(url: &str, patch_uuid: &str) -> Option<String> {
         .or_else(|| path.strip_suffix(&format!("/{patch_uuid}")))?;
     let token = before.rsplit('/').next().unwrap_or("");
     (!token.is_empty()).then(|| token.to_string())
-}
-
-/// Public host of Socket's patch server: the origin every production hosted
-/// artifact / registry URL is served from (`https://patch.socket.dev/patch/…`,
-/// `…/patch-registry/…`), and the root of the Go module namespace
-/// [`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`].
-pub const SOCKET_PATCH_SERVER_HOST: &str = "patch.socket.dev";
-
-/// The Socket patch uuid a lockfile-recorded HOSTED reference names, or
-/// `None` when `url` is not a Socket-hosted patch URL — the inverse of the
-/// rewriters, used by `vex`'s manifest-less lockfile discovery.
-///
-/// Recognition is deliberately strict, because the answer decides whether a
-/// committed (tamper-able) lockfile line becomes an attestation input:
-///
-/// * the ORIGIN must be Socket's patch server (`https://` +
-///   [`SOCKET_PATCH_SERVER_HOST`]) or one of `extra_origins` — the
-///   operator's `--patch-server-url` deployment, compared on scheme + host +
-///   port. A uuid inside any other host's URL is a user's own dependency
-///   source, never a patch reference;
-/// * no userinfo — a Socket-written URL never carries credentials;
-/// * the uuid is the LAST path segment passing the canonical-uuid grammar:
-///   hosted URLs carry the grant token in the level before the uuid
-///   (`…/patch/npm/<name>/<ver>/<token>/<uuid>/<leaf>`,
-///   `…/patch-registry/<eco>/<token>/<uuid>/…`), and grant tokens may
-///   themselves be uuid-shaped, so "the first uuid" would elect the token.
-///
-/// Every spelling the lock formats record the same URL in is accepted: a
-/// `#fragment` (yarn classic `#<sha1>`, pip `#sha256=`) and a `?query` are
-/// ignored; `\/`-escaped slashes (older composer locks) are unescaped; a
-/// wholly percent-encoded URL (yarn berry's `__archiveUrl=` binding) is
-/// decoded; a cargo source-kind prefix (`sparse+`, `registry+`) is dropped.
-/// Path segments are percent-decoded AFTER splitting, so an encoded `/`
-/// can never manufacture a segment.
-pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> {
-    hosted_patch_url_uuids(url, extra_origins)?.pop()
-}
-
-/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
-/// (the grant token first when it is uuid-shaped, the patch uuid last), or
-/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
-/// exact acceptance rules, without electing one segment. `vex` discovery
-/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
-/// the malformed or rejected shapes whose "last uuid" is not a patch.
-pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
-    use crate::patch::path_safety::is_canonical_uuid;
-    use crate::utils::purl::percent_decode_purl_component;
-
-    let unescaped = url.trim().replace("\\/", "/");
-    let lower = unescaped.to_ascii_lowercase();
-    let decoded = if lower.starts_with("https%3a%2f%2f") || lower.starts_with("http%3a%2f%2f") {
-        percent_decode_purl_component(&unescaped).into_owned()
-    } else {
-        unescaped
-    };
-    // `sparse+https://…` / `registry+https://…` (Cargo.lock `source`).
-    let (scheme, _) = decoded.split_once("://")?;
-    let text = match scheme.rsplit_once('+') {
-        Some((kind, _)) if !kind.is_empty() && kind.bytes().all(|b| b.is_ascii_alphabetic()) => {
-            &decoded[kind.len() + 1..]
-        }
-        _ => decoded.as_str(),
-    };
-    let parsed = reqwest::Url::parse(text).ok()?;
-    if !matches!(parsed.scheme(), "https" | "http")
-        || !parsed.username().is_empty()
-        || parsed.password().is_some()
-    {
-        return None;
-    }
-    let socket_host = parsed.scheme() == "https"
-        && parsed.host_str() == Some(SOCKET_PATCH_SERVER_HOST)
-        && parsed.port_or_known_default() == Some(443);
-    let configured = extra_origins.iter().any(|origin| {
-        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
-            o.scheme() == parsed.scheme()
-                && o.host_str().is_some()
-                && o.host_str() == parsed.host_str()
-                && o.port_or_known_default() == parsed.port_or_known_default()
-        })
-    });
-    if !socket_host && !configured {
-        return None;
-    }
-    Some(
-        parsed
-            .path_segments()?
-            .map(|segment| percent_decode_purl_component(segment).into_owned())
-            .filter(|segment| is_canonical_uuid(segment))
-            .collect(),
-    )
 }
 
 /// A dep's Socket index URL as a regex source with the per-request rotating
@@ -8465,77 +8515,12 @@ pub(crate) fn no_maven_or_gradle(files: &BTreeMap<String, String>) -> bool {
     !files.contains_key("pom.xml") && !gradle::gradle_build_present(files)
 }
 
-/// The six `-Daether.*` args that enable Maven's Trusted Checksums resolver
-/// post-processor (twin of the TS `MVN_CONFIG_ARGS`), one per `.mvn/maven.config`
-/// line. `failIfMissing=false` so a dependency without a committed checksum
-/// still resolves (only a MISMATCH fails); origin-unaware so one checksum
-/// matches the artifact from any repository.
-const MVN_CONFIG_ARGS: &[&str] = &[
-    TRUSTED_CHECKSUMS_ON,
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.checksumAlgorithms=SHA-256",
-    "-Daether.artifactResolver.postProcessor.trustedChecksums.failIfMissing=false",
-    "-Daether.trustedChecksumsSource.summaryFile=true",
-    "-Daether.trustedChecksumsSource.summaryFile.basedir=${session.rootDirectory}/.mvn/checksums",
-    "-Daether.trustedChecksumsSource.summaryFile.originAware=false",
-];
-
-/// The resolver switch (the first [`MVN_CONFIG_ARGS`] line) that makes the
-/// checksums file an enforced pin; without it the file is inert.
-pub(crate) const TRUSTED_CHECKSUMS_ON: &str =
-    "-Daether.artifactResolver.postProcessor.trustedChecksums=true";
-
 pub(crate) const MVN_CONFIG: &str = ".mvn/maven.config";
 pub(crate) const MVN_CHECKSUMS: &str = ".mvn/checksums/checksums.sha256";
 /// The Maven Wrapper's settings file. Read only, never edited: its
 /// `distributionUrl` names the Maven release the project builds with, so the
 /// rewriter can tell when the Trusted Checksums files it writes are inert.
 pub(crate) const MVN_WRAPPER_PROPERTIES: &str = ".mvn/wrapper/maven-wrapper.properties";
-
-/// The first Maven release that enforces the `.mvn/*` Trusted Checksums
-/// files (#258). 3.9.0 / 3.9.1 do not interpolate `${session.rootDirectory}`
-/// in `maven.config`, so the summary file is never found; 3.9.2 / 3.9.3
-/// ignore `checksumAlgorithms=SHA-256` and check SHA-1 only. Older lines have
-/// no Trusted Checksums post-processor at all.
-const TRUSTED_CHECKSUMS_MIN_MAVEN: [u32; 3] = [3, 9, 4];
-
-/// The Apache Maven release a `maven-wrapper.properties` pins, taken from its
-/// `distributionUrl` (`…/apache-maven-<version>-bin.zip` or `.tar.gz`). None
-/// for a missing key or any other distribution (e.g. mvnd), which then goes
-/// unwarned.
-fn maven_wrapper_version(props: &str) -> Option<String> {
-    props.lines().find_map(|line| {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with('!') {
-            return None;
-        }
-        let rest = line.strip_prefix("distributionUrl")?;
-        if !rest.starts_with(|c: char| c == '=' || c == ':' || c.is_whitespace()) {
-            return None;
-        }
-        let value = rest
-            .trim_start()
-            .strip_prefix(['=', ':'])
-            .unwrap_or(rest)
-            .trim();
-        let file = value.rsplit('/').next()?;
-        let version = file
-            .strip_prefix("apache-maven-")?
-            .strip_suffix(".zip")
-            .or_else(|| file.strip_prefix("apache-maven-")?.strip_suffix(".tar.gz"))?
-            .strip_suffix("-bin")?;
-        (!version.is_empty()).then(|| version.to_string())
-    })
-}
-
-/// Whether Maven `version` enforces the Trusted Checksums files (≥ 3.9.4;
-/// pre-release suffixes such as `-rc-6` compare as their release).
-fn maven_enforces_trusted_checksums(version: &str) -> bool {
-    let mut parts = [0u32; 3];
-    for (slot, part) in parts.iter_mut().zip(version.split(['.', '-'])) {
-        *slot = part.parse().unwrap_or(0);
-    }
-    parts >= TRUSTED_CHECKSUMS_MIN_MAVEN
-}
 
 /// Strip any `sha256-`/`sha256:` SRI-style prefix off a stored hash, leaving the
 /// bare lowercase hex Maven's trusted-checksums summary file expects (twin of
@@ -8733,8 +8718,35 @@ fn rewrite_maven_pom(
             .clone()
             .unwrap_or_else(|| dep.name.clone());
         let suffixed_version = ov.identifiers.maven_suffixed_version.clone();
-        let pom_sha256 = ov.identifiers.maven_pom_sha256.clone();
-        let jar_sha256 = dep.integrity.sha256.clone();
+        // The jar and served-pom sha256 a Trusted Checksums pin needs, as
+        // the bare lowercase hex Maven compares; a grant hash of any other
+        // shape (an SRI base64 digest, a truncated hex) writes no pin.
+        let checksum_hashes = dep
+            .integrity
+            .sha256
+            .as_deref()
+            .zip(ov.identifiers.maven_pom_sha256.as_deref())
+            .map(|(jar, pom)| (bare_sha256_hex(jar), bare_sha256_hex(pom)));
+        let bad_checksum_hashes = checksum_hashes
+            .as_ref()
+            .is_some_and(|(jar, pom)| !is_hex64_lower(jar) || !is_hex64_lower(pom));
+        let checksum_hashes = checksum_hashes.filter(|_| !bad_checksum_hashes);
+        if let Some(suffixed) = suffixed_version.as_deref().filter(|_| bad_checksum_hashes) {
+            // No pin is written for the suffixed version, so none may stay
+            // either: an earlier release wrote such a grant's hash mangled
+            // (lowercased base64), and Maven fails the build on a line
+            // whose hash does not match. Dropped whether or not the version
+            // pin lands this run (a re-run with the pin present too).
+            for ext in ["jar", "pom"] {
+                checksum_drops.push(crate::vendor::jvm::layout::artifact_path(
+                    &group_id,
+                    &artifact_id,
+                    suffixed,
+                    None,
+                    ext,
+                ));
+            }
+        }
 
         // The pom for the rest of this iteration; edits land in place.
         let Some(pom_text) = pom.as_mut() else {
@@ -8772,9 +8784,9 @@ fn rewrite_maven_pom(
         // (sources, tests, a native build) is its own artifact — managed and
         // resolved apart from the main jar — so it is left alone, and the
         // main jar's literal-vs-depMgmt decision is made without it.
-        let (variants, live): (Vec<_>, Vec<_>) = all_matches
-            .into_iter()
-            .partition(|m| m.classifier.is_some());
+        let (variants, live): (Vec<_>, Vec<_>) = all_matches.into_iter().partition(|m| {
+            crate::formats::maven::is_variant(m.type_text.as_deref(), m.classifier.as_deref())
+        });
         // A variant that carries code onto a classpath (tests, a native
         // build, a JDK-specific jar) at the patched release would keep the
         // unpatched bytes there while the GA counts as redirected and VEX
@@ -8789,8 +8801,14 @@ fn rewrite_maven_pom(
                 || crate::formats::maven::split_socket_version(v)
                     .is_some_and(|(base, _)| base == dep.version);
             if names_release {
-                let classifier = variant.classifier.as_deref().unwrap_or_default();
-                let executable = !matches!(classifier, "sources" | "javadoc");
+                let classifier = crate::formats::maven::variant_label(
+                    variant.type_text.as_deref(),
+                    variant.classifier.as_deref(),
+                );
+                let executable = crate::formats::maven::is_executable_variant(
+                    variant.type_text.as_deref(),
+                    variant.classifier.as_deref(),
+                );
                 executable_variant |= executable;
                 result.warnings.push(RewriteWarning {
                     code: "redirect_maven_classifier_unsupported".into(),
@@ -9088,7 +9106,7 @@ fn rewrite_maven_pom(
             });
         }
 
-        if jar_sha256.is_some() && pom_sha256.is_some() {
+        if checksum_hashes.is_some() {
             pinned_jar_paths.push(crate::vendor::jvm::layout::artifact_path(
                 &group_id,
                 &artifact_id,
@@ -9182,7 +9200,17 @@ fn rewrite_maven_pom(
         // Trusted Checksums: only when BOTH the jar sha256 and the served pom
         // sha256 are known. Two entries per dep — the jar and the pom — under
         // the SUFFIXED version's local-repo path.
-        if let (Some(jar), Some(pom_hash)) = (&jar_sha256, &pom_sha256) {
+        if bad_checksum_hashes {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_maven_trusted_checksums_invalid_hash".into(),
+                detail: format!(
+                    "{group_id}:{artifact_id}: the grant's sha256 is not 64 hex digits; \
+                     no Trusted Checksums pin written to {MVN_CHECKSUMS} (the -socket \
+                     version suffix still pins the patched artifact)"
+                ),
+            });
+        }
+        if let Some((jar, pom_hash)) = &checksum_hashes {
             let (merged, conflicts) =
                 merge_mvn_config(&mvn_config, &format!("{group_id}:{artifact_id}"));
             for conflict in conflicts {
@@ -9216,7 +9244,7 @@ fn rewrite_maven_pom(
                     None,
                     "jar",
                 ),
-                bare_sha256_hex(jar),
+                jar.clone(),
             ));
             checksum_entries.push((
                 crate::vendor::jvm::layout::artifact_path(
@@ -9226,7 +9254,7 @@ fn rewrite_maven_pom(
                     None,
                     "pom",
                 ),
-                bare_sha256_hex(pom_hash),
+                pom_hash.clone(),
             ));
         }
     }
@@ -9239,32 +9267,21 @@ fn rewrite_maven_pom(
     if mvn_config_changed {
         result.files.insert(MVN_CONFIG.into(), mvn_config);
     }
-    // LF-normalized, so the drop check and the filter below split lines the
-    // same way (a CRLF file's paths would otherwise keep a trailing `\r`).
-    let existing_checksums = files
-        .get(MVN_CHECKSUMS)
-        .map(|text| text.replace("\r\n", "\n"))
-        .unwrap_or_default();
-    let names_dropped_path = |line: &str| {
-        line.split_once("  ")
-            .is_some_and(|(_, p)| checksum_drops.iter().any(|d| d == p))
-    };
-    let drops_checksums = existing_checksums.split('\n').any(names_dropped_path);
-    if !checksum_entries.is_empty() || drops_checksums {
-        let action = if files.contains_key(MVN_CHECKSUMS) {
+    // Every line this run does not own (another path's entry in any
+    // spelling, a comment, an unparseable line) keeps its bytes and place.
+    let existing_checksums = files.get(MVN_CHECKSUMS).map(String::as_str);
+    let merged_checksums = trusted_checksums::edit(
+        existing_checksums.unwrap_or_default(),
+        |path| checksum_drops.iter().any(|d| d == path),
+        &checksum_entries,
+    );
+    if merged_checksums != existing_checksums.unwrap_or_default() {
+        let action = if existing_checksums.is_some() {
             "rewritten"
         } else {
             "added"
         };
-        let kept: String = existing_checksums
-            .split('\n')
-            .filter(|l| !names_dropped_path(l))
-            .collect::<Vec<_>>()
-            .join("\n");
-        result.files.insert(
-            MVN_CHECKSUMS.into(),
-            merge_checksums(&kept, &checksum_entries),
-        );
+        result.files.insert(MVN_CHECKSUMS.into(), merged_checksums);
         result.edits.push(FileEdit {
             path: MVN_CHECKSUMS.into(),
             kind: "redirect_maven_trusted_checksums".into(),
@@ -9282,17 +9299,15 @@ fn rewrite_maven_pom(
     // re-scan of an already-pinned project warns as well.
     let final_text = |rel: &str| result.files.get(rel).or_else(|| files.get(rel));
     let pin_in_place = final_text(MVN_CONFIG)
-        .is_some_and(|c| c.lines().any(|l| l.trim() == TRUSTED_CHECKSUMS_ON))
+        .is_some_and(|c| trusted_checksums::config_enforces(c))
         && final_text(MVN_CHECKSUMS).is_some_and(|c| {
-            pinned_jar_paths.iter().any(|p| {
-                c.lines()
-                    .any(|l| l.split_whitespace().nth(1) == Some(p.as_str()))
-            })
+            let pinned = trusted_checksums::pinned(c);
+            pinned_jar_paths.iter().any(|p| pinned.contains_key(p))
         });
     if let Some(version) = files
         .get(MVN_WRAPPER_PROPERTIES)
-        .and_then(|props| maven_wrapper_version(props))
-        .filter(|v| pin_in_place && !maven_enforces_trusted_checksums(v))
+        .and_then(|props| trusted_checksums::wrapper_maven_version(props))
+        .filter(|v| pin_in_place && !trusted_checksums::maven_enforces(v))
     {
         result.warnings.push(RewriteWarning {
             code: "redirect_maven_trusted_checksums_unenforced".into(),
@@ -9351,37 +9366,28 @@ pub(crate) fn maven_repository_removal(pom: &str, id: &str) -> Option<(usize, us
 }
 
 /// Merge trusted-checksums resolver args into `.mvn/maven.config` (one arg per
-/// line). Dedupe by the `-Dkey=` prefix: an arg whose key is already present is
-/// left untouched (existing value wins). Returns the merged text + any conflict
-/// messages (a pre-existing SAME key with a DIFFERENT value). Twin of the TS
-/// `mergeMvnConfig`.
+/// line). A setting is present when Maven 3.9+ reads it from the file
+/// ([`crate::formats::maven::maven_config_line_properties`], the reader
+/// discovery's [`trusted_checksums::config_enforces`] uses: `-Dk=v`,
+/// `--define k=v`, indented or quoted lines, the last definition winning).
+/// A present setting is left untouched (existing value wins); a different
+/// value is reported as a conflict. Returns the merged text + those
+/// conflict messages. Twin of the TS `mergeMvnConfig`.
 fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
-    let lines: Vec<&str> = if existing.is_empty() {
-        vec![]
-    } else {
-        existing.split('\n').collect()
-    };
+    let present = crate::formats::maven::maven_config_line_properties(existing);
     let mut conflicts = vec![];
-    let key_of =
-        |line: &str| -> Option<String> { line.find('=').map(|eq| line[..=eq].to_string()) };
-    let mut present: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for line in &lines {
-        if let Some(key) = key_of(line) {
-            present.insert(key, (*line).to_string());
-        }
-    }
     let mut appended: Vec<&str> = vec![];
     for arg in MVN_CONFIG_ARGS {
-        let key = key_of(arg).expect("every MVN_CONFIG_ARGS entry contains '='");
-        match present.get(&key) {
-            None => {
-                appended.push(arg);
-                present.insert(key, (*arg).to_string());
-            }
-            Some(existing_line) if existing_line.trim() != *arg => {
+        let (key, value) = arg
+            .strip_prefix("-D")
+            .and_then(|def| def.split_once('='))
+            .expect("every MVN_CONFIG_ARGS entry is -Dkey=value");
+        match present.get(key) {
+            None => appended.push(arg),
+            Some(existing_value) if existing_value != value => {
                 conflicts.push(format!(
-                    "{coordinate}: {MVN_CONFIG} already sets {key} to a different value ({}); leaving it as-is",
-                    existing_line.trim()
+                    "{coordinate}: {MVN_CONFIG} already sets -D{key}= to a different value \
+                     (-D{key}={existing_value}); leaving it as-is"
                 ));
             }
             Some(_) => {}
@@ -9398,35 +9404,6 @@ fn merge_mvn_config(existing: &str, coordinate: &str) -> (String, Vec<String>) {
         format!("{existing}\n")
     };
     (format!("{base}{}\n", appended.join("\n")), conflicts)
-}
-
-/// Merge trusted-checksum entries into `.mvn/checksums/checksums.sha256` (GNU
-/// coreutils format: `<sha256-hex><TWO spaces><local-repo-relative path>`).
-/// Parse existing entries, replace/add by path, re-sort by path, trailing
-/// newline. A malformed line (no double-space separator) is dropped. Twin of
-/// the TS `mergeChecksums`.
-fn merge_checksums(existing: &str, entries: &[(String, String)]) -> String {
-    let mut by_path: BTreeMap<String, String> = BTreeMap::new();
-    if !existing.is_empty() {
-        for line in existing.split('\n') {
-            if line.trim().is_empty() {
-                continue;
-            }
-            if let Some(sep) = line.find("  ") {
-                by_path.insert(line[sep + 2..].to_string(), line[..sep].to_string());
-            }
-        }
-    }
-    for (path, sha256) in entries {
-        by_path.insert(path.clone(), sha256.clone());
-    }
-    // BTreeMap iterates keys in sorted (byte) order — matching JS's default
-    // sort on the ASCII paths.
-    let body: Vec<String> = by_path
-        .iter()
-        .map(|(path, sha)| format!("{sha}  {path}"))
-        .collect();
-    format!("{}\n", body.join("\n"))
 }
 
 // ── golang (go.mod fork-replace + go.sum pin) ────────────────────────────────
@@ -10065,6 +10042,61 @@ mod tests {
         }
     }
 
+    /// A uv lock that records an `exclude-newer` cutoff for the package
+    /// (globally under `[options]` or at the top level, or per package) is
+    /// never wired: the unwind refuses to undo such a pin, so hosted must
+    /// not write one. A package the per-package table exempts is wired.
+    #[test]
+    fn uv_lock_recording_a_cutoff_is_not_wired() {
+        const SIX: &str = "[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nwheels = [{ url = \"https://files.pythonhosted.org/packages/six-1.16.0-py2.py3-none-any.whl\", hash = \"sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254\" }]\n";
+        let dep = pypi_override(
+            "six",
+            "1.16.0",
+            "https://patch.test/six-1.16.0-py2.py3-none-any.whl",
+            &"c".repeat(64),
+        );
+        let lock = |head: &str| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "uv.lock".to_string(),
+                format!("version = 1\nrequires-python = \">=3.9\"\n{head}\n{SIX}"),
+            );
+            rewrite_registry_redirect(&files, std::slice::from_ref(&dep))
+        };
+        for head in [
+            "\n[options]\nexclude-newer = \"2024-06-01T00:00:00Z\"\n",
+            "exclude-newer = \"2024-06-01 00:00:00 UTC\"\n",
+            "\n[options]\nexclude-newer-package = { six = \"2024-06-01T00:00:00Z\" }\n",
+        ] {
+            let r = lock(head);
+            assert!(r.files.is_empty(), "{head}: {:?}", r.files);
+            assert!(
+                r.refused_python_lock_uuids.contains(&dep.patch_uuid),
+                "{head}"
+            );
+            assert!(
+                r.warnings
+                    .iter()
+                    .any(|w| w.code == "redirect_uv_lock_unsupported"
+                        && w.detail.contains("exclude-newer")),
+                "{head}: {:?}",
+                r.warnings
+            );
+        }
+        for head in [
+            "",
+            "\n[options]\nexclude-newer = \"2024-06-01T00:00:00Z\"\nexclude-newer-package = { six = false }\n",
+            "\n[options]\nexclude-newer-package = { other = \"2024-06-01T00:00:00Z\" }\n",
+        ] {
+            let r = lock(head);
+            assert!(
+                r.files.get("uv.lock").is_some_and(|l| l.contains("patch.test")),
+                "{head}: {:?}",
+                r.warnings
+            );
+        }
+    }
+
     /// Re-running a rewriter over its own output must be a no-op: zero new
     /// edits, byte-identical files. Recorded edits whose `original` is the
     /// already-redirected value would grow the committed ledger on every
@@ -10334,6 +10366,16 @@ mod tests {
             );
             assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
         }
+        // A type implying an executable classifier (`test-jar` is the
+        // `tests` jar) is the same copy, as the vendored reactor judges it.
+        let typed = pom_with_dep("\n      <version>1.7.36</version>", "").replace(
+            "  </dependencies>",
+            "    <dependency>\n      <groupId>org.slf4j</groupId>\n      <artifactId>slf4j-api</artifactId>\n      <version>1.7.36</version>\n      <type>test-jar</type>\n    </dependency>\n  </dependencies>",
+        );
+        let files = BTreeMap::from([("pom.xml".to_string(), typed)]);
+        let r = rewrite_registry_redirect(&files, &[maven_override()]);
+        assert!(r.files.is_empty(), "test-jar: {:?}", r.files);
+        assert!(warning_codes(&r).contains(&"redirect_maven_classifier_unsupported"));
     }
 
     /// Fail-closed literal pin: the `<version>` is rewritten to the suffixed
@@ -10948,33 +10990,38 @@ mod tests {
     #[test]
     fn maven_wrapper_version_parses_distribution_url() {
         assert_eq!(
-            maven_wrapper_version(&maven_wrapper("3.9.3")).as_deref(),
+            trusted_checksums::wrapper_maven_version(&maven_wrapper("3.9.3")).as_deref(),
             Some("3.9.3")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "distributionUrl : https://archive.apache.org/dist/maven/maven-3/3.9.2/binaries/apache-maven-3.9.2-bin.tar.gz\r\n"
             )
             .as_deref(),
             Some("3.9.2")
         );
         assert_eq!(
-            maven_wrapper_version(
+            trusted_checksums::wrapper_maven_version(
                 "! comment\r\ndistributionUrl=https\\://repo/apache-maven-4.0.0-rc-6-bin.zip\r\n"
             )
             .as_deref(),
             Some("4.0.0-rc-6")
         );
-        assert_eq!(maven_wrapper_version("wrapperVersion=3.3.2\n"), None);
         assert_eq!(
-            maven_wrapper_version("distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"),
+            trusted_checksums::wrapper_maven_version("wrapperVersion=3.3.2\n"),
             None
         );
-        assert!(!maven_enforces_trusted_checksums("3.9.3"));
-        assert!(maven_enforces_trusted_checksums("3.9.4"));
-        assert!(maven_enforces_trusted_checksums("3.10.0-rc-1"));
-        assert!(maven_enforces_trusted_checksums("4.0.0"));
-        assert!(!maven_enforces_trusted_checksums("3.8.9"));
+        assert_eq!(
+            trusted_checksums::wrapper_maven_version(
+                "distributionUrlOld=https://x/apache-maven-3.9.3-bin.zip\n"
+            ),
+            None
+        );
+        assert!(!trusted_checksums::maven_enforces("3.9.3"));
+        assert!(trusted_checksums::maven_enforces("3.9.4"));
+        assert!(trusted_checksums::maven_enforces("3.10.0-rc-1"));
+        assert!(trusted_checksums::maven_enforces("4.0.0"));
+        assert!(!trusted_checksums::maven_enforces("3.8.9"));
     }
 
     #[test]
@@ -10996,6 +11043,38 @@ mod tests {
         );
         assert!(!config.contains("originAware=false"), "ours NOT written");
         assert!(warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"));
+    }
+
+    /// The writer sees a user setting in every spelling Maven 3.9+ reads
+    /// (the reader discovery judges enforcement with): an indented line,
+    /// `--define k=v`, `-D k=v`, a quoted argument. Appending ours after
+    /// one would silently override the user's value (the later line wins).
+    #[test]
+    fn maven_config_conflict_in_any_spelling_keeps_the_user_value() {
+        for user in [
+            "  -Daether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "--define=aether.trustedChecksumsSource.summaryFile.originAware=true",
+            "\"-Daether.trustedChecksumsSource.summaryFile.originAware=true\"",
+        ] {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "pom.xml".to_string(),
+                pom_with_dep("\n      <version>1.7.36</version>", ""),
+            );
+            files.insert(".mvn/maven.config".to_string(), format!("{user}\n"));
+            let r = rewrite_registry_redirect(&files, &[maven_override()]);
+            let config = r.files.get(".mvn/maven.config").expect("config");
+            assert!(!config.contains("originAware=false"), "{user}: {config}");
+            assert!(
+                warning_codes(&r).contains(&"redirect_maven_trusted_checksums_conflict"),
+                "{user}"
+            );
+            assert!(
+                !trusted_checksums::config_enforces(config),
+                "{user}: the user's originAware=true still governs"
+            );
+        }
     }
 
     /// Legacy same-GAV fallback (no suffixed version): only the repository is
@@ -24233,8 +24312,13 @@ packages:
     }
 
     /// The engine's [`GO_WORKSPACE_KEY`] for an in-memory go.work whose
-    /// members are `(dir, go.mod)` pairs (`.` for the root module).
-    fn go_workspace_key(work_extra: &str, members: &[(&str, &str)]) -> (String, String) {
+    /// members are `(dir, go.mod)` pairs (`.` for the root module), in a
+    /// project with a root go.mod when `root_go_mod`.
+    fn go_workspace_key(
+        work_extra: &str,
+        members: &[(&str, &str)],
+        root_go_mod: bool,
+    ) -> (String, String) {
         use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         let hosted = HostedGoWorkspace {
@@ -24266,6 +24350,10 @@ packages:
                         })
                         .collect(),
                 ),
+                files: Some(memory_go_files(
+                    members.iter().map(|(dir, _)| *dir),
+                    root_go_mod,
+                )),
             }),
             modfile: None,
             module_graph: None,
@@ -24276,6 +24364,29 @@ packages:
         )
     }
 
+    /// The files an in-memory workspace of the `use` members `dirs` holds,
+    /// as [`crate::vendor::go_workspace::read_memory`] lists them: go.work,
+    /// the root go.mod when the project has one (`root_go_mod`, whether or
+    /// not `.` is a member) and each in-root member's go.mod.
+    fn memory_go_files<'a>(
+        dirs: impl IntoIterator<Item = &'a str>,
+        root_go_mod: bool,
+    ) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut files = std::collections::BTreeSet::from(["go.work".into()]);
+        if root_go_mod {
+            files.insert("go.mod".into());
+        }
+        for dir in dirs {
+            files.extend(crate::vendor::go_workspace::in_root_dir(dir).map(
+                |dir| match dir.as_str() {
+                    "" => "go.mod".into(),
+                    dir => format!("{dir}/go.mod").into(),
+                },
+            ));
+        }
+        files
+    }
+
     /// [`go_workspace_key`] plus the root go.work itself as a candidate
     /// file, as the engine reads it when go.work sits at the root.
     fn with_root_go_work(
@@ -24283,7 +24394,7 @@ packages:
         work_extra: &str,
         members: &[(&str, &str)],
     ) {
-        let (k, v) = go_workspace_key(work_extra, members);
+        let (k, v) = go_workspace_key(work_extra, members, files.contains_key("go.mod"));
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         files.insert(k, v);
         files.insert(
@@ -24312,8 +24423,11 @@ packages:
             ("\nreplace github.com/foo/bar => ./fork\n", ""),
         ] {
             let mut files = files.clone();
-            let (k, v) =
-                go_workspace_key(work, &[(".", &root), ("b", &go_member("v1.4.2", other))]);
+            let (k, v) = go_workspace_key(
+                work,
+                &[(".", &root), ("b", &go_member("v1.4.2", other))],
+                true,
+            );
             files.insert(k, v);
             let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
             assert!(out.files.is_empty(), "{work}{other}: {:?}", out.files);
@@ -24331,6 +24445,7 @@ packages:
         let (k, v) = go_workspace_key(
             "\nreplace github.com/foo/bar v1.0.0 => ./fork\n",
             &[(".", &root), ("b", &go_member("v1.4.2", ""))],
+            true,
         );
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -24346,7 +24461,7 @@ packages:
         let ovr = golang_override();
         let mut files = golang_files();
         let root = files["go.mod"].clone();
-        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.files.is_empty());
@@ -24356,7 +24471,7 @@ packages:
         let bare = "module example.com/app\n\ngo 1.21\n";
         let mut files = BTreeMap::new();
         files.insert("go.mod".to_string(), bare.to_string());
-        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
@@ -24489,6 +24604,7 @@ packages:
                     member("../out", None),
                 ],
                 graph: None,
+                files: Some(memory_go_files([".", "../out"], true)),
             }),
             modfile: None,
             module_graph: None,
@@ -27569,6 +27685,31 @@ packages:
         assert_eq!(nuget_catch_all(&r.files["nuget.config"]), ["nuget.org"]);
     }
 
+    /// A parent config above the repository root, which the engine never
+    /// reads, skips the dep with a warning and writes nothing.
+    #[test]
+    fn nuget_inherited_config_outside_the_repository_skips_the_dep() {
+        let mut files = BTreeMap::new();
+        files.insert("nuget.config".to_string(), default_nuget_config());
+        files.insert(
+            NUGET_INHERITED_SOURCES_KEY.to_string(),
+            "nuget.org".to_string(),
+        );
+        files.insert(
+            NUGET_INHERITED_OUTSIDE_KEY.to_string(),
+            "NuGet also merges /x/nuget.config, which is outside the repository root".to_string(),
+        );
+        let r = rewrite_registry_redirect(&files, &[nuget_override()]);
+        assert!(r.files.is_empty(), "{:?}", r.files.keys());
+        assert_eq!(
+            r.warnings
+                .iter()
+                .map(|w| w.code.as_str())
+                .collect::<Vec<_>>(),
+            ["redirect_nuget_inherited_config_outside_root"]
+        );
+    }
+
     /// A PRESENT but unparseable packages.lock.json refuses the whole nuget
     /// redirect up front: landing the source + mapping while the lock kept
     /// the upstream contentHash would NU1403 every restore, with the ledger
@@ -29646,129 +29787,6 @@ mod hatch_tests {
     }
 }
 
-#[cfg(test)]
-mod hosted_patch_uuid_tests {
-    //! `hosted_patch_uuid` is the trust gate between a committed lockfile
-    //! line and a VEX attestation input: pin the accepted spellings AND the
-    //! rejections (foreign hosts, credentials, non-canonical tokens).
-    use super::*;
-
-    const UUID: &str = "7c8d9e0f-1a2b-4a1b-8c2d-3e4f5a6b7c8d";
-    /// A uuid-SHAPED grant token: the fixtures use them, and production
-    /// tokens are not guaranteed otherwise — the LAST uuid segment must win.
-    const TOKEN: &str = "11111111-2222-4333-8444-555555555555";
-
-    fn none() -> Vec<String> {
-        Vec::new()
-    }
-
-    #[test]
-    fn artifact_and_registry_shapes_yield_the_patch_uuid_not_the_token() {
-        for url in [
-            format!("https://patch.socket.dev/patch/npm/left-pad/1.3.0/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
-            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz"),
-            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/"),
-            format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID}/gems/rack-2.2.3.gem"),
-            format!("https://patch.socket.dev/patch-registry/maven/{TOKEN}/{UUID}/maven2"),
-            format!("https://patch.socket.dev/patch-registry/nuget/{TOKEN}/{UUID}/index.json"),
-            format!("sparse+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
-            format!("registry+https://patch.socket.dev/patch-registry/cargo/{TOKEN}/{UUID}/index/"),
-        ] {
-            assert_eq!(
-                hosted_patch_uuid(&url, &none()).as_deref(),
-                Some(UUID),
-                "{url}"
-            );
-        }
-    }
-
-    #[test]
-    fn lock_format_spellings_are_normalized() {
-        let url = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
-        // yarn classic `#<sha1>`, pip/hatch `#sha256=`, a stray query.
-        for spelled in [
-            format!("{url}#0123456789abcdef0123456789abcdef01234567"),
-            format!("{url}#sha256=abc"),
-            format!("{url}?x=1"),
-            // composer's `\/`-escaped slashes.
-            url.replace('/', "\\/"),
-            // yarn berry's percent-encoded `__archiveUrl=` binding value.
-            url.replace(':', "%3A").replace('/', "%2F"),
-            format!("  {url}  "),
-        ] {
-            assert_eq!(
-                hosted_patch_uuid(&spelled, &none()).as_deref(),
-                Some(UUID),
-                "{spelled}"
-            );
-        }
-    }
-
-    #[test]
-    fn foreign_hosts_credentials_and_plain_http_are_refused() {
-        for url in [
-            format!("https://registry.npmjs.org/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://patch.socket.dev.evil.example/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://evil.example/patch.socket.dev/{TOKEN}/{UUID}/x.tgz"),
-            format!("http://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://patch.socket.dev:8443/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://user:pw@patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("git+ssh://patch.socket.dev/{UUID}"),
-            format!("file:.socket/vendor/npm/{UUID}/x.tgz"),
-            format!("patch.socket.dev/gopatch/{UUID}"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
-        }
-    }
-
-    #[test]
-    fn non_canonical_segments_are_not_patch_uuids() {
-        for url in [
-            // Placeholder tokens (fixtures use `uuid`, `tok`, `some-uuid`).
-            "https://patch.socket.dev/patch/npm/tok/uuid/x.tgz".to_string(),
-            // Uppercase is not the canonical grammar.
-            format!(
-                "https://patch.socket.dev/patch/npm/tok/{}/x.tgz",
-                UUID.to_ascii_uppercase()
-            ),
-            // A uuid only in the query / fragment is not a path level.
-            format!("https://patch.socket.dev/patch/npm/x.tgz?u={UUID}"),
-            format!("https://patch.socket.dev/patch/npm/x.tgz#{UUID}"),
-            // An encoded `/` cannot split a segment into a uuid.
-            format!("https://patch.socket.dev/patch/npm/tok%2F{UUID}/x.tgz"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&url, &none()), None, "{url}");
-        }
-    }
-
-    #[test]
-    fn configured_patch_server_origin_is_accepted_exactly() {
-        let origins = vec!["http://127.0.0.1:4545/some/base".to_string()];
-        let url = format!("http://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz");
-        assert_eq!(hosted_patch_uuid(&url, &origins).as_deref(), Some(UUID));
-        // Same host, other port / scheme: a different origin.
-        for other in [
-            format!("http://127.0.0.1:4546/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-            format!("https://127.0.0.1:4545/patch/npm/{TOKEN}/{UUID}/x.tgz"),
-        ] {
-            assert_eq!(hosted_patch_uuid(&other, &origins), None, "{other}");
-        }
-        // The default host stays accepted alongside the override, and a
-        // malformed override is ignored rather than widening the allowlist.
-        let default = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz");
-        assert_eq!(hosted_patch_uuid(&default, &origins).as_deref(), Some(UUID));
-        assert_eq!(hosted_patch_uuid(&url, &["not a url".to_string()]), None);
-    }
-
-    /// The Go hosted namespace lives on the same host the URL allowlist
-    /// pins — the two spellings of "Socket's patch server" cannot drift.
-    #[test]
-    fn go_module_namespace_is_on_the_patch_server_host() {
-        assert!(crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX
-            .starts_with(&format!("{SOCKET_PATCH_SERVER_HOST}/")));
-    }
-}
-
 /// #742 / #650: a superseding patch uuid for a package an earlier hosted
 /// scan already wired re-pins socket-patch's own source, end to end through
 /// the redirect planner, instead of warning "revert it" and leaving the old
@@ -30316,8 +30334,124 @@ mod owned_pin_generation_matrix {
         let (repinned, _) = plan(&wired, &maven(B, tok));
         let checksums = &repinned[MVN_CHECKSUMS];
         assert!(!checksums.contains("aaaaaaaa"), "{checksums}");
+        // The file stays CRLF: nothing is normalized to LF.
+        assert!(
+            checksums
+                .split_inclusive('\n')
+                .all(|line| line.ends_with("\r\n")),
+            "{checksums:?}"
+        );
         let (_, again) = plan(&repinned, &maven(B, tok));
         assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A user's checksums lines survive the pin and the re-pin byte for
+    /// byte, in any spelling `sha256sum`-style tools write (one space, a
+    /// `*` binary marker, a tab) and as comments or stray text. The hosted
+    /// merge used to re-parse the file on two spaces and silently drop
+    /// every line it could not split that way.
+    #[test]
+    fn maven_checksums_merge_keeps_every_user_line() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let h = "0123456789abcdef".repeat(4);
+        let user = [
+            "# team pins".to_string(),
+            format!("{h} com/acme/single/1.0/single-1.0.jar"),
+            format!("{h} *com/acme/binary/1.0/binary-1.0.jar"),
+            format!("{h}\tcom/acme/tab/1.0/tab-1.0.jar"),
+            format!("{h}  com/acme/canonical/1.0/canonical-1.0.jar"),
+            "not a checksum line".to_string(),
+        ];
+        let mut files = pom_project();
+        files.insert(MVN_CHECKSUMS.into(), format!("{}\n", user.join("\n")));
+        let (wired, result) = plan(&files, &maven(A, tok));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let (repinned, _) = plan(&wired, &maven(B, tok));
+        for (stage, tree) in [("pin", &wired), ("re-pin", &repinned)] {
+            let checksums = &tree[MVN_CHECKSUMS];
+            let lines: Vec<&str> = checksums.lines().collect();
+            for line in &user {
+                assert!(
+                    lines.contains(&line.as_str()),
+                    "{stage} lost {line:?}:\n{checksums}"
+                );
+            }
+            assert_eq!(lines.len(), user.len() + 2, "{stage}:\n{checksums}");
+        }
+        assert!(repinned[MVN_CHECKSUMS].contains("3.12.0-socket.bbbbbbbb"));
+        assert!(!repinned[MVN_CHECKSUMS].contains("socket.aaaaaaaa"));
+        let (_, again) = plan(&repinned, &maven(B, tok));
+        assert!(again.files.is_empty(), "{:?}", again.files.keys());
+    }
+
+    /// A superseded generation's checksum line goes on re-pin whatever its
+    /// hash holds (a past writer's SRI or truncated digest included), and a
+    /// grant whose hash is not 64 hex digits writes no checksum line at all.
+    #[test]
+    fn maven_checksums_owned_lines_go_whatever_their_hash() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let (clean, _) = plan(&pom_project(), &maven(A, tok));
+        for stale in ["sha256-q83vEjRWeJA=", "a".repeat(63).as_str()] {
+            let mut wired = clean.clone();
+            let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), stale);
+            wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+            let (repinned, _) = plan(&wired, &maven(B, tok));
+            let checksums = &repinned[MVN_CHECKSUMS];
+            assert!(
+                !checksums.contains("socket.aaaaaaaa"),
+                "{stale}: {checksums}"
+            );
+            assert_eq!(checksums.lines().count(), 2, "{stale}: {checksums}");
+        }
+
+        let mut bad = maven(A, tok);
+        bad.integrity.sha256 = Some("sha256-q83vEjRWeJA=".into());
+        let (wired, result) = plan(&pom_project(), &bad);
+        assert!(
+            wired["pom.xml"].contains("3.12.0-socket.aaaaaaaa"),
+            "the version pin still lands"
+        );
+        assert!(
+            !wired.contains_key(MVN_CHECKSUMS),
+            "{:?}",
+            wired.get(MVN_CHECKSUMS)
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.code == "redirect_maven_trusted_checksums_invalid_hash"),
+            "{:?}",
+            result.warnings
+        );
+
+        // An earlier release wrote such a grant's hash mangled for the same
+        // suffixed version: a re-run (the version pin already present) and
+        // a fresh pin both drop it, since Maven fails on a mismatched line.
+        let mut wired = clean.clone();
+        let mangled = wired[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja=");
+        wired.insert(MVN_CHECKSUMS.to_string(), mangled);
+        let (rerun, _) = plan(&wired, &bad);
+        assert!(
+            !rerun
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            rerun.get(MVN_CHECKSUMS)
+        );
+        let mut fresh = pom_project();
+        fresh.insert(
+            MVN_CHECKSUMS.to_string(),
+            clean[MVN_CHECKSUMS].replace(&"a".repeat(64), "q83vejrweja="),
+        );
+        let (fresh, _) = plan(&fresh, &bad);
+        assert!(
+            !fresh
+                .get(MVN_CHECKSUMS)
+                .is_some_and(|c| c.contains("socket.aaaaaaaa")),
+            "{:?}",
+            fresh.get(MVN_CHECKSUMS)
+        );
     }
 
     /// #266: a rotated grant token (same uuid, new token path segment)

@@ -46,8 +46,10 @@ const VENDOR_PREFIX: &str = ".socket/vendor/composer/";
 
 /// The `<vendor>/<name>` of every composer.lock package (`packages` and
 /// `packages-dev`) whose dist is a vendored `path` copy, sorted and
-/// de-duplicated. An unparseable lock yields nothing.
+/// de-duplicated. An unparseable lock yields nothing; one leading BOM is
+/// read past, as the vendored backend reads the lock.
 pub(crate) fn vendored_composer_packages(lock_text: &str) -> Vec<String> {
+    let lock_text = socket_patch_core::formats::text::strip_bom(lock_text);
     let Ok(lock) = serde_json::from_str::<Value>(lock_text) else {
         return Vec::new();
     };
@@ -182,6 +184,13 @@ mod tests {
         );
         assert!(vendored_composer_packages("not json").is_empty());
         assert!(vendored_composer_packages("{}").is_empty());
+        // One leading BOM is encoding (the backend reads past it); a second
+        // is content.
+        assert_eq!(
+            vendored_composer_packages(&format!("\u{feff}{}", lock())),
+            vendored_composer_packages(&lock())
+        );
+        assert!(vendored_composer_packages(&format!("\u{feff}\u{feff}{}", lock())).is_empty());
     }
 
     #[test]

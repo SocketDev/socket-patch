@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
-use super::hosted_patch_uuid;
 use crate::constants::npm_family::{VLT_HIDDEN_LOCK_REL, VLT_STORE_DIR};
+use crate::origin::hosted_patch_uuid;
 use crate::utils::purl_key::PurlKey;
 use crate::vendor::vlt_lock_text::{
     is_default_registry, is_registry_package_name, sniff_lock, split_dep_id, DepIdKind, LockSniff,
