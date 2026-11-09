@@ -51,14 +51,19 @@ pub use registry::registry;
 mod architecture_tests {
     use std::path::Path;
 
-    const IMPURE: [&str; 9] = [
+    const IMPURE: [&str; 12] = [
         "tokio::fs",
         "std::fs",
         "read_regular_",
         "File::open",
         "OpenOptions",
+        // The host policy (`crate::origin`). Its pure path grammar
+        // (`origin::vendor_ref`) is allowed: it applies no host policy.
         "hosted_patch_uuid",
         "hosted_patch_url_uuids",
+        "hosted_uuid(",
+        "OriginPolicy",
+        "SOCKET_PATCH_SERVER_HOST",
         "async fn",
         ".await",
     ];
