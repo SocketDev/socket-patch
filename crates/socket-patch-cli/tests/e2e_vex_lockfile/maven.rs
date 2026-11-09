@@ -776,14 +776,9 @@ fn maven_hosted_spoofed_repositories_never_attest() {
             }
             continue;
         }
-        // FAIL CLOSED: a NON-allowlisted host is how a staging patch server
-        // run without `--patch-server-url` looks, and how a look-alike
-        // looks. A ledger whose pom.xml still pins `-socket.<hex8>` under a
-        // `socket-patch-<uuid>` repository on such a host is never attested
-        // — not with nothing installed, not with the served jar in place,
-        // not under `--no-verify` — and is reported as `redirect_unwired`
-        // (core `RecordLiveness::Undecided`; CLI_CONTRACT.md, "Patch hosts
-        // (manifest-less VEX)").
+        // Fail closed: a ledger record wired through a hosted-shaped url on an
+        // unconfigured origin is `redirect_unwired` whatever is installed, even
+        // under `--no-verify` (CLI_CONTRACT.md, "Patch hosts (manifest-less VEX)").
         let sfx_dir = fx.m2().join(format!("org/slf4j/slf4j-api/{MVN_SUFFIXED}"));
         for installed in [false, true] {
             if installed {

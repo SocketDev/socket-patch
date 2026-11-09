@@ -913,14 +913,9 @@ fn cargo_hosted_f_spoofed_references_never_attest() {
     let run = fx.vex(&["--proxy-url", &api.uri()]);
     assert_nothing_discovered(&run, "foreign host");
     assert_eq!(api.hits(), 0, "a foreign-host uuid is never even fetched");
-    // FAIL CLOSED: a redirect-ledger record whose recorded wiring routes
-    // the uuid through a hosted-shaped url on an origin this run was not
-    // given (here the `Cargo.lock` `sparse+` source and the
-    // `.cargo/config.toml` index) is never attested — whatever is
-    // installed, with or without `--no-verify` — and is reported as
-    // `redirect_unwired` (core `RecordLiveness::Undecided`; CLI_CONTRACT.md,
-    // "Patch hosts (manifest-less VEX)"). A staging patch server needs
-    // `--patch-server-url`, below.
+    // Fail closed: a ledger record wired through a hosted-shaped url on an
+    // unconfigured origin is `redirect_unwired` whatever is installed, even
+    // under `--no-verify` (CLI_CONTRACT.md, "Patch hosts (manifest-less VEX)").
     write_redirect_ledger(&fx, CARGO_PURL, cargo_record(U), CARGO_HOSTED_EDITS);
     for (state, install) in [
         ("not installed", None),

@@ -2589,7 +2589,7 @@ impl Discovery {
         }) {
             return RecordLiveness::Live;
         }
-        if resolved().any(|r| foreign_hosted_uuid(r).as_deref() == Some(uuid)) {
+        if resolved().any(|r| crate::origin::hosted_shape_uuid(r).as_deref() == Some(uuid)) {
             return RecordLiveness::Undecided;
         }
         if entries.iter().any(|e| resolves_elsewhere(e)) {
@@ -2662,48 +2662,21 @@ impl RecordLiveness {
     }
 }
 
-/// The patch uuid `url` names when read as a hosted url of its OWN origin
-/// ([`crate::origin::hosted_patch_uuid`]'s grammar — the last
-/// canonical-uuid path segment — with the url's origin taken as
-/// configured): what a lock entry on an origin this run was not given
-/// claims to resolve from. Only a url in a Socket patch server's path
-/// shape (a `patch`, `patch-registry` or `gopatch` segment) counts: any
-/// other url merely ending in the uuid (an artifact store's blob path)
-/// resolves from elsewhere. Userinfo is dropped first: Socket never writes
-/// one, so `https://patch.socket.dev@evil.example/patch/…` is a look-alike
-/// on the host after the `@`, never an accepted origin.
-fn foreign_hosted_uuid(url: &str) -> Option<String> {
-    // Normalized the way `hosted_patch_uuid` reads it, so an escaped,
-    // percent-encoded or `sparse+` url still yields its origin.
-    let normalized = crate::origin::normalized_hosted_url(url)?;
-    let mut parsed = reqwest::Url::parse(&normalized).ok()?;
-    if !parsed
-        .path_segments()?
-        .any(|s| matches!(s, "patch" | "patch-registry" | "gopatch"))
-    {
-        return None;
-    }
-    let _ = parsed.set_username("");
-    let _ = parsed.set_password(None);
-    let origin = parsed.origin().ascii_serialization();
-    crate::origin::hosted_patch_uuid(parsed.as_str(), &[origin])
-}
-
-/// Whether any of `files` — the root-relative files a REDIRECT ledger
-/// recorded editing — spells a url with the hosted shape for `uuid`
-/// ([`foreign_hosted_uuid`]) on an origin outside Socket's host and
-/// `origins`. Fail closed: one such url is enough, whatever else the files
+/// Whether any of `files` — the root-relative files a REDIRECT ledger recorded
+/// editing — spells a url with the hosted shape for `uuid`
+/// ([`crate::origin::hosted_shape_uuid`]) on an origin outside Socket's host
+/// and `origins`. Fail closed: one such url is enough, whatever else the files
 /// spell (a Socket-host url beside it — a leftover definition, a comment —
-/// does not clear it). Each occurrence of the uuid is widened to the url
-/// token around it (bounded by whitespace, quotes, markup and `=` / `&`,
-/// so a berry `__archiveUrl=` binding value or a `Cargo.lock` `sparse+`
-/// source reads whole), then read the way
-/// [`crate::origin::hosted_patch_uuid`] reads a url; a scheme-less token
-/// (a go.mod `replace` module path, `<host>/gopatch/<uuid>`) is read as
-/// `https://`. Every recorded file counts, registry definitions included:
-/// a definition routes nothing on its own, but it names the host the pin
-/// routes to. `bun.lockb` is binary and is skipped (its inventory carries
-/// the url to step 1). Same path guards as [`hosted_wiring_in_files`].
+/// does not clear it). Each occurrence of the uuid is widened to the url token
+/// around it (bounded by whitespace, quotes, markup and `=` / `&`, so a berry
+/// `__archiveUrl=` binding value or a `Cargo.lock` `sparse+` source reads
+/// whole), then read the way [`crate::origin::hosted_patch_uuid`] reads a url;
+/// a scheme-less token (a go.mod `replace` module path,
+/// `<host>/gopatch/<uuid>`) is read as `https://`. Every recorded file counts,
+/// registry definitions included: a definition routes nothing on its own, but
+/// it names the host the pin routes to. `bun.lockb` is binary and is skipped
+/// (its inventory carries the url to step 1). Same path guards as
+/// [`hosted_wiring_in_files`].
 async fn foreign_hosted_url_in_files(
     root: &Path,
     files: &[&str],
@@ -2728,8 +2701,8 @@ async fn foreign_hosted_url_in_files(
                 schemed = format!("https://{token}");
                 &schemed
             };
-            if foreign_hosted_uuid(url).as_deref() == Some(uuid)
-                && crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
+            if crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
+                && crate::origin::hosted_shape_uuid(url).as_deref() == Some(uuid)
             {
                 return true;
             }
@@ -3464,7 +3437,7 @@ mod tests {
     /// `hosted_patch_uuid` applies: `\\/` escapes, a percent-encoded url
     /// and a Cargo `sparse+` / `registry+` prefix.
     #[test]
-    fn foreign_hosted_uuid_normalizes_like_hosted_patch_uuid() {
+    fn hosted_shape_uuid_normalizes_like_hosted_patch_uuid() {
         const U: &str = "11111111-2222-4333-8444-555555555555";
         for url in [
             format!("https://mirror.example/patch/{U}/x.tgz"),
@@ -3475,15 +3448,18 @@ mod tests {
             format!("https://patch.socket.dev@mirror.example/patch/{U}/x.tgz"),
             format!("https://user:pw@patch.socket.dev/patch/{U}/x.tgz"),
         ] {
-            assert_eq!(foreign_hosted_uuid(&url).as_deref(), Some(U), "{url}");
+            assert_eq!(
+                crate::origin::hosted_shape_uuid(&url).as_deref(),
+                Some(U),
+                "{url}"
+            );
         }
-        // Review on #2012 (round 2): a url merely ending in the uuid is not
-        // a patch server's.
+        // A url merely ending in the uuid is not a patch server's.
         for url in [
             format!("https://artifacts.corp/blobs/{U}/x-1.0.0.tgz"),
             format!("https://evil.example/{U}/x.tgz"),
         ] {
-            assert_eq!(foreign_hosted_uuid(&url), None, "{url}");
+            assert_eq!(crate::origin::hosted_shape_uuid(&url), None, "{url}");
         }
     }
 
@@ -3820,8 +3796,8 @@ mod tests {
             "host not allowlisted"
         );
         // Without the origin, the internal host's url is undecided: never
-        // attested, and — the regression — not vetoed by the script lock's
-        // registry instance either.
+        // attested, and not vetoed by the script lock's registry instance
+        // either.
         let mut inventory = None;
         assert_eq!(
             discovery
@@ -3968,16 +3944,15 @@ mod tests {
         assert!(!hosted_wiring_in_files(root, &["package-lock.json"], "not-a-uuid").await);
     }
 
-    /// REGRESSION (P6): step 1 classifies a lock entry's resolved url with
-    /// the one origin rule ([`crate::origin::hosted_patch_uuid`]),
-    /// never by substring. Only a Socket-host url or a configured origin's
-    /// url for the record's uuid is LIVE (attested). A url with the hosted
-    /// shape for the uuid on an origin this run was not given — a patch
-    /// server an earlier run was pointed at, or a host that merely spells
-    /// it — is UNDECIDED: never attested, but its wiring is retained. A url
-    /// that only contains the uuid (a file name, a query) and a Socket url
-    /// for ANOTHER patch (whose path carries the uuid as its grant token)
-    /// resolve the package from somewhere else: DEAD.
+    /// Step 1 classifies a lock entry's resolved url with the one origin rule
+    /// ([`crate::origin::hosted_patch_uuid`]), never by substring. Only a
+    /// Socket-host url or a configured origin's url for the record's uuid is
+    /// LIVE (attested). A url with the hosted shape for the uuid on an origin
+    /// this run was not given — a patch server an earlier run was pointed at,
+    /// or a host that merely spells it — is UNDECIDED: never attested, but its
+    /// wiring is retained. A url that only contains the uuid (a file name, a
+    /// query) and a Socket url for ANOTHER patch (whose path carries the uuid
+    /// as its grant token) resolve the package from somewhere else: DEAD.
     #[tokio::test]
     async fn liveness_matches_the_resolved_url_by_origin_not_substring() {
         use RecordLiveness::{Dead, Live, Undecided};
@@ -4141,9 +4116,8 @@ mod tests {
                 &with_origin,
                 Live,
             ),
-            // Review on #2012 (round 3): a Socket-host spelling elsewhere in
-            // the files (a comment, a leftover definition) does not clear a
-            // foreign pin.
+            // A Socket-host spelling elsewhere in the files (a comment, a
+            // leftover definition) does not clear a foreign pin.
             (
                 "yarn.lock",
                 "pkg:npm/x@1.0.0",

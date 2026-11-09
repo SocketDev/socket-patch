@@ -78,7 +78,7 @@ pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> 
 /// unescaped, a percent-encoded `http(s)://` url decoded, and a Cargo
 /// `sparse+` / `registry+` source prefix stripped. `None` without a
 /// `://`.
-pub(crate) fn normalized_hosted_url(url: &str) -> Option<String> {
+fn normalized_hosted_url(url: &str) -> Option<String> {
     use crate::utils::purl::percent_decode_purl_component;
 
     let unescaped = url.trim().replace("\\/", "/");
@@ -96,6 +96,30 @@ pub(crate) fn normalized_hosted_url(url: &str) -> Option<String> {
         }
         _ => decoded,
     })
+}
+
+/// The patch uuid `url` names when read as a hosted url of its OWN origin
+/// ([`hosted_patch_uuid`]'s grammar with the url's origin taken as
+/// configured): what a lock entry on an origin a run was not given claims
+/// to resolve from. Only a url in a Socket patch server's path shape (a
+/// `patch`, `patch-registry` or `gopatch` segment) counts: any other url
+/// merely ending in the uuid (an artifact store's blob path) resolves from
+/// elsewhere. Userinfo is dropped first: Socket never writes one, so
+/// `https://patch.socket.dev@evil.example/patch/…` is a look-alike on the
+/// host after the `@`, never an accepted origin.
+pub(crate) fn hosted_shape_uuid(url: &str) -> Option<String> {
+    let normalized = normalized_hosted_url(url)?;
+    let mut parsed = reqwest::Url::parse(&normalized).ok()?;
+    if !parsed
+        .path_segments()?
+        .any(|s| matches!(s, "patch" | "patch-registry" | "gopatch"))
+    {
+        return None;
+    }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    let origin = parsed.origin().ascii_serialization();
+    hosted_patch_uuid(parsed.as_str(), &[origin])
 }
 
 /// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order

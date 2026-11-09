@@ -1045,16 +1045,9 @@ fn uuid_on_a_foreign_host_is_not_a_hosted_reference() {
             assert_eq!(env["error"]["code"], "manifest_not_found", "{cell}: {env}");
             assert_eq!(request_count(&rt, &server), 0, "{cell}: network call");
 
-            // FAIL CLOSED (`Discovery::redirect_record_verdict`,
-            // `RecordLiveness::Undecided`): a pre-v5 redirect-ledger record
-            // whose lock entry resolves from a hosted-shaped url on an
-            // origin this run was not given (a staging patch server used
-            // without `--patch-server-url`, or a look-alike host) is never
-            // attested — not even by an installed tree that hashes to the
-            // record, not even under `--no-verify` — and is reported as
-            // `redirect_unwired` (CLI_CONTRACT.md, "Patch hosts
-            // (manifest-less VEX)"). Pass `--patch-server-url` for a
-            // non-production patch server.
+            // Fail closed: a ledger record wired through a hosted-shaped url on an
+            // unconfigured origin is `redirect_unwired` whatever is installed, even
+            // under `--no-verify` (CLI_CONTRACT.md, "Patch hosts (manifest-less VEX)").
             write_redirect_ledger(cwd, flavor, record(UUID));
             for (state, bytes) in [
                 ("not installed", None),
