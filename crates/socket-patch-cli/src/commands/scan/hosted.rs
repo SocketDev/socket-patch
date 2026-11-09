@@ -870,6 +870,23 @@ async fn run_redirect_selected_untracked(
         );
     }
 
+    // The engine's user-patch gate (pnpm, yarn, patch-package), which the
+    // in-memory engine applies over its own walk. Here the consent gate
+    // already walked the project and left such packages out unless
+    // `--allow-patch-conflicts` (which lifts this one too), so only what
+    // its walk does not read is added: the Rush locks' (common and every
+    // subspace's) and a root `shrinkwrap.yaml`'s patched entries (the
+    // in-memory engine reads them too). Each such package is a skip event,
+    // as the consent gate reports it.
+    // Its warnings join the run's (as the consent gate's and the in-memory
+    // engine's do), after the record warnings.
+    let mut user_patch_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> =
+        Vec::new();
+    if !common.allow_patch_conflicts {
+        user_patch_warnings =
+            engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped).await;
+    }
+
     // A NEW row the lockfiles already pin on the patch server these
     // references name (not a configured one, so the recorded view's
     // discovery could not see it) is ALREADY: decided here, before the lock
@@ -922,7 +939,17 @@ async fn run_redirect_selected_untracked(
 
     // Re-read project patch declarations under the write lock. A patch added
     // during API selection must not be lost in a takeover or lock rewrite.
+    // The supplement's Rush and `shrinkwrap.yaml` locks are re-read too
+    // (the consent gate's walk below doesn't read them): a patch recorded
+    // there while this run waited for the lock withholds its package as
+    // the first read would have.
     if !common.allow_patch_conflicts {
+        if lock.is_some() {
+            let late =
+                engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped)
+                    .await;
+            user_patch_warnings.extend(late);
+        }
         if let Err(error) =
             crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)).await
         {
@@ -1696,6 +1723,7 @@ async fn run_redirect_selected_untracked(
     // record, package-manager, stale-install, takeover and prune warnings.
     let mut engine_warnings = rewrite.warnings.clone();
     engine_warnings.extend(record_warnings);
+    engine_warnings.extend(user_patch_warnings);
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());
