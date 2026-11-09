@@ -2488,6 +2488,12 @@ impl Discovery {
     ///    route nothing once the dependency pin is reverted, and reads a
     ///    Gemfile / `gems.rb` with discovery's source-block grammar).
     ///
+    /// A record steps 0 or 3 find pinned is [`RecordLiveness::Undecided`]
+    /// instead of live when its recorded files route the uuid through a
+    /// hosted-shaped url on an origin this run was not given — the step-1
+    /// rule, for the formats whose inventory carries no url
+    /// ([`foreign_hosted_url_in_files`]).
+    ///
     /// `inventory` is the project's EVERY-instance lock inventory
     /// ([`inventory_project_every_lock`] — step 2 is negative evidence, so a
     /// collapsed view that dropped the hosted instance must not feed it),
@@ -2544,7 +2550,7 @@ impl Discovery {
                     continue;
                 };
                 if gem::gemfile_source_block_pins(&text, uuid, Some(&gem_name)) {
-                    return RecordLiveness::Live;
+                    return self.unless_foreign_hosted(root, recorded_files, uuid).await;
                 }
             }
         }
@@ -2574,7 +2580,34 @@ impl Discovery {
         if entries.iter().any(|e| resolves_elsewhere(e)) {
             return RecordLiveness::Dead;
         }
-        RecordLiveness::from_bool(hosted_wiring_in_files(root, &recorded, uuid).await)
+        if !hosted_wiring_in_files(root, &recorded, uuid).await {
+            return RecordLiveness::Dead;
+        }
+        self.unless_foreign_hosted(root, recorded_files, uuid).await
+    }
+
+    /// The verdict for a record whose ledger-recorded wiring still pins
+    /// `uuid` (steps 0 and 3 of [`Self::redirect_record_live`]): `Live`,
+    /// unless those files route it through a url with the hosted shape for
+    /// `uuid` on an origin this run was not given — the same wiring step 1
+    /// judges `Undecided` when a lock inventory entry carries the url, here
+    /// for the formats whose inventory does not (a yarn berry
+    /// `__archiveUrl=` binding, a `Cargo.lock` registry `source`, a pom
+    /// `<repository>`, a Gemfile `source` block). Fail closed: a pin to a
+    /// staging server used without `--patch-server-url`, or to a look-alike
+    /// host, is never attested ([`foreign_hosted_url_in_files`]).
+    async fn unless_foreign_hosted(
+        &self,
+        root: &Path,
+        recorded_files: &[&str],
+        uuid: &str,
+    ) -> RecordLiveness {
+        if foreign_hosted_url_in_files(root, recorded_files, uuid, &self.patch_server_origins).await
+        {
+            RecordLiveness::Undecided
+        } else {
+            RecordLiveness::Live
+        }
     }
 }
 
@@ -2615,26 +2648,107 @@ impl RecordLiveness {
 }
 
 /// The patch uuid `url` names when read as a hosted url of its OWN origin
-/// ([`crate::origin::hosted_patch_uuid`]'s grammar — no userinfo,
-/// the last canonical-uuid path segment — with the url's origin taken as
+/// ([`crate::origin::hosted_patch_uuid`]'s grammar — the last
+/// canonical-uuid path segment — with the url's origin taken as
 /// configured): what a lock entry on an origin this run was not given
 /// claims to resolve from. Only a url in a Socket patch server's path
 /// shape (a `patch`, `patch-registry` or `gopatch` segment) counts: any
 /// other url merely ending in the uuid (an artifact store's blob path)
-/// resolves from elsewhere.
+/// resolves from elsewhere. Userinfo is dropped first: Socket never writes
+/// one, so `https://patch.socket.dev@evil.example/patch/…` is a look-alike
+/// on the host after the `@`, never an accepted origin.
 fn foreign_hosted_uuid(url: &str) -> Option<String> {
     // Normalized the way `hosted_patch_uuid` reads it, so an escaped,
     // percent-encoded or `sparse+` url still yields its origin.
     let normalized = crate::origin::normalized_hosted_url(url)?;
-    let parsed = reqwest::Url::parse(&normalized).ok()?;
+    let mut parsed = reqwest::Url::parse(&normalized).ok()?;
     if !parsed
         .path_segments()?
         .any(|s| matches!(s, "patch" | "patch-registry" | "gopatch"))
     {
         return None;
     }
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
     let origin = parsed.origin().ascii_serialization();
-    crate::origin::hosted_patch_uuid(url, &[origin])
+    crate::origin::hosted_patch_uuid(parsed.as_str(), &[origin])
+}
+
+/// Whether any of `files` — the root-relative files a REDIRECT ledger
+/// recorded editing — spells a url with the hosted shape for `uuid`
+/// ([`foreign_hosted_uuid`]) on an origin outside Socket's host and
+/// `origins`. Fail closed: one such url is enough, whatever else the files
+/// spell (a Socket-host url beside it — a leftover definition, a comment —
+/// does not clear it). Each occurrence of the uuid is widened to the url
+/// token around it (bounded by whitespace, quotes, markup and `=` / `&`,
+/// so a berry `__archiveUrl=` binding value or a `Cargo.lock` `sparse+`
+/// source reads whole), then read the way
+/// [`crate::origin::hosted_patch_uuid`] reads a url; a scheme-less token
+/// (a go.mod `replace` module path, `<host>/gopatch/<uuid>`) is read as
+/// `https://`. Every recorded file counts, registry definitions included:
+/// a definition routes nothing on its own, but it names the host the pin
+/// routes to. `bun.lockb` is binary and is skipped (its inventory carries
+/// the url to step 1). Same path guards as [`hosted_wiring_in_files`].
+async fn foreign_hosted_url_in_files(
+    root: &Path,
+    files: &[&str],
+    uuid: &str,
+    origins: &[String],
+) -> bool {
+    if !is_canonical_uuid(uuid) {
+        return false;
+    }
+    for file in unique_safe_rel_files(files) {
+        if file == "bun.lockb" || file.ends_with("/bun.lockb") {
+            continue;
+        }
+        let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(&file)).await else {
+            continue;
+        };
+        for token in url_tokens_around(&text, uuid) {
+            let schemed;
+            let url = if token.contains("://") || token.contains("%3A%2F%2F") {
+                token
+            } else {
+                schemed = format!("https://{token}");
+                &schemed
+            };
+            if foreign_hosted_uuid(url).as_deref() == Some(uuid)
+                && crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The url-shaped token around each occurrence of `needle` in `text`:
+/// widened in both directions up to whitespace, a quote, markup or a
+/// key / binding separator (`=`, `&`, `,`, brackets).
+fn url_tokens_around<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
+    let stop = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | '&' | ','
+            )
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let idx = from + pos;
+        let end = idx + needle.len();
+        let start = text[..idx]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| stop(c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let stop_at = text[end..].find(stop).map_or(text.len(), |i| end + i);
+        out.push(&text[start..stop_at]);
+        from = end;
+    }
+    out
 }
 
 /// Whether root-relative `file` is one of `ecosystem`'s lockfiles — what an
@@ -3343,6 +3457,8 @@ mod tests {
             format!("https%3A%2F%2Fmirror.example%2Fpatch%2F{U}%2Fx.tgz"),
             format!("sparse+https://mirror.example/patch/{U}/"),
             format!("registry+https://mirror.example/patch/{U}/"),
+            format!("https://patch.socket.dev@mirror.example/patch/{U}/x.tgz"),
+            format!("https://user:pw@patch.socket.dev/patch/{U}/x.tgz"),
         ] {
             assert_eq!(foreign_hosted_uuid(&url).as_deref(), Some(U), "{url}");
         }
@@ -3731,7 +3847,9 @@ mod tests {
     /// would).
     #[tokio::test]
     async fn gemfile_liveness_reads_live_source_blocks_only() {
-        let index = format!("https://patches.example.com/patch-registry/gem/{TOKEN}/{UUID_A}/");
+        // Socket's host: a source block on an origin this run was not given
+        // is never live (`recorded_wiring_on_a_foreign_origin_is_undecided`).
+        let index = format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID_A}/");
         let p = Project::new();
         p.write(
             "Gemfile.lock",
@@ -3852,6 +3970,9 @@ mod tests {
         let purl = "pkg:npm/x@1.0.0";
         let elsewhere =
             format!("https://evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let userinfo = format!(
+            "https://patch.socket.dev@evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz"
+        );
         let in_name = format!("https://evil.example/files/x-{UUID_A}.tgz");
         let in_query = format!("https://evil.example/files/x-1.0.0.tgz?id={UUID_A}");
         let other_patch =
@@ -3866,6 +3987,7 @@ mod tests {
         for (resolved, discovery, verdict) in [
             (&elsewhere, &with_origin, Undecided),
             (&configured, &without, Undecided),
+            (&userinfo, &without, Undecided),
             (&in_name, &with_origin, Dead),
             (&in_query, &with_origin, Dead),
             (&other_patch, &with_origin, Dead),
@@ -3920,6 +4042,151 @@ mod tests {
                 "{why}"
             );
         }
+    }
+
+    /// Steps 0 and 3 (the ledger's own recorded wiring) fail closed the
+    /// way step 1 does: a pin whose recorded files route the uuid through
+    /// a hosted-shaped url on an origin this run was not given — here a
+    /// yarn berry `__archiveUrl=` binding and a `Cargo.lock` `sparse+`
+    /// source, neither of which the lock inventory carries as a url — is
+    /// `Undecided`, never attested; the same url on Socket's host or a
+    /// configured origin is live, and a userinfo look-alike reads as the
+    /// host after its `@`.
+    #[tokio::test]
+    async fn recorded_wiring_on_a_foreign_origin_is_undecided() {
+        use RecordLiveness::{Live, Undecided};
+        let origin = "http://127.0.0.1:4545";
+        let berry = |base: &str| {
+            let url = format!("{base}/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+            let encoded = url.replace(':', "%3A").replace('/', "%2F");
+            format!(
+                "__metadata:\n  version: 8\n\n\"x@npm:1.0.0\":\n  version: 1.0.0\n  \
+                 resolution: \"x@npm:1.0.0::__archiveUrl={encoded}\"\n  languageName: node\n  \
+                 linkType: hard\n"
+            )
+        };
+        let cargo = |base: &str| {
+            format!(
+                "version = 3\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n\
+                 source = \"sparse+{base}/patch-registry/cargo/{TOKEN}/{UUID_A}/index/\"\n"
+            )
+        };
+        let with_origin = Discovery {
+            patch_server_origins: vec![origin.to_string()],
+            ..Discovery::default()
+        };
+        let without = Discovery::default();
+        for (file, purl, text, discovery, verdict) in [
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://patch.socket.dev@evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry(origin),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry(origin),
+                &with_origin,
+                Live,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://patch.socket.dev"),
+                &without,
+                Live,
+            ),
+            (
+                "Cargo.lock",
+                "pkg:cargo/x@1.0.0",
+                cargo("https://evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "Cargo.lock",
+                "pkg:cargo/x@1.0.0",
+                cargo(origin),
+                &with_origin,
+                Live,
+            ),
+            // Review on #2012 (round 3): a Socket-host spelling elsewhere in
+            // the files (a comment, a leftover definition) does not clear a
+            // foreign pin.
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                format!(
+                    "# https://patch.socket.dev/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz\n{}",
+                    berry("https://evil.example")
+                ),
+                &without,
+                Undecided,
+            ),
+            // A go.mod `replace` names a scheme-less module path.
+            (
+                "go.mod",
+                "pkg:golang/example.com/x@v1.0.0",
+                format!(
+                    "module example.com/app\n\ngo 1.21\n\nrequire example.com/x v1.0.0\n\n\
+                     replace example.com/x v1.0.0 => staging.example/gopatch/{UUID_A} v1.0.0\n"
+                ),
+                &without,
+                Undecided,
+            ),
+            (
+                "go.mod",
+                "pkg:golang/example.com/x@v1.0.0",
+                format!(
+                    "module example.com/app\n\ngo 1.21\n\nrequire example.com/x v1.0.0\n\n\
+                     replace example.com/x v1.0.0 => patch.socket.dev/gopatch/{UUID_A} v1.0.0\n"
+                ),
+                &without,
+                Live,
+            ),
+        ] {
+            let p = Project::new();
+            p.write(file, &text);
+            let why = format!(
+                "{file}: {text} (origins {:?})",
+                discovery.patch_server_origins
+            );
+            let mut inventory = None;
+            assert_eq!(
+                discovery
+                    .redirect_record_verdict(p.root(), purl, UUID_A, &[file], &mut inventory)
+                    .await,
+                verdict,
+                "{why}"
+            );
+        }
+    }
+
+    /// The url token around each needle occurrence stops at quotes, markup
+    /// and binding separators, and never splits a multi-byte character.
+    #[test]
+    fn url_tokens_around_widen_to_the_url() {
+        let text = "a=\"sparse+https://h/x/U/i/\" <url>https://h/U</url>\u{a0}https://h/U#f&b";
+        assert_eq!(
+            url_tokens_around(text, "U"),
+            vec!["sparse+https://h/x/U/i/", "https://h/U", "https://h/U#f"]
+        );
     }
 
     /// Discovery records the origins it classified with, for liveness.
