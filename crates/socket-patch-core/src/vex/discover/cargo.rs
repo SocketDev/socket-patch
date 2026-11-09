@@ -1545,6 +1545,29 @@ fn patch_bypassed(
         .filter(|d| d.source != DeclSource::Path)
         .filter(|d| matches!(route(d, &pins, version, &others), Route::Unpinned(_)))
         .collect();
+    // A declaration pinned to ANOTHER Socket patch builds that patch's
+    // copy, not this one. When the lock resolves the crate from that patch,
+    // its hosted ref stands beside this one and the CLI's conflict gate
+    // refuses both; when it does not (a stale lock), nothing else says so.
+    let locked_from: Vec<String> = bypass
+        .lock
+        .packages()
+        .iter()
+        .filter(|p| p.name == name)
+        .filter_map(|p| p.source.as_deref().and_then(|s| source_uuid(ctx, s)))
+        .collect();
+    let other_patch: Vec<(&Decl, String)> = bypass
+        .decls
+        .and_then(|d| d.get(name))
+        .into_iter()
+        .flatten()
+        .filter_map(|d| match route(d, &pins, version, &others) {
+            Route::Pin(uuid) if uuid != vref.uuid && !locked_from.contains(&uuid) => {
+                Some((d, uuid))
+            }
+            _ => None,
+        })
+        .collect();
     let locked = same_version_foreign_entry(ctx, bypass.lock, name, version);
     let redirects = format!(
         "which no [patch] entry pointing at {} redirects",
@@ -1597,7 +1620,28 @@ fn patch_bypassed(
                 ),
             )
         }
-        (None, None) => return,
+        (None, None) => {
+            let Some((first, _)) = other_patch.first() else {
+                return;
+            };
+            let declared = other_patch
+                .iter()
+                .map(|(d, uuid)| format!("{} (Socket patch {uuid})", d.describe(name)))
+                .collect::<Vec<_>>()
+                .join(", and ");
+            (
+                first.file.as_str(),
+                format!(
+                    "{declared}, which {CARGO_LOCK} does not resolve {name} from (a stale \
+                     lock): cargo re-resolves that declaration from that patch's registry, so \
+                     the crate declaring it builds {name} with another patch than the copy at \
+                     {}, and the requirement allows it to be {version}. Keep one patch for \
+                     {name}: pin that declaration to this patch (or drop it), or roll this \
+                     patch back",
+                    vref.artifact_rel
+                ),
+            )
+        }
     };
     out.unattested(
         purl,
@@ -4533,5 +4577,53 @@ mod tests {
             let out = run(&vendored_workspace(&member, &extra, &[])).await;
             assert_vendored_attested(&out, attested, &member);
         }
+    }
+    /// REGRESSION (Bugbot on #2024): a member pinned to ANOTHER Socket
+    /// patch builds that patch's copy. When the lock resolves cfg-if from
+    /// it, its hosted ref stands beside the vendored one and the CLI's
+    /// conflict gate refuses both; when the lock does not (stale), the
+    /// vendored copy is marked bypassed rather than attested alone.
+    #[tokio::test]
+    async fn a_member_pinned_to_another_patch_bypasses_the_vendored_copy() {
+        let p = vendored_workspace(&pinned("cfg-if", "1", UUID_B), "", &[]);
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored)],
+        );
+        let u = bypassed_mark(&out, "crates/a/Cargo.toml");
+        assert!(
+            u.detail.contains("crates/a/Cargo.toml declares cfg-if")
+                && u.detail.contains(UUID_B)
+                && u.detail.contains("stale"),
+            "{}",
+            u.detail
+        );
+
+        // Locked from that patch: the conflict pair, no bypass mark on A.
+        let b = index(UUID_B);
+        let p = vendored_workspace(&pinned("cfg-if", "1", UUID_B), "", &[("1.0.4", b.as_str())]);
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[
+                ("pkg:cargo/cfg-if@1.0.4", UUID_B, WiringMode::Hosted),
+                ("pkg:cargo/cfg-if@1.0.4", UUID_A, WiringMode::Vendored),
+            ],
+        );
+        assert!(
+            out.unattested.iter().all(|u| u.uuid != UUID_A),
+            "{:#?}",
+            out.unattested
+        );
+
+        // A requirement that excludes the vendored version says nothing.
+        let p = vendored_workspace(&pinned("cfg-if", "0.1", UUID_B), "", &[]);
+        let out = run(&p).await;
+        assert!(
+            out.unattested.iter().all(|u| u.uuid != UUID_A),
+            "{:#?}",
+            out.unattested
+        );
     }
 }
