@@ -18,7 +18,7 @@
 set -euo pipefail
 
 if [ $# -ne 2 ]; then
-  sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 2
 fi
 VERSION="$1"
@@ -72,7 +72,7 @@ if [ -z "$fetched" ]; then
 fi
 
 verify
-unzip -q "$zip" -d "$DIR"
+unzip -oq "$zip" -d "$DIR"
 launcher="$DIR/gradle-$VERSION/bin/gradle"
 case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) launcher="$launcher.bat" ;; esac
 echo "SOCKET_PATCH_GRADLE_E2E_GRADLE=$launcher"

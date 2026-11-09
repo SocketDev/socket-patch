@@ -1863,7 +1863,8 @@ jobs:
         continue-on-error: true
         with:
           path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
-          key: gradle-dist-${{ matrix.gradle }}-${{ runner.os }}
+          # The script holds the pins: a changed pin starts a fresh key.
+          key: gradle-dist-${{ matrix.gradle }}-${{ runner.os }}-${{ hashFiles('scripts/install-gradle.sh') }}
 
       - name: Install Gradle ${{ matrix.gradle }}
         if: matrix.gradle != ''
