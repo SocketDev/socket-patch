@@ -230,7 +230,7 @@ pub(crate) fn profile_combinations(
 }
 
 /// The `name -> trimmed value` pairs of a `<properties>` body, into `map`
-/// (a name's first definition wins). An element's name is its tag up to
+/// (a name's last definition wins, as in Maven's model reader). An element's name is its tag up to
 /// whitespace or `/`, so `<v combine.self="override">` and `<v >` define
 /// `v`, and `<v/>` defines it empty; a comment-blanked or malformed child
 /// is an error (fail closed).
