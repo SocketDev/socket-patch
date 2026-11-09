@@ -230,7 +230,10 @@ a version without a non-empty section in this file.
   #1944, #1955, #1964, #1972, #1978, #1988, #1994, #2000); release
   workflow artifact steps move off Node 20 actions (#2027). A design doc
   and line-count budget plan one lock model for every lockfile reader
-  (#2001).
+  (#2001), and the Socket-origin classifier moves into one module (#2002).
+  Test fixes: PDM e2e compat pins bounded by release, a Windows-only
+  scala-cli liveness test, NuGet walk tests isolated from the host cache
+  (#2034, #2035, #2037).
 
 ## [5.0.1] — 2026-10-13
 
