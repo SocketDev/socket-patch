@@ -107,25 +107,33 @@ pub(crate) fn planned_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
 pub(crate) fn shadowed_locks(files: &BTreeMap<String, String>) -> Vec<&String> {
     files
         .keys()
-        .filter(|key| is_pnpm_lock_key(key) && !governs(files, key))
+        .filter(|key| pnpm_lock_leaf(key).is_some() && !governs(files, key))
         .collect()
 }
 
-/// Whether root-relative `key` names a `pnpm-lock.yaml` or `shrinkwrap.yaml`.
-fn is_pnpm_lock_key(key: &str) -> bool {
-    matches!(
-        key.rsplit('/').next(),
-        Some(PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY)
-    )
+/// The root directory's governing pnpm lock ([`governing_pnpm_lock`]),
+/// `pnpm-lock.yaml` when `files` holds neither.
+pub(crate) fn root_lock(files: &BTreeMap<String, String>) -> &'static str {
+    [PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY]
+        .into_iter()
+        .find(|lock| files.contains_key(*lock) && governs(files, lock))
+        .unwrap_or(PNPM_LOCK)
+}
+
+/// The leaf of root-relative `key` when it names a `pnpm-lock.yaml` or
+/// `shrinkwrap.yaml`.
+fn pnpm_lock_leaf(key: &str) -> Option<&str> {
+    key.rsplit('/')
+        .next()
+        .filter(|leaf| matches!(*leaf, PNPM_LOCK | PNPM_SHRINKWRAP_LEGACY))
 }
 
 /// Whether the pnpm lock `key` is its directory's [`governing_pnpm_lock`],
 /// read with the evidence `files` holds for that directory.
 fn governs(files: &BTreeMap<String, String>, key: &str) -> bool {
-    if !is_pnpm_lock_key(key) {
+    let Some(leaf) = pnpm_lock_leaf(key) else {
         return false;
-    }
-    let leaf = key.rsplit('/').next().unwrap_or(key);
+    };
     // `dir` keeps its trailing `/` (empty at the root).
     let in_dir = |rel: &str| format!("{}{rel}", &key[..key.len() - leaf.len()]);
     let has = |rel: &str| files.contains_key(&in_dir(rel));
@@ -288,6 +296,18 @@ mod tests {
             planned(&record).last().map(String::as_str),
             Some("shrinkwrap.yaml")
         );
+
+        // The root's governing lock, and the shadowed rest.
+        assert_eq!(root_lock(&files(None)), PNPM_LOCK);
+        assert_eq!(root_lock(&files(Some("2.25.7"))), PNPM_SHRINKWRAP_LEGACY);
+        assert_eq!(
+            shadowed_locks(&files(Some("2.25.7"))),
+            ["a/shrinkwrap.yaml", "pnpm-lock.yaml"]
+        );
+        let lone: BTreeMap<String, String> =
+            [(PNPM_SHRINKWRAP_LEGACY.to_string(), String::new())].into();
+        assert_eq!(root_lock(&lone), PNPM_SHRINKWRAP_LEGACY);
+        assert_eq!(root_lock(&BTreeMap::new()), PNPM_LOCK);
     }
 
     #[test]

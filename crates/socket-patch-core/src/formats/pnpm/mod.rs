@@ -13,8 +13,8 @@
 //!   tarball, the raw material lockfile discovery (`vex::discover::npm`)
 //!   classifies as hosted / vendored refs, and [`PnpmLock::wired_integrity`]
 //!   repair's trust anchor for a vendored artifact;
-//! * [`PnpmLock::vendored_in_use`] — whether a vendored artifact is still
-//!   consumed (both vendored backends' revert guards and ledger liveness);
+//! * [`vendored_npm_uuids`] — the vendored artifacts a lock still consumes
+//!   (both vendored backends' revert guards and ledger liveness);
 //! * [`plan_hosted`] — the hosted planner (the redirect rewriter's pnpm
 //!   leg: resolution splices over the whole lock set);
 //! * the vendored planners (`vendor::pnpm_lock` for lockfileVersion 9.0,
@@ -41,7 +41,6 @@ pub(crate) use grammar::{
 pub(crate) use hosted::plan_hosted;
 
 use std::collections::HashSet;
-use std::sync::OnceLock;
 
 use crate::constants::npm_family::PNPM_LOCK;
 use crate::formats::text::strip_bom;
@@ -380,9 +379,6 @@ pub struct PnpmLock<'t> {
     text: &'t str,
     /// Every document's entries, with offsets into `text`.
     packages: Vec<PnpmPackage<'t>>,
-    /// [`vendored_npm_uuids`] of the whole lock, computed on first use (the
-    /// store crawler never asks).
-    vendored: OnceLock<HashSet<String>>,
 }
 
 /// One `packages:` entry whose resolution names a tarball — a candidate
@@ -400,18 +396,17 @@ impl<'t> PnpmLock<'t> {
         PnpmLock {
             text,
             packages: pnpm_packages(text, Resolve::Yes),
-            vendored: OnceLock::new(),
         }
     }
 
     /// [`PnpmLock::parse`] without the resolution maps (every
-    /// [`PnpmPackage::resolution`] is `None`), for a reader of keys and
-    /// entry fields only.
+    /// [`PnpmPackage::resolution`] is `None`) or document tags (every
+    /// entry is [`PnpmDocument::Project`]), for a reader of keys and entry
+    /// fields only: its document queries mean nothing.
     fn parse_keys(text: &'t str) -> Self {
         PnpmLock {
             text,
             packages: pnpm_packages(text, Resolve::No),
-            vendored: OnceLock::new(),
         }
     }
 
@@ -440,10 +435,10 @@ impl<'t> PnpmLock<'t> {
 
     /// The document kinds the lock has entries in, project first.
     pub(crate) fn documents(&self) -> Vec<PnpmDocument> {
-        [PnpmDocument::Project, PnpmDocument::Env]
-            .into_iter()
-            .filter(|kind| self.packages.iter().any(|p| p.document == *kind))
-            .collect()
+        let mut kinds: Vec<PnpmDocument> = self.packages.iter().map(|p| p.document).collect();
+        kinds.sort();
+        kinds.dedup();
+        kinds
     }
 
     fn has_packages_section(&self) -> bool {
@@ -519,19 +514,6 @@ impl<'t> PnpmLock<'t> {
             })
             .find_map(|r| r.integrity.filter(|sri| is_sri_pin(sri)))
             .map(str::to_string)
-    }
-
-    /// Is the vendored npm artifact of patch `uuid` still consumed by this
-    /// lock? `true` when a `packages:` / `snapshots:` block is keyed by it
-    /// ([`vendored_npm_uuid`] — v9's `name@file:` and legacy's bare `file:`
-    /// keys alike); `false` when the lock carries none (the `overrides:`
-    /// declaration alone never counts: pnpm keeps it mirrored from
-    /// package.json even when nothing matches it). CRLF locks read like LF
-    /// ones.
-    pub fn vendored_in_use(&self, uuid: &str) -> bool {
-        self.vendored
-            .get_or_init(|| vendored_npm_uuids(self.text))
-            .contains(uuid)
     }
 }
 
@@ -638,7 +620,9 @@ impl InstalledPackages {
 /// into `.socket/vendor/npm/<uuid>/` — the block-key grammar the vendored
 /// planners splice with ([`lines::parse_key_line`] at two-space indent),
 /// read in one walk with each line's `\r` dropped, so a CRLF lock (a
-/// Windows autocrlf checkout) answers like its LF twin.
+/// Windows autocrlf checkout) answers like its LF twin. An `overrides:`
+/// declaration alone never counts: pnpm keeps it mirrored from
+/// package.json even when nothing matches it.
 pub(crate) fn vendored_npm_uuids(text: &str) -> HashSet<String> {
     let mut out = HashSet::new();
     let mut in_section = false;
@@ -822,7 +806,7 @@ mod tests {
             );
             assert!(lock.resolves("left-pad", "1.3.0"));
             assert!(lock.resolves("cfg-dep", "2.0.0"));
-            assert!(lock.vendored_in_use(UUID));
+            assert!(vendored_npm_uuids(&text).contains(UUID));
             let tagged: Vec<_> = lock
                 .packages()
                 .iter()
@@ -947,7 +931,7 @@ mod tests {
     }
 
     #[test]
-    fn vendored_in_use_reads_v9_and_legacy_keys_and_crlf() {
+    fn vendored_npm_uuids_read_v9_and_legacy_keys_and_crlf() {
         let v9 = format!(
             "lockfileVersion: '9.0'\n\npackages:\n\n  a@file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz:\n    resolution: {{integrity: sha512-x, tarball: file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz}}\n    version: 1.0.0\n"
         );
@@ -958,12 +942,12 @@ mod tests {
             "lockfileVersion: '9.0'\n\nsnapshots:\n\n  a@file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz: {{}}\n"
         );
         for text in [&v9, &legacy, &snapshot] {
-            assert!(PnpmLock::parse(text).vendored_in_use(UUID), "{text}");
+            assert!(vendored_npm_uuids(text).contains(UUID), "{text}");
             let other = "22222222-2222-4222-8222-222222222222";
-            assert!(!PnpmLock::parse(text).vendored_in_use(other));
+            assert!(!vendored_npm_uuids(text).contains(other));
             let crlf = text.replace('\n', "\r\n");
             assert!(
-                PnpmLock::parse(&crlf).vendored_in_use(UUID),
+                vendored_npm_uuids(&crlf).contains(UUID),
                 "CRLF reads like LF"
             );
         }
@@ -971,7 +955,7 @@ mod tests {
         let overrides = format!(
             "lockfileVersion: '9.0'\n\noverrides:\n  a@1.0.0: file:.socket/vendor/npm/{UUID}/a-1.0.0.tgz\n"
         );
-        assert!(!PnpmLock::parse(&overrides).vendored_in_use(UUID));
+        assert!(!vendored_npm_uuids(&overrides).contains(UUID));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::api::types::PackageVendorResult;
-use crate::constants::npm_family::{PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY, VLT_HIDDEN_LOCK_REL};
+use crate::constants::npm_family::VLT_HIDDEN_LOCK_REL;
 use crate::formats::cargo::source_replacement::CratesIoSource;
 use crate::formats::governing_locks::PYPI_REQUIREMENTS;
 use crate::patch::redirect::npmrc::{
@@ -2706,12 +2706,7 @@ fn pnpm_trust(
     // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
     // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
     // config.
-    let shadowed = crate::formats::pnpm::plan::shadowed_locks(files);
-    let root_lock = match shadowed.iter().any(|key| key.as_str() == PNPM_LOCK) {
-        true => PNPM_SHRINKWRAP_LEGACY,
-        false => PNPM_LOCK,
-    };
-    let governing: Vec<&str> = std::iter::once(root_lock)
+    let governing: Vec<&str> = std::iter::once(crate::formats::pnpm::plan::root_lock(files))
         .chain(member_lock_keys.iter().map(String::as_str))
         .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();

@@ -1503,26 +1503,26 @@ impl Discovery {
     fn drop_env_twins(&mut self) {
         let lists = [&self.refs, &self.shadowed, &self.rewirable];
         if !lists
-            .into_iter()
+            .iter()
+            .copied()
             .flatten()
             .any(|r| r.part == TreePart::PnpmEnv)
         {
             return;
         }
-        let project: HashSet<(PathBuf, String, String, WiringMode)> =
-            [&self.refs, &self.shadowed, &self.rewirable]
-                .into_iter()
-                .flatten()
-                .filter(|r| r.part == TreePart::File)
-                .map(|r| {
-                    (
-                        r.source_file.clone(),
-                        r.purl.clone(),
-                        r.uuid.clone(),
-                        r.mode,
-                    )
-                })
-                .collect();
+        let project: HashSet<(PathBuf, String, String, WiringMode)> = lists
+            .into_iter()
+            .flatten()
+            .filter(|r| r.part == TreePart::File)
+            .map(|r| {
+                (
+                    r.source_file.clone(),
+                    r.purl.clone(),
+                    r.uuid.clone(),
+                    r.mode,
+                )
+            })
+            .collect();
         for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
             refs.retain(|r| {
                 r.part == TreePart::File
