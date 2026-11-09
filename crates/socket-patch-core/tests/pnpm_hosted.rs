@@ -134,19 +134,35 @@ fn mixed_newlines_preserve_unrelated_bytes() {
     roundtrip("pnpm-lock.yaml", lock, &dep("left-pad"), 1);
 }
 
+/// pnpm 1's early shrinkwrap (`shrinkwrapVersion: 3`) is no durable
+/// lock: a lone one refuses the dependency. Beside a `pnpm-lock.yaml` it
+/// is shadowed (N11: pnpm >= 3 never reads it), so it refuses nothing and
+/// only the governing lock is rewritten.
 #[test]
-fn early_pnpm1_refuses_non_durable_shrinkwrap_across_all_locks() {
+fn early_pnpm1_shrinkwrap_refuses_only_when_it_governs() {
     let old = "shrinkwrapVersion: 3\npackages:\n  /left-pad/1.3.0:\n    resolution:\n      integrity: sha1-UPSTREAM=\n";
     let newer = "lockfileVersion: '9.0'\npackages:\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-UPSTREAM==}\n";
-    let files = BTreeMap::from([
-        ("shrinkwrap.yaml".into(), old.into()),
-        ("pnpm-lock.yaml".into(), newer.into()),
-    ]);
-    let result = rewrite_registry_redirect(&files, &[dep("left-pad")]);
+    let alone = BTreeMap::from([("shrinkwrap.yaml".into(), old.into())]);
+    let result = rewrite_registry_redirect(&alone, &[dep("left-pad")]);
     assert!(result.files.is_empty() && result.edits.is_empty());
     assert!(result.refused_pnpm_uuids.contains("patch-id"));
     assert_eq!(
         result.warnings[0].code,
         "redirect_pnpm_legacy_lockfile_unsupported"
+    );
+
+    let both = BTreeMap::from([
+        ("shrinkwrap.yaml".into(), old.into()),
+        ("pnpm-lock.yaml".into(), newer.into()),
+    ]);
+    let result = rewrite_registry_redirect(&both, &[dep("left-pad")]);
+    assert!(
+        result.refused_pnpm_uuids.is_empty(),
+        "{:?}",
+        result.warnings
+    );
+    assert_eq!(
+        result.files.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["pnpm-lock.yaml"]
     );
 }
