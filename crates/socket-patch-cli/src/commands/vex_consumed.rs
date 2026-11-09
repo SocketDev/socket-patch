@@ -105,7 +105,7 @@ pub(crate) async fn hosted_consumed_copies(
             // Without installed copies the identity fallback's have not
             // had their store variants enumerated yet.
             if npm.contains(&purl) && installed.get(purl).is_none_or(Vec::is_empty) {
-                paths = with_store_peer_variant_copies(paths).await;
+                paths = with_store_peer_variant_copies(options.read_scope(), paths).await;
             }
             out.insert(
                 purl.clone(),
@@ -441,9 +441,12 @@ mod tests {
         static VARIANT_INPUTS: std::cell::RefCell<Vec<Vec<PathBuf>>>;
     }
 
-    pub(super) async fn recording_store_variants(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    pub(super) async fn recording_store_variants(
+        scope: socket_patch_core::utils::repo_root::ReadScope,
+        paths: Vec<PathBuf>,
+    ) -> Vec<PathBuf> {
         let _ = VARIANT_INPUTS.try_with(|calls| calls.borrow_mut().push(paths.clone()));
-        socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies(paths).await
+        socket_patch_core::crawlers::npm_crawler::with_store_peer_variant_copies(scope, paths).await
     }
 
     #[cfg(unix)]
@@ -782,7 +785,11 @@ mod tests {
             nm.join("left-pad"),
         )
         .unwrap();
-        let mut got = with_store_peer_variant_copies(vec![nm.join("left-pad")]).await;
+        let mut got = with_store_peer_variant_copies(
+            socket_patch_core::utils::repo_root::ReadScope::Workspace,
+            vec![nm.join("left-pad")],
+        )
+        .await;
         got.sort();
         let mut want = vec![
             nm.join("left-pad"),
@@ -791,7 +798,12 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want);
-        assert!(with_store_peer_variant_copies(Vec::new()).await.is_empty());
+        assert!(with_store_peer_variant_copies(
+            socket_patch_core::utils::repo_root::ReadScope::Workspace,
+            Vec::new()
+        )
+        .await
+        .is_empty());
     }
 
     /// vlt: every importer entry is a link into the `.vlt` store (the alias

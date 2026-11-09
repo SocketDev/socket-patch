@@ -5,6 +5,12 @@
 //!   unset, empty or `auto` searches the project directory and its
 //!   ancestors; any other value must be an absolute path to the file, and a
 //!   relative one makes go fail (`invalid GOWORK: not an absolute path`).
+//!   A `go.work` outside the repository root
+//!   ([`crate::utils::repo_root::ReadBoundary`]) is never read: go would
+//!   use it, so the workspace is [`GoWork::Invalid`] (writers refuse,
+//!   discovery withholds) rather than read or silently ignored. Members,
+//!   `go.work.sum` and replacement directories outside the root read as
+//!   missing.
 //! * **What the build selects** ([`GoWorkspace::selection`]): MVS over the
 //!   module graph go loads ([`GoWorkspace::read_graph`]): every `use`
 //!   member's `require`s, the `require`s in each of those modules' go.mod,
@@ -57,9 +63,16 @@ pub enum GoWork {
 }
 
 /// The `go.work` go would use for `project_root`, reading `GOWORK` from
-/// the environment, then the `go env -w` file.
+/// the environment, then the `go env -w` file, in a workspace run.
 pub fn resolve(project_root: &Path) -> GoWork {
-    resolve_with(
+    resolve_in(crate::utils::repo_root::ReadScope::Workspace, project_root)
+}
+
+/// [`resolve`] in a `scope` run: a global run (the Go crawler's
+/// `--global`) is not bounded by the repository root.
+pub fn resolve_in(scope: crate::utils::repo_root::ReadScope, project_root: &Path) -> GoWork {
+    resolve_scoped(
+        scope,
         project_root,
         crate::utils::go_env::go_env("GOWORK").as_deref(),
     )
@@ -67,18 +80,44 @@ pub fn resolve(project_root: &Path) -> GoWork {
 
 /// [`resolve`] for an explicit `GOWORK` value.
 pub fn resolve_with(project_root: &Path, gowork: Option<&str>) -> GoWork {
+    resolve_scoped(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project_root,
+        gowork,
+    )
+}
+
+fn resolve_scoped(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+    gowork: Option<&str>,
+) -> GoWork {
+    let bounded = |file: PathBuf| {
+        let bound = crate::utils::repo_root::ReadBoundary::upward(scope, project_root);
+        if bound.contains(&file) {
+            GoWork::File(file)
+        } else {
+            GoWork::Invalid(format!(
+                "go builds in workspace mode from {}, which socket-patch cannot model: {} \
+                 (set GOWORK=off, or keep the go.work inside the repository)",
+                file.display(),
+                bound.refusal(&file)
+            ))
+        }
+    };
     match gowork {
         Some("off") => GoWork::None,
         None | Some("") | Some("auto") => {
             let base = std::env::current_dir()
                 .unwrap_or_default()
                 .join(project_root);
+            // Only a stat above the root: the file is never opened there.
             base.ancestors()
                 .map(|dir| dir.join("go.work"))
                 .find(|file| file.is_file())
-                .map_or(GoWork::None, GoWork::File)
+                .map_or(GoWork::None, bounded)
         }
-        Some(path) if Path::new(path).is_absolute() => GoWork::File(PathBuf::from(path)),
+        Some(path) if Path::new(path).is_absolute() => bounded(PathBuf::from(path)),
         Some(path) => GoWork::Invalid(format!(
             "GOWORK={path} is not an absolute path, so go refuses to build (\"invalid \
              GOWORK: not an absolute path\")"
@@ -234,11 +273,22 @@ pub async fn load_with(project_root: &Path, gowork: Option<&str>) -> Loaded {
     match resolve_with(project_root, gowork) {
         GoWork::None => Loaded::None,
         GoWork::Invalid(why) => Loaded::Invalid(why),
-        GoWork::File(work_file) => load_file(work_file).await,
+        GoWork::File(work_file) => {
+            load_file(
+                work_file,
+                &crate::utils::repo_root::ReadBoundary::upward(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    project_root,
+                ),
+            )
+            .await
+        }
     }
 }
 
-async fn load_file(work_file: PathBuf) -> Loaded {
+/// Read `work_file` and what it names. A `use` member outside `bound`
+/// reads as one without a go.mod or go.sum (missing).
+async fn load_file(work_file: PathBuf, bound: &crate::utils::repo_root::ReadBoundary) -> Loaded {
     let text = match read_regular_to_string(&work_file).await {
         Ok(text) => go_mod_edit::normalize_for_read(&text),
         Err(e) => {
@@ -258,11 +308,17 @@ async fn load_file(work_file: PathBuf) -> Loaded {
     let mut members = Vec::new();
     for dir in go_mod_edit::parse_use_dirs(&text) {
         let dir = work_dir.join(dir);
-        let go_mod = read_regular_to_string(&dir.join("go.mod"))
-            .await
-            .ok()
-            .map(|t| go_mod_edit::normalize_for_read(&t));
-        let go_sum = read_regular_to_string(&dir.join("go.sum")).await.ok();
+        let (go_mod, go_sum) = if bound.contains(&dir) {
+            (
+                read_regular_to_string(&dir.join("go.mod"))
+                    .await
+                    .ok()
+                    .map(|t| go_mod_edit::normalize_for_read(&t)),
+                read_regular_to_string(&dir.join("go.sum")).await.ok(),
+            )
+        } else {
+            (None, None)
+        };
         members.push(Member {
             dir,
             go_mod,
@@ -661,6 +717,10 @@ impl GoWorkspace {
     /// [`GoWorkspace::read_graph`] against the module cache `cache`.
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
+        let bound = crate::utils::repo_root::ReadBoundary::upward(
+            crate::utils::repo_root::ReadScope::Workspace,
+            self.work_dir(),
+        );
         let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
         // go loads each member at its `workspace` level, which queues the
         // member's requirements at the member's own pruning.
@@ -688,7 +748,7 @@ impl GoWorkspace {
                     continue;
                 }
                 if !graph.contains_key(&key) {
-                    let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
+                    let dep = read_dep_go_mod(&replaces, cache, &bound, &path, &version).await;
                     graph.insert(key.clone(), dep);
                 }
                 let Some(Some(dep)) = graph.get(&key) else {
@@ -1053,10 +1113,13 @@ fn replacement_of<'a>(
 }
 
 /// The go.mod go reads for the dependency `path@version` (see
-/// [`GoWorkspace::read_graph`]).
+/// [`GoWorkspace::read_graph`]). A replacement directory outside `bound`
+/// is never read: its go.mod is missing, so the selection stays
+/// [`Selection::Unknown`] unless a higher version already shows.
 async fn read_dep_go_mod(
     sources: &[Vec<(ReplaceEntry, PathBuf)>; 2],
     cache: Option<&Path>,
+    bound: &crate::utils::repo_root::ReadBoundary,
     path: &str,
     version: &str,
 ) -> Option<DepGoMod> {
@@ -1077,7 +1140,10 @@ async fn read_dep_go_mod(
         Some((entry, dir)) => {
             match (&entry.path, &entry.rhs_module, &entry.rhs_version) {
                 (Some(rel), _, _) => {
-                    candidates.push(dir.join(rel.replace('\\', "/")).join("go.mod"))
+                    let go_mod = dir.join(rel.replace('\\', "/")).join("go.mod");
+                    if bound.contains(&go_mod) {
+                        candidates.push(go_mod);
+                    }
                 }
                 (None, Some(m), Some(v)) => candidates.extend(cached(m, v)),
                 _ => {}
@@ -1144,7 +1210,15 @@ pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
     if resolve(root) == GoWork::None {
         return Vec::new();
     }
-    match load_file(root.join("go.work")).await {
+    match load_file(
+        root.join("go.work"),
+        &crate::utils::repo_root::ReadBoundary::upward(
+            crate::utils::repo_root::ReadScope::Workspace,
+            root,
+        ),
+    )
+    .await
+    {
         Loaded::Workspace(ws) => ws
             .members_within(root)
             .into_iter()
@@ -1460,6 +1534,73 @@ mod tests {
         std::fs::remove_file(&work).unwrap();
         std::fs::create_dir(&work).unwrap();
         assert_eq!(resolve_with(&project, None), GoWork::None);
+    }
+
+    /// A go.work outside the repository root (an ancestor's, or one an
+    /// absolute GOWORK names) is never read: go would build from it, so
+    /// the workspace is Invalid and every writer refuses. Inside the root,
+    /// a `use` member or replacement directory outside it reads as missing.
+    #[tokio::test]
+    async fn go_work_outside_the_repository_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let project = repo.join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        member(&repo, "app", "1.21", &require("v1.0.0"));
+        write(tmp.path(), "go.work", "go 1.21\n\nuse ./repo/app\n");
+        for gowork in [None, Some("auto")] {
+            assert!(
+                matches!(resolve_with(&project, gowork),
+                    GoWork::Invalid(why) if why.contains("outside the repository root")),
+                "{gowork:?}"
+            );
+            assert!(matches!(
+                load_with(&project, gowork).await,
+                Loaded::Invalid(_)
+            ));
+        }
+        let elsewhere = tmp.path().join("go.work").to_string_lossy().into_owned();
+        assert!(matches!(
+            resolve_with(&project, Some(&elsewhere)),
+            GoWork::Invalid(why) if why.contains("outside the repository root")
+        ));
+        // Without a checkout the lookup walks on as before.
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(
+            resolve_with(&project, None),
+            GoWork::File(tmp.path().join("go.work"))
+        );
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // The repository's own go.work: a member outside it, and a replace
+        // pointing outside it, are missing rather than read.
+        member(tmp.path(), "outside", "1.21", &require("v1.9.0"));
+        write(
+            &repo,
+            "go.work",
+            &format!(
+                "go 1.21\n\nuse (\n\t./app\n\t../outside\n)\n\nreplace {DEP} v1.0.0 => ../fork\n"
+            ),
+        );
+        write(
+            tmp.path(),
+            "fork/go.mod",
+            &format!("module {DEP}\n\ngo 1.21\n"),
+        );
+        let Loaded::Workspace(mut ws) = load_with(&project, None).await else {
+            panic!("the repository's go.work loads");
+        };
+        let outside = ws
+            .members
+            .iter()
+            .find(|m| m.dir.ends_with("outside"))
+            .unwrap();
+        assert_eq!((&outside.go_mod, &outside.go_sum), (&None, &None));
+        let cache = tmp.path().join("cache");
+        ws.read_graph_from(Some(&cache)).await;
+        let graph = ws.graph.as_ref().unwrap();
+        assert_eq!(graph.get(&format!("{DEP}@v1.0.0")), Some(&None));
+        assert_eq!(ws.selection(DEP, "v1.0.0"), Selection::Unknown);
     }
 
     /// #1799: `-modfile` keeps a go.mod replace from the build unless it

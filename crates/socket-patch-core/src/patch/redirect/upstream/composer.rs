@@ -33,6 +33,7 @@ use crate::formats::composer::hosted::{
     find_composer_entry, find_composer_member, json_string_field, ComposerEntry,
 };
 use crate::utils::redact::url_hostname;
+use crate::vendor::common::parse_json_text;
 
 const COMPOSER_LOCK: &str = "composer.lock";
 /// The `notification-url` composer records for packagist packages.
@@ -119,7 +120,7 @@ fn declares_custom_repositories(composer_json: Option<&str>) -> Result<bool, Str
         return Ok(false);
     };
     let doc: Value =
-        serde_json::from_str(text).map_err(|e| format!("composer.json is not JSON: {e}"))?;
+        parse_json_text(text).map_err(|e| format!("composer.json is not JSON: {e}"))?;
     Ok(match doc.get("repositories") {
         None | Some(Value::Null) => false,
         Some(Value::Array(a)) => !a.is_empty(),
@@ -137,7 +138,7 @@ fn declares_custom_repositories(composer_json: Option<&str>) -> Result<bool, Str
 /// back). Options on another repository belong to that repository's
 /// entries, which the restore refuses.
 fn packagist_declares_options(composer_json: Option<&str>) -> bool {
-    let Some(doc) = composer_json.and_then(|t| serde_json::from_str::<Value>(t).ok()) else {
+    let Some(doc) = composer_json.and_then(|t| parse_json_text(t).ok()) else {
         return false;
     };
     let packagist_with_options = |r: &Value| {
@@ -495,6 +496,14 @@ mod tests {
             Ok(true)
         );
         assert!(declares_custom_repositories(Some("{")).is_err());
+        // One leading BOM is encoding, as composer.lock's readers treat it.
+        let bom = crate::formats::text::BOM;
+        assert_eq!(
+            declares_custom_repositories(Some(&format!(
+                "{bom}{{\"repositories\": [{{\"type\": \"vcs\", \"url\": \"https://g.example/x\"}}]}}"
+            ))),
+            Ok(true)
+        );
     }
 
     #[test]
@@ -522,6 +531,12 @@ mod tests {
             r#"{"repositories": [{"type": "composer", "url": "https://packagist.org.evil.example",
                 "options": {"http": {"header": ["X-Token: t"]}}}]}"#
         )));
+        let bom = crate::formats::text::BOM;
+        assert!(packagist_declares_options(Some(&format!(
+            "{bom}{}",
+            r#"{"repositories": [{"type": "composer", "url": "https://repo.packagist.org",
+                "options": {"http": {"proxy": "http://proxy:3128"}}}]}"#
+        ))));
     }
 
     #[test]

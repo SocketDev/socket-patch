@@ -606,6 +606,48 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A pnpm lock's pin while any `pnpm-lock.<branch>.yaml` exists (#556),
+    /// whatever pnpm's `gitBranchLockfile` setting says (discovery reads no
+    /// environment, so the setting cannot be decided), or while the members
+    /// that install from their own lock cannot be listed to rule one out:
+    /// with the setting on, pnpm installs a branch from its own lock, which
+    /// no wiring reaches, so hosted mode withholds these locks and vendored
+    /// mode refuses the project.
+    PnpmGitBranchLock,
+    /// An npm or Bun pin of a package the project patches itself
+    /// (`patchedDependencies`, npm's lock-entry `patched` record; npm
+    /// #711, `bun patch` #367): the package manager applies the user's
+    /// diff on top of the locked tarball (npm) or keys it to another
+    /// resolution (Bun), so hosted and vendored mode leave the package
+    /// unwired and never confirm it.
+    UserPatchedDependency,
+    /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
+    /// build's local evidence does not verify, or under a build-wide
+    /// blocker (stale or partial evidence, a `dependencyOverrides` /
+    /// `resolvers` reassignment, a `build.sbt.lock`): the same conditions
+    /// that withhold a hosted sbt ref's lock pin. The vendor ledger, not a
+    /// ref, carries this wiring, so the mark stands alone.
+    SbtResolutionUnverified,
+    /// A vendored sbt pin whose committed `.socket/vendor/maven2` tree file
+    /// is missing or does not hash to the pinned sha256: sbt's load-time
+    /// check fails the build closed, so no copy is the patch.
+    SbtVendoredTreeMissing,
+    /// A NuGet Socket source whose mapped id a governed `packages.lock.json`
+    /// also locks at a version other than the patched one: the mapping
+    /// routes every version of the id to a source that serves only the
+    /// patched one, so that target framework cannot restore — the case both
+    /// writers refuse (`redirect_nuget_lock_other_version`,
+    /// `vendor_nuget_lock_other_version`).
+    NugetLockOtherVersion,
+    /// A hosted sbt pin (`socket-patch.sbt`) whose bytes the build provably
+    /// does not use, and that no current evidence verifies: a build source
+    /// reassigns `dependencyOverrides` (replacing the generated override)
+    /// or `onLoad` without keeping it (dropping the load-time verifier),
+    /// or a resolution record dated after the wiring and every build source
+    /// shows the GA's base version, or the pinned version from outside the
+    /// pin repository with other bytes. The downloaded copy under
+    /// `.socket/sbt-hosted` then proves nothing about what the build runs.
+    SbtPinBypassed,
     /// A Go `replace` the workspace go resolves keeps from the build: that
     /// `go.work` (an ancestor's, or one `GOWORK` names) is not the root's,
     /// overrides the replace, does not `use` its module, or another member
@@ -628,8 +670,9 @@ impl UnattestedKind {
 /// A ref discovery emits (so rollback, remove and list find the wiring,
 /// and the ledgers' liveness gates still see it wired) that must not be
 /// attested: the files show a build that may run a copy the pin does not
-/// reach ([`UnattestedKind`]). The CLI's VEX plan omits every candidate of
-/// `(purl, uuid)` with `detail`. Unlike a contest
+/// reach ([`UnattestedKind`]). A vendored sbt pin is marked with no ref
+/// beside it (its vendor ledger entry is the claim). The CLI's VEX plan
+/// omits every candidate of `(purl, uuid)` with `detail`. Unlike a contest
 /// ([`Discovery::unpatched_copy`], [`Discovery::contest_across_locks`]),
 /// this never drops the ref, so `vendor --check` and `scan` keep treating
 /// the wiring as live — the right answer when re-running `scan` / `vendor`
@@ -654,6 +697,10 @@ pub enum CopyTarget {
     NpmName(String),
     /// Every ref.
     Any,
+    /// Exactly the ref of this canonical base purl wiring this patch uuid:
+    /// a mark for one ref that applies only if that ref survives every
+    /// contest.
+    Ref { purl: String, uuid: String },
 }
 
 /// A copy some build installs where no Socket wiring reaches, recorded by
@@ -683,6 +730,7 @@ impl UnwiredCopy {
                 .and_then(|(_, version)| npm_purl(name, version))
                 .is_some_and(|p| PurlKey::same(&p, &r.purl)),
             CopyTarget::Any => true,
+            CopyTarget::Ref { purl, uuid } => *uuid == r.uuid && PurlKey::same(purl, &r.purl),
         }
     }
 }
@@ -711,7 +759,10 @@ pub struct Discovery {
     /// [`Discovery::contest_within_locks`] ([`Discovery::unidentified_copy`]);
     /// always empty once discovery returns (folded into `unpatched_copies`).
     pub unidentified_copies: Vec<UnidentifiedCopy>,
-    /// Refs in `refs` whose wiring a build bypasses ([`Unattested`]).
+    /// Wired patches that must not be attested ([`Unattested`]): a ref in
+    /// `refs` whose wiring a build bypasses, or a vendored sbt pin whose
+    /// claim is its vendor ledger entry (no ref at all). Consumers match a
+    /// mark by `(purl, uuid)`, never by a ref.
     pub unattested: Vec<Unattested>,
     /// Copies no wiring reaches, pending [`Discovery::unattest_unwired_copies`];
     /// always empty once discovery returns (folded into `unattested`).
@@ -1381,8 +1432,10 @@ impl Discovery {
         });
     }
 
-    /// Record that the ref `(purl, uuid)` is wired but bypassed by the
-    /// build `file` shows ([`Unattested`]). Pushed beside the ref itself.
+    /// Record that patch `uuid` is wired for `purl` but must not be
+    /// attested, for the reason `file` shows ([`Unattested`]). Pushed
+    /// beside the ref itself, or, for a vendored sbt pin (whose claim is
+    /// the vendor ledger's, not a ref's), alone.
     pub(crate) fn unattested(
         &mut self,
         purl: &str,
@@ -2074,21 +2127,13 @@ pub(crate) fn hosted_uuids_in_text(text: &str, origins: &[String]) -> BTreeSet<S
 
 fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, WiringMode)> {
     use aho_corasick::AhoCorasick;
-    use std::borrow::Cow;
 
     let mut found = BTreeSet::new();
-    let decoded = decode_escapes(text);
-    // The folds only ever touch a backslash.
-    let norm: Cow<'_, str> = if decoded.contains('\\') {
-        Cow::Owned(
-            decoded
-                .replace("\\/", "/")
-                .replace("\\\\", "/")
-                .replace('\\', "/"),
-        )
-    } else {
-        decoded
-    };
+    // The escape fold the vendored revert's keep-checks share
+    // ([`crate::utils::path_spelling::mentions_path`] also collapses
+    // separator runs and ignores case; this sweep keeps both as written,
+    // since its hosted-url recognition anchors on `://`).
+    let norm = crate::utils::path_spelling::fold_path_spellings(text);
     let bytes = norm.as_bytes();
 
     // Every anchor in one pass. None of them overlaps itself, so each
@@ -2165,65 +2210,6 @@ fn socket_identities_inner(text: &str, origins: &[String]) -> BTreeSet<(String, 
         }
     }
     found
-}
-
-/// Best-effort decode of `\uXXXX` / `\UXXXXXXXX` escapes and XML entities
-/// (`&#x2F;`, `&#47;`, `&amp;`, …) for [`socket_identities`] — over-decoding
-/// (an escaped backslash before `u`) only ever ADDS recognition, which can
-/// only make a claim dead, never live.
-fn decode_escapes(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains("\\u") && !text.contains("\\U") && !text.contains('&') {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(i) = rest.find(['\\', '&']) {
-        out.push_str(&rest[..i]);
-        let tail = &rest[i..];
-        match decode_one_escape(tail) {
-            Some((ch, used)) => {
-                out.push(ch);
-                rest = &tail[used..];
-            }
-            None => {
-                // `\` and `&` are one byte each.
-                out.push_str(&tail[..1]);
-                rest = &tail[1..];
-            }
-        }
-    }
-    out.push_str(rest);
-    std::borrow::Cow::Owned(out)
-}
-
-/// The char one escape at the start of `tail` stands for, and its length.
-fn decode_one_escape(tail: &str) -> Option<(char, usize)> {
-    let hex_char = |digits: &str| char::from_u32(u32::from_str_radix(digits, 16).ok()?);
-    if let Some(rest) = tail.strip_prefix("\\u") {
-        return Some((hex_char(rest.get(..4)?)?, 6));
-    }
-    if let Some(rest) = tail.strip_prefix("\\U") {
-        return Some((hex_char(rest.get(..8)?)?, 10));
-    }
-    if let Some(rest) = tail.strip_prefix("&#") {
-        let end = rest.get(..rest.len().min(10))?.find(';')?;
-        let body = &rest[..end];
-        let ch = match body.strip_prefix(['x', 'X']) {
-            Some(hex) => hex_char(hex)?,
-            None => char::from_u32(body.parse().ok()?)?,
-        };
-        return Some((ch, end + 3));
-    }
-    [
-        ("&amp;", '&'),
-        ("&quot;", '"'),
-        ("&apos;", '\''),
-        ("&lt;", '<'),
-        ("&gt;", '>'),
-    ]
-    .into_iter()
-    .find(|(name, _)| tail.starts_with(name))
-    .map(|(name, ch)| (ch, name.len()))
 }
 
 /// Start of the url whose `://` (or `%3A%2F%2F`) is at byte `at`: the
@@ -2368,14 +2354,12 @@ pub(crate) fn is_decorated_vendor_path(s: &str) -> bool {
     vendor_ref(s).is_none() && vendor_ref_decorated(s).is_some()
 }
 
-/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`, one
-/// `./`, backslash and `\/` normalization), or `None`.
+/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`,
+/// `./`, backslash and `\/` normalization), or `None`: the writers' own
+/// root-anchoring rule ([`crate::vendor::path::vendor_rest_from`]), so
+/// discovery attests exactly the references the writers claim.
 fn root_anchored_vendor_rest(s: &str) -> Option<String> {
-    let norm = s.trim().replace("\\/", "/").replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    norm.strip_prefix(&format!("{VENDOR_DIR}/"))
-        .map(str::to_string)
+    crate::vendor::path::vendor_rest_from("", s)
 }
 
 /// Cut the lock-format decorations off a vendored leaf: everything from the
@@ -2676,6 +2660,20 @@ impl Discovery {
         vendored_wiring_live(root, &files, &entry.ecosystem, &entry.uuid).await
     }
 
+    /// [`Discovery::vendor_entry_live`] for a reader that must tell a dead
+    /// claim from an undecided one (`scan`'s takeover classifier, which
+    /// tells the user to remove a dead one): `None` when a JVM entry's
+    /// liveness cannot be decided — a pom could not be read, or the tree
+    /// is still referenced without attestable wiring
+    /// ([`crate::vendor::jvm::apply::entry_liveness`]). Every other entry
+    /// answers [`Discovery::vendor_entry_live`].
+    pub async fn vendor_entry_liveness(&self, root: &Path, entry: &VendorEntry) -> Option<bool> {
+        if crate::vendor::jvm::apply::is_jvm_entry(entry) {
+            return crate::vendor::jvm::apply::entry_liveness(root, entry);
+        }
+        Some(self.vendor_entry_live(root, entry).await)
+    }
+
     /// Whether the project still CONSUMES a vendor-ledger entry's artifact —
     /// the question the `scan --prune` GC reverts by and `scan`'s vendored
     /// ledger supplement re-discovers by, answered from the same discovery
@@ -2944,6 +2942,11 @@ impl<'a> LedgerLiveness<'a> {
     pub async fn vendor_entry(&self, entry: &VendorEntry) -> bool {
         self.discovery.vendor_entry_live(self.root, entry).await
     }
+
+    /// [`Discovery::vendor_entry_liveness`] for this project state.
+    pub async fn vendor_entry_state(&self, entry: &VendorEntry) -> Option<bool> {
+        self.discovery.vendor_entry_liveness(self.root, entry).await
+    }
 }
 
 /// A lock inventory entry (already known NOT to carry the patch uuid in its
@@ -2983,7 +2986,9 @@ pub async fn vendored_wiring_in_files(root: &Path, files: &[&str], eco: &str, uu
                 .await
                 .iter()
                 .any(|resolution| {
-                    crate::vendor::parse_vendor_path(resolution)
+                    // A nested `sub/bun.lockb` resolves from `sub/`.
+                    let base = file.rsplit_once('/').map_or("", |(dir, _)| dir);
+                    crate::vendor::path::parse_vendor_path_from(base, resolution)
                         .is_some_and(|p| p.eco == eco && p.uuid == uuid)
                 })
             {
@@ -3086,8 +3091,10 @@ pub async fn hosted_wiring_in_files(root: &Path, files: &[&str], uuid: &str) -> 
                 .await
                 .iter()
                 .any(|resolution| {
+                    // Any vendored spelling, ours or a sibling's, is not
+                    // hosted wiring.
                     resolution.contains(uuid)
-                        && crate::vendor::parse_vendor_path(resolution).is_none()
+                        && crate::vendor::path::recognize_vendor_path_anywhere(resolution).is_none()
                 })
             {
                 return true;
@@ -3347,9 +3354,14 @@ pub(crate) mod testing {
 
         /// A project rooted at `sub/` inside the throwaway directory, so a
         /// fixture can write files beside it (`../ext/…`) without leaving
-        /// the tempdir (#1516).
+        /// the tempdir (#1516). The throwaway directory is the git
+        /// checkout, so what lies beside the project is inside the
+        /// repository root that bounds every read.
         pub(crate) fn nested(sub: &str) -> Self {
             let dir = tempfile::tempdir().expect("create tempdir");
+            if !sub.is_empty() {
+                std::fs::create_dir_all(dir.path().join(".git")).expect("create .git");
+            }
             let root = dir.path().join(sub);
             std::fs::create_dir_all(&root).expect("create project root");
             Project {

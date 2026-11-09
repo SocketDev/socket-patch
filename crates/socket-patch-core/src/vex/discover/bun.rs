@@ -91,12 +91,13 @@
 //! keeps none for it) withdraws every ref of the same package in that lock
 //! ([`Unwired`], #497).
 
+use super::npm::mark_user_patched;
 use super::{
     canonical_base_purl, npm_purl, DiscoverCtx, Discovery, LocateOpts, Located, PatchedRef,
     WiringMode, DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
 use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
-use crate::patch::redirect::hosted_url_version;
+use crate::patch::redirect::{hosted_url_version, NpmUserPatches};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::bun_lock_text::{
     decode_json_string, is_bundled_entry, split_name_spec, user_tarball_version,
@@ -177,6 +178,41 @@ async fn extract_text(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
     bundled.contest(BUN_LOCK, out);
     unwired.contest(BUN_LOCK, out);
+    // The hosted text rewriter reads the manifest's keys and the copy Bun
+    // mirrors at the top of `bun.lock`.
+    let manifest = ctx.read_advisory_text("package.json").await;
+    let mut user_patches = NpmUserPatches::from_manifest(manifest.as_deref());
+    user_patches.add_mirrored_keys(BUN_LOCK, &text);
+    unattest_user_patched(BUN_LOCK, &user_patches, out);
+}
+
+// ── `bun patch` ──────────────────────────────────────────────────────────
+
+/// Mark every ref of `file` whose package the project patches itself with
+/// `bun patch` (#367) [`UnattestedKind::UserPatchedDependency`], by the
+/// hosted rewriters' own per-dependency rule (the npm extractor's
+/// [`mark_user_patched`], read against the ref's hosted URL or vendored
+/// tarball): Bun applies that patch only to the resolution it is keyed on,
+/// so hosted and vendored mode leave the package where it is and never
+/// confirm the Socket patch. A ref a pre-#367 run wired stays a ref, so
+/// `rollback` / `remove` / `list` still find it.
+fn unattest_user_patched(file: &str, user_patches: &NpmUserPatches, out: &mut Discovery) {
+    let refs: Vec<PatchedRef> = out
+        .refs
+        .iter()
+        .filter(|r| r.source_file == std::path::Path::new(file))
+        .cloned()
+        .collect();
+    for r in &refs {
+        mark_user_patched(
+            user_patches,
+            r,
+            "a patch the project applies with `bun patch` only while the package resolves \
+             to what that key names, not to this pin, so hosted and vendored mode leave the \
+             package alone",
+            out,
+        );
+    }
 }
 
 // ── bundled copies ───────────────────────────────────────────────────────
@@ -347,6 +383,11 @@ async fn extract_binary(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     }
     bundled.contest(BUN_LOCKB, out);
     unwired.contest(BUN_LOCKB, out);
+    // The binary lock mirrors no keys: the hosted engine and the vendored
+    // binary backend read the manifest's alone.
+    let manifest = ctx.read_advisory_text("package.json").await;
+    let user_patches = NpmUserPatches::from_manifest(manifest.as_deref());
+    unattest_user_patched(BUN_LOCKB, &user_patches, out);
 }
 
 // ── shared classification ────────────────────────────────────────────────
@@ -1875,6 +1916,120 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn user_patched(out: &Discovery) -> Vec<(&str, &str)> {
+        out.unattested
+            .iter()
+            .filter(|u| u.kind == UnattestedKind::UserPatchedDependency)
+            .map(|u| (u.purl.as_str(), u.uuid.as_str()))
+            .collect()
+    }
+
+    /// REGRESSION (#367, N2): a package the project patches itself with
+    /// `bun patch` is one the hosted rewriters (text and binary) leave on
+    /// its resolution and never confirm, and one vendored mode refuses. A
+    /// pin a pre-#367 run left stays a ref, for rollback, but is never
+    /// attested — by the rewriters' own per-dependency rule, so a key for
+    /// the pin's own tarball (a `bun patch` made on top of it) is no
+    /// conflict, and the manifest's keys and `bun.lock`'s mirror both count.
+    #[tokio::test]
+    async fn bun_user_patched_dependency_pin_is_not_attested() {
+        let p = fixture("basic", "expected");
+        let out = run(&p).await;
+        assert_refs(&out, &[(LEFT_PAD, FIXTURE_UUID, WiringMode::Hosted)]);
+        assert!(out.unattested.is_empty(), "control: {:#?}", out.unattested);
+        let url = out.refs[0].url.clone().unwrap();
+
+        for key in ["left-pad@1.3.0", "left-pad"] {
+            p.write(
+                "package.json",
+                format!(r#"{{"patchedDependencies":{{"{key}":"patches/left-pad.patch"}}}}"#),
+            );
+            let out = run(&p).await;
+            assert_refs(&out, &[(LEFT_PAD, FIXTURE_UUID, WiringMode::Hosted)]);
+            assert_eq!(user_patched(&out), [(LEFT_PAD, FIXTURE_UUID)], "{key}");
+            let detail = &out.unattested[0].detail;
+            assert!(detail.contains(&format!("`{key}`")), "{detail}");
+        }
+        // A patch keyed to the pin's own tarball applies on top of it: the
+        // rewriters leave such a package wired, and so does discovery.
+        p.write(
+            "package.json",
+            format!(r#"{{"patchedDependencies":{{"left-pad@{url}":"patches/left-pad.patch"}}}}"#),
+        );
+        assert_eq!(user_patched(&run(&p).await), []);
+
+        // Vendored, keyed to the registry release; the key mirrored at the
+        // top of `bun.lock` counts like the manifest's.
+        let p = Project::new();
+        let mut lock = text_lock(
+            1,
+            &[tuple(
+                "left-pad",
+                &format!("left-pad@.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"),
+                Some(SRI),
+            )],
+        );
+        p.write("bun.lock", &lock);
+        assert_eq!(user_patched(&run(&p).await), [], "control");
+        lock = lock.replacen(
+            "  \"packages\": {\n",
+            "  \"patchedDependencies\": {\n    \"left-pad@1.3.0\": \"patches/left-pad@1.3.0.patch\",\n  },\n  \"packages\": {\n",
+            1,
+        );
+        p.write("bun.lock", &lock);
+        let out = run(&p).await;
+        assert_refs(&out, &[(LEFT_PAD, UUID_A, WiringMode::Vendored)]);
+        assert_eq!(user_patched(&out), [(LEFT_PAD, UUID_A)]);
+        // Review (#2010): the detail names where the key is, not
+        // package.json when only the lock mirrors it.
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("bun.lock `patchedDependencies` has `left-pad@1.3.0`")
+                && !detail.contains("package.json"),
+            "{detail}"
+        );
+
+        // `bun.lockb`: the manifest's keys.
+        let (_, bytes) = lockb_fixtures().into_iter().next().unwrap();
+        let p = Project::new();
+        p.write(
+            "bun.lockb",
+            rewire(&bytes, &[hosted_minimist("1.2.2", UUID_A)]),
+        );
+        p.write(
+            "package.json",
+            r#"{"patchedDependencies":{"minimist@1.2.2":"patches/minimist.patch"}}"#,
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/minimist@1.2.2", UUID_A, WiringMode::Hosted)],
+        );
+        assert_eq!(user_patched(&out), [("pkg:npm/minimist@1.2.2", UUID_A)]);
+    }
+
+    /// Review (#2010): a user-patched `bun.lock` ref another lock contests
+    /// is dropped by the cross-lock contest and leaves no mark behind.
+    #[tokio::test]
+    async fn a_contested_user_patched_bun_ref_leaves_no_mark() {
+        let p = fixture("basic", "expected");
+        p.write(
+            "package.json",
+            r#"{"patchedDependencies":{"left-pad@1.3.0":"patches/left-pad.patch"}}"#,
+        );
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-UP==}\n",
+        );
+        let out = p.discover().await;
+        assert!(
+            out.refs.iter().all(|r| r.purl != LEFT_PAD),
+            "the contest drops the ref: {:#?}",
+            out.refs
+        );
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
     }
 
     /// REGRESSION (#469), `bun.lockb`: a record a bundled edge reaches is

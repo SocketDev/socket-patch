@@ -1,0 +1,5 @@
+[project]
+name = "proj"
+version = "0.1.0"
+requires-python = ">=3.9"
+dependencies = ["urllib3==1.26.18", "python-dateutil==2.9.0.post0", "isodate==0.6.1"]
