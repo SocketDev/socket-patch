@@ -127,11 +127,14 @@ fn wheel_tags(wheel: &str) -> BTreeSet<String> {
 ///
 /// * The installed `<dist-info>/WHEEL` must carry the patched wheel's tags;
 ///   any other copy (another platform's build, an sdist install with no
-///   `WHEEL`) is never judged.
+///   `WHEEL`), or a record listing no files, cannot be judged: `None`.
 /// * `patched`: every recorded file reads back at its recorded hash.
 /// * `stale_evidence`: some recorded file was read and hashes to something
 ///   else. Missing, unreadable and unsafe-path files are never evidence.
-pub async fn judge_installed_wheel(site: &Path, record: &WheelRecord) -> InstalledRecordJudgment {
+pub async fn judge_installed_wheel(
+    site: &Path,
+    record: &WheelRecord,
+) -> Option<InstalledRecordJudgment> {
     let site = site.to_path_buf();
     let record = record.clone();
     crate::utils::fs::run_blocking(move || {
@@ -141,7 +144,7 @@ pub async fn judge_installed_wheel(site: &Path, record: &WheelRecord) -> Install
         let same_build = crate::utils::fs::read_regular_to_string_sync(&installed_wheel)
             .is_ok_and(|text| wheel_tags(&text) == record.tags && !record.tags.is_empty());
         if !same_build || record.files.is_empty() {
-            return InstalledRecordJudgment::default();
+            return None;
         }
         let mut out = InstalledRecordJudgment {
             patched: true,
@@ -159,13 +162,13 @@ pub async fn judge_installed_wheel(site: &Path, record: &WheelRecord) -> Install
             let got =
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes));
             if got != want.trim_end_matches('=') {
-                return InstalledRecordJudgment {
+                return Some(InstalledRecordJudgment {
                     patched: false,
                     stale_evidence: true,
-                };
+                });
             }
         }
-        out
+        Some(out)
     })
     .await
 }
@@ -238,11 +241,11 @@ mod tests {
         let record = parse_wheel_record(&wheel()).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         install(tmp.path(), PATCHED, WHEEL);
-        let judged = judge_installed_wheel(tmp.path(), &record).await;
+        let judged = judge_installed_wheel(tmp.path(), &record).await.unwrap();
         assert!(judged.patched && !judged.stale_evidence, "{judged:?}");
 
         install(tmp.path(), UPSTREAM, WHEEL);
-        let judged = judge_installed_wheel(tmp.path(), &record).await;
+        let judged = judge_installed_wheel(tmp.path(), &record).await.unwrap();
         assert!(!judged.patched && judged.stale_evidence, "{judged:?}");
 
         install(
@@ -252,8 +255,8 @@ mod tests {
         );
         assert_eq!(
             judge_installed_wheel(tmp.path(), &record).await,
-            InstalledRecordJudgment::default(),
-            "another build's bytes are never evidence"
+            None,
+            "another build's bytes cannot be judged by this wheel"
         );
     }
 
@@ -274,7 +277,10 @@ mod tests {
             )
             .await
             .expect("a FIFO must not block the probe");
-            assert_eq!(judged, InstalledRecordJudgment::default(), "{target}");
+            // An unreadable WHEEL leaves the build unknown; an unreadable
+            // module is no evidence either way.
+            let want = (target == "pkg/mod.py").then(InstalledRecordJudgment::default);
+            assert_eq!(judged, want, "{target}");
         }
     }
 
@@ -286,7 +292,7 @@ mod tests {
         std::fs::remove_file(tmp.path().join("pkg/mod.py")).unwrap();
         assert_eq!(
             judge_installed_wheel(tmp.path(), &record).await,
-            InstalledRecordJudgment::default()
+            Some(InstalledRecordJudgment::default())
         );
     }
 

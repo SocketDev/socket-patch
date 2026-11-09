@@ -786,3 +786,68 @@ async fn pdm_recorded_env_is_probed_for_stale_hosted_installs() {
         assert_eq!(json["vex"]["statements"], 1, "pep582={pep582}: {json}");
     }
 }
+
+/// The patched wheel cannot be downloaded: the stale-install probe falls
+/// back to the patch's view record, fetched once, and still flags the warm
+/// upstream copy; once the env holds the patched bytes, the same fallback
+/// finds it patched.
+#[tokio::test]
+async fn pdm_stale_probe_falls_back_to_the_view_when_the_wheel_fails() {
+    const WHEEL_PATH: &str = "/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+    let server = MockServer::start().await;
+    mock_api(&server).await;
+    let wheel = patched_wheel::build(
+        "urllib3-1.26.18.dist-info",
+        &[("urllib3/response.py", PATCHED)],
+    );
+    patched_wheel::mount_grant(&server, ORG, UUID, PURL, WHEEL_PATH, wheel).await;
+    Mock::given(method("GET"))
+        .and(path(WHEEL_PATH))
+        .respond_with(ResponseTemplate::new(500))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    write_project(&root, LOCK);
+    let venv = tmp.path().join("pdm-venvs").join("app-AbCd-3.12");
+    std::fs::create_dir_all(&venv).unwrap();
+    std::fs::write(venv.join("pyvenv.cfg"), "home = /usr/bin\n").unwrap();
+    let python = if cfg!(windows) {
+        venv.join("Scripts").join("python.exe")
+    } else {
+        venv.join("bin").join("python")
+    };
+    std::fs::write(root.join(".pdm-python"), python.display().to_string()).unwrap();
+    let site = if cfg!(windows) {
+        venv.join("Lib").join("site-packages")
+    } else {
+        venv.join("lib").join("python3.12").join("site-packages")
+    };
+    install_urllib3(&site, UPSTREAM);
+    let views = || async {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().contains("/patches/view/"))
+            .count()
+    };
+
+    let (code, json) = scan_json(&root, &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    assert!(stale_warning(&json), "{json}");
+    assert_eq!(
+        views().await,
+        1,
+        "one view, for the purl the wheel could not judge"
+    );
+
+    install_urllib3(&site, PATCHED);
+    let (code, json) = scan_json(&root, &server, &[]).await;
+    assert_eq!(code, Some(0), "{json}");
+    assert!(!stale_warning(&json), "{json}");
+    assert_eq!(views().await, 2);
+}

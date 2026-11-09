@@ -189,6 +189,69 @@ fn acquire_hosted_lock(
 struct StaleInstallOutcome {
     warnings: Vec<serde_json::Value>,
     stale_purls: std::collections::BTreeSet<String>,
+    /// Installed copies no evidence could judge: no archive or wheel to
+    /// compare, and no patch-view record either (the fetch failed, or
+    /// `--offline`). Never assumed patched: the same-run `--vex` withholds
+    /// them.
+    unjudged_purls: std::collections::BTreeSet<String>,
+}
+
+/// The gem and Python stale-install probes' fallback: when a confirmed
+/// patch's archive or wheel evidence is missing, cannot be fetched, or
+/// cannot judge the installed copy, that patch's own `/patches/view` record
+/// judges it, as before the probes moved off the view. Fetched at most once
+/// per uuid and only for a copy nothing else settled, so a run whose
+/// evidence is all local or downloaded fetches no view. `--offline` fetches
+/// nothing.
+struct ViewFallback<'a> {
+    api: Option<&'a socket_patch_core::api::client::ApiClient>,
+    fetched: std::collections::BTreeMap<
+        String,
+        Option<socket_patch_core::manifest::schema::PatchRecord>,
+    >,
+}
+
+impl<'a> ViewFallback<'a> {
+    fn new(api: &'a socket_patch_core::api::client::ApiClient, offline: bool) -> Self {
+        Self {
+            api: (!offline).then_some(api),
+            fetched: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// A fallback that fetches nothing, as under `--offline`.
+    #[cfg(test)]
+    fn offline() -> Self {
+        Self {
+            api: None,
+            fetched: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `uuid`'s view record; `None` when there is none to judge by
+    /// (`--offline`, a failed or not-found fetch, another patch's record,
+    /// or one listing no files).
+    async fn record(
+        &mut self,
+        uuid: &str,
+    ) -> Option<&socket_patch_core::manifest::schema::PatchRecord> {
+        if !self.fetched.contains_key(uuid) {
+            let record = match self.api {
+                Some(api) => api
+                    .fetch_patch(uuid)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|view| {
+                        socket_patch_core::manifest::records::record_from_patch_response(&view).1
+                    })
+                    .filter(|record| record.uuid == uuid && !record.files.is_empty()),
+                None => None,
+            };
+            self.fetched.insert(uuid.to_string(), record);
+        }
+        self.fetched.get(uuid).and_then(Option::as_ref)
+    }
 }
 
 /// The `redirect_gem_stale_install` warning for one stale installed
@@ -283,6 +346,10 @@ fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
 ///   patched, any other readable one is stale. An agent-mode manifest
 ///   record of the same patch judges the dir by its `afterHash` map instead
 ///   (an in-place patch keeps the upstream archive).
+/// * With neither (no readable archive, or no patched sha to compare it
+///   with), the patch's view record judges the dir ([`ViewFallback`]). A
+///   dir that record cannot judge either (the fetch failed, or `--offline`)
+///   is reported in `unjudged_purls`, never as healthy.
 /// * Judgments are grouped by installed dir: platform-variant purls of one
 ///   gem share a dir, and if any variant proves it patched, it is never
 ///   warned.
@@ -304,27 +371,25 @@ async fn gem_stale_install_warnings(
         (String, String),
         std::collections::BTreeSet<String>,
     >,
+    views: &mut ViewFallback<'_>,
 ) -> StaleInstallOutcome {
     use socket_patch_core::crawlers::types::CrawlerOptions;
     use socket_patch_core::crawlers::RubyCrawler;
     use socket_patch_core::manifest::schema::PatchRecord;
     use socket_patch_core::vendor::file_sha256_hex;
-    use socket_patch_core::vex::verify::judge_installed_record;
+    use socket_patch_core::vex::verify::{judge_installed_record, InstalledRecordJudgment};
 
     let mut out = StaleInstallOutcome::default();
-    // Return before the crawler (and its `gem env` spawn) when nothing can
-    // be judged.
-    let candidates: Vec<(&str, Option<&PatchRecord>)> = confirmed
+    // Return before the crawler (and its `gem env` spawn) when there is no
+    // gem to judge.
+    let candidates: Vec<(&str, &str, Option<&PatchRecord>)> = confirmed
         .iter()
         .filter(|(purl, _)| purl.starts_with("pkg:gem/"))
         .map(|(purl, uuid)| {
             let local = local_records
                 .values()
                 .find(|r| &r.uuid == uuid && !r.files.is_empty());
-            (purl.as_str(), local)
-        })
-        .filter(|(purl, local)| {
-            local.is_some() || gem_artifact_shas.contains_key(&gem_sha_key(purl))
+            (purl.as_str(), uuid.as_str(), local)
         })
         .collect();
     if candidates.is_empty() {
@@ -337,7 +402,21 @@ async fn gem_stale_install_warnings(
         leaf: String,
         patched: bool,
         positive: bool,
+        /// Some variant had no evidence at all (see `unjudged_purls`).
+        unjudged: bool,
+        /// Every candidate purl installed in this dir.
+        purls: std::collections::BTreeSet<String>,
         project_local: bool,
+    }
+    impl DirJudgment {
+        fn record(&mut self, purl: &str, judged: InstalledRecordJudgment) {
+            if judged.patched {
+                self.patched = true;
+            } else if !self.positive && judged.stale_evidence {
+                self.positive = true;
+                self.purl = purl.to_string();
+            }
+        }
     }
     let crawler = RubyCrawler::new();
     let options = CrawlerOptions {
@@ -351,7 +430,7 @@ async fn gem_stale_install_warnings(
     let homes = crawler.bundler_install_homes(&options).await;
     let stripped: Vec<String> = candidates
         .iter()
-        .map(|(purl, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
+        .map(|(purl, _, _)| socket_patch_core::utils::purl::strip_purl_qualifiers(purl).to_string())
         .collect();
     let mut found_per_home = Vec::with_capacity(homes.len());
     for home in &homes {
@@ -364,7 +443,9 @@ async fn gem_stale_install_warnings(
         std::collections::BTreeMap::new();
     // Bundler's configured cache dir (`cache_path`, default vendor/cache).
     let app_cache = socket_patch_core::crawlers::ruby_crawler::bundler_app_cache_dir(cwd).await;
-    for (index, (purl, local)) in candidates.iter().enumerate() {
+    // Copies with no local evidence, judged by the view fallback below.
+    let mut pending: Vec<(std::path::PathBuf, &str, &str)> = Vec::new();
+    for (index, (purl, uuid, local)) in candidates.iter().enumerate() {
         for (found, project_local) in &found_per_home {
             let Some(pkg) = &found[index] else {
                 continue;
@@ -382,36 +463,51 @@ async fn gem_stale_install_warnings(
                     leaf: leaf.to_string(),
                     patched: false,
                     positive: false,
+                    unjudged: false,
+                    purls: std::collections::BTreeSet::new(),
                     project_local: *project_local,
                 });
+            entry.purls.insert((*purl).to_string());
             let judged = match local {
-                Some(record) => judge_installed_record(&pkg.path, record).await,
-                None => {
-                    let archive = pkg
-                        .path
-                        .parent()
-                        .and_then(Path::parent)
-                        .map(|home| home.join("cache").join(format!("{leaf}.gem")));
-                    let sha = match archive {
-                        Some(archive) => file_sha256_hex(&archive).await,
-                        None => None,
-                    };
-                    let patched_shas = gem_artifact_shas.get(&gem_sha_key(purl));
-                    match sha {
-                        Some(sha) => socket_patch_core::vex::verify::InstalledRecordJudgment {
-                            patched: patched_shas.is_some_and(|shas| shas.contains(&sha)),
-                            stale_evidence: patched_shas.is_some_and(|shas| !shas.contains(&sha)),
-                        },
-                        None => Default::default(),
+                Some(record) => Some(judge_installed_record(&pkg.path, record).await),
+                None => match gem_artifact_shas.get(&gem_sha_key(purl)) {
+                    Some(patched_shas) => {
+                        let archive = pkg
+                            .path
+                            .parent()
+                            .and_then(Path::parent)
+                            .map(|home| home.join("cache").join(format!("{leaf}.gem")));
+                        let sha = match archive {
+                            Some(archive) => file_sha256_hex(&archive).await,
+                            None => None,
+                        };
+                        sha.map(|sha| InstalledRecordJudgment {
+                            patched: patched_shas.contains(&sha),
+                            stale_evidence: !patched_shas.contains(&sha),
+                        })
                     }
-                }
+                    None => None,
+                },
             };
-            if judged.patched {
-                entry.patched = true;
-            } else if !entry.positive && judged.stale_evidence {
-                entry.positive = true;
-                entry.purl = (*purl).to_string();
+            match judged {
+                Some(judged) => entry.record(purl, judged),
+                None => pending.push((pkg.path.clone(), purl, uuid)),
             }
+        }
+    }
+    // No archive to compare (pruned cache, `gem cleanup`) or no patched sha
+    // to compare it with: the view record judges the dir, unless another
+    // variant already proved it patched.
+    for (dir, purl, uuid) in pending {
+        let Some(entry) = dir_state.get_mut(&dir) else {
+            continue;
+        };
+        if entry.patched {
+            continue;
+        }
+        match views.record(uuid).await {
+            Some(record) => entry.record(purl, judge_installed_record(&dir, record).await),
+            None => entry.unjudged = true,
         }
     }
 
@@ -421,7 +517,13 @@ async fn gem_stale_install_warnings(
     // a remedy that leaves it behind silently reinstates the stale bytes.
     let mut cache_covered: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
     for (dir, j) in &dir_state {
-        if j.patched || !j.positive {
+        if j.patched {
+            continue;
+        }
+        if !j.positive {
+            if j.unjudged {
+                out.unjudged_purls.extend(j.purls.iter().cloned());
+            }
             continue;
         }
         let project_cache = app_cache.join(format!("{}.gem", j.leaf));
@@ -457,7 +559,7 @@ async fn gem_stale_install_warnings(
     // whose project-local install warning did not already fold it in (a
     // fresh checkout with a committed stale cache has no installed dir at
     // all, and would otherwise never warn).
-    for (purl, _) in &candidates {
+    for (purl, _, _) in &candidates {
         if cache_covered.contains(purl) {
             continue;
         }
@@ -1465,6 +1567,8 @@ async fn run_redirect_selected_untracked(
             .map(|manifest| manifest.patches.into_iter().collect())
             .unwrap_or_default()
     };
+    // The gem and Python probes' shared patch-view fallback.
+    let mut views = ViewFallback::new(api_client, common.offline);
     // Gem stale-install probe (see `gem_stale_install_warnings`): runs after
     // the writes so the warning describes the project as this run leaves it.
     // Idempotent re-scans re-confirm and re-probe, so the warning keeps
@@ -1501,6 +1605,7 @@ async fn run_redirect_selected_untracked(
             &confirmed,
             &local_records,
             &gem_artifact_shas,
+            &mut views,
         )
         .await
     };
@@ -1519,6 +1624,7 @@ async fn run_redirect_selected_untracked(
                 .map(String::as_str),
             &done.overrides,
             &local_records,
+            &mut views,
         )
         .await
     };
@@ -1692,6 +1798,8 @@ async fn run_redirect_selected_untracked(
                     && !nuget_stale.stale_purls.contains(purl)
                     && !python_stale.stale_purls.contains(purl)
                     && !vlt_stale.stale_purls.contains(purl)
+                    && !gem_stale.unjudged_purls.contains(purl)
+                    && !python_stale.unjudged_purls.contains(purl)
             })
             .collect();
         // A healthy copy in another interpreter must not override a stale
@@ -1702,6 +1810,14 @@ async fn run_redirect_selected_untracked(
             .iter()
             .chain(&nuget_stale.stale_purls)
             .chain(&vlt_stale.stale_purls)
+            .cloned()
+            .collect();
+        // An installed copy the probes could not judge is withheld, never
+        // assumed patched (nor verified against another interpreter's copy).
+        params.unjudged = gem_stale
+            .unjudged_purls
+            .iter()
+            .chain(&python_stale.unjudged_purls)
             .cloned()
             .collect();
         let manifest_path = common.resolved_manifest_path();
@@ -2935,6 +3051,7 @@ mod tests {
             confirmed,
             records,
             &std::collections::BTreeMap::new(),
+            &mut super::ViewFallback::offline(),
         )
         .await
     }
@@ -3173,7 +3290,8 @@ mod tests {
     /// Without an agent-mode record, an installed dir is judged by the
     /// archive RubyGems installed it from (`<home>/cache/<leaf>.gem`): a
     /// patched artifact's sha is patched and quiet, any other readable
-    /// archive is stale, and a missing one is never evidence.
+    /// archive is stale, and a missing one is never evidence: with no view
+    /// record to fall back on, the dir is unjudged.
     #[tokio::test]
     async fn gem_stale_probe_judges_the_installed_archive_without_a_record() {
         use sha2::{Digest as _, Sha256};
@@ -3191,8 +3309,16 @@ mod tests {
         )]);
         let one_confirmed = one_confirmed();
 
-        let out =
-            gem_stale_install_warnings(tmp.path(), false, None, &one_confirmed, &none, &shas).await;
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed,
+            &none,
+            &shas,
+            &mut super::ViewFallback::offline(),
+        )
+        .await;
         assert_eq!(out.warnings.len(), 1, "the upstream archive is stale");
         assert_eq!(
             out.stale_purls,
@@ -3200,14 +3326,215 @@ mod tests {
         );
 
         std::fs::write(&cache, b"patched .gem").unwrap();
-        let out =
-            gem_stale_install_warnings(tmp.path(), false, None, &one_confirmed, &none, &shas).await;
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed,
+            &none,
+            &shas,
+            &mut super::ViewFallback::offline(),
+        )
+        .await;
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
 
         std::fs::remove_file(&cache).unwrap();
-        let out =
-            gem_stale_install_warnings(tmp.path(), false, None, &one_confirmed, &none, &shas).await;
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed,
+            &none,
+            &shas,
+            &mut super::ViewFallback::offline(),
+        )
+        .await;
         assert!(out.warnings.is_empty(), "no archive, no evidence");
+        assert!(out.stale_purls.is_empty());
+        assert_eq!(
+            out.unjudged_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()]),
+            "a copy nothing judged is never reported healthy"
+        );
+    }
+
+    /// A patch API whose view of `GEM_UUID` answers `status` (`gem_record()`
+    /// on 200), and a client pointed at it.
+    async fn gem_view_server(
+        status: u16,
+    ) -> (
+        wiremock::MockServer,
+        socket_patch_core::api::client::ApiClient,
+    ) {
+        use socket_patch_core::api::client::{ApiClient, ApiClientOptions, ApiRoute};
+        let server = wiremock::MockServer::start().await;
+        let record = gem_record();
+        let files: serde_json::Map<String, serde_json::Value> = record
+            .files
+            .iter()
+            .map(|(path, info)| {
+                (
+                    path.clone(),
+                    serde_json::json!({
+                        "beforeHash": info.before_hash,
+                        "afterHash": info.after_hash,
+                    }),
+                )
+            })
+            .collect();
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path(format!("/patch/view/{GEM_UUID}")))
+            .respond_with(wiremock::ResponseTemplate::new(status).set_body_json(
+                serde_json::json!({
+                    "uuid": GEM_UUID,
+                    "purl": GEM_PURL,
+                    "publishedAt": "Thu, 01 Jan 2026 00:00:00 GMT",
+                    "files": files,
+                    "vulnerabilities": {},
+                    "description": "x",
+                    "license": "MIT",
+                    "tier": "free",
+                }),
+            ))
+            .mount(&server)
+            .await;
+        let api = ApiClient::new(ApiClientOptions {
+            api_url: server.uri(),
+            api_token: None,
+            route: ApiRoute::Proxy,
+        });
+        (server, api)
+    }
+
+    async fn view_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| request.url.path().contains("/view/"))
+            .count()
+    }
+
+    /// No cached archive (an image that pruned `cache/`, or `gem cleanup`):
+    /// the patch's view record judges the installed dir, fetched once.
+    #[tokio::test]
+    async fn gem_stale_probe_without_an_archive_judges_by_the_view() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gem_dir = materialize_gem(tmp.path(), GEM_UPSTREAM);
+        std::fs::remove_file(
+            gem_home(tmp.path())
+                .join("cache")
+                .join(format!("{GEM_LEAF}.gem")),
+        )
+        .unwrap();
+        let shas = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from(["0".repeat(64)]),
+        )]);
+        let none = std::collections::BTreeMap::new();
+        let (server, api) = gem_view_server(200).await;
+
+        let mut views = super::ViewFallback::new(&api, false);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &none,
+            &shas,
+            &mut views,
+        )
+        .await;
+        assert_eq!(out.warnings.len(), 1, "judged stale by the view record");
+        assert_eq!(
+            out.stale_purls,
+            std::collections::BTreeSet::from([GEM_PURL.to_string()])
+        );
+        assert!(out.unjudged_purls.is_empty());
+        assert_eq!(view_requests(&server).await, 1);
+
+        std::fs::write(gem_dir.join("lib").join("stale_unit.rb"), GEM_PATCHED).unwrap();
+        let mut views = super::ViewFallback::new(&api, false);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &none,
+            &shas,
+            &mut views,
+        )
+        .await;
+        assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+        assert!(out.stale_purls.is_empty() && out.unjudged_purls.is_empty());
+    }
+
+    /// The view fallback cannot judge either (the fetch fails, or
+    /// `--offline` fetches nothing): the dir is unjudged, never healthy.
+    #[tokio::test]
+    async fn gem_stale_probe_without_an_archive_or_a_view_is_unjudged() {
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        std::fs::remove_file(
+            gem_home(tmp.path())
+                .join("cache")
+                .join(format!("{GEM_LEAF}.gem")),
+        )
+        .unwrap();
+        let none = std::collections::BTreeMap::new();
+        for (status, offline) in [(500, false), (200, true)] {
+            let (server, api) = gem_view_server(status).await;
+            let mut views = super::ViewFallback::new(&api, offline);
+            let out = gem_stale_install_warnings(
+                tmp.path(),
+                false,
+                None,
+                &one_confirmed(),
+                &none,
+                &std::collections::BTreeMap::new(),
+                &mut views,
+            )
+            .await;
+            assert!(out.warnings.is_empty(), "{:?}", out.warnings);
+            assert!(out.stale_purls.is_empty());
+            assert_eq!(
+                out.unjudged_purls,
+                std::collections::BTreeSet::from([GEM_PURL.to_string()]),
+                "status={status} offline={offline}"
+            );
+            assert_eq!(
+                view_requests(&server).await,
+                usize::from(!offline),
+                "--offline fetches nothing"
+            );
+        }
+    }
+
+    /// The installed archive settles the dir: no view is fetched.
+    #[tokio::test]
+    async fn gem_stale_probe_with_an_archive_fetches_no_view() {
+        use sha2::{Digest as _, Sha256};
+        let tmp = tempfile::tempdir().unwrap();
+        materialize_gem(tmp.path(), GEM_UPSTREAM);
+        let shas = std::collections::BTreeMap::from([(
+            ("stale-unit".to_string(), "1.0.0".to_string()),
+            std::collections::BTreeSet::from([hex::encode(Sha256::digest(b"upstream .gem"))]),
+        )]);
+        let (server, api) = gem_view_server(200).await;
+        let mut views = super::ViewFallback::new(&api, false);
+        let out = gem_stale_install_warnings(
+            tmp.path(),
+            false,
+            None,
+            &one_confirmed(),
+            &std::collections::BTreeMap::new(),
+            &shas,
+            &mut views,
+        )
+        .await;
+        assert!(out.warnings.is_empty() && out.unjudged_purls.is_empty());
+        assert_eq!(view_requests(&server).await, 0);
     }
 
     /// #709: a `.bundle/config` `path` outside the project is refused as an
@@ -3318,6 +3645,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &std::collections::BTreeMap::new(),
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(
@@ -3392,6 +3720,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(out.warnings.len(), 1, "one warning, cache folded in");
@@ -3434,6 +3763,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(out.warnings.len(), 1, "stale committed cache must warn");
@@ -3461,6 +3791,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &patched_shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert!(out.warnings.is_empty(), "a patched archive must not warn");
@@ -3483,6 +3814,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert!(out.warnings.is_empty());
@@ -3524,6 +3856,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(out.warnings.len(), 1, "configured cache must warn");
@@ -3548,6 +3881,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(out.warnings.len(), 1, "one warning, cache folded in");
@@ -3574,6 +3908,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         assert_eq!(out.warnings.len(), 1, "the stale install still warns");
@@ -3662,6 +3997,7 @@ mod tests {
             &one_confirmed(),
             &one_record(),
             &shas,
+            &mut super::ViewFallback::offline(),
         )
         .await;
         std::fs::set_permissions(&committed, std::fs::Permissions::from_mode(0o644)).unwrap();

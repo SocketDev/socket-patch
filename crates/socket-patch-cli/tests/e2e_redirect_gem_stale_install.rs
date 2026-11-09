@@ -156,7 +156,9 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
         })));
     match view_budget {
         Some(n) => {
-            view.up_to_n_times(n).mount(server).await;
+            if n > 0 {
+                view.up_to_n_times(n).mount(server).await;
+            }
             // After the budget: transient server failure — the re-fire arm.
             Mock::given(method("GET"))
                 .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
@@ -397,6 +399,108 @@ async fn gem_hosted_redirect_over_patched_install_stays_quiet() {
     assert!(
         stale_warnings(&env).is_empty(),
         "an already-patched materialization must never trip the stale warning: {env}"
+    );
+    assert_eq!(
+        view_requests(&server).await,
+        0,
+        "the cached archive judges the install: no patch view is fetched"
+    );
+}
+
+async fn view_requests(server: &MockServer) -> usize {
+    server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| r.url.path().contains("/patches/view/"))
+        .count()
+}
+
+/// A gem home whose `cache/` was pruned after install (`rm -rf
+/// $BUNDLE_PATH/cache` in an image, `gem cleanup`) has no archive to judge
+/// the installed copy by: the scan fetches that patch's view record and
+/// judges the copy from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_pruned_cache_is_judged_by_the_patch_view() {
+    let server = MockServer::start().await;
+    mount_api(&server, None).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let (_, cache, _) = materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+    std::fs::remove_file(&cache).unwrap();
+
+    let (code, stdout, stderr) = hosted_scan_json(&proj, &server.uri());
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
+    assert_eq!(
+        stale_warnings(&env).len(),
+        1,
+        "judged stale by the view: {env}"
+    );
+    assert_eq!(view_requests(&server).await, 1, "one view, for that purl");
+}
+
+/// Pruned cache and a failing view fetch: nothing can judge the installed
+/// copy, so the same run's `--vex` withholds the purl instead of assuming
+/// it patched.
+#[tokio::test(flavor = "multi_thread")]
+async fn gem_hosted_unjudgeable_install_is_not_vex_attested() {
+    let server = MockServer::start().await;
+    mount_api(&server, Some(0)).await; // every view fetch fails
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let (_, cache, _) = materialize_installed_gem(&proj, "3.3.0", UPSTREAM_LIB);
+    std::fs::remove_file(&cache).unwrap();
+
+    let vex_path = proj.join("out.vex.json");
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &[
+            "scan",
+            "--mode",
+            "hosted",
+            "--json",
+            "--yes",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            &server.uri(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(hosted_pinned(&env), 1, "envelope: {env}");
+    assert!(
+        stale_warnings(&env).is_empty(),
+        "no evidence, no warning: {env}"
+    );
+    if let Ok(doc) = std::fs::read_to_string(&vex_path) {
+        assert!(
+            !doc.contains(PURL),
+            "an unjudged purl is never attested:\n{doc}"
+        );
+    }
+    assert_ne!(
+        code, 0,
+        "nothing attestable fails the --vex run.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        view_requests(&server).await >= 1,
+        "the probe asked for the view"
     );
 }
 
