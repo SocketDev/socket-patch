@@ -1431,29 +1431,35 @@ impl Discovery {
     /// file's project document also wires (the same `(purl, uuid, mode)`):
     /// one wiring of the package in that file, whose project instance is
     /// the one an installed `node_modules` copy is verified against, even
-    /// when the two pins differ.
-    fn drop_env_twins(refs: &mut Vec<PatchedRef>) {
-        let project: HashSet<(PathBuf, String, String, WiringMode)> = refs
-            .iter()
-            .filter(|r| r.part == TreePart::File)
-            .map(|r| {
-                (
-                    r.source_file.clone(),
-                    r.purl.clone(),
-                    r.uuid.clone(),
-                    r.mode,
-                )
-            })
-            .collect();
-        refs.retain(|r| {
-            r.part == TreePart::File
-                || !project.contains(&(
-                    r.source_file.clone(),
-                    r.purl.clone(),
-                    r.uuid.clone(),
-                    r.mode,
-                ))
-        });
+    /// when the two pins differ. The project twin counts wherever it ended
+    /// up (`refs`, `shadowed` or `rewirable`), so a withheld project ref
+    /// never leaves its env twin attested in its place.
+    fn drop_env_twins(&mut self) {
+        let project: HashSet<(PathBuf, String, String, WiringMode)> =
+            [&self.refs, &self.shadowed, &self.rewirable]
+                .into_iter()
+                .flatten()
+                .filter(|r| r.part == TreePart::File)
+                .map(|r| {
+                    (
+                        r.source_file.clone(),
+                        r.purl.clone(),
+                        r.uuid.clone(),
+                        r.mode,
+                    )
+                })
+                .collect();
+        for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
+            refs.retain(|r| {
+                r.part == TreePart::File
+                    || !project.contains(&(
+                        r.source_file.clone(),
+                        r.purl.clone(),
+                        r.uuid.clone(),
+                        r.mode,
+                    ))
+            });
+        }
     }
 
     /// The install tree `file` belongs to: its tree's root file, or itself.
@@ -1621,8 +1627,8 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
+        self.drop_env_twins();
         for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
-            Self::drop_env_twins(refs);
             refs.sort_by(|a, b| {
                 (&a.source_file, &a.purl, &a.uuid, a.mode, a.part).cmp(&(
                     &b.source_file,

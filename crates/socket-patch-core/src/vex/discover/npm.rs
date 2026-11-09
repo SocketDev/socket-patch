@@ -3434,6 +3434,38 @@ mod tests {
             Some(LockIntegrity::Sri(SRI.into()))
         );
 
+        // Wired in both documents, the project's ref withheld (a `file:`
+        // copy of the release installs beside it): its env twin is dropped
+        // too, never attested in the project ref's place.
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "{}{}",
+                env(&env_wired),
+                project(&format!("{wired}{file_copy}"))
+            ),
+        );
+        p.write(
+            "forks/left-pad/package.json",
+            r#"{"name":"left-pad","version":"1.3.0"}"#,
+        );
+        let out = p.discover().await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert!(
+            out.shadowed
+                .iter()
+                .chain(&out.rewirable)
+                .all(|r| r.part == TreePart::File),
+            "{:#?} {:#?}",
+            out.shadowed,
+            out.rewirable
+        );
+        assert_ne!(
+            out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
+            Some(true)
+        );
+
         // The env document's registry entry contests no other lock's ref.
         let npm_lock = format!(
             r#"{{"name":"m","lockfileVersion":3,"packages":{{"":{{"name":"m"}},
