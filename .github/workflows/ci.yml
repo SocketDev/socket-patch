@@ -1793,9 +1793,24 @@ jobs:
         with:
           dotnet-version: ${{ matrix.dotnet }}.0.x
 
-      - name: Setup Deno
+      - name: Setup Deno (attempt 1)
+        # setup-deno downloads Deno from a github.com release and gives up
+        # after three tries in ~30 s. On 2026-11-09 a release-CDN 504 blip
+        # failed the e2e_vex_build leg this way (run 42571326428). Try once
+        # more; a second failure is not a blip. (Attempt 2 must be the very
+        # next step: test_merge_queue_fail_fast.py.)
+        id: setup-deno
         if: matrix.deno != ''
         uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        timeout-minutes: 4
+        continue-on-error: true
+        with:
+          deno-version: ${{ matrix.deno }}
+
+      - name: Setup Deno (attempt 2)
+        if: matrix.deno != '' && steps.setup-deno.outcome != 'success'
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        timeout-minutes: 4
         with:
           deno-version: ${{ matrix.deno }}
 
