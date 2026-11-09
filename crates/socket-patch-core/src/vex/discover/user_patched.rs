@@ -28,16 +28,21 @@
 //! are judged per resolution by their extractors instead (#711, #367).
 
 use super::{CopyTarget, DiscoverCtx, Discovery, UnattestedKind, UnwiredCopy};
+use crate::crawlers::types::Ecosystem;
 use crate::patch::user_patches::UserPatchIndex;
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
-    if !out.refs.iter().any(|r| r.purl.starts_with("pkg:npm/")) {
+    if !out
+        .refs
+        .iter()
+        .any(|r| Ecosystem::from_purl(&r.purl) == Some(Ecosystem::Npm))
+    {
         return;
     }
     let mut lock_files: Vec<String> = out
         .refs
         .iter()
-        .filter(|r| r.purl.starts_with("pkg:npm/"))
+        .filter(|r| Ecosystem::from_purl(&r.purl) == Some(Ecosystem::Npm))
         .map(|r| r.source_file.to_string_lossy().replace('\\', "/"))
         .filter(|f| is_patch_lock(f))
         .collect();
@@ -77,7 +82,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let marks: Vec<UnwiredCopy> = out
         .refs
         .iter()
-        .filter(|r| r.purl.starts_with("pkg:npm/"))
+        .filter(|r| Ecosystem::from_purl(&r.purl) == Some(Ecosystem::Npm))
         .filter_map(|r| {
             let sources = index.conflicts(&r.purl);
             if sources.is_empty() {
