@@ -6,7 +6,10 @@
 //! shifting offsets, so a pom with many patched dependencies is scanned once,
 //! not once per dependency.
 
-use crate::formats::maven::PomScope;
+use crate::formats::maven::{
+    classpath_copy, is_executable_classifier, is_executable_variant, is_variant, management_key,
+    may_name, may_shadow, variant_label, CoordinateAlternative, PomScope,
+};
 use crate::formats::xml::{child_text, children, elements, Element};
 
 /// One `<dependency>` outside ignored sections.
@@ -20,6 +23,21 @@ pub(super) struct IndexedDep {
     pub(super) type_text: Option<String>,
     pub(super) classifier: Option<String>,
     pub(super) in_profile: bool,
+    /// The trimmed `<groupId>` / `<artifactId>` text as written.
+    pub(super) group_text: Option<String>,
+    pub(super) artifact_text: Option<String>,
+    /// How each combination of profiles that moves its coordinates reads
+    /// it ([`PomScope::coordinate_alternatives`], as VEX discovery reads
+    /// it).
+    pub(super) coordinate_alternatives: Vec<CoordinateAlternative>,
+    /// Inside a `<dependencyManagement>`.
+    pub(super) managed: bool,
+    /// Every version the build may resolve for it, as VEX discovery reads
+    /// one ([`PomScope::build_versions`]): with no profile active but the
+    /// one holding it, then each combination of profiles whose
+    /// `<properties>` move it (as written where one leaves it unresolved).
+    /// Empty when it has no `<version>`.
+    pub(super) build_versions: Vec<String>,
 }
 
 /// One live `<repository>`.
@@ -126,12 +144,26 @@ impl PomIndex {
         pom: &str,
         user: &std::collections::BTreeMap<String, String>,
     ) -> Result<PomIndex, String> {
-        let scope = PomScope::with_user_properties(pom, user)?;
+        let mut scope = PomScope::with_user_properties(pom, user)?;
+        // Profile `<properties>` may move a `${…}` coordinate or version, as
+        // VEX discovery reads it (one it cannot read fails closed there).
+        scope.read_profiles();
         let masked = &scope.masked;
+        let managed = elements(masked, "dependencyManagement")?;
         let deps = scope
             .dependencies()?
             .into_iter()
             .map(|d| IndexedDep {
+                coordinate_alternatives: scope.coordinate_alternatives(&d),
+                managed: managed
+                    .iter()
+                    .any(|m| d.element.start >= m.start && d.element.start < m.end),
+                build_versions: d.version_text.as_deref().map_or_else(Vec::new, |text| {
+                    let (build, alternatives) = scope.build_versions(text, d.element.start);
+                    std::iter::once(build)
+                        .chain(alternatives.into_iter().map(|a| a.value))
+                        .collect()
+                }),
                 group: d.group,
                 artifact: d.artifact,
                 version_inner: d.version_inner,
@@ -139,6 +171,8 @@ impl PomIndex {
                 type_text: d.type_text,
                 classifier: d.classifier,
                 in_profile: d.in_profile,
+                group_text: d.group_text,
+                artifact_text: d.artifact_text,
             })
             .collect();
         let mut repos = Vec::new();
@@ -198,6 +232,176 @@ impl PomIndex {
                     d.classifier.as_deref(),
                     (group, artifact),
                 )
+        })
+    }
+
+    /// Why a pin of `group:artifact` at `served` (the suffixed version)
+    /// would not hold whenever some combination of profiles is active whose
+    /// `<properties>` redefine a property a `${…}` coordinate names
+    /// ([`IndexedDep::coordinate_alternatives`]), as VEX discovery weighs
+    /// it: a live versioned declaration of it (the one a pin is written
+    /// into) then names another package, or another declaration then names
+    /// its main jar (as [`may_shadow`] reads one) at a version other than
+    /// `served`, or one of its executable classifier copies (literally, or
+    /// through a property this pom does not define, [`may_name`])
+    /// (`test-jar` is the `tests` copy) off `served` or with no version of
+    /// its own. A main jar without a version takes the pin.
+    pub(super) fn retargeted(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: Option<&str>,
+    ) -> Option<String> {
+        self.deps.iter().find_map(|d| {
+            let written = || {
+                format!(
+                    "{}:{}",
+                    d.group_text.as_deref().unwrap_or_default(),
+                    d.artifact_text.as_deref().unwrap_or_default()
+                )
+            };
+            if d.group.as_deref() == Some(group) && d.artifact.as_deref() == Some(artifact) {
+                let moved = d.coordinate_alternatives.first()?;
+                return (!d.in_profile && d.classifier.is_none() && d.version_text.is_some()).then(
+                    || {
+                        format!(
+                            "{} names {group}:{artifact}, but the <properties> of {} make it \
+                             {}:{}",
+                            written(),
+                            moved.by,
+                            moved.group,
+                            moved.artifact
+                        )
+                    },
+                );
+            }
+            let classifier = classpath_copy(d.type_text.as_deref(), d.classifier.as_deref())?;
+            d.coordinate_alternatives.iter().find_map(|r| {
+                let literal = r.group == group && r.artifact == artifact;
+                let names = match classifier {
+                    None => {
+                        (literal
+                            || may_shadow((&r.group, &r.artifact), None, None, (group, artifact)))
+                            && r.version.is_some()
+                    }
+                    // A coordinate still holding a property this pom does
+                    // not define may be this copy, as discovery weighs it.
+                    Some(c) => {
+                        may_name(&r.group, group)
+                            && may_name(&r.artifact, artifact)
+                            && is_executable_classifier(c)
+                    }
+                };
+                (names && r.version.as_deref() != served).then(|| {
+                    format!(
+                        "{}{} declares {}:{} at <version>{}</version> under the \
+                         <properties> of {}",
+                        written(),
+                        classifier.map_or(String::new(), |c| format!(" (classifier {c})")),
+                        r.group,
+                        r.artifact,
+                        r.version.as_deref().unwrap_or("(none of its own)"),
+                        r.by
+                    )
+                })
+            })
+        })
+    }
+
+    /// A `<profiles>` declaration of `group:artifact`'s main jar (literal,
+    /// or through a coordinate property this pom does not define,
+    /// [`may_shadow`]) and a version it may resolve other than `served`
+    /// ([`IndexedDep::build_versions`]: its own profile's `<properties>`,
+    /// or any combination of profiles'), as VEX discovery weighs one: an
+    /// active profile's `<dependencies>` merge over the pom's own, so it
+    /// overrides any pin, and its `<dependencyManagement>` overrides one
+    /// only where management governs the pin (`pin_managed`). A pom /
+    /// sources / javadoc typed one carries no code, and one without a
+    /// version takes the pin.
+    pub(super) fn profile_bypass(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: &str,
+        pin_managed: bool,
+    ) -> Option<(&IndexedDep, &str)> {
+        self.deps.iter().find_map(|d| {
+            let (Some(g), Some(a)) = (d.group.as_deref(), d.artifact.as_deref()) else {
+                return None;
+            };
+            let main_jar = d.classifier.is_none()
+                && !d
+                    .type_text
+                    .as_deref()
+                    .is_some_and(|t| matches!(t, "pom" | "java-source" | "javadoc"))
+                && ((g == group && a == artifact)
+                    || may_shadow((g, a), d.type_text.as_deref(), None, (group, artifact)));
+            if !d.in_profile || !main_jar || (d.managed && !pin_managed) {
+                return None;
+            }
+            let version = d.build_versions.iter().find(|v| *v != served)?;
+            Some((d, version.as_str()))
+        })
+    }
+
+    /// The first executable classifier copy of `group:artifact` (not
+    /// `sources` / `javadoc`; live or inside `<profiles>`) that may resolve
+    /// a version other than `served`, with its classifier and that version
+    /// (`None`: none in this pom), as VEX discovery weighs one: the grant
+    /// serves only the main jar, and a classifier copy is its own
+    /// coordinate, which the pin does not retarget. Its versions are its
+    /// own ([`IndexedDep::build_versions`]), else those of a
+    /// `<dependencyManagement>` entry with the same classifier (Maven keys
+    /// management by classifier; a profile's entry while that profile is
+    /// active), and with no live entry the version comes from outside this
+    /// pom. A type counts like the classifier it implies
+    /// ([`is_executable_variant`]: a `test-jar` is the `tests` jar), and the
+    /// copy is reported by its label ([`variant_label`]).
+    pub(super) fn unserved_classifier_copy(
+        &self,
+        group: &str,
+        artifact: &str,
+        served: &str,
+    ) -> Option<(&str, Option<&str>)> {
+        fn key(d: &IndexedDep) -> (Option<&str>, Option<&str>) {
+            management_key(d.type_text.as_deref(), d.classifier.as_deref())
+        }
+        let copies = move |managed: bool| {
+            self.deps.iter().filter_map(move |d| {
+                let (t, c) = (d.type_text.as_deref(), d.classifier.as_deref());
+                (d.managed == managed
+                    && d.group.as_deref() == Some(group)
+                    && d.artifact.as_deref() == Some(artifact)
+                    && is_variant(t, c)
+                    && is_executable_variant(t, c))
+                .then(|| (d, variant_label(t, c)))
+            })
+        };
+        // Every version a declaration may resolve (`None`: it has none).
+        fn versions(d: &IndexedDep) -> Vec<Option<&str>> {
+            match d.build_versions.as_slice() {
+                [] => vec![None],
+                all => all.iter().map(|v| Some(v.as_str())).collect(),
+            }
+        }
+        copies(false).find_map(|(d, classifier)| {
+            let resolved: Vec<Option<&str>> = if d.version_text.is_some() {
+                versions(d)
+            } else {
+                let entries = |in_profile: bool| {
+                    copies(true)
+                        .filter(move |(m, _)| key(m) == key(d) && m.in_profile == in_profile)
+                        .flat_map(|(m, _)| versions(m))
+                };
+                let mut live: Vec<Option<&str>> = entries(false).collect();
+                if live.is_empty() {
+                    live.push(None);
+                }
+                live.extend(entries(true));
+                live
+            };
+            let version = resolved.into_iter().find(|v| *v != Some(served))?;
+            Some((classifier, version))
         })
     }
 
@@ -344,6 +548,11 @@ impl PomIndex {
             type_text: None,
             classifier: None,
             in_profile: false,
+            group_text: Some(group.to_string()),
+            artifact_text: Some(artifact.to_string()),
+            coordinate_alternatives: Vec::new(),
+            managed: true,
+            build_versions: vec![version.to_string()],
         });
     }
 

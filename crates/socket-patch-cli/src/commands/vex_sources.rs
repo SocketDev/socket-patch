@@ -231,10 +231,15 @@ const NOTE_NPM_SHRINKWRAP_ONLY: &str = "vex_npm_shrinkwrap_only";
 /// Omission tag and note: a hosted Maven pin sits in a reactor root, where a
 /// module's own `<version>` may override it (`vex::Unattested`).
 const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
-/// Omission tag and note: a hosted Maven pin's GA also has an executable
-/// classifier copy at another version, which the pin does not reach
+/// Omission tag and note for [`UnattestedKind::MavenClassifierUnpatched`]
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note for [`UnattestedKind::MavenProfileUnpatched`]
+/// (`vex::Unattested`).
+const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
+/// Omission tag and note for [`UnattestedKind::MavenConfigOverride`]
+/// (`vex::Unattested`).
+const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
 /// Omission tag and note: a hosted Cargo pin beside another declaration of
 /// the crate that names no Socket registry, which cargo resolves as a
 /// separate, unpatched package (`vex::Unattested`).
@@ -310,6 +315,22 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             NOTE_MAVEN_CLASSIFIER_UNPATCHED,
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
+        ),
+        UnattestedKind::MavenProfileUnpatched => (
+            NOTE_MAVEN_PROFILE_UNPATCHED,
+            "not attested while a profile declares it at, or its <properties> move it to, \
+             another version, or its <properties> redefine a groupId / artifactId property so \
+             the pin names another package or another declaration names this one; the wiring \
+             itself is intact, so re-running `scan` does not change this (drop that profile \
+             <version> or property or set it to the pin; `scan --mode vendored` rewrites a \
+             literal profile <version>, but neither mode wires a pin a profile's <properties> \
+             can move, and hosted `scan` writes no pin a profile bypasses)",
+        ),
+        UnattestedKind::MavenConfigOverride => (
+            NOTE_MAVEN_CONFIG_OVERRIDE,
+            "not attested while .mvn/maven.config redefines the property it is spelled \
+             through; the wiring itself is intact, so re-running `scan` does not change this \
+             (drop that -D from .mvn/maven.config, or write the pinned version literally)",
         ),
         UnattestedKind::CargoUnpinnedDeclaration => (
             NOTE_CARGO_UNPINNED_DECLARATION,

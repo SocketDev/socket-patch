@@ -3,7 +3,15 @@
 //! `<base>-socket.<hex8>` version split, and the Trusted Checksums files
 //! ([`trusted_checksums`]). Pure: text in, structure out.
 
+mod properties;
+
 use std::collections::BTreeMap;
+
+pub(crate) use properties::{
+    interpolate_keeping, interpolate_strict, lookup_property, profile_combinations, Definitions,
+    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+};
+use properties::{interpolate_lenient, read_properties};
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
@@ -40,13 +48,44 @@ pub(crate) struct PomRepo {
     pub(crate) in_profile: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PomDep {
+    /// `<groupId>` / `<artifactId>` as [`ScopedDep::group`] reads them:
+    /// with no profile active, an undefined `${…}` kept as written.
     pub(crate) group: String,
     pub(crate) artifact: String,
-    /// Trimmed literal version, `${prop}` resolved from the root
-    /// `<properties>` when possible; `None` when the declaration has none.
+    /// The trimmed `<groupId>` / `<artifactId>` text as written.
+    pub(crate) group_text: String,
+    pub(crate) artifact_text: String,
+    /// How the declaration reads under each combination of active profiles
+    /// whose `<properties>` move its coordinates off
+    /// [`Self::group`] / [`Self::artifact`] (for one inside a profile, its
+    /// own profile is always active), with the version it resolves there
+    /// ([`PomScope::coordinate_alternatives`]); a coordinate reference left
+    /// unresolved stays as written ([`may_name`] reads it as any text).
+    /// Empty when no profile can move its coordinates.
+    pub(crate) coordinate_alternatives: Vec<CoordinateAlternative>,
+    /// Trimmed version, every `${prop}` interpolated
+    /// ([`interpolate_strict`]) from the project model (`project.*` /
+    /// `pom.*`), the `<properties>` of the profile holding the declaration
+    /// (if any), then the root `<properties>`: the version the pom itself
+    /// spells, which the hosted rewriter writes and rolls back. As written
+    /// when that fails (undefined, cyclic, too deep); `None` when the
+    /// declaration has none.
     pub(crate) version: Option<String>,
+    /// [`Self::version`] as the build resolves it: the build's user
+    /// properties (`.mvn/maven.config`'s `-D`) come before the profile's
+    /// and the root `<properties>` at every level — Maven's own lookup
+    /// order (the model still comes first).
+    pub(crate) build_version: Option<String>,
+    /// The trimmed `<version>` text as written.
+    pub(crate) version_text: Option<String>,
+    /// The other versions [`Self::build_version`] becomes when some
+    /// combination of profiles is active whose `<properties>` redefine a
+    /// property it names, directly, through another, or through the
+    /// project model ([`PomScope::resolve_in_build`]); the smallest
+    /// combination that moves it first. Empty when no profile can move it.
+    pub(crate) version_alternatives: Vec<Alternative>,
     /// The non-empty `<classifier>`: a sibling artifact of the GA (sources,
     /// tests, a native build), managed and resolved apart from the main jar.
     pub(crate) classifier: Option<String>,
@@ -55,6 +94,79 @@ pub(crate) struct PomDep {
     /// Inside `<dependencyManagement>`.
     pub(crate) managed: bool,
     pub(crate) in_profile: bool,
+    /// `None` for a declaration as the pom writes it ([`parse_pom`]); a
+    /// reader that expands one into its [`Self::coordinate_alternatives`]
+    /// sets the profiles that give each such reading.
+    pub(crate) retargeted_by: Option<MovedBy>,
+}
+
+/// A value some combination of active profiles gives a `${…}` text other
+/// than its resolution with none active, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Alternative {
+    /// The value, or the text as written when that combination leaves it
+    /// unresolved (undefined, cyclic, too deep) or it could not be worked
+    /// out.
+    pub(crate) value: String,
+    pub(crate) by: MovedBy,
+}
+
+/// How a declaration reads under one combination of active profiles that
+/// moves its `(groupId, artifactId)` off the no-profile reading, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CoordinateAlternative {
+    pub(crate) group: String,
+    pub(crate) artifact: String,
+    /// Its `<version>` in the build under the same profiles
+    /// ([`interpolate_strict`], as written when that fails); `None` when
+    /// it has none.
+    pub(crate) version: Option<String>,
+    pub(crate) by: MovedBy,
+}
+
+/// What each text of a declaration reads under one combination of active
+/// profiles, and which ([`PomScope::resolve_all_in_build`]).
+type Reading = (Vec<Option<String>>, MovedBy);
+
+/// What gives an [`Alternative`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MovedBy {
+    /// These profiles (their `<id>`s) active together.
+    Profiles(Vec<String>),
+    /// More profiles may change it than are combined
+    /// ([`MAX_COMBINED_PROFILES`]): not worked out, fail closed.
+    TooManyProfiles,
+    /// A `<profiles>` `<properties>` this reader cannot parse: fail closed.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for MovedBy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MovedBy::Profiles(ids) => {
+                let s = if ids.len() == 1 { "" } else { "s" };
+                write!(f, "profile{s} {}", ids.join(" + "))
+            }
+            MovedBy::TooManyProfiles => write!(
+                f,
+                "some combination of the more than {MAX_COMBINED_PROFILES} profiles that redefine \
+                 what it names"
+            ),
+            MovedBy::Unreadable(e) => {
+                write!(f, "a <profiles> section this reader cannot parse ({e})")
+            }
+        }
+    }
+}
+
+/// One `<properties>` inside `<profiles>`: the `<profile>` element that
+/// holds it (when the scan finds one), that profile's `<id>`, and its
+/// `name -> trimmed value` pairs.
+#[derive(Debug)]
+struct ProfileProperties {
+    holder: Option<Element>,
+    id: String,
+    props: BTreeMap<String, String>,
 }
 
 /// Where Maven reads a root pom's model from: its text with comments and
@@ -63,7 +175,9 @@ pub(crate) struct PomDep {
 /// classpaths, `<pluginRepositories>` / `<distributionManagement>` plugin
 /// and deploy repositories; `<profiles>` apply only when activated. Shared
 /// by the VEX reader ([`parse_pom`]) and the hosted rewriter, so the
-/// rewriter edits exactly the markup VEX later attests.
+/// rewriter edits exactly the markup VEX later attests. Both the VEX
+/// reader and the hosted rewriter's index weigh profile `<properties>`
+/// ([`Self::read_profiles`]).
 #[derive(Debug)]
 pub(crate) struct PomScope {
     /// The pom with comments and CDATA blanked byte-for-byte.
@@ -72,10 +186,20 @@ pub(crate) struct PomScope {
     profiles: Vec<Element>,
     /// The root `<properties>` (see [`properties`]).
     properties: BTreeMap<String, String>,
-    /// [`Self::properties`] plus the `${project.*}` model references a
-    /// coordinate may name (see [`model_refs`]).
-    coordinate_refs: BTreeMap<String, String>,
+    /// The build's user properties (`.mvn/maven.config`'s `-D`).
+    user: BTreeMap<String, String>,
+    /// The project model references, raw (see [`model_refs`]).
+    model: BTreeMap<String, String>,
+    /// Each `<properties>` inside `<profiles>`, once [`Self::read_profiles`]
+    /// has read them: merged over the root's while that profile is active.
+    profile_properties: Vec<ProfileProperties>,
+    /// Why [`Self::read_profiles`] could not read them (every `${…}` then
+    /// fails closed in [`Self::resolve_in_build`]).
+    profiles_unreadable: Option<String>,
 }
+
+/// No user properties: the view of a version as the pom spells it.
+static NO_USER_PROPERTIES: BTreeMap<String, String> = BTreeMap::new();
 
 impl PomScope {
     /// Fails (fail-closed) on a pom that is not well-formed where it
@@ -87,9 +211,10 @@ impl PomScope {
 
     /// [`Self::new`], with the user properties the build passes Maven
     /// (`.mvn/maven.config`'s `-D`, see [`maven_config_properties`]): they
-    /// override a same-named pom property when a coordinate is
-    /// interpolated, as Maven's model interpolator reads them after the
-    /// model's own.
+    /// override a same-named pom property when a coordinate or a version is
+    /// interpolated, as Maven's model interpolator looks them up before the
+    /// pom's own. Profile `<properties>` are not read (see
+    /// [`Self::read_profiles`]).
     pub(crate) fn with_user_properties(
         raw: &str,
         user: &BTreeMap<String, String>,
@@ -107,24 +232,267 @@ impl PomScope {
         .concat();
         let profiles = elements(&masked, "profiles")?;
         let properties = properties(&masked, &ignored, &profiles)?;
-        let mut coordinate_refs = properties.clone();
-        coordinate_refs.extend(user.iter().map(|(k, v)| (k.clone(), v.clone())));
-        // A `project.*` / `pom.*` reference names the model, whatever a
-        // same-named property says; the deprecated bare form yields to one.
-        for (name, value) in model_refs(&masked, &coordinate_refs.clone())? {
-            if name.starts_with("project.") || name.starts_with("pom.") {
-                coordinate_refs.insert(name, value);
-            } else {
-                coordinate_refs.entry(name).or_insert(value);
-            }
-        }
+        let model = model_refs(&masked)?;
         Ok(PomScope {
             masked,
             ignored,
             profiles,
             properties,
-            coordinate_refs,
+            user: user.clone(),
+            model,
+            profile_properties: Vec::new(),
+            profiles_unreadable: None,
         })
+    }
+
+    /// Read every `<properties>` inside `<profiles>`, which only
+    /// [`Self::resolve_in_build`] weighs. One this reader cannot parse
+    /// does not fail the pom: it is recorded, and every `${…}` resolution
+    /// then fails closed ([`MovedBy::Unreadable`]).
+    pub(crate) fn read_profiles(&mut self) {
+        match profile_properties(&self.masked, &self.ignored, &self.profiles) {
+            Ok(found) => self.profile_properties = found,
+            Err(e) => self.profiles_unreadable = Some(e),
+        }
+    }
+
+    /// The indices into [`Self::profile_properties`] of the profile that
+    /// holds `pos` (none outside one).
+    fn own_profile(&self, pos: usize) -> Vec<usize> {
+        (0..self.profile_properties.len())
+            .filter(|&i| {
+                self.profile_properties[i]
+                    .holder
+                    .is_some_and(|p| pos >= p.start && pos < p.end)
+            })
+            .collect()
+    }
+
+    /// A model reference's raw text (an empty element binds nothing).
+    fn model_ref(&self, name: &str) -> Option<String> {
+        self.model.get(name).filter(|v| !v.is_empty()).cloned()
+    }
+
+    /// What `${name}` reads ([`lookup_property`]) with the profiles `active`
+    /// (indices, in pom order) active, with or without the build's user
+    /// properties.
+    fn lookup(&self, name: &str, active: &[usize], user: bool) -> Option<String> {
+        let layer = PomLayer {
+            own: &self.properties,
+            profiles: active
+                .iter()
+                .map(|&i| &self.profile_properties[i].props)
+                .collect(),
+        };
+        let user = if user {
+            &self.user
+        } else {
+            &NO_USER_PROPERTIES
+        };
+        lookup_property(name, &|n| self.model_ref(n), user, [layer])
+    }
+
+    /// Where `${name}` may be defined in the build, for
+    /// [`profile_combinations`]: the model or a user property fixes it;
+    /// otherwise the root's, every profile's (each but `own`, which is
+    /// always active, may be the one read) and a bare model reference.
+    fn definitions(&self, name: &str, own: &[usize]) -> Definitions {
+        if let Some(fixed) = Definitions::fixed(name, &|n| self.model_ref(n), &self.user) {
+            return fixed;
+        }
+        let mut d = Definitions::default();
+        d.texts.extend(self.properties.get(name).cloned());
+        d.texts.extend(self.model_ref(name));
+        for (i, p) in self.profile_properties.iter().enumerate() {
+            if let Some(v) = p.props.get(name) {
+                d.texts.push(v.clone());
+                if !own.contains(&i) {
+                    d.profiles.push(i);
+                }
+            }
+        }
+        d
+    }
+
+    /// The `<version>` text of the declaration at `pos`, resolved as
+    /// [`PomDep::version`], [`PomDep::build_version`] and
+    /// [`PomDep::version_alternatives`] describe.
+    fn resolve_version(&self, text: &str, pos: usize) -> (String, String, Vec<Alternative>) {
+        if !text.contains("${") {
+            return (text.to_string(), text.to_string(), Vec::new());
+        }
+        let own = self.own_profile(pos);
+        let spelled = interpolate_strict(text, &|name| self.lookup(name, &own, false))
+            .unwrap_or_else(|| text.to_string());
+        let (build, alternatives) = self.build_versions(text, pos);
+        (spelled, build, alternatives)
+    }
+
+    /// [`PomDep::build_version`] and [`PomDep::version_alternatives`] of
+    /// the `<version>` text of the declaration at `pos`.
+    pub(crate) fn build_versions(&self, text: &str, pos: usize) -> (String, Vec<Alternative>) {
+        match self.resolve_in_build(text, pos) {
+            (Some(build), alternatives) => (build, alternatives),
+            // Unresolved here (a parent pom this reader never sees may
+            // define it): the build version stays as written, but a value
+            // some profiles give it is still one the build may resolve.
+            (None, alternatives) => (
+                text.to_string(),
+                alternatives
+                    .into_iter()
+                    .filter(|a| a.value != text)
+                    .collect(),
+            ),
+        }
+    }
+
+    /// What the version `text` (written in the declaration at `pos`)
+    /// resolves to in the build with no profile active but the one holding
+    /// it ([`interpolate_strict`]), and each other value a combination of
+    /// active profiles gives it ([`profile_combinations`], the vendored
+    /// reactor's too), the smallest combination first; a combination that
+    /// cannot resolve it gives the text as written. Fails closed: when the
+    /// combinations cannot be enumerated or a profile's `<properties>` is
+    /// unreadable, the text as written is an alternative.
+    fn resolve_in_build(&self, text: &str, pos: usize) -> (Option<String>, Vec<Alternative>) {
+        let (mut base, readings) = self.resolve_all_in_build(&[(text, interpolate_strict)], pos);
+        let mut alternatives: Vec<Alternative> = Vec::new();
+        for (mut values, by) in readings {
+            let value = values.remove(0).unwrap_or_else(|| text.to_string());
+            if alternatives.iter().all(|a| a.value != value) {
+                alternatives.push(Alternative { value, by });
+            }
+        }
+        (base.remove(0), alternatives)
+    }
+
+    /// [`Self::resolve_in_build`] for several texts of one declaration (its
+    /// groupId, artifactId and version), each through its own
+    /// interpolation and work budget but all under the same combination of
+    /// active profiles: what they read with none active but the one holding
+    /// the declaration, and each combination ([`profile_combinations`] of
+    /// them all) under which any reads otherwise, the smallest first, with
+    /// what they all read there. Fails closed: when the combinations cannot
+    /// be enumerated or a profile's `<properties>` is unreadable, every text
+    /// as written is one reading.
+    fn resolve_all_in_build(
+        &self,
+        texts: &[(&str, Interpolate)],
+        pos: usize,
+    ) -> (Vec<Option<String>>, Vec<Reading>) {
+        let own = self.own_profile(pos);
+        let read = |active: &[usize]| -> Vec<Option<String>> {
+            texts
+                .iter()
+                .map(|(text, interpolate)| {
+                    interpolate(text, &|name| self.lookup(name, active, true))
+                })
+                .collect()
+        };
+        let base = read(&own);
+        if texts.iter().all(|(text, _)| !text.contains("${")) {
+            return (base, Vec::new());
+        }
+        let as_written = |by: MovedBy| {
+            let values = texts.iter().map(|(text, _)| Some(text.to_string()));
+            vec![(values.collect(), by)]
+        };
+        if let Some(e) = &self.profiles_unreadable {
+            return (base, as_written(MovedBy::Unreadable(e.clone())));
+        }
+        let values: Vec<&str> = texts.iter().map(|(text, _)| *text).collect();
+        let Some(combinations) =
+            profile_combinations(&values, &|name| self.definitions(name, &own))
+        else {
+            return (base, as_written(MovedBy::TooManyProfiles));
+        };
+        let mut readings: Vec<Reading> = Vec::new();
+        for combination in combinations {
+            let mut active: Vec<usize> = own.iter().chain(&combination).copied().collect();
+            active.sort_unstable();
+            active.dedup();
+            // What a text cannot resolve there is read as written.
+            let values: Vec<Option<String>> = read(&active)
+                .into_iter()
+                .zip(texts)
+                .map(|(v, (text, _))| v.or_else(|| Some(text.to_string())))
+                .collect();
+            if values != base && readings.iter().all(|(v, _)| *v != values) {
+                let ids = combination
+                    .iter()
+                    .map(|&i| self.profile_properties[i].id.clone())
+                    .collect();
+                readings.push((values, MovedBy::Profiles(ids)));
+            }
+        }
+        (base, readings)
+    }
+
+    /// [`PomDep::coordinate_alternatives`] of `dep`: its groupId and
+    /// artifactId (keeping an unresolved reference,
+    /// [`interpolate_keeping`]) and version ([`interpolate_strict`]) read
+    /// together ([`Self::resolve_all_in_build`]), every reading whose
+    /// coordinates differ from what it reads with no profile active but
+    /// the one holding it ([`ScopedDep::group`] / [`ScopedDep::artifact`]).
+    pub(crate) fn coordinate_alternatives(&self, dep: &ScopedDep) -> Vec<CoordinateAlternative> {
+        let (Some(group_text), Some(artifact_text), Some(group), Some(artifact)) = (
+            dep.group_text.as_deref(),
+            dep.artifact_text.as_deref(),
+            dep.group.as_deref(),
+            dep.artifact.as_deref(),
+        ) else {
+            return Vec::new();
+        };
+        if !group_text.contains("${") && !artifact_text.contains("${") {
+            return Vec::new();
+        }
+        let mut texts: Vec<(&str, Interpolate)> = vec![
+            (group_text, interpolate_keeping),
+            (artifact_text, interpolate_keeping),
+        ];
+        if let Some(version) = dep.version_text.as_deref() {
+            texts.push((version, interpolate_strict));
+        }
+        let (_, readings) = self.resolve_all_in_build(&texts, dep.element.start);
+        let mut out: Vec<CoordinateAlternative> = Vec::new();
+        for (values, by) in readings {
+            let mut values = values.into_iter();
+            let (Some(Some(g)), Some(Some(a))) = (values.next(), values.next()) else {
+                continue;
+            };
+            let version = values.next().flatten();
+            if (g.as_str(), a.as_str()) == (group, artifact) {
+                continue;
+            }
+            let reading = CoordinateAlternative {
+                group: g,
+                artifact: a,
+                version,
+                by,
+            };
+            if !out.iter().any(|o| {
+                (&o.group, &o.artifact, &o.version)
+                    == (&reading.group, &reading.artifact, &reading.version)
+            }) {
+                out.push(reading);
+            }
+        }
+        out
+    }
+
+    /// `text` (a coordinate of the declaration at `pos`) with every
+    /// `${name}` the build defines interpolated, reading the declaration's
+    /// own profile `<properties>` first when it sits in a profile (as its
+    /// version is: that profile is always active with it), an undefined
+    /// one kept as written ([`interpolate_lenient`]). What other profiles
+    /// make of it is [`Self::coordinate_alternatives`]' job, which every
+    /// coordinate check weighs.
+    fn interpolate_coordinate(&self, text: &str, pos: usize) -> String {
+        if !text.contains("${") {
+            return text.to_string();
+        }
+        let own = self.own_profile(pos);
+        interpolate_lenient(text, &|name| self.lookup(name, &own, true))
     }
 
     /// Inside a plugin / deploy section (never project resolution).
@@ -170,12 +538,17 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 #[derive(Debug)]
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
-    /// `<groupId>` / `<artifactId>` with every `${prop}` the root
-    /// `<properties>` or the project's own coordinates define
-    /// interpolated (see [`interpolate`]); an
-    /// undefined one stays as written, so [`may_name`] can tell it apart.
+    /// `<groupId>` / `<artifactId>` with every `${prop}` the build defines
+    /// with no profile active but, for a `<profiles>` declaration, its own
+    /// (user properties, the project model, the root `<properties>`)
+    /// interpolated ([`PomScope::interpolate_coordinate`]); an undefined
+    /// one stays as written, so [`may_name`] can tell it apart. What other
+    /// profiles make of them is [`PomScope::coordinate_alternatives`]' job.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
+    /// The trimmed `<groupId>` / `<artifactId>` text as written.
+    pub(crate) group_text: Option<String>,
+    pub(crate) artifact_text: Option<String>,
     /// Inner-text byte range of the literal `<version>`, when present.
     pub(crate) version_inner: Option<(usize, usize)>,
     /// Trimmed `<version>` text as written (no property resolution).
@@ -194,12 +567,18 @@ impl PomScope {
         for dep in self.elements("dependency")? {
             let body = blank_elements(dep.inner(&self.masked), "exclusions")?;
             let version = elements(&body, "version")?.into_iter().next();
+            let group_text = child_text(&body, "groupId")?;
+            let artifact_text = child_text(&body, "artifactId")?;
             out.push(ScopedDep {
                 element: dep,
-                group: child_text(&body, "groupId")?
-                    .map(|g| interpolate(&g, &self.coordinate_refs)),
-                artifact: child_text(&body, "artifactId")?
-                    .map(|a| interpolate(&a, &self.coordinate_refs)),
+                group: group_text
+                    .as_deref()
+                    .map(|g| self.interpolate_coordinate(g, dep.start)),
+                artifact: artifact_text
+                    .as_deref()
+                    .map(|a| self.interpolate_coordinate(a, dep.start)),
+                group_text,
+                artifact_text,
                 version_inner: version.map(|v| {
                     (
                         dep.inner_start + v.inner_start,
@@ -228,7 +607,8 @@ pub(crate) fn parse_pom(raw: &str) -> Result<Pom, String> {
 /// [`parse_pom`] with the build's user properties (see
 /// [`PomScope::with_user_properties`]).
 pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Result<Pom, String> {
-    let scope = PomScope::with_user_properties(raw, user)?;
+    let mut scope = PomScope::with_user_properties(raw, user)?;
+    scope.read_profiles();
     let text = &scope.masked;
     let managed = elements(text, "dependencyManagement")?;
     let mut pom = Pom::default();
@@ -243,19 +623,34 @@ pub(crate) fn parse_pom_with(raw: &str, user: &BTreeMap<String, String>) -> Resu
     }
 
     for dep in scope.dependencies()? {
-        let (Some(group), Some(artifact)) = (dep.group, dep.artifact) else {
+        let coordinate_alternatives = scope.coordinate_alternatives(&dep);
+        let (Some(group), Some(artifact), Some(group_text), Some(artifact_text)) =
+            (dep.group, dep.artifact, dep.group_text, dep.artifact_text)
+        else {
             continue;
+        };
+        let (version, build_version, version_alternatives) = match &dep.version_text {
+            Some(text) => {
+                let (spelled, build, alternatives) = scope.resolve_version(text, dep.element.start);
+                (Some(spelled), Some(build), alternatives)
+            }
+            None => (None, None, Vec::new()),
         };
         pom.deps.push(PomDep {
             group,
             artifact,
-            version: dep
-                .version_text
-                .map(|v| resolve_property(&v, &scope.properties)),
+            group_text,
+            artifact_text,
+            coordinate_alternatives,
+            version,
+            build_version,
+            version_text: dep.version_text,
+            version_alternatives,
             classifier: dep.classifier,
             type_text: dep.type_text,
             managed: inside(dep.element.start, &managed),
             in_profile: dep.in_profile,
+            retargeted_by: None,
         });
     }
     Ok(pom)
@@ -278,100 +673,79 @@ fn properties(
         {
             continue;
         }
-        let body = props.inner(text);
-        let mut from = 0;
-        while let Some(rel) = body[from..].find('<') {
-            let lt = from + rel;
-            let Some(gt) = body[lt..].find('>').map(|r| lt + r) else {
-                return Err("unterminated tag in <properties>".to_string());
-            };
-            let name = &body[lt + 1..gt];
-            if !is_property_name(name) {
-                from = gt + 1;
-                continue;
-            }
-            let close = format!("</{name}>");
-            let Some(end) = body[gt + 1..].find(&close).map(|r| gt + 1 + r) else {
-                return Err(format!("unterminated <{name}> in <properties>"));
-            };
-            map.entry(name.to_string())
-                .or_insert_with(|| body[gt + 1..end].trim().to_string());
-            from = end + close.len();
-        }
+        read_properties(props.inner(text), &mut map)?;
     }
     Ok(map)
 }
 
-/// `${name}` → the property's value (one level, no recursion); anything
-/// else, or an undefined property, is returned unchanged.
-fn resolve_property(version: &str, properties: &BTreeMap<String, String>) -> String {
-    version
-        .strip_prefix("${")
-        .and_then(|rest| rest.strip_suffix('}'))
-        .filter(|name| is_property_name(name))
-        .and_then(|name| properties.get(name))
-        .cloned()
-        .unwrap_or_else(|| version.to_string())
+/// The trimmed text of `body`'s own `<name>` child (depth 0), never one
+/// nested deeper (a `<repository>`'s `<id>` inside a `<profile>`).
+fn direct_child_text(body: &str, name: &str) -> Option<String> {
+    let mut depth = 0usize;
+    let mut from = 0;
+    while let Some(rel) = body[from..].find('<') {
+        let lt = from + rel;
+        let gt = lt + body[lt..].find('>')?;
+        let tag = &body[lt + 1..gt];
+        from = gt + 1;
+        if tag.starts_with('!') || tag.starts_with('?') || tag.ends_with('/') {
+            continue;
+        }
+        if tag.starts_with('/') {
+            depth = depth.saturating_sub(1);
+            continue;
+        }
+        let tag_name = tag.split(|c: char| c.is_ascii_whitespace()).next()?;
+        if depth == 0 && tag_name == name {
+            let end = from + body[from..].find(&format!("</{name}"))?;
+            return Some(body[from..end].trim().to_string());
+        }
+        depth += 1;
+    }
+    None
 }
 
-/// Interpolation rounds before a still-unresolved reference is given up on
-/// (a property defined through another, or a cycle).
-const MAX_INTERPOLATION: usize = 8;
-
-/// Longest text interpolation builds. A real coordinate is far shorter; a
-/// pom whose properties each name the previous one many times would
-/// otherwise grow exponentially with every round ("billion laughs").
-const MAX_INTERPOLATED_LEN: usize = 1024;
-
-/// `text` with every `${name}` the root `<properties>` or project model
-/// defines replaced by its value, as Maven interpolates a coordinate such as
-/// `org.${vendor}` (a value naming another property is resolved too, up to
-/// [`MAX_INTERPOLATION`] rounds); an undefined or malformed reference is
-/// kept as written, and a round that would exceed [`MAX_INTERPOLATED_LEN`]
-/// is not taken, leaving its references unresolved (which fails closed).
-fn interpolate(text: &str, properties: &BTreeMap<String, String>) -> String {
-    let mut text = text.to_string();
-    for _ in 0..MAX_INTERPOLATION {
-        let Some(next) = interpolate_once(&text, properties) else {
-            break;
-        };
-        if next == text {
-            break;
+/// Each `<properties>` inside `<profiles>` (outside ignored sections) as
+/// `name -> trimmed value`, with the `<profile>` element that holds it.
+fn profile_properties(
+    text: &str,
+    ignored: &[Element],
+    profiles: &[Element],
+) -> Result<Vec<ProfileProperties>, String> {
+    let live = |pos: usize| inside(pos, profiles) && !inside(pos, ignored);
+    // A `<properties>` no `<profile>` is found around (a scan this simple
+    // cannot place) belongs to no profile: it is then only ever an
+    // alternative, never a declaration's own, which reads more versions
+    // into [`PomDep::version_alternatives`], not fewer.
+    let holders: Vec<Element> = elements(text, "profile")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| live(p.start))
+        .collect();
+    let mut out = Vec::new();
+    for props in elements(text, "properties")? {
+        if !live(props.start) {
+            continue;
         }
-        text = next;
+        let holder = holders
+            .iter()
+            .find(|p| props.start >= p.start && props.start < p.end)
+            .copied();
+        // Maven names a profile without an `<id>` `default`, as the
+        // vendored reactor does.
+        let id = holder
+            .and_then(|p| direct_child_text(p.inner(text), "id"))
+            .filter(|id| !id.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        let mut map = BTreeMap::new();
+        read_properties(props.inner(text), &mut map)?;
+        out.push(ProfileProperties {
+            holder,
+            id,
+            props: map,
+        });
     }
-    text
-}
-
-/// One round of [`interpolate`], or `None` once the result would exceed
-/// [`MAX_INTERPOLATED_LEN`].
-fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(open) = rest.find("${") {
-        if out.len() > MAX_INTERPOLATED_LEN {
-            return None;
-        }
-        out.push_str(&rest[..open]);
-        let after = &rest[open + 2..];
-        match after
-            .find('}')
-            .map(|close| (&after[..close], close))
-            .filter(|(name, _)| is_property_name(name))
-            .and_then(|(name, close)| properties.get(name).map(|v| (v, close)))
-        {
-            Some((value, close)) => {
-                out.push_str(value);
-                rest = &after[close + 1..];
-            }
-            None => {
-                out.push_str("${");
-                rest = after;
-            }
-        }
-    }
-    out.push_str(rest);
-    (out.len() <= MAX_INTERPOLATED_LEN).then_some(out)
+    Ok(out)
 }
 
 /// The model references a sibling declaration commonly uses
@@ -379,13 +753,12 @@ fn interpolate_once(text: &str, properties: &BTreeMap<String, String>) -> Option
 /// `${groupId}`, `${project.parent.groupId}`), read from the project's own
 /// `<groupId>` / `<artifactId>` / `<version>` and its `<parent>`'s; groupId
 /// and version fall back to the parent's, which the project inherits when
-/// it omits them. A coordinate written through a property is resolved from
-/// `properties` (never inherited instead: Maven interpolates a present
-/// element), and one that stays unresolved is not bound.
-fn model_refs(
-    masked: &str,
-    properties: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, String> {
+/// it omits them. Each is bound raw: one written through a property
+/// (`<version>${revision}</version>`) is interpolated wherever it is read,
+/// with the user properties and active profiles of that read, as Maven
+/// interpolates the model itself (never inherited instead: Maven
+/// interpolates a present element).
+fn model_refs(masked: &str) -> Result<BTreeMap<String, String>, String> {
     let Some(project) = elements(masked, "project")?.into_iter().next() else {
         return Ok(BTreeMap::new());
     };
@@ -410,15 +783,11 @@ fn model_refs(
     ] {
         own = blank_elements(&own, section)?;
     }
-    let usable = |v: Option<String>| {
-        v.map(|v| interpolate(&v, properties))
-            .filter(|v| !v.is_empty() && !v.contains("${"))
-    };
     let mut refs = BTreeMap::new();
     for (field, inherited) in [("groupId", true), ("artifactId", false), ("version", true)] {
-        let parent_value = usable(parent_text(field)?);
+        let parent_value = parent_text(field)?;
         let value = match child_text(&own, field)? {
-            Some(v) => usable(Some(v)),
+            Some(v) => Some(v),
             None if inherited => parent_value.clone(),
             None => None,
         };
@@ -586,6 +955,37 @@ pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> b
         || type_text.is_some_and(|t| !t.is_empty() && t != "jar" && t != "pom")
 }
 
+/// Which copy of its GA a declaration's `<type>` / `<classifier>` read as
+/// when a profile moves its coordinates: `Some(None)` the main jar,
+/// `Some(Some(c))` the classifier copy `c`, `None` no jar on the classpath.
+/// An empty `<type>` is Maven's default `jar`, `test-jar` is the `tests`
+/// copy, an explicit classifier names the copy whatever the type, and a
+/// `${…}` type may be `jar`.
+pub(crate) fn classpath_copy<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> Option<Option<&'a str>> {
+    match (type_text, classifier) {
+        (None | Some("" | "jar"), c) => Some(c),
+        (Some(t), c) if t.contains("${") => Some(c),
+        (Some("test-jar"), None) => Some(Some("tests")),
+        (Some(_), Some(c)) => Some(Some(c)),
+        _ => None,
+    }
+}
+
+/// How Maven keys a `<dependencyManagement>` entry besides its GA: by
+/// classifier and type, an empty or `jar` type being the default.
+pub(crate) fn management_key<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> (Option<&'a str>, Option<&'a str>) {
+    (
+        classifier.filter(|c| !c.is_empty()),
+        type_text.filter(|t| !t.is_empty() && *t != "jar"),
+    )
+}
+
 /// The label a variant ([`is_variant`]) is reported by: its classifier,
 /// else its type.
 pub(crate) fn variant_label<'a>(
@@ -659,7 +1059,17 @@ fn blank_elements(text: &str, name: &str) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::PomScope;
+
+    /// `.mvn/maven.config`-style user properties from `(name, value)` pairs.
+    fn user_props(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
 
     #[test]
     fn scope_skips_comments_and_plugin_sections_and_flags_profiles() {
@@ -722,7 +1132,7 @@ mod tests {
         let deps = PomScope::new(&pom).unwrap().dependencies().unwrap();
         let group = deps[0].group.as_deref().unwrap();
         assert!(
-            group.len() <= super::MAX_INTERPOLATED_LEN,
+            group.len() <= super::properties::MAX_RESOLVED_LEN,
             "{}",
             group.len()
         );
@@ -805,7 +1215,455 @@ mod tests {
         let scope = PomScope::new(pom).unwrap();
         let deps = scope.dependencies().unwrap();
         assert_eq!(deps[0].group.as_deref(), Some("com.acme"));
-        assert!(!scope.coordinate_refs.contains_key("project.version"));
+        let dep = super::parse_pom(pom).unwrap().deps.remove(0);
+        assert_eq!(
+            dep.build_version.as_deref(),
+            Some("${project.version}"),
+            "an unresolvable project version is not the parent's"
+        );
+    }
+
+    /// Maven's model interpolator reads user properties (`.mvn/maven.config`'s
+    /// `-D`) before the pom's own `<properties>`, for a `<version>` just as
+    /// for a coordinate: `-Dv=1.0` makes `${v}` the base release whatever
+    /// the pom defines.
+    #[test]
+    fn version_property_reads_user_properties_first() {
+        let pom = "<project><properties><v>1.0-socket.77777777</v><w>2</w></properties>\
+                   <dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${v}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${w}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>c</artifactId><version>${u}</version></dependency>\
+                   </dependencies></project>";
+        let versions = |user: &[(&str, &str)]| {
+            super::parse_pom_with(pom, &user_props(user))
+                .unwrap()
+                .deps
+                .into_iter()
+                .map(|d| (d.version.unwrap(), d.build_version.unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let both = |v: &str| (v.to_string(), v.to_string());
+        assert_eq!(
+            versions(&[]),
+            [both("1.0-socket.77777777"), both("2"), both("${u}")]
+        );
+        assert_eq!(
+            versions(&[("v", "1.0"), ("u", "3")]),
+            [
+                ("1.0-socket.77777777".to_string(), "1.0".to_string()),
+                both("2"),
+                ("${u}".to_string(), "3".to_string()),
+            ],
+            "the build's user property wins over the pom's and defines one it lacks; \
+             `version` keeps what the pom spells"
+        );
+    }
+
+    /// Maven reads `${project.*}` / `${pom.*}` from the model before any
+    /// user property: `-Dproject.version=` does not move a dependency
+    /// version written through the model.
+    #[test]
+    fn model_reference_version_ignores_user_properties() {
+        let pom = "<project><version>1</version><dependencies>\
+                   <dependency><groupId>g</groupId><artifactId>a</artifactId><version>${project.version}</version></dependency>\
+                   <dependency><groupId>g</groupId><artifactId>b</artifactId><version>${pom.version}</version></dependency>\
+                   </dependencies></project>";
+        let user = user_props(&[("project.version", "9"), ("pom.version", "9")]);
+        let deps = super::parse_pom_with(pom, &user).unwrap().deps;
+        for d in &deps {
+            assert_eq!(d.build_version, d.version, "{d:?}");
+            assert!(
+                d.build_version.as_deref().is_some_and(|v| v != "9"),
+                "{d:?}"
+            );
+        }
+    }
+
+    /// A `${property}` version is interpolated through every property it
+    /// names, user properties first at each level; a cycle, an undefined
+    /// name or a chain deeper than [`super::MAX_INTERPOLATION_DEPTH`]
+    /// leaves it as written.
+    #[test]
+    fn version_properties_resolve_recursively_and_fail_closed() {
+        // (as the pom spells it, as the build resolves it)
+        let both = |props: &str, user: &[(&str, &str)], text: &str| {
+            let pom = format!(
+                "<project><properties>{props}</properties><dependencies>\
+                 <dependency><groupId>g</groupId><artifactId>a</artifactId>\
+                 <version>{text}</version></dependency></dependencies></project>"
+            );
+            let dep = super::parse_pom_with(&pom, &user_props(user))
+                .unwrap()
+                .deps
+                .remove(0);
+            assert!(dep.version_alternatives.is_empty(), "{props}");
+            (dep.version.unwrap(), dep.build_version.unwrap())
+        };
+        let version = |props: &str, user: &[(&str, &str)], text: &str| {
+            let (spelled, built) = both(props, user, text);
+            if user.is_empty() {
+                assert_eq!(spelled, built, "{props}");
+            }
+            built
+        };
+        assert_eq!(
+            both("<a>${b}</a><b>1.0</b>", &[("b", "2.0")], "${a}"),
+            ("1.0".to_string(), "2.0".to_string()),
+            "a nested user property moves the build's version, not the pom's"
+        );
+        // `<p0>${p1}</p0>` ... `<p{n-1}>1.0</p{n-1}>`.
+        let chain = |n: usize| -> String {
+            (0..n)
+                .map(|i| match i + 1 == n {
+                    true => format!("<p{i}>1.0</p{i}>"),
+                    false => format!("<p{i}>${{p{}}}</p{i}>", i + 1),
+                })
+                .collect()
+        };
+        assert_eq!(
+            version("<a>${b}</a><b>${c}</b><c>1.0</c>", &[], "${a}"),
+            "1.0"
+        );
+        assert_eq!(
+            version("<a>${b}</a><b>1.0</b>", &[("b", "2.0")], "${a}"),
+            "2.0"
+        );
+        assert_eq!(version("<a>1</a><b>0</b>", &[], "${a}.${b}-x"), "1.0-x");
+        assert_eq!(
+            version("", &[], "${project.version}"),
+            "${project.version}",
+            "no project version here"
+        );
+        assert_eq!(version(&chain(16), &[], "${p0}"), "1.0");
+        assert_eq!(version(&chain(17), &[], "${p0}"), "${p0}", "too deep");
+        for cyclic in [
+            "<a>${a}</a>",
+            "<a>${b}</a><b>${a}</b>",
+            "<a>x${b}</a><b>${a}y</b>",
+        ] {
+            assert_eq!(version(cyclic, &[], "${a}"), "${a}", "{cyclic}");
+        }
+        assert_eq!(version("<a>${b}</a>", &[], "${a}"), "${a}", "undefined");
+        assert_eq!(version("<a>1</a>", &[], "${a"), "${a", "unterminated");
+    }
+
+    /// The versions a profile's `<properties>` may move a declaration to:
+    /// every profile, and every set of profiles active together, counts; a
+    /// declaration inside a profile reads that profile's own first; user
+    /// properties and model references no profile can redefine.
+    #[test]
+    fn profile_properties_give_version_alternatives() {
+        fn values(alternatives: Vec<super::Alternative>) -> Vec<String> {
+            alternatives.into_iter().map(|a| a.value).collect()
+        }
+        let resolve = |props: &str, profiles: &[&str], user: &[(&str, &str)], deps: &str| {
+            let profiles: String = profiles
+                .iter()
+                .map(|p| format!("<profile><properties>{p}</properties></profile>"))
+                .collect();
+            let pom = format!(
+                "<project><version>9</version><properties>{props}</properties>\
+                 <dependencies>{deps}</dependencies><profiles>{profiles}</profiles></project>"
+            );
+            super::parse_pom_with(&pom, &user_props(user))
+                .unwrap()
+                .deps
+                .into_iter()
+                .map(|d| (d.build_version.unwrap(), values(d.version_alternatives)))
+                .collect::<Vec<_>>()
+        };
+        let dep = |v: &str| {
+            format!(
+                "<dependency><groupId>g</groupId><artifactId>a</artifactId>\
+                 <version>{v}</version></dependency>"
+            )
+        };
+        let one = |props, profiles: &[&str], user: &[(&str, &str)]| {
+            resolve(props, profiles, user, &dep("${v}")).remove(0)
+        };
+        let s = |v: &[&str]| v.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+        assert_eq!(one("<v>1</v>", &["<v>2</v>"], &[]), ("1".into(), s(&["2"])));
+        assert_eq!(one("<v>1</v>", &["<v>1</v>"], &[]), ("1".into(), s(&[])));
+        assert_eq!(one("<v>1</v>", &["<x>2</x>"], &[]), ("1".into(), s(&[])));
+        assert_eq!(
+            one("<v>${w}</v><w>1</w>", &["<w>2</w>", "<w>3</w>"], &[]),
+            ("1".into(), s(&["2", "3"]))
+        );
+        // Two profiles that move it only together.
+        assert_eq!(
+            one("<v>1</v><w>1</w>", &["<v>${w}</v>", "<w>2</w>"], &[]),
+            ("1".into(), s(&["2"]))
+        );
+        // A profile value this pom cannot resolve, or a cycle.
+        assert_eq!(
+            one("<v>1</v>", &["<v>${nope}</v>"], &[]),
+            ("1".into(), s(&["${v}"]))
+        );
+        assert_eq!(
+            one("<v>1</v>", &["<v>${v}</v>"], &[]),
+            ("1".into(), s(&["${v}"]))
+        );
+        // User properties and model references win over every profile's.
+        assert_eq!(
+            one("<v>1</v>", &["<v>2</v>"], &[("v", "3")]),
+            ("3".into(), s(&[]))
+        );
+        assert_eq!(
+            resolve(
+                "",
+                &["<project.version>2</project.version>"],
+                &[],
+                &dep("${project.version}")
+            )
+            .remove(0),
+            ("9".into(), s(&[]))
+        );
+        // More alternatives than are enumerated: unresolved.
+        let many: Vec<String> = (0..17).map(|i| format!("<v>{i}</v>")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(one("<v>x</v>", &many, &[]), ("x".into(), s(&["${v}"])));
+
+        // A profile's own declaration reads its own properties first.
+        let pom = format!(
+            "<project><properties><v>1</v></properties><dependencies>{}</dependencies>\
+             <profiles><profile><id>a</id><properties><v>2</v></properties>\
+             <dependencies>{}</dependencies></profile>\
+             <profile><id>b</id><properties><v>3</v></properties></profile></profiles></project>",
+            dep("${v}"),
+            dep("${v}")
+        );
+        let deps: Vec<_> = super::parse_pom(&pom)
+            .unwrap()
+            .deps
+            .into_iter()
+            .map(|d| {
+                (
+                    d.in_profile,
+                    d.build_version.unwrap(),
+                    d.version_alternatives,
+                )
+            })
+            .collect();
+        let moved = |value: &str, ids: &[&str]| super::Alternative {
+            value: value.to_string(),
+            by: super::MovedBy::Profiles(s(ids)),
+        };
+        assert_eq!(
+            deps,
+            [
+                (
+                    false,
+                    "1".to_string(),
+                    vec![moved("2", &["a"]), moved("3", &["b"])]
+                ),
+                (true, "2".to_string(), vec![moved("3", &["b"])]),
+            ]
+        );
+
+        // `${project.version}` spelled through a property moves with it.
+        let pom = format!(
+            "<project><version>${{revision}}</version><properties><revision>1</revision>\
+             </properties><dependencies>{}</dependencies><profiles><profile><id>ci</id>\
+             <properties><revision>2</revision></properties></profile></profiles></project>",
+            dep("${project.version}")
+        );
+        let user = user_props(&[("revision", "3")]);
+        for (user, built, alternatives) in [
+            (BTreeMap::new(), "1", vec![moved("2", &["ci"])]),
+            (user, "3", vec![]),
+        ] {
+            let d = super::parse_pom_with(&pom, &user).unwrap().deps.remove(0);
+            assert_eq!(d.version.as_deref(), Some("1"));
+            assert_eq!(d.build_version.as_deref(), Some(built));
+            assert_eq!(d.version_alternatives, alternatives);
+        }
+
+        // An unreadable profile `<properties>` fails a `${…}` closed, and
+        // only for the reader that weighs profiles.
+        let pom = format!(
+            "<project><properties><v>1</v></properties><dependencies>{}{}</dependencies>\
+             <profiles><profile><properties><v>2</properties></profile></profiles></project>",
+            dep("${v}"),
+            dep("1")
+        );
+        assert!(PomScope::new(&pom).unwrap().dependencies().is_ok());
+        let deps = super::parse_pom(&pom).unwrap().deps;
+        assert!(matches!(
+            deps[0].version_alternatives[..],
+            [super::Alternative {
+                by: super::MovedBy::Unreadable(_),
+                ..
+            }]
+        ));
+        assert!(deps[1].version_alternatives.is_empty());
+    }
+
+    /// The shared interpolator's work bounds: a value naming the next
+    /// property many times over fails instead of growing exponentially.
+    #[test]
+    fn interpolation_is_bounded() {
+        let props: std::collections::BTreeMap<String, String> = (0..12)
+            .map(|i| (format!("p{i}"), format!("${{p{}}}", i + 1).repeat(8)))
+            .chain([("p12".to_string(), "x".to_string())])
+            .collect();
+        let lookup = |name: &str| props.get(name).cloned();
+        assert_eq!(super::interpolate_strict("${p0}", &lookup), None);
+        assert_eq!(
+            super::interpolate_strict("${p11}", &lookup).as_deref(),
+            Some("xxxxxxxx")
+        );
+    }
+
+    /// The `(groupId, artifactId)` pairs a profile's `<properties>` may move
+    /// a `${property}` coordinate to: every combination of profiles counts,
+    /// both coordinates read under the same one, a declaration inside a
+    /// profile reads its own first, a value left unresolved stays as
+    /// written, and user properties and model references no profile can
+    /// redefine.
+    #[test]
+    fn profile_properties_give_coordinate_alternatives() {
+        let pairs = |alternatives: Vec<super::CoordinateAlternative>| {
+            alternatives
+                .into_iter()
+                .map(|c| (c.group, c.artifact))
+                .collect::<Vec<_>>()
+        };
+        let alternatives = |props: &str, profiles: &[&str], user: &[(&str, &str)], deps: &str| {
+            let profiles: String = profiles
+                .iter()
+                .map(|p| format!("<profile><properties>{p}</properties></profile>"))
+                .collect();
+            let pom = format!(
+                "<project><groupId>org.self</groupId><properties>{props}</properties>\
+                 <dependencies>{deps}</dependencies><profiles>{profiles}</profiles></project>"
+            );
+            super::parse_pom_with(&pom, &user_props(user))
+                .unwrap()
+                .deps
+                .into_iter()
+                .map(|d| ((d.group, d.artifact), pairs(d.coordinate_alternatives)))
+                .collect::<Vec<_>>()
+        };
+        let dep = |g: &str, a: &str| {
+            format!(
+                "<dependency><groupId>{g}</groupId><artifactId>{a}</artifactId>\
+                 <version>1</version></dependency>"
+            )
+        };
+        let pair = |g: &str, a: &str| (g.to_string(), a.to_string());
+        let one = |props, profiles: &[&str], user: &[(&str, &str)], g: &str, a: &str| {
+            alternatives(props, profiles, user, &dep(g, a)).remove(0)
+        };
+        assert_eq!(
+            one("<g>org.a</g>", &["<g>org.b</g>"], &[], "${g}", "x"),
+            (pair("org.a", "x"), vec![pair("org.b", "x")])
+        );
+        assert_eq!(
+            one("<g>org.a</g>", &["<g>org.a</g>"], &[], "${g}", "x"),
+            (pair("org.a", "x"), vec![])
+        );
+        assert_eq!(
+            one("<g>org.a</g>", &["<y>org.b</y>"], &[], "${g}", "x"),
+            (pair("org.a", "x"), vec![])
+        );
+        // Both coordinates, read under the same profiles.
+        assert_eq!(
+            one("<v>a</v>", &["<v>b</v>"], &[], "org.${v}", "${v}-api").1,
+            [pair("org.b", "b-api")]
+        );
+        // Nested, and two profiles together.
+        assert_eq!(
+            one(
+                "<g>${w}</g><w>org.a</w>",
+                &["<w>org.b</w>", "<g>${w}.c</g>"],
+                &[],
+                "${g}",
+                "x"
+            )
+            .1,
+            [
+                pair("org.b", "x"),
+                pair("org.a.c", "x"),
+                pair("org.b.c", "x")
+            ]
+        );
+        // Unresolved under a profile, or a cycle: kept as written.
+        assert_eq!(
+            one("<g>org.a</g>", &["<g>${nope}</g>"], &[], "${g}", "x").1,
+            [pair("${nope}", "x")]
+        );
+        assert_eq!(
+            one("<g>org.a</g>", &["<g>${g}</g>"], &[], "${g}", "x").1,
+            [pair("${g}", "x")]
+        );
+        // An unterminated `${` in one coordinate stays in that one: each is
+        // read on its own budget, and every reading names its profiles.
+        let pom = format!(
+            "<project><properties><a>x</a></properties><dependencies>{}</dependencies>\
+             <profiles><profile><id>q</id><properties><a>y</a></properties></profile>\
+             </profiles></project>",
+            dep("${g", "${a}")
+        );
+        let d = super::parse_pom(&pom).unwrap().deps.remove(0);
+        assert_eq!((d.group.as_str(), d.artifact.as_str()), ("${g", "x"));
+        assert_eq!(
+            d.coordinate_alternatives,
+            [super::CoordinateAlternative {
+                group: "${g".to_string(),
+                artifact: "y".to_string(),
+                version: Some("1".to_string()),
+                by: super::MovedBy::Profiles(vec!["q".to_string()]),
+            }]
+        );
+        // Undefined with no profile involved: no alternative.
+        assert_eq!(
+            one("<g>org.a</g>", &[], &[], "${g}.${nope}", "x"),
+            (pair("org.a.${nope}", "x"), vec![])
+        );
+        // User properties and model references win over every profile's.
+        assert_eq!(
+            one(
+                "<g>org.a</g>",
+                &["<g>org.b</g>"],
+                &[("g", "org.c")],
+                "${g}",
+                "x"
+            ),
+            (pair("org.c", "x"), vec![])
+        );
+        assert_eq!(
+            one(
+                "",
+                &["<project.groupId>org.b</project.groupId>"],
+                &[],
+                "${project.groupId}",
+                "x"
+            ),
+            (pair("org.self", "x"), vec![])
+        );
+
+        // A profile's own declaration reads its own properties first.
+        let pom = format!(
+            "<project><properties><g>org.a</g></properties><dependencies>{}</dependencies>\
+             <profiles><profile><id>p</id><properties><g>org.b</g></properties>\
+             <dependencies>{}</dependencies></profile></profiles></project>",
+            dep("${g}", "x"),
+            dep("${g}", "x")
+        );
+        let deps: Vec<_> = super::parse_pom(&pom)
+            .unwrap()
+            .deps
+            .into_iter()
+            .map(|d| (d.in_profile, d.group, pairs(d.coordinate_alternatives)))
+            .collect();
+        assert_eq!(
+            deps,
+            [
+                (false, "org.a".to_string(), vec![pair("org.b", "x")]),
+                (true, "org.b".to_string(), vec![]),
+            ]
+        );
     }
 
     #[test]

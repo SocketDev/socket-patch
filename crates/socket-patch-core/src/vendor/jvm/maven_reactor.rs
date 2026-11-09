@@ -11,7 +11,11 @@ use std::ops::Range;
 
 use serde_json::{json, Value};
 
-use crate::formats::maven::maven_config_properties as cli_properties;
+use crate::formats::maven::{
+    classpath_copy, interpolate_keeping, interpolate_strict, is_executable_classifier,
+    lookup_property, maven_config_properties as cli_properties, profile_combinations, Definitions,
+    Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
+};
 
 use super::super::state::{WiringAction, WiringRecord};
 use super::layout::{self, safe_coordinates};
@@ -51,8 +55,6 @@ const NESTED_MVN_FILES: &[&str] = &[
 const SHAPE_UNSUPPORTED: &str = "vendor_jvm_shape_unsupported";
 const UPSTREAM_UNAVAILABLE: &str = "vendor_jvm_upstream_unavailable";
 const DEGRADED: &str = "vendor_jvm_degraded";
-/// Property interpolation depth cap (Maven itself fails on cycles).
-const MAX_INTERPOLATION_DEPTH: usize = 16;
 
 /// Whether the pom declares a `<modules>` or `<subprojects>` of the project
 /// or of a profile (plugin configuration, comments and CDATA do not count).
@@ -776,7 +778,7 @@ fn restore_versions(
     let resolve = |v: &str| {
         reactor
             .filter(|r| r.poms.contains_key(rel))
-            .and_then(|r| r.interpolate(rel, v, 0))
+            .and_then(|r| r.interpolate(rel, v))
     };
     let mut edits = Vec::new();
     for (dep, key) in doc.keyed_declarations(c.group_id, c.artifact_id, &resolve) {
@@ -1094,30 +1096,6 @@ struct ExternalPom {
     pom: Pom,
 }
 
-/// `${name}` interpolation through `lookup`; `None` when a name is
-/// undefined or the nesting is too deep.
-fn interpolate_by(
-    value: &str,
-    lookup: &dyn Fn(&str) -> Option<String>,
-    depth: usize,
-) -> Option<String> {
-    if depth > MAX_INTERPOLATION_DEPTH {
-        return None;
-    }
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(at) = rest.find("${") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let close = after.find('}')?;
-        let raw = lookup(&after[..close])?;
-        out.push_str(&interpolate_by(&raw, lookup, depth + 1)?);
-        rest = &after[close + 1..];
-    }
-    out.push_str(rest);
-    Some(out)
-}
-
 impl Reactor {
     /// Management of `patch`'s g:a that a pin in local root `root` would
     /// override and that does not manage it at the patch's base version:
@@ -1159,7 +1137,7 @@ impl Reactor {
                 })
             };
             let resolve = |value: &str, what: &str| -> Result<String, Missing> {
-                interpolate_by(value, &props, 0).ok_or_else(|| {
+                interpolate_strict(value, &props).ok_or_else(|| {
                     Missing::Unresolved(format!("{rel}: {what} {value} is not defined"))
                 })
             };
@@ -1246,8 +1224,7 @@ impl Reactor {
     ) -> Result<Vec<ExternalPom>, Missing> {
         let mut chain: Vec<ExternalPom> = Vec::new();
         let mut parent = self.poms[root].parent.as_ref().map(|p| {
-            let local =
-                |v: &Option<String>| v.as_deref().and_then(|v| self.interpolate(root, v, 0));
+            let local = |v: &Option<String>| v.as_deref().and_then(|v| self.interpolate(root, v));
             (local(&p.group), local(&p.artifact), local(&p.version))
         });
         while let Some((pg, pa, pv)) = parent {
@@ -1408,7 +1385,7 @@ fn bom_manages<'b>(
         chain.iter().find_map(|e| e.pom.props.get(name).cloned())
     };
     let resolve = |value: &str| -> Result<String, Missing> {
-        interpolate_by(value, &props, 0).ok_or_else(|| {
+        interpolate_strict(value, &props).ok_or_else(|| {
             Missing::Unresolved(format!(
                 "the BOM {}:{}:{} manages {g}:{a} at {value}, which it does not define",
                 bom.0, bom.1, bom.2
@@ -1773,7 +1750,7 @@ impl Reactor {
                     std::iter::once(rel.as_str())
                         .chain(self.inheritors(rel))
                         .any(|reader| {
-                            let resolve = |v: &str| self.interpolate(reader, v, 0);
+                            let resolve = |v: &str| self.interpolate(reader, v);
                             let value = |name: &str| doc.coordinate(dep, name, &resolve);
                             value("groupId").as_deref() == Some(c.group_id)
                                 && value("artifactId").as_deref() == Some(c.artifact_id)
@@ -1791,7 +1768,7 @@ impl Reactor {
     /// outside the checkout (an external parent or BOM) or a transitive
     /// path — or when it cannot be interpolated.
     fn managed_version(&self, rel: &str, g: &str, a: &str) -> Option<String> {
-        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let resolve = |v: &str| self.interpolate(rel, v);
         self.chain(rel)
             .find_map(|p| {
                 let doc = &self.poms[p].doc;
@@ -1818,7 +1795,7 @@ impl Reactor {
         if self.managed_version(rel, g, a).as_deref() != Some(sv) {
             return false;
         }
-        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let resolve = |v: &str| self.interpolate(rel, v);
         let is_ga = |doc: &Doc, dep: usize| {
             doc.is_main_jar(dep)
                 && doc.coordinate(dep, "groupId", &resolve).as_deref() == Some(g)
@@ -1860,7 +1837,7 @@ impl Reactor {
         let Some(declared) = doc.child_text(dep, "version") else {
             return false;
         };
-        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let resolve = |v: &str| self.interpolate(rel, v);
         doc.coordinate(dep, "version", &resolve).as_deref() == Some(sv)
             && (!declared.contains("${")
                 || self
@@ -1873,89 +1850,78 @@ impl Reactor {
     fn keyed_declarations(&self, rel: &str, g: &str, a: &str) -> Vec<(usize, String)> {
         self.poms[rel]
             .doc
-            .keyed_declarations(g, a, &|v| self.interpolate(rel, v, 0))
+            .keyed_declarations(g, a, &|v| self.interpolate(rel, v))
     }
 
     /// Interpolate every `${name}` in `value` in the context of `rel`;
     /// `None` when any name is undefined in the checkout.
-    fn interpolate(&self, rel: &str, value: &str, depth: usize) -> Option<String> {
-        self.interpolate_with(rel, value, depth, None)
+    fn interpolate(&self, rel: &str, value: &str) -> Option<String> {
+        self.interpolate_with(rel, value, &[], interpolate_strict)
     }
 
-    /// [`Self::interpolate`] with `overlay`'s properties (a profile's)
-    /// layered over its pom's own, as when that profile is active.
+    /// [`Self::interpolate`] with the `active` profiles' properties layered
+    /// over their poms' own, as when those profiles are active, through
+    /// `interpolate` ([`interpolate_strict`] for a version,
+    /// [`interpolate_keeping`] for coordinates).
     fn interpolate_with(
         &self,
         rel: &str,
         value: &str,
-        depth: usize,
-        overlay: Option<Overlay<'_>>,
+        active: &[Overlay<'_>],
+        interpolate: Interpolate,
     ) -> Option<String> {
-        if depth > MAX_INTERPOLATION_DEPTH {
-            return None;
-        }
-        let mut out = String::new();
-        let mut rest = value;
-        while let Some(at) = rest.find("${") {
-            out.push_str(&rest[..at]);
-            let after = &rest[at + 2..];
-            let close = after.find('}')?;
-            let raw = self.lookup_with(rel, &after[..close], overlay)?;
-            out.push_str(&self.interpolate_with(rel, &raw, depth + 1, overlay)?);
-            rest = &after[close + 1..];
-        }
-        out.push_str(rest);
-        Some(out)
+        interpolate(value, &|name| self.lookup_with(rel, name, active))
     }
 
-    /// User properties win over model properties, as in Maven; then the
-    /// model's own version expressions, then `<properties>` up the local
-    /// chain.
+    /// Maven's lookup order ([`lookup_property`], shared with VEX
+    /// discovery): the model's own coordinates, user properties, then
+    /// `<properties>` up the local chain with the `active` profiles merged
+    /// over their poms', then the deprecated bare `${version}`.
     fn lookup(&self, rel: &str, name: &str) -> Option<String> {
-        self.lookup_with(rel, name, None)
+        self.lookup_with(rel, name, &[])
     }
 
-    fn lookup_with(&self, rel: &str, name: &str, overlay: Option<Overlay<'_>>) -> Option<String> {
+    fn lookup_with(&self, rel: &str, name: &str, active: &[Overlay<'_>]) -> Option<String> {
+        let layers = self.chain(rel).map(|p| PomLayer {
+            own: &self.poms[p].props,
+            profiles: active
+                .iter()
+                .filter(|(at, _)| *at == p)
+                .map(|(_, props)| *props)
+                .collect(),
+        });
+        lookup_property(name, &|n| self.model_ref(rel, n), &self.cli_props, layers)
+    }
+
+    /// The project model reference `name` of `rel` (`project.version`,
+    /// `project.groupId`, ...; the deprecated bare `version`), raw.
+    fn model_ref(&self, rel: &str, name: &str) -> Option<String> {
         let pom = &self.poms[rel];
         // A Maven 4 child may omit its parent's coordinates too: they come
         // from the inferred local parent.
-        let version = || {
-            self.chain(rel)
-                .find_map(|p| self.poms[p].effective_version())
-                .map(str::to_string)
-        };
         match name {
-            "project.version" | "pom.version" => return version(),
-            "project.groupId" | "pom.groupId" => {
-                return self
-                    .chain(rel)
-                    .find_map(|p| self.poms[p].effective_group())
-                    .map(str::to_string);
-            }
-            "project.artifactId" | "pom.artifactId" => return pom.artifact.clone(),
-            "project.parent.version" => return pom.parent.as_ref()?.version.clone(),
-            "project.parent.groupId" => return pom.parent.as_ref()?.group.clone(),
-            _ => {}
+            "project.version" | "pom.version" | "version" => self
+                .chain(rel)
+                .find_map(|p| self.poms[p].effective_version())
+                .map(str::to_string),
+            "project.groupId" | "pom.groupId" => self
+                .chain(rel)
+                .find_map(|p| self.poms[p].effective_group())
+                .map(str::to_string),
+            "project.artifactId" | "pom.artifactId" => pom.artifact.clone(),
+            "project.parent.version" => pom.parent.as_ref()?.version.clone(),
+            "project.parent.groupId" => pom.parent.as_ref()?.group.clone(),
+            _ => None,
         }
-        if let Some(v) = self.cli_props.get(name) {
-            return Some(v.clone());
-        }
-        if let Some(v) = self.chain(rel).find_map(|p| {
-            overlay
-                .filter(|(at, _)| *at == p)
-                .and_then(|(_, props)| props.get(name))
-                .or_else(|| self.poms[p].props.get(name))
-        }) {
-            return Some(v.clone());
-        }
-        (name == "version").then(version).flatten()
     }
 
     /// A version `declared` (with `${...}`) reaches in a pom that reads
-    /// it, an inheritor of `rel` or `rel` itself with a profile on its
-    /// chain active, that is neither the base nor `sv`: the version and
-    /// where. Profile activation is not evaluated, so every profile counts
-    /// (one at a time).
+    /// it, an inheritor of `rel` or `rel` itself with some combination of
+    /// the profiles on its chain active, that is neither the base nor `sv`:
+    /// the version and where. Profile activation is not evaluated, so every
+    /// combination of profiles that may change it counts
+    /// ([`profile_combinations`], shared with VEX discovery); more of them
+    /// than are combined fails closed.
     fn version_override(
         &self,
         rel: &str,
@@ -1969,37 +1935,153 @@ impl Reactor {
     /// The first version `declared` reaches in a pom that reads it (an
     /// inheritor of `rel`, or `rel` or an inheritor with a profile on its
     /// chain active) for which `moved` holds, and where; an undefined
-    /// value is passed as `an undefined value`.
+    /// value is passed as `an undefined value` ([`Self::read_elsewhere`]).
     fn version_moved(
         &self,
         rel: &str,
         declared: &str,
         moved: &dyn Fn(&str) -> bool,
     ) -> Option<(String, String)> {
+        self.read_elsewhere(rel, &[(declared, interpolate_strict)], &|v| moved(&v[0]))
+            .map(|(mut v, at)| (v.remove(0), at))
+    }
+
+    /// Where `texts` (one declaration's, each read through its own
+    /// interpolation) read values `hit` accepts, other than in `rel` with
+    /// no profile active: in an inheritor of `rel` (Maven interpolates
+    /// after inheritance), or in `rel` or an inheritor with some combination
+    /// of the profiles on its chain active ([`Self::profile_override`]);
+    /// with those values (an undefined one reads "an undefined value") and
+    /// where.
+    fn read_elsewhere(
+        &self,
+        rel: &str,
+        texts: &[(&str, Interpolate)],
+        hit: &dyn Fn(&[String]) -> bool,
+    ) -> Option<(Vec<String>, String)> {
         std::iter::once(rel)
             .chain(self.inheritors(rel))
             .find_map(|reader| {
                 // `rel` resolves it, so a reader or profile that does not
                 // has redefined something it names: that moves it too.
-                let undefined = || "an undefined value".to_string();
                 let plain = (reader != rel)
-                    .then(|| {
-                        self.interpolate(reader, declared, 0)
-                            .unwrap_or_else(undefined)
-                    })
-                    .filter(|v| moved(v))
+                    .then(|| self.read_under(reader, texts, &[]))
+                    .filter(|v| hit(v))
                     .map(|v| (v, reader.to_string()));
-                plain.or_else(|| {
-                    self.chain(reader).find_map(|at| {
-                        self.poms[at].profile_props.iter().find_map(|(id, props)| {
-                            let v = self
-                                .interpolate_with(reader, declared, 0, Some((at, props)))
-                                .unwrap_or_else(undefined);
-                            moved(&v).then(|| (v, format!("{reader} under profile {id} of {at}")))
-                        })
-                    })
-                })
+                plain.or_else(|| self.profile_override(reader, texts, hit))
             })
+    }
+
+    /// What each of `texts` reads in `reader` with the `active` profiles
+    /// active, through its own interpolation and work budget ("an
+    /// undefined value" when that fails).
+    fn read_under(
+        &self,
+        reader: &str,
+        texts: &[(&str, Interpolate)],
+        active: &[Overlay<'_>],
+    ) -> Vec<String> {
+        texts
+            .iter()
+            .map(|(text, interpolate)| {
+                self.interpolate_with(reader, text, active, *interpolate)
+                    .unwrap_or_else(|| "an undefined value".to_string())
+            })
+            .collect()
+    }
+
+    /// The first combination of the profiles on `reader`'s chain under
+    /// which `texts` (all read under the same combination,
+    /// [`Self::read_under`]) read values `moved` accepts, with the values
+    /// and where; fails closed (undetermined values, whatever `moved` says)
+    /// when more profiles may change them than are combined, so a caller
+    /// that weighs only some declarations filters them first.
+    fn profile_override(
+        &self,
+        reader: &str,
+        texts: &[(&str, Interpolate)],
+        moved: &dyn Fn(&[String]) -> bool,
+    ) -> Option<(Vec<String>, String)> {
+        let profiles: Vec<(&str, &str, &BTreeMap<String, String>)> = self
+            .chain(reader)
+            .flat_map(|at| {
+                self.poms[at]
+                    .profile_props
+                    .iter()
+                    .map(move |(id, props)| (at, id.as_str(), props))
+            })
+            .collect();
+        let definitions = |name: &str| {
+            if let Some(fixed) =
+                Definitions::fixed(name, &|n| self.model_ref(reader, n), &self.cli_props)
+            {
+                return fixed;
+            }
+            let mut d = Definitions::default();
+            d.texts.extend(
+                self.chain(reader)
+                    .filter_map(|p| self.poms[p].props.get(name).cloned()),
+            );
+            d.texts.extend(self.model_ref(reader, name));
+            for (i, (_, _, props)) in profiles.iter().enumerate() {
+                if let Some(v) = props.get(name) {
+                    d.texts.push(v.clone());
+                    d.profiles.push(i);
+                }
+            }
+            d
+        };
+        let values: Vec<&str> = texts.iter().map(|(text, _)| *text).collect();
+        let Some(combinations) = profile_combinations(&values, &definitions) else {
+            return Some((
+                vec!["an undetermined value".to_string(); texts.len()],
+                format!(
+                    "{reader} under some combination of the more than {MAX_COMBINED_PROFILES} \
+                     profiles on its chain that redefine what it names"
+                ),
+            ));
+        };
+        combinations.into_iter().find_map(|combination| {
+            let active: Vec<Overlay<'_>> = combination
+                .iter()
+                .map(|&i| (profiles[i].0, profiles[i].2))
+                .collect();
+            let v = self.read_under(reader, texts, &active);
+            moved(&v).then(|| {
+                let under = combination
+                    .iter()
+                    .map(|&i| format!("profile {} of {}", profiles[i].1, profiles[i].0))
+                    .collect::<Vec<_>>()
+                    .join(" + ");
+                (v, format!("{reader} under {under}"))
+            })
+        })
+    }
+
+    /// Where `dep` of `rel`, a declaration named through `${...}`
+    /// coordinates, reads a groupId and artifactId that `hit` accepts,
+    /// other than `rel` with no profile active ([`Self::read_elsewhere`],
+    /// which covers the profile holding `dep`): each read under the same
+    /// profiles but on its own, an unresolved reference kept as written
+    /// ([`interpolate_keeping`]). Maven interpolates after inheritance and
+    /// with the active profiles' `<properties>` merged in, then matches
+    /// management and pins. More profiles than are combined fail closed
+    /// (accepted whatever `hit` says).
+    fn coordinates_elsewhere(
+        &self,
+        rel: &str,
+        dep: usize,
+        hit: &dyn Fn(&str, &str) -> bool,
+    ) -> Option<String> {
+        let doc = &self.poms[rel].doc;
+        let group = doc.child_text(dep, "groupId")?;
+        let artifact = doc.child_text(dep, "artifactId")?;
+        let texts: [(&str, Interpolate); 2] = [
+            (&group, interpolate_keeping),
+            (&artifact, interpolate_keeping),
+        ];
+        self.read_elsewhere(rel, &texts, &|v| hit(&v[0], &v[1]))
+            .map(|(_, at)| at)
     }
 
     /// Every pom in scope that inherits from `rel` (has it on its chain).
@@ -2028,7 +2110,7 @@ impl Reactor {
     ) {
         let doc = &self.poms[rel].doc;
         let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
-        self.warn_unresolved_coordinates(rel, patch, warnings, unpinned, uncertain);
+        self.warn_property_coordinates(rel, patch, warnings, unpinned, uncertain);
         for (dep, key) in self.keyed_declarations(rel, patch.group_id, patch.artifact_id) {
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
             let managed_section = doc.section_of(dep).ends_with("dependencyManagement");
@@ -2063,15 +2145,13 @@ impl Reactor {
                 continue;
             }
             let root = self.local_root(rel);
-            // Maven interpolates after inheritance: a pom that inherits this
-            // declaration may name another artifact through it, which the
-            // literal SV must not reach.
+            // Maven interpolates after inheritance and with the active
+            // profiles: a pom that inherits this declaration, or a profile
+            // redefining a property it names, may make it another artifact,
+            // which the literal SV must not reach.
             if doc.has_property_coordinate(dep) {
-                let other = self.inheritors(rel).find(|p| {
-                    let resolve = |v: &str| self.interpolate(p, v, 0);
-                    doc.coordinate(dep, "groupId", &resolve).as_deref() != Some(patch.group_id)
-                        || doc.coordinate(dep, "artifactId", &resolve).as_deref()
-                            != Some(patch.artifact_id)
+                let other = self.coordinates_elsewhere(rel, dep, &|g, a| {
+                    g != patch.group_id || a != patch.artifact_id
                 });
                 if let Some(p) = other {
                     warnings.push(degraded(
@@ -2103,7 +2183,7 @@ impl Reactor {
             };
             let declared = doc.text_of(version);
             let resolved = if declared.contains("${") {
-                match self.interpolate(rel, &declared, 0) {
+                match self.interpolate(rel, &declared) {
                     Some(v) => v,
                     None => {
                         warnings.push(degraded(
@@ -2178,11 +2258,21 @@ impl Reactor {
 }
 
 impl Reactor {
-    /// Warn for each declaration of `rel` that could be `patch`'s g:a but
-    /// names a `${...}` groupId or artifactId undefined in the checkout:
-    /// it is left as is, probably unpatched. One with its own version
-    /// beats any pin, so its local root is not pinned.
-    fn warn_unresolved_coordinates(
+    /// Warn for each declaration of `rel` named through `${...}`
+    /// coordinates that is not `patch`'s g:a in `rel` itself (those
+    /// `rewrite_declarations` weighs) but may be: one whose property the
+    /// checkout does not define (`property_unresolved`), or one an
+    /// inheritor or a combination of profiles makes it
+    /// (`coordinates_overridden`, [`Self::coordinates_elsewhere`]). It is
+    /// left as is, probably unpatched; one with its own version beats any
+    /// pin, so its local root is not pinned. A classifier copy is its own
+    /// coordinate, which no pin reaches: an executable one is warned about
+    /// as `classifier_declared`, as `rewrite_declarations` does (`sources` /
+    /// `javadoc` never run; `test-jar` is the `tests` copy), and any other
+    /// literal `<type>` but `jar` is not the g:a's jar (a `${…}` one may be). Text that can never
+    /// read the g:a, whatever its properties say ([`may_interpolate_to`]),
+    /// is ruled out first, before any inheritor or profile is read.
+    fn warn_property_coordinates(
         &self,
         rel: &str,
         patch: &JvmPatch<'_>,
@@ -2191,7 +2281,8 @@ impl Reactor {
         uncertain: &mut BTreeSet<String>,
     ) {
         let doc = &self.poms[rel].doc;
-        let resolve = |v: &str| self.interpolate(rel, v, 0);
+        let resolve = |v: &str| self.interpolate(rel, v);
+        let ga = format!("{}:{}", patch.group_id, patch.artifact_id);
         for dep in doc.declarations() {
             let (Some(g), Some(a)) = (
                 doc.child_text(dep, "groupId"),
@@ -2199,23 +2290,80 @@ impl Reactor {
             ) else {
                 continue;
             };
-            let unresolved: Vec<&str> = [&g, &a]
-                .into_iter()
-                .filter(|c| c.contains("${") && resolve(c).is_none())
-                .map(String::as_str)
-                .collect();
-            let could_be = |raw: &str, want: &str| match resolve(raw) {
-                Some(v) => v == want,
-                None => may_interpolate_to(raw, want),
-            };
-            if unresolved.is_empty()
-                || !doc.is_main_jar(dep)
-                || !could_be(&g, patch.group_id)
-                || !could_be(&a, patch.artifact_id)
+            let type_text = doc.child_text(dep, "type").filter(|t| !t.is_empty());
+            let classifier_text = doc.child_text(dep, "classifier").filter(|c| !c.is_empty());
+            // `test-jar` is the `tests` copy ([`classpath_copy`]); the type
+            // check below drops any other literal type but `jar`, even with
+            // an explicit classifier.
+            let classifier = classpath_copy(type_text.as_deref(), classifier_text.as_deref())
+                .flatten()
+                .map(str::to_string);
+            if !doc.has_property_coordinate(dep)
+                || doc.pin_at(dep).is_some()
+                || classifier
+                    .as_deref()
+                    .is_some_and(|c| !is_executable_classifier(c))
+                || !may_interpolate_to(&g, patch.group_id)
+                || !may_interpolate_to(&a, patch.artifact_id)
+                // A `${…}` type may be `jar`, as discovery reads it.
+                || type_text
+                    .as_deref()
+                    .is_some_and(|t| t != "jar" && t != "test-jar" && !t.contains("${"))
             {
                 continue;
             }
+            let (here_g, here_a) = (resolve(&g), resolve(&a));
+            let (reason, detail) = match (&here_g, &here_a) {
+                (Some(hg), Some(ha)) if hg == patch.group_id && ha == patch.artifact_id => {
+                    continue;
+                }
+                (Some(hg), Some(ha)) => {
+                    let Some(there) = self.coordinates_elsewhere(rel, dep, &|rg, ra| {
+                        may_interpolate_to(rg, patch.group_id)
+                            && may_interpolate_to(ra, patch.artifact_id)
+                    }) else {
+                        continue;
+                    };
+                    (
+                        "coordinates_overridden",
+                        format!("{g}:{a} is {hg}:{ha} here but may be {ga} in {there}"),
+                    )
+                }
+                _ => {
+                    let could_be = |read: &Option<String>, raw: &str, want: &str| match read {
+                        Some(v) => v == want,
+                        None => may_interpolate_to(raw, want),
+                    };
+                    if !could_be(&here_g, &g, patch.group_id)
+                        || !could_be(&here_a, &a, patch.artifact_id)
+                    {
+                        continue;
+                    }
+                    let unresolved: Vec<&str> = [(&g, &here_g), (&a, &here_a)]
+                        .into_iter()
+                        .filter(|(_, read)| read.is_none())
+                        .map(|(raw, _)| raw.as_str())
+                        .collect();
+                    (
+                        "property_unresolved",
+                        format!(
+                            "{g}:{a} may be {ga} but {} is not defined in the checkout",
+                            unresolved.join(", ")
+                        ),
+                    )
+                }
+            };
             let at = format!("{rel}:{}", doc.line_of(doc.nodes[dep].start));
+            if let Some(classifier) = classifier {
+                warnings.push(degraded(
+                    "classifier_declared",
+                    format!(
+                        "{at}: {detail}; a classifier variant ({classifier}) of {ga} bypasses \
+                         the pin"
+                    ),
+                ));
+                continue;
+            }
             let versioned = doc
                 .child_text(dep, "version")
                 .is_some_and(|v| !v.is_empty());
@@ -2226,14 +2374,8 @@ impl Reactor {
                 String::new()
             };
             warnings.push(degraded(
-                "property_unresolved",
-                format!(
-                    "{at}: {g}:{a} may be {}:{} but {} is not defined in the checkout; \
-                     left as is, probably unpatched{unpin}",
-                    patch.group_id,
-                    patch.artifact_id,
-                    unresolved.join(", ")
-                ),
+                reason,
+                format!("{at}: {detail}; left as is, probably unpatched{unpin}"),
             ));
             if versioned {
                 unpinned.insert(root);
@@ -6036,6 +6178,38 @@ mod tests {
         }
     }
 
+    /// Profiles that move the version only when active together (one
+    /// points the property at another, the other redefines that one) are
+    /// weighed like a single one: VEX discovery and this planner share the
+    /// combinations (`formats::maven::profile_combinations`).
+    #[test]
+    fn profiles_that_move_the_version_only_together_are_weighed() {
+        let root = with_profile(
+            &ROOT.replace(
+                "  <modules>",
+                "  <properties><ct.version>1.10.0</ct.version><w>1.10.0</w></properties>\n  \
+                 <modules>",
+            ),
+            "indirect",
+            "<ct.version>${w}</ct.version>",
+        );
+        let a = with_profile(
+            &module("a", &dep("${ct.version}")),
+            "raise",
+            "<w>1.11.0</w>",
+        );
+        let files = reactor(&root, &a);
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
+        let detail = &plan.warnings[0].detail;
+        assert!(
+            detail.contains("profile indirect") && detail.contains("profile raise"),
+            "{detail}"
+        );
+        let after = applied(&files, &plan);
+        assert_eq!(text(&after, "a/pom.xml"), a);
+    }
+
     /// #459: a module's profile overriding the property an inherited
     /// management declaration reads keeps that declaration.
     #[test]
@@ -6059,6 +6233,260 @@ mod tests {
         let plan = run(&files).unwrap();
         assert_eq!(reasons(&plan), ["conflicting_literal_version"]);
         assert!(unwired(&applied(&files, &plan)));
+    }
+
+    /// `root` with `<properties>{props}</properties>` and a profile `corp`
+    /// whose `<properties>` are `profile` (none when empty), before its
+    /// `<modules>`.
+    fn root_with(props: &str, profile: &str) -> String {
+        let root = ROOT.replace(
+            "  <modules>",
+            &format!("  <properties>{props}</properties>\n  <modules>"),
+        );
+        match profile {
+            "" => root,
+            p => with_corp_profile(&root, p),
+        }
+    }
+
+    /// `root` with a profile `corp` whose `<properties>` are `props`, before
+    /// its `<modules>`: also how a profile is added to a vendored reactor
+    /// later.
+    fn with_corp_profile(root: &str, props: &str) -> String {
+        root.replace(
+            "  <modules>",
+            &format!(
+                "  <profiles><profile><id>corp</id><properties>{props}</properties>\
+                 </profile></profiles>\n  <modules>"
+            ),
+        )
+    }
+
+    /// The `a` / `b` reactor under `root`, module `a`'s pom being `a` and
+    /// `b` declaring nothing.
+    fn reactor(root: &str, a: &str) -> Fs {
+        fs(&[
+            ("pom.xml", root),
+            ("a/pom.xml", a),
+            ("b/pom.xml", &module("b", "")),
+        ])
+    }
+
+    /// A declaration whose `${...}` groupId a profile redefines names
+    /// another artifact whenever that profile is active, which the literal
+    /// SV must not reach: it is left as is and its root unpinned, as for
+    /// an inheritor that resolves it differently. A `.mvn/maven.config`
+    /// user property wins over the profile's.
+    #[test]
+    fn a_profile_moving_the_declared_coordinates_is_left_alone() {
+        let decl = "<dependency><groupId>${ct.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version></dependency>";
+        let a = module("a", decl);
+        let props = "<ct.group>org.apache.commons</ct.group>";
+        for profile in [
+            "<ct.group>org.other</ct.group>",
+            "<ct.group>${nope}</ct.group>",
+        ] {
+            let files = reactor(&root_with(props, profile), &a);
+            let plan = run(&files).unwrap();
+            assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
+            assert!(
+                plan.warnings[0].detail.contains("profile corp"),
+                "{:?}",
+                plan.warnings
+            );
+            let after = applied(&files, &plan);
+            assert_eq!(text(&after, "a/pom.xml"), a);
+            assert!(!root_pinned(&plan, &files));
+            assert!(unwired(&after), "{profile}");
+        }
+
+        // A vendored reactor a profile is added to later is not attestable.
+        let files = reactor(&root_with(props, ""), &a);
+        let (_, mut after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+        let root = with_corp_profile(&text(&after, "pom.xml"), "<ct.group>org.other</ct.group>");
+        after.insert("pom.xml".to_string(), root.into_bytes());
+        assert_eq!(attestable(&after), (true, false));
+
+        // The same profile, beaten by a user property, or agreeing.
+        for (profile, config) in [
+            (
+                "<ct.group>org.other</ct.group>",
+                "-Dct.group=org.apache.commons\n",
+            ),
+            ("<ct.group>org.apache.commons</ct.group>", ""),
+        ] {
+            let files = fs(&[
+                ("pom.xml", &root_with(props, profile)),
+                ("a/pom.xml", &a),
+                ("b/pom.xml", &module("b", "")),
+                (".mvn/maven.config", config),
+            ]);
+            let (plan, after) = vendor(&files);
+            assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+            assert_eq!(text(&after, "a/pom.xml"), a.replace("1.10.0", SV));
+            assert_eq!(attestable(&after), (true, true), "{profile}");
+        }
+    }
+
+    /// A declaration whose `${...}` groupId names another artifact with no
+    /// profile active, but the patched one under a profile, declares the
+    /// patched artifact at its own version there, beating the root pin:
+    /// it is left as is, warned about, and its root unpinned, so a reactor
+    /// vendored before that profile was added is not attestable. Unrelated
+    /// coordinate properties change nothing.
+    #[test]
+    fn a_profile_turning_a_declaration_into_the_patched_artifact_is_weighed() {
+        let other = |v: &str| {
+            format!(
+                "<dependency><groupId>${{lib.group}}</groupId>\
+                 <artifactId>commons-text</artifactId>{v}</dependency>"
+            )
+        };
+        let props = "<lib.group>org.other</lib.group>";
+        let a = module(
+            "a",
+            &format!("{}{}", dep("1.10.0"), other("<version>1.9</version>")),
+        );
+        for (profile, warned) in [
+            ("<lib.group>org.apache.commons</lib.group>", true),
+            ("<lib.group>${nope}</lib.group>", true),
+            ("<lib.group>org.third</lib.group>", false),
+            ("<x>org.apache.commons</x>", false),
+        ] {
+            let files = reactor(&root_with(props, profile), &a);
+            let plan = run(&files).unwrap();
+            if warned {
+                assert_eq!(reasons(&plan), ["coordinates_overridden"], "{profile}");
+                assert!(
+                    plan.warnings[0].detail.contains("profile corp")
+                        && plan.warnings[0]
+                            .detail
+                            .contains("org.apache.commons:commons-text"),
+                    "{:?}",
+                    plan.warnings
+                );
+                assert!(!root_pinned(&plan, &files), "{profile}");
+            } else {
+                assert!(plan.warnings.is_empty(), "{profile}: {:?}", plan.warnings);
+                assert!(root_pinned(&plan, &files), "{profile}");
+            }
+        }
+
+        // A `${…}` type may be `jar`, as discovery reads it: weighed too.
+        let typed = module(
+            "a",
+            &format!(
+                "{}{}",
+                dep("1.10.0"),
+                other("<version>1.9</version><type>${t}</type>")
+            ),
+        );
+        let to_commons = "<lib.group>org.apache.commons</lib.group>";
+        let files = reactor(&root_with(props, to_commons), &typed);
+        let plan = run(&files).unwrap();
+        assert_eq!(
+            reasons(&plan),
+            ["coordinates_overridden"],
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files));
+
+        // No version of its own: the pin applies, so the root stays pinned.
+        let files = reactor(
+            &root_with(props, to_commons),
+            &module("a", &format!("{}{}", dep("1.10.0"), other(""))),
+        );
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        assert!(root_pinned(&plan, &files));
+
+        // Vendored first, the profile added later: not attestable; a user
+        // property fixing the group keeps it attestable.
+        let files = reactor(&root_with(props, ""), &a);
+        let (_, after) = vendor(&files);
+        assert_eq!(attestable(&after), (true, true));
+        let profiled = with_corp_profile(&text(&after, "pom.xml"), to_commons);
+        let mut later = after.clone();
+        later.insert("pom.xml".to_string(), profiled.into_bytes());
+        assert_eq!(attestable(&later), (true, false));
+        later.insert(
+            ".mvn/maven.config".to_string(),
+            b"-Dlib.group=org.other\n".to_vec(),
+        );
+        assert_eq!(attestable(&later), (true, true));
+    }
+
+    /// Coordinates whose text can never read the patched g:a (`${g}:guava`)
+    /// are not weighed, however many profiles redefine `g`: more than are
+    /// combined would otherwise fail closed and unpin the root. The same text naming commons-text does fail closed.
+    #[test]
+    fn many_profiles_on_an_unrelated_coordinate_are_not_weighed() {
+        let profiles: String = (0..=MAX_COMBINED_PROFILES)
+            .map(|i| {
+                format!("<profile><id>p{i}</id><properties><g>org.g{i}</g></properties></profile>")
+            })
+            .collect();
+        let root = ROOT.replace(
+            "  <modules>",
+            &format!(
+                "  <properties><g>com.google.guava</g></properties>\n  \
+                 <profiles>{profiles}</profiles>\n  <modules>"
+            ),
+        );
+        let named = |artifact: &str| {
+            module(
+                "a",
+                &format!(
+                    "{}<dependency><groupId>${{g}}</groupId><artifactId>{artifact}</artifactId>\
+                     <version>1</version></dependency>",
+                    dep("1.10.0")
+                ),
+            )
+        };
+        let files = reactor(&root, &named("guava"));
+        let plan = run(&files).unwrap();
+        assert!(plan.warnings.is_empty(), "{:?}", plan.warnings);
+        assert!(root_pinned(&plan, &files));
+
+        let files = reactor(&root, &named("commons-text"));
+        let plan = run(&files).unwrap();
+        assert_eq!(reasons(&plan), ["coordinates_overridden"]);
+        assert!(!root_pinned(&plan, &files));
+    }
+
+    /// A classifier copy a profile retargets onto the patched g:a is its
+    /// own coordinate, which no pin reaches: warned about as
+    /// `classifier_declared`, like a literal one, without unpinning the
+    /// root.
+    #[test]
+    fn a_profile_retargeting_a_classifier_copy_warns() {
+        let classified = "<dependency><groupId>${lib.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version>\
+                    <classifier>tests</classifier></dependency>";
+        // `test-jar` is the `tests` copy too.
+        let test_jar = "<dependency><groupId>${lib.group}</groupId>\
+                    <artifactId>commons-text</artifactId><version>1.10.0</version>\
+                    <type>test-jar</type></dependency>";
+        for copy in [classified, test_jar] {
+            let files = reactor(
+                &root_with(
+                    "<lib.group>org.other</lib.group>",
+                    "<lib.group>org.apache.commons</lib.group>",
+                ),
+                &module("a", &format!("{}{copy}", dep("1.10.0"))),
+            );
+            let plan = run(&files).unwrap();
+            assert_eq!(reasons(&plan), ["classifier_declared"], "{copy}");
+            assert!(
+                plan.warnings[0].detail.contains("profile corp"),
+                "{:?}",
+                plan.warnings
+            );
+            assert!(root_pinned(&plan, &files));
+        }
     }
 
     fn attestable(files: &Fs) -> (bool, bool) {
