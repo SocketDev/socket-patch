@@ -402,11 +402,9 @@ pub async fn withhold_user_patched(
         if files.contains_key(rel) {
             continue;
         }
-        match view.read_text(rel).await {
-            Ok(text) => read.push((rel.to_string(), text)),
-            // An in-memory link: the engine refuses a linked file on its
-            // own, as the walk's `read_view` leaves it to.
-            Err(_) if matches!(view, ProjectView::Memory(_)) && view.is_symlink(rel) => {}
+        match read_user_patch_lock(view, rel).await {
+            Ok(Some(text)) => read.push((rel.to_string(), text)),
+            Ok(None) => {}
             Err(e) => unreadable.push((rel, e)),
         }
     }
@@ -422,6 +420,72 @@ pub async fn withhold_user_patched(
         .map(|(rel, text)| (rel.as_str(), text.as_str()))
         .collect();
     let mut index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    for (rel, e) in &unreadable {
+        index.unreadable_lock(rel, e);
+    }
+    withhold_user_patched_by(&index, candidates, skipped)
+}
+
+/// A lock the user-patch evidence reads, as the walk's `read_view` reads
+/// a project file: `None` when it is missing, or is an in-memory link (the
+/// engine refuses a linked candidate on its own); one the repository bound
+/// refused because its real path leaves the repository is read through
+/// the link from disk (`None` when nothing is there). `Err` is a lock that
+/// exists but can't be read, which protects every npm package.
+async fn read_user_patch_lock(
+    view: &ProjectView<'_>,
+    rel: &str,
+) -> std::io::Result<Option<String>> {
+    let read = match view.read_text(rel).await {
+        Err(e) if crate::utils::repo_root::is_refused_read(&e) => {
+            match view.disk_root_reading([rel]) {
+                Some(root) => crate::utils::fs::read_regular_to_string(&root.join(rel)).await,
+                None => Err(e),
+            }
+        }
+        read => read,
+    };
+    match read {
+        Ok(text) => Ok(Some(text)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !crate::utils::repo_root::is_refused_read(&e) =>
+        {
+            Ok(None)
+        }
+        Err(_) if matches!(view, ProjectView::Memory(_)) && view.is_symlink(rel) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The disk flow's supplement to the CLI's consent gate: withhold each
+/// npm candidate a Rush lock (the common one and every subspace's) or a
+/// root `shrinkwrap.yaml` records as patched, which the gate's walk does
+/// not read ([`user_patch_supplement_lock_rels`]), as
+/// [`withhold_user_patched_by`] does. A lock that exists but can't be
+/// read protects every npm package; a missing one is no evidence.
+pub async fn withhold_user_patched_by_supplement(
+    view: ProjectView<'_>,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<RewriteWarning> {
+    if !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        return Vec::new();
+    }
+    let mut read: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
+    for rel in user_patch_supplement_lock_rels(view).await {
+        match read_user_patch_lock(&view, &rel).await {
+            Ok(Some(text)) => read.push((rel, text)),
+            Ok(None) => {}
+            Err(e) => unreadable.push((rel, e)),
+        }
+    }
+    let locks: Vec<(&str, &str)> = read
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let mut index = crate::patch::user_patches::UserPatchIndex::from_locks(&locks);
     for (rel, e) in &unreadable {
         index.unreadable_lock(rel, e);
     }
@@ -4824,9 +4888,6 @@ snapshots:
         }
     }
 
-    /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
-    /// splices nothing on a re-run, yet its `rush install` still needs the
-    /// Rush remedy — the re-run re-issues it (and still writes nothing).
     /// The disk scan's user-patch supplement reads every Rush subspace lock,
     /// as the in-memory engine does through its candidate files, and only
     /// the common lock path outside Rush.
@@ -4848,6 +4909,48 @@ snapshots:
                 "shrinkwrap.yaml"
             ]
         );
+    }
+
+    /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
+    /// splices nothing on a re-run, yet its `rush install` still needs the
+    /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    /// Review (#2018): a supplement lock is read as the user-patch walk
+    /// reads a project file. One that links out of the repository is read
+    /// through the link; a missing one reached through a directory that
+    /// links out is no evidence (not an unreadable lock, which would
+    /// withhold every npm package); one that exists but can't be read is
+    /// an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supplement_locks_are_read_through_links_out_of_the_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(outer.path().join("shared/config/rush")).unwrap();
+        std::fs::write(outer.path().join("shared/shrinkwrap.yaml"), "lock").unwrap();
+        std::os::unix::fs::symlink(
+            outer.path().join("shared/shrinkwrap.yaml"),
+            repo.join("shrinkwrap.yaml"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outer.path().join("shared"), repo.join("common")).unwrap();
+        let view = ProjectView::Disk(&repo);
+        assert_eq!(
+            read_user_patch_lock(&view, "shrinkwrap.yaml")
+                .await
+                .unwrap(),
+            Some("lock".to_string())
+        );
+        assert_eq!(
+            read_user_patch_lock(&view, RUSH_COMMON_LOCK_REL)
+                .await
+                .unwrap(),
+            None
+        );
+        std::fs::create_dir_all(outer.path().join("shared/config/rush/pnpm-lock.yaml")).unwrap();
+        assert!(read_user_patch_lock(&view, RUSH_COMMON_LOCK_REL)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

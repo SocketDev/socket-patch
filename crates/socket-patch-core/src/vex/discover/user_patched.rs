@@ -299,7 +299,8 @@ mod tests {
     /// postinstall that applies `patches/<name>+<version>.patch` (or a
     /// `--patch-dir` a script names) over the installed copy. A pin of such
     /// a package (hosted or vendored) was attested; npm-lock pins likewise.
-    /// Another version's patch file does not count.
+    /// Another package's patch file does not count; another version's does
+    /// (patch-package applies it to whichever version is installed).
     #[tokio::test]
     async fn patch_package_patches_mark_yarn_classic_vlt_and_npm_pins() {
         for fixture in [
@@ -312,8 +313,12 @@ mod tests {
             p.copy_fixture(fixture);
             none_marked(&p.discover().await, fixture);
 
-            p.write("patches/left-pad+1.2.0.patch", "diff\n");
+            p.write("patches/right-pad+1.3.0.patch", "diff\n");
             none_marked(&p.discover().await, fixture);
+
+            p.write("patches/left-pad+1.2.0.patch", "diff\n");
+            all_marked(&p.discover().await, fixture);
+            std::fs::remove_file(p.root().join("patches/left-pad+1.2.0.patch")).unwrap();
 
             p.write("patches/left-pad+1.3.0.patch", "diff\n");
             let out = p.discover().await;

@@ -883,28 +883,8 @@ async fn run_redirect_selected_untracked(
     let mut user_patch_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> =
         Vec::new();
     if !common.allow_patch_conflicts {
-        let mut read: Vec<(String, String)> = Vec::new();
-        let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
-        for rel in engine::user_patch_supplement_lock_rels(view).await {
-            match view.read_text(&rel).await {
-                Ok(text) => read.push((rel, text)),
-                Err(e) => unreadable.push((rel, e)),
-            }
-        }
-        let locks: Vec<(&str, &str)> = read
-            .iter()
-            .map(|(rel, text)| (rel.as_str(), text.as_str()))
-            .collect();
-        // A lock that exists but can't be read protects every npm package,
-        // as the consent walk fails closed on one (a missing lock doesn't).
-        let mut index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&locks);
-        for (rel, e) in &unreadable {
-            index.unreadable_lock(rel, e);
-        }
-        if !index.is_empty() {
-            user_patch_warnings =
-                engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
-        }
+        user_patch_warnings =
+            engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped).await;
     }
 
     // A NEW row the lockfiles already pin on the patch server these
@@ -959,7 +939,17 @@ async fn run_redirect_selected_untracked(
 
     // Re-read project patch declarations under the write lock. A patch added
     // during API selection must not be lost in a takeover or lock rewrite.
+    // The supplement's Rush and `shrinkwrap.yaml` locks are re-read too
+    // (the consent gate's walk below doesn't read them): a patch recorded
+    // there while this run waited for the lock withholds its package as
+    // the first read would have.
     if !common.allow_patch_conflicts {
+        if lock.is_some() {
+            let late =
+                engine::withhold_user_patched_by_supplement(view, &mut candidates, &mut skipped)
+                    .await;
+            user_patch_warnings.extend(late);
+        }
         if let Err(error) =
             crate::commands::user_patches::check(common, candidates.iter().map(&sel_purl)).await
         {

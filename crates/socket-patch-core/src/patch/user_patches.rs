@@ -129,7 +129,9 @@ impl UserPatchIndex {
     /// one for a governing file it cannot read. A missing lock is no
     /// evidence and records nothing.
     pub fn unreadable_lock(&mut self, rel: &str, e: &std::io::Error) {
-        if e.kind() != std::io::ErrorKind::NotFound {
+        // A read the repository bound refused carries the `NotFound` kind,
+        // but the lock is there.
+        if crate::utils::repo_root::is_refused_read(e) || e.kind() != std::io::ErrorKind::NotFound {
             self.unknown(
                 "npm",
                 Path::new(rel),
@@ -440,11 +442,21 @@ impl UserPatchIndex {
                 None
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-            // An in-memory link has no content to read: the engine refuses
-            // a project with a linked candidate file on its own, so it is
-            // not taken for unknown metadata, which would withhold every
-            // package ahead of that refusal.
-            Err(_) if matches!(view, ProjectView::Memory(_)) && view.is_symlink(&rel) => None,
+            // An in-memory link has no content to read. A linked lock or
+            // `pnpm-workspace.yaml` is a file the engine refuses on its
+            // own, so it is not taken for unknown metadata, which would
+            // withhold every package ahead of that refusal. A linked
+            // `package.json` is not refused (the npm rewriter reads around
+            // a manifest it can't read), and its declarations and
+            // `--patch-dir` scripts are unknown: it fails closed below.
+            Err(_)
+                if matches!(view, ProjectView::Memory(_))
+                    && view.is_symlink(&rel)
+                    && (file.rel.file_name().and_then(|n| n.to_str()) != Some("package.json")
+                        || refused_linked_manifest(view, &file.rel).await) =>
+            {
+                None
+            }
             Err(e) => {
                 self.unknown(
                     ecosystem,
@@ -462,11 +474,16 @@ impl UserPatchIndex {
         self.parse_json(&text, &file.shown, "npm")
     }
 
-    /// The patch-package files of directory `dir`. `required`: a directory
-    /// a script names, which must exist (on disk: an in-memory project
-    /// holds a directory only through a file below it, and path selection
-    /// supplies every `*.patch` file, so one with no listing holds no
-    /// patch); `bound` keeps it inside the git repository ([`Self::walk`]).
+    /// The patch-package files of directory `dir`, and of every directory
+    /// below it: patch-package collects its patches recursively and reads
+    /// each one's path relative to `dir`, so `@scope/name+1.0.0.patch`
+    /// patches `@scope/name`. `required`: a directory a script names,
+    /// which must exist (on disk: an in-memory project holds a directory
+    /// only through a file below it, and path selection supplies every
+    /// `*.patch` file, so one with no listing holds no patch); `bound`
+    /// keeps it inside the git repository ([`Self::walk`]). A listing that
+    /// can't be read in full, or a tree past the walk's limits, protects
+    /// every npm package.
     async fn list_patch_directory(
         &mut self,
         view: &ProjectView<'_>,
@@ -474,6 +491,9 @@ impl UserPatchIndex {
         required: bool,
         bound: &Bound,
     ) {
+        /// How deep and how many entries one patch directory is walked.
+        const MAX_DEPTH: usize = 16;
+        const MAX_ENTRIES: usize = 10_000;
         if bound.outside(&dir.rel) {
             self.unknown(
                 "npm",
@@ -483,18 +503,66 @@ impl UserPatchIndex {
             return;
         }
         let in_memory = matches!(view, ProjectView::Memory(_));
-        match view.list_dir(&dir.view_rel()).await {
-            Ok(entries) => {
-                for entry in entries {
-                    self.patch_file(&entry.name, &dir.shown.join(&entry.name), required);
+        // Each directory to list, with its path below `dir` (`/`-separated,
+        // as patch-package reads it).
+        let mut pending = vec![(dir.clone(), String::new(), 0usize)];
+        let mut listed = 0usize;
+        while let Some((current, below, depth)) = pending.pop() {
+            // A directory a script names is listed in full; the default
+            // `patches/` skips what it can't see, as before.
+            let listing = if required {
+                view.list_dir_strict(&current.view_rel()).await
+            } else {
+                view.list_dir(&current.view_rel()).await
+            };
+            let entries = match listing {
+                Ok(entries) => entries,
+                Err(e)
+                    if below.is_empty()
+                        && (!required || in_memory)
+                        && e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    return;
+                }
+                Err(e) => {
+                    self.unknown(
+                        "npm",
+                        &current.shown,
+                        &format!("cannot inspect patch-package directory: {e}"),
+                    );
+                    continue;
+                }
+            };
+            listed += entries.len();
+            if listed > MAX_ENTRIES || (depth >= MAX_DEPTH && entries.iter().any(|e| e.is_dir)) {
+                self.unknown(
+                    "npm",
+                    &dir.shown,
+                    "patch-package directory inspection limit exceeded",
+                );
+                return;
+            }
+            for entry in entries {
+                let rel = if below.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{below}/{}", entry.name)
+                };
+                let file = current.file(&entry.name);
+                // patch-package walks through a linked directory too. The
+                // walk's own skip list (an installed `node_modules` under
+                // `--patch-dir .`) is left out, as path selection leaves
+                // it out of the in-memory project.
+                let is_dir = entry.is_dir
+                    || (!entry.name.ends_with(".patch") && view.is_dir(&file.view_rel()));
+                if is_dir {
+                    if !WALK_SKIP.contains(&entry.name.as_str()) {
+                        pending.push((file, rel, depth + 1));
+                    }
+                } else {
+                    self.patch_file(&rel, &file.shown, required);
                 }
             }
-            Err(e) if (!required || in_memory) && e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => self.unknown(
-                "npm",
-                &dir.shown,
-                &format!("cannot inspect patch-package directory: {e}"),
-            ),
         }
     }
 
@@ -934,24 +1002,32 @@ impl UserPatchIndex {
         dirs
     }
 
-    /// One file of a patch-package directory, named
-    /// `[<parent>++]<name>+<version>[.dev].patch` (`@scope+name+…` scoped).
+    /// One file of a patch-package directory, at `file` below it:
+    /// `[<parent>++]<name>+<version>[+<sequence>][.dev].patch`, its name
+    /// scoped as `@scope+name` or by a `@scope/` directory. patch-package
+    /// applies a patch to whichever version of the package is installed
+    /// (a version that differs from the file name's is only a warning), so
+    /// the evidence protects every version of the package.
     fn patch_file(&mut self, file: &str, path: &Path, required: bool) {
+        static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\d+\.\d+\.\d+").unwrap());
         let Some(stem) = file.strip_suffix(".patch") else {
             return;
         };
+        let stem = stem.strip_suffix(".dev").unwrap_or(stem);
+        // patch-package's own parse of the installed (last) package.
         let leaf = stem.rsplit("++").next().unwrap_or(stem);
-        let parts: Vec<_> = leaf.split('+').collect();
-        let scoped = leaf.starts_with('@');
-        let version_idx = if scoped { 2 } else { 1 };
-        if let Some(version) = parts.get(version_idx) {
-            let version = version.trim_end_matches(".dev");
-            let name = if scoped {
-                format!("{}/{}", parts[0], parts[1])
-            } else {
-                parts[0].to_string()
-            };
-            self.add("npm", &name, Some(version), path);
+        let parts: Vec<&str> = leaf
+            .split('+')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        let name = match parts.iter().position(|p| VERSION.is_match(p)) {
+            Some(1) => Some(parts[0].to_string()),
+            Some(2) => Some(format!("{}/{}", parts[0], parts[1])),
+            _ => None,
+        };
+        if let Some(name) = name {
+            self.add("npm", &name, None, path);
         } else if required {
             self.unknown("npm", path, "unrecognized patch-package filename");
         }
@@ -1109,6 +1185,17 @@ impl Dir {
             .collect::<Vec<_>>()
             .join("/")
     }
+}
+
+/// Whether the engine refuses the in-memory linked `package.json` at
+/// root-relative `manifest` on its own: the root manifest beside a yarn
+/// berry lock is a yarn rewrite target, read strictly.
+async fn refused_linked_manifest(view: &ProjectView<'_>, manifest: &Path) -> bool {
+    manifest == Path::new("package.json")
+        && view
+            .read_text("yarn.lock")
+            .await
+            .is_ok_and(|lock| crate::formats::yarn::is_berry_lock(&lock))
 }
 
 /// The directories the user-patch walk never enters, which path selection
@@ -1412,8 +1499,179 @@ mod tests {
         let index = UserPatchIndex::discover(tmp.path()).await;
         assert!(!index.conflicts("pkg:npm/@s/pkg@1.2.0").is_empty());
         assert!(!index.conflicts("pkg:npm/plain@3.0.0").is_empty());
-        assert!(index.conflicts("pkg:npm/@s/pkg@1.3.0").is_empty());
         assert!(index.conflicts("pkg:npm/parent@1.2.0").is_empty());
+    }
+
+    /// Review (#2018): patch-package applies `<name>+<version>.patch` to
+    /// whichever version is installed (a mismatch is only a warning), so a
+    /// lock bumped past the patch's version still installs the user's
+    /// diff; and it collects patches recursively, reading
+    /// `@scope/name+1.0.0.patch` as `@scope/name`. On disk and in memory,
+    /// through the gate and the npm-family index alike.
+    #[tokio::test]
+    async fn patch_package_protects_every_version_and_scoped_subdirectories() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        let files = [
+            (
+                "package.json",
+                r#"{"scripts":{"postinstall":"patch-package --patch-dir fixes"}}"#,
+            ),
+            ("patches/left-pad+1.3.0.patch", "diff"),
+            ("patches/@scope/name+1.0.0.patch", "diff"),
+            ("fixes/@other/pkg+2.0.0+001+first.dev.patch", "diff"),
+            ("patches/README.md", "notes"),
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut memory = MemoryProject::new();
+        for (path, text) in files {
+            write(tmp.path(), path, text);
+            memory.insert(path, MemoryEntry::Text(text.into()));
+        }
+        let gate = UserPatchIndex::discover(tmp.path()).await;
+        let disk = UserPatchIndex::npm_family_in(&ProjectView::Disk(tmp.path()), &[]).await;
+        let mem = UserPatchIndex::npm_family_in(&ProjectView::Memory(&memory), &[]).await;
+        for index in [&gate, &disk, &mem] {
+            for purl in [
+                "pkg:npm/left-pad@1.3.0",
+                "pkg:npm/left-pad@1.3.1",
+                "pkg:npm/@scope/name@1.0.0",
+                "pkg:npm/@scope/name@2.0.0",
+                "pkg:npm/@other/pkg@9.9.9",
+            ] {
+                assert!(!index.conflicts(purl).is_empty(), "{purl}: {index:?}");
+            }
+            assert!(
+                index.conflicts("pkg:npm/name@1.0.0").is_empty(),
+                "{index:?}"
+            );
+        }
+        // A `--patch-dir` file whose name patch-package can't read
+        // protects every npm package; one in the default `patches/` is
+        // left alone, as before.
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"patch-package --patch-dir fixes"}}"#,
+        );
+        write(tmp.path(), "fixes/sub/not-a-patch-name.patch", "diff");
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/unrelated@1.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
+    /// Review (#2018): the recursive patch-package walk follows a linked
+    /// subdirectory (patch-package does), and a `--patch-dir .` skips the
+    /// installed `node_modules` instead of listing it, so an unrelated
+    /// package stays patchable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn patch_package_walk_follows_links_and_skips_installed_trees() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "shared/@scope/name+1.0.0.patch", "diff");
+        write(tmp.path(), "patches/plain+1.0.0.patch", "diff");
+        std::os::unix::fs::symlink(
+            tmp.path().join("shared/@scope"),
+            tmp.path().join("patches/@scope"),
+        )
+        .unwrap();
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/@scope/name@1.0.0").is_empty(),
+            "{index:?}"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"scripts":{"postinstall":"patch-package --patch-dir ."}}"#,
+        );
+        write(tmp.path(), "left-pad+1.3.0.patch", "diff");
+        write(
+            tmp.path(),
+            "node_modules/x/odd.patch",
+            "not patch-package's",
+        );
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        assert!(
+            !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
+    /// Review (#2018): an in-memory `package.json` that is a link has no
+    /// content, so its `pnpm.patchedDependencies`, `patch:` descriptors and
+    /// `--patch-dir` scripts are unknown. The engine does not refuse a
+    /// linked manifest, so it protects every npm package instead of
+    /// reading as "no patches". A linked lock stays the engine's own
+    /// refusal.
+    #[tokio::test]
+    async fn an_in_memory_linked_manifest_fails_closed() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        let mut memory = MemoryProject::new();
+        memory.insert("package.json", MemoryEntry::Symlink);
+        memory.insert(
+            "fixes/left-pad+1.3.0.patch",
+            MemoryEntry::Text("diff".into()),
+        );
+        let index = UserPatchIndex::npm_family_in(&ProjectView::Memory(&memory), &[]).await;
+        assert!(
+            !index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+
+        let mut memory = MemoryProject::new();
+        memory.insert("package.json", MemoryEntry::Text("{}".into()));
+        memory.insert("pnpm-lock.yaml", MemoryEntry::Symlink);
+        let index = UserPatchIndex::npm_family_in(&ProjectView::Memory(&memory), &[]).await;
+        assert!(index.is_empty(), "{index:?}");
+
+        // Beside a yarn berry lock the root manifest is a rewrite target
+        // the engine refuses as a link: left to that refusal.
+        let mut memory = MemoryProject::new();
+        memory.insert("package.json", MemoryEntry::Symlink);
+        memory.insert(
+            "yarn.lock",
+            MemoryEntry::Text("__metadata:\n  version: 8\n".into()),
+        );
+        let index = UserPatchIndex::npm_family_in(&ProjectView::Memory(&memory), &[]).await;
+        assert!(index.is_empty(), "{index:?}");
+
+        // On disk the link is read through, and its `--patch-dir` found.
+        #[cfg(unix)]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "config/package.json",
+                r#"{"scripts":{"postinstall":"patch-package --patch-dir fixes"}}"#,
+            );
+            write(tmp.path(), "fixes/left-pad+1.3.0.patch", "diff");
+            std::os::unix::fs::symlink("config/package.json", tmp.path().join("package.json"))
+                .unwrap();
+            for index in [
+                UserPatchIndex::discover(tmp.path()).await,
+                UserPatchIndex::npm_family_in(&ProjectView::Disk(tmp.path()), &[]).await,
+            ] {
+                assert!(
+                    !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+                    "{index:?}"
+                );
+                assert!(
+                    index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+                    "{index:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1810,7 +2068,7 @@ mod tests {
                 .any(|s| s.ends_with("shared/a/patches/is-number+7.0.0.patch")),
             "{is_number:?}"
         );
-        assert!(global.conflicts("pkg:npm/left-pad@1.2.0").is_empty());
+        assert!(global.conflicts("pkg:npm/right-pad@1.3.0").is_empty());
         assert_eq!(ReadScope::of_global(true), ReadScope::Global);
         assert_eq!(ReadScope::of_global(false), ReadScope::Workspace);
     }
@@ -2018,7 +2276,9 @@ mod tests {
                 ],
                 true,
             ),
-            (&[("patches/left-pad+1.2.0.patch", "diff")], false),
+            // patch-package applies a patch to any installed version.
+            (&[("patches/left-pad+1.2.0.patch", "diff")], true),
+            (&[("patches/@scope/left-pad+1.3.0.patch", "diff")], false),
             (
                 &[(
                     "package.json",
