@@ -150,8 +150,9 @@ fn is_rush_subspace_file(rel: &str, basename: &str) -> bool {
 }
 
 /// What `rel` (relative to a root whose files are `root_files`) is needed
-/// for.
-fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
+/// for. `user_patches` says whether npm is selected, so the files only the
+/// npm user-patch walk reads ([`user_patch_need`]) are fetched at all.
+fn classify(rel: &str, root_files: &BTreeSet<&str>, user_patches: bool) -> Option<Need> {
     if rel == BUN_LOCKB {
         return Some(Need::Binary);
     }
@@ -175,12 +176,12 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         }
         // A patch-package file of a `--patch-dir .` (see
         // [`user_patch_need`]).
-        if rel.ends_with(".patch") {
+        if user_patches && rel.ends_with(".patch") {
             return Some(Need::Present);
         }
         return None;
     }
-    if let Some(need) = user_patch_need(rel) {
+    if let Some(need) = user_patch_need(rel).filter(|_| user_patches) {
         return Some(need);
     }
     let rush = root_files.contains("rush.json");
@@ -467,10 +468,17 @@ pub fn select_paths(entries: &[TreeEntryInput], options: &SelectOptions) -> Path
         }
     }
 
+    // The user-patch walk only protects npm packages: without npm, its
+    // nested manifests and `.patch` files would only count against the
+    // session's file and byte limits.
+    let user_patches = options
+        .ecosystems
+        .as_deref()
+        .is_none_or(|list| list.iter().any(|e| e == "npm"));
     let mut needs: BTreeMap<String, Need> = BTreeMap::new();
     for (root, files) in &per_root {
         for rel in files {
-            let Some(need) = classify(rel, files) else {
+            let Some(need) = classify(rel, files, user_patches) else {
                 continue;
             };
             let full = join_root(root, rel);
@@ -684,6 +692,39 @@ mod tests {
                 "patches/b+1.0.0.patch",
                 "target/patches/left-pad+1.3.0.patch"
             ]
+        );
+    }
+
+    /// Final review (#2018): without npm, the user-patch walk never runs,
+    /// so its nested manifests and `.patch` files (a `debian/patches`
+    /// series) are not fetched against the session's limits.
+    #[test]
+    fn user_patch_files_are_not_selected_without_npm() {
+        let entries = vec![
+            blob("poetry.lock"),
+            blob("pyproject.toml"),
+            blob("fix+1.0.0.patch"),
+            blob("debian/patches/a+1.0.0.patch"),
+            blob("docs/example/package.json"),
+        ];
+        let s = select_paths(
+            &entries,
+            &SelectOptions {
+                ecosystems: Some(vec!["pypi".into()]),
+                ..SelectOptions::default()
+            },
+        );
+        assert!(s.present_only.is_empty(), "{:?}", s.present_only);
+        assert!(
+            !s.fetch_text.iter().any(|f| f.ends_with("package.json")),
+            "{:?}",
+            s.fetch_text
+        );
+        let all = select_paths(&entries, &SelectOptions::default());
+        assert!(
+            all.present_only.iter().any(|f| f.ends_with(".patch")),
+            "{:?}",
+            all.present_only
         );
     }
 

@@ -878,6 +878,10 @@ async fn run_redirect_selected_untracked(
     // subspace's) and a root `shrinkwrap.yaml`'s patched entries (the
     // in-memory engine reads them too). Each such package is a skip event,
     // as the consent gate reports it.
+    // Its warnings join the run's (as the consent gate's and the in-memory
+    // engine's do), after the record warnings.
+    let mut user_patch_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> =
+        Vec::new();
     if !common.allow_patch_conflicts {
         let mut read: Vec<(String, String)> = Vec::new();
         let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
@@ -898,7 +902,8 @@ async fn run_redirect_selected_untracked(
             index.unreadable_lock(rel, e);
         }
         if !index.is_empty() {
-            let _ = engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
+            user_patch_warnings =
+                engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
         }
     }
 
@@ -1728,6 +1733,7 @@ async fn run_redirect_selected_untracked(
     // record, package-manager, stale-install, takeover and prune warnings.
     let mut engine_warnings = rewrite.warnings.clone();
     engine_warnings.extend(record_warnings);
+    engine_warnings.extend(user_patch_warnings);
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
     engine_warnings.extend(done.npm_warnings.iter().cloned());

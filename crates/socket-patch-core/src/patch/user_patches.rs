@@ -415,6 +415,18 @@ impl UserPatchIndex {
         };
         match read {
             Ok(text) => Some(strip_bom(&text).to_owned()),
+            // A file the view refused because its real path (through a
+            // symlink) leaves the repository is still a file the package
+            // manager reads. The refusal carries the `NotFound` kind, so it
+            // is caught first and fails closed instead of reading as absent.
+            Err(e) if crate::utils::repo_root::is_refused_read(&e) => {
+                self.unknown(
+                    ecosystem,
+                    &file.shown,
+                    &format!("cannot inspect patch metadata: {e}"),
+                );
+                None
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             // An in-memory link has no content to read: the engine refuses
             // a project with a linked candidate file on its own, so it is
@@ -1883,6 +1895,39 @@ mod tests {
             assert!(!index.conflicts("pkg:npm/left-pad@1.3.0").is_empty());
             assert!(index.conflicts("pkg:npm/other@1.0.0").is_empty());
         }
+    }
+
+    /// Final review (#2018): a project file symlinked to a target outside
+    /// the repository is refused by the view's bound, but the package
+    /// manager still reads it, so it protects every npm package instead of
+    /// reading as "no patches".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_file_outside_the_repository_fails_closed() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+        write(&repo, "package.json", "{}");
+        write(
+            outer.path(),
+            "shared/pnpm-workspace.yaml",
+            "patchedDependencies:\n  left-pad@1.3.0: p.patch\n",
+        );
+        std::os::unix::fs::symlink(
+            outer.path().join("shared/pnpm-workspace.yaml"),
+            repo.join("pnpm-workspace.yaml"),
+        )
+        .unwrap();
+        let view = ProjectView::Disk(&repo);
+        let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+        assert!(
+            !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
+            "{index:?}"
+        );
+        assert!(
+            !index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
     }
 
     /// The view-based index the hosted engine and `vex` discovery read
