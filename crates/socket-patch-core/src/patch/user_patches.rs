@@ -123,6 +123,21 @@ impl UserPatchIndex {
         }
     }
 
+    /// Record that the lock at root-relative `rel` exists but could not be
+    /// read (a permission error, a FIFO, non-UTF-8 text): its patches are
+    /// unknown, so every npm package is protected, as the walk protects
+    /// one for a governing file it cannot read. A missing lock is no
+    /// evidence and records nothing.
+    pub fn unreadable_lock(&mut self, rel: &str, e: &std::io::Error) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            self.unknown(
+                "npm",
+                Path::new(rel),
+                &format!("cannot inspect patch metadata: {e}"),
+            );
+        }
+    }
+
     /// Whether the index holds no evidence at all.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
@@ -1157,6 +1172,31 @@ fn split_selector(key: &str) -> (&str, Option<&str>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A lock that exists but can't be read protects every npm package; a
+    /// missing one is no evidence.
+    #[test]
+    fn an_unreadable_lock_protects_every_npm_package() {
+        let mut index = UserPatchIndex::from_locks(&[]);
+        index.unreadable_lock(
+            "common/config/rush/pnpm-lock.yaml",
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        );
+        assert!(index.is_empty());
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let mut index = UserPatchIndex::from_locks(&[]);
+            index.unreadable_lock("shrinkwrap.yaml", &std::io::Error::from(kind));
+            assert_eq!(
+                index.conflicts("pkg:npm/left-pad@1.3.0").len(),
+                1,
+                "{kind:?}"
+            );
+            assert!(index.conflicts("pkg:pypi/requests@2.0.0").is_empty());
+        }
+    }
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join(path);

@@ -397,12 +397,14 @@ pub async fn withhold_user_patched(
         return Vec::new();
     }
     let mut read: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<(&str, std::io::Error)> = Vec::new();
     for rel in USER_PATCH_LOCKS {
         if files.contains_key(rel) {
             continue;
         }
-        if let Ok(text) = view.read_text(rel).await {
-            read.push((rel.to_string(), text));
+        match view.read_text(rel).await {
+            Ok(text) => read.push((rel.to_string(), text)),
+            Err(e) => unreadable.push((rel, e)),
         }
     }
     let locks: Vec<(&str, &str)> = files
@@ -416,7 +418,10 @@ pub async fn withhold_user_patched(
         })
         .map(|(rel, text)| (rel.as_str(), text.as_str()))
         .collect();
-    let index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    let mut index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    for (rel, e) in &unreadable {
+        index.unreadable_lock(rel, e);
+    }
     withhold_user_patched_by(&index, candidates, skipped)
 }
 

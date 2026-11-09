@@ -880,17 +880,24 @@ async fn run_redirect_selected_untracked(
     // as the consent gate reports it.
     if !common.allow_patch_conflicts {
         let mut read: Vec<(String, String)> = Vec::new();
+        let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
         for rel in engine::user_patch_supplement_lock_rels(view).await {
-            if let Ok(text) = view.read_text(&rel).await {
-                read.push((rel, text));
+            match view.read_text(&rel).await {
+                Ok(text) => read.push((rel, text)),
+                Err(e) => unreadable.push((rel, e)),
             }
         }
-        if !read.is_empty() {
-            let locks: Vec<(&str, &str)> = read
-                .iter()
-                .map(|(rel, text)| (rel.as_str(), text.as_str()))
-                .collect();
-            let index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&locks);
+        let locks: Vec<(&str, &str)> = read
+            .iter()
+            .map(|(rel, text)| (rel.as_str(), text.as_str()))
+            .collect();
+        // A lock that exists but can't be read protects every npm package,
+        // as the consent walk fails closed on one (a missing lock doesn't).
+        let mut index = socket_patch_core::patch::user_patches::UserPatchIndex::from_locks(&locks);
+        for (rel, e) in &unreadable {
+            index.unreadable_lock(rel, e);
+        }
+        if !index.is_empty() {
             let _ = engine::withhold_user_patched_by(&index, &mut candidates, &mut skipped);
         }
     }

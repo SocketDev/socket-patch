@@ -173,6 +173,11 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
         if crate::utils::pnpm_workspace::is_git_branch_lock_name(rel) {
             return Some(Need::Present);
         }
+        // A patch-package file of a `--patch-dir .` (see
+        // [`user_patch_need`]).
+        if rel.ends_with(".patch") {
+            return Some(Need::Present);
+        }
         return None;
     }
     if let Some(need) = user_patch_need(rel) {
@@ -210,17 +215,21 @@ fn classify(rel: &str, root_files: &BTreeSet<&str>) -> Option<Need> {
 /// names, is only known from content, so every file it could read is
 /// selected by name. A `package.json`, `pnpm-workspace.yaml`,
 /// `pnpm-lock.yaml` or `yarn.lock` is read (text); a patch-package file
-/// counts by its name alone (present). With every such file selected, a
-/// patch directory the engine finds no `.patch` file in holds none.
+/// counts by its name alone (present), in every directory, including
+/// those the walk never enters (a `--patch-dir target/patches`) and the
+/// root ([`classify`]). With every such file selected, a patch directory
+/// the engine finds no `.patch` file in holds none.
 fn user_patch_need(rel: &str) -> Option<Need> {
     use crate::patch::user_patches::WALK_SKIP;
     let (dir, base) = split_path(rel);
+    if base.ends_with(".patch") {
+        return Some(Need::Present);
+    }
     if dir.split('/').any(|seg| WALK_SKIP.contains(&seg)) {
         return None;
     }
     match base {
         "package.json" | "pnpm-workspace.yaml" | "pnpm-lock.yaml" | "yarn.lock" => Some(Need::Text),
-        _ if base.ends_with(".patch") => Some(Need::Present),
         _ => None,
     }
 }
@@ -650,6 +659,32 @@ mod tests {
         assert_eq!(s.present_only, vec![".pnp.cjs", "pnpm-lock.feature.yaml"]);
         assert_eq!(s.symlinks, vec!["pnpm-workspace.yaml"]);
         assert_eq!(s.ignored_count, 2);
+    }
+
+    /// A patch-package directory anywhere (`--patch-dir .`, or one under a
+    /// directory the user-patch walk never enters) has its `.patch` files
+    /// selected, so the engine never reads the gap as "no patches".
+    #[test]
+    fn patch_package_files_are_selected_in_every_directory() {
+        let entries = vec![
+            blob("package.json"),
+            blob("package-lock.json"),
+            blob("left-pad+1.3.0.patch"),
+            blob("target/patches/left-pad+1.3.0.patch"),
+            blob(".venv/patches/a+1.0.0.patch"),
+            blob("patches/b+1.0.0.patch"),
+            blob("target/notes.txt"),
+        ];
+        let s = select_paths(&entries, &SelectOptions::default());
+        assert_eq!(
+            s.present_only,
+            vec![
+                ".venv/patches/a+1.0.0.patch",
+                "left-pad+1.3.0.patch",
+                "patches/b+1.0.0.patch",
+                "target/patches/left-pad+1.3.0.patch"
+            ]
+        );
     }
 
     /// #975: a nested root's PnP loader is judged by the `nodeLinker` of the
