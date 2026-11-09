@@ -212,12 +212,17 @@ async fn source_block_gems(
 
 /// The Gemfile grammar [`source_block_gems`] reads: a line
 /// `source "<url>" do` / `source('<url>') do` opens a block, a line starting
-/// with `end` closes it, and each `gem "<name>"` / `gem('<name>'…` line in
-/// between (the vendor backend's own [`gem_declaration_any`] grammar)
-/// declares a block-scoped gem. Anything else (nested blocks,
-/// `source` with a block argument, `#` comments, and Ruby's column-0
-/// `=begin` … `=end` block comments) is ignored — this only ever ADDS a
-/// cross-check to lock evidence, never creates a ref on its own.
+/// with `end` closes the innermost open one, and each `gem "<name>"` /
+/// `gem('<name>'…` line inside a block (the vendor backend's own
+/// [`gem_declaration_any`] grammar) declares a gem scoped to the INNERMOST
+/// open block, as bundler's `Dsl#with_source` does. Nesting matters: the
+/// hosted redirect wraps a gem the user declared in their own
+/// `source "…" do` block in a Socket block INSIDE it, so on a merged
+/// (bundler <= 2.1) lock the gem is attributable only through the inner
+/// block (#1997). Anything else (`source` with a block argument, `#`
+/// comments, and Ruby's column-0 `=begin` … `=end` block comments) is
+/// ignored — this only ever ADDS a cross-check to lock evidence, never
+/// creates a ref on its own.
 fn parse_source_blocks(gemfile: &str) -> Vec<(String, String)> {
     parse_source_block_decls(gemfile)
         .into_iter()
@@ -236,7 +241,8 @@ struct BlockDecl {
 /// [`parse_source_blocks`] keeping each declaration's argument tail.
 fn parse_source_block_decls(gemfile: &str) -> Vec<BlockDecl> {
     let mut out = Vec::new();
-    let mut open: Option<String> = None;
+    // The open `source … do` blocks, innermost last.
+    let mut open: Vec<String> = Vec::new();
     let mut block_comment = false;
     for raw in gemfile.lines() {
         // `=begin` / `=end` must start at column 0 and be followed by
@@ -257,49 +263,45 @@ fn parse_source_block_decls(gemfile: &str) -> Vec<BlockDecl> {
         if line.starts_with('#') {
             continue;
         }
-        match &open {
-            None => {
-                let Some(rest) = line.strip_prefix("source") else {
-                    continue;
-                };
-                let rest = rest.trim_start();
-                let (rest, paren) = match rest.strip_prefix('(') {
-                    Some(r) => (r.trim_start(), true),
-                    None => (rest, false),
-                };
-                let Some((_, url, tail)) = quoted_literal(rest) else {
-                    continue;
-                };
-                let tail = tail.trim_start();
-                let tail = if paren {
-                    match tail.strip_prefix(')') {
-                        Some(t) => t.trim_start(),
-                        None => continue,
-                    }
-                } else {
-                    tail
-                };
-                let tail = tail.split('#').next().unwrap_or_default().trim_end();
-                if tail == "do" {
-                    open = Some(url.to_string());
-                }
-            }
-            Some(url) => {
-                if line == "end" || line.starts_with("end ") || line.starts_with("end#") {
-                    open = None;
-                    continue;
-                }
-                if let Some(decl) = gem_declaration_any(line) {
-                    out.push(BlockDecl {
-                        url: url.clone(),
-                        name: decl.name.to_string(),
-                        tail: decl.rest.to_string(),
-                    });
-                }
-            }
+        if let Some(url) = source_block_opener(line) {
+            open.push(url.to_string());
+            continue;
+        }
+        let Some(url) = open.last() else {
+            continue;
+        };
+        if line == "end" || line.starts_with("end ") || line.starts_with("end#") {
+            open.pop();
+            continue;
+        }
+        if let Some(decl) = gem_declaration_any(line) {
+            out.push(BlockDecl {
+                url: url.clone(),
+                name: decl.name.to_string(),
+                tail: decl.rest.to_string(),
+            });
         }
     }
     out
+}
+
+/// The URL of a trimmed Gemfile line that opens a `source "<url>" do` /
+/// `source('<url>') do` block (a trailing `#` comment allowed), else `None`.
+fn source_block_opener(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("source")?.trim_start();
+    let (rest, paren) = match rest.strip_prefix('(') {
+        Some(r) => (r.trim_start(), true),
+        None => (rest, false),
+    };
+    let (_, url, tail) = quoted_literal(rest)?;
+    let tail = tail.trim_start();
+    let tail = if paren {
+        tail.strip_prefix(')')?.trim_start()
+    } else {
+        tail
+    };
+    let tail = tail.split('#').next().unwrap_or_default().trim_end();
+    (tail == "do").then_some(url)
 }
 
 /// Whether the bundler manifest text `gemfile` still routes a gem to patch
@@ -1267,6 +1269,45 @@ mod tests {
         assert_eq!(run(&p).await.refs.len(), 1);
     }
 
+    /// #1997: a gem the user declared in their own `source "…" do` block is
+    /// redirected by a Socket block NESTED inside it (CRLF or not); bundler
+    /// resolves it from the innermost source only, so on a merged lock the
+    /// inner block attributes it. Nested the other way round (the Socket
+    /// block outside, another source innermost), it is not attributed.
+    #[tokio::test]
+    async fn merged_section_nested_source_block_is_attributed_innermost() {
+        let socket = index(UUID_A);
+        let nested = format!(
+            "source \"https://rubygems.org\"\n\nsource \"https://rubygems.org\" do\n\
+             source \"{socket}\" do\n  gem \"vuln-gem\", \"1.0.0\"\nend\nend\n"
+        );
+        for gemfile in [nested.clone(), nested.replace('\n', "\r\n")] {
+            let p = Project::new();
+            p.write("Gemfile.lock", merged_lock(&socket, "!"));
+            p.write("Gemfile", &gemfile);
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:gem/vuln-gem@1.0.0", UUID_A, WiringMode::Hosted)],
+            );
+            assert!(
+                out.diagnostics.is_empty(),
+                "{gemfile:?}: {:?}",
+                out.diagnostics
+            );
+        }
+        let inverted = format!(
+            "source \"{socket}\" do\n  source \"https://rubygems.org\" do\n    \
+             gem \"vuln-gem\", \"1.0.0\"\n  end\nend\n"
+        );
+        let p = Project::new();
+        p.write("Gemfile.lock", merged_lock(&socket, "!"));
+        p.write("Gemfile", &inverted);
+        let out = run(&p).await;
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+    }
+
     /// Each half of the source pin is required, and the block must name
     /// THIS remote.
     #[tokio::test]
@@ -1586,7 +1627,16 @@ mod tests {
              source \"https://d.example/\" do\n  gem 'ghost'\nend\n\
              =end\n\
              =beginning is not a marker\n\
-             gem 'after'\n",
+             gem 'after'\n\
+             source 'https://outer.example/' do\n\
+             \x20 gem 'outer-1'\n\
+             \x20 source 'https://inner.example/' do # nested\n\
+             \x20   gem 'inner'\n\
+             \x20 end\n\
+             \x20 gem 'outer-2'\n\
+             end\n\
+             end\n\
+             gem 'top'\n",
         );
         let got: Vec<(&str, &str)> = got.iter().map(|(u, g)| (u.as_str(), g.as_str())).collect();
         assert_eq!(
@@ -1595,6 +1645,9 @@ mod tests {
                 ("https://a.example/", "one"),
                 ("https://a.example/", "two"),
                 ("https://b.example/", "three"),
+                ("https://outer.example/", "outer-1"),
+                ("https://inner.example/", "inner"),
+                ("https://outer.example/", "outer-2"),
             ]
         );
     }

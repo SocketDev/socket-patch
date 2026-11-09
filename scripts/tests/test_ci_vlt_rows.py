@@ -247,9 +247,6 @@ class CiE2eVltRows(unittest.TestCase):
         for exported in ("SOCKET_PATCH_VLT_E2E_JS=", "SOCKET_PATCH_VLT_E2E_VERSION=1.2.0",
                          "SOCKET_PATCH_VLT_E2E_REQUIRED=1", "SOCKET_PATCH_HOSTED_E2E_STRICT=1"):
             self.assertIn(exported, setup)
-        text = "\n".join(hosted)
-        self.assertNotIn("SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED", text,
-                         "stays unset until the serve fix is verified")
         self.assertIn("check-vlt-legs.py", step(hosted, "Run hosted-mode production e2e"))
         vendored = step(hosted, "Run vendored-mode production e2e (vlt)")
         self.assertIn("--test e2e_vendored_production", vendored)

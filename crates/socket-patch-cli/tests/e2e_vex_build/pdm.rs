@@ -136,13 +136,26 @@ fn pins_for(v: &str) -> Vec<String> {
         // 2.26.9+ require 1.x).
         if ((2, 21, 0)..(2, 26, 1)).contains(&t) {
             pins.push("hishel<1");
+        } else if ((2, 26, 1)..(2, 29, 7)).contains(&t) {
+            // 2.26.9 - 2.29.6 declare an unbounded `hishel>=1.0.0` (2.29.4:
+            // `>=1.4.0`), and hishel 2.0 (2026-11-05) dropped
+            // `SyncSqliteStorage`, so every command dies with "module
+            // 'hishel' has no attribute 'SyncSqliteStorage'". `<2`
+            // resolves the 1.x line those releases shipped against (a
+            // no-op for 2.26.1 - 2.26.8, which already bound `<1`).
+            // 2.29.7+ require `hishel>=2.0`, so the pin would make them
+            // uninstallable.
+            pins.push("hishel<2");
         }
-        // 2.x declares an unbounded `unearth`, and unearth 0.19 (2026-10-27)
-        // moved to `httpx2`: PDM's PyPI client is no longer the `httpx`
-        // client unearth expects, so `pdm lock` dies with "PDMPyPIClient is
-        // not an instance or subtype of type (Client)" (seen on 2.29.2).
-        // `<0.19` resolves the 0.18 line every 2.x ran with before.
-        pins.push("unearth<0.19");
+        // 2.0 - 2.29.3 declare an unbounded `unearth`, and unearth 0.19
+        // (2026-10-27) moved to `httpx2`: PDM's PyPI client is no longer the
+        // `httpx` client unearth expects, so `pdm lock` dies with
+        // "PDMPyPIClient is not an instance or subtype of type (Client)"
+        // (seen on 2.29.2). `<0.19` resolves the 0.18 line they ran with.
+        // 2.29.4+ moved to httpx2 themselves and require `unearth>=0.19`.
+        if t < (2, 29, 4) {
+            pins.push("unearth<0.19");
+        }
     }
     let mut out = vec![format!("pdm=={v}")];
     out.extend(pins.into_iter().map(String::from));

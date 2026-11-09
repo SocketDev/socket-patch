@@ -164,9 +164,12 @@ impl SharedStore {
 /// Classify `pkg_path`: `Some` when its real location is inside a shared
 /// store (see the module docs). A path that does not exist, or cannot be
 /// resolved, is `None`; the normal verify step reports a missing package.
-pub async fn shared_store_of(pkg_path: &Path) -> Option<SharedStore> {
+pub async fn shared_store_of(
+    scope: crate::utils::repo_root::ReadScope,
+    pkg_path: &Path,
+) -> Option<SharedStore> {
     let pkg_path = pkg_path.to_path_buf();
-    tokio::task::spawn_blocking(move || shared_store_of_blocking(&pkg_path))
+    tokio::task::spawn_blocking(move || shared_store_of_blocking(scope, &pkg_path))
         .await
         .ok()
         .flatten()
@@ -181,6 +184,7 @@ pub async fn shared_store_of(pkg_path: &Path) -> Option<SharedStore> {
 /// its nearest existing ancestor at or below `pkg_path`. Keys that escape
 /// the package dir are skipped; the caller refuses them on its own.
 pub async fn shared_store_of_patch_dirs<'a>(
+    scope: crate::utils::repo_root::ReadScope,
     pkg_path: &Path,
     file_keys: impl IntoIterator<Item = &'a str>,
 ) -> Option<SharedStore> {
@@ -201,7 +205,7 @@ pub async fn shared_store_of_patch_dirs<'a>(
             Some(dir)
         }));
         dirs.filter(|dir| seen.insert(dir.clone())).find_map(|dir| {
-            shared_store_of_blocking(&dir).or_else(|| outside_install_tree(&pkg_path, &dir))
+            shared_store_of_blocking(scope, &dir).or_else(|| outside_install_tree(&pkg_path, &dir))
         })
     })
     .await
@@ -209,7 +213,10 @@ pub async fn shared_store_of_patch_dirs<'a>(
     .flatten()
 }
 
-fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
+fn shared_store_of_blocking(
+    scope: crate::utils::repo_root::ReadScope,
+    pkg_path: &Path,
+) -> Option<SharedStore> {
     let real = std::fs::canonicalize(pkg_path).ok()?;
     for dir in real.ancestors() {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
@@ -251,7 +258,7 @@ fn shared_store_of_blocking(pkg_path: &Path) -> Option<SharedStore> {
             });
         }
     }
-    linked_source_of(pkg_path, real)
+    linked_source_of(scope, pkg_path, real)
 }
 
 /// [`SharedStoreKind::OutsideInstallTree`]: `dir` (the package directory
@@ -291,7 +298,11 @@ fn composer_vendor_dir(pkg_path: &Path) -> Option<&Path> {
 /// `node_modules/@scope/<name>`), yet its real path `real` is neither below
 /// that `node_modules` (a real dir, or a link into its own store) nor below
 /// any other `node_modules` (a workspace member's link into the root store).
-fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
+fn linked_source_of(
+    scope: crate::utils::repo_root::ReadScope,
+    pkg_path: &Path,
+    real: PathBuf,
+) -> Option<SharedStore> {
     let parent = pkg_path.parent()?;
     let node_modules = if is_node_modules(parent) {
         parent
@@ -306,7 +317,7 @@ fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
     let real_node_modules = std::fs::canonicalize(node_modules).ok()?;
     if real.starts_with(&real_node_modules)
         || real.components().any(|c| c.as_os_str() == "node_modules")
-        || in_yarn_pnpm_store(node_modules, &real)
+        || in_yarn_pnpm_store(scope, node_modules, &real)
     {
         return None;
     }
@@ -335,7 +346,11 @@ fn linked_source_of(pkg_path: &Path, real: PathBuf) -> Option<SharedStore> {
 /// * `real` is exactly `<store>/<entry>/package`, where `<entry>` is Yarn's
 ///   slug of a registry locator ([`is_yarn_copy_slug`]): the layout
 ///   Yarn gives a hard (installed) package, never a workspace.
-fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
+fn in_yarn_pnpm_store(
+    scope: crate::utils::repo_root::ReadScope,
+    node_modules: &Path,
+    real: &Path,
+) -> bool {
     let Some(project) = node_modules
         .ancestors()
         .skip(1)
@@ -343,7 +358,7 @@ fn in_yarn_pnpm_store(node_modules: &Path, real: &Path) -> bool {
     else {
         return false;
     };
-    let Some(store) = crate::crawlers::pkg_managers::active_yarn_pnpm_store(project) else {
+    let Some(store) = crate::crawlers::pkg_managers::active_yarn_pnpm_store(scope, project) else {
         return false;
     };
     let (Ok(store), Ok(project)) = (std::fs::canonicalize(store), std::fs::canonicalize(project))
@@ -526,7 +541,9 @@ mod tests {
     async fn pnpm_global_virtual_store_is_shared() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = make_pnpm_gvs(dir.path());
-        let got = shared_store_of(&pkg).await.expect("shared");
+        let got = shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg)
+            .await
+            .expect("shared");
         assert_eq!(got.kind, SharedStoreKind::PnpmGlobalVirtualStore);
         assert_eq!(got.real_path, std::fs::canonicalize(&pkg).unwrap());
     }
@@ -535,13 +552,20 @@ mod tests {
     async fn pdm_package_cache_is_shared() {
         let dir = tempfile::tempdir().unwrap();
         let pkg = make_pdm_cache_entry(dir.path());
-        let got = shared_store_of(&pkg).await.expect("shared");
+        let got = shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg)
+            .await
+            .expect("shared");
         assert_eq!(got.kind, SharedStoreKind::PdmPackageCache);
         // A file-level entry beside the package (a top-level module) is
         // inside the shared `lib/` too.
         let entry_lib = pkg.parent().unwrap().to_path_buf();
         std::fs::write(entry_lib.join("six.py"), "x").unwrap();
-        assert!(shared_store_of(&entry_lib.join("six.py")).await.is_some());
+        assert!(shared_store_of(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &entry_lib.join("six.py")
+        )
+        .await
+        .is_some());
     }
 
     /// pnpm's per-project virtual store and plain directories carry no
@@ -557,17 +581,26 @@ mod tests {
             .join("node_modules")
             .join("left-pad");
         std::fs::create_dir_all(&pnpm).unwrap();
-        assert_eq!(shared_store_of(&pnpm).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pnpm).await,
+            None
+        );
 
         // A `links` dir without the store's `files/` sibling, or under a
         // non-version parent, is an ordinary directory.
         let links = dir.path().join("v10").join("links").join("pkg");
         std::fs::create_dir_all(&links).unwrap();
-        assert_eq!(shared_store_of(&links).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &links).await,
+            None
+        );
         let other = dir.path().join("vendor").join("links").join("pkg");
         std::fs::create_dir_all(&other).unwrap();
         std::fs::create_dir_all(dir.path().join("vendor").join("files")).unwrap();
-        assert_eq!(shared_store_of(&other).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &other).await,
+            None
+        );
 
         // A site-packages `lib/` without the PDM entry markers.
         let venv = dir
@@ -578,7 +611,10 @@ mod tests {
             .join("site-packages")
             .join("six");
         std::fs::create_dir_all(&venv).unwrap();
-        assert_eq!(shared_store_of(&venv).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &venv).await,
+            None
+        );
         let no_referrers = dir
             .path()
             .join("packages")
@@ -586,10 +622,20 @@ mod tests {
             .join("lib")
             .join("x");
         std::fs::create_dir_all(&no_referrers).unwrap();
-        assert_eq!(shared_store_of(&no_referrers).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &no_referrers).await,
+            None
+        );
 
         // Missing paths are not classified.
-        assert_eq!(shared_store_of(&dir.path().join("missing")).await, None);
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &dir.path().join("missing")
+            )
+            .await,
+            None
+        );
     }
 
     #[cfg(unix)]
@@ -600,7 +646,12 @@ mod tests {
         let nm = dir.path().join("project").join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         std::os::unix::fs::symlink(&pkg, nm.join("left-pad")).unwrap();
-        assert!(shared_store_of(&nm.join("left-pad")).await.is_some());
+        assert!(shared_store_of(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &nm.join("left-pad")
+        )
+        .await
+        .is_some());
 
         // A per-project `.pnpm` link is not shared.
         let private = nm
@@ -610,7 +661,14 @@ mod tests {
             .join("is-odd");
         std::fs::create_dir_all(&private).unwrap();
         std::os::unix::fs::symlink(&private, nm.join("is-odd")).unwrap();
-        assert_eq!(shared_store_of(&nm.join("is-odd")).await, None);
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("is-odd")
+            )
+            .await,
+            None
+        );
     }
 
     /// #635: with Bun's global store each `node_modules/.bun/<entry>` is a
@@ -649,7 +707,9 @@ mod tests {
                 via_bun.clone(),
                 pkg.join("node_modules/bundled"),
             ] {
-                let got = shared_store_of(&path).await.expect("shared");
+                let got = shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &path)
+                    .await
+                    .expect("shared");
                 assert_eq!(
                     got.kind,
                     SharedStoreKind::BunGlobalStore,
@@ -657,7 +717,12 @@ mod tests {
                     path.display()
                 );
             }
-            let got = shared_store_of_patch_dirs(&link, ["lib/new/a.js"]).await;
+            let got = shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &link,
+                ["lib/new/a.js"],
+            )
+            .await;
             assert_eq!(got.map(|s| s.kind), Some(SharedStoreKind::BunGlobalStore));
         }
     }
@@ -672,7 +737,10 @@ mod tests {
             .path()
             .join("node_modules/.bun/left-pad@1.3.0/node_modules/left-pad");
         std::fs::create_dir_all(&private).unwrap();
-        assert_eq!(shared_store_of(&private).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &private).await,
+            None
+        );
         for not_entry in [
             // No hex hash after the entry name.
             "links/left-pad@1.3.0/node_modules/left-pad",
@@ -687,7 +755,11 @@ mod tests {
         ] {
             let path = dir.path().join("x").join(not_entry);
             std::fs::create_dir_all(&path).unwrap();
-            assert_eq!(shared_store_of(&path).await, None, "{not_entry}");
+            assert_eq!(
+                shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &path).await,
+                None,
+                "{not_entry}"
+            );
         }
     }
 
@@ -705,18 +777,42 @@ mod tests {
         std::fs::create_dir_all(&site).unwrap();
         std::os::unix::fs::symlink(&pkg, site.join("urllib3")).unwrap();
 
-        assert_eq!(shared_store_of(&site).await, None);
+        assert_eq!(
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &site).await,
+            None
+        );
         for key in ["urllib3/response.py", "urllib3/new/dir/added.py"] {
-            let got = shared_store_of_patch_dirs(&site, [key]).await;
+            let got = shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &site,
+                [key],
+            )
+            .await;
             assert_eq!(
                 got.map(|s| s.kind),
                 Some(SharedStoreKind::PdmPackageCache),
                 "{key}"
             );
         }
-        assert_eq!(shared_store_of_patch_dirs(&site, ["six.py"]).await, None);
+        assert_eq!(
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &site,
+                ["six.py"]
+            )
+            .await,
+            None
+        );
         // An escaping key is ignored here (apply refuses it separately).
-        assert_eq!(shared_store_of_patch_dirs(&site, ["../x/y.py"]).await, None);
+        assert_eq!(
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &site,
+                ["../x/y.py"]
+            )
+            .await,
+            None
+        );
     }
 
     /// #626: a `node_modules` entry linked to first-party source (a
@@ -751,11 +847,18 @@ mod tests {
             (nm.join("is-odd"), &checkout),
             (global_nm.join("is-odd"), &checkout),
         ] {
-            let got = shared_store_of(&pkg).await.expect("refused");
+            let got = shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg)
+                .await
+                .expect("refused");
             assert_eq!(got.kind, SharedStoreKind::LinkedSource, "{}", pkg.display());
             assert_eq!(got.real_path, std::fs::canonicalize(real).unwrap());
             // Classified through the patch's own file keys too.
-            let got = shared_store_of_patch_dirs(&pkg, ["index.js", "lib/a.js"]).await;
+            let got = shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &pkg,
+                ["index.js", "lib/a.js"],
+            )
+            .await;
             assert_eq!(got.map(|s| s.kind), Some(SharedStoreKind::LinkedSource));
         }
     }
@@ -805,11 +908,23 @@ mod tests {
             linked_root.join("node_modules").join("six"),
             linked_root.join("node_modules").join("ms"),
         ] {
-            assert_eq!(shared_store_of(&pkg).await, None, "{}", pkg.display());
+            assert_eq!(
+                shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg).await,
+                None,
+                "{}",
+                pkg.display()
+            );
         }
         // A first-party dir that is not spelled as a node_modules entry
         // (a PyPI site-packages root, a cargo vendor dir) is not classified.
-        assert_eq!(shared_store_of(&root.join("packages")).await, None);
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &root.join("packages")
+            )
+            .await,
+            None
+        );
     }
 
     /// Yarn's pnpm linker with a relocated `pnpmStoreFolder` links
@@ -822,7 +937,10 @@ mod tests {
     async fn relocated_yarn_pnpm_store_is_not_refused() {
         use std::os::unix::fs::symlink;
         let is_linked_source = |pkg: PathBuf| async move {
-            shared_store_of(&pkg).await.map(|s| s.kind) == Some(SharedStoreKind::LinkedSource)
+            shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg)
+                .await
+                .map(|s| s.kind)
+                == Some(SharedStoreKind::LinkedSource)
         };
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ws");
@@ -865,16 +983,44 @@ mod tests {
 
         // With a yarn.lock, an ancestor's settings resolve against its dir.
         std::fs::write(root.join("yarn.lock"), "").unwrap();
-        assert_eq!(shared_store_of(&nm.join("left-pad")).await, None);
-        assert_eq!(shared_store_of(&nm.join("react-dom")).await, None);
-        assert_eq!(shared_store_of(&nm.join("@acme").join("tool")).await, None);
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("left-pad")
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("react-dom")
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("@acme").join("tool")
+            )
+            .await,
+            None
+        );
         // The project's own `.yarnrc.yml` wins over the ancestor's.
         std::fs::write(
             root.join(".yarnrc.yml"),
             "pnpmStoreFolder: .cache/.store # relocated\n",
         )
         .unwrap();
-        assert_eq!(shared_store_of(&nm.join("left-pad")).await, None);
+        assert_eq!(
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("left-pad")
+            )
+            .await,
+            None
+        );
         for pkg in &refused {
             assert!(is_linked_source(pkg.clone()).await, "{}", pkg.display());
         }
@@ -927,7 +1073,11 @@ mod tests {
             std::fs::create_dir_all(&odd_nm).unwrap();
             symlink(&number, odd_nm.join("is-number")).unwrap();
             assert_eq!(
-                shared_store_of(&odd_nm.join("is-number")).await,
+                shared_store_of(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &odd_nm.join("is-number")
+                )
+                .await,
                 None,
                 "{folder}"
             );
@@ -938,9 +1088,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                shared_store_of(&odd_nm.join("is-number"))
-                    .await
-                    .map(|s| s.kind),
+                shared_store_of(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    &odd_nm.join("is-number")
+                )
+                .await
+                .map(|s| s.kind),
                 Some(SharedStoreKind::LinkedSource),
                 "{folder}: PnP linker"
             );
@@ -975,7 +1128,9 @@ mod tests {
         symlink(&named, nm.join("named")).unwrap();
         for pkg in [nm.join("left-pad"), nm.join("named")] {
             assert_eq!(
-                shared_store_of(&pkg).await.map(|s| s.kind),
+                shared_store_of(crate::utils::repo_root::ReadScope::Workspace, &pkg)
+                    .await
+                    .map(|s| s.kind),
                 Some(SharedStoreKind::LinkedSource),
                 "{}",
                 pkg.display()
@@ -988,7 +1143,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            shared_store_of(&nm.join("left-pad")).await.map(|s| s.kind),
+            shared_store_of(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &nm.join("left-pad")
+            )
+            .await
+            .map(|s| s.kind),
             Some(SharedStoreKind::LinkedSource)
         );
     }
@@ -1041,9 +1201,13 @@ mod tests {
         std::fs::create_dir_all(source.join("src")).unwrap();
         std::os::unix::fs::symlink(&source, vendor.join("acme/pkg")).unwrap();
 
-        let got = shared_store_of_patch_dirs(&vendor.join("acme/pkg"), ["src/a.php"])
-            .await
-            .expect("refused");
+        let got = shared_store_of_patch_dirs(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &vendor.join("acme/pkg"),
+            ["src/a.php"],
+        )
+        .await
+        .expect("refused");
         assert_eq!(got.kind, SharedStoreKind::OutsideInstallTree);
         assert_eq!(got.real_path, std::fs::canonicalize(&source).unwrap());
         assert!(got
@@ -1062,14 +1226,24 @@ mod tests {
         let installed = vendor.join("acme/real");
         std::fs::create_dir_all(installed.join("src")).unwrap();
         assert_eq!(
-            shared_store_of_patch_dirs(&installed, ["src/a.php"]).await,
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &installed,
+                ["src/a.php"]
+            )
+            .await,
             None
         );
         // Without Composer's marker the layout is not recognized as a
         // vendor dir, and the package dir itself is the install tree.
         std::fs::remove_file(vendor.join("composer/installed.json")).unwrap();
         assert_eq!(
-            shared_store_of_patch_dirs(&vendor.join("acme/pkg"), ["src/a.php"]).await,
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &vendor.join("acme/pkg"),
+                ["src/a.php"]
+            )
+            .await,
             None
         );
     }
@@ -1086,15 +1260,24 @@ mod tests {
         let source = dir.path().join("src/mypkg");
         std::fs::create_dir_all(&source).unwrap();
         std::os::unix::fs::symlink(&source, site.join("mypkg")).unwrap();
-        let got = shared_store_of_patch_dirs(&site, ["mypkg/__init__.py"])
-            .await
-            .expect("refused");
+        let got = shared_store_of_patch_dirs(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &site,
+            ["mypkg/__init__.py"],
+        )
+        .await
+        .expect("refused");
         assert_eq!(got.kind, SharedStoreKind::OutsideInstallTree);
 
         std::fs::create_dir_all(site.join("real/inner")).unwrap();
         std::os::unix::fs::symlink(site.join("real/inner"), site.join("alias")).unwrap();
         assert_eq!(
-            shared_store_of_patch_dirs(&site, ["real/x.py", "alias/y.py"]).await,
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &site,
+                ["real/x.py", "alias/y.py"]
+            )
+            .await,
             None
         );
 
@@ -1102,7 +1285,12 @@ mod tests {
         // user's layout, not a link out of the tree.
         std::os::unix::fs::symlink(&site, dir.path().join("site-link")).unwrap();
         assert_eq!(
-            shared_store_of_patch_dirs(&dir.path().join("site-link"), ["real/x.py"]).await,
+            shared_store_of_patch_dirs(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &dir.path().join("site-link"),
+                ["real/x.py"]
+            )
+            .await,
             None
         );
     }

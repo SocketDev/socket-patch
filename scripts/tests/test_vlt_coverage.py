@@ -19,9 +19,8 @@ CODES = [
     "redirect_vlt_entry_vendored", "redirect_vlt_unsupported_lock_key",
     "redirect_vlt_custom_registry_skipped", "redirect_vlt_old_lockfile_ignored",
     "redirect_vlt_scalar_registry_ignored", "redirect_vlt_lockfile_version_missing",
-    "redirect_vlt_sibling_lockfiles", "redirect_vlt_no_lockfile", "redirect_vlt_artifact_unverifiable",
-    "redirect_vlt_reinstall_required", "vendor_vlt_transitive_unsupported",
-    "vendor_vlt_lock_out_of_sync", "vendor_vlt_legacy_lockfile", "vendor_vlt_reinstall_required",
+    "redirect_vlt_sibling_lockfiles", "redirect_vlt_no_lockfile", "redirect_vlt_reinstall_required",
+    "vendor_vlt_transitive_unsupported", "vendor_vlt_lock_out_of_sync", "vendor_vlt_legacy_lockfile", "vendor_vlt_reinstall_required",
     "vendor_flavor_changed", "vendor_artifact_gitignored",
 ]
 MODE_COMMANDS = [
@@ -154,8 +153,7 @@ class VltCoverageMap(unittest.TestCase):
             self.assertIn(key.split(":", 1)[0], CODES, key)
             self.assertTrue(names, key)
             self.check_names(names)
-        for code in ("redirect_vlt_reinstall_required", "redirect_vlt_artifact_unverifiable"):
-            self.assertTrue(any(k.startswith(code + ":") for k in variants), code)
+        self.assertTrue(any(k.startswith("redirect_vlt_reinstall_required:") for k in variants))
 
     def test_every_mode_command_cell_maps_to_existing_tests(self):
         self.assertEqual(sorted(self.data["modeCommand"]), sorted(MODE_COMMANDS))

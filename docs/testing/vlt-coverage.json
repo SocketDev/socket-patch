@@ -59,17 +59,6 @@
       "golden:npm/vlt/hidden-lock-sentinel",
       "golden:npm/vlt/hidden-lock-sentinel-only"
     ],
-    "redirect_vlt_artifact_unverifiable": [
-      "scan_redirect_vlt_artifact_content_encoding_refused",
-      "scan_redirect_vlt_artifact_sha512_mismatch",
-      "scan_redirect_vlt_artifact_http_404",
-      "scan_redirect_vlt_artifact_http_500",
-      "scan_redirect_vlt_artifact_fetch_error",
-      "scan_redirect_vlt_artifact_already_pinned_failure_left_pinned",
-      "every_failure_reason",
-      "vlt_pinned_matrix_hosted_content_encoding_refused",
-      "vlt_pinned_matrix_production_hosted_install_proof"
-    ],
     "redirect_vlt_reinstall_required": [
       "scan_redirect_vlt_heal_advisory_texts_exact",
       "vlt_hosted_remove_restores_and_emits_the_advisory",
@@ -181,26 +170,6 @@
     "vendor_vlt_reinstall_required: revert with a link still into the vendored dir": [
       "a_revert_asks_for_a_reinstall_while_a_link_or_an_optional_spec_moves_back",
       "vendor_vlt_revert_asks_for_a_reinstall_of_a_linked_vendored_copy"
-    ],
-    "redirect_vlt_artifact_unverifiable: content-encoding": [
-      "scan_redirect_vlt_artifact_content_encoding_refused"
-    ],
-    "redirect_vlt_artifact_unverifiable: sha512 mismatch": [
-      "scan_redirect_vlt_artifact_sha512_mismatch"
-    ],
-    "redirect_vlt_artifact_unverifiable: http status": [
-      "scan_redirect_vlt_artifact_http_404",
-      "scan_redirect_vlt_artifact_http_500"
-    ],
-    "redirect_vlt_artifact_unverifiable: fetch error": [
-      "scan_redirect_vlt_artifact_fetch_error",
-      "scan_redirect_vlt_artifact_redirect_chain_11_fails"
-    ],
-    "redirect_vlt_artifact_unverifiable: offline": [
-      "every_failure_reason"
-    ],
-    "redirect_vlt_artifact_unverifiable: left pinned by an earlier run": [
-      "scan_redirect_vlt_artifact_already_pinned_failure_left_pinned"
     ]
   },
   "modeCommand": {
@@ -210,7 +179,7 @@
       "vlt_pinned_matrix_hosted_scan_fresh_ci"
     ],
     "hosted/get": [
-      "scan_redirect_vlt_artifact_get_uuid_driver",
+      "get_uuid_hosted_pins_vlt_without_fetching_the_artifact",
       "vlt_pinned_matrix_hosted_get_uuid_fresh_ci"
     ],
     "hosted/rollback": [

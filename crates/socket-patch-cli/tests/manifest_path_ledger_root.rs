@@ -398,7 +398,6 @@ const ENGINE_FILES: &[&str] = &[
     "commands/vendor.rs",
     "commands/scan/vendor_flow.rs",
     "commands/scan/hosted.rs",
-    "commands/bun_preflight.rs",
     "commands/vlt_heal.rs",
 ];
 

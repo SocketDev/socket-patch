@@ -2621,20 +2621,10 @@ async fn canary_unpublished_ecosystems() {
 // vlt (suite `production`, DESIGN §8.3)
 // ---------------------------------------------------------------------------
 
-/// `SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1`: the serve fix is
-/// deployed, so a content-encoded artifact is a failure, not a pinned
-/// refusal.
-fn vlt_hosted_production_required() -> bool {
-    std::env::var("SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED").is_ok_and(|v| v == "1")
-}
-
-/// The vlt install proof against production. The artifact is fetched the
-/// way vlt fetches it (`fetch_artifact_probe`): while patch.socket.dev
-/// re-encodes it, the scan must refuse cleanly
-/// (`redirect_vlt_artifact_unverifiable`, nothing written); once it serves
-/// identity bytes, the lock pins it and a fresh checkout's `vlt ci`
-/// installs the patched minimist. So the test neither breaks nor goes
-/// vacuous when the serve fix deploys.
+/// The vlt install proof against production: the scan pins the hosted
+/// artifact in `vlt-lock.json`, and a fresh checkout's `vlt ci` (which
+/// verifies the lock's sha512 against the bytes it receives) installs the
+/// patched minimist.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "live production API + real npm registry + real vlt. Run with --ignored."]
 async fn vlt_pinned_matrix_production_hosted_install_proof() {
@@ -2658,7 +2648,6 @@ async fn vlt_pinned_matrix_production_hosted_install_proof() {
         PATCH_MARKER,
         "vlt hosted production",
     );
-    let lock_before = lock_bytes(&proj);
     std::fs::remove_dir_all(proj.join("node_modules")).unwrap();
     let cwd = proj.to_str().unwrap().to_string();
     let out = socket(
@@ -2666,69 +2655,16 @@ async fn vlt_pinned_matrix_production_hosted_install_proof() {
         &["scan", "--mode", "hosted", "--json", "--yes", "--cwd", &cwd],
         &[],
     );
-    let doc = out.json();
+    assert_eq!(out.code, 0, "{out}");
     let lock = read_lock(&proj);
     let id = node_id(&lock, NPM_NAME, NPM_VERSION);
-    let pinned_url = lock["nodes"][&id][3].as_str().map(str::to_string);
-    // A refusal quotes the artifact URL with its grant token redacted, so
-    // the URL to probe comes from the public reference endpoint scan used.
-    let url = match pinned_url.filter(|u| u.contains(PATCH_HOST)) {
-        Some(u) => u,
-        None => public_reference_url(NPM_UUID).await,
-    };
-    assert!(url.contains(NPM_UUID), "{url}");
-    let client = reqwest::Client::builder().build().unwrap();
-    let probe =
-        socket_patch_core::patch::redirect::vlt_preflight::fetch_artifact_probe(&client, &url)
-            .await;
-    let encoded = probe
-        .content_encoding
-        .as_deref()
-        .is_some_and(|e| !e.trim().is_empty() && !e.trim().eq_ignore_ascii_case("identity"));
-    if encoded {
-        assert!(
-            !vlt_hosted_production_required(),
-            "patch.socket.dev still serves {url} content-encoded ({:?}) but \
-             SOCKET_PATCH_VLT_HOSTED_PRODUCTION_REQUIRED=1",
-            probe.content_encoding
-        );
-        let detail = warning_detail(&doc, "redirect_vlt_artifact_unverifiable");
-        assert!(
-            detail.contains("content-encoding") && detail.contains("nothing was written"),
-            "{detail}"
-        );
-        assert_eq!(lock_bytes(&proj), lock_before, "the refusal writes nothing");
-        assert!(!proj.join(".socket/vendor/redirect-state.json").exists());
-        eprintln!("vlt hosted production: artifact content-encoded; clean refusal pinned");
-    } else {
-        assert_eq!(out.code, 0, "{out}");
-        assert_eq!(
-            lock["nodes"][&id][2].as_str(),
-            probe.sha512.as_deref(),
-            "{lock:#}"
-        );
-        let co = fresh_checkout(&proj, &leg.root.join("fresh"));
-        leg.vlt_ok_with(&co, &leg.locked_install_args(), &VltRun::profile("fresh"));
-        assert_patched(&minimist_entry(&co), PATCH_MARKER, "vlt hosted production");
-    }
+    let pinned_url = lock["nodes"][&id][3].as_str().unwrap_or_default();
+    assert!(
+        pinned_url.contains(PATCH_HOST) && pinned_url.contains(NPM_UUID),
+        "{lock:#}"
+    );
+    let co = fresh_checkout(&proj, &leg.root.join("fresh"));
+    leg.vlt_ok_with(&co, &leg.locked_install_args(), &VltRun::profile("fresh"));
+    assert_patched(&minimist_entry(&co), PATCH_MARKER, "vlt hosted production");
     leg.ran();
-}
-
-/// The hosted artifact URL the public proxy grants for `uuid` — the
-/// reference `scan --mode hosted` resolves on a token-less run.
-async fn public_reference_url(uuid: &str) -> String {
-    use socket_patch_core::api::client::{ApiClient, ApiClientOptions};
-    let client = ApiClient::new(ApiClientOptions {
-        api_url: PROXY.to_string(),
-        api_token: None,
-        route: socket_patch_core::api::client::ApiRoute::Proxy,
-    });
-    let references = client
-        .fetch_registry_references(&[uuid.to_string()])
-        .await
-        .expect("the public proxy answers the reference request");
-    references
-        .get(uuid)
-        .and_then(|r| r.url.clone())
-        .expect("the public proxy grants the free patch's artifact URL")
 }
