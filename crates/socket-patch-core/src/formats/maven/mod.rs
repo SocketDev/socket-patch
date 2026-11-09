@@ -958,14 +958,15 @@ pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> b
 /// Which copy of its GA a declaration's `<type>` / `<classifier>` read as
 /// when a profile moves its coordinates: `Some(None)` the main jar,
 /// `Some(Some(c))` the classifier copy `c`, `None` no jar on the classpath.
-/// `test-jar` is the `tests` copy, an explicit classifier names the copy
-/// whatever the type, and a `${…}` type may be `jar`.
+/// An empty `<type>` is Maven's default `jar`, `test-jar` is the `tests`
+/// copy, an explicit classifier names the copy whatever the type, and a
+/// `${…}` type may be `jar`.
 pub(crate) fn classpath_copy<'a>(
     type_text: Option<&'a str>,
     classifier: Option<&'a str>,
 ) -> Option<Option<&'a str>> {
     match (type_text, classifier) {
-        (None | Some("jar"), c) => Some(c),
+        (None | Some("" | "jar"), c) => Some(c),
         (Some(t), c) if t.contains("${") => Some(c),
         (Some("test-jar"), None) => Some(Some("tests")),
         (Some(_), Some(c)) => Some(Some(c)),

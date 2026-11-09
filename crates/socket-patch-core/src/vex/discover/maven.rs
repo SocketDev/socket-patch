@@ -2572,6 +2572,13 @@ mod tests {
                 vec![to_slf4j.clone()],
                 None,
             ),
+            // An empty `<type>` is Maven's default, `jar`.
+            case(
+                h,
+                with(&other_with("1.7.30", "<type></type>")),
+                vec![to_slf4j.clone()],
+                None,
+            ),
             // Managed, where management governs the pin.
             case(
                 h,

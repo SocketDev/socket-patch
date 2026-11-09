@@ -11013,6 +11013,12 @@ mod tests {
                 format!("{pinned}{}", decl("${h}", "slf4j-api", "1.7.30")),
                 "<h>org.slf4j</h>",
             ),
+            // ... with an empty `<type>`, Maven's default `jar`.
+            (
+                "<h>org.other</h>",
+                pinned.clone() + &h_decl(Some("1.7.30"), "<type></type>"),
+                "<h>org.slf4j</h>",
+            ),
             // ... or its executable classifier copy.
             (
                 "<h>org.other</h>",
