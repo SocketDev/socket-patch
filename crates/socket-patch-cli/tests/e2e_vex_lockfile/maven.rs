@@ -37,9 +37,9 @@
 //! manifest and ledgers are deleted and the standalone `vex` re-attests.
 //!
 //! Documented limitations are asserted explicitly (never skipped): the
-//! legacy same-GAV hosted fallback, a staging (non-allowlisted) host kept
-//! alive by a ledger under `--no-verify`, and agent-mode (`apply`) patches,
-//! which have no lockfile wiring to discover.
+//! legacy same-GAV hosted fallback and agent-mode (`apply`) patches, which
+//! have no lockfile wiring to discover. A staging (non-allowlisted) host is
+//! never attested, even by a ledger under `--no-verify` (fail closed).
 
 #[path = "../prebuilt_common/mod.rs"]
 mod prebuilt_common;
@@ -736,7 +736,8 @@ fn maven_hosted_pin_without_trusted_checksums_still_attests() {
 /// Socket url whose uuid segment differs from the id) is not a patch
 /// reference — with no manifest and no ledger there is nothing to attest,
 /// and the API is never asked about the uuid. A ledger record for the
-/// same uuid is kept dead by the rejected text (rule 11).
+/// same uuid is never attested (`redirect_unwired`): dead by the rejected
+/// text (rule 11), or on a foreign origin.
 #[test]
 fn maven_hosted_spoofed_repositories_never_attest() {
     let golden = std::fs::read_to_string(fixture_dir("maven/pom/basic/expected/pom.xml")).unwrap();
@@ -775,37 +776,29 @@ fn maven_hosted_spoofed_repositories_never_attest() {
             }
             continue;
         }
-        // DOCUMENTED LIMITATION (vex_sources.rs module docs, "only for a
-        // uuid no read file mentions ... patch servers outside the host
-        // allowlist ... does the ledger's own recorded wiring decide"): a
-        // NON-allowlisted host is how a staging patch server run without
-        // `--patch-server-url` looks, so a ledger whose pom.xml still pins
-        // `-socket.<hex8>` under a `socket-patch-<uuid>` repository keeps
-        // the claim alive. With verification on, the installed tree is
-        // still the evidence — nothing installed is `package_not_found`
-        // (the not-installed lockfile basis is only for DISCOVERED refs)
-        // and a pristine served jar is `not_applied` — so nothing attests.
-        // Under `--no-verify` the ledger record attests: `--no-verify`
-        // trusts the records, and the wiring gate cannot tell a staging
-        // host from a hostile one — the limitation CLI_CONTRACT.md records
-        // under "Patch hosts (manifest-less VEX)".
-        let (code, env) = fx.vex(&["--offline"]);
-        assert_omitted(code, &env, MVN_PURL, "package_not_found", label);
+        // Fail closed: a ledger record wired through a hosted-shaped url on an
+        // unconfigured origin is `redirect_unwired` whatever is installed, even
+        // under `--no-verify` (CLI_CONTRACT.md, "Patch hosts (manifest-less VEX)").
         let sfx_dir = fx.m2().join(format!("org/slf4j/slf4j-api/{MVN_SUFFIXED}"));
-        put(
-            &sfx_dir,
-            &format!("slf4j-api-{MVN_SUFFIXED}.pom"),
-            b"<project/>",
-        );
-        put(
-            &sfx_dir,
-            &format!("slf4j-api-{MVN_SUFFIXED}.jar"),
-            MVN_PRISTINE,
-        );
-        let (code, env) = fx.vex(&["--offline"]);
-        assert_omitted(code, &env, MVN_PURL, "not_applied", label);
-        let (code, env) = fx.vex(&["--offline", "--no-verify"]);
-        assert_eq!(code, Some(0), "{label}: documented staging fallback: {env}");
+        for installed in [false, true] {
+            if installed {
+                put(
+                    &sfx_dir,
+                    &format!("slf4j-api-{MVN_SUFFIXED}.pom"),
+                    b"<project/>",
+                );
+                put(
+                    &sfx_dir,
+                    &format!("slf4j-api-{MVN_SUFFIXED}.jar"),
+                    MVN_PRISTINE,
+                );
+            }
+            for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+                let (code, env) = fx.vex(extra);
+                let cell = format!("{label} (installed: {installed}) {extra:?}");
+                assert_omitted(code, &env, MVN_PURL, "redirect_unwired", &cell);
+            }
+        }
     }
 }
 
