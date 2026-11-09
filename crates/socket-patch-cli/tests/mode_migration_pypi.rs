@@ -3346,6 +3346,10 @@ async fn pip_lock_vendor_refuses_an_env_templated_requirements_pin() {
 #[tokio::test]
 async fn pip_lock_beside_an_out_of_root_include_pin_refuses() {
     let (tmp, root) = project();
+    // The include sits outside the project but inside its repository, so
+    // vendor reads its pins: one outside the repository root is never read
+    // (`pypi_requirements::tests::includes_outside_the_repository_are_never_read`).
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
     stage_pip_lock(&root);
     let shared = tmp.path().join("shared");
     std::fs::create_dir_all(&shared).unwrap();

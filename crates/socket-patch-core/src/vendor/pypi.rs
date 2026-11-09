@@ -318,12 +318,8 @@ async fn detect_pypi_flavor(
     // uv.lock, which this run cannot see; routing it by its own files would
     // rewrite it as a lockless (Hatch) project, or rewrite a lock left in
     // the member that uv never reads, and leave the root lock stale.
-    if let Some(workspace) = crate::utils::uv_workspace::governing_uv_workspace(project_root).await
-    {
-        return Err((
-            "pypi_uv_workspace_unsupported",
-            crate::utils::uv_workspace::member_detail(project_root, &workspace),
-        ));
+    if let Some(detail) = crate::utils::uv_workspace::governing_uv_refusal(project_root).await {
+        return Err(("pypi_uv_workspace_unsupported", detail));
     }
     let exists = |name: &str| {
         let p = project_root.join(name);
@@ -4177,6 +4173,8 @@ mod tests {
             ("poetry.lock", ""),
         ] {
             let tmp = tempfile::tempdir().unwrap();
+            // The repository every path of the fixture lives in.
+            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
             let root = tmp.path().join("app");
             tokio::fs::create_dir_all(&root).await.unwrap();
             touch(tmp.path(), "base.txt", "six==1.16.0\n").await;
@@ -4234,6 +4232,8 @@ mod tests {
         shapes.push(("utf-16 six==1.16.0", utf16));
         for (shape, bytes) in shapes {
             let tmp = tempfile::tempdir().unwrap();
+            // The repository every path of the fixture lives in.
+            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
             let root = tmp.path().join("app");
             tokio::fs::create_dir_all(&root).await.unwrap();
             tokio::fs::write(tmp.path().join("base.txt"), &bytes)
@@ -4253,6 +4253,7 @@ mod tests {
         // unknowable, so it refuses too.
         {
             let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
             let root = tmp.path().join("app");
             tokio::fs::create_dir_all(&root).await.unwrap();
             tokio::fs::write(tmp.path().join("base.txt"), b"\x80\x81six==1.16.0\n")
@@ -4274,6 +4275,7 @@ mod tests {
             "../wheels/idna-3.7-py3-none-any.whl\n",
         ] {
             let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
             let root = tmp.path().join("app");
             tokio::fs::create_dir_all(&root).await.unwrap();
             touch(tmp.path(), "base.txt", other).await;

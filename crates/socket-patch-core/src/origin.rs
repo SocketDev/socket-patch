@@ -369,14 +369,12 @@ pub(crate) fn is_decorated_vendor_path(s: &str) -> bool {
     vendor_ref(s).is_none() && vendor_ref_decorated(s).is_some()
 }
 
-/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`, one
-/// `./`, backslash and `\/` normalization), or `None`.
+/// Everything after a LEADING `.socket/vendor/` anchor (after `file:`,
+/// `./`, backslash and `\/` normalization), or `None`: the writers' own
+/// root-anchoring rule ([`crate::vendor::path::vendor_rest_from`]), so
+/// discovery attests exactly the references the writers claim.
 fn root_anchored_vendor_rest(s: &str) -> Option<String> {
-    let norm = s.trim().replace("\\/", "/").replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    norm.strip_prefix(&format!("{VENDOR_DIR}/"))
-        .map(str::to_string)
+    crate::vendor::path::vendor_rest_from("", s)
 }
 
 /// Cut the lock-format decorations off a vendored leaf: everything from the

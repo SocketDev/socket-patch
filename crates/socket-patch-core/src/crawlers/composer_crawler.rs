@@ -102,7 +102,7 @@ impl InstallerLayout {
         let root = crate::utils::fs::read_regular_to_string(&project_root.join("composer.json"))
             .await
             .ok()
-            .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok());
+            .and_then(|content| crate::vendor::common::parse_json_text(&content).ok());
         let extra = root.as_ref().and_then(|r| r.get("extra"));
         Self {
             active: true,
@@ -630,7 +630,7 @@ const PROJECT_ROOT_SEARCH_DEPTH: usize = 3;
 /// value counts as unset. Placeholder expansion is the caller's call, see
 /// [`resolve_vendor_dir`].
 fn parse_config_vendor_dir(composer_json: &str) -> Option<String> {
-    let doc: serde_json::Value = serde_json::from_str(composer_json).ok()?;
+    let doc: serde_json::Value = crate::vendor::common::parse_json_text(composer_json).ok()?;
     let raw = doc.get("config")?.get("vendor-dir")?.as_str()?;
     let trimmed = raw.trim_end_matches(['/', '\\']);
     (!trimmed.is_empty()).then(|| trimmed.to_string())
@@ -1964,6 +1964,14 @@ mod tests {
             None
         );
         assert_eq!(parse_config_vendor_dir("{ not json"), None);
+        // One leading BOM is encoding; a second is content.
+        let bom = crate::formats::text::BOM;
+        let json = r#"{"config":{"vendor-dir":"lib/deps"}}"#;
+        assert_eq!(
+            parse_config_vendor_dir(&format!("{bom}{json}")).as_deref(),
+            Some("lib/deps")
+        );
+        assert_eq!(parse_config_vendor_dir(&format!("{bom}{bom}{json}")), None);
     }
 
     /// Composer's `Platform::expandPath`: only a LEADING `~/`, `$VAR` or
