@@ -20,6 +20,7 @@ use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, first_symlink, open_regular_file_sync,
     read_regular_to_string,
 };
+use crate::utils::path_spelling::PathNeedle;
 
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOutcome, VendorOutcome, VendorServiceConfig, VendorWarning};
@@ -422,20 +423,51 @@ pub(crate) async fn prune_empty_vendor_levels(uuid_dir: &Path) {
 /// both safe (nothing a file still routes at is deleted) and live (the
 /// user can always undo the drift). A file that cannot be read (absent,
 /// unreadable, not a regular file) references nothing.
+///
+/// Every spelling a file may give the path counts, in any case
+/// ([`PathNeedle::keep`]): an older composer.lock's `\/`-escaped slashes, a
+/// Windows backslashed path, `\u` / XML-entity escapes. A plain text match
+/// misses those and would delete an artifact the lock still installs from.
 pub(crate) async fn any_live_file_references(
     root: &Path,
     files: &[&str],
     uuid_dir_rel: &str,
 ) -> bool {
+    first_file_naming(root, files.iter().copied(), &PathNeedle::keep(uuid_dir_rel))
+        .await
+        .is_some()
+}
+
+/// The first of `files` (root-relative) that is a readable regular file
+/// naming `needle` in any of its spellings. An absent or unreadable file
+/// names nothing: callers that must fail closed on an unreadable file read
+/// it themselves.
+pub(crate) async fn first_file_naming<'a>(
+    root: &Path,
+    files: impl IntoIterator<Item = &'a str>,
+    needle: &PathNeedle,
+) -> Option<&'a str> {
     for file in files {
         if read_regular_to_string(&root.join(file))
             .await
-            .is_ok_and(|live| live.contains(uuid_dir_rel))
+            .is_ok_and(|live| needle.found_in(&live))
         {
-            return true;
+            return Some(file);
         }
     }
-    false
+    None
+}
+
+/// The needle a REFUSAL whose miss is safe searches project files with for
+/// `rel` (lifting another refusal, a report): every escape and separator
+/// spelling, but ASCII case folded only where the project's file system
+/// folds it (probed on its `.socket/` dir). Any check whose miss lets an
+/// artifact be deleted uses the broad [`PathNeedle::keep`] instead: a
+/// committed file is installed on case-folding disks too.
+pub(crate) async fn refusal_needle(project_root: &Path, rel: &str) -> PathNeedle {
+    let folds =
+        crate::utils::fs::folds_case(&project_root.join(crate::constants::SOCKET_DIR)).await;
+    PathNeedle::new(rel, folds)
 }
 
 /// The repair remedy for wiring an earlier socket-patch vendoring left in a

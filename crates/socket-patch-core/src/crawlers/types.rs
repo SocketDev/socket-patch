@@ -124,6 +124,16 @@ pub struct CrawlerOptions {
     pub global_prefix: Option<PathBuf>,
 }
 
+impl CrawlerOptions {
+    /// The read scope of this crawl, from its CLI mode: a `--global` /
+    /// `--global-prefix` crawl reads anywhere on the system
+    /// ([`crate::utils::repo_root::ReadScope::Global`]), a project crawl
+    /// stays inside the repository root.
+    pub fn read_scope(&self) -> crate::utils::repo_root::ReadScope {
+        crate::utils::repo_root::ReadScope::of_global(self.global || self.global_prefix.is_some())
+    }
+}
+
 impl Default for CrawlerOptions {
     fn default() -> Self {
         Self {

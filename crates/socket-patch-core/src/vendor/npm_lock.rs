@@ -646,9 +646,11 @@ pub(crate) async fn preflight_packages(
 /// them — it cannot un-wire the lock — so removing the artifact while the
 /// lockfile still resolves through it bricks every subsequent install
 /// (ENOENT on the missing `file:` tarball).
-/// The probe is textual and EXACT for these flavors (the uuid dir path
-/// appears iff some resolution still points at the artifact), over every
-/// lock in
+/// The probe is textual for these flavors (the uuid dir path appears iff
+/// some resolution still points at the artifact). It matches every spelling
+/// of that path — `\/` JSON escapes, backslash separators, `\u` escapes —
+/// and folds ASCII case only on a case-insensitive file system
+/// ([`super::npm_flavor::lock_text_mentions_uuid`]), over every lock in
 /// `lock_names` (a mention in any of them counts — npm 12 installs from the
 /// package-lock.json beside a shrinkwrap). Mentioned ⇒
 /// refuse; readable and provably absent ⇒ `None`, the caller's removal
@@ -4490,6 +4492,47 @@ mod tests {
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
             "artifact pruned once the revert converges"
+        );
+    }
+
+    /// N5: an entry repointed at a SIBLING checkout's vendored copy of the
+    /// same patch (`file:../.socket/vendor/npm/<our uuid>/…`) is that
+    /// project's wiring, not ours: the revert leaves it byte-for-byte and
+    /// keeps our artifact, instead of claiming it by its uuid and restoring
+    /// our recorded original over it.
+    #[tokio::test]
+    async fn revert_never_claims_a_sibling_checkouts_vendor_path() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+
+        let sibling = format!("file:../.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        let mut live = fx.read_lock().await;
+        live["packages"]["node_modules/left-pad"]["resolved"] = json!(sibling);
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_entry_drifted"),
+            "{:?}",
+            outcome.warnings
+        );
+        let after = fx.read_lock().await;
+        assert_eq!(
+            after["packages"]["node_modules/left-pad"], live["packages"]["node_modules/left-pad"],
+            "the sibling's wiring is never rewritten"
+        );
+        assert!(
+            fx.root()
+                .join(format!(".socket/vendor/npm/{UUID}"))
+                .exists(),
+            "the artifact is kept while an entry is left alone"
         );
     }
 

@@ -1,10 +1,13 @@
 //! The root `pom.xml` reader (repositories and dependencies, see
 //! [`parse_pom`]), the Maven coordinate grammars and the hosted
-//! `<base>-socket.<hex8>` version split. Pure: text in, structure out.
+//! `<base>-socket.<hex8>` version split, and the Trusted Checksums files
+//! ([`trusted_checksums`]). Pure: text in, structure out.
 
 use std::collections::BTreeMap;
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
+
+pub(crate) mod trusted_checksums;
 
 // ── pure reader ──
 
@@ -479,14 +482,35 @@ pub(crate) fn may_name(coordinate: &str, want: &str) -> bool {
 /// the file on whitespace instead, so a `-Dk=v` token that only that reading
 /// finds (`-B -Dk=v` on one line) is kept too, unless a line defines `k`.
 pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> {
-    // Java's `String.trim`: every char up to U+0020, nothing beyond.
-    fn trim(s: &str) -> &str {
-        s.trim_matches(|c: char| c <= ' ')
+    let mut props = maven_config_line_properties(config);
+    let tokens = config
+        .lines()
+        .filter(|line| !java_trim(line).starts_with('#'))
+        .flat_map(str::split_whitespace)
+        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
+    let mut legacy = BTreeMap::new();
+    for (k, v) in tokens {
+        if !k.is_empty() && !props.contains_key(k) {
+            legacy.insert(k.to_string(), v.to_string());
+        }
     }
+    props.extend(legacy);
+    props
+}
+
+/// Java's `String.trim`: every char up to U+0020, nothing beyond.
+fn java_trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c <= ' ')
+}
+
+/// [`maven_config_properties`] as Maven 3.9+ alone reads it: only the
+/// argument a whole line holds, never a token of the older whitespace split.
+pub(crate) fn maven_config_line_properties(config: &str) -> BTreeMap<String, String> {
+    let trim = java_trim;
     fn unquote(s: &str) -> &str {
         s.strip_prefix('"')
             .and_then(|s| s.strip_suffix('"'))
-            .map_or(s, trim)
+            .map_or(s, java_trim)
     }
     let mut args = config
         .lines()
@@ -516,18 +540,6 @@ pub(crate) fn maven_config_properties(config: &str) -> BTreeMap<String, String> 
             props.insert(k.to_string(), v.to_string());
         }
     }
-    let tokens = config
-        .lines()
-        .filter(|line| !trim(line).starts_with('#'))
-        .flat_map(str::split_whitespace)
-        .filter_map(|t| t.strip_prefix("-D")?.split_once('='));
-    let mut legacy = BTreeMap::new();
-    for (k, v) in tokens {
-        if !k.is_empty() && !props.contains_key(k) {
-            legacy.insert(k.to_string(), v.to_string());
-        }
-    }
-    props.extend(legacy);
     props
 }
 
@@ -549,6 +561,69 @@ pub(crate) fn may_shadow(
         && type_text.is_none_or(|t| t == "jar" || t.contains("${"))
         && may_name(dep_group, group)
         && may_name(dep_artifact, artifact)
+}
+
+/// The classifiers whose jars never run on a classpath: `sources` and
+/// `javadoc`. Every other classifier copy of a patched GA (tests, a native
+/// or JDK-specific build) carries code, so it must resolve the patched
+/// release too. The hosted rewriter, VEX discovery and the vendored
+/// reactor's attestation share this rule.
+pub(crate) const NON_EXECUTABLE_CLASSIFIERS: &[&str] = &["sources", "javadoc"];
+
+/// Whether a `<classifier>` copy of a GA carries code onto a classpath
+/// (see [`NON_EXECUTABLE_CLASSIFIERS`]).
+pub(crate) fn is_executable_classifier(classifier: &str) -> bool {
+    !NON_EXECUTABLE_CLASSIFIERS.contains(&classifier)
+}
+
+/// Whether a declaration of a GA is a sibling copy of its main jar that
+/// Maven resolves apart from it (and that the main-jar pin does not
+/// reach): a classifier, or a type other than `jar` / `pom`. The `<type>`
+/// a `${...}` leaves unknown counts. The hosted rewriter, VEX discovery and
+/// the vendored reactor share this rule with [`is_executable_variant`].
+pub(crate) fn is_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    classifier.is_some_and(|c| !c.is_empty())
+        || type_text.is_some_and(|t| !t.is_empty() && t != "jar" && t != "pom")
+}
+
+/// The label a variant ([`is_variant`]) is reported by: its classifier,
+/// else its type.
+pub(crate) fn variant_label<'a>(
+    type_text: Option<&'a str>,
+    classifier: Option<&'a str>,
+) -> &'a str {
+    classifier
+        .filter(|c| !c.is_empty())
+        .or(type_text)
+        .unwrap_or_default()
+}
+
+/// Whether a declaration of a GA's main jar: untyped or `jar`-typed, with
+/// no classifier.
+pub(crate) fn is_main_jar(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    type_text.is_none_or(|t| t.is_empty() || t == "jar") && classifier.is_none_or(str::is_empty)
+}
+
+/// Whether a declaration of a GA that is not its main jar
+/// ([`is_main_jar`]) is a copy that carries code onto a classpath. Maven
+/// derives a classifier from some types (`test-jar` is the `tests` jar,
+/// `ejb-client` the `client` one, `java-source` / `javadoc` the
+/// non-executable ones), so a type counts like the classifier it implies.
+/// Of the rest only `pom` holds no code; every other type (`ejb`,
+/// `maven-plugin`, `bundle`, an unknown or `${...}` one) is executable.
+pub(crate) fn is_executable_variant(type_text: Option<&str>, classifier: Option<&str>) -> bool {
+    let type_text = type_text.filter(|t| !t.is_empty()).unwrap_or("jar");
+    let implied = match type_text {
+        "test-jar" => Some("tests"),
+        "ejb-client" => Some("client"),
+        "java-source" => Some("sources"),
+        "javadoc" => Some("javadoc"),
+        _ => None,
+    };
+    match classifier.filter(|c| !c.is_empty()).or(implied) {
+        Some(c) => is_executable_classifier(c),
+        None => type_text != "pom",
+    }
 }
 
 fn is_property_name(name: &str) -> bool {

@@ -566,14 +566,18 @@ pub async fn vendor_nuget(
 
     // ── nuget.config wiring (runs after the artifact) ─────────────────────
     let inherited = super::nuget_config::inherited_sources(project_root).await;
-    let config_edit = match build_config_edit_with(
-        config_text.as_deref(),
-        &inherited.keys,
-        inherited.mapped,
-        &source_key,
-        &uuid_dir_rel,
-        name,
-    ) {
+    let built = match inherited.outside_refusal() {
+        Some(refusal) => Err(refusal),
+        None => build_config_edit_with(
+            config_text.as_deref(),
+            &inherited.keys,
+            inherited.mapped,
+            &source_key,
+            &uuid_dir_rel,
+            name,
+        ),
+    };
+    let config_edit = match built {
         Ok(edit) => edit,
         Err(detail) => {
             let _ = remove_tree(&uuid_dir).await;
@@ -1473,13 +1477,14 @@ async fn revert_config_record(
 /// Whether the project-root config `file` (a recorded wiring basename)
 /// still names the vendored feed dir `uuid_dir_rel`. An unsafe or
 /// unreadable file answers yes: when in doubt the lock pin is kept with
-/// the config that may route to it.
+/// the config that may route to it. A backslashed or entity-escaped
+/// spelling counts ([`crate::utils::path_spelling::mentions_path`]).
 async fn config_references(project_root: &Path, file: &str, uuid_dir_rel: &str) -> bool {
     if !is_safe_single_segment(file) {
         return true;
     }
     match read_regular_to_string(&project_root.join(file)).await {
-        Ok(text) => text.contains(uuid_dir_rel),
+        Ok(text) => crate::utils::path_spelling::mentions_path(&text, uuid_dir_rel),
         Err(e) => e.kind() != std::io::ErrorKind::NotFound,
     }
 }
@@ -5265,6 +5270,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(catch_all_of(&t), ["nuget.org", "corp"], "{t}");
+    }
+
+    /// The same parent config, but above the repository root: it is never
+    /// read, so vendoring cannot tell which sources the catch-all must keep
+    /// and refuses, writing no config and leaving no artifact.
+    #[tokio::test]
+    async fn vendor_refuses_under_a_parent_config_above_the_repository() {
+        let (dir, blobs, installed, record) = fixture(true, None).await;
+        let outer = dir.path();
+        tokio::fs::write(
+            outer.join("nuget.config"),
+            "<configuration>\n  <packageSources>\n    <add key=\"corp\" value=\"https://corp.example/v3/index.json\" />\n  </packageSources>\n</configuration>\n",
+        )
+        .await
+        .unwrap();
+        let root = outer.join("app");
+        tokio::fs::create_dir_all(root.join(".git")).await.unwrap();
+        tokio::fs::rename(outer.join(PACKAGES_LOCK), root.join(PACKAGES_LOCK))
+            .await
+            .unwrap();
+        let (result, _entry, _w) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("outside the repository root")),
+            "{:?}",
+            result.error
+        );
+        assert!(!root.join("nuget.config").exists());
+        assert!(!root.join(".socket/vendor/nuget").exists());
     }
 
     /// A key listed twice gets one catch-all, and an `<add>` without a key

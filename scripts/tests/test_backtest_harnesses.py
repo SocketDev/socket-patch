@@ -802,21 +802,19 @@ class VltOracleTests(unittest.TestCase):
                          'a spurious refusal of a must-patch cell fails')
         self.assertFalse(vlt.matches_expectation(self.row(expectedCodes=['x'])),
                          'a missing documented code fails')
-        refused = vlt.BLOCKED_CODES
         self.assertTrue(vlt.matches_expectation(self.row(verdict=vlt.BLOCKED,
-                                                         blockedByProbe='gzip', codes=refused)))
-        self.assertFalse(vlt.matches_expectation(self.row(verdict=vlt.BLOCKED, codes=refused)),
+                                                         blockedByProbe='gzip')))
+        self.assertFalse(vlt.matches_expectation(self.row(verdict=vlt.BLOCKED)),
                          'blocked needs the probe to have seen a content-encoding')
         self.assertFalse(vlt.matches_expectation(self.row(
-            verdict=vlt.BLOCKED, blockedByProbe='gzip', expectedVerdict='safe-refusal',
-            codes=refused)))
+            verdict=vlt.BLOCKED, blockedByProbe='gzip', expectedVerdict='safe-refusal')))
         limited = self.row(verdict='unsupported', vltLimitations=['x'], expectedLimitation='x')
         self.assertTrue(vlt.matches_expectation(limited))
         self.assertFalse(vlt.matches_expectation(dict(limited, expectedLimitation=None)),
                          'only a documented limitation may leave a cell unproven')
         self.assertFalse(vlt.matches_expectation(dict(limited, failingChecks=['freshCi'])))
 
-    def test_a_blocked_cell_needs_only_the_refusal_code(self):
+    def test_a_blocked_cell_owes_no_codes(self):
         for version, mode, shape in (('0.0.0-16', 'hosted', 'direct'),
                                      ('0.0.0-32', 'hosted', 'direct'),
                                      ('0.0.0-32', 'vendored', 'hosted-then-vendored')):
@@ -824,13 +822,10 @@ class VltOracleTests(unittest.TestCase):
                 expected = vlt.expected_codes(version, mode, shape)
                 self.assertTrue(expected, 'the unblocked cell owes lock-level or vendored codes')
                 blocked = self.row(verdict=vlt.BLOCKED, blockedByProbe='gzip',
-                                   expectedCodes=expected,
-                                   codes=['redirect_vlt_artifact_unverifiable'])
-                self.assertTrue(vlt.matches_expectation(blocked))
-                self.assertFalse(vlt.matches_expectation(dict(blocked, codes=[])),
-                                 'the refusal code itself is still due')
-                self.assertFalse(vlt.matches_expectation(dict(
-                    blocked, verdict='patched', codes=['redirect_vlt_artifact_unverifiable'])),
+                                   expectedCodes=expected)
+                self.assertTrue(vlt.matches_expectation(blocked),
+                                'a blocked cell never ran the CLI')
+                self.assertFalse(vlt.matches_expectation(dict(blocked, verdict='patched')),
                                  'a cell that ran still owes its codes')
 
     def test_a_warm_install_keeps_a_vendored_optional_copy_from_0_0_0_30(self):
@@ -1132,22 +1127,6 @@ class VltRetryTests(unittest.TestCase):
         self.assertFalse(vlt.transient({'serveProbe': {'curlExit': 0, 'status': 200},
                                         'failingChecks': ['freshCi']}))
 
-    def test_a_preflight_transport_failure_retries(self):
-        def refusal(reason):
-            return {'serveProbe': {'curlExit': 0, 'status': 200}, 'safeRefusal': True,
-                    'preflightFailures': [f'vlt would fail to verify https://h/<redacted>/u/a.tgz: '
-                                          f'{reason}; nothing was written for pkg:npm/a@1']}
-        for reason in ('http 502', 'http 504', 'fetch error error sending request',
-                       'fetch error no response within 60s', 'fetch error no response',
-                       'fetch error hosted artifact body not received within 300s'):
-            with self.subTest(reason=reason):
-                self.assertTrue(vlt.transient(refusal(reason)))
-        for reason in ('http 404', 'http 403', 'content-encoding gzip', 'sha512 mismatch',
-                       'offline', 'fetch error refusing a non-http(s) artifact URL',
-                       'fetch error hosted artifact too large (5 bytes > 4)'):
-            with self.subTest(reason=reason):
-                self.assertFalse(vlt.transient(refusal(reason)))
-
     def test_a_vlt_network_drop_retries(self):
         for err in ("vlt install exited 1: Timeout { code: 'ETIMEDOUT', syscall: 'connect' }",
                     'vlt install exited 1: read ECONNRESET', 'getaddrinfo EAI_AGAIN registry',
@@ -1157,24 +1136,6 @@ class VltRetryTests(unittest.TestCase):
         for err in ('getaddrinfo ENOTFOUND h', 'connect ECONNREFUSED 127.0.0.1:1', 'EINTEGRITY'):
             with self.subTest(err=err):
                 self.assertFalse(vlt.transient({'error': f'RuntimeError: {err}'}))
-
-    def test_a_successful_runs_preflight_reasons_reach_the_row(self):
-        with tempfile.TemporaryDirectory() as temp:
-            cell = vlt.Cell({'out': Path(temp), 'record': {}, 'cli': 'socket-patch',
-                             'cli_env': {}}, '1.2.0', 'hosted', 'direct')
-            cell.project.mkdir(parents=True)
-            row = dict(cell=cell.name, expectedVerdict='patched', passed=False, checks={},
-                       safeRefusal=True)
-            detail = 'vlt would fail to verify https://h/a.tgz: http 503; nothing was written for x'
-            envelope = {'status': 'success', 'events': [], 'warnings': [
-                {'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}
-            with patch.object(vlt, 'run', return_value=(0, json.dumps(envelope), '')):
-                cell.patch_run('hosted')
-            with patch('sys.stdout'):
-                cell.finish(row, row['checks'], vlt.time.time())
-            captured = json.loads((cell.case / 'result.json').read_text())
-            self.assertEqual(captured['preflightFailures'], [detail])
-            self.assertTrue(vlt.transient(captured))
 
     def test_a_transport_failure_reruns_from_scratch(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1197,75 +1158,40 @@ class VltRetryTests(unittest.TestCase):
             self.assertTrue((Path(temp) / 'result.json').is_file())
 
 
-class VltBlockedRefusalTests(unittest.TestCase):
+class VltBlockedByEncodingTests(unittest.TestCase):
     """`blocked-by-server-encoding` needs the cell's own probe to have seen a
-    content-encoded 200 and the CLI to have refused cleanly."""
-
-    DETAIL = ('vlt would fail to verify https://patch.socket.dev/x.tgz: content-encoding gzip; '
-              'nothing was written for pkg:npm/minimist@1.2.2')
+    content-encoded 200 for a must-patch cell."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.cell = vlt.Cell({'out': Path(self.temp.name), 'record': {}}, '1.2.0', 'hosted',
                              'direct')
-        self.cell.project.mkdir(parents=True)
-        (self.cell.project / 'vlt-lock.json').write_text('{"nodes":{}}\n', encoding='utf-8')
-        (self.cell.project / 'package.json').write_text('{}\n', encoding='utf-8')
-        self.reference = vlt.snapshot(self.cell.project)
 
     def row(self, encoding='gzip', status=200, expected='patched'):
         return dict(serveProbe={'status': status, 'contentEncoding': encoding},
-                    expectedVerdict=expected, expectedCodes=['redirect_vlt_old_lockfile_ignored'],
-                    codes=[], checks={'serveEncodingIdentity': False})
+                    expectedVerdict=expected)
 
-    def envelope(self, detail=DETAIL):
-        return {'status': 'success', 'events': [],
-                'warnings': [{'code': 'redirect_vlt_artifact_unverifiable', 'detail': detail}]}
-
-    def test_a_clean_refusal_of_an_encoded_artifact_is_blocked(self):
-        row = self.row()
-        self.assertTrue(self.cell.blocked_refusal(row, [self.envelope()], self.reference))
+    def test_an_encoded_artifact_blocks_a_must_patch_cell(self):
+        row, checks = self.row(), {'serveEncodingIdentity': False}
+        self.assertTrue(self.cell.blocked_by_encoding(row, checks))
         self.assertTrue(row['blocked'])
         self.assertEqual(row['blockedByProbe'], 'gzip')
-        self.assertEqual(row['expectedCodes'], vlt.BLOCKED_CODES)
-        self.assertEqual(row['expectedCodesUnblocked'], ['redirect_vlt_old_lockfile_ignored'])
-        self.assertNotIn('serveEncodingIdentity', row['checks'])
-        self.assertEqual(sorted(row['manifestSha256']), ['package.json', 'vlt-lock.json'])
+        self.assertNotIn('serveEncodingIdentity', checks)
+        self.assertEqual(vlt.observed_verdict(row), vlt.BLOCKED)
 
     def test_an_identity_probe_is_never_blocked(self):
         for encoding in (None, '', 'identity'):
             with self.subTest(encoding=encoding):
                 row = self.row(encoding=encoding)
-                self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()],
-                                                           self.reference))
+                self.assertFalse(self.cell.blocked_by_encoding(row, {}))
                 self.assertNotIn('blocked', row)
-
-    def test_a_changed_project_is_not_a_clean_refusal(self):
-        (self.cell.project / 'vlt-lock.json').write_text('{"nodes":{"x":[]}}\n',
-                                                         encoding='utf-8')
-        row = self.row()
-        self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()], self.reference))
-        self.assertNotIn('blocked', row)
 
     def test_a_non_200_probe_or_a_must_refuse_cell_is_not_blocked(self):
         for row in (self.row(status=503), self.row(status=None),
                     self.row(expected='safe-refusal')):
             with self.subTest(row=row):
-                self.assertFalse(self.cell.blocked_refusal(row, [self.envelope()],
-                                                           self.reference))
-                self.assertNotIn('blocked', row)
-
-    def test_the_refusal_must_name_the_encoding_and_write_nothing(self):
-        for envelope in (self.envelope('vlt would fail to verify x: sha512 mismatch; '
-                                       'nothing was written'),
-                         self.envelope('content-encoding gzip'),
-                         {'status': 'success', 'events': [],
-                          'warnings': [{'code': 'redirect_vlt_lock_unsupported',
-                                        'detail': self.DETAIL}]}):
-            with self.subTest(envelope=envelope):
-                row = self.row()
-                self.assertFalse(self.cell.blocked_refusal(row, [envelope], self.reference))
+                self.assertFalse(self.cell.blocked_by_encoding(row, {}))
                 self.assertNotIn('blocked', row)
 
 
@@ -1298,12 +1224,12 @@ class VltProbeTests(unittest.TestCase):
     def test_envelope_codes_read_every_channel(self):
         envelope = {'status': 'error', 'error': {'code': 'c', 'message': 'm'},
                     'warnings': [{'code': 'a', 'detail': ''}],
-                    'events': [{'action': 'skipped', 'errorCode': 'redirect_vlt_artifact_unverifiable',
+                    'events': [{'action': 'skipped', 'errorCode': 'redirect_vlt_lock_unsupported',
                                 'details': {'mode': 'hosted'}},
                                {'action': 'skipped', 'errorCode': 'b', 'reason': 'prose with spaces',
                                 'details': {'mode': 'vendored'}}]}
         self.assertEqual(sorted(vlt.envelope_codes(envelope)),
-                         ['a', 'b', 'c', 'redirect_vlt_artifact_unverifiable'])
+                         ['a', 'b', 'c', 'redirect_vlt_lock_unsupported'])
 
 
 if __name__ == "__main__":

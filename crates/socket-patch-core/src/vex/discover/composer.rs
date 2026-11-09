@@ -100,7 +100,7 @@ impl InstallPreference {
         let preferred_install = ctx
             .read_text(COMPOSER_JSON, out)
             .await
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|text| crate::vendor::common::parse_json_text(&text).ok())
             .and_then(|manifest| manifest.get("config")?.get("preferred-install").cloned());
         Self {
             preferred_install,
@@ -1074,6 +1074,25 @@ mod tests {
                 assert_source_veto(&run(&p).await);
             }
         }
+    }
+
+    /// A composer.json saved with a UTF-8 BOM still decides the install
+    /// preference: its `preferred-install: source` vetoes the leftover
+    /// `source` (before, the BOM read as "no composer.json").
+    #[tokio::test]
+    async fn a_bom_composer_json_still_decides_the_preference() {
+        let entry = with_source(vendored_entry("psr/log", "3.0.2", UUID_B));
+        let p = Project::new();
+        p.write("composer.lock", lock(json!([entry]), json!([])));
+        p.write(
+            "composer.json",
+            format!(
+                "{}{}",
+                crate::formats::text::BOM,
+                composer_json(json!("source"))
+            ),
+        );
+        assert_source_veto(&run(&p).await);
     }
 
     /// Composer's per-package map: the first matching non-`*` pattern

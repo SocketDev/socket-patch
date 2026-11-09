@@ -227,12 +227,21 @@ pub fn render_index_like(rows: &[IndexRow], crlf: bool) -> String {
 /// Whether the index lists `c` (its GAV under its uuid). `Ok(false)` when
 /// there is no index; `Err` when it is malformed.
 pub fn indexed(read: ReadFn<'_>, c: &Coords<'_>) -> Result<bool, JvmRefusal> {
+    Ok(!patch_rows(read, c)?.is_empty())
+}
+
+/// The committed index's rows of the patch at `c` (none without an index);
+/// `Err` for an index this module did not write.
+pub fn patch_rows(read: ReadFn<'_>, c: &Coords<'_>) -> Result<Vec<IndexRow>, JvmRefusal> {
     let Some(bytes) = read(INDEX_REL) else {
-        return Ok(false);
+        return Ok(Vec::new());
     };
     let gav = format!("{}:{}:{}", c.group_id, c.artifact_id, c.version);
     let rows = parse_index(&bytes).map_err(index_refusal)?;
-    Ok(rows.iter().any(|r| r.gav == gav && r.uuid == c.uuid))
+    Ok(rows
+        .into_iter()
+        .filter(|r| r.gav == gav && r.uuid == c.uuid)
+        .collect())
 }
 
 fn index_refusal(why: String) -> JvmRefusal {

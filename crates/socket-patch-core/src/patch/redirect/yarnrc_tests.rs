@@ -428,6 +428,37 @@ fn yarn_classic_workspace_members_follow_the_root_globs() {
     assert!(yarn_classic_workspace_members(root).is_empty());
 }
 
+/// Inside a git checkout a member linked from outside it is listed (stat
+/// only) but never descended into, and its rc files are never read: the
+/// member mirror fails closed naming it. Without a checkout the link is
+/// followed as before.
+#[cfg(unix)]
+#[test]
+fn a_member_linked_from_outside_the_repository_fails_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(tmp.path()).unwrap();
+    let root = base.join("repo");
+    let write = |p: &Path, text: &str| {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    };
+    write(&root.join("yarn.lock"), "# yarn lockfile v1\n\n");
+    write(
+        &root.join("package.json"),
+        r#"{"private":true,"workspaces":["linked/*"]}"#,
+    );
+    write(&base.join("outside/s/package.json"), "{}");
+    std::fs::create_dir_all(root.join("linked")).unwrap();
+    std::os::unix::fs::symlink(base.join("outside/s"), root.join("linked/s")).unwrap();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let members = yarn_classic_workspace_members(&root);
+    assert_eq!(members, vec![root.join("linked/s")]);
+    let setting = linked_member_outside(&root, &members).unwrap();
+    assert!(setting.origin.contains("linked/s"), "{setting:?}");
+    std::fs::remove_dir(root.join(".git")).unwrap();
+    assert_eq!(linked_member_outside(&root, &members), None);
+}
+
 impl Host {
     /// [`configured_yarn_global_folders`] for yarn run in `cwd`.
     fn global_folders(&self, cwd: &str) -> Vec<PathBuf> {

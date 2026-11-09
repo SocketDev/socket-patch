@@ -31,13 +31,12 @@ Checks (agent): cliSuccess, manifestWritten, lockUnchanged, patchedBytes,
 survivesNoopInstall, repeatStableLock, rollbackByteIdentical and
 rollbackOriginalBytes.
 
-Hosted cells whose expected verdict is `patched` first probe the artifact
-(`accept-encoding: gzip;q=1.0, identity;q=0.5`, no decoding). While the
-service re-encodes it, vlt would fail `EINTEGRITY`, so the only correct CLI
-outcome is the clean refusal (`redirect_vlt_artifact_unverifiable`, nothing
-written): the cell records `blocked-by-server-encoding`. That verdict is
-never recorded without the probe seeing a non-identity `Content-Encoding`;
-any other hosted failure is an error.
+Hosted cells first probe the artifact (`accept-encoding: gzip;q=1.0,
+identity;q=0.5`, no decoding). While the service re-encodes it, vlt fails
+`EINTEGRITY` on whatever lock the CLI pins, so a cell whose expected verdict
+is `patched` records `blocked-by-server-encoding` without running the CLI.
+That verdict is never recorded without the probe seeing a non-identity
+`Content-Encoding`; any other hosted failure is an error.
 
 Rows are written in the shape of depscan's capture-vlt.py `result.json`
 (`os, vlt, mode, shape, verdict, codes, manifestSha256, patches` plus the
@@ -100,7 +99,6 @@ NPM_REGISTRY = 'https://registry.npmjs.org/'
 ACME_REGISTRY = 'https://registry.yarnpkg.com/'
 VLT_ACCEPT_ENCODING = 'gzip;q=1.0, identity;q=0.5'
 BLOCKED = 'blocked-by-server-encoding'
-BLOCKED_CODES = ['redirect_vlt_artifact_unverifiable']
 VERDICTS = ['patched', 'safe-refusal', 'unsafe', 'error', 'unsupported', BLOCKED]
 COMMAND_TIMEOUT = 600
 VEX_PRODUCT = 'pkg:npm/vlt-patch-backtest@1.0.0'
@@ -363,20 +361,18 @@ def observed_verdict(row):
 
 
 def required_codes(row):
-    """The codes the row must carry. A blocked cell's dep is withheld from
-    every rewriter (and a conversion never reaches its second run), so only
-    the refusal's own code is due, not the cell's lock-level or vendored
-    codes."""
+    """The codes the row must carry. A blocked cell never runs the CLI, so
+    none are due."""
     if row.get('verdict') == BLOCKED:
-        return BLOCKED_CODES
+        return []
     return row.get('expectedCodes', [])
 
 
 def matches_expectation(row):
     """Observed == expected. Two allowances: a must-patch hosted cell whose
-    probe saw a content-encoded artifact and whose CLI refused cleanly
-    (BLOCKED), and a must-patch cell whose only unproven checks are the
-    documented vlt limitation (`expectedLimitation`)."""
+    probe saw a content-encoded artifact (BLOCKED), and a must-patch cell
+    whose only unproven checks are the documented vlt limitation
+    (`expectedLimitation`)."""
     if not set(required_codes(row)) <= set(row.get('codes', [])):
         return False
     verdict, expected = row.get('verdict'), row.get('expectedVerdict')
@@ -1007,7 +1003,6 @@ class Cell:
         self.envelopes = []
         self.fresh_patched = {}
         self.cli_failures = []
-        self.preflight_failures = []
 
     # CLI -------------------------------------------------------------------
     def cli(self, args, cwd=None):
@@ -1026,11 +1021,7 @@ class Cell:
         cwd = cwd or self.project
         verb = ['get', UUID] if self.spec.get('driver') == 'get' else ['scan']
         code, out, err = self.cli([*verb, '--mode', mode, '--yes', '--cwd', cwd], cwd)
-        envelope = parse_envelope(out)
-        # A successful run's envelope is not on the row; keep the preflight's
-        # reasons there so the transport retry sees them.
-        self.preflight_failures.extend(envelope_details(envelope, BLOCKED_CODES[0]))
-        return code, envelope, err
+        return code, parse_envelope(out), err
 
     def revert(self):
         if self.mode == 'hosted':
@@ -1154,13 +1145,13 @@ class Cell:
                                                            self.ctx['artifact_sha512'],
                                                            self.case / 'probe')
                 checks['serveEncodingIdentity'] = probe['verifies']
+                if self.blocked_by_encoding(row, checks):
+                    return self.finish(row, checks, started)
             if self.spec.get('before'):
                 code, envelope, _ = self.patch_run(self.spec['before'])
                 row['beforeExitCode'] = code
                 save(self.case / 'before-cli-output.json', envelope)
                 if code != 0 or snapshot(self.project) == pristine:
-                    if self.blocked_refusal(row, [envelope], pristine):
-                        return self.finish(row, checks, started)
                     raise RuntimeError(f'the first {self.spec["before"]} run patched nothing '
                                        f'(exit {code})')
             original = snapshot(self.project)
@@ -1176,13 +1167,6 @@ class Cell:
             row['changedFiles'] = sorted(n for n in set(original) | set(after)
                                          if original.get(n) != after.get(n))
             row['manifestSha256'] = capture_tree(self.project, self.case / 'tree')
-            if self.mode == 'hosted' and self.blocked_refusal(row, [envelope], original):
-                return self.finish(row, checks, started)
-            if probing and 'serveEncodingIdentity' in checks and not checks[
-                    'serveEncodingIdentity'] and expected == 'patched':
-                # The probe says vlt cannot verify the artifact, yet this was
-                # no clean refusal: whatever the CLI wrote is unsafe.
-                checks['cleanRefusalWhileEncoded'] = False
             if not checks.get('serveEncodingIdentity', True) and expected != 'patched':
                 checks.pop('serveEncodingIdentity')
             status_ok = isinstance(envelope, dict) and envelope.get('status') in ('success', 'ok')
@@ -1194,37 +1178,22 @@ class Cell:
             row['error'] = tail(f'{type(error).__name__}: {error}', 4000)
         return self.finish(row, checks, started)
 
-    def blocked_refusal(self, row, envelopes, reference):
-        """A clean refusal of a must-patch hosted run while the cell's own
-        probe saw a content-encoded artifact."""
+    def blocked_by_encoding(self, row, checks):
+        """A must-patch hosted cell whose own probe saw a content-encoded
+        200: vlt cannot verify the artifact, so the cell is blocked."""
         probe = row.get('serveProbe') or {}
         encoded = probe.get('status') == 200 and not encoding_is_identity(
             probe.get('contentEncoding'))
         if not encoded or row['expectedVerdict'] != 'patched':
             return False
-        details = [d for e in envelopes
-                   for d in envelope_details(e, 'redirect_vlt_artifact_unverifiable')]
-        row['codes'] = sorted(set(row.get('codes', [])) | {
-            c for e in envelopes for c in envelope_codes(e)})
-        clean = (snapshot(self.project) == reference
-                 and any('content-encoding' in d and 'nothing was written' in d
-                         for d in details))
-        row['blockedDetails'] = details
-        if clean:
-            row['blocked'] = True
-            row['blockedByProbe'] = probe.get('contentEncoding')
-            row['expectedCodesUnblocked'] = row['expectedCodes']
-            row['expectedCodes'] = BLOCKED_CODES
-            row.pop('manifestSha256', None)
-            row['manifestSha256'] = capture_tree(self.project, self.case / 'tree')
-            row['checks'].pop('serveEncodingIdentity', None)
-        return clean
+        row['blocked'] = True
+        row['blockedByProbe'] = probe.get('contentEncoding')
+        checks.pop('serveEncodingIdentity', None)
+        return True
 
     def finish(self, row, checks, started):
         if self.cli_failures:
             row['cliFailures'] = self.cli_failures
-        if self.preflight_failures:
-            row['preflightFailures'] = self.preflight_failures
         row['failingChecks'] = [k for k, v in checks.items() if v is False]
         row['notEvaluated'] = [k for k, v in checks.items() if v is None]
         row.setdefault('codes', [])
@@ -1490,15 +1459,6 @@ class Cell:
 # The CLI's own report of a transport failure: a request error, or a 5xx from
 # the patch API (e.g. "API request failed with status 504: error code: 504").
 CLI_TRANSPORT_FAILURE = re.compile(r'error sending request for url \(|API request failed with status 5\d\d\b')
-# The hosted vlt artifact preflight's fetch of the artifact failed in transit
-# (vlt_preflight.rs `ArtifactProbe::failure`: "fetch error <e>", "http <5xx>").
-# The CLI withholds the dep, writes nothing and exits 0, so the cell reads as
-# a safe refusal although the cell's own probe of the same URL verified. The
-# fetch errors that are deterministic (an over-cap body, a non-http URL) and
-# every other reason (content-encoding, sha512 mismatch, 4xx) stay final.
-PREFLIGHT_TRANSPORT_FAILURE = re.compile(
-    r'vlt would fail to verify \S+: (?:http 5\d\d\b'
-    r'|fetch error (?!refusing a non-http)(?![^;]*too large))')
 # vlt's own registry fetch dropped (Node's errno codes for a connect or read
 # timeout, a reset connection and a temporary DNS failure). ENOTFOUND and
 # ECONNREFUSED stay final: a wrongly rewritten URL fails that way too.
@@ -1516,8 +1476,7 @@ def transient(row):
                   or probe.get('status') is None):
         return True
     text = json.dumps(row)
-    return any(p.search(text) for p in (CLI_TRANSPORT_FAILURE, PREFLIGHT_TRANSPORT_FAILURE,
-                                         VLT_TRANSPORT_FAILURE))
+    return any(p.search(text) for p in (CLI_TRANSPORT_FAILURE, VLT_TRANSPORT_FAILURE))
 
 
 def run_with_retries(cell_factory, job, attempts=3):
@@ -1568,23 +1527,9 @@ def downgrade(args, ctx, vlt):
         try:
             vlt.run(['install'], project, out / mode / 'home', log)
             pristine = snapshot(project)
-            env, extra = ctx['cli_env'], []
-            mirror = None
-            if mode == 'hosted' and not probe_artifact(
-                    ctx['artifact_url'], ctx['artifact_sha512'], out / 'probe')['verifies']:
-                # The live artifact is content-encoded, so this build refuses to
-                # pin it; write the hosted pin through the identity mirror.
-                mirror = IdentityMirror().__enter__()
-                env = dict(env, SOCKET_PROXY_URL=mirror.url)
-                extra = ['--patch-server-url', mirror.url]
-                row['identityMirror'] = True
-            try:
-                code, output, _ = run([ctx['cli'], 'scan', '--mode', mode, '--json', '--yes',
-                                       '--no-telemetry', *extra, '--cwd', project],
-                                      project, env, log)
-            finally:
-                if mirror:
-                    mirror.__exit__()
+            code, output, _ = run([ctx['cli'], 'scan', '--mode', mode, '--json', '--yes',
+                                   '--no-telemetry', '--cwd', project],
+                                  project, ctx['cli_env'], log)
             written = snapshot(project)
             ledger = '.socket/vendor/redirect-state.json' if mode == 'hosted' \
                 else '.socket/vendor/state.json'

@@ -545,6 +545,11 @@ async fn verify_native_vendor_with(
             replaces: &replaces,
             known,
             command,
+            // A project's Go check: a workspace run.
+            bound: crate::utils::repo_root::ReadBoundary::upward(
+                crate::utils::repo_root::ReadScope::Workspace,
+                project_root,
+            ),
         },
         record,
     )
