@@ -88,9 +88,9 @@ impl<'a> ComposerLockPackage<'a> {
             .map(LockIntegrity::Sha1Hex)
     }
 
-    /// The Socket-vendored path `dist.url` names, anchored anywhere
-    /// ([`parse_vendor_path`]: the writers' ownership rule, not discovery's
-    /// root-anchored attestation grammar).
+    /// The path into THIS project's `.socket/vendor/` that `dist.url`
+    /// names ([`parse_vendor_path`]: the writers' root-anchored ownership
+    /// rule; a sibling's `../.socket/vendor/…` is not ours).
     pub(crate) fn dist_vendor_path(&self) -> Option<VendorPathParts> {
         self.dist_str("url").and_then(parse_vendor_path)
     }
@@ -170,7 +170,12 @@ impl<'a> ComposerLock<'a> {
                 continue;
             }
             // Our own vendored entries use a path dist — skip.
-            if pkg.dist_str("type") == Some("path") || pkg.dist_vendor_path().is_some() {
+            if pkg.dist_str("type") == Some("path")
+                || pkg
+                    .dist_str("url")
+                    .and_then(crate::vendor::path::recognize_vendor_path_anywhere)
+                    .is_some()
+            {
                 continue;
             }
             let dist_url = pkg.dist_str("url").unwrap_or("");

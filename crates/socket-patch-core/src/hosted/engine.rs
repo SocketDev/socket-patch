@@ -165,6 +165,24 @@ pub fn symlink_refusal(linked: &str) -> Refusal {
     }
 }
 
+/// The refusal for a candidate read through a link: the file itself
+/// ([`symlink_refusal`]), or, on disk, a directory on its path that links
+/// out of the repository root, so a rewrite would land outside it.
+fn linked_read_refusal(view: &ProjectView<'_>, rel: &str) -> Refusal {
+    if matches!(view, ProjectView::Memory(_)) || view.is_symlink(rel) {
+        return symlink_refusal(rel);
+    }
+    Refusal {
+        code: SYMLINK_REFUSAL.to_string(),
+        message: format!(
+            "{rel} is reached through a symbolic link that leaves the repository root; \
+             socket-patch does not read or rewrite project files outside it — replace the \
+             link with a regular directory (or run socket-patch in the directory it points \
+             to) and re-run; nothing was written"
+        ),
+    }
+}
+
 /// The refusal for a symlinked `bun.lockb` (checked before any takeover
 /// changes wiring).
 pub fn bun_lockb_symlink_refusal() -> Refusal {
@@ -329,10 +347,11 @@ pub struct CandidateFiles {
     /// The workspace members' own locks among `files`, read beside the
     /// root's when the workspace turned the shared lock off (#492).
     pub pnpm_member_lock_keys: Vec<String>,
-    /// In memory only: candidate files the disk flow reads through a
-    /// symbolic link. Their bytes are unknown here, so a project whose
-    /// candidates could rewrite one is refused like the disk symlink guard
-    /// refuses the write.
+    /// In memory: candidate files the disk flow reads through a symbolic
+    /// link. On disk: candidate files linked out of the repository root,
+    /// whose reads the bound refused. Their bytes are unknown, so a project
+    /// whose candidates could rewrite one is refused like the disk symlink
+    /// guard refuses the write.
     pub symlinked_reads: Vec<String>,
     /// In memory only: candidate files that exist without content; a
     /// project whose candidates could rewrite (or whose rewrite depends on)
@@ -381,6 +400,22 @@ impl CandidateFiles {
                 Ok(text) => Some(text),
                 Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
                     self.undecodable_reads.push(rel.to_string());
+                    None
+                }
+                // A candidate whose real path leaves the repository root
+                // (the file itself, or a directory on its path, is a link
+                // out of it; a candidate name never climbs): the bound
+                // refuses the read, but the package manager still follows
+                // the link, so the guard refuses it, never takes it for
+                // absent. Install state under `node_modules/` (a linked
+                // `node_modules` is a common layout) is no rewrite target:
+                // only a link of the file itself counts there.
+                Err(e)
+                    if crate::utils::repo_root::is_refused_read(&e)
+                        && (view.is_symlink(rel)
+                            || !rel.split('/').any(|segment| segment == "node_modules")) =>
+                {
+                    self.symlinked_reads.push(rel.to_string());
                     None
                 }
                 Err(_) => None,
@@ -458,64 +493,68 @@ async fn read_advisory(
     }
 }
 
+/// An in-memory project's Go files as the hosted engine reads them
+/// ([`read_advisory`]: a link or an entry without content is unreadable,
+/// but still exists).
+struct AdvisoryGoFiles<'v, 'p> {
+    view: &'v ProjectView<'p>,
+    unreadable: &'v BTreeSet<String>,
+}
+
+impl crate::vendor::go_workspace::MemoryFiles for AdvisoryGoFiles<'_, '_> {
+    async fn exists(&mut self, rel: &str) -> bool {
+        self.unreadable.contains(rel) || self.view.exists_no_follow(rel).await
+    }
+
+    async fn read(&mut self, rel: &str) -> Option<String> {
+        read_advisory(self.view, self.unreadable, rel).await
+    }
+
+    async fn read_sum(&mut self, rel: &str) -> Option<String> {
+        read_advisory(self.view, self.unreadable, rel).await
+    }
+
+    /// Kept, as the disk loader keeps it: a member that declares the
+    /// patched module, or replaces it, is still weighed (refused), never
+    /// pinned over.
+    fn unparseable(&mut self, _rel: &str, _problem: &str) -> bool {
+        true
+    }
+}
+
 /// The Go workspace in effect for the project, handed to the golang
 /// rewriter under [`crate::patch::redirect::GO_WORKSPACE_KEY`]. On disk it is
 /// the one go resolves (`GOWORK`, else a go.work at or above the root, with
 /// members anywhere, plus a `-modfile` that GOFLAGS sets); in memory a root
-/// `go.work` and its in-root members. A root go.work and go.work.sum are candidate files the rewriter writes.
+/// `go.work` and its in-root members, read as discovery reads them
+/// ([`crate::vendor::go_workspace::read_memory`]), whose paths every check
+/// compares lexically, never probing the disk or the process's working
+/// directory. A root go.work and go.work.sum are candidate files the
+/// rewriter writes.
 async fn read_go_workspace(
     view: &ProjectView<'_>,
     unreadable: &BTreeSet<String>,
     out: &mut CandidateFiles,
 ) {
-    use crate::vendor::go_workspace::{self, GoWorkspace, Loaded, Member};
+    use crate::vendor::go_workspace::{self, Loaded};
     let (root, loaded, modfile, module_graph) = match view {
-        ProjectView::Memory(_) => 'memory: {
+        ProjectView::Memory(_) => {
             let Some(work) = read_advisory(view, unreadable, "go.work").await else {
                 return;
             };
             let work = crate::vendor::go_mod_edit::normalize_for_read(&work);
             // As on disk (`go_workspace::load`): a go.work go cannot parse
             // is a workspace go refuses to build, never module mode.
-            if let Some(problem) = crate::vendor::go_mod_edit::block_structure_error(&work) {
-                break 'memory (
-                    std::path::PathBuf::new(),
-                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build")),
-                    None,
-                    None,
-                );
-            }
-            let mut members = Vec::new();
-            for raw in crate::vendor::go_mod_edit::parse_use_dirs(&work) {
-                let Some(dir) = go_workspace::in_root_dir(&raw) else {
-                    members.push(Member {
-                        dir: raw.into(),
-                        go_mod: None,
-                        go_sum: None,
-                    });
-                    continue;
-                };
-                let at = |file: &str| match dir.as_str() {
-                    "" => file.to_string(),
-                    dir => format!("{dir}/{file}"),
-                };
-                members.push(Member {
-                    go_mod: read_advisory(view, unreadable, &at("go.mod"))
-                        .await
-                        .map(|t| crate::vendor::go_mod_edit::normalize_for_read(&t)),
-                    go_sum: read_advisory(view, unreadable, &at("go.sum")).await,
-                    dir: dir.into(),
-                });
-            }
-            let work_sum = read_advisory(view, unreadable, "go.work.sum").await;
-            let ws = GoWorkspace {
-                work_file: "go.work".into(),
-                work,
-                work_sum,
-                members,
-                graph: None,
+            let loaded = match crate::vendor::go_mod_edit::block_structure_error(&work) {
+                Some(problem) => {
+                    Loaded::Invalid(format!("go.work: {problem}, so go refuses to build"))
+                }
+                None => {
+                    let mut files = AdvisoryGoFiles { view, unreadable };
+                    Loaded::Workspace(go_workspace::read_memory(&work, &mut files).await.0)
+                }
             };
-            (std::path::PathBuf::new(), Loaded::Workspace(ws), None, None)
+            (std::path::PathBuf::new(), loaded, None, None)
         }
         ProjectView::Disk(_) | ProjectView::Snapshot(_) => {
             let Some(root) = view.disk_root_reading(std::iter::empty::<&std::path::Path>()) else {
@@ -785,6 +824,12 @@ pub async fn read_candidate_files(
                     String::new(),
                 );
             }
+            if let Some(why) = inherited.outside_refusal() {
+                out.files.insert(
+                    crate::patch::redirect::NUGET_INHERITED_OUTSIDE_KEY.to_string(),
+                    why,
+                );
+            }
         }
     }
 
@@ -868,6 +913,14 @@ pub async fn read_candidate_files(
             out.files.insert(
                 crate::patch::redirect::UV_ANCESTOR_CONFIG_KEY.to_string(),
                 format!("{}\n{}", config.rel, config.text),
+            );
+        } else if let Some(why) = view
+            .disk_root_reading(std::iter::empty::<&std::path::Path>())
+            .and_then(|root| crate::utils::python_script::uv_config_above_repo(root, None))
+        {
+            out.files.insert(
+                crate::patch::redirect::UV_ANCESTOR_OUTSIDE_KEY.to_string(),
+                why,
             );
         }
     }
@@ -2735,12 +2788,22 @@ fn pnpm_trust(
         // only from the workspace root's file, and a nested one would be
         // ignored (#880). The governing-root pre-check refused every root
         // file but these two, so nothing is written here.
+        // One above the repository root is never read (the pre-check
+        // refuses it; this keeps the read bounded on its own).
+        let readable = view.disk_root().is_some_and(|root| {
+            crate::utils::repo_root::upward_readable(
+                crate::utils::repo_root::ReadScope::Workspace,
+                root,
+                &root_file,
+            )
+        });
         let root_file = root_file.display().to_string();
         if let Some(found) = pnpm_trust_env_override(view, files, options.pnpm_env) {
             pnpm_trust_env_set_detail(&server, &found.source)
         } else {
-            match read_workspace_for_trust(std::path::Path::new(&root_file))
-                .ok()
+            match readable
+                .then(|| read_workspace_for_trust(std::path::Path::new(&root_file)))
+                .and_then(Result::ok)
                 .flatten()
                 .map(|text| plan_workspace_trust(Some(&text)))
             {
@@ -3553,16 +3616,18 @@ pub fn guard(
         .iter()
         .map(|c| c.dep.ecosystem.as_str())
         .collect();
-    let ProjectView::Memory(project) = view else {
-        return None;
-    };
+    // In memory, every linked candidate; on disk, those whose real path
+    // leaves the repository root, whose reads the bound refused.
     if let Some(linked) = done
         .symlinked_reads
         .iter()
         .find(|rel| file_ecosystem(rel).is_some_and(|eco| candidate_ecosystems.contains(eco)))
     {
-        return Some(symlink_refusal(linked));
+        return Some(linked_read_refusal(view, linked));
     }
+    let ProjectView::Memory(project) = view else {
+        return None;
+    };
     done.unreadable_reads
         .iter()
         .find(|rel| {
@@ -3621,6 +3686,179 @@ mod tests {
             matches!(hosted.loaded, Loaded::Invalid(_)),
             "{:?}",
             hosted.loaded
+        );
+    }
+
+    /// The in-memory engine's workspace is judged lexically, from the
+    /// project's own files: a root module go.work doesn't `use` is "not a
+    /// member", whatever the process's working directory holds. The disk
+    /// checks probed `<cwd>/go.mod` instead, so with this crate's directory
+    /// as the cwd (no go.mod) the rewriter called the root module-less
+    /// ("nowhere to go"), and with a go.mod there it gave the member answer.
+    /// A root go.mod go cannot parse, or one that cannot be read (a link),
+    /// still exists: the same files, the same verdict, as discovery's
+    /// `in_memory_workspace_files_are_the_files_that_exist` finds.
+    #[tokio::test]
+    async fn memory_go_workspace_never_probes_the_cwd() {
+        use crate::patch::redirect::{
+            rewrite_registry_redirect, HostedGoWorkspace, Integrity, RegistryOverride,
+            RegistryOverrideIdentifiers, GO_WORKSPACE_KEY,
+        };
+        use crate::vendor::go_workspace::{Loaded, WorkspaceConflict};
+        const MODULE: &str = "github.com/foo/bar";
+        let socket = format!("patch.socket.dev/gopatch/{PATCH_UUID}");
+        let hash = format!("h1:{}=", "A".repeat(43));
+        let ovr = DepOverride {
+            ecosystem: "golang".into(),
+            name: MODULE.into(),
+            version: "v1.4.2".into(),
+            registry_override: Some(RegistryOverride {
+                kind: "goproxy".into(),
+                index_url: "https://patch.socket.dev/patch-registry/golang".into(),
+                identifiers: RegistryOverrideIdentifiers {
+                    name: MODULE.into(),
+                    version: "v1.4.2".into(),
+                    go_module_path: Some(socket.clone()),
+                    go_module_version: Some("v1.4.2-socketpatch.1".into()),
+                    ..Default::default()
+                },
+            }),
+            integrity: Integrity {
+                dirhash_h1: Some(hash.clone()),
+                go_mod_h1: Some(hash),
+                ..Default::default()
+            },
+            ..grant_dep("golang", String::new())
+        };
+        let go_mod = format!("module example.com/app\n\ngo 1.21\n\nrequire {MODULE} v1.4.2\n");
+        let b = format!("module example.com/b\n\ngo 1.21\n\nrequire {MODULE} v1.4.2\n");
+        let work = "go 1.21\n\nuse ./b\n";
+        let ours = crate::vendor::go_mod_edit::ReplaceEntry {
+            module: MODULE.into(),
+            version: Some("v1.4.2".into()),
+            path: None,
+            rhs_module: Some(socket),
+            rhs_version: Some("v1.4.2-socketpatch.1".into()),
+            owner: Some(crate::vendor::go_mod_edit::ReplaceOwner::Hosted),
+        };
+        let unparseable = MemoryEntry::Text("module example.com/app\n\nrequire (\n".into());
+        for root in [
+            MemoryEntry::Text(go_mod.as_str().into()),
+            unparseable,
+            MemoryEntry::Symlink,
+        ] {
+            let mut p = MemoryProject::new();
+            p.insert("go.mod", root.clone());
+            p.insert_text("go.work", work);
+            p.insert_text("b/go.mod", b.as_str());
+            let mut out = CandidateFiles::default();
+            read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+            let hosted: HostedGoWorkspace =
+                serde_json::from_str(&out.files[GO_WORKSPACE_KEY]).unwrap();
+            let Loaded::Workspace(ws) = &hosted.loaded else {
+                panic!("{root:?}: {:?}", hosted.loaded);
+            };
+            assert_eq!(
+                ws.files,
+                Some(
+                    ["go.mod", "go.work", "b/go.mod"]
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect()
+                ),
+                "{root:?}"
+            );
+            assert!(
+                matches!(
+                    hosted
+                        .loaded
+                        .conflict(&hosted.root, MODULE, "v1.4.2", &ours),
+                    Some(WorkspaceConflict::NotAMember { .. })
+                ),
+                "{root:?}"
+            );
+        }
+        // Review on #2031 (round 2): a member go.mod go cannot parse is
+        // still weighed, as the disk loader keeps it: one declaring the
+        // patched module makes every replace of it inert (refused).
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", go_mod.as_str());
+        p.insert_text("go.work", "go 1.21\n\nuse (\n\t.\n\t./b\n)\n");
+        p.insert_text("b/go.mod", format!("module {MODULE}\n\nrequire (\n"));
+        let mut out = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut out).await;
+        let hosted: HostedGoWorkspace = serde_json::from_str(&out.files[GO_WORKSPACE_KEY]).unwrap();
+        assert!(
+            matches!(
+                hosted
+                    .loaded
+                    .conflict(&hosted.root, MODULE, "v1.4.2", &ours),
+                Some(WorkspaceConflict::MainModule { .. })
+            ),
+            "{:?}",
+            hosted.loaded
+        );
+
+        // End to end through the rewriter.
+        let mut p = MemoryProject::new();
+        p.insert_text("go.mod", go_mod.as_str());
+        p.insert_text("go.work", work);
+        p.insert_text("b/go.mod", b.as_str());
+        let mut read = CandidateFiles::default();
+        read_go_workspace(&ProjectView::Memory(&p), &BTreeSet::new(), &mut read).await;
+        let mut files = read.files;
+        for (path, text) in [("go.mod", go_mod.as_str()), ("go.work", work)] {
+            files.insert(path.into(), text.into());
+        }
+        let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+        assert!(out.files.is_empty(), "{:?}", out.files);
+        assert!(out.confirmed_golang_uuids.is_empty());
+        assert_eq!(out.warnings.len(), 1, "{:?}", out.warnings);
+        assert_eq!(out.warnings[0].code, "redirect_golang_workspace_conflict");
+        assert!(
+            out.warnings[0]
+                .detail
+                .contains("go.work does not `use` this module"),
+            "{:?}",
+            out.warnings
+        );
+    }
+
+    /// A disk candidate whose real path leaves the repository root, as
+    /// the file itself or through a directory link on its path, is
+    /// recorded as a linked read (refused by the guard), never as absent.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disk_candidates_linked_out_of_the_repository_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        std::fs::write(outside.join("uv.lock"), "version = 1\n").unwrap();
+        std::fs::write(outside.join("sub/package-lock.json"), "{}\n").unwrap();
+        std::os::unix::fs::symlink(outside.join("uv.lock"), repo.join("uv.lock")).unwrap();
+        std::os::unix::fs::symlink(outside.join("sub"), repo.join("sub")).unwrap();
+        let view = ProjectView::Disk(&repo);
+        let mut out = CandidateFiles::default();
+        for rel in ["uv.lock", "sub/package-lock.json"] {
+            assert!(!out.read(&view, &BTreeSet::new(), rel).await, "{rel}");
+        }
+        assert_eq!(out.symlinked_reads, ["uv.lock", "sub/package-lock.json"]);
+        assert!(out.files.is_empty());
+        let file = linked_read_refusal(&view, "uv.lock");
+        assert_eq!(file.code, SYMLINK_REFUSAL);
+        assert!(
+            file.message.contains("uv.lock is a symbolic link"),
+            "{}",
+            file.message
+        );
+        let dir = linked_read_refusal(&view, "sub/package-lock.json");
+        assert_eq!(dir.code, SYMLINK_REFUSAL);
+        assert!(
+            dir.message.contains("leaves the repository root"),
+            "{}",
+            dir.message
         );
     }
 
@@ -4296,6 +4534,8 @@ mod tests {
     #[tokio::test]
     async fn issue_1951_yarn_classic_copy_manifests_read_as_vendored_reads_them() {
         let tmp = tempfile::tempdir().unwrap();
+        // The repository every path of the fixture lives in.
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
         let root = tmp.path().join("app");
         let manifest = r#"{"name":"left-pad","version":"1.3.0"}"#;
         for dir in ["app/lpdir", "ext/lpdir", "abs/lpdir"] {

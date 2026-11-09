@@ -62,11 +62,11 @@ use crate::patch::apply::PatchSources;
 use crate::utils::fs::read_regular_to_string;
 
 use super::common::refused;
-use super::path::parse_vendor_path;
+use super::path::parse_vendor_path_or_machine_absolute;
 use super::pnpm_lock::{
     dep_entries, drifted, lines_value, lock_has_target_package, ref_record_blocks, removed,
-    revert_block, revert_overrides_line, target_block, vendor_value_is_for, DepPair, DepRef,
-    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    revert_block, revert_overrides_line, target_block, DepPair, DepRef, EditCtx, PnpmDialect,
+    KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -175,11 +175,12 @@ impl Ctx<'_> {
     }
 
     /// Does `value` point at OUR vendored tarball for THIS name@version
-    /// (any uuid, relative or the machine-absolute specifier spelling —
-    /// `parse_vendor_path` anchors on `.socket/vendor/` anywhere in the
-    /// string)?
+    /// (any uuid; root-relative, or the machine-absolute specifier spelling
+    /// pnpm <= 8 records — never a relative `../` escape)?
     fn is_ours(&self, value: &str) -> bool {
-        vendor_value_is_for(value, self.name, self.version)
+        parse_vendor_path_or_machine_absolute(value).is_some_and(|p| {
+            p.eco == "npm" && p.leaf == super::npm_common::tgz_rel_leaf(self.name, self.version)
+        })
     }
 
     /// The peer-suffix marker this grammar appends to a version/key
@@ -858,7 +859,16 @@ pub(super) fn revert_lock_record(
         KIND_LOCK_ROOT_DEP_PAIR => {
             revert_root_dep_pair(lines, rec, key, entry_uuid, dirty, warnings)
         }
-        KIND_LOCK_PACKAGE => revert_block(lines, rec, key, "packages", entry_uuid, dirty, warnings),
+        KIND_LOCK_PACKAGE => revert_block(
+            lines,
+            rec,
+            key,
+            "packages",
+            entry_uuid,
+            parse_vendor_path_or_machine_absolute,
+            dirty,
+            warnings,
+        ),
         KIND_LOCK_PKG_DEP_REF => revert_pkg_dep_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
@@ -903,7 +913,7 @@ fn revert_value_line(
             .as_ref()
             .and_then(Value::as_str)
             .is_some_and(|new| rest == new || rest == yaml_value(new))
-            || parse_vendor_path(unquote_value(rest))
+            || parse_vendor_path_or_machine_absolute(unquote_value(rest))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
@@ -954,6 +964,7 @@ fn revert_root_dep_pair(
         dep,
         entry_uuid,
         label: "root dep",
+        parse: parse_vendor_path_or_machine_absolute,
     };
     pair.restore(lines, start + 1, end, 2, dirty, warnings);
 }
@@ -990,6 +1001,7 @@ fn revert_pkg_dep_ref(
         entry_uuid,
         label: "dep ref",
         dep_maps_only: true,
+        parse: parse_vendor_path_or_machine_absolute,
     };
     for (header, block_end) in ref_record_blocks(lines, start, end, pkg_key) {
         if target.restore_in(lines, header, block_end, dirty, warnings) {

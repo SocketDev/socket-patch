@@ -3303,10 +3303,26 @@ fn revert_lock_record(
     match rec.kind.as_str() {
         KIND_LOCK_OVERRIDES => revert_overrides_line(lines, rec, key, entry_uuid, dirty, warnings),
         KIND_LOCK_IMPORTER_DEP => revert_importer_dep(lines, rec, key, entry_uuid, dirty, warnings),
-        KIND_LOCK_PACKAGE => revert_block(lines, rec, key, "packages", entry_uuid, dirty, warnings),
-        KIND_LOCK_SNAPSHOT => {
-            revert_block(lines, rec, key, "snapshots", entry_uuid, dirty, warnings)
-        }
+        KIND_LOCK_PACKAGE => revert_block(
+            lines,
+            rec,
+            key,
+            "packages",
+            entry_uuid,
+            parse_vendor_path,
+            dirty,
+            warnings,
+        ),
+        KIND_LOCK_SNAPSHOT => revert_block(
+            lines,
+            rec,
+            key,
+            "snapshots",
+            entry_uuid,
+            parse_vendor_path,
+            dirty,
+            warnings,
+        ),
         KIND_LOCK_SNAPSHOT_REF => revert_snapshot_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
@@ -3415,6 +3431,7 @@ fn revert_importer_dep(
         dep,
         entry_uuid,
         label: "importer dep",
+        parse: parse_vendor_path,
     };
     let mut i = start + 1;
     while let Some(importer) = next_block(lines, i, end) {
@@ -3435,6 +3452,9 @@ pub(super) struct DepPair<'a> {
     pub(super) entry_uuid: &'a str,
     /// Warning prefix (`importer dep` / `root dep`).
     pub(super) label: &'a str,
+    /// The ownership parse: [`parse_vendor_path`], or for pnpm <= 8 locks
+    /// [`super::path::parse_vendor_path_or_machine_absolute`].
+    pub(super) parse: fn(&str) -> Option<super::path::VendorPathParts>,
 }
 
 impl DepPair<'_> {
@@ -3477,8 +3497,7 @@ impl DepPair<'_> {
             return;
         }
         let ours = field(rec.new.as_ref(), "version") == Some(live_ver)
-            || parse_vendor_path(live_ver)
-                .is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
+            || (self.parse)(live_ver).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
             return warnings.push(drifted(format!(
                 "{label} `{key}` was re-resolved since vendoring ({live_ver}); left alone"
@@ -3505,13 +3524,16 @@ impl DepPair<'_> {
 /// Restore a rekeyed packages/snapshots block: locate the block by the NEW
 /// key (from `rec.new`'s first line), verify ownership, splice the original
 /// lines back — merged with any dependency ref ANOTHER entry rewrote inside
-/// the block since (#830, [`merge_live_dep_refs`]).
+/// the block since (#830, [`merge_live_dep_refs`]). `parse` is the
+/// ownership parse, as on [`DepPair::parse`].
+#[allow(clippy::too_many_arguments)]
 pub(super) fn revert_block(
     lines: &mut Vec<String>,
     rec: &WiringRecord,
     key: &str,
     section: &str,
     entry_uuid: &str,
+    parse: fn(&str) -> Option<super::path::VendorPathParts>,
     dirty: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -3545,8 +3567,7 @@ pub(super) fn revert_block(
         // `name@file:<path>` or legacy's bare `file:<path>`.
         let live: Vec<String> = lines[block.header..block.end].to_vec();
         let path = new_key.rsplit_once("@file:").map_or(new_key, |(_, p)| p);
-        let key_is_ours =
-            parse_vendor_path(path).is_some_and(|v| v.eco == "npm" && v.uuid == entry_uuid);
+        let key_is_ours = parse(path).is_some_and(|v| v.eco == "npm" && v.uuid == entry_uuid);
         if live != new_lines && !key_is_ours {
             warnings.push(drifted(format!(
                 "{section} entry `{new_key}` was changed since vendoring; left alone"
@@ -3635,6 +3656,7 @@ fn revert_snapshot_ref(
         entry_uuid,
         label: "snapshot ref",
         dep_maps_only: false,
+        parse: parse_vendor_path,
     };
     for (header, block_end) in ref_record_blocks(lines, start, end, snapshot_key) {
         if target.restore_in(lines, header, block_end, dirty, warnings) {
@@ -3712,6 +3734,9 @@ pub(super) struct DepRef<'a> {
     /// Only look inside `dependencies:` / `optionalDependencies:` maps (the
     /// legacy edit's scope; the v9 edit rewrites any 6-space key).
     pub(super) dep_maps_only: bool,
+    /// The ownership parse: [`parse_vendor_path`], or for pnpm <= 8 locks
+    /// [`super::path::parse_vendor_path_or_machine_absolute`].
+    pub(super) parse: fn(&str) -> Option<super::path::VendorPathParts>,
 }
 
 impl DepRef<'_> {
@@ -3748,7 +3773,7 @@ impl DepRef<'_> {
             return true;
         }
         let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
-            || parse_vendor_path(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
+            || (self.parse)(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
             warnings.push(drifted(format!(
                 "{} `{}` was re-resolved since vendoring ({rest}); left alone",
@@ -10106,6 +10131,7 @@ snapshots:
             "left-pad@1.3.0",
             "packages",
             UUID,
+            parse_vendor_path,
             &mut dirty,
             &mut warnings,
         );
@@ -10127,6 +10153,7 @@ snapshots:
             "left-pad@1.3.0",
             "packages",
             UUID,
+            parse_vendor_path,
             &mut dirty,
             &mut warnings,
         );

@@ -5,6 +5,12 @@
 //!   unset, empty or `auto` searches the project directory and its
 //!   ancestors; any other value must be an absolute path to the file, and a
 //!   relative one makes go fail (`invalid GOWORK: not an absolute path`).
+//!   A `go.work` outside the repository root
+//!   ([`crate::utils::repo_root::ReadBoundary`]) is never read: go would
+//!   use it, so the workspace is [`GoWork::Invalid`] (writers refuse,
+//!   discovery withholds) rather than read or silently ignored. Members,
+//!   `go.work.sum` and replacement directories outside the root read as
+//!   missing.
 //! * **What the build selects** ([`GoWorkspace::selection`]): MVS over the
 //!   module graph go loads ([`GoWorkspace::read_graph`]): every `use`
 //!   member's `require`s, the `require`s in each of those modules' go.mod,
@@ -57,9 +63,16 @@ pub enum GoWork {
 }
 
 /// The `go.work` go would use for `project_root`, reading `GOWORK` from
-/// the environment, then the `go env -w` file.
+/// the environment, then the `go env -w` file, in a workspace run.
 pub fn resolve(project_root: &Path) -> GoWork {
-    resolve_with(
+    resolve_in(crate::utils::repo_root::ReadScope::Workspace, project_root)
+}
+
+/// [`resolve`] in a `scope` run: a global run (the Go crawler's
+/// `--global`) is not bounded by the repository root.
+pub fn resolve_in(scope: crate::utils::repo_root::ReadScope, project_root: &Path) -> GoWork {
+    resolve_scoped(
+        scope,
         project_root,
         crate::utils::go_env::go_env("GOWORK").as_deref(),
     )
@@ -67,18 +80,44 @@ pub fn resolve(project_root: &Path) -> GoWork {
 
 /// [`resolve`] for an explicit `GOWORK` value.
 pub fn resolve_with(project_root: &Path, gowork: Option<&str>) -> GoWork {
+    resolve_scoped(
+        crate::utils::repo_root::ReadScope::Workspace,
+        project_root,
+        gowork,
+    )
+}
+
+fn resolve_scoped(
+    scope: crate::utils::repo_root::ReadScope,
+    project_root: &Path,
+    gowork: Option<&str>,
+) -> GoWork {
+    let bounded = |file: PathBuf| {
+        let bound = crate::utils::repo_root::ReadBoundary::upward(scope, project_root);
+        if bound.contains(&file) {
+            GoWork::File(file)
+        } else {
+            GoWork::Invalid(format!(
+                "go builds in workspace mode from {}, which socket-patch cannot model: {} \
+                 (set GOWORK=off, or keep the go.work inside the repository)",
+                file.display(),
+                bound.refusal(&file)
+            ))
+        }
+    };
     match gowork {
         Some("off") => GoWork::None,
         None | Some("") | Some("auto") => {
             let base = std::env::current_dir()
                 .unwrap_or_default()
                 .join(project_root);
+            // Only a stat above the root: the file is never opened there.
             base.ancestors()
                 .map(|dir| dir.join("go.work"))
                 .find(|file| file.is_file())
-                .map_or(GoWork::None, GoWork::File)
+                .map_or(GoWork::None, bounded)
         }
-        Some(path) if Path::new(path).is_absolute() => GoWork::File(PathBuf::from(path)),
+        Some(path) if Path::new(path).is_absolute() => bounded(PathBuf::from(path)),
         Some(path) => GoWork::Invalid(format!(
             "GOWORK={path} is not an absolute path, so go refuses to build (\"invalid \
              GOWORK: not an absolute path\")"
@@ -156,6 +195,12 @@ pub struct GoWorkspace {
     /// the module cache has it); `None` until [`GoWorkspace::read_graph`].
     #[serde(default)]
     pub graph: Option<BTreeMap<String, Option<DepGoMod>>>,
+    /// An in-memory project's workspace ([`read_memory`]): the
+    /// root-relative files that exist, so every path check compares paths
+    /// lexically ([`PathSpace::Memory`]) and none touches the filesystem or
+    /// the process's working directory. `None` on disk.
+    #[serde(default)]
+    pub files: Option<BTreeSet<PathBuf>>,
 }
 
 /// What MVS reads from a dependency's go.mod.
@@ -228,11 +273,22 @@ pub async fn load_with(project_root: &Path, gowork: Option<&str>) -> Loaded {
     match resolve_with(project_root, gowork) {
         GoWork::None => Loaded::None,
         GoWork::Invalid(why) => Loaded::Invalid(why),
-        GoWork::File(work_file) => load_file(work_file).await,
+        GoWork::File(work_file) => {
+            load_file(
+                work_file,
+                &crate::utils::repo_root::ReadBoundary::upward(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    project_root,
+                ),
+            )
+            .await
+        }
     }
 }
 
-async fn load_file(work_file: PathBuf) -> Loaded {
+/// Read `work_file` and what it names. A `use` member outside `bound`
+/// reads as one without a go.mod or go.sum (missing).
+async fn load_file(work_file: PathBuf, bound: &crate::utils::repo_root::ReadBoundary) -> Loaded {
     let text = match read_regular_to_string(&work_file).await {
         Ok(text) => go_mod_edit::normalize_for_read(&text),
         Err(e) => {
@@ -252,11 +308,17 @@ async fn load_file(work_file: PathBuf) -> Loaded {
     let mut members = Vec::new();
     for dir in go_mod_edit::parse_use_dirs(&text) {
         let dir = work_dir.join(dir);
-        let go_mod = read_regular_to_string(&dir.join("go.mod"))
-            .await
-            .ok()
-            .map(|t| go_mod_edit::normalize_for_read(&t));
-        let go_sum = read_regular_to_string(&dir.join("go.sum")).await.ok();
+        let (go_mod, go_sum) = if bound.contains(&dir) {
+            (
+                read_regular_to_string(&dir.join("go.mod"))
+                    .await
+                    .ok()
+                    .map(|t| go_mod_edit::normalize_for_read(&t)),
+                read_regular_to_string(&dir.join("go.sum")).await.ok(),
+            )
+        } else {
+            (None, None)
+        };
         members.push(Member {
             dir,
             go_mod,
@@ -272,6 +334,7 @@ async fn load_file(work_file: PathBuf) -> Loaded {
         work_sum,
         members,
         graph: None,
+        files: None,
     })
 }
 
@@ -517,6 +580,7 @@ pub async fn module_graph(dir: &Path, go_mod: &str, cache: Option<&Path>) -> Mod
             go_sum: None,
         }],
         graph: None,
+        files: None,
     };
     ws.read_graph_from(cache).await;
     let graph = ws.graph.unwrap_or_default();
@@ -532,6 +596,12 @@ impl GoWorkspace {
         go_mod_edit::parse_replace_entries(&self.work)
     }
 
+    /// Where this workspace's paths live: lexical in memory, on disk
+    /// otherwise.
+    pub fn paths(&self) -> PathSpace<'_> {
+        PathSpace::from_files(self.files.as_ref())
+    }
+
     /// The directory holding go.work.
     pub fn work_dir(&self) -> &Path {
         self.work_file.parent().unwrap_or(Path::new(""))
@@ -540,10 +610,7 @@ impl GoWorkspace {
     /// The member whose directory is `dir`, matched as go matches a module
     /// root against the `use` list.
     pub fn member_at(&self, dir: &Path) -> Option<&Member> {
-        self.member_at_in(PathSpace::Disk, dir)
-    }
-
-    fn member_at_in(&self, paths: PathSpace<'_>, dir: &Path) -> Option<&Member> {
+        let paths = self.paths();
         let key = paths.key(dir);
         self.members.iter().find(|m| paths.key(&m.dir) == key)
     }
@@ -551,16 +618,18 @@ impl GoWorkspace {
     /// The members inside `root`, with their `root`-relative directory
     /// (`""` for `root` itself, forward slashes).
     pub fn members_within(&self, root: &Path) -> Vec<(String, &Member)> {
-        self.members_within_in(PathSpace::Disk, root)
-    }
-
-    fn members_within_in(&self, paths: PathSpace<'_>, root: &Path) -> Vec<(String, &Member)> {
+        let paths = self.paths();
         let base = paths.key(root);
         self.members
             .iter()
             .filter_map(|m| {
                 let rel = paths.key(&m.dir).strip_prefix(&base).ok()?.to_path_buf();
-                Some((rel.to_string_lossy().replace('\\', "/"), m))
+                // In memory every relative key strips the empty root, so a
+                // member outside it (`../out`, `/abs`) is only told apart
+                // by its components.
+                rel.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+                    .then(|| (rel.to_string_lossy().replace('\\', "/"), m))
             })
             .collect()
     }
@@ -585,10 +654,11 @@ impl GoWorkspace {
     /// [`Selection::Unknown`] without them. A module that is a `use` member
     /// is built from its directory, never at `version`.
     pub fn selection(&self, module: &str, version: &str) -> Selection {
+        let paths = self.paths();
         if let Some(member) = self.main_module(module) {
             return Selection::Other(format!(
                 "(the workspace module in {})",
-                display_path(self.work_dir(), &member.dir)
+                paths.display(self.work_dir(), &member.dir)
             ));
         }
         let mut complete = !self.members.is_empty() && self.graph.is_some();
@@ -647,6 +717,10 @@ impl GoWorkspace {
     /// [`GoWorkspace::read_graph`] against the module cache `cache`.
     pub async fn read_graph_from(&mut self, cache: Option<&Path>) {
         let replaces = self.replace_sources();
+        let bound = crate::utils::repo_root::ReadBoundary::upward(
+            crate::utils::repo_root::ReadScope::Workspace,
+            self.work_dir(),
+        );
         let mut graph: BTreeMap<String, Option<DepGoMod>> = BTreeMap::new();
         // go loads each member at its `workspace` level, which queues the
         // member's requirements at the member's own pruning.
@@ -674,7 +748,7 @@ impl GoWorkspace {
                     continue;
                 }
                 if !graph.contains_key(&key) {
-                    let dep = read_dep_go_mod(&replaces, cache, &path, &version).await;
+                    let dep = read_dep_go_mod(&replaces, cache, &bound, &path, &version).await;
                     graph.insert(key.clone(), dep);
                 }
                 let Some(Some(dep)) = graph.get(&key) else {
@@ -756,11 +830,7 @@ impl GoWorkspace {
     /// `root` (`ci.work`) is not: go doesn't read `root/go.work` then, so
     /// a replace written there would do nothing (#1810).
     pub fn rooted_at(&self, root: &Path) -> bool {
-        self.rooted_at_in(PathSpace::Disk, root)
-    }
-
-    /// [`GoWorkspace::rooted_at`] in `paths`.
-    pub fn rooted_at_in(&self, paths: PathSpace<'_>, root: &Path) -> bool {
+        let paths = self.paths();
         self.work_file.file_name() == Some(std::ffi::OsStr::new("go.work"))
             && paths.key(self.work_dir()) == paths.key(root)
     }
@@ -775,11 +845,12 @@ impl GoWorkspace {
     /// module's go.mod keeps the replace too
     /// ([`ReplaceHost::mirrors_root_go_mod`]).
     pub fn replace_host(&self, root: &Path, root_has_go_mod: bool, module: &str) -> ReplaceHost {
+        let paths = self.paths();
         if !self.rooted_at(root) {
             return ReplaceHost::GoMod;
         }
-        let own = same_dir_key(root);
-        let root_is_member = self.members.iter().any(|m| same_dir_key(&m.dir) == own);
+        let own = paths.key(root);
+        let root_is_member = self.members.iter().any(|m| paths.key(&m.dir) == own);
         let ours_here = self
             .replaces()
             .iter()
@@ -787,7 +858,13 @@ impl GoWorkspace {
         let listed_elsewhere = self
             .members
             .iter()
-            .any(|m| same_dir_key(&m.dir) != own && m.lists(module));
+            .any(|m| paths.key(&m.dir) != own && m.lists(module));
+        // In memory a root go.mod can exist with no text the caller holds
+        // (a link, an unreadable file): it is still the root's module, so a
+        // root go.work doesn't `use` keeps go.mod and [`GoWorkspace::conflict`]
+        // refuses it, as on disk.
+        let root_has_go_mod = root_has_go_mod
+            || (self.files.is_some() && !root_is_member && paths.exists(&root.join("go.mod")));
         let shared = !root_has_go_mod || (root_is_member && (ours_here || listed_elsewhere));
         if shared {
             ReplaceHost::GoWork
@@ -808,18 +885,7 @@ impl GoWorkspace {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
-        self.work_conflict_in(PathSpace::Disk, project_root, module, version, ours)
-    }
-
-    /// [`GoWorkspace::work_conflict`] in `paths`.
-    pub fn work_conflict_in(
-        &self,
-        paths: PathSpace<'_>,
-        project_root: &Path,
-        module: &str,
-        version: &str,
-        ours: &ReplaceEntry,
-    ) -> Option<WorkspaceConflict> {
+        let paths = self.paths();
         let display = paths.display(project_root, &self.work_file);
         if let Some(member) = self.main_module(module) {
             return Some(WorkspaceConflict::MainModule {
@@ -873,18 +939,7 @@ impl GoWorkspace {
         version: &str,
         ours: &ReplaceEntry,
     ) -> Option<WorkspaceConflict> {
-        self.conflict_in(PathSpace::Disk, project_root, module, version, ours)
-    }
-
-    /// [`GoWorkspace::conflict`] in `paths`.
-    pub fn conflict_in(
-        &self,
-        paths: PathSpace<'_>,
-        project_root: &Path,
-        module: &str,
-        version: &str,
-        ours: &ReplaceEntry,
-    ) -> Option<WorkspaceConflict> {
+        let paths = self.paths();
         let display = paths.display(project_root, &self.work_file);
         if let Some(member) = self.main_module(module) {
             return Some(WorkspaceConflict::MainModule {
@@ -892,12 +947,12 @@ impl GoWorkspace {
                 member: paths.display(project_root, &member.dir),
             });
         }
-        let own = self.member_at_in(paths, project_root);
+        let own = self.member_at(project_root);
         // With no go.mod there is no file to write, even when the workspace
         // already replaces the module the same way (#1810).
         if own.is_none() && !paths.exists(&project_root.join("go.mod")) {
             let members: Vec<String> = self
-                .members_within_in(paths, project_root)
+                .members_within(project_root)
                 .into_iter()
                 .map(|(dir, _)| dir)
                 .filter(|dir| !dir.is_empty())
@@ -905,7 +960,7 @@ impl GoWorkspace {
             return Some(WorkspaceConflict::NoModule {
                 work_file: display,
                 members: members.join(", "),
-                own_work: !self.rooted_at_in(paths, project_root)
+                own_work: !self.rooted_at(project_root)
                     && paths.is_file(&project_root.join("go.work")),
             });
         }
@@ -1058,10 +1113,13 @@ fn replacement_of<'a>(
 }
 
 /// The go.mod go reads for the dependency `path@version` (see
-/// [`GoWorkspace::read_graph`]).
+/// [`GoWorkspace::read_graph`]). A replacement directory outside `bound`
+/// is never read: its go.mod is missing, so the selection stays
+/// [`Selection::Unknown`] unless a higher version already shows.
 async fn read_dep_go_mod(
     sources: &[Vec<(ReplaceEntry, PathBuf)>; 2],
     cache: Option<&Path>,
+    bound: &crate::utils::repo_root::ReadBoundary,
     path: &str,
     version: &str,
 ) -> Option<DepGoMod> {
@@ -1082,7 +1140,10 @@ async fn read_dep_go_mod(
         Some((entry, dir)) => {
             match (&entry.path, &entry.rhs_module, &entry.rhs_version) {
                 (Some(rel), _, _) => {
-                    candidates.push(dir.join(rel.replace('\\', "/")).join("go.mod"))
+                    let go_mod = dir.join(rel.replace('\\', "/")).join("go.mod");
+                    if bound.contains(&go_mod) {
+                        candidates.push(go_mod);
+                    }
                 }
                 (None, Some(m), Some(v)) => candidates.extend(cached(m, v)),
                 _ => {}
@@ -1149,7 +1210,15 @@ pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
     if resolve(root) == GoWork::None {
         return Vec::new();
     }
-    match load_file(root.join("go.work")).await {
+    match load_file(
+        root.join("go.work"),
+        &crate::utils::repo_root::ReadBoundary::upward(
+            crate::utils::repo_root::ReadScope::Workspace,
+            root,
+        ),
+    )
+    .await
+    {
         Loaded::Workspace(ws) => ws
             .members_within(root)
             .into_iter()
@@ -1158,6 +1227,90 @@ pub async fn module_roots(root: &Path) -> Vec<PathBuf> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// An in-memory project's files, as [`read_memory`] reads them. Each
+/// reader keeps its own access rules (what counts as unreadable, what a
+/// failed read reports); what the workspace is made of is decided once.
+pub(crate) trait MemoryFiles {
+    /// Whether root-relative `rel` exists, readable or not: a link, an
+    /// entry without content and a file go cannot parse all exist.
+    async fn exists(&mut self, rel: &str) -> bool;
+    /// `rel`'s text, when it can be read.
+    async fn read(&mut self, rel: &str) -> Option<String>;
+    /// The sum file `rel`'s text, when this reader keeps sum files with
+    /// the workspace.
+    async fn read_sum(&mut self, rel: &str) -> Option<String>;
+    /// The go.mod `rel` is one go cannot parse (`problem`). Whether its
+    /// text is still kept with the member: the hosted engine keeps it, as
+    /// the disk loader ([`load_file`]) does, so its module and replaces are
+    /// still weighed; discovery drops it after its diagnostic.
+    fn unparseable(&mut self, rel: &str, problem: &str) -> bool;
+}
+
+/// The workspace of an in-memory project with the root `go.work` `work`
+/// (normalized, parseable): its `use` members, those in the root with
+/// their go.mod (`None` when unreadable or unparseable), those outside it
+/// without (out of reach, so every selection stays unknown), and the files
+/// that exist ([`GoWorkspace::files`]). There is no directory to resolve
+/// from in memory, so every path stays root-relative and is compared
+/// lexically. Shared by the in-memory hosted engine and discovery, so both
+/// judge one workspace. Also returns the in-root members, as
+/// `(root-relative dir, index into members)`.
+pub(crate) async fn read_memory(
+    work: &str,
+    files: &mut impl MemoryFiles,
+) -> (GoWorkspace, Vec<(String, usize)>) {
+    let at = |dir: &str, file: &str| match dir {
+        "" => file.to_string(),
+        dir => format!("{dir}/{file}"),
+    };
+    let mut exist: BTreeSet<PathBuf> = BTreeSet::from([PathBuf::from("go.work")]);
+    if files.exists("go.mod").await {
+        exist.insert("go.mod".into());
+    }
+    let mut members = Vec::new();
+    let mut in_root = Vec::new();
+    for raw in go_mod_edit::parse_use_dirs(work) {
+        let Some(dir) = in_root_dir(&raw) else {
+            members.push(Member {
+                dir: raw.into(),
+                go_mod: None,
+                go_sum: None,
+            });
+            continue;
+        };
+        let rel = at(&dir, "go.mod");
+        if !exist.contains(Path::new(&rel)) && files.exists(&rel).await {
+            exist.insert(rel.clone().into());
+        }
+        let go_mod = match files.read(&rel).await {
+            Some(text) => {
+                let text = go_mod_edit::normalize_for_read(&text);
+                match go_mod_edit::block_structure_error(&text) {
+                    Some(problem) => files.unparseable(&rel, &problem).then_some(text),
+                    None => Some(text),
+                }
+            }
+            None => None,
+        };
+        let go_sum = files.read_sum(&at(&dir, "go.sum")).await;
+        in_root.push((dir.clone(), members.len()));
+        members.push(Member {
+            dir: dir.into(),
+            go_mod,
+            go_sum,
+        });
+    }
+    let ws = GoWorkspace {
+        work_file: "go.work".into(),
+        work: work.to_string(),
+        work_sum: files.read_sum("go.work.sum").await,
+        members,
+        graph: None,
+        files: Some(exist),
+    };
+    (ws, in_root)
 }
 
 /// The root-relative directory of a `use` member spelled `dir` in a root
@@ -1176,8 +1329,8 @@ pub fn in_root_dir(dir: &str) -> Option<String> {
     )
 }
 
-/// Where the paths of a [`GoWorkspace`] live, for the checks that compare
-/// them ([`GoWorkspace::conflict_in`], [`GoWorkspace::work_conflict_in`]).
+/// Where the paths of a [`GoWorkspace`] live ([`GoWorkspace::paths`]), for
+/// the checks that compare them.
 #[derive(Debug, Clone, Copy)]
 pub enum PathSpace<'a> {
     /// On disk: matched as go matches them (absolute,
@@ -1191,7 +1344,16 @@ pub enum PathSpace<'a> {
     Memory { files: &'a BTreeSet<PathBuf> },
 }
 
-impl PathSpace<'_> {
+impl<'a> PathSpace<'a> {
+    /// [`PathSpace::Memory`] over `files` when an in-memory project lists
+    /// them, else [`PathSpace::Disk`].
+    pub fn from_files(files: Option<&'a BTreeSet<PathBuf>>) -> Self {
+        match files {
+            Some(files) => PathSpace::Memory { files },
+            None => PathSpace::Disk,
+        }
+    }
+
     /// The key two spellings of one directory share.
     fn key(self, dir: &Path) -> PathBuf {
         match self {
@@ -1372,6 +1534,73 @@ mod tests {
         std::fs::remove_file(&work).unwrap();
         std::fs::create_dir(&work).unwrap();
         assert_eq!(resolve_with(&project, None), GoWork::None);
+    }
+
+    /// A go.work outside the repository root (an ancestor's, or one an
+    /// absolute GOWORK names) is never read: go would build from it, so
+    /// the workspace is Invalid and every writer refuses. Inside the root,
+    /// a `use` member or replacement directory outside it reads as missing.
+    #[tokio::test]
+    async fn go_work_outside_the_repository_is_never_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let project = repo.join("app");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        member(&repo, "app", "1.21", &require("v1.0.0"));
+        write(tmp.path(), "go.work", "go 1.21\n\nuse ./repo/app\n");
+        for gowork in [None, Some("auto")] {
+            assert!(
+                matches!(resolve_with(&project, gowork),
+                    GoWork::Invalid(why) if why.contains("outside the repository root")),
+                "{gowork:?}"
+            );
+            assert!(matches!(
+                load_with(&project, gowork).await,
+                Loaded::Invalid(_)
+            ));
+        }
+        let elsewhere = tmp.path().join("go.work").to_string_lossy().into_owned();
+        assert!(matches!(
+            resolve_with(&project, Some(&elsewhere)),
+            GoWork::Invalid(why) if why.contains("outside the repository root")
+        ));
+        // Without a checkout the lookup walks on as before.
+        std::fs::remove_dir(repo.join(".git")).unwrap();
+        assert_eq!(
+            resolve_with(&project, None),
+            GoWork::File(tmp.path().join("go.work"))
+        );
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        // The repository's own go.work: a member outside it, and a replace
+        // pointing outside it, are missing rather than read.
+        member(tmp.path(), "outside", "1.21", &require("v1.9.0"));
+        write(
+            &repo,
+            "go.work",
+            &format!(
+                "go 1.21\n\nuse (\n\t./app\n\t../outside\n)\n\nreplace {DEP} v1.0.0 => ../fork\n"
+            ),
+        );
+        write(
+            tmp.path(),
+            "fork/go.mod",
+            &format!("module {DEP}\n\ngo 1.21\n"),
+        );
+        let Loaded::Workspace(mut ws) = load_with(&project, None).await else {
+            panic!("the repository's go.work loads");
+        };
+        let outside = ws
+            .members
+            .iter()
+            .find(|m| m.dir.ends_with("outside"))
+            .unwrap();
+        assert_eq!((&outside.go_mod, &outside.go_sum), (&None, &None));
+        let cache = tmp.path().join("cache");
+        ws.read_graph_from(Some(&cache)).await;
+        let graph = ws.graph.as_ref().unwrap();
+        assert_eq!(graph.get(&format!("{DEP}@v1.0.0")), Some(&None));
+        assert_eq!(ws.selection(DEP, "v1.0.0"), Selection::Unknown);
     }
 
     /// #1799: `-modfile` keeps a go.mod replace from the build unless it
@@ -2174,5 +2403,152 @@ mod tests {
         assert_eq!(module_roots(&root).await, vec![root.clone()]);
         // A member's own dir is a module root, not the workspace.
         assert_eq!(module_roots(&root.join("a")).await, vec![root.join("a")]);
+    }
+
+    /// An in-memory project for [`read_memory`]: `(path, Some(text))` is
+    /// readable, `(path, None)` exists without content (a link, an
+    /// unreadable entry).
+    struct MapFiles {
+        files: BTreeMap<&'static str, Option<&'static str>>,
+        unparseable: Vec<String>,
+    }
+
+    impl MapFiles {
+        fn new(files: &[(&'static str, Option<&'static str>)]) -> Self {
+            MapFiles {
+                files: files.iter().copied().collect(),
+                unparseable: Vec::new(),
+            }
+        }
+    }
+
+    impl MemoryFiles for MapFiles {
+        async fn exists(&mut self, rel: &str) -> bool {
+            self.files.contains_key(rel)
+        }
+        async fn read(&mut self, rel: &str) -> Option<String> {
+            self.files.get(rel).copied().flatten().map(str::to_string)
+        }
+        async fn read_sum(&mut self, rel: &str) -> Option<String> {
+            self.read(rel).await
+        }
+        fn unparseable(&mut self, rel: &str, _problem: &str) -> bool {
+            self.unparseable.push(rel.to_string());
+            false
+        }
+    }
+
+    fn files(paths: &[&str]) -> Option<BTreeSet<PathBuf>> {
+        Some(paths.iter().map(PathBuf::from).collect())
+    }
+
+    /// The in-memory workspace's `files` are the files that exist: a root
+    /// go.mod go cannot parse, or one that cannot be read (a link), is
+    /// still the root's module, so a root module go.work doesn't `use` is
+    /// "not a member", never "no go.mod". A member go.mod go cannot parse
+    /// exists but carries no text.
+    #[tokio::test]
+    async fn read_memory_lists_the_files_that_exist() {
+        let work = "go 1.21\n\nuse (\n\t./b\n\t./c\n\t../out\n)\n";
+        let b = "module example.com/b\n\ngo 1.21\n";
+        let ours = replace(&format!("{DEP} v1.0.0 => ./fork"));
+        for root in [Some("module example.com/app\n\nrequire (\n"), None] {
+            let mut reader = MapFiles::new(&[
+                ("go.mod", root),
+                ("go.work", Some(work)),
+                ("b/go.mod", Some(b)),
+                ("c/go.mod", Some("module example.com/c\n\nrequire (\n")),
+            ]);
+            let (ws, in_root) = read_memory(work, &mut reader).await;
+            assert_eq!(
+                ws.files,
+                files(&["go.mod", "go.work", "b/go.mod", "c/go.mod"]),
+                "{root:?}"
+            );
+            assert_eq!(reader.unparseable, ["c/go.mod"]);
+            assert_eq!(ws.members[1].go_mod, None);
+            assert_eq!(
+                in_root,
+                [("b".to_string(), 0), ("c".to_string(), 1)],
+                "{root:?}"
+            );
+            assert!(
+                matches!(
+                    ws.conflict(Path::new(""), DEP, "v1.0.0", &ours),
+                    Some(WorkspaceConflict::NotAMember { .. })
+                ),
+                "{root:?}"
+            );
+            // The rewriter holds no text for an unreadable root go.mod, but
+            // it is the root's module all the same: go.mod hosts the replace,
+            // so `conflict` (not a member) refuses it.
+            assert_eq!(
+                ws.replace_host(Path::new(""), false, DEP),
+                ReplaceHost::GoMod,
+                "{root:?}"
+            );
+        }
+        // A root module go.work uses still shares go.work's replace.
+        let used = "go 1.21
+
+use (
+	.
+	./b
+)
+";
+        let mut reader = MapFiles::new(&[
+            ("go.mod", None),
+            ("go.work", Some(used)),
+            ("b/go.mod", Some(b)),
+        ]);
+        let (ws, _) = read_memory(used, &mut reader).await;
+        assert_eq!(
+            ws.replace_host(Path::new(""), false, DEP),
+            ReplaceHost::GoWork
+        );
+        // No go.mod at all: nowhere to go.
+        let mut reader = MapFiles::new(&[("go.work", Some(work))]);
+        let (ws, _) = read_memory(work, &mut reader).await;
+        assert_eq!(ws.files, files(&["go.work"]));
+        assert!(matches!(
+            ws.conflict(Path::new(""), DEP, "v1.0.0", &ours),
+            Some(WorkspaceConflict::NoModule { .. })
+        ));
+    }
+
+    /// In memory every member path is root-relative, so the empty root is a
+    /// prefix of all of them: a member outside the root (`../out`, an
+    /// absolute path) is still never "within" it.
+    #[test]
+    fn memory_members_within_excludes_members_outside_the_root() {
+        let member = |dir: &str| Member {
+            dir: dir.into(),
+            go_mod: Some(format!("module example.com/{dir}\n")),
+            go_sum: None,
+        };
+        let ws = GoWorkspace {
+            work_file: "go.work".into(),
+            work: String::new(),
+            work_sum: None,
+            members: vec![member("a"), member("../out"), member("/abs"), member("")],
+            graph: None,
+            files: files(&["go.work", "a/go.mod"]),
+        };
+        let within: Vec<String> = ws
+            .members_within(Path::new(""))
+            .into_iter()
+            .map(|(dir, _)| dir)
+            .collect();
+        assert_eq!(within, ["a", ""]);
+        // The NoModule hint names in-root members only.
+        let ws = GoWorkspace {
+            members: vec![member("a"), member("../out")],
+            ..ws
+        };
+        let ours = replace(&format!("{DEP} v1.0.0 => ./fork"));
+        match ws.conflict(Path::new(""), DEP, "v1.0.0", &ours) {
+            Some(WorkspaceConflict::NoModule { members, .. }) => assert_eq!(members, "a"),
+            other => panic!("{other:?}"),
+        }
     }
 }

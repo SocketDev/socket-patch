@@ -281,7 +281,12 @@ async fn reaching_backend(
 
 /// Whether the backend can fetch `purl`'s pristine source and verify it:
 /// the lockfile pins it with an integrity, or the ledger's recorded
-/// original entry does.
+/// original entry (the pre-vendor fragment) does. This is the yes/no gate
+/// [`reaching_backend`] reads. It downloads nothing — the vendored backends
+/// take their bytes from the patch service by patch uuid — so a
+/// Socket-hosted entry's patched URL and hash are never used as a pristine
+/// source here (the callers leave hosted-pinned purls to the takeover,
+/// which restores the upstream entry from the registry).
 pub async fn pristine_fetch_is_verifiable(
     project_root: &Path,
     inventory: &[lock_inventory::LockfileEntry],

@@ -134,34 +134,167 @@ pub struct VendorPathParts {
     pub leaf: String,
 }
 
-/// Recover `(eco, uuid, leaf)` from any lockfile-recorded vendored path
-/// string — `file:` npm specs, `./`-prefixed go.mod replace targets,
-/// composer dist urls, requirement lines, backslashed Windows spellings.
-/// This is the documented external-tool recovery rule; `None` means the
-/// string is not a Socket-vendored path.
+/// Recover `(eco, uuid, leaf)` from a vendored path recorded in a file at
+/// the project root — `file:` npm specs, `./`-prefixed go.mod replace
+/// targets, composer dist urls, requirement lines, backslashed Windows
+/// spellings. `None` means the string is not a path into THIS project's
+/// `.socket/vendor/`.
+///
+/// This is the writers' ownership rule: every vendored writer, reverter
+/// and GC claims a lock entry or wiring line only through it (or
+/// [`parse_vendor_path_from`] for a file below the root). The anchor must
+/// START the path, after `file:` and `./`: a `../.socket/vendor/…` or
+/// `/abs/.socket/vendor/…` spelling names ANOTHER project's vendor store
+/// (a sibling checkout's), and claiming it would let `vendor --revert` or
+/// GC rewrite or delete wiring that project owns. To merely RECOGNIZE a
+/// vendored path wherever it points (to report it, or to keep a directory
+/// a lockfile may still name), use [`recognize_vendor_path_anywhere`].
 pub fn parse_vendor_path(s: &str) -> Option<VendorPathParts> {
-    parse_vendor_reference(s).filter(|parts| !parts.leaf.is_empty())
+    parse_vendor_path_from("", s)
+}
+
+/// [`parse_vendor_path`] for a string recorded in a file whose directory
+/// is `base` (project-root-relative, `/`-separated, `""` for the root): a
+/// pnpm importer's `specifier: file:../../.socket/vendor/…`, a
+/// requirements file in `deploy/` naming `../.socket/vendor/…`. Only `.`
+/// and `..` segments may precede the anchor, and they must resolve from
+/// `base` to exactly the project root — never above it, never into a
+/// sub-project's own `.socket/vendor/`.
+pub fn parse_vendor_path_from(base: &str, s: &str) -> Option<VendorPathParts> {
+    parse_vendor_reference_from(base, s).filter(|parts| !parts.leaf.is_empty())
+}
+
+/// [`parse_vendor_path`], also accepting a machine-absolute spelling
+/// (`/home/ci/app/.socket/vendor/npm/<uuid>/…`), for pnpm <= 8 locks ONLY:
+/// pnpm itself records a `file:` override specifier as an absolute path,
+/// so a committed lock carries the vendoring checkout's absolute root,
+/// which is this project at another path. The writer still binds the
+/// result to its own entry's uuid and leaf. A relative escape
+/// (`../.socket/vendor/…`) is still never ours, nor is an absolute path
+/// with `.`/`..` segments.
+pub fn parse_vendor_path_or_machine_absolute(s: &str) -> Option<VendorPathParts> {
+    parse_vendor_path(s).or_else(|| {
+        let norm = normalize_vendor_spelling(s);
+        let idx = vendor_anchor_index(&norm)?;
+        let prefix = &norm[..idx];
+        // A drive-absolute spelling (`C:/…`, backslashes already folded)
+        // is absolute whichever OS reads the lock: one written on Windows
+        // reverts on Linux CI too.
+        let drive = prefix
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && prefix.get(1..3) == Some(":/");
+        let absolute = (crate::utils::relpath::is_anchored(prefix) || drive)
+            && !prefix.split('/').any(|seg| matches!(seg, "." | ".."));
+        if !absolute {
+            return None;
+        }
+        split_vendor_rest(&norm[idx + VENDOR_DIR.len() + 1..]).filter(|p| !p.leaf.is_empty())
+    })
+}
+
+/// [`parse_vendor_path`] for a package locator or descriptor that prefixes
+/// the path with its package name: yarn berry's
+/// `resolution: "left-pad@file:./.socket/vendor/…"`, a pnpm v9
+/// `left-pad@file:.socket/vendor/…` key. The `[@scope/]name@` is cut, and
+/// the rest must be root-anchored as usual; a string without that prefix
+/// is parsed as it stands.
+pub fn parse_vendor_locator(s: &str) -> Option<VendorPathParts> {
+    let s = s.trim();
+    let name_end = if let Some(scoped) = s.strip_prefix('@') {
+        scoped
+            .find('/')
+            .map(|slash| slash + 1)
+            .and_then(|slash| s[slash + 1..].find(['@', '/']).map(|at| slash + 1 + at))
+    } else {
+        s.find(['@', '/'])
+    };
+    match name_end {
+        Some(at) if at > 0 && s.as_bytes()[at] == b'@' => parse_vendor_path(&s[at + 1..]),
+        _ => parse_vendor_path(s),
+    }
 }
 
 /// [`parse_vendor_path`]'s grammar, also accepting a reference to the uuid
 /// directory itself (`leaf` empty): NuGet's vendored feed
 /// (`value=".socket/vendor/nuget/<uuid>"`) and Maven's vendored repository
-/// (`<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>`)
-/// name the unit, not a file inside it. The vendored-reference scan reads
-/// wiring through this, so a directory-wired unit counts as still wired.
+/// (`<url>file://${project.basedir}/.socket/vendor/maven/<uuid></url>`,
+/// whose caller strips the basedir prefix) name the unit, not a file
+/// inside it.
 pub fn parse_vendor_reference(s: &str) -> Option<VendorPathParts> {
-    let norm = s.replace('\\', "/");
-    let norm = norm.strip_prefix("file:").unwrap_or(&norm);
-    let norm = norm.strip_prefix("./").unwrap_or(norm);
-    // Find the `.socket/vendor/` anchor anywhere in the string (a workspace
-    // sub-project may record `../.socket/vendor/...`).
+    parse_vendor_reference_from("", s)
+}
+
+/// [`parse_vendor_reference`] for a file whose directory is `base` (see
+/// [`parse_vendor_path_from`]).
+pub fn parse_vendor_reference_from(base: &str, s: &str) -> Option<VendorPathParts> {
+    split_vendor_rest(&vendor_rest_from(base, s)?)
+}
+
+/// Recover `(eco, uuid, leaf)` from a vendored path wherever its
+/// `.socket/vendor/` anchor sits — `../.socket/vendor/…`, an absolute
+/// path, another project's store. For RECOGNITION only (reporting a
+/// reference, keeping a directory a lockfile may still name from being
+/// swept): never the basis for rewriting, reverting or deleting wiring,
+/// which [`parse_vendor_path`] gates. `leaf` may be empty (a uuid-dir
+/// reference).
+pub fn recognize_vendor_path_anywhere(s: &str) -> Option<VendorPathParts> {
+    let norm = normalize_vendor_spelling(s);
+    let idx = vendor_anchor_index(&norm)?;
+    split_vendor_rest(&norm[idx + VENDOR_DIR.len() + 1..])
+}
+
+/// `s` with surrounding whitespace, `\/` JSON escapes, backslashes and a
+/// leading `file:` normalized away.
+fn normalize_vendor_spelling(s: &str) -> String {
+    let norm = s.trim().replace("\\/", "/").replace('\\', "/");
+    match norm.strip_prefix("file:") {
+        Some(rest) => rest.to_string(),
+        None => norm,
+    }
+}
+
+/// The byte index of the first `.socket/vendor/` anchor in `norm` at a
+/// path-component boundary.
+fn vendor_anchor_index(norm: &str) -> Option<usize> {
     let anchor = format!("{VENDOR_DIR}/");
-    let idx = norm.find(&anchor)?;
-    // Anchor must sit at a path-component boundary.
-    if idx > 0 && norm.as_bytes()[idx - 1] != b'/' {
+    let mut from = 0;
+    while let Some(found) = norm[from..].find(&anchor) {
+        let idx = from + found;
+        if idx == 0 || norm.as_bytes()[idx - 1] == b'/' {
+            return Some(idx);
+        }
+        from = idx + 1;
+    }
+    None
+}
+
+/// Everything after the `.socket/vendor/` anchor of a path recorded in a
+/// file at `base` (see [`parse_vendor_path_from`]) when that anchor is THIS
+/// project's vendor directory, else `None`. The one root-anchoring rule the
+/// writers ([`parse_vendor_path`]) and VEX discovery
+/// ([`crate::vex::discover::vendor_ref`]) share.
+pub(crate) fn vendor_rest_from(base: &str, s: &str) -> Option<String> {
+    let norm = normalize_vendor_spelling(s);
+    let idx = vendor_anchor_index(&norm)?;
+    let prefix = &norm[..idx];
+    // Only `.`/`..` may lead to the anchor: a named segment can be a link
+    // whose `..` the OS resolves elsewhere, and an anchored (absolute)
+    // spelling names whatever store it names.
+    if crate::utils::relpath::is_anchored(prefix)
+        || prefix.split('/').any(|seg| !matches!(seg, "" | "." | ".."))
+    {
         return None;
     }
-    let rest = &norm[idx + anchor.len()..];
+    let landed = crate::utils::relpath::resolve_rel(base, prefix, 0)?;
+    landed
+        .is_empty()
+        .then(|| norm[idx + VENDOR_DIR.len() + 1..].to_string())
+}
+
+/// `<eco>/<uuid>[/<leaf>]`, split and validated.
+fn split_vendor_rest(rest: &str) -> Option<VendorPathParts> {
     let mut it = rest.splitn(3, '/');
     let eco = it.next()?;
     let uuid = it.next()?;
@@ -637,16 +770,88 @@ mod tests {
             ("cargo", "serde-1.0.190")
         );
 
-        // anchored mid-string (workspace-relative)
-        assert!(parse_vendor_path(&format!(
-            "../.socket/vendor/pypi/{UUID}/six-1.16.0-py2.py3-none-any.whl"
-        ))
-        .is_some());
-
         // Rejections: bad uuid, unknown eco, non-boundary anchor.
         assert!(parse_vendor_path(".socket/vendor/npm/not-a-uuid/x.tgz").is_none());
         assert!(parse_vendor_path(&format!(".socket/vendor/jsr/{UUID}/x")).is_none());
         assert!(parse_vendor_path(&format!("x.socket/vendor/npm/{UUID}/y.tgz")).is_none());
+    }
+
+    /// N5: the writers' ownership parse claims only THIS project's
+    /// `.socket/vendor/`. A sibling checkout's store (`../.socket/vendor/…`),
+    /// an absolute path, or a sub-project's own store is recognized only
+    /// by [`recognize_vendor_path_anywhere`], which nothing rewrites by.
+    #[test]
+    fn ownership_parse_is_root_anchored() {
+        let leaf = "six-1.16.0-py2.py3-none-any.whl";
+        for foreign in [
+            format!("../.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("file:../.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("./../.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("..\\.socket\\vendor\\pypi\\{UUID}\\{leaf}"),
+            format!("../sibling/.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("/home/ci/other/.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("sub/.socket/vendor/pypi/{UUID}/{leaf}"),
+            format!("sub/../.socket/vendor/pypi/{UUID}/{leaf}"),
+        ] {
+            assert!(parse_vendor_path(&foreign).is_none(), "{foreign}");
+            assert!(parse_vendor_reference(&foreign).is_none(), "{foreign}");
+            assert!(
+                parse_vendor_locator(&format!("six@{foreign}")).is_none(),
+                "{foreign}"
+            );
+            assert!(
+                recognize_vendor_path_anywhere(&foreign).is_some_and(|p| p.uuid == UUID),
+                "{foreign}"
+            );
+        }
+        // From a file below the root, `..` back to exactly the root is ours;
+        // past the root, or short of it, is not.
+        let up_two = format!("file:../../.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        assert!(parse_vendor_path_from("packages/a", &up_two).is_some());
+        assert!(parse_vendor_path_from("packages", &up_two).is_none());
+        assert!(parse_vendor_path_from("a/b/c", &up_two).is_none());
+        assert!(parse_vendor_path(&up_two).is_none());
+        // Locators cut the package name, scoped or not.
+        for locator in [
+            format!("left-pad@file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz::locator=a%40workspace%3A."),
+            format!("@s/left-pad@file:.socket/vendor/npm/{UUID}/@s/left-pad-1.3.0.tgz"),
+            format!("./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+        ] {
+            assert!(parse_vendor_locator(&locator).is_some(), "{locator}");
+        }
+        // pnpm <= 8's machine-absolute specifier is the one absolute
+        // spelling a writer may claim; never with `..` in it.
+        let abs = format!("/home/ci/app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
+        assert!(parse_vendor_path_or_machine_absolute(&abs).is_some());
+        assert!(parse_vendor_path_or_machine_absolute(&format!("file:{abs}")).is_some());
+        // Review finding 7: a Windows checkout's drive-absolute specifier
+        // reads as machine-absolute on every OS (a lock written on Windows
+        // reverts on Linux CI); a drive path with `..` still does not.
+        for windows in [
+            format!("C:\\Users\\ci\\app\\.socket\\vendor\\npm\\{UUID}\\left-pad-1.3.0.tgz"),
+            format!("file:D:/ci/app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+        ] {
+            assert!(
+                parse_vendor_path_or_machine_absolute(&windows).is_some_and(|p| p.uuid == UUID),
+                "{windows}"
+            );
+        }
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "C:/ci/app/../other/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "app/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "/home/ci/app/../other/.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
+        assert!(parse_vendor_path_or_machine_absolute(&format!(
+            "../.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"
+        ))
+        .is_none());
     }
 
     /// `parse_vendor_reference` is `parse_vendor_path`'s grammar plus the
@@ -658,7 +863,6 @@ mod tests {
             format!(".socket/vendor/nuget/{UUID}"),
             format!(".socket/vendor/nuget/{UUID}/"),
             format!(".socket\\vendor\\nuget\\{UUID}"),
-            format!("file://${{project.basedir}}/.socket/vendor/nuget/{UUID}"),
         ] {
             let p = parse_vendor_reference(&s).unwrap_or_else(|| panic!("{s}"));
             assert_eq!(

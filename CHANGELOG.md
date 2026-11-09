@@ -62,6 +62,10 @@ a version without a non-empty section in this file.
     `=begin`/`=end` blocks, heredoc bodies and `__END__` data are skipped, so
     a commented-out dev dependency no longer adds a bogus requirement and a
     heredoc no longer refuses the Gemfile (#1932, #1936).
+  - A gem declared inside nested `source … do` blocks is attributed to the
+    innermost block, as Bundler reads it, so hosted `rollback` and `remove`
+    of a pin inside the user's own source block no longer refuse with
+    `hosted_wiring_contested` on Bundler 2.1 and older (#1997, #1999).
 - **npm family.**
   - pnpm workspace globs with brace sets and character classes
     (`packages/{a,b}`, `packages/[ab]*`) are read the way pnpm reads them in
@@ -88,6 +92,14 @@ a version without a non-empty section in this file.
     npm config layer sets `omit-lockfile-registry-resolved`, which makes the
     next `npm install` drop the hosted URL and fail with `EINTEGRITY`, and
     names where it is set and the remedies (#1871, #1872).
+  - Hosted vlt scans no longer download every granted patch archive to
+    check its encoding, and no longer withhold dependencies with
+    `redirect_vlt_artifact_unverifiable`; a mirror that re-encodes archives
+    makes `vlt ci` fail closed with `EINTEGRITY`. The in-memory hosted
+    engine (the Node addon and `hosted-bundle`) now pins vlt dependencies
+    instead of withholding them as offline (#2013).
+  - The lock inventory skips Rush subspace locks with unsafe names, as
+    lockfile discovery already did (#2003).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -106,16 +118,52 @@ a version without a non-empty section in this file.
   - A `poetry.lock` in an old format (0, 1.0, 1.1) keeps its "written by
     Poetry < 1.4" warnings and refusals even when a hand-merged header claims
     a newer Poetry (#1847, #1865).
-- **Go.** In a go 1.16 (unpruned) module where a dependency imports a fork
-  that the root `go.mod` replaces with the patched module, `apply`,
-  `apply --check`, hosted mode and `vex` read the module graph to tell
-  whether the patch is really built, instead of reporting it applied while
-  `go build` linked the unpatched code (#1840, #1843).
-- **Maven.** A Maven 4 root that builds its subdirectories implicitly
-  (model 4.1.0, `pom` packaging, no `<subprojects>`) is treated as a reactor
-  by hosted mode, `vex` and the Maven cache scope, not only by vendored mode,
-  so a root-only pin is no longer attested while a module keeps its own
-  version (#1809, #1886).
+  - Hosted `rollback`, `remove` and `scan` restore the pins hosted mode
+    writes into uv 0.2 `[[distribution]]` locks (uv < 0.2.35) instead of
+    refusing them (#2014).
+- **Go.**
+  - In a go 1.16 (unpruned) module where a dependency imports a fork that
+    the root `go.mod` replaces with the patched module, `apply`,
+    `apply --check`, hosted mode and `vex` read the module graph to tell
+    whether the patch is really built, instead of reporting it applied
+    while `go build` linked the unpatched code (#1840, #1843).
+  - `vex` reads the `go.work` that governs the project (`GOWORK`, else the
+    nearest one at or above it, with members anywhere), as hosted and
+    vendored modes already did, and no longer attests a Socket replace the
+    workspace keeps out of the build (`go_workspace_override`) (#2011).
+- **JVM.**
+  - A Maven 4 root that builds its subdirectories implicitly (model 4.1.0,
+    `pom` packaging, no `<subprojects>`) is treated as a reactor by hosted
+    mode, `vex` and the Maven cache scope, not only by vendored mode, so a
+    root-only pin is no longer attested while a module keeps its own
+    version (#1809, #1886).
+  - Hosted Maven keeps every line of `.mvn/checksums/checksums.sha256` it
+    doesn't own (single-space or `*` sha256sum lines, tabs, comments) and
+    the file's line endings, instead of silently dropping them (#2016).
+  - Vendored Maven `vex` no longer attests a build that may still use the
+    unpatched jar: an executable classifier copy of the patched artifact,
+    or a suffixed version left only in a plugin, profile or unused property,
+    now withholds attestation (#2006).
+  - Vendored Gradle withholds attestation when a `gradle.lockfile` locks
+    the patched artifact at another version
+    (`gradle_lock_overrides_vendored`) or a custom `lockFile` location is
+    used (`gradle_custom_lock_file`) (#2004).
+  - sbt: `vex` no longer attests a hosted pin that a build reassignment of
+    `dependencyOverrides` or `resolvers`, `sbt.override.build.repos=true`,
+    or newer resolution evidence shows the build doesn't apply
+    (`vex_sbt_pin_bypassed`) (#2030), nor a vendored pin without current
+    sbt resolution evidence or with its vendored tree missing
+    (`vex_sbt_resolution_unverified`, `vex_sbt_vendored_tree_missing`)
+    (#2008).
+- **NuGet.** When a `packages.lock.json` locks a patched package at a
+  version the writers refuse to wire (another target framework or
+  project), `vex` no longer attests that version
+  (`vex_nuget_lock_other_version`); `1.0` and `1.0.0` count as one version
+  (#2007).
+- **Composer.** A `composer.lock` with a UTF-8 BOM is read everywhere,
+  and vendor then `--revert` keeps the BOM byte for byte; a revert no
+  longer deletes a vendored artifact such a lock still installs from
+  (#2017).
 - **Vendoring.**
   - Vendored dry runs leave already-vendored patches out of the "Would
     download and vendor" headline and list them as skipped, matching the wet
@@ -129,6 +177,17 @@ a version without a non-empty section in this file.
     slot (#1976, #1977).
   - In a vlt project, `vendor` no longer requests service downloads for
     packages it then refuses (#1909, #1947).
+  - Every vendored entry point (`scan` previews and rollout plans, the
+    download phase, `get`, and `vendor`) applies the same refusals before
+    any download: a v1 `package-lock.json` project, or a hosted pnpm pin
+    whose takeover would be refused, is refused before its patch is
+    fetched; `get <uuid> --mode vendored` reports every such refusal and
+    writes nothing; and `vendor` refuses before restoring a hosted pin
+    instead of restoring it and rolling back. Codes and details are
+    unchanged (#2015).
+  - A vendored revert keeps an artifact the lock still references through
+    an escaped path spelling (`\/` in an older `composer.lock`, Windows
+    backslashes) instead of deleting it (#2022).
 - **General.**
   - The nested-project remedy quotes its path for the shell it prints for,
     including Windows and `%` (#1859, #1884).
@@ -146,7 +205,10 @@ a version without a non-empty section in this file.
   runner, `copy_tree` and apply fixtures; hermetic children scrub color
   variables; failing tests are annotated in CI; offline bun.lockb rollback
   mock and a Windows venv layout in the PyPI fixture (#1891, #1890, #1905,
-  #1944, #1955, #1964, #1972, #1978, #1988, #1994).
+  #1944, #1955, #1964, #1972, #1978, #1988, #1994, #2000); release
+  workflow artifact steps move off Node 20 actions (#2027). A design doc
+  and line-count budget plan one lock model for every lockfile reader
+  (#2001).
 
 ## [5.0.1] — 2026-10-13
 

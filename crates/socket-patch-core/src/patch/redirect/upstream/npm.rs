@@ -620,6 +620,9 @@ struct BerryRegistrySettings {
     /// The variables a value's `${NAME}` reads: this process's
     /// environment under the project's injected dotenv files (#1611).
     env: crate::crawlers::pkg_managers::YarnEnv,
+    /// Why the registry is unknowable: an rc file above the repository
+    /// root that is never read.
+    unread: Option<String>,
 }
 
 impl BerryRegistrySettings {
@@ -634,8 +637,21 @@ impl BerryRegistrySettings {
             .unwrap_or_else(|| ".yarnrc.yml".to_string());
         let root = view.root().join(dir_prefix);
         let root = tokio::fs::canonicalize(&root).await.unwrap_or(root);
-        let mut read: Vec<std::path::PathBuf> =
-            root.ancestors().map(|d| d.join(&rc_name)).collect();
+        // Inside a git checkout an rc file above its root is never read;
+        // one there may name the registry, so every lookup refuses.
+        let bound = crate::utils::repo_root::upward_bound(
+            crate::utils::repo_root::ReadScope::Workspace,
+            &root,
+        );
+        let unread = bound.as_ref().and_then(|bound| {
+            let marker = bound.marker_above(&[rc_name.as_str()])?;
+            Some(bound.marker_refusal(&marker))
+        });
+        let mut read: Vec<std::path::PathBuf> = root
+            .ancestors()
+            .take_while(|d| bound.as_ref().is_none_or(|b| b.contains(d)))
+            .map(|d| d.join(&rc_name))
+            .collect();
         let home = std::env::var_os("HOME")
             .or_else(|| std::env::var_os("USERPROFILE"))
             .filter(|h| !h.is_empty())
@@ -656,11 +672,18 @@ impl BerryRegistrySettings {
         BerryRegistrySettings {
             rcs,
             env_registry: std::env::var("YARN_NPM_REGISTRY_SERVER").ok(),
-            env: crate::crawlers::pkg_managers::YarnEnv::for_project(&root),
+            env: crate::crawlers::pkg_managers::YarnEnv::for_project(
+                crate::utils::repo_root::ReadScope::Workspace,
+                &root,
+            ),
+            unread,
         }
     }
 
     fn registry(&self, name: &str) -> Result<Option<String>, String> {
+        if let Some(why) = &self.unread {
+            return Err(why.clone());
+        }
         berry_lookup_registry(
             &self.rcs,
             self.env_registry.as_deref(),
@@ -1911,6 +1934,32 @@ pub(crate) async fn restore_pnpm_locks(
             .iter()
             .map(|(_, u, n, v)| (u.clone(), n.clone(), v.clone()))
             .collect();
+        // pnpm reads a member's settings from its workspace root; one
+        // above the repository root is never read, so the restore cannot
+        // tell how pnpm writes this lock and refuses it.
+        let prefix = pnpm_settings_prefix(view, rel).await;
+        if let Some(bound) = std::path::Path::new(&prefix)
+            .is_absolute()
+            .then(|| {
+                crate::utils::repo_root::upward_bound(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    view.root(),
+                )
+            })
+            .flatten()
+            .filter(|bound| !bound.contains(std::path::Path::new(&prefix)))
+        {
+            let file = std::path::Path::new(&prefix).join("pnpm-workspace.yaml");
+            let why = format!(
+                "pnpm reads the settings for {rel} from {}: {}",
+                file.display(),
+                bound.refusal(&file)
+            );
+            for (_, uuid, ..) in &hits {
+                result.refuse(uuid, why.clone());
+            }
+            continue;
+        }
         let policy = pnpm_tarball_policy(view, rel, &text, ctx).await;
         let dists = fetch_dists_on(&wanted, |name| policy.registry(name), ctx, &mut result).await;
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();

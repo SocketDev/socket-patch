@@ -686,7 +686,9 @@ mod tests {
         // Bloop evidence of a build after vendoring (it lists the root
         // file), newer than every input, resolving the GAV outside the
         // tree: a command-line `-r` or a repository declared elsewhere won.
-        let ws = root.canonicalize().unwrap();
+        // Bloop writes plain paths, never Windows' `\\?\` verbatim form
+        // that `canonicalize` returns there.
+        let ws = crate::crawlers::sbt_evidence::strip_verbatim(&root.canonicalize().unwrap());
         let sources: Vec<_> = [PROJECT_FILE, "main.scala", ROOT_FILE]
             .iter()
             .map(|f| ws.join(f))

@@ -105,49 +105,19 @@ mod tests {
             "\\xef\\xbb\\xbf",
             "\\xEF\\xBB\\xBF",
         ];
-        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-            for entry in std::fs::read_dir(dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    out.push(path);
-                }
-            }
-        }
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let mut files = Vec::new();
-        walk(&src, &mut files);
         let mut inline = Vec::new();
-        for path in files {
-            let rel = path
-                .strip_prefix(&src)
-                .unwrap()
-                .to_string_lossy()
-                .replace('\\', "/");
+        // Test-only files and items are left out by the shared reader.
+        for file in crate::vendor::test_support::production_sources::production_sources(&src) {
+            let rel = file.rel.as_str();
             if rel == "formats/text.rs"
-                || rel.ends_with("tests.rs")
-                || rel.contains("test_support")
-                || PENDING_INLINE_BOMS.contains(&rel.as_str())
-                || OWN_BOM_RULE.contains(&rel.as_str())
+                || PENDING_INLINE_BOMS.contains(&rel)
+                || OWN_BOM_RULE.contains(&rel)
             {
                 continue;
             }
-            // Windows CI checks out with CRLF.
-            let text = std::fs::read_to_string(&path)
-                .unwrap()
-                .replace("\r\n", "\n");
-            let production = [
-                "#[cfg(test)]\nmod tests",
-                "#[cfg(test)]\npub(crate) mod tests",
-                "#[cfg(test)]\nmod architecture_tests",
-            ]
-            .iter()
-            .filter_map(|marker| text.find(marker))
-            .min()
-            .map_or(text.as_str(), |at| &text[..at]);
-            if INLINE.iter().any(|p| production.contains(p)) {
-                inline.push(rel);
+            if INLINE.iter().any(|p| file.text.contains(p)) {
+                inline.push(file.rel);
             }
         }
         inline.sort();
