@@ -516,12 +516,13 @@ impl Decl {
 
     /// Whether the `[patch.<table>]` table redirects this declaration:
     /// a registry dependency of that registry (`crates-io`, or a crates.io
-    /// URL alias, for one with no `registry`).
+    /// URL alias, for one with no `registry` or `registry = "crates-io"`,
+    /// which cargo reads as crates.io too).
     fn patched_by(&self, table: &str) -> bool {
         self.source == DeclSource::Registry
-            && match self.registry.as_deref() {
-                None => is_crates_io_source(table),
-                Some(reg) => reg.trim() == table,
+            && match self.registry.as_deref().map(str::trim) {
+                None | Some("crates-io") => is_crates_io_source(table),
+                Some(reg) => reg == table,
             }
     }
 
@@ -2711,6 +2712,28 @@ mod tests {
         );
         assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
         // The crates.io declaration is what the entry redirects: not unpinned.
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+
+        // Review on #2019 (Bugbot): an explicit `registry = "crates-io"` is
+        // crates.io, so a `[patch."<crates.io URL>"]` pin redirects it too.
+        let p = Project::new();
+        p.write(
+            "Cargo.toml",
+            format!(
+                "{}\n[patch.\"https://github.com/rust-lang/crates.io-index\"]\n{}\n",
+                manifest("serde = { version = \"1\", registry = \"crates-io\" }"),
+                pinned("serde", "1", UUID_A)
+            ),
+        );
+        p.write(
+            "Cargo.lock",
+            lock(&[("serde", "1.0.1", Some(&index(UUID_A)), Some(CKSUM))]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+        );
         assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
 
         // A declaration from ANOTHER registry is not redirected by
