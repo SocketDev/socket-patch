@@ -1965,10 +1965,22 @@ pub(crate) async fn restore_pnpm_locks(
         let mut splices: Vec<(std::ops::Range<usize>, String)> = Vec::new();
         // (uuid, name@version whose `tarball:` only the guessed setting decided)
         let mut handled: Vec<(String, Option<String>)> = Vec::new();
+        // pnpm 11+ records the env lockfile document's resolutions bare
+        // whatever `lockfileIncludeTarballUrl` says (see
+        // `pnpm_tarball_policy`): only a URL it cannot derive gets
+        // `tarball:` there.
+        let env_spans: Vec<std::ops::Range<usize>> = pnpm::documents(&text)
+            .into_iter()
+            .filter(|(_, document)| *document == pnpm::PnpmDocument::Env)
+            .map(|(span, _)| span)
+            .collect();
         for entry in pnpm::entries(&text) {
             let Some(resolution) = pnpm::resolution(&entry) else {
                 continue;
             };
+            let in_env = env_spans
+                .iter()
+                .any(|span| span.contains(&resolution.range.start));
             let Some((_, uuid, name, version)) = hits.iter().find(|(r, ..)| *r == resolution.range)
             else {
                 continue;
@@ -1990,13 +2002,15 @@ pub(crate) async fn restore_pnpm_locks(
             // pnpm records `tarball:` under lockfileIncludeTarballUrl and for
             // a URL it cannot derive from the registry (#557).
             let derived = policy.derives_tarball(name, version, &dist.tarball, found.from_project);
-            let restored = if policy.always || !derived {
+            let restored = if (policy.always && !in_env) || !derived {
                 resolution.rewrite(integrity, &dist.tarball)
             } else {
                 resolution.restore(integrity)
             };
-            // A URL pnpm records anyway is no guess.
-            let guessed = (policy.guess.is_some() && derived).then(|| format!("{name}@{version}"));
+            // A URL pnpm records anyway is no guess, and neither is an env
+            // document entry.
+            let guessed =
+                (policy.guess.is_some() && derived && !in_env).then(|| format!("{name}@{version}"));
             splices.push((resolution.range.clone(), restored));
             handled.push((uuid.clone(), guessed));
         }

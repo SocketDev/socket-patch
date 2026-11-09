@@ -6075,6 +6075,53 @@ async fn pnpm_rollback_keeps_tarball_under_workspace_include_tarball_url() {
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
 }
 
+/// #2009 review: pnpm 11+ records a config dependency bare in the env
+/// lockfile document even under `lockfileIncludeTarballUrl`, so a rollback
+/// of a pin in both documents gives the project entry its `tarball:` back
+/// and leaves the env entry bare. It used to write the project document's
+/// `tarball:` into the env entry too, a lock pnpm never writes.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_the_env_document_bare_under_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = write_pnpm_tarball_project(tmp.path(), &tarball);
+    let pristine = format!(
+        "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      \
+         {NAME}:\n        specifier: {VERSION}\n        version: {VERSION}\n\npackages:\n\n  \
+         {NAME}@{VERSION}:\n    resolution: {{integrity: sha512-UPSTREAMupstream==}}\n\n\
+         snapshots:\n\n  {NAME}@{VERSION}: {{}}\n\n---\n{project}"
+    );
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &pristine).unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pinned_twice = |root: &Path| {
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        lock.matches("patch.test").count()
+    };
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+    assert_eq!(pinned_twice(tmp.path()), 2, "both documents are pinned");
+    let (code, env) = rollback_json(tmp.path(), &server);
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine
+    );
+}
+
 /// #557, the other case pnpm records `tarball:` in: the registry's
 /// `dist.tarball` is not the conventional URL pnpm would derive, so pnpm
 /// keeps it even without the setting.

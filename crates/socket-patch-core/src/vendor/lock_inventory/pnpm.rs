@@ -122,15 +122,12 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// the source lock into common/temp and runs pnpm there.
 ///
 /// Called (via `npm_family::inventory_npm_trees_raw_in`) only when
-/// `rush.json` is present, which that caller checks once through the
-/// view; the locks are read beside whatever lock the router picks. Outside
-/// a Rush monorepo ([`is_rush`]) it reads nothing. The locks are the ones
+/// `rush.json` is present ([`is_rush`]), which that caller checks once
+/// through the view, so this reader does not stat it again; the locks are
+/// read beside whatever lock the router picks. The locks are the ones
 /// lockfile discovery reads ([`rush_lock_rels`]), each read through the
 /// view. Missing files/dirs are skipped fail-soft.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
-    if !is_rush(*view).await {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for rel in rush_lock_rels(*view).await {
         if let Some(entries) = inventory_pnpm_lock_rel_in(view, &rel).await {

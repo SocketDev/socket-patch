@@ -1308,6 +1308,7 @@ impl Discovery {
     /// and the project ref then stands in its place, see
     /// [`Discovery::drop_env_twins`]).
     fn contest_within_locks(&mut self) {
+        self.drop_env_twins();
         self.expand_unidentified_copies();
         if self.unpatched_copies.is_empty() && self.refs.iter().all(|r| r.part == TreePart::File) {
             return;
@@ -1491,9 +1492,12 @@ impl Discovery {
     /// file's project document also wires (the same `(purl, uuid, mode)`):
     /// one wiring of the package in that file, whose project instance is
     /// the one an installed `node_modules` copy is verified against, even
-    /// when the two pins differ. The project twin counts wherever it ended
-    /// up (`refs`, `shadowed` or `rewirable`), so a withheld project ref
-    /// never leaves its env twin attested in its place.
+    /// when the two pins differ. Runs before any contest
+    /// ([`Discovery::contest_within_locks`]), so the twin leaves no
+    /// diagnostic or [`Unattested`] mark (keyed by `(purl, uuid)`, which
+    /// would withhold the project ref) behind, and a withheld project ref
+    /// never leaves it attested in its place. The project twin counts
+    /// wherever an extractor put it (`refs`, `shadowed` or `rewirable`).
     fn drop_env_twins(&mut self) {
         let project: HashSet<(PathBuf, String, String, WiringMode)> =
             [&self.refs, &self.shadowed, &self.rewirable]
@@ -1687,7 +1691,6 @@ impl Discovery {
         self.unattested.dedup();
         self.contested.sort();
         self.contested.dedup();
-        self.drop_env_twins();
         for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
             refs.sort_by(|a, b| {
                 (&a.source_file, &a.purl, &a.uuid, a.mode, a.part).cmp(&(
