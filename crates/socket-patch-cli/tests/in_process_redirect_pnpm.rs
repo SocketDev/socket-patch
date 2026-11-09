@@ -3012,6 +3012,84 @@ async fn hosted_pnpm_file_tarball_copy_is_named() {
     .await;
 }
 
+/// #2009: the registry release is a pnpm config dependency (the env
+/// lockfile document) and the project document installs only a `file:`
+/// copy of the same `name@version`. The scan pins the config dependency,
+/// and names the project's copy with `redirect_copy_unpatched`, since a
+/// VEX statement covers the release, not one install tree. Before, the
+/// env pin's copy check compared trees, so the copy went unnamed.
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_config_dependency_names_the_projects_file_copy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let copy_key = format!("file:forks/{NAME}");
+    write_file_copy_project(
+        root,
+        &copy_key,
+        &format!("    resolution: {{directory: forks/{NAME}, type: directory}}\n"),
+        &format!("file:../../forks/{NAME}"),
+    );
+    std::fs::remove_dir_all(root.join("packages").join("a")).unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "---
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies:
+      {NAME}:
+        specifier: {VERSION}
+        version: {VERSION}
+
+packages:
+
+  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+---
+lockfileVersion: '9.0'
+
+importers:
+  .: {{}}
+  packages/b:
+    dependencies:
+      {NAME}:
+        specifier: file:../../forks/{NAME}
+        version: {copy_key}
+
+packages:
+  {NAME}@{copy_key}:
+    resolution: {{directory: forks/{NAME}, type: directory}}
+
+snapshots:
+  {NAME}@{copy_key}: {{}}
+"
+        ),
+    )
+    .unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "the config dependency is pinned: {lock}"
+    );
+    let text = doc.to_string();
+    assert!(
+        text.contains("redirect_copy_unpatched") && text.contains(&format!("`{NAME}@{copy_key}`")),
+        "the project's copy is named: {doc:#}"
+    );
+}
+
 /// The #935 workspace: member `a` depends on the registry release, member
 /// `b` on the `file:` copy `copy_key` (spelled `spec` in its manifest).
 fn write_file_copy_project(root: &Path, copy_key: &str, copy_entry: &str, spec: &str) {
