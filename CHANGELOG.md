@@ -104,6 +104,12 @@ a version without a non-empty section in this file.
     refuse: pnpm pins while `gitBranchLockfile` is on and a branch lock
     exists (`vex_pnpm_git_branch_lockfile`), and npm or Bun packages the
     project patches itself (`vex_npm_patched_dependency`) (#2010).
+  - A registry dependency that the root `package.json` `overrides` send to a
+    tarball URL, git or path spec (npm installs that spec, not the lock's
+    `resolved`) is skipped by hosted mode with
+    `redirect_npm_non_registry_entry_skipped`, refused by vendored mode,
+    and no longer attested by `vex`, including overrides scoped to a
+    workspace member (#1965, #1966).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -233,7 +239,8 @@ a version without a non-empty section in this file.
   (#2001), and the Socket-origin classifier moves into one module (#2002).
   Test fixes: PDM e2e compat pins bounded by release, a Windows-only
   scala-cli liveness test, NuGet walk tests isolated from the host cache
-  (#2034, #2035, #2037).
+  (#2034, #2035, #2037); CI retries `setup-ruby` and `setup-deno` once
+  on a release-CDN error (#2041, #2042).
 
 ## [5.0.1] — 2026-10-13
 
