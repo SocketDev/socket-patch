@@ -75,10 +75,12 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     if index.is_empty() {
         return;
     }
-    // Each mark is an `UnwiredCopy` for exactly that ref, as the npm and
-    // Bun extractors' (`npm::mark_user_patched`): it lands only on a ref
-    // that survives every contest, and a ref one of those already covers
-    // keeps that first reason.
+    // Each mark is an `UnwiredCopy` for exactly that ref, in its own tree
+    // of its file, as the npm and Bun extractors' (`npm::mark_user_patched`):
+    // it lands only on a ref that survives every contest, and a ref one of
+    // those already covers keeps that first reason. A pnpm env-lockfile ref
+    // (`TreePart::PnpmEnv`) of a user-patched package is marked too: the
+    // index is per package, and a missed attestation is the safe side.
     let marks: Vec<UnwiredCopy> = out
         .refs
         .iter()
@@ -97,7 +99,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 sources.join(", ")
             );
             Some(UnwiredCopy {
-                scope: Some(r.source_file.clone()),
+                scope: Some((r.source_file.clone(), r.part)),
                 target: CopyTarget::Ref {
                     purl: r.purl.clone(),
                     uuid: r.uuid.clone(),

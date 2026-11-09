@@ -887,6 +887,8 @@ mod tests {
 
         /// A hosted pnpm pin's takeover meets the pnpm lock-text gates
         /// (#853); a ledger entry already at the selected uuid is in sync.
+        /// The lock mixes CRLF and LF endings, which the pnpm rewriter
+        /// cannot write back byte-faithfully (a pure CRLF lock is wired).
         #[tokio::test]
         async fn a_hosted_pin_meets_the_pnpm_gates_before_its_takeover() {
             let tmp = tempfile::tempdir().unwrap();
@@ -897,7 +899,7 @@ mod tests {
             .unwrap();
             std::fs::write(
                 tmp.path().join("pnpm-lock.yaml"),
-                HOSTED_V9.replace('\n', "\r\n"),
+                HOSTED_V9.replacen('\n', "\r\n", 1),
             )
             .unwrap();
             let pin = HostedPin {

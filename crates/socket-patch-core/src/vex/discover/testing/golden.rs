@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Map, Value};
 
 use crate::vex::discover::{
-    ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, Unattested,
+    ContestedRef, Diag, Discovery, PatchedRef, Recognized, ResolvedElsewhere, TreePart, Unattested,
     UnlockedPin, UnpatchedCopy, WiringMode,
 };
 
@@ -152,8 +152,9 @@ fn render(out: &Discovery, root: &Path) -> Value {
             url,
             // The block's lines; the lock itself is the golden's input.
             yarn_classic_block: _,
+            part,
         } = r;
-        json!({
+        let mut rendered = json!({
             "purl": purl,
             "uuid": uuid,
             "mode": mode(*m),
@@ -163,7 +164,13 @@ fn render(out: &Discovery, root: &Path) -> Value {
             "integrity_required": integrity_required,
             "url": url,
             "lockfile_basis_ok": r.lockfile_basis_ok(),
-        })
+        });
+        // Only off the default, so the goldens of single-tree files stay
+        // byte-identical.
+        if *part != TreePart::File {
+            rendered["part"] = json!(format!("{part:?}"));
+        }
+        rendered
     };
     let refs: Vec<Value> = refs.iter().map(render_ref).collect();
     let diagnostics: Vec<Value> = diagnostics
@@ -264,6 +271,8 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     key,
                     how,
                     remedy,
+                    // A pnpm env-lockfile copy contests only its own tree.
+                    part: _,
                 } = c;
                 let mut copy = json!({
                     "purl": purl,
@@ -310,6 +319,7 @@ fn render(out: &Discovery, root: &Path) -> Value {
                     key,
                     how,
                     remedy,
+                    part: _,
                 } = c;
                 let mut copy = json!({
                     "purl": purl,

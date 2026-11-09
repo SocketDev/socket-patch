@@ -375,6 +375,7 @@ pub(super) fn python_lock_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
         out.push(LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             purl,
             name,
             version: version.to_string(),
@@ -416,6 +417,7 @@ async fn inventory_poetry_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEnt
         out.push(LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             purl,
             name,
             version,
@@ -537,6 +539,7 @@ async fn inventory_pipfile_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEn
                     out.push(LockfileEntry {
                         ecosystem: "pypi",
                         source_kind: SourceKind::Unspecified,
+                        pnpm_env: false,
                         purl,
                         name: n,
                         version: v,
@@ -570,6 +573,7 @@ async fn inventory_pipfile_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEn
         out.push(LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             purl,
             name: n,
             version: version.to_string(),
@@ -597,6 +601,7 @@ async fn inventory_pdm_lock(view: &ProjectView<'_>) -> Option<Vec<LockfileEntry>
         .map(|(name, version, purl, _)| LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             purl,
             name,
             version,
@@ -722,6 +727,7 @@ async fn inventory_requirements_txt(view: &ProjectView<'_>) -> Option<Vec<Lockfi
         out.push(LockfileEntry {
             ecosystem: "pypi",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             purl,
             name,
             version,

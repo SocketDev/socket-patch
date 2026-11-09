@@ -872,10 +872,17 @@ pub async fn read_candidate_files(
     // and yarn classic rewriters read it as advisory input only: no
     // rewriter edits it, so a link or an unreadable in-memory entry is left
     // out (the rewriters then keep their conservative reading) rather than
-    // refused.
+    // refused. Beside a root `pnpm-lock.yaml` / `shrinkwrap.yaml` pair its
+    // `packageManager` pin decides which of the two pnpm reads
+    // (`formats::pnpm::plan::planned_locks`), as vendored mode and
+    // discovery read it, when no `node_modules/.modules.yaml` records the
+    // installed major (a fresh clone).
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
         && (NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
-            || out.files.contains_key("yarn.lock"))
+            || out.files.contains_key("yarn.lock")
+            || ROOT_PNPM_LOCKS
+                .iter()
+                .all(|lock| out.files.contains_key(*lock)))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
@@ -2415,6 +2422,7 @@ async fn unattributed_pins(
         for c in discovery.unpatched_copies.iter().filter(|c| {
             c.purl == r.purl
                 && c.file == r.source_file
+                && r.part.withheld_by(c.part)
                 && matches!(
                     c.file.file_name().and_then(|n| n.to_str()),
                     Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
@@ -2897,8 +2905,11 @@ fn pnpm_trust(
         .count();
     // The locks pnpm installs the project from: the root lock, plus each
     // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
-    // lock is never one: rush installs it from common/temp.
-    let governing: Vec<&str> = std::iter::once("pnpm-lock.yaml")
+    // lock is never one: rush installs it from common/temp. The root lock
+    // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
+    // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
+    // config.
+    let governing: Vec<&str> = std::iter::once(crate::formats::pnpm::plan::root_lock(files))
         .chain(member_lock_keys.iter().map(String::as_str))
         .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();
@@ -3538,9 +3549,15 @@ fn confirm(
         name.ends_with("/pom.xml")
             || maven_reactor_refused && (name == "pom.xml" || name.starts_with(".mvn/"))
     };
+    // A pnpm lock pnpm does not read (a `shrinkwrap.yaml` beside a
+    // `pnpm-lock.yaml`, or the reverse under a pnpm 1 / 2 pin, N11) is
+    // never rewritten, so a Socket URL an earlier run left in it pins
+    // nothing either.
+    let shadowed_pnpm = crate::formats::pnpm::plan::shadowed_locks(files);
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .filter(|(name, _)| !shadowed_pnpm.contains(name))
         .filter(|(name, _)| !is_npm_manifest(name))
         .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
@@ -4781,6 +4798,104 @@ mod tests {
             "{:?}",
             read.files.keys()
         );
+    }
+
+    /// N11: under a pnpm 1 / 2 pin `shrinkwrap.yaml` governs, so a
+    /// stray v9 `pnpm-lock.yaml` an earlier run redirected is no heal root
+    /// and plans no `trustLockfile` write for a lock pnpm never reads.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_is_no_heal_root() {
+        let redirected = LEFT_PAD_V9_LOCK.replace(
+            "resolution: {integrity: sha512-UPSTREAM==}",
+            &format!(
+                "resolution: {{integrity: sha512-PATCHED==, tarball: {}}}",
+                left_pad_url()
+            ),
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("pnpm-lock.yaml", redirected.as_str());
+        p.insert_text(
+            "shrinkwrap.yaml",
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        );
+        p.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#,
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            !done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+
+        // Without the pin, pnpm-lock.yaml governs and the heal plans it.
+        p.insert_text("package.json", r#"{"name":"app"}"#);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+    }
+
+    /// N11: a shadowed `shrinkwrap.yaml` still carrying an earlier run's
+    /// Socket URL confirms nothing (and so is no `redirect_unattributable`
+    /// skip) when the governing `pnpm-lock.yaml` does not pin the package.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_confirms_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\npackages:\n  other@1.0.0:\n    \
+             resolution: {integrity: sha512-OTHER==}\n",
+        );
+        p.insert_text(
+            "shrinkwrap.yaml",
+            format!(
+                "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9\npackages:\n  /left-pad/1.3.0:\n    \
+                 resolution:\n      integrity: sha512-PATCHED==\n      tarball: {}\n",
+                left_pad_url()
+            )
+            .as_str(),
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+    }
+
+    #[tokio::test]
+    async fn a_pnpm_lock_pair_reads_the_package_manager_pin() {
+        // pnpm 2 pinned in package.json, no install record: pnpm reads
+        // shrinkwrap.yaml, so the planner must see the pin to leave the
+        // stray pnpm-lock.yaml alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let manifest = r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#;
+        std::fs::write(root.join("package.json"), manifest).unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 5.4\n").unwrap();
+        std::fs::write(
+            root.join("shrinkwrap.yaml"),
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            crate::formats::pnpm::plan::planned_locks(&read.files),
+            vec!["shrinkwrap.yaml"]
+        );
+
+        // One pnpm lock alone governs whatever the pin: no manifest read.
+        std::fs::remove_file(root.join("shrinkwrap.yaml")).unwrap();
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert!(!read.files.contains_key("package.json"));
     }
 
     #[tokio::test]

@@ -202,11 +202,17 @@ pub(crate) fn lock_has_member_importers<S: AsRef<str>>(lines: &[S]) -> bool {
 }
 
 /// [`lock_has_member_importers`] of a whole `pnpm-lock.yaml` text: its
-/// project document alone ([`super::grammar::main_document`]), so importers
+/// project documents alone ([`super::grammar::documents`]), so importers
 /// of a pnpm 11+ env document never count.
 pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
-    let doc = super::grammar::main_document(strip_bom(text));
-    lock_has_member_importers(&doc.split('\n').collect::<Vec<_>>())
+    use super::grammar::{documents, PnpmDocument};
+    documents(text)
+        .into_iter()
+        .filter(|(_, kind)| *kind == PnpmDocument::Project)
+        .any(|(span, _)| {
+            let doc = strip_bom(&text[span]);
+            lock_has_member_importers(&doc.split('\n').collect::<Vec<_>>())
+        })
 }
 
 /// `text` with the contiguous run of lines `block` removed, when that

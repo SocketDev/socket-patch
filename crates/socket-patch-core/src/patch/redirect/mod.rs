@@ -28591,6 +28591,186 @@ packages:
         );
     }
 
+    /// Lock-model divergence N5 (pnpm): "is this dep vendored?" reads the
+    /// rekeyed packages entry with the origin classifier
+    /// (`origin::vendor_ref`), the rule discovery reads vendored pnpm keys
+    /// with, instead of a substring test over every line. A path that is
+    /// not this project's vendored npm artifact (no canonical uuid dir,
+    /// another ecosystem's dir) and an `overrides:` line with no rekeyed
+    /// entry behind it are the generic entry-not-found now; the backends'
+    /// real v9 and legacy shapes stay vendored (see
+    /// `pnpm_vendored_entry_is_named_vendored_not_entry_not_found`).
+    #[test]
+    fn pnpm_vendored_diagnosis_reads_the_rekeyed_entry_through_origin() {
+        let ovr = npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/left-pad-1.3.0.tgz",
+            "sha512-PATCHED==",
+        );
+        let uuid = "1a2b3c4d-5e6f-4a1b-8c2d-0123456789ab";
+        let v9 = |path: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@file:{path}:\n    \
+                 resolution: {{integrity: sha512-VENDORED==, tarball: file:{path}}}\n    \
+                 version: 1.3.0\n"
+            )
+        };
+        let legacy_overrides_only = format!(
+            "lockfileVersion: '6.0'\n\noverrides:\n  left-pad@1.3.0: \
+             file:/abs/project/.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz\n\npackages:\n\n  \
+             /other@1.0.0:\n    resolution: {{integrity: sha512-OTHER==}}\n    dev: false\n"
+        );
+        let codes = |lock: &str| {
+            let files = BTreeMap::from([("pnpm-lock.yaml".to_string(), lock.to_string())]);
+            let r = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{lock}");
+            r.warnings.into_iter().map(|w| w.code).collect::<Vec<_>>()
+        };
+        for (case, lock, want) in [
+            (
+                "the backend's v9 shape",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_vendored",
+            ),
+            (
+                "no uuid dir",
+                v9(".socket/vendor/npm/left-pad-1.3.0.tgz"),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "another ecosystem's dir",
+                v9(&format!(".socket/vendor/cargo/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "an overrides line alone",
+                legacy_overrides_only,
+                "redirect_pnpm_entry_not_found",
+            ),
+            // Another version vendored is not this one (the dep's version
+            // is simply not locked).
+            (
+                "another version vendored",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz"))
+                    .replace("version: 1.3.0", "version: 1.2.0"),
+                "redirect_pnpm_entry_not_found",
+            ),
+            // Lock-model 2b: the hint reads the key with the planning core's
+            // `match_key`, the rule the vendored planner rekeys by, so the
+            // artifact leaf names the release and the `version:` line is not
+            // consulted.
+            (
+                "a rekey without a version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz"))
+                    .replace("    version: 1.3.0\n", ""),
+                "redirect_pnpm_entry_vendored",
+            ),
+            (
+                "another release's artifact under this version line",
+                v9(&format!(".socket/vendor/npm/{uuid}/left-pad-1.2.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+            (
+                "a sibling checkout's artifact",
+                v9(&format!("../.socket/vendor/npm/{uuid}/left-pad-1.3.0.tgz")),
+                "redirect_pnpm_entry_not_found",
+            ),
+        ] {
+            assert_eq!(codes(&lock), vec![want], "{case}");
+        }
+    }
+
+    /// Divergence N11 (owner decision, lock-model 2b): a pnpm <= 2
+    /// `shrinkwrap.yaml` beside a `pnpm-lock.yaml` is shadowed. pnpm reads
+    /// only the `pnpm-lock.yaml`, so the hosted planner never rewrites the
+    /// shrinkwrap and leaves it out of the all-or-nothing gate: debris in it
+    /// (a key the splice cannot repoint, or pnpm 1's early shrinkwrap head)
+    /// refuses nothing. A `shrinkwrap.yaml`
+    /// that is the only pnpm lock is still rewritten.
+    #[test]
+    fn pnpm_shrinkwrap_beside_a_pnpm_lock_is_shadowed() {
+        let url = "http://patch.test/left-pad-1.3.0.tgz";
+        let ovr = npm_override("left-pad", "1.3.0", url, "sha512-PATCHED==");
+        let lock = "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@1.3.0:\n    \
+                    resolution: {integrity: sha512-OLD==}\n";
+        let shrinkwrap = |head: &str, key: &str| {
+            format!(
+                "{head}\n\npackages:\n\n  {key}:\n    resolution: {{integrity: sha512-OLD==}}\n"
+            )
+        };
+        let supported = "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9";
+        let run = |files: &[(&str, String)]| {
+            let files: BTreeMap<String, String> = files
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect();
+            rewrite_registry_redirect(&files, std::slice::from_ref(&ovr))
+        };
+        for (case, shrink) in [
+            ("a plain entry", shrinkwrap(supported, "/left-pad/1.3.0")),
+            (
+                "an unparseable key",
+                shrinkwrap(supported, "/left-pad/1.3.0)("),
+            ),
+            (
+                "an early shrinkwrap",
+                shrinkwrap("shrinkwrapVersion: 3", "/left-pad/1.3.0"),
+            ),
+        ] {
+            let r = run(&[
+                ("pnpm-lock.yaml", lock.to_string()),
+                ("shrinkwrap.yaml", shrink),
+            ]);
+            assert_eq!(
+                r.files.keys().collect::<Vec<_>>(),
+                ["pnpm-lock.yaml"],
+                "{case}: only the governing lock is written: {:?}",
+                r.warnings
+            );
+            assert!(r.files["pnpm-lock.yaml"].contains(url), "{case}");
+            assert!(r.warnings.is_empty(), "{case}: {:?}", r.warnings);
+            assert!(r.refused_pnpm_uuids.is_empty(), "{case}");
+            assert!(r.edits.iter().all(|e| e.path == "pnpm-lock.yaml"), "{case}");
+        }
+        // A nested `shrinkwrap.yaml` is shadowed only by its own sibling.
+        let r = run(&[
+            ("pnpm-lock.yaml", lock.to_string()),
+            (
+                "sub/shrinkwrap.yaml",
+                shrinkwrap(supported, "/left-pad/1.3.0"),
+            ),
+        ]);
+        assert!(
+            r.files.contains_key("sub/shrinkwrap.yaml"),
+            "{:?}",
+            r.warnings
+        );
+        // A project pinning pnpm 2 installs from `shrinkwrap.yaml` (review
+        // finding): it is rewritten and the stray `pnpm-lock.yaml` is the
+        // shadowed one, so debris in it refuses nothing.
+        let pnpm2 = r#"{"packageManager": "pnpm@2.25.7"}"#.to_string();
+        let r = run(&[
+            ("package.json", pnpm2),
+            (
+                "pnpm-lock.yaml",
+                lock.replace("left-pad@1.3.0:", "left-pad@1.3.0)(:"),
+            ),
+            ("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0")),
+        ]);
+        assert_eq!(
+            r.files.keys().collect::<Vec<_>>(),
+            ["shrinkwrap.yaml"],
+            "{:?}",
+            r.warnings
+        );
+        assert!(r.files["shrinkwrap.yaml"].contains(url));
+        assert!(r.refused_pnpm_uuids.is_empty(), "{:?}", r.warnings);
+        // The only pnpm lock: rewritten as before.
+        let r = run(&[("shrinkwrap.yaml", shrinkwrap(supported, "/left-pad/1.3.0"))]);
+        assert!(r.files["shrinkwrap.yaml"].contains(url), "{:?}", r.warnings);
+    }
+
     /// A classic-lock block whose first line is not a `key:` line
     /// (hand-mangled) is skipped without derailing the rewrite of the real
     /// entry — and survives byte-identically.

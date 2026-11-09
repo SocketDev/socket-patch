@@ -121,21 +121,13 @@ fn pnpm_lock_text_inventory(text: &str) -> Option<Vec<LockfileEntry>> {
 /// `common/config/subspaces/<name>/pnpm-lock.yaml`. `rush install` copies
 /// the source lock into common/temp and runs pnpm there.
 ///
-/// The last fallback of [`super::npm_family::inventory_npm_lock_raw_in`]:
-/// reached whenever the npm-family flavor probe refuses the project (any
-/// refusal but the PnP ones, which propagate) and no earlier fallback (the
-/// out-of-family root pnpm lock, a live sibling lock, pnpm <= 2's
-/// `shrinkwrap.yaml`, the members' own locks) returned entries — typically
-/// no root lock at all, where the probe refuses with
-/// `vendor_rush_unsupported` or `vendor_lockfile_missing`. Outside a Rush
-/// monorepo ([`is_rush`]) it reads nothing. The locks are the ones lockfile
-/// discovery reads ([`rush_lock_rels`]), each read through the view.
-/// Missing files/dirs are skipped fail-soft; the caller drops the whole
-/// result when it comes back empty.
+/// Called (via `npm_family::inventory_npm_trees_raw_in`) only when
+/// `rush.json` is present ([`is_rush`]), which that caller checks once
+/// through the view, so this reader does not stat it again; the locks are
+/// read beside whatever lock the router picks. The locks are the ones
+/// lockfile discovery reads ([`rush_lock_rels`]), each read through the
+/// view. Missing files/dirs are skipped fail-soft.
 pub(super) async fn inventory_rush_pnpm_locks_in(view: &ProjectView<'_>) -> Vec<LockfileEntry> {
-    if !is_rush(*view).await {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for rel in rush_lock_rels(*view).await {
         if let Some(entries) = inventory_pnpm_lock_rel_in(view, &rel).await {
