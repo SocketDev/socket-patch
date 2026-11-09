@@ -77,7 +77,8 @@ use crate::vendor::lock_inventory::{
     NpmLockNode,
 };
 use crate::vendor::npm_origin::{
-    npm_link_source_identity, npm_non_registry_entries, npm_shrinkwrapped_entries, NpmOverrides,
+    npm_link_source_identity, npm_non_registry_entries, npm_override_only_entries,
+    npm_shrinkwrapped_entries, NpmOverrides,
 };
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
@@ -522,8 +523,16 @@ fn drop_non_registry_installs(
     out: &mut Discovery,
 ) {
     let non_registry = npm_non_registry_entries(doc, overrides);
-    // Locations a wiring of which is not the rewriters' own output.
-    let foreign: BTreeSet<String> = non_registry.keys().cloned().collect();
+    // Locations a wiring of which is not the rewriters' own output. A copy
+    // flagged only because `overrides` swap its registry spec for a url
+    // (#1965) has a registry-style `resolved` that a pre-#1965 run may
+    // have wired, so a ref there is still ours to unwind.
+    let override_only = npm_override_only_entries(doc, overrides);
+    let foreign: BTreeSet<String> = non_registry
+        .keys()
+        .filter(|key| !override_only.contains(*key))
+        .cloned()
+        .collect();
     // (lock key, why that copy installs from elsewhere)
     let elsewhere: Vec<(String, String)> = non_registry
         .into_iter()
@@ -2611,6 +2620,72 @@ mod tests {
                     "{wiring} / {overrides:?}: {:#?}",
                     out.diagnostics
                 );
+            }
+        }
+    }
+
+    /// #1965: a registry range the root `overrides` swap for a remote
+    /// tarball url is installed from that url, so a copy a pre-#1965 run
+    /// wired is not attested. The wiring is still the rewriters' own
+    /// output, so it stays shadowed for rollback / remove to unwind.
+    #[tokio::test]
+    async fn issue_1965_a_registry_edge_overridden_to_a_url_is_not_attested() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let tarball = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        for (wiring, resolved) in [("hosted", &hosted), ("vendored", &vendored)] {
+            for (overrides, attested) in [
+                (None, true),
+                (Some(r#"{"left-pad":"1.3.0"}"#.to_string()), true),
+                (Some(format!(r#"{{"left-pad":"{tarball}"}}"#)), false),
+                (
+                    Some(format!(r#"{{"foo":{{"left-pad":"{tarball}"}}}}"#)),
+                    false,
+                ),
+            ] {
+                let p = Project::new();
+                p.write(
+                    "package-lock.json",
+                    lock_with_packages(serde_json::json!({
+                        "": { "name": "app", "version": "1.0.0",
+                              "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+                        "node_modules/foo": {
+                            "version": "1.0.0",
+                            "resolved": "file:foo-1.0.0.tgz",
+                            "dependencies": { "left-pad": "^1.3.0" }
+                        },
+                        "node_modules/left-pad": {
+                            "version": "1.3.0", "resolved": resolved, "integrity": SRI
+                        },
+                    })),
+                );
+                if let Some(overrides) = &overrides {
+                    p.write(
+                        "package.json",
+                        format!(
+                            r#"{{"name":"app","dependencies":{{"foo":"file:foo-1.0.0.tgz"}},"overrides":{overrides}}}"#
+                        ),
+                    );
+                }
+                let out = run(&p).await;
+                assert_eq!(
+                    out.refs.len(),
+                    usize::from(attested),
+                    "{wiring} / {overrides:?}: {:#?}",
+                    out.diagnostics
+                );
+                if !attested {
+                    assert!(
+                        diag_codes(&out).contains(&DIAG_REF_UNATTRIBUTABLE),
+                        "{wiring} / {overrides:?}: {:?}",
+                        diag_codes(&out)
+                    );
+                    assert_eq!(
+                        out.shadowed.len(),
+                        1,
+                        "{wiring} / {overrides:?}: the old wiring stays unwindable"
+                    );
+                }
             }
         }
     }
