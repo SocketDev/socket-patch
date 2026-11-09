@@ -100,6 +100,10 @@ a version without a non-empty section in this file.
     instead of withholding them as offline (#2013).
   - The lock inventory skips Rush subspace locks with unsafe names, as
     lockfile discovery already did (#2003).
+  - `vex` no longer attests npm-family pins the hosted and vendored writers
+    refuse: pnpm pins while `gitBranchLockfile` is on and a branch lock
+    exists (`vex_pnpm_git_branch_lockfile`), and npm or Bun packages the
+    project patches itself (`vex_npm_patched_dependency`) (#2010).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -189,6 +193,17 @@ a version without a non-empty section in this file.
     an escaped path spelling (`\/` in an older `composer.lock`, Windows
     backslashes) instead of deleting it (#2022).
 - **General.**
+  - Workspace runs never read or rewrite project files outside the
+    enclosing git repository root. Ancestor workspace roots, settings
+    files, `go.work`, NuGet parent configs, `.cargo/config` and
+    out-of-tree requirements above the root are not read: writers refuse
+    (new `redirect_cargo_config_outside_root`,
+    `redirect_nuget_inherited_config_outside_root`,
+    `pypi_requirements_outside_root`) and `vex` withholds. Vendored writers
+    and `vendor --revert` only claim `.socket/vendor/` paths anchored at
+    this project, so a sibling checkout's wiring is never rewritten.
+    Global runs (`-g`, `--global-prefix`) and projects outside a git
+    checkout are unchanged (#2025).
   - The nested-project remedy quotes its path for the shell it prints for,
     including Windows and `%` (#1859, #1884).
   - Patch and vendor download errors read the same on every path (size
