@@ -1546,25 +1546,28 @@ fn patch_bypassed(
         .filter(|d| matches!(route(d, &pins, version, &others), Route::Unpinned(_)))
         .collect();
     // A declaration pinned to ANOTHER Socket patch builds that patch's
-    // copy, not this one. When the lock resolves the crate from that patch,
-    // its hosted ref stands beside this one and the CLI's conflict gate
-    // refuses both; when it does not (a stale lock), nothing else says so.
-    let locked_from: Vec<String> = bypass
-        .lock
-        .packages()
-        .iter()
-        .filter(|p| p.name == name)
-        .filter_map(|p| p.source.as_deref().and_then(|s| source_uuid(ctx, s)))
-        .collect();
+    // copy, not this one. Only a ref for that patch at this very package,
+    // emitted by the hosted pass (from the lock, or a conflict pair beside
+    // a lock pin) and not itself withheld, puts the pair before the CLI's
+    // conflict gate; otherwise (a stale lock, a lock line whose config
+    // index disagrees, another locked version) nothing else says so.
+    let gated = |uuid: &str| {
+        out.refs.iter().any(|r| {
+            r.uuid == uuid
+                && r.purl == purl
+                && !out
+                    .unattested
+                    .iter()
+                    .any(|u| u.uuid == uuid && u.purl == purl && u.file == r.source_file)
+        })
+    };
     let other_patch: Vec<(&Decl, String)> = bypass
         .decls
         .and_then(|d| d.get(name))
         .into_iter()
         .flatten()
         .filter_map(|d| match route(d, &pins, version, &others) {
-            Route::Pin(uuid) if uuid != vref.uuid && !locked_from.contains(&uuid) => {
-                Some((d, uuid))
-            }
+            Route::Pin(uuid) if uuid != vref.uuid && !gated(&uuid) => Some((d, uuid)),
             _ => None,
         })
         .collect();
@@ -1632,10 +1635,11 @@ fn patch_bypassed(
             (
                 first.file.as_str(),
                 format!(
-                    "{declared}, which {CARGO_LOCK} does not resolve {name} from (a stale \
-                     lock): cargo re-resolves that declaration from that patch's registry, so \
-                     the crate declaring it builds {name} with another patch than the copy at \
-                     {}, and the requirement allows it to be {version}. Keep one patch for \
+                    "{declared}, which no wiring of that patch for {name} {version} pairs \
+                     with this copy (a stale {CARGO_LOCK}, or a registry definition that \
+                     disagrees): cargo resolves that declaration from that patch's registry, \
+                     so the crate declaring it builds {name} with another patch than the copy \
+                     at {}, and the requirement allows it to be {version}. Keep one patch for \
                      {name}: pin that declaration to this patch (or drop it), or roll this \
                      patch back",
                     vref.artifact_rel
@@ -4595,7 +4599,7 @@ mod tests {
         assert!(
             u.detail.contains("crates/a/Cargo.toml declares cfg-if")
                 && u.detail.contains(UUID_B)
-                && u.detail.contains("stale"),
+                && u.detail.contains("stale Cargo.lock"),
             "{}",
             u.detail
         );
@@ -4616,6 +4620,21 @@ mod tests {
             "{:#?}",
             out.unattested
         );
+
+        // Locked from that patch, but the project's registry definition
+        // indexes another patch: the hosted pass emits no ref for it, so
+        // nothing pairs with the vendored copy and it is withheld.
+        let p = vendored_workspace(&pinned("cfg-if", "1", UUID_B), "", &[("1.0.4", b.as_str())]);
+        p.write(
+            ".cargo/config.toml",
+            format!(
+                "[registries.socket-patch-{UUID_B}]\nindex = \"{}\"\n",
+                index(UUID_A)
+            ),
+        );
+        let out = run(&p).await;
+        assert!(out.refs.iter().all(|r| r.uuid != UUID_B), "{:#?}", out.refs);
+        bypassed_mark(&out, "crates/a/Cargo.toml");
 
         // A requirement that excludes the vendored version says nothing.
         let p = vendored_workspace(&pinned("cfg-if", "0.1", UUID_B), "", &[]);
