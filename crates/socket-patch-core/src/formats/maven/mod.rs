@@ -176,8 +176,9 @@ struct ProfileProperties {
 /// classpaths, `<pluginRepositories>` / `<distributionManagement>` plugin
 /// and deploy repositories; `<profiles>` apply only when activated. Shared
 /// by the VEX reader ([`parse_pom`]) and the hosted rewriter, so the
-/// rewriter edits exactly the markup VEX later attests. Only the VEX
-/// reader weighs profile `<properties>` ([`Self::read_profiles`]).
+/// rewriter edits exactly the markup VEX later attests. Both the VEX
+/// reader and the hosted rewriter's index weigh profile `<properties>`
+/// ([`Self::read_profiles`]).
 #[derive(Debug)]
 pub(crate) struct PomScope {
     /// The pom with comments and CDATA blanked byte-for-byte.
@@ -555,15 +556,12 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
     /// `<groupId>` / `<artifactId>` with every `${prop}` the build defines
-    /// (user properties, the project model, the root `<properties>`)
-    /// interpolated ([`PomScope::interpolate_coordinate`]); an undefined
-    /// one stays as written, so [`may_name`] can tell it apart. No profile
-    /// is active but, for a `<profiles>` declaration, its own, whose
-    /// `<properties>` count only once [`PomScope::read_profiles`] has run:
-    /// the VEX reader runs it, the hosted rewriter does not, so a profile
-    /// declaration whose coordinates only its own profile's `<properties>`
-    /// define is the pinned GA to VEX (which then withholds the pin) and
-    /// not to the rewriter.
+    /// with no profile active (user properties, the project model, the
+    /// root `<properties>`) interpolated
+    /// ([`PomScope::interpolate_coordinate`]); an undefined one stays as
+    /// written, so [`may_name`] can tell it apart. What a profile (a
+    /// `<profiles>` declaration's own included) makes of them is
+    /// [`PomScope::coordinate_alternatives`]' job.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
     /// The trimmed `<groupId>` / `<artifactId>` text as written.
