@@ -100,6 +100,16 @@ a version without a non-empty section in this file.
     instead of withholding them as offline (#2013).
   - The lock inventory skips Rush subspace locks with unsafe names, as
     lockfile discovery already did (#2003).
+  - `vex` no longer attests npm-family pins the hosted and vendored writers
+    refuse: pnpm pins while `gitBranchLockfile` is on and a branch lock
+    exists (`vex_pnpm_git_branch_lockfile`), and npm or Bun packages the
+    project patches itself (`vex_npm_patched_dependency`) (#2010).
+  - A registry dependency that the root `package.json` `overrides` send to a
+    tarball URL, git or path spec (npm installs that spec, not the lock's
+    `resolved`) is skipped by hosted mode with
+    `redirect_npm_non_registry_entry_skipped`, refused by vendored mode,
+    and no longer attested by `vex`, including overrides scoped to a
+    workspace member (#1965, #1966).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -127,10 +137,23 @@ a version without a non-empty section in this file.
     `apply --check`, hosted mode and `vex` read the module graph to tell
     whether the patch is really built, instead of reporting it applied
     while `go build` linked the unpatched code (#1840, #1843).
+  - In a go 1.16-or-older module where a downgrade left the old version's
+    `go.sum` lines behind, `apply`, `apply --check`, hosted mode and `vex`
+    use the version the module graph selects instead of the highest
+    `go.sum` line. When the module cache can't answer, they fail closed:
+    `apply` refuses with a remedy, `apply --check` reports drift, and the
+    patch is not pinned or attested (#1862, #1893).
   - `vex` reads the `go.work` that governs the project (`GOWORK`, else the
     nearest one at or above it, with members anywhere), as hosted and
     vendored modes already did, and no longer attests a Socket replace the
-    workspace keeps out of the build (`go_workspace_override`) (#2011).
+    workspace keeps out of the build (`go_workspace_override`). Such a
+    replace stays visible to `list`, `rollback` and `remove`, and a root
+    `go.work` replace that `go` never reads no longer withholds the root
+    `go.mod`'s copy of it (#2011, #2031).
+  - The in-memory hosted engine judges a Go workspace from the project's
+    own files instead of probing the process's working directory, so a
+    root module the `go.work` does not `use` is no longer refused for a
+    missing `go.mod` (or answered from the server's) (#2031).
 - **JVM.**
   - A Maven 4 root that builds its subdirectories implicitly (model 4.1.0,
     `pom` packaging, no `<subprojects>`) is treated as a reactor by hosted
@@ -189,6 +212,17 @@ a version without a non-empty section in this file.
     an escaped path spelling (`\/` in an older `composer.lock`, Windows
     backslashes) instead of deleting it (#2022).
 - **General.**
+  - Workspace runs never read or rewrite project files outside the
+    enclosing git repository root. Ancestor workspace roots, settings
+    files, `go.work`, NuGet parent configs, `.cargo/config` and
+    out-of-tree requirements above the root are not read: writers refuse
+    (new `redirect_cargo_config_outside_root`,
+    `redirect_nuget_inherited_config_outside_root`,
+    `pypi_requirements_outside_root`) and `vex` withholds. Vendored writers
+    and `vendor --revert` only claim `.socket/vendor/` paths anchored at
+    this project, so a sibling checkout's wiring is never rewritten.
+    Global runs (`-g`, `--global-prefix`) and projects outside a git
+    checkout are unchanged (#2025).
   - The nested-project remedy quotes its path for the shell it prints for,
     including Windows and `%` (#1859, #1884).
   - Patch and vendor download errors read the same on every path (size
@@ -208,7 +242,12 @@ a version without a non-empty section in this file.
   #1944, #1955, #1964, #1972, #1978, #1988, #1994, #2000); release
   workflow artifact steps move off Node 20 actions (#2027). A design doc
   and line-count budget plan one lock model for every lockfile reader
-  (#2001).
+  (#2001), and the Socket-origin classifier moves into one module (#2002).
+  Test fixes: PDM e2e compat pins bounded by release, a Windows-only
+  scala-cli liveness test, NuGet walk tests isolated from the host cache
+  (#2034, #2035, #2037); CI retries `setup-ruby` and `setup-deno` once
+  on a release-CDN error (#2041, #2042), `lint-ecosystems` installs retry
+  release 504s, and `vexctl` is cached on every OS (#2040, #2039).
 
 ## [5.0.1] — 2026-10-13
 

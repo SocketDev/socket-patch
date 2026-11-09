@@ -9808,6 +9808,8 @@ fn rewrite_golang_target(
                 "the go.work workspace selects"
             } else if scan.required.as_deref() == Some(selected.as_str()) {
                 "go.mod requires"
+            } else if graph.as_ref().is_some_and(|g| g.complete) {
+                "the module graph selects"
             } else {
                 "go.sum shows the build selects"
             };
@@ -9873,6 +9875,7 @@ fn rewrite_golang_target(
         return false;
     } else if selection != go_build_list::Selection::Selected
         && (in_workspace && selection == go_build_list::Selection::Unknown
+            || selection == go_build_list::Selection::Unproven
             || prior.is_none_or(|e| e.version.as_deref() != Some(dep.version.as_str())))
     {
         // Not selected by go.mod's require, no go.sum zip line at this
@@ -9881,10 +9884,19 @@ fn rewrite_golang_target(
         // module cache). Its replace would be inert, and confirming it
         // would attest a patch no build links. A workspace graph that
         // could not be read proves nothing either way, so there even our
-        // own pin is no proof the build selects this version.
+        // own pin is no proof the build selects this version. Nor is it
+        // over a go.sum zip line above go.mod's require that a downgrade
+        // may have left behind (#1862).
         result.warnings.push(RewriteWarning {
             code: "redirect_golang_not_in_module_graph".into(),
-            detail: if in_workspace && selection == go_build_list::Selection::Unknown {
+            detail: if selection == go_build_list::Selection::Unproven {
+                format!(
+                    "{fname}@{}: nothing shows the build selects this version — {}; \
+                     nothing redirected",
+                    dep.version,
+                    go_build_list::UNPROVEN_REASON
+                )
+            } else if in_workspace && selection == go_build_list::Selection::Unknown {
                 format!(
                     "{fname}@{}: nothing shows the go.work workspace building this version \
                      — a go.mod its module graph needs is not in the module cache (`go mod \
@@ -21351,6 +21363,87 @@ mod tests {
         assert_eq!(entry["integrity"], "sha512-PATCHED==");
         // The manifest is input only: never written.
         assert!(!r.files.contains_key("package.json"));
+    }
+
+    /// #1965: `foo` depends on left-pad by a registry range and the root
+    /// `overrides` swap it for a remote tarball url, so npm installs that
+    /// url whatever the lock's (registry-looking) `resolved` says. The
+    /// rewriter must skip the entry loudly and keep it out of the VEX.
+    #[test]
+    fn issue_1965_a_registry_edge_overridden_to_a_url_is_unredirected() {
+        let url = "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+        let lock = json!({
+            "name": "app",
+            "lockfileVersion": 3,
+            "packages": {
+                "": { "name": "app", "version": "0.0.0", "dependencies": { "foo": "file:foo-1.0.0.tgz" } },
+                "node_modules/foo": {
+                    "version": "1.0.0",
+                    "resolved": "file:foo-1.0.0.tgz",
+                    "dependencies": { "left-pad": "^1.3.0" }
+                },
+                "node_modules/left-pad": {
+                    "version": "1.3.0",
+                    "resolved": url,
+                    "integrity": "sha512-UPSTREAM=="
+                }
+            }
+        });
+        let overrides = vec![npm_override(
+            "left-pad",
+            "1.3.0",
+            "http://patch.test/lp.tgz",
+            "sha512-PATCHED==",
+        )];
+        let files_with = |manifest_overrides: Value| {
+            let mut files = BTreeMap::new();
+            files.insert(
+                "package-lock.json".to_string(),
+                serde_json::to_string_pretty(&lock).unwrap(),
+            );
+            files.insert(
+                "package.json".to_string(),
+                json!({
+                    "name": "app",
+                    "dependencies": { "foo": "file:foo-1.0.0.tgz" },
+                    "overrides": manifest_overrides
+                })
+                .to_string(),
+            );
+            files
+        };
+        for manifest_overrides in [
+            json!({ "left-pad": url }),
+            json!({ "foo": { "left-pad": url } }),
+            json!({ "left-pad": "github:someone/left-pad" }),
+        ] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            assert!(r.files.is_empty(), "{manifest_overrides}: {:?}", r.edits);
+            let skipped = r
+                .warnings
+                .iter()
+                .find(|w| w.code == "redirect_npm_non_registry_entry_skipped")
+                .unwrap_or_else(|| panic!("{manifest_overrides}: {:?}", r.warnings));
+            assert!(
+                skipped.detail.contains("overrides"),
+                "the warning names the override: {}",
+                skipped.detail
+            );
+            assert!(
+                r.bundled_skipped_uuids.contains(&overrides[0].patch_uuid),
+                "{manifest_overrides}: the skipped copy keeps the patch out of the in-run VEX"
+            );
+        }
+        // Control: a registry override (or none) still redirects.
+        for manifest_overrides in [json!({}), json!({ "left-pad": "1.3.0" })] {
+            let r = rewrite_registry_redirect(&files_with(manifest_overrides.clone()), &overrides);
+            let rewritten: Value = serde_json::from_str(&r.files["package-lock.json"]).unwrap();
+            assert_eq!(
+                rewritten["packages"]["node_modules/left-pad"]["resolved"],
+                "http://patch.test/lp.tgz",
+                "{manifest_overrides}"
+            );
+        }
     }
 
     #[test]

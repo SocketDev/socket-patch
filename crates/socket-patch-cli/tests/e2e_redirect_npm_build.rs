@@ -1433,3 +1433,217 @@ async fn npm_agent_keeps_crlf_shebang_of_bin_npm_did_not_link() {
         );
     }
 }
+
+/// #1965: a local `foo` depends on left-pad by a registry range, and the
+/// project's `overrides` replace it with a remote tarball url. npm records
+/// that copy with a registry-looking `resolved`, but installs it from the
+/// override spec, so a hosted pin would never install. The hosted scan
+/// must skip it loudly (`redirect_npm_non_registry_entry_skipped`), leave
+/// the lock byte-identical, and attest nothing in the in-run VEX.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "wall-bound real-npm install; runs on the e2e CI matrix leg"]
+async fn npm_redirect_skips_a_registry_edge_overridden_to_a_url() {
+    let suite = "e2e_redirect_npm_build (overridden-to-url)";
+    if npm_e2e_common::npm_major().is_none() {
+        npm_e2e_common::skip(suite, "`npm` not installed");
+        return;
+    }
+    if !npm_supports_overrides() {
+        println!("N/A {suite}: this npm predates `overrides` (npm 8.3)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    let foo = tmp.path().join("foo");
+    let cache = tmp.path().join("npm-cache");
+    std::fs::create_dir_all(&proj).unwrap();
+    std::fs::create_dir_all(&foo).unwrap();
+    std::fs::write(
+        foo.join("package.json"),
+        format!(
+            r#"{{"name":"foo","version":"1.0.0","dependencies":{{"{DEP}":"^{DEP_VERSION}"}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        foo.join("index.js"),
+        format!("module.exports = require('{DEP}');\n"),
+    )
+    .unwrap();
+    let packed = npm_e2e_common::npm(&foo, &["pack", "--cache", cache.to_str().unwrap()]);
+    assert!(
+        packed.status.success(),
+        "npm pack foo: {}",
+        npm_e2e_common::output_text(&packed)
+    );
+    std::fs::rename(foo.join("foo-1.0.0.tgz"), proj.join("foo-1.0.0.tgz")).unwrap();
+    let tarball = format!("https://registry.npmjs.org/{DEP}/-/{DEP}-{DEP_VERSION}.tgz");
+    std::fs::write(
+        proj.join("package.json"),
+        format!(
+            r#"{{"name":"app","version":"1.0.0","private":true,"dependencies":{{"foo":"file:foo-1.0.0.tgz"}},"overrides":{{"{DEP}":"{tarball}"}}}}"#
+        ),
+    )
+    .unwrap();
+    // npm >= 12 refuses a url override unless remote installs are allowed.
+    std::fs::write(proj.join(".npmrc"), "allow-remote=all\n").unwrap();
+    let out = npm_e2e_common::npm(
+        &proj,
+        &[
+            "install",
+            "--no-audit",
+            "--no-fund",
+            "--cache",
+            cache.to_str().unwrap(),
+        ],
+    );
+    if !out.status.success() {
+        npm_e2e_common::skip(
+            suite,
+            &format!(
+                "`npm install` of the overrides fixture failed (registry unreachable?):\n{}",
+                npm_e2e_common::output_text(&out)
+            ),
+        );
+        return;
+    }
+    // The #1965 premise: the copy's `resolved` looks like a registry entry,
+    // and `foo`'s entry keeps its registry range.
+    let lock_before = std::fs::read(proj.join("package-lock.json")).unwrap();
+    let lock: serde_json::Value = serde_json::from_slice(&lock_before).unwrap();
+    assert_eq!(
+        lock["packages"][format!("node_modules/{DEP}")]["resolved"],
+        tarball.as_str(),
+        "{lock}"
+    );
+    assert_eq!(
+        lock["packages"]["node_modules/foo"]["dependencies"][DEP],
+        format!("^{DEP_VERSION}"),
+        "{lock}"
+    );
+
+    let server = MockServer::start().await;
+    let hosted_url = format!(
+        "{}/patch/npm/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.tgz",
+        server.uri()
+    );
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "packages": [{
+                "purl": PURL,
+                "patches": [{
+                    "uuid": UUID, "purl": PURL, "tier": "free",
+                    "cveIds": [], "ghsaIds": [], "severity": "high",
+                    "title": "overridden-to-url fixture"
+                }]
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "patches": [{
+                "uuid": UUID, "purl": PURL,
+                "publishedAt": "2026-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {}
+            }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": hosted_url,
+                    "purl": PURL,
+                    "artifacts": [{
+                        "kind": "tarball",
+                        "url": hosted_url,
+                        "integrity": { "sha512": "sha512-UEFUQ0hFRA==" }
+                    }],
+                    "registryOverride": null
+                }
+            }
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/view/{UUID}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "uuid": UUID,
+            "purl": PURL,
+            "publishedAt": "2026-01-01T00:00:00Z",
+            "files": {},
+            "vulnerabilities": {
+                GHSA: {
+                    "cves": ["CVE-2026-1111"],
+                    "summary": "overridden-to-url vuln",
+                    "severity": "high",
+                    "description": "d"
+                }
+            },
+            "description": "x", "license": "MIT", "tier": "free"
+        })))
+        .mount(&server)
+        .await;
+
+    let uri = server.uri();
+    let argv = [
+        "scan",
+        "--mode=hosted",
+        "--json",
+        "--yes",
+        "--cwd",
+        proj.to_str().unwrap(),
+        "--api-url",
+        &uri,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+        "--vex",
+        "out.vex.json",
+        "--vex-product",
+        PRODUCT,
+    ];
+    let (_code, stdout, stderr) = run_socket(&proj, &argv);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON ({e}):\n{stdout}\nstderr:\n{stderr}"));
+    let skipped = env["warnings"]
+        .as_array()
+        .and_then(|w| {
+            w.iter()
+                .find(|w| w["code"] == "redirect_npm_non_registry_entry_skipped")
+        })
+        .unwrap_or_else(|| panic!("the overridden copy must be skipped loudly: {env}"));
+    assert!(
+        skipped["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("overrides")),
+        "the skip names the override: {skipped}"
+    );
+    assert_eq!(
+        std::fs::read(proj.join("package-lock.json")).unwrap(),
+        lock_before,
+        "the lock is left byte-identical: {env}"
+    );
+    let vex_path = proj.join("out.vex.json");
+    if vex_path.exists() {
+        let vex: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+        let not_affected = vex["statements"].as_array().is_some_and(|s| {
+            s.iter()
+                .any(|s| s["status"].as_str() == Some("not_affected"))
+        });
+        assert!(!not_affected, "nothing is attested not_affected: {vex}");
+    }
+}
