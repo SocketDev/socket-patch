@@ -259,14 +259,39 @@ pub enum TreePart {
     /// pnpm 11+'s env lockfile document (config dependencies, the pinned
     /// package manager), which installs apart from the project's
     /// `node_modules`: its own tree (owner decision, lock-model divergence
-    /// N4). Its refs and the project document's entries of the same lock
-    /// never contest each other ([`Discovery::contest_within_locks`],
-    /// [`UnwiredCopy`] scopes), its wiring never exempts the project
-    /// document in [`Discovery::contest_across_locks`], and that contest
-    /// skips it both ways: no other lock decides a config dependency, and a
-    /// config dependency decides no other lock's ref. Within the document
-    /// the same-lock rules apply.
+    /// N4). Its wiring never exempts the project document in
+    /// [`Discovery::contest_across_locks`], and that contest skips it both
+    /// ways: no other lock decides a config dependency, and a config
+    /// dependency decides no other lock's ref. Within the document the
+    /// same-lock rules apply. Its entries never contest the project
+    /// document's refs, but the project document's copies DO withhold its
+    /// refs ([`TreePart::withheld_by`], owner decision on #2009).
     PnpmEnv,
+}
+
+impl TreePart {
+    /// Whether a copy of a package installed in tree `copy` of a ref's own
+    /// file withholds that ref (`self`): a copy in the same tree does, and
+    /// so does a pnpm lock's project document copy for a ref in the env
+    /// document of the same lock. A VEX statement covers the release, not
+    /// one install tree, so attesting a config dependency's wiring while
+    /// the project's `node_modules` installs the same `name@version` from
+    /// the registry, a `file:` copy or a bundled copy would claim the
+    /// release is fixed where it is not (owner decision on #2009). The
+    /// reverse does not hold: the env document's copies install into
+    /// pnpm's config store only and withhold no project ref.
+    pub(crate) fn withheld_by(self, copy: TreePart) -> bool {
+        self == copy || (self == TreePart::PnpmEnv && copy == TreePart::File)
+    }
+
+    /// How diagnostics name this tree of root-relative `file`:
+    /// `<file> (env lockfile)` for the env document, else `file`.
+    pub(crate) fn label(self, file: &str) -> String {
+        match self {
+            TreePart::File => file.to_string(),
+            TreePart::PnpmEnv => format!("{file} (env lockfile)"),
+        }
+    }
 }
 
 impl From<crate::formats::pnpm::PnpmDocument> for TreePart {
@@ -766,8 +791,8 @@ pub enum CopyTarget {
 /// extractor has run ([`Discovery::unattest_unwired_copies`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnwiredCopy {
-    /// Only refs of this root-relative file, in this tree of it; `None` =
-    /// refs of any file.
+    /// Only refs of this root-relative file, in a tree this tree of it
+    /// withholds ([`TreePart::withheld_by`]); `None` = refs of any file.
     pub(crate) scope: Option<(PathBuf, TreePart)>,
     pub(crate) target: CopyTarget,
     /// Root-relative file that shows the copy.
@@ -782,7 +807,7 @@ impl UnwiredCopy {
         if self
             .scope
             .as_ref()
-            .is_some_and(|(f, part)| *f != r.source_file || *part != r.part)
+            .is_some_and(|(f, part)| *f != r.source_file || !r.part.withheld_by(*part))
         {
             return false;
         }
@@ -847,8 +872,10 @@ pub struct Discovery {
     /// another entry of the same lock (an `npm:` alias added after the
     /// pin), the npm twin lock, another manager's lock
     /// ([`Discovery::contest_across_locks`]), npm 6's legacy mirror, a Bun
-    /// registry entry. Each is diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is
-    /// neither attested nor unwound by the management commands, but it is
+    /// registry entry, the project document's registry entry beside a pnpm
+    /// env-lockfile ref ([`Discovery::contest_within_locks`]). Each is
+    /// diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is neither attested nor
+    /// unwound by the management commands, but it is
     /// still a pin a live lock records: the rollout's recorded view counts
     /// it ([`HostedPin::recorded`]), so the re-scan that rewires the other
     /// copy is not capped as NEW (#1195). Validated and sorted like `refs`.
@@ -1238,9 +1265,10 @@ impl Discovery {
             let purls: BTreeSet<&str> = self
                 .refs
                 .iter()
-                // A file-level copy: no extractor records one in a pnpm
-                // env lockfile, whose refs are a tree of their own.
-                .filter(|r| r.source_file == u.file && r.part == TreePart::File)
+                // A file-level copy, in the project tree: it withholds a
+                // pnpm env-lockfile ref of the same file too
+                // ([`TreePart::withheld_by`]).
+                .filter(|r| r.source_file == u.file && r.part.withheld_by(TreePart::File))
                 .filter(|r| match &u.version {
                     Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
                     None => true,
@@ -1272,9 +1300,16 @@ impl Discovery {
     /// that copy whatever the wiring does, so the ref is diagnosed
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
     /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
+    ///
+    /// A pnpm env-lockfile ref ([`TreePart::PnpmEnv`]) is withheld by the
+    /// project document's copies too ([`TreePart::withheld_by`]): a `file:`
+    /// copy shadows it as above, and a registry entry of the same release
+    /// moves it to [`Discovery::rewirable`] (a re-run rewires that entry,
+    /// and the project ref then stands in its place, see
+    /// [`Discovery::drop_env_twins`]).
     fn contest_within_locks(&mut self) {
         self.expand_unidentified_copies();
-        if self.unpatched_copies.is_empty() {
+        if self.unpatched_copies.is_empty() && self.refs.iter().all(|r| r.part == TreePart::File) {
             return;
         }
         let refs = std::mem::take(&mut self.refs);
@@ -1282,26 +1317,51 @@ impl Discovery {
             let copy = self
                 .unpatched_copies
                 .iter()
-                .find(|c| c.purl == r.purl && c.file == r.source_file && c.part == r.part)
+                .find(|c| c.purl == r.purl && c.file == r.source_file && r.part.withheld_by(c.part))
                 .cloned();
-            match copy {
-                Some(c) => {
-                    let file = r.source_file.to_string_lossy().into_owned();
-                    self.diag(
-                        DIAG_REF_UNATTRIBUTABLE,
-                        &file,
-                        format!(
-                            "{file}: {} is wired to Socket patch {} but lock entry `{}` {}; \
-                             that copy stays UNPATCHED and nothing is attested",
-                            r.purl, r.uuid, c.key, c.how
-                        ),
-                    );
-                    // Withheld, not lost: rollback / remove / the takeover
-                    // still unwind the wiring (#828).
-                    self.shadow(r);
-                }
-                None => self.refs.push(r),
+            let file = r.source_file.to_string_lossy().into_owned();
+            let label = r.part.label(&file);
+            if let Some(c) = copy {
+                let entry = if c.part == r.part {
+                    ""
+                } else {
+                    "the project document's "
+                };
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{label}: {} is wired to Socket patch {} but {entry}lock entry `{}` {}; \
+                         that copy stays UNPATCHED and nothing is attested",
+                        r.purl, r.uuid, c.key, c.how
+                    ),
+                );
+                // Withheld, not lost: rollback / remove / the takeover
+                // still unwind the wiring (#828).
+                self.shadow(r);
+                continue;
             }
+            let registry = r.part == TreePart::PnpmEnv
+                && self.elsewhere.iter().any(|e| {
+                    e.file == r.source_file && e.part == TreePart::File && e.covers(&r.purl)
+                });
+            if registry {
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{label}: {} is wired to Socket patch {}, but the project document of \
+                         the same lock resolves that version from elsewhere (not a Socket \
+                         patch); a VEX statement covers the release, not one install tree, so \
+                         the patch is not attested while `node_modules` installs the unpatched \
+                         copy — re-run `socket-patch scan` / `vendor` to rewire it too",
+                        r.purl, r.uuid
+                    ),
+                );
+                self.withhold_rewirable(r);
+                continue;
+            }
+            self.refs.push(r);
         }
     }
 

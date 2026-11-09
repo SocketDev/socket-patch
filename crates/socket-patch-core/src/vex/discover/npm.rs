@@ -741,7 +741,11 @@ fn entry_ref(
 /// (config dependencies, the pinned package manager; identified by its
 /// importers, [`PnpmLock::packages`]) is an install tree of its own
 /// ([`TreePart::PnpmEnv`]): its refs are emitted, and they never contest
-/// or are contested by the project document or another lock.
+/// or are contested by another lock, nor contest the project document's.
+/// The project document's registry entry, `file:` copy or bundled copy of
+/// the same `name@version` withholds an env ref, though (owner decision on
+/// #2009, [`TreePart::withheld_by`]): a VEX statement covers the release,
+/// not one install tree.
 ///
 /// With pnpm's `gitBranchLockfile` on and a `pnpm-lock.<branch>.yaml`
 /// present (#556), every ref of the root and member locks is marked
@@ -874,25 +878,18 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 /// be listed (`why`), so a member's `pnpm-lock.<branch>.yaml` cannot be
 /// ruled out. See [`unattest_git_branch_lock`].
 fn unattest_unlisted_branch_locks(file: &str, why: &str, out: &mut Discovery) {
-    for part in BRANCH_LOCK_PARTS {
-        out.unwired_copy(UnwiredCopy {
-            scope: Some((PathBuf::from(file), part)),
-            target: CopyTarget::Any,
-            file: PathBuf::from(file),
-            detail: format!(
-                "its pin is in {file}, but a pnpm branch lock cannot be ruled out: {why}; with \
-                 `gitBranchLockfile` on, pnpm installs a git branch from its own \
-                 `pnpm-lock.<branch>.yaml` rather than {file}"
-            ),
-            kind: UnattestedKind::PnpmGitBranchLock,
-        });
-    }
+    out.unwired_copy(UnwiredCopy {
+        scope: Some((PathBuf::from(file), TreePart::File)),
+        target: CopyTarget::Any,
+        file: PathBuf::from(file),
+        detail: format!(
+            "its pin is in {file}, but a pnpm branch lock cannot be ruled out: {why}; with \
+             `gitBranchLockfile` on, pnpm installs a git branch from its own \
+             `pnpm-lock.<branch>.yaml` rather than {file}"
+        ),
+        kind: UnattestedKind::PnpmGitBranchLock,
+    });
 }
-
-/// Every install tree of a pnpm lock: a branch lock replaces the whole
-/// file, its env lockfile document included, so a branch-lock mark covers
-/// the refs of both documents.
-const BRANCH_LOCK_PARTS: [TreePart; 2] = [TreePart::File, TreePart::PnpmEnv];
 
 /// Mark every ref of the pnpm lock `file` [`UnattestedKind::PnpmGitBranchLock`]
 /// because `branch_locks` (root-relative `pnpm-lock.<branch>.yaml` files)
@@ -904,7 +901,9 @@ const BRANCH_LOCK_PARTS: [TreePart; 2] = [TreePart::File, TreePart::PnpmEnv];
 /// the wiring in `file` is intact (rollback, remove and list still manage
 /// it, and the ledgers keep it live), and no `scan` / `vendor` re-run can
 /// rewire the branch lock. The mark names the branch lock in `file`'s own
-/// directory when there is one.
+/// directory when there is one. A branch lock replaces the whole file, so
+/// the mark is the project tree's, which covers the env lockfile
+/// document's refs too ([`TreePart::withheld_by`]).
 fn unattest_git_branch_lock(file: &str, branch_locks: &[String], out: &mut Discovery) {
     let dir = Path::new(file).parent().unwrap_or(Path::new(""));
     let shown = branch_locks
@@ -912,21 +911,19 @@ fn unattest_git_branch_lock(file: &str, branch_locks: &[String], out: &mut Disco
         .find(|lock| Path::new(lock.as_str()).parent() == Some(dir))
         .or(branch_locks.first())
         .map_or(file, String::as_str);
-    for part in BRANCH_LOCK_PARTS {
-        out.unwired_copy(UnwiredCopy {
-            scope: Some((PathBuf::from(file), part)),
-            target: CopyTarget::Any,
-            file: PathBuf::from(shown),
-            detail: format!(
-                "its pin is in {file} while the pnpm branch lock(s) {} exist: with \
-                 `gitBranchLockfile` on, pnpm installs a git branch from its own \
-                 `pnpm-lock.<branch>.yaml` rather than {file}, and a branch lock's presence \
-                 withholds the statement whatever the setting says",
-                branch_locks.join(", ")
-            ),
-            kind: UnattestedKind::PnpmGitBranchLock,
-        });
-    }
+    out.unwired_copy(UnwiredCopy {
+        scope: Some((PathBuf::from(file), TreePart::File)),
+        target: CopyTarget::Any,
+        file: PathBuf::from(shown),
+        detail: format!(
+            "its pin is in {file} while the pnpm branch lock(s) {} exist: with \
+             `gitBranchLockfile` on, pnpm installs a git branch from its own \
+             `pnpm-lock.<branch>.yaml` rather than {file}, and a branch lock's presence \
+             withholds the statement whatever the setting says",
+            branch_locks.join(", ")
+        ),
+        kind: UnattestedKind::PnpmGitBranchLock,
+    });
 }
 
 /// One pnpm lock at root-relative `file` (see [`extract_pnpm`]).
@@ -953,8 +950,9 @@ async fn extract_pnpm_lock(
         return;
     }
     // Each document is its own install tree: pnpm 11+'s env lockfile is
-    // read as [`TreePart::PnpmEnv`], so its refs and the project document's
-    // entries never contest each other.
+    // read as [`TreePart::PnpmEnv`], so its entries never contest the
+    // project document's refs (the project document's copies do withhold
+    // its refs, [`TreePart::withheld_by`]).
     for document in lock.documents() {
         let tree = PnpmTree::of(file, document);
         extract_pnpm_document(ctx, &tree, &lock, document, disabled, out).await;
@@ -973,11 +971,11 @@ struct PnpmTree<'a> {
 impl<'a> PnpmTree<'a> {
     fn of(file: &'a str, document: PnpmDocument) -> Self {
         let part = TreePart::from(document);
-        let label = match part {
-            TreePart::File => file.to_string(),
-            TreePart::PnpmEnv => format!("{file} (env lockfile)"),
-        };
-        PnpmTree { file, part, label }
+        PnpmTree {
+            file,
+            part,
+            label: part.label(file),
+        }
     }
 }
 
@@ -3411,9 +3409,12 @@ mod tests {
     /// pnpm 11+'s env lockfile document is read as an install tree of its
     /// own (owner decision, lock-model divergence N4). Before, discovery
     /// skipped it (#1949), so a Socket wiring of a config dependency was
-    /// no ref although the hosted planner writes it. Now it is a ref; the
-    /// project document's registry entry, `file:` copy and bundled copy of
-    /// the same release never contest it (and the reverse); its wiring does
+    /// no ref although the hosted planner writes it. Now it is a ref, but
+    /// one the project document of the same lock withholds when it resolves
+    /// the same release from the registry (rewirable), a `file:` copy
+    /// (shadowed) or a bundled copy (unattested): a VEX statement covers the
+    /// release, not one tree (owner decision on #2009). The env document's
+    /// entries never contest the project document's refs; its wiring does
     /// not exempt the project document from contesting another lock; and
     /// it contests no other lock's ref.
     #[tokio::test]
@@ -3440,12 +3441,31 @@ mod tests {
         let bundle = "  host-pkg@1.0.0:\n    resolution: {integrity: sha512-HOST==}\n    \
                       bundledDependencies: true\n\n";
 
-        // Wired in the env document, the project resolving the same release
-        // from the registry, from a `file:` copy, or bundling it: a ref.
-        for (case, project_packages) in [
-            ("registry", registry.to_string()),
-            ("file: copy", format!("{registry}{file_copy}")),
-            ("bundled copy", format!("{registry}{bundle}")),
+        // Wired in the env document, the project document resolving the
+        // same release elsewhere: never attested. A registry entry a
+        // re-run can rewire withholds it as rewirable, a `file:` copy
+        // shadows it, and a bundled copy (whose version the lock does not
+        // record) leaves it a ref marked unattested.
+        #[derive(Debug, PartialEq)]
+        enum Withheld {
+            Rewirable,
+            Shadowed,
+            Unattested,
+        }
+        for (case, project_packages, how) in [
+            ("registry", registry.to_string(), Withheld::Rewirable),
+            ("file: copy", file_copy.to_string(), Withheld::Shadowed),
+            (
+                "registry + file: copy",
+                format!("{registry}{file_copy}"),
+                Withheld::Shadowed,
+            ),
+            ("bundled copy", bundle.to_string(), Withheld::Unattested),
+            (
+                "registry + bundled copy",
+                format!("{registry}{bundle}"),
+                Withheld::Rewirable,
+            ),
         ] {
             for crlf in [false, true] {
                 let p = Project::new();
@@ -3461,24 +3481,84 @@ mod tests {
                     r#"{"name":"left-pad","version":"1.3.0"}"#,
                 );
                 let out = p.discover().await;
-                assert_refs(&out, &hosted);
+                let case = format!("{case} (crlf: {crlf})");
+                let withheld = match how {
+                    Withheld::Rewirable => &out.rewirable,
+                    Withheld::Shadowed => &out.shadowed,
+                    Withheld::Unattested => &out.refs,
+                };
+                assert_eq!(withheld.len(), 1, "{case}: {out:#?}");
                 // The real lock path, with the tree carried beside it
                 // (code-review finding 6: no pseudo path).
                 assert_eq!(
-                    out.refs[0].source_file,
-                    std::path::Path::new("pnpm-lock.yaml")
-                );
-                assert_eq!(out.refs[0].part, TreePart::PnpmEnv, "{case}");
-                assert!(out.unattested.is_empty(), "{case}: {:#?}", out.unattested);
-                assert!(out.shadowed.is_empty(), "{case}: {:#?}", out.shadowed);
-                assert!(out.contested.is_empty(), "{case}: {:#?}", out.contested);
-                assert_eq!(
-                    out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
-                    Some(true),
+                    (
+                        withheld[0].purl.as_str(),
+                        withheld[0].source_file.as_path(),
+                        withheld[0].part
+                    ),
+                    (
+                        "pkg:npm/left-pad@1.3.0",
+                        std::path::Path::new("pnpm-lock.yaml"),
+                        TreePart::PnpmEnv
+                    ),
                     "{case}"
                 );
+                assert!(out.contested.is_empty(), "{case}: {:#?}", out.contested);
+                if how == Withheld::Unattested {
+                    // The ref stays (no re-run clears a bundled copy), but
+                    // the VEX plan omits it.
+                    assert_eq!(out.unattested.len(), 1, "{case}: {:#?}", out.unattested);
+                    let u = &out.unattested[0];
+                    assert_eq!(
+                        (u.purl.as_str(), u.uuid.as_str(), u.kind),
+                        (
+                            "pkg:npm/left-pad@1.3.0",
+                            UUID_A,
+                            UnattestedKind::BundledCopy
+                        ),
+                        "{case}"
+                    );
+                } else {
+                    assert!(out.refs.is_empty(), "{case}: {:#?}", out.refs);
+                    assert_eq!(
+                        out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
+                        Some(false),
+                        "{case}"
+                    );
+                    let diag = out
+                        .diagnostics
+                        .iter()
+                        .find(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                        .unwrap_or_else(|| panic!("{case}: {:#?}", out.diagnostics));
+                    assert!(
+                        diag.detail.starts_with("pnpm-lock.yaml (env lockfile): ")
+                            && diag.detail.contains("project document"),
+                        "{case}: {}",
+                        diag.detail
+                    );
+                }
             }
         }
+
+        // Wired in the env document, the project document resolving
+        // another version from the registry: a ref, attested.
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "{}{}",
+                env(&wired),
+                project(&registry.replace("1.3.0", "1.2.0"))
+            ),
+        );
+        let out = p.discover().await;
+        assert_refs(&out, &hosted);
+        assert_eq!(out.refs[0].part, TreePart::PnpmEnv);
+        assert!(out.unattested.is_empty(), "{:#?}", out.unattested);
+        assert_eq!(
+            out.hosted_claim("pkg:npm/left-pad@1.3.0", UUID_A),
+            Some(true)
+        );
 
         // Wired in the project document, the env document resolving the
         // same release from the registry: a ref.
@@ -3557,8 +3637,8 @@ mod tests {
         assert!(out.contested.is_empty(), "{:#?}", out.contested);
 
         // The env document's wiring does not exempt the project document,
-        // whose registry entry still contests package-lock.json's ref; the
-        // env document's own ref stands.
+        // whose registry entry still contests package-lock.json's ref (and
+        // withholds the env document's own ref).
         let p = Project::new();
         p.write("package-lock.json", &npm_lock);
         p.write(
@@ -3566,10 +3646,16 @@ mod tests {
             format!("{}{}", env(&wired), project(registry)),
         );
         let out = p.discover().await;
-        assert_refs(&out, &hosted);
+        assert!(out.refs.is_empty(), "{:#?}", out.refs);
         assert_eq!(
-            out.refs[0].source_file,
-            std::path::Path::new("pnpm-lock.yaml")
+            out.rewirable
+                .iter()
+                .map(|r| (r.source_file.as_path(), r.part))
+                .collect::<Vec<_>>(),
+            [
+                (std::path::Path::new("package-lock.json"), TreePart::File),
+                (std::path::Path::new("pnpm-lock.yaml"), TreePart::PnpmEnv),
+            ]
         );
         assert_eq!(out.contested.len(), 1, "{:#?}", out.contested);
         let c = &out.contested[0];
