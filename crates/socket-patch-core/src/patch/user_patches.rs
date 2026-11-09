@@ -409,17 +409,29 @@ impl UserPatchIndex {
         } else {
             None
         };
-        let read = match outside {
+        let mut read = match outside {
             Some(root) => read_regular_to_string(&root.join(&file.rel)).await,
             None => view.read_text(&rel).await,
         };
+        // A file the view refused because its real path (through a
+        // symlink) leaves the repository is still a file the package
+        // manager reads. The refusal carries the `NotFound` kind, so it is
+        // caught here and the file is read through the link straight from
+        // disk, as the walk does for an ancestor file: its declarations
+        // still protect their packages, while a file that declares nothing
+        // (a lock with no `patched` entry) does not withhold every package
+        // ahead of the writer's own symlinked-file refusal.
+        let refused = matches!(&read, Err(e) if crate::utils::repo_root::is_refused_read(e));
+        if refused {
+            if let Some(root) = view.disk_root_reading([&rel]) {
+                read = read_regular_to_string(&root.join(&rel)).await;
+            }
+        }
         match read {
             Ok(text) => Some(strip_bom(&text).to_owned()),
-            // A file the view refused because its real path (through a
-            // symlink) leaves the repository is still a file the package
-            // manager reads. The refusal carries the `NotFound` kind, so it
-            // is caught first and fails closed instead of reading as absent.
-            Err(e) if crate::utils::repo_root::is_refused_read(&e) => {
+            // Fail closed when the refused file can't be read through the
+            // link either, instead of reading as absent.
+            Err(e) if refused || crate::utils::repo_root::is_refused_read(&e) => {
                 self.unknown(
                     ecosystem,
                     &file.shown,
@@ -1899,11 +1911,13 @@ mod tests {
 
     /// Final review (#2018): a project file symlinked to a target outside
     /// the repository is refused by the view's bound, but the package
-    /// manager still reads it, so it protects every npm package instead of
-    /// reading as "no patches".
+    /// manager still reads it, so it is read through the link: its
+    /// declarations protect their packages instead of reading as "no
+    /// patches", and a package it does not name stays patchable (the
+    /// writer's own symlinked-file refusal handles the link).
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_symlinked_file_outside_the_repository_fails_closed() {
+    async fn a_symlinked_file_outside_the_repository_is_read_through_the_link() {
         let outer = tempfile::tempdir().unwrap();
         let repo = outer.path().join("repo");
         write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
@@ -1924,6 +1938,30 @@ mod tests {
             !index.conflicts("pkg:npm/left-pad@1.3.0").is_empty(),
             "{index:?}"
         );
+        assert!(
+            index.conflicts("pkg:npm/other@1.0.0").is_empty(),
+            "{index:?}"
+        );
+    }
+
+    /// A refused symlink that can't be read through the link either (its
+    /// target outside the repository is not a regular file) fails closed:
+    /// unknown metadata protects every npm package.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_symlinked_file_outside_the_repository_fails_closed() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
+        write(&repo, "package.json", "{}");
+        std::fs::create_dir_all(outer.path().join("shared/pnpm-workspace.yaml")).unwrap();
+        std::os::unix::fs::symlink(
+            outer.path().join("shared/pnpm-workspace.yaml"),
+            repo.join("pnpm-workspace.yaml"),
+        )
+        .unwrap();
+        let view = ProjectView::Disk(&repo);
+        let index = UserPatchIndex::npm_family_in(&view, &[]).await;
         assert!(
             !index.conflicts("pkg:npm/other@1.0.0").is_empty(),
             "{index:?}"
