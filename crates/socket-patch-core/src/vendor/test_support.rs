@@ -503,6 +503,7 @@ pub(crate) fn tree_snapshot(root: &Path) -> std::collections::BTreeMap<String, V
     out
 }
 
+pub mod production_sources;
 pub mod service_fixture;
 
 /// Keep-side oracle for the prune GC
