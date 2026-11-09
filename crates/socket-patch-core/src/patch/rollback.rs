@@ -380,14 +380,15 @@ pub fn cannot_rollback_error(file: &str, why: &str) -> String {
 /// a restore of a twin alone still counts as rolled back (see
 /// [`store_copies`](crate::patch::store_copies)).
 pub async fn rollback_package_patch(
+    scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
     blobs_path: &Path,
     dry_run: bool,
 ) -> RollbackResult {
-    crate::patch::store_copies::fan_out(package_key, pkg_path, |path| async move {
-        rollback_package_patch_at(package_key, &path, files, blobs_path, dry_run).await
+    crate::patch::store_copies::fan_out(scope, package_key, pkg_path, |path| async move {
+        rollback_package_patch_at(scope, package_key, &path, files, blobs_path, dry_run).await
     })
     .await
 }
@@ -408,6 +409,7 @@ pub async fn rollback_package_patch(
 /// record) is left, as the primary is. `None` when no copy holds this
 /// record's patch (or `package_key` is not npm).
 pub async fn rollback_store_copies_holding_patch(
+    scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -418,12 +420,13 @@ pub async fn rollback_store_copies_holding_patch(
         return None;
     }
     let mut folded: Option<RollbackResult> = None;
-    for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(pkg_path).await {
+    for copy in crate::crawlers::npm_crawler::find_store_peer_variant_copies(scope, pkg_path).await
+    {
         if !holds_this_patch(&copy, files).await {
             continue;
         }
         let copy_result =
-            rollback_package_patch_at(package_key, &copy, files, blobs_path, dry_run).await;
+            rollback_package_patch_at(scope, package_key, &copy, files, blobs_path, dry_run).await;
         let result = folded.get_or_insert_with(|| RollbackResult {
             package_key: package_key.to_string(),
             package_path: pkg_path.display().to_string(),
@@ -606,6 +609,7 @@ async fn mark_crlf_bin_rewrite(
 }
 
 async fn rollback_package_patch_at(
+    scope: crate::utils::repo_root::ReadScope,
     package_key: &str,
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -664,6 +668,7 @@ async fn rollback_package_patch_at(
     // already-original shared copy needs no write and passes.
     if !all_original {
         if let Some(store) = crate::patch::shared_store::shared_store_of_patch_dirs(
+            scope,
             pkg_path,
             files.keys().map(String::as_str),
         )
@@ -937,6 +942,7 @@ mod tests {
             );
         }
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/lodash@4.17.20",
             pkg_dir.path(),
             &files,
@@ -1263,6 +1269,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:golang/example.com/x@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1326,6 +1333,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1372,6 +1380,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1416,6 +1425,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1448,6 +1458,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1533,6 +1544,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1610,8 +1622,15 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            &pkg_dir,
+            &files,
+            &blobs_dir,
+            false,
+        )
+        .await;
 
         assert!(!result.success, "escaping delete must be refused");
         assert!(result.files_rolled_back.is_empty());
@@ -1645,6 +1664,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1678,6 +1698,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1724,6 +1745,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:golang/example.com/x@1.0.0",
             pkg_dir.path(),
             &files,
@@ -1784,6 +1806,7 @@ mod tests {
         let files = write_added_files(site.path(), &["six_safe/__init__.py"]).await;
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/six@1.16.0",
             site.path(),
             &files,
@@ -1820,6 +1843,7 @@ mod tests {
             .unwrap();
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/six@1.16.0",
             site.path(),
             &files,
@@ -1858,6 +1882,7 @@ mod tests {
             .unwrap();
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/pkg@1.0.0",
             site.path(),
             &files,
@@ -1889,9 +1914,15 @@ mod tests {
             .await
             .unwrap();
 
-        let result =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
 
         assert!(result.success, "{:?}", result.error);
         assert!(!pkg.path().join("lib/new").exists());
@@ -1915,9 +1946,15 @@ mod tests {
         std::os::unix::fs::symlink(&target, pkg.path().join("link")).unwrap();
         let files = write_added_files(pkg.path(), &["link/inner/added.js"]).await;
 
-        let result =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
 
         assert!(!result.success);
         let err = result.error.as_deref().unwrap_or_default();
@@ -1950,6 +1987,7 @@ mod tests {
             .unwrap();
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:golang/example.com/x@1.0.0",
             pkg.path(),
             &files,
@@ -2053,8 +2091,15 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            &pkg_dir,
+            &files,
+            &blobs_dir,
+            false,
+        )
+        .await;
 
         assert!(!result.success, "escaping blob hash must be refused");
         assert!(result.files_rolled_back.is_empty());
@@ -2100,6 +2145,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2191,9 +2237,15 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:cargo/demo@1.0.0", pkg, &files, blobs_dir.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
 
         assert!(result.success, "rollback failed: {:?}", result.error);
         assert_eq!(result.files_rolled_back.len(), 2);
@@ -2268,9 +2320,15 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:cargo/demo@1.0.0", pkg, &files, blobs_dir.path(), false)
-                .await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
 
         assert!(
             result.success,
@@ -2360,6 +2418,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:cargo/mycrate@1.0.0",
             pkg,
             &files,
@@ -2477,8 +2536,15 @@ mod tests {
 
         let mut files = HashMap::new();
         files.insert("index.js".to_string(), file_info);
-        let result =
-            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            &pkg_dir,
+            &files,
+            &blobs_dir,
+            false,
+        )
+        .await;
         assert!(!result.success);
         let err = result.error.unwrap();
         assert!(
@@ -2584,8 +2650,15 @@ mod tests {
             },
         );
 
-        let result =
-            rollback_package_patch("pkg:npm/test@1.0.0", &pkg_dir, &files, &blobs_dir, false).await;
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            &pkg_dir,
+            &files,
+            &blobs_dir,
+            false,
+        )
+        .await;
 
         assert!(!result.success, "symlinked blob entry must be refused");
         assert!(result.files_rolled_back.is_empty());
@@ -2773,6 +2846,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2837,6 +2911,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2907,6 +2982,7 @@ mod tests {
         assert!(status.success(), "chflags uchg failed");
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/test@1.0.0",
             pkg_dir.path(),
             &files,
@@ -2981,6 +3057,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -3013,6 +3090,7 @@ mod tests {
             .await
             .unwrap();
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:npm/foo@1.0.0",
             &primary,
             &files,
@@ -3079,7 +3157,15 @@ mod tests {
                 },
             );
             for dry_run in [true, false] {
-                let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, dry_run).await;
+                let result = rollback_package_patch(
+                    crate::utils::repo_root::ReadScope::Workspace,
+                    purl,
+                    &pkg_root,
+                    &files,
+                    &blobs,
+                    dry_run,
+                )
+                .await;
                 assert!(!result.success, "{purl} dry_run={dry_run}: must refuse");
                 let err = result.error.unwrap_or_default();
                 assert!(
@@ -3091,7 +3177,15 @@ mod tests {
 
             // Already original: nothing to write, so nothing to refuse.
             std::fs::write(store_pkg.join("index.js"), &original).unwrap();
-            let result = rollback_package_patch(purl, &pkg_root, &files, &blobs, false).await;
+            let result = rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                purl,
+                &pkg_root,
+                &files,
+                &blobs,
+                false,
+            )
+            .await;
             assert!(result.success, "{purl}: {:?}", result.error);
         }
     }
@@ -3126,6 +3220,7 @@ mod tests {
         );
         for dry_run in [true, false] {
             let result = rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/left-pad@1.3.0",
                 &nm.join("left-pad"),
                 &files,
@@ -3178,6 +3273,7 @@ mod tests {
         );
 
         let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
             "pkg:pypi/pkg@1.0.0",
             site.path(),
             &files,
@@ -3221,18 +3317,30 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(after),
             },
         )]);
-        let res =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let res = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(res.success, "{res:?}");
         assert_eq!(res.files_rolled_back, vec!["package/cli.js".to_string()]);
         assert_eq!(
             tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
             b"#!/usr/bin/env node\nconsole.log(1);\r\n"
         );
-        let again =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let again = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(again.success, "{again:?}");
         assert!(again.files_rolled_back.is_empty(), "{again:?}");
     }
@@ -3273,8 +3381,15 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(after),
             },
         )]);
-        let res =
-            rollback_package_patch("pkg:npm/x@1.0.0", &pkg, &files, blobs.path(), false).await;
+        let res = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            &pkg,
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(res.success, "{res:?}");
         assert_eq!(
             tokio::fs::read(pkg.join("cli.js")).await.unwrap(),
@@ -3321,8 +3436,15 @@ mod tests {
             .await
             .unwrap();
             tokio::fs::write(pkg.join("cli.js"), before).await.unwrap();
-            let res =
-                rollback_package_patch("pkg:npm/x@1.0.0", &pkg, &files, blobs.path(), false).await;
+            let res = rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:npm/x@1.0.0",
+                &pkg,
+                &files,
+                blobs.path(),
+                false,
+            )
+            .await;
             assert!(res.success, "{with_blob}: {res:?}");
             let expected: &[u8] = if with_blob {
                 b"#!/usr/bin/env node\nconsole.log(1);\r\n"
@@ -3356,9 +3478,15 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(b"#!/usr/bin/env node\r\nnew();\r\n"),
             },
         )]);
-        let res =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let res = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(res.success, "{res:?}");
         assert!(!pkg.path().join("cli.js").exists());
     }
@@ -3387,9 +3515,15 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(after),
             },
         )]);
-        let res =
-            rollback_package_patch("pkg:npm/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let res = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(res.success, "{res:?}");
         assert_eq!(
             tokio::fs::read(pkg.path().join("cli.js")).await.unwrap(),
@@ -3418,9 +3552,15 @@ mod tests {
                 after_hash: compute_git_sha256_from_bytes(after),
             },
         )]);
-        let res =
-            rollback_package_patch("pkg:pypi/x@1.0.0", pkg.path(), &files, blobs.path(), false)
-                .await;
+        let res = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:pypi/x@1.0.0",
+            pkg.path(),
+            &files,
+            blobs.path(),
+            false,
+        )
+        .await;
         assert!(res.success, "{res:?}");
         assert_eq!(
             tokio::fs::read(pkg.path().join("cli.py")).await.unwrap(),

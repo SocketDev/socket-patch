@@ -671,6 +671,7 @@ mod tests {
                 "upper={upper}: {verify:?}"
             );
             let applied = apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
                 "pkg:npm/demo@1.0.0",
                 &pkg,
                 files,
@@ -688,8 +689,15 @@ mod tests {
                 VerifyRollbackStatus::Ready,
                 "upper={upper}: {verify:?}"
             );
-            let rolled =
-                rollback_package_patch("pkg:npm/demo@1.0.0", &pkg, files, &blobs, false).await;
+            let rolled = rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:npm/demo@1.0.0",
+                &pkg,
+                files,
+                &blobs,
+                false,
+            )
+            .await;
             assert!(rolled.success, "upper={upper}: {:?}", rolled.error);
             assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), original);
         }

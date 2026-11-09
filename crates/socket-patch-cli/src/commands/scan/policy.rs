@@ -361,6 +361,7 @@ impl ScanPolicy {
                 skipped_purls.push(pkg.purl.clone());
             }
         }
+        // socket.yml policy judges a project's nested roots: a workspace run.
         let crawler = socket_patch_core::crawlers::NpmCrawler::new();
         let mut more: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for (root, ok) in roots {
