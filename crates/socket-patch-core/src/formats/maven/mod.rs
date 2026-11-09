@@ -440,10 +440,8 @@ impl PomScope {
     /// artifactId (keeping an unresolved reference,
     /// [`interpolate_keeping`]) and version ([`interpolate_strict`]) read
     /// together ([`Self::resolve_all_in_build`]), every reading whose
-    /// coordinates differ from what it reads with no profile active
-    /// ([`ScopedDep::group`] / [`ScopedDep::artifact`]). A profile
-    /// declaration's own profile is always active with it, so what it reads
-    /// there is one too.
+    /// coordinates differ from what it reads with no profile active but
+    /// the one holding it ([`ScopedDep::group`] / [`ScopedDep::artifact`]).
     pub(crate) fn coordinate_alternatives(&self, dep: &ScopedDep) -> Vec<CoordinateAlternative> {
         let (Some(group_text), Some(artifact_text), Some(group), Some(artifact)) = (
             dep.group_text.as_deref(),
@@ -463,22 +461,9 @@ impl PomScope {
         if let Some(version) = dep.version_text.as_deref() {
             texts.push((version, interpolate_strict));
         }
-        let pos = dep.element.start;
-        let (own_base, readings) = self.resolve_all_in_build(&texts, pos);
-        let own: Vec<String> = self
-            .own_profile(pos)
-            .into_iter()
-            .map(|i| self.profile_properties[i].id.clone())
-            .collect();
-        let own_reading = (!own.is_empty()).then(|| {
-            let mut values = own_base;
-            if let Some(v) = values.get_mut(2) {
-                *v = v.take().or_else(|| dep.version_text.clone());
-            }
-            (values, MovedBy::Profiles(own))
-        });
+        let (_, readings) = self.resolve_all_in_build(&texts, dep.element.start);
         let mut out: Vec<CoordinateAlternative> = Vec::new();
-        for (values, by) in own_reading.into_iter().chain(readings) {
+        for (values, by) in readings {
             let mut values = values.into_iter();
             let (Some(Some(g)), Some(Some(a))) = (values.next(), values.next()) else {
                 continue;
@@ -503,13 +488,16 @@ impl PomScope {
         out
     }
 
-    /// `text` (a coordinate) with every `${name}` the build defines with
-    /// no profile active interpolated, an undefined one kept as written
-    /// ([`interpolate_lenient`]). What any profile (a declaration's own
-    /// included) makes of it is [`ScopedDep::coordinate_alternatives`]'
-    /// job, which every coordinate check weighs.
-    fn interpolate_coordinate(&self, text: &str) -> String {
-        interpolate_lenient(text, &|name| self.lookup(name, &[], true))
+    /// `text` (a coordinate of the declaration at `pos`) with every
+    /// `${name}` the build defines interpolated, reading the declaration's
+    /// own profile `<properties>` first when it sits in a profile (as its
+    /// version is: that profile is always active with it), an undefined
+    /// one kept as written ([`interpolate_lenient`]). What other profiles
+    /// make of it is [`Self::coordinate_alternatives`]' job, which every
+    /// coordinate check weighs.
+    fn interpolate_coordinate(&self, text: &str, pos: usize) -> String {
+        let own = self.own_profile(pos);
+        interpolate_lenient(text, &|name| self.lookup(name, &own, true))
     }
 
     /// Inside a plugin / deploy section (never project resolution).
@@ -556,12 +544,11 @@ fn inside(pos: usize, set: &[Element]) -> bool {
 pub(crate) struct ScopedDep {
     pub(crate) element: Element,
     /// `<groupId>` / `<artifactId>` with every `${prop}` the build defines
-    /// with no profile active (user properties, the project model, the
-    /// root `<properties>`) interpolated
-    /// ([`PomScope::interpolate_coordinate`]); an undefined one stays as
-    /// written, so [`may_name`] can tell it apart. What a profile (a
-    /// `<profiles>` declaration's own included) makes of them is
-    /// [`PomScope::coordinate_alternatives`]' job.
+    /// with no profile active but, for a `<profiles>` declaration, its own
+    /// (user properties, the project model, the root `<properties>`)
+    /// interpolated ([`PomScope::interpolate_coordinate`]); an undefined
+    /// one stays as written, so [`may_name`] can tell it apart. What other
+    /// profiles make of them is [`PomScope::coordinate_alternatives`]' job.
     pub(crate) group: Option<String>,
     pub(crate) artifact: Option<String>,
     /// The trimmed `<groupId>` / `<artifactId>` text as written.
@@ -591,10 +578,10 @@ impl PomScope {
                 element: dep,
                 group: group_text
                     .as_deref()
-                    .map(|g| self.interpolate_coordinate(g)),
+                    .map(|g| self.interpolate_coordinate(g, dep.start)),
                 artifact: artifact_text
                     .as_deref()
-                    .map(|a| self.interpolate_coordinate(a)),
+                    .map(|a| self.interpolate_coordinate(a, dep.start)),
                 group_text,
                 artifact_text,
                 version_inner: version.map(|v| {
@@ -1658,7 +1645,7 @@ mod tests {
             deps,
             [
                 (false, "org.a".to_string(), vec![pair("org.b", "x")]),
-                (true, "org.a".to_string(), vec![pair("org.b", "x")]),
+                (true, "org.b".to_string(), vec![]),
             ]
         );
     }

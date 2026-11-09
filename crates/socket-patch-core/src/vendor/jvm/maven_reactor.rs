@@ -2274,7 +2274,7 @@ impl Reactor {
     /// coordinate, which no pin reaches: an executable one is warned about
     /// as `classifier_declared`, as `rewrite_declarations` does (`sources` /
     /// `javadoc` never run; `test-jar` is the `tests` copy), and any other
-    /// `<type>` but `jar` is not the g:a's jar. Text that can never
+    /// literal `<type>` but `jar` is not the g:a's jar (a `${…}` one may be). Text that can never
     /// read the g:a, whatever its properties say ([`may_interpolate_to`]),
     /// is ruled out first, before any inheritor or profile is read.
     fn warn_property_coordinates(
@@ -2312,9 +2312,10 @@ impl Reactor {
                     .is_some_and(|c| !is_executable_classifier(c))
                 || !may_interpolate_to(&g, patch.group_id)
                 || !may_interpolate_to(&a, patch.artifact_id)
+                // A `${…}` type may be `jar`, as discovery reads it.
                 || type_text
                     .as_deref()
-                    .is_some_and(|t| t != "jar" && t != "test-jar")
+                    .is_some_and(|t| t != "jar" && t != "test-jar" && !t.contains("${"))
             {
                 continue;
             }
@@ -6393,6 +6394,32 @@ mod tests {
                 assert!(root_pinned(&plan, &files), "{profile}");
             }
         }
+
+        // A `${…}` type may be `jar`, as discovery reads it: weighed too.
+        let typed = module(
+            "a",
+            &format!(
+                "{}{}",
+                dep("1.10.0"),
+                other("<version>1.9</version><type>${t}</type>")
+            ),
+        );
+        let files = fs(&[
+            (
+                "pom.xml",
+                &root_with(props, "<lib.group>org.apache.commons</lib.group>"),
+            ),
+            ("a/pom.xml", &typed),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let plan = run(&files).unwrap();
+        assert_eq!(
+            reasons(&plan),
+            ["coordinates_overridden"],
+            "{:?}",
+            plan.warnings
+        );
+        assert!(!root_pinned(&plan, &files));
 
         // No version of its own: the pin applies, so the root stays pinned.
         let files = fs(&[

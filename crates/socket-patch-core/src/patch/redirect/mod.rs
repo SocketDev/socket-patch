@@ -11085,6 +11085,22 @@ mod tests {
             let out = r.files.get("pom.xml").expect("pom rewritten");
             assert!(out.contains(MAVEN_SUFFIXED), "{deps}: pinned: {out}");
         }
+        // A profile declaration whose groupId only its own profile's
+        // `<properties>` define, as another group: it is read under its own
+        // profile, so it never names the GA, and the pin lands.
+        let own = format!(
+            "<project>\n  <dependencies>\n    {pinned}\n  </dependencies>\n  <profiles>\
+             <profile><id>p</id><properties><g>org.other</g></properties><dependencies>{}\
+             </dependencies></profile></profiles>\n</project>\n",
+            decl("${g}", "slf4j-api", "2.0")
+        );
+        let r = rewrite_registry_redirect(
+            &BTreeMap::from([("pom.xml".to_string(), own)]),
+            &[maven_override()],
+        );
+        assert!(warning_codes(&r).is_empty(), "{:?}", r.warnings);
+        let out = r.files.get("pom.xml").expect("pom rewritten");
+        assert!(out.contains(MAVEN_SUFFIXED), "pinned: {out}");
     }
 
     /// A versioned `<profiles>` declaration through an undefined coordinate

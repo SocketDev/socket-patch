@@ -2645,16 +2645,6 @@ mod tests {
                 vec![to_slf4j.clone()],
                 None,
             ),
-            // A profile declaration its own profile's properties retarget.
-            case(
-                h,
-                with(""),
-                vec![format!(
-                    "{to_slf4j}<dependencies>\n{}</dependencies>\n",
-                    other(Some("1.7.36"))
-                )],
-                None,
-            ),
             // Through a user property lower in the chain.
             case(
                 "<h>${corp}</h>",
@@ -2666,6 +2656,26 @@ mod tests {
         for c in &withheld {
             assert_coordinate_case(c, false).await;
         }
+        // A profile declaration its own profile's properties retarget: it
+        // is read under its own profile, so it is a profile declaration of
+        // the GA itself.
+        let own = property_project(
+            h,
+            &with(""),
+            &[&format!(
+                "{to_slf4j}<dependencies>\n{}</dependencies>\n",
+                other(Some("1.7.36"))
+            )],
+        );
+        let out = run(&own).await;
+        assert_refs(&out, &[(FX_PURL, UUID_A, WiringMode::Hosted)]);
+        let kinds: Vec<_> = out.unattested.iter().map(|u| u.kind).collect();
+        assert_eq!(
+            kinds,
+            [UnattestedKind::MavenProfileUnpatched],
+            "{:?}",
+            out.unattested
+        );
         let attested = [
             // No version of its own: the live pin applies.
             case(h, with(&other(None)), vec![to_slf4j.clone()], None),
@@ -2769,6 +2779,19 @@ mod tests {
                     dep("${g}", "slf4j-api", Some(&pin))
                 ),
                 vec![in_props("<x>org.other</x>")],
+                none.clone(),
+            ),
+            // A profile declaration whose groupId only its own profile's
+            // `<properties>` define, as another group: whenever it is
+            // read, it names that group.
+            (
+                String::new(),
+                with(""),
+                vec![format!(
+                    "{}<dependencies>\n{}</dependencies>\n",
+                    in_props("<g>org.other</g>"),
+                    dep("${g}", "slf4j-api", Some("2.0"))
+                )],
                 none.clone(),
             ),
         ] {
