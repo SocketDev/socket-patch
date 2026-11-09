@@ -134,7 +134,14 @@ a version without a non-empty section in this file.
   - `vex` reads the `go.work` that governs the project (`GOWORK`, else the
     nearest one at or above it, with members anywhere), as hosted and
     vendored modes already did, and no longer attests a Socket replace the
-    workspace keeps out of the build (`go_workspace_override`) (#2011).
+    workspace keeps out of the build (`go_workspace_override`). Such a
+    replace stays visible to `list`, `rollback` and `remove`, and a root
+    `go.work` replace that `go` never reads no longer withholds the root
+    `go.mod`'s copy of it (#2011, #2031).
+  - The in-memory hosted engine judges a Go workspace from the project's
+    own files instead of probing the process's working directory, so a
+    root module the `go.work` does not `use` is no longer refused for a
+    missing `go.mod` (or answered from the server's) (#2031).
 - **JVM.**
   - A Maven 4 root that builds its subdirectories implicitly (model 4.1.0,
     `pom` packaging, no `<subprojects>`) is treated as a reactor by hosted
