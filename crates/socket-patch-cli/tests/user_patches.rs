@@ -183,10 +183,12 @@ fn unknown_local_edits_fail_closed_by_default_including_yes_silent_and_dry_run()
 #[test]
 fn unrelated_versions_and_ecosystems_are_not_blocked() {
     let tmp = fixture();
+    // A pnpm patch for another release (patch-package's patches apply to
+    // every installed version, so they can't stand in here).
     write(
         tmp.path(),
-        "patches/example+2.0.0.patch",
-        b"different release\n",
+        "pnpm-workspace.yaml",
+        b"patchedDependencies:\n  example@2.0.0: patches/example.patch\n",
     );
     write(
         tmp.path(),

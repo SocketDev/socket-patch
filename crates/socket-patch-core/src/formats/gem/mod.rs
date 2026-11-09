@@ -290,6 +290,7 @@ impl<'t> GemfileLock<'t> {
                 out.push(LockfileEntry {
                     ecosystem: "gem",
                     source_kind: SourceKind::Unspecified,
+                    pnpm_env: false,
                     purl,
                     resolved,
                     name: name.to_string(),

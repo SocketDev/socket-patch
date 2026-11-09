@@ -493,6 +493,7 @@ impl CargoLock {
             out.push(LockfileEntry {
                 ecosystem: "cargo",
                 source_kind,
+                pnpm_env: false,
                 purl,
                 name: pkg.name.clone(),
                 version,

@@ -43,6 +43,7 @@ pub(super) async fn inventory_go_sum_raw_in(view: &ProjectView<'_>) -> Option<Ve
         out.push(LockfileEntry {
             ecosystem: "golang",
             source_kind: SourceKind::Unspecified,
+            pnpm_env: false,
             name: line.module.to_string(),
             version: line.version.to_string(),
             purl,

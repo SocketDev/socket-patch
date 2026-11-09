@@ -2184,3 +2184,125 @@ async fn issue_1630_berry_exec_and_git_copies_are_named() {
         }
     }
 }
+
+/// REGRESSION: the in-memory engine (no consent gate in front of it, unlike
+/// the CLI) pinned a package the project patches itself with pnpm
+/// (`patchedDependencies`, in `pnpm-workspace.yaml`, `package.json`'s
+/// `pnpm` field or the lock), yarn (a `patch:` descriptor in
+/// `package.json`, or the locator `yarn.lock` resolves) or patch-package,
+/// so the install stacked the user's diff on the hosted
+/// patch. Such a candidate is now withheld from every rewriter, skipped
+/// `user_patch_conflict` with a warning, and its lock left untouched;
+/// another package's patch withholds nothing.
+#[tokio::test]
+async fn user_patched_npm_packages_are_never_pinned() {
+    let berry_wrapper =
+        "\"left-pad\": \"patch:left-pad@npm%3A^1.3.0#./.yarn/patches/left-pad.patch\"";
+    let cases: Vec<(&str, &str, String, &str)> = vec![
+        (
+            "redirect/npm/pnpm/basic",
+            "pnpm-workspace.yaml",
+            "patchedDependencies:\n  left-pad@1.3.0: patches/left-pad@1.3.0.patch\n".into(),
+            "pnpm-lock.yaml",
+        ),
+        (
+            "redirect/npm/pnpm/basic",
+            "package.json",
+            r#"{"pnpm":{"patchedDependencies":{"left-pad":"patches/left-pad.patch"}}}"#.into(),
+            "pnpm-lock.yaml",
+        ),
+        (
+            "redirect/npm/yarn-berry/basic",
+            "package.json",
+            String::from_utf8(
+                fixture_files(&fixtures_root().join("redirect/npm/yarn-berry/basic/input"))
+                    ["package.json"]
+                    .clone(),
+            )
+            .unwrap()
+            .replacen("\"left-pad\": \"^1.3.0\"", berry_wrapper, 1),
+            "yarn.lock",
+        ),
+        (
+            "redirect/npm/yarn-berry/basic",
+            "yarn.lock",
+            format!(
+                "{}\n\"left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/patches/lp.patch\":\n  \
+                 version: 1.3.0\n  resolution: \"left-pad@patch:left-pad@npm%3A1.3.0#./.yarn/\
+                 patches/lp.patch::version=1.3.0&hash=abc123\"\n  languageName: node\n  \
+                 linkType: hard\n",
+                String::from_utf8(
+                    fixture_files(&fixtures_root().join("redirect/npm/yarn-berry/basic/input"))
+                        ["yarn.lock"]
+                        .clone()
+                )
+                .unwrap()
+            ),
+            "yarn.lock",
+        ),
+        (
+            NPM_FIXTURE,
+            "patches/left-pad+1.3.0.patch",
+            "diff\n".into(),
+            "package-lock.json",
+        ),
+    ];
+    for (fixture, file, text, lock) in cases {
+        let dir = fixtures_root().join(fixture);
+        let server = MockServer::start().await;
+        mount_api(
+            &server,
+            &patches_from_overrides(&dir.join("overrides.json"), None),
+        )
+        .await;
+        let files = fixture_files(&dir.join("input"));
+        let control = run_engine(&server, build_input(&files, &[], options(false))).await;
+        assert_eq!(
+            control.projects[0].redirected.len(),
+            1,
+            "{fixture}: control {:?}",
+            control.projects[0].skipped
+        );
+
+        let mut files = files;
+        files.insert(file.to_string(), text.clone().into_bytes());
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        let project = &output.projects[0];
+        assert!(project.error.is_none(), "{fixture}: {:?}", project.error);
+        assert!(
+            project.redirected.is_empty(),
+            "{fixture} {file}: {:?}",
+            project.redirected
+        );
+        let skip = project
+            .skipped
+            .iter()
+            .find(|s| s.reason == "user_patch_conflict")
+            .unwrap_or_else(|| panic!("{fixture} {file}: {:?}", project.skipped));
+        assert_eq!(skip.purl, "pkg:npm/left-pad@1.3.0");
+        assert!(
+            skip.detail.as_deref().is_some_and(|d| d.contains(file)),
+            "{fixture}: {:?}",
+            skip.detail
+        );
+        let warnings = project.redirect["warnings"].as_array().unwrap();
+        assert!(
+            warnings.iter().any(|w| w["code"] == "user_patch_conflict"),
+            "{fixture}: {warnings:?}"
+        );
+        assert!(
+            output.changed_files.iter().all(|f| f.path != lock),
+            "{fixture}: {lock} must stay untouched"
+        );
+
+        // Another package's patch withholds nothing.
+        let mut files = fixture_files(&dir.join("input"));
+        files.insert(
+            "pnpm-workspace.yaml".into(),
+            b"patchedDependencies:\n  is-number@7.0.0: patches/is-number.patch\n".to_vec(),
+        );
+        files.insert("patches/is-number+7.0.0.patch".into(), b"diff\n".to_vec());
+        let output = run_engine(&server, build_input(&files, &[], options(false))).await;
+        assert_eq!(output.projects[0].redirected.len(), 1, "{fixture}: other");
+    }
+}

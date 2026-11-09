@@ -44,7 +44,10 @@
 //!   whatever raw text survives. Only for a uuid no read file mentions
 //!   (formats no extractor reads, patch servers outside the host allowlist)
 //!   does the ledger's own recorded wiring decide — only files that PIN the
-//!   resolution, never a leftover registry definition; a vendor entry
+//!   resolution, never a leftover registry definition — and a hosted
+//!   record whose lock entry or recorded wiring routes the uuid through a
+//!   hosted-shaped url on an origin this run was not given is never
+//!   attested (core `RecordLiveness::Undecided`, fail closed); a vendor entry
 //!   recording no wiring (repair's reconstruction) probes its ecosystem's
 //!   root locks; a lock inventory entry resolving the purl elsewhere is
 //!   dead. A reverted lockfile plus a leftover ledger or artifact must not
@@ -82,7 +85,7 @@ use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
 use socket_patch_core::vendor::state::{VendorArtifact, VendorEntry, VendorState};
 use socket_patch_core::vex::discover::{
-    vendor_ref, Discovery, LedgerLiveness, PatchedRef, WiringMode,
+    vendor_ref, Discovery, LedgerLiveness, PatchedRef, RecordLiveness, WiringMode,
 };
 use socket_patch_core::vex::{FailedPatch, Unattested, UnattestedKind};
 
@@ -237,12 +240,21 @@ const NOTE_MAVEN_REACTOR_ROOT: &str = "vex_maven_reactor_root";
 /// classifier copy at another version, which the pin does not reach
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CLASSIFIER_UNPATCHED: &str = "vex_maven_classifier_unpatched";
+/// Omission tag and note: a hosted Cargo pin beside another declaration of
+/// the crate that names no Socket registry, which cargo resolves as a
+/// separate, unpatched package (`vex::Unattested`).
+const NOTE_CARGO_UNPINNED_DECLARATION: &str = "vex_cargo_unpinned_declaration";
+/// Omission tag and note: a vendored Cargo copy beside a copy of the crate
+/// from a source its `[patch]` entry does not redirect (another registry,
+/// git), which cargo builds unpatched (`vex::Unattested`).
+const NOTE_CARGO_PATCH_BYPASSED: &str = "vex_cargo_patch_bypassed";
 /// Omission tag and note: a pnpm lock pins the patch, but a
 /// `pnpm-lock.<branch>.yaml` exists, which pnpm installs from instead when
 /// `gitBranchLockfile` is on; its presence withholds (`vex::Unattested`).
 const NOTE_PNPM_GIT_BRANCH_LOCKFILE: &str = "vex_pnpm_git_branch_lockfile";
-/// Omission tag and note: an npm or Bun pin's package is one the project
-/// patches itself (`patchedDependencies`, `vex::Unattested`).
+/// Omission tag and note: an npm-family pin's package is one the project
+/// patches itself (npm / Bun / pnpm `patchedDependencies`, a yarn `patch:`
+/// descriptor, a patch-package patch; `vex::Unattested`).
 const NOTE_NPM_PATCHED_DEPENDENCY: &str = "vex_npm_patched_dependency";
 /// Omission tag and note: a vendored sbt pin the build's local resolution
 /// evidence does not verify, or under a build-wide blocker
@@ -304,6 +316,15 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while that classifier copy resolves an unpatched version; the \
              wiring itself is intact, so re-running `scan` does not change this",
         ),
+        UnattestedKind::CargoUnpinnedDeclaration => (
+            NOTE_CARGO_UNPINNED_DECLARATION,
+            "not attested while that declaration stands",
+        ),
+        UnattestedKind::CargoPatchBypassed => (
+            NOTE_CARGO_PATCH_BYPASSED,
+            "not attested while that copy can build beside the vendored one; the vendored \
+             wiring itself is intact (the warning above says how to clear it)",
+        ),
         UnattestedKind::PnpmGitBranchLock => (
             NOTE_PNPM_GIT_BRANCH_LOCKFILE,
             "not attested while any branch lock exists (or the members that could hold one \
@@ -315,10 +336,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
         ),
         UnattestedKind::UserPatchedDependency => (
             NOTE_NPM_PATCHED_DEPENDENCY,
-            "not attested while the project patches the package itself (fold the Socket fix \
-             into your own patch, or remove the `patchedDependencies` entry and re-run); an \
-             npm pin an earlier hosted run wrote fails `npm ci` with `EPATCHFAILED` until \
-             `socket-patch rollback <uuid>` restores the registry entry",
+            "not attested while the project patches the package itself, even when it was \
+             wired with `--allow-patch-conflicts` (fold the Socket fix into your own patch, or \
+             remove your patch: the `patchedDependencies` entry, the yarn `patch:` descriptor \
+             or the patch-package file, and re-run); an npm pin an earlier hosted run wrote \
+             fails `npm ci` with `EPATCHFAILED` until `socket-patch rollback <uuid>` restores \
+             the registry entry",
         ),
         UnattestedKind::SbtResolutionUnverified => (
             NOTE_SBT_RESOLUTION_UNVERIFIED,
@@ -680,9 +703,14 @@ pub(crate) async fn plan(
                 continue;
             }
         } else if cand.redirected {
-            let live = assumed.contains(strip_purl_qualifiers(&cand.key))
-                || liveness.redirect_record(&cand.key, &cand.uuid).await;
-            if live {
+            let verdict = if assumed.contains(strip_purl_qualifiers(&cand.key)) {
+                RecordLiveness::Live
+            } else {
+                liveness
+                    .redirect_record_verdict(&cand.key, &cand.uuid)
+                    .await
+            };
+            if verdict.attests() {
                 Basis::Hosted {
                     lockfile_basis: false,
                 }
@@ -691,6 +719,9 @@ pub(crate) async fn plan(
                 // purl: verify it as the agent-mode patch it now is.
                 Basis::Installed
             } else {
+                if verdict == RecordLiveness::Undecided {
+                    notes.push(foreign_origin_note(&cand.key, &cand.uuid));
+                }
                 notes.extend(dead_claim_notes(
                     &discovery,
                     &cand.key,
@@ -1118,6 +1149,20 @@ fn dead_claim_notes(
         });
     }
     notes
+}
+
+/// Why a hosted-ledger record whose wiring resolves from a patch server
+/// this run was not given ([`RecordLiveness::Undecided`]) is not attested:
+/// fail closed, and say how a staging server is admitted.
+fn foreign_origin_note(key: &str, uuid: &str) -> PlanNote {
+    PlanNote {
+        code: NOTE_CLAIM_UNWIRED,
+        detail: format!(
+            "{key}: the hosted ledger records patch {uuid}, but its wiring resolves it from a \
+             patch server this run was not given; pass --patch-server-url for a non-production \
+             patch server; not attested"
+        ),
+    }
 }
 
 /// A local record for `uuid` (manifest, then redirect ledger, then vendor
@@ -2121,6 +2166,108 @@ mod tests {
             !plan.gated.iter().any(|f| PurlKey::same(&f.purl, PURL)),
             "{:?}",
             plan.gated
+        );
+    }
+
+    /// A hosted Cargo pin beside an unpinned declaration of the crate is
+    /// omitted as `vex_cargo_unpinned_declaration`, the note naming the
+    /// declaration and the remedy.
+    #[tokio::test]
+    async fn a_cargo_pin_beside_an_unpinned_declaration_is_gated() {
+        const PURL: &str = "pkg:cargo/serde@1.0.1";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut redirect = RedirectState::new();
+        redirect.records.insert(PURL.into(), record(U1));
+        let mut found = discovery(vec![hosted_ref(PURL, U1, true)]);
+        found.unattested.push(socket_patch_core::vex::Unattested {
+            purl: PURL.into(),
+            uuid: U1.into(),
+            file: "crates/a/Cargo.toml".into(),
+            detail: "crates/a/Cargo.toml declares serde \"1\" from crates.io, not registry \
+                     \"socket-patch-…\"; re-run `socket-patch scan` to pin it too"
+                .into(),
+            kind: UnattestedKind::CargoUnpinnedDeclaration,
+        });
+        let gated = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest: PatchManifest::new(),
+                vendor: VendorState::new(),
+                redirect: Some(redirect),
+                discovery: found,
+                hosted_uuids: Vec::new(),
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(
+            gated.gated,
+            vec![failed(PURL, NOTE_CARGO_UNPINNED_DECLARATION)]
+        );
+        assert!(
+            gated
+                .notes
+                .iter()
+                .any(|n| n.code == NOTE_CARGO_UNPINNED_DECLARATION
+                    && n.detail.contains("crates/a/Cargo.toml declares serde")
+                    && n.detail.ends_with(
+                        "re-run `socket-patch scan` to pin it too; not attested while that \
+                         declaration stands"
+                    )),
+            "{:?}",
+            gated.notes
+        );
+    }
+
+    /// A vendored Cargo copy beside a copy of the crate its `[patch]`
+    /// entry does not redirect is omitted as `vex_cargo_patch_bypassed`,
+    /// the note naming that copy and the remedy.
+    #[tokio::test]
+    async fn a_vendored_cargo_copy_beside_a_bypassing_source_is_gated() {
+        const PURL: &str = "pkg:cargo/serde@1.0.1";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(PURL.into(), record(U1));
+        let vref = vendor_ref(&format!(".socket/vendor/cargo/{U1}/serde-1.0.1")).unwrap();
+        let mut found = discovery(vec![PatchedRef::vendored(
+            PURL.into(),
+            &vref,
+            "Cargo.toml",
+            None,
+        )]);
+        found.unattested.push(socket_patch_core::vex::Unattested {
+            purl: PURL.into(),
+            uuid: U1.into(),
+            file: "crates/a/Cargo.toml".into(),
+            detail: "crates/a/Cargo.toml declares serde \"1\" from registry `my-corp`".into(),
+            kind: UnattestedKind::CargoPatchBypassed,
+        });
+        let gated = plan(
+            &common(tmp.path()),
+            Sources {
+                manifest,
+                vendor: VendorState::new(),
+                redirect: None,
+                discovery: found,
+                hosted_uuids: Vec::new(),
+            },
+            &[],
+            &RunApiClient::new(),
+        )
+        .await;
+        assert!(gated.view.patches.is_empty() && gated.hosted.is_empty());
+        assert_eq!(gated.gated, vec![failed(PURL, NOTE_CARGO_PATCH_BYPASSED)]);
+        assert!(
+            gated
+                .notes
+                .iter()
+                .any(|n| n.code == NOTE_CARGO_PATCH_BYPASSED
+                    && n.detail.contains("from registry `my-corp`")
+                    && n.detail.contains("says how to clear it")),
+            "{:?}",
+            gated.notes
         );
     }
 

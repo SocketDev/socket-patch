@@ -188,6 +188,7 @@ impl<'a> ComposerLock<'a> {
             out.push(LockfileEntry {
                 ecosystem: "composer",
                 source_kind: SourceKind::Unspecified,
+                pnpm_env: false,
                 name,
                 version,
                 purl,

@@ -4,13 +4,14 @@
 //! rewriter's pnpm leg).
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 
 use crate::patch::redirect::{full_name, DepOverride, FileEdit, RewriteResult, RewriteWarning};
 
 use super::grammar as pnpm;
+use super::plan::{hosted_refuses_lock, match_key, planned_locks, KeyMatch, Target};
 
 /// Whether `entry` resolves to exactly `artifact_url` — the per-instance
 /// residual-gate predicate.
@@ -42,7 +43,7 @@ struct PnpmLockState<'f> {
     /// Entry indices sorted by normalized (unquoted, `/`-stripped) key.
     sorted: Vec<usize>,
     pending: Vec<(std::ops::Range<usize>, String)>,
-    spliced: std::collections::HashSet<usize>,
+    spliced: HashSet<usize>,
     changed: bool,
 }
 
@@ -51,7 +52,7 @@ impl<'f> PnpmLockState<'f> {
         let mut state = PnpmLockState {
             path,
             text: Cow::Borrowed(text),
-            early_shrinkwrap: pnpm::unsupported_early_shrinkwrap(text),
+            early_shrinkwrap: hosted_refuses_lock(text),
             entries: Vec::new(),
             sorted: Vec::new(),
             pending: Vec::new(),
@@ -96,33 +97,37 @@ impl<'f> PnpmLockState<'f> {
     }
 
     /// Entries whose key names `fname@version` (any suffix), in file order —
-    /// the same set a full [`pnpm::suffix`] scan of the logical lock yields.
+    /// the same set a full [`match_key`] scan of the logical lock yields.
     fn hits(&mut self, fname: &str, version: &str) -> Vec<usize> {
-        let hits = self.lookup(fname, version);
+        let hits = self.lookup(fname, version, false);
         if hits.iter().any(|i| self.spliced.contains(i)) {
             self.materialize();
-            return self.lookup(fname, version);
+            return self.lookup(fname, version, false);
         }
         hits
     }
 
-    fn lookup(&self, fname: &str, version: &str) -> Vec<usize> {
+    /// The entries [`match_key`] matches as a registry instance or, with
+    /// `rekeyed`, as a vendored rekey, found by their key prefixes.
+    fn lookup(&self, fname: &str, version: &str, rekeyed: bool) -> Vec<usize> {
+        let prefixes = match rekeyed {
+            false => [format!("{fname}@{version}"), format!("{fname}/{version}")],
+            true => [format!("{fname}@file:"), "file:".to_string()],
+        };
         let mut out = Vec::new();
-        for sep in ['@', '/'] {
-            let prefix = format!("{fname}{sep}{version}");
+        for prefix in &prefixes {
             let start = self
                 .sorted
                 .partition_point(|&i| self.norm_key(i) < prefix.as_str());
-            out.extend(
-                self.sorted[start..]
-                    .iter()
-                    .take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str()))
-                    .copied(),
-            );
+            let rest = self.sorted[start..].iter();
+            out.extend(rest.take_while(|&&i| self.norm_key(i).starts_with(prefix.as_str())));
         }
         out.sort_unstable();
         out.dedup();
-        out.retain(|&i| pnpm::suffix(self.entry(i).key, fname, version).is_some());
+        out.retain(|&i| {
+            match_key(self.entry(i).key, fname, version)
+                .is_some_and(|m| (m == KeyMatch::Rekeyed) == rekeyed)
+        });
         out
     }
 
@@ -175,17 +180,11 @@ pub(crate) fn plan_hosted(
     let npm: Vec<&DepOverride> = overrides.iter().filter(|o| o.ecosystem == "npm").collect();
     // A pnpm lock lives at the project root or at any nested path (e.g. Rush
     // repos keep them under `common/config/rush/`); every such files-map key
-    // is rewritten under the same grammar. Deterministic order: BTreeMap
-    // iterates keys sorted, so goldens are stable across every lock in the set.
-    let lock_keys: Vec<&String> = files
-        .keys()
-        .filter(|k| {
-            matches!(
-                k.rsplit('/').next(),
-                Some("pnpm-lock.yaml" | "shrinkwrap.yaml")
-            )
-        })
-        .collect();
+    // is rewritten under the same grammar, except the one of a
+    // `pnpm-lock.yaml` / `shrinkwrap.yaml` pair pnpm never reads
+    // ([`planned_locks`]). Deterministic order:
+    // BTreeMap iterates keys sorted, so goldens are stable across every lock.
+    let lock_keys = planned_locks(files);
     if npm.is_empty() || lock_keys.is_empty() {
         return;
     }
@@ -252,7 +251,7 @@ pub(crate) fn plan_hosted(
                 let entry = lock.entry(i);
                 let suffix = pnpm::suffix(entry.key, &fname, &dep.version)
                     .expect("hits only holds entries naming this dep");
-                let resolution = if pnpm::supported_suffix(suffix) {
+                let resolution = if Target::Hosted.repoints(suffix) {
                     pnpm::resolution(&entry)
                 } else {
                     None
@@ -338,44 +337,16 @@ pub(crate) fn plan_hosted(
         // is named as such: `socket-patch vendor` removes the registry
         // resolution this grammar looks for (v9 respells the packages key
         // `<name>@file:.socket/vendor/…`; v5/v6 rekey it to a bare `file:`
-        // key but keep the `<name>@<version>: file:…` overrides line), so
-        // the generic not-locked wording would send users on a wild-goose
-        // `pnpm install` when the real path is a mode switch. Fail-closed
-        // either way: nothing is rewritten for the dep.
+        // key with a `name:` line), so the generic not-locked wording would
+        // send users on a wild-goose `pnpm install` when the real path is a
+        // mode switch. Fail-closed either way: nothing is rewritten for the
+        // dep.
         if !matched_any {
-            let v9_vendored_key = format!("{fname}@file:");
-            let override_key = format!("{fname}@{}", dep.version);
-            // Scanned over the post-splice text, so fold pending splices in.
-            for lock in locks.iter_mut() {
-                lock.materialize();
-            }
-            let vendored = locks.iter().any(|lock| {
-                lock.text.lines().any(|line| {
-                    let t = line.trim_start();
-                    let t = t.strip_prefix('\'').unwrap_or(t);
-                    // v9 packages/snapshots key (leading `/` in v6 spelling).
-                    // The vendor backend always writes the RELATIVE
-                    // `file:.socket/vendor/…` spelling here, so anchoring on
-                    // it keeps a user's own `file:` dep of the same name
-                    // from being misreported as vendored.
-                    let key = t.strip_prefix('/').unwrap_or(t);
-                    if key
-                        .strip_prefix(&v9_vendored_key)
-                        .is_some_and(|rest| rest.starts_with(".socket/vendor/"))
-                    {
-                        return true;
-                    }
-                    // overrides / root-dep line: `<name>@<version>: file:…`
-                    // (pnpm <=8 absolutizes the value, so only the
-                    // `.socket/vendor/` tail is stable enough to match).
-                    t.strip_prefix(&override_key)
-                        .map(|rest| rest.strip_prefix('\'').unwrap_or(rest))
-                        .and_then(|rest| rest.strip_prefix(':'))
-                        .is_some_and(|rest| {
-                            rest.contains("file:") && rest.contains(".socket/vendor/")
-                        })
-                })
-            });
+            // A rekey ([`KeyMatch::Rekeyed`]) is read from `text` without
+            // folding `pending` in: a resolution splice never touches a key.
+            let vendored = locks
+                .iter()
+                .any(|lock| !lock.lookup(&fname, &dep.version, true).is_empty());
             if vendored {
                 result.warnings.push(RewriteWarning {
                     code: "redirect_pnpm_entry_vendored".into(),

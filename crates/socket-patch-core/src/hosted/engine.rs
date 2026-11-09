@@ -337,6 +337,209 @@ pub fn bun_lockb_symlinked(view: &ProjectView<'_>, candidates: &[Candidate]) -> 
         && view.is_symlink("bun.lockb")
 }
 
+/// Skip reason of an npm candidate withheld because the project patches
+/// that package itself ([`withhold_user_patched`]): the code the CLI's
+/// consent gate reports for the same packages.
+pub const USER_PATCH_CONFLICT: &str = "user_patch_conflict";
+
+/// The pnpm and yarn locks [`withhold_user_patched`] reads when `files`
+/// does not already hold them.
+const USER_PATCH_LOCKS: [&str; 4] = [
+    "pnpm-lock.yaml",
+    "shrinkwrap.yaml",
+    "yarn.lock",
+    crate::constants::npm_family::RUSH_COMMON_LOCK_REL,
+];
+
+/// The locks a disk scan reads on top of the CLI consent gate's walk for
+/// the user-patch gate ([`withhold_user_patched_by`]): a root
+/// `shrinkwrap.yaml`, and a Rush monorepo's pnpm locks — the common lock
+/// and every subspace's, through the same safe listing lockfile discovery
+/// uses ([`rush_lock_rels`]). The in-memory engine reads the subspace locks
+/// as candidate files, so leaving them out on disk would pin a package the
+/// in-memory engine withholds. Outside Rush only the common lock path is
+/// tried, as before (a missing file is simply not read).
+pub async fn user_patch_supplement_lock_rels(view: ProjectView<'_>) -> Vec<String> {
+    let mut rels = if is_rush(view).await {
+        rush_lock_rels(view).await
+    } else {
+        vec![crate::constants::npm_family::RUSH_COMMON_LOCK_REL.to_string()]
+    };
+    rels.push("shrinkwrap.yaml".to_string());
+    rels
+}
+
+/// Withhold from every rewriter each npm candidate whose package the
+/// project patches itself with pnpm (`patchedDependencies`), yarn (a
+/// `patch:` descriptor) or patch-package, recording each as skipped
+/// ([`USER_PATCH_CONFLICT`]). The package manager applies the user's
+/// diff on top of whatever tarball the lock names, so a hosted pin either
+/// fails the install once the diff no longer applies or installs bytes
+/// that are neither the user's package nor the Socket patch. The
+/// evidence is [`UserPatchIndex::npm_family_in`], which `vex` discovery
+/// reads too, over `files` (the candidate texts already read: a member's
+/// own pnpm lock) and the root pnpm, yarn and Rush locks. npm's and Bun's
+/// own `patchedDependencies` are not read here: their rewriters skip such
+/// a package per resolution (#711, #367). `allow` is the caller's explicit
+/// consent (the CLI's `--allow-patch-conflicts`): nothing is withheld.
+/// Returns one [`USER_PATCH_CONFLICT`] warning per withheld candidate,
+/// with the skip's detail.
+///
+/// [`UserPatchIndex::npm_family_in`]: crate::patch::user_patches::UserPatchIndex::npm_family_in
+pub async fn withhold_user_patched(
+    view: &ProjectView<'_>,
+    files: &BTreeMap<String, String>,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+    allow: bool,
+) -> Vec<RewriteWarning> {
+    if allow || !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        return Vec::new();
+    }
+    let mut read: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<(&str, std::io::Error)> = Vec::new();
+    for rel in USER_PATCH_LOCKS {
+        if files.contains_key(rel) {
+            continue;
+        }
+        match read_user_patch_lock(view, rel).await {
+            Ok(Some(text)) => read.push((rel.to_string(), text)),
+            Ok(None) => {}
+            Err(e) => unreadable.push((rel, e)),
+        }
+    }
+    let locks: Vec<(&str, &str)> = files
+        .iter()
+        .chain(read.iter().map(|(rel, text)| (rel, text)))
+        .filter(|(rel, _)| {
+            matches!(
+                rel.rsplit('/').next(),
+                Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
+            )
+        })
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let mut index = crate::patch::user_patches::UserPatchIndex::npm_family_in(view, &locks).await;
+    for (rel, e) in &unreadable {
+        index.unreadable_lock(rel, e);
+    }
+    withhold_user_patched_by(&index, candidates, skipped)
+}
+
+/// A lock the user-patch evidence reads, as the walk's `read_view` reads
+/// a project file: `None` when it is missing, or is an in-memory link (the
+/// engine refuses a linked candidate on its own); one the repository bound
+/// refused because its real path leaves the repository is read through
+/// the link from disk (`None` when nothing is there). `Err` is a lock that
+/// exists but can't be read, which protects every npm package.
+async fn read_user_patch_lock(
+    view: &ProjectView<'_>,
+    rel: &str,
+) -> std::io::Result<Option<String>> {
+    let read = match view.read_text(rel).await {
+        Err(e) if crate::utils::repo_root::is_refused_read(&e) => {
+            match view.disk_root_reading([rel]) {
+                Some(root) => crate::utils::fs::read_regular_to_string(&root.join(rel)).await,
+                None => Err(e),
+            }
+        }
+        read => read,
+    };
+    match read {
+        Ok(text) => Ok(Some(text)),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound
+                && !crate::utils::repo_root::is_refused_read(&e) =>
+        {
+            Ok(None)
+        }
+        Err(_) if matches!(view, ProjectView::Memory(_)) && view.is_symlink(rel) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The disk flow's supplement to the CLI's consent gate: withhold each
+/// npm candidate a Rush lock (the common one and every subspace's) or a
+/// root `shrinkwrap.yaml` records as patched, which the gate's walk does
+/// not read ([`user_patch_supplement_lock_rels`]), as
+/// [`withhold_user_patched_by`] does. A lock that exists but can't be
+/// read protects every npm package; a missing one is no evidence.
+pub async fn withhold_user_patched_by_supplement(
+    view: ProjectView<'_>,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<RewriteWarning> {
+    if !candidates.iter().any(|c| c.dep.ecosystem == "npm") {
+        return Vec::new();
+    }
+    let mut read: Vec<(String, String)> = Vec::new();
+    let mut unreadable: Vec<(String, std::io::Error)> = Vec::new();
+    for rel in user_patch_supplement_lock_rels(view).await {
+        match read_user_patch_lock(&view, &rel).await {
+            Ok(Some(text)) => read.push((rel, text)),
+            Ok(None) => {}
+            Err(e) => unreadable.push((rel, e)),
+        }
+    }
+    let locks: Vec<(&str, &str)> = read
+        .iter()
+        .map(|(rel, text)| (rel.as_str(), text.as_str()))
+        .collect();
+    let mut index = crate::patch::user_patches::UserPatchIndex::from_locks(&locks);
+    for (rel, e) in &unreadable {
+        index.unreadable_lock(rel, e);
+    }
+    withhold_user_patched_by(&index, candidates, skipped)
+}
+
+/// [`withhold_user_patched`] by evidence the caller already holds: the
+/// disk flow passes what its consent gate's walk did not read (a Rush
+/// lock), [`UserPatchIndex::from_locks`], instead of walking the project
+/// a second time.
+///
+/// [`UserPatchIndex::from_locks`]: crate::patch::user_patches::UserPatchIndex::from_locks
+pub fn withhold_user_patched_by(
+    index: &crate::patch::user_patches::UserPatchIndex,
+    candidates: &mut Vec<Candidate>,
+    skipped: &mut Vec<SkippedPatch>,
+) -> Vec<RewriteWarning> {
+    let mut warnings = Vec::new();
+    if index.is_empty() {
+        return warnings;
+    }
+    candidates.retain(|c| {
+        if c.dep.ecosystem != "npm" {
+            return true;
+        }
+        let sources = index.conflicts(&c.purl);
+        if sources.is_empty() {
+            return true;
+        }
+        let detail = user_patched_detail(&c.purl, &sources);
+        warnings.push(warning(USER_PATCH_CONFLICT, detail.clone()));
+        skipped.push(SkippedPatch {
+            detail: Some(detail),
+            ..SkippedPatch::new(&c.purl, &c.dep.patch_uuid, USER_PATCH_CONFLICT)
+        });
+        false
+    });
+    warnings
+}
+
+/// [`withhold_user_patched`]'s skip detail.
+fn user_patched_detail(purl: &str, sources: &[String]) -> String {
+    format!(
+        "{purl}: {} declares a patch the project applies to this package itself (pnpm \
+         `patchedDependencies`, a yarn `patch:` descriptor, or a patch-package patch); the \
+         package manager applies it on top of whatever tarball the lock names, so pinning the \
+         hosted patch would stack the two (or fail every install once the user's diff no \
+         longer applies). It is left unchanged and stays without the Socket patch: fold the \
+         Socket fix into your own patch, or remove the user patch and re-run (the CLI's \
+         explicit `--allow-patch-conflicts` wires it anyway)",
+        sources.join(", ")
+    )
+}
+
 /// The project's candidate files as the rewriters read them.
 #[derive(Debug, Clone, Default)]
 pub struct CandidateFiles {
@@ -575,14 +778,23 @@ async fn read_go_workspace(
                 }
             }
             // Module mode: whether a module-to-module replace is in effect
-            // can turn on modules only the dependencies require (#1840).
+            // can turn on modules only the dependencies require (#1840),
+            // and which version the build selects on a go.sum zip line a
+            // downgrade may have left behind (#1862).
             let mut module_graph = None;
             if loaded == Loaded::None {
                 touched.push(root.join("go.mod"));
+                touched.push(root.join("go.sum"));
                 let go_mod = crate::utils::fs::read_regular_to_string(&root.join("go.mod")).await;
+                let go_sum = crate::utils::fs::read_regular_to_string(&root.join("go.sum"))
+                    .await
+                    .ok();
                 if let Ok(go_mod) = go_mod {
                     let go_mod = crate::vendor::go_mod_edit::normalize_for_read(&go_mod);
-                    if crate::vendor::go_build_list::may_need_module_graph(&go_mod) {
+                    if crate::vendor::go_build_list::may_need_module_graph(
+                        &go_mod,
+                        go_sum.as_deref(),
+                    ) {
                         touched.extend(
                             crate::vendor::go_build_list::module_graph_reads(&go_mod)
                                 .into_iter()
@@ -660,10 +872,17 @@ pub async fn read_candidate_files(
     // and yarn classic rewriters read it as advisory input only: no
     // rewriter edits it, so a link or an unreadable in-memory entry is left
     // out (the rewriters then keep their conservative reading) rather than
-    // refused.
+    // refused. Beside a root `pnpm-lock.yaml` / `shrinkwrap.yaml` pair its
+    // `packageManager` pin decides which of the two pnpm reads
+    // (`formats::pnpm::plan::planned_locks`), as vendored mode and
+    // discovery read it, when no `node_modules/.modules.yaml` records the
+    // installed major (a fresh clone).
     } else if candidates.iter().any(|c| c.dep.ecosystem == "npm")
         && (NPM_LOCKS.iter().any(|lock| out.files.contains_key(*lock))
-            || out.files.contains_key("yarn.lock"))
+            || out.files.contains_key("yarn.lock")
+            || ROOT_PNPM_LOCKS
+                .iter()
+                .all(|lock| out.files.contains_key(*lock)))
     {
         let rel = crate::hosted::memory::select::NPM_MANIFEST_REL;
         if let Some(text) = read_advisory(view, unreadable, rel).await {
@@ -761,7 +980,7 @@ pub async fn read_candidate_files(
     // unsatisfiable. Keyed `<dir>/Cargo.toml` for the cargo rewriter.
     if out.files.contains_key("Cargo.toml") && candidates.iter().any(|c| c.dep.ecosystem == "cargo")
     {
-        for rel in crate::utils::cargo_workspace::member_manifests_in(view) {
+        for rel in crate::utils::cargo_workspace::member_manifests_in(view).await {
             out.read(view, unreadable, &rel).await;
         }
     }
@@ -2203,6 +2422,7 @@ async fn unattributed_pins(
         for c in discovery.unpatched_copies.iter().filter(|c| {
             c.purl == r.purl
                 && c.file == r.source_file
+                && r.part.withheld_by(c.part)
                 && matches!(
                     c.file.file_name().and_then(|n| n.to_str()),
                     Some("pnpm-lock.yaml" | "shrinkwrap.yaml" | "yarn.lock")
@@ -2685,8 +2905,11 @@ fn pnpm_trust(
         .count();
     // The locks pnpm installs the project from: the root lock, plus each
     // member's own under `sharedWorkspaceLockfile: false` (#492). A Rush
-    // lock is never one: rush installs it from common/temp.
-    let governing: Vec<&str> = std::iter::once("pnpm-lock.yaml")
+    // lock is never one: rush installs it from common/temp. The root lock
+    // is the one pnpm reads (N11): `shrinkwrap.yaml` under a pnpm 1 / 2
+    // pin, so a stray `pnpm-lock.yaml` never drives the heal or the trust
+    // config.
+    let governing: Vec<&str> = std::iter::once(crate::formats::pnpm::plan::root_lock(files))
         .chain(member_lock_keys.iter().map(String::as_str))
         .filter(|key| !rush_lock_keys.iter().any(|rush| rush == key))
         .collect();
@@ -3326,9 +3549,15 @@ fn confirm(
         name.ends_with("/pom.xml")
             || maven_reactor_refused && (name == "pom.xml" || name.starts_with(".mvn/"))
     };
+    // A pnpm lock pnpm does not read (a `shrinkwrap.yaml` beside a
+    // `pnpm-lock.yaml`, or the reverse under a pnpm 1 / 2 pin, N11) is
+    // never rewritten, so a Socket URL an earlier run left in it pins
+    // nothing either.
+    let shadowed_pnpm = crate::formats::pnpm::plan::shadowed_locks(files);
     let final_texts: Vec<(&str, &String)> = files
         .iter()
         .filter(|(name, _)| !(pdm_inactive && name.as_str() == "pdm.lock"))
+        .filter(|(name, _)| !shadowed_pnpm.contains(name))
         .filter(|(name, _)| !is_npm_manifest(name))
         .filter(|(name, _)| !is_unpinned_maven(name))
         .filter(|(name, _)| !crate::patch::redirect::sbt::is_synthetic_key(name))
@@ -4558,6 +4787,104 @@ mod tests {
         );
     }
 
+    /// N11: under a pnpm 1 / 2 pin `shrinkwrap.yaml` governs, so a
+    /// stray v9 `pnpm-lock.yaml` an earlier run redirected is no heal root
+    /// and plans no `trustLockfile` write for a lock pnpm never reads.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_is_no_heal_root() {
+        let redirected = LEFT_PAD_V9_LOCK.replace(
+            "resolution: {integrity: sha512-UPSTREAM==}",
+            &format!(
+                "resolution: {{integrity: sha512-PATCHED==, tarball: {}}}",
+                left_pad_url()
+            ),
+        );
+        let mut p = MemoryProject::new();
+        p.insert_text("pnpm-lock.yaml", redirected.as_str());
+        p.insert_text(
+            "shrinkwrap.yaml",
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        );
+        p.insert_text(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#,
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            !done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+
+        // Without the pin, pnpm-lock.yaml governs and the heal plans it.
+        p.insert_text("package.json", r#"{"name":"app"}"#);
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(
+            done.rewrite.files.contains_key(PNPM_WORKSPACE_REL),
+            "{:?}",
+            done.rewrite.files.keys()
+        );
+    }
+
+    /// N11: a shadowed `shrinkwrap.yaml` still carrying an earlier run's
+    /// Socket URL confirms nothing (and so is no `redirect_unattributable`
+    /// skip) when the governing `pnpm-lock.yaml` does not pin the package.
+    #[tokio::test]
+    async fn a_shadowed_pnpm_lock_confirms_nothing() {
+        let mut p = MemoryProject::new();
+        p.insert_text(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\npackages:\n  other@1.0.0:\n    \
+             resolution: {integrity: sha512-OTHER==}\n",
+        );
+        p.insert_text(
+            "shrinkwrap.yaml",
+            format!(
+                "shrinkwrapVersion: 3\nshrinkwrapMinorVersion: 9\npackages:\n  /left-pad/1.3.0:\n    \
+                 resolution:\n      integrity: sha512-PATCHED==\n      tarball: {}\n",
+                left_pad_url()
+            )
+            .as_str(),
+        );
+        let (_, done) = npm_rewrite(&ProjectView::Memory(&p), &BTreeSet::new()).await;
+        assert!(done.confirmed.is_empty(), "{:?}", done.confirmed);
+        assert!(done.unattributed.is_empty(), "{:?}", done.unattributed);
+    }
+
+    #[tokio::test]
+    async fn a_pnpm_lock_pair_reads_the_package_manager_pin() {
+        // pnpm 2 pinned in package.json, no install record: pnpm reads
+        // shrinkwrap.yaml, so the planner must see the pin to leave the
+        // stray pnpm-lock.yaml alone.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let manifest = r#"{"name":"app","packageManager":"pnpm@2.25.7"}"#;
+        std::fs::write(root.join("package.json"), manifest).unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), "lockfileVersion: 5.4\n").unwrap();
+        std::fs::write(
+            root.join("shrinkwrap.yaml"),
+            "shrinkwrapMinorVersion: 9\nshrinkwrapVersion: 3\n",
+        )
+        .unwrap();
+        let candidates = vec![left_pad_candidate()];
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert_eq!(
+            read.files.get("package.json").map(String::as_str),
+            Some(manifest)
+        );
+        assert_eq!(
+            crate::formats::pnpm::plan::planned_locks(&read.files),
+            vec!["shrinkwrap.yaml"]
+        );
+
+        // One pnpm lock alone governs whatever the pin: no manifest read.
+        std::fs::remove_file(root.join("shrinkwrap.yaml")).unwrap();
+        let read =
+            read_candidate_files(&ProjectView::Disk(root), &BTreeSet::new(), &candidates).await;
+        assert!(!read.files.contains_key("package.json"));
+    }
+
     #[tokio::test]
     async fn issue_490_the_root_manifest_overrides_reach_the_npm_rewriter() {
         let redirected = |done: &Rewritten| {
@@ -4811,9 +5138,71 @@ snapshots:
         }
     }
 
+    /// The disk scan's user-patch supplement reads every Rush subspace lock,
+    /// as the in-memory engine does through its candidate files, and only
+    /// the common lock path outside Rush.
+    #[tokio::test]
+    async fn user_patch_supplement_reads_rush_subspace_locks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("common/config/subspaces/web")).unwrap();
+        let disk = ProjectView::Disk(tmp.path());
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [RUSH_COMMON_LOCK_REL, "shrinkwrap.yaml"]
+        );
+        std::fs::write(tmp.path().join("rush.json"), "{}").unwrap();
+        assert_eq!(
+            user_patch_supplement_lock_rels(disk).await,
+            [
+                RUSH_COMMON_LOCK_REL,
+                "common/config/subspaces/web/pnpm-lock.yaml",
+                "shrinkwrap.yaml"
+            ]
+        );
+    }
+
     /// #713 HEAL-ON-RERUN: a Rush lock an earlier run already redirected
     /// splices nothing on a re-run, yet its `rush install` still needs the
     /// Rush remedy — the re-run re-issues it (and still writes nothing).
+    /// Review (#2018): a supplement lock is read as the user-patch walk
+    /// reads a project file. One that links out of the repository is read
+    /// through the link; a missing one reached through a directory that
+    /// links out is no evidence (not an unreadable lock, which would
+    /// withhold every npm package); one that exists but can't be read is
+    /// an error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn supplement_locks_are_read_through_links_out_of_the_repository() {
+        let outer = tempfile::tempdir().unwrap();
+        let repo = outer.path().join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(outer.path().join("shared/config/rush")).unwrap();
+        std::fs::write(outer.path().join("shared/shrinkwrap.yaml"), "lock").unwrap();
+        std::os::unix::fs::symlink(
+            outer.path().join("shared/shrinkwrap.yaml"),
+            repo.join("shrinkwrap.yaml"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outer.path().join("shared"), repo.join("common")).unwrap();
+        let view = ProjectView::Disk(&repo);
+        assert_eq!(
+            read_user_patch_lock(&view, "shrinkwrap.yaml")
+                .await
+                .unwrap(),
+            Some("lock".to_string())
+        );
+        assert_eq!(
+            read_user_patch_lock(&view, RUSH_COMMON_LOCK_REL)
+                .await
+                .unwrap(),
+            None
+        );
+        std::fs::create_dir_all(outer.path().join("shared/config/rush/pnpm-lock.yaml")).unwrap();
+        assert!(read_user_patch_lock(&view, RUSH_COMMON_LOCK_REL)
+            .await
+            .is_err());
+    }
+
     #[tokio::test]
     async fn issue_713_rerun_on_a_redirected_rush_lock_keeps_the_rush_remedy() {
         let mut first = MemoryProject::new();

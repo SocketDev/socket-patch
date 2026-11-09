@@ -53,7 +53,7 @@ use std::time::Instant;
 use crate::api::client::PatchApi;
 use crate::api::types::PatchSearchResult;
 use crate::crawlers::Ecosystem;
-use crate::utils::cargo_workspace::member_manifests_in;
+use crate::utils::cargo_workspace::member_manifests_in_memory;
 use crate::vendor::lock_inventory::{
     inventory_project_diagnosed_in, MemoryEntry, MemoryProject, ProjectView,
 };
@@ -279,7 +279,7 @@ fn demote_cargo_members(states: &mut [RootState], warnings: &mut Vec<EngineWarni
         if !project.contains("Cargo.lock") {
             continue;
         }
-        for rel in member_manifests_in(&ProjectView::Memory(project)) {
+        for rel in member_manifests_in_memory(project) {
             if let Some(dir) = rel.strip_suffix("/Cargo.toml") {
                 member_of
                     .entry(roots::join_root(&state.root, dir))

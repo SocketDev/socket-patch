@@ -1,28 +1,17 @@
 //! The `packages:` entry grammar: read pnpm's package blocks without
 //! reserializing unrelated YAML. The old shrinkwrap and lockfile 5.1/5.2
 //! formats use block resolutions; newer locks use flow mappings. Peer
-//! suffixes are identities, not part of the version. The hosted planner
-//! ([`super::hosted`]), the lock inventory and lockfile discovery all read
-//! entries through this one walk.
+//! suffixes are identities, not part of the version. Every reader reads
+//! entries through [`super::PnpmLock`], which wraps this walk; the writers
+//! that splice byte ranges (the hosted planner, [`super::hosted`], and the
+//! hosted unwind) call it directly (see `architecture_tests` in
+//! `formats/pnpm/mod.rs`).
 
 use std::ops::Range;
 
 use crate::formats::text::strip_bom;
 
-/// Early pnpm 1 writes shrinkwrapVersion 3 without a minor version and
-/// unconditionally drops registry tarball URLs on install. Its frozen flag
-/// cannot preserve this redirect (verified with pnpm 1.0.0).
-pub(crate) fn unsupported_early_shrinkwrap(content: &str) -> bool {
-    let content = strip_bom(content);
-    let version = content
-        .lines()
-        .find_map(|line| line.strip_prefix("shrinkwrapVersion:"));
-    let minor = content
-        .lines()
-        .find_map(|line| line.strip_prefix("shrinkwrapMinorVersion:"));
-    version.is_some_and(|v| v.trim().trim_matches(['\'', '"']) == "3")
-        && !minor.is_some_and(|v| v.trim().parse::<u32>().is_ok_and(|v| v > 0))
-}
+use super::lines::ENV_DOC_IMPORTER_FIELDS;
 
 pub(crate) struct Entry<'a> {
     pub key: &'a str,
@@ -88,24 +77,96 @@ pub(crate) fn is_pnpm_lock_text(text: &str) -> bool {
         .any(|line| line.starts_with("lockfileVersion:") || line.starts_with("shrinkwrapVersion:"))
 }
 
-/// The main document of a pnpm lock: the text after its last column-0
-/// `---` marker, else all of it. pnpm 11+ writes the env lockfile
-/// (`configDependencies` / `packageManagerDependencies`, whose resolutions
-/// never carry `tarball:`) as a first document ahead of the project lock.
-pub(crate) fn main_document(content: &str) -> &str {
+/// Which document of a pnpm lock a span belongs to ([`documents`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PnpmDocument {
+    /// The project lock: what `pnpm install` links into `node_modules`.
+    Project,
+    /// pnpm 11+'s env lockfile: the `configDependencies` /
+    /// `packageManagerDependencies` pnpm installs into its config store
+    /// and its own package-manager install, not into `node_modules`. Its
+    /// own install tree (docs/design/lock-model-unification.md, Decisions).
+    Env,
+}
+
+/// The documents of a pnpm lock, in file order: the byte range of each
+/// (separator lines excluded, a leading BOM inside the first) and what it
+/// is. A text without a column-0 `---` line is one project document. A
+/// blank document (the empty span before a leading `---`) is dropped.
+///
+/// pnpm >= 11 writes the env lockfile as the FIRST document, ahead of the
+/// project lock, and reads it from there (as the vendored planners'
+/// `lines::split_project_document` does). So the env document is told by
+/// position AND content: in a lock of two or more documents, the first one
+/// is [`PnpmDocument::Env`] when its `importers:` carry only
+/// [`ENV_DOC_IMPORTER_FIELDS`] (at least one). Every other document is
+/// [`PnpmDocument::Project`], an env-shaped later one included: no
+/// document can opt out of the project tree's contests, and a crafted lock
+/// cannot hide entries by adding documents, since each one is read. CRLF
+/// reads like LF.
+pub(crate) fn documents(content: &str) -> Vec<(Range<usize>, PnpmDocument)> {
+    let mut spans = Vec::new();
     let mut start = 0;
     let mut offset = 0;
-    for line in content.split_inclusive('\n') {
-        offset += line.len();
+    for (i, line) in content.split_inclusive('\n').enumerate() {
         let text = line.trim_end_matches(['\r', '\n']);
+        let text = if i == 0 { strip_bom(text) } else { text };
         if text
             .strip_prefix("---")
             .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\t']))
         {
-            start = offset;
+            spans.push(start..offset);
+            start = offset + line.len();
+        }
+        offset += line.len();
+    }
+    spans.push(start..content.len());
+    spans.retain(|span| {
+        strip_bom(&content[span.clone()]).lines().any(|line| {
+            let line = line.trim();
+            !line.is_empty() && !line.starts_with('#')
+        })
+    });
+    if spans.is_empty() {
+        return vec![(0..content.len(), PnpmDocument::Project)];
+    }
+    let several = spans.len() > 1;
+    spans
+        .into_iter()
+        .enumerate()
+        .map(|(i, span)| {
+            let kind = if several && i == 0 && is_env_document(&content[span.clone()]) {
+                PnpmDocument::Env
+            } else {
+                PnpmDocument::Project
+            };
+            (span, kind)
+        })
+        .collect()
+}
+
+/// Whether one document's `importers:` carry only the env lockfile's
+/// fields ([`ENV_DOC_IMPORTER_FIELDS`]), at least one of them.
+fn is_env_document(doc: &str) -> bool {
+    let mut in_importers = false;
+    let mut env_fields = 0usize;
+    for line in strip_bom(doc).split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if !line.is_empty() && !line.starts_with([' ', '#']) {
+            in_importers = line == "importers:";
+            continue;
+        }
+        if !in_importers {
+            continue;
+        }
+        if let Some((field, _, _)) = super::lines::parse_key_line(line, 4) {
+            if !ENV_DOC_IMPORTER_FIELDS.contains(&field) {
+                return false;
+            }
+            env_fields += 1;
         }
     }
-    &content[start..]
+    env_fields > 0
 }
 
 /// The value of the entry-level (four-space) `field:` line of a packages
@@ -181,9 +242,11 @@ pub(crate) fn entry_bundled<'a>(entry: &Entry<'a>) -> Option<Bundled<'a>> {
 pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a str> {
     let key = unquote(key);
     let key = key.strip_prefix('/').unwrap_or(key);
+    // `name@version` or `name/version`, without allocating either.
     let suffix = key
-        .strip_prefix(&format!("{name}@{version}"))
-        .or_else(|| key.strip_prefix(&format!("{name}/{version}")))?;
+        .strip_prefix(name)?
+        .strip_prefix(['@', '/'])?
+        .strip_prefix(version)?;
     if suffix
         .chars()
         .next()
@@ -192,23 +255,6 @@ pub(crate) fn suffix<'a>(key: &'a str, name: &str, version: &str) -> Option<&'a 
         return None;
     }
     Some(suffix)
-}
-
-pub(crate) fn supported_suffix(suffix: &str) -> bool {
-    if suffix.is_empty() || suffix.starts_with('_') {
-        return true;
-    }
-    let mut depth = 0usize;
-    for c in suffix.chars() {
-        match c {
-            '(' => depth += 1,
-            ')' if depth > 0 => depth -= 1,
-            ')' => return false,
-            _ if depth == 0 => return false,
-            _ => {}
-        }
-    }
-    depth == 0
 }
 
 pub(crate) struct Resolution<'a> {

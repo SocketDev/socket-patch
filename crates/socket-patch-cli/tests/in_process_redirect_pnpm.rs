@@ -3012,6 +3012,83 @@ async fn hosted_pnpm_file_tarball_copy_is_named() {
     .await;
 }
 
+/// #2009: the registry release is a pnpm config dependency (the env
+/// lockfile document) and the project document installs only a `file:`
+/// copy of the same `name@version`. The scan pins the config dependency,
+/// and names the project's copy with `redirect_copy_unpatched`, since a
+/// VEX statement covers the release, not one install tree.
+#[tokio::test]
+#[serial]
+async fn hosted_pnpm_config_dependency_names_the_projects_file_copy() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let copy_key = format!("file:forks/{NAME}");
+    write_file_copy_project(
+        root,
+        &copy_key,
+        &format!("    resolution: {{directory: forks/{NAME}, type: directory}}\n"),
+        &format!("file:../../forks/{NAME}"),
+    );
+    std::fs::remove_dir_all(root.join("packages").join("a")).unwrap();
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        format!(
+            "---
+lockfileVersion: '9.0'
+
+importers:
+
+  .:
+    configDependencies:
+      {NAME}:
+        specifier: {VERSION}
+        version: {VERSION}
+
+packages:
+
+  {NAME}@{VERSION}:
+    resolution: {{integrity: {UPSTREAM_SHA512}}}
+
+---
+lockfileVersion: '9.0'
+
+importers:
+  .: {{}}
+  packages/b:
+    dependencies:
+      {NAME}:
+        specifier: file:../../forks/{NAME}
+        version: {copy_key}
+
+packages:
+  {NAME}@{copy_key}:
+    resolution: {{directory: forks/{NAME}, type: directory}}
+
+snapshots:
+  {NAME}@{copy_key}: {{}}
+"
+        ),
+    )
+    .unwrap();
+
+    let (code, doc) = run_hosted_json(root, &server.uri());
+    assert_eq!(code, Some(0), "{doc}");
+    let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "the config dependency is pinned: {lock}"
+    );
+    let text = doc.to_string();
+    assert!(
+        text.contains("redirect_copy_unpatched") && text.contains(&format!("`{NAME}@{copy_key}`")),
+        "the project's copy is named: {doc:#}"
+    );
+}
+
 /// The #935 workspace: member `a` depends on the registry release, member
 /// `b` on the `file:` copy `copy_key` (spelled `spec` in its manifest).
 fn write_file_copy_project(root: &Path, copy_key: &str, copy_entry: &str, spec: &str) {
@@ -3352,5 +3429,77 @@ async fn issue_1268_member_lock_still_hosted_keeps_trust_without_warning() {
         std::fs::read_to_string(root.join("pnpm-workspace.yaml")).unwrap(),
         ws,
         "the workspace file is left as it was"
+    );
+}
+
+/// A package the project patches itself with pnpm's `patchedDependencies`
+/// is never pinned by default (the consent gate skips it), and only the
+/// explicit `--allow-patch-conflicts` override pins it. pnpm then applies
+/// the user's diff on top of the hosted tarball, so the install never runs
+/// the Socket patch alone: lockfile discovery keeps the pin as a ref (so
+/// `rollback` restores it) but marks it unattested, and `vex` omits it.
+#[tokio::test]
+#[serial]
+async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
+    use socket_patch_core::vex::discover::{
+        discover_patched_refs_with, DiscoverOptions, UnattestedKind,
+    };
+
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let workspace = format!(
+        "packages:\n  - '.'\npatchedDependencies:\n  {NAME}@{VERSION}: patches/{NAME}.patch\n"
+    );
+    std::fs::write(tmp.path().join("pnpm-workspace.yaml"), &workspace).unwrap();
+    let pristine = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+
+    // Default: skipped, nothing written.
+    let code = run(hosted_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "a user-patch skip alone exits 0");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine,
+        "the user-patched package is left on its registry entry"
+    );
+
+    // Explicit consent: pinned.
+    let mut args = hosted_args(tmp.path(), server.uri());
+    args.common.allow_patch_conflicts = true;
+    let code = run(args).await;
+    assert_eq!(code, 0, "the consented run succeeds");
+    let lock = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
+    assert!(
+        lock.contains(&format!("tarball: {HOSTED_URL}")),
+        "--allow-patch-conflicts pins the package; got:\n{lock}"
+    );
+
+    // ...but the pin is never attested while pnpm stacks the user's patch.
+    let out = discover_patched_refs_with(
+        tmp.path(),
+        &DiscoverOptions {
+            patch_server_origins: vec!["http://patch.test".to_string()],
+        },
+    )
+    .await;
+    assert!(
+        out.refs.iter().any(|r| r.purl == PURL && r.uuid == UUID),
+        "the pin stays a ref: {:?}",
+        out.refs
+    );
+    let marked: Vec<_> = out
+        .unattested
+        .iter()
+        .filter(|u| u.kind == UnattestedKind::UserPatchedDependency)
+        .map(|u| (u.purl.as_str(), u.uuid.as_str()))
+        .collect();
+    assert_eq!(marked, [(PURL, UUID)], "{:#?}", out.unattested);
+    assert!(
+        out.unattested[0].detail.contains("pnpm-workspace.yaml"),
+        "{}",
+        out.unattested[0].detail
     );
 }

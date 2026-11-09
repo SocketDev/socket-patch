@@ -30,7 +30,7 @@
 //! lockfile supplement, the vendored fetch inventory) read each format
 //! through ONE shared reader that yields EVERY entry, Socket-owned ones
 //! included: the npm-family entry models in `lock_inventory`
-//! (`npm_lock_nodes`, `pnpm::pnpm_packages`, `yarn::classic_entries` /
+//! (`npm_lock_nodes`, `PnpmLock::packages`, `yarn::classic_entries` /
 //! `berry_entries`, `BunLockb::parse_packages`, `vlt::vlt_lock_model`) and,
 //! for the other formats, the readers the writers own (`cargo_lock` /
 //! `cargo_config`, `go_mod_edit` / `go_sum_edit`, `formats::gem`,
@@ -182,7 +182,7 @@
 //!     `vlt-lock.json`), so discovery and the inventory see one entry walk
 //!     per format (an architecture test in this module enforces it).
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -228,6 +228,7 @@ pub(crate) mod sbt;
 pub use sbt::{
     DIAG_SBT_OWNED_FILE_MODIFIED, DIAG_SBT_RESOLUTION_UNVERIFIED, DIAG_VENDORED_TREE_MISSING,
 };
+pub(crate) mod user_patched;
 pub(crate) mod vlt;
 pub(crate) mod yarn;
 
@@ -248,6 +249,60 @@ pub const DIAG_REF_INVALID: &str = "patched_ref_invalid";
 /// artifact (a maven `socket-patch-<uuid>` repository with no suffixed
 /// dependency version, a nuget source with no package mapping).
 pub const DIAG_REF_UNATTRIBUTABLE: &str = "patched_ref_unattributable";
+
+/// Which install tree of its file a record belongs to: the install-tree
+/// key is the file (its [`Discovery::install_trees`] root) plus this part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TreePart {
+    /// The file's own tree (every format but the one below).
+    #[default]
+    File,
+    /// pnpm 11+'s env lockfile document (config dependencies, the pinned
+    /// package manager), which installs apart from the project's
+    /// `node_modules`: its own tree (owner decision, lock-model divergence
+    /// N4). Its wiring never exempts the project document in
+    /// [`Discovery::contest_across_locks`], and that contest skips it both
+    /// ways: no other lock decides a config dependency, and a config
+    /// dependency decides no other lock's ref. Within the document the
+    /// same-lock rules apply. Its entries never contest the project
+    /// document's refs, but the project document's copies DO withhold its
+    /// refs ([`TreePart::withheld_by`], owner decision on #2009).
+    PnpmEnv,
+}
+
+impl TreePart {
+    /// Whether a copy of a package installed in tree `copy` of a ref's own
+    /// file withholds that ref (`self`): a copy in the same tree does, and
+    /// so does a pnpm lock's project document copy for a ref in the env
+    /// document of the same lock. A VEX statement covers the release, not
+    /// one install tree, so attesting a config dependency's wiring while
+    /// the project's `node_modules` installs the same `name@version` from
+    /// the registry, a `file:` copy or a bundled copy would claim the
+    /// release is fixed where it is not (owner decision on #2009). The
+    /// reverse does not hold: the env document's copies install into
+    /// pnpm's config store only and withhold no project ref.
+    pub(crate) fn withheld_by(self, copy: TreePart) -> bool {
+        self == copy || (self == TreePart::PnpmEnv && copy == TreePart::File)
+    }
+
+    /// How diagnostics name this tree of root-relative `file`:
+    /// `<file> (env lockfile)` for the env document, else `file`.
+    pub(crate) fn label(self, file: &str) -> String {
+        match self {
+            TreePart::File => file.to_string(),
+            TreePart::PnpmEnv => format!("{file} (env lockfile)"),
+        }
+    }
+}
+
+impl From<crate::formats::pnpm::PnpmDocument> for TreePart {
+    fn from(document: crate::formats::pnpm::PnpmDocument) -> Self {
+        match document {
+            crate::formats::pnpm::PnpmDocument::Project => TreePart::File,
+            crate::formats::pnpm::PnpmDocument::Env => TreePart::PnpmEnv,
+        }
+    }
+}
 
 /// One non-fatal discovery finding. The CLI surfaces each as a run warning
 /// (`code` is the stable routing tag, `file` the root-relative source).
@@ -303,6 +358,8 @@ pub struct PatchedRef {
     /// package from, whose dependency sub-maps decide which dependencies
     /// install beside it (#1538).
     pub yarn_classic_block: Option<ClassicPinnedBlock>,
+    /// The install tree of `source_file` the wiring is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 /// A hosted yarn classic pin's lock block, as lock-only VEX reads it
@@ -361,7 +418,14 @@ impl PatchedRef {
             integrity_required,
             url: url.map(str::to_string),
             yarn_classic_block: None,
+            part: TreePart::File,
         }
+    }
+
+    /// This ref, in install tree `part` of its file.
+    pub(crate) fn in_part(mut self, part: TreePart) -> Self {
+        self.part = part;
+        self
     }
 
     /// A vendored ref for the artifact `vref` names.
@@ -381,6 +445,7 @@ impl PatchedRef {
             integrity_required: false,
             url: None,
             yarn_classic_block: None,
+            part: TreePart::File,
         }
     }
 
@@ -429,6 +494,13 @@ pub struct UnlockedPin {
     /// `version = "…"`); a ledger version must satisfy every one. Empty =
     /// none to check (nuget: the csproj `Version` is only a minimum).
     pub version_reqs: Vec<String>,
+    /// Requirements of the package's OTHER declarations, which carry no
+    /// pin (cargo: a member's `serde = "0.9"` beside the root's pinned
+    /// `serde = "1"`). The hosted rewriter pins every declaration whose
+    /// requirement accepts the patched version, so one that accepts a
+    /// ledger version means the pin does not reach it: a ledger version must
+    /// satisfy none of these.
+    pub excluded_reqs: Vec<String>,
     /// The Socket index url the pin routes to (the nuget source value, the
     /// cargo registry's `index`): its grant-token segment is part of this
     /// pin, not other hosted wiring.
@@ -452,16 +524,22 @@ impl UnlockedPin {
         };
         let pinned =
             canonical_base_purl(&format!("pkg:{}/{}@{version}", self.ecosystem, self.name));
+        let parsed = semver::Version::parse(version);
+        // An unreadable requirement or version answers `None`: it matches
+        // no pinned requirement and is never proven excluded.
+        let matches = |req: &str| match (semver::VersionReq::parse(req), &parsed) {
+            (Ok(req), Ok(version)) => Some(req.matches(version)),
+            _ => None,
+        };
         pinned == key
-            && self.version_reqs.iter().all(|req| {
-                match (
-                    semver::VersionReq::parse(req),
-                    semver::Version::parse(version),
-                ) {
-                    (Ok(req), Ok(version)) => req.matches(&version),
-                    _ => false,
-                }
-            })
+            && self
+                .version_reqs
+                .iter()
+                .all(|req| matches(req) == Some(true))
+            && self
+                .excluded_reqs
+                .iter()
+                .all(|req| matches(req) == Some(false))
     }
 }
 
@@ -482,6 +560,8 @@ pub struct ResolvedElsewhere {
     /// which pip compares as a string
     /// ([`Discovery::resolved_elsewhere_as_spelled`]).
     pub as_spelled: bool,
+    /// The install tree of `file` the entry is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 impl ResolvedElsewhere {
@@ -553,6 +633,8 @@ pub struct UnpatchedCopy {
     /// What makes the build patch that copy, when it is not the usual
     /// "depend on the registry release instead" (a bundled copy, #758).
     pub remedy: Option<String>,
+    /// The install tree of `file` the entry is in ([`TreePart`]).
+    pub part: TreePart,
 }
 
 /// A lock entry that installs SOME package (at `version`, when known) under
@@ -620,6 +702,21 @@ pub enum UnattestedKind {
     /// version: the classifier-less pin does not retarget it and the grant
     /// serves only the main jar, so the build runs the public classifier jar.
     MavenClassifierUnpatched,
+    /// A hosted Cargo pin beside another declaration of the crate (the
+    /// root's or a workspace member's) that is not pinned (no Socket
+    /// registry or `[patch]` redirect reaches it, or a path / git /
+    /// `registry-index` overrides its registry) and whose requirement may
+    /// select the pinned version: cargo resolves that
+    /// declaration from its own source as a separate package, so the crate
+    /// declaring it builds an unpatched copy, possibly of this version.
+    CargoUnpinnedDeclaration,
+    /// A vendored Cargo copy that a `[patch.<source>]` entry wires (in v5,
+    /// the root's `[patch.crates-io]`) beside a copy of the crate from a
+    /// source that entry does not redirect: a declaration (the root's or a
+    /// workspace member's) from another registry or git whose requirement
+    /// accepts the patched version, or a same-version `Cargo.lock` entry
+    /// from any source. Cargo builds that copy unpatched.
+    CargoPatchBypassed,
     /// A pnpm lock's pin while any `pnpm-lock.<branch>.yaml` exists (#556),
     /// whatever pnpm's `gitBranchLockfile` setting says (discovery reads no
     /// environment, so the setting cannot be decided), or while the members
@@ -628,12 +725,15 @@ pub enum UnattestedKind {
     /// no wiring reaches, so hosted mode withholds these locks and vendored
     /// mode refuses the project.
     PnpmGitBranchLock,
-    /// An npm or Bun pin of a package the project patches itself
-    /// (`patchedDependencies`, npm's lock-entry `patched` record; npm
-    /// #711, `bun patch` #367): the package manager applies the user's
-    /// diff on top of the locked tarball (npm) or keys it to another
-    /// resolution (Bun), so hosted and vendored mode leave the package
-    /// unwired and never confirm it.
+    /// An npm-family pin of a package the project patches itself: npm's
+    /// and Bun's `patchedDependencies` and npm's lock-entry `patched`
+    /// record (npm #711, `bun patch` #367), pnpm's `patchedDependencies`,
+    /// a yarn berry `patch:` descriptor, or a patch-package patch
+    /// ([`user_patched`]). The package manager applies the user's diff on
+    /// top of the locked tarball (npm, pnpm, yarn, patch-package) or keys
+    /// it to another resolution (Bun), so the install never runs the
+    /// Socket patch alone; hosted and vendored mode leave the package
+    /// unwired unless the user explicitly consents.
     UserPatchedDependency,
     /// A vendored sbt pin (`socket-patch-vendor.sbt`) whose resolution the
     /// build's local evidence does not verify, or under a build-wide
@@ -723,8 +823,9 @@ pub enum CopyTarget {
 /// extractor has run ([`Discovery::unattest_unwired_copies`]).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct UnwiredCopy {
-    /// Only refs of this root-relative file; `None` = refs of any file.
-    pub(crate) scope: Option<PathBuf>,
+    /// Only refs of this root-relative file, in a tree this tree of it
+    /// withholds ([`TreePart::withheld_by`]); `None` = refs of any file.
+    pub(crate) scope: Option<(PathBuf, TreePart)>,
     pub(crate) target: CopyTarget,
     /// Root-relative file that shows the copy.
     pub(crate) file: PathBuf,
@@ -735,7 +836,11 @@ pub struct UnwiredCopy {
 
 impl UnwiredCopy {
     fn covers(&self, r: &PatchedRef) -> bool {
-        if self.scope.as_ref().is_some_and(|f| *f != r.source_file) {
+        if self
+            .scope
+            .as_ref()
+            .is_some_and(|(f, part)| *f != r.source_file || !r.part.withheld_by(*part))
+        {
             return false;
         }
         match &self.target {
@@ -799,8 +904,10 @@ pub struct Discovery {
     /// another entry of the same lock (an `npm:` alias added after the
     /// pin), the npm twin lock, another manager's lock
     /// ([`Discovery::contest_across_locks`]), npm 6's legacy mirror, a Bun
-    /// registry entry. Each is diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is
-    /// neither attested nor unwound by the management commands, but it is
+    /// registry entry, the project document's registry entry beside a pnpm
+    /// env-lockfile ref ([`Discovery::contest_within_locks`]). Each is
+    /// diagnosed [`DIAG_REF_UNATTRIBUTABLE`] and is neither attested nor
+    /// unwound by the management commands, but it is
     /// still a pin a live lock records: the rollout's recorded view counts
     /// it ([`HostedPin::recorded`]), so the re-scan that rewires the other
     /// copy is not capped as NEW (#1195). Validated and sorted like `refs`.
@@ -842,6 +949,12 @@ pub struct Discovery {
     /// (#1445) ([`StaleSelector`]). Not refs and not contested wiring: the
     /// management commands retire them. Sorted, deduped.
     pub stale_selectors: Vec<StaleSelector>,
+    /// The operator's patch-server origins ([`DiscoverOptions::patch_server_origins`])
+    /// this discovery classified urls with. Ledger liveness
+    /// ([`Discovery::redirect_record_live`]) classifies the lock inventory's
+    /// urls with the same origins, so a record discovery does not claim is
+    /// judged by the one origin rule ([`crate::origin::hosted_patch_uuid`]).
+    pub patch_server_origins: Vec<String>,
 }
 
 /// A Socket-hosted yarn berry `resolutions` selector whose lock entry is
@@ -1047,11 +1160,22 @@ impl Discovery {
     /// lock's size (#993), and every reader before then only asks whether
     /// some entry matches.
     pub(crate) fn resolved_elsewhere(&mut self, file: &str, purl: Option<String>) {
+        self.resolved_elsewhere_in(file, TreePart::File, purl);
+    }
+
+    /// [`Discovery::resolved_elsewhere`] in install tree `part` of `file`.
+    pub(crate) fn resolved_elsewhere_in(
+        &mut self,
+        file: &str,
+        part: TreePart,
+        purl: Option<String>,
+    ) {
         let Some(purl) = purl else { return };
         self.elsewhere.push(ResolvedElsewhere {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
             as_spelled: false,
+            part,
         });
     }
 
@@ -1064,6 +1188,7 @@ impl Discovery {
             purl: canonical_base_purl(&purl),
             file: PathBuf::from(file),
             as_spelled: true,
+            part: TreePart::File,
         });
     }
 
@@ -1083,6 +1208,7 @@ impl Discovery {
             purl,
             file: PathBuf::from(file),
             as_spelled: false,
+            part: TreePart::File,
         });
     }
 
@@ -1101,10 +1227,22 @@ impl Discovery {
         key: &str,
         how: &str,
     ) {
+        self.unpatched_copy_in(file, TreePart::File, purl, key, how);
+    }
+
+    /// [`Discovery::unpatched_copy`] in install tree `part` of `file`.
+    pub(crate) fn unpatched_copy_in(
+        &mut self,
+        file: &str,
+        part: TreePart,
+        purl: Option<String>,
+        key: &str,
+        how: &str,
+    ) {
         let Some(purl) = purl else {
             return;
         };
-        self.resolved_elsewhere(file, Some(purl.clone()));
+        self.resolved_elsewhere_in(file, part, Some(purl.clone()));
         // Deduplicated once, in `finalize`: a per-push scan is quadratic
         // over a lock with thousands of registry blocks.
         self.unpatched_copies.push(UnpatchedCopy {
@@ -1113,6 +1251,7 @@ impl Discovery {
             key: key.to_string(),
             how: how.to_string(),
             remedy: None,
+            part,
         });
     }
 
@@ -1164,7 +1303,10 @@ impl Discovery {
             let purls: BTreeSet<&str> = self
                 .refs
                 .iter()
-                .filter(|r| r.source_file == u.file)
+                // A file-level copy, in the project tree: it withholds a
+                // pnpm env-lockfile ref of the same file too
+                // ([`TreePart::withheld_by`]).
+                .filter(|r| r.source_file == u.file && r.part.withheld_by(TreePart::File))
                 .filter(|r| match &u.version {
                     Some(v) => r.purl.rsplit_once('@').is_some_and(|(_, rv)| rv == v),
                     None => true,
@@ -1183,6 +1325,7 @@ impl Discovery {
                     key: u.key.clone(),
                     how: u.how.clone(),
                     remedy: None,
+                    part: TreePart::File,
                 });
             }
         }
@@ -1195,9 +1338,17 @@ impl Discovery {
     /// that copy whatever the wiring does, so the ref is diagnosed
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming the entry) and not emitted, but
     /// [`Discovery::shadowed`]. Its uuid stays recognized (rule 11).
+    ///
+    /// A pnpm env-lockfile ref ([`TreePart::PnpmEnv`]) is withheld by the
+    /// project document's copies too ([`TreePart::withheld_by`]): a `file:`
+    /// copy shadows it as above, and a registry entry of the same release
+    /// moves it to [`Discovery::rewirable`] (a re-run rewires that entry,
+    /// and the project ref then stands in its place, see
+    /// [`Discovery::drop_env_twins`]).
     fn contest_within_locks(&mut self) {
+        self.drop_env_twins();
         self.expand_unidentified_copies();
-        if self.unpatched_copies.is_empty() {
+        if self.unpatched_copies.is_empty() && self.refs.iter().all(|r| r.part == TreePart::File) {
             return;
         }
         let refs = std::mem::take(&mut self.refs);
@@ -1205,26 +1356,53 @@ impl Discovery {
             let copy = self
                 .unpatched_copies
                 .iter()
-                .find(|c| c.purl == r.purl && c.file == r.source_file)
+                .find(|c| c.purl == r.purl && c.file == r.source_file && r.part.withheld_by(c.part))
                 .cloned();
-            match copy {
-                Some(c) => {
-                    let file = r.source_file.to_string_lossy().into_owned();
-                    self.diag(
-                        DIAG_REF_UNATTRIBUTABLE,
-                        &file,
-                        format!(
-                            "{file}: {} is wired to Socket patch {} but lock entry `{}` {}; \
-                             that copy stays UNPATCHED and nothing is attested",
-                            r.purl, r.uuid, c.key, c.how
-                        ),
-                    );
-                    // Withheld, not lost: rollback / remove / the takeover
-                    // still unwind the wiring (#828).
-                    self.shadow(r);
-                }
-                None => self.refs.push(r),
+            if let Some(c) = copy {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let label = r.part.label(&file);
+                let entry = if c.part == r.part {
+                    ""
+                } else {
+                    "the project document's "
+                };
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{label}: {} is wired to Socket patch {} but {entry}lock entry `{}` {}; \
+                         that copy stays UNPATCHED and nothing is attested",
+                        r.purl, r.uuid, c.key, c.how
+                    ),
+                );
+                // Withheld, not lost: rollback / remove / the takeover
+                // still unwind the wiring (#828).
+                self.shadow(r);
+                continue;
             }
+            let registry = r.part == TreePart::PnpmEnv
+                && self.elsewhere.iter().any(|e| {
+                    e.file == r.source_file && e.part == TreePart::File && e.covers(&r.purl)
+                });
+            if registry {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let label = r.part.label(&file);
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{label}: {} is wired to Socket patch {}, but the project document of \
+                         the same lock resolves that version from elsewhere (not a Socket \
+                         patch); a VEX statement covers the release, not one install tree, so \
+                         the patch is not attested while `node_modules` installs the unpatched \
+                         copy — re-run `socket-patch scan` / `vendor` to rewire it too",
+                        r.purl, r.uuid
+                    ),
+                );
+                self.withhold_rewirable(r);
+                continue;
+            }
+            self.refs.push(r);
         }
     }
 
@@ -1241,14 +1419,17 @@ impl Discovery {
     /// 11). This generalizes the npm extractor's shrinkwrap/package-lock
     /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
     /// neither contest nor are contested: each is scoped to its own script's
-    /// install. Files of one install tree ([`Discovery::install_trees`]) are
-    /// one lock here: pip resolves a direct reference and a compatible `==`
-    /// pin of the same version in `requirements.txt` and its `-r` includes
-    /// to the reference (#1086).
+    /// install. Neither is a pnpm env lockfile document
+    /// ([`TreePart::PnpmEnv`]): pnpm installs its config dependencies into
+    /// its config store whatever else runs, and its wiring exempts no
+    /// other tree. Files of one install tree ([`Discovery::install_trees`])
+    /// are one lock here: pip resolves a direct reference and a compatible
+    /// `==` pin of the same version in `requirements.txt` and its `-r`
+    /// includes to the reference (#1086).
     fn contest_across_locks(&mut self) {
         // The purls each install tree wires.
         let mut wiring: BTreeMap<PathBuf, BTreeSet<String>> = BTreeMap::new();
-        for r in &self.refs {
+        for r in self.refs.iter().filter(|r| r.part == TreePart::File) {
             wiring
                 .entry(self.tree_of(&r.source_file).to_path_buf())
                 .or_default()
@@ -1266,7 +1447,7 @@ impl Discovery {
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let other = (!is_script_lock(&r.source_file))
+            let other = (!is_script_lock(&r.source_file) && r.part == TreePart::File)
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
                     // Only a PyPI ref can match another spelling of its
@@ -1285,9 +1466,13 @@ impl Discovery {
                         .find(|e| {
                             let other = self.tree_of(&e.file);
                             // A tree that wires the release itself, in any
-                            // spelling, is no contester.
+                            // spelling, is no contester. A pnpm env
+                            // lockfile installs config dependencies apart
+                            // from every `node_modules`: it contests no
+                            // other tree.
                             e.covers(&r.purl)
                                 && other != tree
+                                && e.part == TreePart::File
                                 && !wiring.get(other).is_some_and(|purls| {
                                     purls.contains(&r.purl)
                                         || (pypi
@@ -1340,6 +1525,52 @@ impl Discovery {
         if file != root {
             self.install_trees
                 .insert(PathBuf::from(file), PathBuf::from(root));
+        }
+    }
+
+    /// Drop a pnpm env-lockfile ref ([`TreePart::PnpmEnv`]) that the same
+    /// file's project document also wires (the same `(purl, uuid, mode)`):
+    /// one wiring of the package in that file, whose project instance is
+    /// the one an installed `node_modules` copy is verified against, even
+    /// when the two pins differ. Runs before any contest
+    /// ([`Discovery::contest_within_locks`]), so the twin leaves no
+    /// diagnostic or [`Unattested`] mark (keyed by `(purl, uuid)`, which
+    /// would withhold the project ref) behind, and a withheld project ref
+    /// never leaves it attested in its place. The project twin counts
+    /// wherever an extractor put it (`refs`, `shadowed` or `rewirable`).
+    fn drop_env_twins(&mut self) {
+        let lists = [&self.refs, &self.shadowed, &self.rewirable];
+        if !lists
+            .iter()
+            .copied()
+            .flatten()
+            .any(|r| r.part == TreePart::PnpmEnv)
+        {
+            return;
+        }
+        let project: HashSet<(PathBuf, String, String, WiringMode)> = lists
+            .into_iter()
+            .flatten()
+            .filter(|r| r.part == TreePart::File)
+            .map(|r| {
+                (
+                    r.source_file.clone(),
+                    r.purl.clone(),
+                    r.uuid.clone(),
+                    r.mode,
+                )
+            })
+            .collect();
+        for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
+            refs.retain(|r| {
+                r.part == TreePart::File
+                    || !project.contains(&(
+                        r.source_file.clone(),
+                        r.purl.clone(),
+                        r.uuid.clone(),
+                        r.mode,
+                    ))
+            });
         }
     }
 
@@ -1510,11 +1741,12 @@ impl Discovery {
         self.contested.dedup();
         for refs in [&mut self.refs, &mut self.shadowed, &mut self.rewirable] {
             refs.sort_by(|a, b| {
-                (&a.source_file, &a.purl, &a.uuid, a.mode).cmp(&(
+                (&a.source_file, &a.purl, &a.uuid, a.mode, a.part).cmp(&(
                     &b.source_file,
                     &b.purl,
                     &b.uuid,
                     b.mode,
+                    b.part,
                 ))
             });
             refs.dedup();
@@ -1604,6 +1836,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     yarn::extract(&ctx, &mut out).await;
     bun::extract(&ctx, &mut out).await;
     vlt::extract(&ctx, &mut out).await;
+    user_patched::extract(&ctx, &mut out).await;
     ctx.ecosystem = "cargo";
     cargo::extract(&ctx, &mut out).await;
     ctx.ecosystem = "golang";
@@ -1628,6 +1861,7 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
     out.unattest_unwired_copies();
     out.recognized.extend(ctx.take_recognized());
     out.read.extend(ctx.take_read());
+    out.patch_server_origins = ctx.origin.origins().to_vec();
     out.finalize();
     out
 }
@@ -1725,6 +1959,14 @@ impl<'a> DiscoverCtx<'a> {
             ecosystem: "",
             read: Mutex::new(BTreeSet::new()),
         }
+    }
+
+    /// Account for `text`, which a walk through [`Self::view`] read from
+    /// `rel` on this ctx's behalf, exactly as [`Self::read_text`] accounts
+    /// for its own reads (rule 11 recognition and the read log).
+    pub(crate) fn adopt_read(&self, rel: &str, text: &str) {
+        self.log_read(rel, true);
+        self.recognize_text(rel, text);
     }
 
     /// Log a guarded read of `rel` ([`Discovery::read`]).
@@ -2441,8 +2683,15 @@ impl Discovery {
     ///    `source "<patch registry>" do` block still declares the gem
     ///    ([`gem::gemfile_source_block_pins`]): live — bundler re-resolves
     ///    from it whatever the lock says;
-    /// 1. a lock inventory entry for this purl whose resolved url carries
-    ///    the uuid: live;
+    /// 1. a lock inventory entry for this purl whose resolved url is a
+    ///    Socket-hosted url for THIS uuid
+    ///    ([`crate::origin::hosted_patch_uuid`] over Socket's host
+    ///    and [`Discovery::patch_server_origins`]): live. Failing that, an
+    ///    entry whose url has the hosted shape for this uuid on an origin
+    ///    this run was not given (a patch server an earlier run was pointed
+    ///    at with `--patch-server-url`, or a host that merely spells the
+    ///    uuid): [`RecordLiveness::Undecided`] — never attested, never
+    ///    judged dead;
     /// 2. a lock inventory entry that resolves the purl from somewhere ELSE
     ///    (a registry url, a crates.io-checksummed Cargo.lock source): dead
     ///    — the lock positively says the build fetches the unpatched
@@ -2453,10 +2702,19 @@ impl Discovery {
     ///    route nothing once the dependency pin is reverted, and reads a
     ///    Gemfile / `gems.rb` with discovery's source-block grammar).
     ///
+    /// A record steps 0 or 3 find pinned is [`RecordLiveness::Undecided`]
+    /// instead of live when its recorded files route the uuid through a
+    /// hosted-shaped url on an origin this run was not given — the step-1
+    /// rule, for the formats whose inventory carries no url
+    /// ([`foreign_hosted_url_in_files`]).
+    ///
     /// `inventory` is the project's EVERY-instance lock inventory
     /// ([`inventory_project_every_lock`] — step 2 is negative evidence, so a
     /// collapsed view that dropped the hosted instance must not feed it),
     /// loaded on first need and shared across calls.
+    ///
+    /// The attestation-grade verdict: [`Self::redirect_record_verdict`]
+    /// is [`RecordLiveness::Live`].
     pub async fn redirect_record_live(
         &self,
         root: &Path,
@@ -2465,8 +2723,23 @@ impl Discovery {
         recorded_files: &[&str],
         inventory: &mut Option<Vec<LockfileEntry>>,
     ) -> bool {
+        self.redirect_record_verdict(root, purl, uuid, recorded_files, inventory)
+            .await
+            .attests()
+    }
+
+    /// [`Self::redirect_record_live`]'s three-way verdict (see
+    /// [`RecordLiveness`]).
+    pub async fn redirect_record_verdict(
+        &self,
+        root: &Path,
+        purl: &str,
+        uuid: &str,
+        recorded_files: &[&str],
+        inventory: &mut Option<Vec<LockfileEntry>>,
+    ) -> RecordLiveness {
         if let Some(live) = self.hosted_claim(purl, uuid) {
-            return live;
+            return RecordLiveness::from_bool(live);
         }
         // Bundler resolves from the Gemfile / `gems.rb`: when a `source
         // "<patch registry>" do` block there still pins the uuid but the
@@ -2491,7 +2764,7 @@ impl Discovery {
                     continue;
                 };
                 if gem::gemfile_source_block_pins(&text, uuid, Some(&gem_name)) {
-                    return true;
+                    return self.unless_foreign_hosted(root, recorded_files, uuid).await;
                 }
             }
         }
@@ -2509,17 +2782,160 @@ impl Discovery {
             .iter()
             .filter(|e| lookup(std::slice::from_ref(*e), purl).is_some())
             .collect();
-        if entries
-            .iter()
-            .any(|e| e.resolved.as_deref().is_some_and(|r| r.contains(uuid)))
-        {
-            return true;
+        let resolved = || entries.iter().filter_map(|e| e.resolved.as_deref());
+        if resolved().any(|r| {
+            crate::origin::hosted_patch_uuid(r, &self.patch_server_origins).as_deref() == Some(uuid)
+        }) {
+            return RecordLiveness::Live;
+        }
+        if resolved().any(|r| crate::origin::hosted_shape_uuid(r).as_deref() == Some(uuid)) {
+            return RecordLiveness::Undecided;
         }
         if entries.iter().any(|e| resolves_elsewhere(e)) {
-            return false;
+            return RecordLiveness::Dead;
         }
-        hosted_wiring_in_files(root, &recorded, uuid).await
+        if !hosted_wiring_in_files(root, &recorded, uuid).await {
+            return RecordLiveness::Dead;
+        }
+        self.unless_foreign_hosted(root, recorded_files, uuid).await
     }
+
+    /// The verdict for a record whose ledger-recorded wiring still pins
+    /// `uuid` (steps 0 and 3 of [`Self::redirect_record_live`]): `Live`,
+    /// unless those files route it through a url with the hosted shape for
+    /// `uuid` on an origin this run was not given — the same wiring step 1
+    /// judges `Undecided` when a lock inventory entry carries the url, here
+    /// for the formats whose inventory does not (a yarn berry
+    /// `__archiveUrl=` binding, a `Cargo.lock` registry `source`, a pom
+    /// `<repository>`, a Gemfile `source` block). Fail closed: a pin to a
+    /// staging server used without `--patch-server-url`, or to a look-alike
+    /// host, is never attested ([`foreign_hosted_url_in_files`]).
+    async fn unless_foreign_hosted(
+        &self,
+        root: &Path,
+        recorded_files: &[&str],
+        uuid: &str,
+    ) -> RecordLiveness {
+        if foreign_hosted_url_in_files(root, recorded_files, uuid, &self.patch_server_origins).await
+        {
+            RecordLiveness::Undecided
+        } else {
+            RecordLiveness::Live
+        }
+    }
+}
+
+/// A redirect-ledger record's liveness ([`Discovery::redirect_record_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordLiveness {
+    /// The build resolves the package from the record's patch.
+    Live,
+    /// A lock entry resolves the package from a url with the hosted shape
+    /// for the record's patch, on an origin this run does not accept as a
+    /// patch server: perhaps the operator's own server, configured on an
+    /// earlier run (`--patch-server-url`) but not this one; perhaps a host
+    /// that merely spells the uuid. Never attested, never judged dead —
+    /// what keeps the wiring (the hosted-wiring advisories) keeps it.
+    Undecided,
+    /// The build does not resolve the package from the record's patch.
+    Dead,
+}
+
+impl RecordLiveness {
+    fn from_bool(live: bool) -> Self {
+        if live {
+            Self::Live
+        } else {
+            Self::Dead
+        }
+    }
+
+    /// Whether the record may be attested.
+    pub fn attests(self) -> bool {
+        self == Self::Live
+    }
+
+    /// Whether the record's wiring is to be kept (not judged gone).
+    pub fn retained(self) -> bool {
+        self != Self::Dead
+    }
+}
+
+/// Whether any of `files` — the root-relative files a REDIRECT ledger recorded
+/// editing — spells a url with the hosted shape for `uuid`
+/// ([`crate::origin::hosted_shape_uuid`]) on an origin outside Socket's host
+/// and `origins`. Fail closed: one such url is enough, whatever else the files
+/// spell (a Socket-host url beside it — a leftover definition, a comment —
+/// does not clear it). Each occurrence of the uuid is widened to the url token
+/// around it (bounded by whitespace, quotes, markup and `=` / `&`, so a berry
+/// `__archiveUrl=` binding value or a `Cargo.lock` `sparse+` source reads
+/// whole), then read the way [`crate::origin::hosted_patch_uuid`] reads a url;
+/// a scheme-less token (a go.mod `replace` module path,
+/// `<host>/gopatch/<uuid>`) is read as `https://`. Every recorded file counts,
+/// registry definitions included: a definition routes nothing on its own, but
+/// it names the host the pin routes to. `bun.lockb` is binary and is skipped
+/// (its inventory carries the url to step 1). Same path guards as
+/// [`hosted_wiring_in_files`].
+async fn foreign_hosted_url_in_files(
+    root: &Path,
+    files: &[&str],
+    uuid: &str,
+    origins: &[String],
+) -> bool {
+    if !is_canonical_uuid(uuid) {
+        return false;
+    }
+    for file in unique_safe_rel_files(files) {
+        if file == "bun.lockb" || file.ends_with("/bun.lockb") {
+            continue;
+        }
+        let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(&file)).await else {
+            continue;
+        };
+        for token in url_tokens_around(&text, uuid) {
+            let schemed;
+            let url = if token.contains("://") || token.contains("%3A%2F%2F") {
+                token
+            } else {
+                schemed = format!("https://{token}");
+                &schemed
+            };
+            if crate::origin::hosted_patch_uuid(url, origins).as_deref() != Some(uuid)
+                && crate::origin::hosted_shape_uuid(url).as_deref() == Some(uuid)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The url-shaped token around each occurrence of `needle` in `text`:
+/// widened in both directions up to whitespace, a quote, markup or a
+/// key / binding separator (`=`, `&`, `,`, brackets).
+fn url_tokens_around<'a>(text: &'a str, needle: &str) -> Vec<&'a str> {
+    let stop = |c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '=' | '&' | ','
+            )
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(pos) = text[from..].find(needle) {
+        let idx = from + pos;
+        let end = idx + needle.len();
+        let start = text[..idx]
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| stop(c))
+            .map_or(0, |(i, c)| i + c.len_utf8());
+        let stop_at = text[end..].find(stop).map_or(text.len(), |i| end + i);
+        out.push(&text[start..stop_at]);
+        from = end;
+    }
+    out
 }
 
 /// Whether root-relative `file` is one of `ecosystem`'s lockfiles — what an
@@ -2596,10 +3012,24 @@ impl<'a> LedgerLiveness<'a> {
         }
     }
 
-    /// [`Discovery::redirect_record_live`] for this project state.
+    /// [`Discovery::redirect_record_live`] for this project state: whether
+    /// the record may be ATTESTED.
     pub async fn redirect_record(&mut self, purl: &str, uuid: &str) -> bool {
+        self.redirect_record_verdict(purl, uuid).await.attests()
+    }
+
+    /// Whether the record's hosted wiring is still in place for a caller
+    /// that keeps or reports wiring rather than attesting it
+    /// ([`RecordLiveness::retained`]: an [`RecordLiveness::Undecided`]
+    /// record is kept).
+    pub async fn redirect_record_retained(&mut self, purl: &str, uuid: &str) -> bool {
+        self.redirect_record_verdict(purl, uuid).await.retained()
+    }
+
+    /// [`Discovery::redirect_record_verdict`] for this project state.
+    pub async fn redirect_record_verdict(&mut self, purl: &str, uuid: &str) -> RecordLiveness {
         self.discovery
-            .redirect_record_live(
+            .redirect_record_verdict(
                 self.root,
                 purl,
                 uuid,
@@ -2620,9 +3050,10 @@ impl<'a> LedgerLiveness<'a> {
     }
 }
 
-/// A lock inventory entry (already known NOT to carry the patch uuid in its
-/// resolved url) that positively resolves from a non-patch source: an
-/// explicit artifact url, or a crates.io Cargo.lock source (the registry
+/// A lock inventory entry (already known NOT to resolve from the record's
+/// patch: its resolved url, if any, is no Socket-hosted url for that uuid)
+/// that positively resolves from somewhere else: an explicit artifact url
+/// (another host, or another patch), or a crates.io Cargo.lock source (the registry
 /// view's [`SourceKind::CratesIo`]; Socket sparse sources carry no url in
 /// the inventory and so prove nothing either way). An entry with no url is
 /// the conventional registry for most formats but is also how the inventory
@@ -3201,6 +3632,36 @@ mod tests {
     use super::testing::*;
     use super::*;
 
+    /// A foreign hosted url reads its origin after the same normalization
+    /// `hosted_patch_uuid` applies: `\\/` escapes, a percent-encoded url
+    /// and a Cargo `sparse+` / `registry+` prefix.
+    #[test]
+    fn hosted_shape_uuid_normalizes_like_hosted_patch_uuid() {
+        const U: &str = "11111111-2222-4333-8444-555555555555";
+        for url in [
+            format!("https://mirror.example/patch/{U}/x.tgz"),
+            format!("https:\\/\\/mirror.example\\/patch\\/{U}\\/x.tgz"),
+            format!("https%3A%2F%2Fmirror.example%2Fpatch%2F{U}%2Fx.tgz"),
+            format!("sparse+https://mirror.example/patch/{U}/"),
+            format!("registry+https://mirror.example/patch/{U}/"),
+            format!("https://patch.socket.dev@mirror.example/patch/{U}/x.tgz"),
+            format!("https://user:pw@patch.socket.dev/patch/{U}/x.tgz"),
+        ] {
+            assert_eq!(
+                crate::origin::hosted_shape_uuid(&url).as_deref(),
+                Some(U),
+                "{url}"
+            );
+        }
+        // A url merely ending in the uuid is not a patch server's.
+        for url in [
+            format!("https://artifacts.corp/blobs/{U}/x-1.0.0.tgz"),
+            format!("https://evil.example/{U}/x.tgz"),
+        ] {
+            assert_eq!(crate::origin::hosted_shape_uuid(&url), None, "{url}");
+        }
+    }
+
     /// The read-only parse [`toml_or_diag`] hands extractors reads every
     /// value the way the `DocumentMut` it replaced did (#1473): escaped,
     /// literal and multi-line strings decode, quoted and dotted keys
@@ -3468,12 +3929,13 @@ mod tests {
     }
 
     /// REGRESSION: step 2's negative evidence reads EVERY lock's instance.
-    /// `uv.lock` routes six to a hosted wheel on a patch host outside the
-    /// discovery allowlist (no `hosted_claim`), and a PEP 723 script lock
-    /// that sorts first resolves the same six from PyPI. The collapsed
-    /// inventory keeps only the script lock's instance, which made the
-    /// record look resolved-elsewhere (dead) although the project lock still
-    /// installs the patch.
+    /// `uv.lock` routes six to a hosted wheel on the operator's configured
+    /// patch server, which a discovery that holds no claim on the uuid
+    /// classifies with the run's origins, and a PEP 723 script lock that
+    /// sorts first resolves the same six from PyPI. The collapsed inventory
+    /// keeps only the script lock's instance, which made the record look
+    /// resolved-elsewhere (dead) although the project lock still installs
+    /// the patch.
     #[tokio::test]
     async fn a_script_lock_registry_instance_does_not_veto_the_hosted_project_lock() {
         let p = Project::new();
@@ -3532,6 +3994,21 @@ mod tests {
             None,
             "host not allowlisted"
         );
+        // Without the origin, the internal host's url is undecided: never
+        // attested, and not vetoed by the script lock's registry instance
+        // either.
+        let mut inventory = None;
+        assert_eq!(
+            discovery
+                .redirect_record_verdict(root, purl, UUID_A, &["uv.lock"], &mut inventory)
+                .await,
+            RecordLiveness::Undecided,
+            "an unconfigured patch host is never attested, nor judged dead"
+        );
+        let discovery = Discovery {
+            patch_server_origins: vec!["https://patches.internal.example".to_string()],
+            ..Discovery::default()
+        };
         let mut inventory = None;
         assert!(
             discovery
@@ -3560,7 +4037,9 @@ mod tests {
     /// would).
     #[tokio::test]
     async fn gemfile_liveness_reads_live_source_blocks_only() {
-        let index = format!("https://patches.example.com/patch-registry/gem/{TOKEN}/{UUID_A}/");
+        // Socket's host: a source block on an origin this run was not given
+        // is never live (`recorded_wiring_on_a_foreign_origin_is_undecided`).
+        let index = format!("https://patch.socket.dev/patch-registry/gem/{TOKEN}/{UUID_A}/");
         let p = Project::new();
         p.write(
             "Gemfile.lock",
@@ -3662,6 +4141,250 @@ mod tests {
         );
         assert!(!hosted_wiring_in_files(root, &["package-lock.json"], UUID_B).await);
         assert!(!hosted_wiring_in_files(root, &["package-lock.json"], "not-a-uuid").await);
+    }
+
+    /// Step 1 classifies a lock entry's resolved url with the one origin rule
+    /// ([`crate::origin::hosted_patch_uuid`]), never by substring. Only a
+    /// Socket-host url or a configured origin's url for the record's uuid is
+    /// LIVE (attested). A url with the hosted shape for the uuid on an origin
+    /// this run was not given — a patch server an earlier run was pointed at,
+    /// or a host that merely spells it — is UNDECIDED: never attested, but its
+    /// wiring is retained. A url that only contains the uuid (a file name, a
+    /// query) and a Socket url for ANOTHER patch (whose path carries the uuid
+    /// as its grant token) resolve the package from somewhere else: DEAD.
+    #[tokio::test]
+    async fn liveness_matches_the_resolved_url_by_origin_not_substring() {
+        use RecordLiveness::{Dead, Live, Undecided};
+        let origin = "http://127.0.0.1:4545";
+        let purl = "pkg:npm/x@1.0.0";
+        let elsewhere =
+            format!("https://evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let userinfo = format!(
+            "https://patch.socket.dev@evil.example/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz"
+        );
+        let in_name = format!("https://evil.example/files/x-{UUID_A}.tgz");
+        let in_query = format!("https://evil.example/files/x-1.0.0.tgz?id={UUID_A}");
+        let other_patch =
+            format!("https://patch.socket.dev/patch/npm/x/1.0.0/{UUID_A}/{UUID_B}/x-1.0.0.tgz");
+        let socket = hosted_url("npm", "x", "1.0.0", UUID_A, "x-1.0.0.tgz");
+        let configured = format!("{origin}/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+        let with_origin = Discovery {
+            patch_server_origins: vec![origin.to_string()],
+            ..Discovery::default()
+        };
+        let without = Discovery::default();
+        for (resolved, discovery, verdict) in [
+            (&elsewhere, &with_origin, Undecided),
+            (&configured, &without, Undecided),
+            (&userinfo, &without, Undecided),
+            (&in_name, &with_origin, Dead),
+            (&in_query, &with_origin, Dead),
+            (&other_patch, &with_origin, Dead),
+            (&socket, &without, Live),
+            (&configured, &with_origin, Live),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                format!(
+                    r#"{{"lockfileVersion":3,"packages":{{"":{{}},"node_modules/x":{{"version":"1.0.0","resolved":"{resolved}"}}}}}}"#
+                ),
+            );
+            let why = format!("{resolved} (origins {:?})", discovery.patch_server_origins);
+            let mut inventory = None;
+            assert_eq!(
+                discovery
+                    .redirect_record_verdict(
+                        p.root(),
+                        purl,
+                        UUID_A,
+                        &["package-lock.json"],
+                        &mut inventory,
+                    )
+                    .await,
+                verdict,
+                "{why}"
+            );
+            let mut inventory = None;
+            assert_eq!(
+                discovery
+                    .redirect_record_live(
+                        p.root(),
+                        purl,
+                        UUID_A,
+                        &["package-lock.json"],
+                        &mut inventory,
+                    )
+                    .await,
+                verdict == Live,
+                "only a live record attests: {why}"
+            );
+            let mut liveness = LedgerLiveness::new(p.root(), discovery, None);
+            assert_eq!(
+                liveness.redirect_record(purl, UUID_A).await,
+                verdict.attests(),
+                "{why}"
+            );
+            assert_eq!(
+                liveness.redirect_record_retained(purl, UUID_A).await,
+                verdict != Dead,
+                "{why}"
+            );
+        }
+    }
+
+    /// Steps 0 and 3 (the ledger's own recorded wiring) fail closed the
+    /// way step 1 does: a pin whose recorded files route the uuid through
+    /// a hosted-shaped url on an origin this run was not given — here a
+    /// yarn berry `__archiveUrl=` binding and a `Cargo.lock` `sparse+`
+    /// source, neither of which the lock inventory carries as a url — is
+    /// `Undecided`, never attested; the same url on Socket's host or a
+    /// configured origin is live, and a userinfo look-alike reads as the
+    /// host after its `@`.
+    #[tokio::test]
+    async fn recorded_wiring_on_a_foreign_origin_is_undecided() {
+        use RecordLiveness::{Live, Undecided};
+        let origin = "http://127.0.0.1:4545";
+        let berry = |base: &str| {
+            let url = format!("{base}/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz");
+            let encoded = url.replace(':', "%3A").replace('/', "%2F");
+            format!(
+                "__metadata:\n  version: 8\n\n\"x@npm:1.0.0\":\n  version: 1.0.0\n  \
+                 resolution: \"x@npm:1.0.0::__archiveUrl={encoded}\"\n  languageName: node\n  \
+                 linkType: hard\n"
+            )
+        };
+        let cargo = |base: &str| {
+            format!(
+                "version = 3\n\n[[package]]\nname = \"x\"\nversion = \"1.0.0\"\n\
+                 source = \"sparse+{base}/patch-registry/cargo/{TOKEN}/{UUID_A}/index/\"\n"
+            )
+        };
+        let with_origin = Discovery {
+            patch_server_origins: vec![origin.to_string()],
+            ..Discovery::default()
+        };
+        let without = Discovery::default();
+        for (file, purl, text, discovery, verdict) in [
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://patch.socket.dev@evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry(origin),
+                &without,
+                Undecided,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry(origin),
+                &with_origin,
+                Live,
+            ),
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                berry("https://patch.socket.dev"),
+                &without,
+                Live,
+            ),
+            (
+                "Cargo.lock",
+                "pkg:cargo/x@1.0.0",
+                cargo("https://evil.example"),
+                &without,
+                Undecided,
+            ),
+            (
+                "Cargo.lock",
+                "pkg:cargo/x@1.0.0",
+                cargo(origin),
+                &with_origin,
+                Live,
+            ),
+            // A Socket-host spelling elsewhere in the files (a comment, a
+            // leftover definition) does not clear a foreign pin.
+            (
+                "yarn.lock",
+                "pkg:npm/x@1.0.0",
+                format!(
+                    "# https://patch.socket.dev/patch/npm/x/1.0.0/{TOKEN}/{UUID_A}/x-1.0.0.tgz\n{}",
+                    berry("https://evil.example")
+                ),
+                &without,
+                Undecided,
+            ),
+            // A go.mod `replace` names a scheme-less module path.
+            (
+                "go.mod",
+                "pkg:golang/example.com/x@v1.0.0",
+                format!(
+                    "module example.com/app\n\ngo 1.21\n\nrequire example.com/x v1.0.0\n\n\
+                     replace example.com/x v1.0.0 => staging.example/gopatch/{UUID_A} v1.0.0\n"
+                ),
+                &without,
+                Undecided,
+            ),
+            (
+                "go.mod",
+                "pkg:golang/example.com/x@v1.0.0",
+                format!(
+                    "module example.com/app\n\ngo 1.21\n\nrequire example.com/x v1.0.0\n\n\
+                     replace example.com/x v1.0.0 => patch.socket.dev/gopatch/{UUID_A} v1.0.0\n"
+                ),
+                &without,
+                Live,
+            ),
+        ] {
+            let p = Project::new();
+            p.write(file, &text);
+            let why = format!(
+                "{file}: {text} (origins {:?})",
+                discovery.patch_server_origins
+            );
+            let mut inventory = None;
+            assert_eq!(
+                discovery
+                    .redirect_record_verdict(p.root(), purl, UUID_A, &[file], &mut inventory)
+                    .await,
+                verdict,
+                "{why}"
+            );
+        }
+    }
+
+    /// The url token around each needle occurrence stops at quotes, markup
+    /// and binding separators, and never splits a multi-byte character.
+    #[test]
+    fn url_tokens_around_widen_to_the_url() {
+        let text = "a=\"sparse+https://h/x/U/i/\" <url>https://h/U</url>\u{a0}https://h/U#f&b";
+        assert_eq!(
+            url_tokens_around(text, "U"),
+            vec!["sparse+https://h/x/U/i/", "https://h/U", "https://h/U#f"]
+        );
+    }
+
+    /// Discovery records the origins it classified with, for liveness.
+    #[tokio::test]
+    async fn discovery_carries_its_patch_server_origins() {
+        let p = Project::new().with_origin("http://127.0.0.1:4545");
+        assert_eq!(
+            p.discover().await.patch_server_origins,
+            vec!["http://127.0.0.1:4545".to_string()]
+        );
     }
 
     /// [`LedgerLiveness`]: the redirect ledger's edit files are sorted and
@@ -4598,7 +5321,7 @@ mod tests {
 
     /// ARCHITECTURE GUARD (rule 12): the npm-family extractors read their
     /// locks through the entry models the lock inventory shares
-    /// (`classic_entries` / `berry_entries`, `pnpm_packages`,
+    /// (`classic_entries` / `berry_entries`, `PnpmLock::packages`,
     /// `bun_text_entries`, `BunLockb::parse_packages`), never through the
     /// grammar primitives those models wrap, nor a second parser of the
     /// same lock (a JSON read of `bun.lock`) — so discovery and the

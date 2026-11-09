@@ -659,7 +659,7 @@ pub(crate) fn is_safe_npm_name(name: &str) -> bool {
 
 /// The artifact path under the uuid dir: `[@scope/]<name>-<version>.tgz`,
 /// with the scope kept as a real subdirectory.
-pub(super) fn tgz_rel_leaf(name: &str, version: &str) -> String {
+pub(crate) fn tgz_rel_leaf(name: &str, version: &str) -> String {
     format!("{}.tgz", pkg_rel_leaf(name, version))
 }
 

@@ -1852,3 +1852,176 @@ async fn a_pnpm_workspace_file_listing_nothing_adds_no_root() {
         );
     }
 }
+
+/// The in-memory engine through path selection, and the disk flow, over a
+/// project whose `left-pad@1.3.0` (the pnpm golden fixture's patch) the
+/// project may patch itself: the `redirected` count of each, and whether
+/// the memory root project skipped a candidate `user_patch_conflict`.
+/// The memory run is made twice through selection: with the roots it
+/// detects, and with the caller naming the root (`projectRoots: [""]`),
+/// where a pnpm member with a lock is no root of its own; both must agree.
+async fn user_patch_runs(files: &BTreeMap<String, Vec<u8>>) -> (u64, usize, bool) {
+    use socket_patch_cli::hosted_memory::{select_paths, SelectOptions, TreeEntryInput};
+    let dir = fixtures_root().join("redirect/npm/pnpm/basic");
+    let server = MockServer::start().await;
+    let patches = patches_from_overrides(&dir.join("overrides.json"), Some(&server.uri()));
+    mount_api(&server, &patches).await;
+    let disk = run_disk_with(&server, files, false, &["--no-trust-lockfile-config"]);
+    let entries: Vec<TreeEntryInput> = files
+        .iter()
+        .map(|(p, bytes)| TreeEntryInput {
+            path: p.clone(),
+            mode: "100644".into(),
+            kind: "blob".into(),
+            size: Some(bytes.len() as u64),
+        })
+        .collect();
+    let mut runs = Vec::new();
+    for roots in [None, Some(vec![String::new()])] {
+        let selection = select_paths(
+            &entries,
+            &SelectOptions {
+                project_roots: roots,
+                ..SelectOptions::default()
+            },
+        );
+        let fetched: BTreeMap<String, Vec<u8>> = selection
+            .fetch_text
+            .iter()
+            .chain(selection.fetch_binary.iter())
+            .map(|p| (p.clone(), files[p].clone()))
+            .collect();
+        let present: Vec<&str> = selection.present_only.iter().map(String::as_str).collect();
+        let mut opts = options(false);
+        opts.project_roots = Some(selection.roots.clone());
+        opts.trust_lockfile_config = Some(false);
+        let memory = run_engine(&server, build_input(&fetched, &present, opts)).await;
+        let root = memory
+            .projects
+            .iter()
+            .find(|p| p.root.is_empty())
+            .expect("the root project");
+        assert!(root.error.is_none(), "{:?}", root.error);
+        let skipped = root
+            .skipped
+            .iter()
+            .any(|s| s.reason == "user_patch_conflict");
+        runs.push((root.redirected.len(), skipped));
+    }
+    assert_eq!(runs[0], runs[1], "detected and named roots agree");
+    (
+        disk.redirect["redirected"].as_u64().unwrap_or(0),
+        runs[0].0,
+        runs[0].1,
+    )
+}
+
+/// Review (#2018): the in-memory engine reads user patches only from the
+/// files path selection asks the host for. A pnpm workspace's member
+/// manifests, an npm / yarn workspace member's manifest and `patches/`
+/// folder, and the root's patch-package files and `--patch-dir` must all
+/// be selected (with content where the walk reads it), or the engine
+/// either pins a package the project patches itself or withholds every
+/// npm package over a file it saw without content. Through selection,
+/// memory agrees with the disk flow, whose consent gate reads the same
+/// declarations: a patched `left-pad` is never pinned, and an unrelated
+/// patch withholds nothing.
+#[tokio::test]
+async fn user_patches_are_selected_and_agree_with_the_disk_flow() {
+    let lock =
+        String::from_utf8(read_fixture("redirect/npm/pnpm/basic/input/pnpm-lock.yaml")).unwrap();
+    let pnpm_ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+    let member_patch = r#"{ "name": "a", "dependencies": { "left-pad": "1.3.0" }, "pnpm": { "patchedDependencies": { "left-pad@1.3.0": "x.patch" } } }"#;
+    let npm_ws = r#"{ "name": "root", "private": true, "workspaces": ["packages/*"] }"#;
+    let patch_dir =
+        r#"{ "name": "root", "scripts": { "postinstall": "patch-package --patch-dir fixes" } }"#;
+    let root_manifest = r#"{ "name": "root", "private": true }"#;
+    let with_root_lock = |extra: &[(&str, &str)]| -> Vec<(String, String)> {
+        let mut files = vec![("pnpm-lock.yaml".to_string(), lock.clone())];
+        files.extend(extra.iter().map(|(p, t)| (p.to_string(), t.to_string())));
+        files
+    };
+    let pnpm_members = |a: &str| -> Vec<(String, String)> {
+        vec![
+            ("pnpm-workspace.yaml".into(), pnpm_ws.into()),
+            ("package.json".into(), root_manifest.into()),
+            ("packages/a/package.json".into(), a.into()),
+            ("packages/a/pnpm-lock.yaml".into(), lock.clone()),
+            (
+                "packages/b/package.json".into(),
+                r#"{ "name": "b" }"#.into(),
+            ),
+        ]
+    };
+    let cases: Vec<(&str, Vec<(String, String)>, bool)> = vec![
+        ("pnpm member manifest", pnpm_members(member_patch), true),
+        (
+            "pnpm members without a patch",
+            pnpm_members(r#"{ "name": "a", "dependencies": { "left-pad": "1.3.0" } }"#),
+            false,
+        ),
+        (
+            "npm workspace member's patches/",
+            with_root_lock(&[
+                ("package.json", npm_ws),
+                ("packages/a/package.json", r#"{ "name": "a" }"#),
+                ("packages/a/patches/left-pad+1.3.0.patch", "diff\n"),
+            ]),
+            true,
+        ),
+        (
+            "npm workspace member's patch: descriptor",
+            with_root_lock(&[
+                ("package.json", npm_ws),
+                (
+                    "packages/a/package.json",
+                    r#"{ "name": "a", "resolutions": { "left-pad": "patch:left-pad@npm%3A1.3.0#./p.patch" } }"#,
+                ),
+            ]),
+            true,
+        ),
+        (
+            "npm workspace members without a patch",
+            with_root_lock(&[
+                ("package.json", npm_ws),
+                ("packages/a/package.json", r#"{ "name": "a" }"#),
+            ]),
+            false,
+        ),
+        (
+            "root patches/",
+            with_root_lock(&[("patches/left-pad+1.3.0.patch", "diff\n")]),
+            true,
+        ),
+        (
+            "root --patch-dir",
+            with_root_lock(&[
+                ("package.json", patch_dir),
+                ("fixes/left-pad+1.3.0.patch", "diff\n"),
+            ]),
+            true,
+        ),
+        (
+            "root --patch-dir patching another package",
+            with_root_lock(&[
+                ("package.json", patch_dir),
+                ("fixes/other+1.0.0.patch", "diff\n"),
+            ]),
+            false,
+        ),
+    ];
+    for (what, files, patched) in cases {
+        let files: BTreeMap<String, Vec<u8>> = files
+            .into_iter()
+            .map(|(p, t)| (p, t.into_bytes()))
+            .collect();
+        let (disk, memory, skipped) = user_patch_runs(&files).await;
+        if patched {
+            assert_eq!((disk, memory), (0, 0), "{what}: never pinned");
+            assert!(skipped, "{what}: memory skips it user_patch_conflict");
+        } else {
+            assert!(disk > 0 && memory > 0, "{what}: pinned ({disk}, {memory})");
+            assert!(!skipped, "{what}");
+        }
+    }
+}

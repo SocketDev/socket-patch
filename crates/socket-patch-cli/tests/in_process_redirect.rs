@@ -2833,6 +2833,64 @@ async fn scan_redirect_rewrites_rush_common_and_subspace_locks() {
     vlt_hosted_common::assert_no_ledger(tmp.path());
 }
 
+/// A package a Rush subspace lock records as patched (its pnpm
+/// `patchedDependencies`) is the user's own: the consent gate's walk never
+/// reads a Rush lock, so the hosted disk flow's supplement withholds it
+/// from every lock (a `user_patch_conflict` skip, exit 0, nothing written)
+/// unless `--allow-patch-conflicts` is passed.
+#[tokio::test]
+#[serial]
+async fn scan_redirect_withholds_a_package_a_rush_lock_records_as_patched() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_rush_project(tmp.path(), false);
+    let subspace = tmp
+        .path()
+        .join("common/config/subspaces/frontend/pnpm-lock.yaml");
+    let patched = rush_pnpm_lock(NAME).replacen(
+        "\nimporters:",
+        &format!(
+            "\npatchedDependencies:\n  {NAME}@{VERSION}:\n    hash: abc\n    path: patches/{NAME}.patch\n\nimporters:"
+        ),
+        1,
+    );
+    std::fs::write(&subspace, &patched).unwrap();
+    let rels = [
+        "common/config/rush/pnpm-lock.yaml",
+        "common/config/subspaces/frontend/pnpm-lock.yaml",
+    ];
+    let before: Vec<String> = rels
+        .iter()
+        .map(|rel| std::fs::read_to_string(tmp.path().join(rel)).unwrap())
+        .collect();
+
+    let code = run(redirect_args(tmp.path(), server.uri())).await;
+    assert_eq!(code, 0, "a user-patch skip alone exits 0");
+    for (rel, before) in rels.iter().zip(&before) {
+        assert_eq!(
+            &std::fs::read_to_string(tmp.path().join(rel)).unwrap(),
+            before,
+            "{rel}: the user-patched package is left on its registry entry"
+        );
+    }
+
+    let mut args = redirect_args(tmp.path(), server.uri());
+    args.common.allow_patch_conflicts = true;
+    let code = run(args).await;
+    assert_eq!(code, 0, "the consented run succeeds");
+    for rel in rels {
+        let lock = std::fs::read_to_string(tmp.path().join(rel)).unwrap();
+        assert!(
+            lock.contains(HOSTED_URL),
+            "{rel}: --allow-patch-conflicts pins the package; got:\n{lock}"
+        );
+    }
+}
+
 /// Run the built `socket-patch` binary as a subprocess against `api_url`
 /// (a wiremock server) so we can parse the `--json` envelope's `warnings`
 /// array — the in-process `run` writes JSON to the process stdout, which a
@@ -6072,6 +6130,52 @@ async fn pnpm_rollback_keeps_tarball_under_workspace_include_tarball_url() {
     )
     .unwrap();
     assert_eq!(pnpm_pin_and_rollback(tmp.path(), &server), pristine);
+}
+
+/// pnpm 11+ records a config dependency bare in the env lockfile document
+/// even under `lockfileIncludeTarballUrl`, so a rollback of a pin in both
+/// documents gives the project entry its `tarball:` back and leaves the env
+/// entry bare.
+#[tokio::test]
+#[serial]
+async fn pnpm_rollback_keeps_the_env_document_bare_under_include_tarball_url() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    mock_npm_registry(&server, "sha512-UPSTREAMupstream==", None).await;
+    let tarball = format!(
+        "{}/npm-registry/{NAME}/-/{NAME}-{VERSION}.tgz",
+        server.uri()
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = write_pnpm_tarball_project(tmp.path(), &tarball);
+    let pristine = format!(
+        "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    configDependencies:\n      \
+         {NAME}:\n        specifier: {VERSION}\n        version: {VERSION}\n\npackages:\n\n  \
+         {NAME}@{VERSION}:\n    resolution: {{integrity: sha512-UPSTREAMupstream==}}\n\n\
+         snapshots:\n\n  {NAME}@{VERSION}: {{}}\n\n---\n{project}"
+    );
+    std::fs::write(tmp.path().join("pnpm-lock.yaml"), &pristine).unwrap();
+    std::fs::write(
+        tmp.path().join("pnpm-workspace.yaml"),
+        "packages:\n  - '.'\nlockfileIncludeTarballUrl: true\n",
+    )
+    .unwrap();
+    let pinned_twice = |root: &Path| {
+        let lock = std::fs::read_to_string(root.join("pnpm-lock.yaml")).unwrap();
+        lock.matches("patch.test").count()
+    };
+    let env = run_redirect_subprocess(tmp.path(), &server.uri());
+    assert_eq!(vlt_hosted_common::redirected(&env), 1, "{env:#}");
+    assert_eq!(pinned_twice(tmp.path()), 2, "both documents are pinned");
+    let (code, env) = rollback_json(tmp.path(), &server);
+    assert_eq!(code, Some(0), "rollback: {env:#}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap(),
+        pristine
+    );
 }
 
 /// #557, the other case pnpm records `tarball:` in: the registry's
