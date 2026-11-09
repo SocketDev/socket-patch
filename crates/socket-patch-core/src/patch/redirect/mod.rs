@@ -24312,8 +24312,13 @@ packages:
     }
 
     /// The engine's [`GO_WORKSPACE_KEY`] for an in-memory go.work whose
-    /// members are `(dir, go.mod)` pairs (`.` for the root module).
-    fn go_workspace_key(work_extra: &str, members: &[(&str, &str)]) -> (String, String) {
+    /// members are `(dir, go.mod)` pairs (`.` for the root module), in a
+    /// project with a root go.mod when `root_go_mod`.
+    fn go_workspace_key(
+        work_extra: &str,
+        members: &[(&str, &str)],
+        root_go_mod: bool,
+    ) -> (String, String) {
         use crate::vendor::go_workspace::{GoWorkspace, Loaded, Member};
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         let hosted = HostedGoWorkspace {
@@ -24345,6 +24350,10 @@ packages:
                         })
                         .collect(),
                 ),
+                files: Some(memory_go_files(
+                    members.iter().map(|(dir, _)| *dir),
+                    root_go_mod,
+                )),
             }),
             modfile: None,
             module_graph: None,
@@ -24355,6 +24364,29 @@ packages:
         )
     }
 
+    /// The files an in-memory workspace of the `use` members `dirs` holds,
+    /// as [`crate::vendor::go_workspace::read_memory`] lists them: go.work,
+    /// the root go.mod when the project has one (`root_go_mod`, whether or
+    /// not `.` is a member) and each in-root member's go.mod.
+    fn memory_go_files<'a>(
+        dirs: impl IntoIterator<Item = &'a str>,
+        root_go_mod: bool,
+    ) -> std::collections::BTreeSet<std::path::PathBuf> {
+        let mut files = std::collections::BTreeSet::from(["go.work".into()]);
+        if root_go_mod {
+            files.insert("go.mod".into());
+        }
+        for dir in dirs {
+            files.extend(crate::vendor::go_workspace::in_root_dir(dir).map(
+                |dir| match dir.as_str() {
+                    "" => "go.mod".into(),
+                    dir => format!("{dir}/go.mod").into(),
+                },
+            ));
+        }
+        files
+    }
+
     /// [`go_workspace_key`] plus the root go.work itself as a candidate
     /// file, as the engine reads it when go.work sits at the root.
     fn with_root_go_work(
@@ -24362,7 +24394,7 @@ packages:
         work_extra: &str,
         members: &[(&str, &str)],
     ) {
-        let (k, v) = go_workspace_key(work_extra, members);
+        let (k, v) = go_workspace_key(work_extra, members, files.contains_key("go.mod"));
         let uses: String = members.iter().map(|(d, _)| format!("\t{d}\n")).collect();
         files.insert(k, v);
         files.insert(
@@ -24391,8 +24423,11 @@ packages:
             ("\nreplace github.com/foo/bar => ./fork\n", ""),
         ] {
             let mut files = files.clone();
-            let (k, v) =
-                go_workspace_key(work, &[(".", &root), ("b", &go_member("v1.4.2", other))]);
+            let (k, v) = go_workspace_key(
+                work,
+                &[(".", &root), ("b", &go_member("v1.4.2", other))],
+                true,
+            );
             files.insert(k, v);
             let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
             assert!(out.files.is_empty(), "{work}{other}: {:?}", out.files);
@@ -24410,6 +24445,7 @@ packages:
         let (k, v) = go_workspace_key(
             "\nreplace github.com/foo/bar v1.0.0 => ./fork\n",
             &[(".", &root), ("b", &go_member("v1.4.2", ""))],
+            true,
         );
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
@@ -24425,7 +24461,7 @@ packages:
         let ovr = golang_override();
         let mut files = golang_files();
         let root = files["go.mod"].clone();
-        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", &root), ("b", &go_member("v1.5.0", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.files.is_empty());
@@ -24435,7 +24471,7 @@ packages:
         let bare = "module example.com/app\n\ngo 1.21\n";
         let mut files = BTreeMap::new();
         files.insert("go.mod".to_string(), bare.to_string());
-        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))]);
+        let (k, v) = go_workspace_key("", &[(".", bare), ("b", &go_member("v1.4.2", ""))], true);
         files.insert(k, v);
         let out = rewrite_registry_redirect(&files, std::slice::from_ref(&ovr));
         assert!(out.warnings.is_empty(), "{:?}", out.warnings);
@@ -24568,6 +24604,7 @@ packages:
                     member("../out", None),
                 ],
                 graph: None,
+                files: Some(memory_go_files([".", "../out"], true)),
             }),
             modfile: None,
             module_graph: None,
