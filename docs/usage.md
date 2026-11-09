@@ -266,6 +266,15 @@ consent permits replacing a mismatched file with Socket's verified content; it
 does not merge your changes. Without consent, mismatched files fail by default,
 unless they hold an earlier Socket patch's content (a patch update).
 `--yes` and `--force` do not approve combining declared project patches. Some
-package-manager combinations remain unsupported even with consent. See
+package-manager combinations remain unsupported even with consent: a package
+patched with npm's or Bun's own `patchedDependencies` stays unwired in hosted
+mode and is refused in vendored mode.
+With consent, hosted and vendored mode do wire a package patched with pnpm's
+`patchedDependencies`, a Yarn `patch:` descriptor or `patch-package` (Yarn
+classic and vlt have no patch mechanism of their own, so `patch-package` is how
+those projects patch). The package manager then applies your patch on top of
+Socket's, so `vex` never attests that package while your patch is declared.
+The in-memory hosted engine has no consent option and always skips such a
+package (`user_patch_conflict`). See
 [existing project patches](ecosystems.md#existing-project-patches) for the
 mechanisms checked and the limitations.

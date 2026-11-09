@@ -769,7 +769,10 @@ fn two_uuids_for_one_package_are_a_conflict() {
 /// A user `yarn patch` on top of Socket's hosted patch: yarn keeps the
 /// hosted base entry and adds a `patch:` entry wrapping its locator. The
 /// `patch:` entry is not Socket's (silently skipped); the base entry is,
-/// and the installed tree (base + the user's patch) decides.
+/// but yarn applies the user's diff over the Socket bytes, so the install
+/// never runs the Socket patch alone: the reference is omitted as
+/// `vex_npm_patched_dependency` whatever the user's patch touched, and is
+/// attested again once the user's patch is removed.
 #[test]
 fn user_yarn_patch_on_top_of_hosted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -817,8 +820,13 @@ fn user_yarn_patch_on_top_of_hosted() {
         b"user-patched readme\n",
     );
     let out = run_vex(&binary(), cwd, &VexRun::online(&api));
-    attested(&out, LP, Marker::Redirected, "user patch elsewhere");
-    // The user's patch rewrote the Socket-patched file: not attested.
+    omitted(
+        &out,
+        LP,
+        "vex_npm_patched_dependency",
+        "user patch elsewhere",
+    );
+    // The user's patch rewrote the Socket-patched file: still omitted.
     install_at(
         cwd,
         "node_modules/left-pad",
@@ -827,7 +835,20 @@ fn user_yarn_patch_on_top_of_hosted() {
         b"/* user yarn patch */\nmodule.exports = 1;\n",
     );
     let out = run_vex(&binary(), cwd, &VexRun::online(&api));
-    omitted(&out, LP, "hash_mismatch", "user patch rewrote the file");
+    omitted(
+        &out,
+        LP,
+        "vex_npm_patched_dependency",
+        "user patch rewrote the file",
+    );
+    // The user drops their patch: only the hosted base entry is left, and
+    // the Socket-patched tree is attested.
+    project(cwd, serde_json::json!({ "left-pad": "1.3.0" }), None);
+    put(cwd, "yarn.lock", lp_hosted_lock(&url).as_bytes());
+    install_at(cwd, "node_modules/left-pad", "left-pad", "1.3.0", PATCHED);
+    std::fs::remove_file(cwd.join("node_modules/left-pad/README.md")).unwrap();
+    let out = run_vex(&binary(), cwd, &VexRun::online(&api));
+    attested(&out, LP, Marker::Redirected, "user patch removed");
 }
 
 // ── spoofing ─────────────────────────────────────────────────────────────
