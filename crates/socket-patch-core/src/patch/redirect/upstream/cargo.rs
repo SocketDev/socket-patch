@@ -178,6 +178,10 @@ pub(crate) async fn restore(
             }
         }
         splices.sort_by_key(|(r, _)| std::cmp::Reverse(r.start));
+        // Two blocks of one name, version and source (a hand-merged lock)
+        // name the same `[metadata]` line. Every other range is its own
+        // block or value, so equal ranges are the only ones that meet.
+        splices.dedup_by(|a, b| a.0 == b.0);
         for (range, with) in splices {
             lock.replace_range(range, &with);
         }
@@ -848,6 +852,78 @@ mod tests {
         let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
         let after = std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap();
         (outcome, after)
+    }
+
+    /// A hosted-source block whose `name` crates.io cannot hold (empty, or
+    /// not ASCII) refuses its pin with the name, online too, and leaves the
+    /// lock as it was: the index path is never built from it.
+    #[tokio::test]
+    async fn restore_refuses_a_hosted_block_named_like_no_crate() {
+        for name in ["éa", ""] {
+            let lock = format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+                 [[package]]\nname = \"{name}\"\nversion = \"1.0.4\"\n\
+                 source = \"{}\"\nchecksum = \"{SOCKET_CKSUM}\"\n",
+                socket_source(B)
+            );
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Cargo.toml"), manifest("")).unwrap();
+            std::fs::write(tmp.path().join("Cargo.lock"), &lock).unwrap();
+            let pins = [super::super::HostedPin {
+                purl: "pkg:cargo/cfg-if@1.0.4".into(),
+                uuid: B.into(),
+                files: vec!["Cargo.lock".into(), "Cargo.toml".into()],
+            }];
+            // Online: the name is refused before any registry request.
+            let opts = super::super::RestoreOptions::default();
+            let outcome = super::super::restore_upstream(tmp.path(), &pins, &opts).await;
+            let refusals: Vec<&str> = outcome.refused().map(|(_, why)| why).collect();
+            assert_eq!(refusals.len(), 1, "{:?}", outcome.pins);
+            assert!(
+                refusals[0].contains(&format!("{name:?} is not a crates.io crate name")),
+                "{refusals:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.lock")).unwrap(),
+                lock
+            );
+            assert_eq!(
+                std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
+                manifest("")
+            );
+        }
+    }
+
+    /// A hand-merged v1 lock holding the Socket block twice (cargo refuses
+    /// it, TOML does not) names one `[metadata]` line from both blocks: the
+    /// line is removed once, not spliced out of the text a second time.
+    #[tokio::test]
+    async fn restore_merge_drops_a_shared_metadata_line_once() {
+        let socket = socket_source(B);
+        let socket_block = format!(
+            "[[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\nsource = \"{socket}\"\n\n"
+        );
+        let lock = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 ({socket})\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             {socket_block}{socket_block}\
+             [metadata]\n\
+             \"checksum cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\" = \"{CRATES_IO_CKSUM}\"\n\
+             \"checksum cfg-if 1.0.4 ({socket})\" = \"{SOCKET_CKSUM}\"\n"
+        );
+        let (outcome, after) = restore_lock(&lock).await;
+        assert_eq!(outcome.restored().count(), 1, "{:?}", outcome.pins);
+        let want = format!(
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = [\n \
+             \"cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\",\n]\n\n\
+             [[package]]\nname = \"cfg-if\"\nversion = \"1.0.4\"\n\
+             source = \"registry+https://github.com/rust-lang/crates.io-index\"\n\n\
+             [metadata]\n\
+             \"checksum cfg-if 1.0.4 (registry+https://github.com/rust-lang/crates.io-index)\" = \"{CRATES_IO_CKSUM}\"\n"
+        );
+        assert_eq!(after, want);
     }
 
     /// The lock cargo writes once a later dependency (crc32fast) locks a

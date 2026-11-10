@@ -70,15 +70,26 @@ fn crates_index_base() -> String {
         .unwrap_or_else(|| DEFAULT_CRATES_INDEX.to_string())
 }
 
-/// The sparse-index path of a crate (`cargo`'s `index_path` layout).
-fn crates_index_path(name: &str) -> String {
+/// The sparse-index path of a crate (`cargo`'s `index_path` layout), or
+/// `None` for a name crates.io cannot hold. Its names are non-empty ASCII
+/// letters, digits, `-` and `_`; the name here comes from a `Cargo.lock`,
+/// so anything else is refused rather than cut at byte offsets (which is
+/// only sound for ASCII) or placed in a URL path.
+fn crates_index_path(name: &str) -> Option<String> {
+    let crates_io_name = !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !crates_io_name {
+        return None;
+    }
     let lower = name.to_ascii_lowercase();
-    match lower.len() {
+    Some(match lower.len() {
         1 => format!("1/{lower}"),
         2 => format!("2/{lower}"),
         3 => format!("3/{}/{lower}", &lower[..1]),
         _ => format!("{}/{}/{lower}", &lower[..2], &lower[2..4]),
-    }
+    })
 }
 
 /// The RubyGems compact index root; override with `SOCKET_RUBYGEMS_URL`.
@@ -412,10 +423,12 @@ impl UpstreamClient {
             return hit.clone();
         }
         let result = async {
+            let path = crates_index_path(name)
+                .ok_or_else(|| format!("{name:?} is not a crates.io crate name"))?;
             if self.offline {
                 return Err(OFFLINE.to_string());
             }
-            let url = format!("{}/{}", crates_index_base(), crates_index_path(name));
+            let url = format!("{}/{path}", crates_index_base());
             let text = self.get_text(&url).await?;
             for line in text.lines().filter(|l| !l.trim().is_empty()) {
                 let Ok(row) = serde_json::from_str::<Value>(line) else {
@@ -840,10 +853,34 @@ mod tests {
 
     #[test]
     fn crates_index_paths_follow_cargo_layout() {
-        assert_eq!(crates_index_path("a"), "1/a");
-        assert_eq!(crates_index_path("ab"), "2/ab");
-        assert_eq!(crates_index_path("abc"), "3/a/abc");
-        assert_eq!(crates_index_path("Serde"), "se/rd/serde");
+        let path = |name: &str| crates_index_path(name).unwrap();
+        assert_eq!(path("a"), "1/a");
+        assert_eq!(path("ab"), "2/ab");
+        assert_eq!(path("abc"), "3/a/abc");
+        assert_eq!(path("Serde"), "se/rd/serde");
+        assert_eq!(path("serde_json"), "se/rd/serde_json");
+        assert_eq!(path("cfg-if"), "cf/g-/cfg-if");
+    }
+
+    /// A `Cargo.lock` is a project file: a `name` crates.io cannot hold
+    /// (empty, non-ASCII, or holding a path or URL character) is refused by
+    /// name, never sliced into an index path or sent in a URL.
+    #[tokio::test]
+    async fn cargo_cksum_refuses_a_name_crates_io_cannot_hold() {
+        for name in [
+            "", "éa", "aé", "aéb", "日本", "a/b", "..", "a b", "a?b", "a.b",
+        ] {
+            assert_eq!(crates_index_path(name), None, "{name:?}");
+            // Online and offline alike: the name is refused before any
+            // request, so this never reaches the network.
+            for offline in [false, true] {
+                let why = UpstreamClient::new(offline)
+                    .cargo_cksum(name, "1.0.0")
+                    .await
+                    .expect_err(name);
+                assert_eq!(why, format!("{name:?} is not a crates.io crate name"));
+            }
+        }
     }
 
     #[test]
