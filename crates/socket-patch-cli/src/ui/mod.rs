@@ -24,8 +24,8 @@ pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
-    agent_next_steps, manifest_error_message, next_steps, plural, sentence_case, shell_word,
-    short_uuid, sweep_failure, truncate,
+    agent_next_steps, manifest_error_message, next_steps, next_steps_installed, plural,
+    sentence_case, shell_word, short_uuid, sweep_failure, truncate,
 };
 
 /// [`text::no_patches_message`] for this run: the manifest path is named

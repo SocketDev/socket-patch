@@ -26,6 +26,18 @@ pub(crate) fn next_steps(commit: &str, reinstall: &str, extra: &[String]) -> Vec
     numbered_next_steps(&steps)
 }
 
+/// [`next_steps`] for a run that already brought the installed packages in
+/// line itself (`installed` says so in a few words): there is nothing to
+/// reinstall, so the second step is the verification alone.
+pub(crate) fn next_steps_installed(commit: &str, installed: &str, extra: &[String]) -> Vec<String> {
+    let mut steps = vec![
+        format!("Commit {commit}."),
+        format!("Run `socket-patch vex` to verify the installed patches ({installed})."),
+    ];
+    steps.extend(extra.iter().cloned());
+    numbered_next_steps(&steps)
+}
+
 /// `Next steps:` over `steps`, numbered from 1.
 fn numbered_next_steps(steps: &[String]) -> Vec<String> {
     let mut out = vec!["Next steps:".to_string()];

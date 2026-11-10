@@ -580,6 +580,32 @@ struct GemRefreshed {
     summary: Option<gem_refresh::Summary>,
     /// The cache-dir archives replaced: files the project commits.
     replaced_archives: Vec<std::path::PathBuf>,
+    /// An installed copy was replaced with the patched gem.
+    replaced_installs: bool,
+}
+
+/// What became of the copies of the switched gems that Bundler already
+/// held, as the run's next steps need it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GemCopies {
+    /// None was found unpatched and none was replaced.
+    Untouched,
+    /// Every unpatched one was replaced with the patched gem.
+    Refreshed,
+    /// Some are still unpatched; the run's warning names the command.
+    Stale,
+}
+
+impl GemRefreshed {
+    fn copies(&self) -> GemCopies {
+        if self.summary.is_some() {
+            GemCopies::Stale
+        } else if self.replaced_installs {
+            GemCopies::Refreshed
+        } else {
+            GemCopies::Untouched
+        }
+    }
 }
 
 /// The gem stale-install guard: probe ([`gem_stale_install_warnings`]),
@@ -704,6 +730,13 @@ async fn refresh_stale_gems(
         } else {
             pass.replaced_archives().map(Path::to_path_buf).collect()
         },
+        replaced_installs: !common.dry_run
+            && pass.refreshed.iter().any(|(_, target)| {
+                matches!(
+                    target,
+                    socket_patch_core::patch::gem_refresh::Target::Installed(_)
+                )
+            }),
     }
 }
 
@@ -2229,6 +2262,7 @@ async fn run_redirect_selected_untracked(
                     &commit_files,
                     &rewrite.edits,
                     !takeover_migrated.is_empty(),
+                    gem_refreshed.copies(),
                 )
             };
             next_steps.extend(deferred_steps);
@@ -2715,11 +2749,17 @@ fn join_names(names: &[String], max: usize) -> String {
 /// (`vendored_removed`) the commit also has to carry the deleted vendored
 /// ledger entries and artifacts. `cwd` locates the project's Composer
 /// vendor directory for the composer reinstall hint.
+///
+/// A run that rewrote Bundler's files alone words the second step by what
+/// it did about the gems Bundler already held (`gem_copies`): a plain
+/// `bundle install` keeps an installed gem whatever source the lock names,
+/// so "reinstall" is either done already or not the command that helps.
 fn format_next_steps(
     cwd: &std::path::Path,
     files: &[String],
     edits: &[socket_patch_core::patch::redirect::FileEdit],
     vendored_removed: bool,
+    gem_copies: GemCopies,
 ) -> Vec<String> {
     if files.is_empty() && !vendored_removed {
         return Vec::new();
@@ -2750,14 +2790,34 @@ fn format_next_steps(
     {
         extra.push("vlt: commit vlt-lock.json; CI should run `vlt ci`.".to_string());
     }
-    crate::ui::next_steps(
-        &format!("{} to keep the hosted patches", join_names(&commit, 6)),
-        &format!(
-            "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
-             patched artifacts"
+    let commit = format!("{} to keep the hosted patches", join_names(&commit, 6));
+    let bundler_only = !files.is_empty()
+        && files.iter().all(|file| {
+            let leaf = file.rsplit('/').next().unwrap_or(file);
+            matches!(leaf, "Gemfile" | "Gemfile.lock" | "gems.rb" | "gems.locked")
+                || leaf.ends_with(".gem")
+        });
+    match gem_copies {
+        GemCopies::Refreshed if bundler_only => crate::ui::next_steps_installed(
+            &commit,
+            "the installed gems already hold the patched builds, so there is nothing to reinstall",
+            &extra,
         ),
-        &extra,
-    )
+        GemCopies::Stale if bundler_only => crate::ui::next_steps(
+            &commit,
+            "Install the patched gems with the command in the warning above (a plain `bundle \
+             install` keeps the gems it already has)",
+            &extra,
+        ),
+        _ => crate::ui::next_steps(
+            &commit,
+            &format!(
+                "Reinstall from the updated lockfile{hint} so the installed packages pick up the \
+                 patched artifacts"
+            ),
+            &extra,
+        ),
+    }
 }
 
 /// Transient-frame boxed constructor for [`run_redirect_selected`] — the
@@ -2869,7 +2929,7 @@ mod tests {
         describe_skip_reason, format_error_line, format_hosted_summary, format_next_steps,
         format_redirect_summary, format_takeover_line, format_unredirected, format_warning,
         join_names, lock_entry_warning_count, pnpm_trust_rerun_reminder, split_sentences,
-        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
+        wrap_tokens, wrap_words, GemCopies, TAKEOVER_INFO_CODES,
     };
     use super::{
         gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
@@ -4879,13 +4939,21 @@ mod tests {
 
     #[test]
     fn next_steps_name_the_rewritten_files_and_reinstall() {
-        assert!(format_next_steps(std::path::Path::new("."), &[], &[], false).is_empty());
+        assert!(format_next_steps(
+            std::path::Path::new("."),
+            &[],
+            &[],
+            false,
+            GemCopies::Untouched
+        )
+        .is_empty());
         assert_eq!(
             format_next_steps(
                 std::path::Path::new("."),
                 &["package-lock.json".to_string()],
                 &[],
-                false
+                false,
+                GemCopies::Untouched
             ),
             vec![
                 "Next steps:".to_string(),
@@ -4904,12 +4972,63 @@ mod tests {
             ],
             &[],
             false,
+            GemCopies::Untouched,
         );
         assert_eq!(
             steps[1],
             "  1. Commit pnpm-lock.yaml and pnpm-workspace.yaml to keep the hosted patches."
         );
         assert!(!steps[2].contains("npm ci"), "{}", steps[2]);
+    }
+
+    /// A run that rewrote Bundler's files words the reinstall step by what
+    /// it did about the gems Bundler already held: nothing to reinstall
+    /// once it replaced them, and not `bundle install` (which keeps them)
+    /// when a shared gem home was left alone.
+    #[test]
+    fn next_steps_for_bundler_follow_what_became_of_the_installed_gems() {
+        let bundler = ["Gemfile".to_string(), "Gemfile.lock".to_string()];
+        let steps = |files: &[String], copies| {
+            format_next_steps(std::path::Path::new("."), files, &[], false, copies)
+        };
+        assert_eq!(
+            steps(&bundler, GemCopies::Refreshed),
+            vec![
+                "Next steps:".to_string(),
+                "  1. Commit Gemfile and Gemfile.lock to keep the hosted patches.".to_string(),
+                "  2. Run `socket-patch vex` to verify the installed patches (the installed gems \
+                 already hold the patched builds, so there is nothing to reinstall)."
+                    .to_string(),
+            ]
+        );
+        assert_eq!(
+            steps(&bundler, GemCopies::Stale)[2],
+            "  2. Install the patched gems with the command in the warning above (a plain \
+             `bundle install` keeps the gems it already has), then run `socket-patch vex` to \
+             verify the installed patches."
+        );
+        // A replaced cache-dir archive is one of Bundler's files too.
+        let with_cache = [
+            "Gemfile.lock".to_string(),
+            "vendor/cache/rack-2.2.3.gem".to_string(),
+        ];
+        assert!(
+            steps(&with_cache, GemCopies::Refreshed)[2].starts_with("  2. Run `socket-patch vex`")
+        );
+        // Nothing installed was touched, or another ecosystem's lock was
+        // rewritten too: the ordinary reinstall step.
+        for (files, copies) in [
+            (&bundler[..], GemCopies::Untouched),
+            (
+                &["Gemfile.lock".to_string(), "package-lock.json".to_string()][..],
+                GemCopies::Refreshed,
+            ),
+        ] {
+            assert!(
+                steps(files, copies)[2].starts_with("  2. Reinstall from the updated lockfile"),
+                "{files:?} {copies:?}"
+            );
+        }
     }
 
     #[test]
@@ -4919,6 +5038,7 @@ mod tests {
             &["vlt-lock.json".to_string()],
             &[],
             false,
+            GemCopies::Untouched,
         );
         assert_eq!(
             steps.last().map(String::as_str),
@@ -4928,7 +5048,8 @@ mod tests {
             std::path::Path::new("."),
             &["package-lock.json".to_string()],
             &[],
-            false
+            false,
+            GemCopies::Untouched
         )
         .iter()
         .any(|s| s.contains("vlt:")));
@@ -4941,7 +5062,8 @@ mod tests {
                 std::path::Path::new("."),
                 &["pnpm-lock.yaml".to_string()],
                 &[],
-                true
+                true,
+                GemCopies::Untouched
             )[1],
             "  1. Commit .socket/vendor/ (the removed vendored ledger entries and artifacts) and \
              pnpm-lock.yaml to keep the hosted patches."
