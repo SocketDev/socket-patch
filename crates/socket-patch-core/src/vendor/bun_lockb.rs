@@ -14,7 +14,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha512_256};
 use std::cmp::Ordering;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
 
@@ -309,9 +309,18 @@ impl BunLockb {
     }
 
     pub(crate) fn packages(&self) -> Result<Vec<BinaryPackage>, String> {
-        let mut packages = (0..self.count)
-            .map(|id| self.package(id))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut budget = self.string_budget();
+        let mut packages = Vec::with_capacity(self.count);
+        for id in 0..self.count {
+            let package = self.package(id)?;
+            spend(
+                &mut budget,
+                package.name.len()
+                    + package.resolution.len()
+                    + package.version.as_ref().map_or(0, String::len),
+            )?;
+            packages.push(package);
+        }
         // (bundled edges, other edges) resolving to each record.
         let mut edges = vec![(0usize, 0usize); self.count];
         let dependencies = self.dependency_array()?;
@@ -502,7 +511,8 @@ impl BunLockb {
             self.data[trees.data].to_vec(),
             self.data[hoisted.data].to_vec(),
         );
-        if hoist(&graph).as_ref() != Some(&own) {
+        let recorded = own.1.len() / 4;
+        if hoist(&graph, recorded).as_ref() != Some(&own) {
             return Ok(false);
         }
 
@@ -565,7 +575,7 @@ impl BunLockb {
                 })
                 .collect(),
         };
-        let Some((tree_bytes, hoisted_bytes)) = hoist(&merged) else {
+        let Some((tree_bytes, hoisted_bytes)) = hoist(&merged, recorded) else {
             return Ok(false);
         };
 
@@ -633,11 +643,14 @@ impl BunLockb {
         if resolutions.data.len() / 4 != count {
             return Err("bun.lockb: dependency and resolution buffer lengths differ".into());
         }
+        let mut budget = self.string_budget();
         let edges = (0..count)
             .map(|edge| {
                 let at = dependencies.data.start + edge * 26;
+                let name = self.string_at(at)?.into_bytes();
+                spend(&mut budget, name.len())?;
                 Ok(HoistEdge {
-                    name: self.string_at(at)?.into_bytes(),
+                    name,
                     hash: u64_at(&self.data, at + 8)?,
                     behavior: self.data[at + 16],
                     package: u32_at(&self.data, resolutions.data.start + edge * 4)? as usize,
@@ -1181,6 +1194,11 @@ impl BunLockb {
             return Ok(());
         }
         let extension_pointers = self.legacy_extension_string_pointers()?;
+        // Every string field is eight bytes of the file and is listed at
+        // most twice, and each package's dependencies are its own slice of
+        // the buffer: more fields or pending children than the file has
+        // bytes means the slices overlap, which Bun never writes.
+        let overlapping = || "bun.lockb: package dependency slices overlap".to_string();
         let mut pointers = Vec::new();
         let mut visited = vec![false; self.count];
         let mut pending = vec![0];
@@ -1201,12 +1219,18 @@ impl BunLockb {
                     pending.push(child);
                 }
             }
+            if pointers.len().max(pending.len()) > self.data.len() {
+                return Err(overlapping());
+            }
         }
         // Keep dev-only/unreachable packages and auxiliary metadata too;
         // they follow the prefix used by the filtered production clone.
         for (id, seen) in visited.into_iter().enumerate() {
             if !seen {
                 pointers.extend(self.package_clone_string_pointers(id)?);
+                if pointers.len() > self.data.len() {
+                    return Err(overlapping());
+                }
             }
         }
         for at in (dependencies.data.start..dependencies.data.end).step_by(26) {
@@ -1215,8 +1239,9 @@ impl BunLockb {
         let external = self.buffer_array(4)?;
         pointers.extend((external.data.start..external.data.end).step_by(16));
         pointers.extend(extension_pointers);
+        let mut budget = self.string_budget();
         let mut pool = Vec::new();
-        let mut interned = std::collections::HashMap::<String, [u8; 8]>::new();
+        let mut interned = HashMap::<String, [u8; 8]>::new();
         let mut writes = std::collections::BTreeMap::new();
         for at in pointers {
             if writes.contains_key(&at) {
@@ -1231,6 +1256,7 @@ impl BunLockb {
                 if raw.len() < 8 || (raw.len() == 8 && raw[7] < 0x80) {
                     pointer[..raw.len()].copy_from_slice(raw);
                 } else {
+                    spend(&mut budget, raw.len())?;
                     let offset = u32::try_from(pool.len())
                         .map_err(|_| "bun.lockb: string buffer exceeds 4 GiB")?;
                     let len = u32::try_from(raw.len())
@@ -1532,6 +1558,7 @@ impl BunLockb {
             version: Option<(u64, u64, u64, String, String)>,
             repository: Vec<String>,
         }
+        let mut budget = self.string_budget();
         let mut entries = Vec::with_capacity(self.count - 1);
         for id in 1..self.count {
             let package = self.package(id)?;
@@ -1631,6 +1658,10 @@ impl BunLockb {
                 0 | 1 => String::new(),
                 _ => return Err("bun.lockb: unsupported resolution metadata hash".into()),
             };
+            spend(
+                &mut budget,
+                package.name.len() + text.len() + repository.iter().map(String::len).sum::<usize>(),
+            )?;
             entries.push(Entry {
                 name: package.name,
                 text,
@@ -1696,6 +1727,7 @@ impl BunLockb {
                         continue;
                     }
                     let script = self.string_at(start + id * 49 + i * 8)?;
+                    spend(&mut budget, script.len())?;
                     if !script.is_empty() {
                         block.push_str(name);
                         block.push_str(": ");
@@ -1749,6 +1781,15 @@ impl BunLockb {
 
     fn string_at(&self, at: usize) -> Result<String, String> {
         self.decode_string(take(&self.data, at, 8)?)
+    }
+
+    /// The string bytes one pass over the records may decode ([`spend`]),
+    /// and the size a rebuilt string buffer may reach. Bun writes a string
+    /// into the buffer once, so the strings a real lock's records name add
+    /// up to less than the file; in a file that points every record at one
+    /// long string they add up to the record count times its length.
+    fn string_budget(&self) -> usize {
+        self.data.len().saturating_mul(8).saturating_add(4096)
     }
 
     fn decode_string(&self, bytes: &[u8]) -> Result<String, String> {
@@ -1996,6 +2037,11 @@ struct HoistGraph {
     edges: Vec<HoistEdge>,
 }
 
+/// The steps [`hoist`] may take per hoisted dependency the lock records,
+/// per edge and per package: one for each edge it visits and each tree it
+/// looks an edge up in. A lock Bun wrote takes a handful.
+const HOIST_STEPS: usize = 64;
+
 /// Where [`hoist_dependency`] puts an edge.
 enum Hoisted {
     /// An ancestor already holds the same package.
@@ -2046,9 +2092,24 @@ fn behavior_order(l: u8, r: u8) -> Ordering {
 /// that order, a package listing one name for two packages, a peer edge
 /// meeting another package of its name (a semver check), or a peer or
 /// cyclic folder edge.
-fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
+///
+/// `recorded` is how many hoisted dependencies the lock itself records.
+/// Bun wrote those from a hoist that ended, so one that reproduces the
+/// lock places exactly that many (and folding records places no more).
+/// This one stops, with `None`, once it has placed more than that (plus
+/// one unwritten optional peer per edge) or has spent more than
+/// [`HOIST_STEPS`] steps per recorded entry, edge and package: a graph
+/// that keeps nesting two packages of one name inside each other never
+/// ends, and `bun.lockb` is a file anyone can write.
+fn hoist(graph: &HoistGraph, recorded: usize) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut placements = recorded.saturating_add(graph.edges.len());
+    let mut steps = placements
+        .saturating_add(graph.lists.len())
+        .saturating_mul(HOIST_STEPS);
     // (dependency, parent, placed edges) per tree.
     let mut trees: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    // The first edge of each name placed in each tree.
+    let mut named: HashMap<(usize, u64), usize> = HashMap::new();
     let mut queue = VecDeque::from([(INVALID_TREE, ROOT_DEPENDENCY, INVALID_TREE)]);
     while let Some((parent, dependency, hoist_root)) = queue.pop_front() {
         let package = match dependency {
@@ -2059,6 +2120,7 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
         if list.is_empty() {
             continue;
         }
+        steps = steps.checked_sub(list.len())?;
         let mut sorted: Vec<usize> = list.clone().collect();
         let order = |l: &usize, r: &usize| {
             let (l, r) = (&graph.edges[*l], &graph.edges[*r]);
@@ -2089,10 +2151,13 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
                     // Bun skips an unresolvable edge that is no optional peer.
                     continue;
                 }
-                hoist_dependency(graph, &trees, true, next, hoist_root, edge, &list)?
+                hoist_dependency(
+                    graph, &trees, &named, &mut steps, next, hoist_root, edge, &list,
+                )?
             } else if graph.folder[package] {
                 let mut tree = next;
                 while tree != INVALID_TREE {
+                    steps = steps.checked_sub(1)?;
                     let (ancestor, parent, _) = trees[tree];
                     if ancestor < graph.edges.len() && graph.edges[ancestor].package == package {
                         return None;
@@ -2104,10 +2169,14 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
                 }
                 Hoisted::Placed(next)
             } else {
-                hoist_dependency(graph, &trees, true, next, hoist_root, edge, &list)?
+                hoist_dependency(
+                    graph, &trees, &named, &mut steps, next, hoist_root, edge, &list,
+                )?
             };
             if let Hoisted::Placed(tree) = hoisted {
+                placements = placements.checked_sub(1)?;
                 trees[tree].2.push(edge);
+                named.entry((tree, graph.edges[edge].hash)).or_insert(edge);
                 if resolved && !graph.lists[package].is_empty() {
                     queue.push_back((tree, edge, if bundled { tree } else { hoist_root }));
                 }
@@ -2147,45 +2216,60 @@ fn hoist(graph: &HoistGraph) -> Option<(Vec<u8>, Vec<u8>)> {
 /// below a different one, else placed in the highest tree reached. An
 /// unresolved optional peer meeting another one of its name is set aside
 /// (Bun's `resolve_later`, which only a later resolution acts on); meeting
-/// a resolved one either way round re-resolves it, which is `None`.
+/// a resolved one either way round re-resolves it, which is `None`. So is
+/// running out of `steps`, one per tree looked at (see [`hoist`]). `named`
+/// is the first edge of each name placed in each tree.
+#[allow(clippy::too_many_arguments)]
 fn hoist_dependency(
     graph: &HoistGraph,
     trees: &[(usize, usize, Vec<usize>)],
-    as_defined: bool,
+    named: &HashMap<(usize, u64), usize>,
+    steps: &mut usize,
     tree: usize,
     hoist_root: usize,
     edge: usize,
     list: &Range<usize>,
 ) -> Option<Hoisted> {
     let wanted = &graph.edges[edge];
-    let (_, parent, placed) = &trees[tree];
-    if let Some(&other) = placed
-        .iter()
-        .find(|&&other| graph.edges[other].hash == wanted.hash)
-    {
-        let unresolved = |edge: &HoistEdge| edge.package >= graph.lists.len();
-        match (unresolved(&graph.edges[other]), unresolved(wanted)) {
-            (true, true) => return Some(Hoisted::Deduplicated),
-            (true, false) | (false, true) => return None,
-            (false, false) => {}
+    let mut at = tree;
+    loop {
+        *steps = steps.checked_sub(1)?;
+        if let Some(&other) = named.get(&(at, wanted.hash)) {
+            let unresolved = |edge: &HoistEdge| edge.package >= graph.lists.len();
+            match (unresolved(&graph.edges[other]), unresolved(wanted)) {
+                (true, true) => return Some(Hoisted::Deduplicated),
+                (true, false) | (false, true) => return None,
+                (false, false) => {}
+            }
+            if graph.edges[other].package == wanted.package {
+                return Some(Hoisted::Deduplicated);
+            }
+            if list.contains(&other) || wanted.behavior & BEHAVIOR_PEER != 0 {
+                return None;
+            }
+            // Below a different package of its name the edge stays where
+            // its own package declares it.
+            return Some(if at == tree {
+                Hoisted::Conflict
+            } else {
+                Hoisted::Placed(tree)
+            });
         }
-        if graph.edges[other].package == wanted.package {
-            return Some(Hoisted::Deduplicated);
+        let parent = trees[at].1;
+        if parent == INVALID_TREE || at == hoist_root {
+            return Some(Hoisted::Placed(at));
         }
-        if list.contains(&other) || wanted.behavior & BEHAVIOR_PEER != 0 {
-            return None;
-        }
-        return Some(Hoisted::Conflict);
+        at = parent;
     }
-    if *parent != INVALID_TREE && tree != hoist_root {
-        let hoisted = hoist_dependency(graph, trees, false, *parent, hoist_root, edge, list)?;
-        if !as_defined || !matches!(hoisted, Hoisted::Conflict) {
-            return Some(hoisted);
-        }
-    }
-    Some(Hoisted::Placed(tree))
 }
 
+/// Take `len` decoded string bytes out of a [`BunLockb::string_budget`].
+fn spend(budget: &mut usize, len: usize) -> Result<(), String> {
+    *budget = budget
+        .checked_sub(len)
+        .ok_or("bun.lockb: the records name more string data than the lockfile holds")?;
+    Ok(())
+}
 fn take(data: &[u8], at: usize, len: usize) -> Result<&[u8], String> {
     at.checked_add(len)
         .and_then(|end| data.get(at..end))
@@ -3251,7 +3335,7 @@ mod tests {
                     lock.data[lock.buffer_array(1).unwrap().data].to_vec(),
                 );
                 let graph = lock.hoist_graph().unwrap();
-                let hoisted = hoist(&graph);
+                let hoisted = hoist(&graph, own.1.len() / 4);
                 // Joined with `/` on every platform: `display()` would use `\`
                 // on Windows and miss the `bun-lockb/0.1.` era check below.
                 let label = path
@@ -3276,5 +3360,241 @@ mod tests {
         // REGRESSION (#861): locks with an optional peer nothing installs
         // (the `late-dependent/*-ws-*` ones) hoist too.
         assert!(unresolved >= 8, "{unresolved}");
+    }
+
+    /// A format-2 lock built from scratch: a root package (id 0) and one
+    /// npm record per name in `packages`, each `<name>@1.0.0`; `edges` are
+    /// `(from, dependency name, to)` production edges sorted by `from`;
+    /// `trees` and `hoisted` are written as the hoisting buffers as given.
+    /// The metadata hash is the lock's own.
+    fn synthetic_lock(
+        packages: &[&str],
+        edges: &[(usize, &str, usize)],
+        trees: &[u8],
+        hoisted: &[u8],
+    ) -> Vec<u8> {
+        fn inline(value: &str) -> [u8; 8] {
+            assert!(value.len() < 8, "{value}");
+            let mut out = [0; 8];
+            out[..value.len()].copy_from_slice(value.as_bytes());
+            out
+        }
+        let mut pool = Vec::new();
+        let mut pooled = |value: &str| {
+            let mut pointer = [0; 8];
+            pointer[..4].copy_from_slice(&(pool.len() as u32).to_le_bytes());
+            pointer[4..].copy_from_slice(&(value.len() as u32 | 0x8000_0000).to_le_bytes());
+            pool.extend_from_slice(value.as_bytes());
+            pool.resize(pool.len().next_multiple_of(8), 0);
+            pointer
+        };
+        let count = packages.len() + 1;
+        let (mut names, mut hashes, mut resolutions) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut slices, mut meta) = (Vec::new(), Vec::new());
+        for id in 0..count {
+            let name = if id == 0 { "" } else { packages[id - 1] };
+            names.extend_from_slice(&inline(name));
+            hashes.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            let mut resolution = [0; 64];
+            if id == 0 {
+                resolution[0] = 1;
+            } else {
+                resolution[0] = 2;
+                let url = format!("https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz");
+                resolution[8..16].copy_from_slice(&pooled(&url));
+                resolution[16..20].copy_from_slice(&1u32.to_le_bytes());
+            }
+            resolutions.extend_from_slice(&resolution);
+            let own: Vec<usize> = (0..edges.len()).filter(|e| edges[*e].0 == id).collect();
+            let start = own.first().copied().unwrap_or(0);
+            assert!(own.iter().enumerate().all(|(i, e)| *e == start + i));
+            slices.extend_from_slice(&(start as u32).to_le_bytes());
+            slices.extend_from_slice(&(own.len() as u32).to_le_bytes());
+            let mut record = [0; 88];
+            record[8..12].copy_from_slice(&(id as u32).to_le_bytes());
+            meta.extend_from_slice(&record);
+        }
+        let mut columns = [names, hashes, resolutions, slices.clone(), slices, meta].concat();
+        columns.resize(columns.len() + count * (20 + 49), 0);
+        let (mut dependencies, mut resolved) = (Vec::new(), Vec::new());
+        for (_, name, to) in edges {
+            dependencies.extend_from_slice(&inline(name));
+            dependencies.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            dependencies.extend_from_slice(&[BEHAVIOR_PROD, 0]);
+            dependencies.extend_from_slice(&inline("1.0.0"));
+            resolved.extend_from_slice(&(*to as u32).to_le_bytes());
+        }
+        let mut out = HEADER.to_vec();
+        out.extend_from_slice(&2u32.to_le_bytes());
+        out.resize(PACKAGES_AT, 0);
+        for value in [count, 8, 8, 0, 0] {
+            out.extend_from_slice(&(value as u64).to_le_bytes());
+        }
+        out.resize(out.len().next_multiple_of(8), 0);
+        let start = out.len();
+        out.extend_from_slice(&columns);
+        let end = out.len();
+        put_u64(&mut out, PACKAGES_AT + 24, start);
+        put_u64(&mut out, PACKAGES_AT + 32, end);
+        for data in [trees, hoisted, &resolved, &dependencies, &[], &pool] {
+            let descriptor = out.len();
+            out.resize(descriptor + 16, 0);
+            let start = out.len();
+            out.extend_from_slice(data);
+            let end = out.len();
+            put_u64(&mut out, descriptor, start);
+            put_u64(&mut out, descriptor + 8, end);
+        }
+        out.extend_from_slice(&0u64.to_le_bytes());
+        let total = out.len();
+        put_u64(&mut out, TOTAL_AT, total);
+        let mut lock = BunLockb::parse(&out).unwrap();
+        lock.update_hash((false, true)).unwrap();
+        lock.validate_mutation().unwrap();
+        lock.bytes()
+    }
+
+    /// Run `test` on its own thread. One still going after five seconds is
+    /// a hoist that no longer stops, and it allocates as it goes: the whole
+    /// test process is aborted rather than left to exhaust the machine.
+    fn finishes<T: Send + 'static>(test: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, result) = std::sync::mpsc::channel();
+        std::thread::spawn(move || done.send(test()));
+        match result.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(value) => value,
+            Err(_) => {
+                eprintln!("the hoist did not finish; aborting the test process");
+                std::process::abort()
+            }
+        }
+    }
+
+    /// REGRESSION (VBV-S1): two records each of `m@1.0.0` and `n@1.0.0`
+    /// whose edges run root → m → n → m → n → the first m. Every edge
+    /// meets a different package of its name one tree up, so each is
+    /// placed in a new nested tree, without end. Folding the two `m`
+    /// records re-hoists that graph: the hoist stops at the size the lock
+    /// itself records, and the fold is declined with the lock unchanged.
+    #[test]
+    fn a_dependency_cycle_that_never_stops_nesting_declines_the_fold() {
+        let packages = ["m", "n", "m", "n"];
+        let edges = [
+            (0, "m", 1),
+            (1, "n", 2),
+            (2, "m", 3),
+            (3, "n", 4),
+            (4, "m", 1),
+        ];
+        // No trees at all, and a plausible first two.
+        let mut trees = Vec::new();
+        for (id, dependency, parent, start, len) in
+            [(0u32, u32::MAX - 1, u32::MAX, 0u32, 2u32), (1, 1, 0, 2, 1)]
+        {
+            for value in [id, dependency, parent, start, len] {
+                trees.extend_from_slice(&value.to_le_bytes());
+            }
+        }
+        let hoisted: Vec<u8> = [0u32, 1, 2].iter().flat_map(|e| e.to_le_bytes()).collect();
+        for (trees, hoisted) in [(Vec::new(), Vec::new()), (trees, hoisted)] {
+            let bytes = synthetic_lock(&packages, &edges, &trees, &hoisted);
+            assert!(bytes.len() < 4096, "{}", bytes.len());
+            let merged = finishes(move || {
+                let mut lock = BunLockb::parse(&bytes).unwrap();
+                let merged = lock.merge_packages(1, &[3]);
+                (merged, lock.bytes() == bytes)
+            });
+            assert_eq!(merged, (Ok(false), true));
+        }
+    }
+
+    /// No cycle is needed (VBV-S1): forty layers of an `m` and an `n` that
+    /// both depend on the next layer's pair nest two trees under every
+    /// tree, 2^40 in all. The hoist stops at the same bound.
+    #[test]
+    fn a_dependency_graph_that_nests_exponentially_declines_the_fold() {
+        const LAYERS: usize = 40;
+        let packages: Vec<&str> = (0..LAYERS).flat_map(|_| ["m", "n"]).collect();
+        let mut edges = vec![(0, "m", 1), (0, "n", 2)];
+        for layer in 0..LAYERS - 1 {
+            for id in [1 + 2 * layer, 2 + 2 * layer] {
+                edges.push((id, "m", 3 + 2 * layer));
+                edges.push((id, "n", 4 + 2 * layer));
+            }
+        }
+        let bytes = synthetic_lock(&packages, &edges, &[], &[]);
+        let merged = finishes(move || {
+            let mut lock = BunLockb::parse(&bytes).unwrap();
+            let merged = lock.merge_packages(1, &[3]);
+            (merged, lock.bytes() == bytes)
+        });
+        assert_eq!(merged, (Ok(false), true));
+    }
+
+    /// A lock whose records all name one long string would be decoded once
+    /// per record, the file's size times its record count: refused instead,
+    /// wherever a pass over the records copies their strings.
+    #[test]
+    fn records_naming_more_string_data_than_the_file_holds_are_refused() {
+        let packages = vec!["p"; 200];
+        let edges: Vec<_> = (0..200).map(|i| (0, "p", i + 1)).collect();
+        let bytes = synthetic_lock(&packages, &edges, &[], &[]);
+        let lock = BunLockb::parse(&bytes).unwrap();
+        let pool = lock.strings.data.len();
+        assert!(pool * 200 > lock.string_budget(), "{pool}");
+        let mut whole_pool = [0; 8];
+        whole_pool[4..].copy_from_slice(&(pool as u32 | 0x8000_0000).to_le_bytes());
+        let refused = |result: Result<(), String>| {
+            let error = result.unwrap_err();
+            assert!(error.contains("more string data"), "{error}");
+        };
+
+        // Every package name.
+        let mut names = lock.clone();
+        for id in 1..names.count {
+            let at = names.package_start + id * 8;
+            names.data[at..at + 8].copy_from_slice(&whole_pool);
+        }
+        refused(BunLockb::parse(&names.bytes()).map(drop));
+        refused(names.packages().map(drop));
+        refused(names.meta_hash((false, true)).map(drop));
+
+        // Every dependency name.
+        let mut dependencies = lock.clone();
+        let array = dependencies.dependency_array().unwrap();
+        for at in array.data.clone().step_by(26) {
+            dependencies.data[at..at + 8].copy_from_slice(&whole_pool);
+        }
+        refused(dependencies.hoist_graph().map(drop));
+        assert!(dependencies.merge_packages(1, &[2]).is_err());
+
+        // A legacy production graph rebuilds its string buffer from every
+        // string the records name: here, a different slice of the buffer
+        // per dependency.
+        let mut rebuilt = lock.clone();
+        rebuilt.data[array.data.start + 16] = BEHAVIOR_DEV;
+        for (index, at) in array.data.clone().step_by(26).enumerate() {
+            let mut pointer = whole_pool;
+            pointer[..4].copy_from_slice(&(index as u32 * 8).to_le_bytes());
+            let len = (pool - index * 8) as u32 | 0x8000_0000;
+            pointer[4..].copy_from_slice(&len.to_le_bytes());
+            rebuilt.data[at + 18..at + 26].copy_from_slice(&pointer);
+        }
+        assert!(rebuilt.needs_production_pool().unwrap());
+        refused(rebuilt.validate_mutation());
+
+        // Dependency slices that all cover the whole buffer list its string
+        // fields once per package.
+        let mut overlapping = lock.clone();
+        overlapping.data[array.data.start + 16] = BEHAVIOR_DEV;
+        let slices = overlapping.package_start + overlapping.count * (16 + 64);
+        for at in (slices..slices + overlapping.count * 16).step_by(8) {
+            overlapping.data[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+            overlapping.data[at + 4..at + 8].copy_from_slice(&200u32.to_le_bytes());
+        }
+        let error = overlapping.validate_mutation().unwrap_err();
+        assert!(error.contains("dependency slices overlap"), "{error}");
+        // The lock as built passes every one of those.
+        lock.validate_mutation().unwrap();
+        lock.hoist_graph().unwrap();
     }
 }
