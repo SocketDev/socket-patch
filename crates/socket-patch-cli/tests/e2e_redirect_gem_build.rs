@@ -2143,6 +2143,101 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 
     manifestless_vex_matrix(&fx, &fresh).await;
     lock_only_revert_reconverges(&fx).await;
+    manifest_only_revert_installs_upstream(&fx).await;
+}
+
+/// The other half-revert: the Gemfile is back at its pre-scan declaration
+/// (a `git checkout` of it, or a merge that took the other side) while the
+/// lock still resolves the gem from the patch registry. Bundler takes a gem
+/// from the source its Gemfile declaration names, so the lock section is
+/// not wiring. Proven with the REAL bundler on a fresh checkout of that
+/// pair: a frozen install refuses it, an unfrozen one rewrites the lock to
+/// the pre-scan lock and installs the UPSTREAM gem. So `vex` attests
+/// nothing from that lock: not with the patched gem still installed from
+/// before the revert, not on the fresh checkout, not after the install.
+async fn manifest_only_revert_installs_upstream(fx: &RedirectFixture) {
+    use vex_e2e_common::{assert_absent, run_vex};
+    let bin = binary();
+    let nothing_attests = |dir: &Path, when: &str| {
+        for no_verify in [false, true] {
+            let mut run = vex_run(fx);
+            run.no_verify = no_verify;
+            let out = run_vex(&bin, dir, &run);
+            let cell = format!(
+                "{when}, no_verify={no_verify} (bundler {})",
+                fx.bundler.version
+            );
+            assert_eq!(out.code, Some(2), "{cell}: {out}");
+            assert_eq!(
+                out.envelope["error"]["code"], "manifest_not_found",
+                "{cell}: {out}"
+            );
+            assert_absent(out.doc.as_ref(), PURL);
+        }
+    };
+
+    // The patched gem installed, then the Gemfile reverted under it.
+    let stale = stage_fresh_checkout(fx, "fresh-manifest-only-revert-installed");
+    let install = bundle(&stale, &["install"]);
+    assert!(
+        install.status.success(),
+        "{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_patched_install(fx, &stale);
+    std::fs::write(stale.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
+    nothing_attests(&stale, "Gemfile reverted, lock and patched install kept");
+
+    // A fresh checkout of the same pair: what CI and a new clone get.
+    let dir = stage_fresh_checkout(fx, "fresh-manifest-only-revert");
+    let scanned_lock = std::fs::read(dir.join(fx.lock_name)).unwrap();
+    std::fs::write(dir.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
+    nothing_attests(&dir, "Gemfile reverted, nothing installed");
+
+    let frozen = bundle_env(&dir, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        !frozen.status.success(),
+        "a frozen install must refuse a lock whose source the Gemfile does not name (bundler \
+         {}):\n{}",
+        fx.bundler.version,
+        String::from_utf8_lossy(&frozen.stdout)
+    );
+    assert_eq!(
+        std::fs::read(dir.join(fx.lock_name)).unwrap(),
+        scanned_lock,
+        "a frozen install never writes the lock"
+    );
+
+    // Bundler <= 2.0 persisted `BUNDLE_FROZEN: "true"` into the checkout's
+    // `.bundle/config` on that frozen attempt; a developer's unfrozen
+    // install runs from the committed config.
+    copy_dir_recursive(&fx.proj.join(".bundle"), &dir.join(".bundle"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "unfrozen install over the lock-only pair (bundler {}):\n{}",
+        fx.bundler.version,
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(dir.join(fx.lock_name)).unwrap()),
+        String::from_utf8_lossy(&fx.pristine_lock),
+        "bundler must drop the lock section the Gemfile does not name (bundler {})",
+        fx.bundler.version
+    );
+    let installed = std::fs::read(fresh_installed_lib(
+        &dir,
+        &format!("{DEP}-{DEP_VERSION}"),
+        "vuln_gem.rb",
+    ))
+    .expect("the upstream gem is installed");
+    assert_eq!(
+        String::from_utf8_lossy(&installed),
+        orig_lib(),
+        "the install holds the UPSTREAM gem (bundler {})",
+        fx.bundler.version
+    );
+    nothing_attests(&dir, "after bundler re-resolved from the Gemfile");
 }
 
 /// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v4.0,

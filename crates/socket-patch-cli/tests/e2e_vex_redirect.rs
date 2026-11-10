@@ -488,6 +488,15 @@ fn write_hosted_wiring(cwd: &Path, eco: &str, uuid: &str) -> Vec<&'static str> {
             vec!["Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
         }
         "gem" => {
+            // The pair: bundler takes the gem from the source the Gemfile
+            // declaration names, so the lock section alone wires nothing.
+            write(
+                "Gemfile",
+                format!(
+                    "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.3\", source: \"{}/\"\n",
+                    registry("gem")
+                ),
+            );
             write(
                 "Gemfile.lock",
                 format!(
@@ -496,7 +505,7 @@ fn write_hosted_wiring(cwd: &Path, eco: &str, uuid: &str) -> Vec<&'static str> {
                     registry("gem")
                 ),
             );
-            vec!["Gemfile.lock"]
+            vec!["Gemfile", "Gemfile.lock"]
         }
         "golang" => {
             write(

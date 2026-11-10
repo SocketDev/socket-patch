@@ -1877,6 +1877,18 @@ re-scan leaves the block as it is (and brings a lock that never followed it in l
 (`upstream_gem_declaration_pinned`): if the requirement was a range such as `~> 2.2`, put it
 back by hand and run `bundle lock`.
 
+**Keep the Gemfile and the lock together.** Bundler takes a gem from the source its Gemfile
+declaration names; a lock that names another source is out of date to it. If the Gemfile loses
+the `source:` option while the lock keeps the patch's `GEM` section (a `git checkout` of one
+file, or a merge that took the other side of the Gemfile), a frozen install fails with "the list
+of sources changed" and an ordinary `bundle install` rewrites the lock and installs the
+unpatched gem (Bundler 1.17.2, 2.1.4, 2.4.22, 2.5.23 and 4.0.15 all do; the same holds for a
+vendored gem whose Gemfile loses its `path:`). `vex` therefore attests a gem only when the
+Gemfile (or `gems.rb`) beside the lock gives it the source the lock resolves it from. Otherwise
+it warns `patched_ref_unattributable`, naming the gem and what the Gemfile says instead, and
+writes no statement for it. Re-run `socket-patch scan` (or `vendor`) to wire both files again,
+or `bundle lock` to drop the stale lock section; `rollback` and `remove` still restore it.
+
 ## Ruby gems: gems already installed
 
 Bundler keeps a gem it has already installed, whatever source `Gemfile.lock` names for it. After
