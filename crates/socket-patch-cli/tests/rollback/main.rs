@@ -1,6 +1,7 @@
 //! `rollback`: invariants, duality with remove, silent mode, the multi-copy
 //! blob gate, the `--json` failure paths and their human render checks,
-//! and `--ecosystems`-scoped hosted rollback.
+//! `--ecosystems`-scoped hosted rollback, and the patched projects below
+//! `--cwd` as `list`, `rollback` and the single-project commands see them.
 //!
 //! One test binary per command: each module was its own binary.
 
@@ -18,6 +19,7 @@ mod vlt_hosted_common;
 mod vlt_vendored;
 
 mod cli_rollback_silent;
+mod projects_below_e2e;
 mod rollback_duality_invariants;
 mod rollback_ecosystem_scoped_hosted;
 mod rollback_failure_paths;

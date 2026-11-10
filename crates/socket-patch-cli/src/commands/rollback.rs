@@ -1392,7 +1392,171 @@ pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option
     }
 }
 
+/// Whether `--cwd` holds nothing a rollback would undo or refuse around:
+/// no patch in any store, no pre-v5 hosted ledger to retire, and no
+/// lockfile still wired to a vendored artifact its ledger lost.
+async fn nothing_to_roll_back_here(common: &GlobalArgs) -> bool {
+    if crate::commands::projects_below::cwd_is_patched(common).await {
+        return false;
+    }
+    let root = common.project_root();
+    let legacy = root.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+    tokio::fs::symlink_metadata(&legacy).await.is_err()
+        && crate::commands::vendored_backend::repair::scan_vendor_references(&root)
+            .await
+            .is_empty()
+}
+
+/// ` --preserve-state` when the run was given it: part of the command a
+/// message tells the user to run in another directory.
+fn preserve_state_flag(args: &RollbackArgs) -> &'static str {
+    if args.preserve_state {
+        " --preserve-state"
+    } else {
+        ""
+    }
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
+    use crate::commands::projects_below::{self, Work};
+    apply_env_toggles(&args.common);
+    // What `scan` patched from this directory, `rollback` undoes from it:
+    // with nothing to undo at `--cwd` itself, look to the project
+    // directories below. A directory that holds patch state of its own is
+    // the one project this run is about.
+    let below = if projects_below::searches_below(&args.common)
+        && nothing_to_roll_back_here(&args.common).await
+    {
+        projects_below::patched(&args.common, projects_below::Depth::All).await
+    } else {
+        Default::default()
+    };
+    let loud = !args.common.json && !args.common.silent;
+    if loud {
+        below.print_notes();
+    }
+    if below.projects.is_empty() {
+        return run_project(args, Vec::new()).await;
+    }
+    if args.targets.is_empty() {
+        return roll_back_projects(args, below).await;
+    }
+    // A target names a patch of one project, so the run stays the
+    // single-project one it was; where it finds no patch at all, it says
+    // which directories hold the one it was asked for, and the command to
+    // run there: this one, flags included.
+    let targets: Vec<String> = args
+        .targets
+        .iter()
+        .map(|t| crate::ui::shell_word(t))
+        .collect();
+    let command = format!(
+        "rollback {}{}",
+        targets.join(" "),
+        preserve_state_flag(&args)
+    );
+    let advice = below.advice(&args.common, &command, Work::Any, &args.targets);
+    let code = run_project(args, advice.warnings()).await;
+    if loud && code == 1 {
+        advice.print();
+    }
+    code
+}
+
+/// Roll back each patched project directory below `--cwd` as if it were
+/// `--cwd`, under the heading `scan` printed for it: only the directories
+/// in `below`, each to the end whatever the one before it did. The exit
+/// code is the worst of the runs. `--json` takes one directory, so stdout
+/// stays one document.
+async fn roll_back_projects(
+    args: RollbackArgs,
+    below: crate::commands::projects_below::Below,
+) -> i32 {
+    use crate::commands::projects_below::heading;
+    let total = plural(
+        below.projects.len(),
+        "project directory",
+        "project directories",
+    );
+    if args.common.json && below.projects.len() > 1 {
+        return crate::json_envelope::usage_error(
+            crate::json_envelope::Command::Rollback,
+            args.common.json,
+            args.common.dry_run,
+            "invalid_args",
+            &format!(
+                "--json takes one project directory ({} hold patches: {}); run one rollback \
+                 per directory, e.g. `{}`",
+                below.counted(),
+                below.names(),
+                below.projects[0].command(
+                    &args.common,
+                    &format!("rollback --json{}", preserve_state_flag(&args))
+                ),
+            ),
+        );
+    }
+    // One question for the whole run, naming every directory it reaches;
+    // each project's own run then asks nothing. As in a single project,
+    // none for a preview or a `--preserve-state` run (they delete no local
+    // state).
+    let loud = !args.common.json && !args.common.silent;
+    if !args.common.dry_run && !args.preserve_state {
+        let prompt = format!(
+            "Roll back every Socket patch in {} ({})?",
+            below.counted(),
+            below.names()
+        );
+        if !crate::ui::confirm(&prompt, true, &args.common) {
+            if loud {
+                println!("{}", crate::ui::CANCELLED);
+            }
+            return 0;
+        }
+    }
+    let mut code = 0;
+    let mut failed: Vec<&str> = Vec::new();
+    for project in &below.projects {
+        if loud {
+            println!("{}", heading(&project.shown));
+        }
+        let mut common = project.common(&args.common);
+        common.yes = true;
+        let child = RollbackArgs {
+            targets: Vec::new(),
+            common,
+            preserve_state: args.preserve_state,
+        };
+        let project_code = Box::pin(run_project(child, Vec::new())).await;
+        if project_code != 0 {
+            failed.push(&project.shown);
+        }
+        code = code.max(project_code);
+    }
+    if failed.is_empty() {
+        if loud {
+            let done = if args.common.dry_run {
+                "Would roll back"
+            } else {
+                "Rolled back"
+            };
+            println!("\n{done} {}.", below.counted());
+        }
+    } else if !args.common.json {
+        // Errors print even under --silent.
+        eprintln!(
+            "Error: Rollback failed in {} of {total}: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+    code
+}
+
+/// Roll back the project at `--cwd`. `below` is the advice of a targeted
+/// run made above patched project directories (see [`run`]): the warnings
+/// its "nothing here" envelope carries.
+async fn run_project(args: RollbackArgs, below: Vec<crate::json_envelope::RunWarning>) -> i32 {
     apply_env_toggles(&args.common);
 
     // Classify targets up front: the glob validation is a pre-network
@@ -1566,6 +1730,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 "path",
                 serde_json::json!(manifest_path.display().to_string()),
             );
+            env.warnings.extend(below);
             println!("{}", env.to_pretty_json());
         } else {
             // Errors print even under --silent ("errors only", never

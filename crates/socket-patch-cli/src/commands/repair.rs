@@ -130,16 +130,37 @@ pub async fn run(args: RepairArgs) -> i32 {
                 return 0;
             }
             let msg = format!("Manifest not found at {}", manifest_path.display());
+            // Nothing to repair here; the project directories below that
+            // keep local patch state are where this command has work (and
+            // hosted ones are patched all the same, with nothing to repair).
+            let below = if args.common.json || !args.common.silent {
+                use crate::commands::projects_below::{patched, Depth, Work};
+                let command = if args.download_only {
+                    "repair --download-only"
+                } else {
+                    "repair"
+                };
+                patched(&args.common, Depth::All).await.advice(
+                    &args.common,
+                    command,
+                    Work::Local,
+                    &[],
+                )
+            } else {
+                Default::default()
+            };
             if args.common.json {
-                let env = error_envelope(
+                let mut env = error_envelope(
                     Command::Repair,
                     args.common.dry_run,
                     "manifest_not_found",
                     &msg,
                 );
+                env.warnings.extend(below.warnings());
                 crate::ui::print_json(&env.to_value());
             } else {
                 eprintln!("Error: {msg}");
+                below.print();
             }
             return 1;
         }

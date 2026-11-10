@@ -36,6 +36,14 @@ directory: each directory with its own lockfile is scanned as its own project, u
 and `socket.yml` path filters apply. `--json` and `--vex` still report on one directory:
 they scan the current one and list the others in a `projects_not_scanned` warning.
 
+What that scan patched can be seen and undone from the same directory. When the
+current directory holds no patches of its own, `list` shows the patches of each project
+directory below it under the same headings, and `rollback` with no target rolls each of
+them back after one confirmation that names them (`rollback --json` takes one project
+directory). `vex`, `apply`, `repair`, `remove` and `rollback <target>` still act on one
+project: run there, they name the project directories that hold patches and the
+`--cwd <dir>` command for each.
+
 To make selection consistent across contributors and CI, commit a
 [repository policy](configuration.md#repository-patch-policy). To target a specific
 advisory or patch:

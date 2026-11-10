@@ -100,10 +100,22 @@ fn note_hosted_state_not_preservable(common: &GlobalArgs) -> (String, String) {
 /// paths in `run` so they all share the same JSON shape. `dry_run` rides
 /// the envelope so preview failures report `dryRun: true`.
 fn emit_error_envelope(json: bool, dry_run: bool, code: &str, message: String) {
+    emit_error_envelope_with(json, dry_run, code, message, Vec::new());
+}
+
+/// [`emit_error_envelope`] with run `warnings` for the envelope.
+fn emit_error_envelope_with(
+    json: bool,
+    dry_run: bool,
+    code: &str,
+    message: String,
+    warnings: Vec<crate::json_envelope::RunWarning>,
+) {
     if json {
         let mut env = Envelope::new(Command::Remove);
         env.dry_run = dry_run;
         env.mark_error(EnvelopeError::new(code, message));
+        env.warnings = warnings;
         crate::ui::print_json(&env.to_value());
     } else {
         eprintln!("Error: {}", crate::ui::sentence_case(&message));
@@ -389,12 +401,37 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 );
                 return 1;
             }
-            emit_error_envelope(
+            // No patch here to remove; say which project directories below
+            // hold the one this run named.
+            let below = if args.common.json || !args.common.silent {
+                use crate::commands::projects_below::{patched, Depth, Work};
+                // The command to run there is this one, flags included.
+                let mut command = format!("remove {}", crate::ui::shell_word(&args.identifier));
+                if args.skip_rollback {
+                    command.push_str(" --skip-rollback");
+                }
+                if args.preserve_state {
+                    command.push_str(" --preserve-state");
+                }
+                patched(&args.common, Depth::All).await.advice(
+                    &args.common,
+                    &command,
+                    Work::Any,
+                    std::slice::from_ref(&args.identifier),
+                )
+            } else {
+                Default::default()
+            };
+            emit_error_envelope_with(
                 args.common.json,
                 args.common.dry_run,
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
+                below.warnings(),
             );
+            if !args.common.json {
+                below.print();
+            }
             return 1;
         }
     }
