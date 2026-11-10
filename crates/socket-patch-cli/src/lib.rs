@@ -5,6 +5,63 @@
 //! is a thin wrapper that delegates to [`parse_argv_with_shortcuts`] and the
 //! `run` function on each command's `Args`.
 
+// The four print macros, crate-wide: every call site in the modules below
+// goes through `socket_patch_core::utils::stdio::print`, so once `main` has
+// opted in (`interrupt::install`) a closed stdout or stderr pipe stops the
+// printing instead of ending a command between two of its writes. Declared
+// before the modules: a `macro_rules!` shadows std's macro only in what
+// follows it.
+macro_rules! println {
+    () => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            true,
+            ::std::format_args!(""),
+        )
+    };
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            true,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! eprintln {
+    () => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            true,
+            ::std::format_args!(""),
+        )
+    };
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            true,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! print {
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            false,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            false,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
