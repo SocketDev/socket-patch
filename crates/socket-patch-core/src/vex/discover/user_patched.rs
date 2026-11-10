@@ -328,6 +328,7 @@ mod tests {
             assert!(
                 out.unattested[0]
                     .detail
+                    .replace('\\', "/")
                     .contains("patches/left-pad+1.3.0.patch"),
                 "{}",
                 out.unattested[0].detail
@@ -420,7 +421,7 @@ mod tests {
             all_marked(&out, what);
             let member = files[files.len() - 1].0.rsplit_once('/').unwrap().0;
             assert!(
-                out.unattested[0].detail.contains(member),
+                out.unattested[0].detail.replace('\\', "/").contains(member),
                 "{what}: {}",
                 out.unattested[0].detail
             );

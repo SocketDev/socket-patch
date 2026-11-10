@@ -437,7 +437,13 @@ mod tests {
         .unwrap();
         let warnings = invalidate_project(ReadScope::Workspace, &app, purls);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
-        assert!(warnings[0].1.contains(".cargo/config.toml"), "{warnings:?}");
+        assert!(
+            warnings[0]
+                .1
+                .replace('\\', "/")
+                .contains(".cargo/config.toml"),
+            "{warnings:?}"
+        );
         // A global run reads it as before.
         assert!(invalidate_project(ReadScope::Global, &app, purls).is_empty());
     }

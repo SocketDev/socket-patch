@@ -2281,7 +2281,9 @@ async fn user_patched_npm_packages_are_never_pinned() {
             .unwrap_or_else(|| panic!("{fixture} {file}: {:?}", project.skipped));
         assert_eq!(skip.purl, "pkg:npm/left-pad@1.3.0");
         assert!(
-            skip.detail.as_deref().is_some_and(|d| d.contains(file)),
+            skip.detail
+                .as_deref()
+                .is_some_and(|d| d.replace('\\', "/").contains(file)),
             "{fixture}: {:?}",
             skip.detail
         );
