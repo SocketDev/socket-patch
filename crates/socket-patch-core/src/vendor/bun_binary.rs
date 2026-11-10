@@ -808,6 +808,33 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         outcome.keep_artifact(&dir);
         return outcome;
     }
+    // The artifact goes only when no record still installs from it: one the
+    // ledger has no record of wiring keeps it (and its member copies), with
+    // the recorded ones restored. Checked on a dry run too.
+    if let (RevertLock::Binary(lock), false) = (&lock, opts.keep_artifact) {
+        let wired = lock.packages().map(|packages| {
+            packages.into_iter().find(|p| {
+                parse_vendor_path(&p.resolution)
+                    .is_some_and(|path| path.eco == "npm" && path.uuid == entry.uuid)
+            })
+        });
+        let unrecorded = match wired {
+            Ok(None) => None,
+            Ok(Some(package)) => Some(format!("package #{} ({})", package.id, package.name)),
+            Err(e) => Some(format!("package table ({e})")),
+        };
+        if let Some(what) = unrecorded {
+            outcome.warnings.push(VendorWarning::new(
+                super::RESIDUAL_REFERENCE_CODE,
+                format!(
+                    "{LOCK} {what} still installs from {dir} and the vendor ledger has no \
+                     record of wiring it; point it back at the registry release (`bun install` \
+                     after restoring the dependency's version) and re-run the revert"
+                ),
+            ));
+            outcome.keep_artifact_for_reference(&dir);
+        }
+    }
     if opts.dry_run {
         return outcome;
     }
@@ -834,7 +861,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         });
         remember_reverted_origin(root, still_vendored.then_some(origin));
     }
-    if !opts.keep_artifact {
+    if !opts.keep_artifact && !outcome.kept_artifact {
         if matches!(lock, RevertLock::Migrated(_))
             && super::npm_flavor::keep_artifact_while_lock_references_it(
                 &mut outcome,
@@ -1989,6 +2016,53 @@ mod rebuild_tests {
         revert_in_order(root, &[&minimist], "earlier copy").await;
         assert!(std::fs::read(root.join(LOCK)).unwrap() == ORIGINAL);
         assert!(!root.join("packages/helper/.socket").exists());
+    }
+
+    /// The artifact goes only when no record still installs from it
+    /// (VBV-D3's invariant, for the binary lock): a record the ledger has
+    /// no wiring for that resolves into the uuid dir keeps the tarball and
+    /// the ledger entry, while the recorded one is restored.
+    #[tokio::test]
+    async fn a_record_the_ledger_never_wired_keeps_the_artifact() {
+        let pristine = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        let fx = fixture_with(pristine);
+        let root = fx.root();
+        let (_, entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        let mut lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+        let packages = lock.packages().unwrap();
+        let minimist = packages.iter().find(|p| p.name == "minimist").unwrap();
+        let other = packages.iter().find(|p| p.name == "is-number").unwrap();
+        lock.set_package(
+            other.id,
+            &entry.artifact.path,
+            minimist.integrity.as_deref().unwrap(),
+        )
+        .unwrap();
+        let both = lock.bytes();
+        std::fs::write(root.join(LOCK), &both).unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert(&entry, root, RevertOpts::new(dry_run)).await;
+            assert!(outcome.success && outcome.kept_artifact, "{outcome:?}");
+            assert!(outcome.kept_for_residual_reference(), "{outcome:?}");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.detail.contains("is-number")),
+                "{outcome:?}"
+            );
+            assert!(root.join(&entry.artifact.path).exists());
+            let live = std::fs::read(root.join(LOCK)).unwrap();
+            assert_eq!(live == both, dry_run, "only the wet run restores");
+            let packages = BunLockb::parse_packages(&live).unwrap();
+            let version = |name: &str| {
+                let package = packages.iter().find(|p| p.name == name).unwrap();
+                package.version.clone()
+            };
+            assert_eq!(version("minimist").is_some(), !dry_run);
+            assert_eq!(version("is-number"), None, "still the tarball");
+        }
     }
 
     /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)
