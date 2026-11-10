@@ -763,6 +763,19 @@ never a grammar file (`.y`, `.rl`), whose generated output the gem packs. The Ru
 the gem's installed `extensions/<platform>/<abi>/` dir; a gem without one (installed by a RubyGems
 older than 2.2) is refused. The rebuild runs the gem's own build scripts, as `gem install` did.
 
+What runs, and when: whether a record needs a rebuild is decided from files alone. The installed
+gemspec is read as text for its `extensions` and `require_paths`, never evaluated, so
+`apply --dry-run`, `apply --check` and `vex` start no Ruby. A dry run reports the pending rebuild
+as a `native_extension_rebuilt` warning ("apply would …") and refuses only what it can see without
+one (no extension directory, no `ruby` to run). A real run starts Ruby only once every file of the
+record verified against the installed copy (it holds the record's `beforeHash` or `afterHash`
+content, or a mismatch the run was told to overwrite): first the host Ruby alone, asked where it
+builds extensions for that gem home, which loads RubyGems and nothing of the gem; then, with the
+patched sources written, RubyGems' builder, which loads the installed gemspec and runs the gem's
+build scripts. A Ruby inside the project is never run, and both run without the Socket
+credentials (see [Environment variables](#environment-variables)), `RUBYOPT`, `RUBYLIB` and
+`BUNDLE*`.
+
 The first rebuild of a copy backs up the install-time build (extension directory and `lib/`
 copies) to `.socket-patch-native-orig/` in the gem directory, and every rebuild records
 `.socket-patch-native-build.json` there: the source hashes it was built from and the hash of every
@@ -781,7 +794,7 @@ warning. `vex` and `apply --check` then omit the patch until a rebuild by `apply
 |---|---|---|
 | `native_extensions_unsupported` | refused, exit 1 | The record changes build inputs that cannot be rebuilt in place: the copy is not a RubyGems install with a `specifications/` entry (a Bundler git checkout), the gem declares no extensions (a precompiled platform gem), or no Ruby whose extension directory for the gem is the installed one was found. Nothing is written; use `scan --mode hosted`, where RubyGems compiles the patched gem. |
 | `native_extension_build_failed` | refused, exit 1 | The extension did not build from the patched sources (no compiler or Ruby headers, a build error). The previous build and the original sources are put back; the error carries the build output's tail. |
-| `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996) and the extension was rebuilt from them. |
+| `native_extension_rebuilt` | warning | The sources were already patched (by a release before #1996) and the extension was rebuilt from them. Under `--dry-run`: the rebuild a real `apply` would run; no Ruby is started to check that it can. |
 | `native_extension_not_rebuilt` | warning | `--no-gem-native-rebuild`: the sources were written without a rebuild; Ruby loads the old build until the caller compiles it. |
 | `native_extension_restore_failed` | rollback: that copy fails | The sources were restored, but the original compiled extension could not be put back. Run `gem pristine <gem> --extensions`. |
 

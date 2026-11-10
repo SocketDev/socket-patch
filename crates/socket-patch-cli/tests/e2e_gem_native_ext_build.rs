@@ -303,6 +303,61 @@ fn native_patch_that_does_not_build_is_put_back() {
     assert_eq!(walk_files(&ext_dir), built_before);
 }
 
+/// The installed gemspec is a Ruby program, and a committed `vendor/bundle`
+/// lets the scanned repository supply it. It is read as text to decide
+/// whether a record needs a rebuild and only loaded by the build itself,
+/// after the record's files verified: never by a dry run, and never for a
+/// record that does not match the installed copy.
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn the_installed_gemspec_is_not_evaluated_before_the_record_verifies() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let patched = c_source(2);
+    let fx = Fixture::new(&abi, &patched);
+    let spec = fx
+        .home
+        .join("specifications")
+        .join(format!("{FULL_NAME}.gemspec"));
+    let evaluated = fx.home.join("gemspec-was-evaluated");
+    // The spec must stay the value of the file, and its stub lines first.
+    let text = std::fs::read_to_string(&spec).unwrap();
+    let planted = text.replacen(
+        "Gem::Specification.new do |s|",
+        &format!(
+            "File.write({:?}, \"x\")\nGem::Specification.new do |s|",
+            evaluated.display().to_string()
+        ),
+        1,
+    );
+    assert_ne!(planted, text, "the installed spec has the to_ruby shape");
+    std::fs::write(&spec, planted).unwrap();
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--dry-run"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(!evaluated.exists(), "a dry run evaluated the gemspec");
+    assert!(stdout.contains("apply would"), "{stdout}");
+    assert_eq!(fx.c_file(), c_source(1));
+
+    // A copy that matches neither side of the record.
+    std::fs::write(fx.gem_dir.join(C_KEY), c_source(7)).unwrap();
+    let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        !evaluated.exists(),
+        "the gemspec was evaluated for a record that does not verify"
+    );
+    std::fs::write(fx.gem_dir.join(C_KEY), c_source(1)).unwrap();
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert!(evaluated.exists(), "the build loads the gemspec");
+    assert_eq!(fx.value(), "2", "Ruby must load the rebuilt extension");
+}
+
 /// An `extconf.rb` that, like nokogiri's (which activates `mini_portile2`),
 /// loads a helper gem installed beside the copy in the same home.
 const EXTCONF_WITH_HELPER: &str = "gem \"sp_helper\"\nrequire \"sp_helper\"\n\
@@ -490,10 +545,10 @@ fn run_without_ruby(proj: &Path, args: &[&str]) -> (i32, String, String) {
 }
 
 /// A stand-in `ruby`, alone on the `PATH` the CLI is run with: a shell
-/// script that answers the probe for [`fake_native_gem`]'s copy and
-/// "builds" its extension by writing a new shared object and its `lib/`
-/// copy. Each run appends its mode to `<state>/calls` and writes the
-/// environment it saw to `<state>/env.<mode>`.
+/// script that says it builds extensions into [`fake_native_gem`]'s
+/// `extensions/x86_64-linux/3.4.0` and "builds" one by writing a new shared
+/// object and its `lib/` copy. Each run appends its mode to `<state>/calls`
+/// and writes the environment it saw to `<state>/env.<mode>`.
 #[cfg(unix)]
 struct FakeRuby {
     _tmp: tempfile::TempDir,
@@ -510,30 +565,27 @@ impl FakeRuby {
         let state = tmp.path().join("state");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&state).unwrap();
-        // argv: -e <program> <mode> <gemspec>
+        // argv: -e <program> extensions_dir <gem home>
+        //       -e <program> build <gemspec> <extension dir> <require path>
         let script = format!(
             r#"#!/bin/sh
 PATH=/usr/bin:/bin
 state='{state}'
 mode="$3"
-spec="$4"
 echo "$mode" >> "$state/calls"
 env > "$state/env.$mode"
-home=$(dirname "$(dirname "$spec")")
-full=$(basename "$spec" .gemspec)
-gem="$home/gems/$full"
-ext="$home/extensions/x86_64-linux/3.4.0/$full"
 case "$mode" in
-probe)
-  printf 'sp_gem_dir\t%s\n' "$gem"
-  printf 'sp_extension_dir\t%s\n' "$ext"
-  printf 'sp_lib_dir\t%s\n' "$gem/lib"
-  printf 'sp_extension\text/sp_native/extconf.rb\n'
+extensions_dir)
+  printf 'sp_extensions_dir\t%s\n' "$4/extensions/x86_64-linux/3.4.0"
   ;;
 build)
-  mkdir -p "$ext/sp_native" "$gem/lib/sp_native"
+  home=$(dirname "$(dirname "$4")")
+  full=$(basename "$4" .gemspec)
+  ext="$5"
+  lib="$home/gems/$full/$6"
+  mkdir -p "$ext/sp_native" "$lib/sp_native"
   printf 'rebuilt' > "$ext/sp_native/sp_native.so"
-  cp "$ext/sp_native/sp_native.so" "$gem/lib/sp_native/sp_native.so"
+  cp "$ext/sp_native/sp_native.so" "$lib/sp_native/sp_native.so"
   : > "$ext/gem.build_complete"
   ;;
 *)
@@ -623,6 +675,87 @@ fn the_rebuild_does_not_hand_the_socket_token_to_ruby() {
             "`ruby` ({mode}) lost the registry auth:\n{seen}"
         );
     }
+}
+
+/// A dry run starts no Ruby at all: it verifies the record against the
+/// installed copy, says the extension would be rebuilt, and changes nothing.
+#[cfg(unix)]
+#[test]
+fn a_dry_run_starts_no_ruby_and_reports_the_rebuild() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--dry-run"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(ruby.calls(), Vec::<String>::new(), "a dry run ran Ruby");
+    assert!(
+        stdout.contains("native_extension_rebuilt") && stdout.contains("apply would"),
+        "the dry run must say a rebuild is pending: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(1)
+    );
+    assert_eq!(walk_files(&proj.join("vendor")), tree_before);
+}
+
+/// No Ruby runs for a record whose files do not verify against the
+/// installed copy: until they match, nothing says this is the package the
+/// patch is for.
+#[cfg(unix)]
+#[test]
+fn ruby_does_not_run_for_a_record_that_does_not_verify() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    // Neither the record's beforeHash nor its afterHash.
+    std::fs::write(gem_dir.join(C_KEY), c_source(7)).unwrap();
+    let ruby = FakeRuby::new();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+        let (code, stdout, stderr) = ruby.run(&proj, args, &[]);
+        assert_eq!(code, 1, "{args:?}: {stdout}\n{stderr}");
+        assert_eq!(event_action(&stdout), "failed", "{args:?}: {stdout}");
+        assert_eq!(
+            ruby.calls(),
+            Vec::<String>::new(),
+            "{args:?}: Ruby ran before the record verified"
+        );
+        assert_eq!(walk_files(&proj.join("vendor")), tree_before, "{args:?}");
+    }
+}
+
+/// A real run asks the host Ruby where it builds extensions (a question
+/// that loads nothing of the gem), then builds: the installed gemspec is
+/// only loaded by the build itself.
+#[cfg(unix)]
+#[test]
+fn a_real_run_asks_ruby_for_its_extension_dir_then_builds() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json"], &[]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(2)
+    );
+    assert_eq!(
+        std::fs::read(gem_dir.join("lib/sp_native/sp_native.so")).unwrap(),
+        b"rebuilt"
+    );
+    assert!(gem_dir.join(".socket-patch-native-build.json").is_file());
+    assert!(gem_dir.join(".socket-patch-native-orig").is_dir());
+
+    // Built from these sources: nothing more to run.
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
 }
 
 #[test]
