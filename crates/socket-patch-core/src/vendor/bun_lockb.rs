@@ -407,14 +407,45 @@ impl BunLockb {
     /// Snapshot includes semantic values for inventory/ownership and binary
     /// values for byte-exact restoration. String values accompany pointers so
     /// restoration also works after Bun has compacted/re-saved its string pool.
+    /// It also records the lock [`Self::restore_toward`] works back toward
+    /// (its [`Origin`]): this lock, as a package's first vendoring finds it.
     pub(crate) fn snapshot(&self, id: usize) -> Result<Value, String> {
+        self.snapshot_toward(id, self)
+    }
+
+    /// [`Self::snapshot`] of a package in a lock that already holds other
+    /// vendored packages, where `origin` is that lock with each of them
+    /// restored. Every snapshot of one lock then records the same origin,
+    /// so whichever package is restored last gets it back exactly, in any
+    /// order: the steps in between cannot (an edit normalizes an older
+    /// lock once, and each one appends to the string buffer behind the
+    /// last).
+    pub(crate) fn snapshot_toward(&self, id: usize, origin: &Self) -> Result<Value, String> {
+        let layout = (origin.format == 1
+            || origin.needs_workspace_normalization()?
+            || origin.needs_production_pool()?)
+        .then(|| STANDARD.encode(&origin.data));
+        let mut snapshot = serde_json::Map::new();
+        snapshot.insert("layout_original".into(), json!(layout));
+        snapshot.extend(self.record_snapshot(id)?);
+        snapshot.insert("string_buffer_len".into(), json!(origin.strings.data.len()));
+        Ok(Value::Object(snapshot))
+    }
+
+    /// The package record's own values, without the lock's [`Origin`]: what
+    /// a ledger keeps of a record as vendoring leaves it, which is matched
+    /// against the lock and never restored from.
+    pub(crate) fn rewritten_snapshot(&self, id: usize) -> Result<Value, String> {
+        self.record_snapshot(id).map(Value::Object)
+    }
+
+    fn record_snapshot(&self, id: usize) -> Result<serde_json::Map<String, Value>, String> {
         let pkg = self.package(id)?;
         let at = self.resolution_at(id);
         let raw = &self.data[at..at + self.resolution_size];
         let refs = self.resolution_strings(raw)?;
         let integrity = self.integrity_at(id);
-        Ok(json!({
-            "layout_original": if self.format == 1 || self.needs_workspace_normalization()? || self.needs_production_pool()? {Some(STANDARD.encode(&self.data))} else {None},
+        let snapshot = json!({
             "name": pkg.name,
             "version": pkg.version,
             "resolution": pkg.resolution,
@@ -423,8 +454,11 @@ impl BunLockb {
             "raw_resolution": STANDARD.encode(raw),
             "raw_integrity": STANDARD.encode(&self.data[integrity..integrity + INTEGRITY_LEN]),
             "strings": refs,
-            "string_buffer_len": self.strings.data.len(),
-        }))
+        });
+        match snapshot {
+            Value::Object(snapshot) => Ok(snapshot),
+            _ => unreachable!("json! of an object literal"),
+        }
     }
 
     pub(crate) fn matches_snapshot(&self, id: usize, snapshot: &Value) -> Result<bool, String> {
@@ -921,9 +955,26 @@ impl BunLockb {
         Ok(())
     }
 
+    /// [`Self::restore_toward`] with no earlier origin handed on.
+    #[cfg(test)]
     pub(crate) fn restore(&mut self, id: usize, snapshot: &Value) -> Result<(), String> {
+        self.restore_toward(id, snapshot, &Origin::default())
+    }
+
+    /// Put package `id` back as `snapshot` recorded it, and work the lock
+    /// back toward the origin the snapshot records and toward `earlier`:
+    /// the origin the snapshots of packages already restored in this lock
+    /// recorded. A ledger written before every snapshot recorded the
+    /// lock's one origin holds it only in the package vendored first, and
+    /// it is lost with that package's entry unless handed on.
+    pub(crate) fn restore_toward(
+        &mut self,
+        id: usize,
+        snapshot: &Value,
+        earlier: &Origin,
+    ) -> Result<(), String> {
         let mut candidate = self.clone();
-        candidate.restore_inner(id, snapshot)?;
+        candidate.restore_inner(id, snapshot, earlier)?;
         if !candidate.matches_snapshot(id, snapshot)? {
             return Err("bun.lockb: snapshot binary and semantic values disagree".into());
         }
@@ -931,7 +982,12 @@ impl BunLockb {
         Ok(())
     }
 
-    fn restore_inner(&mut self, id: usize, snapshot: &Value) -> Result<(), String> {
+    fn restore_inner(
+        &mut self,
+        id: usize,
+        snapshot: &Value,
+        earlier: &Origin,
+    ) -> Result<(), String> {
         self.check_editable()?;
         let style = self.hash_style()?;
         let pkg = self.package(id)?;
@@ -1031,46 +1087,55 @@ impl BunLockb {
         self.data[at..at + self.resolution_size].copy_from_slice(&resolution);
         let at = self.integrity_at(id);
         self.data[at..at + INTEGRITY_LEN].copy_from_slice(&integrity);
-        if let Some(len) = snapshot
-            .get("string_buffer_len")
-            .and_then(Value::as_u64)
-            .and_then(|n| usize::try_from(n).ok())
-        {
-            self.trim_unreferenced_tail(len)?;
+        let mut origin = Origin::of(snapshot);
+        origin.merge(earlier);
+        if let Some(len) = origin.pool_len {
+            self.trim_tail_toward(len)?;
         }
         self.normalize_production_pool()?;
         self.update_hash(style)?;
-        if let Some(encoded) = snapshot.get("layout_original").and_then(Value::as_str) {
-            // The snapshot comes from the committed ledger, so it is read
-            // as any lock a user hands over.
-            let unusable = |detail: String| {
-                format!(
-                    "bun.lockb: the vendor ledger's snapshot of the original lockfile \
-                     (layout_original) cannot be restored from: {detail}"
-                )
-            };
-            let original = STANDARD
-                .decode(encoded)
-                .map_err(|_| unusable("it is not base64".into()))?;
-            let normalized = || {
-                let mut expected = Self::parse(&original)?;
-                expected.check_editable()?;
-                let original_style = expected.hash_style()?;
-                expected.promote_legacy_format()?;
-                expected.normalize_workspace_behaviors()?;
-                expected.normalize_production_pool()?;
-                expected.update_hash(original_style)?;
-                Ok(expected)
-            };
-            let expected = normalized().map_err(unusable)?;
-            let mut compacted = self.clone();
-            compacted.normalize_production_pool()?;
-            compacted.trim_unreferenced_tail(expected.strings.data.len())?;
-            if compacted.bytes() == expected.bytes() {
-                *self = Self::parse(&original)?;
+        for layout in &origin.layouts {
+            if self.restore_layout(layout)? {
+                break;
             }
         }
         Ok(())
+    }
+
+    /// Become `encoded` again (the exact lock a snapshot recorded before an
+    /// edit normalized it) when this lock is that one but for the
+    /// normalization, which holds once every package vendored into it is
+    /// restored. `Ok(false)` leaves the lock as it is. `encoded` comes from
+    /// the committed ledger, so it is read as any lock a user hands over.
+    fn restore_layout(&mut self, encoded: &str) -> Result<bool, String> {
+        let unusable = |detail: String| {
+            format!(
+                "bun.lockb: the vendor ledger's snapshot of the original lockfile \
+                 (layout_original) cannot be restored from: {detail}"
+            )
+        };
+        let original = STANDARD
+            .decode(encoded)
+            .map_err(|_| unusable("it is not base64".into()))?;
+        let normalized = |original: &[u8]| {
+            let mut expected = Self::parse(original)?;
+            expected.check_editable()?;
+            let style = expected.hash_style()?;
+            expected.promote_legacy_format()?;
+            expected.normalize_workspace_behaviors()?;
+            expected.normalize_production_pool()?;
+            expected.update_hash(style)?;
+            Ok(expected)
+        };
+        let expected = normalized(&original).map_err(unusable)?;
+        let mut compacted = self.clone();
+        compacted.normalize_production_pool()?;
+        compacted.trim_tail_toward(expected.strings.data.len())?;
+        if compacted.bytes() != expected.bytes() {
+            return Ok(false);
+        }
+        *self = Self::parse(&original)?;
+        Ok(true)
     }
 
     fn buffer_array(&self, wanted: usize) -> Result<Array, String> {
@@ -1943,25 +2008,51 @@ impl BunLockb {
         Ok(())
     }
 
-    /// Conservative compaction after restoration. Any eight bytes resembling
-    /// a live out-of-line reference keep the tail alive; false positives merely
-    /// retain unused bytes. Looking at all byte alignments also protects opaque
-    /// extension records and old Bun fields with one-byte alignment.
+    /// Trim the string buffer to `len` when nothing references the bytes
+    /// past it (see [`Self::referenced_end`]).
     fn trim_unreferenced_tail(&mut self, len: usize) -> Result<(), String> {
         let current = self.strings.data.len();
-        if len >= current || !(current - len).is_multiple_of(8) {
+        if len >= current || !(current - len).is_multiple_of(8) || self.referenced_end(len) > len {
             return Ok(());
         }
-        let keeps_tail = |candidate: &[u8]| {
+        self.resize_pool(len, &[])
+    }
+
+    /// Trim the string buffer's unreferenced tail, to no shorter than
+    /// `floor`, in the eight-byte steps strings are appended in (which keeps
+    /// every array after the buffer aligned). A reference past `floor`
+    /// keeps the buffer through its string: restoring one package leaves
+    /// the strings of those still vendored.
+    fn trim_tail_toward(&mut self, floor: usize) -> Result<(), String> {
+        let current = self.strings.data.len();
+        if floor >= current {
+            return Ok(());
+        }
+        let unused = (current - self.referenced_end(floor)) / 8 * 8;
+        if unused == 0 {
+            return Ok(());
+        }
+        self.resize_pool(current - unused, &[])
+    }
+
+    /// Where the last string referenced past `floor` ends in the string
+    /// buffer, or `floor` when nothing references the bytes past it. The
+    /// scan is conservative: any eight bytes resembling a live out-of-line
+    /// reference count; false positives merely retain unused bytes. Looking
+    /// at all byte alignments also protects opaque extension records and
+    /// old Bun fields with one-byte alignment.
+    fn referenced_end(&self, floor: usize) -> usize {
+        let current = self.strings.data.len();
+        let end_past_floor = |candidate: &[u8]| {
             if candidate[7] & 0x80 == 0 {
-                return false;
+                return None;
             }
             let start = u32::from_le_bytes(candidate[..4].try_into().unwrap()) as usize;
             let size =
                 (u32::from_le_bytes(candidate[4..].try_into().unwrap()) & 0x7fff_ffff) as usize;
             start
                 .checked_add(size)
-                .is_some_and(|end| end <= current && end > len)
+                .filter(|end| *end <= current && *end > floor)
         };
         // Old releases wrote uninitialized padding in inactive resolution/bin
         // unions. Only active package string fields can keep pool bytes alive.
@@ -1969,6 +2060,7 @@ impl BunLockb {
         let bins = meta + self.count * 88;
         let scripts = bins + self.count * 20;
         let package_end = scripts + if self.fields == 8 { self.count * 49 } else { 0 };
+        let mut end = floor;
         for id in 0..self.count {
             let mut pointers = vec![self.package_start + id * 8, meta + id * 88 + 12];
             let at = self.resolution_at(id);
@@ -1993,11 +2085,8 @@ impl BunLockb {
             if self.fields == 8 {
                 pointers.extend((0..6).map(|i| scripts + id * 49 + i * 8));
             }
-            if pointers
-                .into_iter()
-                .any(|at| keeps_tail(&self.data[at..at + 8]))
-            {
-                return Ok(());
+            for at in pointers {
+                end = end.max(end_past_floor(&self.data[at..at + 8]).unwrap_or(floor));
             }
         }
         // Scan opaque array records conservatively; false positives retain
@@ -2006,11 +2095,50 @@ impl BunLockb {
             &self.data[package_end..self.strings.data.start],
             &self.data[self.strings.data.end..self.total],
         ] {
-            if part.windows(8).any(keeps_tail) {
-                return Ok(());
+            for candidate in part.windows(8) {
+                end = end.max(end_past_floor(candidate).unwrap_or(floor));
             }
         }
-        self.resize_pool(len, &[])
+        end
+    }
+}
+
+/// The lock a [`BunLockb::snapshot`] restores toward: how long its string
+/// buffer was and, when an edit had to normalize it, its exact bytes
+/// (base64, as the ledger records them). Origins of one lock merge to the
+/// shortest buffer and every distinct layout.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Origin {
+    pool_len: Option<usize>,
+    layouts: Vec<String>,
+}
+
+impl Origin {
+    pub(crate) fn of(snapshot: &Value) -> Self {
+        Origin {
+            pool_len: snapshot
+                .get("string_buffer_len")
+                .and_then(Value::as_u64)
+                .and_then(|len| usize::try_from(len).ok()),
+            layouts: snapshot
+                .get("layout_original")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .into_iter()
+                .collect(),
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: &Origin) {
+        self.pool_len = match (self.pool_len, other.pool_len) {
+            (Some(own), Some(other)) => Some(own.min(other)),
+            (own, other) => own.or(other),
+        };
+        for layout in &other.layouts {
+            if !self.layouts.contains(layout) {
+                self.layouts.push(layout.clone());
+            }
+        }
     }
 }
 
@@ -2809,6 +2937,118 @@ mod tests {
             snapshot["layout_original"] = json!(garbage);
             let error = lock.clone().restore(1, &snapshot).unwrap_err();
             assert!(error.contains("layout_original"), "{garbage}: {error}");
+        }
+    }
+
+    /// Every order of `0..len`.
+    fn orders(len: usize) -> Vec<Vec<usize>> {
+        if len == 0 {
+            return vec![Vec::new()];
+        }
+        let mut all = Vec::new();
+        for order in orders(len - 1) {
+            for at in 0..len {
+                let mut next = order.clone();
+                next.insert(at, len - 1);
+                all.push(next);
+            }
+        }
+        all
+    }
+
+    /// REGRESSION (VBV-D1): packages vendored one after another into one
+    /// lock, each snapshot recording the pre-vendor lock as its origin,
+    /// restore to that lock's exact bytes in every order, and to a lock
+    /// this codec edits after each step. That covers a current lock, locks
+    /// an edit normalizes (workspace flags, format 1, a legacy string
+    /// buffer) and tarball paths of different lengths behind one another.
+    #[test]
+    fn snapshots_of_one_origin_restore_to_it_in_every_order() {
+        for version in [
+            "1.1.45",
+            "1.4.2",
+            "two-versions",
+            "1.1.45-extensions",
+            "1.4.2-extensions",
+            "0.1.1",
+            "0.8.1-production-complex",
+        ] {
+            let original = fixture(version);
+            let pristine = BunLockb::parse(&original).unwrap();
+            let ids: Vec<usize> = pristine
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.version.is_some())
+                .map(|p| p.id)
+                .take(3)
+                .collect();
+            assert!(ids.len() >= 2, "{version}");
+            let mut vendored = pristine.clone();
+            let mut snapshots = Vec::new();
+            for (n, id) in ids.iter().enumerate() {
+                snapshots.push(vendored.snapshot_toward(*id, &pristine).unwrap());
+                let path = format!(".socket/vendor/npm/{n}/{}.tgz", "p".repeat(3 + 7 * n));
+                vendored.set_package(*id, &path, &digest()).unwrap();
+            }
+            for order in orders(ids.len()) {
+                let mut lock = vendored.clone();
+                for (done, n) in order.iter().enumerate() {
+                    lock.restore(ids[*n], &snapshots[*n])
+                        .unwrap_or_else(|e| panic!("{version} {order:?}: {e}"));
+                    lock.validate_mutation()
+                        .unwrap_or_else(|e| panic!("{version} {order:?}: {e}"));
+                    assert_eq!(
+                        lock.bytes() == original,
+                        done + 1 == order.len(),
+                        "{version} {order:?}: exact once the last package is restored"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A ledger written before snapshots shared one origin records each
+    /// step: the lock as that package's vendoring found it. Restored in
+    /// vendoring order, the first package's origin is handed on to the
+    /// later ones ([`BunLockb::restore_toward`]) and the lock is exact
+    /// again; without it the last one can only get back to its own step
+    /// (which is the pre-vendor lock only where every edit rebuilds the
+    /// string buffer from scratch, as for the legacy production graph).
+    #[test]
+    fn stepwise_snapshots_restore_exactly_when_the_first_origin_is_handed_on() {
+        for (version, exact_alone) in [
+            ("1.1.45", false),
+            ("1.1.45-extensions", false),
+            ("0.1.1", false),
+            ("0.8.1-production-complex", true),
+        ] {
+            let original = fixture(version);
+            let mut vendored = BunLockb::parse(&original).unwrap();
+            let ids: Vec<usize> = vendored
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| p.version.is_some())
+                .map(|p| p.id)
+                .take(2)
+                .collect();
+            let mut snapshots = Vec::new();
+            for (n, id) in ids.iter().enumerate() {
+                snapshots.push(vendored.snapshot(*id).unwrap());
+                let path = format!(".socket/vendor/npm/{n}/package-{n}.tgz");
+                vendored.set_package(*id, &path, &digest()).unwrap();
+            }
+            let mut alone = vendored.clone();
+            let mut handed_on = vendored.clone();
+            let mut earlier = Origin::default();
+            for (id, snapshot) in ids.iter().zip(&snapshots) {
+                alone.restore(*id, snapshot).unwrap();
+                handed_on.restore_toward(*id, snapshot, &earlier).unwrap();
+                earlier.merge(&Origin::of(snapshot));
+            }
+            assert_eq!(alone.bytes() == original, exact_alone, "{version}");
+            assert!(handed_on.bytes() == original, "{version}");
         }
     }
 

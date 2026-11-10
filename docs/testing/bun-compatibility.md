@@ -103,6 +103,14 @@ offsets fail closed.
 
 Vendoring uses per-package binary snapshots in its ledger. This allows a scoped
 rollback or mode switch to restore one package while keeping other packages wired.
+Every snapshot of one lock also records the same pre-vendor lock (the length of
+its string buffer and, when the edit had to normalize it, its exact bytes), so
+reverting the last vendored package returns `bun.lockb` to its exact pre-vendor
+bytes whatever order the packages are reverted in. A ledger written by 5.0 or
+5.1 records that lock with the package vendored first only: `vendor --revert`
+of all its packages in one run is still exact, while reverting that package
+alone and the others in a later run leaves an equivalent lock that keeps the
+normalization.
 Hosted mode (v5.0) keeps no ledger. The hosted → vendored takeover (and the
 eject) rebuild a hosted `bun.lockb` entry as Bun's npm registry record from the
 registry's `dist.tarball` / `dist.integrity`; the hosted rewrite keeps the
