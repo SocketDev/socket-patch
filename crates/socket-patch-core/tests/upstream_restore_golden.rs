@@ -625,14 +625,57 @@ async fn gem_pre_checksums_states() {
         .replace(&format!("\nCHECKSUMS\n{checksums}\n"), "")
         .replace("2.6.2", "2.5.22");
     assert!(!lock.contains("CHECKSUMS"));
-    // Mixed: the rewriter edits only the Gemfile, so discovery finds no pin;
-    // hand the restore one. The untouched lock keeps the original constraint.
-    let mut mixed = synthetic(
-        "mixed",
+
+    // The rewriter converges a bundler 2.2–2.5 lock itself (a Socket GEM
+    // section, the `!` on the user's own requirement, no CHECKSUMS), and
+    // the pair unwinds offline, byte for byte: `~> 7.0` is still `~> 7.0`.
+    let converged_by_rewriter = synthetic(
+        "pre-checksums",
         &[("Gemfile", gemfile), ("Gemfile.lock", &lock)],
         gem_override("rails", "7.0.0"),
     );
-    assert_eq!(mixed.expected["Gemfile.lock"], lock);
+    assert!(converged_by_rewriter.expected["Gemfile.lock"].contains("  rails (~> 7.0)!\n"));
+    let (after, statuses) = run_case_with(&converged_by_rewriter, None, &offline()).await;
+    assert_round_trip(&converged_by_rewriter, &after, &statuses);
+
+    // So does a bundler ≤ 2.1 lock, whose one GEM section lists the patch
+    // registry as a second remote.
+    let merged_by_rewriter = synthetic(
+        "merged",
+        &[
+            ("Gemfile", gemfile),
+            ("Gemfile.lock", &lock.replace("2.5.22", "2.1.4")),
+        ],
+        gem_override("rails", "7.0.0"),
+    );
+    assert!(
+        merged_by_rewriter.expected["Gemfile.lock"].contains(&format!(
+            "GEM\n  remote: https://rubygems.org/\n  remote: {GEM_INDEX}\n  specs:\n"
+        ))
+    );
+    let (after, statuses) = run_case_with(&merged_by_rewriter, None, &offline()).await;
+    assert_round_trip(&merged_by_rewriter, &after, &statuses);
+
+    // The pairs socket-patch 5.0 / 5.1 left: a `source … do` block in the
+    // declaration's place, which holds the exact version only.
+    let block_gemfile = format!(
+        "source \"https://rubygems.org\"\nsource \"{GEM_INDEX}\" do\n  gem \"rails\", \"7.0.0\"\nend\ngem \"puma\"\n"
+    );
+    let mut mixed = Case {
+        dir: PathBuf::from("synthetic/mixed-block"),
+        input: BTreeMap::from([
+            ("Gemfile".to_string(), gemfile.to_string()),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]),
+        expected: BTreeMap::from([
+            ("Gemfile".to_string(), block_gemfile),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]),
+        overrides: gem_override("rails", "7.0.0").as_array().unwrap().clone(),
+    };
+    // Mixed: those releases edited only the Gemfile on such a lock, so
+    // discovery finds no pin; hand the restore one. The untouched lock keeps
+    // the original constraint, which comes back with the declaration.
     let pin = HostedPin {
         purl: "pkg:gem/rails@7.0.0".into(),
         uuid: GEM_UUID.into(),
@@ -641,7 +684,7 @@ async fn gem_pre_checksums_states() {
     let (after, statuses) = run_case_with(&mixed, Some(vec![pin]), &offline()).await;
     assert_round_trip(&mixed, &after, &statuses);
 
-    // Bundler 2.2–2.5 then converges the pair itself (a Socket GEM section,
+    // Bundler 2.2–2.5 then converged the pair itself (a Socket GEM section,
     // a `!` pin, no CHECKSUMS): restorable offline. Not derivable: `~> 7.0`
     // comes back as the exact pin the lock records.
     let restored_lock = lock.replace("  rails (~> 7.0)\n", "  rails (= 7.0.0)\n");
@@ -686,7 +729,7 @@ async fn gem_pre_checksums_states() {
 #[serial]
 async fn gem_transitive_append_round_trips_unless_unprovable() {
     // #457: on a Gemfile ending in a declaration line, the rewriter's own
-    // append for a transitive gem is undone byte for byte: no new `gem`
+    // line for a transitive gem is undone byte for byte: no new `gem`
     // line, no `(= version)` DEPENDENCIES pin freezing the version.
     let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
     let lock = transitive_lock().replace("  rails (= 7.0.0)\n", "");
@@ -698,12 +741,12 @@ async fn gem_transitive_append_round_trips_unless_unprovable() {
     let (after, statuses) = gem_run(&case).await;
     assert_round_trip(&case, &after, &statuses);
 
-    // An append with no blank line before it (what releases before #457
-    // wrote) is indistinguishable from a direct last-line declaration, so
-    // it is kept as a direct exact pin.
+    // A block socket-patch 5.0 appended with no blank line before it (what
+    // releases before #457 wrote) is indistinguishable from a direct
+    // last-line declaration, so it is kept as a direct exact pin.
     let mut case = case.clone_with("transitive-ambiguous");
-    let legacy = case.expected["Gemfile"].replace("\n\nsource", "\nsource");
-    assert_ne!(legacy, case.expected["Gemfile"]);
+    let legacy =
+        format!("{gemfile}source \"{GEM_INDEX}\" do\n  gem \"zeitwerk\", \"2.6.0\"\nend\n");
     case.expected.insert("Gemfile".into(), legacy);
     let (after, statuses) = gem_run(&case).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
@@ -728,13 +771,13 @@ async fn gem_refusals_leave_everything_hosted() {
     );
     // Offline: the CHECKSUMS sha256 needs the registry.
     let (after, statuses) = run_case_with(&case, None, &offline()).await;
-    assert_refused(&case, &after, &statuses, "Gemfile.lock", "offline");
+    assert_refused(&case, &after, &statuses, "Gemfile Gemfile.lock", "offline");
     // The registry does not know the gem.
     {
         let server = MockServer::start().await;
         let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
-        assert_refused(&case, &after, &statuses, "Gemfile.lock", "404");
+        assert_refused(&case, &after, &statuses, "Gemfile Gemfile.lock", "404");
     }
     // The upstream section is another registry's.
     let mut foreign = case.clone_with("foreign-upstream");
@@ -749,7 +792,7 @@ async fn gem_refusals_leave_everything_hosted() {
         &foreign,
         &after,
         &statuses,
-        "Gemfile.lock",
+        "Gemfile Gemfile.lock",
         "not rubygems.org",
     );
     // Two upstream sections, neither singled out.
@@ -774,23 +817,44 @@ async fn gem_refusals_leave_everything_hosted() {
         &ambiguous,
         &after,
         &statuses,
-        "Gemfile.lock",
+        "Gemfile Gemfile.lock",
         "upstream GEM sections",
     );
-    // The Gemfile block was hand-edited.
-    let mut edited = case.clone_with("edited-block");
+    // The Gemfile wiring was hand-edited into a shape nothing reads: the
+    // source moved into a constant.
+    let mut edited = case.clone_with("edited-option");
+    let option = format!("source: \"{GEM_INDEX}\"");
+    assert!(edited.expected["Gemfile"].contains(&option));
     edited.expected.insert(
         "Gemfile".into(),
-        edited.expected["Gemfile"]
-            .replace("  gem \"rails\", \"7.0.0\"", "  gem \"rails\", \"~> 7.0\""),
+        format!(
+            "SOCKET = \"{GEM_INDEX}\"\n{}",
+            edited.expected["Gemfile"].replace(&option, "source: SOCKET")
+        ),
     );
     let (after, statuses) = gem_run(&edited).await;
     assert_refused(
         &edited,
         &after,
         &statuses,
-        "Gemfile.lock",
-        "shape other than the source block",
+        "Gemfile Gemfile.lock",
+        "shape other than the `source:` option or the source block",
+    );
+    // A block of socket-patch 5.0 / 5.1 whose declaration was hand-edited.
+    let mut edited = case.clone_with("edited-block");
+    edited.expected.insert(
+        "Gemfile".into(),
+        format!(
+            "source \"https://rubygems.org\"\n\nsource \"{GEM_INDEX}\" do\n  gem \"rails\", \"~> 7.0\"\nend\ngem \"puma\"\n"
+        ),
+    );
+    let (after, statuses) = gem_run(&edited).await;
+    assert_refused(
+        &edited,
+        &after,
+        &statuses,
+        "Gemfile Gemfile.lock",
+        "shape other than the `source:` option or the source block",
     );
 }
 

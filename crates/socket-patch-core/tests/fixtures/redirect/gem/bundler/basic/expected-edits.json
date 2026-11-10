@@ -1,11 +1,11 @@
 [
   {
     "path": "Gemfile",
-    "kind": "redirect_gemfile_source_block",
-    "action": "rewritten",
+    "kind": "redirect_gemfile_source_option",
+    "action": "added",
     "key": "rails",
-    "original": "\ngem \"rails\", \"7.0.0\"",
-    "new": "source \"https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/\" do\n  gem \"rails\", \"7.0.0\"\nend"
+    "original": "gem \"rails\", \"7.0.0\"",
+    "new": "gem \"rails\", \"7.0.0\", source: \"https://patch.socket.dev/patch-registry/gem/11111111-1111-1111-1111-111111111111/77777777-7777-7777-7777-777777777777/\""
   },
   {
     "path": "Gemfile.lock",

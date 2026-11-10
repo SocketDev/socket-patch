@@ -1,37 +1,55 @@
 //! RubyGems upstream restore: a hosted gem goes back to the upstream `GEM`
-//! section of `Gemfile.lock` / `gems.locked`, and the `source "<patch
-//! registry>" do … end` block the hosted rewriter (`rewrite_gem`) put into
-//! `Gemfile` / `gems.rb` is undone. Discovery records only the lock; the
-//! manifest is its bundler sibling ([`bundler_manifest_for`]).
+//! section of `Gemfile.lock` / `gems.locked`, and the Socket source the
+//! hosted rewriter (`rewrite_gem`) gave it in `Gemfile` / `gems.rb` is taken
+//! off. Discovery records only the lock; the manifest is its bundler sibling
+//! ([`bundler_manifest_for`]).
+//!
+//! The manifest wires a hosted gem in one of three ways ([`Wired`]):
+//!
+//! * a `source: "<patch registry>"` option appended to the user's own
+//!   declaration. The option (and the comma before it) is removed; nothing
+//!   else of the declaration was ever touched, so the line is back byte for
+//!   byte;
+//! * a line the rewriter added for a gem the manifest did not declare (a
+//!   transitive dependency), marked with
+//!   [`ADDED_LINE_MARKER`](crate::formats::gem::declarations::ADDED_LINE_MARKER).
+//!   The line goes, with the blank line written before it, and the
+//!   `DEPENDENCIES` entry added for it;
+//! * the `source "<patch registry>" do … end` block socket-patch 5.0 / 5.1
+//!   put in the declaration's place. See "The block form" below.
 //!
 //! The lock states a hosted gem can be in, and what each restore does:
 //!
-//! * **Converged** (bundler ≥ 2.2 after the rewrite or an unfrozen install;
-//!   the rewriter writes it itself in the `CHECKSUMS` era): the gem's spec
-//!   (+ its dependency sub-lines) sits in a `GEM` section of its own whose
-//!   single remote is the patch registry. The section is deleted and the
-//!   spec moves back, in name order, into the upstream `GEM` section: the
-//!   one remaining non-Socket single-remote section, or — when there are
-//!   several — the one naming the manifest's global `source`, else the
-//!   rubygems.org one; anything else is ambiguous and refused.
+//! * **Converged** (bundler ≥ 2.2): the gem's spec (+ its dependency
+//!   sub-lines) sits in a `GEM` section of its own whose single remote is
+//!   the patch registry. The section is deleted and the spec moves back, in
+//!   name order, into the upstream `GEM` section: the one remaining
+//!   non-Socket single-remote section, or — when there are several — the
+//!   one naming the manifest's global `source`, else the rubygems.org one;
+//!   anything else is ambiguous and refused.
 //! * **Merged** (bundler ≤ 2.1 writes every rubygems source into ONE `GEM`
 //!   section): the Socket `remote:` line is dropped from it.
-//! * **Mixed** (bundler < 2.6: the rewriter edits only the manifest and the
-//!   lock still records the upstream source; see `redirect_gem_frozen_install`):
-//!   discovery finds no pin for it (no lock wiring), so it is only unwound
-//!   when a caller hands in a pin for it — the manifest block alone is then
-//!   undone, and the untouched lock says exactly how the gem was declared.
+//! * **Mixed** (a block of 5.0 / 5.1 on a bundler < 2.6 lock those releases
+//!   left alone, which still records the upstream source; see
+//!   `redirect_gem_frozen_install`): discovery finds no pin for it (no lock
+//!   wiring), so it is only unwound when a caller hands in a pin for it —
+//!   the manifest block alone is then undone, and the untouched lock says
+//!   exactly how the gem was declared.
 //!
 //! In every state a `CHECKSUMS` entry is re-pinned to the upstream sha256
 //! from the rubygems.org compact index (`info/<name>`, what bundler itself
 //! records; other upstream remotes are refused: their index may need
 //! credentials and is not the default registry), and the `DEPENDENCIES`
-//! source pin (`name (= v)!`) loses its `!` — unless the declaration comes
-//! back inside the user's own `source … do` block, where bundler writes the
-//! `!` itself ([`in_source_block`], #1056).
+//! source pin (`name (…)!`) loses its `!` — unless the declaration sits
+//! inside the user's own `source … do` block, where bundler writes the `!`
+//! itself ([`in_source_block`], #1056). A `CHECKSUMS` entry the rewriter
+//! ADDED is only recognizable next to bundler's own bare entry for the gem
+//! (then it is dropped); otherwise it is re-pinned in place.
 //!
-//! What the rewrite discards is NOT derivable, so the restore picks the
-//! installable reading and documents it:
+//! ## The block form
+//!
+//! What that rewrite discarded is NOT derivable, so the restore picks the
+//! installable reading and says so ([`DECLARATION_PINNED`]):
 //!
 //! * the original declaration's version constraint (`"~> 7.0"`, or none),
 //!   quote style, parenthesized form and comment: the gem comes back as
@@ -40,26 +58,25 @@
 //!   (the mixed state keeps the lock's own constraint instead);
 //! * the blank lines and indentation the rewriter's `^\s*gem` match
 //!   swallowed before the declaration: see [`declaration_prefix`];
-//! * whether the gem was declared at all. The rewriter APPENDS a block for a
-//!   transitive gem and adds its `DEPENDENCIES` entry, but a direct gem on
-//!   the manifest's last line produces the same bytes. The block and entry
-//!   are removed only when that is provable: an option-less block the
+//! * whether the gem was declared at all. That rewriter APPENDED a block for
+//!   a transitive gem and added its `DEPENDENCIES` entry, but a direct gem
+//!   on the manifest's last line produced the same bytes. The block and
+//!   entry are removed only when that is provable: an option-less block the
 //!   rewriter could not have written in place (a blank line before it —
-//!   the in-place match swallows every blank line before the declaration,
-//!   and the append always writes one; it goes with the block) that
+//!   the in-place match swallowed every blank line before the declaration,
+//!   and the append always wrote one; it goes with the block) that
 //!   another locked spec depends on (a spec sub-line, or a Bundler 4.1
 //!   `OVERRIDES` `with:` target, #1989). Otherwise the gem is kept as a
 //!   direct pin: a stray exact pin installs the same bytes, while dropping
 //!   a real declaration would stop `Bundler.require` loading the gem.
-//! * a `CHECKSUMS` entry the rewriter ADDED is only recognizable next to
-//!   bundler's own bare entry for the gem (then it is dropped); otherwise it
-//!   is re-pinned in place.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use regex::Regex;
 
 use super::{Ctx, FormatResult, HostedPin, UpstreamClient, View};
+use crate::formats::gem::declarations::{self, Declaration};
+use crate::formats::gem::ruby::{block_stack, BlockSource};
 use crate::formats::gem::{
     bundler_manifest_for, parse_spec, same_remote, split_checksum_entry, BUNDLER_LOCKS,
 };
@@ -450,7 +467,8 @@ fn lock_edit(
 
 // ── manifest (Gemfile / gems.rb) ────────────────────────────────────────────
 
-/// The rewriter's `source "<index>" do\n  gem "n", "v"[, opts]\nend` block.
+/// The `source "<index>" do\n  gem "n", "v"[, opts]\nend` block that
+/// socket-patch 5.0 / 5.1 wrote.
 struct Block {
     start: usize,
     /// Past the `end` line's line break.
@@ -460,33 +478,92 @@ struct Block {
     eol: bool,
 }
 
-fn find_block(
+/// How the manifest gives the gem its Socket source (module docs).
+enum Wired {
+    /// A `source:` option on the gem's own declaration.
+    Option(Declaration),
+    /// The line the rewriter added for a gem the manifest did not declare.
+    AddedLine(Declaration),
+    /// The block of socket-patch 5.0 / 5.1.
+    Block(Block),
+}
+
+impl Wired {
+    /// The byte range that holds the wiring's Socket URL: the `source:`
+    /// argument, or the whole block.
+    fn span(&self) -> (usize, usize) {
+        match self {
+            Wired::Option(decl) | Wired::AddedLine(decl) => decl
+                .source()
+                .map_or((decl.start, decl.end), |(arg, _)| (arg.start, arg.end)),
+            Wired::Block(block) => (block.start, block.end),
+        }
+    }
+
+    /// Whether `text` names `uuid` anywhere but in this wiring.
+    fn mentioned_outside(&self, text: &str, uuid: &str) -> bool {
+        let (start, end) = self.span();
+        text[..start].contains(uuid) || text[end..].contains(uuid)
+    }
+}
+
+/// Every wiring of `gem` to a hosted patch the manifest holds, with the
+/// patch uuid its URL names: a `source:` option on a declaration of the
+/// gem's name, and a 5.0 / 5.1 block for its name and version.
+fn socket_wirings(text: &str, gem: &Gem<'_>, ctx: &Ctx<'_>) -> Vec<(Wired, String)> {
+    let mut out: Vec<(Wired, String)> = socket_blocks(text, gem, ctx)
+        .into_iter()
+        .map(|(block, uuid)| (Wired::Block(block), uuid))
+        .collect();
+    for decl in declarations::declarations(text).literal {
+        if decl.name != gem.name {
+            continue;
+        }
+        let Some(uuid) = decl
+            .source()
+            .and_then(|(_, url)| url)
+            .and_then(|url| ctx.hosted_uuid(url))
+        else {
+            continue;
+        };
+        let wired = if declarations::is_added_line(text, &decl) {
+            Wired::AddedLine(decl)
+        } else {
+            Wired::Option(decl)
+        };
+        out.push((wired, uuid));
+    }
+    out
+}
+
+fn find_wiring(
     text: &str,
     gem: &Gem<'_>,
     rel: &str,
     ctx: &Ctx<'_>,
-) -> Result<Option<Block>, String> {
-    let hits: Vec<Block> = socket_blocks(text, gem, ctx)
+) -> Result<Option<Wired>, String> {
+    let mut hits: Vec<Wired> = socket_wirings(text, gem, ctx)
         .into_iter()
         .filter(|(_, uuid)| uuid == gem.uuid)
-        .map(|(b, _)| b)
+        .map(|(wired, _)| wired)
         .collect();
-    let rest_mentions = |b: Option<&Block>| mentions_outside(text, b, gem.uuid);
-    match hits.as_slice() {
-        [] if rest_mentions(None) => Err(format!(
-            "{rel} wires it in a shape other than the source block socket-patch writes"
+    match hits.len() {
+        0 if text.contains(gem.uuid) => Err(format!(
+            "{rel} wires it in a shape other than the `source:` option or the source block \
+             socket-patch writes"
         )),
-        [] => Ok(None),
-        [_] if rest_mentions(hits.first()) => Err(format!(
-            "{rel} names the patch outside the source block socket-patch writes"
+        0 => Ok(None),
+        1 if hits[0].mentioned_outside(text, gem.uuid) => Err(format!(
+            "{rel} names the patch outside the `source:` option or the source block \
+             socket-patch writes"
         )),
-        [_] => Ok(hits.into_iter().next()),
-        _ => Err(format!("{rel} declares it in several Socket source blocks")),
+        1 => Ok(hits.pop()),
+        _ => Err(format!("{rel} gives it the patch's source more than once")),
     }
 }
 
-/// Every rewriter-shaped `source "<patch registry>" do` block for `gem`'s
-/// name and version, with the hosted patch uuid its index names.
+/// Every `source "<patch registry>" do` block of the shape 5.0 / 5.1 wrote
+/// for `gem`'s name and version, with the hosted patch uuid its index names.
 fn socket_blocks(text: &str, gem: &Gem<'_>, ctx: &Ctx<'_>) -> Vec<(Block, String)> {
     let re = Regex::new(&format!(
         r#"(?m)^source "([^"\r\n]*)" do\r?\n  gem "{}", "{}"(?:, ([^\r\n]*))?\r?\nend(\r?\n|\z)"#,
@@ -509,39 +586,33 @@ fn socket_blocks(text: &str, gem: &Gem<'_>, ctx: &Ctx<'_>) -> Vec<(Block, String
         .collect()
 }
 
-/// Whether `text` names `uuid` anywhere but inside `block`.
-fn mentions_outside(text: &str, block: Option<&Block>, uuid: &str) -> bool {
-    match block {
-        Some(b) => text[..b.start].contains(uuid) || text[b.end..].contains(uuid),
-        None => text.contains(uuid),
-    }
-}
-
-/// The block a superseding hosted re-scan left for `gem` (#1626): on a lock
-/// with no `CHECKSUMS` section that scan moves only the manifest's block to
-/// the new patch's uuid, so until a `bundle install` the lock pins `gem`'s
-/// uuid while the manifest's block names another patch of the same name
-/// and version. Restoring the lock alone would leave that block behind,
-/// and the next unfrozen install would re-patch. Returns the block and the
-/// superseding patch's uuid.
-fn superseded_block(
+/// The wiring another patch of the same gem left in the manifest while the
+/// lock still pins `gem`'s uuid (#1626): a superseding hosted re-scan by
+/// socket-patch 5.0 / 5.1 on a lock with no `CHECKSUMS` section moved only
+/// the manifest's block to the new patch's uuid, and a hand-merged pair can
+/// disagree the same way. Restoring the lock alone would leave that wiring
+/// behind, and the next unfrozen install would re-patch. Returns the wiring
+/// and the superseding patch's uuid.
+fn superseded_wiring(
     text: &str,
     gem: &Gem<'_>,
     rel: &str,
     ctx: &Ctx<'_>,
-) -> Result<Option<(Block, String)>, String> {
-    let hits: Vec<(Block, String)> = socket_blocks(text, gem, ctx)
+) -> Result<Option<(Wired, String)>, String> {
+    let mut hits: Vec<(Wired, String)> = socket_wirings(text, gem, ctx)
         .into_iter()
         .filter(|(_, uuid)| uuid != gem.uuid)
         .collect();
-    match hits.as_slice() {
-        [] => Ok(None),
-        [(b, uuid)] if mentions_outside(text, Some(b), uuid) => Err(format!(
-            "{rel} names the superseding patch {uuid} outside the source block socket-patch writes"
+    match hits.len() {
+        0 => Ok(None),
+        1 if hits[0].0.mentioned_outside(text, &hits[0].1) => Err(format!(
+            "{rel} names the superseding patch {} outside the `source:` option or the source \
+             block socket-patch writes",
+            hits[0].1
         )),
-        [_] => Ok(hits.into_iter().next()),
+        1 => Ok(hits.pop()),
         _ => Err(format!(
-            "{rel} declares it in several superseding Socket source blocks"
+            "{rel} gives it the source of several superseding patches"
         )),
     }
 }
@@ -610,586 +681,31 @@ fn declaration_prefix(text: &str, block: &Block, eol: &str) -> String {
 /// Bundler records a dependency declared there with a `!` source pin in the
 /// lock's `DEPENDENCIES`, whichever URL the block names (#1056).
 fn in_source_block(text: &str, at: usize) -> bool {
-    block_stack(text, at).iter().any(|f| f.source)
+    block_stack(text, at)
+        .iter()
+        .any(|f| f.source == Some(BlockSource::Source))
 }
 
-/// A Ruby construct still open at some point of the manifest.
-struct Frame {
-    /// A `source … do` or `source(…) {` block (anything else Ruby closes
-    /// with `end` or `}`: `group … do`, `if`, `case`, `def`, a hash, … is
-    /// not).
-    source: bool,
-    /// Byte offset of the start of the line its statement began on.
-    line: usize,
-    /// Byte offset of the start of the line holding its opener (the `do`,
-    /// `{` or keyword), below `line` when the statement spans lines.
-    opener: usize,
-}
-
-/// The Ruby constructs still open at byte `at` (a line start) of the
-/// manifest, outermost first. A word-level count over each line's code:
-/// a construct opened and closed on one line nets out, and a keyword opens
-/// one wherever it starts an expression (`v = if …`, `require: case …`,
-/// #1476), not only at the start of a line, so its `end` never closes an
-/// enclosing block. A `{` opens one that its `}` closes (a brace block or
-/// a hash). A statement runs on while a `(` or `[` is open, so a `source(`
-/// whose arguments span lines still owns the `do` or `{` that follows its
-/// `)` (#1509). A `source` call counts wherever it starts an expression,
-/// as a keyword does (`x = 1; source "…" do`, `… then source "…" do`,
-/// #1531). String, `%w[]`, regexp and backtick literals, comments,
-/// `=begin` … `=end` blocks and heredoc bodies are not code.
-fn block_stack(text: &str, at: usize) -> Vec<Frame> {
-    let mut open: Vec<Frame> = Vec::new();
-    let mut block_comment = false;
-    // Pending heredoc terminators: (identifier, may be indented).
-    let mut heredocs: std::collections::VecDeque<(String, bool)> = Default::default();
-    // A string or `%`-literal still open at the end of the last line.
-    let mut literal: Option<Literal> = None;
-    // The code the last line left unfinished (a trailing `,`, `\`, `=`,
-    // …): only its end matters, to tell what a keyword follows.
-    let mut carried = String::new();
-    // Open `(`, `[` and hash `{` of the statement.
-    let mut depth = 0usize;
-    // Each open `{`: a hash (counted in `depth`) or a block (a frame).
-    let mut braces: Vec<bool> = Vec::new();
-    // A `source` call whose block has not opened yet: the number of brace
-    // blocks open around it (a `}` closing one of them ends the call, and
-    // only a `do` or `{` at that level is its block).
-    let mut source_pending: Option<usize> = None;
-    // The `source(` call's argument list: (it is open, it has closed or
-    // there is none).
-    let mut source_call = (false, true);
-    let mut statement_line = 0;
-    let mut start = 0;
-    for raw in text[..at].split_inclusive('\n') {
-        let line_start = start;
-        start += raw.len();
-        let line = raw.trim_end_matches(['\n', '\r']);
-        // `=begin` / `=end` start at column 0 and are followed by
-        // whitespace or the end of the line (Ruby's own rule).
-        let marker = |word: &str| {
-            line.strip_prefix(word)
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-        };
-        if block_comment {
-            block_comment = !marker("=end");
-            continue;
-        }
-        if let Some((id, indented)) = heredocs.front() {
-            let body = if *indented { line.trim_start() } else { line };
-            if body == id {
-                heredocs.pop_front();
-            }
-            continue;
-        }
-        if literal.is_none() && marker("=begin") {
-            block_comment = true;
-            continue;
-        }
-        // An open bracket carries only a `source` statement on to its
-        // block opener: elsewhere a bracket the masker missed (one in an
-        // interpolation) must not swallow the rest of the file.
-        let continues =
-            literal.is_some() || !carried.is_empty() || (depth > 0 && source_pending.is_some());
-        let masked = masked_ruby_code(line, &mut literal);
-        heredocs.extend(heredoc_openers(line, &masked));
-        let masked = masked.trim();
-        if !continues {
-            depth = 0;
-            statement_line = line_start;
-            source_pending = None;
-            source_call = (false, true);
-        }
-        for (n, statement) in masked.split(';').enumerate() {
-            let lead = if n == 0 { carried.as_str() } else { "" };
-            // A top-level `;` starts a new statement, unless it sits in a
-            // brace block of the `source` call's own arguments.
-            if n > 0 && depth == 0 && source_pending.is_none_or(|level| braces.len() <= level) {
-                statement_line = line_start;
-                source_pending = None;
-                source_call = (false, true);
-            }
-            // A `while`/`until`/`for` takes its optional `do` as part of
-            // the loop, not as a block of its own.
-            let mut loop_do = false;
-            // The word after `def` is the method's name (`def begin`).
-            let mut method_name = false;
-            // The last token closed the `source(…)` argument list.
-            let mut after_source_call = false;
-            for (word, start, end) in ruby_tokens(statement) {
-                let closed_source_call = std::mem::take(&mut after_source_call);
-                if is_ident_byte(word.as_bytes()[0]) && std::mem::take(&mut method_name) {
-                    continue;
-                }
-                let expression = || starts_expression(&format!("{lead} {}", &statement[..start]));
-                let (opens, source) = match word {
-                    // One in a brace block of an outer call's arguments
-                    // does not replace that call.
-                    "source" if depth == 0 && source_pending.is_none() && expression() => {
-                        if let Some(parenthesized) = source_call_args(&statement[end..]) {
-                            source_pending = Some(braces.len());
-                            source_call = (false, !parenthesized);
-                        }
-                        (false, false)
-                    }
-                    "(" | "[" => {
-                        if depth == 0 && !source_call.1 {
-                            source_call.0 = true;
-                        }
-                        depth += 1;
-                        (false, false)
-                    }
-                    ")" | "]" => {
-                        depth = depth.saturating_sub(1);
-                        if depth == 0 && std::mem::take(&mut source_call.0) {
-                            source_call.1 = true;
-                            after_source_call = true;
-                        }
-                        (false, false)
-                    }
-                    // A hash literal, part of the statement.
-                    "{" if expression() && !statement[..start].trim_end().ends_with("->") => {
-                        braces.push(true);
-                        depth += 1;
-                        (false, false)
-                    }
-                    // A brace block binds to the call before it, so only
-                    // the one right after `source(…)` is the source's.
-                    "{" => {
-                        braces.push(false);
-                        (
-                            true,
-                            closed_source_call
-                                && take_source(&mut source_pending, braces.len() - 1),
-                        )
-                    }
-                    "}" => {
-                        match braces.pop() {
-                            Some(true) => depth = depth.saturating_sub(1),
-                            Some(false) => {
-                                open.pop();
-                                // A `source` call inside the block ends with it.
-                                if source_pending.is_some_and(|level| braces.len() < level) {
-                                    source_pending = None;
-                                }
-                            }
-                            None => {}
-                        }
-                        (false, false)
-                    }
-                    "do" => {
-                        let opens = !std::mem::take(&mut loop_do);
-                        (
-                            opens,
-                            opens && depth == 0 && take_source(&mut source_pending, braces.len()),
-                        )
-                    }
-                    "if" | "unless" => (expression(), false),
-                    "while" | "until" => {
-                        let opens = expression();
-                        loop_do |= opens;
-                        (opens, false)
-                    }
-                    "for" => {
-                        loop_do = true;
-                        (true, false)
-                    }
-                    "def" => {
-                        method_name = true;
-                        (!endless_def(&statement[end..]), false)
-                    }
-                    "case" | "begin" | "class" | "module" => (true, false),
-                    "end" => {
-                        open.pop();
-                        (false, false)
-                    }
-                    _ => (false, false),
-                };
-                if opens {
-                    open.push(Frame {
-                        source,
-                        line: statement_line,
-                        opener: line_start,
-                    });
-                }
-            }
-        }
-        // A line ending mid-expression; one that only leaves a bracket open
-        // starts a fresh expression on the next line.
-        let unfinished = literal.is_some()
-            || masked.ends_with(['\\', ',', '(', '[', '+', '-', '*', '='])
-            || masked.ends_with("||")
-            || masked.ends_with("&&");
-        carried = if unfinished {
-            let tail = masked.rsplit(';').next().unwrap_or_default();
-            tail.trim_end_matches('\\').trim().to_string()
-        } else {
-            String::new()
-        };
-    }
-    open
-}
-
-/// Whether the pending `source` call (see [`block_stack`]) sits at brace
-/// level `level`, in which case the block opening there is its block.
-fn take_source(pending: &mut Option<usize>, level: usize) -> bool {
-    pending.take_if(|l| *l == level).is_some()
-}
-
-/// Whether `rest`, what follows the word `source` that starts an
-/// expression, makes it a call with arguments, and whether those are in
-/// parentheses (`source(…)`). `source = …` assigns a local variable.
-fn source_call_args(rest: &str) -> Option<bool> {
-    if rest.starts_with('(') {
-        return Some(true);
-    }
-    let args = rest.strip_prefix([' ', '\t'])?.trim_start();
-    (!args.is_empty() && !args.starts_with('=')).then_some(false)
-}
-
-/// [`ruby_words`] and the brackets (`(`, `)`, `[`, `]`, `{`, `}`) of a
-/// masked code line, in order, with their byte range.
-fn ruby_tokens(code: &str) -> impl Iterator<Item = (&str, usize, usize)> {
-    let mut words = ruby_words(code).peekable();
-    let mut brackets = code
-        .match_indices(['(', ')', '[', ']', '{', '}'])
-        .map(|(at, b)| (b, at, at + 1))
-        .peekable();
-    std::iter::from_fn(move || match (words.peek(), brackets.peek()) {
-        (Some(w), Some(b)) if b.1 < w.1 => brackets.next(),
-        (Some(_), _) => words.next(),
-        (None, _) => brackets.next(),
-    })
-}
-
-/// The keyword-like words of a masked code line, with their byte range: a
-/// symbol (`:if`), method call (`.class`) or variable sigil is a name, and
-/// so are a predicate or bang (`begin?`) and a hash label (`if:`).
-fn ruby_words(code: &str) -> impl Iterator<Item = (&str, usize, usize)> {
-    let bytes = code.as_bytes();
-    let mut i = 0;
-    std::iter::from_fn(move || {
-        while i < bytes.len() {
-            if !is_ident_byte(bytes[i]) {
-                i += 1;
-                continue;
-            }
-            let start = i;
-            while i < bytes.len() && is_ident_byte(bytes[i]) {
-                i += 1;
-            }
-            let prev_ok = start == 0 || !matches!(bytes[start - 1], b':' | b'.' | b'@' | b'$');
-            let next_ok = match bytes.get(i) {
-                Some(b'?' | b'!') => false,
-                Some(b':') => bytes.get(i + 1) == Some(&b':'),
-                _ => true,
-            };
-            if prev_ok && next_ok {
-                return Some((&code[start..i], start, i));
-            }
-        }
-        None
-    })
-}
-
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || !b.is_ascii()
-}
-
-/// Whether a keyword or literal after `before` (the masked code before it
-/// in its statement) starts an expression, as opposed to modifying the
-/// statement before it (`gem "x" if cond`, `x.save! if y`) or dividing.
-fn starts_expression(before: &str) -> bool {
-    let before = before.trim_end();
-    let Some(last) = before.bytes().next_back() else {
-        return true;
-    };
-    match last {
-        b'=' | b'(' | b'[' | b'{' | b',' | b';' | b'|' | b'&' | b'>' | b'<' | b'+' | b'-'
-        | b'*' | b'~' => true,
-        // A unary `!`, not a bang method (`x.save! if y`).
-        b'!' => before.len() == 1 || !is_ident_byte(before.as_bytes()[before.len() - 2]),
-        // A label (`require: if …`) or a ternary's `:`, not `Foo::`.
-        b':' => !before.ends_with("::"),
-        // A ternary's `?`, not a predicate (`x.empty? if y`).
-        b'?' => before[..before.len() - 1].ends_with(char::is_whitespace),
-        b if is_ident_byte(b) => {
-            let word_start = before
-                .bytes()
-                .rposition(|b| !is_ident_byte(b))
-                .map_or(0, |i| i + 1);
-            let called = word_start > 0
-                && matches!(before.as_bytes()[word_start - 1], b'.' | b':' | b'@' | b'$');
-            !called
-                && matches!(
-                    &before[word_start..],
-                    "then"
-                        | "else"
-                        | "elsif"
-                        | "do"
-                        | "begin"
-                        | "ensure"
-                        | "and"
-                        | "or"
-                        | "not"
-                        | "when"
-                        | "in"
-                        | "if"
-                        | "unless"
-                        | "while"
-                        | "until"
-                        | "case"
-                )
-        }
-        _ => false,
-    }
-}
-
-/// Whether `rest` (what follows `def`) is an endless method (`def x = 1`,
-/// `def x(a = f()) = a`, `def ==(o) = …`), which Ruby closes without an
-/// `end`. A setter (`def x=(v)`) is not.
-fn endless_def(rest: &str) -> bool {
-    let rest = rest.trim_start();
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    let name_len = if rest.starts_with(ident) {
-        // `x`, `self.x`, `x?`, `x!`.
-        let len = rest
-            .find(|c: char| !(ident(c) || c == '.'))
-            .unwrap_or(rest.len());
-        len + usize::from(rest[len..].starts_with(['?', '!']))
-    } else {
-        // An operator method: `==`, `<=>`, `[]=`, `+@`, ….
-        rest.find(|c: char| !"[]=!<>+-*/%~^&|@".contains(c))
-            .unwrap_or(rest.len())
-    };
-    if name_len == 0 {
-        return false;
-    }
-    let mut tail = &rest[name_len..];
-    if tail.starts_with('(') {
-        let mut depth = 0usize;
-        let Some(close) = tail.find(|c: char| {
-            match c {
-                '(' => depth += 1,
-                ')' => depth -= 1,
-                _ => {}
-            }
-            depth == 0
-        }) else {
-            return false;
-        };
-        tail = &tail[close + 1..];
-    } else if !tail.starts_with([' ', '\t']) {
-        return false;
-    }
-    tail.trim_start()
-        .strip_prefix('=')
-        .is_some_and(|t| !t.starts_with(['=', '~', '>']))
-}
-
-/// A string or `%`-literal left open at the end of a line.
-#[derive(Clone, Copy)]
-struct Literal {
-    open: u8,
-    close: u8,
-    /// Nesting of `open` inside a bracketed literal (`%w[a [b] c]`).
-    depth: usize,
-}
-
-/// `line` up to its `#` comment, with the contents of every string,
-/// character literal, backtick, `%`-literal (`%w[…]`, `%i(…)`, `%q{…}`, …) and regexp literal
-/// masked as `x`, byte for byte, so a keyword or `#` inside one never counts
-/// as code. The delimiters stay. A string or `%`-literal still open at the
-/// end of the line is carried in `literal` to mask the next line from its
-/// start.
-fn masked_ruby_code(line: &str, literal: &mut Option<Literal>) -> String {
-    let bytes = line.as_bytes();
-    let mut out = bytes.to_vec();
-    let mut i = 0;
-    if let Some(lit) = literal.take() {
-        match mask_literal(bytes, &mut out, 0, lit) {
-            Ok(end) => i = end + 1,
-            Err(lit) => {
-                *literal = Some(lit);
-                i = bytes.len();
-            }
-        }
-    }
-    while i < bytes.len() {
-        let b = bytes[i];
-        let before = std::str::from_utf8(&out[..i]).unwrap_or_default();
-        let (lit, body) = match b {
-            b'#' => {
-                out.truncate(i);
-                break;
-            }
-            // A character literal (`?(`, `?}`, `?\n`): its character is
-            // not code.
-            b'?' if starts_expression(before) => {
-                let len = match bytes.get(i + 1) {
-                    Some(b'\\') => 2,
-                    Some(c) if c.is_ascii_punctuation() => 1,
-                    _ => 0,
-                };
-                let next = bytes.get(i + 1 + len).copied();
-                if len > 0 && !next.is_some_and(is_ident_byte) {
-                    out[i + 1..(i + 1 + len).min(bytes.len())].fill(b'x');
-                }
-                i += 1 + len;
-                continue;
-            }
-            b'"' | b'\'' | b'`' => (
-                Literal {
-                    open: b,
-                    close: b,
-                    depth: 0,
-                },
-                i + 1,
-            ),
-            b'/' if starts_expression(before) => (
-                Literal {
-                    open: b,
-                    close: b,
-                    depth: 0,
-                },
-                i + 1,
-            ),
-            b'%' if starts_expression(before) => {
-                let mut j = i + 1;
-                if bytes.get(j).is_some_and(|c| b"wWiIqQrsx".contains(c)) {
-                    j += 1;
-                }
-                match bytes.get(j) {
-                    Some(&open) if open.is_ascii_punctuation() => {
-                        let close = match open {
-                            b'(' => b')',
-                            b'[' => b']',
-                            b'{' => b'}',
-                            b'<' => b'>',
-                            _ => open,
-                        };
-                        (
-                            Literal {
-                                open,
-                                close,
-                                depth: 0,
-                            },
-                            j + 1,
-                        )
-                    }
-                    _ => {
-                        i += 1;
-                        continue;
-                    }
-                }
-            }
-            _ => {
-                i += 1;
-                continue;
-            }
-        };
-        match mask_literal(bytes, &mut out, body, lit) {
-            Ok(end) => i = end + 1,
-            // An unclosed `/` was a division after all.
-            Err(_) if b == b'/' => {
-                out[body..].copy_from_slice(&bytes[body..]);
-                i += 1;
-            }
-            Err(lit) => {
-                *literal = Some(lit);
-                break;
-            }
-        }
-    }
-    // The delimiters are ASCII, so a masked run never cuts a multi-byte
-    // character: the result is still UTF-8.
-    String::from_utf8(out).unwrap_or_default()
-}
-
-/// Masks `lit`'s body in `out` from byte `from` of `bytes`: `Ok` with the
-/// closing delimiter's index, or `Err` with the literal still open at the
-/// end of the line.
-fn mask_literal(
-    bytes: &[u8],
-    out: &mut [u8],
-    from: usize,
-    mut lit: Literal,
-) -> Result<usize, Literal> {
-    let mut j = from;
-    while j < bytes.len() {
-        let c = bytes[j];
-        if c == b'\\' {
-            out[j] = b'x';
-            if let Some(next) = out.get_mut(j + 1) {
-                *next = b'x';
-            }
-            j += 2;
-            continue;
-        }
-        if c == lit.close && lit.depth == 0 {
-            return Ok(j);
-        }
-        if lit.open != lit.close && c == lit.open {
-            lit.depth += 1;
-        } else if lit.open != lit.close && c == lit.close {
-            lit.depth -= 1;
-        }
-        out[j] = b'x';
-        j += 1;
-    }
-    Err(lit)
-}
-
-/// The heredocs a line opens (`<<~EOS`, `<<-"EOS"`, `x = <<EOS`), in
-/// order, as (terminator, may be indented). `masked` is `line` through
-/// [`masked_ruby_code`], so an opener inside a literal or comment does not
-/// count, and neither does an append (`list << x`, `a<<B`, `class <<self`):
-/// a bare `<<NAME` must start an expression.
-fn heredoc_openers(line: &str, masked: &str) -> Vec<(String, bool)> {
-    let bytes = masked.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while let Some(at) = masked[i..].find("<<").map(|p| p + i) {
-        i = at + 2;
-        if at > 0 && (is_ident_byte(bytes[at - 1]) || matches!(bytes[at - 1], b')' | b']' | b'}')) {
-            continue;
-        }
-        let mut j = at + 2;
-        let indented = matches!(bytes.get(j), Some(b'~' | b'-'));
-        if indented {
-            j += 1;
-        }
-        let id = match bytes.get(j) {
-            Some(&q @ (b'"' | b'\'' | b'`')) => masked[j + 1..]
-                .find(q as char)
-                .map(|end| &line[j + 1..j + 1 + end]),
-            Some(&b)
-                if (b.is_ascii_alphabetic() || b == b'_')
-                    && (indented || starts_expression(&masked[..at])) =>
-            {
-                let len = masked[j..]
-                    .bytes()
-                    .position(|b| !is_ident_byte(b))
-                    .unwrap_or(masked.len() - j);
-                Some(&line[j..j + len])
-            }
-            _ => None,
-        };
-        if let Some(id) = id.filter(|id| !id.is_empty()) {
-            out.push((id.to_string(), indented));
-            i = j + 1;
-        }
-    }
-    out
-}
-
-/// How the gem comes back into the manifest.
+/// How a gem wired by a 5.0 / 5.1 block comes back into the manifest.
 enum Decl {
     /// Gone: the block was the rewriter's append for a transitive gem.
     Transitive,
     /// `gem "<name>"<args>[, <opts>]`; `args` is the version constraint list
     /// (`, "7.0.0"`).
     Direct(String),
+}
+
+/// The manifest without the wiring `wired`: the `source:` option off the
+/// declaration, the added line gone, or the block undone as `decl` says.
+fn unwire_manifest(text: &str, wired: &Wired, gem: &Gem<'_>, decl: &Decl) -> String {
+    match wired {
+        Wired::Option(declaration) => match declaration.source() {
+            Some((arg, _)) => declarations::without_arg(text, arg),
+            None => text.to_string(),
+        },
+        Wired::AddedLine(declaration) => declarations::without_added_line(text, declaration),
+        Wired::Block(block) => restore_manifest(text, block, gem, decl),
+    }
 }
 
 /// Byte offset of the start of the line before byte `at` (`at` itself at
@@ -1312,6 +828,9 @@ pub(crate) async fn restore(
         let mut ordered: Vec<&&HostedPin> = pins.iter().collect();
         ordered.sort_by_key(|p| !lock_wires(&p.uuid));
         let mut undone: Vec<String> = Vec::new();
+        // The declarations that came back as exact pins (module docs, "The
+        // block form").
+        let mut pinned: Vec<String> = Vec::new();
         for pin in ordered {
             if result.refused.contains_key(&pin.uuid) {
                 continue;
@@ -1340,21 +859,41 @@ pub(crate) async fn restore(
             .await
             {
                 Ok(None) => {}
-                Ok(Some((next_lock, next_manifest, superseded))) => {
-                    if endings == Some(LineEndings::Mixed) && next_lock != lock {
+                Ok(Some(restored)) => {
+                    if endings == Some(LineEndings::Mixed) && restored.lock != lock {
                         result.refuse(
                             &pin.uuid,
                             format!("{lock_rel} mixes CRLF and LF line endings"),
                         );
                         continue;
                     }
-                    lock = next_lock;
-                    manifest = next_manifest;
+                    lock = restored.lock;
+                    manifest = restored.manifest;
                     result.handled.insert(pin.uuid.clone());
-                    undone.extend(superseded);
+                    undone.extend(restored.superseded);
+                    if restored.pinned {
+                        pinned.push(format!("`gem \"{}\", \"{}\"`", gem.name, gem.version));
+                    }
                 }
                 Err(why) => result.refuse(&pin.uuid, why),
             }
+        }
+        if !pinned.is_empty() {
+            let (was, each) = if pinned.len() == 1 {
+                ("was restored as an exact pin", "the declaration")
+            } else {
+                ("were restored as exact pins", "each declaration")
+            };
+            result.warnings.push((
+                DECLARATION_PINNED,
+                format!(
+                    "{manifest_rel}: {} {was}. socket-patch 5.0 / 5.1 replaced {each} with a \
+                     `source … do` block, so the original version requirement, quoting and \
+                     comment could not be recovered; if the requirement was a range (for \
+                     example `~> 2.2`), put it back by hand and run `bundle lock`",
+                    pinned.join(", ")
+                ),
+            ));
         }
         // The pins this pair restored, each judged once against its own
         // restored lock (a superseding pin shares its archive with the pin
@@ -1402,6 +941,11 @@ pub(crate) async fn restore(
 /// an unwind (the restore-side counterpart of scan's
 /// `redirect_gem_stale_install`).
 pub(crate) const STALE_CACHE: &str = "upstream_gem_stale_cache";
+
+/// The warning code for declarations a restore brought back as exact pins:
+/// a `source … do` block of socket-patch 5.0 / 5.1 does not hold the
+/// declaration it replaced (module docs, "The block form").
+pub(crate) const DECLARATION_PINNED: &str = "upstream_gem_declaration_pinned";
 
 /// The `CHECKSUMS` sha256 the lock pins for `name (version)`, if any.
 fn lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
@@ -1524,8 +1068,7 @@ fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {
 }
 
 /// Restore one gem in a lock + manifest pair: `Ok(None)` when neither wires
-/// it, else the next `(lock, manifest)` texts and the uuid of a superseding
-/// patch whose block was undone with it ([`superseded_block`]).
+/// it, else the next texts ([`Restored`]).
 async fn restore_one(
     gem: &Gem<'_>,
     lock: Option<&str>,
@@ -1533,9 +1076,9 @@ async fn restore_one(
     manifest_rel: &str,
     globals: &[String],
     ctx: &Ctx<'_>,
-) -> Result<Option<RestoredPair>, String> {
-    let mut block = match manifest {
-        Some(text) => find_block(text, gem, manifest_rel, ctx)?,
+) -> Result<Option<Restored>, String> {
+    let mut wiring_in_manifest = match manifest {
+        Some(text) => find_wiring(text, gem, manifest_rel, ctx)?,
         None => None,
     };
     let lines: Vec<&str> = lock.map(|l| l.split('\n').collect()).unwrap_or_default();
@@ -1544,22 +1087,22 @@ async fn restore_one(
         None => false,
     };
     let mut superseded = None;
-    if wired && block.is_none() {
-        if let Some((b, uuid)) = manifest
-            .map(|text| superseded_block(text, gem, manifest_rel, ctx))
+    if wired && wiring_in_manifest.is_none() {
+        if let Some((other, uuid)) = manifest
+            .map(|text| superseded_wiring(text, gem, manifest_rel, ctx))
             .transpose()?
             .flatten()
         {
-            block = Some(b);
+            wiring_in_manifest = Some(other);
             superseded = Some(uuid);
         }
     }
-    if !wired && block.is_none() {
+    if !wired && wiring_in_manifest.is_none() {
         return Ok(None);
     }
-    // The other side of #1626: the manifest's block is this (superseding)
+    // The other side of #1626: the manifest's wiring is this (superseding)
     // patch's, but the lock still pins the gem to an earlier Socket patch.
-    // Undoing the block alone would leave the lock on that patch, so only
+    // Undoing the manifest alone would leave the lock on that patch, so only
     // the earlier patch's pin (which undoes both) can restore the pair.
     if !wired {
         if let Some(earlier) = earlier_lock_pin(&lines, gem, ctx) {
@@ -1570,8 +1113,13 @@ async fn restore_one(
             ));
         }
     }
+    let block = match &wiring_in_manifest {
+        Some(Wired::Block(block)) => Some(block),
+        _ => None,
+    };
+    // What a 5.0 / 5.1 block comes back as (module docs, "The block form").
     let decl = if wired {
-        let transitive = block.as_ref().is_some_and(|b| {
+        let transitive = block.is_some_and(|b| {
             b.opts.is_none()
                 && manifest.is_some_and(|m| provably_appended(m, b))
                 && is_subdependency(&lines, &gem.name)
@@ -1591,12 +1139,25 @@ async fn restore_one(
     } else {
         Decl::Direct(format!(", \"{}\"", gem.version))
     };
-    // The restored declaration goes back where the block is: a user
+    // The declaration is (or goes back) where the wiring is: a user
     // `source … do` block around it keeps the `!` bundler wrote for it.
-    let dep = match (&decl, &block, manifest) {
-        (Decl::Transitive, _, _) => DepEntry::Drop,
-        (Decl::Direct(_), Some(b), Some(text)) if in_source_block(text, b.start) => DepEntry::Keep,
-        (Decl::Direct(_), _, _) => DepEntry::Unpin,
+    let line_start = |text: &str, at: usize| text[..at].rfind('\n').map_or(0, |i| i + 1);
+    let dep = match (&wiring_in_manifest, manifest) {
+        // The line and its DEPENDENCIES entry are the rewriter's own.
+        (Some(Wired::AddedLine(_)), _) => DepEntry::Drop,
+        (Some(Wired::Option(declaration)), Some(text))
+            if in_source_block(text, line_start(text, declaration.start)) =>
+        {
+            DepEntry::Keep
+        }
+        (Some(Wired::Option(_)), _) => DepEntry::Unpin,
+        (Some(Wired::Block(b)), Some(text))
+            if matches!(decl, Decl::Direct(_)) && in_source_block(text, b.start) =>
+        {
+            DepEntry::Keep
+        }
+        _ if matches!(decl, Decl::Transitive) => DepEntry::Drop,
+        _ => DepEntry::Unpin,
     };
     let next_lock = match lock {
         None => None,
@@ -1622,16 +1183,31 @@ async fn restore_one(
             }
         }),
     };
-    let next_manifest = match (manifest, &block) {
-        (Some(text), Some(b)) => Some(restore_manifest(text, b, gem, &decl)),
+    let next_manifest = match (manifest, &wiring_in_manifest) {
+        (Some(text), Some(wiring)) => Some(unwire_manifest(text, wiring, gem, &decl)),
         _ => manifest.map(str::to_string),
     };
-    Ok(Some((next_lock, next_manifest, superseded)))
+    Ok(Some(Restored {
+        lock: next_lock,
+        manifest: next_manifest,
+        superseded,
+        // The lock's exact pin stood in for a declaration the block replaced.
+        pinned: wired && block.is_some() && matches!(decl, Decl::Direct(_)),
+    }))
 }
 
-/// What [`restore_one`] gives back: the next lock and manifest texts, and
-/// the superseding patch whose block it undid.
-type RestoredPair = (Option<String>, Option<String>, Option<String>);
+/// What [`restore_one`] gives back.
+struct Restored {
+    /// The next lock and manifest texts.
+    lock: Option<String>,
+    manifest: Option<String>,
+    /// The superseding patch whose manifest wiring was undone with this
+    /// gem's ([`superseded_wiring`]).
+    superseded: Option<String>,
+    /// Whether a 5.0 / 5.1 block came back as an exact pin
+    /// ([`DECLARATION_PINNED`]).
+    pinned: bool,
+}
 
 /// Another Socket patch's uuid whose own lock section locks `gem`'s name
 /// and version (the lock side of an unconverged superseding re-scan). Only
@@ -1682,6 +1258,20 @@ mod tests {
             LockEdit::Done(t) => t,
             LockEdit::NeedsSha { .. } => panic!("unexpected sha request"),
         }
+    }
+
+    /// The 5.0 / 5.1 block that wires `gem`, as [`find_wiring`] reads it.
+    fn find_block(
+        text: &str,
+        gem: &Gem<'_>,
+        rel: &str,
+        ctx: &Ctx<'_>,
+    ) -> Result<Option<Block>, String> {
+        Ok(match find_wiring(text, gem, rel, ctx)? {
+            Some(Wired::Block(block)) => Some(block),
+            Some(_) => panic!("{text}: wired by an option, not a block"),
+            None => None,
+        })
     }
 
     #[test]
@@ -1934,21 +1524,12 @@ mod tests {
         assert!(!is_subdependency(&lines, "rails"));
     }
 
-    /// #457: what the hosted rewriter itself writes for a TRANSITIVE gem
-    /// (an appended block, converged CHECKSUMS lock) must be recognized as
-    /// its append, and undoing it must give the manifest back byte for
-    /// byte, whatever its trailing newlines. A hand-built fixture is not
-    /// enough: the rewriter used to append with no blank line before the
-    /// block, so rollback re-added the gem as a direct exact pin.
-    #[test]
-    fn rewriter_transitive_append_restores_byte_identically() {
+    /// The hosted override for `rails 7.0.0` under patch [`UUID`].
+    fn rails_override() -> crate::patch::redirect::DepOverride {
         use crate::patch::redirect::{
-            rewrite_registry_redirect, DepOverride, Integrity, RegistryOverride,
-            RegistryOverrideIdentifiers,
+            DepOverride, Integrity, RegistryOverride, RegistryOverrideIdentifiers,
         };
-        let client = super::super::UpstreamClient::new(true);
-        let ctx = ctx_with(&client);
-        let ov = DepOverride {
+        DepOverride {
             ecosystem: "gem".into(),
             name: "rails".into(),
             namespace: None,
@@ -1967,7 +1548,53 @@ mod tests {
                 },
             }),
             integrity: Integrity::default(),
-        };
+        }
+    }
+
+    /// The pair socket-patch 5.0 / 5.1 left for a `gem "rails", "7.0.0"`
+    /// declaration of `manifest`: its `source … do` block in the
+    /// declaration's place (the blank lines and indent before the line
+    /// swallowed, as that rewriter's `^\s*gem` match did), and `lock`
+    /// converged on it with the patched checksum.
+    fn block_form_pair(manifest: &str, lock: &str, upstream_sha: &str) -> (String, String) {
+        use crate::formats::gem::hosted::{converge_gem_lock_source, DependencyPin};
+        let decl = Regex::new(r#"(?m)^\s*gem "rails", "7.0.0"$"#).unwrap();
+        assert!(decl.is_match(manifest), "{manifest}");
+        let hosted_manifest = decl
+            .replace(
+                manifest,
+                regex::NoExpand(&format!(
+                    "source \"{IDX}\" do\n  gem \"rails\", \"7.0.0\"\nend"
+                )),
+            )
+            .into_owned();
+        let mut hosted_lock = lock.replace(
+            &format!("rails (7.0.0) sha256={upstream_sha}"),
+            &format!("rails (7.0.0) sha256={}", "f".repeat(64)),
+        );
+        converge_gem_lock_source(
+            &mut hosted_lock,
+            &rails_override(),
+            IDX,
+            "Gemfile.lock",
+            DependencyPin::Exact("= 7.0.0"),
+            &mut false,
+            &mut Default::default(),
+        )
+        .expect("the lock converges");
+        (hosted_manifest, hosted_lock)
+    }
+
+    /// #457: what the hosted rewriter itself writes for a TRANSITIVE gem
+    /// (one added line, converged CHECKSUMS lock) must be recognized as its
+    /// own line, and undoing it must give the manifest back byte for byte,
+    /// whatever its line ending and whether it ends on one.
+    #[test]
+    fn rewriter_added_line_restores_byte_identically() {
+        use crate::patch::redirect::{rewrite_registry_redirect, DepOverride};
+        let client = super::super::UpstreamClient::new(true);
+        let ctx = ctx_with(&client);
+        let ov = rails_override();
         let lock = format!(
             "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n      rails (>= 7)\n    \
              rails (7.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  puma\n\nCHECKSUMS\n  puma (6.0.0) \
@@ -1977,15 +1604,15 @@ mod tests {
         );
         let lf = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
         let crlf = lf.replace('\n', "\r\n");
-        let unterminated = lf.trim_end_matches('\n');
-        for (original, restored) in [
+        for original in [
             // The issue's shape: the manifest ends with a declaration + LF.
-            (lf.to_string(), lf.to_string()),
-            // A trailing blank line (the issue's passing control).
-            (format!("{lf}\n"), format!("{lf}\n")),
-            (crlf.clone(), crlf.clone()),
-            // No final line break: it comes back with one.
-            (unterminated.to_string(), lf.to_string()),
+            lf.to_string(),
+            // A trailing blank line.
+            format!("{lf}\n"),
+            crlf.clone(),
+            // No final line break: it comes back without one.
+            lf.trim_end_matches('\n').to_string(),
+            crlf.trim_end_matches("\r\n").to_string(),
         ] {
             let files = BTreeMap::from([
                 ("Gemfile".to_string(), original.clone()),
@@ -1998,24 +1625,21 @@ mod tests {
                 lock_out.contains("  rails (= 7.0.0)!"),
                 "converged lock: {lock_out}"
             );
-            let b = find_block(gemfile, &gem(), "Gemfile", &ctx)
+            let wired = find_wiring(gemfile, &gem(), "Gemfile", &ctx)
                 .unwrap()
-                .expect("the appended block is found");
-            assert!(b.opts.is_none());
+                .expect("the added line is found");
             assert!(
-                provably_appended(gemfile, &b),
-                "the rewriter's append must be provably an append: {gemfile:?}"
+                matches!(wired, Wired::AddedLine(_)),
+                "the rewriter's line must be recognized as added: {gemfile:?}"
             );
-            let lines: Vec<&str> = lock_out.split('\n').collect();
-            assert!(is_subdependency(&lines, "rails"));
             assert_eq!(
-                restore_manifest(gemfile, &b, &gem(), &Decl::Transitive),
-                restored,
+                unwire_manifest(gemfile, &wired, &gem(), &Decl::Transitive),
+                original,
                 "from {gemfile:?}"
             );
         }
 
-        // Two transitive appends (two patches) unwind in either order.
+        // Two added lines (two patches) unwind in either order.
         const RACK_UUID: &str = "88888888-8888-8888-8888-888888888888";
         let rack_ov = DepOverride {
             name: "rack".into(),
@@ -2029,8 +1653,6 @@ mod tests {
             }),
             ..ov.clone()
         };
-        // A CHECKSUMS-less lock resolving both (hosted mode pins only a
-        // version a lock resolves, #1125) and left untouched by the rewrite.
         let files = BTreeMap::from([
             ("Gemfile".to_string(), lf.to_string()),
             (
@@ -2049,16 +1671,126 @@ mod tests {
             version: "3.0.0".into(),
         };
         for (first, second) in [(gem(), rack()), (rack(), gem())] {
-            let b = find_block(&gemfile, &first, "Gemfile", &ctx)
+            let wired = find_wiring(&gemfile, &first, "Gemfile", &ctx)
                 .unwrap()
                 .unwrap();
-            assert!(provably_appended(&gemfile, &b), "{gemfile:?}");
-            let half = restore_manifest(&gemfile, &b, &first, &Decl::Transitive);
-            let b = find_block(&half, &second, "Gemfile", &ctx)
+            let half = unwire_manifest(&gemfile, &wired, &first, &Decl::Transitive);
+            let wired = find_wiring(&half, &second, "Gemfile", &ctx)
                 .unwrap()
                 .unwrap();
-            assert!(provably_appended(&half, &b), "{half:?}");
-            assert_eq!(restore_manifest(&half, &b, &second, &Decl::Transitive), lf);
+            assert_eq!(
+                unwire_manifest(&half, &wired, &second, &Decl::Transitive),
+                lf
+            );
+        }
+    }
+
+    /// B2 / RE-D5: a hosted pin of a DIRECT gem unwinds to the pre-scan
+    /// pair byte for byte, in every form the declaration is written in:
+    /// the appended option goes, and the lock's entry keeps the requirement
+    /// the user wrote (`rails (~> 7.0)`, not an exact pin). LF and CRLF.
+    #[tokio::test]
+    async fn direct_redirect_round_trips_through_restore_in_every_declaration_form() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        for (decl, entry) in [
+            (
+                "gem \"rails\", \"~> 7.0\"       # the framework",
+                "rails (~> 7.0)",
+            ),
+            ("gem 'rails'", "rails"),
+            (
+                "gem 'rails', '>= 7.0.0', '< 7.1', group: :test",
+                "rails (>= 7.0.0, < 7.1)",
+            ),
+            ("gem(\"rails\", \"7.0.0\")", "rails (= 7.0.0)"),
+            (
+                "gem \"rails\",\n    \"7.0.0\",\n    require: false",
+                "rails (= 7.0.0)",
+            ),
+            (
+                "gem \"rails\", platforms: %i[mri windows], require: %w[rails rails/all]",
+                "rails",
+            ),
+            (
+                "group :development do\n  gem \"rails\", \"7.0.0\" # pinned\nend",
+                "rails (= 7.0.0)",
+            ),
+            (
+                "gem \"rails\", \"7.0.0\" if RUBY_VERSION >= \"3.0\"",
+                "rails (= 7.0.0)",
+            ),
+            ("gem \"rails\", \"7.0.0\"; gem \"puma\"", "rails (= 7.0.0)"),
+        ] {
+            for eol in ["\n", "\r\n"] {
+                for checksums in [true, false] {
+                    let manifest =
+                        format!("source \"https://rubygems.org\"\n\n{decl}\ngem \"rack\"\n")
+                            .replace('\n', eol);
+                    let pins = if checksums {
+                        format!(
+                            "CHECKSUMS\n  puma (6.0.0) sha256={a}\n  rack (3.0.0) sha256={a}\n  \
+                             rails (7.0.0) sha256={upstream_sha}\n\n",
+                            a = "a".repeat(64)
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let lock = format!(
+                        "GEM\n  remote: https://rubygems.org/\n  specs:\n    puma (6.0.0)\n    \
+                         rack (3.0.0)\n    rails (7.0.0)\n      rack (>= 2)\n\nPLATFORMS\n  ruby\n\n\
+                         DEPENDENCIES\n  puma\n  rack\n  {entry}\n\n{pins}BUNDLED WITH\n   4.0.17\n"
+                    )
+                    .replace('\n', eol);
+                    let files = BTreeMap::from([
+                        ("Gemfile".to_string(), manifest.clone()),
+                        ("Gemfile.lock".to_string(), lock.clone()),
+                    ]);
+                    let r = crate::patch::redirect::rewrite_registry_redirect(
+                        &files,
+                        &[rails_override()],
+                    );
+                    let hosted_manifest = r
+                        .files
+                        .get("Gemfile")
+                        .unwrap_or_else(|| panic!("{decl}: {:?}", r.warnings));
+                    let hosted_lock = &r.files["Gemfile.lock"];
+                    assert!(
+                        hosted_lock.contains(&format!("  {entry}!{eol}")),
+                        "{hosted_lock}"
+                    );
+                    // The restore edits the lock in LF, as `restore` hands it in.
+                    let restored = restore_one(
+                        &gem(),
+                        Some(&hosted_lock.replace("\r\n", "\n")),
+                        Some(hosted_manifest),
+                        "Gemfile",
+                        &global_sources(hosted_manifest),
+                        &ctx,
+                    )
+                    .await
+                    .unwrap()
+                    .expect("the redirect is found");
+                    assert_eq!(
+                        restored.manifest.as_deref(),
+                        Some(manifest.as_str()),
+                        "{decl}"
+                    );
+                    assert_eq!(
+                        restored.lock.map(|l| l.replace('\n', eol)).as_deref(),
+                        Some(lock.as_str()),
+                        "{decl} (checksums: {checksums})"
+                    );
+                    assert!(
+                        !restored.pinned,
+                        "{decl}: nothing was lost, nothing to report"
+                    );
+                }
+            }
         }
     }
 
@@ -2111,7 +1843,11 @@ mod tests {
         );
         let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
         assert!(hosted_lock.contains("  rails (= 7.0.0)!"), "{hosted_lock}");
-        let (next_lock, next_manifest, _) = restore_one(
+        let Restored {
+            lock: next_lock,
+            manifest: next_manifest,
+            ..
+        } = restore_one(
             &gem(),
             Some(hosted_lock),
             Some(hosted_manifest),
@@ -2176,7 +1912,11 @@ mod tests {
         );
         let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
         assert!(hosted_lock.contains("  rails (= 7.0.0)!"), "{hosted_lock}");
-        let (next_lock, next_manifest, _) = restore_one(
+        let Restored {
+            lock: next_lock,
+            manifest: next_manifest,
+            ..
+        } = restore_one(
             &gem(),
             Some(hosted_lock),
             Some(hosted_manifest),
@@ -2249,49 +1989,54 @@ mod tests {
                  sha256={upstream_sha}\n\nBUNDLED WITH\n   4.0.22\n",
                 "a".repeat(64)
             );
-            let files = BTreeMap::from([
-                ("Gemfile".to_string(), manifest.to_string()),
-                ("Gemfile.lock".to_string(), lock.clone()),
-            ]);
-            let r = crate::patch::redirect::rewrite_registry_redirect(
-                &files,
-                &[crate::patch::redirect::DepOverride {
-                    ecosystem: "gem".into(),
-                    name: "rails".into(),
-                    namespace: None,
-                    version: "7.0.0".into(),
-                    token: "tok".into(),
-                    patch_uuid: UUID.into(),
-                    artifact_url: "https://patch.test/rails-7.0.0.gem".into(),
-                    registry_override: Some(crate::patch::redirect::RegistryOverride {
-                        kind: "rubygems-compact-index".into(),
-                        index_url: IDX.into(),
-                        identifiers: crate::patch::redirect::RegistryOverrideIdentifiers {
-                            name: "rails".into(),
-                            version: "7.0.0".into(),
-                            gem_checksum_sha256: Some("f".repeat(64)),
-                            ..Default::default()
-                        },
-                    }),
-                    integrity: Default::default(),
-                }],
-            );
-            let (hosted_manifest, hosted_lock) = (&r.files["Gemfile"], &r.files["Gemfile.lock"]);
+            // The pair as socket-patch 5.0 / 5.1 left it: the gem's own
+            // Socket block nested in the user's (today's rewriter refuses a
+            // declaration in a user's source block instead).
+            let (hosted_manifest, hosted_lock) = block_form_pair(manifest, &lock, &upstream_sha);
             assert!(hosted_lock.contains(IDX), "{hosted_lock}");
-            let (next_lock, next_manifest, _) = restore_one(
+            let restored = restore_one(
                 &gem(),
-                Some(hosted_lock),
-                Some(hosted_manifest),
+                Some(&hosted_lock),
+                Some(&hosted_manifest),
                 "Gemfile",
-                &global_sources(hosted_manifest),
+                &global_sources(&hosted_manifest),
                 &ctx,
             )
             .await
             .unwrap()
             .expect("the redirect is found");
-            assert_eq!(next_manifest.as_deref(), Some(manifest));
-            assert_eq!(next_lock.as_deref(), Some(lock.as_str()));
+            assert_eq!(restored.manifest.as_deref(), Some(manifest));
+            assert_eq!(restored.lock.as_deref(), Some(lock.as_str()));
         }
+
+        // A `source:` option on a declaration inside the user's block (a
+        // hand-edited pair): it comes off, and the `!` stays the same way.
+        let manifest = "source \"https://rubygems.org\"\n\nsource \"https://rubygems.org\" do\n  \
+                        gem \"rails\", \"7.0.0\"\nend\n";
+        let lock = "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                    PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.5.23\n";
+        let hosted_manifest = manifest.replace(
+            "gem \"rails\", \"7.0.0\"",
+            &format!("gem \"rails\", \"7.0.0\", source: \"{IDX}\""),
+        );
+        let hosted_lock = format!(
+            "GEM\n  remote: {IDX}\n  specs:\n    rails (7.0.0)\n\nGEM\n  remote: \
+             https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  \
+             rails (= 7.0.0)!\n\nBUNDLED WITH\n   2.5.23\n"
+        );
+        let restored = restore_one(
+            &gem(),
+            Some(&hosted_lock),
+            Some(&hosted_manifest),
+            "Gemfile",
+            &global_sources(&hosted_manifest),
+            &ctx,
+        )
+        .await
+        .unwrap()
+        .expect("the redirect is found");
+        assert_eq!(restored.manifest.as_deref(), Some(manifest));
+        assert_eq!(restored.lock.as_deref(), Some(lock));
     }
 
     #[test]
@@ -3056,15 +2801,81 @@ mod tests {
         assert!(why.contains(UUID), "{why}");
         assert_eq!((gemfile, lock), (None, None));
 
-        // Two superseding blocks for the same gem: not ours to pick.
-        let other = upstream["Gemfile"].replace(UUID, "99999999-9999-9999-9999-999999999999");
-        let block = &other[other.find("source \"https://patch").unwrap()..];
+        // Two superseding wirings for the same gem: not ours to pick.
+        let block = format!(
+            "source \"{}\" do\n  gem \"rails\", \"7.0.0\"\nend\n",
+            IDX.replace(UUID, "99999999-9999-9999-9999-999999999999")
+        );
         let (r, _, _) = run(
             vec![pin(UUID, &["Gemfile.lock"])],
             format!("{superseded}{block}"),
         )
         .await;
         assert!(r.refused.contains_key(UUID), "{:?}", r.handled);
+    }
+
+    /// RE-D5: a pin socket-patch 5.0 / 5.1 wrote as a `source … do` block
+    /// still unwinds as before — the declaration comes back as the exact
+    /// pin the lock records — and the restore now says so, naming the
+    /// declaration, once for the manifest. A pin in the option form restores
+    /// the user's own declaration and reports nothing.
+    #[tokio::test]
+    async fn restore_of_a_block_names_the_declaration_it_pinned() {
+        let client = super::super::UpstreamClient::new(true);
+        let upstream_sha = "2".repeat(64);
+        client
+            .seed_rubygems_sha256("rails", "7.0.0", &upstream_sha)
+            .await;
+        let ctx = ctx_with(&client);
+        let original = "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n";
+        let lock = format!(
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\nPLATFORMS\n  \
+             ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\nCHECKSUMS\n  rails (7.0.0) \
+             sha256={upstream_sha}\n\nBUNDLED WITH\n   2.6.9\n"
+        );
+        let (block_manifest, block_lock) = block_form_pair(original, &lock, &upstream_sha);
+        let option_pair = hosted_pair(true, &upstream_sha);
+        let pin = HostedPin {
+            purl: "pkg:gem/rails@7.0.0".into(),
+            uuid: UUID.into(),
+            files: vec!["Gemfile.lock".into()],
+        };
+        for (manifest, hosted_lock, warns) in [
+            (&block_manifest, &block_lock, true),
+            (&option_pair["Gemfile"], &option_pair["Gemfile.lock"], false),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("Gemfile"), manifest).unwrap();
+            std::fs::write(tmp.path().join("Gemfile.lock"), hosted_lock).unwrap();
+            let mut view = View::new(tmp.path());
+            let r = restore(&mut view, &[&pin], &pin.files, &ctx).await;
+            assert!(r.refused.is_empty(), "{:?}", r.refused);
+            let changed = view.changed();
+            assert_eq!(
+                changed.get("Gemfile").cloned().flatten().as_deref(),
+                Some(original)
+            );
+            assert_eq!(
+                changed.get("Gemfile.lock").cloned().flatten().as_deref(),
+                Some(lock.as_str())
+            );
+            let pinned: Vec<&str> = r
+                .warnings
+                .iter()
+                .filter(|(code, _)| *code == DECLARATION_PINNED)
+                .map(|(_, detail)| detail.as_str())
+                .collect();
+            assert_eq!(pinned.len(), usize::from(warns), "{:?}", r.warnings);
+            if let [detail] = pinned.as_slice() {
+                assert!(
+                    detail.contains(
+                        "Gemfile: `gem \"rails\", \"7.0.0\"` was restored as an exact pin"
+                    ) && detail.contains("put it back by hand")
+                        && detail.contains("bundle lock"),
+                    "{detail}"
+                );
+            }
+        }
     }
 
     /// #1626: only a Socket section of its own pins the gem to an earlier

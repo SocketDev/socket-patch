@@ -601,12 +601,30 @@ impl RestoreOutcome {
 /// For a Bun lock it also names `bun install --force`: Bun's hoisted linker
 /// keeps the installed patched copy when the restored entry is the registry
 /// copy of the same `name@version`, so a plain `bun install` after the
-/// checkout reports no changes (#764).
+/// checkout reports no changes (#764). A Bundler lock is named with its
+/// manifest: a hosted gem is wired in both, and a `Gemfile` left on the
+/// Socket source beside a restored lock fails every frozen install.
 pub fn checkout_remedy(files: &[String]) -> String {
     if files.is_empty() {
         return "restore the lockfile from version control (`git checkout -- <lockfile>`)"
             .to_string();
     }
+    let mut with_manifests: Vec<String> = Vec::new();
+    for file in files {
+        let (dir, leaf) = match file.rfind(['/', '\\']) {
+            Some(at) => file.split_at(at + 1),
+            None => ("", file.as_str()),
+        };
+        let manifest = crate::formats::gem::BUNDLER_LOCKS
+            .contains(&leaf)
+            .then(|| format!("{dir}{}", crate::formats::gem::bundler_manifest_for(leaf)));
+        for name in manifest.into_iter().chain([file.clone()]) {
+            if !with_manifests.contains(&name) {
+                with_manifests.push(name);
+            }
+        }
+    }
+    let files = &with_manifests;
     use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
     let bun = files.iter().any(|f| {
         let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
@@ -1099,6 +1117,30 @@ mod tests {
             assert_eq!(
                 checkout_remedy(&[file.to_string()]),
                 format!("restore it from version control instead (`git checkout -- {file}`)")
+            );
+        }
+    }
+
+    /// HE-U3: a hosted gem is wired in the manifest and the lock, and
+    /// discovery names only the lock. Checking out the lock alone leaves the
+    /// Gemfile on the Socket source beside an upstream lock, which bundler
+    /// refuses under frozen mode, so the remedy names the pair.
+    #[test]
+    fn gem_lock_remedies_name_the_manifest_too() {
+        for (files, want) in [
+            (vec!["Gemfile.lock"], "Gemfile Gemfile.lock"),
+            (vec!["gems.locked"], "gems.rb gems.locked"),
+            (vec!["api/Gemfile.lock"], "api/Gemfile api/Gemfile.lock"),
+            (vec!["Gemfile", "Gemfile.lock"], "Gemfile Gemfile.lock"),
+            (
+                vec!["Gemfile.lock", "package-lock.json"],
+                "Gemfile Gemfile.lock package-lock.json",
+            ),
+        ] {
+            let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+            assert_eq!(
+                checkout_remedy(&files),
+                format!("restore it from version control instead (`git checkout -- {want}`)")
             );
         }
     }
