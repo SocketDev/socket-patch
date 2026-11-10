@@ -386,8 +386,11 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `yarn install`, `yarn add` or `yarn workspace <name> …` run from a member directory
   fails ("Tarball is not in network and can not be located in cache"), whether or not the
   member depends on the patched package (yarn 1.7.0, 1.10.1 and 1.22.22; no relative
-  spelling installs from both). Installs from the workspace root work, and warm the cache
-  for later member-directory commands. A vendored run in such a project warns
+  spelling installs from both). Installs from the workspace root work, as does
+  `yarn install --cwd <workspace root>` run from a member directory, and either warms the
+  cache for later member-directory commands. Vendoring adds nothing to the members to
+  change this: yarn fetches the whole workspace from any member, so a tarball copy would
+  be needed in every one of them. A vendored run in such a project warns
   `yarn_classic_workspace_member_install_risk`; hosted mode, which pins an absolute URL,
   is not affected.
 - **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
