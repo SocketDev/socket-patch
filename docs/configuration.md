@@ -40,6 +40,10 @@ Empty environment values are treated as unset.
 - `--proxy-url` / `SOCKET_PROXY_URL` selects the public patch API endpoint. It is
   distinct from an HTTP forward proxy: use `HTTP_PROXY`, `HTTPS_PROXY`, and
   `NO_PROXY` for those.
+- The programs Socket Patch runs (package managers, interpreters, `git`, a gem's
+  native build) do not inherit the Socket token or the other Socket Patch
+  settings from its environment. Their own settings, such as `HTTP_PROXY` and
+  registry tokens, pass through unchanged.
 - HTTPS connections trust the bundled Mozilla (webpki) roots plus the operating
   system's trust store (macOS keychain, Windows certificate store, the distro
   bundle on Linux). `SSL_CERT_FILE` / `SSL_CERT_DIR` replace the system store

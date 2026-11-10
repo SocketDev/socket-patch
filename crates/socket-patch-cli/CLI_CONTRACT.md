@@ -1431,6 +1431,8 @@ Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accept
 
 Empty string means unset at every layer: exported-but-empty flag-bound vars are scrubbed before clap parses, and the API-client resolution filters empty values at each fallback step.
 
+**Child processes do not inherit Socket configuration.** The programs socket-patch runs (package managers and their version-manager shims, interpreters, `git`, and the `extconf.rb` / compiler of a gem's native rebuild) are started without the Socket API token under any name a Socket tool reads it from (`SOCKET_API_TOKEN`, `SOCKET_CLI_API_TOKEN`, `SOCKET_SECURITY_API_TOKEN`, `SOCKET_API_KEY`, `SOCKET_CLI_API_KEY`, `SOCKET_SECURITY_API_KEY`), without `SOCKET_CLI_CONFIG` and `SOCKET_CLI_API_PROXY`, and without every flag-bound variable, peer alias and registry override in the tables below, plus `SOCKET_UPDATE_BASE_URL`. Names are matched exactly: the child's own settings (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `NPM_TOKEN` and other registry credentials, and any `SOCKET_`-prefixed variable not named here) pass through unchanged.
+
 | Env var | CLI equivalent | Default | Notes |
 |---|---|---|---|
 | `SOCKET_CWD` | `--cwd` | `.` | — |

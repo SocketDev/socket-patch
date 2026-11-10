@@ -489,6 +489,142 @@ fn run_without_ruby(proj: &Path, args: &[&str]) -> (i32, String, String) {
     common::run_with_env(proj, args, &[("PATH", path.as_str())])
 }
 
+/// A stand-in `ruby`, alone on the `PATH` the CLI is run with: a shell
+/// script that answers the probe for [`fake_native_gem`]'s copy and
+/// "builds" its extension by writing a new shared object and its `lib/`
+/// copy. Each run appends its mode to `<state>/calls` and writes the
+/// environment it saw to `<state>/env.<mode>`.
+#[cfg(unix)]
+struct FakeRuby {
+    _tmp: tempfile::TempDir,
+    bin: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeRuby {
+    fn new() -> FakeRuby {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // argv: -e <program> <mode> <gemspec>
+        let script = format!(
+            r#"#!/bin/sh
+PATH=/usr/bin:/bin
+state='{state}'
+mode="$3"
+spec="$4"
+echo "$mode" >> "$state/calls"
+env > "$state/env.$mode"
+home=$(dirname "$(dirname "$spec")")
+full=$(basename "$spec" .gemspec)
+gem="$home/gems/$full"
+ext="$home/extensions/x86_64-linux/3.4.0/$full"
+case "$mode" in
+probe)
+  printf 'sp_gem_dir\t%s\n' "$gem"
+  printf 'sp_extension_dir\t%s\n' "$ext"
+  printf 'sp_lib_dir\t%s\n' "$gem/lib"
+  printf 'sp_extension\text/sp_native/extconf.rb\n'
+  ;;
+build)
+  mkdir -p "$ext/sp_native" "$gem/lib/sp_native"
+  printf 'rebuilt' > "$ext/sp_native/sp_native.so"
+  cp "$ext/sp_native/sp_native.so" "$gem/lib/sp_native/sp_native.so"
+  : > "$ext/gem.build_complete"
+  ;;
+*)
+  echo "fake ruby: unexpected mode $mode" >&2
+  exit 1
+  ;;
+esac
+"#,
+            state = state.display()
+        );
+        let ruby = bin.join("ruby");
+        std::fs::write(&ruby, script).unwrap();
+        std::fs::set_permissions(&ruby, std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeRuby {
+            _tmp: tmp,
+            bin,
+            state,
+        }
+    }
+
+    /// Run the CLI in `proj` with this Ruby as the only program on `PATH`.
+    fn run(&self, proj: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let path = self.bin.display().to_string();
+        let mut all = vec![("PATH", path.as_str())];
+        all.extend_from_slice(env);
+        common::run_with_env(proj, args, &all)
+    }
+
+    /// The modes this Ruby was run in, in order.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The environment the `mode` run saw, as `env` printed it.
+    fn env_seen(&self, mode: &str) -> String {
+        std::fs::read_to_string(self.state.join(format!("env.{mode}"))).unwrap()
+    }
+}
+
+/// The Ruby that rebuilds an extension runs the gem's own build scripts and
+/// the compiler: none of that is handed the Socket token the run was given,
+/// while a package manager's own registry auth still reaches it.
+#[cfg(unix)]
+#[test]
+fn the_rebuild_does_not_hand_the_socket_token_to_ruby() {
+    const SECRET: &str = "sktsec_e2e_child_env_marker";
+    let (_tmp, proj, _gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+
+    let (code, stdout, stderr) = ruby.run(
+        &proj,
+        &["apply", "--json", "--offline"],
+        &[
+            ("SOCKET_API_TOKEN", SECRET),
+            ("SOCKET_CLI_API_TOKEN", SECRET),
+            ("SOCKET_SECURITY_API_TOKEN", SECRET),
+            ("NPM_TOKEN", "registry-auth"),
+        ],
+    );
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    let calls = ruby.calls();
+    assert_eq!(calls.last().map(String::as_str), Some("build"), "{calls:?}");
+    for mode in &calls {
+        let seen = ruby.env_seen(mode);
+        assert!(
+            !seen.contains(SECRET),
+            "`ruby` ({mode}) was handed the Socket token:\n{seen}"
+        );
+        for gone in [
+            "SOCKET_API_TOKEN=",
+            "SOCKET_CLI_API_TOKEN=",
+            "SOCKET_SECURITY_API_TOKEN=",
+            "SOCKET_OFFLINE=",
+        ] {
+            assert!(
+                !seen.lines().any(|line| line.starts_with(gone)),
+                "`ruby` ({mode}) inherited {gone}:\n{seen}"
+            );
+        }
+        assert!(
+            seen.lines().any(|line| line == "NPM_TOKEN=registry-auth"),
+            "`ruby` ({mode}) lost the registry auth:\n{seen}"
+        );
+    }
+}
+
 #[test]
 fn native_patch_without_a_ruby_is_refused_and_writes_nothing() {
     let (_tmp, proj, gem_dir) = fake_native_gem(true);

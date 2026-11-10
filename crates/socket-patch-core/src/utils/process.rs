@@ -28,6 +28,108 @@ use std::time::{Duration, Instant};
 /// self-update `--version` check use.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The environment variables no child process inherits
+/// ([`scrub_child_env`]).
+///
+/// Everything this CLI spawns is someone else's program: a package
+/// manager or its version-manager shim, an interpreter, a gem's
+/// `extconf.rb` and the compiler it starts. Some of it is chosen by the
+/// repository being scanned, and CI usually exports the Socket API token
+/// for the run. None of those programs needs a Socket credential, nor
+/// this CLI's own settings (the URL ones can carry credentials in their
+/// userinfo, and name the hosts the token is sent to).
+///
+/// Names are exact. A package manager's own settings (`HTTP_PROXY`,
+/// `HTTPS_PROXY`, `NO_PROXY`, `NPM_TOKEN` and other registry auth) reach
+/// the child untouched, and so does any other variable, `SOCKET_`-prefixed
+/// or not: an `.npmrc` or `.yarnrc.yml` may expand one.
+///
+/// The CLI's flag bindings are listed here because core runs the
+/// children; `socket-patch-cli`'s `args` tests fail when a binding is
+/// missing.
+pub const CHILD_ENV_SCRUB: &[&str] = &[
+    // The Socket API token, under each name a Socket tool reads it from
+    // (this CLI, socket-cli and its legacy spellings, the Python CLI, the
+    // SDKs).
+    "SOCKET_API_TOKEN",
+    "SOCKET_CLI_API_TOKEN",
+    "SOCKET_SECURITY_API_TOKEN",
+    "SOCKET_API_KEY",
+    "SOCKET_CLI_API_KEY",
+    "SOCKET_SECURITY_API_KEY",
+    // socket-cli's inline config (it can hold `apiToken`) and its forward
+    // proxy URL.
+    "SOCKET_CLI_CONFIG",
+    "SOCKET_CLI_API_PROXY",
+    // The other accepted socket-cli aliases (`env_compat::PEER_ENV_ALIASES`)
+    // and the canonical name of the one that is not a flag.
+    "SOCKET_CLI_ORG_SLUG",
+    "SOCKET_CLI_API_BASE_URL",
+    "SOCKET_CLI_NO_API_TOKEN",
+    "SOCKET_NO_API_TOKEN",
+    // Every flag binding of the CLI.
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
+    "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
+    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
+    "SOCKET_NO_GEM_NATIVE_REBUILD",
+    "SOCKET_PATCH_VERSION",
+    "SOCKET_SAVE_ONLY",
+    "SOCKET_ALL_RELEASES",
+    "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_PRESERVE_STATE",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_VENDOR_REVERT",
+    "SOCKET_BATCH_SIZE",
+    "SOCKET_SCAN_PACKAGES",
+    "SOCKET_NO_SOCKET_YML",
+    "SOCKET_VEX",
+    "SOCKET_VEX_OUTPUT",
+    "SOCKET_VEX_PRODUCT",
+    "SOCKET_VEX_NO_VERIFY",
+    "SOCKET_VEX_DOC_ID",
+    "SOCKET_VEX_COMPACT",
+    // Socket-specific service URLs read from the environment alone.
+    "SOCKET_NPM_REGISTRY",
+    "SOCKET_PYPI_JSON_API",
+    "SOCKET_RUBYGEMS_URL",
+    "SOCKET_PACKAGIST_URL",
+    "SOCKET_CRATES_INDEX",
+    "SOCKET_GOPROXY",
+    "SOCKET_GOSUMDB_URL",
+    "SOCKET_MAVEN_REGISTRY",
+    "SOCKET_NUGET_URL",
+    "SOCKET_UPDATE_BASE_URL",
+];
+
+/// Take every [`CHILD_ENV_SCRUB`] variable out of `command`'s environment,
+/// inherited or set on it.
+pub fn scrub_child_env(command: &mut Command) {
+    for name in CHILD_ENV_SCRUB {
+        command.env_remove(name);
+    }
+}
+
 /// Why [`output_within`] produced no [`Output`].
 #[derive(Debug)]
 pub enum BoundedError {
@@ -49,8 +151,13 @@ pub enum BoundedError {
 /// version manager prompting for an install, a Ruby waiting on a network
 /// gem home) therefore costs at most `budget`, never the whole run.
 ///
+/// The child never sees a [`CHILD_ENV_SCRUB`] variable, whatever the
+/// caller did to the command's environment after [`command_for`] made it
+/// (an `env_clear().envs(..)` copy of the ambient one puts them back).
+///
 /// Blocking: async callers run it through `utils::fs::run_blocking`.
 pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    scrub_child_env(&mut command);
     let deadline = Instant::now() + budget;
     let mut child = command
         .stdin(Stdio::null())
@@ -105,6 +212,7 @@ pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, B
 ///
 /// Blocking: async callers run it through `utils::fs::run_blocking`.
 pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    scrub_child_env(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -271,6 +379,10 @@ fn is_executable(path: &Path) -> bool {
 /// cwd / env; `tokio::process::Command::from` lifts it into the async
 /// runtime unchanged.
 ///
+/// Every child process is made here, and none inherits a
+/// [`CHILD_ENV_SCRUB`] variable: the Socket token in the CLI's own
+/// environment is not for the programs it runs.
+///
 /// A Windows `.bat` / `.cmd` shim (npm-global `bun.cmd`, pyenv-win
 /// `pipenv.bat`) is spawned through this same path: since Rust 1.77.2 (the
 /// BatBadBut fix) `std` detects the batch extension on the resolved program
@@ -284,7 +396,9 @@ fn is_executable(path: &Path) -> bool {
 /// recognized". Nothing to add on top of `std`; a wrapper can only be
 /// less correct.
 pub fn command_for(program: &Path) -> Command {
-    Command::new(program)
+    let mut command = Command::new(program);
+    scrub_child_env(&mut command);
+    command
 }
 
 /// Run an external binary with the given args and return its
@@ -854,6 +968,126 @@ pub(crate) mod tests {
         let none = |_: &str| None::<OsString>;
         let root = neutral_probe_dir_with(&none).expect("the drive root");
         assert!(root.is_absolute() && root.parent().is_none(), "{root:?}");
+    }
+
+    // ───────────────────────── child environment ─────────────────────────
+
+    /// A Socket token under the names CI exports it, and the package
+    /// managers' own settings beside it.
+    #[cfg(unix)]
+    const SECRET: &str = "sktsec_child_env_marker";
+    #[cfg(unix)]
+    const SOCKET_SECRETS: &[&str] = &[
+        "SOCKET_API_TOKEN",
+        "SOCKET_CLI_API_TOKEN",
+        "SOCKET_SECURITY_API_TOKEN",
+    ];
+    #[cfg(unix)]
+    const TOOL_SETTINGS: &[(&str, &str)] = &[
+        ("NPM_TOKEN", "registry-auth"),
+        ("HTTPS_PROXY", "http://proxy.example:3128"),
+        ("NO_PROXY", "localhost"),
+    ];
+
+    /// `env`, with the token and the tool settings set on the command the
+    /// way a caller that rebuilds the child's environment from the ambient
+    /// one hands them over (the PDM site probe: `env_clear().envs(..)`).
+    #[cfg(unix)]
+    fn env_with_a_socket_token() -> Command {
+        let env_bin = resolve_tool("env").expect("`env` is on PATH");
+        let mut command = command_for(&env_bin);
+        command.env_clear();
+        for name in SOCKET_SECRETS {
+            command.env(name, SECRET);
+        }
+        command.envs(TOOL_SETTINGS.iter().copied());
+        command
+    }
+
+    #[cfg(unix)]
+    fn assert_no_socket_token(what: &str, output: &Output) {
+        let seen = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !seen.contains(SECRET) && !SOCKET_SECRETS.iter().any(|name| seen.contains(name)),
+            "{what}: the child saw a Socket credential:\n{seen}"
+        );
+        for (name, value) in TOOL_SETTINGS {
+            assert!(
+                seen.lines().any(|line| line == format!("{name}={value}")),
+                "{what}: the child lost {name}, which its package manager needs:\n{seen}"
+            );
+        }
+    }
+
+    /// No spawned child sees the Socket token, whichever spawn runs it and
+    /// however its environment was put together; a package manager's own
+    /// proxy and registry settings still reach it.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_children_do_not_see_socket_credentials() {
+        let probe = output_within(env_with_a_socket_token(), PROBE_TIMEOUT).unwrap();
+        assert_no_socket_token("output_within", &probe);
+        let build = build_output_within(env_with_a_socket_token(), PROBE_TIMEOUT).unwrap();
+        assert_no_socket_token("build_output_within", &build);
+    }
+
+    /// A command no bounded spawn runs (the `git` pipe) drops the ambient
+    /// token too: `command_for` removes it when the command is made.
+    #[test]
+    fn command_for_drops_the_inherited_socket_credentials() {
+        let command = command_for(Path::new("/x/git"));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "SOCKET_API_TOKEN",
+            "SOCKET_CLI_API_TOKEN",
+            "SOCKET_SECURITY_API_TOKEN",
+        ] {
+            assert!(
+                removed.iter().any(|r| r == name),
+                "{name} is inherited: {removed:?}"
+            );
+        }
+        assert_eq!(removed.len(), CHILD_ENV_SCRUB.len(), "the whole list goes");
+        assert!(
+            command.get_envs().all(|(_, value)| value.is_none()),
+            "nothing is set"
+        );
+    }
+
+    /// The scrub list names every accepted socket-cli alias and its
+    /// canonical name, each once, and nothing but `SOCKET_*` names: a proxy
+    /// or registry credential of the package manager's is never on it.
+    #[test]
+    fn the_scrub_list_covers_the_peer_aliases_and_only_socket_names() {
+        for (canonical, alias) in crate::utils::env_compat::PEER_ENV_ALIASES {
+            for name in [canonical, alias] {
+                assert!(
+                    CHILD_ENV_SCRUB.contains(name),
+                    "{name} is read as Socket configuration but reaches child processes"
+                );
+            }
+        }
+        let mut sorted = CHILD_ENV_SCRUB.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            CHILD_ENV_SCRUB.len(),
+            "a name is listed twice"
+        );
+        for name in CHILD_ENV_SCRUB {
+            assert!(
+                name.starts_with("SOCKET_")
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "{name} is not a Socket variable"
+            );
+        }
     }
 
     // ───────────────────────── resolve_tool / command_for ─────────────────────────
