@@ -265,8 +265,9 @@ impl NpmLockBackend for BunBinaryBackend {
         }
         // Bun 0.5.9–1.3 resolves workspace local tarballs relative to the
         // declaring member. Preserve the same portable resolution for every
-        // consumer by committing identical tarballs at those member-relative
-        // locations as well as the canonical root artifact.
+        // consumer by committing identical tarballs at the member-relative
+        // locations of the members that depend on the package, as well as
+        // the canonical root artifact.
         let artifact = read_regular_to_bytes_sync(&root.join(&staged.rel_tgz))
             .map_err(|e| format!("cannot read staged tarball: {e}"))?;
         let lock_changed = merged || !wiring.is_empty();
@@ -503,21 +504,25 @@ pub(super) fn preflight_package(
             ),
         )));
     }
-    let mirrors = match project.lock.workspace_paths().and_then(|paths| {
-        paths
-            .into_iter()
-            .map(|workspace| {
-                let rel = format!(
-                    "{}/{}/{}",
-                    workspace.trim_start_matches("./"),
-                    coords.uuid_dir_rel,
-                    leaf
-                );
-                validate_mirror_path(root, &rel)?;
-                Ok((workspace, rel))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    }) {
+    let targets: Vec<usize> = matches.iter().map(|p| p.id).collect();
+    let mirrors = match project
+        .lock
+        .workspace_paths_reaching(&targets)
+        .and_then(|paths| {
+            paths
+                .into_iter()
+                .map(|workspace| {
+                    let rel = format!(
+                        "{}/{}/{}",
+                        workspace.trim_start_matches("./"),
+                        coords.uuid_dir_rel,
+                        leaf
+                    );
+                    validate_mirror_path(root, &rel)?;
+                    Ok((workspace, rel))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        }) {
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
@@ -1025,9 +1030,10 @@ fn mirror_uuid_dir_rel(rel: &str) -> Option<String> {
 }
 
 /// The member uuid dirs (`<member>/.socket/vendor/npm/<uuid>`) a
-/// `bun.lockb` workspace mirrors `uuid`'s tarball into, as the backend's
-/// pre-flight lists them; empty when no readable binary lock drives the
-/// installs.
+/// `bun.lockb` workspace may mirror `uuid`'s tarball into: every member's,
+/// since only the package (which this caller does not have) says which of
+/// them depend on it, as the backend's own pre-flight asks. Empty when no
+/// readable binary lock drives the installs.
 pub(crate) fn workspace_mirror_dirs(root: &Path, uuid: &str) -> Vec<String> {
     if super::lock_inventory::bun_text_lock_drives(&super::lock_inventory::ProjectView::Disk(root))
     {
@@ -1679,7 +1685,7 @@ mod rebuild_tests {
         }
     }
 
-    // ── several packages in one lock (VBV-D1, VBV-P2) ────────────────────
+    // ── several packages in one lock (VBV-D1, VBV-P2, VBV-P5) ────────────
 
     const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
 
@@ -1916,6 +1922,73 @@ mod rebuild_tests {
             ledger.len(),
             pristine.len()
         );
+    }
+
+    /// REGRESSION (VBV-P5): a member gets its own copy of a vendored
+    /// tarball only when its dependencies reach the package. The fixture's
+    /// root depends on minimist and its `packages/helper` member on
+    /// left-pad alone: minimist is not copied into the member, left-pad is.
+    #[tokio::test]
+    async fn a_member_gets_a_tarball_copy_only_of_what_it_depends_on() {
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let (minimist, entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        assert_eq!(mirror_rels(&entry), [] as [String; 0]);
+        assert!(!root.join("packages/helper/.socket").exists());
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+
+        let (left_pad, entry) = vendor_package(&fx, "left-pad", "1.3.0", UUID_B).await;
+        let copy = format!("packages/helper/.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        assert_eq!(mirror_rels(&entry), [copy.clone()]);
+        assert_eq!(
+            std::fs::read(root.join(&copy)).unwrap(),
+            std::fs::read(root.join(&entry.artifact.path)).unwrap()
+        );
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+        assert!(!root
+            .join(format!("packages/helper/.socket/vendor/npm/{UUID}"))
+            .exists());
+
+        revert_in_order(root, &[&left_pad, &minimist], "member copies").await;
+        assert!(std::fs::read(root.join(LOCK)).unwrap() == ORIGINAL);
+        assert!(!root.join("packages/helper/.socket").exists());
+    }
+
+    /// VBV-P5: releases before this one copied every vendored tarball into
+    /// every member. Such a copy is still in the ledger: a revert removes
+    /// it, and a health check does not ask for it back.
+    #[tokio::test]
+    async fn a_copy_an_earlier_release_made_in_every_member_is_still_reverted() {
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let (minimist, mut entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        let copy = format!("packages/helper/.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        let tarball = std::fs::read(root.join(&entry.artifact.path)).unwrap();
+        std::fs::create_dir_all(root.join(&copy).parent().unwrap()).unwrap();
+        std::fs::write(root.join(&copy), &tarball).unwrap();
+        restore_mirror_metadata(root, &copy).await.unwrap();
+        entry.wiring.push(WiringRecord {
+            file: copy.clone(),
+            kind: MIRROR_KIND.into(),
+            action: WiringAction::Added,
+            key: Some("packages/helper".into()),
+            original: None,
+            new: Some(serde_json::Value::String(
+                crate::utils::digest::sha256_hex_of(&tarball),
+            )),
+        });
+        ts::persist(root, &minimist, entry.clone()).await;
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+
+        revert_in_order(root, &[&minimist], "earlier copy").await;
+        assert!(std::fs::read(root.join(LOCK)).unwrap() == ORIGINAL);
+        assert!(!root.join("packages/helper/.socket").exists());
     }
 
     /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)

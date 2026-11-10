@@ -132,13 +132,17 @@ input is promoted directly to binary format 2 when needed for tarball resolution
 with an exact original snapshot for rollback. When `bun.lock` also exists, it
 takes precedence, matching modern Bun's installer.
 
-Binary workspace vendoring records byte-identical tarball copies under each
-workspace's `.socket/vendor/npm/<uuid>/` directory as well as the canonical root
-artifact. This supports Bun releases that interpret local-tarball paths relative
-to the workspace and those that interpret them relative to the lockfile. Commit
-these copies along with the root artifact. Repair rebuilds missing or corrupt
-copies, including recovery when the local ledger is missing; rollback and mode
-switches remove the tracked copies with drift checks.
+Binary workspace vendoring records a byte-identical tarball copy under the
+`.socket/vendor/npm/<uuid>/` directory of each workspace whose dependencies
+(direct, or through other packages) reach the patched package, as well as the
+canonical root artifact. This supports Bun releases that interpret local-tarball
+paths relative to the workspace that declares the dependency and those that
+interpret them relative to the lockfile. A workspace that does not depend on
+the package gets no copy (5.0 and 5.1 copied every tarball into every
+workspace; those copies stay tracked in the ledger and are removed with the
+package). Commit these copies along with the root artifact. Repair rebuilds
+missing or corrupt copies, including recovery when the local ledger is missing;
+rollback and mode switches remove the tracked copies with drift checks.
 
 Bun 1.2 and newer can still write native binary locks. Use the following project
 configuration in `bunfig.toml` when creating a new binary lock:

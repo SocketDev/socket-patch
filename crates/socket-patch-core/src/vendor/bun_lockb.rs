@@ -368,6 +368,63 @@ impl BunLockb {
         Ok(paths)
     }
 
+    /// [`Self::workspace_paths`] of the members whose dependencies, direct
+    /// or through other packages, reach one of the records `targets`. A
+    /// release that reads a local tarball path relative to the member
+    /// declaring it does so only for a member that depends on the package,
+    /// so these are the members that need their own copy. When the
+    /// dependency slices are not a graph to walk (they overlap, or one
+    /// does not hold together: nothing Bun writes) it is every member: one
+    /// copy too many, never one too few.
+    pub(crate) fn workspace_paths_reaching(
+        &self,
+        targets: &[usize],
+    ) -> Result<Vec<String>, String> {
+        let resolutions = self.buffer_array(2)?;
+        let mut lists = Vec::with_capacity(self.count);
+        let mut listed = 0usize;
+        for id in 0..self.count {
+            let Ok(list) = self.package_dependency_range(id) else {
+                return self.workspace_paths();
+            };
+            listed = listed.saturating_add(list.len());
+            lists.push(list);
+        }
+        if listed > resolutions.data.len() / 4 {
+            return self.workspace_paths();
+        }
+        let mut dependents = vec![Vec::new(); self.count];
+        for (id, list) in lists.into_iter().enumerate() {
+            for edge in list {
+                let to = u32_at(&self.data, resolutions.data.start + edge * 4)? as usize;
+                if to < self.count {
+                    dependents[to].push(id);
+                }
+            }
+        }
+        let mut reaches = vec![false; self.count];
+        let mut pending: Vec<usize> = targets
+            .iter()
+            .copied()
+            .filter(|id| *id < self.count)
+            .collect();
+        while let Some(id) = pending.pop() {
+            if !std::mem::replace(&mut reaches[id], true) {
+                pending.extend(dependents[id].iter().filter(|d| !reaches[**d]));
+            }
+        }
+        let mut paths = Vec::new();
+        for id in (0..self.count).filter(|id| reaches[*id]) {
+            let at = self.resolution_at(id);
+            if self.data[at] == 72 {
+                paths.push(self.string_at(at + 8)?);
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        Ok(paths)
+    }
+
     fn package(&self, id: usize) -> Result<BinaryPackage, String> {
         self.check_id(id)?;
         let name = self.string_at(self.package_start + id * 8)?;
@@ -3458,6 +3515,57 @@ mod tests {
             ),
         ),
     ];
+
+    /// VBV-P5: the members whose dependencies reach a record, directly
+    /// (`consumer` and `late` each depend on their own mkdirp record) or
+    /// through another package (both reach minimist through mkdirp); the
+    /// root's own dependency reaches no member. Slices that overlap are no
+    /// graph to walk, and give every member.
+    #[test]
+    fn workspace_paths_reaching_follow_the_dependency_edges() {
+        let bytes = LATE_DEPENDENT
+            .iter()
+            .find(|(label, _)| *label == "1.4.2-deps-late")
+            .unwrap()
+            .1;
+        let lock = BunLockb::parse(bytes).unwrap();
+        let packages = lock.packages().unwrap();
+        let id = |name: &str, vendored: bool| {
+            let found = packages
+                .iter()
+                .find(|p| p.name == name && p.resolution.starts_with(".socket/") == vendored);
+            found.unwrap_or_else(|| panic!("{name}")).id
+        };
+        let reaching = |targets: &[usize]| lock.workspace_paths_reaching(targets).unwrap();
+        assert_eq!(
+            lock.workspace_paths().unwrap(),
+            ["packages/consumer", "packages/late"]
+        );
+        assert_eq!(reaching(&[id("mkdirp", true)]), ["packages/consumer"]);
+        assert_eq!(reaching(&[id("mkdirp", false)]), ["packages/late"]);
+        assert_eq!(
+            reaching(&[id("minimist", false)]),
+            ["packages/consumer", "packages/late"]
+        );
+        assert_eq!(reaching(&[id("is-number", false)]), [] as [&str; 0]);
+        assert_eq!(reaching(&[]), [] as [&str; 0]);
+        assert_eq!(reaching(&[usize::MAX]), [] as [&str; 0]);
+
+        let mut overlapping = lock.clone();
+        let edges = overlapping.dependency_array().unwrap().data.len() / 26;
+        let slices =
+            overlapping.package_start + overlapping.count * (16 + overlapping.resolution_size);
+        for at in (slices..slices + overlapping.count * 16).step_by(8) {
+            overlapping.data[at..at + 4].copy_from_slice(&0u32.to_le_bytes());
+            overlapping.data[at + 4..at + 8].copy_from_slice(&(edges as u32).to_le_bytes());
+        }
+        assert_eq!(
+            overlapping
+                .workspace_paths_reaching(&[id("is-number", false)])
+                .unwrap(),
+            ["packages/consumer", "packages/late"]
+        );
+    }
 
     /// Each hoisting tree as `(parent, names of the packages it places)`.
     fn tree_placements(lock: &BunLockb) -> Vec<(u32, Vec<String>)> {
