@@ -1614,28 +1614,7 @@ pub fn subproject_owner(
 /// `gradle/wrapper/gradle-wrapper.properties`.
 pub fn wrapper_version(read: TextReadFn<'_>, root: &str) -> Option<(u32, u32, u32)> {
     let text = read(&join_rel(root, "gradle/wrapper/gradle-wrapper.properties"))?;
-    let url = crate::formats::text::strip_bom(&text)
-        .lines()
-        .find_map(|line| {
-            let line = line.trim_start();
-            let rest = line.strip_prefix("distributionUrl")?;
-            let rest = rest.trim_start();
-            let rest = rest
-                .strip_prefix('=')
-                .or_else(|| rest.strip_prefix(':'))
-                .unwrap_or(rest);
-            Some(rest.trim().replace('\\', ""))
-        })?;
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
-        regex::Regex::new(r"gradle-(\d+)\.(\d+)(?:\.(\d+))?").expect("valid wrapper regex")
-    });
-    let caps = re.captures(&url)?;
-    Some((
-        caps[1].parse().ok()?,
-        caps[2].parse().ok()?,
-        caps.get(3).map_or(Some(0), |m| m.as_str().parse().ok())?,
-    ))
+    crate::crawlers::gradle_cache::wrapper_distribution_version(text.as_bytes(), "gradle")
 }
 
 // ── declarations ────────────────────────────────────────────────────────────────

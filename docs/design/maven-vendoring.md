@@ -164,7 +164,9 @@ later clears both.
 Gradle 6.8+ is supported, including Groovy and Kotlin settings, multi-project
 builds, buildSrc, and literal `includeBuild` paths inside the checkout. A
 wrapper proving a version below 6.8 is refused before writes; the generated
-script also checks the running Gradle version.
+script also checks the running Gradle version. `gradle-wrapper.properties` is
+read as Java reads a properties file, so `distributionUrl = …`,
+`distributionUrl: …` and `https\://` name the same distribution.
 
 Run vendoring from the Gradle root. A directory an ancestor settings file
 includes (literally, through a relocated `projectDir`, or possibly, when its

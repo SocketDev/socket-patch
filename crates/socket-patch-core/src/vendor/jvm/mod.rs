@@ -76,18 +76,7 @@ pub fn wrapper_version(read: ReadFn<'_>, tool: &str) -> Option<(u32, u32, u32)> 
         "gradle" => "gradle/wrapper/gradle-wrapper.properties",
         _ => return None,
     };
-    let bytes = read(path)?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    let url = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("distributionUrl="))?;
-    let re = regex::Regex::new(&format!(r"{tool}-(\d+)\.(\d+)(?:\.(\d+))?")).ok()?;
-    let caps = re.captures(url)?;
-    Some((
-        caps[1].parse().ok()?,
-        caps[2].parse().ok()?,
-        caps.get(3).map_or(Some(0), |m| m.as_str().parse().ok())?,
-    ))
+    crate::crawlers::gradle_cache::wrapper_distribution_version(&read(path)?, tool)
 }
 
 /// Reads a project-relative, forward-slash path. `None` = missing or
@@ -831,6 +820,75 @@ mod tests {
             extra_artifacts: &[],
             patched_members: &[],
         }
+    }
+
+    /// A72: every spelling a Java properties file allows names the same
+    /// distribution. Requiring the exact prefix `distributionUrl=` read
+    /// `distributionUrl = …gradle-6.7…` as "no wrapper", which let a Gradle
+    /// 6.7 build past the 6.8 gate and into a script it cannot run.
+    #[test]
+    fn wrapper_version_reads_every_properties_spelling() {
+        let gradle = "https\\://services.gradle.org/distributions/gradle-6.7-bin.zip";
+        for line in [
+            format!("distributionUrl={gradle}"),
+            format!("distributionUrl = {gradle}"),
+            format!("distributionUrl:{gradle}"),
+            format!("distributionUrl\t{gradle}"),
+            format!("  distributionUrl={gradle}\r"),
+            "distributionUrl=https\\://services.gradle.org/\\\n    distributions/gradle-6.7-bin.zip"
+                .to_string(),
+            format!("#distributionUrl=x/gradle-9.9-bin.zip\ndistributionBase=GRADLE_USER_HOME\ndistributionUrl={gradle}"),
+        ] {
+            let props = format!("{line}\nzipStoreBase=GRADLE_USER_HOME\n");
+            let read = |rel: &str| {
+                (rel == "gradle/wrapper/gradle-wrapper.properties").then(|| props.clone().into_bytes())
+            };
+            assert_eq!(wrapper_version(&read, "gradle"), Some((6, 7, 0)), "{line}");
+            assert_eq!(wrapper_version(&read, "maven"), None, "{line}");
+            // The gate the version feeds: refused before anything is written.
+            let files: std::collections::BTreeMap<String, Vec<u8>> = [
+                ("gradle/wrapper/gradle-wrapper.properties", props.as_str()),
+                ("settings.gradle", "rootProject.name = 'app'\n"),
+            ]
+            .into_iter()
+            .map(|(rel, body)| (rel.to_string(), body.as_bytes().to_vec()))
+            .collect();
+            let refused = plan(
+                Shape::Gradle,
+                &|rel: &str| files.get(rel).cloned(),
+                &|dir: &str| testing::list_of(&files, dir),
+                &mixed_patch(),
+            )
+            .unwrap_err();
+            assert!(
+                refused.detail.starts_with("reason: gradle_below_6_8:"),
+                "{line}: {}",
+                refused.detail
+            );
+        }
+        let maven = |url: &str| {
+            let props = format!("distributionUrl = {url}\n").into_bytes();
+            wrapper_version(
+                &|rel: &str| {
+                    (rel == ".mvn/wrapper/maven-wrapper.properties").then(|| props.clone())
+                },
+                "maven",
+            )
+        };
+        assert_eq!(
+            maven("https\\://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.9/apache-maven-3.9.9-bin.zip"),
+            Some((3, 9, 9))
+        );
+        assert_eq!(
+            maven("https://example.com/maven-mvnd-1.0.2-linux-amd64.zip"),
+            None
+        );
+        assert_eq!(
+            maven("https://example.com/apache-maven-4.0.0-rc-4-bin.zip"),
+            Some((4, 0, 0))
+        );
+        assert_eq!(wrapper_version(&|_: &str| None, "gradle"), None);
+        assert_eq!(wrapper_version(&|_: &str| Some(Vec::new()), "ant"), None);
     }
 
     #[test]
