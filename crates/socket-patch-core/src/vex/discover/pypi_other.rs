@@ -1285,6 +1285,45 @@ mod tests {
         }
     }
 
+    /// pip percent-decodes a `file:` reference (pip 26.2.1 installs
+    /// `six-….whl` for `six @ file:…/%73ix-….whl` and cannot find the
+    /// literal file), so a vendored reference whose wheel name carries a
+    /// `%` does not name the committed artifact `vex` would hash. It is
+    /// diagnosed, in the url form and as a bare path, and the plain
+    /// spelling beside it is the control.
+    #[tokio::test]
+    async fn percent_encoded_vendored_wheel_is_not_a_reference() {
+        let plain = vendored_wheel(UUID_A, WHEEL);
+        let encoded = vendored_wheel(UUID_A, &WHEEL.replacen('u', "%75", 1));
+        for (line, attested) in [
+            (format!("urllib3 @ file:{plain} --hash=sha256:{SHA}"), true),
+            (
+                format!("urllib3 @ file:{encoded} --hash=sha256:{SHA}"),
+                false,
+            ),
+            (format!("./{encoded} --hash=sha256:{SHA}"), false),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", format!("{line}\n"));
+            let out = run(&p).await;
+            assert_eq!(out.refs.len(), usize::from(attested), "{line}: {out:#?}");
+            if !attested {
+                assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{line}");
+            }
+        }
+        let p = Project::new();
+        p.write(
+            "pyproject.toml",
+            format!(
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"urllib3 @ {{root:uri}}/{encoded}#sha256={SHA}\"]\n"
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+    }
+
     // ── Pipfile.lock ──────────────────────────────────────────────────────
 
     /// The real Pipenv 2026.8.0 lock, rewritten by the real hosted planner

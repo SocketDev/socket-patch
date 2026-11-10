@@ -413,7 +413,10 @@ pub struct VendorRef {
 /// rejected (`None`) rather than cut — `…/foo-1.0.0.tgz#evil.tgz` is a file
 /// of that literal name, which npm installs while the cut leaf would verify
 /// the good `foo-1.0.0.tgz` beside it. The formats whose grammar DEFINES
-/// those decorations use [`vendor_ref_decorated`] instead.
+/// those decorations use [`vendor_ref_decorated`] instead. A leaf carrying
+/// `%` is rejected in both: "literally" does not hold for it everywhere
+/// (pip percent-decodes a `file:` reference, npm does not), so it names no
+/// single file to verify.
 pub fn vendor_ref(s: &str) -> Option<VendorRef> {
     vendor_ref_with(s, false)
 }
@@ -445,7 +448,11 @@ fn vendor_ref_with(s: &str, decorated: bool) -> Option<VendorRef> {
         leaf_raw
     };
     let leaf = leaf.trim_end_matches('/');
-    if leaf.is_empty() || !is_safe_multi_segment(leaf) {
+    // A `%` in the leaf names two files: npm, yarn 1 and pnpm open the
+    // literal one, pip's `file:` references the percent-decoded one, and
+    // the leaf-name checks decode it too (`%66oo-1.0.0.tgz` reads as
+    // `foo`). No vendor backend writes one, so it is no artifact of ours.
+    if leaf.is_empty() || leaf.contains('%') || !is_safe_multi_segment(leaf) {
         return None;
     }
     Some(VendorRef {
@@ -962,6 +969,40 @@ mod tests {
         ] {
             assert_eq!(vendor_ref(&bad), None, "{bad}");
         }
+    }
+
+    /// A `%` in a vendored leaf names two files: the literal one for npm,
+    /// yarn 1 and pnpm, and the percent-decoded one for pip's `file:`
+    /// references (measured on npm 11.19.1, yarn 1.22.19, pnpm 10.34.1 and
+    /// pip 26.2.1). The leaf-name checks decode it, so `%66oo-1.0.0.tgz`
+    /// would pass for `foo` while the file hashed is the literal one. No
+    /// vendor backend writes such a leaf, so it is no vendored reference in
+    /// either leaf grammar.
+    #[test]
+    fn vendor_ref_rejects_a_percent_encoded_leaf() {
+        let a = UUID;
+        for bad in [
+            format!(".socket/vendor/npm/{a}/%66oo-1.0.0.tgz"),
+            format!("file:.socket/vendor/npm/{a}/@scope/%66oo-1.0.0.tgz"),
+            format!(".socket/vendor/npm/{a}/%40scope/foo-1.0.0.tgz"),
+            format!("./.socket/vendor/pypi/{a}/%66oo-1.0-py3-none-any.whl"),
+            format!(".socket/vendor/npm/{a}/foo-1.0.0.tgz%00"),
+        ] {
+            assert_eq!(vendor_ref(&bad), None, "{bad}");
+            assert_eq!(vendor_ref_decorated(&bad), None, "{bad}");
+            assert_eq!(
+                vendor_ref_decorated(&format!("{bad}#sha256=00")),
+                None,
+                "{bad}"
+            );
+        }
+        // A `%` in a decoration after the leaf (berry's `::locator=` binding)
+        // is not part of the file name.
+        let berry = format!(".socket/vendor/npm/{a}/foo-1.0.0.tgz::locator=app%40workspace%3A.");
+        assert_eq!(
+            vendor_ref_decorated(&berry).map(|v| v.leaf),
+            Some("foo-1.0.0.tgz".to_string())
+        );
     }
 
     #[test]

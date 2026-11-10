@@ -1773,6 +1773,56 @@ mod tests {
         );
     }
 
+    /// A vendored `resolved` whose tarball name carries a `%` is not a
+    /// reference: the leaf-name check would decode it (`%6ceft-pad` reads
+    /// as `left-pad`), and whether the file a package manager opens is the
+    /// literal or the decoded one differs by package manager, so one rule
+    /// refuses it for all (`vendor_ref`). The uuid stays recognized, so a
+    /// ledger entry for it is dead.
+    #[tokio::test]
+    async fn percent_encoded_vendored_tarball_is_not_a_reference() {
+        for (leaf, attested) in [
+            ("left-pad-1.3.0.tgz", true),
+            ("%6ceft-pad-1.3.0.tgz", false),
+            ("left-pad-1.3.0%2etgz", false),
+        ] {
+            let resolved = format!("file:.socket/vendor/npm/{UUID_B}/{leaf}");
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved, "integrity": SRI },
+                })),
+            );
+            p.write(
+                "pnpm-lock.yaml",
+                format!(
+                    "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@{resolved}:\n    resolution: \
+                     {{integrity: {SRI}, tarball: {resolved}}}\n    version: 1.3.0\n"
+                ),
+            );
+            let out = run(&p).await;
+            let files: Vec<&Path> = out.refs.iter().map(|r| r.source_file.as_path()).collect();
+            if attested {
+                assert_eq!(
+                    files,
+                    [Path::new("package-lock.json"), Path::new("pnpm-lock.yaml")],
+                    "{leaf}"
+                );
+            } else {
+                assert!(files.is_empty(), "{leaf}: {:#?}", out.refs);
+                assert!(
+                    out.recognized
+                        .iter()
+                        .any(|r| r.uuid == UUID_B && r.mode == WiringMode::Vendored),
+                    "{leaf}: {:#?}",
+                    out.recognized
+                );
+            }
+        }
+    }
+
     /// Nested instances and the alias `name` field: the package is the
     /// entry's `name`, not the alias key; nested `node_modules/` keys count.
     #[tokio::test]
