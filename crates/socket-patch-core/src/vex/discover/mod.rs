@@ -564,6 +564,16 @@ pub struct ResolvedElsewhere {
     pub as_spelled: bool,
     /// The install tree of `file` the entry is in ([`TreePart`]).
     pub part: TreePart,
+    /// The entry is one resolved package of a Python lock (uv, a PEP 723
+    /// script lock, pylock, Poetry, PDM, `Pipfile.lock`), which the
+    /// installer installs wherever its markers, extras or category select
+    /// it, beside every other entry of the lock. It is then a same-lock
+    /// copy too ([`Discovery::locked_elsewhere`]). `false` for a pip
+    /// requirement, which pip resolves together with a direct reference to
+    /// the same release (#1086), and for npm-family entries, whose
+    /// extractors record same-lock copies themselves
+    /// ([`Discovery::unpatched_copy`]).
+    pub locked: bool,
 }
 
 impl ResolvedElsewhere {
@@ -1202,7 +1212,36 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: false,
             part,
+            locked: false,
         });
+    }
+
+    /// [`Discovery::resolved_elsewhere`] for one resolved package of a
+    /// Python lock ([`ResolvedElsewhere::locked`]): evidence against
+    /// another lock's wiring of the release, and a same-lock copy that
+    /// withholds this lock's own ref of it
+    /// ([`Discovery::contest_within_locks`]). The Python lock extractors
+    /// record every non-Socket entry through here, so the same-lock rule is
+    /// decided in one place for all of them.
+    pub(crate) fn locked_elsewhere(&mut self, file: &str, purl: Option<String>) {
+        let before = self.elsewhere.len();
+        self.resolved_elsewhere(file, purl);
+        self.mark_locked(before);
+    }
+
+    /// [`Discovery::resolved_elsewhere_any_version`] for a Python lock
+    /// entry ([`Discovery::locked_elsewhere`]).
+    pub(crate) fn locked_elsewhere_any_version(&mut self, file: &str, name_purl: Option<String>) {
+        let before = self.elsewhere.len();
+        self.resolved_elsewhere_any_version(file, name_purl);
+        self.mark_locked(before);
+    }
+
+    /// Mark the evidence recorded since `from` as lock entries.
+    fn mark_locked(&mut self, from: usize) {
+        for entry in &mut self.elsewhere[from..] {
+            entry.locked = true;
+        }
     }
 
     /// [`Discovery::resolved_elsewhere`] for a version that matches only as
@@ -1215,6 +1254,7 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: true,
             part: TreePart::File,
+            locked: false,
         });
     }
 
@@ -1235,6 +1275,7 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: false,
             part: TreePart::File,
+            locked: false,
         });
     }
 
@@ -1371,14 +1412,72 @@ impl Discovery {
     /// moves it to [`Discovery::rewirable`] (a re-run rewires that entry,
     /// and the project ref then stands in its place, see
     /// [`Discovery::drop_env_twins`]).
+    ///
+    /// A Python lock's ref is withheld by another entry of the SAME lock
+    /// that resolves its release from elsewhere
+    /// ([`Discovery::locked_elsewhere`]; any PEP 440 spelling of the
+    /// version, or an entry naming no version): uv's marker forks, Poetry's
+    /// multiple-constraint dependencies, a PEP 751 marker split, a PDM
+    /// extras variant and a `Pipfile.lock` category each install their own
+    /// entry where it is selected. A re-run rewires that entry, so the ref
+    /// moves to [`Discovery::rewirable`].
     fn contest_within_locks(&mut self) {
         self.drop_env_twins();
         self.expand_unidentified_copies();
-        if self.unpatched_copies.is_empty() && self.refs.iter().all(|r| r.part == TreePart::File) {
+        // The Python lock entries, by the keys a ref looks its own up under
+        // ([`ResolvedElsewhere::index_keys`]).
+        let mut locked: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, e) in self.elsewhere.iter().enumerate().filter(|(_, e)| e.locked) {
+            for key in e.index_keys() {
+                locked.entry(key).or_default().push(i);
+            }
+        }
+        if self.unpatched_copies.is_empty()
+            && locked.is_empty()
+            && self.refs.iter().all(|r| r.part == TreePart::File)
+        {
             return;
         }
+        // Each ref's own-lock entry of its release, decided before the refs
+        // move: (ref index, whether the entry names no version).
+        let own_entry: HashMap<usize, bool> = self
+            .refs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let entry = ResolvedElsewhere::lookup_keys(&r.purl)
+                    .filter_map(|key| locked.get(key))
+                    .flatten()
+                    .map(|&e| &self.elsewhere[e])
+                    .find(|e| e.file == r.source_file && e.part == r.part && e.covers(&r.purl))?;
+                Some((i, entry.any_version()))
+            })
+            .collect();
+        drop(locked);
         let refs = std::mem::take(&mut self.refs);
-        for r in refs {
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(&any_version) = own_entry.get(&i) {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let resolves = if any_version {
+                    "resolves the package, at a version it doesn't name, from elsewhere"
+                } else {
+                    "resolves the same release from elsewhere"
+                };
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{file}: {} is wired to Socket patch {}, but another entry of the same \
+                         lock {resolves} (not a Socket patch); the installer takes that entry \
+                         wherever its markers, extras or category select it, so the patch is \
+                         not attested — re-run `socket-patch scan` / `vendor` to rewire every \
+                         entry",
+                        r.purl, r.uuid
+                    ),
+                );
+                self.withhold_rewirable(r);
+                continue;
+            }
             let copy = self
                 .unpatched_copies
                 .iter()
@@ -1443,10 +1542,14 @@ impl Discovery {
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming both files) and not emitted.
     /// Its uuid stays recognized, so a ledger claim for it is dead too (rule
     /// 11). This generalizes the npm extractor's shrinkwrap/package-lock
-    /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
-    /// neither contest nor are contested: each is scoped to its own script's
-    /// install. Neither is a pnpm env lockfile document
-    /// ([`TreePart::PnpmEnv`]): pnpm installs its config dependencies into
+    /// rule to every pair of locks. A PEP 723 script lock (`*.py.lock`) is
+    /// one of them: `uv run` installs the release its script imports from
+    /// it, so a script lock wired to a patch does not vouch for a project
+    /// lock that resolves the same release from the index, nor the reverse
+    /// (a VEX statement covers the release, not one install tree; both
+    /// writers rewire script locks, so a re-run clears it). A pnpm env
+    /// lockfile document ([`TreePart::PnpmEnv`]) neither contests nor is
+    /// contested: pnpm installs its config dependencies into
     /// its config store whatever else runs, and its wiring exempts no
     /// other tree. Files of one install tree ([`Discovery::install_trees`])
     /// are one lock here: pip resolves a direct reference and a compatible
@@ -1473,7 +1576,7 @@ impl Discovery {
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let other = (!is_script_lock(&r.source_file) && r.part == TreePart::File)
+            let other = (r.part == TreePart::File)
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
                     // Only a PyPI ref can match another spelling of its
@@ -2001,11 +2104,6 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
         }
     }
     ctx.ignored = stray.ignored;
-}
-
-/// A PEP 723 script lock (`<script>.py.lock`).
-fn is_script_lock(file: &Path) -> bool {
-    crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
 }
 
 /// What every extractor receives: the project view plus the hosted-origin
@@ -5906,8 +6004,9 @@ mod tests {
     }
 
     /// What does NOT contest: a lock that never mentions the package, a lock
-    /// that wires the same patch too, another version of the package, and a
-    /// PEP 723 script lock (scoped to its script's own install).
+    /// that wires the same patch too, and another version of the package.
+    /// A PEP 723 script lock is a lock like any other: one that resolves
+    /// the release from the index does contest.
     #[tokio::test]
     async fn only_a_registry_resolution_of_the_same_version_contests() {
         const SRI: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
@@ -5980,6 +6079,16 @@ mod tests {
         p.write(
             "tool.py.lock",
             "version = 1\n\n[[package]]\nname = \"vexdemo\"\nversion = \"1.2.3\"\n\
+             source = { registry = \"https://pypi.org/simple\" }\n",
+        );
+        let out = p.discover().await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.contested.len(), 1, "{out:#?}");
+        assert_eq!(out.contested[0].other, Path::new("tool.py.lock"));
+        // Another release in the script lock contests nothing.
+        p.write(
+            "tool.py.lock",
+            "version = 1\n\n[[package]]\nname = \"vexdemo\"\nversion = \"2.0.0\"\n\
              source = { registry = \"https://pypi.org/simple\" }\n",
         );
         let out = p.discover().await;
