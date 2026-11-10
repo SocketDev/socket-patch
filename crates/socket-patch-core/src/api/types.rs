@@ -122,6 +122,22 @@ pub struct BatchPackagePatches {
 pub struct BatchSearchResponse {
     pub packages: Vec<BatchPackagePatches>,
     pub can_access_paid_patches: bool,
+    /// Requested purls the patch service gave no answer for: on the public
+    /// proxy's legacy per-package path, the lookups that failed while
+    /// others were answered. Such a purl was NOT checked, so its absence
+    /// from `packages` says nothing about it; a caller must report it.
+    /// Filled in by the client, never part of the wire format.
+    #[serde(skip)]
+    pub unanswered: Vec<UnansweredPurl>,
+}
+
+/// One purl of a batch search the patch service gave no answer for
+/// ([`BatchSearchResponse::unanswered`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnansweredPurl {
+    pub purl: String,
+    /// The failed lookup's error text.
+    pub error: String,
 }
 
 /// Request body for the package-vendor endpoint: `POST

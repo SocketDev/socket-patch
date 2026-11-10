@@ -267,6 +267,37 @@ pub(super) fn all_batches_failed(total: usize, err: &str) -> String {
     }
 }
 
+/// How many unanswered purls [`unanswered_lookups`] spells out.
+const UNANSWERED_NAMED: usize = 5;
+
+/// The warning detail for packages the patch API gave no answer for while
+/// it answered for others: how many of the `total` queried, which ones
+/// (the first few), and the first one's error. `unanswered` is
+/// `(purl, error)`, never empty.
+pub(super) fn unanswered_lookups(unanswered: &[(String, String)], total: usize) -> String {
+    let mut names: Vec<&str> = unanswered
+        .iter()
+        .take(UNANSWERED_NAMED)
+        .map(|(purl, _)| purl.as_str())
+        .collect();
+    let more = format!("{} more", unanswered.len().saturating_sub(names.len()));
+    if unanswered.len() > names.len() {
+        names.push(&more);
+    }
+    format!(
+        "{} of {total} packages could not be checked for patches ({}): {}",
+        unanswered.len(),
+        names.join(", "),
+        unanswered.first().map_or("", |(_, error)| error.as_str())
+    )
+}
+
+/// The result line of a scan that found no patch but could not check
+/// every package (a failed batch, or packages the API gave no answer for):
+/// "no patches" is only known for the ones that were answered.
+pub(super) const NO_PATCHES_AMONG_CHECKED: &str = "No patches found for the packages that could \
+     be checked; the others were not checked (see the warning above).";
+
 /// Warning printed when `--prune` cannot run because nothing was crawled
 /// (pruning every manifest entry is too destructive to do implicitly).
 pub(super) const PRUNE_SKIPPED_EMPTY: &str = "Warning: --prune skipped: no installed packages \
@@ -561,6 +592,22 @@ mod tests {
         assert_eq!(
             all_batches_failed(3, "Network error: refused"),
             "Error: All 3 API batch queries failed (last error: Network error: refused)"
+        );
+    }
+
+    #[test]
+    fn unanswered_lookups_counts_names_and_bounds_the_list() {
+        let miss = |i: usize| (format!("pkg:npm/p{i}@1.0.0"), format!("error {i}"));
+        assert_eq!(
+            unanswered_lookups(&[miss(1)], 3),
+            "1 of 3 packages could not be checked for patches (pkg:npm/p1@1.0.0): error 1"
+        );
+        let many: Vec<_> = (1..=7).map(miss).collect();
+        assert_eq!(
+            unanswered_lookups(&many, 500),
+            "7 of 500 packages could not be checked for patches (pkg:npm/p1@1.0.0, \
+             pkg:npm/p2@1.0.0, pkg:npm/p3@1.0.0, pkg:npm/p4@1.0.0, pkg:npm/p5@1.0.0, 2 more): \
+             error 1"
         );
     }
 

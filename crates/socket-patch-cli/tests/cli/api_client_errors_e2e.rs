@@ -422,15 +422,96 @@ async fn get_by_cve_with_500_reports_error() {
     assert_error_envelope(&v, "500");
 }
 
-/// A 404 on the GHSA search endpoint is "no patches found", a graceful
-/// not_found (exit 0) — NOT an error and NOT a crash.
+/// The Socket API's error body for `status`.
+fn api_error(status: u16, message: &str) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_json(serde_json::json!({
+        "error": { "message": message, "details": null }
+    }))
+}
+
+/// `get <identifier> --json` against `mock` as the authenticated API for
+/// org `org`: (exit code, stdout as JSON).
+fn get_json(mock: &MockServer, org: &str, identifier: &str) -> (i32, serde_json::Value) {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = crate::common::hermetic_command(&binary())
+        .args([
+            "get",
+            identifier,
+            "--json",
+            "--save-only",
+            "--yes",
+            "--api-url",
+            &mock.uri(),
+            "--api-token",
+            "fake-token",
+            "--org",
+            org,
+        ])
+        .current_dir(tmp.path())
+        .output()
+        .expect("run");
+    (out.status.code().unwrap_or(-1), json_stdout(&out))
+}
+
+/// A mistyped `--org`: the API answers every route of an unknown org with
+/// its 404 "Organization not found". That is not "no patches" for a search
+/// nor "no such patch" for a uuid: `get` fails and names the slug.
+#[tokio::test]
+async fn get_with_an_unknown_org_is_an_error_not_a_not_found() {
+    let mock = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(api_error(404, "Organization not found"))
+        .mount(&mock)
+        .await;
+
+    for identifier in [
+        "CVE-2021-23337",
+        "GHSA-aaaa-bbbb-cccc",
+        "pkg:npm/lodash@4.17.20",
+        UUID,
+    ] {
+        let (code, v) = get_json(&mock, "typo-org", identifier);
+        assert_eq!(code, 1, "{identifier}: {v}");
+        assert_error_envelope(&v, "Organization not found");
+        assert_error_envelope(&v, "'typo-org'");
+        assert_error_envelope(&v, "--org / SOCKET_ORG_SLUG");
+    }
+}
+
+/// A wrong `--api-url`: the host answers a search with its own 404 — a
+/// page, or nothing at all. Neither is the patch service saying "no
+/// patches": `get` fails, naming the host and the setting to check.
+#[tokio::test]
+async fn get_search_answered_by_another_host_is_an_error() {
+    let page = ResponseTemplate::new(404).set_body_raw(
+        "<!doctype html><html><body>Not Found</body></html>",
+        "text/html",
+    );
+    for answer in [page, ResponseTemplate::new(404)] {
+        let mock = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(answer)
+            .mount(&mock)
+            .await;
+        for identifier in ["CVE-2021-23337", "pkg:npm/lodash@4.17.20"] {
+            let (code, v) = get_json(&mock, ORG_SLUG, identifier);
+            assert_eq!(code, 1, "{identifier}: {v}");
+            assert_error_envelope(&v, &mock.address().to_string());
+            assert_error_envelope(&v, "did not answer like the Socket patch API");
+            assert_error_envelope(&v, "--api-url");
+        }
+    }
+}
+
+/// The service's own 404 on the GHSA search endpoint is "no patches
+/// found", a graceful not_found (exit 0) — NOT an error and NOT a crash.
 #[tokio::test]
 async fn get_by_ghsa_with_404_reports_not_found() {
     let mock = MockServer::start().await;
     let ghsa = "GHSA-aaaa-bbbb-cccc";
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/by-ghsa/{ghsa}")))
-        .respond_with(ResponseTemplate::new(404))
+        .respond_with(api_error(404, "Not found"))
         .mount(&mock)
         .await;
 

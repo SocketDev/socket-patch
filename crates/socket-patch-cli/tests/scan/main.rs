@@ -37,6 +37,7 @@ mod scan_nested_project_e2e;
 mod scan_ordered_concurrency_e2e;
 mod scan_paths_e2e;
 mod scan_project_discovery_e2e;
+mod scan_proxy_fallback_e2e;
 mod scan_prune_corrupt_vendor_ledger;
 mod scan_render;
 mod scan_sync_e2e;
