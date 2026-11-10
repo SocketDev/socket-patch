@@ -135,7 +135,8 @@ fn pnpm_workspace_file_above_the_repository_fails_closed() {
     write(&file, "packages:\n  - other\n");
     assert_eq!(
         crate::utils::pnpm_workspace::governing_workspace_file(&l.app),
-        Some(file)
+        // Reported without Windows' `\\?\` prefix, which `layout` keeps.
+        Some(crate::utils::pnpm_workspace::without_verbatim_prefix(file))
     );
     let plain = layout(false);
     write(

@@ -2058,14 +2058,14 @@ mod tests {
         assert!(
             left_pad
                 .iter()
-                .any(|s| s.ends_with("fixes/left-pad+1.3.0.patch")),
+                .any(|s| s.replace('\\', "/").ends_with("fixes/left-pad+1.3.0.patch")),
             "{left_pad:?}"
         );
         let is_number = global.conflicts("pkg:npm/is-number@7.0.0");
         assert!(
-            is_number
-                .iter()
-                .any(|s| s.ends_with("shared/a/patches/is-number+7.0.0.patch")),
+            is_number.iter().any(|s| s
+                .replace('\\', "/")
+                .ends_with("shared/a/patches/is-number+7.0.0.patch")),
             "{is_number:?}"
         );
         assert!(global.conflicts("pkg:npm/right-pad@1.3.0").is_empty());
@@ -2116,14 +2116,13 @@ mod tests {
         let repo = std::fs::canonicalize(tmp.path()).unwrap();
         write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
         let fixes = repo.join("fixes");
-        write(
-            &repo,
-            "package.json",
-            &format!(
-                r#"{{"scripts":{{"postinstall":"patch-package --patch-dir {}"}}}}"#,
-                fixes.display()
-            ),
-        );
+        // Built as JSON so a Windows path's backslashes are escaped.
+        let manifest = serde_json::json!({
+            "scripts": {
+                "postinstall": format!("patch-package --patch-dir {}", fixes.display())
+            }
+        });
+        write(&repo, "package.json", &manifest.to_string());
         write(&repo, "fixes/left-pad+1.3.0.patch", "diff\n");
         let index = UserPatchIndex::discover(&repo).await;
         assert!(
