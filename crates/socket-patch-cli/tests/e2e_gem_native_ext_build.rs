@@ -303,15 +303,16 @@ fn native_patch_that_does_not_build_is_put_back() {
     assert_eq!(walk_files(&ext_dir), built_before);
 }
 
-/// `(relative path, bytes)` of every file under `dir`.
 /// An `extconf.rb` that, like nokogiri's (which activates `mini_portile2`),
 /// loads a helper gem installed beside the copy in the same home.
 const EXTCONF_WITH_HELPER: &str = "gem \"sp_helper\"\nrequire \"sp_helper\"\n\
                                    require \"mkmf\"\ncreate_makefile(\"sp_native/sp_native\")\n";
 
-/// Build the pure-Ruby `sp_helper` gem and install it into `home`.
-fn install_helper_gem(home: &Path) {
-    let src = home.parent().unwrap().join("sp_helper-src");
+/// Build the pure-Ruby `sp_helper` gem in `scratch` (outside the project)
+/// and install it into `home`.
+fn install_helper_gem(scratch: &Path, home: &Path) {
+    let src = scratch.join("sp_helper-src");
+    let user_home = scratch.join("gem-user-home");
     std::fs::create_dir_all(src.join("lib")).unwrap();
     std::fs::write(src.join("lib/sp_helper.rb"), "module SpHelper; end\n").unwrap();
     std::fs::write(
@@ -337,7 +338,7 @@ fn install_helper_gem(home: &Path) {
         let out = Command::new("gem")
             .args(&args)
             .current_dir(&dir)
-            .env("HOME", home.parent().unwrap())
+            .env("HOME", &user_home)
             .output()
             .unwrap();
         assert!(
@@ -362,7 +363,7 @@ fn native_patch_builds_from_a_relative_crawl_root() {
     };
     let patched = c_source(2);
     let fx = Fixture::new(&abi, &patched);
-    install_helper_gem(&fx.home);
+    install_helper_gem(fx._tmp.path(), &fx.home);
     let socket = fx.proj.join(".socket");
     let entries = [
         ("ext/sp_native/extconf.rb", EXTCONF, EXTCONF_WITH_HELPER),
@@ -408,8 +409,15 @@ fn native_patch_builds_from_a_relative_crawl_root() {
     assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
     assert_eq!(event_action(&stdout), "applied", "{stdout}");
     assert_eq!(fx.value(), "2", "Ruby must load the rebuilt extension");
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
+    assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1", "the original build is back");
+    assert!(!fx.marker().exists());
 }
 
+/// `(relative path, bytes)` of every file under `dir`.
 fn walk_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
