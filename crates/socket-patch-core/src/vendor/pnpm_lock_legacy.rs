@@ -64,8 +64,8 @@ use super::common::refused;
 use super::path::parse_vendor_path_or_machine_absolute;
 use super::pnpm_lock::{
     check_rebuilt_entry, dep_entries, drifted, entry_fields, lines_value, lock_has_target_package,
-    ref_record_blocks, removed, revert_block, revert_overrides_line, target_block, DepPair, DepRef,
-    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    removed, revert_block, revert_overrides_line, target_block, DepPair, EditCtx, PnpmDialect,
+    KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -87,7 +87,7 @@ pub(super) const FLAVOR: &str = "pnpm-legacy";
 const KIND_LOCK_SPECIFIER: &str = "pnpm_lock_specifier";
 const KIND_LOCK_ROOT_DEP: &str = "pnpm_lock_root_dep";
 const KIND_LOCK_ROOT_DEP_PAIR: &str = "pnpm_lock_root_dep_pair";
-const KIND_LOCK_PKG_DEP_REF: &str = "pnpm_lock_pkg_dep_ref";
+pub(super) const KIND_LOCK_PKG_DEP_REF: &str = "pnpm_lock_pkg_dep_ref";
 
 /// The flat root-dependency sections a v5.4/v6.0 single-package lock keys
 /// its direct deps under.
@@ -871,7 +871,6 @@ pub(super) fn revert_lock_record(
             dirty,
             warnings,
         ),
-        KIND_LOCK_PKG_DEP_REF => revert_pkg_dep_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
         ))),
@@ -970,50 +969,6 @@ fn revert_root_dep_pair(
         parse: parse_vendor_path_or_machine_absolute,
     };
     pair.restore(lines, start + 1, end, 2, dirty, warnings);
-}
-
-/// Restore one dependent packages block's dep ref to this entry. Keyed by
-/// the dependent's packages key at vendor time, which a later vendor or
-/// revert of the dependent itself rekeys (`/debug/4.3.4` ⇄ `file:…`): when
-/// that key is gone the ref is found under the same package's other key
-/// (#830, [`ref_record_blocks`]).
-fn revert_pkg_dep_ref(
-    lines: &mut [String],
-    rec: &WiringRecord,
-    key: &str,
-    entry_uuid: &str,
-    dirty: &mut bool,
-    warnings: &mut Vec<VendorWarning>,
-) {
-    let Some((pkg_key, dep)) = key.rsplit_once('|') else {
-        warnings.push(drifted(format!(
-            "malformed dep-ref key `{key}`; left alone"
-        )));
-        return;
-    };
-    let Some((start, end)) = section_bounds(lines, "packages") else {
-        warnings.push(drifted(
-            "packages section is gone; nothing to restore".to_string(),
-        ));
-        return;
-    };
-    let target = DepRef {
-        rec,
-        key,
-        dep,
-        entry_uuid,
-        label: "dep ref",
-        dep_maps_only: true,
-        parse: parse_vendor_path_or_machine_absolute,
-    };
-    for (header, block_end) in ref_record_blocks(lines, start, end, pkg_key) {
-        if target.restore_in(lines, header, block_end, dirty, warnings) {
-            return;
-        }
-    }
-    warnings.push(removed(format!(
-        "dep ref `{key}` no longer exists; nothing to restore"
-    )));
 }
 
 #[cfg(test)]

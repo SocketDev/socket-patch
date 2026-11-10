@@ -179,6 +179,29 @@ impl PnpmDialect {
         REVERT_ALLOWLIST.contains(&file) && (self == Self::V9 || file != PNPM_WORKSPACE)
     }
 
+    /// The dialect's dependency-ref records: a v9 snapshot's ref, a legacy
+    /// packages block's dep ref.
+    fn dep_refs(self) -> DepRefs {
+        match self {
+            Self::V9 => DepRefs {
+                kind: KIND_LOCK_SNAPSHOT_REF,
+                section: "snapshots",
+                label: "snapshot ref",
+                noun: "snapshot-ref",
+                dep_maps_only: false,
+                parse: parse_vendor_path,
+            },
+            Self::Legacy => DepRefs {
+                kind: super::pnpm_lock_legacy::KIND_LOCK_PKG_DEP_REF,
+                section: "packages",
+                label: "dep ref",
+                noun: "dep-ref",
+                dep_maps_only: true,
+                parse: super::path::parse_vendor_path_or_machine_absolute,
+            },
+        }
+    }
+
     /// The grammar of a lock this dialect rewrites: one the vendored target
     /// rewrites ([`sniff_lock_grammar`]: 5.4, 6.0 and 9.0, the grammars its
     /// rekey was captured against; N16) and this dialect splices.
@@ -1175,10 +1198,31 @@ pub(super) async fn revert_pnpm_dialect(
 
     let mut lock_dirty = false;
     let mut pkg_dirty = false;
+    // One record per dependent of the vendored package: their section's
+    // blocks are read once and looked up by key, not walked again for
+    // every record (a package most of the lock depends on has that many).
+    let refs = dialect.dep_refs();
+    let mut ref_blocks: Option<RefBlocks> = None;
     for rec in entry.wiring.iter().rev() {
         match rec.file.as_str() {
             PNPM_LOCK => {
                 if let Some(lines) = lock_lines.as_mut() {
+                    if rec.kind == refs.kind {
+                        let blocks =
+                            ref_blocks.get_or_insert_with(|| RefBlocks::of(lines, refs.section));
+                        refs.restore(
+                            lines,
+                            blocks,
+                            rec,
+                            &entry.uuid,
+                            &mut lock_dirty,
+                            &mut outcome.warnings,
+                        );
+                        continue;
+                    }
+                    // Any other record may splice blocks in or out; a ref
+                    // restore only replaces a line in place.
+                    ref_blocks = None;
                     let revert = match dialect {
                         PnpmDialect::V9 => revert_lock_record,
                         PnpmDialect::Legacy => super::pnpm_lock_legacy::revert_lock_record,
@@ -3461,7 +3505,6 @@ fn revert_lock_record(
             dirty,
             warnings,
         ),
-        KIND_LOCK_SNAPSHOT_REF => revert_snapshot_ref(lines, rec, key, entry_uuid, dirty, warnings),
         other => warnings.push(drifted(format!(
             "unknown wiring kind `{other}` for `{key}`; left alone"
         ))),
@@ -3763,54 +3806,109 @@ pub(super) fn revert_block(
     )));
 }
 
-/// Restore one dependent snapshot's ref to this entry. The record is keyed
-/// by the dependent's snapshot key AT VENDOR TIME, which a later vendor or
-/// revert of the dependent itself rekeys (`debug@4.3.4` ⇄
-/// `debug@file:…`): when that key is gone, the ref is found in the block
-/// that names the same package under its other key (#830).
-fn revert_snapshot_ref(
-    lines: &mut [String],
-    rec: &WiringRecord,
-    key: &str,
-    entry_uuid: &str,
-    dirty: &mut bool,
-    warnings: &mut Vec<VendorWarning>,
-) {
-    let Some((snapshot_key, dep)) = key.rsplit_once('|') else {
-        warnings.push(drifted(format!(
-            "malformed snapshot-ref key `{key}`; left alone"
-        )));
-        return;
-    };
-    let Some((start, end)) = section_bounds(lines, "snapshots") else {
-        warnings.push(drifted(
-            "snapshots section is gone; nothing to restore".to_string(),
-        ));
-        return;
-    };
-    let target = DepRef {
-        rec,
-        key,
-        dep,
-        entry_uuid,
-        label: "snapshot ref",
-        dep_maps_only: false,
-        parse: parse_vendor_path,
-    };
-    for (header, block_end) in ref_record_blocks(lines, start, end, snapshot_key) {
-        if target.restore_in(lines, header, block_end, dirty, warnings) {
-            return;
+/// The dependency-ref records of a pnpm dialect ([`PnpmDialect::dep_refs`]):
+/// one per dependent that resolved the vendored package.
+struct DepRefs {
+    /// The `WiringRecord.kind`.
+    kind: &'static str,
+    /// The section whose blocks hold the refs.
+    section: &'static str,
+    /// Warning prefix (`snapshot ref` / `dep ref`).
+    label: &'static str,
+    /// The record key's name in the malformed-key warning.
+    noun: &'static str,
+    dep_maps_only: bool,
+    parse: fn(&str) -> Option<super::path::VendorPathParts>,
+}
+
+/// A section's blocks by key, as `[header, end)` line ranges. Valid while
+/// lines are only replaced in place.
+struct RefBlocks {
+    bounds: Option<(usize, usize)>,
+    by_key: HashMap<String, (usize, usize)>,
+}
+
+impl RefBlocks {
+    fn of(lines: &[String], section: &str) -> Self {
+        let bounds = section_bounds(lines, section);
+        let mut by_key = HashMap::new();
+        if let Some((start, end)) = bounds {
+            let mut i = start + 1;
+            while let Some(block) = next_block(lines, i, end) {
+                i = block.end;
+                // A repeated key reads as its first block, as a scan does.
+                by_key.entry(block.key).or_insert((block.header, block.end));
+            }
         }
+        Self { bounds, by_key }
     }
-    warnings.push(removed(format!(
-        "snapshot ref `{key}` no longer exists; nothing to restore"
-    )));
+}
+
+impl DepRefs {
+    /// Restore one dependent's ref to this entry. The record is keyed by
+    /// the dependent's block key AT VENDOR TIME, which a later vendor or
+    /// revert of the dependent itself rekeys (`debug@4.3.4` ⇄
+    /// `debug@file:…`): when that key is gone, the ref is found in the
+    /// block that names the same package under its other key (#830,
+    /// [`ref_record_blocks`]).
+    fn restore(
+        &self,
+        lines: &mut [String],
+        blocks: &RefBlocks,
+        rec: &WiringRecord,
+        entry_uuid: &str,
+        dirty: &mut bool,
+        warnings: &mut Vec<VendorWarning>,
+    ) {
+        let Some(key) = rec.key.as_deref() else {
+            warnings.push(drifted(format!(
+                "wiring record in {PNPM_LOCK} has no key; left alone"
+            )));
+            return;
+        };
+        let Some((block_key, dep)) = key.rsplit_once('|') else {
+            warnings.push(drifted(format!(
+                "malformed {} key `{key}`; left alone",
+                self.noun
+            )));
+            return;
+        };
+        let Some((start, end)) = blocks.bounds else {
+            warnings.push(drifted(format!(
+                "{} section is gone; nothing to restore",
+                self.section
+            )));
+            return;
+        };
+        let target = DepRef {
+            rec,
+            key,
+            dep,
+            entry_uuid,
+            label: self.label,
+            dep_maps_only: self.dep_maps_only,
+            parse: self.parse,
+        };
+        let candidates = match blocks.by_key.get(block_key) {
+            Some(&block) => vec![block],
+            None => ref_record_blocks(lines, start, end, block_key),
+        };
+        for (header, block_end) in candidates {
+            if target.restore_in(lines, header, block_end, dirty, warnings) {
+                return;
+            }
+        }
+        warnings.push(removed(format!(
+            "{} `{key}` no longer exists; nothing to restore",
+            self.label
+        )));
+    }
 }
 
 /// The `[header, end)` ranges a dependency-ref record keyed by `block_key`
 /// may live in: that block itself, else (it was rekeyed since) every block
 /// naming the same package ([`key_package_leaves`]).
-pub(super) fn ref_record_blocks(
+fn ref_record_blocks(
     lines: &[String],
     start: usize,
     end: usize,
@@ -3863,25 +3961,25 @@ fn key_package_leaves(key: &str) -> Vec<String> {
 
 /// One recorded dependency ref to restore (a v9 snapshot ref or a legacy
 /// packages dep ref).
-pub(super) struct DepRef<'a> {
-    pub(super) rec: &'a WiringRecord,
-    pub(super) key: &'a str,
-    pub(super) dep: &'a str,
-    pub(super) entry_uuid: &'a str,
+struct DepRef<'a> {
+    rec: &'a WiringRecord,
+    key: &'a str,
+    dep: &'a str,
+    entry_uuid: &'a str,
     /// Warning prefix (`snapshot ref` / `dep ref`).
-    pub(super) label: &'a str,
+    label: &'a str,
     /// Only look inside `dependencies:` / `optionalDependencies:` maps (the
     /// legacy edit's scope; the v9 edit rewrites any 6-space key).
-    pub(super) dep_maps_only: bool,
+    dep_maps_only: bool,
     /// The ownership parse: [`parse_vendor_path`], or for pnpm <= 8 locks
     /// [`super::path::parse_vendor_path_or_machine_absolute`].
-    pub(super) parse: fn(&str) -> Option<super::path::VendorPathParts>,
+    parse: fn(&str) -> Option<super::path::VendorPathParts>,
 }
 
 impl DepRef<'_> {
     /// Restore the ref inside the block `[header, end)`. `false` when the
     /// block has no such ref line (the caller tries the next candidate).
-    pub(super) fn restore_in(
+    fn restore_in(
         &self,
         lines: &mut [String],
         header: usize,
@@ -7057,6 +7155,47 @@ snapshots:
         // A resolution other than the one the entry was rebuilt for.
         let other = good.replace("sha512-BBBB", "sha512-CCCC");
         assert!(check(&other).is_err());
+    }
+
+    /// A package most of the lock depends on has one wiring record per
+    /// dependent. Restoring them reads the snapshots section once, so the
+    /// revert stays linear in the lock. It used to walk the lock again for
+    /// every record: a 60,000-package lock vendored in under a second and
+    /// took two minutes to revert.
+    #[tokio::test]
+    async fn revert_of_a_widely_depended_on_package_reads_the_lock_once() {
+        const DEPENDENTS: usize = 20_000;
+        let mut packages = String::new();
+        let mut snapshots = String::new();
+        for i in 0..DEPENDENTS {
+            packages.push_str(&format!(
+                "\n  dep-{i:05}@1.0.0:\n    resolution: {{integrity: sha512-AAAA}}\n"
+            ));
+            snapshots.push_str(&format!(
+                "\n  dep-{i:05}@1.0.0:\n    dependencies:\n      left-pad: 1.3.0\n"
+            ));
+        }
+        let lock = P1_BEFORE_LOCK
+            .replace("\n\nsnapshots:\n", &format!("\n{packages}\nsnapshots:\n"))
+            + &snapshots;
+        let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let entry = entry.unwrap();
+        assert!(entry.wiring.len() > DEPENDENTS, "one record per dependent");
+
+        let started = std::time::Instant::now();
+        let outcome = revert_pnpm(&entry, fx.root(), false).await;
+        let took = started.elapsed();
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert!(fx.read(PNPM_LOCK).await == lock, "lock byte-restored");
+        // One read of the section is well under a second here; one walk of
+        // the lock per record took over a minute.
+        assert!(
+            took < std::time::Duration::from_secs(20),
+            "the revert took {took:?}"
+        );
     }
 
     #[tokio::test]
