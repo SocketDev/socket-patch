@@ -728,6 +728,13 @@ pub enum UnattestedKind {
     /// redefines (`-D`, which Maven reads before the pom's `<properties>`):
     /// the build resolves that version, not the pin.
     MavenConfigOverride,
+    /// A hosted Maven pin that only the root pom's `<dependencyManagement>`
+    /// carries, for a GA the root pom does not declare itself, while a
+    /// parent pom in the checkout (the `<parent>`, or one above it) declares
+    /// the GA in its `<dependencies>` with a version of its own: the root
+    /// inherits that declaration, and management never replaces a declared
+    /// version, so the build resolves the parent's version.
+    MavenParentDeclares,
     /// A hosted Cargo pin beside another declaration of the crate (the
     /// root's or a workspace member's) that is not pinned (no Socket
     /// registry or `[patch]` redirect reaches it, or a path / git /

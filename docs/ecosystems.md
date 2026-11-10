@@ -893,6 +893,21 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
   `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
   declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
+* **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
+  literal `<version>` in the root pom (a transitive one, or one whose version a parent
+  manages), hosted mode pins it in the root pom's `<dependencyManagement>`
+  (`redirect_maven_dep_management_added`). Maven applies a managed version only to a
+  dependency that declares none, and a pom inherits its parents' `<dependencies>`: when a
+  parent pom declares the package with a version, the build resolves that version and
+  the pin does nothing. `vex` follows the parent chain through the checkout and writes no
+  statement in that case (`vex_maven_parent_declares`, naming the parent pom). Declare
+  the package in the root pom's `<dependencies>` with no `<version>`: its own
+  declaration replaces the inherited one, and the pin then governs it. When the parent is
+  not in the checkout (`<relativePath/>`, as Spring Initializr writes it, or a parent
+  resolved from a repository), `vex` cannot read what it declares, so a managed-only pin
+  is attested only after a build has resolved the patched version: until then it is
+  omitted as `package_not_found`. A pin on the root pom's own declaration is not
+  affected.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
