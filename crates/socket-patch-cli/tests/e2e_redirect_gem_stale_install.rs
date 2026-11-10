@@ -318,7 +318,7 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
     assert!(
         gemfile.contains("/patch-registry/gem/"),
-        "Gemfile must gain the patch-registry source block:\n{gemfile}"
+        "Gemfile must gain the patch-registry source:\n{gemfile}"
     );
 
     let details = stale_warnings(&env);
@@ -1377,13 +1377,14 @@ async fn gem_hosted_manifest_less_vex_follows_the_installed_tree() {
         "hosted mode writes no redirect ledger"
     );
 
-    // Stale: the lock is not converged yet (bundler < 2.6 mixed pair), the
-    // Gemfile is not a discovery input, and v5 keeps no ledger claim —
-    // nothing to attest.
+    // Stale: the scan converged the lock with the Gemfile, so the pin is
+    // discovered from the lock — and judged against the installed tree,
+    // which still holds the upstream copy. Nothing is attested, and the
+    // run says why.
     strip_ledgers(&proj);
     let out = run_vex(&bin, &proj, &base);
-    assert_eq!(out.code, Some(2), "nothing discoverable: {out}");
-    assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
+    assert_eq!(out.code, Some(1), "stale install: {out}");
+    assert_not_attested(&out.envelope, PURL, "not_applied");
     assert_absent(out.doc.as_ref(), PURL);
 
     // The prescribed re-install: patched tree + the lock bundler writes.

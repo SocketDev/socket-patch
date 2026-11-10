@@ -705,51 +705,42 @@ fn gem_lock_checksum(lock: &str, name: &str, version: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix(&prefix).map(|h| h.trim().to_string()))
 }
 
-/// The patch UUID the gem rewriter wired into `Gemfile`'s per-dep Socket
-/// source block for `name`. The block's URL shape is
-/// `https://<PATCH_HOST>/patch-registry/gem/<grant>/<patch-uuid>/`; the grant
-/// token is itself UUID-shaped, so this takes the SECOND path segment rather
-/// than scanning for "something UUID-like".
+/// The patch UUID the gem rewriter wired `name` to in the `Gemfile`: the
+/// `source:` option it put on the gem's declaration. The option's URL shape
+/// is `https://<PATCH_HOST>/patch-registry/gem/<grant>/<patch-uuid>/`; the
+/// grant token is itself UUID-shaped, so this takes the SECOND path segment
+/// rather than scanning for "something UUID-like".
 ///
-/// The rewriter writes one block per redirected gem, and production also
-/// publishes patches for `activestorage`'s own dependencies (`actionpack`,
-/// `activesupport`), so the Gemfile can hold several blocks in any order.
-/// Only the block whose body declares `gem "<name>"` counts: reading the
-/// first block would attribute a transitive gem's patch to `name`.
+/// Production also publishes patches for `activestorage`'s own dependencies
+/// (`actionpack`, `activesupport`), each of which gets a line of its own
+/// with the same option, in any order. Only the line that declares
+/// `gem "<name>"` counts: reading the first Socket source would attribute a
+/// transitive gem's patch to `name`.
 fn wired_gem_registry_uuid(gemfile: &str, name: &str) -> Option<String> {
-    let marker = format!("source \"https://{PATCH_HOST}/patch-registry/gem/");
     let decl = format!("gem \"{name}\"");
-    let mut text = gemfile;
-    while let Some(at) = text.find(&marker) {
-        let rest = &text[at + marker.len()..];
+    let marker = format!("source: \"https://{PATCH_HOST}/patch-registry/gem/");
+    gemfile.lines().find_map(|line| {
+        let args = line.trim_start().strip_prefix(&decl)?;
+        let rest = &args[args.find(&marker)? + marker.len()..];
         let path = &rest[..rest.find('"')?];
-        // The block body runs from the opener's line to its `end` line.
-        let body_start = rest.find('\n').map_or(rest.len(), |i| i + 1);
-        let body = &rest[body_start..];
-        let body = &body[..body.find("\nend").map_or(body.len(), |i| i + 1)];
-        if body.lines().any(|l| l.trim_start().starts_with(&decl)) {
-            let mut segments = path.split('/').filter(|s| !s.is_empty());
-            let _grant = segments.next()?;
-            return segments.next().map(str::to_string);
-        }
-        text = rest;
-    }
-    None
+        let mut segments = path.split('/').filter(|s| !s.is_empty());
+        let _grant = segments.next()?;
+        segments.next().map(str::to_string)
+    })
 }
 
 #[test]
-fn wired_gem_registry_uuid_reads_the_named_gems_block() {
-    let block = |grant: &str, uuid: &str, gem: &str| {
+fn wired_gem_registry_uuid_reads_the_named_gems_declaration() {
+    let wired = |grant: &str, uuid: &str, gem: &str| {
         format!(
-            "source \"https://{PATCH_HOST}/patch-registry/gem/{grant}/{uuid}/\" do\n  \
-             gem \"{gem}\", \"6.0.3\"\nend\n"
+            "gem \"{gem}\", \"6.0.3\", source: \"https://{PATCH_HOST}/patch-registry/gem/{grant}/{uuid}/\"\n"
         )
     };
     let transitive_first = format!(
-        "source \"https://rubygems.org\"\n\n{}\n{}\n{}",
-        block("g1", "u-actionpack", "actionpack"),
-        block("g2", "u-activestorage", "activestorage"),
-        block("g3", "u-activesupport", "activesupport"),
+        "source \"https://rubygems.org\"\n{}\n{}{}",
+        wired("g2", "u-activestorage", "activestorage"),
+        wired("g1", "u-actionpack", "actionpack"),
+        wired("g3", "u-activesupport", "activesupport"),
     );
     assert_eq!(
         wired_gem_registry_uuid(&transitive_first, "activestorage").as_deref(),
@@ -759,17 +750,17 @@ fn wired_gem_registry_uuid_reads_the_named_gems_block() {
         wired_gem_registry_uuid(&transitive_first, "actionpack").as_deref(),
         Some("u-actionpack")
     );
-    // `activestorage` left unwired beside wired transitive gems: no block
-    // for it, never a neighbour's UUID (the 2026-11-01 hosted-e2e shape).
+    // `activestorage` left unwired beside wired transitive gems: no option
+    // on it, never a neighbour's UUID (the 2026-11-01 hosted-e2e shape).
     let unwired = format!(
-        "source \"https://rubygems.org\"\ngem \"activestorage\", \"6.0.3\"\n\n{}\n{}",
-        block("g1", "u-actionpack", "actionpack"),
-        block("g3", "u-activesupport", "activesupport"),
+        "source \"https://rubygems.org\"\ngem \"activestorage\", \"6.0.3\"\n\n{}{}",
+        wired("g1", "u-actionpack", "actionpack"),
+        wired("g3", "u-activesupport", "activesupport"),
     );
     assert_eq!(wired_gem_registry_uuid(&unwired, "activestorage"), None);
     // A prefix of another gem's name is not a match.
     assert_eq!(
-        wired_gem_registry_uuid(&block("g", "u", "activestorage-x"), "activestorage"),
+        wired_gem_registry_uuid(&wired("g", "u", "activestorage-x"), "activestorage"),
         None
     );
 }
@@ -2166,9 +2157,9 @@ fn pypi_uv_lock_hosted_install_proof() {
 // RubyGems — full hosted install proof
 // ===========================================================================
 
-/// Full hosted install proof for RubyGems: the redirect rewrites `Gemfile`
-/// with a per-dep Socket source block and swaps the lock's CHECKSUMS pin to
-/// the patched artifact's sha256, then a real `bundle install` from the
+/// Full hosted install proof for RubyGems: the redirect gives the gem's
+/// `Gemfile` declaration a Socket `source:` option and swaps the lock's
+/// CHECKSUMS pin to the patched artifact's sha256, then a real `bundle install` from the
 /// rewritten files alone fetches through `patch.socket.dev` and every file
 /// the patch rewrites is verified on disk against the `/patch/view`
 /// afterHash.
@@ -2249,8 +2240,8 @@ async fn gem_bundler_hosted_install_proof() {
     let gemfile = read(&proj.join("Gemfile"));
     let wired_uuid = wired_gem_registry_uuid(&gemfile, GEM_NAME).unwrap_or_else(|| {
         panic!(
-            "{LEG}: Gemfile carries no per-dep Socket source block declaring \
-             `gem \"{GEM_NAME}\"` (`source \"https://{PATCH_HOST}/patch-registry/gem/<grant>/<uuid>/\" do`) \
+            "{LEG}: the `gem \"{GEM_NAME}\"` declaration in the Gemfile carries no Socket \
+             source (`source: \"https://{PATCH_HOST}/patch-registry/gem/<grant>/<uuid>/\"`) \
              — the hosted scan did not redirect {GEM_NAME} itself:\n{gemfile}"
         )
     });

@@ -18,11 +18,13 @@
 //! section at all) is collected in [`GemfileLock::problems`] for the
 //! readers that must refuse such a lock.
 
+pub(crate) mod declarations;
 pub(crate) mod gemfile;
 pub(crate) mod gemspec;
 pub(crate) mod hosted;
 pub(crate) mod manifest;
 pub(crate) mod mirror;
+pub(crate) mod ruby;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;

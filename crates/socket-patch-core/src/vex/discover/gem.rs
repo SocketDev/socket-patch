@@ -11,11 +11,11 @@
 //! [`DIAG_REF_UNATTRIBUTABLE`] instead: a leftover redirected
 //! `Gemfile.lock` beside `gems.rb` + `gems.locked` is never installed
 //! (#736). The Gemfile / `gems.rb` is NOT read: it is
-//! Ruby source whose `source … do` blocks and `path:` options only become
-//! what bundler installs once they are locked, and every wiring our tools
-//! write lands in the lock as well (see below). A Gemfile-only wiring (the
-//! pre-2.6 "mixed" hosted pair the rewriter warns about) is left to the
-//! ledger fallback [`super::hosted_wiring_in_files`].
+//! Ruby source whose `source:` / `path:` options and `source … do` blocks
+//! only become what bundler installs once they are locked, and every wiring
+//! our tools write lands in the lock as well (see below). A Gemfile-only
+//! wiring (the "mixed" pair socket-patch 5.0 / 5.1 left on a bundler < 2.6
+//! lock) is left to the ledger fallback [`super::hosted_wiring_in_files`].
 //!
 //! ## Lock grammar
 //!
@@ -64,17 +64,18 @@
 //! that era (bundler ≥ 2.6) the rewriter only converges the lock after
 //! writing the patched gem's sha256, so a pin-less
 //! Socket spec there is not Socket-written. A lock without `CHECKSUMS`
-//! (bundler < 2.6) never carries a pin — there the rewriter leaves the lock
-//! mixed and bundler writes the Socket section itself on the next unfrozen
-//! install — so its refs may use the host-allowlist lockfile basis alone.
+//! (bundler < 2.6) never carries a pin — the format has no place for one:
+//! the rewriter (or bundler, on an unfrozen install) writes the Socket
+//! section alone — so its refs may use the host-allowlist lockfile basis
+//! alone.
 //!
 //! ## Merged sections (bundler ≤ 2.1 and locks that started there)
 //!
 //! Bundler 1.17, 2.0 and 2.1 write every rubygems source into ONE `GEM`
-//! section (`SourceList#combine_rubygems_sources`), and bundler 2.2+ keeps
-//! a lock that already has that shape merged. After the prescribed unfrozen
-//! install over the rewriter's Gemfile source block, such a lock reads
-//! (verified on 1.17.3 / 2.0.2 / 2.1.4):
+//! section (`SourceList#combine_rubygems_sources`). The rewriter writes
+//! that layout for a lock such a bundler wrote, as bundler itself does on
+//! an unfrozen install over the redirected Gemfile; such a lock reads
+//! (verified on 1.17.2 / 1.17.3 / 2.0.2 / 2.1.4):
 //!
 //! ```text
 //! GEM
@@ -90,21 +91,22 @@
 //! ```
 //!
 //! The section alone cannot say which remote served which spec, but bundler
-//! resolves a gem declared inside a `source "<url>" do` block ONLY from that
-//! source, and marks it source-pinned (`!`) in `DEPENDENCIES`. So a spec in
-//! a merged section is a hosted ref of one of its Socket patch-registry
-//! remotes when BOTH hold: `DEPENDENCIES` pins it (`name …!`) and the
-//! sibling manifest (`Gemfile` for `Gemfile.lock`, `gems.rb` for
-//! `gems.locked`) declares it inside a `source` block whose URL is that
-//! remote. With several hosted gems the section lists one Socket remote
-//! per patch, and each remote is attributed on its own. That manifest is
-//! read ONLY for this cross-check — i.e. only when the lock has a merged
-//! section, whose own Socket remotes already name the uuids — so a
+//! resolves a gem declared with a `source: "<url>"` option, or inside a
+//! `source "<url>" do` block, ONLY from that source, and marks it
+//! source-pinned (`!`) in `DEPENDENCIES`. So a spec in a merged section is
+//! a hosted ref of one of its Socket patch-registry remotes when BOTH hold:
+//! `DEPENDENCIES` pins it (`name …!`) and the sibling manifest (`Gemfile`
+//! for `Gemfile.lock`, `gems.rb` for `gems.locked`) gives it that remote as
+//! its source: the option the rewriter appends, or the block socket-patch
+//! 5.0 / 5.1 wrote. With several hosted gems the section lists one Socket
+//! remote per patch, and each remote is attributed on its own. That
+//! manifest is read ONLY for this cross-check — i.e. only when the lock has
+//! a merged section, whose own Socket remotes already name the uuids — so a
 //! Gemfile-only wiring (lock not merged) stays with the ledger fallback.
 //! The manifest is read as text, not run as Ruby, so the cross-check fails
-//! closed on what text cannot settle: `=begin` … `=end` block comments are
-//! skipped, and a gem the manifest ALSO declares in a block for another
-//! source (dead code, a conditional branch) is not attributed.
+//! closed on what text cannot settle: comments are skipped, and a gem the
+//! manifest ALSO gives another source (a block around the declaration, dead
+//! code, a conditional branch) is not attributed.
 //! The section's other specs (upstream gems) are silent; a Socket remote of
 //! a merged section with no such pinned gem, or whose pinned gems the
 //! section does not lock, is [`DIAG_REF_UNATTRIBUTABLE`] (the section's
@@ -139,7 +141,8 @@ use super::{
 };
 use crate::crawlers::ruby_crawler::bundler_loaded_lock_in;
 use crate::formats::gem::{
-    bundler_manifest_for, gemfile, same_remote, GemfileLock, Section, SpecLine, BUNDLER_LOCKS,
+    bundler_manifest_for, declarations, gemfile, same_remote, GemfileLock, Section, SpecLine,
+    BUNDLER_LOCKS,
 };
 use crate::patch::path_safety::is_canonical_uuid;
 use crate::vendor::gem::{gem_declaration_any, quoted_literal};
@@ -196,8 +199,8 @@ async fn extract_file(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) {
     extract_lock(ctx, file, &lock, &blocks, out);
 }
 
-/// `(source URL, gem name)` for every `gem` declared inside a `source "<url>"
-/// do … end` block of the root manifest `rel` (see "Merged sections").
+/// `(source URL, gem name)` for every `gem` the root manifest `rel` gives a
+/// source of its own ([`parse_source_blocks`]; see "Merged sections").
 /// Missing => empty; unreadable => empty + the usual unreadable diagnostic.
 async fn source_block_gems(
     ctx: &DiscoverCtx<'_>,
@@ -210,23 +213,45 @@ async fn source_block_gems(
         .unwrap_or_default()
 }
 
-/// The Gemfile grammar [`source_block_gems`] reads: a line
-/// `source "<url>" do` / `source('<url>') do` opens a block, a line starting
-/// with `end` closes the innermost open one, and each `gem "<name>"` /
-/// `gem('<name>'…` line inside a block (the vendor backend's own
-/// [`gem_declaration_any`] grammar) declares a gem scoped to the INNERMOST
-/// open block, as bundler's `Dsl#with_source` does. Nesting matters: the
-/// hosted redirect wraps a gem the user declared in their own
-/// `source "…" do` block in a Socket block INSIDE it, so on a merged
-/// (bundler <= 2.1) lock the gem is attributable only through the inner
-/// block (#1997). Anything else (`source` with a block argument, `#`
-/// comments, and Ruby's column-0 `=begin` … `=end` block comments) is
-/// ignored — this only ever ADDS a cross-check to lock evidence, never
-/// creates a ref on its own.
+/// The Gemfile grammar [`source_block_gems`] reads, `(source URL, gem
+/// name)` for every gem the manifest gives a source of its own:
+///
+/// * a `gem "<name>", …, source: "<url>"` declaration, read with the ONE
+///   declaration model the hosted rewriter writes it with
+///   ([`declarations`]: the option on whatever line of the call it sits);
+/// * a gem declared inside a `source … do` block: a line `source "<url>"
+///   do` / `source('<url>') do` opens a block, a line starting with `end`
+///   closes the innermost open one, and each `gem "<name>"` / `gem('<name>'…`
+///   line inside a block (the vendor backend's own [`gem_declaration_any`]
+///   grammar) declares a gem scoped to the INNERMOST open block, as
+///   bundler's `Dsl#with_source` does. Nesting matters: socket-patch 5.0 /
+///   5.1 wrapped a gem the user declared in their own `source "…" do` block
+///   in a Socket block INSIDE it, so on a merged (bundler <= 2.1) lock the
+///   gem is attributable only through the inner block (#1997).
+///
+/// A gem declared both ways is listed twice, so a reader that asks for ONE
+/// source per gem refuses it. Anything else (`source` with a block
+/// argument, `#` comments, and Ruby's column-0 `=begin` … `=end` block
+/// comments) is ignored — this only ever ADDS a cross-check to lock
+/// evidence, never creates a ref on its own.
 fn parse_source_blocks(gemfile: &str) -> Vec<(String, String)> {
     parse_source_block_decls(gemfile)
         .into_iter()
         .map(|d| (d.url, d.name))
+        .chain(source_option_decls(gemfile))
+        .collect()
+}
+
+/// `(source URL, gem name)` for every `gem` declaration that carries a
+/// `source:` option whose value is a plain string literal.
+fn source_option_decls(gemfile: &str) -> Vec<(String, String)> {
+    declarations::declarations(gemfile)
+        .literal
+        .into_iter()
+        .filter_map(|decl| {
+            let url = decl.source()?.1?.to_string();
+            Some((url, decl.name))
+        })
         .collect()
 }
 
@@ -305,12 +330,13 @@ fn source_block_opener(line: &str) -> Option<&str> {
 }
 
 /// Whether the bundler manifest text `gemfile` still routes a gem to patch
-/// `uuid`'s registry: a `source "<…/patch-registry/gem/<token>/<uuid>>" do`
-/// block ([`is_patch_registry_index`], host-agnostic) declaring `gem_name`
-/// (any gem when `None`), read with the ONE Gemfile grammar
-/// ([`parse_source_blocks`] — `#` and `=begin` … `=end` comments are not
-/// wiring). Ledger liveness asks it for records whose host is outside the
-/// discovery allowlist, so a commented-out block never keeps one alive.
+/// `uuid`'s registry: `gem_name` (any gem when `None`) given the source
+/// `<…/patch-registry/gem/<token>/<uuid>>` ([`is_patch_registry_index`],
+/// host-agnostic) by a `source:` option or a `source … do` block, read with
+/// the ONE Gemfile grammar ([`parse_source_blocks`] — `#` and `=begin` …
+/// `=end` comments are not wiring). Ledger liveness asks it for records
+/// whose host is outside the discovery allowlist, so commented-out wiring
+/// never keeps one alive.
 pub(crate) fn gemfile_source_block_pins(gemfile: &str, uuid: &str, gem_name: Option<&str>) -> bool {
     parse_source_blocks(gemfile)
         .iter()
@@ -340,23 +366,26 @@ fn patch_registry_uuid(remote: &str) -> Option<String> {
 }
 
 /// The gems the manifest of the lock bundler loads (`Gemfile` for
-/// `Gemfile.lock`, `gems.rb` for `gems.locked`) pins to a Socket patch with
-/// a `source "<…/patch-registry/gem/<token>/<uuid>/>" do` block, as
+/// `Gemfile.lock`, `gems.rb` for `gems.locked`) pins to a Socket patch by
+/// giving them the source `<…/patch-registry/gem/<token>/<uuid>/>`, as
 /// `(pkg:gem/<name>@<version>, uuid)`.
 ///
-/// This is the hosted rewriter's Gemfile-only wiring: on a lock with no
-/// `CHECKSUMS` section it rewrites the manifest and leaves the lock for the
-/// next unfrozen `bundle install` (`redirect_gem_no_checksums_section`), so
-/// lockfile discovery has no ref for the pin yet. Discovery stays
-/// lock-only (the pin is not installed until the lock converges, so it is
-/// never VEX evidence); this is for the gradual rollout's recorded view,
-/// which must count the pin the run already wrote as recorded or every
-/// capped re-scan spends a NEW slot on it again (#1224).
+/// This is hosted wiring the lock may not hold: socket-patch 5.0 / 5.1
+/// rewrote only the manifest on a lock with no `CHECKSUMS` section and left
+/// the lock for the next unfrozen `bundle install`, and a lock checked out
+/// or regenerated without its manifest disagrees the same way. Lockfile
+/// discovery has no ref for such a pin. Discovery stays lock-only (the pin
+/// is not installed until the lock follows, so it is never VEX evidence);
+/// this is for the gradual rollout's recorded view, which must count the
+/// pin a run already wrote as recorded or every capped re-scan spends a
+/// NEW slot on it again (#1224).
 ///
-/// Only the shape the rewriter writes counts, read with discovery's
-/// Gemfile grammar: one exact version (`gem "x", "1.0.0"`), no
-/// source-selecting option, a canonical uuid, and no block for another
-/// source declaring the same gem.
+/// Only the shapes the rewriter writes count, read with discovery's
+/// Gemfile grammar, each with a canonical uuid and no other source for the
+/// same gem: a 5.0 / 5.1 block declaring one exact version (`gem "x",
+/// "1.0.0"`) with no source-selecting option, and a `source:` option on a
+/// declaration of a gem the lock resolves at one version (the declaration
+/// keeps the user's own requirement, so the lock names the version).
 pub async fn manifest_source_pins(view: &ProjectView<'_>) -> Vec<(String, String)> {
     let Some(lock) = bundler_loaded_lock_in(view).await else {
         return Vec::new();
@@ -381,6 +410,31 @@ pub async fn manifest_source_pins(view: &ProjectView<'_>) -> Vec<(String, String
             continue;
         };
         pins.insert((format!("pkg:gem/{}@{version}", d.name), uuid));
+    }
+    let options = source_option_decls(&text);
+    if options.is_empty() {
+        return pins.into_iter().collect();
+    }
+    let lock_text = view.read_text(lock).await.unwrap_or_default();
+    let locked = GemfileLock::parse(&lock_text);
+    for (url, name) in &options {
+        let Some(uuid) = patch_registry_uuid(url).filter(|u| is_canonical_uuid(u)) else {
+            continue;
+        };
+        if decls.iter().any(|o| &o.name == name)
+            || options.iter().filter(|(_, n)| n == name).count() != 1
+        {
+            continue;
+        }
+        let versions: BTreeSet<&str> = locked
+            .gem_sections()
+            .flat_map(|section| section.specs.iter().filter_map(|line| line.parsed))
+            .filter(|spec| spec.name == name && spec.platform.is_none())
+            .map(|spec| spec.version)
+            .collect();
+        if let [version] = versions.into_iter().collect::<Vec<_>>().as_slice() {
+            pins.insert((format!("pkg:gem/{name}@{version}"), uuid));
+        }
     }
     pins.into_iter().collect()
 }
@@ -831,6 +885,91 @@ mod tests {
         );
     }
 
+    /// The option form on a lock that does not follow it (checked out or
+    /// regenerated without its Gemfile): the pin is recorded with the
+    /// version the lock resolves, since the declaration keeps the user's
+    /// own requirement. A computed source, a gem the manifest gives two
+    /// sources, a gem the lock does not resolve at one version, a uuid that
+    /// is not canonical and a comment yield nothing.
+    #[tokio::test]
+    async fn source_option_pin_is_a_manifest_source_pin() {
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"~> 7.0\",\n    require: false, \
+             source: \"{}\" # web\ngem 'tiny', source: '{}'\n",
+            index(UUID_A),
+            index(UUID_B)
+        );
+        let pins = manifest_pins(&[("Gemfile", &gemfile), ("Gemfile.lock", MIXED_LOCK)]).await;
+        assert_eq!(
+            pins,
+            [
+                ("pkg:gem/rails@7.0.0".to_string(), UUID_A.to_string()),
+                ("pkg:gem/tiny@1.0.0".to_string(), UUID_B.to_string()),
+            ]
+        );
+        for (case, gemfile) in [
+            "gem \"rails\", source: SOCKET\n".to_string(),
+            format!("# gem \"rails\", source: \"{}\"\n", index(UUID_A)),
+            format!("gem \"rails\", source: \"{}\"\n", index("not-a-uuid")),
+            "gem \"rails\", source: \"https://gems.example.com/\"\n".to_string(),
+            format!("gem \"absent\", source: \"{}\"\n", index(UUID_A)),
+            format!(
+                "source \"https://gems.example.com/\" do\n  gem \"rails\", source: \"{}\"\nend\n",
+                index(UUID_A)
+            ),
+            format!(
+                "gem \"rails\", source: \"{}\"\ngem \"rails\", source: \"{}\"\n",
+                index(UUID_A),
+                index(UUID_B)
+            ),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let pins =
+                manifest_pins(&[("Gemfile", gemfile.as_str()), ("Gemfile.lock", MIXED_LOCK)]).await;
+            assert!(pins.is_empty(), "case {case} must yield no pin: {pins:?}");
+        }
+    }
+
+    /// The option form converged by the rewriter (or by `bundle lock`): the
+    /// spec sits in a `GEM` section of its own and attests from the lock
+    /// under the same rule as the 5.0 / 5.1 block form — the manifest is
+    /// not consulted for a single-remote section either way.
+    #[tokio::test]
+    async fn source_option_pair_attests_like_the_block_pair() {
+        let lock = format!(
+            "GEM\n  remote: {}\n  specs:\n    rails (7.0.0)\n\nGEM\n  remote: \
+             https://rubygems.org/\n  specs:\n    tiny (1.0.0)\n\nPLATFORMS\n  ruby\n\n\
+             DEPENDENCIES\n  rails (~> 7.0)!\n  tiny\n\nBUNDLED WITH\n   2.5.23\n",
+            index(UUID_A)
+        );
+        let option = format!(
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"~> 7.0\", source: \"{}\"\ngem \"tiny\"\n",
+            index(UUID_A)
+        );
+        let block = format!(
+            "source \"https://rubygems.org\"\n\nsource \"{}\" do\n  gem \"rails\", \"7.0.0\"\nend\ngem \"tiny\"\n",
+            index(UUID_A)
+        );
+        for gemfile in [option, block] {
+            let p = Project::new();
+            p.write("Gemfile", &gemfile);
+            p.write("Gemfile.lock", &lock);
+            let out = run(&p).await;
+            let r = only(&out);
+            assert_eq!(
+                (r.purl.as_str(), r.uuid.as_str()),
+                ("pkg:gem/rails@7.0.0", UUID_A)
+            );
+            assert!(
+                !r.integrity_required,
+                "no CHECKSUMS section, no pin to require"
+            );
+            assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        }
+    }
+
     fn only(out: &Discovery) -> &PatchedRef {
         assert_eq!(out.refs.len(), 1, "{:#?}", out.refs);
         &out.refs[0]
@@ -1267,6 +1406,52 @@ mod tests {
             block_gemfile(index(UUID_A).trim_end_matches('/')),
         );
         assert_eq!(run(&p).await.refs.len(), 1);
+    }
+
+    /// The option form on a merged lock (what the rewriter writes for a
+    /// bundler < 2.2 project, and bundler 1.17.2 / 2.1.4 write themselves):
+    /// the gem is attributed through the `source:` option on its
+    /// declaration, on whatever line of the call it sits, under the same
+    /// two-part pin as the block form. An option naming another source, or
+    /// a declaration that also sits in a block for another source, is not
+    /// attributed.
+    #[tokio::test]
+    async fn merged_section_source_option_gem_is_hosted() {
+        let socket = index(UUID_A);
+        let merged = format!(
+            "GEM\n  remote: https://rubygems.org/\n  remote: {socket}\n  specs:\n    \
+             tiny-dep (1.0.0)\n    vuln-gem (1.0.0)\n      tiny-dep\n\nPLATFORMS\n  ruby\n\n\
+             DEPENDENCIES\n  vuln-gem (~> 1.0)!\n\nBUNDLED WITH\n   2.1.4\n"
+        );
+        for gemfile in [
+            format!("source \"https://rubygems.org\"\n\ngem \"vuln-gem\", \"~> 1.0\", source: \"{socket}\" # why\n"),
+            format!("source \"https://rubygems.org\"\r\n\r\ngem \"vuln-gem\",\r\n    \"~> 1.0\",\r\n    require: false, source: \"{socket}\"\r\n"),
+            format!("source \"https://rubygems.org\"\n\ngroup :test do\n  gem(\"vuln-gem\", \"~> 1.0\", source: \"{socket}\")\nend\n"),
+        ] {
+            let p = Project::new();
+            p.write("Gemfile.lock", &merged);
+            p.write("Gemfile", &gemfile);
+            let out = run(&p).await;
+            assert_refs(
+                &out,
+                &[("pkg:gem/vuln-gem@1.0.0", UUID_A, WiringMode::Hosted)],
+            );
+            assert!(out.diagnostics.is_empty(), "{gemfile:?}: {:?}", out.diagnostics);
+        }
+        for gemfile in [
+            format!("gem \"vuln-gem\", \"~> 1.0\", source: \"{}\"\n", index(UUID_B)),
+            format!("# gem \"vuln-gem\", \"~> 1.0\", source: \"{socket}\"\n"),
+            format!(
+                "source \"https://gems.example.com\" do\n  gem \"vuln-gem\", source: \"{socket}\"\nend\n"
+            ),
+        ] {
+            let p = Project::new();
+            p.write("Gemfile.lock", &merged);
+            p.write("Gemfile", &gemfile);
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{gemfile:?}: {:#?}", out.refs);
+            assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE], "{gemfile:?}");
+        }
     }
 
     /// #1997: a gem the user declared in their own `source "…" do` block is

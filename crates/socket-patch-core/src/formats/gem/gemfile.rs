@@ -19,7 +19,7 @@
 /// `gitlab:`) and any `git_source(:name) { … }` the Gemfile declares —
 /// bundler rejects every other unknown key, so an unknown key here can only
 /// be a git source.
-const NON_SOURCE_KEYS: [&str; 14] = [
+pub(crate) const NON_SOURCE_KEYS: [&str; 14] = [
     "group",
     "groups",
     "require",
@@ -234,10 +234,10 @@ pub(crate) struct SourceOption {
 }
 
 /// The first option on a `gem` line's argument tail that picks the gem's
-/// source, if any. Bundler allows ONE source per gem, so such an option
-/// moved into the Socket source block overrides the block (hosted: the
-/// redirect becomes a silent no-op that still gets attested), and kept next
-/// to a vendored `path:` makes bundler refuse the Gemfile. Fails closed:
+/// source, if any. Bundler allows ONE source per gem, so a declaration
+/// that carries such an option cannot take a Socket `source:` as well
+/// (hosted), and kept next to a vendored `path:` it makes bundler refuse
+/// the Gemfile. Fails closed:
 /// an unreadable tail counts as source-selecting, and so (flagged
 /// [`SourceOption::dynamic`]) does a `**opts` splat or hash literal, since
 /// it may carry one. Positional arguments (`*V`, constants, method calls)
@@ -270,9 +270,9 @@ pub(crate) fn source_option(tail: &str) -> Option<SourceOption> {
 /// The argument tail of a `gem "name", …` line minus any leading quoted
 /// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
 /// options (`require: false`, `group: :test`, `"require" => false`, …) that
-/// must survive the move into the source block or next to a vendored
-/// `path:`. Empty when the line carries none; bails to empty on an
-/// unparseable tail (unbalanced quote or bracket).
+/// must survive next to a vendored `path:` (and that a socket-patch 5.0 /
+/// 5.1 source block carried along). Empty when the line carries none; bails
+/// to empty on an unparseable tail (unbalanced quote or bracket).
 pub(crate) fn trailing_options(tail: &str) -> String {
     let tail = &without_statement_end(tail);
     let Some(args) = args(tail) else {

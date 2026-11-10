@@ -328,8 +328,8 @@ pub fn build_candidates(
         // level before the patch uuid. Recover it so the rewriters'
         // rotation-idempotency guards (which wildcard the token path level
         // of a previously-written URL) don't depend on it being derivable
-        // from the URL alone (an empty token makes the gem guard nest a new
-        // source block on every re-scan).
+        // from the URL alone (with an empty token the gem guard does not
+        // recognise the `source:` a previous scan wrote as its own).
         let token = reference
             .registry_override
             .as_ref()
@@ -5775,11 +5775,13 @@ snapshots:
                 token: FIXTURE_TOKEN.into(),
                 patch_uuid: FIXTURE_UUID.into(),
                 artifact_url: format!(
-                    "https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
+                    "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/gems/rails-7.0.0.gem"
                 ),
                 registry_override: Some(RegistryOverride {
                     kind: "rubygems-compact-index".into(),
-                    index_url: format!("https://patch.test/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
+                    index_url: format!(
+                        "https://patch.test/patch-registry/gem/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"
+                    ),
                     identifiers: RegistryOverrideIdentifiers {
                         name: "rails".into(),
                         version: "7.0.0".into(),
@@ -6865,7 +6867,9 @@ snapshots:
     #[tokio::test]
     async fn bundler_mirror_for_the_patch_source_redirects_nothing() {
         for key in [
-            format!("BUNDLE_MIRROR__HTTPS://PATCH__TEST/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"),
+            format!(
+                "BUNDLE_MIRROR__HTTPS://PATCH__TEST/PATCH___REGISTRY/GEM/{FIXTURE_TOKEN}/{FIXTURE_UUID}/"
+            ),
             "BUNDLE_MIRROR__PATCH__TEST".to_string(),
             "BUNDLE_MIRROR__PATCH__TEST/".to_string(),
         ] {

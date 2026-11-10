@@ -2161,6 +2161,10 @@ async fn run_redirect_selected_untracked(
                     println!("{line}");
                 }
             }
+            // Then what the run did to the user's Bundler manifest.
+            for line in format_gem_manifest_edits(&rewrite.edits, common.dry_run) {
+                println!("{line}");
+            }
             let human_warnings: Vec<(&str, &str)> = warnings
                 .iter()
                 .map(|w| (w.code.as_str(), w.detail.as_str()))
@@ -2572,6 +2576,83 @@ fn format_redirect_summary(redirected: usize, files: usize, dry_run: bool) -> St
     } else {
         format!("Switched {pkgs} to hosted patches; rewrote {files}.")
     }
+}
+
+/// What the run did to each Bundler manifest, one line per file: a hosted
+/// gem is wired in the user's own `Gemfile` (or `gems.rb`), so the summary
+/// names the declarations that gained a `source:` option and the lines
+/// added for gems the manifest did not declare.
+///
+/// - `Added `source:` to 3 gem declarations in Gemfile (addressable, rack,
+///   and rexml); added 1 line for the transitive dependency rack-protection.`
+/// - dry run: `Would add `source:` to …; would add 1 line …`
+fn format_gem_manifest_edits(
+    edits: &[socket_patch_core::patch::redirect::FileEdit],
+    dry_run: bool,
+) -> Vec<String> {
+    use crate::ui::plural;
+    // Per manifest, in first-edit order: (options appended, lines added,
+    // source URLs refreshed).
+    let mut files: Vec<(&str, [Vec<String>; 3])> = Vec::new();
+    for edit in edits {
+        let slot = match edit.kind.as_str() {
+            "redirect_gemfile_source_option" => 0,
+            "redirect_gemfile_dependency_line" => 1,
+            "redirect_gemfile_source_url" => 2,
+            _ => continue,
+        };
+        let at = match files.iter().position(|(path, _)| *path == edit.path) {
+            Some(at) => at,
+            None => {
+                files.push((edit.path.as_str(), Default::default()));
+                files.len() - 1
+            }
+        };
+        files[at].1[slot].push(edit.key.clone().unwrap_or_default());
+    }
+    let (add, refresh) = if dry_run {
+        ("would add", "would refresh")
+    } else {
+        ("added", "refreshed")
+    };
+    files
+        .into_iter()
+        .map(|(path, [options, lines, urls])| {
+            let mut parts: Vec<String> = Vec::new();
+            if !options.is_empty() {
+                parts.push(format!(
+                    "{add} `source:` to {} in {path} ({})",
+                    plural(options.len(), "gem declaration", "gem declarations"),
+                    join_names(&options, 6)
+                ));
+            }
+            if !lines.is_empty() {
+                parts.push(format!(
+                    "{add} {} {}for the transitive {} {}",
+                    plural(lines.len(), "line", "lines"),
+                    if options.is_empty() {
+                        format!("to {path} ")
+                    } else {
+                        String::new()
+                    },
+                    if lines.len() == 1 {
+                        "dependency"
+                    } else {
+                        "dependencies"
+                    },
+                    join_names(&lines, 6)
+                ));
+            }
+            if !urls.is_empty() {
+                parts.push(format!(
+                    "{refresh} the Socket source of {} in {path} ({})",
+                    plural(urls.len(), "gem declaration", "gem declarations"),
+                    join_names(&urls, 6)
+                ));
+            }
+            format!("{}.", crate::ui::sentence_case(&parts.join("; ")))
+        })
+        .collect()
 }
 
 /// [`format_redirect_summary`] for a run that confirmed `confirmed`
@@ -4935,6 +5016,63 @@ mod tests {
         assert_eq!(join_names(&n(&["a", "b"]), 6), "a and b");
         assert_eq!(join_names(&n(&["a", "b", "c"]), 6), "a, b, and c");
         assert_eq!(join_names(&n(&["a", "b", "c", "d"]), 2), "a, b, and 2 more");
+    }
+
+    /// A hosted gem is wired in the user's own Gemfile, so the run says, in
+    /// one line per manifest, which declarations it touched and how.
+    #[test]
+    fn gem_manifest_edits_are_summarized_in_one_line() {
+        use socket_patch_core::patch::redirect::FileEdit;
+        let edit = |path: &str, kind: &str, key: &str| FileEdit {
+            path: path.to_string(),
+            kind: kind.to_string(),
+            action: "added".to_string(),
+            key: Some(key.to_string()),
+            original: None,
+            new: None,
+        };
+        let edits = [
+            edit("Gemfile", "redirect_gemfile_source_option", "rack"),
+            edit("Gemfile.lock", "redirect_gemfile_lock_gem_source", "rack"),
+            edit("Gemfile", "redirect_gemfile_source_option", "rexml"),
+            edit("Gemfile", "redirect_gemfile_source_option", "addressable"),
+            edit(
+                "Gemfile",
+                "redirect_gemfile_dependency_line",
+                "public_suffix",
+            ),
+            edit("package-lock.json", "redirect_npm_lock", "lodash"),
+        ];
+        assert_eq!(
+            super::format_gem_manifest_edits(&edits, false),
+            [
+                "Added `source:` to 3 gem declarations in Gemfile (rack, rexml, and addressable); \
+              added 1 line for the transitive dependency public_suffix."
+            ]
+        );
+        assert_eq!(
+            super::format_gem_manifest_edits(&edits, true),
+            ["Would add `source:` to 3 gem declarations in Gemfile (rack, rexml, and addressable); \
+              would add 1 line for the transitive dependency public_suffix."]
+        );
+        assert_eq!(
+            super::format_gem_manifest_edits(
+                &[
+                    edit("gems.rb", "redirect_gemfile_dependency_line", "rack"),
+                    edit("gems.rb", "redirect_gemfile_dependency_line", "tiny-dep"),
+                ],
+                false
+            ),
+            ["Added 2 lines to gems.rb for the transitive dependencies rack and tiny-dep."]
+        );
+        assert_eq!(
+            super::format_gem_manifest_edits(
+                &[edit("Gemfile", "redirect_gemfile_source_url", "rack")],
+                false
+            ),
+            ["Refreshed the Socket source of 1 gem declaration in Gemfile (rack)."]
+        );
+        assert!(super::format_gem_manifest_edits(&edits[5..], false).is_empty());
     }
 
     #[test]
