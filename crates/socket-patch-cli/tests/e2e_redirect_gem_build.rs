@@ -27,16 +27,22 @@
 //!   1. `bundle install` the fixture project from the mock upstream into a
 //!      project-local `vendor/bundle` (no rubygems.org, no network beyond
 //!      loopback).
-//!   2. `scan --mode hosted --json --vex …` (the real binary): the Gemfile
-//!      gains the `source "<index-url>" do … end` block, NO redirect ledger
+//!   2. `scan --mode hosted --json --vex …` (the real binary): the gem's own
+//!      declaration in the Gemfile gains a `source: "<index-url>"` option
+//!      (nothing else of it changes) and the lock is converged to what the
+//!      host bundler itself writes for that Gemfile — asserted by running
+//!      the real `bundle lock` over the pre-scan lock and comparing bytes —
+//!      on every lock era: a `GEM` section of its own on bundler >= 2.2
+//!      (with the patched sha256 where the lock has `CHECKSUMS`), one more
+//!      `remote:` in the single section on bundler < 2.2. NO redirect ledger
 //!      is written (v5: the manifest pair is the hosted state), the in-run
 //!      VEX is the unverified `(redirected)` attestation.
-//!   3. FRESH-CHECKOUT PROOF: only the committable files travel; an UNFROZEN
-//!      `bundle install` (the flow the rewriter's `redirect_gem_frozen_install`
-//!      warning prescribes) resolves the patched gem from the mock patch
-//!      registry: installed bytes byte-match the patch blob, the runtime dep
-//!      installs BECAUSE the registry `/info` declares it, and a require
-//!      probe loads the patched code.
+//!   3. FRESH-CHECKOUT PROOF: only the committable files travel; a FROZEN
+//!      `bundle install` (what CI and deploys run) resolves the patched gem
+//!      from the mock patch registry and leaves the lock byte-identical:
+//!      installed bytes byte-match the patch blob, the runtime dep installs
+//!      BECAUSE the registry `/info` declares it, and a require probe loads
+//!      the patched code.
 //!   4. POST-INSTALL VERIFIED VEX: `socket-patch vex` discovers the pin from
 //!      the lock (`--patch-server-url` names the mock origin), fetches the
 //!      record from the patch API and hash-verifies the installed tree.
@@ -57,19 +63,25 @@
 //! API` — the signature live CI saw until the 2026-08-18 server fix — so any
 //! server or fixture that stops declaring runtime deps turns this suite red.
 //!
-//! CHECKSUMS locks (bundler >= 4 writes the section by default) come out
-//! FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
-//! `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha. The flipped
-//! canary proves the converged pair installs patched bytes on a fresh
-//! checkout both FROZEN (`BUNDLE_FROZEN=true`, lock byte-identical — no
-//! unfrozen two-step) and unfrozen (the historical exit 37 "mismatched
-//! checksums" mixed-state refusal is gone; it was pinned here as a known
-//! limitation until the converged rewrite landed). The depscan TS twin
-//! (registry-rewrite gem.ts) must be ported to match.
+//! Every lock comes out FULLY CONVERGED, with or without a `CHECKSUMS`
+//! section: the DEPENDENCIES entry keeps the requirement the user declared
+//! and gains the `!`, and where the lock has `CHECKSUMS` the entry holds the
+//! patched sha. The canary proves the converged pair installs patched bytes
+//! on a fresh checkout both FROZEN (`BUNDLE_FROZEN=true`, lock
+//! byte-identical) and unfrozen. The depscan TS twin (registry-rewrite
+//! gem.ts) must be ported to match.
+//!
+//! `rollback` / `remove` take the option off again: the pair is the
+//! pre-scan pair, byte for byte.
+//!
+//! A pin socket-patch 5.0 / 5.1 wrote (a `source "<index-url>" do … end`
+//! block in the declaration's place) is built by hand over the fixture and
+//! locked by the real bundler: a re-scan leaves it alone, `vex` attests it,
+//! and its unwind brings the declaration back as the exact pin and says so.
 //!
 //! The grant-rotation capstone drives token A -> A -> B re-scans through the
 //! real binary: byte-idempotent under the same grant, in-place URL refresh
-//! (Gemfile source block + converged-lock remote) under a rotated one.
+//! (the Gemfile option + the converged lock's remote) under a rotated one.
 //!
 //! MANIFEST-LESS VEX (every installing arm, `manifestless_vex_matrix`): on
 //! the fresh checkout the real bundler installed — hosted never writes a
@@ -78,17 +90,19 @@
 //! `apply --vex`); `--offline` is `record_unavailable` with zero requests;
 //! the pair reverted to its registry version names the patch nowhere, even
 //! under `--no-verify`. The main arm also proves the lock-only revert
-//! (Gemfile block kept) re-converges on the next unfrozen install.
+//! (the Gemfile's option kept) re-converges on the next unfrozen install,
+//! and on the next hosted scan.
 //!
 //! VERSION MATRIX: the arms run on bundler 1.17 → 4.x (the CHECKSUMS arm
 //! from 2.6, the CHECKSUMS-era floor; every other arm from 1.17). Pick the
 //! bundler with `PATH` (CI: `ruby/setup-ruby`'s `bundler:` input) and name
 //! it in `SOCKET_PATCH_BUNDLER_E2E_VERSION` (asserted) plus
 //! `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1` (missing toolchain = failure) —
-//! see `common/bundler_e2e.rs`. Lock shapes per era: bundler 1.17–2.1
-//! writes ONE merged `GEM` section listing both remotes (attributed through
-//! the Gemfile source pin), 2.2 on a separate patch-registry section; before
-//! 2.2 there is no API-mismatch check (the deps red-arm's signature differs).
+//! see `common/bundler_e2e.rs`. Lock shapes per era, each written by the
+//! scan itself: for bundler 1.17–2.1 ONE merged `GEM` section listing both
+//! remotes (attributed through the Gemfile's `source:` option), from 2.2 on
+//! a separate patch-registry section; before 2.2 there is no API-mismatch
+//! check (the deps red-arm's signature differs).
 //!
 //! Skips (with a println) when `ruby`/`gem`/`bundle` are missing (a hard
 //! failure under `SOCKET_PATCH_BUNDLER_E2E_REQUIRED=1`) or the bundler is
@@ -218,6 +232,43 @@ fn bundle_env(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+/// `manifest` as hosted mode leaves it: `, source: "<index_url>"` right
+/// after `last_argument` (the text the gem's declaration ends its argument
+/// list with), every other byte as it was.
+fn with_source_option(manifest: &str, last_argument: &str, index_url: &str) -> String {
+    let at = manifest
+        .find(last_argument)
+        .unwrap_or_else(|| panic!("{last_argument:?} is not in the manifest:\n{manifest}"))
+        + last_argument.len();
+    format!(
+        "{}, source: \"{index_url}\"{}",
+        &manifest[..at],
+        &manifest[at..]
+    )
+}
+
+/// `manifest` as socket-patch 5.0 / 5.1 left it: the `gem "<DEP>"…`
+/// declaration line replaced by a `source "<index_url>" do … end` block
+/// that declares the exact version. That rewriter matched `^\s*gem`, so the
+/// blank lines and the indent before the declaration went with it.
+fn with_source_block(manifest: &str, index_url: &str) -> String {
+    let decl = manifest
+        .find(&format!("gem \"{DEP}\""))
+        .unwrap_or_else(|| panic!("no `gem \"{DEP}\"` declaration:\n{manifest}"));
+    let start = match manifest[..decl].trim_end().len() {
+        0 => 0,
+        text_end => text_end + 1,
+    };
+    let line_end = manifest[decl..]
+        .find('\n')
+        .map_or(manifest.len(), |i| decl + i);
+    format!(
+        "{}source \"{index_url}\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend{}",
+        &manifest[..start],
+        &manifest[line_end..]
+    )
 }
 
 /// MD5 hex digest via the host ruby (`Digest::MD5`) — the compact-index
@@ -421,31 +472,31 @@ enum Driver {
     /// The fixture asserts that contract itself and yields `None`.
     ScanVexDualBoot,
     /// [`Driver::ScanVex`] on a Gemfile that declares the gem in two `group`
-    /// blocks (#548): bundler accepts the duplicate, but rewriting only one
-    /// declaration would leave conflicting requirements. The run must
-    /// refuse, write nothing and attest nothing; the fixture asserts that
-    /// and yields `None`.
+    /// blocks (#548): bundler accepts the duplicate, but giving only one
+    /// declaration the Socket source would leave the gem with two sources.
+    /// The run must refuse, write nothing and attest nothing; the fixture
+    /// asserts that and yields `None`.
     ScanVexDuplicateDeclaration,
     /// [`Driver::ScanVex`] on a Gemfile that declares the gem through
     /// `eval_gemfile` (#482): the lock lists it as a direct dependency, so
-    /// appending a source block would declare it twice. Same contract as
+    /// adding a line for it would declare it twice. Same contract as
     /// [`Driver::ScanVexDuplicateDeclaration`].
     ScanVexEvalGemfile,
     /// [`Driver::ScanVex`] on a Gemfile whose declaration continues on the
-    /// next line (`gem "x",` ↵ `require: false`, #340): rewriting the first
-    /// line would orphan the continuation after the source block. Same
-    /// contract as [`Driver::ScanVexDuplicateDeclaration`].
+    /// next line (`gem "x",` ↵ `require: false`, #340): the option goes
+    /// after the last argument, on the continuation line.
     ScanVexMultiLineDeclaration,
     /// [`Driver::ScanVex`] on a Gemfile whose declaration carries an `if`
-    /// modifier (#340): rewriting it would drop the condition. Same contract
-    /// as [`Driver::ScanVexDuplicateDeclaration`].
+    /// modifier (#340): the option goes before the modifier, which stays.
     ScanVexConditionalDeclaration,
     /// A modifier adjacent to a top-level constant is still a modifier,
-    /// not a hash label (`if::ENV`, #340).
+    /// not a hash label (`if::ENV`, #340): the option goes before it.
     ScanVexScopedConstantModifier,
     /// [`Driver::ScanVex`] on a gem declared inside the user's own
-    /// `source "<upstream>" do` block (#1056): bundler locks it with a `!`
-    /// source pin, which the unwind must keep.
+    /// `source "<upstream>" do` block (#1056): the block already selects
+    /// the gem's source (bundler locks it with a `!` source pin), so the
+    /// run refuses it. Same contract as
+    /// [`Driver::ScanVexDuplicateDeclaration`].
     ScanVexSourceBlock,
     /// [`Driver::ScanVexSourceBlock`] with assignment-form keyword
     /// constructs (`v = if … end`, `w = case … end`) before the gem
@@ -464,17 +515,16 @@ enum Driver {
     ScanVexHeredocDeclaration,
     /// A double-quoted interpolation can itself contain a heredoc opener.
     ScanVexInterpolatedHeredocDeclaration,
-    /// A second declaration joined to the gem's line by `;` (#826): the
-    /// line rewrite would delete it. Same contract as
-    /// [`Driver::ScanVexDuplicateDeclaration`].
+    /// A second declaration joined to the gem's line by `;` (#826): it
+    /// stays where it is, the option going before the `;`.
     ScanVexSemicolonJoinedDeclaration,
     /// [`Driver::ScanVex`] on a declaration ending in a bare `;` and a
     /// comment (#826): a complete declaration, so it is redirected.
     ScanVexTrailingSemicolonDeclaration,
     /// [`Driver::ScanVex`] on a gem library whose Gemfile's `gemspec`
     /// directive also declares the gem as a development dependency (#985):
-    /// bundler 2.7+ merges the two requirements, and the lock must pin the
-    /// union for frozen installs to accept it.
+    /// bundler 2.7+ merges the two requirements, and the lock must keep the
+    /// requirement bundler recorded for frozen installs to accept it.
     ScanVexGemspecDevDependency,
     /// [`Driver::ScanVexDualBoot`] with `BUNDLE_GEMFILE=Gemfile` exported to
     /// socket-patch too (#507): bundler's local app config outranks the
@@ -498,10 +548,10 @@ enum Driver {
     /// four files byte-identical. Every bundler line.
     ScanVexTwin,
     /// [`Driver::ScanVex`] on a Gemfile that declares the gem inside a
-    /// `group :development do … end` block (#775): hosted mode wraps it in
-    /// a source block inside the group, but vendored mode cannot edit an
-    /// indented declaration, so a later takeover must refuse before it
-    /// un-hosts the gem.
+    /// `group :development do … end` block (#775): hosted mode edits the
+    /// declaration where it is, but vendored mode cannot edit an indented
+    /// declaration, so a later takeover must refuse before it un-hosts the
+    /// gem.
     ScanVexGroupBlock,
     /// [`Driver::ScanVex`] on a project whose committed `.bundle/config`
     /// sets `mirror.all` (#681): bundler fetches the patch-registry source
@@ -518,9 +568,9 @@ enum Driver {
     ScanVexMirrorSourceEnv,
     ScanVexMirrorAllEnv,
     /// [`Driver::ScanVex`] on a Gemfile that pulls the gem from a custom
-    /// `git_source(:local)` key (#652): moved into a Socket source block the
-    /// key still overrides it, so bundler keeps loading the unpatched git
-    /// checkout. Same refuse-and-attest-nothing contract as
+    /// `git_source(:local)` key (#652): the key selects the gem's one
+    /// source, and bundler keeps loading the unpatched git checkout. Same
+    /// refuse-and-attest-nothing contract as
     /// [`Driver::ScanVexDuplicateDeclaration`].
     ScanVexCustomGitSource,
 }
@@ -900,12 +950,15 @@ async fn redirect_scanned_project(
         Driver::ScanVexCustomGitSource => {
             // The gem's pristine source as a local git repo, reached through
             // a custom `git_source` key: bundler resolves it from a `GIT`
-            // section, never from the registry a Socket source block names.
+            // section, never from the registry a Socket `source:` names.
             let repos = tmp.path().join("repos");
             let repo = repos.join(DEP);
             copy_dir_recursive(&stage.join(format!("{DEP}-src")), &repo);
             for args in [
                 &["init", "-q"][..],
+                // Bundler <= 2.1 checks out `master` when the Gemfile names
+                // no ref, whatever `init.defaultBranch` says.
+                &["symbolic-ref", "HEAD", "refs/heads/master"][..],
                 &["add", "-A"][..],
                 &[
                     "-c",
@@ -1270,13 +1323,13 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorSource
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv => Some("redirect_gem_mirror_overrides_source"),
-        Driver::ScanVexCustomGitSource => Some("redirect_gem_source_option"),
-        Driver::ScanVexMultiLineDeclaration
-        | Driver::ScanVexConditionalDeclaration
-        | Driver::ScanVexScopedConstantModifier
-        | Driver::ScanVexHeredocDeclaration
-        | Driver::ScanVexInterpolatedHeredocDeclaration
-        | Driver::ScanVexSemicolonJoinedDeclaration => {
+        Driver::ScanVexCustomGitSource
+        | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
+        | Driver::ScanVexSourceBlockAfterSemicolon => Some("redirect_gem_source_option"),
+        Driver::ScanVexHeredocDeclaration | Driver::ScanVexInterpolatedHeredocDeclaration => {
             Some("redirect_gem_unrecognized_declaration")
         }
         _ => None,
@@ -1336,41 +1389,34 @@ async fn redirect_scanned_project(
         .flatten()
         .filter_map(|w| w["code"].as_str())
         .collect();
-    if checksums_lock {
-        // CHECKSUMS-era locks converge (patch-registry GEM section +
-        // dependency pin + patched sha), so the pair is frozen-installable
-        // as written — the caveat would be a lie.
-        assert!(
-            !warning_codes.contains(&"redirect_gem_frozen_install"),
-            "a converged CHECKSUMS pair must not carry the frozen-install caveat: {env}"
-        );
-        assert!(
-            rewritten.contains(&lock_name),
-            "the CHECKSUMS pin must land in {lock_name}: {env}"
-        );
-    } else {
-        assert!(
-            warning_codes.contains(&"redirect_gem_frozen_install"),
-            "the frozen-install caveat must be surfaced on a mixed (no-CHECKSUMS) pair: {env}"
-        );
-        assert!(
-            warning_codes.contains(&"redirect_gem_no_checksums_section"),
-            "a no-CHECKSUMS lock cannot be pinned and must say so: {env}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(proj.join(lock_name)).unwrap(),
-            lock_before,
-            "a no-CHECKSUMS lock must be byte-untouched"
-        );
-    }
+    // Every lock converges with the Gemfile (a patch-registry GEM section
+    // or, before bundler 2.2, remote; the `!` on the dependency; the patched
+    // sha where the lock holds checksums), so the pair is frozen-installable
+    // as written and there is no frozen-install caveat to give.
+    assert!(
+        !warning_codes.contains(&"redirect_gem_frozen_install"),
+        "a converged pair must not carry the frozen-install caveat: {env}"
+    );
+    assert!(
+        rewritten.contains(&lock_name),
+        "{lock_name} must follow the {gemfile_name}: {env}"
+    );
+    // The one thing a lock without CHECKSUMS cannot hold is said, once.
+    assert_eq!(
+        warning_codes
+            .iter()
+            .filter(|code| **code == "redirect_gem_no_checksums_section")
+            .count(),
+        usize::from(!checksums_lock),
+        "a lock that cannot record the artifact checksum must say so once: {env}"
+    );
     match driver {
         Driver::ScanVex
         | Driver::ScanVexGroupBlock
-        | Driver::ScanVexSourceBlock
-        | Driver::ScanVexSourceBlockAssignment
-        | Driver::ScanVexSourceBlockMultiLineOpener
-        | Driver::ScanVexSourceBlockBraces
-        | Driver::ScanVexSourceBlockAfterSemicolon
+        | Driver::ScanVexMultiLineDeclaration
+        | Driver::ScanVexConditionalDeclaration
+        | Driver::ScanVexScopedConstantModifier
+        | Driver::ScanVexSemicolonJoinedDeclaration
         | Driver::ScanVexTrailingSemicolonDeclaration
         | Driver::ScanVexGemspecDevDependency => {
             assert_eq!(env["vex"]["statements"], 1, "vex block: {env}");
@@ -1394,12 +1440,13 @@ async fn redirect_scanned_project(
         | Driver::ScanVexMirrorSourceEnv
         | Driver::ScanVexMirrorAllEnv
         | Driver::ScanVexCustomGitSource
-        | Driver::ScanVexMultiLineDeclaration
-        | Driver::ScanVexConditionalDeclaration
-        | Driver::ScanVexScopedConstantModifier
+        | Driver::ScanVexSourceBlock
+        | Driver::ScanVexSourceBlockAssignment
+        | Driver::ScanVexSourceBlockMultiLineOpener
+        | Driver::ScanVexSourceBlockBraces
+        | Driver::ScanVexSourceBlockAfterSemicolon
         | Driver::ScanVexHeredocDeclaration
-        | Driver::ScanVexInterpolatedHeredocDeclaration
-        | Driver::ScanVexSemicolonJoinedDeclaration => {
+        | Driver::ScanVexInterpolatedHeredocDeclaration => {
             unreachable!("asserted and returned above")
         }
         Driver::GetUuid => {
@@ -1420,20 +1467,61 @@ async fn redirect_scanned_project(
         }
     }
 
-    // The Gemfile rewrite: the declaration moved into the source block whose
-    // URL is the patch-registry compact index.
+    // The Gemfile edit: the user's declaration, byte for byte, with ONE
+    // option after its last argument — the patch-registry compact index as
+    // the gem's source. Nothing else in the file changes.
     let gemfile = std::fs::read_to_string(proj.join(gemfile_name)).unwrap();
-    assert!(
-        gemfile.contains(&format!(
-            "source \"{index_url}\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend"
-        )),
-        "{gemfile_name} must gain the patch-registry source block:\n{gemfile}"
+    let pristine = String::from_utf8(pristine_gemfile.clone()).expect("utf8 Gemfile");
+    let last_argument = match driver {
+        Driver::ScanVexMultiLineDeclaration => "require: false".to_string(),
+        Driver::ScanVexScopedConstantModifier | Driver::ScanVexSemicolonJoinedDeclaration => {
+            format!("gem \"{DEP}\", \"{DEP_VERSION}\"")
+        }
+        _ => format!("gem \"{DEP}\""),
+    };
+    assert_eq!(
+        gemfile,
+        with_source_option(&pristine, &last_argument, &index_url),
+        "{gemfile_name} must keep the declaration and gain the `source:` option"
     );
+    let lock = std::fs::read_to_string(proj.join(lock_name)).unwrap();
     if checksums_lock {
-        let lock = std::fs::read_to_string(proj.join(lock_name)).unwrap();
         assert!(
             lock.contains(&format!("  {DEP} ({DEP_VERSION}) sha256={patched_sha}")),
             "the lock CHECKSUMS must pin the PATCHED .gem's sha256:\n{lock}"
+        );
+    }
+    // The lock is the one the host bundler writes for that Gemfile over the
+    // pre-scan lock, byte for byte — so a frozen install accepts it, on
+    // every bundler line (one merged GEM section before 2.2, a section per
+    // source after). The deps red-arm has no such reference: its registry
+    // misreports the gem's dependencies, so bundler's own resolution over
+    // it drops the runtime dependency the scan (rightly) keeps.
+    if registry_declares_deps {
+        let relock = tmp.path().join("relock");
+        std::fs::create_dir_all(&relock).unwrap();
+        std::fs::write(relock.join(gemfile_name), &gemfile).unwrap();
+        std::fs::write(relock.join(lock_name), &pristine_lock).unwrap();
+        for extra in [GEMSPEC_LIB, "lib"] {
+            let from = proj.join(extra);
+            if from.is_dir() {
+                copy_dir_recursive(&from, &relock.join(extra));
+            } else if from.is_file() {
+                std::fs::copy(&from, relock.join(extra)).unwrap();
+            }
+        }
+        copy_dir_recursive(&proj.join(".bundle"), &relock.join(".bundle"));
+        let out = bundle(&relock, &["lock"]);
+        assert!(
+            out.status.success(),
+            "bundle lock over the redirected {gemfile_name} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            lock,
+            std::fs::read_to_string(relock.join(lock_name)).unwrap(),
+            "the scan's {lock_name} must be what bundler {} writes for the redirected {gemfile_name}",
+            bundler.version
         );
     }
 
@@ -1616,12 +1704,79 @@ fn stage_fresh_checkout(fx: &RedirectFixture, name: &str) -> PathBuf {
     fresh
 }
 
-/// Fresh checkout + the UNFROZEN `bundle install` the redirect prescribes on
-/// a not-yet-converged lock. Returns the fresh dir and the install output.
+/// Fresh checkout + the FROZEN `bundle install` that CI and deploys run
+/// (`BUNDLE_FROZEN=true`, bundler's deployment contract: exit 16 on any
+/// Gemfile-vs-lock drift, the lock never written). The pair the scan wrote
+/// must install as it is, on every bundler line. Returns the fresh dir and
+/// the install output.
 fn fresh_checkout_bundle_install(fx: &RedirectFixture) -> (PathBuf, Output) {
     let fresh = stage_fresh_checkout(fx, "fresh");
-    let install = bundle(&fresh, &["install"]);
+    let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
     (fresh, install)
+}
+
+/// The frozen install left the committed lock exactly as the scan wrote it.
+fn assert_lock_untouched_by_install(fx: &RedirectFixture, fresh: &Path) {
+    assert_eq!(
+        std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap(),
+        std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+        "a frozen install must leave {} byte-identical (bundler {})",
+        fx.lock_name,
+        fx.bundler.version
+    );
+}
+
+/// One declaration form hosted mode edits where it stands (the fixture has
+/// asserted the edit, and that the lock is the host bundler's own): a fresh
+/// checkout's FROZEN install takes the patched bytes from the patch registry
+/// and leaves the lock alone, and `rollback` hands the pre-scan pair back
+/// byte for byte.
+fn assert_form_installs_patched_and_rolls_back(fx: &RedirectFixture) {
+    let (fresh, install) = fresh_checkout_bundle_install(fx);
+    assert!(
+        install.status.success(),
+        "fresh-checkout frozen `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stdout),
+        String::from_utf8_lossy(&install.stderr),
+    );
+    assert_lock_untouched_by_install(fx, &fresh);
+    assert_patched_install(fx, &fresh);
+
+    let api = fx._server.uri();
+    let upstream = format!("{api}/upstream");
+    let cwd = fx.proj.to_str().expect("utf8 tmp path");
+    let (code, stdout, stderr) = run_socket_env(
+        &fx.proj,
+        &[
+            "rollback",
+            PURL,
+            "--json",
+            "--cwd",
+            cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ],
+        &[("SOCKET_RUBYGEMS_URL", &upstream)],
+    );
+    assert_eq!(code, 0, "rollback:\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(fx.proj.join(fx.gemfile_name)).unwrap()),
+        String::from_utf8_lossy(&fx.pristine_gemfile),
+        "rollback must hand the {} back byte for byte",
+        fx.gemfile_name
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&std::fs::read(fx.proj.join(fx.lock_name)).unwrap()),
+        String::from_utf8_lossy(&fx.pristine_lock),
+        "rollback must hand the {} back byte for byte",
+        fx.lock_name
+    );
 }
 
 /// The installed gem's lib file under the fresh checkout's vendor/bundle.
@@ -1821,16 +1976,17 @@ async fn manifestless_vex_matrix(fx: &RedirectFixture, fresh: &Path) {
     }
 }
 
-/// The mixed pair the bundler < 2.6 rewriter leaves (and a lock-only
-/// `git checkout`): the Gemfile still carries the patch-registry source
-/// block, the lock resolves the gem from upstream. Bundler re-resolves from
-/// the Gemfile — proven here with the REAL bundler. v5 keeps no ledger, so
-/// the mixed checkout has nothing discovery reads (lockfile pins only) until
-/// that install re-converges the lock, after which it attests from the lock
-/// alone.
+/// A lock-only `git checkout` (or a merge that took the other side of the
+/// lock): the Gemfile still gives the gem the patch-registry source, the
+/// lock resolves it from upstream. v5 keeps no ledger, so that checkout has
+/// nothing discovery reads (lockfile pins only). Both ways back are proven
+/// with the REAL bundler: an unfrozen install re-resolves from the Gemfile,
+/// and a hosted re-scan converges the lock itself — to the same bytes —
+/// after which the pair attests from the lock alone.
 async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
     use vex_e2e_common::{assert_attested, run_vex, Marker};
     let bin = binary();
+    let scanned_lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
     let dir = stage_fresh_checkout(fx, "fresh-lock-only-revert");
     let install = bundle(&dir, &["install"]);
     assert!(
@@ -1848,17 +2004,35 @@ async fn lock_only_revert_reconverges(fx: &RedirectFixture) {
     );
     assert_eq!(out.envelope["error"]["code"], "manifest_not_found", "{out}");
 
+    // The scan's way back: the lock follows the Gemfile again.
+    let rescan = stage_fresh_checkout(fx, "fresh-lock-only-revert-rescan");
+    std::fs::write(rescan.join(fx.lock_name), &fx.pristine_lock).unwrap();
+    let (code, stdout, stderr) = run_hosted_scan(&rescan, &fx._server.uri());
+    assert_eq!(code, 0, "re-scan: {stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(rescan.join(fx.lock_name)).unwrap(),
+        scanned_lock,
+        "a re-scan must converge the reverted lock"
+    );
+    assert_eq!(
+        std::fs::read(rescan.join(fx.gemfile_name)).unwrap(),
+        std::fs::read(fx.proj.join(fx.gemfile_name)).unwrap(),
+        "and leave the Gemfile as it is"
+    );
+
+    // Bundler's way back.
     let install = bundle(&dir, &["install"]);
     assert!(
         install.status.success(),
-        "unfrozen install over the mixed pair (bundler {}):\n{}",
+        "unfrozen install over the Gemfile-only pair (bundler {}):\n{}",
         fx.bundler.version,
         String::from_utf8_lossy(&install.stderr)
     );
-    let lock = std::fs::read_to_string(dir.join(fx.lock_name)).unwrap();
-    assert!(
-        lock.contains(&format!("remote: {}", fx.index_url)),
-        "bundler must re-resolve the gem from the Gemfile's patch-registry block:\n{lock}"
+    assert_eq!(
+        std::fs::read_to_string(dir.join(fx.lock_name)).unwrap(),
+        scanned_lock,
+        "bundler must re-resolve the gem from the Gemfile's `source:` option, to the lock \
+         the scan writes"
     );
     assert_patched_install(fx, &dir);
     let out = run_vex(&bin, &dir, &vex_run(fx));
@@ -1887,27 +2061,30 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
         return;
     };
 
-    // FRESH-CHECKOUT PROOF: the unfrozen install the redirect prescribes
-    // pulls the patched .gem from the hosted compact index.
+    // FRESH-CHECKOUT PROOF (B1): the frozen install CI and deploys run
+    // accepts the pair as the scan wrote it — a lock with no CHECKSUMS
+    // section included — and pulls the patched .gem from the hosted
+    // compact index.
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
-        "fresh-checkout `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
+        "fresh-checkout frozen `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
+    assert_lock_untouched_by_install(&fx, &fresh);
     assert_patched_install(&fx, &fresh);
 
-    // The converged lock records the patch registry as the gem's source and
-    // bundler's own `!` pin — the state a subsequent frozen install accepts.
+    // The lock records the patch registry as the gem's source and the `!`
+    // pin on the requirement the Gemfile declares (none here).
     let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
     assert!(
         lock.contains(&format!("remote: {}", fx.index_url)),
-        "post-install lock must record the patch-registry source:\n{lock}"
+        "the lock must record the patch-registry source:\n{lock}"
     );
     assert!(
-        lock.contains(&format!("{DEP} (= {DEP_VERSION})!")),
-        "post-install lock must carry bundler's source-pinned dependency:\n{lock}"
+        lock.contains(&format!("\nDEPENDENCIES\n  {DEP}!\n")),
+        "the lock must carry the source-pinned dependency, its requirement untouched:\n{lock}"
     );
 
     // POST-INSTALL VERIFIED VEX: default verify mode hash-verifies the
@@ -1962,7 +2139,7 @@ async fn gem_hosted_fresh_checkout_bundle_install_installs_patched_bytes_and_vex
 
 /// GET-DRIVEN TWIN of the main capstone: `get <uuid> --mode hosted` (v4.0,
 /// the per-advisory selector) must leave the same committable redirect
-/// state as `scan --mode hosted` — same Gemfile source block, NO ledger,
+/// state as `scan --mode hosted` — same Gemfile `source:` option, NO ledger,
 /// NO manifest, NO blobs — proven the same way against the REAL bundler: a
 /// fresh checkout of only the committable files resolves the PATCHED gem
 /// (bytes + runtime dep + require probe) from the mock patch registry.
@@ -1985,7 +2162,7 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
 
     // Persistence parity with `scan --mode hosted`: nothing lands in
     // .socket/ — no ledger, no manifest, no blobs (the fixture already
-    // asserted the missing ledger + the Gemfile source block).
+    // asserted the missing ledger + the Gemfile `source:` option).
     assert!(
         !fx.proj.join(".socket/manifest.json").exists(),
         "get --mode hosted must NOT write the manifest (parity with scan --mode hosted)"
@@ -1995,28 +2172,29 @@ async fn gem_get_uuid_hosted_fresh_checkout_bundle_install() {
         "get --mode hosted must NOT persist blobs"
     );
 
-    // FRESH-CHECKOUT PROOF: the unfrozen install the redirect prescribes
-    // pulls the patched .gem from the hosted compact index.
+    // FRESH-CHECKOUT PROOF: the frozen install pulls the patched .gem from
+    // the hosted compact index.
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
-        "fresh-checkout `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
+        "fresh-checkout frozen `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
+    assert_lock_untouched_by_install(&fx, &fresh);
     assert_patched_install(&fx, &fresh);
 
-    // The converged lock records the patch registry as the gem's source and
-    // bundler's own `!` pin — identical to what the scan-driven capstone
-    // leaves behind (parity by construction).
+    // The lock records the patch registry as the gem's source and the `!`
+    // pin — identical to what the scan-driven capstone leaves behind
+    // (parity by construction).
     let lock = std::fs::read_to_string(fresh.join(fx.lock_name)).unwrap();
     assert!(
         lock.contains(&format!("remote: {}", fx.index_url)),
-        "post-install lock must record the patch-registry source:\n{lock}"
+        "the lock must record the patch-registry source:\n{lock}"
     );
     assert!(
-        lock.contains(&format!("{DEP} (= {DEP_VERSION})!")),
-        "post-install lock must carry bundler's source-pinned dependency:\n{lock}"
+        lock.contains(&format!("\nDEPENDENCIES\n  {DEP}!\n")),
+        "the lock must carry the source-pinned dependency:\n{lock}"
     );
     manifestless_vex_matrix(&fx, &fresh).await;
 }
@@ -2421,7 +2599,10 @@ async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
         );
         stdout
     };
+    // The scan converges the lock itself, so an unfrozen install has
+    // nothing left to rewrite.
     let converge = |what: &str| {
+        let scanned = std::fs::read_to_string(&lock_path).unwrap();
         let install = bundle(&fx.proj, &["install"]);
         assert!(
             install.status.success(),
@@ -2429,12 +2610,26 @@ async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
             String::from_utf8_lossy(&install.stdout),
             String::from_utf8_lossy(&install.stderr)
         );
-        std::fs::read_to_string(&lock_path).unwrap()
+        let lock = std::fs::read_to_string(&lock_path).unwrap();
+        assert_eq!(
+            lock, scanned,
+            "{what}: bundler must leave the scan's lock as it is"
+        );
+        lock
     };
 
-    // Both gems hosted, then the prescribed unfrozen install.
+    // Both gems hosted: the direct one by its declaration's `source:`
+    // option, the transitive one by an added line.
     mount_patch_generation(&fx._server, 2, &[vuln(VULN_GEN2, patched_lib()), tiny()]).await;
     scan("generation-2 scan");
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    assert!(
+        gemfile.ends_with(&format!(
+            "\n\ngem \"{TRANSITIVE}\", \"1.0.0\", source: \"{api}/patch-registry/gem/{TOKEN}/{TINY_GEN2}/\", \
+             require: false # added by socket-patch (transitive dependency)\n"
+        )),
+        "the transitive gem gets one marked line:\n{gemfile}"
+    );
     let lock = converge("generation 2");
     for uuid in [VULN_GEN2, TINY_GEN2] {
         assert!(lock.contains(uuid), "generation 2 lock:\n{lock}");
@@ -2613,25 +2808,21 @@ async fn gem_hosted_two_gems_rescan_supersede_and_attest() {
     }
 }
 
-/// #1626: on a lock with no CHECKSUMS section, a superseding hosted
-/// re-scan moves only the Gemfile's `source … do` block to the new patch;
-/// the lock keeps pinning the old one until a `bundle install`. A
-/// `rollback` / `remove` in that window must undo the new block along with
-/// the lock, or the pair stays inconsistent (frozen installs fail) and the
-/// next unfrozen install re-patches.
-/// On bundler < 2.2 (one merged GEM section) the re-scan moves the lock's
-/// Socket remote along with the block (#1688), so there is no such window;
-/// the test proves the superseding patch lands there and unwinds.
+/// #1626 / #1688, B2: a superseding hosted re-scan moves the Gemfile's
+/// `source:` option AND the lock to the new patch, whatever the lock's era
+/// (a section of its own from bundler 2.2 on, a remote of the one merged
+/// section before), so the pair stays frozen-installable. A `rollback` /
+/// `remove` after it hands back the pre-scan pair, byte for byte.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler; \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_unwind_after_unconverged_supersede_undoes_the_new_block() {
+async fn gem_hosted_unwind_after_a_superseding_rescan_restores_the_pre_scan_pair() {
     for command in ["rollback", "remove"] {
-        unwind_after_unconverged_supersede(command).await;
+        unwind_after_superseding_rescan(command).await;
     }
 }
 
-async fn unwind_after_unconverged_supersede(command: &str) {
+async fn unwind_after_superseding_rescan(command: &str) {
     let Some(fx) = redirect_scanned_project(
         &format!("unconverged-supersede-{command}"),
         Spelling::Gemfile,
@@ -2685,36 +2876,28 @@ async fn unwind_after_unconverged_supersede(command: &str) {
     let lock_path = fx.proj.join(fx.lock_name);
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
     let lock = std::fs::read_to_string(&lock_path).unwrap();
-    assert!(gemfile.contains(GEN3), "{command}: Gemfile:\n{gemfile}");
-    if fx.bundler.at_least(2, 2) {
-        // The unconverged window this test is about: Gemfile on gen 3, lock
-        // on gen 2.
-        assert!(
-            lock.contains(GEN2) && !lock.contains(GEN3),
-            "{command}: lock:\n{lock}"
-        );
-    } else {
-        // #1688: bundler < 2.2 locks every remote in one merged GEM section,
-        // whose Socket remote moves to gen 3 with the Gemfile block (the
-        // pair stays converged, so a frozen install accepts it). The
-        // unwind below then undoes the converged gen 3 pair.
-        assert!(
-            lock.contains(GEN3) && !lock.contains(GEN2),
-            "{command}: lock:\n{lock}"
-        );
-        let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
-        assert!(
-            frozen.status.success(),
-            "{command}: frozen install of the gen 3 pair:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&frozen.stdout),
-            String::from_utf8_lossy(&frozen.stderr)
-        );
-        assert_eq!(
-            std::fs::read_to_string(&lock_path).unwrap(),
-            lock,
-            "{command}: the frozen install leaves the gen 3 lock as is"
-        );
-    }
+    assert!(
+        gemfile.contains(GEN3) && !gemfile.contains(GEN2),
+        "{command}: Gemfile:\n{gemfile}"
+    );
+    // The lock moves with the Gemfile on every bundler line, so the pair
+    // stays converged and a frozen install accepts it.
+    assert!(
+        lock.contains(GEN3) && !lock.contains(GEN2),
+        "{command}: lock:\n{lock}"
+    );
+    let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        frozen.status.success(),
+        "{command}: frozen install of the gen 3 pair:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&frozen.stdout),
+        String::from_utf8_lossy(&frozen.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        lock,
+        "{command}: the frozen install leaves the gen 3 lock as is"
+    );
 
     let upstream = format!("{api}/upstream");
     let cwd = fx.proj.to_str().expect("utf8 tmp path");
@@ -2745,9 +2928,17 @@ async fn unwind_after_unconverged_supersede(command: &str) {
         !lock.contains("patch-registry"),
         "{command}: the lock is still wired to a Socket patch:\n{lock}"
     );
-    assert!(
-        gemfile.contains(&format!("gem \"{DEP}\"")),
-        "{command}: the Gemfile declares the gem again:\n{gemfile}"
+    // Exactly the pre-scan pair: the declaration was never rewritten, so
+    // nothing of it is lost.
+    assert_eq!(
+        gemfile.as_bytes(),
+        fx.pristine_gemfile,
+        "{command}: the Gemfile must come back byte for byte"
+    );
+    assert_eq!(
+        lock.as_bytes(),
+        fx.pristine_lock,
+        "{command}: the lock must come back byte for byte"
     );
     // The pair is consistent: a frozen install accepts it as is.
     let frozen = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
@@ -2792,10 +2983,11 @@ async fn gem_hosted_gems_rb_spelling_redirects_and_installs() {
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
-        "fresh-checkout `bundle install` from gems.rb must succeed.\nstdout:\n{}\nstderr:\n{}",
+        "fresh-checkout frozen `bundle install` from gems.rb must succeed.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
+    assert_lock_untouched_by_install(&fx, &fresh);
     assert_patched_install(&fx, &fresh);
     let lock = std::fs::read_to_string(fresh.join("gems.locked")).unwrap();
     assert!(
@@ -2900,12 +3092,13 @@ async fn gem_hosted_group_block_pin_survives_a_refused_vendored_takeover() {
     }
 }
 
-/// #1761 on a CHECKSUMS-less lock that an unfrozen `bundle install`
-/// converged (the lock now resolves the hosted gem from the patch
-/// registry): `vendor --dry-run` previewed `eject_planned` (exit 0) while
-/// the wet eject refused `gemfile_declaration_not_editable`.
+/// #1761 on a converged CHECKSUMS-less lock (it resolves the hosted gem
+/// from the patch registry): `vendor --dry-run` previewed `eject_planned`
+/// (exit 0) while the wet eject refused `gemfile_declaration_not_editable`.
+/// The scan writes that lock itself now; an unfrozen install over it has
+/// nothing to change.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_group_block_pin_survives_a_refused_eject_of_a_converged_lock() {
     let Some(fx) = redirect_scanned_project(
@@ -2920,24 +3113,21 @@ async fn gem_hosted_group_block_pin_survives_a_refused_eject_of_a_converged_lock
     else {
         return;
     };
-    if !fx.bundler.at_least(2, 2) {
-        println!(
-            "SKIP e2e_redirect_gem_build (group-block converged eject): bundler {} merges \
-             every rubygems source into one GEM section",
-            fx.bundler.version
-        );
-        return;
-    }
-    let install = bundle(&fx.proj, &["install"]);
-    assert!(
-        install.status.success(),
-        "converging install:\n{}",
-        String::from_utf8_lossy(&install.stderr)
-    );
     let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
     assert!(
         lock.contains(&format!("remote: {}", fx.index_url)),
         "converged:\n{lock}"
+    );
+    let install = bundle(&fx.proj, &["install"]);
+    assert!(
+        install.status.success(),
+        "install of the converged pair:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+        lock,
+        "an unfrozen install has nothing to change in the lock the scan wrote"
     );
     mount_vendored_grant(&fx).await;
     for dry_run in [true, false] {
@@ -2948,9 +3138,8 @@ async fn gem_hosted_group_block_pin_survives_a_refused_eject_of_a_converged_lock
 /// The other side of #1761: a top-level hosted gem the vendored backend
 /// can wire previews a clean `vendor --dry-run` eject (exit 0), and the wet
 /// `vendor` then ejects it. The dry run checks the Gemfile/lock edits over
-/// the restored text; the hosted `source … do` block that still wraps the
-/// declaration on disk must not be read as the user's own indented
-/// declaration.
+/// the restored text; the hosted `source:` option still on the declaration
+/// on disk must not be read as a source the user chose for the gem.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -2967,11 +3156,12 @@ async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
     else {
         return;
     };
-    // Converge the hosted pair, so the eject can restore its upstream entry.
+    // Install the hosted pair: the lock the scan wrote already resolves the
+    // gem from the patch registry, which the eject restores from.
     let install = bundle(&fx.proj, &["install"]);
     assert!(
         install.status.success(),
-        "converging install:\n{}",
+        "install of the hosted pair:\n{}",
         String::from_utf8_lossy(&install.stderr)
     );
     mount_vendored_grant(&fx).await;
@@ -3005,7 +3195,7 @@ async fn gem_hosted_pin_previews_and_runs_a_clean_eject() {
         assert_eq!(code, 0, "{label}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
         assert!(
             !stdout.contains("gemfile_declaration_not_editable"),
-            "{label}: the hosted block is not a user declaration:\n{stdout}"
+            "{label}: the hosted option is not the user's own source:\n{stdout}"
         );
         if dry_run {
             assert!(
@@ -3060,7 +3250,7 @@ async fn gem_hosted_pin_with_a_crlf_lock_ejects_cleanly() {
         let install = bundle(&fx.proj, &["install"]);
         assert!(
             install.status.success(),
-            "converging install:\n{}",
+            "install of the hosted pair:\n{}",
             String::from_utf8_lossy(&install.stderr)
         );
         for file in crlf_files {
@@ -3199,78 +3389,147 @@ fn vendor_eject_keeps_the_hosted_group_pin(fx: &RedirectFixture, dry_run: bool) 
 }
 
 /// #1056: a gem the user declared inside their own `source "…" do` block
-/// is locked as `name (= v)!`. After the hosted scan converges (an
-/// unfrozen install), `rollback` / `remove` must hand back the exact
-/// pre-scan pair, `!` included, so a FROZEN install of the restored pair
-/// still succeeds (it exited 16 when the unwind dropped the `!`).
-/// Converged without CHECKSUMS so the restore needs no rubygems.org sha.
+/// already has its source selected by that block (bundler locks it as
+/// `name (= v)!`). Hosted mode re-points gems that come from the Gemfile's
+/// default source only: the scan refuses this one
+/// (`redirect_gem_source_option`, naming the block and the way out), writes
+/// nothing, attests nothing, and the untouched project still installs.
 /// #1476: the same holds when assignment-form `v = if … end` /
 /// `w = case … end` constructs precede the gem inside the block.
 /// #1509: and when the block's `source(` opener spans lines, or the block
 /// is a `source(…) { … }` brace block.
 /// #1531: and when the `source … do` follows `x = 1;` on its line.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.2); \
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_unwind_keeps_a_source_block_bang() {
-    for (driver, command) in [
-        (Driver::ScanVexSourceBlock, "rollback"),
-        (Driver::ScanVexSourceBlock, "remove"),
-        (Driver::ScanVexSourceBlockAssignment, "rollback"),
-        (Driver::ScanVexSourceBlockAssignment, "remove"),
-        (Driver::ScanVexSourceBlockMultiLineOpener, "rollback"),
-        (Driver::ScanVexSourceBlockMultiLineOpener, "remove"),
-        (Driver::ScanVexSourceBlockBraces, "rollback"),
-        (Driver::ScanVexSourceBlockBraces, "remove"),
-        (Driver::ScanVexSourceBlockAfterSemicolon, "rollback"),
-        (Driver::ScanVexSourceBlockAfterSemicolon, "remove"),
+async fn gem_hosted_gem_in_a_user_source_block_is_refused_and_still_installs() {
+    for (driver, label) in [
+        (Driver::ScanVexSourceBlock, "source-block"),
+        (
+            Driver::ScanVexSourceBlockAssignment,
+            "source-block-assignment",
+        ),
+        (
+            Driver::ScanVexSourceBlockMultiLineOpener,
+            "source-block-multi-line-opener",
+        ),
+        (Driver::ScanVexSourceBlockBraces, "source-block-braces"),
+        (
+            Driver::ScanVexSourceBlockAfterSemicolon,
+            "source-block-after-semicolon",
+        ),
     ] {
-        let label = match driver {
-            Driver::ScanVexSourceBlockAssignment => "source-block-assignment",
-            Driver::ScanVexSourceBlockMultiLineOpener => "source-block-multi-line-opener",
-            Driver::ScanVexSourceBlockBraces => "source-block-braces",
-            Driver::ScanVexSourceBlockAfterSemicolon => "source-block-after-semicolon",
-            _ => "source-block",
-        };
+        let fx =
+            redirect_scanned_project(label, Spelling::Gemfile, false, true, None, driver).await;
+        assert!(fx.is_none(), "the {label} driver asserts in place");
+    }
+}
+
+/// A pin socket-patch 5.0 / 5.1 wrote: the declaration replaced by a
+/// `source "<index-url>" do … end` block declaring the exact version, the
+/// lock (one without CHECKSUMS) left on the registry — the pair a frozen
+/// install refused (B1). This version no longer writes the block, so the
+/// pair is built by hand over the fixture. Against the real bundler:
+///
+///   * a re-scan keeps the block as it is (a pin is never migrated to the
+///     option form behind the user's back) and brings the lock in line with
+///     it — to the bytes `bundle lock` writes — so a fresh checkout installs
+///     the patched gem FROZEN; a second re-scan changes nothing;
+///   * `vex` attests the installed pin;
+///   * `rollback` / `remove` take the block off. The declaration it replaced
+///     is not in the file, so the gem comes back as the exact pin the block
+///     held and the run says so (`upstream_gem_declaration_pinned`); the
+///     restored lock is again what `bundle lock` writes, and installs
+///     upstream bytes frozen.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_source_block_pin_of_5_1_is_kept_healed_and_unwound_with_a_warning() {
+    use vex_e2e_common::{assert_attested, run_vex, Marker};
+    for command in ["rollback", "remove"] {
         let Some(fx) = redirect_scanned_project(
-            &format!("{label} {command}"),
+            &format!("5.1 block {command}"),
             Spelling::Gemfile,
             false,
             true,
             None,
-            driver,
+            Driver::ScanVex,
         )
         .await
         else {
             return;
         };
-        if !fx.bundler.at_least(2, 2) {
-            println!(
-                "SKIP e2e_redirect_gem_build (source-block unwind): bundler {} merges every \
-                 rubygems source into one GEM section",
-                fx.bundler.version
+        let api = fx._server.uri();
+        let gemfile_path = fx.proj.join(fx.gemfile_name);
+        let lock_path = fx.proj.join(fx.lock_name);
+        let pristine = String::from_utf8(fx.pristine_gemfile.clone()).unwrap();
+        // `bundle lock` for `gemfile` over the pre-scan lock, in a side dir.
+        let bundler_lock = |name: &str, gemfile: &str| -> String {
+            let dir = fx.tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(fx.gemfile_name), gemfile).unwrap();
+            std::fs::write(dir.join(fx.lock_name), &fx.pristine_lock).unwrap();
+            copy_dir_recursive(&fx.proj.join(".bundle"), &dir.join(".bundle"));
+            let out = bundle(&dir, &["lock"]);
+            assert!(
+                out.status.success(),
+                "{command}: bundle lock ({name}):\n{}",
+                String::from_utf8_lossy(&out.stderr)
             );
-            return;
-        }
-        let pristine_lock = String::from_utf8(fx.pristine_lock.clone()).unwrap();
+            std::fs::read_to_string(dir.join(fx.lock_name)).unwrap()
+        };
+
+        // The pair 5.1 left behind.
+        let block_gemfile = with_source_block(&pristine, &fx.index_url);
+        std::fs::write(&gemfile_path, &block_gemfile).unwrap();
+        std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
+        let block_lock = bundler_lock("block-relock", &block_gemfile);
         assert!(
-            pristine_lock.contains(&format!("  {DEP} (= {DEP_VERSION})!\n")),
-            "bundler pins a source-block gem with `!` (test premise):\n{pristine_lock}"
-        );
-        // Converge the mixed pair: the lock now resolves from the registry.
-        let install = bundle(&fx.proj, &["install"]);
-        assert!(
-            install.status.success(),
-            "converging install:\n{}",
-            String::from_utf8_lossy(&install.stderr)
-        );
-        let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
-        assert!(
-            lock.contains(&format!("remote: {}", fx.index_url)),
-            "converged:\n{lock}"
+            block_lock.contains(&format!("  {DEP} (= {DEP_VERSION})!\n")),
+            "bundler pins a source-block gem exactly, with `!` (test premise):\n{block_lock}"
         );
 
-        let api = fx._server.uri();
+        for pass in ["heals the lock", "changes nothing"] {
+            let (code, stdout, stderr) = run_hosted_scan(&fx.proj, &api);
+            assert_eq!(
+                code, 0,
+                "{command}: re-scan ({pass}):\n{stdout}\nstderr:\n{stderr}"
+            );
+            assert!(
+                !stdout.contains("redirect_gem_frozen_install"),
+                "{command}: re-scan ({pass}): a converged pair has no frozen-install caveat:\n{stdout}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&gemfile_path).unwrap(),
+                block_gemfile,
+                "{command}: re-scan ({pass}): the block is kept as it is"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&lock_path).unwrap(),
+                block_lock,
+                "{command}: re-scan ({pass}): the lock is the one bundler {} writes for the block",
+                fx.bundler.version
+            );
+        }
+
+        let fresh = stage_fresh_checkout(&fx, &format!("block-fresh-{command}"));
+        let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
+        assert!(
+            install.status.success(),
+            "{command}: frozen install of the healed pair:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&install.stdout),
+            String::from_utf8_lossy(&install.stderr)
+        );
+        assert_lock_untouched_by_install(&fx, &fresh);
+        assert_patched_install(&fx, &fresh);
+        let out = run_vex(&binary(), &fresh, &vex_run(&fx));
+        assert_eq!(
+            out.code,
+            Some(0),
+            "{command}: vex over the block pin: {out}"
+        );
+        assert_attested(out.doc(), PURL, UUID, Marker::Redirected, VULNS);
+
         let cwd = fx.proj.to_str().expect("utf8 tmp path");
         let mut argv = vec![command];
         if command == "remove" {
@@ -3291,17 +3550,26 @@ async fn gem_hosted_unwind_keeps_a_source_block_bang() {
         ]);
         let (code, stdout, stderr) = run_socket(&fx.proj, &argv);
         assert_eq!(code, 0, "{command}:\nstdout:\n{stdout}\nstderr:\n{stderr}");
-        assert_eq!(
-            std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
-            pristine_lock,
-            "{command}: the lock comes back byte for byte, `!` included"
+        assert!(
+            stdout.contains("upstream_gem_declaration_pinned"),
+            "{command}: the unwind must say the declaration came back as an exact pin:\n{stdout}"
+        );
+        let restored_gemfile = pristine.replace(
+            &format!("gem \"{DEP}\""),
+            &format!("gem \"{DEP}\", \"{DEP_VERSION}\""),
         );
         assert_eq!(
-            std::fs::read(fx.proj.join(fx.gemfile_name)).unwrap(),
-            fx.pristine_gemfile,
-            "{command}: the Gemfile comes back byte for byte"
+            std::fs::read_to_string(&gemfile_path).unwrap(),
+            restored_gemfile,
+            "{command}: the declaration comes back as the exact pin the block held"
         );
-        let fresh = stage_fresh_checkout(&fx, &format!("{label}-{command}"));
+        assert_eq!(
+            std::fs::read_to_string(&lock_path).unwrap(),
+            bundler_lock("restored-relock", &restored_gemfile),
+            "{command}: the restored lock is the one bundler {} writes for the restored Gemfile",
+            fx.bundler.version
+        );
+        let fresh = stage_fresh_checkout(&fx, &format!("block-restored-{command}"));
         let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
         assert!(
             install.status.success(),
@@ -3583,8 +3851,8 @@ async fn gem_hosted_eval_gemfile_direct_dep_is_refused_and_still_installs() {
 }
 
 /// #652: a gem pulled from a custom `git_source` key must not be "redirected"
-/// into a Socket source block the key overrides (bundler would keep loading
-/// the unpatched git checkout while VEX attested `not_affected`).
+/// to a Socket source the key overrides (bundler would keep loading the
+/// unpatched git checkout while VEX attested `not_affected`).
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -3604,13 +3872,15 @@ async fn gem_hosted_custom_git_source_is_refused_and_still_installs() {
     );
 }
 
-/// #340: a `gem` declaration that continues on the next line must not be
-/// rewritten (the orphaned `require: false` made bundler refuse the Gemfile).
+/// #340, B2: a `gem` declaration that continues on the next line gains the
+/// option after its last argument, on the continuation line. (A rewrite of
+/// the first line alone orphaned `require: false` and bundler refused the
+/// Gemfile; a refusal left the gem unpatched.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_multi_line_declaration_is_refused_and_still_installs() {
-    let fx = redirect_scanned_project(
+async fn gem_hosted_multi_line_declaration_redirects_in_place_and_installs() {
+    let Some(fx) = redirect_scanned_project(
         "multi-line",
         Spelling::Gemfile,
         false,
@@ -3618,17 +3888,21 @@ async fn gem_hosted_multi_line_declaration_is_refused_and_still_installs() {
         None,
         Driver::ScanVexMultiLineDeclaration,
     )
-    .await;
-    assert!(fx.is_none(), "the multi-line driver asserts in place");
+    .await
+    else {
+        return;
+    };
+    assert_form_installs_patched_and_rolls_back(&fx);
 }
 
-/// #826: `gem "x"; gem "y"` must not be rewritten. The line rewrite
-/// deleted `gem "y"`, so the next frozen install failed.
+/// #826, B2: in `gem "x"; gem "y"` the option goes before the `;` and the
+/// second declaration stays. (A rewrite of the whole line deleted
+/// `gem "y"`, so the next frozen install failed.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             run with a pinned toolchain via --ignored"]
-async fn gem_hosted_semicolon_joined_declarations_are_refused_and_still_install() {
-    let fx = redirect_scanned_project(
+async fn gem_hosted_semicolon_joined_declarations_redirect_in_place_and_install() {
+    let Some(fx) = redirect_scanned_project(
         "semicolon-joined",
         Spelling::Gemfile,
         false,
@@ -3636,8 +3910,11 @@ async fn gem_hosted_semicolon_joined_declarations_are_refused_and_still_install(
         None,
         Driver::ScanVexSemicolonJoinedDeclaration,
     )
-    .await;
-    assert!(fx.is_none(), "the `;`-joined driver asserts in place");
+    .await
+    else {
+        return;
+    };
+    assert_form_installs_patched_and_rolls_back(&fx);
 }
 
 /// #826: `gem "x"; # c` is a complete declaration. Since #637 it was
@@ -3659,26 +3936,21 @@ async fn gem_hosted_trailing_semicolon_declaration_redirects_and_installs() {
     else {
         return;
     };
-    let (fresh, install) = fresh_checkout_bundle_install(&fx);
-    assert!(
-        install.status.success(),
-        "fresh-checkout `bundle install` must succeed from the patch registry.\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&install.stdout),
-        String::from_utf8_lossy(&install.stderr),
-    );
-    assert_patched_install(&fx, &fresh);
+    assert_form_installs_patched_and_rolls_back(&fx);
 }
 
 /// #985: a gem library whose Gemfile's `gemspec` directive declares the
 /// vulnerable gem as a development dependency AND whose Gemfile declares it
-/// too. Bundler 2.7+ merges the two into one Gemfile dependency, so the
-/// redirected lock must pin the union (`(>= 0, = 1.0.0)!`): a fresh
-/// checkout's FROZEN install accepts the pair unchanged and installs the
-/// patched bytes (before the fix it exited 16). Older bundlers keep the
-/// plain exact pin, which they accept frozen too. A vendored takeover, which
-/// bundler 2.7+ cannot frozen-install in this shape (the vendored backend
-/// refuses it), must refuse before it restores the hosted pin, in the
-/// preview too, or the gem ends up unpatched in both modes.
+/// too. Bundler 2.7+ merges the two into one Gemfile dependency. The
+/// redirect leaves the declaration's requirement alone, so the lock's
+/// DEPENDENCIES entry keeps the requirement bundler recorded and only gains
+/// the `!` (the fixture already proved the lock is the one the host bundler
+/// writes): a fresh checkout's FROZEN install accepts the pair unchanged and
+/// installs the patched bytes (a rewrite that pinned `= 1.0.0` there exited
+/// 16). A vendored takeover, which bundler 2.7+ cannot frozen-install in
+/// this shape (the vendored backend refuses it), must refuse before it
+/// restores the hosted pin, in the preview too, or the gem ends up unpatched
+/// in both modes.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6); \
             run with a pinned toolchain via --ignored"]
@@ -3696,12 +3968,11 @@ async fn gem_hosted_gemspec_dev_dependency_frozen_install_accepts_the_pin() {
         return;
     };
     let lock = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
-    let want = if fx.bundler.at_least(2, 7) {
-        format!("  {DEP} (>= 0, = {DEP_VERSION})!\n")
-    } else {
-        format!("  {DEP} (= {DEP_VERSION})!\n")
-    };
-    assert!(lock.contains(&want), "lock must pin {want:?}:\n{lock}");
+    let want = format!("\nDEPENDENCIES\n  mylib!\n  {DEP}!\n");
+    assert!(
+        lock.contains(&want),
+        "the dependency keeps its requirement and gains the `!` ({want:?}):\n{lock}"
+    );
     let fresh = stage_fresh_checkout(&fx, "fresh-frozen");
     let install = bundle_env(&fresh, &["install"], &[("BUNDLE_FROZEN", "true")]);
     assert!(
@@ -3750,13 +4021,14 @@ async fn gem_hosted_gemspec_dev_dependency_frozen_install_accepts_the_pin() {
     }
 }
 
-/// #340: a `gem` declaration with an `if` modifier must not be rewritten
-/// (the rewrite dropped the condition and declared the gem unconditionally).
+/// #340, B2: a `gem` declaration with an `if` modifier keeps the modifier:
+/// the option goes before it. (A rewrite of the line dropped the condition
+/// and declared the gem unconditionally; a refusal left the gem unpatched.)
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_conditional_declaration_is_refused_and_still_installs() {
-    let fx = redirect_scanned_project(
+async fn gem_hosted_conditional_declaration_redirects_in_place_and_installs() {
+    let Some(fx) = redirect_scanned_project(
         "conditional",
         Spelling::Gemfile,
         false,
@@ -3764,15 +4036,20 @@ async fn gem_hosted_conditional_declaration_is_refused_and_still_installs() {
         None,
         Driver::ScanVexConditionalDeclaration,
     )
-    .await;
-    assert!(fx.is_none(), "the conditional driver asserts in place");
+    .await
+    else {
+        return;
+    };
+    assert_form_installs_patched_and_rolls_back(&fx);
 }
 
+/// `if::ENV[…]` is a modifier too, not a hash label: the option goes before
+/// it.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             run with a pinned toolchain via --ignored"]
-async fn gem_hosted_scoped_constant_modifier_is_refused_and_still_installs() {
-    let fx = redirect_scanned_project(
+async fn gem_hosted_scoped_constant_modifier_redirects_in_place_and_installs() {
+    let Some(fx) = redirect_scanned_project(
         "scoped-constant-modifier",
         Spelling::Gemfile,
         false,
@@ -3780,8 +4057,11 @@ async fn gem_hosted_scoped_constant_modifier_is_refused_and_still_installs() {
         None,
         Driver::ScanVexScopedConstantModifier,
     )
-    .await;
-    assert!(fx.is_none(), "the scoped modifier driver asserts in place");
+    .await
+    else {
+        return;
+    };
+    assert_form_installs_patched_and_rolls_back(&fx);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3819,8 +4099,8 @@ async fn gem_hosted_bundle_gemfile_config_outranks_env_redirects_nothing() {
     assert!(fx.is_none(), "the dual-boot driver asserts in place");
 }
 
-/// #681: bundler's `mirror.all` sends the per-dep patch-registry `source`
-/// block to the mirror, which serves the upstream gem. The hosted scan used
+/// #681: bundler's `mirror.all` sends the per-dep patch-registry source to
+/// the mirror, which serves the upstream gem. The hosted scan used
 /// to report the gem redirected and attest it while the next install was
 /// unpatched (or failed CHECKSUMS); it must refuse, leave the pair
 /// untouched and attest nothing.
@@ -3972,7 +4252,15 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
         return;
     };
 
-    let (_fresh, install) = fresh_checkout_bundle_install(&fx);
+    // The probe: the redirected Gemfile beside the lock's registry version,
+    // installed unfrozen, so bundler resolves the gem from the registry's
+    // `/info` and trips over the gem it then downloads. (The lock the scan
+    // wrote is no probe of the contract: it records the gem's real
+    // dependencies, so bundler 2.5 installs from it regardless, while
+    // bundler 4 refuses it with "incorrect dependencies in the lockfile".)
+    let fresh = stage_fresh_checkout(&fx, "fresh-unfrozen");
+    std::fs::write(fresh.join(fx.lock_name), &fx.pristine_lock).unwrap();
+    let install = bundle(&fresh, &["install"]);
     assert!(
         !install.status.success(),
         "a deps-less registry /info MUST break the fresh install — a quiet success here means \
@@ -4014,9 +4302,10 @@ async fn gem_hosted_registry_info_without_deps_breaks_install_like_production() 
 }
 
 /// FLIPPED CANARY — CHECKSUMS locks (bundler >= 4 default) must come out
-/// FULLY CONVERGED: patch-registry GEM section holding the dep's spec,
-/// `<name> (= <ver>)!` DEPENDENCIES pin, patched CHECKSUMS sha (v5 keeps no
-/// ledger: a rollback re-resolves the upstream sha from the registry). The old mixed-state rewrite (pin only,
+/// FULLY CONVERGED: patch-registry GEM section holding the dep's spec, the
+/// `!` on the DEPENDENCIES entry (its requirement as the user declared it),
+/// patched CHECKSUMS sha (v5 keeps no ledger: a rollback re-resolves the
+/// upstream sha from the registry). The old mixed-state rewrite (pin only,
 /// GEM section left upstream) made the prescribed unfrozen install fail with
 /// "Bundler found mismatched checksums" (exit 37 — the bundler-4 DEFAULT
 /// lock, i.e. the mainstream hosted-gem path) and forced a frozen-install
@@ -4067,8 +4356,8 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
         "the lock must attribute the dep to the patch-registry GEM section:\n{lock}"
     );
     assert!(
-        lock.contains(&format!("  {DEP} (= {DEP_VERSION})!")),
-        "DEPENDENCIES must carry the source-pinned entry:\n{lock}"
+        lock.contains(&format!("\nDEPENDENCIES\n  {DEP}!\n")),
+        "DEPENDENCIES must carry the source-pinned entry, its requirement untouched:\n{lock}"
     );
 
     // FROZEN fresh checkout: the converged pair needs no unfrozen two-step —
@@ -4095,14 +4384,20 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
     manifestless_vex_matrix(&fx, &frozen).await;
 
     // UNFROZEN fresh checkout: no exit 37 "mismatched checksums" refusal
-    // either.
-    let (fresh, install) = fresh_checkout_bundle_install(&fx);
+    // either, and bundler has nothing to rewrite in the lock.
+    let fresh = stage_fresh_checkout(&fx, "fresh-unfrozen");
+    let install = bundle(&fresh, &["install"]);
     assert!(
         install.status.success(),
         "unfrozen fresh-checkout install of the converged pair must succeed (the pinned \
          exit-37 mixed-state refusal is fixed).\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join(fx.lock_name)).unwrap(),
+        lock_before,
+        "an unfrozen install has nothing to change in the converged lock"
     );
     assert_patched_install(&fx, &fresh);
 }
@@ -4111,15 +4406,15 @@ async fn gem_hosted_checksums_lock_converges_and_installs_frozen_and_unfrozen() 
 /// production reference endpoint rotates the grant-token path segment of the
 /// index URL per request, so a periodic/CI re-scan sees a NEW index URL for
 /// the SAME redirect. The re-scan must (1) be byte-idempotent under the same
-/// grant, (2) refresh the source block's URL IN PLACE under a rotated grant —
-/// exactly one Socket source block, no stale token anywhere, no ledger — and (3) leave a pair a fresh checkout
-/// installs the patched bytes from — never wrap the old block's indented
-/// gem line in a new NESTED source block (+1 nesting per re-scan) with the
-/// stale token URL still live.
+/// grant, (2) refresh the `source:` option's URL IN PLACE under a rotated
+/// grant, the lock's remote with it — exactly one Socket source, no stale
+/// token anywhere, no ledger — and (3) leave a pair a fresh checkout installs
+/// the patched bytes from, frozen. It must never stack a second option (or
+/// a block) on the declaration with the stale token URL still live.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17; CHECKSUMS arm >= 2.6); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
-async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
+async fn gem_hosted_rotated_grant_rescan_refreshes_source_option_and_installs() {
     const TOKEN_B: &str = "55555555-5555-4555-8555-555555555555";
     let Some(fx) = redirect_scanned_project(
         "rotation",
@@ -4170,36 +4465,40 @@ async fn gem_hosted_rotated_grant_rescan_refreshes_source_block_and_installs() {
     assert_eq!(env["summary"]["applied"], 1, "envelope: {env}");
     let gemfile = std::fs::read_to_string(fx.proj.join("Gemfile"))
         .expect("read Gemfile after rotated-grant re-scan");
+    // The whole edit is the URL inside the option: the same Gemfile with
+    // the rotated grant's index URL where the first one stood.
+    assert_eq!(
+        gemfile,
+        gemfile_after_run1.replace(&fx.index_url, &index_url_b),
+        "the option's URL must be refreshed to the rotated grant in place"
+    );
     assert_eq!(
         gemfile.matches("/patch-registry/gem/").count(),
         1,
-        "exactly one Socket source block, never nested:\n{gemfile}"
-    );
-    assert!(
-        gemfile.contains(&format!(
-            "source \"{index_url_b}\" do\n  gem \"{DEP}\", \"{DEP_VERSION}\"\nend"
-        )),
-        "the block's URL must be refreshed to the rotated grant in place:\n{gemfile}"
+        "exactly one Socket source, never stacked:\n{gemfile}"
     );
     assert!(
         !gemfile.contains(TOKEN),
         "the stale grant token must be gone from the Gemfile:\n{gemfile}"
     );
-    assert!(
-        !gemfile.contains(&fx.index_url),
-        "the grant-A index URL must be refreshed away:\n{gemfile}"
+    // The lock follows, so the pair stays frozen-installable.
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+        lock_after_run1.replace(&fx.index_url, &index_url_b),
+        "the lock's remote must be refreshed with the Gemfile"
     );
     assert_no_redirect_ledger(&fx.proj);
 
-    // Fresh checkout of the rotated pair: the prescribed unfrozen install
-    // resolves the patched gem from the rotated registry path.
+    // Fresh checkout of the rotated pair: the frozen install resolves the
+    // patched gem from the rotated registry path and leaves the lock alone.
     let (fresh, install) = fresh_checkout_bundle_install(&fx);
     assert!(
         install.status.success(),
-        "fresh-checkout `bundle install` after rotation must succeed.\nstdout:\n{}\nstderr:\n{}",
+        "fresh-checkout frozen `bundle install` after rotation must succeed.\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&install.stdout),
         String::from_utf8_lossy(&install.stderr),
     );
+    assert_lock_untouched_by_install(&fx, &fresh);
     assert_patched_install(&fx, &fresh);
     // The rotated grant's URL (token B) is what the lock names now.
     let rotated = RedirectFixture {
@@ -4247,13 +4546,14 @@ fn rollout_counts(env: &serde_json::Value) -> (u64, u64, u64, u64) {
     (n("new"), n("upgrade"), n("already"), n("deferred"))
 }
 
-/// #1224: on a lock with no CHECKSUMS section (bundler < 2.6, or an older
-/// lock bundler 4 keeps without one) the hosted redirect wires only the
-/// Gemfile's `source "<patch registry>" do` block and leaves the lock for
-/// the next unfrozen install. A capped re-scan must still count that pin as
-/// ALREADY: `--max-new-patches 0` must not defer it, and under a cap of 1
-/// the run after the first must spend its slot on the NEXT gem instead of
-/// re-counting the wired one as NEW forever.
+/// #1224: a pin only the Gemfile holds — its `source:` option is there, the
+/// lock still names the registry (what a reverted or regenerated lock, or a
+/// pair socket-patch 5.0 / 5.1 wrote for a lock with no CHECKSUMS section,
+/// looks like). A capped re-scan must count that pin as ALREADY:
+/// `--max-new-patches 0` must not defer it, and brings the lock back in
+/// line with the Gemfile; under a cap of 1 the run after the first must
+/// spend its slot on the NEXT gem instead of re-counting the wired one as
+/// NEW forever.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -4273,11 +4573,15 @@ async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
     let api = fx._server.uri();
     let lock_path = fx.proj.join(fx.lock_name);
     let gemfile_path = fx.proj.join(fx.gemfile_name);
-    let lock = std::fs::read_to_string(&lock_path).unwrap();
+    let converged = std::fs::read_to_string(&lock_path).unwrap();
     assert!(
-        !lock.contains("CHECKSUMS") && !lock.contains(&fx.index_url),
-        "the fixture must leave the CHECKSUMS-less lock mixed (Gemfile-only pin):\n{lock}"
+        !converged.contains("CHECKSUMS") && converged.contains(&fx.index_url),
+        "the scan converges the CHECKSUMS-less lock:\n{converged}"
     );
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+
+    // The Gemfile-only pin: the lock reverted to its registry version.
+    std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
 
     // Single gem, already wired in the Gemfile: "upgrade existing patches
     // only" must read it as ALREADY, not defer it as NEW.
@@ -4289,6 +4593,16 @@ async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
         .flatten()
         .any(|s| s["reason"] == "rollout_deferred");
     assert!(!deferred, "a wired gem must not be rollout_deferred: {env}");
+    assert_eq!(
+        std::fs::read_to_string(&gemfile_path).unwrap(),
+        gemfile,
+        "cap 0 re-scan: the Gemfile is already wired"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        converged,
+        "cap 0 re-scan: the lock is brought back in line with the Gemfile"
+    );
 
     // Two patchable gems under a cap of 1, from the pristine pair: run 1
     // wires one, run 2 must wire the other, run 3 finds both in place.
@@ -4341,10 +4655,15 @@ async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
         "run 2 must count the gem run 1 wired as ALREADY and add the other: {env}"
     );
     let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    let lock = std::fs::read_to_string(&lock_path).unwrap();
     for (gem, patch) in [(DEP, UUID), (TRANSITIVE, TINY_GEN2)] {
         assert!(
             gemfile.contains(&registry(patch)),
-            "run 2 must leave both gems wired ({gem} missing)"
+            "run 2 must leave both gems wired ({gem} missing):\n{gemfile}"
+        );
+        assert!(
+            lock.contains(&registry(patch)),
+            "run 2: the lock follows the Gemfile ({gem} missing):\n{lock}"
         );
     }
     let env = run_capped_hosted_scan(&fx.proj, &api, "1");
@@ -4354,13 +4673,19 @@ async fn gem_hosted_capped_rescan_counts_a_gemfile_only_pin_as_already() {
         gemfile,
         "run 3 must leave the Gemfile byte-identical"
     );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        lock,
+        "run 3 must leave the lock byte-identical"
+    );
 }
 
 /// #1224 (superseding shape): a newer patch for the same gem version, new
-/// uuid, over a Gemfile-only pin. `--max-new-patches 0` ("upgrade existing
-/// patches only") must see the recorded pin and UPGRADE it to the new uuid,
-/// as it does on a CHECKSUMS lock, instead of deferring it as NEW and
-/// leaving the Gemfile on the superseded patch.
+/// uuid, over a Gemfile-only pin (the lock reverted to its registry
+/// version). `--max-new-patches 0` ("upgrade existing patches only") must
+/// see the Gemfile's pin and UPGRADE it to the new uuid, the lock with it,
+/// instead of deferring it as NEW and leaving the Gemfile on the superseded
+/// patch.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
@@ -4398,14 +4723,22 @@ async fn gem_hosted_cap_zero_upgrades_a_superseded_gemfile_only_pin() {
         ),
     };
     mount_patch_generation(&fx._server, 1, &[vuln]).await;
+    let gemfile_before = std::fs::read_to_string(fx.proj.join(fx.gemfile_name)).unwrap();
+    let lock_before = std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap();
+    std::fs::write(fx.proj.join(fx.lock_name), &fx.pristine_lock).unwrap();
 
     let env = run_capped_hosted_scan(&fx.proj, &api, "0");
     assert_eq!(rollout_counts(&env), (0, 1, 0, 0), "cap 0 re-scan: {env}");
-    let gemfile = std::fs::read_to_string(fx.proj.join(fx.gemfile_name)).unwrap();
-    assert!(
-        gemfile.contains(&format!("{api}/patch-registry/gem/{TOKEN}/{VULN_GEN2}/"))
-            && !gemfile.contains(&fx.index_url),
-        "the Gemfile must move to the superseding patch:\n{gemfile}"
+    let gen2_url = format!("{api}/patch-registry/gem/{TOKEN}/{VULN_GEN2}/");
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join(fx.gemfile_name)).unwrap(),
+        gemfile_before.replace(&fx.index_url, &gen2_url),
+        "the Gemfile's option must move to the superseding patch, in place"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.proj.join(fx.lock_name)).unwrap(),
+        lock_before.replace(&fx.index_url, &gen2_url),
+        "the lock must converge on the superseding patch"
     );
 }
 
@@ -4771,91 +5104,100 @@ async fn gem_vendored_unwind_names_a_patched_archive_in_vendor_cache() {
 }
 
 /// #1831: a hosted redirect over a CRLF Gemfile (a Windows checkout, or
-/// `core.autocrlf=true`) keeps it CRLF throughout, for a plain top-level
-/// declaration and for one inside the user's own `source … do` block; a
-/// real bundler converges the result, a re-scan is a no-op, and `rollback`
-/// hands back a CRLF Gemfile that still declares the gem.
+/// `core.autocrlf=true`) keeps it CRLF throughout: the edit is the option
+/// alone, the real bundler installs the pair frozen and has nothing to
+/// change in the lock, a re-scan is a no-op, and `rollback` hands back the
+/// CRLF Gemfile byte for byte.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
             the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
 async fn gem_hosted_redirect_keeps_a_crlf_gemfile_crlf() {
-    fn all_crlf(text: &str) -> bool {
-        let crlf = text.matches("\r\n").count();
-        crlf > 0 && crlf == text.matches('\n').count() && crlf == text.matches('\r').count()
-    }
-    for (tag, driver) in [
-        ("crlf-gemfile", Driver::ScanVex),
-        ("crlf-gemfile-source-block", Driver::ScanVexSourceBlock),
-    ] {
-        let Some(fx) =
-            redirect_scanned_project(tag, Spelling::Gemfile, false, true, None, driver).await
-        else {
-            return;
-        };
-        let api = fx._server.uri();
-        let gemfile_path = fx.proj.join(fx.gemfile_name);
-        let lock_path = fx.proj.join(fx.lock_name);
-        // Start over from the pristine pair, its Gemfile in CRLF.
-        let pristine = String::from_utf8(fx.pristine_gemfile.clone()).unwrap();
-        let crlf = pristine.replace("\r\n", "\n").replace('\n', "\r\n");
-        let _ = std::fs::remove_dir_all(fx.proj.join(".socket"));
-        std::fs::write(&gemfile_path, &crlf).unwrap();
-        std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
+    let Some(fx) = redirect_scanned_project(
+        "crlf-gemfile",
+        Spelling::Gemfile,
+        false,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let api = fx._server.uri();
+    let gemfile_path = fx.proj.join(fx.gemfile_name);
+    let lock_path = fx.proj.join(fx.lock_name);
+    let scanned_lock = std::fs::read_to_string(&lock_path).unwrap();
+    // Start over from the pristine pair, its Gemfile in CRLF.
+    let pristine = String::from_utf8(fx.pristine_gemfile.clone()).unwrap();
+    let crlf = pristine.replace("\r\n", "\n").replace('\n', "\r\n");
+    let _ = std::fs::remove_dir_all(fx.proj.join(".socket"));
+    std::fs::write(&gemfile_path, &crlf).unwrap();
+    std::fs::write(&lock_path, &fx.pristine_lock).unwrap();
 
-        let (code, out, err) = run_hosted_scan(&fx.proj, &api);
-        assert_eq!(code, 0, "{tag}: hosted scan: {out}\n{err}");
-        let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
-        assert!(
-            gemfile.contains(&fx.index_url),
-            "{tag}: the Gemfile is redirected: {gemfile:?}"
-        );
-        assert!(
-            all_crlf(&gemfile),
-            "{tag}: the redirected Gemfile mixes line endings: {gemfile:?}"
-        );
+    let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(code, 0, "hosted scan: {out}\n{err}");
+    let gemfile = std::fs::read_to_string(&gemfile_path).unwrap();
+    assert_eq!(
+        gemfile,
+        with_source_option(&crlf, &format!("gem \"{DEP}\""), &fx.index_url),
+        "the CRLF Gemfile gains the option and nothing else"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        scanned_lock,
+        "the lock converges as it does beside an LF Gemfile"
+    );
 
-        let install = bundle(&fx.proj, &["install"]);
-        assert!(
-            install.status.success(),
-            "{tag}: converging install of the CRLF Gemfile:\n{}",
-            String::from_utf8_lossy(&install.stderr)
-        );
-        let (code, out, err) = run_hosted_scan(&fx.proj, &api);
-        assert_eq!(code, 0, "{tag}: re-scan: {out}\n{err}");
-        assert_eq!(
-            std::fs::read_to_string(&gemfile_path).unwrap(),
-            gemfile,
-            "{tag}: a re-scan leaves the Gemfile byte-identical"
-        );
+    let install = bundle_env(&fx.proj, &["install"], &[("BUNDLE_FROZEN", "true")]);
+    assert!(
+        install.status.success(),
+        "frozen install of the CRLF Gemfile's pair:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let (code, out, err) = run_hosted_scan(&fx.proj, &api);
+    assert_eq!(code, 0, "re-scan: {out}\n{err}");
+    assert_eq!(
+        std::fs::read_to_string(&gemfile_path).unwrap(),
+        gemfile,
+        "a re-scan leaves the Gemfile byte-identical"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&lock_path).unwrap(),
+        scanned_lock,
+        "a re-scan leaves the lock byte-identical"
+    );
 
-        let upstream = format!("{api}/upstream");
-        let cwd = fx.proj.to_str().expect("utf8 tmp path");
-        let (code, stdout, stderr) = run_socket_env(
-            &fx.proj,
-            &[
-                "rollback",
-                PURL,
-                "--json",
-                "--cwd",
-                cwd,
-                "--api-url",
-                &api,
-                "--org",
-                ORG,
-                "--api-token",
-                "fake",
-                "--patch-server-url",
-                &api,
-            ],
-            &[("SOCKET_RUBYGEMS_URL", &upstream)],
-        );
-        assert_eq!(code, 0, "{tag}: rollback: {stdout}\nstderr:\n{stderr}");
-        let restored = std::fs::read_to_string(&gemfile_path).unwrap();
-        assert!(
-            !restored.contains("patch-registry")
-                && restored.contains(&format!("gem \"{DEP}\""))
-                && all_crlf(&restored),
-            "{tag}: rollback restores a CRLF Gemfile declaring the gem: {restored:?}"
-        );
-    }
+    let upstream = format!("{api}/upstream");
+    let cwd = fx.proj.to_str().expect("utf8 tmp path");
+    let (code, stdout, stderr) = run_socket_env(
+        &fx.proj,
+        &[
+            "rollback",
+            PURL,
+            "--json",
+            "--cwd",
+            cwd,
+            "--api-url",
+            &api,
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            &api,
+        ],
+        &[("SOCKET_RUBYGEMS_URL", &upstream)],
+    );
+    assert_eq!(code, 0, "rollback: {stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        std::fs::read_to_string(&gemfile_path).unwrap(),
+        crlf,
+        "rollback hands the CRLF Gemfile back byte for byte"
+    );
+    assert_eq!(
+        std::fs::read(&lock_path).unwrap(),
+        fx.pristine_lock,
+        "rollback hands the lock back byte for byte"
+    );
 }
