@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchFileInfo;
-use crate::patch::apply::{files_in_order, normalize_file_path};
+use crate::patch::apply::{
+    commit_package, files_in_order, finish_package, normalize_file_path, stage_change, FileChange,
+    PackageWrite, PackageWriteError,
+};
 use crate::patch::file_hash::compute_file_git_sha256;
 
 /// Status of a file rollback verification.
@@ -678,6 +681,15 @@ async fn rollback_package_patch_at(
             return result;
         }
     }
+    // An earlier run that was interrupted may have left stages behind.
+    if !dry_run {
+        crate::patch::apply::sweep_stale_stages(
+            pkg_path,
+            files,
+            crate::patch::apply::STALE_STAGE_AGE,
+        )
+        .await;
+    }
     if all_original || dry_run {
         // Maven: retry a Coursier sidecar resync an earlier rollback could
         // not finish (see `sidecars::coursier::retry_record`).
@@ -699,170 +711,174 @@ async fn rollback_package_patch_at(
         return result;
     }
 
-    // Advisory notes from restores that committed but could not put the
-    // ownership back (see `apply_file_patch_at`); reported on `error`
-    // alongside `success`.
+    // Advisory notes from restores that committed but could not keep an
+    // owner or clean up after themselves (see `apply_file_patch_at`);
+    // reported on `error` alongside `success`.
     let mut warnings: Vec<String> = Vec::new();
 
-    // Rollback files that need it
+    // A failed restore or delete fails the package with every file as it
+    // was, and names the file (apply's twin, the Windows daemon advisory
+    // included).
+    let write_failed = |result: &mut RollbackResult, e: PackageWriteError| {
+        let file = e.file.unwrap_or_default();
+        let target = pkg_path.join(normalize_file_path(&file));
+        if package_key.starts_with("pkg:maven/")
+            && crate::patch::sidecars::maven::is_locked_by_daemon(&e.source, &target)
+        {
+            result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                purl: package_key.to_string(),
+                ecosystem: "maven".to_string(),
+                files: Vec::new(),
+                advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                    &target,
+                )),
+            });
+        }
+        let note = crate::patch::apply::not_restored_note(&e.not_restored);
+        result.error = Some(if e.delete {
+            format!("Failed to delete {file}: {}{note}", e.source)
+        } else {
+            format!(
+                "{}{note}",
+                cannot_rollback_error(&file, &e.source.to_string())
+            )
+        });
+    };
+
+    // Stage every restore, and plan every delete, before the first file is
+    // changed: rolling a file back is the same operation as patching it
+    // forward ("safely overwrite this file with these hash-verified
+    // bytes"), so it goes through the same `PackageWrite` and gets the same
+    // guarantees. A before blob that cannot be read or does not hold its
+    // hash's bytes stops the package with nothing changed. pnpm store
+    // copies are rolled back by the package-level wrapper, one full verify
+    // each.
+    let pending: std::collections::HashSet<&str> = result
+        .files_verified
+        .iter()
+        .filter(|v| v.status != VerifyRollbackStatus::AlreadyOriginal)
+        .map(|v| v.file.as_str())
+        .collect();
+    let mut write = PackageWrite::new();
+    // Each changed file, and whether it was deleted.
+    let mut changed: Vec<(&String, bool)> = Vec::new();
     for (file_name, file_info) in files_in_order(files) {
-        let already_original = result
-            .files_verified
-            .iter()
-            .any(|v| v.file == *file_name && v.status == VerifyRollbackStatus::AlreadyOriginal);
-        if already_original {
+        if !pending.contains(file_name.as_str()) {
             continue;
         }
 
         // New files (empty beforeHash): delete instead of restoring.
-        if file_info.before_hash.is_empty() {
-            let normalized = normalize_file_path(file_name);
-            // SECURITY: this delete path constructs the target itself and
-            // does NOT go through `apply_file_patch_at`, so it must enforce the
-            // same path-escape guard. Without it a poisoned manifest entry
-            // (empty beforeHash + a `../../`/absolute key) would unlink an
-            // arbitrary file outside the package directory. Verify already
-            // blocks such keys, but defense-in-depth: never trust an
-            // unvalidated key at the syscall.
-            if !crate::patch::apply::is_safe_relative_subpath(normalized) {
-                result.error = Some(format!(
-                    "Unsafe patch path (escapes package directory): {}",
-                    file_name
-                ));
-                return result;
-            }
-            let filepath = pkg_path.join(normalized);
-            // Unlinking a directory entry requires write permission on the
-            // *parent directory*, not the file. Go's module cache marks
-            // package directories read-only (0o555), so — exactly as the
-            // apply write path does — temporarily grant owner-write on the
-            // parent and restore its exact mode afterward, whether the
-            // delete succeeds or fails.
-            let dir_guard = crate::patch::apply::DirWriteGuard::acquire(filepath.parent()).await;
-            let remove_result = tokio::fs::remove_file(&filepath).await;
-            dir_guard.restore().await;
-            if let Err(e) = remove_result {
-                result.error = Some(format!("Failed to delete {}: {}", file_name, e));
-                return result;
-            }
-            // The bytecode goes whatever the pruning decides: a stale `.pyc`
-            // of a deleted module must not outlive it, and a failed delete is
-            // reported like a restore's (`stale_bytecode_not_removed`).
-            warnings.extend(
-                crate::patch::apply::remove_stale_bytecode(
-                    &filepath,
-                    crate::patch::apply::StaleBytecode::All,
-                )
-                .await,
-            );
-            prune_emptied_parents(pkg_path, &filepath).await;
-            result.files_rolled_back.push(file_name.clone());
-            continue;
-        }
-
-        // SECURITY: defense-in-depth twin of the verify-time guard — never
-        // join an unvalidated manifest hash onto the blobs directory at the
-        // read syscall either (mirrors the delete branch above). Verify
-        // already blocks unsafe hashes, but this read must not depend on it.
-        if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
-            result.error = Some(format!(
-                "Unsafe before-blob hash (escapes blobs directory): {}",
-                file_info.before_hash
-            ));
-            return result;
-        }
-        // Twin of the verify-time 64-hex gate (see `verify_file_rollback`):
-        // shared with the apply engine's `read_blob`.
-        if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
-            result.error = Some(format!(
-                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
-                file_info.before_hash
-            ));
-            return result;
-        }
-
-        // Read the original content from the blob. SECURITY: defense-in-depth
-        // twin of the verify-time entry-type guard (exactly like the string
-        // guard above) — `read_blob_entry` lstat's the ENTRY (a planted
-        // symlink is refused, never followed) and opens FIFO-safe, so this
-        // read does not depend on verify having blocked a bad entry.
-        let blob_path = blobs_path.join(&file_info.before_hash);
-        let original_content = match crate::patch::apply::read_blob_entry(&blob_path).await {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                result.error = Some(format!(
-                    "Before blob is not a regular file: {}",
+        let change = if file_info.before_hash.is_empty() {
+            FileChange::Delete
+        } else {
+            // SECURITY: defense-in-depth twin of the verify-time guards —
+            // never join an unvalidated manifest hash onto the blobs
+            // directory at the read syscall either. Verify already blocks
+            // unsafe hashes, but this read must not depend on it.
+            let blob = if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
+                Err(format!(
+                    "Unsafe before-blob hash (escapes blobs directory): {}",
                     file_info.before_hash
-                ));
-                return result;
-            }
-            Err(e) => {
-                result.error = Some(format!(
-                    "Failed to read blob {}: {}",
-                    file_info.before_hash, e
-                ));
-                return result;
-            }
-        };
-
-        // Restore via `apply_file_patch_at`, the hardened single-copy write
-        // path shared with apply — rolling a file back is the same operation
-        // as patching it forward ("safely overwrite this file with these
-        // hash-verified bytes") and gets the same guarantees: blob
-        // hash-checked in memory before any disk write, atomic stage+rename
-        // (which also isolates shared pnpm / Go-cache inodes), and the
-        // file's original mode + uid/gid restored afterward. pnpm store
-        // copies are rolled back by the package-level wrapper, one full
-        // verify each.
-        //
-        // A bin npm installed with an LF shebang gets the original in that
-        // form, the bytes `npm install` leaves (see `npm_bin`).
-        let (original_content, restored_hash) = match crate::patch::npm_bin::form_for_write(
-            package_key,
-            pkg_path,
-            normalize_file_path(file_name),
-            &file_info.after_hash,
-            std::borrow::Cow::Owned(original_content),
-            &file_info.before_hash,
-        )
-        .await
-        {
-            Ok(write) => write,
-            Err(e) => {
-                result.error = Some(e.to_string());
-                return result;
-            }
-        };
-        match crate::patch::apply::apply_file_patch_at(
-            pkg_path,
-            file_name,
-            &original_content,
-            &restored_hash,
-        )
-        .await
-        {
-            Ok(warning) => warnings.extend(warning),
-            Err(e) => {
-                // A Windows daemon holding a cached jar open: say which
-                // process to stop (apply's twin).
-                let target = pkg_path.join(normalize_file_path(file_name));
-                if package_key.starts_with("pkg:maven/")
-                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
-                {
-                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
-                        purl: package_key.to_string(),
-                        ecosystem: "maven".to_string(),
-                        files: Vec::new(),
-                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
-                            &target,
-                        )),
-                    });
+                ))
+            } else if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
+                Err(format!(
+                    "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
+                    file_info.before_hash
+                ))
+            } else {
+                // `read_blob_entry` lstat's the ENTRY (a planted symlink is
+                // refused, never followed) and opens FIFO-safe.
+                let blob_path = blobs_path.join(&file_info.before_hash);
+                match crate::patch::apply::read_blob_entry(&blob_path).await {
+                    Ok(content) => {
+                        let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&content);
+                        if hash == file_info.before_hash {
+                            Ok(content)
+                        } else {
+                            Err(format!(
+                                "Hash verification failed before patch. Expected: {}, Got: \
+                                 {hash}. The blob {} is corrupt: delete it and re-download the \
+                                 patch to enable rollback",
+                                file_info.before_hash,
+                                blob_path.display()
+                            ))
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(format!(
+                        "Before blob is not a regular file: {}",
+                        file_info.before_hash
+                    )),
+                    Err(e) => Err(format!(
+                        "Failed to read blob {}: {}",
+                        file_info.before_hash, e
+                    )),
                 }
-                result.error = Some(e.to_string());
+            };
+            // A bin npm installed with an LF shebang gets the original in
+            // that form, the bytes `npm install` leaves (see `npm_bin`).
+            let formed = match blob {
+                Ok(content) => crate::patch::npm_bin::form_for_write(
+                    package_key,
+                    pkg_path,
+                    normalize_file_path(file_name),
+                    &file_info.after_hash,
+                    std::borrow::Cow::Owned(content),
+                    &file_info.before_hash,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                Err(msg) => Err(msg),
+            };
+            match formed {
+                Ok((content, hash)) => FileChange::Write {
+                    content: content.into_owned(),
+                    hash,
+                },
+                Err(msg) => {
+                    crate::patch::apply::abort_package(write).await;
+                    result.error = Some(cannot_rollback_error(file_name, &msg));
+                    return result;
+                }
+            }
+        };
+
+        let deleted = matches!(change, FileChange::Delete);
+        write = match stage_change(write, pkg_path, file_name, change).await {
+            Ok((write, warning)) => {
+                warnings.extend(warning);
+                write
+            }
+            Err(e) => {
+                write_failed(&mut result, e);
                 return result;
             }
-        }
+        };
+        changed.push((file_name, deleted));
+    }
 
+    let write = match commit_package(write).await {
+        Ok(write) => write,
+        Err(e) => {
+            write_failed(&mut result, e);
+            return result;
+        }
+    };
+    warnings.extend(finish_package(write).await);
+    for (file_name, deleted) in changed {
+        let filepath = pkg_path.join(normalize_file_path(file_name));
+        // The bytecode goes whatever the pruning decides: a stale `.pyc` of
+        // a rewritten or deleted module must not outlive it, and a failed
+        // delete is reported (`stale_bytecode_not_removed`).
+        warnings.extend(
+            crate::patch::apply::remove_stale_bytecode(
+                &filepath,
+                crate::patch::apply::StaleBytecode::All,
+            )
+            .await,
+        );
+        if deleted {
+            prune_emptied_parents(pkg_path, &filepath).await;
+        }
         result.files_rolled_back.push(file_name.clone());
     }
 
@@ -2943,6 +2959,82 @@ mod tests {
                 "stage/cow litter leaked: {name}"
             );
         }
+    }
+
+    /// A package rollback changes nothing when a LATER file cannot be
+    /// restored: with the before blob of the last file corrupt, the
+    /// patch-added file sorted first is not deleted and the file before it
+    /// is not restored, and the error names the file and its blob.
+    #[tokio::test]
+    async fn test_rollback_package_patch_later_file_failure_changes_nothing() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let hash = compute_git_sha256_from_bytes;
+
+        let mut files = HashMap::new();
+        tokio::fs::write(pkg_dir.path().join("a-added.js"), b"added")
+            .await
+            .unwrap();
+        files.insert(
+            "a-added.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: hash(b"added"),
+            },
+        );
+        for name in ["b.js", "c.js"] {
+            let (original, patched) = (format!("original {name}"), format!("patched {name}"));
+            tokio::fs::write(pkg_dir.path().join(name), &patched)
+                .await
+                .unwrap();
+            let blob = if name == "c.js" {
+                b"corrupted blob bytes".to_vec()
+            } else {
+                original.clone().into_bytes()
+            };
+            tokio::fs::write(blobs_dir.path().join(hash(original.as_bytes())), blob)
+                .await
+                .unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: hash(original.as_bytes()),
+                    after_hash: hash(patched.as_bytes()),
+                },
+            );
+        }
+
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("c.js") && err.contains(&hash(b"original c.js")),
+            "the error must name the file and its blob: {err}"
+        );
+        let read = |name: &str| std::fs::read(pkg_dir.path().join(name)).unwrap();
+        assert_eq!(read("a-added.js"), b"added");
+        assert_eq!(read("b.js"), b"patched b.js");
+        assert_eq!(read("c.js"), b"patched c.js");
+        let mut names: Vec<String> = std::fs::read_dir(pkg_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a-added.js", "b.js", "c.js"],
+            "no stage may be left"
+        );
     }
 
     /// New-file delete failure surfaces: when the unlink itself fails the
