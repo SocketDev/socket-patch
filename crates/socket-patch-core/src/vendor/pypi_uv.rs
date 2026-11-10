@@ -36,7 +36,7 @@ use crate::patch::redirect::upstream::{
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
-use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_lock::preserve_each_line_ending;
 use crate::utils::python_script::{
     find_ancestor_uv_config, refuse_uv_no_binary, refuse_uv_no_sources,
     refuse_uv_project_shadowing, root_governs_script, UvConfig, UV_TOML,
@@ -674,10 +674,8 @@ pub(super) async fn wire_uv(
                     .and_then(Item::as_value)
                     .map(|v| v.to_string().trim().to_string())
                     .unwrap_or_default();
-                // Multi-line arrays render LF; record both fragments in the
-                // file's own convention or revert's exact-text splice misses.
-                let old_text = preserve_line_endings(&p.pyproject_text, old_text);
-                let new_text = preserve_line_endings(&p.pyproject_text, new_text);
+                // Both fragments are respelled below, once the file is
+                // rendered, as the bytes it holds on each side of the edit.
                 wiring.push(record(
                     "pyproject.toml",
                     "uv_override",
@@ -714,7 +712,26 @@ pub(super) async fn wire_uv(
     ));
     // toml_edit re-emits every newline as LF; a CRLF pyproject would come
     // back all-LF (whole-file churn, and revert splices never restore it).
-    let new_pyproject = preserve_line_endings(&p.pyproject_text, doc.to_string());
+    // One mixing CRLF and LF lines gets each line's own ending back.
+    let new_pyproject = preserve_each_line_ending(&p.pyproject_text, doc.to_string());
+    // A rewritten array's lines render LF and are then given the file's
+    // endings line by line, so it is recorded as the bytes the file holds
+    // before and after: revert splices it back by exact text.
+    if let Some(rec) = wiring
+        .iter_mut()
+        .find(|r| r.kind == "uv_override" && r.action == WiringAction::Rewritten)
+    {
+        let (old, new) = override_array_text(&p.pyproject_text)
+            .zip(override_array_text(&new_pyproject))
+            .ok_or_else(|| {
+                (
+                    "pypi_uv_lock_parse_failed",
+                    "cannot locate [tool.uv] override-dependencies in pyproject.toml".to_string(),
+                )
+            })?;
+        rec.original = Some(serde_json::Value::String(old.to_string()));
+        rec.new = Some(serde_json::Value::String(new.to_string()));
+    }
     // toml_edit writes each added key in the spelling its parent already
     // uses (`sources.six = …` under a dotted `[tool.uv]` key, `uv.…` under
     // `[tool]`), so record the line as it actually rendered: revert splices
@@ -1699,6 +1716,19 @@ fn header_is_ours(item: Option<&Item>) -> bool {
         Some(Item::Table(t)) => t.is_implicit() && !t.is_dotted(),
         Some(_) => false,
     }
+}
+
+/// The bytes of `[tool.uv] override-dependencies`' value in the pyproject
+/// `text`, from its `[` to its `]`.
+fn override_array_text(text: &str) -> Option<&str> {
+    let doc = toml_edit::Document::parse(text).ok()?;
+    let span = doc
+        .get("tool")?
+        .get("uv")?
+        .get("override-dependencies")?
+        .as_value()?
+        .span()?;
+    text.get(span)
 }
 
 /// The line of `new` that renders the added `fragment` (`key = value`),
@@ -7362,6 +7392,118 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             let (pyproject, lock) = read_pair(tmp.path()).await;
             assert_eq!(pyproject, pyproject_crlf, "{label}: pyproject not restored");
             assert_eq!(lock, lock_crlf, "{label}: lock not restored");
+        }
+    }
+
+    /// A pyproject.toml that mixes CRLF and LF lines (a CRLF checkout a
+    /// tool appended LF lines to) has no one style to give back, and used
+    /// to be written all-LF: every CRLF line churned, and the revert, which
+    /// only takes the wired lines out, left them that way. Each line the
+    /// wiring leaves alone now keeps its own ending, and the revert restores
+    /// the file's bytes. Same shapes as the CRLF round trip above.
+    #[tokio::test]
+    async fn mixed_line_ending_pyproject_keeps_its_lines_and_reverts_byte_exact() {
+        use crate::utils::line_endings::LineEndings;
+        let existing_override_pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\n    \"attrs==23.1.0\",\n]\n"
+        );
+        let existing_override_lock = TRANSITIVE_REGISTRY_LOCK.replacen(
+            "[[package]]",
+            "[manifest]\noverrides = [\n    { name = \"attrs\", specifier = \"==23.1.0\" },\n]\n\n[[package]]",
+            1,
+        );
+        let cases: [(&str, &str, &str); 4] = [
+            ("direct", DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT,
+                TRANSITIVE_REGISTRY_LOCK,
+            ),
+            (
+                "existing-override",
+                &existing_override_pyproject,
+                &existing_override_lock,
+            ),
+            (
+                "dev-group",
+                DEV_GROUP_REGISTRY_PYPROJECT,
+                DEV_GROUP_REGISTRY_LOCK,
+            ),
+        ];
+        // Which lines are LF: every third one (mostly CRLF), or all but
+        // every third one (mostly LF).
+        for lf_line in [|i: usize| i % 3 == 1, |i: usize| i % 3 != 1] {
+            for (label, pyproject_lf, lock) in cases {
+                let mixed: String = pyproject_lf
+                    .split_inclusive('\n')
+                    .enumerate()
+                    .map(|(i, line)| match lf_line(i) {
+                        true => line.to_string(),
+                        false => line.replace('\n', "\r\n"),
+                    })
+                    .collect();
+                assert_eq!(LineEndings::of(&mixed), LineEndings::Mixed, "{label}");
+                let tmp = write_pair(&mixed, lock).await;
+                let p = load_uv_project(tmp.path()).await.unwrap();
+                let (wiring, meta, _) = wire_uv(
+                    &p,
+                    tmp.path(),
+                    "six",
+                    "1.16.0",
+                    REL_WHEEL,
+                    WHEEL_NAME,
+                    WHEEL_SHA,
+                    UUID,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                let (wired, wired_lock) = read_pair(tmp.path()).await;
+
+                // Modulo line endings the wired pair is the LF pair's wiring.
+                let tmp_lf = write_pair(pyproject_lf, lock).await;
+                let p_lf = load_uv_project(tmp_lf.path()).await.unwrap();
+                wire_uv(
+                    &p_lf,
+                    tmp_lf.path(),
+                    "six",
+                    "1.16.0",
+                    REL_WHEEL,
+                    WHEEL_NAME,
+                    WHEEL_SHA,
+                    UUID,
+                )
+                .await
+                .unwrap();
+                let (wired_lf, wired_lock_lf) = read_pair(tmp_lf.path()).await;
+                assert_eq!(wired.replace("\r\n", "\n"), wired_lf, "{label}");
+                assert_eq!(wired_lock, wired_lock_lf, "{label}");
+
+                // Every line the file had is still there, ending included
+                // (but the one array line the override is added to).
+                let wired_lines: Vec<&str> = wired.split_inclusive('\n').collect();
+                let mut next = 0;
+                for line in mixed.split_inclusive('\n') {
+                    match wired_lines[next..].iter().position(|w| *w == line) {
+                        Some(at) => next += at + 1,
+                        None => assert!(
+                            label == "existing-override" && line.contains("attrs==23.1.0"),
+                            "{label}: {line:?} did not keep its bytes:\n{wired:?}"
+                        ),
+                    }
+                }
+
+                let entry = entry_for(wiring, meta);
+                let outcome = revert_uv(&entry, tmp.path(), false).await;
+                assert!(outcome.success, "{label}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{label}: {:?}",
+                    outcome.warnings
+                );
+                let (pyproject, reverted_lock) = read_pair(tmp.path()).await;
+                assert_eq!(pyproject, mixed, "{label}: pyproject not restored");
+                assert_eq!(reverted_lock, lock, "{label}: lock not restored");
+            }
         }
     }
 

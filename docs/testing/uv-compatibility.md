@@ -195,7 +195,12 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - Both uv backends preserve CRLF line endings: the hosted rewriter and the
   vendored `uv.lock` / `pyproject.toml` writer (including the appended
   `[manifest]` and `[package.metadata]` fragments and their revert) keep the
-  file's convention.
+  file's convention. A `pyproject.toml` that mixes CRLF and LF lines keeps
+  each line's own ending through vendored uv wiring: only the lines the
+  wiring adds or changes are new (they take the ending most of the file's
+  lines have), and `vendor --revert` restores the file's original bytes.
+  The other writers that render a whole document (hosted mode, Hatch, PEP
+  723 script blocks, PEP 751 locks) still write a mixed-ending file all-LF.
 - The `[package.metadata]` block of a vendored or hosted wheel is rebuilt
   from the wheel's `Requires-Dist` / `Provides-Extra` headers. Each value is
   written as one TOML string, and a header a lock entry cannot hold is

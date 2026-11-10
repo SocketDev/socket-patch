@@ -326,6 +326,94 @@ pub fn preserve_line_endings(original: &str, rendered: String) -> String {
     output
 }
 
+/// [`preserve_line_endings`] for a file whose every untouched line must keep
+/// its bytes even when the file mixes CRLF and LF lines: a user-authored
+/// `pyproject.toml` that a revert restores by splicing lines out, never by
+/// rewriting the file. A mixed file has no one style to convert the
+/// rendering to, so each rendered line takes the ending of the input line
+/// it renders, and a line the edit added or changed takes the ending most
+/// of the file's lines have. A file in one style comes back as
+/// [`preserve_line_endings`] gives it.
+pub(crate) fn preserve_each_line_ending(original: &str, rendered: String) -> String {
+    let mixed = original.contains("\r\n") && original.replace("\r\n", "").contains('\n');
+    if !mixed {
+        return preserve_line_endings(original, rendered);
+    }
+    use crate::utils::line_endings::{split_lines, terminator};
+    let old = split_lines(original);
+    let new = split_lines(&rendered);
+    let added = terminator(original);
+    let mut out = String::with_capacity(rendered.len() + new.len());
+    for ((content, ending), old_line) in new.iter().zip(pair_lines(&old, &new)) {
+        out.push_str(content);
+        // An unterminated last line stays unterminated.
+        if !ending.is_empty() {
+            out.push_str(match old_line.map(|line| old[line].1) {
+                Some(own) if !own.is_empty() => own,
+                _ => added,
+            });
+        }
+    }
+    out
+}
+
+/// The most `old × new` line pairs [`pair_lines`] compares between the
+/// first and the last line an edit changed. A pyproject edited in a few
+/// places is far below it; past it the lines in between are not paired.
+const MAX_PAIRED_CELLS: usize = 1 << 20;
+
+/// For each line of `new`, the line of `old` it is: one of equal content,
+/// in order (a longest common subsequence). The lines before and after the
+/// edited region pair up one to one; the region itself is aligned while it
+/// is small ([`MAX_PAIRED_CELLS`]) and left unpaired otherwise.
+fn pair_lines(old: &[(&str, &str)], new: &[(&str, &str)]) -> Vec<Option<usize>> {
+    let mut paired = vec![None; new.len()];
+    let same = |(a, b): &(&(&str, &str), &(&str, &str))| a.0 == b.0;
+    let head = old.iter().zip(new).take_while(same).count();
+    let tail = old[head..]
+        .iter()
+        .rev()
+        .zip(new[head..].iter().rev())
+        .take_while(same)
+        .count();
+    for (line, slot) in paired[..head].iter_mut().enumerate() {
+        *slot = Some(line);
+    }
+    for back in 1..=tail {
+        paired[new.len() - back] = Some(old.len() - back);
+    }
+    let old_mid = &old[head..old.len() - tail];
+    let new_mid = &new[head..new.len() - tail];
+    if old_mid.len().saturating_mul(new_mid.len()) > MAX_PAIRED_CELLS {
+        return paired;
+    }
+    // common[i][j]: the most lines old_mid[i..] and new_mid[j..] share.
+    let width = new_mid.len() + 1;
+    let mut common = vec![0u32; (old_mid.len() + 1) * width];
+    for i in (0..old_mid.len()).rev() {
+        for j in (0..new_mid.len()).rev() {
+            common[i * width + j] = if old_mid[i].0 == new_mid[j].0 {
+                common[(i + 1) * width + j + 1] + 1
+            } else {
+                common[(i + 1) * width + j].max(common[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < old_mid.len() && j < new_mid.len() {
+        if old_mid[i].0 == new_mid[j].0 {
+            paired[head + j] = Some(head + i);
+            i += 1;
+            j += 1;
+        } else if common[(i + 1) * width + j] >= common[i * width + j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    paired
+}
+
 /// Whether `existing` is an earlier hosted redirect of the SAME artifact:
 /// same origin (`scheme://host[:port]`) and same trailing filename as the
 /// current artifact URL, fragments ignored. Grant tokens and patch uuids live
@@ -2083,6 +2171,56 @@ wheels = [{url = "https://pypi.org/urllib3.whl", hashes = {sha256 = "old"}}]
         assert_eq!(
             preserve_line_endings("a\r\n", "a\r\nb\n".into()),
             "a\r\nb\r\n"
+        );
+    }
+
+    /// A file mixing CRLF and LF lines gets each line's own ending back, so
+    /// the edit changes only the lines it adds or rewrites; those take the
+    /// ending most of the file's lines have. One style is restored as
+    /// [`preserve_line_endings`] restores it.
+    #[test]
+    fn each_line_keeps_its_ending_in_a_mixed_file() {
+        for (original, rendered) in [
+            ("a\r\nb\r\n", "a\nb\nc\n"),
+            ("a\nb\n", "a\nb\nc\n"),
+            ("a", "a\nb\n"),
+        ] {
+            assert_eq!(
+                preserve_each_line_ending(original, rendered.into()),
+                preserve_line_endings(original, rendered.into())
+            );
+        }
+        // Nothing edited: the input bytes, an unterminated last line too.
+        for mixed in ["a\r\nb\nc", "a\r\nb\nc\r\n", "a\nb\r\n\r\nc\n"] {
+            assert_eq!(
+                preserve_each_line_ending(mixed, mixed.replace("\r\n", "\n")),
+                mixed
+            );
+        }
+        // Lines appended, inserted, changed and dropped (CRLF majority).
+        let mixed = "a\r\nb\nc\r\nd\r\n";
+        for (rendered, want) in [
+            ("a\nb\nc\nd\ne\n", "a\r\nb\nc\r\nd\r\ne\r\n"),
+            ("a\nx\nb\nc\nd\n", "a\r\nx\r\nb\nc\r\nd\r\n"),
+            ("a\nB\nc\nd\n", "a\r\nB\r\nc\r\nd\r\n"),
+            ("a\nc\nd\n", "a\r\nc\r\nd\r\n"),
+            ("x\na\nb\ny\nc\nd\nz\n", "x\r\na\r\nb\ny\r\nc\r\nd\r\nz\r\n"),
+        ] {
+            assert_eq!(preserve_each_line_ending(mixed, rendered.into()), want);
+        }
+        // An LF majority gives new lines LF, and a line appended after an
+        // unterminated last line terminates it.
+        assert_eq!(
+            preserve_each_line_ending("a\r\nb\nc\nd", "a\nb\nc\nd\ne\n".into()),
+            "a\r\nb\nc\nd\ne\n"
+        );
+        // Two edits apart: the lines between them keep their endings.
+        assert_eq!(
+            preserve_each_line_ending(
+                "h\r\nk = [\n  1,\r\n]\nm\r\nt\n",
+                "h\nk = [\n  1,\n  2,\n]\nm\nt\n[s]\nv = 1\n".into()
+            ),
+            "h\r\nk = [\n  1,\r\n  2,\n]\nm\r\nt\n[s]\nv = 1\n"
         );
     }
 
