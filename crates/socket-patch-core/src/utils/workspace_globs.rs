@@ -150,9 +150,18 @@ pub(crate) fn workspaces_include_as(
     if rel.is_empty() {
         return false;
     }
+    // A pattern past the matcher's bounds ([`pattern_matches`]) lists every
+    // directory and, as a `!` pattern, excludes none.
     let matches = |pattern: &str, negated: bool| {
         let picomatch = dialect.picomatch.then_some(Picomatch { negated });
-        pattern_matches(pattern, rel, dialect.dot, dialect.extglob, picomatch)
+        pattern_matches(
+            pattern,
+            rel,
+            dialect.dot,
+            dialect.extglob,
+            picomatch,
+            !negated,
+        )
     };
     match dialect.negation {
         Negation::LastMatchWins => {
@@ -163,7 +172,7 @@ pub(crate) fn workspaces_include_as(
                 // walked directories through its `!` patterns with a plain
                 // match that has no dot rule (as node-glob's ignore below).
                 let hit = if negated {
-                    pattern_matches(pattern, rel, true, dialect.extglob, None)
+                    pattern_matches(pattern, rel, true, dialect.extglob, None, false)
                 } else {
                     matches(pattern, false)
                 };
@@ -205,14 +214,16 @@ pub(crate) fn workspaces_include_as(
                     .filter(|s| !s.is_empty() && *s != ".")
                     .map(str::to_string)
                     .collect();
-                ignore.retain(|ign| !pattern_matches(ign, &text, false, true, None));
+                // An ignore past the matcher's bounds is dropped here, as
+                // one the pattern relists is: it excludes nothing.
+                ignore.retain(|ign| !pattern_matches(ign, &text, false, true, None, true));
                 listed |= matches(pattern, false);
             }
             // node-glob's ignore matches dot components.
             listed
                 && !ignore
                     .iter()
-                    .any(|ign| pattern_matches(ign, rel, true, dialect.extglob, None))
+                    .any(|ign| pattern_matches(ign, rel, true, dialect.extglob, None, false))
         }
         Negation::Literal => patterns.iter().any(|pattern| matches(pattern, false)),
     }
@@ -229,7 +240,9 @@ pub(crate) fn split_negation(pattern: &str) -> (bool, &str) {
 /// Whether one (un-negated) pattern matches `rel`. A pattern with no
 /// components left (`""`, `.`, `./`) matches nothing.
 pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, true, false, None)
+    // Without groups every pattern is read whole ([`pattern_matches`]), so
+    // the answer for one that is not never applies.
+    pattern_matches(pattern, rel, true, false, None, true)
 }
 
 /// [`glob_matches`] the way pnpm's globber reads `packages:` (`dot: false`,
@@ -238,7 +251,7 @@ pub(crate) fn glob_matches(pattern: &str, rel: &[String]) -> bool {
 /// `packages/*` does not list `packages/.hidden`. A pattern component that
 /// itself starts with `.` (`.github/**`) still matches it.
 pub(crate) fn glob_matches_no_dot(pattern: &str, rel: &[String]) -> bool {
-    pattern_matches(pattern, rel, false, false, None)
+    pattern_matches(pattern, rel, false, false, None, true)
 }
 
 /// How yarn berry's fast-glob / picomatch read a pattern beyond the shared
@@ -272,14 +285,40 @@ fn fast_glob_dynamic(pattern: &str) -> bool {
     DYNAMIC.is_match(pattern)
 }
 
+/// Longest brace alternative holding a group (or, read by picomatch, any
+/// alternative) that is matched, in characters: group matching recurses
+/// and rescans in proportion to it. minimatch and picomatch themselves
+/// refuse a pattern past 65,536.
+const MAX_GROUPED_CHARS: usize = 4096;
+
+/// Most `(` in a brace alternative that is matched: each may open a group,
+/// and the picomatch rewrite nests a call per group.
+const MAX_GROUPS: usize = 64;
+
+/// Most group-matcher steps ([`ExtglobMatcher`]) one pattern may take
+/// against one path. An ambiguous group costs the cube of the component's
+/// length, which a 255-character directory name turns into seconds per
+/// brace alternative; the patterns package managers are given take a few
+/// thousand.
+const MAX_GROUP_STEPS: usize = 1 << 20;
+
+/// Whether `pattern` matches `rel`. `unreadable` is the answer for a
+/// brace alternative with groups that is past the bounds above (its
+/// length, its groups, the steps or depth matching it takes): fail closed,
+/// so `true` where the pattern lists a directory and `false` where it
+/// excludes one. Without `extglob` and `picomatch` there are no groups,
+/// every alternative is read in pattern length × name length, and
+/// `unreadable` never applies.
 fn pattern_matches(
     pattern: &str,
     rel: &[String],
     dot: bool,
     extglob: bool,
     picomatch: Option<Picomatch>,
+    unreadable: bool,
 ) -> bool {
     let rel: Vec<Vec<char>> = rel.iter().map(|c| c.chars().collect()).collect();
+    let steps = std::cell::Cell::new(MAX_GROUP_STEPS);
     let matches = |alternative: &[char], static_path: bool| {
         let alternative: String = alternative.iter().collect();
         let mut segments: Vec<Vec<char>> = Vec::new();
@@ -300,13 +339,28 @@ fn pattern_matches(
             segments.push(segment.chars().collect());
         }
         !segments.is_empty()
-            && path_glob_matches(&segments, &rel, dot, extglob, picomatch.is_some())
+            && path_glob_matches(&segments, &rel, dot, extglob, picomatch.is_some(), &steps)
+                .unwrap_or(unreadable)
     };
     expand_braces(pattern.trim()).iter().any(|alternative| {
         let chars: Vec<char> = alternative.chars().collect();
+        let count = |open: char| chars.iter().filter(|c| **c == open).count();
         let Some(p) = picomatch else {
+            let groups = if extglob { count('(') } else { 0 };
+            if groups > MAX_GROUPS || (groups > 0 && chars.len() > MAX_GROUPED_CHARS) {
+                return unreadable;
+            }
             return matches(&chars, false);
         };
+        // The rewrite below reads the alternative once per group and per
+        // class, and writes it once per spelling.
+        if chars.len() > MAX_GROUPED_CHARS
+            || count('(') > MAX_GROUPS
+            || count('[') > MAX_GROUPS
+            || steps.get() < chars.len()
+        {
+            return unreadable;
+        }
         // fast-glob reads a static pattern as a literal path, where a
         // group without `|` is plain text.
         let static_path = !p.negated && !fast_glob_dynamic(alternative);
@@ -316,6 +370,8 @@ fn pattern_matches(
             // every directory and, as a `!` pattern, excludes none.
             return !p.negated;
         }
+        let written: usize = spelled.iter().map(Vec::len).sum();
+        steps.set(steps.get().saturating_sub(written));
         spelled.iter().any(|spelling| {
             picomatch_as_extglob(spelling, !static_path, false)
                 .is_some_and(|rewritten| matches(&rewritten, static_path))
@@ -514,69 +570,119 @@ fn group_alternatives(p: &[char], open: usize) -> Option<(usize, Vec<&[char]>)> 
 /// sequence (`{1..1000000}`) cannot stall the run.
 const MAX_BRACE_EXPANSIONS: usize = 4096;
 
+/// Cap on the text one pattern's expansion builds, the partly expanded
+/// patterns on the way to an alternative included. Every group expanded
+/// copies the rest of the pattern, so a long pattern of many groups
+/// (`{a,b}` a hundred thousand times over) would otherwise build gigabytes
+/// before its first alternative, and every alternative is then matched
+/// against each path. 4,096 alternatives of 250 bytes fit.
+const MAX_BRACE_BYTES: usize = 1 << 20;
+
 /// The brace expansion of a glob, as minimatch's `brace-expansion` does it:
 /// the first `{...}` group holding a top-level `,` or a `x..y[..step]`
-/// sequence is replaced by each alternative, recursively. A group with
-/// neither, and an unbalanced `{`, stay literal.
+/// sequence is replaced by each alternative, and each result expanded the
+/// same way. A group with neither, and an unbalanced `{`, stay literal.
+/// Past [`MAX_BRACE_EXPANSIONS`] alternatives or [`MAX_BRACE_BYTES`] of
+/// text the expansion stops with the alternatives it has.
 pub(crate) fn expand_braces(pattern: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    expand_braces_into(pattern, &mut out);
-    out
+    brace_expansion(pattern).0
 }
 
 /// [`expand_braces`] for a caller that walks each alternative itself:
 /// `None` when the pattern has more alternatives than the matcher expands,
 /// so a walk over the ones it returned would miss some.
 pub(crate) fn brace_alternatives(pattern: &str) -> Option<Vec<String>> {
-    let alternatives = expand_braces(pattern.trim());
-    (alternatives.len() < MAX_BRACE_EXPANSIONS).then_some(alternatives)
+    let (alternatives, whole) = brace_expansion(pattern.trim());
+    (whole && alternatives.len() < MAX_BRACE_EXPANSIONS).then_some(alternatives)
 }
 
-fn expand_braces_into(pattern: &str, out: &mut Vec<String>) {
-    if out.len() >= MAX_BRACE_EXPANSIONS {
-        return;
-    }
-    for (open, _) in pattern.match_indices('{') {
-        let Some(close) = matching_brace(pattern, open) else {
-            continue;
-        };
-        let body = &pattern[open + 1..close];
-        let alternatives = split_top_level_commas(body);
-        let alternatives = if alternatives.len() > 1 {
-            alternatives
-        } else if let Some(sequence) = brace_sequence(body) {
-            sequence
-        } else {
+/// [`expand_braces`], and whether the expansion is whole (it stopped at
+/// neither cap).
+fn brace_expansion(pattern: &str) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut bytes = MAX_BRACE_BYTES;
+    // Depth first with the next alternative on top, so the alternatives
+    // come out in the order expanding the first group first gives them.
+    // A stack of patterns rather than a call per group: the groups of one
+    // pattern have no bound a call stack could be sized for.
+    let mut pending = vec![pattern.to_string()];
+    while let Some(pattern) = pending.pop() {
+        if out.len() >= MAX_BRACE_EXPANSIONS {
+            return (out, false);
+        }
+        let Some((open, close, alternatives)) = first_brace_group(&pattern) else {
+            out.push(pattern);
             continue;
         };
         let (prefix, suffix) = (&pattern[..open], &pattern[close + 1..]);
-        for alternative in alternatives {
-            expand_braces_into(&format!("{prefix}{alternative}{suffix}"), out);
-            if out.len() >= MAX_BRACE_EXPANSIONS {
-                return;
-            }
+        for alternative in alternatives.iter().rev() {
+            let expanded = format!("{prefix}{alternative}{suffix}");
+            let Some(left) = bytes.checked_sub(expanded.len()) else {
+                return (out, false);
+            };
+            bytes = left;
+            pending.push(expanded);
         }
-        return;
     }
-    out.push(pattern.to_string());
+    (out, true)
 }
 
-/// The byte index of the `}` closing the `{` at `open`.
-fn matching_brace(pattern: &str, open: usize) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, c) in pattern[open..].char_indices() {
+/// The first `{...}` group of `pattern` that expands: the byte offsets of
+/// its braces and its alternatives. Every `{` is paired with its `}` in
+/// one pass (a scan per `{` is quadratic in a pattern of unclosed ones),
+/// which also notes whether a `,` or another `{` sits directly inside.
+fn first_brace_group(pattern: &str) -> Option<(usize, usize, Vec<String>)> {
+    struct Group {
+        open: usize,
+        close: Option<usize>,
+        comma: bool,
+        nests: bool,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    // The groups still open, innermost last, as indices into `groups`.
+    let mut open: Vec<usize> = Vec::new();
+    for (at, c) in pattern.char_indices() {
         match c {
-            '{' => depth += 1,
+            '{' => {
+                if let Some(&outer) = open.last() {
+                    groups[outer].nests = true;
+                }
+                open.push(groups.len());
+                groups.push(Group {
+                    open: at,
+                    close: None,
+                    comma: false,
+                    nests: false,
+                });
+            }
             '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
+                if let Some(closed) = open.pop() {
+                    groups[closed].close = Some(at);
+                }
+            }
+            ',' => {
+                if let Some(&inner) = open.last() {
+                    groups[inner].comma = true;
                 }
             }
             _ => {}
         }
     }
-    None
+    groups.into_iter().find_map(|group| {
+        let close = group.close?;
+        let body = &pattern[group.open + 1..close];
+        let alternatives = if group.comma {
+            split_top_level_commas(body)
+        } else if group.nests && body != "{..}" && !body.starts_with("{..}..") {
+            // The one sequence that holds a brace runs from the character
+            // `{` to `}`. Any other body with a group inside is not read:
+            // a pattern of nested groups would be read once per group.
+            return None;
+        } else {
+            brace_sequence(body)?
+        };
+        Some((group.open, close, alternatives))
+    })
 }
 
 fn split_top_level_commas(body: &str) -> Vec<String> {
@@ -600,7 +706,8 @@ fn split_top_level_commas(body: &str) -> Vec<String> {
 /// A `{x..y}` or `{x..y..step}` sequence body: integers (zero-padded when
 /// either end is) or single characters.
 fn brace_sequence(body: &str) -> Option<Vec<String>> {
-    let parts: Vec<&str> = body.split("..").collect();
+    // A fourth part is one too many, and all that needs finding out.
+    let parts: Vec<&str> = body.splitn(4, "..").collect();
     let (from, to, step) = match parts.as_slice() {
         [from, to] => (*from, *to, None),
         [from, to, step] => (*from, *to, Some(*step)),
@@ -630,13 +737,21 @@ fn brace_sequence(body: &str) -> Option<Vec<String>> {
         };
     let mut out = Vec::new();
     let mut n = start;
+    // The zero padding is as wide as the body is long, so the items are
+    // held to the expansion's text bound as well as its count.
+    let mut bytes = 0;
     loop {
         out.push(if as_char {
             char::from_u32(u32::try_from(n).ok()?)?.to_string()
         } else {
-            format!("{n:0width$}")
+            // `{n:0width$}` by hand: the width is the pattern's to choose,
+            // and `format!` panics on one past 65,535.
+            let (sign, digits) = (if n < 0 { "-" } else { "" }, n.unsigned_abs().to_string());
+            let zeros = width.saturating_sub(sign.len() + digits.len());
+            format!("{sign}{}{digits}", "0".repeat(zeros))
         });
-        if n == end || out.len() >= MAX_BRACE_EXPANSIONS {
+        bytes += out.last().map_or(0, String::len);
+        if n == end || out.len() >= MAX_BRACE_EXPANSIONS || bytes > MAX_BRACE_BYTES {
             break;
         }
         let next = if start <= end {
@@ -654,66 +769,207 @@ fn brace_sequence(body: &str) -> Option<Vec<String>> {
 
 /// `dot: false` keeps wildcards off components starting with `.`; `posix`
 /// reads POSIX classes inside brackets.
+///
+/// A `**` segment takes any number of components, and a pattern may hold
+/// many, so the answer is filled in from the last segment back rather than
+/// by trying each number of components every `**` could take (which is
+/// exponential in the `**` count): at most one component match per
+/// (segment, component) pair. `None` when matching a group ran out of
+/// `steps` or nested too deep ([`component_matches`]).
 fn path_glob_matches(
     pattern: &[Vec<char>],
     path: &[Vec<char>],
     dot: bool,
     ext: bool,
     posix: bool,
-) -> bool {
+    steps: &std::cell::Cell<usize>,
+) -> Option<bool> {
     let hidden = |component: &Vec<char>| !dot && component.first() == Some(&'.');
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((first, rest)) if first.as_slice() == ['*', '*'] => (0..=path.len())
-            .take_while(|&skip| skip == 0 || !hidden(&path[skip - 1]))
-            .any(|skip| path_glob_matches(rest, &path[skip..], dot, ext, posix)),
-        Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
-            (!hidden(head) || first.first() == Some(&'.'))
-                && if ext || posix {
-                    ExtglobMatcher {
-                        extglob: ext,
-                        posix,
-                        ..ExtglobMatcher::default()
-                    }
-                    .segment(first, head)
-                } else {
-                    segment_glob_matches(first, head)
-                }
-                && path_glob_matches(rest, tail, dot, ext, posix)
-        }),
+    // `tail[at]`: the segments after the one being read match `path[at..]`.
+    // No segments match only the end of the path.
+    let mut tail = vec![false; path.len() + 1];
+    tail[path.len()] = true;
+    for segment in pattern.iter().rev() {
+        if segment.as_slice() == ['*', '*'] {
+            // No component, or one that is not hidden and then `**` again.
+            for at in (0..path.len()).rev() {
+                tail[at] = tail[at] || (!hidden(&path[at]) && tail[at + 1]);
+            }
+        } else {
+            for at in 0..path.len() {
+                tail[at] = tail[at + 1]
+                    && (!hidden(&path[at]) || segment.first() == Some(&'.'))
+                    && component_matches(segment, &path[at], ext, posix, steps)?;
+            }
+            tail[path.len()] = false;
+        }
     }
+    Some(tail[0])
+}
+
+/// Whether one path component matches one pattern segment. `None` when the
+/// segment holds a group and matching it took the last of `steps` or
+/// nested past [`MAX_GROUP_DEPTH`].
+fn component_matches(
+    pattern: &[char],
+    name: &[char],
+    ext: bool,
+    posix: bool,
+    steps: &std::cell::Cell<usize>,
+) -> Option<bool> {
+    // An extglob group opens with a `(`. A segment without one is
+    // wildcards, classes and literals in every dialect, read without a
+    // call per character or a table.
+    if !(ext && pattern.contains(&'(')) {
+        return Some(wildcard_matches(pattern, name, posix));
+    }
+    let mut matcher = ExtglobMatcher::new(true, posix, steps.get());
+    let matched = matcher.segment(pattern, name);
+    steps.set(matcher.steps);
+    (!matcher.gave_up).then_some(matched)
 }
 
 /// Whether one component matches a component pattern, without extglobs.
 pub(crate) fn segment_glob_matches(pattern: &[char], name: &[char]) -> bool {
-    match pattern.split_first() {
-        None => name.is_empty(),
-        Some(('*', rest)) => (0..=name.len()).any(|skip| segment_glob_matches(rest, &name[skip..])),
-        Some(('?', rest)) => !name.is_empty() && segment_glob_matches(rest, &name[1..]),
-        Some(('[', rest)) => match char_class(rest, false) {
-            Some((class, after)) => name
-                .split_first()
-                .is_some_and(|(c, tail)| class.matches(*c) && segment_glob_matches(after, tail)),
-            None => name.first() == Some(&'[') && segment_glob_matches(rest, &name[1..]),
-        },
-        Some((c, rest)) => name.first() == Some(c) && segment_glob_matches(rest, &name[1..]),
+    wildcard_matches(pattern, name, false)
+}
+
+/// One step of a component pattern that holds no extglob group.
+enum Wildcard {
+    /// `*`: any run of characters, the empty one included.
+    Run,
+    /// `?`: any one character.
+    One,
+    /// `[...]`: one character of the class.
+    Class(CharClass),
+    /// The character itself (a `[` that opens no class included).
+    Literal(char),
+}
+
+/// `pattern` as the steps it reads as, left to right.
+fn wildcards(pattern: &[char], posix: bool) -> Vec<Wildcard> {
+    let mut steps = Vec::with_capacity(pattern.len());
+    let mut rest = pattern;
+    // Without POSIX names a `[` stays open only when no `]` follows its
+    // first member, so none follows a later `[` either: looking again for
+    // each would read a pattern of unclosed `[` once per `[`. (A POSIX
+    // name's own `]` can close a later class, so those are all read; only
+    // picomatch reads them, and it is held to `MAX_GROUPED_CHARS`.)
+    let mut unclosed = false;
+    while let Some((&c, after)) = rest.split_first() {
+        rest = after;
+        steps.push(match c {
+            '*' => Wildcard::Run,
+            '?' => Wildcard::One,
+            '[' if !unclosed => match char_class(after, posix) {
+                Some((class, after_class)) => {
+                    rest = after_class;
+                    Wildcard::Class(class)
+                }
+                None => {
+                    unclosed = !posix;
+                    Wildcard::Literal('[')
+                }
+            },
+            c => Wildcard::Literal(c),
+        });
     }
+    steps
+}
+
+/// Whether `name` matches a component pattern of `*`, `?`, classes and
+/// literals (`posix`: the classes read POSIX names).
+///
+/// The steps are matched in order with one place to go back to, the last
+/// `*` passed: when a later step fails, that `*` takes one more character
+/// and the steps after it are tried again. An earlier `*` never has to
+/// give anything back, because whatever it could give up the later one can
+/// take. So the cost is at most pattern length × name length, where trying
+/// every way each `*` can end is exponential in the number of `*`
+/// (`*a*a*a*a*a*a*a*a*a*a*b` against sixty `a` never finished).
+fn wildcard_matches(pattern: &[char], name: &[char], posix: bool) -> bool {
+    let steps = wildcards(pattern, posix);
+    let (mut step, mut at) = (0, 0);
+    // The step after the last `*` passed, and where in `name` it resumes.
+    let mut retry: Option<(usize, usize)> = None;
+    while at < name.len() {
+        let matched = match steps.get(step) {
+            Some(Wildcard::Run) => {
+                step += 1;
+                retry = Some((step, at));
+                continue;
+            }
+            Some(Wildcard::One) => true,
+            Some(Wildcard::Class(class)) => class.matches(name[at]),
+            Some(Wildcard::Literal(c)) => *c == name[at],
+            None => false,
+        };
+        if matched {
+            step += 1;
+            at += 1;
+        } else if let Some((after_run, resume)) = retry {
+            step = after_run;
+            at = resume + 1;
+            retry = Some((after_run, resume + 1));
+        } else {
+            return false;
+        }
+    }
+    steps[step..].iter().all(|s| matches!(s, Wildcard::Run))
 }
 
 /// One component matched against a pattern with extglob groups (`@(a|b)`,
 /// `?(..)`, `*(..)`, `+(..)`, `!(..)`), as minimatch reads them. Every
 /// (sub-pattern, name suffix) pair is decided once, so an ambiguous group
 /// (`*(a|aa)`) costs polynomial time, not exponential.
-#[derive(Default)]
+///
+/// Polynomial is still the cube of the name's length times the pattern's,
+/// and the matcher calls itself once per pattern character, so its work
+/// is bounded: past `steps` or [`MAX_GROUP_DEPTH`] it stops and sets
+/// `gave_up`, and the answer it returned means nothing.
 struct ExtglobMatcher {
     /// Extglob groups match; off, they are literal.
     extglob: bool,
     /// Brackets read POSIX classes (picomatch, #1490).
     posix: bool,
     memo: std::collections::HashMap<(usize, usize, usize, usize), bool>,
+    /// Steps left ([`MAX_GROUP_STEPS`], shared by the brace alternatives
+    /// and components of one pattern).
+    steps: usize,
+    /// How many of its own calls the matcher is inside.
+    depth: usize,
+    /// The matcher ran out of steps or depth.
+    gave_up: bool,
 }
 
+/// Deepest the group matcher calls itself: a call per character matched
+/// since the last group, and one per repetition of a `*(..)` or `+(..)`.
+/// Twice the longest directory name a filesystem holds.
+const MAX_GROUP_DEPTH: usize = 512;
+
 impl ExtglobMatcher {
+    fn new(extglob: bool, posix: bool, steps: usize) -> Self {
+        ExtglobMatcher {
+            extglob,
+            posix,
+            memo: std::collections::HashMap::new(),
+            steps,
+            depth: 0,
+            gave_up: false,
+        }
+    }
+
+    /// One more call, `cost` steps, if the bounds allow it.
+    fn enter(&mut self, cost: usize) -> bool {
+        if self.gave_up || self.depth >= MAX_GROUP_DEPTH || self.steps < cost {
+            self.gave_up = true;
+            return false;
+        }
+        self.steps -= cost;
+        self.depth += 1;
+        true
+    }
+
     fn segment(&mut self, pattern: &[char], name: &[char]) -> bool {
         let key = (
             pattern.as_ptr() as usize,
@@ -721,11 +977,23 @@ impl ExtglobMatcher {
             name.as_ptr() as usize,
             name.len(),
         );
-        if let Some(&known) = self.memo.get(&key) {
-            return known;
+        // A lookup is a step too: a group's loops make one per split.
+        // Finding where a group or a class closes reads the pattern after
+        // it, to the end when it never does.
+        let scans = pattern.first() == Some(&'[') || pattern.get(1) == Some(&'(');
+        let cost = 1 + if scans { pattern.len() / 8 } else { 0 };
+        if !self.enter(cost) {
+            return false;
         }
-        let matched = self.segment_uncached(pattern, name);
-        self.memo.insert(key, matched);
+        let matched = match self.memo.get(&key) {
+            Some(&known) => known,
+            None => {
+                let matched = self.segment_uncached(pattern, name);
+                self.memo.insert(key, matched);
+                matched
+            }
+        };
+        self.depth -= 1;
         matched
     }
 
@@ -796,6 +1064,9 @@ impl ExtglobMatcher {
         if let Some(&known) = self.memo.get(&key) {
             return known;
         }
+        if !self.enter(1) {
+            return false;
+        }
         let matched = self.segment(group.rest, name)
             || (1..=name.len()).any(|split| {
                 group
@@ -804,6 +1075,7 @@ impl ExtglobMatcher {
                     .any(|alt| self.segment(alt, &name[..split]))
                     && self.repeat(group, &name[split..])
             });
+        self.depth -= 1;
         self.memo.insert(key, matched);
         matched
     }
@@ -831,13 +1103,16 @@ fn extglob_group(pattern: &[char], posix: bool) -> Option<ExtglobGroup<'_>> {
     let (mut depth, mut start) = (0usize, 0usize);
     let mut alternatives = Vec::new();
     let mut i = 0;
+    // As in `wildcards`: once a `[` stays open, so does every later one.
+    let mut unclosed = false;
     while i < body.len() {
         let c = body[i];
-        if c == '[' {
+        if c == '[' && !unclosed {
             if let Some((_, after)) = char_class(&body[i + 1..], posix) {
                 i = body.len() - after.len();
                 continue;
             }
+            unclosed = !posix;
         }
         match c {
             '(' => depth += 1,
@@ -1449,5 +1724,626 @@ mod tests {
         assert!(glob_matches_no_dot("packages/.*", &rel("packages/.hidden")));
         assert!(glob_matches_no_dot("**", &rel("examples/demo")));
         assert!(glob_matches_no_dot("packages/**", &rel("packages/x/demo")));
+    }
+
+    /// `decide`'s answer, or a failure when it has not answered in a
+    /// minute. It runs on its own thread: a matcher that backtracks
+    /// exponentially never returns, and a test waiting on it would hang
+    /// the suite instead of failing.
+    fn decided<T: Send + 'static>(decide: impl FnOnce() -> T + Send + 'static) -> T {
+        let (answer, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = answer.send(decide());
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the glob matcher did not decide within a minute")
+    }
+
+    /// A component pattern of many `*` against a long name that almost
+    /// matches is decided at once in every dialect: `*a*a*a*a*a*a*a*a*a*a*b`
+    /// against sixty `a` took plain backtracking about 10^11 steps, so one
+    /// such directory hung `scan`.
+    #[test]
+    fn many_stars_against_a_long_name_decide_at_once() {
+        let stars = format!("build/{}b", "*a".repeat(10));
+        let near_miss = vec!["build".to_string(), "a".repeat(60)];
+        let hit = vec!["build".to_string(), format!("{}b", "a".repeat(60))];
+        let answers = decided(move || {
+            let mut answers = Vec::new();
+            for rel in [&near_miss, &hit] {
+                for dialect in WorkspacesDialect::ALL {
+                    answers.push(workspaces_include_as(
+                        std::slice::from_ref(&stars),
+                        rel,
+                        dialect,
+                    ));
+                }
+                answers.push(glob_matches(&stars, rel));
+                answers.push(glob_matches_no_dot(&stars, rel));
+                let pattern: Vec<char> = stars["build/".len()..].chars().collect();
+                let name: Vec<char> = rel[1].chars().collect();
+                answers.push(segment_glob_matches(&pattern, &name));
+            }
+            answers
+        });
+        let (missed, matched) = answers.split_at(answers.len() / 2);
+        assert!(missed.iter().all(|listed| !listed), "{missed:?}");
+        assert!(matched.iter().all(|listed| *listed), "{matched:?}");
+
+        // The cost is pattern length × name length, whatever the pattern:
+        // a thousand stars against a name as long as a file name gets.
+        let pattern: Vec<char> = format!("{}b", "*a".repeat(1000)).chars().collect();
+        let name: Vec<char> = "a".repeat(255).chars().collect();
+        assert!(!decided(move || segment_glob_matches(&pattern, &name)));
+    }
+
+    /// `**` segments are decided in pattern segments × path components:
+    /// twenty of them against a forty-deep path that does not end in the
+    /// name they lead to took the recursive matcher about 10^15 steps.
+    #[test]
+    fn repeated_globstars_decide_at_once() {
+        let globstars = format!("build/{}zz", "**/".repeat(20));
+        let interleaved = format!("build/{}zz", "**/a/".repeat(20));
+        let deep = |last: &str| {
+            let mut rel = vec!["build".to_string()];
+            rel.extend(std::iter::repeat_n("a".to_string(), 40));
+            rel.push(last.to_string());
+            rel
+        };
+        let (near_miss, hit) = (deep("a"), deep("zz"));
+        let answers = decided(move || {
+            let mut answers = Vec::new();
+            for rel in [&near_miss, &hit] {
+                for pattern in [&globstars, &interleaved] {
+                    for dialect in WorkspacesDialect::ALL {
+                        answers.push(workspaces_include_as(
+                            std::slice::from_ref(pattern),
+                            rel,
+                            dialect,
+                        ));
+                    }
+                    answers.push(glob_matches(pattern, rel));
+                    answers.push(glob_matches_no_dot(pattern, rel));
+                }
+            }
+            answers
+        });
+        let (missed, matched) = answers.split_at(answers.len() / 2);
+        assert!(missed.iter().all(|listed| !listed), "{missed:?}");
+        assert!(matched.iter().all(|listed| *listed), "{matched:?}");
+    }
+
+    /// A group pattern whose matching would take hours is not worked out:
+    /// it reads as unreadable, which lists every directory and, as a `!`
+    /// pattern, excludes none. Sixty `*(a|aa)` groups against one
+    /// 255-character directory name take the matcher seconds, and twelve
+    /// two-way brace sets in front make that 4,096 times over.
+    #[test]
+    fn a_group_pattern_past_the_step_bound_fails_closed() {
+        let costly = format!("build/{}{}x", "{a,b}".repeat(12), "*(a|aa)".repeat(60));
+        let rel = vec!["build".to_string(), "a".repeat(255)];
+        let extglob_dialects = WorkspacesDialect::ALL
+            .into_iter()
+            .filter(|dialect| dialect.extglob);
+        let answers = decided(move || {
+            let mut answers = Vec::new();
+            for dialect in extglob_dialects {
+                let listed = workspaces_include_as(std::slice::from_ref(&costly), &rel, dialect);
+                let excluding = ["build/*".to_string(), format!("!{costly}")];
+                let kept = workspaces_include_as(&excluding, &rel, dialect);
+                answers.push((dialect, listed, kept));
+            }
+            answers
+        });
+        assert_eq!(answers.len(), 5);
+        for (dialect, listed, kept) in answers {
+            assert!(listed, "{dialect:?}: an unreadable pattern lists");
+            assert!(kept, "{dialect:?}: an unreadable `!` pattern excludes none");
+        }
+        // The dialects without groups read the same text as literals.
+        let rel = vec!["build".to_string(), "a".repeat(255)];
+        let costly = format!("build/{}x", "*(a|aa)".repeat(60));
+        assert!(!workspaces_include_as(
+            std::slice::from_ref(&costly),
+            &rel,
+            WorkspacesDialect::BUN
+        ));
+    }
+
+    /// The group matcher calls itself per pattern character, and the
+    /// picomatch rewrite per group: a pattern long or nested enough to
+    /// overflow the stack (a hundred kilobytes of `*` after a group, fifty
+    /// thousand nested parentheses) is unreadable instead, so it lists
+    /// every directory and excludes none.
+    #[test]
+    fn a_group_pattern_past_the_size_bounds_fails_closed() {
+        let rel = vec!["build".to_string(), "a".repeat(10)];
+        let cases = [
+            format!("build/@(a){}", "*".repeat(100_000)),
+            format!("build/{}a|b{}", "(".repeat(50_000), ")".repeat(50_000)),
+            format!("build/{}", "@(a|b)".repeat(MAX_GROUPS + 1)),
+            format!("build/@(a|b){}", "?".repeat(MAX_GROUPED_CHARS)),
+            // Within the size bounds, past the depth one.
+            format!("build/@(a){}", "*".repeat(2_000)),
+        ];
+        let answers = decided(move || {
+            let mut answers = Vec::new();
+            for pattern in &cases {
+                for dialect in WorkspacesDialect::ALL {
+                    if !dialect.extglob {
+                        continue;
+                    }
+                    let listed =
+                        workspaces_include_as(std::slice::from_ref(pattern), &rel, dialect);
+                    let excluding = ["build/*".to_string(), format!("!{pattern}")];
+                    let kept = workspaces_include_as(&excluding, &rel, dialect);
+                    answers.push((pattern.len(), dialect, listed, kept));
+                }
+            }
+            answers
+        });
+        for (len, dialect, listed, kept) in answers {
+            assert!(listed, "{dialect:?}: a {len}-byte pattern lists");
+            assert!(kept, "{dialect:?}: a {len}-byte `!` pattern excludes none");
+        }
+        // A group-free pattern of any length is still read, in every
+        // dialect: it needs no call per character.
+        let long = format!("build/{}", "?".repeat(100_000));
+        let name = vec!["build".to_string(), "a".repeat(100_000)];
+        let answers = decided(move || {
+            WorkspacesDialect::ALL
+                .into_iter()
+                .filter(|dialect| !dialect.picomatch)
+                .map(|dialect| workspaces_include_as(std::slice::from_ref(&long), &name, dialect))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(answers, [true; 6]);
+    }
+
+    /// The patterns package managers are given stay far inside the step
+    /// bound: the costliest shapes here, against names of fifty to 240
+    /// characters, use under a twentieth of it.
+    #[test]
+    fn ordinary_group_patterns_stay_inside_the_step_bound() {
+        let long = format!("{}b", "a".repeat(60));
+        for (pattern, name, want) in [
+            ("*(a|aa)c", long.as_str(), false),
+            ("+(*)x", &long, false),
+            ("!(*(a|aa))b", &long, false),
+            ("*(a|aa)b", &long, true),
+            ("@(pkg-*|[xy])", "pkg-one", true),
+            ("!(node_modules|dist|build)", "some-package-name-here", true),
+            (
+                "@(alpha|beta|gamma|delta|epsilon|zeta|eta|theta)-*",
+                "theta-service-with-a-long-name",
+                true,
+            ),
+            (
+                "!(*-internal|*-private)",
+                "a-fairly-long-package-directory-name-of-fifty-chars",
+                true,
+            ),
+            (
+                "+(a|b|c|d|e|f|g|h|i|j|k|l|m|n|o|p|q|r|s|t|u|v|w|x|y|z|-)",
+                "a-fairly-long-package-directory-name-of-fifty-chars",
+                true,
+            ),
+            ("+(a|b)", &"ab".repeat(120), true),
+        ] {
+            let p: Vec<char> = pattern.chars().collect();
+            let n: Vec<char> = name.chars().collect();
+            let steps = std::cell::Cell::new(MAX_GROUP_STEPS);
+            assert_eq!(
+                component_matches(&p, &n, true, false, &steps),
+                Some(want),
+                "{pattern} ~ {name}"
+            );
+            let used = MAX_GROUP_STEPS - steps.get();
+            assert!(used < MAX_GROUP_STEPS / 20, "{pattern} ~ {name}: {used}");
+        }
+    }
+
+    /// The brace expansion this module had before the one that keeps its
+    /// own stack: a call per group, a scan per `{`. Kept as the oracle.
+    fn recursive_brace_expansion(pattern: &str, out: &mut Vec<String>) {
+        fn matching_brace(pattern: &str, open: usize) -> Option<usize> {
+            let mut depth = 0usize;
+            for (i, c) in pattern[open..].char_indices() {
+                match c {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(open + i);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+        if out.len() >= MAX_BRACE_EXPANSIONS {
+            return;
+        }
+        for (open, _) in pattern.match_indices('{') {
+            let Some(close) = matching_brace(pattern, open) else {
+                continue;
+            };
+            let body = &pattern[open + 1..close];
+            let alternatives = split_top_level_commas(body);
+            let alternatives = if alternatives.len() > 1 {
+                alternatives
+            } else if let Some(sequence) = brace_sequence(body) {
+                sequence
+            } else {
+                continue;
+            };
+            let (prefix, suffix) = (&pattern[..open], &pattern[close + 1..]);
+            for alternative in alternatives {
+                recursive_brace_expansion(&format!("{prefix}{alternative}{suffix}"), out);
+                if out.len() >= MAX_BRACE_EXPANSIONS {
+                    return;
+                }
+            }
+            return;
+        }
+        out.push(pattern.to_string());
+    }
+
+    /// The expansion that keeps its own stack gives the alternatives the
+    /// recursive one gave, in its order, on 20,000 seeded patterns of
+    /// nested, unbalanced, empty and sequence groups (the `{..}` character
+    /// sequence included), and says the same of whether they are all of
+    /// them.
+    #[test]
+    fn brace_expansion_agrees_with_the_recursive_one() {
+        const ALPHABET: &[&str] = &[
+            "a",
+            "b",
+            "/",
+            "*",
+            "{",
+            "{",
+            "}",
+            "}",
+            ",",
+            ",",
+            "..",
+            "1",
+            "3",
+            "{a,b}",
+            "{1..3}",
+            "{a..c}",
+            "{..}",
+            "{{..}..2}",
+            "{,x}",
+            "{a}",
+            "{3..1..2}",
+            "{01..3}",
+            "é",
+        ];
+        let mut rng = crate::test_rng::Rng::new(0x53);
+        let (mut expanded, mut capped) = (0, 0);
+        // Patterns at and past the cap on alternatives first.
+        let mut patterns = vec![
+            "{a,b}".repeat(12),
+            "{a,b}".repeat(13),
+            "x{1..4095}".to_string(),
+            "x{1..5000}y".to_string(),
+            "{1..70}/{1..70}".to_string(),
+            " packages/{a,b} ".to_string(),
+        ];
+        patterns
+            .extend((0..20_000).map(|_| random_text(&mut rng, ALPHABET, 12).into_iter().collect()));
+        for (case, pattern) in patterns.into_iter().enumerate() {
+            let mut want = Vec::new();
+            recursive_brace_expansion(&pattern, &mut want);
+            assert_eq!(expand_braces(&pattern), want, "case {case}: {pattern:?}");
+            assert_eq!(
+                brace_alternatives(&pattern),
+                (want.len() < MAX_BRACE_EXPANSIONS).then(|| {
+                    let mut trimmed = Vec::new();
+                    recursive_brace_expansion(pattern.trim(), &mut trimmed);
+                    trimmed
+                }),
+                "case {case}: {pattern:?}"
+            );
+            expanded += usize::from(want.len() > 1);
+            capped += usize::from(want.len() >= MAX_BRACE_EXPANSIONS);
+        }
+        assert!(expanded > 5_000, "{expanded}");
+        assert!(capped > 0, "{capped}");
+    }
+
+    /// A pattern of very many brace groups is expanded within a megabyte
+    /// of text and no call stack: `{a,b}` four thousand times over
+    /// overflowed the stack, a hundred thousand times would have built
+    /// gigabytes on the way to its first alternative.
+    #[test]
+    fn brace_expansion_is_bounded_in_text_and_stack() {
+        let cases = [
+            "{a,b}".repeat(100_000),
+            "{1..1}".repeat(50_000),
+            // Unclosed and nested groups: nothing expands, in one pass.
+            "{".repeat(300_000),
+            format!("{}{}", "{".repeat(150_000), "}".repeat(150_000)),
+            format!("{}{}", "{{..}x".repeat(50_000), "}".repeat(50_000)),
+            // A zero padding as wide as the pattern is long.
+            format!("{{{}1..9999}}", "0".repeat(300_000)),
+        ];
+        let answers = decided(move || {
+            cases
+                .iter()
+                .map(|pattern| {
+                    let alternatives = expand_braces(pattern);
+                    let text: usize = alternatives.iter().map(String::len).sum();
+                    (
+                        alternatives.len(),
+                        text,
+                        brace_alternatives(pattern).map(|whole| whole.len()),
+                        // The matcher reads what was expanded and no more.
+                        glob_matches(pattern, &["a".to_string()]),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let within = |(count, text, ..): &(usize, usize, Option<usize>, bool)| {
+            *count <= MAX_BRACE_EXPANSIONS && *text <= MAX_BRACE_BYTES + 300_010
+        };
+        assert!(answers.iter().all(within), "{answers:?}");
+        let whole: Vec<Option<usize>> = answers.iter().map(|a| a.2).collect();
+        assert_eq!(whole, [None, None, Some(1), Some(1), Some(1), None]);
+        assert!(answers.iter().all(|a| !a.3), "{answers:?}");
+    }
+
+    /// A zero-padded sequence pads to the width of its longer end,
+    /// whatever that is: `{0…01..2}` with seventy thousand zeros is two
+    /// long names, where `format!`'s own width (65,535 at most) panicked.
+    #[test]
+    fn zero_padded_sequences_pad_to_any_width() {
+        assert_eq!(expand_braces("{08..10}"), ["08", "09", "10"]);
+        assert_eq!(expand_braces("{-01..1}"), ["-01", "000", "001"]);
+        assert_eq!(expand_braces("{1..-02}"), ["001", "000", "-01", "-02"]);
+        assert_eq!(expand_braces("{007..9..2}"), ["007", "009"]);
+        let wide = expand_braces(&format!("v{{{}1..2}}", "0".repeat(70_000)));
+        assert_eq!(wide.len(), 2);
+        for (alternative, last) in wide.iter().zip(["1", "2"]) {
+            assert_eq!(alternative.len(), 70_002);
+            assert_eq!(
+                alternative.trim_start_matches('v').trim_start_matches('0'),
+                last
+            );
+        }
+    }
+
+    /// A component pattern of unclosed `[` is read in one pass: looking
+    /// for the `]` of each would read it once per `[`.
+    #[test]
+    fn unclosed_classes_are_read_in_one_pass() {
+        let pattern: Vec<char> = "[".repeat(300_000).chars().collect();
+        let name: Vec<char> = "[".repeat(255).chars().collect();
+        let whole: Vec<char> = "[".repeat(300_000).chars().collect();
+        // The same run inside a group, whose end is looked for past it.
+        let grouped: Vec<char> = format!("@({}|a)", "[".repeat(100_000)).chars().collect();
+        let answers = decided(move || {
+            [
+                segment_glob_matches(&pattern, &name),
+                segment_glob_matches(&pattern, &whole),
+                component_matches(&grouped, &['a'], true, false, &unbounded()) == Some(true),
+            ]
+        });
+        assert_eq!(answers, [false, true, true]);
+    }
+
+    /// The component matcher this module had before the linear one: one
+    /// recursive call per way a `*` can end, so the plainest statement of
+    /// what a pattern matches and, on a crafted pattern, exponential. Kept
+    /// as the oracle the linear matcher is compared against.
+    fn backtracking_segment_matches(pattern: &[char], name: &[char], posix: bool) -> bool {
+        let rec = |pattern, name| backtracking_segment_matches(pattern, name, posix);
+        match pattern.split_first() {
+            None => name.is_empty(),
+            Some(('*', rest)) => (0..=name.len()).any(|skip| rec(rest, &name[skip..])),
+            Some(('?', rest)) => !name.is_empty() && rec(rest, &name[1..]),
+            Some(('[', rest)) => match char_class(rest, posix) {
+                Some((class, after)) => name
+                    .split_first()
+                    .is_some_and(|(c, tail)| class.matches(*c) && rec(after, tail)),
+                None => name.first() == Some(&'[') && rec(rest, &name[1..]),
+            },
+            Some((c, rest)) => name.first() == Some(c) && rec(rest, &name[1..]),
+        }
+    }
+
+    /// The path matcher this module had before the table-filling one, over
+    /// any component matcher: it tries every number of components each
+    /// `**` can take, one recursive call each.
+    fn backtracking_path_matches(
+        pattern: &[Vec<char>],
+        path: &[Vec<char>],
+        dot: bool,
+        component: &dyn Fn(&[char], &[char]) -> bool,
+    ) -> bool {
+        let hidden = |component: &Vec<char>| !dot && component.first() == Some(&'.');
+        match pattern.split_first() {
+            None => path.is_empty(),
+            Some((first, rest)) if first.as_slice() == ['*', '*'] => (0..=path.len())
+                .take_while(|&skip| skip == 0 || !hidden(&path[skip - 1]))
+                .any(|skip| backtracking_path_matches(rest, &path[skip..], dot, component)),
+            Some((first, rest)) => path.split_first().is_some_and(|(head, tail)| {
+                (!hidden(head) || first.first() == Some(&'.'))
+                    && component(first, head)
+                    && backtracking_path_matches(rest, tail, dot, component)
+            }),
+        }
+    }
+
+    /// A step budget no test pattern reaches.
+    fn unbounded() -> std::cell::Cell<usize> {
+        std::cell::Cell::new(usize::MAX)
+    }
+
+    /// A short random string over `alphabet` (whole fragments, so a class
+    /// or a group shows up closed more often than chance would close it).
+    fn random_text(rng: &mut crate::test_rng::Rng, alphabet: &[&str], max: usize) -> Vec<char> {
+        (0..rng.below(max + 1))
+            .flat_map(|_| rng.pick(alphabet).chars())
+            .collect()
+    }
+
+    const NAME_ALPHABET: &[&str] = &["a", "a", "b", "b", "c", ".", "-", "[", "]", "!", "é"];
+
+    /// The linear component matcher answers as the backtracking one did,
+    /// on 40,000 seeded pattern/name pairs over the whole grammar (`*`,
+    /// `?`, classes with ranges, negation, a leading `]` and POSIX names,
+    /// unclosed classes), short enough for the oracle to finish.
+    #[test]
+    fn linear_component_matcher_agrees_with_backtracking() {
+        const PATTERN_ALPHABET: &[&str] = &[
+            "a",
+            "a",
+            "b",
+            "c",
+            ".",
+            "-",
+            "*",
+            "*",
+            "*",
+            "?",
+            "?",
+            "[",
+            "]",
+            "!",
+            "^",
+            "[ab]",
+            "[!a]",
+            "[^b]",
+            "[a-c]",
+            "[]a]",
+            "[!]]",
+            "[[:alpha:]]",
+            "[![:punct:]b]",
+            "[:",
+            ":]",
+            "é",
+        ];
+        let mut rng = crate::test_rng::Rng::new(0x51);
+        let (mut matched, mut classes) = (0, 0);
+        for case in 0..40_000 {
+            let pattern = random_text(&mut rng, PATTERN_ALPHABET, 9);
+            let name = if rng.chance(30) {
+                // A name the pattern is likely to match: its literals, with
+                // each wildcard and bracket turned into a character.
+                pattern
+                    .iter()
+                    .filter(|c| !rng.chance(10) && **c != '*')
+                    .map(|c| if "?[]!^:".contains(*c) { 'a' } else { *c })
+                    .collect()
+            } else {
+                random_text(&mut rng, NAME_ALPHABET, 7)
+            };
+            for posix in [false, true] {
+                let want = backtracking_segment_matches(&pattern, &name, posix);
+                assert_eq!(
+                    wildcard_matches(&pattern, &name, posix),
+                    want,
+                    "case {case}: {pattern:?} ~ {name:?} (posix: {posix})"
+                );
+                // The extglob matcher reads a pattern without a group the
+                // same way, which is what lets `component_matches` send
+                // one to the linear matcher.
+                for extglob in [false, true] {
+                    let mut general = ExtglobMatcher::new(extglob, posix, usize::MAX);
+                    assert_eq!(
+                        general.segment(&pattern, &name),
+                        want,
+                        "case {case}: {pattern:?} ~ {name:?} (posix: {posix}, extglob: {extglob})"
+                    );
+                    assert_eq!(
+                        component_matches(&pattern, &name, extglob, posix, &unbounded()),
+                        Some(want),
+                        "case {case}: {pattern:?} ~ {name:?} (posix: {posix}, extglob: {extglob})"
+                    );
+                }
+                matched += usize::from(want);
+            }
+            assert_eq!(
+                segment_glob_matches(&pattern, &name),
+                backtracking_segment_matches(&pattern, &name, false),
+                "case {case}: {pattern:?} ~ {name:?}"
+            );
+            classes += usize::from(char_class(&pattern, true).is_some());
+        }
+        // The sweep is not vacuous: thousands of pairs match, thousands do
+        // not, and thousands of patterns hold a class that closes.
+        assert!((4_000..76_000).contains(&matched), "{matched}");
+        assert!(classes > 2_000, "{classes}");
+    }
+
+    /// The path matcher answers as the recursive one did, on 40,000 seeded
+    /// pattern/path pairs with `**` segments, hidden components and every
+    /// `dot` / extglob / POSIX reading.
+    #[test]
+    fn table_path_matcher_agrees_with_backtracking() {
+        const SEGMENTS: &[&str] = &[
+            "**",
+            "**",
+            "**",
+            "*",
+            "*",
+            "a",
+            "a",
+            "b",
+            ".a",
+            ".*",
+            "?",
+            "a*",
+            "*a",
+            "[ab]",
+            "@(a|b)",
+            "!(a)",
+            "+(a|.a)",
+            "*(b)",
+            "[[:alpha:]]",
+            "a?",
+        ];
+        const COMPONENTS: &[&str] = &["a", "a", "a", "b", "b", ".a", ".b", "ab", "aa", "c"];
+        let mut rng = crate::test_rng::Rng::new(0x52);
+        let mut matched = 0;
+        for case in 0..40_000 {
+            let pattern: Vec<Vec<char>> = (0..rng.below(7))
+                .map(|_| rng.pick(SEGMENTS).chars().collect())
+                .collect();
+            let path: Vec<Vec<char>> = (0..rng.below(7))
+                .map(|_| rng.pick(COMPONENTS).chars().collect())
+                .collect();
+            for (dot, ext, posix) in [
+                (true, false, false),
+                (false, false, false),
+                (true, true, false),
+                (false, true, false),
+                (true, true, true),
+                (false, false, true),
+            ] {
+                // Each component as the recursive matcher decided it: the
+                // extglob matcher when either flag is on, else the plain
+                // one.
+                let component = |segment: &[char], name: &[char]| {
+                    if ext || posix {
+                        ExtglobMatcher::new(ext, posix, usize::MAX).segment(segment, name)
+                    } else {
+                        backtracking_segment_matches(segment, name, false)
+                    }
+                };
+                let want = backtracking_path_matches(&pattern, &path, dot, &component);
+                assert_eq!(
+                    path_glob_matches(&pattern, &path, dot, ext, posix, &unbounded()),
+                    Some(want),
+                    "case {case}: {pattern:?} ~ {path:?} (dot: {dot}, ext: {ext}, posix: {posix})"
+                );
+                matched += usize::from(want);
+            }
+        }
+        assert!((10_000..230_000).contains(&matched), "{matched}");
     }
 }
