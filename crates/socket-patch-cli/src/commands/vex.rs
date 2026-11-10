@@ -25,8 +25,8 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
-    build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
-    VerifyOutcome,
+    build_document_marking_unverified, detect_product, BuildOptions, Document, FailedPatch,
+    VendorContext, VerifyOutcome, NOT_VERIFIED_SUFFIX,
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
@@ -75,7 +75,9 @@ pub struct VexArgs {
     /// that doesn't have the patched files laid out yet. The wiring checks
     /// still apply: a hosted or vendored ledger record the lockfile no
     /// longer wires, or a lockfile reference whose record is unavailable or
-    /// names another package, is omitted either way.
+    /// names another package, is omitted either way. A statement emitted
+    /// this way says so (its impact statement ends with "; not verified on
+    /// disk"), and the run warns how many there are.
     //
     // `value_parser = parse_bool_flag`: clap's default bool parser accepts
     // only `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1`
@@ -126,7 +128,8 @@ pub struct VexEmbedArgs {
     pub vex_product: Option<String>,
 
     /// Skip the on-disk file-hash check when building the VEX document and
-    /// trust the patch records (the lockfile wiring checks still apply). See
+    /// trust the patch records (the lockfile wiring checks still apply, and
+    /// each such statement is marked "; not verified on disk"). See
     /// `socket-patch vex --no-verify`.
     //
     // `value_parser = parse_bool_flag`: these share env vars with the
@@ -177,7 +180,7 @@ impl VexEmbedArgs {
             hosted_gem_mirror_check: false,
             // Embedded callers skip VEX entirely under `--dry-run`.
             dry_run: false,
-            product_flag: "--vex-product",
+            flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
         }
@@ -229,9 +232,10 @@ pub(crate) struct VexBuildParams {
     /// leave any previous document there alone. Printing to stdout is not a
     /// mutation, so it still happens.
     pub dry_run: bool,
-    /// The flag that carried `product`, named in the non-IRI advisory
-    /// (`--product` standalone, `--vex-product` embedded).
-    pub product_flag: &'static str,
+    /// How this run spells its flags, for the advisories that name one:
+    /// `--` standalone (`--product`, `--doc-id`, `--no-verify`), `--vex-`
+    /// embedded (`--vex-product`, …). See [`Self::flag`].
+    pub flag_prefix: &'static str,
     /// Embedded hosted `scan --vex` only: scan's npm crawl of the same
     /// tree earlier in this process. The installed-copy lookups take the
     /// npm `node_modules` roots (and, for the identity fallback, the
@@ -252,6 +256,12 @@ pub(crate) struct VexBuildParams {
 }
 
 impl VexBuildParams {
+    /// The flag this run spells `name` as (`product` → `--product`
+    /// standalone, `--vex-product` embedded).
+    fn flag(&self, name: &str) -> String {
+        format!("{}{name}", self.flag_prefix)
+    }
+
     /// Where this run's `vex_*` telemetry goes: the run client's route when
     /// one was built, else the no-client route from the credential chain
     /// (flag / env / socket-cli config), with no network.
@@ -379,7 +389,7 @@ pub async fn run(args: VexArgs) -> i32 {
         hosted_gem_mirror_refused: false,
         hosted_gem_mirror_check: false,
         dry_run: args.common.dry_run,
-        product_flag: "--product",
+        flag_prefix: "--",
         npm_prior: None,
         hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
@@ -715,10 +725,32 @@ async fn generate_vex(
                      (pkg:...) nor an absolute IRI; it is emitted verbatim as the OpenVEX \
                      product @id, which the spec requires to be an IRI — strict consumers may \
                      reject the document. Prefer pkg:<type>/<name>@<version>.",
-                    params.product_flag
+                    params.flag("product")
                 ),
             );
         }
+    }
+    // The document `@id` is an IRI by the same spec, and consumers key
+    // re-issued documents on it: the same advisory for its override. Empty
+    // means unset: `@id` is a required field, so `--doc-id "$UNSET_VAR"`
+    // must not emit a literal `"@id": ""`.
+    let doc_id = params
+        .doc_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if let Some(d) = doc_id.filter(|d| !has_iri_scheme(d)) {
+        note_warning(
+            warnings,
+            common,
+            "doc_id_not_iri",
+            format!(
+                "Document id override {d:?} ({}) is not an absolute IRI; it is emitted \
+                 verbatim as the OpenVEX document @id, which the spec requires to be an IRI — \
+                 strict consumers may reject the document. Prefer urn:uuid:<uuid> or an https URL.",
+                params.flag("doc-id")
+            ),
+        );
     }
 
     // The plan's advisories (fetch failures, wiring conflicts, superseded
@@ -897,6 +929,7 @@ async fn generate_vex(
             manifest,
             &package_paths,
             &plan.hosted,
+            socket_patch_core::patch::jvm_jar::derived_copies_in,
             common,
             warnings,
         )
@@ -1193,10 +1226,11 @@ async fn generate_vex(
     outcome.failed.extend(plan.gated.iter().cloned());
 
     // Vendored disclosure: the committed artifact verified (the attestation
-    // stands — the committables are what the lockfile consumes) but the LIVE
-    // installed tree is present and running different bytes. Say so — a
-    // build that bypasses the vendor wiring is unpatched until the next
-    // package-manager install.
+    // stands — the plan only takes the vendored basis for an artifact a
+    // discovered lockfile / config reference, or the JVM wiring check, shows
+    // wired in) but the LIVE installed tree is present and running different
+    // bytes. Say so — a build that bypasses the vendor wiring is unpatched
+    // until the next package-manager install.
     // A Hatch env is never resynced by an install: Hatch keeps a present
     // release (#335), so name the remedy that recreates it.
     let hatch_note = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
@@ -1236,9 +1270,10 @@ async fn generate_vex(
             "vendored_tree_out_of_sync",
             format!(
                 "{purl}: the installed tree does not match its vendored artifact; the \
-                 attestation is based on the committed .socket/vendor artifact (the lockfile \
-                 consumes it), but the live tree carries different bytes — re-run your \
-                 package manager's install to resync it.{hatch_note}{pdm_note}"
+                 attestation is based on the committed .socket/vendor artifact (the project's \
+                 lockfile or package-manager config wires it in), but the live tree carries \
+                 different bytes — re-run your package manager's install to resync it.\
+                 {hatch_note}{pdm_note}"
             ),
         );
     }
@@ -1257,22 +1292,39 @@ async fn generate_vex(
 
     let opts = BuildOptions {
         product_id,
-        // Empty means unset: the document `@id` is a required field, so
-        // `--doc-id "$UNSET_VAR"` must not emit a literal `"@id": ""`.
-        doc_id: params
-            .doc_id
-            .clone()
-            .filter(|d| !d.trim().is_empty())
+        doc_id: doc_id
+            .map(str::to_string)
             .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4())),
         author: "Socket".to_string(),
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document(
+    // `--no-verify` declared these applied with nothing checked on disk. The
+    // purls an in-run hosted redirect confirmed are attested from that run's
+    // own evidence in either mode, so they are not among them.
+    let unverified: Vec<String> = if params.no_verify {
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        let confirmed: HashSet<&str> = params
+            .assume_applied
+            .iter()
+            .map(|purl| strip_purl_qualifiers(purl))
+            .collect();
+        outcome
+            .applied
+            .iter()
+            .filter(|purl| !confirmed.contains(strip_purl_qualifiers(purl)))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let doc = match build_document_marking_unverified(
         manifest,
         &outcome.applied,
         &outcome.vendored,
         redirected,
+        &unverified,
         &opts,
     ) {
         Some(doc) => doc,
@@ -1287,6 +1339,42 @@ async fn generate_vex(
             });
         }
     };
+
+    // Trusting the records is the caller's choice, but never a silent one:
+    // the document marks each such statement, and the run says how many.
+    if !unverified.is_empty() {
+        let unverified: HashSet<&str> = unverified.iter().map(String::as_str).collect();
+        let marked = doc
+            .statements
+            .iter()
+            .filter(|statement| {
+                statement
+                    .products
+                    .iter()
+                    .flat_map(|product| &product.subcomponents)
+                    .any(|component| unverified.contains(component.id.as_str()))
+            })
+            .count();
+        let total = doc.statements.len();
+        note_warning(
+            warnings,
+            common,
+            "vex_not_verified",
+            format!(
+                "{marked} of {total} VEX {} emitted without on-disk verification of the patch \
+                 ({}, or SOCKET_VEX_NO_VERIFY in the environment): nothing checked that the \
+                 patched files are in place, and each such impact statement ends with \
+                 \"{}\". Run without it to attest only what is verified.",
+                if total == 1 {
+                    "statement was"
+                } else {
+                    "statements were"
+                },
+                params.flag("no-verify"),
+                NOT_VERIFIED_SUFFIX.trim_start_matches("; "),
+            ),
+        );
+    }
 
     let serialized = match if params.compact {
         serde_json::to_string(&doc)
@@ -1462,6 +1550,14 @@ async fn narrow_gem_variant_copies(
     sets.extend(narrowed);
 }
 
+/// The derived-cache check [`withhold_unpatched_jvm_copies`] runs per hash
+/// directory: `socket_patch_core::patch::jvm_jar::derived_copies_in`.
+type DerivedCopiesIn = fn(
+    &socket_patch_core::patch::jvm_jar::DerivedCache,
+    &Path,
+    &str,
+) -> Option<socket_patch_core::patch::jvm_jar::DerivedVerdict>;
+
 /// Maven / Gradle: withhold the statement of every purl a build may still
 /// load unpatched, naming the copy (`vex_gradle_unpatched_copy`): a copy
 /// the record check found unpatched while others are patched, and — for
@@ -1469,12 +1565,15 @@ async fn narrow_gem_variant_copies(
 /// `files-2.1` (`caches/transforms-*`, `jars-*`) or one older than the
 /// patched jar that cannot be matched to it. A derived-cache walk cut
 /// short is a warning (`vex_gradle_derived_cache_unchecked`), not a reason
-/// to withhold.
+/// to withhold; a check that did not finish at all (its task panicked)
+/// withholds the purl (`vex_gradle_derived_cache_check_failed`), because
+/// nothing it would have found is known.
 async fn withhold_unpatched_jvm_copies(
     outcome: &mut VerifyOutcome,
     manifest: &PatchManifest,
     copies: &HashMap<String, Vec<PathBuf>>,
     hosted: &std::collections::BTreeMap<String, crate::commands::vex_sources::HostedWiring>,
+    derived_copies_in: DerivedCopiesIn,
     common: &GlobalArgs,
     warnings: &mut Vec<RunWarning>,
 ) {
@@ -1489,6 +1588,7 @@ async fn withhold_unpatched_jvm_copies(
     });
     let mut derived: Vec<(String, PathBuf)> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
+    let mut check_failed: Vec<(String, PathBuf, String)> = Vec::new();
     let cache = jvm_jar::DerivedCache::default();
     for purl in &outcome.applied {
         let (Some(record), Some(paths)) = (manifest.patches.get(purl), copies.get(purl)) else {
@@ -1510,10 +1610,19 @@ async fn withhold_unpatched_jvm_copies(
             for leaf in &leaves {
                 for dir in jvm_jar::jar_copies(path, leaf) {
                     let (leaf, cache) = (leaf.clone(), cache.clone());
-                    let check = move || jvm_jar::derived_copies_in(&cache, &dir, &leaf);
-                    let Some(verdict) = tokio::task::spawn_blocking(check).await.ok().flatten()
-                    else {
-                        continue;
+                    let checked = dir.clone();
+                    let check = move || derived_copies_in(&cache, &dir, &leaf);
+                    let verdict = match tokio::task::spawn_blocking(check).await {
+                        Ok(Some(verdict)) => verdict,
+                        // Not a writable Gradle hash dir: nothing is
+                        // derived from it.
+                        Ok(None) => continue,
+                        // The check died, so what it would have found is
+                        // unknown: never a clean verdict.
+                        Err(e) => {
+                            check_failed.push((purl.clone(), checked, e.to_string()));
+                            continue;
+                        }
                     };
                     derived.extend(
                         verdict
@@ -1529,8 +1638,12 @@ async fn withhold_unpatched_jvm_copies(
             }
         }
     }
-    let withheld: std::collections::BTreeSet<String> =
-        derived.iter().map(|(purl, _)| purl.clone()).collect();
+    let withheld: std::collections::BTreeSet<String> = derived
+        .iter()
+        .map(|(purl, _)| purl)
+        .chain(check_failed.iter().map(|(purl, ..)| purl))
+        .cloned()
+        .collect();
     outcome.applied.retain(|purl| !withheld.contains(purl));
     outcome
         .failed
@@ -1552,6 +1665,22 @@ async fn withhold_unpatched_jvm_copies(
                 "{purl}: Gradle's derived caches (caches/transforms-*, jars-*) are too large to \
                  check completely; a copy derived from the unpatched jar there would not be \
                  seen (`gradle --stop` and clearing them removes any)."
+            ),
+        );
+    }
+    check_failed.sort();
+    check_failed.dedup();
+    for (purl, dir, error) in check_failed {
+        note_warning(
+            warnings,
+            common,
+            "vex_gradle_derived_cache_check_failed",
+            format!(
+                "{purl}: checking Gradle's derived caches for copies of {} failed ({error}); \
+                 a copy derived from the unpatched jar cannot be ruled out, so no statement is \
+                 emitted (`gradle --stop` and clearing caches/transforms-* and jars-* removes \
+                 any).",
+                dir.display()
             ),
         );
     }
@@ -1932,7 +2061,9 @@ async fn resolve_product_id(
     // An empty (or whitespace-only) override means "unset". `Product::id` is
     // `skip_serializing_if = "String::is_empty"`, so passing it through would
     // write a spec-invalid document about a product with no identifier.
-    if let Some(p) = product.filter(|p| !p.trim().is_empty()) {
+    // Surrounding whitespace is the shell's or the environment's, never
+    // part of an identifier: the id is emitted as it is checked, trimmed.
+    if let Some(p) = product.map(str::trim).filter(|p| !p.is_empty()) {
         return Ok(p.to_string());
     }
     let detect = detect_product(&common.cwd).await;
@@ -2618,7 +2749,7 @@ mod npm_prior_tests {
             hosted_gem_mirror_refused: false,
             hosted_gem_mirror_check: false,
             dry_run: false,
-            product_flag: "--vex-product",
+            flag_prefix: "--vex-",
             npm_prior: prior,
             hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
@@ -2893,6 +3024,102 @@ mod mirror_refusal_tests {
                 assert_eq!(summary.failed[0].reason, "mirror_overrides_source");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod derived_cache_tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::jvm_jar::{DerivedCache, DerivedVerdict};
+    use std::collections::BTreeMap;
+
+    const PURL: &str = "pkg:maven/com.x/lib@1.0";
+
+    /// An attested Gradle copy of [`PURL`]: `(outcome, view, copies)` over
+    /// one `files-2.1` hash dir under `home` holding `lib-1.0.jar`.
+    fn attested_gradle_copy(
+        home: &Path,
+    ) -> (VerifyOutcome, PatchManifest, HashMap<String, Vec<PathBuf>>) {
+        let version_dir = home.join("caches/modules-2/files-2.1/com.x/lib/1.0");
+        let hash_dir = version_dir.join("0123456789abcdef0123456789abcdef01234567");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("lib-1.0.jar"), b"patched jar").unwrap();
+        let record: PatchRecord = serde_json::from_value(serde_json::json!({
+            "uuid": "00000000-0000-4000-8000-000000000000",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {"lib-1.0.jar": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+            "vulnerabilities": {"GHSA-derived-0000": {"cves": [], "summary": "test", "severity": "high", "description": "test"}},
+            "description": "test", "license": "MIT", "tier": "free"
+        }))
+        .unwrap();
+        let mut view = PatchManifest::new();
+        view.patches.insert(PURL.to_string(), record);
+        let outcome = VerifyOutcome {
+            applied: vec![PURL.to_string()],
+            ..Default::default()
+        };
+        let copies = HashMap::from([(PURL.to_string(), vec![version_dir])]);
+        (outcome, view, copies)
+    }
+
+    async fn withhold(check: DerivedCopiesIn) -> (VerifyOutcome, Vec<RunWarning>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            no_telemetry: true,
+            ..Default::default()
+        };
+        let (mut outcome, view, copies) = attested_gradle_copy(tmp.path());
+        let mut warnings = Vec::new();
+        withhold_unpatched_jvm_copies(
+            &mut outcome,
+            &view,
+            &copies,
+            &BTreeMap::new(),
+            check,
+            &common,
+            &mut warnings,
+        )
+        .await;
+        (outcome, warnings)
+    }
+
+    /// A derived-cache check that dies proves nothing about the copies it
+    /// would have found: the purl is withheld, never attested by default.
+    #[tokio::test]
+    async fn a_derived_cache_check_that_panics_withholds_the_purl() {
+        fn clean(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            Some(DerivedVerdict::default())
+        }
+        fn not_a_hash_dir(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            None
+        }
+        fn dies(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            panic!("derived-cache walk died")
+        }
+        for (what, check) in [
+            ("clean", clean as DerivedCopiesIn),
+            ("not a hash dir", not_a_hash_dir),
+        ] {
+            let (outcome, warnings) = withhold(check).await;
+            assert_eq!(outcome.applied, vec![PURL.to_string()], "{what}");
+            assert!(outcome.failed.is_empty(), "{what}: {:?}", outcome.failed);
+            assert!(warnings.is_empty(), "{what}: {warnings:?}");
+        }
+        let (outcome, warnings) = withhold(dies).await;
+        assert!(outcome.applied.is_empty(), "{:?}", outcome.applied);
+        assert_eq!(
+            outcome.failed,
+            vec![FailedPatch {
+                purl: PURL.to_string(),
+                reason: "gradle_unpatched_copy".to_string(),
+            }]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "vex_gradle_derived_cache_check_failed");
+        assert!(warnings[0].detail.starts_with(PURL), "{warnings:?}");
     }
 }
 

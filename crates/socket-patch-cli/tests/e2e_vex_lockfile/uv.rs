@@ -755,7 +755,11 @@ fn assert_attested(
     assert_eq!(subs[0]["@id"], subcomponent, "{what}: {doc}");
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({})", marker(mode)),
+        format!(
+            "Patched via Socket patch {uuid} ({}){}",
+            marker(mode),
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{what}"
     );
     let events = env["events"].as_array().unwrap();

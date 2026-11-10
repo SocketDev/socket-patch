@@ -54,7 +54,16 @@ fn output_dash_means_stdout() {
     let doc: Value = serde_json::from_slice(&o.stdout).expect("document on stdout");
     assert_eq!(doc["statements"].as_array().unwrap().len(), 1);
     assert!(!cwd.join("-").exists(), "no file literally named `-`");
-    assert_eq!(stderr(&o).trim_end(), "Emitted 1 VEX statement");
+    // `--no-verify`'s disclosure, then the summary.
+    let stderr = stderr(&o);
+    let lines: Vec<&str> = stderr.lines().collect();
+    assert_eq!(lines.len(), 2, "{stderr}");
+    assert!(
+        lines[0]
+            .starts_with("Warning: 1 of 1 VEX statement was emitted without on-disk verification"),
+        "{stderr}"
+    );
+    assert_eq!(lines[1], "Emitted 1 VEX statement");
 }
 
 #[test]

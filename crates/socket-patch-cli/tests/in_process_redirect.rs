@@ -5244,7 +5244,8 @@ async fn cargo_granted_but_nothing_pinned_is_not_confirmed_or_attested() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "11111111-1111-4111-8111-111111111111";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url =
+        format!("sparse+https://patch.test/patch-registry/cargo/tok/{CARGO_UUID}/index/");
 
     let server = MockServer::start().await;
     mock_cargo_patch(
@@ -5326,7 +5327,8 @@ async fn cargo_transitive_only_crate_is_refused_loudly_and_not_attested() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "22222222-2222-4222-8222-222222222222";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url =
+        format!("sparse+https://patch.test/patch-registry/cargo/tok/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,
@@ -5425,7 +5427,8 @@ async fn cargo_member_outside_the_project_or_behind_a_symlink_refuses_the_crate(
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url =
+        format!("sparse+https://patch.test/patch-registry/cargo/tok/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,
@@ -5513,7 +5516,8 @@ async fn cargo_table_form_without_lock_is_pinned_and_attested() {
     const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
     const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
     let cksum = "11".repeat(32);
-    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url =
+        format!("sparse+https://patch.test/patch-registry/cargo/tok/{CARGO_UUID}/index/");
 
     let server = MockServer::start().await;
     mock_cargo_patch(
@@ -6996,7 +7000,8 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
     const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url =
+        format!("sparse+https://patch.test/patch-registry/cargo/tok/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,

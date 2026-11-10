@@ -196,6 +196,11 @@ ledger when offline attestation is required. A reference no longer used by the
 project is excluded even with `--no-verify`; that flag bypasses file-hash checks,
 not reference validation. A patch record alone does not prove it is consumed.
 
+`--no-verify` (or `SOCKET_VEX_NO_VERIFY` in the environment) attests without checking
+any file, so it also attests an agent-mode patch whose files are unpatched or missing.
+It never does so silently: the run warns how many statements it emitted that way, and
+each one ends its impact statement with `; not verified on disk`.
+
 The product identifier is inferred from the Git origin or project metadata. Use
 `--product <identifier>` when inference is unavailable or unsuitable. `--json`
 requires `--output` so the document and command result do not share stdout.

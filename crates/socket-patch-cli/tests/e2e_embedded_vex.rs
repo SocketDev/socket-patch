@@ -916,19 +916,26 @@ fn scan_json_vex_no_verify_emits_summary() {
     assert_eq!(result["vex"]["statements"], 1);
     assert_eq!(result["vex"]["format"], "openvex-0.2.0");
     assert_eq!(result["vex"]["path"], vex_path.to_str().unwrap());
-    // A clean PURL product raises no advisory — skip-if-empty must keep the
-    // additive `warnings` key absent so pre-existing consumers see the
-    // unchanged three-key vex object.
+    // The one advisory is `--vex-no-verify`'s own disclosure: the statement
+    // was emitted with nothing checked on disk (here the package is not
+    // even installed), and the summary says so, naming the embedded flag.
+    let warnings = result["vex"]["warnings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected vex.warnings, got {:?}", result["vex"]));
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert_eq!(warnings[0]["code"], "vex_not_verified");
+    let detail = warnings[0]["detail"].as_str().unwrap();
     assert!(
-        !result["vex"]
-            .as_object()
-            .expect("vex summary object")
-            .contains_key("warnings"),
-        "a warning-free scan run must omit vex.warnings, got {:?}",
-        result["vex"]
+        detail.starts_with("1 of 1 VEX statement was emitted without on-disk verification")
+            && detail.contains("--vex-no-verify"),
+        "{detail}"
     );
 
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(&vex_path).unwrap()).unwrap();
+    assert_eq!(
+        doc["statements"][0]["impact_statement"],
+        "Patched via Socket patch 11111111-1111-4111-8111-111111111111; not verified on disk"
+    );
     assert_eq!(doc["@context"], "https://openvex.dev/ns/v0.2.0");
     assert_eq!(doc["version"], 1, "OpenVEX revision counter starts at 1");
     assert!(

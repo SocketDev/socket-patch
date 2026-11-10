@@ -159,10 +159,12 @@
 //!     nuget source) or skips because the package manager does not read it
 //!     (npm's v2 mirror, `inBundle` / `link` entries, commented-out lines,
 //!     an unparseable lock) can never be resurrected as live wiring from the
-//!     same raw text by the CLI's fallbacks ([`hosted_wiring_in_files`],
-//!     [`vendored_wiring_live`]), which only ever see uuids no read file
-//!     mentions (formats nothing reads, patch servers outside the host
-//!     allowlist). So extractors get this for free — they cannot forget it —
+//!     same raw text by the hosted ledger's fallback
+//!     ([`hosted_wiring_in_files`]), which only ever sees uuids no read
+//!     file mentions (formats nothing reads, patch servers outside the host
+//!     allowlist); the vendor ledger has no such fallback
+//!     ([`Discovery::vendor_entry_live`]). So extractors get this for free
+//!     — they cannot forget it —
 //!     as long as they read content ONLY through the ctx helpers (an
 //!     architecture test in this module enforces it) and sweep a file the
 //!     package manager IGNORES in favor of a sibling with
@@ -1626,8 +1628,9 @@ impl Discovery {
 
     /// [`Discovery::hosted_claim`]'s VENDORED twin (the vendor ledger's
     /// liveness gate): `Some(true)` only when a ref wires `purl` to exactly
-    /// the ledger's committed `artifact_rel` under `uuid`; `None` hands the
-    /// decision to the ledger's recorded wiring ([`vendored_wiring_live`]).
+    /// the ledger's committed `artifact_rel` under `uuid`; `None` when no
+    /// file discovery read mentions the uuid, which wires nothing either
+    /// ([`Discovery::vendor_entry_live`]) but is not a rejected mention.
     pub fn vendored_claim(&self, purl: &str, uuid: &str, artifact_rel: &str) -> Option<bool> {
         self.recognizes(uuid, WiringMode::Vendored).then(|| {
             let key = canonical_base_purl(purl);
@@ -2559,32 +2562,30 @@ impl Discovery {
 
     /// Liveness of a VENDOR-ledger entry — the ONE rule every reader of the
     /// vendor ledger applies (`vex`'s liveness gate, `scan`'s cross-mode
-    /// takeover classifier). Discovery is AUTHORITATIVE for every uuid a
-    /// file it read mentions ([`Discovery::vendored_claim`], rule 11): the
-    /// entry is live only if a ref wires this package to this artifact — a
-    /// mention an extractor rejected (an orphaned berry entry, an unbuilt
-    /// cargo `[patch]`, a uv lock its pyproject does not confirm, …) or a
-    /// section the package manager never reads is DEAD, and re-deriving
-    /// liveness from that same raw text is exactly the stale-ledger false
-    /// attestation the gate closes. Only a uuid no read file mentions (a
-    /// format nothing reads) falls back to the ledger's recorded wiring
-    /// files still naming the uuid dir (or, with none recorded, the
-    /// ecosystem's root locks — [`vendored_wiring_live`]).
+    /// takeover classifier): the entry is live only if a ref wires this
+    /// package to this artifact ([`Discovery::vendored_claim`]). A mention
+    /// an extractor rejected (an orphaned berry entry, an unbuilt cargo
+    /// `[patch]`, a uv lock its pyproject does not confirm, …) or a section
+    /// the package manager never reads is DEAD (rule 11), and so is an
+    /// entry no file discovery read mentions at all: the lock the install
+    /// consumes does not resolve the package from the artifact — reverted
+    /// by a merge, relocked, deleted — whatever a manifest override or any
+    /// other file the ledger names still spells.
+    ///
+    /// Raw text never decides. Every root lock and wiring config a vendored
+    /// artifact can be wired from is a file discovery reads, so text found
+    /// where no ref was is text the package manager does not install from;
+    /// and the ledger is committed, tamper-able data, so a file it names
+    /// proves nothing about what installs. (The prune GC, whose mistake
+    /// would be a revert, still keeps an entry on that weaker evidence:
+    /// [`Discovery::vendor_entry_in_use`].)
     pub async fn vendor_entry_live(&self, root: &Path, entry: &VendorEntry) -> bool {
         // The JVM backend's trees are not `<eco>/<uuid>` dirs its refs could
         // name: its own layout decides.
         if crate::vendor::jvm::apply::is_jvm_entry(entry) {
             return crate::vendor::jvm::apply::entry_wired(root, entry);
         }
-        if let Some(live) = self.vendored_claim(&entry.base_purl, &entry.uuid, &entry.artifact.path)
-        {
-            return live;
-        }
-        // `repair`'s reconstructed entries record no wiring files; the
-        // helper then probes the ecosystem's root locks rather than
-        // concluding "unwired" from a missing record.
-        let files: Vec<&str> = entry.wiring.iter().map(|w| w.file.as_str()).collect();
-        vendored_wiring_live(root, &files, &entry.ecosystem, &entry.uuid).await
+        self.vendored_claim(&entry.base_purl, &entry.uuid, &entry.artifact.path) == Some(true)
     }
 
     /// [`Discovery::vendor_entry_live`] for a reader that must tell a dead
@@ -2611,9 +2612,13 @@ impl Discovery {
     ///   wired; `vendor --check` names both locks, reverting would not
     ///   settle which one installs), or an extractor withheld its wiring
     ///   ([`Discovery::withheld`]), or a file mentioning it had wiring
-    ///   dropped as unattributable (`unattributable_mention`). A JVM entry: its tree is still
-    ///   referenced ([`crate::vendor::jvm::apply::entry_references`], which
-    ///   also answers `true` when a file cannot be read);
+    ///   dropped as unattributable (`unattributable_mention`), or — for a
+    ///   uuid no read file mentions — a file the ledger recorded as wiring
+    ///   still names its dir ([`vendored_wiring_recorded`]: a manifest
+    ///   override the next relock consumes although the lock was reverted;
+    ///   kept, never attested). A JVM entry: its tree is still referenced
+    ///   ([`crate::vendor::jvm::apply::entry_references`], which also
+    ///   answers `true` when a file cannot be read);
     /// * `Some(false)` — discovery read a lockfile of this ecosystem
     ///   ([`decides_install`]) and nothing wires the entry: the dependency
     ///   left the lock, was re-resolved elsewhere, or the wiring survives
@@ -2640,6 +2645,15 @@ impl Discovery {
             || self.unattributable_mention(&entry.uuid)
         {
             return Some(true);
+        }
+        // Reverting is destructive, so the recorded wiring's own text still
+        // keeps an entry no read file mentions: weaker evidence than
+        // liveness takes, and wrong only toward keeping.
+        if !self.recognizes(&entry.uuid, WiringMode::Vendored) {
+            let recorded: Vec<&str> = entry.wiring.iter().map(|w| w.file.as_str()).collect();
+            if vendored_wiring_recorded(root, &recorded, &entry.ecosystem, &entry.uuid).await {
+                return Some(true);
+            }
         }
         let mut read_lock = false;
         for read in self.read.iter().filter(|r| r.ecosystem == entry.ecosystem) {
@@ -3078,14 +3092,13 @@ fn resolves_elsewhere(entry: &LockfileEntry) -> bool {
         || (entry.ecosystem == "cargo" && entry.source_kind == SourceKind::CratesIo)
 }
 
-/// Whether any of `files` — the root-relative wiring files a VENDOR ledger
-/// entry recorded editing — still references the entry's
-/// `.socket/vendor/<eco>/<uuid>` dir. This is the fallback liveness proof
-/// for ledger entries whose uuid NO file discovery read mentions
-/// ([`Discovery::vendored_claim`] is `None` — rule 11); for a recognized
-/// uuid the refs decide, because this raw-text match cannot tell a wiring
-/// from a rejected or ignored mention. A vendored artifact left behind
-/// after the lockfile was reverted must not keep attesting.
+/// Whether any of the root-relative `files` still spells the
+/// `.socket/vendor/<eco>/<uuid>` dir. A raw-text match: it cannot tell a
+/// wiring from a rejected or ignored mention, so it is never a liveness
+/// proof ([`Discovery::vendor_entry_live`] reads refs alone) — only the
+/// prune GC's reason to keep an entry ([`vendored_wiring_recorded`]), and
+/// only for a uuid NO file discovery read mentions
+/// ([`Discovery::vendored_claim`] is `None` — rule 11).
 ///
 /// `bun.lockb` is read through its binary resolution records, never as text
 /// — its append-only string pool can retain paths from earlier patch
@@ -3121,18 +3134,20 @@ pub async fn vendored_wiring_in_files(root: &Path, files: &[&str], eco: &str, uu
     false
 }
 
-/// Liveness of a vendor-ledger entry by its recorded wiring — the fallback
-/// for ledger entries no discovered reference covers. The entry's own
+/// Whether a vendor-ledger entry's RECORDED wiring still names its dir —
+/// the prune GC's reason to keep an entry no discovered reference covers
+/// ([`Discovery::vendor_entry_in_use`]), never a liveness proof: the files
+/// are the ledger's to name, and one of them (a `package.json` override)
+/// can outlive the lock entry the install consumes. The entry's own
 /// `wiring` files are authoritative when any of them still exists: a
 /// recorded lockfile that no longer names `.socket/vendor/<eco>/<uuid>` was
-/// reverted, and the leftover artifact must not keep attesting. When the
-/// entry recorded NO wiring file that exists — `repair`'s ledger
-/// reconstruction writes `wiring: []` for every ecosystem but gem, and an
-/// older ledger may name a lock since renamed — the entry's ecosystem's
-/// root lockfiles / wiring configs ([`vendored_wiring_probe_files`]) are
-/// probed instead: absence of a wiring RECORD is not evidence the wiring is
-/// gone.
-pub async fn vendored_wiring_live(root: &Path, recorded: &[&str], eco: &str, uuid: &str) -> bool {
+/// reverted. When the entry recorded NO wiring file that exists —
+/// `repair`'s ledger reconstruction writes `wiring: []` for every ecosystem
+/// but gem, and an older ledger may name a lock since renamed — the entry's
+/// ecosystem's root lockfiles / wiring configs
+/// ([`vendored_wiring_probe_files`]) are probed instead: absence of a
+/// wiring RECORD is not evidence the wiring is gone.
+async fn vendored_wiring_recorded(root: &Path, recorded: &[&str], eco: &str, uuid: &str) -> bool {
     if vendored_wiring_in_files(root, recorded, eco, uuid).await {
         return true;
     }
@@ -3653,13 +3668,15 @@ mod tests {
     fn hosted_shape_uuid_normalizes_like_hosted_patch_uuid() {
         const U: &str = "11111111-2222-4333-8444-555555555555";
         for url in [
-            format!("https://mirror.example/patch/{U}/x.tgz"),
-            format!("https:\\/\\/mirror.example\\/patch\\/{U}\\/x.tgz"),
-            format!("https%3A%2F%2Fmirror.example%2Fpatch%2F{U}%2Fx.tgz"),
-            format!("sparse+https://mirror.example/patch/{U}/"),
-            format!("registry+https://mirror.example/patch/{U}/"),
-            format!("https://patch.socket.dev@mirror.example/patch/{U}/x.tgz"),
-            format!("https://user:pw@patch.socket.dev/patch/{U}/x.tgz"),
+            format!("https://mirror.example/patch/npm/tok/{U}/x.tgz"),
+            format!("https:\\/\\/mirror.example\\/patch\\/npm\\/tok\\/{U}\\/x.tgz"),
+            format!("https%3A%2F%2Fmirror.example%2Fpatch%2Fnpm%2Ftok%2F{U}%2Fx.tgz"),
+            format!("sparse+https://mirror.example/patch-registry/cargo/tok/{U}/index/"),
+            format!("registry+https://mirror.example/patch-registry/cargo/tok/{U}/index/"),
+            format!("https://mirror.example/base/patch/npm/tok/{U}/x.tgz"),
+            format!("https://mirror.example/gopatch/{U}"),
+            format!("https://patch.socket.dev@mirror.example/patch/npm/tok/{U}/x.tgz"),
+            format!("https://user:pw@patch.socket.dev/patch/npm/tok/{U}/x.tgz"),
         ] {
             assert_eq!(
                 crate::origin::hosted_shape_uuid(&url).as_deref(),
@@ -3667,10 +3684,13 @@ mod tests {
                 "{url}"
             );
         }
-        // A url merely ending in the uuid is not a patch server's.
+        // A url merely ending in the uuid is not a patch server's, nor is
+        // one whose `patch` level is followed by no ecosystem.
         for url in [
             format!("https://artifacts.corp/blobs/{U}/x-1.0.0.tgz"),
             format!("https://evil.example/{U}/x.tgz"),
+            format!("https://mirror.example/patch/{U}/x.tgz"),
+            format!("https://mirror.example\\@evil.example/patch/npm/tok/{U}/x.tgz"),
         ] {
             assert_eq!(crate::origin::hosted_shape_uuid(&url), None, "{url}");
         }
@@ -4708,13 +4728,14 @@ mod tests {
         assert!(!vendored_wiring_in_files(root, &["bun.lockb"], "npm", UUID_A).await);
     }
 
-    /// REGRESSION: `repair`'s reconstructed ledger entries carry `wiring: []`
-    /// (every ecosystem but gem). No recorded wiring file is not evidence the
-    /// wiring is gone: the ecosystem's root locks are probed instead. A
-    /// recorded file that still exists stays authoritative (reverted =>
-    /// dead, even if another root lock mentions the dir).
+    /// The prune GC's keep check. `repair`'s reconstructed ledger entries
+    /// carry `wiring: []` (every ecosystem but gem). No recorded wiring file
+    /// is not evidence the wiring is gone: the ecosystem's root locks are
+    /// probed instead. A recorded file that still exists stays
+    /// authoritative (reverted => not kept, even if another root lock
+    /// mentions the dir).
     #[tokio::test]
-    async fn vendored_liveness_probes_root_locks_when_no_wiring_is_recorded() {
+    async fn recorded_wiring_probes_root_locks_when_no_wiring_is_recorded() {
         let p = Project::new();
         let dir = format!(".socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz");
         p.write(
@@ -4724,14 +4745,14 @@ mod tests {
             ),
         );
         let root = p.root();
-        assert!(vendored_wiring_live(root, &[], "npm", UUID_A).await);
+        assert!(vendored_wiring_recorded(root, &[], "npm", UUID_A).await);
         assert!(
-            vendored_wiring_live(root, &["yarn.lock"], "npm", UUID_A).await,
+            vendored_wiring_recorded(root, &["yarn.lock"], "npm", UUID_A).await,
             "a recorded wiring file that no longer exists falls back to the probe"
         );
-        assert!(!vendored_wiring_live(root, &[], "npm", UUID_B).await);
+        assert!(!vendored_wiring_recorded(root, &[], "npm", UUID_B).await);
         assert!(
-            !vendored_wiring_live(root, &[], "cargo", UUID_A).await,
+            !vendored_wiring_recorded(root, &[], "cargo", UUID_A).await,
             "the probe reads only the entry's own ecosystem's files for its own dir"
         );
         p.write(
@@ -4739,7 +4760,7 @@ mod tests {
             "{\"lockfileVersion\":3,\"packages\":{}}",
         );
         assert!(
-            !vendored_wiring_live(root, &["package-lock.json"], "npm", UUID_A).await,
+            !vendored_wiring_recorded(root, &["package-lock.json"], "npm", UUID_A).await,
             "an existing recorded wiring file that was reverted is authoritative"
         );
         // Pre-v5 cargo wiring lives in the cargo config, not Cargo.lock.
@@ -4748,7 +4769,7 @@ mod tests {
             ".cargo/config.toml",
             format!("[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
         );
-        assert!(vendored_wiring_live(c.root(), &[], "cargo", UUID_A).await);
+        assert!(vendored_wiring_recorded(c.root(), &[], "cargo", UUID_A).await);
         // v5 cargo wiring lives in the root Cargo.toml (repair rebuilds such
         // entries with no recorded wiring).
         let m = Project::new();
@@ -4756,8 +4777,135 @@ mod tests {
             "Cargo.toml",
             format!("[package]\nname = \"app\"\n\n[patch.crates-io]\nsmallvec = {{ path = \".socket/vendor/cargo/{UUID_A}/smallvec-1.6.0\" }}\n"),
         );
-        assert!(vendored_wiring_live(m.root(), &[], "cargo", UUID_A).await);
-        assert!(!vendored_wiring_live(m.root(), &[], "cargo", UUID_B).await);
+        assert!(vendored_wiring_recorded(m.root(), &[], "cargo", UUID_A).await);
+        assert!(!vendored_wiring_recorded(m.root(), &[], "cargo", UUID_B).await);
+    }
+
+    /// A vendor-ledger entry for `foo@1.0.0` under [`UUID_A`] recording
+    /// `wiring` (`(file, kind)` pairs).
+    fn npm_ledger_entry(wiring: &[(&str, &str)]) -> VendorEntry {
+        let wiring: Vec<serde_json::Value> = wiring
+            .iter()
+            .map(|(file, kind)| serde_json::json!({"file": file, "kind": kind, "action": "added"}))
+            .collect();
+        serde_json::from_value(serde_json::json!({
+            "ecosystem": "npm",
+            "basePurl": "pkg:npm/foo@1.0.0",
+            "uuid": UUID_A,
+            "artifact": {
+                "path": format!(".socket/vendor/npm/{UUID_A}/foo-1.0.0.tgz"),
+                "sha256": "",
+            },
+            "wiring": wiring,
+        }))
+        .unwrap()
+    }
+
+    /// A pnpm lock reverted to the registry resolution (a merge that took
+    /// the other side) while the `pnpm.overrides` entry stays in
+    /// `package.json`. The lock is what the install consumes, and it
+    /// resolves the package without the artifact: the entry is dead, however
+    /// much of its recorded wiring still names the vendored dir. The prune
+    /// GC still keeps it (the next relock re-reads the override).
+    #[tokio::test]
+    async fn reverted_lock_kills_a_vendor_entry_its_manifest_still_names() {
+        let p = Project::new();
+        let artifact = format!(".socket/vendor/npm/{UUID_A}/foo-1.0.0.tgz");
+        p.write(
+            "package.json",
+            format!(
+                "{{\"name\":\"app\",\"version\":\"0.1.0\",\"dependencies\":{{\"foo\":\"1.0.0\"}},\
+                 \"pnpm\":{{\"overrides\":{{\"foo@1.0.0\":\"file:{artifact}\"}}}}}}"
+            ),
+        );
+        p.write(
+            "pnpm-lock.yaml",
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      foo:\n        \
+             specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  foo@1.0.0:\n    \
+             resolution: {integrity: sha512-AAAA==}\n\nsnapshots:\n\n  foo@1.0.0: {}\n",
+        );
+        let entry = npm_ledger_entry(&[("package.json", "override"), ("pnpm-lock.yaml", "lock")]);
+        let discovery = p.discover().await;
+        assert_eq!(
+            discovery.vendored_claim(&entry.base_purl, &entry.uuid, &entry.artifact.path),
+            None,
+            "no swept file mentions the uuid, so the refs alone do not decide"
+        );
+        assert!(
+            !discovery.vendor_entry_live(p.root(), &entry).await,
+            "the lock discovery read resolves foo from the registry"
+        );
+        assert_eq!(
+            discovery.vendor_entry_liveness(p.root(), &entry).await,
+            Some(false)
+        );
+        assert_eq!(
+            discovery.vendor_entry_in_use(p.root(), &entry).await,
+            Some(true),
+            "the override is still wiring a relock consumes: never pruned"
+        );
+    }
+
+    /// The ledger is committed, tamper-able data. A `wiring[].file` naming
+    /// an arbitrary project file that spells the vendored dir is no liveness
+    /// proof, with or without a lock beside it.
+    #[tokio::test]
+    async fn ledger_named_files_never_prove_a_vendor_entry_live() {
+        let entry = npm_ledger_entry(&[("docs/notes.txt", "lock")]);
+        let note = format!("see .socket/vendor/npm/{UUID_A}/foo-1.0.0.tgz for the patch\n");
+
+        // Beside a lock that resolves the package from the registry.
+        let locked = Project::new();
+        locked.write("docs/notes.txt", &note);
+        locked.write(
+            "package-lock.json",
+            "{\"name\":\"app\",\"version\":\"0.1.0\",\"lockfileVersion\":3,\"packages\":{\"\":\
+             {\"name\":\"app\",\"version\":\"0.1.0\",\"dependencies\":{\"foo\":\"1.0.0\"}},\
+             \"node_modules/foo\":{\"version\":\"1.0.0\",\"resolved\":\
+             \"https://registry.npmjs.org/foo/-/foo-1.0.0.tgz\",\"integrity\":\"sha512-AAAA==\"}}}",
+        );
+        let discovery = locked.discover().await;
+        assert!(!discovery.vendor_entry_live(locked.root(), &entry).await);
+
+        // With no lock at all: no ref, so still not live.
+        let lockless = Project::new();
+        lockless.write("docs/notes.txt", &note);
+        let discovery = lockless.discover().await;
+        assert!(!discovery.vendor_entry_live(lockless.root(), &entry).await);
+    }
+
+    /// A `resolved` url whose host depends on who parses it (the WHATWG
+    /// parser reads `patch.socket.dev\@evil.example` as Socket's host,
+    /// libcurl as `evil.example`), or whose path the patch server serves
+    /// no patch under, wires nothing. Its uuid is still recognized, so no
+    /// ledger claim for it is decided from raw text.
+    #[tokio::test]
+    async fn a_look_alike_hosted_url_wires_nothing_and_stays_recognized() {
+        let tail = format!("{TOKEN}/{UUID_A}/foo-1.0.0.tgz");
+        for resolved in [
+            format!("https://patch.socket.dev\\\\@evil.example/patch/npm/foo/1.0.0/{tail}"),
+            format!("https://patch.socket.dev/x/{tail}"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID_A}/..%2f..%2ffoo-1.0.0.tgz"),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                format!(
+                    "{{\"name\":\"app\",\"version\":\"0.1.0\",\"lockfileVersion\":3,\"packages\":{{\"\":\
+                     {{\"name\":\"app\",\"version\":\"0.1.0\",\"dependencies\":{{\"foo\":\"1.0.0\"}}}},\
+                     \"node_modules/foo\":{{\"version\":\"1.0.0\",\"resolved\":\"{resolved}\",\
+                     \"integrity\":\"sha512-{}==\"}}}}}}",
+                    "A".repeat(86)
+                ),
+            );
+            let out = p.discover().await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.hosted_claim("pkg:npm/foo@1.0.0", UUID_A),
+                Some(false),
+                "{resolved}"
+            );
+        }
     }
 
     /// Cross-package-manager union: one root carrying the committed hosted

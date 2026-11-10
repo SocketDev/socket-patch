@@ -4823,7 +4823,9 @@ mod tests {
     const FIXTURE_UUID: &str = "77777777-7777-4777-8777-777777777777";
 
     fn left_pad_url() -> String {
-        format!("https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/left-pad-1.3.0.tgz")
+        format!(
+            "https://patch.test/patch/npm/left-pad/1.3.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/left-pad-1.3.0.tgz"
+        )
     }
 
     fn left_pad_candidate() -> Candidate {
@@ -5542,7 +5544,7 @@ snapshots:
                 token: FIXTURE_TOKEN.into(),
                 patch_uuid: FIXTURE_UUID.into(),
                 artifact_url: format!(
-                    "https://patch.test/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
+                    "https://patch.test/patch/npm/is-number/7.0.0/{FIXTURE_TOKEN}/{FIXTURE_UUID}/is-number-7.0.0.tgz"
                 ),
                 registry_override: None,
                 integrity: Integrity {

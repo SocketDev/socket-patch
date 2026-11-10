@@ -585,7 +585,10 @@ fn assert_attested(
     );
     assert_eq!(
         s["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{cell}: {doc}"
     );
     assert!(

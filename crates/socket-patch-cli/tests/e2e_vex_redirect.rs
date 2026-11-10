@@ -416,9 +416,10 @@ fn redirected_no_verify_attests_without_installed_tree() {
         "the redirected patch must be attested: {doc}"
     );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-nv");
+    // The (redirected) marker, then `--no-verify`'s own disclosure.
     assert_eq!(
         stmts[0]["impact_statement"].as_str().unwrap(),
-        format!("Patched via Socket patch {UUID} (redirected)"),
+        format!("Patched via Socket patch {UUID} (redirected); not verified on disk"),
     );
 }
 
@@ -691,8 +692,8 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
         assert_eq!(st["status"], "not_affected");
         assert_eq!(
             st["impact_statement"].as_str().unwrap(),
-            format!("Patched via Socket patch {uuid} (redirected)"),
-            "{ghsa} must carry the (redirected) marker"
+            format!("Patched via Socket patch {uuid} (redirected); not verified on disk"),
+            "{ghsa} must carry the (redirected) marker and --no-verify's disclosure"
         );
         assert_eq!(
             st["products"][0]["subcomponents"][0]["@id"], *purl,
@@ -945,6 +946,54 @@ fn uuid_on_a_foreign_host_is_not_a_patch_reference() {
         message.contains("Manifest not found") && message.contains("no hosted or vendored"),
         "{message}"
     );
+}
+
+/// A `resolved` that only looks like Socket's is no patch reference either,
+/// however available the patch record: a host that depends on who parses
+/// the URL (`patch.socket.dev\@evil.example` is Socket's host to a WHATWG
+/// parser and `evil.example` to libcurl), a path the patch server serves no
+/// patch under, or one a percent-encoded `/` can lead out of. With no
+/// manifest the run finds nothing to attest and asks the API for nothing.
+#[test]
+fn look_alike_socket_urls_are_not_patch_references() {
+    let tail = format!("{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
+    for resolved in [
+        format!("https://patch.socket.dev\\@evil.example/patch/npm/left-pad/1.3.0/{tail}"),
+        format!("https://patch.socket.dev/x/{tail}"),
+        format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/..%2f..%2fleft-pad-1.3.0.tgz"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("package-lock.json"),
+            serde_json::json!({
+                "name": "app",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": SRI
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (rt, server) =
+            serve_patch_views(vec![(UUID.to_string(), left_pad_view(&"b".repeat(64)))]);
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_eq!(code, Some(2), "{resolved}: {env}");
+        assert_eq!(
+            env["error"]["code"], "manifest_not_found",
+            "{resolved}: {env}"
+        );
+        assert!(!cwd.join("out.vex.json").exists(), "{resolved}");
+        let asked = rt.block_on(server.received_requests()).unwrap_or_default();
+        assert!(asked.is_empty(), "{resolved}: {asked:?}");
+    }
 }
 
 /// `--patch-server-url` (staging / self-hosted / test servers): hosted
@@ -1254,7 +1303,7 @@ fn hosted_takeover_of_a_vendored_package_attests_the_hosted_patch() {
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-host-u2");
     assert_eq!(
         stmts[0]["impact_statement"],
-        format!("Patched via Socket patch {U2} (redirected)")
+        format!("Patched via Socket patch {U2} (redirected); not verified on disk")
     );
 
     // Hosted wiring reverted as well: nothing is wired any more.
@@ -1734,7 +1783,7 @@ fn lockless_hosted_pins_keep_their_redirect_ledger_record_alive() {
                 serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
             assert_eq!(
                 doc["statements"][0]["impact_statement"],
-                format!("Patched via Socket patch {uuid} (redirected)"),
+                format!("Patched via Socket patch {uuid} (redirected); not verified on disk"),
                 "{name}: {doc}"
             );
         } else {
