@@ -1537,6 +1537,7 @@ pub fn wired(read: ReadFn<'_>, list: ListFn<'_>, c: &Coords<'_>) -> bool {
         uuid: c.uuid,
         jar: &jar,
         upstream_pom: &pom,
+        upstream_parents: None,
         upstream_module: module.as_deref(),
         extra_artifacts: &extras,
         patched_members: &patched,
@@ -2679,6 +2680,7 @@ pub(crate) fn add_verification_metadata(
             uuid: "",
             jar: &[],
             upstream_pom: &m.bytes,
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -2770,6 +2772,7 @@ mod tests {
             uuid: UUID,
             jar: b"PATCHED-JAR",
             upstream_pom: b"<project></project>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -3172,6 +3175,7 @@ mod tests {
     fn index_rows_include_the_module() {
         let p = JvmPatch {
             upstream_pom: b"<!-- do_not_remove: published-with-gradle-metadata -->",
+            upstream_parents: None,
             upstream_module: Some(b"{\"formatVersion\":\"1.1\"}"),
             ..patch()
         };
@@ -3290,6 +3294,7 @@ mod tests {
         assert_eq!(err.code, "vendor_jvm_upstream_unavailable");
         assert!(err.detail.starts_with("reason: module_unavailable: "));
         let p = JvmPatch {
+            upstream_parents: None,
             upstream_module: Some(b"{\"variants\":[{\"available-at\":{}}]}"),
             ..patch()
         };
@@ -3590,6 +3595,7 @@ mod tests {
         .replace('\n', "\r\n");
         let p = JvmPatch {
             upstream_pom: b"<!-- do_not_remove: published-with-gradle-metadata -->",
+            upstream_parents: None,
             upstream_module: Some(b"{}"),
             ..patch()
         };
@@ -3813,6 +3819,7 @@ mod tests {
             uuid: UUID_B,
             jar: b"B-JAR",
             upstream_pom: b"<project></project>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],

@@ -1156,6 +1156,7 @@ fn verification_edit(text: &str, a: &Accepted) -> Result<String, String> {
         uuid: &a.row.uuid,
         jar: &[],
         upstream_pom: &[],
+        upstream_parents: None,
         upstream_module: None,
         extra_artifacts: &[],
         patched_members: &[],

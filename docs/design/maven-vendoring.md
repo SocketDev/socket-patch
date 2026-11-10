@@ -76,7 +76,48 @@ The backend writes:
 - Rewrites of conflicting base-version literals and resolved local properties,
   including profiles and local parent POMs outside the module list.
 - Two lines in `.mvn/maven.config`: offline file protocol access and the local
-  repository tail at `${session.rootDirectory}/.socket/vendor/maven2`.
+  repository tail at `${session.rootDirectory}/.socket/vendor/maven2`. A
+  `maven.config` that is not UTF-8 is edited byte for byte, and reverts to
+  its original bytes.
+
+The suffixed POM is the upstream POM with its own version suffixed and its own
+`${project.version}` references written out. Maven interpolates a POM after
+merging its parents into it, so a `${project.version}` in a parent POM reads
+the suffixed version too. A sibling the parent manages that way (log4j,
+logback) would then resolve at `<base>-socket.<hex8>`, which nothing serves.
+`vendor` therefore reads the upstream parent chain, from the local caches or
+the registry like other upstream metadata, and declares in the suffixed POM
+what it inherits through such a reference, at the base version:
+
+- a property a dependency version reads;
+- the parents' managed dependencies and dependencies, up to the last one that
+  names the version, in the order Maven inherits them (a child's own
+  declarations come first, so declaring one entry alone would reorder the
+  classpath and the imported BOMs).
+
+The additions sit between `<!-- socket-patch:inherited:begin -->` and
+`<!-- socket-patch:inherited:end -->`. A parent that names the version only
+where no consumer reads it (plugin configuration, a release property), or only
+for the patched artifact itself, changes nothing, so those POMs stay byte for
+byte what 5.1 wrote. Planning ends by reading the result the way Maven does,
+and refuses a POM that would still resolve or manage a suffixed version the
+tree does not serve. Refused with `vendor_jvm_upstream_unavailable`:
+
+- `parent_unavailable`: a first vendoring whose parents are in no cache and
+  cannot be fetched. A committed tree re-planned offline keeps the POM it has.
+- `inherited_version_unresolvable`: a shape the additions cannot express,
+  because a child's declaration always beats a parent's. That is a parent
+  profile that declares such a version or may set a copied property or entry,
+  a management key or repository URL built from the version, and a parent
+  that names the version but cannot be parsed.
+
+`vendor --check` reads the parents from `--local-repo` and the machine's Maven
+and Gradle caches, never the network. A tree vendored by 5.0 or 5.1 whose POM
+resolves a dependency or imports a BOM at the suffixed version fails the
+check, with the dependency and the parent named; `socket-patch vendor`
+rewrites the POM. Management the POM does not use is not read by Maven 3, so
+such a tree keeps passing (the next `vendor` still rewrites it). With the
+parents in no cache the POM is not judged.
 
 Parent chains must remain within the checkout. Local parent coordinates are
 checked before using their properties. Range selectors, unresolved properties,
@@ -88,8 +129,10 @@ fallback repository and warns that the tail requires Maven 3.9.2 or newer.
 A local root's pin beats every management from outside the checkout, so it is
 weighed against that management first: the parents a local root resolves from
 a repository (`<relativePath/>`, a corporate or Spring Boot parent) and every
-`<scope>import</scope>` BOM of the reactor and of those parents, read from the
-local caches or the registry like other upstream metadata. Properties follow
+`<scope>import</scope>` BOM of the reactor and of those parents. A copy in a
+local cache is the one the build reads, so it decides whatever the registry
+says of it (a corporate parent is on no public registry); only a POM no cache
+holds is fetched. Properties follow
 Maven's order (the reactor's own values override an external parent's). When
 that management, or a literal an external parent declares, sets the artifact to
 another version than the patch's base, the root is not pinned
@@ -234,7 +277,7 @@ tree is refused nowhere and degraded nowhere.
 
 ## Artifact identity and integrity
 
-Service jars pass transfer-integrity and patched-member checks. The server constructs jars and strips invalidated signatures; the CLI never rebuilds jar archives. Online vendoring authenticates upstream POM and Gradle module metadata against registry sidecars. Metadata fetches use a separate HTTP client and do not send Socket API credentials. `SOCKET_MAVEN_REGISTRY` supports a private mirror.
+Service jars pass transfer-integrity and patched-member checks. The server constructs jars and strips invalidated signatures; the CLI never rebuilds jar archives. Online vendoring authenticates upstream POM and Gradle module metadata against registry sidecars. A POM or module that a local cache holds and the registry gives no checksum for is the file the build resolved: it is used, and the entry is recorded unverified (`vendor_jvm_upstream_unverified`), as an offline one is. Bytes that differ from a published checksum are refused. Metadata fetches use a separate HTTP client and do not send Socket API credentials. `SOCKET_MAVEN_REGISTRY` supports a private mirror.
 
 Maven v5 does not enable Resolver trusted-checksum processors at build time.
 Those processors crash some release reactors and system-scope dependencies,
