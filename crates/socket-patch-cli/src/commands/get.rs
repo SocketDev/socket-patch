@@ -2041,7 +2041,11 @@ async fn save_and_apply_patch(
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
     // an error return below drops the guard.
-    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(
+        &socket_dir,
+        lock_timeout,
+        args.common.dry_run,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             let err = report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
@@ -2053,6 +2057,7 @@ async fn save_and_apply_patch(
             return 1;
         }
     };
+    let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&guard);
 
     let action = match save_patch_record(args, &manifest_path, &socket_dir, patch).await {
         Ok(action) => action,
@@ -2074,7 +2079,7 @@ async fn save_and_apply_patch(
     // explicitly fetched this uuid; if the vendor ledger still wires a
     // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
     // until a `vendor` run refreshes the committed artifact.
-    let mut warnings: Vec<RunWarning> = Vec::new();
+    let mut warnings: Vec<RunWarning> = commit_recovery.into_iter().collect();
     let recorded = [(patch.purl.clone(), patch.uuid.clone())];
     if changed {
         warn_on_vendored_uuid_drift(&args.common.project_root(), quiet, &recorded, &mut warnings)

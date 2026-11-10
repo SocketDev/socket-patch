@@ -480,6 +480,67 @@ async fn scan_vendor_lock_io_reports_json_error() {
     );
 }
 
+/// The vendor step's lock finishes a commit an interrupted run journaled,
+/// and the scan says so: the roll-forward is a `Warning:` on stderr and a
+/// `vendor_commit_recovered` run warning in scan's own envelope, naming the
+/// files it rewrote. The run then vendors as usual.
+#[tokio::test]
+async fn scan_vendor_reports_the_interrupted_commit_its_lock_finished() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let mock = MockServer::start().await;
+    mount_patch_api(&mock, UUID).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_fixture(tmp.path());
+    std::fs::create_dir_all(tmp.path().join("tools")).unwrap();
+    let entry = |rel: &str, old: &[u8], new: &[u8]| {
+        std::fs::write(tmp.path().join(rel), old).unwrap();
+        serde_json::json!({
+            "path": rel,
+            "before": hex::encode(sha2::Sha256::digest(old)),
+            "after": base64::engine::general_purpose::STANDARD.encode(new),
+        })
+    };
+    let journal = tmp.path().join(".socket/vendor/.commit-journal.json");
+    std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+    let files = [
+        entry("tools/a.lock", b"a-old\n", b"a-new\n"),
+        entry("tools/b.lock", b"b-old\n", b"b-new\n"),
+    ];
+    std::fs::write(
+        &journal,
+        serde_json::to_vec(&serde_json::json!({ "version": 1, "files": files })).unwrap(),
+    )
+    .unwrap();
+
+    let (code, stdout, stderr) = run_scan_vendor(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(!journal.exists(), "the journal is consumed");
+    assert_eq!(
+        std::fs::read(tmp.path().join("tools/b.lock")).unwrap(),
+        b"b-new\n"
+    );
+    assert!(
+        stderr.lines().any(|l| l.starts_with("Warning:")
+            && l.contains("rolled forward tools/a.lock, tools/b.lock")),
+        "stderr={stderr}"
+    );
+    let v = parse_json_envelope(stdout.trim());
+    assert_eq!(v["summary"]["applied"], 1, "envelope={v}");
+    let recovered: Vec<&str> = v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == "vendor_commit_recovered")
+        .filter_map(|w| w["detail"].as_str())
+        .collect();
+    assert_eq!(recovered.len(), 1, "reported once; envelope={v}");
+    assert!(
+        recovered[0].contains("tools/a.lock, tools/b.lock"),
+        "envelope={v}"
+    );
+}
+
 /// A corrupt committed manifest is not vendored mode's record source:
 /// scan's early tolerant read swallows the parse error, the run vendors
 /// normally (exit 0), and only the post-vendor legacy-record migration

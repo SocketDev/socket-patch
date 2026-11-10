@@ -157,7 +157,7 @@ fn acquire_hosted_lock(
 ) -> Result<LockGuard, i32> {
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
+    match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout, common.dry_run) {
         Ok(guard) => Ok(guard),
         Err(err) => {
             let (code, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
@@ -1479,7 +1479,7 @@ async fn run_redirect_selected_untracked(
         }
     }
     // Held to the end of the function.
-    let _lock = lock;
+    let lock = lock;
     let confirmed = done.confirmed.clone();
 
     // SYMLINK GUARD (see `engine::guard`) — before any write, dry runs
@@ -1907,6 +1907,12 @@ async fn run_redirect_selected_untracked(
         record_hosted_events(&mut env, &confirmed, &unconfirmed, &skipped, common.dry_run);
         env.set_extra("redirect", redirect_block(done.rewritten.clone()));
         env.warnings.extend(warnings);
+        // Taking the lock may have finished an interrupted run's commit
+        // (stderr said so then).
+        env.warnings.extend(
+            lock.as_ref()
+                .and_then(crate::commands::lock_cli::commit_recovery_warning),
+        );
         if let Some(gate) = &rollout {
             super::finish_rollout_json(gate.stage, &mut env);
         }

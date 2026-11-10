@@ -18,7 +18,9 @@
 //! and [`GroupCommit::commit`] writes the final state once.
 //!
 //! **What is captured.** Files under the root whose relative path has no
-//! `.socket` component, the two ledgers (`.socket/vendor/state.json`,
+//! `.socket` and no `.git` component, under any spelling a filesystem
+//! folds onto those names (no backend writes into a git directory), the
+//! two ledgers (`.socket/vendor/state.json`,
 //! `.socket/vendor/redirect-state.json`), and the small text files the JVM
 //! wiring owns under `.socket/` (the Gradle index and settings script, the
 //! owned `.gitattributes` files, the derived `maven-metadata.xml` files, the
@@ -53,7 +55,19 @@
 //! replaced, so the lockfiles and the ledger are observed all-new by the
 //! next locked command; never a half-wired lock with a ledger that
 //! disagrees. A replay that fails on I/O keeps the journal and fails the
-//! acquire, so no command works over the torn state.
+//! acquire, so no command works over the torn state. The command that
+//! replayed a journal says which files it rewrote; a dry run, which writes
+//! nothing, replays nothing and refuses to preview over the torn state
+//! ([`pending`], [`crate::patch::apply_lock::acquire_dry_run`]).
+//!
+//! The journal sits in the working tree, so a checkout can supply one that
+//! no crash wrote (a pull request can commit it). A replay therefore writes
+//! only what a commit could have journaled: the captured set above, at a
+//! relative path with no `..`, reached through no symbolic link. That keeps
+//! it out of every git directory, which a checkout cannot otherwise reach,
+//! and inside the project. The file names themselves cannot be narrowed
+//! further: the backends rewrite files the project names (a `-r` include of
+//! any name at any depth, each workspace member's manifest).
 //!
 //! A file matching neither side (edited by hand since the crash) is never
 //! written over, and the journal is renamed aside once the replay has made
@@ -64,8 +78,9 @@
 //! none carries any of them (it was edited before the crash reached it)
 //! the files already replaced are put back from the journal's recorded
 //! bytes; otherwise nothing is written. A journal naming a path outside the
-//! captured set, or one that would write through a symbolic link, is set
-//! aside unapplied. A single changed file needs no journal: its own atomic
+//! captured set (a git directory, an artifact, a path that leaves the
+//! project), or one that would write through a symbolic link, is set aside
+//! unapplied. A single changed file needs no journal: its own atomic
 //! rename is the commit.
 //!
 //! A failed replacement during the commit itself puts the files already
@@ -182,9 +197,62 @@ fn relative_to(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+/// Whether a path component names the dot-directory `dir` (`.git`,
+/// `.socket`) on some filesystem this CLI runs on, by the rules git guards
+/// its own tree with (`is_ntfs_dotgit`, `is_hfs_dotgit`): ASCII case is
+/// folded (APFS, HFS+, NTFS), the code points HFS+ ignores are skipped,
+/// the 8.3 short name NTFS gives it counts (`git~1`), and NTFS drops
+/// trailing dots and spaces and reads `:` as the start of a stream name.
+fn names_dot_dir(component: &std::ffi::OsStr, dir: &str) -> bool {
+    let name = component.to_string_lossy();
+    let mut chars = name
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200C}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{206A}'..='\u{206F}'
+                    | '\u{FEFF}'
+            )
+        })
+        .peekable();
+    let (stem, short) = match chars.peek() {
+        Some('.') => (dir, ""),
+        Some(_) => (&dir[1..], "~1"),
+        None => return false,
+    };
+    for expected in stem.chars().chain(short.chars()) {
+        if !chars
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
+        {
+            return false;
+        }
+    }
+    for c in chars {
+        match c {
+            '.' | ' ' => {}
+            ':' | '\\' => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Whether a project-relative path is a captured commit point.
 fn is_captured(rel: &Path) -> bool {
     if rel.as_os_str().is_empty() {
+        return false;
+    }
+    let below = |dir: &str| {
+        rel.components()
+            .any(|c| matches!(c, Component::Normal(p) if names_dot_dir(p, dir)))
+    };
+    // No backend's commit point is inside a git directory, and the journal
+    // (which replays exactly the captured set, from a file the checkout can
+    // supply) must never reach the hooks and config a commit cannot.
+    if below(".git") {
         return false;
     }
     let spelled = rel.to_string_lossy().replace('\\', "/");
@@ -194,8 +262,9 @@ fn is_captured(rel: &Path) -> bool {
     {
         return true;
     }
-    !rel.components()
-        .any(|c| matches!(c, Component::Normal(p) if p == crate::constants::SOCKET_DIR))
+    // Under any spelling: `.SOCKET/manifest.json` is the manifest wherever
+    // the filesystem folds case.
+    !below(crate::constants::SOCKET_DIR)
 }
 
 /// The open overlay capturing `path`, and its key.
@@ -1091,8 +1160,8 @@ pub enum Recovery {
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetAsideOutcome {
     /// Nothing was written: the journal is unreadable, or names a path it
-    /// must never write (outside the lockfiles and ledgers, or through a
-    /// symbolic link).
+    /// must never write (outside the lockfiles and ledgers, inside a git
+    /// directory, or through a symbolic link).
     Refused,
     /// Nothing was written: a file changed since the crash, and its edit
     /// does not say which side of the commit it was made on.
@@ -1191,17 +1260,50 @@ fn write_sync(path: &Path, bytes: Option<&[u8]>, preserve_mode: bool) -> std::io
     }
 }
 
+/// The journal under `project_root` and its bytes; `None` when there is
+/// none.
+fn read_journal(project_root: &Path) -> std::io::Result<Option<(PathBuf, Vec<u8>)>> {
+    let journal_path = project_root.join(COMMIT_JOURNAL_REL);
+    match super::fs::read_regular_to_bytes_sync(&journal_path) {
+        Ok(raw) => Ok(Some((journal_path, raw))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The journal [`recover`] would act on, as [`pending`] finds it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PendingCommit {
+    pub journal: PathBuf,
+    /// The project-relative paths the journal names, exactly as written in
+    /// it: unvalidated, so for a message only. Empty when the journal
+    /// cannot be parsed.
+    pub files: Vec<String>,
+}
+
+/// The journal an interrupted group commit left, without replaying it or
+/// writing anything; `None` when there is none. For a command that must
+/// not write (a dry run): it can neither finish the commit nor trust the
+/// files the journal covers, which may be half replaced. Errors as
+/// [`recover`] does when the journal cannot be read.
+pub fn pending(project_root: &Path) -> std::io::Result<Option<PendingCommit>> {
+    let Some((journal, raw)) = read_journal(project_root)? else {
+        return Ok(None);
+    };
+    let files = serde_json::from_slice::<Journal>(&raw)
+        .map(|journal| journal.files.into_iter().map(|f| f.path).collect())
+        .unwrap_or_default();
+    Ok(Some(PendingCommit { journal, files }))
+}
+
 /// Finish (or set aside) a group commit a crash interrupted — see the
 /// module docs. Synchronous: it runs inside the apply-lock acquire, before
 /// the locked command reads any file the journal covers. An `Err` (a file
 /// it cannot read or write) leaves the journal in place; the caller must
 /// not proceed over the files it covers.
 pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
-    let journal_path = project_root.join(COMMIT_JOURNAL_REL);
-    let raw = match super::fs::read_regular_to_bytes_sync(&journal_path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Recovery::Clean),
-        Err(e) => return Err(e),
+    let Some((journal_path, raw)) = read_journal(project_root)? else {
+        return Ok(Recovery::Clean);
     };
     let set_aside = |outcome: SetAsideOutcome| -> std::io::Result<Recovery> {
         let aside = journal_path.with_file_name(format!(
@@ -1233,6 +1335,10 @@ pub fn recover(project_root: &Path) -> std::io::Result<Recovery> {
     let mut items: Vec<Replay> = Vec::with_capacity(journal.files.len());
     for file in &journal.files {
         let rel = Path::new(&file.path);
+        // Only what a commit could have journaled: a relative path that
+        // stays in the project (no root, prefix or `..`) and is a captured
+        // commit point, so never inside a git directory. Checked before
+        // any level is probed, so such a path is refused, not an error.
         if relative_to(Path::new(""), rel).is_none()
             || !is_captured(rel)
             // A journal must never write through a link (out of the
@@ -1342,9 +1448,71 @@ mod tests {
             (".socket/vendor/npm/u/left-pad-1.3.0.tgz", false),
             (".socket/manifest.json", false),
             ("packages/a/.socket/vendor/npm/u/a.tgz", false),
+            (".git/config", false),
+            (".git/hooks/post-checkout", false),
+            ("packages/a/.GIT/config", false),
+            (".github/requirements.txt", true),
+            (".gitattributes", true),
+            (".SOCKET/manifest.json", false),
+            (".Socket/vendor/state.json", false),
+            ("socket~1/vendor/npm/u/a.tgz", false),
+            (".socketrc", true),
             ("", false),
         ] {
             assert_eq!(is_captured(Path::new(rel)), captured, "{rel}");
+        }
+    }
+
+    #[test]
+    fn a_dot_directory_is_recognized_under_every_spelling_a_filesystem_folds() {
+        for (name, socket) in [
+            (".socket", true),
+            (".SOCKET", true),
+            ("SOCKET~1", true),
+            (".socket.", true),
+            (".socket:x", true),
+            (".sock\u{200d}et", true),
+            (".sockets", false),
+            ("socket", false),
+            (".git", false),
+        ] {
+            assert_eq!(
+                names_dot_dir(std::ffi::OsStr::new(name), ".socket"),
+                socket,
+                "{name:?}"
+            );
+        }
+        for (name, git) in [
+            (".git", true),
+            (".GIT", true),
+            (".Git", true),
+            (".git.", true),
+            (".git ", true),
+            (".git . .", true),
+            ("git~1", true),
+            ("GIT~1.", true),
+            (".git:stream", true),
+            (".git::$INDEX_ALLOCATION", true),
+            (".git\\hooks", true),
+            (".g\u{200c}i\u{feff}t", true),
+            ("\u{202e}.git", true),
+            (".github", false),
+            (".gitignore", false),
+            (".gitattributes", false),
+            (".gitmodules", false),
+            (".git2", false),
+            ("git", false),
+            ("git~2", false),
+            ("a.git", false),
+            ("..git", false),
+            (".", false),
+            ("", false),
+        ] {
+            assert_eq!(
+                names_dot_dir(std::ffi::OsStr::new(name), ".git"),
+                git,
+                "{name:?}"
+            );
         }
     }
 
@@ -1355,6 +1523,7 @@ mod tests {
         assert!(!captures(".socket/gradle/hosted-index.tsv"));
         assert!(!captures("../pnpm-lock.yaml"));
         assert!(!captures("/abs/pnpm-lock.yaml"));
+        assert!(!captures(".git/config"));
         assert!(!captures(""));
     }
 
@@ -1807,6 +1976,150 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    /// Every regular file under `root` except the journal and its set-aside
+    /// copies, for "nothing was written" assertions.
+    fn project_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = rel_string(path.strip_prefix(root).unwrap());
+                if path.is_dir() {
+                    stack.push(path);
+                } else if !rel.starts_with(".socket/vendor/.commit-journal") {
+                    out.push((rel, std::fs::read(&path).unwrap()));
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The journal is a file the checkout itself can supply (a pull request
+    /// can commit one), so a replay must not reach what a commit cannot: a
+    /// git directory, under any spelling a filesystem folds onto `.git`, or
+    /// anything outside the project. Nor may another spelling of `.socket`
+    /// reach the manifest and artifacts no commit journals. Such a journal
+    /// is refused whole: the plausible entry beside the bad one is not
+    /// applied either.
+    #[test]
+    fn recovery_refuses_a_forged_journal_and_writes_nothing() {
+        let config = b"[core]\n\tbare = false\n";
+        let outside = tempfile::tempdir().unwrap();
+        let absolute = outside
+            .path()
+            .join("abs.txt")
+            .to_string_lossy()
+            .into_owned();
+        for bad in [
+            ".git/hooks/post-checkout",
+            ".GIT/config",
+            ".git",
+            "packages/a/.Git/config",
+            "./.git/config",
+            ".git./config",
+            ".git /config",
+            "git~1/config",
+            "GIT~1/hooks/pre-commit",
+            ".g\u{200c}it/config",
+            ".git::$INDEX_ALLOCATION/config",
+            ".git:hooks",
+            ".SOCKET/manifest.json",
+            ".Socket/vendor/npm/u/a.tgz",
+            absolute.as_str(),
+            "../escaped.txt",
+            "packages/../../escaped.txt",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("proj");
+            std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+            std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+            std::fs::write(root.join(".git/config"), config).unwrap();
+            std::fs::write(root.join("package.json"), b"{}\n").unwrap();
+            // The entry replaces the file it names when that file exists
+            // (a known `.git/config`), and creates it otherwise.
+            let before = std::fs::read(root.join(bad)).ok();
+            let journal = serde_json::json!({
+                "version": 1,
+                "files": [
+                    {
+                        "path": "package.json",
+                        "before": sha256_hex(b"{}\n"),
+                        "after": "cHduZWQ=",
+                    },
+                    {
+                        "path": bad,
+                        "before": before.as_deref().map(sha256_hex),
+                        "after": "cHduZWQ=",
+                    },
+                ]
+            });
+            std::fs::write(
+                root.join(COMMIT_JOURNAL_REL),
+                serde_json::to_vec(&journal).unwrap(),
+            )
+            .unwrap();
+            let files = project_files(&root);
+            assert_eq!(
+                set_aside_outcome(recover(&root).unwrap()),
+                SetAsideOutcome::Refused,
+                "{bad:?}"
+            );
+            assert_eq!(project_files(&root), files, "{bad:?}: nothing is written");
+            assert!(!tmp.path().join("escaped.txt").exists(), "{bad:?}");
+            assert!(!outside.path().join("abs.txt").exists(), "{bad:?}");
+        }
+    }
+
+    /// `pending` finds the journal a dry run must not replay and names what
+    /// it covers, writing nothing; an unparseable journal is pending too
+    /// (a wet run has to set it aside). `recover` then finishes the commit.
+    #[test]
+    fn pending_reports_the_journal_without_replaying_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(pending(root).unwrap(), None);
+        std::fs::write(root.join("a.lock"), b"a-old").unwrap();
+        std::fs::write(root.join("b.lock"), b"b-old").unwrap();
+        let journal = root.join(COMMIT_JOURNAL_REL);
+
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(&journal, b"{not json").unwrap();
+        assert_eq!(
+            pending(root).unwrap(),
+            Some(PendingCommit {
+                journal: journal.clone(),
+                files: Vec::new(),
+            })
+        );
+
+        write_journal(
+            root,
+            &[
+                change("a.lock", b"a-old", b"a-new"),
+                change("b.lock", b"b-old", b"b-new"),
+            ],
+        );
+        let files = project_files(root);
+        let journaled = std::fs::read(&journal).unwrap();
+        assert_eq!(
+            pending(root).unwrap(),
+            Some(PendingCommit {
+                journal: journal.clone(),
+                files: vec!["a.lock".into(), "b.lock".into()],
+            })
+        );
+        assert_eq!(project_files(root), files, "nothing is replayed");
+        assert_eq!(std::fs::read(&journal).unwrap(), journaled);
+
+        assert_eq!(
+            recover(root).unwrap(),
+            Recovery::RolledForward(vec!["a.lock".into(), "b.lock".into()])
+        );
+        assert_eq!(pending(root).unwrap(), None);
     }
 
     fn set_aside_outcome(recovery: Recovery) -> SetAsideOutcome {

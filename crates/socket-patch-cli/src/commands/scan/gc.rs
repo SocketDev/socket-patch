@@ -84,6 +84,20 @@ impl GcSummary {
         gc
     }
 
+    /// Carry what taking the pass's lock did about an interrupted run's
+    /// commit (see `lock_cli::commit_recovery_warning`) into the envelope.
+    /// The acquire printed it on stderr, so a human run, which prints
+    /// `warnings`, is given nothing to repeat.
+    fn note_commit_recovery(&mut self, common: &GlobalArgs, guard: &LockGuard) {
+        if common.json {
+            self.warnings.extend(
+                guard
+                    .commit_recovery()
+                    .map(|recovery| (recovery.code, recovery.detail.clone())),
+            );
+        }
+    }
+
     /// Fold a vendored-state GC pass into this summary: purl lists sorted,
     /// its failed post-revert rewrites join `warnings`.
     fn absorb_vendor_gc(&mut self, v: VendorGcSummary) {
@@ -244,11 +258,23 @@ pub(super) async fn run_apply_gc(
 
     // One acquire for both halves: flock is per open file description, so
     // a nested acquire in the vendored half would read as a live holder.
-    let _guard = match lock(common, socket_dir) {
+    let guard = match lock(common, socket_dir) {
         Ok(g) => g,
         Err(skipped) => return *skipped,
     };
+    let mut gc = apply_gc_locked(common, manifest_path, socket_dir, scanned_purls, vendored).await;
+    gc.note_commit_recovery(common, &guard);
+    gc
+}
 
+/// [`run_apply_gc`] under the lock its caller holds.
+async fn apply_gc_locked(
+    common: &GlobalArgs,
+    manifest_path: &Path,
+    socket_dir: &Path,
+    scanned_purls: &HashSet<String>,
+    vendored: &HashSet<PurlKey>,
+) -> GcSummary {
     let vendor_gc = run_vendor_gc(common, manifest_path, /*dry_run=*/ false).await;
 
     // Missing or unreadable ⇒ nothing to prune, and the blob sweep has no
@@ -332,7 +358,7 @@ async fn has_ledger(common: &GlobalArgs) -> bool {
 /// summary recording why.
 fn lock(common: &GlobalArgs, socket_dir: &Path) -> Result<LockGuard, Box<GcSummary>> {
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    acquire_with_status(socket_dir, timeout).map_err(|e| {
+    acquire_with_status(socket_dir, timeout, common.dry_run).map_err(|e| {
         Box::new(GcSummary {
             skipped: Some(lock_failure(&e, timeout)),
             ..Default::default()
@@ -396,11 +422,13 @@ pub(super) async fn run_vendor_only_gc(
     if !has_ledger(common).await {
         return GcSummary::default();
     }
-    let _guard = match lock(common, socket_dir) {
+    let guard = match lock(common, socket_dir) {
         Ok(g) => g,
         Err(skipped) => return *skipped,
     };
-    GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await)
+    let mut gc = GcSummary::vendor_only(run_vendor_gc(common, manifest_path, false).await);
+    gc.note_commit_recovery(common, &guard);
+    gc
 }
 
 /// Dry-run preview of the apply-mode GC pass. Same summary as

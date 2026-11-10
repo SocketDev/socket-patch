@@ -5,16 +5,18 @@
 use std::path::Path;
 use std::time::Duration;
 
-use socket_patch_core::patch::apply_lock::{acquire, LockError, LockGuard};
+use socket_patch_core::patch::apply_lock::{acquire, acquire_dry_run, LockError, LockGuard};
 
-use crate::json_envelope::{Command, Envelope, EnvelopeError};
+use crate::json_envelope::{Command, Envelope, EnvelopeError, RunWarning};
 
 /// Try to acquire `<socket_dir>/apply.lock` and return the guard, or
 /// emit a failure envelope and a non-zero exit code.
 ///
 /// `Duration::ZERO` tries once; a positive `timeout` waits for the lock.
 /// The core guard owns the lock file's whole lifecycle (see
-/// `socket_patch_core::patch::apply_lock`).
+/// `socket_patch_core::patch::apply_lock`). `dry_run` also decides what
+/// the acquire does with an interrupted run's commit (see
+/// [`acquire_with_status`]).
 pub(crate) fn acquire_or_emit(
     socket_dir: &Path,
     command: Command,
@@ -22,7 +24,7 @@ pub(crate) fn acquire_or_emit(
     dry_run: bool,
     timeout: Duration,
 ) -> Result<LockGuard, i32> {
-    let err = match acquire_with_status(socket_dir, timeout) {
+    let err = match acquire_with_status(socket_dir, timeout, dry_run) {
         Ok(guard) => return Ok(guard),
         Err(err) => err,
     };
@@ -45,10 +47,19 @@ pub(crate) fn acquire_or_emit(
 /// sitting there silently for 30 s. The status line is terminal-only and
 /// quiet under --json/--silent (the process-wide quiet switch). Every
 /// lock site goes through this (or [`acquire_or_emit`], which wraps it).
+///
+/// Taking the lock finishes the commit an interrupted vendored run left
+/// behind, which rewrites project files: the acquire names them on stderr,
+/// and [`commit_recovery_warning`] is the same report for the caller's
+/// envelope. A `dry_run` writes nothing, so it finishes nothing: a pending
+/// commit refuses the lock (`vendor_commit_pending`) until a wet run has
+/// finished it.
 pub(crate) fn acquire_with_status(
     socket_dir: &Path,
     timeout: Duration,
+    dry_run: bool,
 ) -> Result<LockGuard, LockError> {
+    let acquire = if dry_run { acquire_dry_run } else { acquire };
     match acquire(socket_dir, Duration::ZERO) {
         Err(LockError::Held) if timeout > Duration::ZERO => {
             let mut status = crate::ui::StatusLine::stderr(crate::ui::quiet(), false);
@@ -84,8 +95,21 @@ fn failure_hint(err: &LockError, lock_path: &Path, timeout: Duration) -> String 
                 path.parent().unwrap_or(path).display()
             )
         }
-        LockError::Io { .. } => String::new(),
+        // The message itself says how to finish the commit.
+        LockError::Io { .. } | LockError::CommitPending { .. } => String::new(),
     }
+}
+
+/// What taking `guard` did about an interrupted vendored run's commit, as
+/// a run warning for the envelope of the command that took the lock:
+/// `vendor_commit_recovered` (rolled forward; the detail names the files)
+/// or `vendor_commit_set_aside` (not replayable as written). The acquire
+/// already printed it on stderr, so a human path adds nothing. `None` when
+/// the acquire found no journal.
+pub(crate) fn commit_recovery_warning(guard: &LockGuard) -> Option<RunWarning> {
+    guard
+        .commit_recovery()
+        .map(|recovery| RunWarning::new(recovery.code, recovery.detail.clone()))
 }
 
 /// The human (stderr) report of a lock failure, for the sites that build
@@ -129,6 +153,7 @@ pub(crate) fn lock_failure(err: &LockError, timeout: Duration) -> (&'static str,
             "lock_io",
             format!("failed to open lock file at {}: {}", path.display(), source),
         ),
+        LockError::CommitPending { .. } => ("vendor_commit_pending", err.to_string()),
     }
 }
 
@@ -408,12 +433,95 @@ mod tests {
     #[test]
     fn acquire_with_status_takes_a_free_lock_and_reports_a_held_one() {
         let dir = tempfile::tempdir().unwrap();
-        let guard = acquire_with_status(dir.path(), Duration::ZERO).unwrap();
+        let guard = acquire_with_status(dir.path(), Duration::ZERO, false).unwrap();
         assert!(matches!(
-            acquire_with_status(dir.path(), Duration::from_millis(200)),
+            acquire_with_status(dir.path(), Duration::from_millis(200), false),
             Err(LockError::Held)
         ));
         drop(guard);
+    }
+
+    /// The journal a vendored commit interrupted after `package.json` and
+    /// before `pnpm-lock.yaml` leaves under `root`.
+    fn interrupted_commit(root: &Path) {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let sha256 = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
+        std::fs::write(root.join("package.json"), b"new\n").unwrap();
+        std::fs::write(root.join("pnpm-lock.yaml"), b"lock-old\n").unwrap();
+        let journal = serde_json::json!({
+            "version": 1,
+            "files": [
+                { "path": "package.json", "before": sha256(b"old\n"), "after": b64(b"new\n") },
+                {
+                    "path": "pnpm-lock.yaml",
+                    "before": sha256(b"lock-old\n"),
+                    "after": b64(b"lock-new\n"),
+                },
+            ]
+        });
+        std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+        std::fs::write(
+            root.join(".socket/vendor/.commit-journal.json"),
+            serde_json::to_vec(&journal).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The one acquire every lock site shares: a dry run never finishes an
+    /// interrupted commit (the refusal is `vendor_commit_pending`, with
+    /// the remedy in the message and nothing written), and the wet acquire
+    /// that does finish it hands the caller a run warning naming the file
+    /// it rewrote.
+    #[test]
+    fn a_dry_run_refuses_a_pending_commit_and_a_wet_acquire_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(".socket");
+        let clean = acquire_with_status(&socket, Duration::ZERO, true).unwrap();
+        assert!(commit_recovery_warning(&clean).is_none());
+        drop(clean);
+
+        interrupted_commit(dir.path());
+        let err = acquire_with_status(&socket, Duration::ZERO, true).unwrap_err();
+        let (code, message) = lock_failure(&err, Duration::ZERO);
+        assert_eq!(code, "vendor_commit_pending");
+        assert!(
+            message.contains("run without --dry-run to finish it")
+                && message.contains("package.json, pnpm-lock.yaml"),
+            "{message}"
+        );
+        assert_eq!(
+            format_lock_error(&socket, &err, Duration::ZERO),
+            format!("Error: {}\n", crate::ui::sentence_case(&message)),
+            "the message carries the remedy: no second hint line"
+        );
+        assert_eq!(
+            acquire_or_emit(&socket, Command::Vendor, false, true, Duration::ZERO).unwrap_err(),
+            1
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("pnpm-lock.yaml")).unwrap(),
+            b"lock-old\n",
+            "a dry run rolls nothing forward"
+        );
+        assert!(dir
+            .path()
+            .join(".socket/vendor/.commit-journal.json")
+            .is_file());
+
+        let guard = acquire_with_status(&socket, Duration::ZERO, false).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("pnpm-lock.yaml")).unwrap(),
+            b"lock-new\n"
+        );
+        let warning = commit_recovery_warning(&guard).expect("the roll-forward is reported");
+        assert_eq!(warning.code, "vendor_commit_recovered");
+        assert!(
+            warning.detail.contains("rolled forward pnpm-lock.yaml;"),
+            "only the file the replay rewrote is named: {}",
+            warning.detail
+        );
     }
 
     #[test]

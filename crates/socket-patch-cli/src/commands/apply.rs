@@ -1388,6 +1388,13 @@ pub(crate) async fn run_locked(
     lock: LockGuard,
 ) -> ApplyRunReport {
     let telemetry = TelemetryAuth::for_client(client);
+    // What taking the lock did about an interrupted run's commit, for this
+    // run's envelope (stderr has it from the acquire). A nested apply's
+    // caller took the lock and carries it in its own envelope.
+    let commit_recovery = match &args.nested {
+        None => crate::commands::lock_cli::commit_recovery_warning(&lock),
+        Some(_) => None,
+    };
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -1744,6 +1751,7 @@ pub(crate) async fn run_locked(
                 // skip, the sources-unavailable reason): the envelope's
                 // `warnings[]` is their machine channel — stderr is
                 // suppressed under --json.
+                env.warnings.extend(commit_recovery);
                 env.warnings.extend(run_warnings.iter().cloned());
                 // A token whose org could not be resolved put the run on the
                 // proxy (stderr already said so); the embedded `--vex` reuses
