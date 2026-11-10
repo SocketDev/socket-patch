@@ -684,8 +684,12 @@ pub(crate) async fn plan(
         {
             Basis::Vendored(Box::new(vendored_entry_for(&cand, vref)))
         } else if cand.discovered.iter().any(|r| r.mode == WiringMode::Hosted) {
+            // Every lock wiring the patch must allow the basis. Which lock
+            // the build installs from is not decidable from the files (the
+            // cross-lock contest's argument), so a pinned lock never vouches
+            // for one whose pin is missing.
             Basis::Hosted {
-                lockfile_basis: cand.discovered.iter().any(PatchedRef::lockfile_basis_ok),
+                lockfile_basis: cand.discovered.iter().all(PatchedRef::lockfile_basis_ok),
             }
         } else if let Some(entry) = &cand.vendor_entry {
             if liveness.vendor_entry(entry).await {
@@ -1652,6 +1656,62 @@ mod tests {
         assert_eq!(plan.redirected, vec!["pkg:npm/x@1.0.0".to_string()]);
         assert!(plan.lockfile_basis.contains("pkg:npm/x@1.0.0"));
         assert!(plan.gated.is_empty(), "{:?}", plan.gated);
+    }
+
+    /// Two locks wire one package to the same patch, and one of them lost
+    /// the pin its rewriter always writes (an entry no Socket rewrite
+    /// produced). Which lock the build installs from is not decidable from
+    /// the files — the cross-lock contest's own argument — so the pinned
+    /// lock does not vouch for the other: the purl stays hosted, without
+    /// the lockfile basis. A ref whose format never pins withholds nothing.
+    #[tokio::test]
+    async fn every_hosted_ref_of_a_patch_must_allow_the_lockfile_basis() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key = "pkg:npm/x@1.0.0";
+        let in_file = |mut r: PatchedRef, file: &str| {
+            r.source_file = file.into();
+            r
+        };
+        let pinned = || hosted_ref(key, U1, true);
+        let pinless = || in_file(hosted_ref(key, U1, false), "pnpm-lock.yaml");
+        let never_pins = || {
+            PatchedRef::hosted(
+                key.to_string(),
+                U1.to_string(),
+                "yarn.lock",
+                None,
+                None,
+                false,
+            )
+        };
+        for (what, refs, basis) in [
+            ("one pinned lock", vec![pinned()], true),
+            (
+                "a pinned and a pin-less lock",
+                vec![pinned(), pinless()],
+                false,
+            ),
+            ("one pin-less lock", vec![pinless()], false),
+            (
+                "a pinned lock and a format without pins",
+                vec![pinned(), never_pins()],
+                true,
+            ),
+        ] {
+            let mut redirect = RedirectState::new();
+            redirect.records.insert(key.into(), record(U1));
+            let sources = Sources {
+                manifest: PatchManifest::new(),
+                vendor: VendorState::new(),
+                redirect: Some(redirect),
+                discovery: discovery(refs),
+                hosted_uuids: Vec::new(),
+            };
+            let plan = plan(&common(tmp.path()), sources, &[], &RunApiClient::new()).await;
+            assert_eq!(plan.redirected, vec![key.to_string()], "{what}");
+            assert_eq!(plan.lockfile_basis.contains(key), basis, "{what}");
+            assert!(plan.gated.is_empty(), "{what}: {:?}", plan.gated);
+        }
     }
 
     /// Superseded: the manifest's U1 record for a package the lockfile wires
