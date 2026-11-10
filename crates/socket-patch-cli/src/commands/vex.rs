@@ -699,7 +699,14 @@ async fn generate_vex(
                 && plan.hosted.contains_key(purl))
     };
     let redirected: &[String] = &plan.redirected;
-    let product_id = match resolve_product_id(common, params.product.as_deref(), warnings).await {
+    let product_id = match resolve_product_id(
+        common,
+        params.product.as_deref(),
+        &params.flag("product"),
+        warnings,
+    )
+    .await
+    {
         Ok(id) => id,
         Err(reason) => return Err(fail(common, params, "product_undetected", reason).await),
     };
@@ -2052,10 +2059,12 @@ async fn fail(
 
 /// Pick the product PURL from an explicit override or by filesystem
 /// auto-detect. Auto-detect advisories (several project manifests) join
-/// `warnings`.
+/// `warnings`. `flag` is how this run spells the override, for the error
+/// that asks for it.
 async fn resolve_product_id(
     common: &GlobalArgs,
     product: Option<&str>,
+    flag: &str,
     warnings: &mut Vec<RunWarning>,
 ) -> Result<String, String> {
     // An empty (or whitespace-only) override means "unset". `Product::id` is
@@ -2079,7 +2088,7 @@ async fn resolve_product_id(
             found.push(*name);
         }
     }
-    Err(format_product_undetected(&common.cwd, &found))
+    Err(format_product_undetected(&common.cwd, &found, flag))
 }
 
 /// The project manifests product auto-detection reads (after the git
@@ -2093,23 +2102,61 @@ const PRODUCT_MANIFESTS: &[&str] = &[
     "pom.xml",
 ];
 
-/// The `product_undetected` message. `found` names the manifests that exist
-/// but yielded no PURL (no name/version), so the user knows which file to
-/// fix instead of guessing.
-fn format_product_undetected(cwd: &Path, found: &[&str]) -> String {
+/// The `product_undetected` message: what detection reads, the manifests
+/// that exist but yielded no PURL (`found`: no name or version, so the user
+/// knows which file to fix), and last, where it can be copied from, the
+/// run's product `flag` with a value built from this project
+/// ([`example_product`]).
+///
+/// The run stops instead of assuming that value: a directory name is not an
+/// identity. One checkout is `app` in a container and `workspace` in CI,
+/// and unrelated projects share those names, so a document issued under it
+/// could be read as a statement about another project.
+fn format_product_undetected(cwd: &Path, found: &[&str], flag: &str) -> String {
     let why = match found {
         [] => String::new(),
-        [one] => format!(" ({one} was found but has no usable name and version)"),
+        [one] => format!(" {one} was found but has no usable name and version."),
         many => format!(
-            " ({} were found but have no usable name and version)",
+            " {} were found but have no usable name and version.",
             join_and(many)
         ),
     };
+    // `--cwd` defaults to `.`, which would end the sentence on `..`.
+    let shown = cwd.display().to_string();
+    let place = if shown.is_empty() || shown == "." {
+        "the current directory"
+    } else {
+        shown.as_str()
+    };
     format!(
-        "Could not auto-detect a top-level product PURL in {}{why}. \
-         Provide one with --product <purl> (e.g. pkg:npm/my-app@1.0.0).",
-        cwd.display()
+        "The VEX document must name the project it describes (its product), and none was \
+         detected in {place}.{why} Detection reads the git `origin` remote, then the name and \
+         version in package.json, pyproject.toml, Cargo.toml, go.mod, composer.json, pom.xml, a \
+         .csproj or a .gemspec. Pass a name that identifies this project, for example: {flag} {}",
+        example_product(cwd)
     )
+}
+
+/// A product id to suggest for a project nothing names:
+/// `pkg:generic/<directory name>`, the name reduced to characters that need
+/// no quoting or escaping, or `my-app` when none is left.
+fn example_product(cwd: &Path) -> String {
+    // `.` has no name of its own: resolve it.
+    let resolved = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let name = resolved
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let words: Vec<&str> = name
+        .split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .map(|word| word.trim_matches('-'))
+        .filter(|word| !word.is_empty())
+        .collect();
+    if words.is_empty() {
+        "pkg:generic/my-app".to_string()
+    } else {
+        format!("pkg:generic/{}", words.join("-"))
+    }
 }
 
 /// `a`, `a and b`, `a, b and c`.
@@ -2513,29 +2560,70 @@ mod tests {
 
     #[test]
     fn product_undetected_names_unusable_manifests() {
-        let cwd = Path::new("proj");
+        const LOOKED_FOR: &str = "Detection reads the git `origin` remote, then the name and \
+            version in package.json, pyproject.toml, Cargo.toml, go.mod, composer.json, pom.xml, \
+            a .csproj or a .gemspec. Pass a name that identifies this project, for example: ";
+        let cwd = Path::new("work/proj");
         assert_eq!(
-            format_product_undetected(cwd, &[]),
-            "Could not auto-detect a top-level product PURL in proj. Provide one with \
-             --product <purl> (e.g. pkg:npm/my-app@1.0.0)."
+            format_product_undetected(cwd, &[], "--product"),
+            format!(
+                "The VEX document must name the project it describes (its product), and none \
+                 was detected in work/proj. {LOOKED_FOR}--product pkg:generic/proj"
+            )
         );
+        // An embedded run names its own flag.
         assert_eq!(
-            format_product_undetected(cwd, &["package.json"]),
-            "Could not auto-detect a top-level product PURL in proj (package.json was found \
-             but has no usable name and version). Provide one with --product <purl> (e.g. \
-             pkg:npm/my-app@1.0.0)."
+            format_product_undetected(cwd, &["package.json"], "--vex-product"),
+            format!(
+                "The VEX document must name the project it describes (its product), and none \
+                 was detected in work/proj. package.json was found but has no usable name and \
+                 version. {LOOKED_FOR}--vex-product pkg:generic/proj"
+            )
         );
-        let many =
-            format_product_undetected(cwd, &["package.json", "pyproject.toml", "Cargo.toml"]);
+        let many = format_product_undetected(
+            cwd,
+            &["package.json", "pyproject.toml", "Cargo.toml"],
+            "--product",
+        );
         assert!(
             many.contains(
-                "(package.json, pyproject.toml and Cargo.toml were found but have no usable \
-                 name and version)"
+                " package.json, pyproject.toml and Cargo.toml were found but have no usable \
+                 name and version. "
             ),
             "{many}"
         );
+        // No sentence ends on the `.` of the current directory, and none
+        // runs past 25 words.
+        let here = format_product_undetected(Path::new("."), &[], "--product");
+        assert!(
+            here.contains("detected in the current directory. "),
+            "{here}"
+        );
+        assert!(!here.contains(".."), "{here}");
+        for sentence in many.split(". ") {
+            assert!(sentence.split_whitespace().count() <= 25, "{sentence}");
+        }
         assert_eq!(join_and(&["a", "b"]), "a and b");
         assert_eq!(join_and(&[]), "");
+    }
+
+    #[test]
+    fn example_product_is_a_pasteable_purl_from_the_directory_name() {
+        assert_eq!(example_product(Path::new("/srv/gemA")), "pkg:generic/gemA");
+        assert_eq!(
+            example_product(Path::new("/srv/My App (v2)")),
+            "pkg:generic/My-App-v2"
+        );
+        assert_eq!(
+            example_product(Path::new("/srv/api.v2_x-1")),
+            "pkg:generic/api.v2_x-1"
+        );
+        // Nothing usable in the name: a neutral placeholder.
+        assert_eq!(example_product(Path::new("/")), "pkg:generic/my-app");
+        assert_eq!(
+            example_product(Path::new("/srv/日本")),
+            "pkg:generic/my-app"
+        );
     }
 
     #[test]

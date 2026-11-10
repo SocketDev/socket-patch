@@ -251,9 +251,60 @@ fn product_undetected_names_the_unusable_manifest() {
     let o = vex_command(cwd, None).arg("--no-verify").output().unwrap();
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("(package.json was found but has no usable name and version)"),
+        stderr(&o).contains(". package.json was found but has no usable name and version. "),
         "{}",
         stderr(&o)
+    );
+}
+
+/// A plain application (no git remote, no project file with a name) has no
+/// product to detect. Run from the project directory, the error says what
+/// was looked for and ends with a flag and a value the user can paste,
+/// built from the directory's name. It never ends a sentence on the `.` of
+/// the current directory.
+#[test]
+fn product_undetected_in_a_plain_app_ends_with_a_pasteable_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("billing api (v2)");
+    std::fs::create_dir(&cwd).unwrap();
+    write_npm_manifest(&cwd, &["pkg:npm/a@1.0.0"]);
+
+    let mut cmd = crate::common::hermetic::binary_command();
+    let o = cmd
+        .current_dir(&cwd)
+        .args(["vex", "--no-verify"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(o.stdout.is_empty(), "no document: {}", stdout(&o));
+    let err = stderr(&o);
+    assert_eq!(
+        err.trim_end(),
+        "Error: The VEX document must name the project it describes (its product), and none was \
+         detected in the current directory. Detection reads the git `origin` remote, then the \
+         name and version in package.json, pyproject.toml, Cargo.toml, go.mod, composer.json, \
+         pom.xml, a .csproj or a .gemspec. Pass a name that identifies this project, for \
+         example: --product pkg:generic/billing-api-v2"
+    );
+    assert!(!err.contains(".."), "{err}");
+
+    // The suggested flag works as printed.
+    let mut cmd = crate::common::hermetic::binary_command();
+    let o = cmd
+        .current_dir(&cwd)
+        .args([
+            "vex",
+            "--no-verify",
+            "--product",
+            "pkg:generic/billing-api-v2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let doc: Value = serde_json::from_slice(&o.stdout).expect("document on stdout");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:generic/billing-api-v2"
     );
 }
 

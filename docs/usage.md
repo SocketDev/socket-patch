@@ -213,7 +213,9 @@ It never does so silently: the run warns how many statements it emitted that way
 each one ends its impact statement with `; not verified on disk`.
 
 The product identifier is inferred from the Git origin or project metadata. Use
-`--product <identifier>` when inference is unavailable or unsuitable. `--json`
+`--product <identifier>` when inference is unavailable or unsuitable. A project
+with neither (an application with no Git remote and no named project file) must
+pass one; the error suggests `--product pkg:generic/<directory name>`. `--json`
 requires `--output` so the document and command result do not share stdout.
 
 `scan`, `apply`, and `vendor` accept `--vex <path>`. Generation is skipped for
