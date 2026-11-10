@@ -188,10 +188,12 @@ a version without a non-empty section in this file.
     packages found." and exited 0 when the root had no lockfile. A project
     directory is one holding an npm-family, PyPI, Cargo, RubyGems, Go or
     Composer lockfile; Maven, Gradle, sbt and NuGet projects are still
-    scanned only as `--cwd` or a named PATH. The search honours the
-    checkout's ignore files, follows no link, never enters `node_modules`,
-    `.git`, `.socket`, `.yarn` or `vendor`, and leaves out a workspace
-    member whose lock the workspace root's run reads. `socket.yml` path
+    scanned only as `--cwd` or a named PATH. The search honours git's
+    ignore rules (a `.ignore` file is not one of them), follows no link,
+    never enters `node_modules`, `.git`, `.socket`, `.yarn` or `vendor`,
+    never enters a git submodule or a nested clone (another repository:
+    run socket-patch inside it), and leaves out a workspace member whose
+    lock the workspace root's run reads. `socket.yml` path
     filters and the built-in test and fixture ignores apply, with one note
     counting what they left out. Nothing changes outside a git checkout,
     with a PATH, under `--global` / `--global-prefix` or in agent mode.
@@ -203,10 +205,13 @@ a version without a non-empty section in this file.
     `projects[]` beside the unchanged envelope for `--cwd`. `rollback` with
     no target now also rolls back the directories below, after one
     confirmation that names them, and exits with the worst code; `--dry-run`
-    previews them all. `rollback --json` rolls back `--cwd` alone, as
-    before, and warns `projects_not_rolled_back`; with nothing to undo at
-    `--cwd` it rolls back the one patched directory below, or is refused
-    (exit 2, `invalid_args`) when there are several. `rollback <target>`,
+    previews them all. It reaches exactly as far as a bare scan from the
+    same directory: from an agent-mode project, whose scan covers that
+    project alone, it rolls back that project alone and warns
+    `projects_not_rolled_back`. `rollback --json` never changes a directory
+    other than `--cwd`: it rolls back `--cwd` alone, as before, with the
+    same warning, and with nothing to undo there it fails as it always did
+    (`manifest_not_found`, exit 1). `rollback <target>`,
     `remove`, `vex`, `repair` and `apply` still act on one project and keep
     their exit codes. When `--cwd` holds nothing for them they add a note
     (`patched_projects_below` under `--json`) naming the directories below
@@ -363,6 +368,17 @@ a version without a non-empty section in this file.
     are not attested, and one `patched_ref_unattributable` names the root to
     run from. Per-member pnpm locks (`sharedWorkspaceLockfile: false`) and a
     berry lock in a member are read as before (#PRNUM).
+  - Hosted `scan` and `get` run from such a member refuse instead of
+    pinning a lock nothing installs from. A `pnpm-lock.yaml` inside a member
+    that `pnpm-workspace.yaml` lists is never read by pnpm, which installs
+    the member from the workspace's shared lock (checked with pnpm 10.34 and
+    11.27), and yarn 1 never reads a `yarn.lock` inside a `package.json`
+    workspace member. Earlier releases wrote the pin there and reported the
+    package switched while installs kept the unpatched copy. The run now
+    exits 1 with `redirect_workspace_lockfile_elsewhere`, names the
+    workspace root to run from and writes nothing. A workspace that sets
+    `sharedWorkspaceLockfile: false`, a directory the workspace does not
+    list and a yarn berry lock in a member are pinned as before (#PRNUM).
 - **PyPI.**
   - Vendored uv refuses a patch for another version than `uv.lock` resolves
     (`pypi_uv_lock_package_missing`, exit 1), before any download and in the
@@ -1328,7 +1344,9 @@ a version without a non-empty section in this file.
     (`Cannot apply patch: <file> - <cause>`). A killed run can leave
     `.socket-stage-*` / `.socket-orig-*` files beside the package's files;
     the next `apply` or `rollback` of that package finishes it and removes
-    them once they are ten minutes old (#PRNUM).
+    them once they are ten minutes old. When a failed write can't put a
+    file back either, its original is kept beside it as
+    `.socket-kept-<file>-<uuid>`, which no later run removes (#PRNUM).
   - Commands that rewrite `.socket/manifest.json` (`remove`, `rollback`,
     `get`, `scan`) keep the top-level and per-record fields this version
     doesn't know, such as ones a newer CLI wrote, and the file's mode.
