@@ -106,17 +106,9 @@ pub fn decode_hosted_wheel_metadata(bytes: &[u8], sha256: &str) -> Result<Option
             return Err(format!("hosted wheel core metadata is missing {required}"));
         }
     }
-    let rendered = super::pypi_uv::render_package_metadata_block(&metadata);
-    if rendered.is_none()
-        && headers.iter().any(|(name, _)| {
-            name.eq_ignore_ascii_case("Requires-Dist")
-                || name.eq_ignore_ascii_case("Provides-Extra")
-        })
-    {
-        return Err(
-            "hosted wheel dependency metadata cannot be represented in a uv lockfile".to_string(),
-        );
-    }
+    let rendered = super::pypi_uv::render_package_metadata_block(&metadata).map_err(|why| {
+        format!("hosted wheel dependency metadata cannot be represented in a uv lockfile: {why}")
+    })?;
     if let Some(rendered) = &rendered {
         rendered
             .parse::<toml_edit::DocumentMut>()

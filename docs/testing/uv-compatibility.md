@@ -196,6 +196,19 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   vendored `uv.lock` / `pyproject.toml` writer (including the appended
   `[manifest]` and `[package.metadata]` fragments and their revert) keep the
   file's convention.
+- The `[package.metadata]` block of a vendored or hosted wheel is rebuilt
+  from the wheel's `Requires-Dist` / `Provides-Extra` headers. Each value is
+  written as one TOML string, and a header a lock entry cannot hold is
+  refused before any file is written (`pypi_uv_metadata_unsupported`
+  vendored, `pypi_lock_parse_failed` for a vendored script lock,
+  `python_metadata_unavailable` hosted): a requirement with no
+  distribution name, an extra that is not a PEP 508 identifier, a version
+  specifier that is not a PEP 440 specifier set, a control character in a
+  marker, or a direct reference (`name @ url`). The refusal names the header.
+  uv reads these strings back strictly: measured on 0.11.19, a `specifier`
+  such as `>=1.26.*`, `>=1.26,`, `~=1`, `>=1.0+local` or `===1.0x`, an
+  `extras` entry that is not a name, or a malformed `marker` makes every uv
+  command fail with `Failed to parse uv.lock`.
 - uv workspaces are refused from the root (`pypi_uv_workspace_unsupported` /
   `redirect_uv_project_unsupported`) and from a member directory: a member
   listed by the nearest ancestor `[tool.uv.workspace] members` (no
