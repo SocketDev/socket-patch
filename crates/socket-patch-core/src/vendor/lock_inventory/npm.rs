@@ -416,6 +416,30 @@ pub(super) async fn inventory_package_lock(root: &Path) -> Option<Vec<LockfileEn
     inventory_package_lock_in(&ProjectView::Disk(root)).await
 }
 
+/// The diagnosis for a `package-lock.json` / `npm-shrinkwrap.json` that is
+/// there but is not JSON (truncated, a merge conflict, the wrong file): it
+/// lists packages nobody can read, which is not the same as listing none.
+/// `None` when the lock [`inventory_package_lock_in`] reads parses, or when
+/// there is no lock.
+pub(super) async fn invalid_package_lock_in(
+    view: &ProjectView<'_>,
+) -> Option<super::UnsupportedNpmLayout> {
+    for lock in NPM_LOCKS {
+        let Ok(bytes) = view.read_bytes(lock).await else {
+            continue;
+        };
+        let error = crate::vendor::common::parse_json_manifest(&bytes).err()?;
+        return Some(super::UnsupportedNpmLayout {
+            code: "npm_lock_invalid",
+            detail: format!(
+                "{lock} is not valid JSON ({error}), so the packages it lists were NOT \
+                 scanned. Fix or regenerate it (`npm install --package-lock-only`) and run again."
+            ),
+        });
+    }
+    None
+}
+
 pub(super) async fn inventory_package_lock_in(
     view: &ProjectView<'_>,
 ) -> Option<Vec<LockfileEntry>> {

@@ -395,6 +395,50 @@ async fn stale_pnpm_lock_behind_yarn_berry_pnp_marker_is_not_inventoried() {
     );
 }
 
+/// A `package-lock.json` (or shrinkwrap) that is there but is not JSON
+/// lists packages nobody can read: the inventory says so, naming the file
+/// and the parse error, instead of reading as a project with no
+/// dependencies. A lock that parses, and a project with no lock, yield no
+/// diagnosis.
+#[tokio::test]
+async fn unparseable_package_lock_yields_a_diagnosis_naming_the_file() {
+    for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .await;
+        write(tmp.path(), lock, "this is not json").await;
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{lock}: {entries:?}");
+        assert_eq!(unsupported.len(), 1, "{lock}: {unsupported:?}");
+        assert_eq!(unsupported[0].code, "npm_lock_invalid", "{lock}");
+        assert_eq!(
+            unsupported[0].detail,
+            format!(
+                "{lock} is not valid JSON (expected ident at line 1 column 2), so the packages \
+                 it lists were NOT scanned. Fix or regenerate it (`npm install \
+                 --package-lock-only`) and run again."
+            )
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "package.json",
+        r#"{"name":"x","version":"1.0.0"}"#,
+    )
+    .await;
+    assert!(inventory_project_diagnosed(tmp.path()).await.1.is_empty());
+    write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+    let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(!entries.is_empty());
+    assert!(unsupported.is_empty(), "{unsupported:?}");
+}
+
 /// A malformed binary lock fails closed with format context, including
 /// beside a different package manager's lock. A text Bun lock wins.
 #[tokio::test]

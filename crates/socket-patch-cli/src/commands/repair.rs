@@ -129,7 +129,6 @@ pub async fn run(args: RepairArgs) -> i32 {
                 }
                 return 0;
             }
-            let msg = format!("Manifest not found at {}", manifest_path.display());
             // Nothing to repair here; the project directories below that
             // keep local patch state are where this command has work (and
             // hosted ones are patched all the same, with nothing to repair).
@@ -149,7 +148,10 @@ pub async fn run(args: RepairArgs) -> i32 {
             } else {
                 Default::default()
             };
+            // `--json` keeps its `manifest_not_found` message; a person is
+            // told what that means for the command they ran.
             if args.common.json {
+                let msg = format!("Manifest not found at {}", manifest_path.display());
                 let mut env = error_envelope(
                     Command::Repair,
                     args.common.dry_run,
@@ -159,7 +161,10 @@ pub async fn run(args: RepairArgs) -> i32 {
                 env.warnings.extend(below.warnings());
                 crate::ui::print_json(&env.to_value());
             } else {
-                eprintln!("Error: {msg}");
+                eprintln!(
+                    "Error: {}",
+                    crate::ui::no_patches_message("repair", &args.common)
+                );
                 below.print();
             }
             return 1;

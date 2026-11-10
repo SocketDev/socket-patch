@@ -111,7 +111,9 @@ fn rollback_silent_no_manifest_keeps_error_output() {
     );
     let chatter = stderr_chatter(&stderr);
     assert!(
-        chatter.iter().any(|l| l.contains("Manifest not found")),
+        chatter
+            .iter()
+            .any(|l| l.contains("No patches in this project; nothing to roll back.")),
         "--silent must keep the manifest-not-found error (errors only, \
          never nothing); stderr was: {stderr:?}"
     );

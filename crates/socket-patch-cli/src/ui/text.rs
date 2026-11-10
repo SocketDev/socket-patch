@@ -23,6 +23,11 @@ pub(crate) fn next_steps(commit: &str, reinstall: &str, extra: &[String]) -> Vec
         format!("{reinstall}, then run `socket-patch vex` to verify the installed patches."),
     ];
     steps.extend(extra.iter().cloned());
+    numbered_next_steps(&steps)
+}
+
+/// `Next steps:` over `steps`, numbered from 1.
+fn numbered_next_steps(steps: &[String]) -> Vec<String> {
     let mut out = vec!["Next steps:".to_string()];
     out.extend(
         steps
@@ -31,6 +36,62 @@ pub(crate) fn next_steps(commit: &str, reinstall: &str, extra: &[String]) -> Vec
             .map(|(i, step)| format!("  {}. {step}", i + 1)),
     );
     out
+}
+
+/// The "Next steps:" block after an agent-mode run that recorded a patch.
+/// Agent mode patches the installed files, so its two steps are to commit
+/// `commit` (`.socket/`, and what else the run wired) and to run
+/// `socket-patch apply` after every install: `installs` are the install
+/// commands of the patched ecosystems (`bundle install`), none when the
+/// project's package manager is not known. `apply_now` is a `--save-only`
+/// run, whose patches are recorded but not applied yet. `reapply` is false
+/// when no install can remove the patches (Go builds from the committed
+/// copies), which leaves the commit step alone.
+pub(crate) fn agent_next_steps(
+    commit: &str,
+    installs: &[&str],
+    apply_now: bool,
+    reapply: bool,
+) -> Vec<String> {
+    let mut steps = vec![format!("Commit {commit} to keep the patches.")];
+    if reapply {
+        let every = match installs {
+            [] => "every dependency install".to_string(),
+            [one] => format!("every `{one}`"),
+            [head @ .., last] => format!(
+                "every {} and `{last}`",
+                head.iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        let when = if apply_now { "now, and after" } else { "after" };
+        steps.push(format!(
+            "Run `socket-patch apply` {when} {every}, locally and in CI. A fresh install \
+             removes the patches."
+        ));
+    } else if apply_now {
+        steps.push("Run `socket-patch apply` to apply the patches.".to_string());
+    }
+    numbered_next_steps(&steps)
+}
+
+/// What a command says in a project that holds no patch of any mode (no
+/// manifest, no vendored patch, no hosted patch in its lockfiles), in place
+/// of "Manifest not found": hosted mode, the default, never has a manifest,
+/// so the word tells its users nothing. `nothing_to` is what the command
+/// would have done (`roll back`). `moved_manifest` is the manifest path a
+/// `--manifest-path` moved it to: it is named, so a mistyped one shows.
+pub(crate) fn no_patches_message(
+    nothing_to: &str,
+    moved_manifest: Option<&std::path::Path>,
+) -> String {
+    let base = format!("No patches in this project; nothing to {nothing_to}");
+    match moved_manifest {
+        None => format!("{base}."),
+        Some(path) => format!("{base} (no manifest at {}).", path.display()),
+    }
 }
 
 /// Short, display-only prefix of a UUID for log lines. Returns
@@ -420,6 +481,72 @@ mod tests {
                 "  2. Run `npm ci`, then run `socket-patch vex` to verify the installed patches.",
                 "  3. vlt: x",
             ]
+        );
+    }
+
+    #[test]
+    fn agent_next_steps_name_the_commit_and_the_reapply_after_each_install() {
+        assert_eq!(
+            agent_next_steps(".socket/", &["bundle install"], false, true),
+            vec![
+                "Next steps:",
+                "  1. Commit .socket/ to keep the patches.",
+                "  2. Run `socket-patch apply` after every `bundle install`, locally and in CI. \
+                 A fresh install removes the patches.",
+            ]
+        );
+        let two = agent_next_steps(".socket/", &["npm install", "pip install"], false, true);
+        assert!(
+            two[2].contains("after every `npm install` and `pip install`, locally"),
+            "{two:?}"
+        );
+        let three = agent_next_steps(".socket/", &["a", "b", "c"], false, true);
+        assert!(
+            three[2].contains("after every `a`, `b` and `c`,"),
+            "{three:?}"
+        );
+        // No known package manager: still say when to re-apply.
+        let unknown = agent_next_steps(".socket/", &[], false, true);
+        assert!(
+            unknown[2].contains("after every dependency install, locally"),
+            "{unknown:?}"
+        );
+        // `--save-only` recorded the patch without applying it.
+        let saved = agent_next_steps(".socket/", &["npm install"], true, true);
+        assert!(
+            saved[2]
+                .starts_with("  2. Run `socket-patch apply` now, and after every `npm install`,"),
+            "{saved:?}"
+        );
+        // Nothing an install could undo: the commit is the only step.
+        assert_eq!(
+            agent_next_steps(".socket/ and go.mod", &[], false, false),
+            vec![
+                "Next steps:",
+                "  1. Commit .socket/ and go.mod to keep the patches."
+            ]
+        );
+        assert_eq!(
+            agent_next_steps(".socket/ and go.mod", &[], true, false)[2],
+            "  2. Run `socket-patch apply` to apply the patches."
+        );
+        // No sentence runs past 25 words.
+        for line in agent_next_steps(".socket/", &["bundle install"], true, true) {
+            for sentence in line.split(". ") {
+                assert!(sentence.split_whitespace().count() <= 25, "{sentence}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_patches_message_names_only_a_manifest_path_of_the_users_own() {
+        assert_eq!(
+            no_patches_message("roll back", None),
+            "No patches in this project; nothing to roll back."
+        );
+        assert_eq!(
+            no_patches_message("remove", Some(std::path::Path::new("ops/patches.json"))),
+            "No patches in this project; nothing to remove (no manifest at ops/patches.json)."
         );
     }
 

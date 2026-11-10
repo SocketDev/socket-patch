@@ -50,7 +50,13 @@ pub(crate) struct VendoredBackend<'a> {
     /// lockfile wiring they record always belong to one project.
     pub(crate) common: std::borrow::Cow<'a, GlobalArgs>,
     pub(crate) service: Option<&'a VendorServiceConfig>,
+    /// See [`VendoredBackend::with_closing_lines`].
+    pub(crate) closing_lines: Option<&'a ClosingLines<'a>>,
 }
+
+/// Lines for the human close of a vendor run to print under its summary
+/// line, given the purls the run vendored or found already vendored.
+pub(crate) type ClosingLines<'a> = dyn Fn(&[&str]) -> Vec<String> + Sync + 'a;
 
 /// What [`VendoredBackend::apply`] vendors.
 pub(crate) struct ApplyRequest<'a> {
@@ -83,7 +89,16 @@ impl<'a> VendoredBackend<'a> {
         Self {
             common: common.at_project_root(),
             service,
+            closing_lines: None,
         }
+    }
+
+    /// Have [`VendoredBackend::apply`]'s human close print what `lines`
+    /// returns under its summary line. `scan --mode vendored` uses it to
+    /// say which advisories each vendored patch fixes.
+    pub(crate) fn with_closing_lines(mut self, lines: Option<&'a ClosingLines<'a>>) -> Self {
+        self.closing_lines = lines;
+        self
     }
 
     /// Vendor `req.manifest`'s records. The caller holds the apply lock.
@@ -124,6 +139,7 @@ impl<'a> VendoredBackend<'a> {
             req.ledger,
             req.prior,
             req.eject,
+            self.closing_lines,
         ))
         .await
     }

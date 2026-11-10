@@ -70,6 +70,17 @@ publication date. Reruns upgrade existing patches only when a better-ranked patc
 is available. See the [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
 for tie-breaking and upgrade rules.
 
+One patch is applied per package version. When a package has several patches for
+different advisories, `scan` applies the top-ranked one and names the rest:
+
+```text
+Switched 1 package to hosted patches; rewrote 1 file.
+  pkg:pypi/urllib3@1.26.18: fixes CVE-2025-66418; still unpatched: CVE-2025-66471, CVE-2026-21441
+Only one patch is applied per package version. Upgrade the package to fix the advisories still unpatched.
+```
+
+`scan --json` lists the same ids as `packages[].fixedIds` and `packages[].unfixedIds`.
+
 ## CI and automation
 
 Hosted and vendored projects use their normal dependency install step. Run scans
@@ -210,7 +221,9 @@ It never does so silently: the run warns how many statements it emitted that way
 each one ends its impact statement with `; not verified on disk`.
 
 The product identifier is inferred from the Git origin or project metadata. Use
-`--product <identifier>` when inference is unavailable or unsuitable. `--json`
+`--product <identifier>` when inference is unavailable or unsuitable. A project
+with neither (an application with no Git remote and no named project file) must
+pass one; the error suggests `--product pkg:generic/<directory name>`. `--json`
 requires `--output` so the document and command result do not share stdout.
 
 `scan`, `apply`, and `vendor` accept `--vex <path>`. Generation is skipped for

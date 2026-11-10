@@ -823,6 +823,7 @@ pub(super) async fn run_redirect(
             rows,
             prior,
             references,
+            coverage: Vec::new(),
         }),
         "scan",
     )
@@ -2089,10 +2090,44 @@ async fn run_redirect_selected_untracked(
             // The summary line: scripts read it, so it stays on stdout, as do
             // the rollout line and the next steps; the warnings below are on
             // stderr and name their package themselves.
+            // A package whose hosted patch scan's pre-redirect discovery
+            // already found in place was confirmed by this run, not switched.
+            // (That discovery knows the configured patch servers; a pin on
+            // another one still counts as switched, as before.)
+            let already = rollout
+                .as_ref()
+                .and_then(|gate| gate.prior)
+                .map_or(0, |prior| {
+                    let in_place: std::collections::HashSet<String> =
+                        socket_patch_core::patch::redirect::upstream::HostedPin::all(
+                            prior.discovery,
+                        )
+                        .into_iter()
+                        .map(|pin| pin.uuid)
+                        .collect();
+                    confirmed
+                        .iter()
+                        .filter(|(_, uuid)| in_place.contains(uuid))
+                        .count()
+                });
             println!(
                 "{}",
-                format_redirect_summary(confirmed.len(), human_files.len(), common.dry_run)
+                format_hosted_summary(confirmed.len(), already, human_files.len(), common.dry_run)
             );
+            // Under it, per package on a hosted patch: the advisories that
+            // patch fixes and the ones it leaves unpatched.
+            if let Some(gate) = &rollout {
+                let pinned: std::collections::HashSet<&str> =
+                    confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
+                for line in super::coverage_lines_for(
+                    &gate.coverage,
+                    &pinned,
+                    common.dry_run,
+                    common.verbose,
+                ) {
+                    println!("{line}");
+                }
+            }
             let human_warnings: Vec<(&str, &str)> = warnings
                 .iter()
                 .map(|w| (w.code.as_str(), w.detail.as_str()))
@@ -2505,6 +2540,30 @@ fn format_redirect_summary(redirected: usize, files: usize, dry_run: bool) -> St
     }
 }
 
+/// [`format_redirect_summary`] for a run that confirmed `confirmed`
+/// packages, `already` of them on their hosted patch before it started.
+/// Those were not switched by this run, so they leave the count and get a
+/// sentence of their own:
+/// `Switched 1 package to hosted patches; rewrote 1 file. 2 packages were
+/// already on hosted patches.`
+fn format_hosted_summary(confirmed: usize, already: usize, files: usize, dry_run: bool) -> String {
+    let already = already.min(confirmed);
+    // Nothing rewritten: the one-line "already on hosted patches" form
+    // covers every confirmed package.
+    if already == 0 || files == 0 {
+        return format_redirect_summary(confirmed, files, dry_run);
+    }
+    let were = if dry_run {
+        crate::ui::plural(already, "package is", "packages are")
+    } else {
+        crate::ui::plural(already, "package was", "packages were")
+    };
+    format!(
+        "{} {were} already on hosted patches.",
+        format_redirect_summary(confirmed - already, files, dry_run)
+    )
+}
+
 /// Readable text for a `skipped[].reason` code (the JSON keeps the code).
 /// Unknown server statuses fall through verbatim.
 fn describe_skip_reason(reason: &str) -> String {
@@ -2807,10 +2866,10 @@ fn created_settings_over_existing(
 #[cfg(test)]
 mod tests {
     use super::{
-        describe_skip_reason, format_error_line, format_next_steps, format_redirect_summary,
-        format_takeover_line, format_unredirected, format_warning, join_names,
-        lock_entry_warning_count, pnpm_trust_rerun_reminder, split_sentences, wrap_tokens,
-        wrap_words, TAKEOVER_INFO_CODES,
+        describe_skip_reason, format_error_line, format_hosted_summary, format_next_steps,
+        format_redirect_summary, format_takeover_line, format_unredirected, format_warning,
+        join_names, lock_entry_warning_count, pnpm_trust_rerun_reminder, split_sentences,
+        wrap_tokens, wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{
         gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
@@ -4478,6 +4537,40 @@ mod tests {
                 "3 packages are already on hosted patches; nothing to rewrite."
             );
         }
+    }
+
+    #[test]
+    fn hosted_summary_does_not_count_packages_already_hosted_as_switched() {
+        assert_eq!(
+            format_hosted_summary(3, 2, 1, false),
+            "Switched 1 package to hosted patches; rewrote 1 file. 2 packages were already on \
+             hosted patches."
+        );
+        assert_eq!(
+            format_hosted_summary(3, 1, 2, true),
+            "Would switch 2 packages to hosted patches and rewrite 2 files (--dry-run: nothing \
+             was changed). 1 package is already on hosted patches."
+        );
+        // A file rewritten for packages that were all in place (a settings
+        // file put back): nothing was switched.
+        assert_eq!(
+            format_hosted_summary(2, 2, 1, false),
+            "Switched 0 packages to hosted patches; rewrote 1 file. 2 packages were already on \
+             hosted patches."
+        );
+        // None in place before, or nothing rewritten: the plain forms.
+        assert_eq!(
+            format_hosted_summary(2, 0, 3, false),
+            format_redirect_summary(2, 3, false)
+        );
+        assert_eq!(
+            format_hosted_summary(2, 2, 0, false),
+            "2 packages are already on hosted patches; nothing to rewrite."
+        );
+        assert_eq!(
+            format_hosted_summary(1, 5, 0, true),
+            "1 package is already on hosted patches; nothing to rewrite."
+        );
     }
 
     #[test]

@@ -198,27 +198,25 @@ fn missing_manifest_suggests_next_step() {
     let tmp = tempfile::tempdir().unwrap();
     let o = vex(tmp.path(), &[]);
     assert_eq!(o.status.code(), Some(2));
-    // Manifest-less VEX: the error also says the lockfiles and ledgers
-    // wired nothing, since those alone could have supplied patches.
-    let expected = format!(
-        "Error: Manifest not found at {}, and no hosted or vendored patch references were \
-         found in the project's lockfiles or .socket/vendor ledgers — nothing to attest. Run \
-         `socket-patch scan` or `socket-patch get` first, or pass --manifest-path.\n",
-        tmp.path().join(".socket/manifest.json").display()
+    // No patch of any mode: hosted mode never has a manifest, so the
+    // error names none.
+    assert_eq!(
+        stderr(&o),
+        "Error: No patches in this project; nothing to attest. Run `socket-patch scan` \
+         first.\n"
     );
-    assert_eq!(stderr(&o), expected);
 }
 
-/// A user who already passed `--manifest-path` is not told to pass it.
+/// A user who passed their own `--manifest-path` sees the path that was
+/// looked for: a mistyped one shows.
 #[test]
-fn missing_custom_manifest_does_not_suggest_manifest_path() {
+fn missing_custom_manifest_names_the_path_looked_for() {
     let tmp = tempfile::tempdir().unwrap();
     let o = vex(tmp.path(), &["--manifest-path", "nope.json"]);
     assert_eq!(o.status.code(), Some(2));
     let expected = format!(
-        "Error: Manifest not found at {}, and no hosted or vendored patch references were \
-         found in the project's lockfiles or .socket/vendor ledgers — nothing to attest. Run \
-         `socket-patch scan` or `socket-patch get` first.\n",
+        "Error: No patches in this project; nothing to attest (no manifest at {}). Run \
+         `socket-patch scan` first.\n",
         tmp.path().join("nope.json").display()
     );
     assert_eq!(stderr(&o), expected);
@@ -251,9 +249,60 @@ fn product_undetected_names_the_unusable_manifest() {
     let o = vex_command(cwd, None).arg("--no-verify").output().unwrap();
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("(package.json was found but has no usable name and version)"),
+        stderr(&o).contains(". package.json was found but has no usable name and version. "),
         "{}",
         stderr(&o)
+    );
+}
+
+/// A plain application (no git remote, no project file with a name) has no
+/// product to detect. Run from the project directory, the error says what
+/// was looked for and ends with a flag and a value the user can paste,
+/// built from the directory's name. It never ends a sentence on the `.` of
+/// the current directory.
+#[test]
+fn product_undetected_in_a_plain_app_ends_with_a_pasteable_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("billing api (v2)");
+    std::fs::create_dir(&cwd).unwrap();
+    write_npm_manifest(&cwd, &["pkg:npm/a@1.0.0"]);
+
+    let mut cmd = crate::common::hermetic::binary_command();
+    let o = cmd
+        .current_dir(&cwd)
+        .args(["vex", "--no-verify"])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(o.stdout.is_empty(), "no document: {}", stdout(&o));
+    let err = stderr(&o);
+    assert_eq!(
+        err.trim_end(),
+        "Error: The VEX document must name the project it describes (its product), and none was \
+         detected in the current directory. Detection reads the git `origin` remote, then the \
+         name and version in package.json, pyproject.toml, Cargo.toml, go.mod, composer.json, \
+         pom.xml, a .csproj or a .gemspec. Pass a name that identifies this project, for \
+         example: --product pkg:generic/billing-api-v2"
+    );
+    assert!(!err.contains(".."), "{err}");
+
+    // The suggested flag works as printed.
+    let mut cmd = crate::common::hermetic::binary_command();
+    let o = cmd
+        .current_dir(&cwd)
+        .args([
+            "vex",
+            "--no-verify",
+            "--product",
+            "pkg:generic/billing-api-v2",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    let doc: Value = serde_json::from_slice(&o.stdout).expect("document on stdout");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"],
+        "pkg:generic/billing-api-v2"
     );
 }
 

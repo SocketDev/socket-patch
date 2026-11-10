@@ -44,8 +44,24 @@ fn protecting(common: &GlobalArgs, index: &UserPatchIndex, purl: &str) -> Option
     (!sources.is_empty()).then_some(sources)
 }
 
-pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool) -> String {
+/// The `user_patch_conflict` / `user_patch_override` text for `purl`.
+/// `unreadable` ([`UserPatchIndex::unreadable_only`]): nothing the project
+/// declares protects it, only files that could not be read or parsed. That
+/// is a broken file, not a conflict, so the text says to fix it rather than
+/// to switch the check off.
+pub(crate) fn detail(purl: &str, sources: &[String], allowed: bool, unreadable: bool) -> String {
+    let fix = if sources.len() == 1 {
+        "that file"
+    } else {
+        "those files"
+    };
     let sources = sources.join(", ");
+    if unreadable && !allowed {
+        return format!(
+            "{purl}: not patched, because this project's own patches for it could not be \
+             checked: {sources}. Fix {fix} and run again."
+        );
+    }
     if allowed {
         format!("{purl}: --allow-patch-conflicts permits attempting a Socket patch alongside project patches in {sources}; review and test the combined result. Backend safety checks still apply")
     } else {
@@ -90,7 +106,12 @@ pub(crate) async fn partition(
         let Some(sources) = protecting(common, &index, purl) else {
             continue;
         };
-        let message = detail(purl, &sources, common.allow_patch_conflicts);
+        let message = detail(
+            purl,
+            &sources,
+            common.allow_patch_conflicts,
+            index.unreadable_only(purl),
+        );
         if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));
         } else {
@@ -155,7 +176,12 @@ pub(crate) async fn skip_protected(
         let Some(sources) = protecting(common, &index, purl) else {
             return true;
         };
-        let message = detail(purl, &sources, common.allow_patch_conflicts);
+        let message = detail(
+            purl,
+            &sources,
+            common.allow_patch_conflicts,
+            index.unreadable_only(purl),
+        );
         if common.allow_patch_conflicts {
             warnings.push((ALLOWED.into(), message));
             true
@@ -184,4 +210,43 @@ pub(crate) fn refuse(common: &GlobalArgs, command: Command, error: EnvelopeError
         eprintln!("Error: {}", error.message);
     }
     1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detail;
+
+    #[test]
+    fn detail_tells_an_unreadable_file_from_a_declared_patch() {
+        let declared = ["/p/package.json".to_string()];
+        let blocked = detail("pkg:npm/a@1.0.0", &declared, false, false);
+        assert!(
+            blocked.starts_with("pkg:npm/a@1.0.0: protected by project patch/replacement metadata in /p/package.json;"),
+            "{blocked}"
+        );
+        assert!(blocked.contains("--allow-patch-conflicts"), "{blocked}");
+
+        // A file that could not be read: say so and how to fix it. Switching
+        // the safety check off is not the remedy for a syntax error.
+        let unreadable = ["/p/package.json (not valid JSON: EOF at line 2 column 0)".to_string()];
+        assert_eq!(
+            detail("pkg:npm/a@1.0.0", &unreadable, false, true),
+            "pkg:npm/a@1.0.0: not patched, because this project's own patches for it could not \
+             be checked: /p/package.json (not valid JSON: EOF at line 2 column 0). Fix that file \
+             and run again."
+        );
+        let two = [
+            unreadable[0].clone(),
+            "pnpm-lock.yaml (cannot be read: denied)".to_string(),
+        ];
+        assert!(
+            detail("pkg:npm/a@1.0.0", &two, false, true)
+                .ends_with(". Fix those files and run again."),
+            "{}",
+            detail("pkg:npm/a@1.0.0", &two, false, true)
+        );
+        // Consent given: the override wording is the same for both.
+        assert!(detail("pkg:npm/a@1.0.0", &unreadable, true, true)
+            .contains("--allow-patch-conflicts permits"),);
+    }
 }
