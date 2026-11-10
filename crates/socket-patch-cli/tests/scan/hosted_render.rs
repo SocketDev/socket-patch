@@ -617,6 +617,162 @@ async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
     );
 }
 
+/// A run that puts a second package on a hosted patch, beside one an
+/// earlier run already switched, counts one package as switched and says
+/// the other was already there. Before, it said "Switched 2 packages".
+#[tokio::test]
+async fn human_summary_counts_only_the_packages_this_run_switched() {
+    const SECOND: &str = "covgap-second";
+    const SECOND_PURL: &str = "pkg:npm/covgap-second@1.0.0";
+    const SECOND_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    const SECOND_URL: &str = "https://patch.test/patch/npm/covgap-second/1.0.0/22222222-2222-4222-8222-222222222222/55555555-5555-4555-8555-555555555555/covgap-second-1.0.0.tgz";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{SECOND}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let mut packages = String::new();
+    for name in [NAME, SECOND] {
+        let pkg = root.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        packages.push_str(&format!(
+            r#",
+    "node_modules/{name}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{name}/-/{name}-{VERSION}.tgz",
+      "integrity": "{UPSTREAM_SHA512}"
+    }}"#
+        ));
+    }
+    std::fs::write(
+        root.join("package-lock.json"),
+        format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{SECOND}": "{VERSION}" }} }}{packages}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    // First run: only one of the two packages has a patch.
+    let first = MockServer::start().await;
+    mock_discovery(&first, PURL, UUID).await;
+    mock_granted_reference(&first, UUID, PURL, HOSTED_URL).await;
+    mock_view(&first, UUID, PURL).await;
+    let (code, stdout, stderr) = scan_hosted(root, &first.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        engine_stdout(&stdout)
+            .starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    // Second run: both have one.
+    let second = MockServer::start().await;
+    let patch = |uuid: &str, purl: &str| {
+        json!({
+            "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+            "severity": "high", "title": "covgap hosted fixture"
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [
+                { "purl": PURL, "patches": [patch(UUID, PURL)] },
+                { "purl": SECOND_PURL, "patches": [patch(SECOND_UUID, SECOND_PURL)] },
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&second)
+        .await;
+    for (uuid, purl, name) in [(UUID, PURL, NAME), (SECOND_UUID, SECOND_PURL, SECOND)] {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{name}.*$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": uuid, "purl": purl,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&second)
+            .await;
+        mock_view(&second, uuid, purl).await;
+    }
+    let grant = |url: &str, purl: &str| {
+        json!({
+            "status": "granted", "url": url, "purl": purl,
+            "artifacts": [{
+                "kind": "tarball", "url": url,
+                "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
+            }],
+            "registryOverride": null
+        })
+    };
+    mock_reference_results(
+        &second,
+        json!({ UUID: grant(HOSTED_URL, PURL), SECOND_UUID: grant(SECOND_URL, SECOND_PURL) }),
+    )
+    .await;
+
+    // The fixture's patch server is not Socket's: name it, so its pins are
+    // recognised as hosted, as Socket's own are by default.
+    const SERVER: [&str; 2] = ["--patch-server-url", "https://patch.test"];
+    let (code, stdout, stderr) = scan_hosted(
+        root,
+        &second.uri(),
+        &[SERVER[0], SERVER[1], "--dry-run"],
+        &[],
+    );
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        "Would switch 1 package to hosted patches and rewrite 1 file (--dry-run: nothing was \
+         changed). 1 package is already on hosted patches.\n",
+        "stderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(root, &second.uri(), &SERVER, &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        engine_stdout(&stdout).starts_with(
+            "Switched 1 package to hosted patches; rewrote 1 file. 1 package was already on \
+             hosted patches.\nNext steps:\n"
+        ),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(root, &second.uri(), &SERVER, &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        "2 packages are already on hosted patches; nothing to rewrite.\n",
+        "stderr=\n{stderr}"
+    );
+}
+
 /// A granted patch whose package has no lock entry is listed by purl on
 /// stderr (not just hinted at by a raw rewriter warning), under a
 /// `No patches could be redirected:` headline when nothing was.
