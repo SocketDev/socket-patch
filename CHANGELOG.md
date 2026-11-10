@@ -76,7 +76,7 @@ a version without a non-empty section in this file.
     is one human warning with the remedy as a command
     (`redirect_gem_stale_install`, and the new `upstream_gem_stale_install`
     after an unwind), and the hosted `Next steps:` of a Bundler-only run say
-    there is nothing to reinstall once the copies were replaced (#PRNUM).
+    there is nothing to reinstall once the copies were replaced (#2052).
 - **Go.**
   - Run from the directory holding `go.work`, `apply`, `vendor` and hosted
     scans write one replace into `go.work` for a module the workspace
@@ -108,7 +108,7 @@ a version without a non-empty section in this file.
     rest. `scan --json` carries the same on each `packages[]` entry the run
     selected a patch for, in the new `selectedUuids`, `fixedIds` and
     `unfixedIds` keys. An advisory is reported fixed only when the selected
-    patch names it (#PRNUM).
+    patch names it (#2052).
   - An agent-mode run that records a patch (`scan --mode agent`, agent-mode
     `get`) ends with a `Next steps:` block: commit `.socket/`, and run
     `socket-patch apply` after every install, locally and in CI, naming the
@@ -116,7 +116,7 @@ a version without a non-empty section in this file.
     `pnpm install`, `uv sync`, …). After `--save-only` it says to run
     `apply` now, and a Go patch adds `go.mod` to the commit step and needs
     no re-apply. Nothing is printed for a dry run, a failed or global run,
-    or under `--silent` / `--json` (#PRNUM).
+    or under `--silent` / `--json` (#2052).
   - `--ecosystems` and `socket.yml` `patches.ecosystems` accept the names
     the output prints and everyday ones, in any case: `python`, `ruby`,
     `go`, `php`, `pip`, `rubygems`, `rust`, `crates`, `java`, `gradle`,
@@ -124,7 +124,7 @@ a version without a non-empty section in this file.
     `bun` / `vlt` for `npm`. Before, `-e go` and `-e python` were rejected
     although the CLI prints "(5 go)", and `socket.yml` answered `go` with
     "did you mean `gem`?". Any other name is a usage error that lists the
-    slugs (#PRNUM).
+    slugs (#2052).
 
 ### Changed
 
@@ -198,7 +198,7 @@ a version without a non-empty section in this file.
     counting what they left out. Nothing changes outside a git checkout,
     with a PATH, under `--global` / `--global-prefix` or in agent mode.
     `--json` and `--vex` still scan `--cwd` alone and name the directories
-    they left in a new `projects_not_scanned` warning (#PRNUM).
+    they left in a new `projects_not_scanned` warning (#2052).
   - `list` and a bare `rollback` cover what such a scan patched: the project
     at `--cwd` and every patched project directory below it, under the same
     headings. `list` adds one total line and, under `--json`, a top-level
@@ -216,7 +216,7 @@ a version without a non-empty section in this file.
     their exit codes. When `--cwd` holds nothing for them they add a note
     (`patched_projects_below` under `--json`) naming the directories below
     and the `--cwd <dir>` command for each; `apply --silent` does not search
-    (#PRNUM).
+    (#2052).
   - `scan` and `get` report "no patches" only when the patch service said
     so. An answer from another host (a mistyped `--proxy-url` or
     `--api-url`, a captive portal, a forward proxy), a 404 the service did
@@ -230,7 +230,7 @@ a version without a non-empty section in this file.
     every mode, and exits 1 with `api_batch_failed` when no package was
     answered. `get` exits 1 naming the host or the org slug to check. A
     lookup still throttled after its retries is reported the same way
-    instead of failing its whole batch (#PRNUM).
+    instead of failing its whole batch (#2052).
   - Manifest records no crawler can look for are named instead of dropped. A
     record of an ecosystem this CLI doesn't support (one a newer
     socket-patch wrote, or a mis-cased type such as `pkg:NPM/…`) is a
@@ -242,7 +242,7 @@ a version without a non-empty section in this file.
     `rollback` a failed entry. `remove` refuses either kind before any
     change (exit 1) unless `--skip-rollback` is given. Before, `apply`
     printed "No patches to apply." and exited 0, and `remove` dropped the
-    record without restoring anything (#PRNUM).
+    record without restoring anything (#2052).
   - `repair` verifies the blobs it finds. Every referenced blob is
     re-hashed, and one whose bytes changed on disk (a `core.autocrlf`
     checkout of a committed `.socket/blobs/`, a truncated file) is
@@ -252,7 +252,7 @@ a version without a non-empty section in this file.
     corrupt, with a `failed` event per blob (`offline_missing_sources` / new
     `blob_corrupt`) and an error list `--silent` doesn't mute; it used to
     print "Repair complete." and exit 0. `apply` and `rollback` name a
-    corrupt blob by its path and say to run `socket-patch repair` (#PRNUM).
+    corrupt blob by its path and say to run `socket-patch repair` (#2052).
   - A failed checksum-sidecar fixup now fails the package. When `apply` or
     `rollback` can't bring cargo's `.cargo-checksum.json`, NuGet's
     `.nupkg.metadata` or the Maven and Coursier checksum files in line with
@@ -263,7 +263,7 @@ a version without a non-empty section in this file.
     `sidecar_fixup_failed` record under `--json`, which for cargo left a
     crate `cargo build` refuses. A run that finds every file already patched
     now rechecks and repairs those sidecars, and `apply` prints sidecar
-    notes and warnings on stderr without `--json` (#PRNUM).
+    notes and warnings on stderr without `--json` (#2052).
   - The programs socket-patch runs (package managers and their
     version-manager shims, interpreters, `git`, a gem's `extconf.rb` and
     compiler) no longer inherit Socket credentials or settings. Their
@@ -273,14 +273,14 @@ a version without a non-empty section in this file.
     `SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, every flag-bound `SOCKET_*`
     variable and the Socket registry override URLs. Names are matched
     exactly, so `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, `NPM_TOKEN` and
-    other registry credentials still reach the child (#PRNUM).
+    other registry credentials still reach the child (#2052).
   - `vex --no-verify` (also `--vex-no-verify` and `SOCKET_VEX_NO_VERIFY`)
     says what it did not check. Each statement emitted without on-disk
     verification ends its impact statement with `; not verified on disk`,
     and the run warns `vex_not_verified` with the count. Before, an
     agent-mode patch whose files were unpatched or missing was attested
     `not_affected` with the same text as a verified one, with no warning. A
-    verifying run's document is unchanged (#PRNUM).
+    verifying run's document is unchanged (#2052).
   - `vex` attests a vendored patch only while a lockfile reference wires its
     package to its artifact. A vendor ledger entry is no longer kept alive
     by text in the files the ledger names: a `pnpm.overrides` entry left in
@@ -288,7 +288,7 @@ a version without a non-empty section in this file.
     Gemfile `path:` beside a reverted lock, or any file that merely spells
     the vendored directory now gets `vendor_unwired` and no statement.
     `vendor --check` applies the same rule; `scan --prune` still keeps such
-    an entry (#PRNUM).
+    an entry (#2052).
   - A lockfile URL counts as a Socket patch reference only when every client
     reads its host alike and the patch server serves its path. A URL with a
     backslash, whitespace or a control character
@@ -296,15 +296,15 @@ a version without a non-empty section in this file.
     `\`, or a path other than `patch/<ecosystem>/…`,
     `patch-registry/<ecosystem>/…` or `gopatch/…` (under any prefix on a
     `--patch-server-url` deployment) is no longer attested by `vex` or
-    managed by `list`, `rollback`, `remove` and `scan` (#PRNUM).
+    managed by `list`, `rollback`, `remove` and `scan` (#2052).
   - When two lockfiles wire one package to the same hosted patch and one of
     them lacks the integrity pin hosted mode always writes, `vex` no longer
     attests the patch from the lockfiles alone: the pinned lock doesn't
-    vouch for the other (#PRNUM).
+    vouch for the other (#2052).
   - `vex` no longer accepts a vendored reference whose artifact name carries
     a `%` (`.socket/vendor/npm/<uuid>/%66oo-1.0.0.tgz`): npm, yarn and pnpm
     open the literal file while pip percent-decodes it, so it names no
-    single file to verify. No vendor backend writes such a name (#PRNUM).
+    single file to verify. No vendor backend writes such a name (#2052).
 - **RubyGems.**
   - **Hosted mode keeps your `gem` declaration and always converges the
     lock.** `scan` / `get --mode hosted` used to replace a gem's Gemfile
@@ -334,7 +334,7 @@ a version without a non-empty section in this file.
     re-scan keeps the block and now converges its lock, and their unwind
     still restores the exact pin, with a new
     `upstream_gem_declaration_pinned` warning. The scan prints one line
-    naming the declarations it changed (#PRNUM).
+    naming the declarations it changed (#2052).
 - **npm family.**
   - A package the project patches itself (pnpm `patchedDependencies`, a
     yarn `patch:` descriptor or lock locator, patch-package files),
@@ -354,20 +354,20 @@ a version without a non-empty section in this file.
     installed tree that verifies, and a vendored pin is omitted with the new
     `vex_lock_not_read`, except a pnpm pin that the override map pnpm reads
     still routes to the artifact. `list`, `rollback`, `remove` and
-    `vendor --check` still see the pin (#PRNUM).
+    `vendor --check` still see the pin (#2052).
   - `vex` withholds a pnpm pin (`patched_ref_unattributable`) when the lock
     installs a second copy of the same `name@version`: an entry from a git
     remote or a URL tarball, a `file:` copy whose `package.json` can't be
     read, or, in lockfileVersion 5 / 6 locks, another registry key of the
     release. A root-relative `.socket/vendor/npm/…` path in a per-member or
     Rush lock is reported as `patched_ref_invalid` instead of attested,
-    since pnpm resolves it against that lock's own directory (#PRNUM).
+    since pnpm resolves it against that lock's own directory (#2052).
   - Run from a pnpm or yarn 1 workspace member, `vex` reads the member's own
     stray `pnpm-lock.yaml` or classic `yarn.lock` as absent, because the
     package manager installs the member from the workspace root: its pins
     are not attested, and one `patched_ref_unattributable` names the root to
     run from. Per-member pnpm locks (`sharedWorkspaceLockfile: false`) and a
-    berry lock in a member are read as before (#PRNUM).
+    berry lock in a member are read as before (#2052).
   - Hosted `scan` and `get` run from such a member refuse instead of
     pinning a lock nothing installs from. A `pnpm-lock.yaml` inside a member
     that `pnpm-workspace.yaml` lists is never read by pnpm, which installs
@@ -378,7 +378,7 @@ a version without a non-empty section in this file.
     exits 1 with `redirect_workspace_lockfile_elsewhere`, names the
     workspace root to run from and writes nothing. A workspace that sets
     `sharedWorkspaceLockfile: false`, a directory the workspace does not
-    list and a yarn berry lock in a member are pinned as before (#PRNUM).
+    list and a yarn berry lock in a member are pinned as before (#2052).
 - **PyPI.**
   - Vendored uv refuses a patch for another version than `uv.lock` resolves
     (`pypi_uv_lock_package_missing`, exit 1), before any download and in the
@@ -387,7 +387,7 @@ a version without a non-empty section in this file.
     moved the lock down to the older release and `uv sync` installed it.
     With patches for two releases, the one for the locked release is wired
     and the other is refused. A project an earlier release vendored that way
-    keeps working and still reverts (#PRNUM).
+    keeps working and still reverts (#2052).
   - `vex` withholds a Python pin that another entry or requirement installs
     unpatched. That covers a second entry of the same release in the same
     `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock` or `Pipfile.lock`
@@ -398,13 +398,13 @@ a version without a non-empty section in this file.
     reference behind an environment marker, extra, dependency group or Hatch
     environment is also withheld (`patched_ref_unattributable`) while a
     plain requirement can install the same release where the reference
-    doesn't apply (#PRNUM).
+    doesn't apply (#2052).
 - **JVM.**
   - `vex` withholds a Gradle statement when the derived-cache check of its
     patched copy doesn't finish: the purl is omitted as
     `gradle_unpatched_copy` with the new
     `vex_gradle_derived_cache_check_failed` warning. A check that crashed
-    used to count as nothing to check (#PRNUM).
+    used to count as nothing to check (#2052).
 
 ### Fixed
 
@@ -468,7 +468,7 @@ a version without a non-empty section in this file.
     program that a committed `vendor/bundle` lets the scanned repository
     supply. The gemspec is now read as text, a dry run reports the pending
     rebuild as a `native_extension_rebuilt` warning, and refusal codes are
-    unchanged (#PRNUM).
+    unchanged (#2052).
   - Interrupting `apply` during a gem's native rebuild (Ctrl-C, SIGTERM)
     ends the build with it, instead of leaving `ruby`, `extconf.rb` and the
     compiler running into a gem no lock protects. The next `apply`,
@@ -476,7 +476,7 @@ a version without a non-empty section in this file.
     or restores; before, it deleted the parked build or refused with
     "installed by a RubyGems older than 2.2". A gem that another process is
     still rebuilding is refused with `native_extensions_unsupported`
-    (#PRNUM).
+    (#2052).
 - **npm family.**
   - pnpm workspace globs with brace sets and character classes
     (`packages/{a,b}`, `packages/[ab]*`) are read the way pnpm reads them in
@@ -737,12 +737,12 @@ a version without a non-empty section in this file.
     number spellings (`5.173e28`), duplicate keys, line endings and a BOM
     stay, so `vendor` then `vendor --revert` is byte-exact. A yarn berry
     revert removes a `resolutions` table only when vendoring created it and
-    leaves one the project already had, even empty (#PRNUM).
+    leaves one the project already had, even empty (#2052).
   - A yarn berry vendored revert reads `package.json` before it writes
     `yarn.lock`. A manifest that doesn't parse (a merge-conflict marker) now
     fails with "nothing was reverted" and both files untouched, instead of
     leaving the lock restored while `resolutions` still pointed at the
-    vendored tarball (#PRNUM).
+    vendored tarball (#2052).
   - A vendored pnpm or yarn revert finishes only once nothing resolves
     through the artifact. A pnpm revert points dependency references added
     after vendoring (a new package or workspace importer) back at the
@@ -752,32 +752,32 @@ a version without a non-empty section in this file.
     "Broken lockfile". Once a dependency was upgraded past the patched
     version, pnpm and yarn reverts remove the artifact and ledger entry with
     the new `vendor_revert_dependency_moved_on` warning instead of reporting
-    the same drift forever (#PRNUM).
+    the same drift forever (#2052).
   - Vendored pnpm no longer corrupts a `packages:` entry whose `deprecated`
     message is a block scalar, or one with a peer dependency named
     `resolution`. The rebuilt entry is read back before anything is written,
     and a lock that doesn't read back is refused with the project untouched
-    (#PRNUM).
+    (#2052).
   - Hosted pnpm keeps a CRLF `pnpm-workspace.yaml` CRLF when it adds
     `trustLockfile: true`. `rollback` restores the file byte for byte and
-    removes a scaffold hosted mode created in either line ending (#PRNUM).
+    removes a scaffold hosted mode created in either line ending (#2052).
   - Reverting two or more packages vendored into one `bun.lockb` restores
     the lock's exact pre-vendor bytes in any order, also for a ledger 5.0 /
     5.1 wrote when one `vendor --revert` run reverts them all. Before, the
     first package's tarball path stayed in the lock while the revert
-    reported success (#PRNUM).
+    reported success (#2052).
   - In a `bun.lockb` workspace, vendoring copies a tarball only into the
     members whose dependencies reach the package, instead of into every
     member's `.socket/vendor/npm/<uuid>/`. `repair` asks for the same
     members, and a revert still removes the copies an earlier release made
-    (#PRNUM).
+    (#2052).
   - A Bun vendored revert keeps the artifact and ledger entry
     (`vendor_revert_residual_reference`) while any `bun.lock` or `bun.lockb`
     entry still installs from it. Vendoring now refuses a `bun.lock` that
     lists the key it would rewrite more than once, as a merge that kept both
     sides leaves it (`vendor_lockfile_version_unsupported`); before, the
     revert restored one line and deleted the tarball the other still pointed
-    at (#PRNUM).
+    at (#2052).
   - A vlt `vendor --revert` checks what it leaves behind. An unrecorded lock
     edge that still reaches the vendored node leaves the revert alone as
     drift, and anything else still naming the uuid directory keeps it with
@@ -787,22 +787,22 @@ a version without a non-empty section in this file.
     (`vendor_lock_entry_unsupported`) instead of being written through, and
     a `vlt-lock.json` whose `nodes` or `edges` section can't be located for
     certain is refused before any write
-    (`vendor_lockfile_version_unsupported`) (#PRNUM).
+    (`vendor_lockfile_version_unsupported`) (#2052).
   - The `yarn_classic_workspace_member_install_risk` warning says that a
     cold-cache install fails from every workspace member, whether or not it
     depends on a patched package, and names the install that works from a
-    member directory: `yarn install --cwd <workspace root>` (#PRNUM).
+    member directory: `yarn install --cwd <workspace root>` (#2052).
   - A broken project file is reported as a broken file. A `package.json`
     that isn't valid JSON now reads "not patched, because this project's own
     patches for it could not be checked", names the file and the parse error
     and says to fix it, instead of advising `--allow-patch-conflicts`. A
     `package-lock.json` that isn't JSON warns `npm_lock_invalid` and the
     scan ends "No packages found (see the warning)." instead of advising an
-    install. Both runs still exit 0 (#PRNUM).
+    install. Both runs still exit 0 (#2052).
   - `vex` reads a yarn berry lock that holds a YAML complex-key entry
     (`? "<descriptors>"`, yarn's spelling of a key longer than 1024
     characters). Before, the whole lock was rejected as "not a yarn
-    lockfile" and no patch in it could be attested (#PRNUM).
+    lockfile" and no patch in it could be attested (#2052).
 - **PyPI.**
   - A requirements line pinned through an environment variable
     (`six==${SIXV}`) is refused by `vendor` with
@@ -946,7 +946,7 @@ a version without a non-empty section in this file.
     "no sibling registry package". The entry is rebuilt on PyPI's default
     index with the fields uv writes at the lock's `revision`, and the run
     warns `upstream_uv_entry_rebuilt`. It still refuses when the revision is
-    newer than 3 or uv is configured with a package index (#PRNUM).
+    newer than 3 or uv is configured with a package index (#2052).
   - A patched wheel's `Requires-Dist` / `Provides-Extra` headers reach
     `uv.lock` only as TOML strings. A header holding a double quote could
     add a key to the lock or leave it unparseable while vendored uv
@@ -955,10 +955,10 @@ a version without a non-empty section in this file.
     `pypi_lock_parse_failed` for a vendored script lock; hosted mode skips
     with `python_metadata_unavailable`). That includes the direct references
     (`name @ url`) vendored mode used to wire while leaving a lock
-    `uv lock --check` calls stale (#PRNUM).
+    `uv lock --check` calls stale (#2052).
   - Vendored uv keeps each line's own ending in a `pyproject.toml` that
     mixes CRLF and LF, instead of rewriting the file all-LF, and
-    `vendor --revert` restores it byte for byte (#PRNUM).
+    `vendor --revert` restores it byte for byte (#2052).
 - **Go.**
   - In a go 1.16 (unpruned) module where a dependency imports a fork that
     the root `go.mod` replaces with the patched module, `apply`,
@@ -1058,7 +1058,7 @@ a version without a non-empty section in this file.
     on a `Cargo.lock` package whose name is empty or not ASCII, or on a v1
     lock that lists the hosted block twice. A pin with such a block is
     refused whole ("is not a crates.io crate name") before any lookup, with
-    no file changed (#PRNUM).
+    no file changed (#2052).
 - **JVM.**
   - A Maven 4 root that builds its subdirectories implicitly (model 4.1.0,
     `pom` packaging, no `<subprojects>`) is treated as a reactor by hosted
@@ -1127,31 +1127,31 @@ a version without a non-empty section in this file.
     with `inherited_version_unresolvable`, and a first vendoring whose
     parent poms can't be read with `parent_unavailable`. A parent or BOM
     that only a corporate repository holds is read from the local repository
-    instead of leaving the root unpinned (#PRNUM).
+    instead of leaving the root unpinned (#2052).
   - Vendoring keeps the bytes of a `.mvn/maven.config` that is not UTF-8 (a
     Latin-1 `-Duser.name=José`) instead of rewriting them as U+FFFD, and the
     revert restores the file instead of leaving the added lines behind
-    (#PRNUM).
+    (#2052).
   - A Gradle module declared with a computed classifier
     (`${osdetector.classifier}`) is refused: by vendored mode with the new
     `gradle_classifier_computed`, by hosted mode with
     `redirect_gradle_classifier_declared`. Before, `vendor` and
     `vendor --check` reported success while Gradle could no longer resolve
-    the classifier jar (#PRNUM).
+    the classifier jar (#2052).
   - `vendor --revert` finds its `gradle/verification-metadata.xml` entry
     after the file was re-serialised
     (`./gradlew --write-verification-metadata`) and puts the original entry
     back; before, it reported success and left the patched jar's sha256 in
     place. When the patched hash sits where no recorded shape applies,
     nothing is reverted and `vendor_lock_entry_drifted` names the entry
-    (#PRNUM).
+    (#2052).
   - In a `settings.gradle.kts`, vendoring creates `pluginManagement {}`
     after the file annotations (`@file:Suppress(…)`) instead of above them,
-    where the script stopped compiling (#PRNUM).
+    where the script stopped compiling (#2052).
   - The Gradle and Maven wrapper version is read from the
     `distributionUrl = …` and `distributionUrl: …` spellings too, so a
     Gradle 6.7 wrapper no longer passes vendored mode's 6.8 gate and a Maven
-    3.9.9 wrapper no longer reads as unknown (#PRNUM).
+    3.9.9 wrapper no longer reads as unknown (#2052).
 - **NuGet.**
   - When a `packages.lock.json` locks a patched package at a
     version the writers refuse to wire (another target framework or
@@ -1166,7 +1166,7 @@ a version without a non-empty section in this file.
     (`vendored_ownership_retained`) (#489, #1790).
   - `rollback` no longer panics on a package id with non-ASCII letters
     (`Ünicode.Pkg`) when `nuget.config` maps package sources by prefix
-    pattern (#PRNUM).
+    pattern (#2052).
 - **Composer.**
   - A `composer.lock` with a UTF-8 BOM is read everywhere,
     and vendor then `--revert` keeps the BOM byte for byte; a revert no
@@ -1215,7 +1215,7 @@ a version without a non-empty section in this file.
     next save but stay in git history, so rotate them), and vendored gems
     refuse a `gem` line whose positional argument is computed
     (`gemfile_declaration_not_editable`), since it couldn't be reverted
-    (#PRNUM).
+    (#2052).
   - Finishing an interrupted vendored commit can no longer write under
     `.git`, and is never silent. A checkout can carry a hand-written
     `.socket/vendor/.commit-journal.json`; one that names a path inside a
@@ -1226,7 +1226,7 @@ a version without a non-empty section in this file.
     `--json`. A `--dry-run` of `apply`, `rollback`, `remove`, `repair` or
     `vendor` no longer replays a pending journal: it exits 1 with the new
     `vendor_commit_pending` error, where it used to finish the commit and
-    then preview (#PRNUM).
+    then preview (#2052).
 - **General.**
   - Workspace runs never read or rewrite project files outside the
     enclosing git repository root. Ancestor workspace roots, settings
@@ -1314,7 +1314,7 @@ a version without a non-empty section in this file.
     written now prunes and sweeps nothing (`manifest_write_failed`), and the
     blob, diff and package sweeps of `repair`, `remove`, `rollback` and
     `scan --prune` refuse a symlinked `.socket/` level (`cleanup_failed`)
-    instead of deleting the files at the link's target (#PRNUM).
+    instead of deleting the files at the link's target (#2052).
   - Hosted mode checks each patch reference the API grants before any of it
     is written into project files: a canonical uuid, `https` URLs of plain
     URL characters, digests of the right length and alphabet, names and
@@ -1324,7 +1324,7 @@ a version without a non-empty section in this file.
     loopback address with `redirect_grant_insecure_url`; nothing is written
     for that package and the exit code is unchanged. Before, a quote,
     newline or markup in a grant could add fields to `yarn.lock` or
-    `Gemfile.lock`, break `pom.xml` or panic the run (#PRNUM).
+    `Gemfile.lock`, break `pom.xml` or panic the run (#2052).
   - Hosted multi-file writes are all or nothing. `rollback`, `remove` and
     the withdrawn-pin sweep check every file a restore would write before
     touching the first, and put back the files already written when a later
@@ -1334,7 +1334,7 @@ a version without a non-empty section in this file.
     `hosted_write_failed` and exits 1, and `--dry-run` previews that failure
     with exit 1 where it previewed a success. A hosted `scan` whose write
     fails says "(nothing was changed)" only when every file was put back,
-    and otherwise names each file and the state it is left in (#PRNUM).
+    and otherwise names each file and the state it is left in (#2052).
   - Agent `apply` and `rollback` of a package are all or nothing and keep
     file modes. Every file is staged with its final mode and owner before
     the first is renamed into place, and a failure puts the files already
@@ -1346,87 +1346,87 @@ a version without a non-empty section in this file.
     the next `apply` or `rollback` of that package finishes it and removes
     them once they are ten minutes old. When a failed write can't put a
     file back either, its original is kept beside it as
-    `.socket-kept-<file>-<uuid>`, which no later run removes (#PRNUM).
+    `.socket-kept-<file>-<uuid>`, which no later run removes (#2052).
   - Commands that rewrite `.socket/manifest.json` (`remove`, `rollback`,
     `get`, `scan`) keep the top-level and per-record fields this version
     doesn't know, such as ones a newer CLI wrote, and the file's mode.
     Before, the first rewrite dropped them and a `0600` manifest came back
-    `0644` (#PRNUM).
+    `0644` (#2052).
   - `apply`, `rollback`, `remove` and `repair` set up the API client only
     when they have something to download. A run that finds everything on
     disk makes no API request, prints no "No SOCKET_API_TOKEN set" notice
     and reports no `api_auth_fallback`. A no-op `apply` with a token and no
     `--org` used to wait on the organization lookup first: 12 s against an
     endpoint that drops packets, 65 s against one that never answers. An
-    `apply` with a Maven patch in scope still sets the client up (#PRNUM).
+    `apply` with a Maven patch in scope still sets the client up (#2052).
   - Telemetry opt-outs that did nothing are honoured: `DO_NOT_TRACK` (any
     value except `0`, `false` and empty) and
     `SOCKET_PATCH_TELEMETRY_DISABLED`, the v3/v4 name that v5 had dropped,
     now turn telemetry off like `SOCKET_TELEMETRY_DISABLED`. README and
     `docs/configuration.md` gain a Telemetry section listing every event,
     field and switch, and the `--no-telemetry` help no longer calls the
-    events anonymous (#PRNUM).
+    events anonymous (#2052).
   - A closed output pipe no longer cuts a command short. `apply | head -1`
     or `rollback --yes | true` used to die of SIGPIPE (exit 141) at the line
     being printed, with `.socket/apply.lock` left behind and, for `rollback`
     and `remove`, possibly between the restores and the manifest cleanup.
     The command now stops printing, finishes its work, releases the lock and
     exits with its own code; a read-only command piped into `head` exits 0
-    (#PRNUM).
+    (#2052).
   - Staging entries an interrupted run leaves under `.socket/` are swept:
     every lock-taking command except a dry run removes `.socket-stage-*`
     entries older than an hour. `apply` now stages the blobs it downloads in
     `.socket/.socket-stage-apply-blobs-*`, removed when the run ends,
     instead of the system temp directory, so it no longer needs a usable
     `$TMPDIR` and a killed run no longer leaves a copy of the blob cache
-    there (#PRNUM).
+    there (#2052).
   - `apply --force` names the patch files it skipped because they are
     missing on disk (new `patch_files_skipped` warning), and a re-run that
     writes nothing reports `already_patched` instead of an `applied` event
-    with no files (#PRNUM).
+    with no files (#2052).
   - `apply`, `apply --check` and `list --json` warn
     `vendor_state_unreadable` when `.socket/vendor/state.json` can't be
     read, instead of silently treating vendored packages as in-place patches
     or leaving them out of a `success` listing. Exit codes are unchanged
-    (#PRNUM).
+    (#2052).
   - `gem env` and the `python3` probes run from `--cwd` for a project and
     from the home directory under `--global`, not from wherever the CLI was
     started. A version manager's shim (rbenv, pyenv, asdf, mise) therefore
     picks the project's interpreter, and the directory the shell is in no
-    longer steers a global scan (#PRNUM).
+    longer steers a global scan (#2052).
   - `remove` and `rollback` no longer promise a later restore for a patch
     whose package isn't installed. The warning and the
     `rollback_not_installed` event now say that nothing was restored, that
     the record is gone, and that reinstalling the package is the remedy
-    (#PRNUM).
+    (#2052).
   - `--help` wraps to the terminal (100 columns at most) instead of running
     lines of up to 564 characters, and the root help defines hosted,
     vendored and agent mode. The npm launcher explains a missing platform
     package (`npm install --omit=optional`) and how to get the binary
     instead of printing `spawnSync … ENOENT`, and lists the supported
-    platforms on an unsupported one (#PRNUM).
+    platforms on an unsupported one (#2052).
   - In a project with no patch of any mode, `rollback`, `repair`, `remove`
     and `vex` say "No patches in this project; nothing to roll back." (or to
     repair, to remove, to attest) instead of "Manifest not found at
     ./.socket/manifest.json", a file a hosted project never has. Exit codes
-    and the `--json` `manifest_not_found` error are unchanged (#PRNUM).
+    and the `--json` `manifest_not_found` error are unchanged (#2052).
   - When `vex` can't detect a product, the error lists what detection reads,
     names the project files that lack a usable name and version, and ends
     with the run's own flag and a value to paste
     (`--product pkg:generic/<directory name>`, or `--vex-product` on an
-    embedded run). It still exits 2 with `product_undetected` (#PRNUM).
+    embedded run). It still exits 2 with `product_undetected` (#2052).
   - `--product` / `--vex-product` and `--doc-id` / `--vex-doc-id` values are
     emitted trimmed; surrounding whitespace used to land in the document's
     `@id`. A document id with no IRI scheme is honoured with a new
-    `doc_id_not_iri` warning (#PRNUM).
+    `doc_id_not_iri` warning (#2052).
   - A report-only `scan` (`--prune`, `--global`, `--global-prefix`) previews
     as the report it is: its `--dry-run` no longer prints "Would download
     and apply N patches" for a run that applies nothing, and the listing is
-    headed `Patches available:` (#PRNUM).
+    headed `Patches available:` (#2052).
   - The hosted summary counts only the packages the run switched and gives
     the others a sentence of their own: "Switched 3 packages to hosted
     patches; rewrote 2 files. 1 package was already on hosted patches."
-    `--json` is unchanged (#PRNUM).
+    `--json` is unchanged (#2052).
   - Crafted project files no longer hang, exhaust memory or crash a run: a
     workspace glob with many `*`, `**`, brace sets or extglob groups (a
     pattern past the bounds fails closed and lists every directory); a Hatch
@@ -1436,10 +1436,10 @@ a version without a non-empty section in this file.
     unparseable, where `scan` aborted with exit 134); a small crafted
     `bun.lockb` that made `vendor` allocate gigabytes; and a torn
     `bun.lockb` snapshot in the vendor ledger, which `vendor --revert` now
-    leaves alone as drift instead of panicking (#PRNUM).
+    leaves alone as drift instead of panicking (#2052).
   - The `git checkout` remedy printed when a hosted pin can't be restored
     names every file hosted mode edited: `Gemfile` with `Gemfile.lock`, and
-    the `pyproject.toml` or script paired with a `uv.lock` (#PRNUM).
+    the `pyproject.toml` or script paired with a `uv.lock` (#2052).
 
 ### Performance
 
@@ -1457,11 +1457,11 @@ a version without a non-empty section in this file.
     the lock section once instead of once per dependent. On a 60,000-package
     lock a revert took 1 min 51 s against 0.77 s to vendor; a revert over
     20,000 dependents drops from 94 s to about half a second in a debug
-    build (#PRNUM).
+    build (#2052).
   - Vendoring into a large `vlt-lock.json` no longer decodes lock edges for
     every comparison. It took 20.9 s for 24 packages on a 20,000-node lock;
     planning one package drops from 2.1 s to 12 ms in a debug build
-    (#PRNUM).
+    (#2052).
 - **PyPI.**
   - Hosted Poetry and PDM scans parse each lock once instead of
     five or six times (about 31–34% fewer instructions on the bench). VEX
@@ -1475,7 +1475,7 @@ a version without a non-empty section in this file.
   - A Maven pom whose declarations share `${property}` texts is interpolated
     once per profile combination instead of once per declaration. A
     1,000-declaration pom that cost 263 million property lookups, 28 s in
-    `socket-patch list`, now takes under 600,000 units of work (#PRNUM).
+    `socket-patch list`, now takes under 600,000 units of work (#2052).
 - **General.**
   - The project-patch check and purl canonicalization are cheaper on large
     Yarn Berry locks, about 3% fewer instructions per rescan (#1607,
@@ -1485,12 +1485,12 @@ a version without a non-empty section in this file.
   - Agent `apply` and `rollback` flush the device cache twice per package
     instead of twice per file. On a 2,000-file package on macOS, `apply`
     drops from 16.4–18.8 s to 1.2–1.6 s and `rollback` from 17.5–18.2 s to
-    2.0–2.8 s (#PRNUM).
+    2.0–2.8 s (#2052).
   - Telemetry never delays a command. Events are sent in the background and
     the exit waits at most 300 ms for them. With an endpoint that accepts
     and never answers, `list` drops from 5.02 s to 0.32 s and prints its
     output after 0.02 s instead of 5.02 s. An event still in flight after
-    the wait is dropped (#PRNUM).
+    the wait is dropped (#2052).
 
 ### Maintenance
 
@@ -1523,7 +1523,7 @@ a version without a non-empty section in this file.
 - Tests for the hosted gem, vendored Maven and pnpm revert fixes:
   real-Bundler and real-Maven (log4j-core) capstones, a byte-exact pnpm
   revert in the ledger schema e2e, and expectations reconciled across the
-  merged fixes (#PRNUM).
+  merged fixes (#2052).
 
 ## [5.0.1] — 2026-10-13
 
