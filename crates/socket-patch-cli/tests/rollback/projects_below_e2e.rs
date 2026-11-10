@@ -1,13 +1,15 @@
 //! What a bare `scan` patched from a checkout's root is visible and
-//! undoable from that root: with no patches at `--cwd` itself, `list` and
-//! a bare `rollback` cover the patched projects below it, and the commands
-//! that act on one project name them.
+//! undoable from that root: `list` and a bare `rollback` cover the project
+//! at `--cwd` and the patched projects below it, and the commands that act
+//! on one project name the ones below when `--cwd` holds nothing for them.
 //!
 //! Binary-driven over a checkout with nothing at its root and three patched
 //! projects below it: `api` (agent mode: a manifest, blobs and an installed
-//! patched package), `svc` and `web` (hosted pins in `yarn.lock`). A fourth
-//! hosted-wired lockfile sits under `tests/fixtures/`, where the path
-//! policy's built-in ignores keep it out of every run made from the root.
+//! patched package), `svc` and `web` (hosted pins in `yarn.lock`); and over
+//! its twin whose root is patched too (`patched_root_monorepo`). A
+//! hosted-wired lockfile sits under `tests/fixtures/` in both, where the
+//! path policy's built-in ignores keep it out of every run made from the
+//! root.
 
 use std::path::{Path, PathBuf};
 
@@ -296,6 +298,31 @@ mod interactive {
         assert_eq!(output.matches("[Y/n]").count(), 1, "{output}");
         assert!(output.contains("Cancelled; no changes made."), "{output}");
         assert!(headings(&output.replace('\r', "")).is_empty(), "{output}");
+        assert_eq!(tree(tmp.path()), before);
+    }
+
+    /// At a root that holds patches too, the one question covers it and
+    /// names the directories below.
+    #[test]
+    fn the_question_at_a_patched_root_covers_it_and_the_projects_below() {
+        let (tmp, _) = patched_root_monorepo();
+        let before = tree(tmp.path());
+        let (code, output) = pty_io::run(
+            &["rollback", "--patch-server-url", PATCH_SERVER],
+            tmp.path(),
+            "n\n",
+            Duration::from_secs(15),
+        );
+        assert_eq!(code, 0, "{output}");
+        assert!(
+            unwrapped(&output).contains(
+                "Roll back every Socket patch in this directory and 2 project directories \
+                 below it (api, web)? [Y/n]"
+            ),
+            "{output}"
+        );
+        assert_eq!(output.matches("[Y/n]").count(), 1, "{output}");
+        assert!(output.contains("Cancelled; no changes made."), "{output}");
         assert_eq!(tree(tmp.path()), before);
     }
 
@@ -618,35 +645,206 @@ fn outside_a_checkout_nothing_changes() {
     assert_eq!(tree(tmp.path()), before);
 }
 
-/// A directory with patches of its own is the project the run is about:
-/// no headings, no projects below, as before.
+/// A patched project with nothing patched below it is the single-project
+/// run it always was, byte for byte: the same output and exit code as the
+/// same project on its own outside any checkout. A project directory with
+/// no patch and a hosted-wired fixture below it change nothing.
 #[test]
-fn a_directory_with_its_own_patches_behaves_as_before() {
-    let (tmp, _) = monorepo();
+fn a_patched_project_with_nothing_patched_below_is_unchanged() {
     let registry = registry();
+    let lone = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_hosted_project(tmp.path(), &is_odd_redirected_block());
+        tmp
+    };
+    let in_checkout = || {
+        let tmp = lone();
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        write_hosted_project(&tmp.path().join("plain"), &yarn_original_block());
+        write_hosted_project(
+            &tmp.path().join("tests/fixtures/app"),
+            &yarn_redirected_block(),
+        );
+        tmp
+    };
 
-    // A project directory of the checkout.
-    let web = tmp.path().join("web");
-    let (code, stdout, _) = run_hosted(&web, &["list"], None);
+    for args in [
+        &["list"][..],
+        &["list", "--json"][..],
+        &["rollback", "--dry-run"][..],
+        &["rollback", "--json", "--dry-run"][..],
+        &["rollback", "--yes"][..],
+    ] {
+        let (alone, checkout) = (lone(), in_checkout());
+        let fixture = read(checkout.path(), FIXTURE_LOCK);
+        assert_eq!(
+            run_hosted(checkout.path(), args, Some(&registry)),
+            run_hosted(alone.path(), args, Some(&registry)),
+            "{args:?}"
+        );
+        assert_eq!(
+            read(checkout.path(), "yarn.lock"),
+            read(alone.path(), "yarn.lock"),
+            "{args:?}"
+        );
+        assert_eq!(read(checkout.path(), FIXTURE_LOCK), fixture, "{args:?}");
+    }
+
+    // A project directory of a checkout, run from inside it.
+    let (tmp, _) = monorepo();
+    let (code, stdout, _) = run_hosted(&tmp.path().join("web"), &["list"], None);
     assert_eq!(code, 0);
     assert!(headings(&stdout).is_empty(), "{stdout}");
     assert!(stdout.contains(&format!("Package: {LP_PURL}")), "{stdout}");
+}
 
-    // The root, once it holds a hosted pin itself.
-    std::fs::write(
-        tmp.path().join("yarn.lock"),
-        yarn_lock_content(&is_odd_redirected_block()),
-    )
-    .unwrap();
-    let (code, stdout, _) = run_hosted(tmp.path(), &["list"], None);
-    assert_eq!(code, 0);
-    assert!(headings(&stdout).is_empty(), "{stdout}");
-    assert!(stdout.contains(&format!("Package: {IO_PURL}")), "{stdout}");
-    assert!(!stdout.contains(LP_PURL), "{stdout}");
+// ── a root that holds patches of its own above patched projects ──────────
+//
+// A bare scan there covers the root and the projects below, so `list` and
+// a bare `rollback` do too: the root first, under the heading scan gives
+// `--cwd` itself.
 
+/// [`monorepo`] with a hosted pin in the root's own lockfile (is-odd)
+/// instead of the `svc` project: the root, `api` (agent mode) and `web`
+/// (hosted) are patched, and the fixture still is not this run's.
+fn patched_root_monorepo() -> (tempfile::TempDir, PathBuf) {
+    let (tmp, pkg) = monorepo();
+    std::fs::remove_dir_all(tmp.path().join("svc")).unwrap();
+    write_hosted_project(tmp.path(), &is_odd_redirected_block());
+    (tmp, pkg)
+}
+
+const ROOT_AND_BELOW: [&str; 3] = ["== . ==", "== api ==", "== web =="];
+
+#[test]
+fn list_at_a_patched_root_lists_it_and_the_projects_below() {
+    let (tmp, _) = patched_root_monorepo();
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["list"], None);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(headings(&stdout), ROOT_AND_BELOW, "{stdout}");
+    // The root's own listing comes first.
+    let at = |purl: &str| {
+        stdout
+            .find(&format!("Package: {purl}"))
+            .unwrap_or_else(|| panic!("{purl}: {stdout}"))
+    };
+    assert!(at(IO_PURL) < at(AGENT_PURL) && at(AGENT_PURL) < at(LP_PURL));
+    assert!(
+        stdout
+            .trim_end()
+            .ends_with("3 patches in this directory and 2 project directories below it."),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("fixtures"), "{stdout}");
+
+    // `--json`: the root's envelope as it is on its own, the ones below
+    // beside it.
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["list", "--json"], None);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
+    assert_eq!(envelope["status"], "success");
+    assert_eq!(envelope["summary"]["discovered"], 1);
+    assert_eq!(envelope["events"][0]["purl"], IO_PURL);
+    let paths: Vec<&str> = envelope["projects"]
+        .as_array()
+        .expect("projects[]")
+        .iter()
+        .map(|p| p["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["api", "web"]);
+}
+
+#[test]
+fn rollback_dry_run_at_a_patched_root_previews_it_and_the_projects_below() {
+    let (tmp, _) = patched_root_monorepo();
+    let before = tree(tmp.path());
+    let registry = registry();
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--dry-run"], Some(&registry));
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(headings(&stdout), ROOT_AND_BELOW, "{stdout}");
+    for purl in [IO_PURL, LP_PURL] {
+        assert!(
+            stdout.contains(&format!(
+                "Would restore {purl} to its upstream registry entry"
+            )),
+            "{purl}: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("Would roll back this directory and 2 project directories below it."),
+        "{stdout}"
+    );
+    assert_eq!(tree(tmp.path()), before, "a dry run writes nothing");
+}
+
+#[test]
+fn rollback_at_a_patched_root_undoes_it_and_the_projects_below() {
+    let (tmp, pkg) = patched_root_monorepo();
+    let fixture = read(tmp.path(), FIXTURE_LOCK);
+    let registry = registry();
+    let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback"], Some(&registry));
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(headings(&stdout), ROOT_AND_BELOW, "{stdout}");
+    assert_eq!(
+        read(tmp.path(), "yarn.lock"),
+        yarn_lock_content(&yarn_upstream_block_for("is-odd", "3.0.1"))
+    );
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), BEFORE);
+    assert_eq!(
+        read(tmp.path(), "web/yarn.lock"),
+        yarn_lock_content(&yarn_original_block())
+    );
+    assert_eq!(read(tmp.path(), FIXTURE_LOCK), fixture);
+    assert!(
+        stdout.contains("Rolled back this directory and 2 project directories below it."),
+        "{stdout}"
+    );
+    assert_eq!(
+        stderr.matches("proceeding automatically").count(),
+        1,
+        "one question for the whole run: {stderr}"
+    );
+}
+
+/// The root is one of the directories: when its rollback fails, the ones
+/// below are still rolled back, and the run names it as scan heads it.
+#[test]
+fn a_failing_root_does_not_stop_the_projects_below() {
+    let (tmp, pkg) = patched_root_monorepo();
+    // The registry cannot resolve is-odd: the root cannot be restored.
+    let registry = NpmRegistry::start(&[("left-pad", "1.2.3")]);
     let (code, stdout, stderr) = run_hosted(tmp.path(), &["rollback", "--yes"], Some(&registry));
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        read(tmp.path(), "yarn.lock"),
+        yarn_lock_content(&is_odd_redirected_block()),
+        "the failed root keeps its wiring"
+    );
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), BEFORE);
+    assert_eq!(
+        read(tmp.path(), "web/yarn.lock"),
+        yarn_lock_content(&yarn_original_block())
+    );
+    assert!(
+        stderr.contains("Error: Rollback failed in 1 of 3 project directories: ."),
+        "{stderr}"
+    );
+}
+
+/// A target is still one project's: at a patched root it selects among the
+/// root's patches, as before. One the root does not hold fails as before,
+/// and says which project below holds it.
+#[test]
+fn rollback_of_an_identifier_at_a_patched_root_stays_the_roots() {
+    let registry = registry();
+
+    let (tmp, pkg) = patched_root_monorepo();
+    let (code, stdout, stderr) =
+        run_hosted(tmp.path(), &["rollback", "--yes", IO_PURL], Some(&registry));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(headings(&stdout).is_empty(), "{stdout}");
+    assert!(!stderr.contains("--cwd"), "{stderr}");
     assert_eq!(
         read(tmp.path(), "yarn.lock"),
         yarn_lock_content(&yarn_upstream_block_for("is-odd", "3.0.1"))
@@ -656,6 +854,74 @@ fn a_directory_with_its_own_patches_behaves_as_before() {
         yarn_lock_content(&yarn_redirected_block()),
         "the project below is not this run's"
     );
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), AFTER);
+
+    let (tmp, _) = patched_root_monorepo();
+    let before = tree(tmp.path());
+    let (code, stdout, stderr) = run_hosted(
+        tmp.path(),
+        &["rollback", "--dry-run", LP_PURL],
+        Some(&registry),
+    );
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(stderr.contains("Error: "), "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "\n  socket-patch rollback {LP_PURL} --dry-run --cwd web\n"
+        )),
+        "{stderr}"
+    );
+    assert!(headings(&stdout).is_empty(), "{stdout}");
+
+    let (code, stdout, _) = run_hosted(
+        tmp.path(),
+        &["rollback", "--json", "--dry-run", LP_PURL],
+        Some(&registry),
+    );
+    assert_eq!(code, 1, "{stdout}");
+    let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
+    assert_eq!(envelope["error"]["code"], "patch_not_found");
+    let detail = warning(&envelope, "patched_projects_below").expect("the warning");
+    assert!(
+        detail.contains(&format!(
+            "socket-patch rollback {LP_PURL} --dry-run --cwd web"
+        )),
+        "{detail}"
+    );
+    assert_eq!(tree(tmp.path()), before);
+}
+
+/// `--json` reports on one project directory, and the one at `--cwd` is
+/// the run it has always been: it is rolled back alone, with the
+/// directories it left named in a warning, as a `--json` scan names them.
+#[test]
+fn rollback_json_at_a_patched_root_rolls_it_back_and_names_the_rest() {
+    let (tmp, pkg) = patched_root_monorepo();
+    let registry = registry();
+    let (code, stdout, stderr) = run_hosted(
+        tmp.path(),
+        &["rollback", "--json", "--yes"],
+        Some(&registry),
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
+    assert_eq!(envelope["command"], "rollback");
+    assert_eq!(envelope["status"], "success");
+    let detail = warning(&envelope, "projects_not_rolled_back").expect("the warning");
+    assert!(detail.contains("(api, web)"), "{detail}");
+    assert!(
+        detail.contains("socket-patch rollback --json --cwd api"),
+        "{detail}"
+    );
+    assert_eq!(
+        read(tmp.path(), "yarn.lock"),
+        yarn_lock_content(&yarn_upstream_block_for("is-odd", "3.0.1"))
+    );
+    assert_eq!(
+        read(tmp.path(), "web/yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block())
+    );
+    assert_eq!(std::fs::read(pkg.join("index.js")).unwrap(), AFTER);
 }
 
 /// The set is scan's: a project the repository's socket.yml leaves out of

@@ -346,27 +346,42 @@ fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
 }
 
 pub async fn run(args: ListArgs) -> i32 {
-    use crate::commands::projects_below;
+    use crate::commands::projects_below::{self, CWD_NAME};
     apply_env_toggles(&args.common);
-    let mut own = list_project(&args).await;
-    // What `scan` patched from this directory is listed from it: with no
-    // patch at `--cwd` itself, look to the project directories below.
-    let below = if own.code == 0 && own.patches == 0 {
-        projects_below::patched(&args.common, projects_below::Depth::All).await
-    } else {
-        Default::default()
-    };
+    // What `scan` patched from this directory is listed from it: the
+    // project at `--cwd`, then the patched project directories below it.
+    let below = projects_below::patched(&args.common, projects_below::Depth::All).await;
     let loud = !args.common.json && !args.common.silent;
     if loud {
         below.print_notes();
+    }
+    // With nothing patched below, the project at `--cwd` is the plain
+    // listing it always was. Above patched directories it is one of them
+    // when it holds patches itself: listed first, under the heading scan
+    // gives `--cwd`. A project's warnings and errors go to stderr as it is
+    // read, so its heading goes out before it is.
+    let mut here = !below.projects.is_empty() && projects_below::cwd_is_patched(&args.common).await;
+    if here && loud {
+        println!("{}", projects_below::heading(CWD_NAME));
+    }
+    let mut own = list_project(&args).await;
+    // The listing has the last word on what `--cwd` holds.
+    if !here && !below.projects.is_empty() && (own.patches > 0 || own.code != 0) {
+        here = true;
+        if loud {
+            println!("{}", projects_below::heading(CWD_NAME));
+        }
+    }
+    if here {
+        if let Some(text) = &own.text {
+            println!("{text}");
+        }
     }
     let mut listed: Vec<(&str, Listed)> = Vec::new();
     for project in &below.projects {
         let child = ListArgs {
             common: project.common(&args.common),
         };
-        // A project's warnings and errors go to stderr as it is read, so
-        // its heading goes out first.
         if loud {
             println!("{}", projects_below::heading(&project.shown));
         }
@@ -389,11 +404,7 @@ pub async fn run(args: ListArgs) -> i32 {
         track_patch_listed(manifest_patches, &args.common.telemetry_auth()).await;
     }
 
-    let failed: Vec<&str> = listed
-        .iter()
-        .filter(|(_, listing)| listing.code != 0)
-        .map(|(shown, _)| *shown)
-        .collect();
+    let below_failed = listed.iter().any(|(_, listing)| listing.code != 0);
     if let Some(env) = own.envelope.as_mut() {
         // One document: the envelope for `--cwd`, and beside it the one
         // each project's own `list --json` prints, with its directory.
@@ -414,7 +425,7 @@ pub async fn run(args: ListArgs) -> i32 {
         }
         // The run's status goes with its exit code: a directory that could
         // not be listed carries its own error in `projects[]`.
-        if !failed.is_empty() {
+        if below_failed {
             env.mark_partial_failure();
         }
         env.warnings.extend(
@@ -433,11 +444,25 @@ pub async fn run(args: ListArgs) -> i32 {
             let patches: usize = listed.iter().map(|(_, listing)| listing.patches).sum();
             println!(
                 "\n{} in {}.",
-                crate::ui::plural(patches, "patch", "patches"),
-                below.counted()
+                crate::ui::plural(
+                    patches + if here { own.patches } else { 0 },
+                    "patch",
+                    "patches"
+                ),
+                below.covered(here)
             );
         }
         // Errors print even under --silent.
+        let failed: Vec<&str> = (own.code != 0)
+            .then_some(CWD_NAME)
+            .into_iter()
+            .chain(
+                listed
+                    .iter()
+                    .filter(|(_, listing)| listing.code != 0)
+                    .map(|(shown, _)| *shown),
+            )
+            .collect();
         if !failed.is_empty() {
             eprintln!(
                 "Error: {} could not be listed: {}",
