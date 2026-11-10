@@ -26,7 +26,6 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::blocks::{
     block_eol, classic_field, repin_classic_block, replace_block, scan_blocks, LockBlock,
 };
@@ -39,7 +38,6 @@ use crate::manifest::schema::PatchRecord;
 use crate::patch::apply::PatchSources;
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
-use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::refused;
 use super::npm_common::{
@@ -48,6 +46,7 @@ use super::npm_common::{
 };
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
@@ -734,72 +733,16 @@ pub async fn revert_yarn_classic_opts(
         }
     }
 
-    // LOSSINESS GUARD: when any wiring record was left alone ("drifted;
-    // left alone"), the uuid dir may hold the only copy of what the lock —
-    // or the redirect ledger's recorded originals — still points at. Keep
-    // it (and let the CLI keep the ledger entry) instead of deleting evidence
-    // out from under a lock we just refused to touch.
-    if outcome.drift_skipped() {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-
-    // `--preserve-state` (`keep_artifact`): the wiring restore above already
-    // ran; the artifact dir stays behind (and the caller keeps the ledger
-    // entry), so the deletion — and the still-wired probe that exists only
-    // to protect it — are skipped.
-    if keep_artifact {
-        return outcome;
-    }
-
-    if super::npm_flavor::keep_artifact_while_lock_references_it(
-        &mut outcome,
-        project_root,
-        &[YARN_LOCK],
-        &entry.uuid,
-        &uuid_dir_rel,
-    )
-    .await
-    {
-        return outcome;
-    }
-
-    // FAIL-CLOSED (same brick class as the unwired guard above, twin of
-    // npm_lock's and yarn_berry's post-restore probes): the restore only
-    // rewrites the blocks the wiring recorded, but yarn can still resolve
-    // through the artifact via a block the wiring never named (hand-copied
-    // or re-keyed since vendoring). Deleting the uuid dir then fails every
-    // subsequent install on the missing tarball, silently. Mentioned ⇒
-    // refuse; absent or unprovable keeps the wired revert's existing
-    // missing-lock tolerance.
-    if super::npm_flavor::lock_text_mentions_uuid(project_root, &[YARN_LOCK], &entry.uuid).await
-        == Some(true)
-    {
-        let detail = format!(
-            "refusing to remove {uuid_dir_rel}: after restoring the recorded lock blocks, \
-             {YARN_LOCK} still resolves through it (was the entry re-keyed or hand-copied \
-             since vendoring?) — deleting the artifact would make every subsequent install \
-             fail; restore the pre-vendor {YARN_LOCK} (or remove the dependency and re-lock) \
-             and re-run `vendor --revert`"
-        );
-        outcome.success = false;
-        outcome.error = Some(detail.clone());
-        outcome.warnings.push(VendorWarning::new(
-            "vendor_lock_still_wired_revert_blocked",
-            detail,
-        ));
-        return outcome;
-    }
-
-    // The last npm-family entry leaves `.socket/vendor/npm/` (and
-    // `.socket/vendor/`) empty: the shared helper prunes them so a reverted
-    // project carries no vendor residue (non-recursive: siblings keep them).
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-        return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
-    }
-
-    outcome
+    // The artifact goes only once yarn.lock no longer resolves through it:
+    // a block left alone or vanished keeps it while the lock still names
+    // it, and a block the wiring never recorded (hand-copied or re-keyed
+    // since vendoring) refuses the deletion. See [`KeepPolicy::NpmFamily`].
+    let policy = KeepPolicy::NpmFamily {
+        locks: &[YARN_LOCK],
+        wired: &[YARN_LOCK],
+        uuid: &entry.uuid,
+    };
+    revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
 /// Apply one wiring record in reverse: restore `original` iff the live block
@@ -897,12 +840,9 @@ pub(super) fn revert_recorded_block(
         // into OUR uuid dir — anything else means a third party re-resolved
         // it.
         if !ours(&block.lines) {
-            warnings.push(VendorWarning::new(
-                "vendor_lock_entry_drifted",
-                format!(
-                    "{noun} `{}` was re-resolved since vendoring; left alone",
-                    block.key
-                ),
+            warnings.push(revert::re_resolved(
+                format_args!("{noun} `{}`", block.key),
+                None,
             ));
             return false;
         }
@@ -2535,50 +2475,57 @@ left-pad@^1.3.0:
             after.contains("left-pad@^1.3.0, left-pad@~1.3.0:\n  version \"1.3.0\"\n  resolved \"https://registry.yarnpkg.com/"),
             "non-drifted block restored: {after}"
         );
-        // A drift-skip keeps the artifact dir (the drifted block's recorded
-        // original may still be needed later) and says so.
-        assert!(
-            fx.root()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists(),
-            "drift-skip must keep the artifact dir"
-        );
+        // The re-resolved block no longer installs from the artifact and
+        // the other one is restored, so nothing references it: the revert
+        // finishes (and says why) instead of keeping the artifact and the
+        // ledger entry on this and every later run.
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             outcome
                 .warnings
                 .iter()
-                .any(|w| w.code == "vendor_artifact_kept"),
-            "the keep must be surfaced: {:?}",
+                .any(|w| w.code == "vendor_revert_dependency_moved_on"),
+            "{:?}",
             outcome.warnings
-        );
-
-        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the alias block
-        // back at the vendored tarball). The block the first revert already
-        // restored must now read as CONVERGED, not drifted — otherwise
-        // every later revert would re-classify it as drift and keep the
-        // artifacts + ledger entry forever.
-        let healed = after.replace(theirs, &ours);
-        assert_ne!(healed, after, "the undo edit must hit");
-        tokio::fs::write(fx.lock_path(), healed).await.unwrap();
-
-        let outcome = revert_yarn_classic(&entry, fx.root(), false).await;
-        assert!(outcome.success, "{:?}", outcome.error);
-        assert!(
-            outcome.warnings.is_empty(),
-            "the already-restored block is converged, not drifted: {:?}",
-            outcome.warnings
-        );
-        assert!(!outcome.kept_artifact);
-        assert_eq!(
-            tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes,
-            "lock restored byte-for-byte"
         );
         assert!(
             !fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
-            "artifact pruned once the revert converges"
+            "an artifact nothing references is removed"
+        );
+    }
+
+    /// Upgrading past the patched version is the normal end of a vendored
+    /// patch: `yarn upgrade` re-resolves the block from the registry, and
+    /// the revert then has nothing to restore. It removes the artifact
+    /// instead of reporting drift the user cannot undo.
+    #[tokio::test]
+    async fn revert_finishes_after_the_dependency_was_upgraded() {
+        let fx = fixture_with_lock(Y2_BEFORE).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let (sha1, sri) = fx.packed_hashes().await;
+        let upgraded = fx
+            .lock_text()
+            .await
+            .replace("  version \"1.3.0\"", "  version \"1.3.1\"")
+            .replace(
+                &format!(
+                    "  resolved \"file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz#{sha1}\""
+                ),
+                "  resolved \"https://registry.yarnpkg.com/left-pad/-/left-pad-1.3.1.tgz#0000000000000000000000000000000000000000\"",
+            )
+            .replace(&format!("  integrity {sri}"), "  integrity sha512-BBBB");
+        assert!(!upgraded.contains(UUID), "{upgraded}");
+        tokio::fs::write(fx.lock_path(), &upgraded).await.unwrap();
+
+        let outcome = revert_yarn_classic(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert_eq!(fx.lock_text().await, upgraded, "the upgrade is left alone");
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "nothing references the artifact, so it is removed"
         );
     }
 

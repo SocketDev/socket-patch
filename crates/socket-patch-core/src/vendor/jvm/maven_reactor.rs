@@ -137,26 +137,40 @@ pub fn tree_dir(c: &Coords<'_>) -> String {
 }
 
 /// The committed tree of `c`, as the [`JvmPatch`] bytes that re-plan it
-/// unchanged: `(jar, upstream pom)`, the pom un-suffixed. `None` when a
-/// file is missing or the pom does not carry the suffixed version.
+/// unchanged: `(jar, upstream pom)`, the pom un-suffixed (what
+/// [`suffixed_pom`] added for inherited versions stays, so the re-plan
+/// needs no parent). `None` when a file is missing or the pom does not
+/// carry the suffixed version.
 pub fn committed(read: ReadFn<'_>, c: &Coords<'_>) -> Option<(Vec<u8>, Vec<u8>)> {
     let sv = c.suffixed_version();
     let dir = tree_dir(c);
     let a = c.artifact_id;
     let jar = read(&format!("{dir}/{a}-{sv}.jar"))?;
-    let pom = String::from_utf8(read(&format!("{dir}/{a}-{sv}.pom"))?).ok()?;
-    let children = scan_pom_project(&pom)?;
+    let pom = committed_pom(read, c)?;
+    Some((jar, unsuffixed(&pom, c.version, &sv)?.into_bytes()))
+}
+
+/// The suffixed pom the tree of `c` serves, when it is UTF-8.
+fn committed_pom(read: ReadFn<'_>, c: &Coords<'_>) -> Option<String> {
+    let sv = c.suffixed_version();
+    let path = format!("{}/{}-{sv}.pom", tree_dir(c), c.artifact_id);
+    String::from_utf8(read(&path)?).ok()
+}
+
+/// A suffixed pom with `base` back in its `<version>`: the inverse of
+/// [`suffix_maven_pom`] up to the references that one made literal. `None`
+/// when the pom does not carry `suffixed`.
+fn unsuffixed(pom: &str, base: &str, suffixed: &str) -> Option<String> {
+    let children = scan_pom_project(pom)?;
     let version = scan_find(&children, "version")?;
-    if pom[version.inner_start..version.inner_end].trim() != sv {
+    if pom[version.inner_start..version.inner_end].trim() != suffixed {
         return None;
     }
-    let upstream = format!(
-        "{}{}{}",
+    Some(format!(
+        "{}{base}{}",
         &pom[..version.inner_start],
-        c.version,
         &pom[version.inner_end..]
-    );
-    Some((jar, upstream.into_bytes()))
+    ))
 }
 
 /// Plan vendoring `patch` into the reactor rooted at `pom.xml`.
@@ -198,16 +212,7 @@ pub fn plan_with_external(
         });
     }
     let sv = patch.suffixed_version();
-    let suffixed_pom = std::str::from_utf8(patch.upstream_pom)
-        .ok()
-        .and_then(|pom| suffix_maven_pom(pom, patch.version, &sv))
-        .ok_or_else(|| JvmRefusal {
-            code: UPSTREAM_UNAVAILABLE,
-            detail: format!(
-                "reason: suffix_unavailable: the upstream pom of {g}:{a}:{v} computes its own \
-                 version, so it cannot be served as {sv}"
-            ),
-        })?;
+    let suffixed_pom = suffixed_pom(patch)?;
 
     let reactor = Reactor::discover(read, list)?;
     let mut warnings = Vec::new();
@@ -458,6 +463,7 @@ pub fn unplan(
     }
     let mut still_wired = false;
     let mut live = false;
+    let mut config_bytewise = false;
     for (rel, text) in &after {
         let Some(t) = text else { continue };
         let (masked, _) = mask(t);
@@ -493,7 +499,9 @@ pub fn unplan(
             .iter()
             .find(|w| w.kind == CONFIG_LINE_KIND && w.file == MAVEN_CONFIG && op_of(w) == "config")
         {
-            if let Some(text) = read(MAVEN_CONFIG).and_then(|b| String::from_utf8(b).ok()) {
+            if let Some(bytes) = read(MAVEN_CONFIG) {
+                let (text, bytewise) = config_text(&bytes);
+                config_bytewise = bytewise;
                 after.insert(MAVEN_CONFIG.to_string(), undo_config(&text, w));
                 before.insert(MAVEN_CONFIG.to_string(), Some(text));
             }
@@ -511,8 +519,18 @@ pub fn unplan(
             }
         }
     }
+    let mut changes = changes_between(&before, &after);
+    if config_bytewise {
+        for (rel, bytes) in changes.iter_mut().filter(|(rel, _)| rel == MAVEN_CONFIG) {
+            *bytes = after
+                .get(rel.as_str())
+                .cloned()
+                .flatten()
+                .map(|text| config_bytes(text, true));
+        }
+    }
     JvmUnplan {
-        changes: changes_between(&before, &after),
+        changes,
         drifted,
         still_wired,
     }
@@ -653,6 +671,7 @@ pub fn unattestable_checked(
         uuid: c.uuid,
         jar: &[],
         upstream_pom: &[],
+        upstream_parents: None,
         upstream_module: None,
         extra_artifacts: &[],
         patched_members: &[],
@@ -1266,9 +1285,13 @@ fn fetch_external<'b>(
     match lookup(gav) {
         Lookup::Found(bytes) => Pom::parse(&format!("{g}:{a}:{v}"), bytes.to_vec())
             .map_err(|e| Missing::Unresolved(format!("{named} is unreadable ({})", e.detail))),
+        // A copy in a local cache is used whatever a registry says of it,
+        // so this is a pom neither holds.
         Lookup::Unavailable => Err(Missing::Need(
             gav.clone(),
-            format!("{named} is in no local Maven repository"),
+            format!(
+                "{named} is in no local Maven repository (nor, vendoring online, on the registry)"
+            ),
         )),
         Lookup::Unknown => Err(Missing::Need(
             gav.clone(),
@@ -2896,7 +2919,7 @@ fn repository_edit(doc: &Doc) -> Edit {
 /// identical lines are adopted, the last (effective) tail gets our
 /// directory appended to its list, the last protocol list gets `file`.
 fn merge_maven_config(config: Option<&[u8]>) -> (Vec<u8>, Value) {
-    let text = config.map(String::from_utf8_lossy).unwrap_or_default();
+    let (text, bytewise) = config.map(config_text).unwrap_or_default();
     let nl = crate::utils::line_endings::terminator(&text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let arg_of = |line: &str| line.trim().to_string();
@@ -2946,7 +2969,29 @@ fn merge_maven_config(config: Option<&[u8]>) -> (Vec<u8>, Value) {
             "rewritten": rewritten,
         })
     };
-    (out.into_bytes(), op)
+    (config_bytes(out, bytewise), op)
+}
+
+/// `.mvn/maven.config` as text the edits can splice: UTF-8 as it is, and
+/// any other encoding (a Latin-1 `-Duser.name=José`, a Windows path) one
+/// `char` per byte, flagged `true`, so [`config_bytes`] writes every byte
+/// the edits leave alone back unchanged. The lines vendoring adds are
+/// ASCII in either reading; a lossy decode would rewrite the file.
+fn config_text(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), false),
+        Err(_) => (bytes.iter().map(|&b| char::from(b)).collect(), true),
+    }
+}
+
+/// The bytes of a [`config_text`] reading.
+fn config_bytes(text: String, bytewise: bool) -> Vec<u8> {
+    if bytewise {
+        // One char per byte went in and only ASCII was added.
+        text.chars().map(|c| c as u8).collect()
+    } else {
+        text.into_bytes()
+    }
 }
 
 /// `arg` (`<key><list>`) with `item` appended to its comma list, `None`
@@ -2969,19 +3014,8 @@ fn extend_list(arg: &str, key: &str, item: &str) -> Option<String> {
 pub(crate) fn suffixed_tree(
     patch: &JvmPatch<'_>,
 ) -> Result<(String, String, Vec<FileWrite>), JvmRefusal> {
-    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
-    let sv = patch.suffixed_version();
-    let suffixed_pom = std::str::from_utf8(patch.upstream_pom)
-        .ok()
-        .and_then(|pom| suffix_maven_pom(pom, v, &sv))
-        .ok_or_else(|| JvmRefusal {
-            code: UPSTREAM_UNAVAILABLE,
-            detail: format!(
-                "reason: suffix_unavailable: the upstream pom of {g}:{a}:{v} computes its own \
-                 version, so it cannot be served as {sv}"
-            ),
-        })?;
-    Ok(tree_writes(patch, &sv, suffixed_pom))
+    let suffixed_pom = suffixed_pom(patch)?;
+    Ok(tree_writes(patch, &patch.suffixed_version(), suffixed_pom))
 }
 
 /// `(tree_dir, jar_rel, writes)` of the version directory.
@@ -3826,6 +3860,916 @@ fn suffix_maven_pom(pom: &str, base: &str, suffixed: &str) -> Option<String> {
     Some(literalize_project_version_refs(&spliced, base))
 }
 
+// ── inherited version references ────────────────────────────────────────
+//
+// Maven (and Coursier) interpolate a pom after merging its parents into it,
+// so a `${project.version}` written in a parent reads the version of the
+// pom being resolved: the suffixed version, for the pom the tree serves.
+// A sibling the parent manages at `${project.version}` (log4j, logback)
+// would resolve at `<base>-socket.<hex8>`, which no repository has. The
+// parents stay the upstream ones, so the suffixed pom declares again, at
+// the base version, what it would inherit through such a reference.
+
+/// Delimit what [`suffixed_pom`] adds to a pom for its inherited versions.
+const INHERITED_BEGIN: &str = "<!-- socket-patch:inherited:begin -->";
+const INHERITED_END: &str = "<!-- socket-patch:inherited:end -->";
+
+/// The pom `patch`'s tree serves at the suffixed version: the upstream pom
+/// with its own version suffixed ([`suffix_maven_pom`]) and, when the
+/// parent chain was read ([`JvmPatch::upstream_parents`]), the properties,
+/// managed dependencies and dependencies it inherits through a reference
+/// to the pom's version declared again at the base version, so it resolves
+/// exactly what the upstream pom does. Refused when that cannot be
+/// expressed, and whenever the result would still resolve a suffixed
+/// version the tree does not serve.
+pub(crate) fn suffixed_pom(patch: &JvmPatch<'_>) -> Result<String, JvmRefusal> {
+    let (g, a, v) = (patch.group_id, patch.artifact_id, patch.version);
+    let sv = patch.suffixed_version();
+    let suffix = |pom: Option<&str>| {
+        pom.and_then(|pom| suffix_maven_pom(pom, v, &sv))
+            .ok_or_else(|| JvmRefusal {
+                code: UPSTREAM_UNAVAILABLE,
+                detail: format!(
+                    "reason: suffix_unavailable: the upstream pom of {g}:{a}:{v} computes its \
+                     own version, so it cannot be served as {sv}"
+                ),
+            })
+    };
+    let upstream = std::str::from_utf8(patch.upstream_pom).ok();
+    let Some(parents) = patch.upstream_parents else {
+        return suffix(upstream);
+    };
+    let unresolvable = |why: String| JvmRefusal {
+        code: UPSTREAM_UNAVAILABLE,
+        detail: format!(
+            "reason: inherited_version_unresolvable: {why}, so {g}:{a}:{v} cannot be served as \
+             {sv}"
+        ),
+    };
+    // A committed pom carries what an earlier run added: computed again.
+    let bare = suffix(upstream.map(strip_inherited).as_deref())?;
+    let c = patch.coords();
+    let resolved = match Inherited::read(&bare, parents, &c) {
+        Ok(chain) => chain.resolve().map_err(&unresolvable)?,
+        // A pom that cannot be read hides what it defines, which is
+        // harmless only when no parent names the version at all.
+        Err(unreadable) => {
+            if parents
+                .iter()
+                .any(|p| names_model_version(&String::from_utf8_lossy(p)))
+            {
+                return Err(unresolvable(unreadable));
+            }
+            bare
+        }
+    };
+    // The invariant that protects the build: nothing the pom resolves or
+    // manages may name a suffixed version the tree does not serve.
+    if let Some(leak) = inherited_leaks(&resolved, parents, &c) {
+        return Err(unresolvable(leak.detail));
+    }
+    // A committed tree is re-planned from this pom with its version put
+    // back, parents or not: that must give the same bytes.
+    let replanned = unsuffixed(&resolved, v, &sv).and_then(|pom| suffix_maven_pom(&pom, v, &sv));
+    if replanned.as_deref() != Some(resolved.as_str()) {
+        return Err(unresolvable(
+            "the versions it inherits cannot be written so that the pom reads the same again"
+                .to_string(),
+        ));
+    }
+    Ok(resolved)
+}
+
+/// The literal coordinates of `pom`'s `<parent>` (`None`: it has none), as
+/// Maven requires them; an error names what is wrong with them.
+pub(crate) fn parent_gav(pom: &[u8]) -> Result<Option<Gav>, String> {
+    let text = String::from_utf8_lossy(pom);
+    let children = scan_pom_project(&text).ok_or("it is not a readable pom")?;
+    let Some(parent) = scan_find(&children, "parent") else {
+        return Ok(None);
+    };
+    let part = |name: &str| scan_child_text(&text, parent, name).filter(|t| !t.is_empty());
+    let (Some(g), Some(a), Some(v)) = (part("groupId"), part("artifactId"), part("version")) else {
+        return Err("its <parent> lacks a groupId, artifactId or version".to_string());
+    };
+    if !safe_coordinates(&g, &a, &v) {
+        return Err(format!(
+            "its <parent> {g}:{a}:{v} is not a literal coordinate"
+        ));
+    }
+    Ok(Some((g, a, v)))
+}
+
+/// Why the committed pom of `c` resolves a suffixed version nothing
+/// serves, given its upstream `parents` (nearest first): the tree was
+/// vendored before the parent chain was read. `None` when it does not, or
+/// only in management no dependency of the pom uses (which no Maven before
+/// 4 applies), or when a pom cannot be read.
+pub fn committed_pom_leak(read: ReadFn<'_>, c: &Coords<'_>, parents: &[Vec<u8>]) -> Option<String> {
+    let pom = committed_pom(read, c)?;
+    let leak = inherited_leaks(&pom, parents, c).filter(|leak| leak.hard)?;
+    Some(format!(
+        "the vendored pom of {}:{}:{} resolves a version nothing serves: {} (re-run \
+         `socket-patch vendor` to rewrite it)",
+        c.group_id,
+        c.artifact_id,
+        c.suffixed_version(),
+        leak.detail
+    ))
+}
+
+/// Whether `text` holds a reference to the model's own version, in any of
+/// its spellings.
+fn names_model_version(text: &str) -> bool {
+    ["${project.version}", "${pom.version}", "${version}"]
+        .iter()
+        .any(|r| text.contains(r))
+}
+
+/// `pom` without the blocks [`suffixed_pom`] added: whole lines where a
+/// block was added as lines, else the marked span alone.
+fn strip_inherited(pom: &str) -> std::borrow::Cow<'_, str> {
+    if !pom.contains(INHERITED_BEGIN) {
+        return std::borrow::Cow::Borrowed(pom);
+    }
+    let mut out = String::with_capacity(pom.len());
+    let mut rest = pom;
+    while let Some(begin) = rest.find(INHERITED_BEGIN) {
+        let Some(end) = rest[begin..]
+            .find(INHERITED_END)
+            .map(|r| begin + r + INHERITED_END.len())
+        else {
+            break;
+        };
+        let line = rest[..begin].rfind('\n').map_or(0, |n| n + 1);
+        let indented = rest[line..begin].bytes().all(|b| b == b' ' || b == b'\t');
+        let after = &rest[end..];
+        match after
+            .strip_prefix("\r\n")
+            .or_else(|| after.strip_prefix('\n'))
+        {
+            Some(next) if indented => {
+                out.push_str(&rest[..line]);
+                rest = next;
+            }
+            _ => {
+                out.push_str(&rest[..begin]);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// The `${name}` references of `text`, in order.
+fn refs_in(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = text;
+    std::iter::from_fn(move || {
+        let at = rest.find("${")?;
+        let after = &rest[at + 2..];
+        let close = after.find('}')?;
+        rest = &after[close + 1..];
+        Some(&after[..close])
+    })
+}
+
+/// A dependency's management key on its raw text, as Maven merges a child
+/// with its parent before interpolating:
+/// `groupId:artifactId:type[:classifier]`.
+type DepKey = (String, String, String, Option<String>);
+
+/// Something a suffixed pom resolves or manages at a suffixed version.
+#[derive(Debug, PartialEq, Eq)]
+struct Leak {
+    /// A dependency of the pom, or a BOM it imports, resolves there: the
+    /// build fails. Otherwise only management, or a profile, names it.
+    hard: bool,
+    detail: String,
+}
+
+/// The first [`Leak`] of the suffixed pom `vendored` over its upstream
+/// `parents`, a hard one first; `None` when it has none or a pom cannot be
+/// read.
+fn inherited_leaks(vendored: &str, parents: &[Vec<u8>], c: &Coords<'_>) -> Option<Leak> {
+    let mut leaks = Inherited::read(vendored, parents, c).ok()?.leaks();
+    let at = leaks.iter().position(|l| l.hard).unwrap_or(0);
+    (!leaks.is_empty()).then(|| leaks.swap_remove(at))
+}
+
+/// A suffixed pom over the upstream poms it inherits from.
+struct Inherited<'a> {
+    c: Coords<'a>,
+    sv: String,
+    /// The suffixed pom, then its parents, nearest first.
+    docs: Vec<Doc>,
+    /// Whether the pom at that index is not UTF-8 (read lossily: its
+    /// markup is ASCII, but its text cannot be copied).
+    lossy: Vec<bool>,
+    /// `${version}` reads the model: no pom of the chain defines a
+    /// property of that name, which Maven would read first.
+    bare_version: bool,
+}
+
+impl<'a> Inherited<'a> {
+    fn read(suffixed: &str, parents: &[Vec<u8>], c: &Coords<'a>) -> Result<Self, String> {
+        if parents.len() > MAX_EXTERNAL_DEPTH {
+            return Err("its parent poms nest too deep".to_string());
+        }
+        let child = Doc::parse(suffixed.to_string())
+            .map_err(|e| format!("its pom is not well-formed ({e})"))?;
+        let (mut docs, mut lossy) = (vec![child], vec![false]);
+        for bytes in parents {
+            let text = String::from_utf8_lossy(bytes);
+            let named = Self::parent_label(&docs[docs.len() - 1]);
+            lossy.push(matches!(text, std::borrow::Cow::Owned(_)));
+            docs.push(
+                Doc::parse(text.into_owned())
+                    .map_err(|e| format!("{named} is not well-formed ({e})"))?,
+            );
+        }
+        let bare_version = !docs.iter().any(|doc| {
+            Self::models(doc).into_iter().any(|model| {
+                Self::properties(doc, model)
+                    .into_iter()
+                    .any(|p| doc.nodes[p].name == "version")
+            })
+        });
+        Ok(Self {
+            c: *c,
+            sv: c.suffixed_version(),
+            docs,
+            lossy,
+            bare_version,
+        })
+    }
+
+    /// `the parent pom g:a:v`, as `doc` names its parent.
+    fn parent_label(doc: &Doc) -> String {
+        let part = |name: &str| {
+            doc.child(doc.project, "parent")
+                .and_then(|p| doc.child_text(p, name))
+                .unwrap_or_default()
+        };
+        format!(
+            "the parent pom {}:{}:{}",
+            part("groupId"),
+            part("artifactId"),
+            part("version")
+        )
+    }
+
+    /// `docs[i]` for a message.
+    fn label(&self, i: usize) -> String {
+        match i {
+            0 => "the pom itself".to_string(),
+            _ => Self::parent_label(&self.docs[i - 1]),
+        }
+    }
+
+    fn profiles(doc: &Doc) -> Vec<usize> {
+        doc.child(doc.project, "profiles")
+            .into_iter()
+            .flat_map(|ps| doc.children(ps, "profile"))
+            .collect()
+    }
+
+    /// The project, then its profiles: where a model section lives.
+    fn models(doc: &Doc) -> Vec<usize> {
+        let mut models = vec![doc.project];
+        models.extend(Self::profiles(doc));
+        models
+    }
+
+    fn profile_id(doc: &Doc, profile: usize) -> String {
+        doc.child_text(profile, "id").unwrap_or_default()
+    }
+
+    /// The elements of `model`'s `<properties>`.
+    fn properties(doc: &Doc, model: usize) -> Vec<usize> {
+        doc.child(model, "properties")
+            .map(|p| doc.nodes[p].children.clone())
+            .unwrap_or_default()
+    }
+
+    /// The `<dependency>` elements of `model`'s `<dependencies>`, or of
+    /// its `<dependencyManagement>`.
+    fn dependencies(doc: &Doc, model: usize, managed: bool) -> Vec<usize> {
+        let owner = if managed {
+            doc.child(model, "dependencyManagement")
+        } else {
+            Some(model)
+        };
+        owner
+            .and_then(|o| doc.child(o, "dependencies"))
+            .map(|deps| doc.children(deps, "dependency").collect())
+            .unwrap_or_default()
+    }
+
+    fn repositories(doc: &Doc, model: usize) -> Vec<usize> {
+        doc.child(model, "repositories")
+            .map(|r| doc.children(r, "repository").collect())
+            .unwrap_or_default()
+    }
+
+    /// The text of every leaf element under `n` (`n` itself when it has no
+    /// child element).
+    fn leaves(doc: &Doc, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![n];
+        while let Some(n) = stack.pop() {
+            match doc.nodes[n].children.as_slice() {
+                [] => out.push(doc.text_of(n)),
+                children => stack.extend(children.iter().rev()),
+            }
+        }
+        out
+    }
+
+    fn key(doc: &Doc, dep: usize) -> DepKey {
+        (
+            doc.child_text(dep, "groupId").unwrap_or_default(),
+            doc.child_text(dep, "artifactId").unwrap_or_default(),
+            doc.child_text(dep, "type")
+                .unwrap_or_else(|| "jar".to_string()),
+            doc.child_text(dep, "classifier"),
+        )
+    }
+
+    fn names_version(&self, text: &str) -> bool {
+        refs_in(text).any(|name| {
+            matches!(name, "project.version" | "pom.version")
+                || (self.bare_version && name == "version")
+        })
+    }
+
+    /// Whether the element `n` of `doc` names the pom's version anywhere.
+    fn reads_version(&self, doc: &Doc, n: usize) -> bool {
+        Self::leaves(doc, n).iter().any(|t| self.names_version(t))
+    }
+
+    /// `text` with every reference to the pom's version made the base
+    /// version, which is what it read upstream.
+    fn literal(&self, text: &str) -> String {
+        let base = self.c.version;
+        let text = text
+            .replace("${project.version}", base)
+            .replace("${pom.version}", base);
+        if self.bare_version {
+            text.replace("${version}", base)
+        } else {
+            text
+        }
+    }
+
+    /// The management entry of the patched artifact's own main jar at the
+    /// pom's version: it reads the suffixed version, which the tree
+    /// serves.
+    fn is_own(&self, doc: &Doc, dep: usize) -> bool {
+        let text = |name: &str| doc.child_text(dep, name).unwrap_or_default();
+        let group = text("groupId");
+        let version = text("version");
+        (group == self.c.group_id
+            || matches!(
+                group.as_str(),
+                "${project.groupId}" | "${pom.groupId}" | "${groupId}"
+            ))
+            && text("artifactId") == self.c.artifact_id
+            && doc.is_main_jar(dep)
+            && self.names_version(&version)
+            && version.starts_with("${")
+            && version.find('}') == Some(version.len() - 1)
+            && Self::leaves(doc, dep)
+                .iter()
+                .filter(|t| self.names_version(t))
+                .count()
+                == 1
+    }
+
+    /// The nearest pom whose own `<properties>` define `name` (the last
+    /// definition, as Maven reads a repeated one), with that element.
+    fn base_definition(&self, name: &str) -> Option<(usize, usize)> {
+        self.docs.iter().enumerate().find_map(|(i, doc)| {
+            Self::properties(doc, doc.project)
+                .into_iter()
+                .rev()
+                .find(|p| doc.nodes[*p].name == name)
+                .map(|p| (i, p))
+        })
+    }
+
+    /// Every property a dependency, a managed dependency or a repository of
+    /// the chain may read, through any definition of any pom or profile:
+    /// what a consumer's resolution depends on. A property only plugins
+    /// read (`commons.release.version`) is not one.
+    fn reachable(&self) -> BTreeSet<String> {
+        let mut definitions: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+        let mut queue: Vec<String> = Vec::new();
+        for doc in &self.docs {
+            for model in Self::models(doc) {
+                for p in Self::properties(doc, model) {
+                    definitions
+                        .entry(doc.nodes[p].name.as_str())
+                        .or_default()
+                        .push(doc.text_of(p));
+                }
+                let read = Self::dependencies(doc, model, false)
+                    .into_iter()
+                    .chain(Self::dependencies(doc, model, true))
+                    .chain(Self::repositories(doc, model));
+                for n in read {
+                    for text in Self::leaves(doc, n) {
+                        queue.extend(refs_in(&text).map(str::to_string));
+                    }
+                }
+            }
+        }
+        let mut seen = BTreeSet::new();
+        while let Some(name) = queue.pop() {
+            let Some(texts) = definitions.get(name.as_str()) else {
+                continue;
+            };
+            if seen.insert(name) {
+                for text in texts {
+                    queue.extend(refs_in(text).map(str::to_string));
+                }
+            }
+        }
+        seen
+    }
+
+    /// The suffixed pom with every version it inherits through a reference
+    /// to the pom's version declared again at the base version, or why
+    /// that cannot be done faithfully. A child's own property and
+    /// declaration always beat a parent's, a parent profile's included, so
+    /// anything a profile on the way may set instead is refused.
+    fn resolve(&self) -> Result<String, String> {
+        let reachable = self.reachable();
+        let mut properties = Vec::new();
+        for name in &reachable {
+            let Some((at, node)) = self.base_definition(name) else {
+                continue;
+            };
+            let doc = &self.docs[at];
+            if at == 0 || !self.names_version(&doc.text_of(node)) {
+                continue;
+            }
+            let redefined = (1..=at).find(|&i| {
+                Self::profiles(&self.docs[i]).into_iter().any(|profile| {
+                    Self::properties(&self.docs[i], profile)
+                        .into_iter()
+                        .any(|p| self.docs[i].nodes[p].name == *name)
+                })
+            });
+            if let Some(i) = redefined {
+                return Err(format!(
+                    "{} sets the property `{name}` from the pom's own version and a profile of \
+                     {} may set it instead",
+                    self.label(at),
+                    self.label(i)
+                ));
+            }
+            if self.lossy[at] {
+                return Err(format!("{} is not UTF-8", self.label(at)));
+            }
+            let n = &doc.nodes[node];
+            properties.push(format!(
+                "<{name}>{}</{name}>",
+                self.literal(&doc.text[n.inner_start..n.inner_end])
+            ));
+        }
+        for (i, doc) in self.docs.iter().enumerate().skip(1) {
+            for profile in Self::profiles(doc) {
+                let id = Self::profile_id(doc, profile);
+                // A profile's definition is read ahead of every pom above
+                // it, but after the poms below.
+                let property = Self::properties(doc, profile).into_iter().find(|&p| {
+                    let name = doc.nodes[p].name.as_str();
+                    reachable.contains(name)
+                        && self.names_version(&doc.text_of(p))
+                        && self.base_definition(name).is_none_or(|(at, _)| at >= i)
+                });
+                if let Some(p) = property {
+                    return Err(format!(
+                        "profile `{id}` of {} sets the property `{}` from the pom's own version",
+                        self.label(i),
+                        doc.nodes[p].name
+                    ));
+                }
+                let declares = [false, true].into_iter().any(|managed| {
+                    Self::dependencies(doc, profile, managed)
+                        .into_iter()
+                        .any(|dep| self.reads_version(doc, dep))
+                });
+                if declares {
+                    return Err(format!(
+                        "profile `{id}` of {} declares a dependency at the pom's own version",
+                        self.label(i)
+                    ));
+                }
+            }
+            let repository = Self::models(doc).into_iter().any(|model| {
+                Self::repositories(doc, model)
+                    .into_iter()
+                    .any(|r| self.reads_version(doc, r))
+            });
+            if repository {
+                return Err(format!(
+                    "{} addresses a repository through the pom's own version",
+                    self.label(i)
+                ));
+            }
+        }
+        let managed = self.copies(true)?;
+        let dependencies = self.copies(false)?;
+        self.splice(properties, managed, dependencies)
+    }
+
+    /// The parents' `<dependencies>` (or managed dependencies) the pom
+    /// must declare itself, as lines: every inherited entry up to the last
+    /// one naming the pom's version, in the order Maven inherits them (a
+    /// nearer pom's first, one per key). Maven lists a child's own
+    /// declarations ahead of the inherited ones, so declaring only the
+    /// entries that name the version would reorder the others, and with
+    /// them the classpath and which imported BOM wins.
+    fn copies(&self, managed: bool) -> Result<Vec<String>, String> {
+        let what = if managed {
+            "managed dependencies"
+        } else {
+            "dependencies"
+        };
+        let child = &self.docs[0];
+        let mut seen: BTreeSet<DepKey> = Self::dependencies(child, child.project, managed)
+            .into_iter()
+            .map(|dep| Self::key(child, dep))
+            .collect();
+        let mut inherited: Vec<(usize, usize)> = Vec::new();
+        let mut repeated: Option<usize> = None;
+        for (i, doc) in self.docs.iter().enumerate().skip(1) {
+            let mut own = BTreeSet::new();
+            for dep in Self::dependencies(doc, doc.project, managed) {
+                let key = Self::key(doc, dep);
+                if !own.insert(key.clone()) {
+                    repeated.get_or_insert(i);
+                }
+                if seen.insert(key) {
+                    inherited.push((i, dep));
+                }
+            }
+        }
+        let Some(last) = inherited.iter().rposition(|&(i, dep)| {
+            self.reads_version(&self.docs[i], dep) && !self.is_own(&self.docs[i], dep)
+        }) else {
+            return Ok(Vec::new());
+        };
+        let through = inherited[last].0;
+        let source = self.label(through);
+        // Which of two entries with one key Maven keeps depends on where
+        // they are declared.
+        if let Some(i) = repeated.filter(|&i| i <= through) {
+            return Err(format!(
+                "{source} declares {what} at the pom's own version and {} declares one of its \
+                 {what} twice",
+                self.label(i)
+            ));
+        }
+        let profiled = (0..=through).find(|&i| {
+            Self::profiles(&self.docs[i])
+                .into_iter()
+                .any(|profile| !Self::dependencies(&self.docs[i], profile, managed).is_empty())
+        });
+        if let Some(i) = profiled {
+            return Err(format!(
+                "{source} declares {what} at the pom's own version and a profile of {} adds \
+                 {what} of its own",
+                self.label(i)
+            ));
+        }
+        let mut lines = Vec::new();
+        for &(i, dep) in &inherited[..=last] {
+            let doc = &self.docs[i];
+            let keyed = ["groupId", "artifactId", "type", "classifier"]
+                .iter()
+                .any(|name| {
+                    doc.child_text(dep, name)
+                        .is_some_and(|t| self.names_version(&t))
+                });
+            if keyed {
+                return Err(format!(
+                    "{} names one of its {what} through the pom's own version",
+                    self.label(i)
+                ));
+            }
+            let node = &doc.nodes[dep];
+            let raw = &doc.text[node.start..node.end];
+            if self.lossy[i] || raw.contains("socket-patch:inherited") {
+                return Err(format!(
+                    "{} declares {what} at the pom's own version in text that cannot be copied",
+                    self.label(i)
+                ));
+            }
+            let indent = doc.indent_of(dep);
+            lines.extend(self.literal(raw).split('\n').enumerate().map(|(n, line)| {
+                let line = line.trim_end_matches('\r');
+                match n {
+                    0 => line,
+                    _ => line
+                        .strip_prefix(indent.as_str())
+                        .unwrap_or_else(|| line.trim_start()),
+                }
+                .to_string()
+            }));
+        }
+        Ok(lines)
+    }
+
+    /// The suffixed pom with `properties`, `managed` and `dependencies`
+    /// (lines) added to its own sections, each run between the markers; a
+    /// section the pom lacks is added before `</project>`.
+    fn splice(
+        &self,
+        properties: Vec<String>,
+        managed: Vec<String>,
+        dependencies: Vec<String>,
+    ) -> Result<String, String> {
+        let doc = &self.docs[0];
+        let u = doc.unit.as_str();
+        let project = doc.project;
+        let empty = |n: usize| {
+            format!(
+                "its pom has an empty <{}/> the inherited versions cannot be added to",
+                doc.nodes[n].name
+            )
+        };
+        let mut inserts: Vec<(usize, String)> = Vec::new();
+        let mut loose: Vec<String> = Vec::new();
+        if !properties.is_empty() {
+            match doc.child(project, "properties") {
+                Some(p) if doc.is_self_closing(p) => return Err(empty(p)),
+                Some(p) => inserts.push(self.block_in(p, properties)),
+                None => loose.extend(nest(u, "<properties>", properties, "</properties>")),
+            }
+        }
+        if !managed.is_empty() {
+            let section = |lines| nest(u, "<dependencies>", lines, "</dependencies>");
+            match doc.child(project, "dependencyManagement") {
+                None => loose.extend(nest(
+                    u,
+                    "<dependencyManagement>",
+                    section(managed),
+                    "</dependencyManagement>",
+                )),
+                Some(dm) if doc.is_self_closing(dm) => return Err(empty(dm)),
+                Some(dm) => match doc.child(dm, "dependencies") {
+                    Some(deps) if doc.is_self_closing(deps) => return Err(empty(deps)),
+                    Some(deps) => inserts.push(self.block_in(deps, managed)),
+                    None => inserts.push(self.block_in(dm, section(managed))),
+                },
+            }
+        }
+        if !dependencies.is_empty() {
+            match doc.child(project, "dependencies") {
+                Some(deps) if doc.is_self_closing(deps) => return Err(empty(deps)),
+                Some(deps) => inserts.push(self.block_in(deps, dependencies)),
+                None => loose.extend(nest(u, "<dependencies>", dependencies, "</dependencies>")),
+            }
+        }
+        if !loose.is_empty() {
+            inserts.push(self.block_in(project, loose));
+        }
+        inserts.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+        let mut text = doc.text.clone();
+        for (at, block) in inserts {
+            text.insert_str(at, &block);
+        }
+        Ok(text)
+    }
+
+    /// `lines` between the markers as the last children of `container`:
+    /// where to insert, and the text. Whole lines before a close tag that
+    /// starts its line, else the marked span alone right before it, which
+    /// is what [`strip_inherited`] takes out again.
+    fn block_in(&self, container: usize, lines: Vec<String>) -> (usize, String) {
+        let doc = &self.docs[0];
+        let nl = doc.nl;
+        let at = doc.nodes[container].inner_end;
+        let indent = doc.child_indent(container);
+        if doc.starts_line(at) {
+            let block: String = std::iter::once(INHERITED_BEGIN.to_string())
+                .chain(lines)
+                .chain(std::iter::once(INHERITED_END.to_string()))
+                .map(|l| format!("{indent}{l}{nl}"))
+                .collect();
+            return (doc.line_start(at), block);
+        }
+        let body: String = lines.iter().map(|l| format!("{nl}{indent}{l}")).collect();
+        (
+            at,
+            format!("{INHERITED_BEGIN}{body}{nl}{indent}{INHERITED_END}"),
+        )
+    }
+
+    /// What the suffixed pom resolves or manages at the suffixed version,
+    /// read the way Maven does: the chain merged (a nearer pom's property
+    /// and declaration first, one per raw key), then interpolated with the
+    /// model's version being the suffixed one. The tree serves the patched
+    /// artifact's main jar at that version and nothing else.
+    fn leaks(&self) -> Vec<Leak> {
+        let child = &self.docs[0];
+        let sv = self.sv.as_str();
+        let model = |name: &str| -> Option<String> {
+            let bare = name
+                .strip_prefix("project.")
+                .or_else(|| name.strip_prefix("pom."))
+                .unwrap_or(name);
+            match bare {
+                "version" => Some(sv.to_string()),
+                "groupId" => Some(self.c.group_id.to_string()),
+                "artifactId" => Some(self.c.artifact_id.to_string()),
+                "parent.version" | "parent.groupId" | "parent.artifactId" => child
+                    .child(child.project, "parent")
+                    .and_then(|p| child.child_text(p, &bare["parent.".len()..])),
+                _ => None,
+            }
+        };
+        let own: Vec<BTreeMap<String, String>> = self
+            .docs
+            .iter()
+            .map(|doc| {
+                Self::properties(doc, doc.project)
+                    .into_iter()
+                    .map(|p| (doc.nodes[p].name.clone(), doc.text_of(p)))
+                    .collect()
+            })
+            .collect();
+        let user = BTreeMap::new();
+        let lookup = |name: &str| {
+            let layers = own.iter().map(|own| PomLayer {
+                own,
+                profiles: Vec::new(),
+            });
+            lookup_property(name, &model, &user, layers)
+        };
+        let expand = |text: String| interpolate_keeping(&text, &lookup).unwrap_or(text);
+        // `(g:a[:v], expanded key, reads the suffixed version)` of a
+        // declaration; the patched artifact's own main jar does not count.
+        let entry = |doc: &Doc, dep: usize| -> (String, Option<String>, DepKey, bool) {
+            let part = |name: &str| doc.child_text(dep, name).map(&expand);
+            let (g, a) = (
+                part("groupId").unwrap_or_default(),
+                part("artifactId").unwrap_or_default(),
+            );
+            let version = part("version").filter(|v| !v.is_empty());
+            let (kind, classifier) = (part("type"), part("classifier"));
+            let own = g == self.c.group_id
+                && a == self.c.artifact_id
+                && version.as_deref() == Some(sv)
+                && crate::formats::maven::is_main_jar(kind.as_deref(), classifier.as_deref());
+            let reads = [
+                Some(&g),
+                Some(&a),
+                version.as_ref(),
+                kind.as_ref(),
+                classifier.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|t| t.contains(sv));
+            let key = (
+                g.clone(),
+                a.clone(),
+                kind.unwrap_or_else(|| "jar".to_string()),
+                classifier,
+            );
+            (format!("{g}:{a}"), version, key, reads && !own)
+        };
+        let mut leaks = Vec::new();
+
+        // Management first: a dependency without a version takes the first
+        // entry of its key; `Some` when that one reads the suffixed version.
+        let mut managed: BTreeMap<DepKey, Option<(String, usize)>> = BTreeMap::new();
+        let mut seen = BTreeSet::new();
+        for (at, doc) in self.docs.iter().enumerate() {
+            for dep in Self::dependencies(doc, doc.project, true) {
+                if !seen.insert(Self::key(doc, dep)) {
+                    continue;
+                }
+                let (ga, version, key, reads) = entry(doc, dep);
+                let version = version.unwrap_or_default();
+                if doc.child_text(dep, "scope").as_deref() != Some("import") {
+                    managed
+                        .entry(key)
+                        .or_insert_with(|| reads.then_some((version, at)));
+                } else if reads {
+                    leaks.push(Leak {
+                        hard: true,
+                        detail: format!(
+                            "the suffixed pom imports the BOM {ga}:{version}, where {} reads the \
+                             pom's own version",
+                            self.label(at)
+                        ),
+                    });
+                }
+            }
+        }
+        let mut used = BTreeSet::new();
+        let mut seen = BTreeSet::new();
+        for (at, doc) in self.docs.iter().enumerate() {
+            for dep in Self::dependencies(doc, doc.project, false) {
+                if !seen.insert(Self::key(doc, dep)) {
+                    continue;
+                }
+                let (ga, version, key, reads) = entry(doc, dep);
+                let (version, at) = match (version, managed.get(&key)) {
+                    (Some(version), _) if reads => (version, at),
+                    (None, Some(Some((version, at)))) => {
+                        used.insert(key.clone());
+                        (version.clone(), *at)
+                    }
+                    _ => continue,
+                };
+                leaks.push(Leak {
+                    hard: true,
+                    detail: format!(
+                        "the suffixed pom depends on {ga}:{version}, where {} reads the pom's own \
+                         version",
+                        self.label(at)
+                    ),
+                });
+            }
+        }
+        // Only a Maven that applies a dependency's management to what it
+        // pulls in (4.x) reads these.
+        for (key, entry) in &managed {
+            if let Some((version, at)) = entry.as_ref().filter(|_| !used.contains(key)) {
+                leaks.push(Leak {
+                    hard: false,
+                    detail: format!(
+                        "the suffixed pom manages {}:{}:{version}, where {} reads the pom's own \
+                         version",
+                        key.0,
+                        key.1,
+                        self.label(*at)
+                    ),
+                });
+            }
+        }
+        let reachable = self.reachable();
+        for (at, doc) in self.docs.iter().enumerate() {
+            for profile in Self::profiles(doc) {
+                let id = Self::profile_id(doc, profile);
+                let mut soft = |what: String| {
+                    leaks.push(Leak {
+                        hard: false,
+                        detail: format!(
+                            "profile `{id}` of {} {what} through the pom's own version",
+                            self.label(at)
+                        ),
+                    })
+                };
+                for is_managed in [false, true] {
+                    for dep in Self::dependencies(doc, profile, is_managed) {
+                        let (ga, version, key, reads) = entry(doc, dep);
+                        match (version, managed.get(&key)) {
+                            (Some(version), _) if reads => soft(format!("declares {ga}:{version}")),
+                            (None, Some(Some((version, _)))) if !is_managed => {
+                                soft(format!("depends on {ga}:{version}"))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for p in Self::properties(doc, profile) {
+                    let name = doc.nodes[p].name.as_str();
+                    if reachable.contains(name)
+                        && self.base_definition(name).is_none_or(|(def, _)| def >= at)
+                        && expand(doc.text_of(p)).contains(sv)
+                    {
+                        soft(format!("sets the property `{name}`"));
+                    }
+                }
+            }
+            for model in Self::models(doc) {
+                for repository in Self::repositories(doc, model) {
+                    if Self::leaves(doc, repository)
+                        .into_iter()
+                        .any(|t| expand(t).contains(sv))
+                    {
+                        leaks.push(Leak {
+                            hard: false,
+                            detail: format!(
+                                "{} addresses a repository through the pom's own version",
+                                self.label(at)
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        leaks
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3847,6 +4791,7 @@ mod tests {
             uuid: UUID,
             jar: b"PK\x03\x04patched",
             upstream_pom: pom.as_bytes(),
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -5190,6 +6135,453 @@ mod tests {
         );
     }
 
+    // ── inherited `${project.version}` ──
+
+    const ACME_UUID: &str = "deadbeef-0000-4000-8000-000000000000";
+    const ACME_SV: &str = "1.0-socket.deadbeef";
+    const ACME_TREE_POM: &str = ".socket/vendor/maven2/com/acme/acme-core/1.0-socket.deadbeef/\
+        acme-core-1.0-socket.deadbeef.pom";
+    const ACME_APP: &str = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  \
+        <groupId>com.example</groupId>\n  <artifactId>app</artifactId>\n  <version>0.1</version>\n  \
+        <dependencies>\n    <dependency>\n      <groupId>com.acme</groupId>\n      \
+        <artifactId>acme-core</artifactId>\n      <version>1.0</version>\n    </dependency>\n  \
+        </dependencies>\n</project>\n";
+    /// The log4j-core shape: no `<version>` of its own, and a sibling whose
+    /// version only the parent's management gives.
+    const ACME_CORE: &str = r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>com.acme</groupId>
+    <artifactId>acme-parent</artifactId>
+    <version>1.0</version>
+  </parent>
+  <artifactId>acme-core</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>acme-api</artifactId>
+    </dependency>
+  </dependencies>
+</project>
+"#;
+    const ACME_PARENT: &str = r#"<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.acme</groupId>
+  <artifactId>acme-parent</artifactId>
+  <version>1.0</version>
+  <packaging>pom</packaging>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>acme-api</artifactId>
+        <version>${project.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+</project>
+"#;
+
+    fn acme(pom: &str) -> JvmPatch<'_> {
+        JvmPatch {
+            group_id: "com.acme",
+            artifact_id: "acme-core",
+            version: "1.0",
+            uuid: ACME_UUID,
+            jar: b"PK\x03\x04patched",
+            upstream_pom: pom.as_bytes(),
+            upstream_parents: None,
+            upstream_module: None,
+            extra_artifacts: &[],
+            patched_members: &[],
+        }
+    }
+
+    /// The pom the tree serves for `pom` over the upstream `parents`
+    /// (nearest first).
+    fn acme_pom(pom: &str, parents: &[&str]) -> Result<String, JvmRefusal> {
+        let parents: Vec<Vec<u8>> = parents.iter().map(|p| p.as_bytes().to_vec()).collect();
+        suffixed_pom(&JvmPatch {
+            upstream_parents: Some(&parents),
+            ..acme(pom)
+        })
+    }
+
+    /// What `acme_pom` adds to the 5.1 shape of the suffixed pom: every
+    /// line of each marked block, trimmed.
+    fn inherited_lines(pom: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut inside = false;
+        for line in pom.lines().map(str::trim) {
+            match line {
+                INHERITED_BEGIN => inside = true,
+                INHERITED_END => inside = false,
+                _ if inside => out.push(line),
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// VJ-D1: Maven interpolates after inheritance, so the parent's
+    /// `${project.version}` reads the vendored child's suffixed version and
+    /// the build asks for `acme-api:1.0-socket.deadbeef`, which nothing
+    /// serves. The planner must write the base version instead.
+    #[test]
+    fn a_version_the_parent_manages_through_project_version_stays_at_the_base() {
+        let files = fs(&[("pom.xml", ACME_APP)]);
+        let read = |p: &str| files.get(p).cloned();
+        let parents = vec![ACME_PARENT.as_bytes().to_vec()];
+        let patch = JvmPatch {
+            upstream_parents: Some(&parents),
+            ..acme(ACME_CORE)
+        };
+        let plan = plan(&read, &lister(&files), &patch).expect("plan");
+        let pom = text(&applied(&files, &plan), ACME_TREE_POM);
+        assert!(
+            pom.contains(&format!("<version>{ACME_SV}</version>")),
+            "{pom}"
+        );
+        assert_eq!(
+            inherited_lines(&pom),
+            [
+                "<dependencyManagement>",
+                "<dependencies>",
+                "<dependency>",
+                "<groupId>com.acme</groupId>",
+                "<artifactId>acme-api</artifactId>",
+                "<version>1.0</version>",
+                "</dependency>",
+                "</dependencies>",
+                "</dependencyManagement>",
+            ],
+            "{pom}"
+        );
+        assert_eq!(inherited_leaks(&pom, &parents, &patch.coords()), None);
+        // The legacy shape is what leaks, and the check names it.
+        let legacy = suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap();
+        let leak = inherited_leaks(&legacy, &parents, &patch.coords()).expect("leak");
+        assert!(
+            leak.hard
+                && leak
+                    .detail
+                    .contains("com.acme:acme-api:1.0-socket.deadbeef"),
+            "{leak:?}"
+        );
+    }
+
+    /// The parent's `<dependencies>`, a property and its management, as
+    /// built with Maven 3.9.16 (`target/tmp/exp`, variant `fixed`): every
+    /// inherited entry up to the last one naming the version is declared
+    /// again, in the inherited order, because Maven lists a child's own
+    /// declarations first.
+    #[test]
+    fn inherited_declarations_are_copied_in_their_inherited_order() {
+        let grand =
+            "<project>\n  <groupId>com.acme</groupId>\n  <artifactId>acme-grand</artifactId>\n  \
+            <version>7</version>\n  <dependencies>\n    <dependency><groupId>com.acme</groupId>\
+            <artifactId>acme-d</artifactId><version>1.0</version></dependency>\n  </dependencies>\n\
+            </project>\n";
+        let parent = r#"<project>
+  <parent><groupId>com.acme</groupId><artifactId>acme-grand</artifactId><version>7</version></parent>
+  <groupId>com.acme</groupId>
+  <artifactId>acme-parent</artifactId>
+  <version>1.0</version>
+  <properties>
+    <acme.c.version>${project.version}</acme.c.version>
+    <unrelated>${project.version}</unrelated>
+  </properties>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.acme</groupId>
+        <artifactId>acme-c</artifactId>
+        <version>${acme.c.version}</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <dependencies>
+    <dependency><groupId>com.acme</groupId><artifactId>acme-b</artifactId><version>1.0</version></dependency>
+    <dependency><groupId>${project.groupId}</groupId><artifactId>acme-c</artifactId></dependency>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>acme-api</artifactId>
+      <version>${pom.version}</version>
+    </dependency>
+    <dependency><groupId>com.acme</groupId><artifactId>acme-e</artifactId><version>1.0</version></dependency>
+  </dependencies>
+</project>
+"#;
+        let core = "<project>\n  <parent>\n    <groupId>com.acme</groupId>\n    \
+            <artifactId>acme-parent</artifactId>\n    <version>1.0</version>\n  </parent>\n  \
+            <artifactId>acme-core</artifactId>\n  <version>1.0</version>\n  <properties>\n    \
+            <own>1</own>\n  </properties>\n</project>\n";
+        let pom = acme_pom(core, &[parent, grand]).expect("resolved");
+        assert_eq!(
+            pom,
+            format!(
+                "<project>\n  <parent>\n    <groupId>com.acme</groupId>\n    \
+                 <artifactId>acme-parent</artifactId>\n    <version>1.0</version>\n  </parent>\n  \
+                 <artifactId>acme-core</artifactId>\n  <version>{ACME_SV}</version>\n  <properties>\n    \
+                 <own>1</own>\n    {INHERITED_BEGIN}\n    <acme.c.version>1.0</acme.c.version>\n    \
+                 {INHERITED_END}\n  </properties>\n  {INHERITED_BEGIN}\n  <dependencies>\n    \
+                 <dependency><groupId>com.acme</groupId><artifactId>acme-b</artifactId>\
+                 <version>1.0</version></dependency>\n    \
+                 <dependency><groupId>${{project.groupId}}</groupId><artifactId>acme-c</artifactId>\
+                 </dependency>\n    <dependency>\n      <groupId>com.acme</groupId>\n      \
+                 <artifactId>acme-api</artifactId>\n      <version>1.0</version>\n    </dependency>\n  \
+                 </dependencies>\n  {INHERITED_END}\n</project>\n"
+            )
+        );
+    }
+
+    /// A parent that names the version only where no consumer reads it
+    /// (commons-parent: a release property, plugin configuration) changes
+    /// nothing: the pom stays byte for byte what 5.1 wrote, so committed
+    /// trees of such artifacts stay in sync.
+    #[test]
+    fn a_parent_naming_the_version_outside_dependency_data_changes_nothing() {
+        let parent = "<project>\n  <groupId>com.acme</groupId>\n  <artifactId>acme-parent</artifactId>\n  \
+            <version>1.0</version>\n  <properties>\n    \
+            <release.version>${project.version}</release.version>\n  </properties>\n  <build>\n    \
+            <finalName>acme-${project.version}</finalName>\n  </build>\n  <dependencyManagement>\n    \
+            <dependencies>\n      <dependency><groupId>org.x</groupId><artifactId>y</artifactId>\
+            <version>3</version></dependency>\n    </dependencies>\n  </dependencyManagement>\n\
+            </project>\n";
+        assert_eq!(
+            acme_pom(ACME_CORE, &[parent]).unwrap(),
+            suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap()
+        );
+        // The parent managing the artifact itself reads the suffixed
+        // version, which the tree serves.
+        let own = parent.replace(
+            "<groupId>org.x</groupId><artifactId>y</artifactId><version>3</version>",
+            "<groupId>${project.groupId}</groupId><artifactId>acme-core</artifactId>\
+             <version>${project.version}</version>",
+        );
+        assert_eq!(
+            acme_pom(ACME_CORE, &[&own]).unwrap(),
+            suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap()
+        );
+        assert_eq!(
+            acme_pom(ACME_CORE, &[]).unwrap(),
+            suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap()
+        );
+    }
+
+    /// A committed tree is re-planned from its own pom: with the parents at
+    /// hand the additions are computed again, without them they are kept,
+    /// and either way nothing is rewritten.
+    #[test]
+    fn a_committed_pom_replans_unchanged_with_or_without_its_parents() {
+        for nl in ["\n", "\r\n"] {
+            let app = ACME_APP.replace('\n', nl);
+            let core = ACME_CORE.replace('\n', nl);
+            let files = fs(&[("pom.xml", &app)]);
+            let parents = vec![ACME_PARENT.as_bytes().to_vec()];
+            let first = JvmPatch {
+                upstream_parents: Some(&parents),
+                ..acme(&core)
+            };
+            let plan_of = |files: &Fs, patch: &JvmPatch<'_>| {
+                plan(&|p: &str| files.get(p).cloned(), &lister(files), patch).expect("plan")
+            };
+            let after = applied(&files, &plan_of(&files, &first));
+            let pom = text(&after, ACME_TREE_POM);
+            assert!(pom.contains(INHERITED_BEGIN), "{pom}");
+            let (jar, upstream) = committed(&|p: &str| after.get(p).cloned(), &first.coords())
+                .expect("committed tree");
+            for parents in [Some(parents.as_slice()), None] {
+                let again = JvmPatch {
+                    jar: &jar,
+                    upstream_pom: &upstream,
+                    upstream_parents: parents,
+                    ..acme("")
+                };
+                let writes = plan_of(&after, &again).writes;
+                assert!(
+                    writes.is_empty(),
+                    "{nl:?} {:?}",
+                    writes.iter().map(|w| &w.rel).collect::<Vec<_>>()
+                );
+            }
+            // A tree vendored before the parents were read is brought up to
+            // date once they are.
+            let legacy = suffix_maven_pom(&core, "1.0", ACME_SV).unwrap();
+            let mut old = after.clone();
+            old.insert(ACME_TREE_POM.to_string(), legacy.into_bytes());
+            let (jar, upstream) =
+                committed(&|p: &str| old.get(p).cloned(), &first.coords()).expect("legacy tree");
+            let again = JvmPatch {
+                jar: &jar,
+                upstream_pom: &upstream,
+                upstream_parents: Some(&parents),
+                ..acme("")
+            };
+            assert_eq!(
+                text(&applied(&old, &plan_of(&old, &again)), ACME_TREE_POM),
+                pom
+            );
+        }
+    }
+
+    #[test]
+    fn strip_inherited_removes_exactly_what_was_added() {
+        let grand = "<project><groupId>com.acme</groupId><artifactId>g</artifactId><version>7</version>\
+            <properties><p>${project.version}</p></properties><dependencyManagement><dependencies>\
+            <dependency><groupId>com.acme</groupId><artifactId>acme-api</artifactId><version>${p}</version>\
+            </dependency><dependency><groupId>com.acme</groupId><artifactId>acme-b</artifactId>\
+            <version>${version}</version></dependency></dependencies></dependencyManagement></project>";
+        // Whole lines, and a one-line pom where the additions go inline.
+        for core in [
+            ACME_CORE.to_string(),
+            ACME_CORE.replace('\n', "\r\n"),
+            ACME_CORE.replace("\n  ", "\t").replace('\n', ""),
+            ACME_CORE.replace(
+                "  <dependencies>",
+                "  <properties><a>1</a></properties>\n  <dependencyManagement>\n  \
+                 </dependencyManagement>\n  <dependencies>",
+            ),
+        ] {
+            let legacy = suffix_maven_pom(&core, "1.0", ACME_SV).unwrap();
+            let pom = acme_pom(&core, &[grand]).expect("resolved");
+            assert_eq!(
+                pom.matches(INHERITED_BEGIN).count(),
+                pom.matches(INHERITED_END).count()
+            );
+            assert!(pom.contains(INHERITED_BEGIN), "{pom}");
+            assert_eq!(strip_inherited(&pom), legacy, "{pom}");
+            assert!(
+                pom.contains("<p>1.0</p>") && pom.contains("<artifactId>acme-b</artifactId>"),
+                "{pom}"
+            );
+            assert!(Doc::parse(pom.clone()).is_ok(), "{pom}");
+        }
+        assert_eq!(strip_inherited(ACME_CORE), ACME_CORE);
+    }
+
+    /// Shapes the additions cannot express are refused, never guessed: a
+    /// parent profile is active or not on the consumer's machine, and a
+    /// child declaration always beats it.
+    #[test]
+    fn unresolvable_inherited_versions_refuse() {
+        let profile = |body: &str| {
+            ACME_PARENT.replace(
+                "</project>",
+                &format!("  <profiles><profile><id>p</id>{body}</profile></profiles>\n</project>"),
+            )
+        };
+        let dep = "<dependency><groupId>com.acme</groupId><artifactId>acme-b</artifactId>\
+            <version>${project.version}</version></dependency>";
+        for (what, parent) in [
+            (
+                "a profile dependency naming the version",
+                profile(&format!("<dependencies>{dep}</dependencies>")),
+            ),
+            (
+                "profile management beside copied management",
+                profile(
+                    "<dependencyManagement><dependencies><dependency><groupId>o</groupId>\
+                     <artifactId>x</artifactId><version>1</version></dependency></dependencies>\
+                     </dependencyManagement>",
+                ),
+            ),
+            (
+                "a version reference in a management key",
+                ACME_PARENT.replace(
+                    "<version>${project.version}</version>",
+                    "<classifier>${project.version}</classifier><version>1</version>",
+                ),
+            ),
+            (
+                "a repository addressed through the version",
+                ACME_PARENT.replace(
+                    "</project>",
+                    "<repositories><repository><id>r</id><url>https://r/${project.version}</url>\
+                     </repository></repositories></project>",
+                ),
+            ),
+            (
+                "a profile redefining an overridden property",
+                ACME_PARENT
+                    .replace(
+                        "<version>${project.version}</version>",
+                        "<version>${api.version}</version>",
+                    )
+                    .replace(
+                        "<packaging>pom</packaging>",
+                        "<properties><api.version>${project.version}</api.version></properties>\
+                         <profiles><profile><id>p</id><properties><api.version>9</api.version>\
+                         </properties></profile></profiles>",
+                    ),
+            ),
+            ("an unparseable parent", format!("{ACME_PARENT}</oops>")),
+        ] {
+            let r = acme_pom(ACME_CORE, &[&parent]).expect_err(what);
+            assert_eq!(r.code, UPSTREAM_UNAVAILABLE, "{what}");
+            assert_eq!(
+                refusal_reason(&r),
+                "inherited_version_unresolvable",
+                "{what}"
+            );
+            assert!(
+                r.detail.contains("com.acme:acme-parent:1.0"),
+                "{what}: {}",
+                r.detail
+            );
+        }
+        // An unparseable parent that never names the version cannot move one.
+        let literal = ACME_PARENT.replace("${project.version}", "1.0");
+        assert_eq!(
+            acme_pom(ACME_CORE, &[&format!("{literal}</oops>")]).unwrap(),
+            suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap()
+        );
+    }
+
+    /// What `vendor --check` reports for a tree 5.0 / 5.1 wrote: a
+    /// dependency that resolves at the suffixed version is broken for every
+    /// Maven; management nothing of the pom uses (netty-parent's
+    /// `netty-dev-tools`) is not, so such a tree keeps passing.
+    #[test]
+    fn only_a_resolved_suffixed_version_is_a_hard_leak() {
+        let c = acme("").coords();
+        let legacy = suffix_maven_pom(ACME_CORE, "1.0", ACME_SV).unwrap();
+        let unused = ACME_PARENT.replace("acme-api", "acme-dev-tools");
+        let leak = inherited_leaks(&legacy, &[unused.into_bytes()], &c).expect("soft leak");
+        assert!(!leak.hard, "{leak:?}");
+        let import = ACME_PARENT.replace(
+            "<version>${project.version}</version>",
+            "<version>${project.version}</version><type>pom</type><scope>import</scope>",
+        );
+        let leak = inherited_leaks(&legacy, &[import.into_bytes()], &c).expect("import");
+        assert!(leak.hard, "{leak:?}");
+        let literal = ACME_PARENT.replace("${project.version}", "1.0");
+        assert_eq!(inherited_leaks(&legacy, &[literal.into_bytes()], &c), None);
+    }
+
+    #[test]
+    fn parent_gav_reads_a_literal_parent_only() {
+        assert_eq!(
+            parent_gav(ACME_CORE.as_bytes()),
+            Ok(Some((
+                "com.acme".into(),
+                "acme-parent".into(),
+                "1.0".into()
+            )))
+        );
+        assert_eq!(parent_gav(ACME_PARENT.as_bytes()), Ok(None));
+        for pom in [
+            "<project><parent><groupId>g</groupId><artifactId>a</artifactId>\
+             <version>${revision}</version></parent></project>",
+            "<project><parent><groupId>g</groupId><artifactId>a</artifactId></parent></project>",
+            "<project><parent><groupId>../g</groupId><artifactId>a</artifactId><version>1</version>\
+             </parent></project>",
+            "<notproject/>",
+        ] {
+            assert!(parent_gav(pom.as_bytes()).is_err(), "{pom}");
+        }
+    }
+
     #[test]
     fn suffix_multi_module_pom_keeps_modules() {
         let pom = "<project>\n  <groupId>com.acme</groupId>\n  <artifactId>parent</artifactId>\n  <version>5.0.0</version>\n  \
@@ -5261,6 +6653,7 @@ mod tests {
             uuid: UUID_B,
             jar: b"PK\x03\x04B",
             upstream_pom: b"<project><groupId>org.example</groupId><artifactId>lib</artifactId><version>2.0</version></project>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -7146,6 +8539,49 @@ mod tests {
         assert!(refs(&format!("{PIN_TAG}{UUID_B}: g:a:1 -->")));
         assert!(!refs(&format!("{PIN_TAG}{UUID}: g:a:1 -->")));
         assert!(!refs("<version>1-socket.xyz</version>"));
+    }
+
+    /// VJ-D5: a `.mvn/maven.config` that is not UTF-8 (a Latin-1 user name,
+    /// a Windows path) was decoded lossily, so vendoring rewrote `e9` as
+    /// `ef bf bd` and revert, which reads UTF-8 only, left it and the added
+    /// lines there. Every byte the two edits do not touch survives both.
+    #[tokio::test]
+    async fn a_maven_config_that_is_not_utf8_keeps_its_bytes_and_reverts() {
+        let dir = disk(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let root = dir.path();
+        let config: &[u8] = b"-Duser.name=Jos\xe9\r\n-Dmaven.repo.local.tail=/opt/r\xe9po\r\n";
+        std::fs::create_dir_all(root.join(".mvn")).unwrap();
+        std::fs::write(root.join(MAVEN_CONFIG), config).unwrap();
+        let pristine = testing::snapshot(root);
+        let mut ledger = BTreeMap::new();
+        testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join(MAVEN_CONFIG)).unwrap(),
+            [
+                b"-Duser.name=Jos\xe9\r\n-Dmaven.repo.local.tail=/opt/r\xe9po,".as_slice(),
+                TAIL_DIR.as_bytes(),
+                b"\r\n",
+                OFFLINE_LINE.as_bytes(),
+                b"\r\n",
+            ]
+            .concat()
+        );
+        assert!(replan_writes(root, &patch()).is_empty());
+        let out = testing::revert(root, &patch(), &mut ledger).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(testing::snapshot(root), pristine);
+        // The two readings round-trip on their own.
+        for bytes in [config, "-Dx=é\n".as_bytes(), b""] {
+            let (text, bytewise) = config_text(bytes);
+            assert_eq!(bytewise, std::str::from_utf8(bytes).is_err());
+            assert_eq!(config_bytes(text, bytewise), bytes);
+        }
     }
 
     /// A comment naming the suffixed version is not a reference: revert

@@ -593,7 +593,11 @@ fn assert_attested(cwd: &Path, code: Option<i32>, env: &Value, uuid: &str, mode:
     );
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({})", marker(mode)),
+        format!(
+            "Patched via Socket patch {uuid} ({}){}",
+            marker(mode),
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{what}: {doc}"
     );
     let verified: Vec<&Value> = env["events"]

@@ -1,7 +1,7 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{
-    fetch_missing_blobs, format_fetch_failures, format_fetch_successes, get_missing_blobs,
-    ArtifactNoun, BLOB, DIFF_ARCHIVE, PACKAGE_ARCHIVE,
+    fetch_blobs_replacing, format_fetch_failures, format_fetch_successes, get_corrupt_blobs,
+    get_missing_blobs, ArtifactNoun, BLOB, DIFF_ARCHIVE, PACKAGE_ARCHIVE,
 };
 use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::manifest::cleanup_blobs::{
@@ -129,17 +129,43 @@ pub async fn run(args: RepairArgs) -> i32 {
                 }
                 return 0;
             }
-            let msg = format!("Manifest not found at {}", manifest_path.display());
+            // Nothing to repair here; the project directories below that
+            // keep local patch state are where this command has work (and
+            // hosted ones are patched all the same, with nothing to repair).
+            let below = if args.common.json || !args.common.silent {
+                use crate::commands::projects_below::{patched, Depth, Work};
+                let command = if args.download_only {
+                    "repair --download-only"
+                } else {
+                    "repair"
+                };
+                patched(&args.common, Depth::All).await.advice(
+                    &args.common,
+                    command,
+                    Work::Local,
+                    &[],
+                )
+            } else {
+                Default::default()
+            };
+            // `--json` keeps its `manifest_not_found` message; a person is
+            // told what that means for the command they ran.
             if args.common.json {
-                let env = error_envelope(
+                let msg = format!("Manifest not found at {}", manifest_path.display());
+                let mut env = error_envelope(
                     Command::Repair,
                     args.common.dry_run,
                     "manifest_not_found",
                     &msg,
                 );
+                env.warnings.extend(below.warnings());
                 crate::ui::print_json(&env.to_value());
             } else {
-                eprintln!("Error: {msg}");
+                eprintln!(
+                    "Error: {}",
+                    crate::ui::no_patches_message("repair", &args.common)
+                );
+                below.print();
             }
             return 1;
         }
@@ -259,9 +285,13 @@ fn format_id_list(ids: &[String], cap: usize) -> Vec<String> {
     lines
 }
 
-/// `Found 2 missing blobs` / `Found 1 missing blob`.
-fn format_found_missing(n: usize) -> String {
-    format!("Found {}", BLOB.count(n).replacen(' ', " missing ", 1))
+/// `Found 2 missing blobs` / `Found 1 corrupt blob`.
+fn format_found(n: usize, fault: BlobFault) -> String {
+    format!(
+        "Found {}",
+        BLOB.count(n)
+            .replacen(' ', &format!(" {} ", fault.word()), 1)
+    )
 }
 
 /// Why a hosted-only project has nothing to repair (the JSON skip
@@ -285,15 +315,58 @@ fn format_nothing_missing(
     }
 }
 
-/// The `--offline` warning (stderr) for artifacts that cannot be fetched.
-fn format_offline_warning(ids: &[String]) -> String {
+/// Why a referenced blob has to be downloaded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlobFault {
+    /// No `.socket/blobs/<hash>` entry.
+    Missing,
+    /// The entry's bytes no longer hash to its name.
+    Corrupt,
+}
+
+impl BlobFault {
+    /// `"missing"` / `"corrupt"`, as printed and as `details.state`.
+    fn word(self) -> &'static str {
+        match self {
+            BlobFault::Missing => "missing",
+            BlobFault::Corrupt => "corrupt",
+        }
+    }
+
+    /// The `errorCode` of a blob `--offline` could not restore.
+    fn offline_code(self) -> &'static str {
+        match self {
+            BlobFault::Missing => "offline_missing_sources",
+            BlobFault::Corrupt => "blob_corrupt",
+        }
+    }
+}
+
+/// The `--offline` error (stderr) for blobs with `fault` that cannot be
+/// fetched.
+fn format_offline_error(ids: &[String], fault: BlobFault) -> String {
     let verb = if ids.len() == 1 { "is" } else { "are" };
     let mut lines = vec![format!(
-        "Warning: {} {verb} missing (offline mode - not downloading):",
-        BLOB.count(ids.len())
+        "Error: {} {verb} {} (offline mode - not downloading):",
+        BLOB.count(ids.len()),
+        fault.word()
     )];
     lines.extend(format_id_list(ids, OFFLINE_LIST_CAP));
     lines.join("\n")
+}
+
+/// The `failed` event for one blob `--offline` could not restore.
+fn offline_unrestored_event(hash: &str, fault: BlobFault) -> PatchEvent {
+    PatchEvent::artifact(PatchAction::Failed)
+        .with_error(
+            fault.offline_code(),
+            format!(
+                "blob {hash} is {} and --offline is set; re-run `socket-patch repair` \
+                 without --offline to download it",
+                fault.word()
+            ),
+        )
+        .with_details(serde_json::json!({ "hash": hash, "state": fault.word() }))
 }
 
 /// The cleanup phase's summary: one result block per kind that had
@@ -319,15 +392,33 @@ fn format_cleanup_summary(results: &[(ArtifactNoun, CleanupResult)], dry_run: bo
     format_all_in_use(&checked, total)
 }
 
-/// The closing line of a human repair run. `other_failure` is a failure
-/// recorded elsewhere in the run (a vendored artifact that could not be
-/// rebuilt): the run exits 1, so it must not close on "Repair complete.".
-fn format_final_line(download_failed: usize, other_failure: bool, dry_run: bool) -> String {
+/// The closing line of a human repair run. `offline_unrestored` counts the
+/// missing or corrupt blobs `--offline` left as they were. `other_failure`
+/// is a failure recorded elsewhere in the run (a vendored artifact that
+/// could not be rebuilt): the run exits 1, so it must not close on "Repair
+/// complete.".
+fn format_final_line(
+    download_failed: usize,
+    offline_unrestored: usize,
+    other_failure: bool,
+    dry_run: bool,
+) -> String {
     if download_failed > 0 {
         let verb = if download_failed == 1 { "was" } else { "were" };
         format!(
             "Repair finished with errors: {} {verb} not downloaded.",
             BLOB.count(download_failed)
+        )
+    } else if offline_unrestored > 0 {
+        format!(
+            "Repair finished with errors: {} could not be restored in offline mode. \
+             Re-run without --offline to download {}.",
+            BLOB.count(offline_unrestored),
+            if offline_unrestored == 1 {
+                "it"
+            } else {
+                "them"
+            }
         )
     } else if other_failure {
         "Repair finished with errors.".to_string()
@@ -338,51 +429,67 @@ fn format_final_line(download_failed: usize, other_failure: bool, dry_run: bool)
     }
 }
 
-/// What one download pass did: how many artifacts were missing, and how
-/// many of them it downloaded or failed to.
+/// What one download pass did: how many blobs it had to fetch (the missing
+/// ones and the corrupt ones), and how many of them it downloaded or
+/// failed to.
 #[derive(Default)]
 struct DownloadPass {
-    missing: usize,
+    wanted: usize,
     downloaded: usize,
     failed: usize,
+    /// `--offline`: every blob of the pass, none of which was fetched.
+    offline_unrestored: Vec<(String, BlobFault)>,
 }
 
-/// Step 1's pass over `missing` (non-empty), the `afterHash` blobs `m`
-/// references: the `--offline` warning, the `--dry-run` preview, or the
-/// download into `blobs_path` and its result lines.
+/// Step 1's pass over the blobs to fetch (at least one): the `missing`
+/// `afterHash` blobs and the `corrupt` cached ones, both sorted. The
+/// `--offline` errors, the `--dry-run` preview, or the download into
+/// `blobs_path` (a corrupt entry is replaced whole) and its result lines.
 async fn download_pass(
     args: &RepairArgs,
     client: &mut Option<ApiClient>,
-    m: &socket_patch_core::manifest::schema::PatchManifest,
     missing: &[String],
+    corrupt: &[String],
     blobs_path: &Path,
 ) -> DownloadPass {
     let quiet = args.common.json || args.common.silent;
+    let wanted: Vec<String> = missing.iter().chain(corrupt).cloned().collect();
     let mut pass = DownloadPass {
-        missing: missing.len(),
+        wanted: wanted.len(),
         ..DownloadPass::default()
     };
+    let faults = [(missing, BlobFault::Missing), (corrupt, BlobFault::Corrupt)];
     if args.common.offline {
-        if !quiet {
-            eprintln!("{}", format_offline_warning(missing));
+        for (ids, fault) in faults {
+            // The run exits 1 over these, so they print even under
+            // `--silent` (`--json` runs carry them in the envelope).
+            if !ids.is_empty() && !args.common.json {
+                eprintln!("{}", format_offline_error(ids, fault));
+            }
+            pass.offline_unrestored
+                .extend(ids.iter().map(|id| (id.clone(), fault)));
         }
         return pass;
     }
     if !quiet {
-        println!("{}", format_found_missing(missing.len()));
+        for (ids, fault) in faults {
+            if !ids.is_empty() {
+                println!("{}", format_found(ids.len(), fault));
+            }
+        }
     }
     if args.common.dry_run {
         if !quiet {
             println!();
             println!("Would download:");
-            for line in format_id_list(missing, DRY_RUN_LIST_CAP) {
+            for line in format_id_list(&wanted, DRY_RUN_LIST_CAP) {
                 println!("{line}");
             }
         }
         return pass;
     }
     let mut status = crate::ui::StatusLine::stderr(args.common.json, args.common.silent);
-    status.set(format!("Downloading {}...", BLOB.count(missing.len())));
+    status.set(format!("Downloading {}...", BLOB.count(wanted.len())));
     if client.is_none() {
         *client = Some(
             get_api_client_with_overrides(args.common.api_client_overrides())
@@ -391,7 +498,7 @@ async fn download_pass(
         );
     }
     let client = client.as_ref().expect("client built just above");
-    let fetch_result = fetch_missing_blobs(m, blobs_path, client, None).await;
+    let fetch_result = fetch_blobs_replacing(&wanted, blobs_path, client, None).await;
     status.finish();
     pass.downloaded = fetch_result.downloaded;
     pass.failed = fetch_result.failed;
@@ -488,31 +595,52 @@ async fn repair_inner(
             setup: m.setup.clone(),
         }
     });
-    let missing_artifacts: Vec<String> = match &scoped_manifest {
-        None => Vec::new(),
-        Some(m) => get_missing_blobs(m, &blobs_path)
-            .await
-            .into_iter()
-            .collect(),
+    // A blob that is on disk is not thereby usable: one whose bytes no
+    // longer hash to its name (a `core.autocrlf` checkout, a truncated
+    // file) fails every `apply`, so it is fetched again like a missing one.
+    let (missing_artifacts, corrupt_artifacts) = match &scoped_manifest {
+        None => (Vec::new(), Vec::new()),
+        Some(m) => {
+            let sorted = |set: std::collections::HashSet<String>| {
+                let mut ids: Vec<String> = set.into_iter().collect();
+                ids.sort();
+                ids
+            };
+            (
+                sorted(get_missing_blobs(m, &blobs_path).await),
+                sorted(get_corrupt_blobs(m, &blobs_path).await),
+            )
+        }
     };
+    let nothing_to_fetch = missing_artifacts.is_empty() && corrupt_artifacts.is_empty();
     // Whether stdout already carries a line, so the blank separators
-    // between sections never open the output (the offline warning goes
-    // to stderr).
-    let mut stdout_started = !args.common.offline || missing_artifacts.is_empty();
-    let primary = match scoped_manifest.as_ref() {
-        Some(m) if !missing_artifacts.is_empty() => {
-            download_pass(args, client, m, &missing_artifacts, &blobs_path).await
+    // between sections never open the output (the offline errors go to
+    // stderr).
+    let mut stdout_started = !args.common.offline || nothing_to_fetch;
+    let primary = if nothing_to_fetch {
+        if !quiet {
+            println!("{}", format_nothing_missing(manifest.as_ref()));
         }
-        _ => {
-            if !quiet {
-                println!("{}", format_nothing_missing(manifest.as_ref()));
-            }
-            DownloadPass::default()
-        }
+        DownloadPass::default()
+    } else {
+        download_pass(
+            args,
+            client,
+            &missing_artifacts,
+            &corrupt_artifacts,
+            &blobs_path,
+        )
+        .await
     };
-    let missing_count = primary.missing;
+    let wanted_count = primary.wanted;
     downloaded_count += primary.downloaded;
     download_failed_count += primary.failed;
+    // `--offline` never contacts the network, so a blob it found missing or
+    // corrupt stays that way and the next `apply --offline` fails on it:
+    // each is a failure of this run, not a note.
+    for (hash, fault) in &primary.offline_unrestored {
+        env.record(offline_unrestored_event(hash, *fault));
+    }
 
     // Step 1.5: vendored artifacts — health-check the ledger and re-vendor
     // missing/corrupt artifacts through the vendored backend (the patch
@@ -607,7 +735,12 @@ async fn repair_inner(
         // so a piped stdout never ends in a stray blank line when the
         // line itself goes to stderr.
         let other_failure = matches!(env.status, Status::PartialFailure | Status::Error);
-        let line = format_final_line(download_failed_count, other_failure, args.common.dry_run);
+        let line = format_final_line(
+            download_failed_count,
+            primary.offline_unrestored.len(),
+            other_failure,
+            args.common.dry_run,
+        );
         if download_failed_count > 0 || other_failure {
             if stdout_started {
                 eprintln!();
@@ -626,22 +759,26 @@ async fn repair_inner(
     // `PatchEvent::artifact` form (no PURL/UUID).
     //
     // Only the online path downloads (or, in dry-run, *would* download).
-    // In offline mode nothing is fetched even when artifacts are missing,
-    // so don't record a download/would-download event there — that would
-    // contradict the human-readable path, which only prints a warning.
-    if downloaded_count > 0 || (!args.common.offline && args.common.dry_run && missing_count > 0) {
+    // In offline mode nothing is fetched, so there is no download or
+    // would-download event: each blob it could not restore is a `failed`
+    // event of its own, recorded above.
+    if downloaded_count > 0 || (!args.common.offline && args.common.dry_run && wanted_count > 0) {
         let (action, count) = if args.common.dry_run {
-            (PatchAction::Verified, missing_count)
+            (PatchAction::Verified, wanted_count)
         } else {
             (PatchAction::Downloaded, downloaded_count)
         };
-        env.record(
-            PatchEvent::artifact(action).with_details(serde_json::json!({
-                "count": count,
-                // Always "file"; kept for the event's shape.
-                "downloadMode": "file",
-            })),
-        );
+        let mut details = serde_json::json!({
+            "count": count,
+            // Always "file"; kept for the event's shape.
+            "downloadMode": "file",
+        });
+        // How many of the pass's blobs were on disk but corrupt (the human
+        // path's "Found N corrupt blobs"); absent when none were.
+        if !corrupt_artifacts.is_empty() {
+            details["corrupt"] = corrupt_artifacts.len().into();
+        }
+        env.record(PatchEvent::artifact(action).with_details(details));
     }
     if download_failed_count > 0 {
         env.record(PatchEvent::artifact(PatchAction::Failed).with_error(
@@ -724,7 +861,7 @@ mod tests {
           "files": {
             "package/index.js": {
               "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-              "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
+              "afterHash":  "ec6300ae5bdb6ca9433c068514962f8f983e55f32803176f77d3e80a6345f147"
             }
           },
           "vulnerabilities": {},
@@ -735,8 +872,19 @@ mod tests {
       }
     }"#;
 
+    /// The manifest's one `afterHash`: the git-sha256 of [`REFERENCED_BYTES`],
+    /// so a blob written with them verifies.
     const REFERENCED_HASH: &str =
-        "1111111111111111111111111111111111111111111111111111111111111111";
+        "ec6300ae5bdb6ca9433c068514962f8f983e55f32803176f77d3e80a6345f147";
+    const REFERENCED_BYTES: &[u8] = b"kept";
+
+    #[test]
+    fn referenced_hash_names_the_referenced_bytes() {
+        assert_eq!(
+            socket_patch_core::hash::git_sha256::compute_git_sha256_from_bytes(REFERENCED_BYTES),
+            REFERENCED_HASH
+        );
+    }
 
     /// Write a `.socket/manifest.json` under `root` and return the socket dir.
     fn make_socket(root: &Path) -> PathBuf {
@@ -786,10 +934,35 @@ mod tests {
         })
     }
 
-    /// `--offline` skips the download phase: a missing artifact is a
-    /// warning, never a download or would-download event, dry run or not.
+    /// The `failed` events for blobs `--offline` could not restore, as
+    /// `(errorCode, details.hash, details.state)`.
+    fn unrestored(env: &Envelope) -> Vec<(String, String, String)> {
+        env.events
+            .iter()
+            .filter(|e| e.action == PatchAction::Failed)
+            .map(|e| {
+                let detail = |key: &str| {
+                    e.details
+                        .as_ref()
+                        .and_then(|d| d.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                (
+                    e.error_code.clone().unwrap_or_default(),
+                    detail("hash"),
+                    detail("state"),
+                )
+            })
+            .collect()
+    }
+
+    /// `--offline` cannot fetch a missing blob, and the next
+    /// `apply --offline` fails on it: the run is a failure that names the
+    /// blob, never a download or would-download event, dry run or not.
     #[tokio::test]
-    async fn offline_missing_artifact_records_no_download_event() {
+    async fn offline_missing_blob_fails_the_run_and_is_named() {
         for dry_run in [false, true] {
             let tmp = tempfile::tempdir().unwrap();
             let socket = make_socket(tmp.path());
@@ -808,8 +981,76 @@ mod tests {
                 env.events
             );
             assert_eq!(counts.downloaded, 0);
-            assert_eq!(env.status, Status::Success);
+            assert_eq!(env.status, Status::PartialFailure, "dry_run={dry_run}");
+            assert_eq!(
+                unrestored(&env),
+                vec![(
+                    "offline_missing_sources".to_string(),
+                    REFERENCED_HASH.to_string(),
+                    "missing".to_string()
+                )],
+                "dry_run={dry_run}"
+            );
         }
+    }
+
+    /// A blob that is on disk with the wrong bytes (here the CRLF form a
+    /// `core.autocrlf` checkout leaves) is not "present": offline it is a
+    /// named failure, and the bad file is left for an online repair.
+    #[tokio::test]
+    async fn offline_corrupt_blob_fails_the_run_and_is_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        write_blob(&socket, REFERENCED_HASH, b"ke\r\npt");
+
+        let args = offline_args(tmp.path());
+        let (env, counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
+
+        assert_eq!(counts.downloaded, 0);
+        assert_eq!(env.status, Status::PartialFailure);
+        assert_eq!(
+            unrestored(&env),
+            vec![(
+                "blob_corrupt".to_string(),
+                REFERENCED_HASH.to_string(),
+                "corrupt".to_string()
+            )]
+        );
+        assert_eq!(
+            std::fs::read(socket.join("blobs").join(REFERENCED_HASH)).unwrap(),
+            b"ke\r\npt",
+            "offline repair never deletes what it cannot replace"
+        );
+    }
+
+    /// An online dry run previews the re-download of a corrupt blob like
+    /// that of a missing one, and says how many were corrupt.
+    #[tokio::test]
+    async fn online_dry_run_previews_the_redownload_of_a_corrupt_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = make_socket(tmp.path());
+        write_blob(&socket, REFERENCED_HASH, b"truncat");
+        let mut args = offline_args(tmp.path());
+        args.common.offline = false;
+        args.common.dry_run = true;
+
+        let (env, _counts) =
+            repair_inner(&args, &socket.join("manifest.json"), &mut None, Vec::new())
+                .await
+                .expect("repair_inner");
+
+        let preview = env
+            .events
+            .iter()
+            .find(|e| e.action == PatchAction::Verified)
+            .and_then(|e| e.details.clone())
+            .expect("a would-download event");
+        assert_eq!(preview["count"], 1);
+        assert_eq!(preview["corrupt"], 1);
+        assert_eq!(env.status, Status::Success);
     }
 
     /// The online dry-run path *should* still preview the download — this
@@ -1037,19 +1278,27 @@ mod tests {
 
     #[test]
     fn found_missing_line() {
-        assert_eq!(format_found_missing(1), "Found 1 missing blob");
-        assert_eq!(format_found_missing(12), "Found 12 missing blobs");
+        assert_eq!(format_found(1, BlobFault::Missing), "Found 1 missing blob");
+        assert_eq!(
+            format_found(12, BlobFault::Missing),
+            "Found 12 missing blobs"
+        );
+        assert_eq!(format_found(2, BlobFault::Corrupt), "Found 2 corrupt blobs");
     }
 
     #[test]
-    fn offline_warning_singular_and_plural() {
+    fn offline_error_singular_and_plural() {
         assert_eq!(
-            format_offline_warning(&ids(&["a"])),
-            "Warning: 1 blob is missing (offline mode - not downloading):\n  - a"
+            format_offline_error(&ids(&["a"]), BlobFault::Missing),
+            "Error: 1 blob is missing (offline mode - not downloading):\n  - a"
         );
         assert_eq!(
-            format_offline_warning(&ids(&["b", "a"])),
-            "Warning: 2 blobs are missing (offline mode - not downloading):\n  - a\n  - b"
+            format_offline_error(&ids(&["b", "a"]), BlobFault::Missing),
+            "Error: 2 blobs are missing (offline mode - not downloading):\n  - a\n  - b"
+        );
+        assert_eq!(
+            format_offline_error(&ids(&["a"]), BlobFault::Corrupt),
+            "Error: 1 blob is corrupt (offline mode - not downloading):\n  - a"
         );
     }
 
@@ -1118,26 +1367,37 @@ mod tests {
 
     #[test]
     fn final_line_reflects_failures_and_dry_run() {
-        assert_eq!(format_final_line(0, false, false), "Repair complete.");
+        assert_eq!(format_final_line(0, 0, false, false), "Repair complete.");
         assert_eq!(
-            format_final_line(0, false, true),
+            format_final_line(0, 0, false, true),
             "Dry run: no changes made."
         );
         assert_eq!(
-            format_final_line(1, false, false),
+            format_final_line(1, 0, false, false),
             "Repair finished with errors: 1 blob was not downloaded."
         );
         assert_eq!(
-            format_final_line(2, true, false),
+            format_final_line(2, 0, true, false),
             "Repair finished with errors: 2 blobs were not downloaded."
+        );
+        // Blobs `--offline` left missing or corrupt (exit 1), dry run or not.
+        assert_eq!(
+            format_final_line(0, 1, true, false),
+            "Repair finished with errors: 1 blob could not be restored in offline mode. \
+             Re-run without --offline to download it."
+        );
+        assert_eq!(
+            format_final_line(0, 3, true, true),
+            "Repair finished with errors: 3 blobs could not be restored in offline mode. \
+             Re-run without --offline to download them."
         );
         // A failed vendored rebuild (exit 1) never closes on "complete".
         assert_eq!(
-            format_final_line(0, true, false),
+            format_final_line(0, 0, true, false),
             "Repair finished with errors."
         );
         assert_eq!(
-            format_final_line(0, true, true),
+            format_final_line(0, 0, true, true),
             "Repair finished with errors."
         );
     }

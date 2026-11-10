@@ -4766,13 +4766,17 @@ fn checkout_with_cache(fx: &RedirectFixture, src: &Path, name: &str) -> PathBuf 
 
 /// #1260 through one unwind `command` (`rollback` / `remove`): a project
 /// that ran `bundle cache` while the hosted pin was live commits the
-/// PATCHED archive. The unwind puts the manifest pair back on rubygems.org
-/// but cannot make that archive upstream, and bundler installs from its
-/// cache first: a fresh checkout either fails on the restored upstream
-/// checksum (exit 37) or keeps installing the patched bytes. The unwind
-/// must name the file, and deleting it must be the whole remedy.
-fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) {
-    let dir = stage_fresh_checkout(fx, &format!("cache-{command}"));
+/// PATCHED archive, and bundler installs from its cache first: left there
+/// after the unwind, a fresh checkout either fails on the restored upstream
+/// checksum (exit 37) or keeps installing the patched bytes.
+///
+/// `refresh` (the default run): the unwind brings the archive, and the
+/// project's installed gem, back to the upstream gem itself, so a fresh
+/// frozen checkout installs the upstream bytes with no further step. With
+/// `--no-gem-install-refresh` the unwind only names the file, and deleting
+/// it must be the whole remedy.
+fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str, refresh: bool) {
+    let dir = stage_fresh_checkout(fx, &format!("cache-{command}-{refresh}"));
     let install = bundle(&dir, &["install"]);
     assert!(
         install.status.success(),
@@ -4806,6 +4810,10 @@ fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) 
     if command == "remove" {
         argv.push("--yes");
     }
+    if !refresh {
+        argv.push("--no-gem-install-refresh");
+    }
+    let cached_while_hosted = std::fs::read(&archive).unwrap();
     argv.extend([
         "--api-url",
         &api,
@@ -4834,11 +4842,72 @@ fn unwind_names_the_patched_cached_archive(fx: &RedirectFixture, command: &str) 
                 .collect()
         })
         .unwrap_or_default();
+    let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    if refresh {
+        assert!(
+            hits.is_empty(),
+            "{command}: the archive was refreshed, not warned about: {env}"
+        );
+        let refreshed = env["warnings"]
+            .as_array()
+            .map(|w| {
+                w.iter()
+                    .filter(|w| w["code"] == "upstream_gem_install_refreshed")
+                    .count()
+            })
+            .unwrap_or(0);
+        assert_eq!(
+            refreshed, 2,
+            "{command}: the installed gem and the cached archive: {env}"
+        );
+        assert!(
+            std::fs::read(&archive).unwrap() != cached_while_hosted,
+            "{command}: the cached archive is no longer the patched gem"
+        );
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: the installed gem is the upstream one again"
+        );
+        // Every reinstall keeps the upstream bytes, and so does a fresh
+        // frozen checkout that carries the committed cache.
+        for args in [&["install"][..], &["pristine"][..]] {
+            let out = bundle(&dir, args);
+            assert!(
+                out.status.success(),
+                "{command}: bundle {args:?} after the unwind:\n{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                std::fs::read(&installed).unwrap(),
+                orig_lib().into_bytes(),
+                "{command}: bundle {args:?} keeps the upstream bytes"
+            );
+        }
+        let fixed = checkout_with_cache(fx, &dir, &format!("cache-{command}-refreshed"));
+        let install = bundle_env(&fixed, &["install"], &[("BUNDLE_FROZEN", "true")]);
+        assert!(
+            install.status.success(),
+            "{command}: frozen install from the refreshed cache:\n{}",
+            String::from_utf8_lossy(&install.stderr)
+        );
+        let lib = fresh_installed_lib(&fixed, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+        assert_eq!(
+            std::fs::read(&lib).unwrap(),
+            orig_lib().into_bytes(),
+            "{command}: the upstream bytes are installed"
+        );
+        return;
+    }
     assert_eq!(hits.len(), 1, "{command}: one stale-cache warning: {env}");
     let detail = hits[0]["detail"].as_str().unwrap();
     assert!(
         detail.contains(&archive.display().to_string()),
         "{command}: the warning names the cached archive: {detail}"
+    );
+    assert!(
+        std::fs::read(&archive).unwrap() == cached_while_hosted,
+        "{command}: an opted-out unwind leaves the archive alone"
     );
 
     // The defect the warning is about: with the archive left in place a
@@ -4904,8 +4973,134 @@ async fn gem_hosted_unwind_names_a_patched_archive_in_vendor_cache() {
     else {
         return;
     };
-    unwind_names_the_patched_cached_archive(&fx, "rollback");
-    unwind_names_the_patched_cached_archive(&fx, "remove");
+    for refresh in [true, false] {
+        unwind_names_the_patched_cached_archive(&fx, "rollback", refresh);
+        unwind_names_the_patched_cached_archive(&fx, "remove", refresh);
+    }
+}
+
+/// A warm project: the pre-redirect pair installed from the mock upstream
+/// into the project's `vendor/bundle`, as on a developer machine or a CI
+/// job with a restored bundle cache.
+fn stage_warm_install(fx: &RedirectFixture, name: &str) -> PathBuf {
+    let dir = fx.tmp.path().join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(fx.gemfile_name), &fx.pristine_gemfile).unwrap();
+    std::fs::write(dir.join(fx.lock_name), &fx.pristine_lock).unwrap();
+    copy_dir_recursive(&fx.proj.join(".bundle"), &dir.join(".bundle"));
+    let install = bundle(&dir, &["install"]);
+    assert!(
+        install.status.success(),
+        "warm install from the mock upstream:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+    dir
+}
+
+/// The stale-install refresh against the real bundler (the "Gem
+/// stale-install guard" section of CLI_CONTRACT.md): the upstream gem is
+/// ALREADY installed when the hosted scan runs, which is where bundler
+/// keeps the installed copy and reports success. The scan itself must
+/// leave the patched gem installed, and every way of reinstalling
+/// (`install`, `--redownload`, `pristine`, a frozen install) must succeed
+/// and keep it: before the refresh they kept the upstream bytes, failed on
+/// the pinned checksum (exit 37), or left the gem dir deleted.
+async fn scan_refreshes_a_warm_install(tag: &str, checksums_lock: bool) {
+    let Some(fx) = redirect_scanned_project(
+        tag,
+        Spelling::Gemfile,
+        checksums_lock,
+        true,
+        None,
+        Driver::ScanVex,
+    )
+    .await
+    else {
+        return;
+    };
+    let dir = stage_warm_install(&fx, "warm");
+    let lib = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        orig_lib().into_bytes(),
+        "premise: the upstream gem is installed before the scan"
+    );
+
+    let api = fx._server.uri();
+    let (code, stdout, stderr) = run_hosted_scan(&dir, &api);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\nstdout:\n{stdout}\nstderr:\n{stderr}"));
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    let codes: Vec<&str> = env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert!(
+        codes.contains(&"redirect_gem_install_refreshed")
+            && !codes.contains(&"redirect_gem_stale_install"),
+        "the scan refreshes the installed gem itself: {env}"
+    );
+    assert_eq!(
+        std::fs::read(&lib).unwrap(),
+        patched_lib().into_bytes(),
+        "the installed gem is the patched one right after the scan"
+    );
+
+    // With no CHECKSUMS section the scan leaves the lock for one unfrozen
+    // `bundle install` to converge (`redirect_gem_frozen_install`); with
+    // one, the pair is already what bundler writes.
+    if !checksums_lock {
+        let converge = bundle(&dir, &["install"]);
+        assert!(
+            converge.status.success(),
+            "the converging install:\n{}",
+            String::from_utf8_lossy(&converge.stderr)
+        );
+    }
+    assert_patched_install(&fx, &dir);
+
+    let redownload = if fx.bundler.at_least(2, 0) {
+        "--redownload"
+    } else {
+        "--force"
+    };
+    let flavors: [(&[&str], &[(&str, &str)]); 4] = [
+        (&["install"], &[]),
+        (&["install", redownload], &[]),
+        (&["pristine"], &[]),
+        (&["install"], &[("BUNDLE_FROZEN", "true")]),
+    ];
+    for (args, envs) in flavors {
+        let out = bundle_env(&dir, args, envs);
+        assert!(
+            out.status.success(),
+            "bundle {args:?} {envs:?} after the refresh:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read(&lib).unwrap(),
+            patched_lib().into_bytes(),
+            "bundle {args:?} {envs:?} keeps the patched bytes"
+        );
+    }
+    assert_patched_install(&fx, &dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 1.17); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_scan_refreshes_a_warm_install() {
+    scan_refreshes_a_warm_install("warm-refresh", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "host capstone: shells out to a real ruby/gem/bundler (>= 2.6 for the CHECKSUMS lock); \
+            the unpinned `test` job skips it, an e2e job with a pinned toolchain runs it via --ignored"]
+async fn gem_hosted_scan_refreshes_a_warm_install_with_a_checksums_lock() {
+    scan_refreshes_a_warm_install("warm-refresh-checksums", true).await;
 }
 
 /// The vendored half of the patch API for the fixture's patch: the
@@ -5021,12 +5216,28 @@ fn vendored_unwind_names_the_patched_cached_archive(fx: &RedirectFixture, comman
     ];
     let envs = [("SOCKET_RUBYGEMS_URL", upstream.as_str())];
 
+    // What bundler already holds when the takeover runs: the patched gem
+    // it installed from the patch registry, and the patched archive.
+    let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    let held = (
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(&archive).unwrap(),
+    );
+    assert!(held.0 == patched_lib().into_bytes(), "{command}: premise");
+
     let mut takeover = vec!["get", UUID, "--mode", "vendored", "--yes"];
     takeover.extend(common);
     let (code, stdout, stderr) = run_socket_env(&dir, &takeover, &envs);
     assert_eq!(
         code, 0,
         "{command}: takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The takeover leaves them alone: bundler loads the vendored copy from
+    // now on, and resetting an unused copy to upstream would only cost a
+    // download and leave an unpatched leftover.
+    assert!(
+        std::fs::read(&installed).unwrap() == held.0 && std::fs::read(&archive).unwrap() == held.1,
+        "{command}: the takeover changed a gem bundler already held"
     );
     let gemfile = std::fs::read_to_string(dir.join(fx.gemfile_name)).unwrap();
     assert!(

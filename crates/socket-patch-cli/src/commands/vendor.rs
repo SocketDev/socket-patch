@@ -1357,6 +1357,9 @@ async fn run_check(args: &VendorArgs) -> i32 {
     };
     let go_sync_issues =
         socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
+    // Read only: the parents of a suffixed Maven pom, when a cache of this
+    // machine holds them, say whether the pom resolves what its upstream does.
+    let jvm_caches = socket_patch_core::crawlers::jvm_cache::all_local_roots(root);
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1367,7 +1370,12 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
-            match vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()) {
+            match vendor::jvm::apply::check_entry_in(
+                root,
+                entry,
+                local_repo.as_deref(),
+                &jvm_caches,
+            ) {
                 Ok(None) => {}
                 // Intact and wired, but `vex` will not attest it: a
                 // declaration may still build the base. Re-vendoring cannot
@@ -2432,7 +2440,7 @@ async fn run_eject(
         // The vendored summary and its "Next steps:", deferred until the
         // eject is known to stand: a failed one is rolled back (or needs
         // the manual restore its error names), so neither applies.
-        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true);
+        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true, None);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     drop(guard);
@@ -3171,7 +3179,7 @@ pub(crate) async fn vendor_records(
     ledger: std::io::Result<VendorState>,
 ) -> bool {
     vendor_records_reusing(
-        common, records, sources, detached, force, env, service, ledger, None, None,
+        common, records, sources, detached, force, env, service, ledger, None, None, None,
     )
     .await
 }
@@ -3194,6 +3202,9 @@ pub(crate) async fn vendor_records_reusing(
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
     mut eject: Option<&mut EjectCapture>,
+    // Lines for the human close to print under its summary line (see
+    // `VendoredBackend::with_closing_lines`).
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) -> bool {
     let mut has_errors = false;
     // This run's events start here (`scan --mode vendored` hands over an
@@ -4356,28 +4367,51 @@ pub(crate) async fn vendor_records_reusing(
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
         Some(capture) => capture.wired_flavors = wired_flavors,
-        None => print_vendor_closing(common, env, dry_in_sync, &wired_flavors, !commit_failed),
+        None => print_vendor_closing(
+            common,
+            env,
+            dry_in_sync,
+            &wired_flavors,
+            !commit_failed,
+            closing_lines,
+        ),
     }
 
     has_errors
 }
 
-/// The human close of a vendor run: the summary line, then — when
-/// something was vendored and `next_steps` (the run's commit landed) — the
-/// commit and reinstall "Next steps:" for the lockfile flavors the run
-/// wired.
+/// The human close of a vendor run: the summary line, the caller's
+/// `closing_lines` for the packages the run vendored or found already
+/// vendored, then — when something was vendored and `next_steps` (the run's
+/// commit landed) — the commit and reinstall "Next steps:" for the lockfile
+/// flavors the run wired.
 fn print_vendor_closing(
     common: &GlobalArgs,
     env: &Envelope,
     dry_in_sync: u32,
     wired_flavors: &HashSet<String>,
     next_steps: bool,
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) {
     if common.json || common.silent {
         return;
     }
     let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
     println!("{}", format_vendor_summary(common.dry_run, &tally));
+    if let Some(lines) = closing_lines {
+        let vendored: Vec<&str> = env
+            .events
+            .iter()
+            .filter(|e| {
+                e.action == PatchAction::Applied
+                    || e.error_code.as_deref() == Some("already_vendored")
+            })
+            .filter_map(|e| e.purl.as_deref())
+            .collect();
+        for line in lines(&vendored) {
+            println!("{line}");
+        }
+    }
     if env.summary.applied > 0 && !common.dry_run && next_steps {
         // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
         // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired

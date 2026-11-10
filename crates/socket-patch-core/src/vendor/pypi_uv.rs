@@ -36,7 +36,7 @@ use crate::patch::redirect::upstream::{
 use crate::utils::fs::{atomic_write_bytes_preserving_mode, read_regular_to_string};
 use crate::utils::line_endings::terminator;
 use crate::utils::purl::purl_name_version;
-use crate::utils::python_lock::preserve_line_endings;
+use crate::utils::python_lock::preserve_each_line_ending;
 use crate::utils::python_script::{
     find_ancestor_uv_config, refuse_uv_no_binary, refuse_uv_no_sources,
     refuse_uv_project_shadowing, root_governs_script, UvConfig, UV_TOML,
@@ -348,6 +348,7 @@ pub(super) enum UvTarget {
 pub(super) fn check_target_guards(
     p: &UvProject,
     canon_name: &str,
+    version: &str,
     record_uuid: &str,
 ) -> Result<UvTarget, (&'static str, String)> {
     // uv drops the [tool.uv.sources] entry under no-sources (or a
@@ -366,28 +367,41 @@ pub(super) fn check_target_guards(
         .map_err(|detail| ("pypi_uv_ancestor_settings", detail))?;
     // The same name at multiple versions/sources (platform forks) means one
     // surgical [[package]] rewrite would mispin the other forks — refuse.
-    let units = p
+    let mut units = p
         .lock
         .get("package")
         .and_then(Item::as_array_of_tables)
-        .map(|pkgs| {
-            pkgs.iter()
-                .filter(|t| t.get("name").and_then(Item::as_str) == Some(canon_name))
-                .count()
-        })
-        .unwrap_or(0);
-    if units == 0 {
+        .into_iter()
+        .flat_map(|pkgs| pkgs.iter())
+        .filter(|t| t.get("name").and_then(Item::as_str) == Some(canon_name));
+    let Some(unit) = units.next() else {
         return Err((
             "pypi_uv_lock_package_missing",
             format!("uv.lock has no [[package]] entry for {canon_name}; run `uv lock` first"),
         ));
-    }
-    if units > 1 {
+    };
+    if units.next().is_some() {
         return Err((
             "pypi_uv_lock_forked_package",
             format!(
                 "uv.lock resolves {canon_name} at multiple versions/sources (a forked \
                  resolution); vendoring would mispin the other forks"
+            ),
+        ));
+    }
+    // The wheel replaces the release the lock resolves, never another one:
+    // every manifest patch is a candidate, the ones for a release the
+    // project has since moved off included, and wiring one of those would
+    // move the project back to it.
+    let locked_version = unit.get("version").and_then(Item::as_str).unwrap_or("");
+    if !crate::utils::pep440::versions_equal(locked_version, version) {
+        return Err((
+            "pypi_uv_lock_package_missing",
+            format!(
+                "uv.lock resolves {canon_name} at {locked_version:?}, not the patched {version}; \
+                 the patch is for another release than the project locks, so nothing is wired \
+                 (drop it with `socket-patch remove pkg:pypi/{canon_name}@{version}`, or scan \
+                 again for a patch of the locked release)"
             ),
         ));
     }
@@ -567,7 +581,7 @@ pub(super) async fn wire_uv(
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     // Before ANY write: a symlinked half would be replaced by the rename.
     refuse_symlinked(root, &UV_PAIR).await?;
-    match check_target_guards(p, canon_name, record_uuid)? {
+    match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
         // "original", and a re-run requires-dist rewrite would append a
@@ -660,10 +674,8 @@ pub(super) async fn wire_uv(
                     .and_then(Item::as_value)
                     .map(|v| v.to_string().trim().to_string())
                     .unwrap_or_default();
-                // Multi-line arrays render LF; record both fragments in the
-                // file's own convention or revert's exact-text splice misses.
-                let old_text = preserve_line_endings(&p.pyproject_text, old_text);
-                let new_text = preserve_line_endings(&p.pyproject_text, new_text);
+                // Both fragments are respelled below, once the file is
+                // rendered, as the bytes it holds on each side of the edit.
                 wiring.push(record(
                     "pyproject.toml",
                     "uv_override",
@@ -700,7 +712,26 @@ pub(super) async fn wire_uv(
     ));
     // toml_edit re-emits every newline as LF; a CRLF pyproject would come
     // back all-LF (whole-file churn, and revert splices never restore it).
-    let new_pyproject = preserve_line_endings(&p.pyproject_text, doc.to_string());
+    // One mixing CRLF and LF lines gets each line's own ending back.
+    let new_pyproject = preserve_each_line_ending(&p.pyproject_text, doc.to_string());
+    // A rewritten array's lines render LF and are then given the file's
+    // endings line by line, so it is recorded as the bytes the file holds
+    // before and after: revert splices it back by exact text.
+    if let Some(rec) = wiring
+        .iter_mut()
+        .find(|r| r.kind == "uv_override" && r.action == WiringAction::Rewritten)
+    {
+        let (old, new) = override_array_text(&p.pyproject_text)
+            .zip(override_array_text(&new_pyproject))
+            .ok_or_else(|| {
+                (
+                    "pypi_uv_lock_parse_failed",
+                    "cannot locate [tool.uv] override-dependencies in pyproject.toml".to_string(),
+                )
+            })?;
+        rec.original = Some(serde_json::Value::String(old.to_string()));
+        rec.new = Some(serde_json::Value::String(new.to_string()));
+    }
     // toml_edit writes each added key in the spelling its parent already
     // uses (`sources.six = …` under a dotted `[tool.uv]` key, `uv.…` under
     // `[tool]`), so record the line as it actually rendered: revert splices
@@ -727,12 +758,21 @@ pub(super) async fn wire_uv(
     // from the vendored wheel's core METADATA. Without it `uv lock --check`
     // reports the lock stale and a plain `uv sync` silently rewrites the block
     // back in — lock churn that also defeats a byte-exact `vendor --revert`.
-    let metadata_block = wheel_metadata_block(&root.join(rel_wheel)).await;
+    let metadata_block = wheel_metadata_block(&root.join(rel_wheel))
+        .await
+        .map_err(|why| {
+            (
+                "pypi_uv_metadata_unsupported",
+                format!(
+                    "the patched {canon_name} {version} artifact declares dependency metadata \
+                     that uv.lock cannot record: {why}"
+                ),
+            )
+        })?;
 
     let (old_unit, new_unit) = rewrite_target_package_unit(
         &new_lock,
         canon_name,
-        version,
         rel_wheel,
         wheel_file_name,
         wheel_sha256_hex,
@@ -1696,6 +1736,19 @@ fn header_is_ours(item: Option<&Item>) -> bool {
     }
 }
 
+/// The bytes of `[tool.uv] override-dependencies`' value in the pyproject
+/// `text`, from its `[` to its `]`.
+fn override_array_text(text: &str) -> Option<&str> {
+    let doc = toml_edit::Document::parse(text).ok()?;
+    let span = doc
+        .get("tool")?
+        .get("uv")?
+        .get("override-dependencies")?
+        .as_value()?
+        .span()?;
+    text.get(span)
+}
+
 /// The line of `new` that renders the added `fragment` (`key = value`),
 /// including any dotted-key prefix toml_edit gave it, without its line
 /// ending. Only lines absent from `old` count, so a user's identical line
@@ -1787,8 +1840,9 @@ fn unit_is_root(lines: &[&str]) -> bool {
 
 /// Rewrite the target `[[package]]` unit to the path-wheel shape proven by
 /// the fixtures: `source = { path = ... }`, `sdist` dropped, `wheels` becomes
-/// the single `{ filename, hash }` element, `version` pinned to the vendored
-/// version. `metadata_block`, when present, is the reconstructed
+/// the single `{ filename, hash }` element. The `version` line stays the
+/// lock's own: [`check_target_guards`] admits only a patch for the release
+/// it names. `metadata_block`, when present, is the reconstructed
 /// `[package.metadata]` section a path source needs (registry packages omit
 /// it — see [`wheel_metadata_block`]); it is appended after the unit so the
 /// whole rewrite stays inside the single `uv_lock_package` wiring record and
@@ -1797,7 +1851,6 @@ fn unit_is_root(lines: &[&str]) -> bool {
 fn rewrite_target_package_unit(
     lock_text: &str,
     canon: &str,
-    version: &str,
     rel_wheel: &str,
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
@@ -1834,9 +1887,7 @@ fn rewrite_target_package_unit(
     let mut i = 0;
     while i < unit.len() {
         let line = unit[i];
-        if line.starts_with("version = ") {
-            out.push(format!("version = \"{version}\""));
-        } else if line.starts_with("source = ") {
+        if line.starts_with("source = ") {
             out.push(format!("source = {{ path = \"{rel_wheel}\" }}"));
         } else if line.starts_with("sdist = ") {
             // dropped: a path-wheel source has no sdist (fixture-pinned)
@@ -2290,25 +2341,31 @@ struct MetaDep {
     marker: Option<String>,
 }
 
-/// Best-effort: read the vendored wheel's core METADATA and render the
-/// `[package.metadata]` block a uv path source needs. `None` when the wheel
-/// can't be read, has no `*.dist-info/METADATA`, or (like `six`) declares no
-/// requires-dist / provides-extras — uv omits the block in that case too, so
-/// the fixtures that pass no block stay byte-exact.
-pub(super) async fn wheel_metadata_block(wheel_path: &Path) -> Option<String> {
-    let bytes = tokio::fs::read(wheel_path).await.ok()?;
-    let text = if wheel_path.to_string_lossy().ends_with(".whl") {
-        wheel_metadata_text(&bytes)?
-    } else {
-        let members =
-            super::pypi_distribution::read_members(&bytes, &wheel_path.to_string_lossy()).ok()?;
-        let metadata = members.get("PKG-INFO")?;
-        if metadata.len() > 4 * 1024 * 1024 {
-            return None;
-        }
-        String::from_utf8(metadata.clone()).ok()?
+/// Read the vendored wheel's core METADATA and render the
+/// `[package.metadata]` block a uv path source needs. `Ok(None)` when the
+/// wheel can't be read, has no `*.dist-info/METADATA`, or (like `six`)
+/// declares no requires-dist / provides-extras — uv omits the block in that
+/// case too, so the fixtures that pass no block stay byte-exact. `Err(why)`
+/// when it declares dependency metadata a uv lock cannot hold
+/// ([`render_package_metadata_block`]).
+pub(super) async fn wheel_metadata_block(wheel_path: &Path) -> Result<Option<String>, String> {
+    let Ok(bytes) = tokio::fs::read(wheel_path).await else {
+        return Ok(None);
     };
-    render_package_metadata_block(&text)
+    let name = wheel_path.to_string_lossy();
+    let text = if name.ends_with(".whl") {
+        wheel_metadata_text(&bytes)
+    } else {
+        super::pypi_distribution::read_members(&bytes, &name)
+            .ok()
+            .and_then(|mut members| members.remove("PKG-INFO"))
+            .filter(|metadata| metadata.len() as u64 <= MAX_WHEEL_METADATA_BYTES)
+            .and_then(|metadata| String::from_utf8(metadata).ok())
+    };
+    match text {
+        Some(text) => render_package_metadata_block(&text),
+        None => Ok(None),
+    }
 }
 
 /// Extract the top-level `*.dist-info/METADATA` text from a wheel zip.
@@ -2369,43 +2426,60 @@ fn parse_core_metadata_fields(text: &str) -> (Vec<String>, Vec<String>) {
 }
 
 /// Parse one PEP 508 `Requires-Dist` value into its uv inline-table pieces.
-/// `None` when the leading distribution name is missing (a malformed line) —
-/// the caller then drops the whole block rather than emit partial TOML.
-fn parse_requires_dist(raw: &str) -> Option<MetaDep> {
+/// `Err(why)` when it is not a requirement a lock entry can record as
+/// `{ name, extras, marker, specifier }`. uv parses each of those strings
+/// again when it loads the lock, so a piece that is not what its key holds
+/// (a specifier that is no PEP 440 specifier, an extra that is no name)
+/// would leave a lock no uv command can read.
+fn parse_requires_dist(raw: &str) -> Result<MetaDep, String> {
     let raw = raw.trim();
     let (req, marker) = match raw.split_once(';') {
         Some((r, m)) => (r.trim(), Some(m.trim().to_string())),
         None => (raw, None),
     };
     let marker = marker.filter(|m| !m.is_empty());
+    // No PEP 508 marker holds one, quoted or not.
+    if marker
+        .as_deref()
+        .is_some_and(|m| m.chars().any(char::is_control))
+    {
+        return Err("has a control character in its environment marker".to_string());
+    }
 
     let name_end = req
         .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')))
         .unwrap_or(req.len());
-    if name_end == 0 {
-        return None;
+    if !is_pep508_identifier(&req[..name_end]) {
+        return Err("does not start with a distribution name".to_string());
     }
     let name = canonicalize_pypi_name(&req[..name_end]);
     let mut rest = req[name_end..].trim_start();
 
     let mut extras = Vec::new();
     if let Some(after_open) = rest.strip_prefix('[') {
-        let close = after_open.find(']')?;
-        extras = after_open[..close]
+        let close = after_open.find(']').ok_or("has an unclosed extras list")?;
+        for extra in after_open[..close]
             .split(',')
             .map(str::trim)
             .filter(|e| !e.is_empty())
-            .map(canonicalize_pypi_name)
-            .collect();
+        {
+            if !is_pep508_identifier(extra) {
+                return Err("names an extra that is not a PEP 508 identifier".to_string());
+            }
+            extras.push(canonicalize_pypi_name(extra));
+        }
         rest = after_open[close + 1..].trim_start();
     }
 
     // A PEP 508 direct reference (`name @ https://…`) has no PEP 440
-    // specifier form uv could parse back out of the lock — fail closed (the
-    // caller drops the whole block; `uv sync` heals it) rather than emit a
-    // bogus `specifier = "@https://…"`.
+    // specifier form: uv records it as a source, which this reconstruction
+    // does not write.
     if rest.starts_with('@') {
-        return None;
+        return Err(
+            "is a direct reference, which a lock entry records as a source rather than a \
+             specifier"
+                .to_string(),
+        );
     }
 
     // The version specifier may be wrapped in parens (older METADATA style,
@@ -2415,14 +2489,70 @@ fn parse_requires_dist(raw: &str) -> Option<MetaDep> {
     if let Some(inner) = spec.strip_prefix('(').and_then(|s| s.strip_suffix(')')) {
         spec = inner.trim();
     }
-    let specifier =
+    let specifier: Option<String> =
         (!spec.is_empty()).then(|| spec.chars().filter(|c| !c.is_whitespace()).collect());
+    if specifier
+        .as_deref()
+        .is_some_and(|s| !is_pep440_specifier(s))
+    {
+        return Err("has a version specifier that is not a PEP 440 specifier".to_string());
+    }
 
-    Some(MetaDep {
+    Ok(MetaDep {
         name,
         extras,
         specifier,
         marker,
+    })
+}
+
+/// Whether `text` is a PEP 508 identifier (a distribution or extra name):
+/// ASCII letters and digits, with `.`, `-` and `_` only between them.
+fn is_pep508_identifier(text: &str) -> bool {
+    let alphanumeric = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric());
+    alphanumeric(text.chars().next())
+        && alphanumeric(text.chars().next_back())
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+}
+
+/// Whether the whitespace-free `specifier` is a PEP 440 specifier set as uv
+/// loads one from a lock (checked against uv 0.11.19, which fails to parse
+/// the whole lock on any other): comma-separated `<operator><version>`
+/// clauses, no empty one, each version a valid one, `===` included. A
+/// trailing `.*` goes with `==` / `!=` on a plain release, a local label
+/// (`+…`) with the equality operators, and `~=` wants two release segments.
+fn is_pep440_specifier(specifier: &str) -> bool {
+    specifier.split(',').all(|clause| {
+        // The longer operator of each pair first.
+        let Some((op, version)) = ["===", "~=", "==", "!=", "<=", ">=", "<", ">"]
+            .iter()
+            .find_map(|op| Some((*op, clause.strip_prefix(op)?)))
+        else {
+            return false;
+        };
+        let (version, wildcard) = match version.strip_suffix(".*") {
+            Some(prefix) => (prefix, true),
+            None => (version, false),
+        };
+        let Some(normal) = crate::utils::pep440::normalize(version) else {
+            return false;
+        };
+        // `[N!]release[pre][.post][.dev][+local]`, the release first.
+        let after_epoch = normal.split_once('!').map_or(normal.as_str(), |(_, v)| v);
+        let release = after_epoch
+            .split(|c: char| !(c.is_ascii_digit() || c == '.'))
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        let local = normal.contains('+');
+        match op {
+            "==" | "!=" => !wildcard || release == after_epoch,
+            "===" => !wildcard,
+            "~=" => !wildcard && !local && release.contains('.'),
+            _ => !wildcard && !local,
+        }
     })
 }
 
@@ -2431,77 +2561,98 @@ fn toml_basic_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Render one parsed dependency as a uv `requires-dist` inline table
+/// `text` as the TOML basic string (`"…"`) every string of a uv lock is,
+/// or `None` when that spelling does not hold it. toml_edit reads the
+/// spelling back, so the value is `text` and nothing else. Left to choose,
+/// toml_edit spells a string holding a double quote as a literal (`'…'`)
+/// or `"""` string: a marker the wheel wrote with double quotes would come
+/// out as no uv lock spells one, and unlike the entries already wired.
+fn toml_basic_string(text: &str) -> Option<Value> {
+    let value: Value = format!("\"{}\"", toml_basic_escape(text)).parse().ok()?;
+    (value.as_str() == Some(text)).then_some(value)
+}
+
+/// One parsed dependency as a uv `requires-dist` inline table
 /// (`{ name = …, extras = […], marker = "…", specifier = "…" }`, key order
-/// matching uv's serializer).
-fn render_requires_dist_entry(dep: &MetaDep) -> String {
-    let mut parts = vec![format!("name = \"{}\"", dep.name)];
+/// matching uv's serializer). `None` when a piece has no basic-string
+/// spelling.
+fn requires_dist_entry(dep: &MetaDep) -> Option<toml_edit::InlineTable> {
+    let mut entry = toml_edit::InlineTable::new();
+    entry.insert("name", toml_basic_string(&dep.name)?);
     if !dep.extras.is_empty() {
-        let extras = dep
-            .extras
-            .iter()
-            .map(|e| format!("\"{e}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        parts.push(format!("extras = [{extras}]"));
+        let mut extras = toml_edit::Array::new();
+        for extra in &dep.extras {
+            extras.push(toml_basic_string(extra)?);
+        }
+        entry.insert("extras", Value::Array(extras));
     }
     if let Some(marker) = &dep.marker {
-        parts.push(format!("marker = \"{}\"", toml_basic_escape(marker)));
+        entry.insert("marker", toml_basic_string(marker)?);
     }
     if let Some(specifier) = &dep.specifier {
-        parts.push(format!("specifier = \"{specifier}\""));
+        entry.insert("specifier", toml_basic_string(specifier)?);
     }
-    format!("{{ {} }}", parts.join(", "))
+    Some(entry)
 }
 
 /// Reconstruct uv's `[package.metadata]` block for a path source from its
-/// wheel core METADATA text. Returns the block (no leading/trailing newline)
-/// or `None` when there is nothing to record (no requires-dist AND no
-/// provides-extras) or a `Requires-Dist` line fails to parse — in which case
-/// we emit no block rather than risk malformed TOML (`uv sync` then heals it
-/// instead of failing to parse the lock).
-pub(super) fn render_package_metadata_block(metadata_text: &str) -> Option<String> {
+/// wheel core METADATA text: the block (no leading/trailing newline), or
+/// `Ok(None)` when there is nothing to record (no requires-dist AND no
+/// provides-extras).
+///
+/// The values are the wheel's own text, so every one is built as a TOML
+/// value: whatever it holds, it is one string in the lock and never
+/// syntax. `Err(why)` names the first `Requires-Dist` / `Provides-Extra`
+/// line a lock entry cannot hold ([`parse_requires_dist`]); the caller
+/// refuses the wheel instead of wiring a lock uv could not load.
+pub(super) fn render_package_metadata_block(metadata_text: &str) -> Result<Option<String>, String> {
     let (requires_raw, provides_raw) = parse_core_metadata_fields(metadata_text);
     if requires_raw.is_empty() && provides_raw.is_empty() {
-        return None;
+        return Ok(None);
     }
+    let unrepresentable = |field: &str, raw: &str, why: &str| {
+        let shown: String = raw.chars().take(120).collect();
+        format!("{field} `{}` {why}", terminal_safe(&shown))
+    };
 
-    let mut entries = Vec::with_capacity(requires_raw.len());
+    let mut requires = toml_edit::Array::new();
     for raw in &requires_raw {
-        entries.push(render_requires_dist_entry(&parse_requires_dist(raw)?));
+        let entry = parse_requires_dist(raw)
+            .and_then(|dep| {
+                requires_dist_entry(&dep).ok_or_else(|| "does not spell as TOML".to_string())
+            })
+            .map_err(|why| unrepresentable("Requires-Dist", raw, &why))?;
+        requires.push(entry);
     }
-
-    let mut block = String::from("[package.metadata]\n");
-    match entries.len() {
-        0 => block.push_str("requires-dist = []"),
-        1 => {
-            block.push_str("requires-dist = [");
-            block.push_str(&entries[0]);
-            block.push(']');
+    // uv keeps one entry on the key's line and gives several a line each.
+    if requires.len() > 1 {
+        for entry in requires.iter_mut() {
+            entry.decor_mut().set_prefix("\n    ");
         }
-        _ => {
-            block.push_str("requires-dist = [\n");
-            for entry in &entries {
-                block.push_str("    ");
-                block.push_str(entry);
-                block.push_str(",\n");
-            }
-            block.push(']');
-        }
+        requires.set_trailing_comma(true);
+        requires.set_trailing("\n");
     }
+    let mut metadata = DocumentMut::new();
+    metadata.insert("requires-dist", Item::Value(Value::Array(requires)));
 
     if !provides_raw.is_empty() {
-        let extras = provides_raw
-            .iter()
-            .map(|e| format!("\"{}\"", canonicalize_pypi_name(e)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        block.push_str("\nprovides-extras = [");
-        block.push_str(&extras);
-        block.push(']');
+        let mut provides = toml_edit::Array::new();
+        for raw in &provides_raw {
+            let extra = Some(raw.as_str())
+                .filter(|extra| is_pep508_identifier(extra))
+                .and_then(|extra| toml_basic_string(&canonicalize_pypi_name(extra)))
+                .ok_or_else(|| {
+                    unrepresentable("Provides-Extra", raw, "is not a PEP 508 identifier")
+                })?;
+            provides.push(extra);
+        }
+        metadata.insert("provides-extras", Item::Value(Value::Array(provides)));
     }
 
-    Some(block)
+    Ok(Some(format!(
+        "[package.metadata]\n{}",
+        metadata.to_string().trim_end()
+    )))
 }
 
 #[cfg(test)]
@@ -2635,11 +2786,11 @@ wheels = [
 
 [[package]]
 name = "six"
-version = "1.17.0"
+version = "1.16.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
 ]
 "#;
 
@@ -2830,9 +2981,116 @@ wheels = [
         );
     }
 
+    /// The registry `[[package]]` unit of six 1.17.0, as uv writes it.
+    const SIX_1_17_UNIT: &str = r#"[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+    /// `lock` with its registry six 1.16.0 unit replaced by the 1.17.0 one:
+    /// the project moved on to the next release.
+    fn bumped_to_1_17(lock: &str) -> String {
+        let at = lock
+            .find("[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n")
+            .expect("the lock holds six 1.16.0");
+        assert!(lock[at..].contains("registry"), "a registry unit");
+        format!("{}{SIX_1_17_UNIT}", &lock[..at])
+    }
+
+    /// A patch for another release than the lock resolves (a manifest entry
+    /// left behind by a dependency bump) is refused, declared or transitive:
+    /// wiring it would move the project back to the patch's version. With
+    /// patches for both releases, the one the lock resolves is the one
+    /// wired, and the unit keeps the lock's own `version` line.
+    #[tokio::test]
+    async fn a_patch_for_another_version_than_the_lock_resolves_is_refused() {
+        const WHEEL_1_17: &str = "six-1.17.0-py2.py3-none-any.whl";
+        let rel_1_17 = format!(".socket/vendor/pypi/{UUID}/{WHEEL_1_17}");
+        for (label, pyproject, lock) in [
+            (
+                "direct",
+                DIRECT_REGISTRY_PYPROJECT.replace("six==1.16.0", "six>=1.16"),
+                bumped_to_1_17(DIRECT_REGISTRY_LOCK).replace("\"==1.16.0\"", "\">=1.16\""),
+            ),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT.to_string(),
+                bumped_to_1_17(TRANSITIVE_REGISTRY_LOCK),
+            ),
+        ] {
+            let tmp = write_pair(&pyproject, &lock).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            // The pre-flight refuses it, before any artifact is fetched.
+            let preflight = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
+            assert_eq!(preflight.0, "pypi_uv_lock_package_missing", "{label}");
+            assert_eq!(
+                check_target_guards(&p, "six", "1.17.0", UUID),
+                Ok(UvTarget::Fresh),
+                "{label}"
+            );
+            let err = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, "pypi_uv_lock_package_missing", "{label}: {}", err.1);
+            assert!(
+                err.1.contains("1.17.0") && err.1.contains("1.16.0"),
+                "{label}: the refusal names both versions: {}",
+                err.1
+            );
+            assert_eq!(
+                read_pair(tmp.path()).await,
+                (pyproject.clone(), lock.clone()),
+                "{label}: a refused patch leaves both files untouched"
+            );
+
+            let (wiring, _, _) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.17.0",
+                &rel_1_17,
+                WHEEL_1_17,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the locked release's patch wires: {e:?}"));
+            let (_, wired) = read_pair(tmp.path()).await;
+            assert!(
+                wired.contains(&format!(
+                    "name = \"six\"\nversion = \"1.17.0\"\nsource = {{ path = \"{rel_1_17}\" }}\n"
+                )),
+                "{label}: {wired}"
+            );
+            assert!(!wired.contains("1.16.0"), "{label}: {wired}");
+            let package = wiring
+                .iter()
+                .find(|w| w.kind == "uv_lock_package")
+                .expect("the package unit is recorded");
+            assert_eq!(
+                package.original.as_ref().and_then(|v| v.as_str()),
+                Some(SIX_1_17_UNIT.trim_end()),
+                "{label}: the recorded original is the lock's own unit"
+            );
+        }
+    }
+
     /// Transitive deps wire via override-dependencies, never
-    /// promotion — the result must byte-match the override-transitive pair,
-    /// including the lock's 1.17.0 → 1.16.0 version pin-down.
+    /// promotion — the result must byte-match the override-transitive pair.
     #[tokio::test]
     async fn override_wiring_matches_fixture_byte_identically() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
@@ -2877,7 +3135,8 @@ wheels = [
     #[tokio::test]
     async fn guards_refuse_shadowing_a_parents_uv_settings() {
         let target = |p: &UvProject| {
-            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+            check_target_guards(p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f")
+                .map(|_| ())
         };
         let nested = |parent: &'static str, text: &'static str| async move {
             let tmp = tempfile::tempdir().unwrap();
@@ -2985,7 +3244,8 @@ wheels = [
         // no-sources-package list naming the package, set in pyproject's
         // [tool.uv] or in a project uv.toml (which replaces it).
         let target = |p: &UvProject| {
-            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+            check_target_guards(p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f")
+                .map(|_| ())
         };
         for setting in ["no-sources = true", "no-sources-package = [\"Six\"]"] {
             let tmp = write_pair(
@@ -3134,7 +3394,7 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
         assert_eq!(
-            check_target_guards(&p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
+            check_target_guards(&p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
             Ok(UvTarget::InSync),
             "the same patch generation is in sync, not a refusal"
         );
@@ -3183,7 +3443,7 @@ wheels = [
         ] {
             let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let err = check_target_guards(&p, "six", UUID).unwrap_err();
+            let err = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             assert_eq!(err.0, "pypi_uv_source_already_exists", "{pyproject}");
             assert!(err.1.contains("PEP 508 direct reference"), "{}", err.1);
         }
@@ -3817,7 +4077,7 @@ wheels = [
         let tmp = write_pair(DIRECT_PATH_PYPROJECT, DIRECT_PATH_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::InSync),
             "precondition: the pair is in sync at this uuid"
         );
@@ -4116,7 +4376,7 @@ wheels = [
         // extra-gated dep with a bare specifier
         assert_eq!(
             parse_requires_dist("leftpad >=1.0 ; extra == 'fast'"),
-            Some(MetaDep {
+            Ok(MetaDep {
                 name: "leftpad".into(),
                 extras: vec![],
                 specifier: Some(">=1.0".into()),
@@ -4126,7 +4386,7 @@ wheels = [
         // legacy parenthesized specifier, no marker (uv strips the parens)
         assert_eq!(
             parse_requires_dist("six (>=1.5)"),
-            Some(MetaDep {
+            Ok(MetaDep {
                 name: "six".into(),
                 extras: vec![],
                 specifier: Some(">=1.5".into()),
@@ -4136,7 +4396,7 @@ wheels = [
         // extras in the name, name canonicalized, multi-constraint specifier
         assert_eq!(
             parse_requires_dist("PySocks[Fast,Slow] !=1.5.7,<2.0,>=1.5.6 ; extra == 'socks'"),
-            Some(MetaDep {
+            Ok(MetaDep {
                 name: "pysocks".into(),
                 extras: vec!["fast".into(), "slow".into()],
                 specifier: Some("!=1.5.7,<2.0,>=1.5.6".into()),
@@ -4146,7 +4406,7 @@ wheels = [
         // no specifier at all
         assert_eq!(
             parse_requires_dist("certifi ; extra == 'secure'"),
-            Some(MetaDep {
+            Ok(MetaDep {
                 name: "certifi".into(),
                 extras: vec![],
                 specifier: None,
@@ -4154,7 +4414,7 @@ wheels = [
             })
         );
         // a line with no leading name is rejected (fail-closed)
-        assert_eq!(parse_requires_dist(">=1.0"), None);
+        assert!(parse_requires_dist(">=1.0").is_err());
     }
 
     #[test]
@@ -4182,7 +4442,7 @@ wheels = [
                     \n\
                     body\n";
         assert_eq!(
-            render_package_metadata_block(text).as_deref(),
+            render_package_metadata_block(text).unwrap().as_deref(),
             Some(
                 "[package.metadata]\n\
                  requires-dist = [\n    \
@@ -4196,13 +4456,13 @@ wheels = [
         // one requires-dist, no extras → uv's single-line array form
         let single = "Name: x\nRequires-Dist: six (>=1.5)\n\n";
         assert_eq!(
-            render_package_metadata_block(single).as_deref(),
+            render_package_metadata_block(single).unwrap().as_deref(),
             Some("[package.metadata]\nrequires-dist = [{ name = \"six\", specifier = \">=1.5\" }]")
         );
 
         // a package with no requires-dist / provides-extras (like `six`) gets
         // NO block, so the fixtures that pass no block stay byte-exact.
-        assert_eq!(render_package_metadata_block("Name: six\n\n"), None);
+        assert_eq!(render_package_metadata_block("Name: six\n\n"), Ok(None));
     }
 
     #[test]
@@ -4210,7 +4470,7 @@ wheels = [
         let text = "Name: x\n\
                     Requires-Dist: brotlicffi >=0.8.0 ; os_name != \"nt\" and extra == 'brotli'\n\
                     Provides-Extra: brotli\n\n";
-        let block = render_package_metadata_block(text).unwrap();
+        let block = render_package_metadata_block(text).unwrap().unwrap();
         assert!(
             block.contains("marker = \"os_name != \\\"nt\\\" and extra == 'brotli'\""),
             "double quotes in the marker must be TOML-escaped: {block}"
@@ -4344,6 +4604,94 @@ wheels = [
         assert_eq!(
             lock, WIDGET_REGISTRY_LOCK,
             "revert must byte-restore uv.lock"
+        );
+    }
+
+    /// The wheel's `Requires-Dist` / `Provides-Extra` values reach uv.lock
+    /// only as TOML strings. A value that would close its own string used to
+    /// be spliced in as written: `specifier = ">=1.0", path = "/tmp/evil"`
+    /// (a key the wheel chose) or an unclosed inline table no uv command
+    /// could parse. Metadata that is not a requirement uv could read back is
+    /// refused before either file is written.
+    #[tokio::test]
+    async fn wheel_metadata_never_reaches_the_lock_as_toml_syntax() {
+        let rel_wheel = format!(".socket/vendor/pypi/{UUID}/{WIDGET_WHEEL_NAME}");
+        let wire = |metadata: String| {
+            let rel_wheel = rel_wheel.clone();
+            async move {
+                let tmp = write_pair(WIDGET_REGISTRY_PYPROJECT, WIDGET_REGISTRY_LOCK).await;
+                write_widget_wheel(tmp.path(), &rel_wheel, &metadata).await;
+                let p = load_uv_project(tmp.path()).await.unwrap();
+                let wired = wire_uv(
+                    &p,
+                    tmp.path(),
+                    "widget",
+                    "1.0.0",
+                    &rel_wheel,
+                    WIDGET_WHEEL_NAME,
+                    WIDGET_WHEEL_SHA,
+                    UUID,
+                )
+                .await;
+                (wired, read_pair(tmp.path()).await)
+            }
+        };
+        let head = "Metadata-Version: 2.1\nName: widget\nVersion: 1.0.0\n";
+        for (label, line) in [
+            (
+                "a specifier that closes its string",
+                "Requires-Dist: foo >=1.0\", path = \"/tmp/evil",
+            ),
+            (
+                "a quote in an arbitrary-equality version",
+                "Requires-Dist: bar ===1.0\"x",
+            ),
+            ("a quote in an extra", "Requires-Dist: baz[a\"b] >=1.0"),
+            ("a quote in a provided extra", "Provides-Extra: fast\", \"x"),
+            (
+                "a control character in a marker",
+                "Requires-Dist: qux ; extra == 'a\u{1}b'",
+            ),
+            ("a line with no name", "Requires-Dist: >=1.0"),
+        ] {
+            let (wired, files) = wire(format!("{head}{line}\n\n")).await;
+            let err = wired.expect_err(label);
+            assert_eq!(err.0, "pypi_uv_metadata_unsupported", "{label}: {}", err.1);
+            assert!(!err.1.contains('\u{1}'), "{label}: {:?}", err.1);
+            assert_eq!(
+                files,
+                (
+                    WIDGET_REGISTRY_PYPROJECT.to_string(),
+                    WIDGET_REGISTRY_LOCK.to_string()
+                ),
+                "{label}: a refused wheel leaves both files untouched"
+            );
+        }
+
+        // The quotes and backslashes a marker may hold stay inside its
+        // string: uv reads back the marker the wheel declares.
+        let marker = "os_name != \"nt\" and platform_release != 'a\\b'";
+        let (wired, (_, lock)) = wire(format!(
+            "{head}Provides-Extra: brotli\nRequires-Dist: brotlicffi >=0.8.0 ; {marker}\n\n"
+        ))
+        .await;
+        wired.expect("a representable wheel wires");
+        let doc: DocumentMut = lock.parse().expect("the wired lock is TOML");
+        let widget = doc["package"]
+            .as_array_of_tables()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"].as_str() == Some("widget"))
+            .unwrap();
+        let entry = widget["metadata"]["requires-dist"][0]
+            .as_inline_table()
+            .unwrap();
+        let keys: Vec<&str> = entry.iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["name", "marker", "specifier"], "{lock}");
+        assert_eq!(entry["marker"].as_str(), Some(marker), "{lock}");
+        assert!(
+            lock.contains("marker = \"os_name != \\\"nt\\\" and platform_release != 'a\\\\b'\""),
+            "the marker keeps uv's basic-string spelling:\n{lock}"
         );
     }
 
@@ -4683,28 +5031,95 @@ wheels = [
     }
 
     /// A PEP 508 direct reference (`name @ https://…`) has no PEP 440
-    /// specifier form — it must fail closed (whole block dropped, uv sync
-    /// heals the lock) rather than sail through as the bogus
+    /// specifier form — it must fail closed (the wheel is refused, naming
+    /// the line) rather than sail through as the bogus
     /// `specifier = "@https://…"` uv refuses to parse back.
     #[test]
     fn parse_requires_dist_rejects_direct_url_references() {
-        assert_eq!(
-            parse_requires_dist("foo @ https://example.com/foo-1.0-py3-none-any.whl"),
-            None
-        );
-        // extras + marker variants are equally direct references
-        assert_eq!(
-            parse_requires_dist("foo[fast] @ git+https://example.com/foo.git ; extra == 'x'"),
-            None
-        );
+        for line in [
+            "foo @ https://example.com/foo-1.0-py3-none-any.whl",
+            // extras + marker variants are equally direct references
+            "foo[fast] @ git+https://example.com/foo.git ; extra == 'x'",
+        ] {
+            let why = parse_requires_dist(line).unwrap_err();
+            assert!(why.contains("direct reference"), "{line}: {why}");
+        }
 
-        // block-level: one direct-reference line drops the WHOLE block
+        // block-level: one direct-reference line refuses the WHOLE block
         let text = "Name: widget\n\
                     Requires-Dist: leftpad >=1.0\n\
                     Requires-Dist: foo @ https://example.com/foo-1.0-py3-none-any.whl\n\
                     \n\
                     body\n";
-        assert_eq!(render_package_metadata_block(text), None);
+        let why = render_package_metadata_block(text).unwrap_err();
+        assert!(
+            why.starts_with("Requires-Dist `foo @ https://example.com/foo-1.0-py3-none-any.whl`"),
+            "{why}"
+        );
+    }
+
+    /// What a lock entry's strings may hold: uv parses `specifier` as a
+    /// PEP 440 specifier set and `extras` / `provides-extras` as names
+    /// when it loads the lock, so anything else is refused here.
+    #[test]
+    fn parse_requires_dist_accepts_only_what_uv_reads_back() {
+        // The specifiers are the ones uv 0.11.19 loads from a lock, and
+        // refuses to (`Failed to parse uv.lock`).
+        for line in [
+            "foo",
+            "foo>=1.0",
+            "foo (>= 1.0, < 2)",
+            "foo==1.0.*",
+            "foo!=1.5.*",
+            "foo==1.*",
+            "foo!=1.5.7,<2.0,>=1.5.6",
+            "foo~=1.4.2",
+            "foo~=1.0.dev1",
+            "foo===1.0",
+            "foo===1.0+local",
+            "foo>=1.0rc1",
+            "foo>=v1.26",
+            "foo<1.0a",
+            "foo>=1.0.post",
+            "foo==1.0-1",
+            "foo==1.0+local.1",
+            "foo!=1.0+local",
+            "foo==1!2.0",
+            "foo<=2!1.0.post1.dev2",
+            "foo>=1.0;",
+            "Foo_Bar.baz[A_b,c.d]>=1 ; python_version < \"3.8\"",
+        ] {
+            parse_requires_dist(line).unwrap_or_else(|why| panic!("{line}: {why}"));
+        }
+        for (line, why) in [
+            ("foo >=1.0\", path = \"/tmp/evil", "PEP 440"),
+            ("foo ===1.0\"x", "PEP 440"),
+            ("foo ===1.26.18x", "PEP 440"),
+            ("foo >=", "PEP 440"),
+            ("foo >=1.0,", "PEP 440"),
+            ("foo ,>=1.0", "PEP 440"),
+            ("foo >=1.0.*", "PEP 440"),
+            ("foo ==1.0a1.*", "PEP 440"),
+            ("foo ==1.0.dev1.*", "PEP 440"),
+            ("foo ==*", "PEP 440"),
+            ("foo ~=1", "PEP 440"),
+            ("foo ~=1.0+local", "PEP 440"),
+            ("foo >=1.0+local", "PEP 440"),
+            ("foo >=1_0", "PEP 440"),
+            ("foo =1.0", "PEP 440"),
+            ("foo 1.0", "PEP 440"),
+            ("foo[a\"b]", "extra"),
+            ("foo[-a]", "extra"),
+            ("foo[a", "unclosed"),
+            ("-foo", "distribution name"),
+            ("foo-", "distribution name"),
+            ("foo ; extra == 'a\u{7}'", "control character"),
+        ] {
+            let err = parse_requires_dist(line).unwrap_err();
+            assert!(err.contains(why), "{line:?}: {err}");
+        }
+        assert!(render_package_metadata_block("Name: x\nProvides-Extra: a\"b\n\n").is_err());
+        assert!(render_package_metadata_block("Name: x\nProvides-Extra: A_b\n\n").is_ok());
     }
 
     // ── load/wire refusal edges ──────────────────────────────────────────
@@ -4817,7 +5232,7 @@ wheels = [
             let pyproject = format!("{DIRECT_REGISTRY_PYPROJECT}{extra}");
             let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let guard = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             let wire = wire_uv(
                 &p,
                 tmp.path(),
@@ -4848,7 +5263,7 @@ wheels = [
             let pyproject = format!("{TRANSITIVE_REGISTRY_PYPROJECT}{extra}");
             let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let guard = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             let wire = wire_uv(
                 &p,
                 tmp.path(),
@@ -4889,7 +5304,7 @@ wheels = [
             };
             let tmp = write_pair(&format!("{base}{extra}"), lock).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let got = check_target_guards(&p, "six", UUID);
+            let got = check_target_guards(&p, "six", "1.16.0", UUID);
             if base == DIRECT_REGISTRY_PYPROJECT {
                 assert_eq!(got, Ok(UvTarget::Fresh), "{extra}");
             } else {
@@ -4918,7 +5333,7 @@ wheels = [
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::Fresh),
             "a sources entry for another package must not refuse"
         );
@@ -4932,7 +5347,7 @@ wheels = [
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::Fresh),
             "an override pin for another package must not refuse"
         );
@@ -5697,11 +6112,10 @@ wheels = [
     /// never after it.
     #[test]
     fn sdist_only_unit_splices_wheels_before_a_package_subtable() {
-        let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.15.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
-        let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock_text, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
-        )
-        .unwrap();
+        let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.16.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
+        let (old_unit, new_unit) =
+            rewrite_target_package_unit(lock_text, "six", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None)
+                .unwrap();
         assert!(lock_text.contains(&old_unit));
         assert_eq!(
             new_unit,
@@ -5847,7 +6261,7 @@ wheels = [
     fn render_entry_pins_uv_key_order_name_extras_marker_specifier() {
         let text = "Name: x\nRequires-Dist: requests[socks,security] >=2.0 ; extra == 'fast'\n\n";
         assert_eq!(
-            render_package_metadata_block(text).as_deref(),
+            render_package_metadata_block(text).unwrap().as_deref(),
             Some(
                 "[package.metadata]\nrequires-dist = [{ name = \"requests\", extras = [\"socks\", \"security\"], marker = \"extra == 'fast'\", specifier = \">=2.0\" }]"
             )
@@ -5860,7 +6274,9 @@ wheels = [
     #[test]
     fn render_block_with_provides_extra_only_yields_empty_requires_dist() {
         assert_eq!(
-            render_package_metadata_block("Name: x\nProvides-Extra: fast\n\n").as_deref(),
+            render_package_metadata_block("Name: x\nProvides-Extra: fast\n\n")
+                .unwrap()
+                .as_deref(),
             Some("[package.metadata]\nrequires-dist = []\nprovides-extras = [\"fast\"]")
         );
     }
@@ -5920,10 +6336,11 @@ wheels = [
         );
     }
 
-    /// A version string that breaks the override TOML value (an embedded
-    /// quote) is reported as a parse failure BEFORE any write.
+    /// A version string that would break the override TOML value (an
+    /// embedded quote) is not the release the lock resolves, so it is
+    /// refused BEFORE any write and never reaches that value.
     #[tokio::test]
-    async fn wire_reports_an_unbuildable_override_value() {
+    async fn wire_refuses_a_version_that_would_break_the_override_value() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         let err = wire_uv(
@@ -5938,8 +6355,7 @@ wheels = [
         )
         .await
         .unwrap_err();
-        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
-        assert!(err.1.contains("cannot build override value"), "{}", err.1);
+        assert_eq!(err.0, "pypi_uv_lock_package_missing", "{}", err.1);
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(
             py, TRANSITIVE_REGISTRY_PYPROJECT,
@@ -6358,11 +6774,10 @@ wheels = [
     /// append path.
     #[test]
     fn single_line_wheels_array_is_rewritten_in_place() {
-        let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
-        let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
-        )
-        .unwrap();
+        let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
+        let (old_unit, new_unit) =
+            rewrite_target_package_unit(lock, "six", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None)
+                .unwrap();
         assert!(old_unit.contains("wheels = [{ url"), "{old_unit}");
         let expected_wheels = format!(
             "wheels = [\n    {{ filename = \"{WHEEL_NAME}\", hash = \"sha256:{WHEEL_SHA}\" }},\n]"
@@ -6998,6 +7413,118 @@ six = { path = ".socket/vendor/pypi/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/six-1.1
             let (pyproject, lock) = read_pair(tmp.path()).await;
             assert_eq!(pyproject, pyproject_crlf, "{label}: pyproject not restored");
             assert_eq!(lock, lock_crlf, "{label}: lock not restored");
+        }
+    }
+
+    /// A pyproject.toml that mixes CRLF and LF lines (a CRLF checkout a
+    /// tool appended LF lines to) has no one style to give back, and used
+    /// to be written all-LF: every CRLF line churned, and the revert, which
+    /// only takes the wired lines out, left them that way. Each line the
+    /// wiring leaves alone now keeps its own ending, and the revert restores
+    /// the file's bytes. Same shapes as the CRLF round trip above.
+    #[tokio::test]
+    async fn mixed_line_ending_pyproject_keeps_its_lines_and_reverts_byte_exact() {
+        use crate::utils::line_endings::LineEndings;
+        let existing_override_pyproject = format!(
+            "{TRANSITIVE_REGISTRY_PYPROJECT}\n[tool.uv]\noverride-dependencies = [\n    \"attrs==23.1.0\",\n]\n"
+        );
+        let existing_override_lock = TRANSITIVE_REGISTRY_LOCK.replacen(
+            "[[package]]",
+            "[manifest]\noverrides = [\n    { name = \"attrs\", specifier = \"==23.1.0\" },\n]\n\n[[package]]",
+            1,
+        );
+        let cases: [(&str, &str, &str); 4] = [
+            ("direct", DIRECT_REGISTRY_PYPROJECT, DIRECT_REGISTRY_LOCK),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT,
+                TRANSITIVE_REGISTRY_LOCK,
+            ),
+            (
+                "existing-override",
+                &existing_override_pyproject,
+                &existing_override_lock,
+            ),
+            (
+                "dev-group",
+                DEV_GROUP_REGISTRY_PYPROJECT,
+                DEV_GROUP_REGISTRY_LOCK,
+            ),
+        ];
+        // Which lines are LF: every third one (mostly CRLF), or all but
+        // every third one (mostly LF).
+        for lf_line in [|i: usize| i % 3 == 1, |i: usize| i % 3 != 1] {
+            for (label, pyproject_lf, lock) in cases {
+                let mixed: String = pyproject_lf
+                    .split_inclusive('\n')
+                    .enumerate()
+                    .map(|(i, line)| match lf_line(i) {
+                        true => line.to_string(),
+                        false => line.replace('\n', "\r\n"),
+                    })
+                    .collect();
+                assert_eq!(LineEndings::of(&mixed), LineEndings::Mixed, "{label}");
+                let tmp = write_pair(&mixed, lock).await;
+                let p = load_uv_project(tmp.path()).await.unwrap();
+                let (wiring, meta, _) = wire_uv(
+                    &p,
+                    tmp.path(),
+                    "six",
+                    "1.16.0",
+                    REL_WHEEL,
+                    WHEEL_NAME,
+                    WHEEL_SHA,
+                    UUID,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                let (wired, wired_lock) = read_pair(tmp.path()).await;
+
+                // Modulo line endings the wired pair is the LF pair's wiring.
+                let tmp_lf = write_pair(pyproject_lf, lock).await;
+                let p_lf = load_uv_project(tmp_lf.path()).await.unwrap();
+                wire_uv(
+                    &p_lf,
+                    tmp_lf.path(),
+                    "six",
+                    "1.16.0",
+                    REL_WHEEL,
+                    WHEEL_NAME,
+                    WHEEL_SHA,
+                    UUID,
+                )
+                .await
+                .unwrap();
+                let (wired_lf, wired_lock_lf) = read_pair(tmp_lf.path()).await;
+                assert_eq!(wired.replace("\r\n", "\n"), wired_lf, "{label}");
+                assert_eq!(wired_lock, wired_lock_lf, "{label}");
+
+                // Every line the file had is still there, ending included
+                // (but the one array line the override is added to).
+                let wired_lines: Vec<&str> = wired.split_inclusive('\n').collect();
+                let mut next = 0;
+                for line in mixed.split_inclusive('\n') {
+                    match wired_lines[next..].iter().position(|w| *w == line) {
+                        Some(at) => next += at + 1,
+                        None => assert!(
+                            label == "existing-override" && line.contains("attrs==23.1.0"),
+                            "{label}: {line:?} did not keep its bytes:\n{wired:?}"
+                        ),
+                    }
+                }
+
+                let entry = entry_for(wiring, meta);
+                let outcome = revert_uv(&entry, tmp.path(), false).await;
+                assert!(outcome.success, "{label}: {:?}", outcome.error);
+                assert!(
+                    outcome.warnings.is_empty(),
+                    "{label}: {:?}",
+                    outcome.warnings
+                );
+                let (pyproject, reverted_lock) = read_pair(tmp.path()).await;
+                assert_eq!(pyproject, mixed, "{label}: pyproject not restored");
+                assert_eq!(reverted_lock, lock, "{label}: lock not restored");
+            }
         }
     }
 

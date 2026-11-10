@@ -9,10 +9,16 @@
 //! * the entry's `source = { registry = R }` became `{ url = <artifact> }`
 //!   (pylock: `index = R` was dropped) — R is the ONE registry every other
 //!   registry package of the lock names, and must be PyPI's simple index;
-//!   no sibling, or several registries, refuses. A pylock from
+//!   several registries refuse. A pylock from
 //!   `uv pip compile` records no `index` at all: siblings without one whose
 //!   files are all on `files.pythonhosted.org` show PyPI, and the entry is
-//!   restored without one too;
+//!   restored without one too. A `[[package]]` lock with no sibling at all
+//!   (every registry package is hosted: a project with one dependency) is
+//!   restored on PyPI's default index, in the artifact shape uv records at
+//!   the lock's `revision`, unless a uv setting names another index; the
+//!   run says the entry was rebuilt (`upstream_uv_entry_rebuilt`). A pylock
+//!   or a uv 0.2 `[[distribution]]` lock with no sibling still refuses:
+//!   nothing in them tells their writers' shapes apart;
 //! * `sdist` / `wheels` were replaced by the patched wheel (pylock: an
 //!   `archive`) — re-derived from PyPI's JSON API in the artifact shape a
 //!   sibling registry package shows (which of `size` / `upload-time` (or
@@ -127,6 +133,20 @@ struct Shape {
     selected_only: bool,
     /// A sibling package's key order (pylock re-places `index` by it).
     package_keys: Vec<String>,
+    /// What no sibling showed (see [`Assumed`]).
+    assumed: Assumed,
+}
+
+/// What no other registry package of a `[[package]]` lock showed, so the
+/// restore took uv's own default for it: the lock of a project whose only
+/// dependencies are hosted ones has no sibling to read either from.
+#[derive(Clone, Copy, Default)]
+struct Assumed {
+    /// The registry: PyPI's default index.
+    registry: bool,
+    /// The artifact fields: the ones uv records at the lock's `revision`
+    /// ([`revision_artifact_keys`]).
+    artifacts: bool,
 }
 
 pub(crate) async fn restore(
@@ -508,6 +528,11 @@ async fn restore_lock(
             );
         }
     }
+    if shape.assumed.registry {
+        if let Err(why) = refuse_configured_index(view, rel, metadata.as_ref()).await {
+            return refuse_hits(result, &why);
+        }
+    }
 
     let wanted = hits
         .iter()
@@ -573,6 +598,17 @@ async fn restore_lock(
     }
     if restored.is_empty() {
         return;
+    }
+    if shape.assumed.artifacts {
+        let entries: Vec<String> = hits
+            .iter()
+            .filter(|h| restored.contains(&h.uuid))
+            .map(|h| format!("{}=={}", h.name, h.version))
+            .collect();
+        result.warnings.push((
+            "upstream_uv_entry_rebuilt",
+            rebuilt_detail(rel, &doc, &shape, &entries),
+        ));
     }
     view.write(rel, preserve_line_endings(&text, doc.to_string()));
     if let Some(meta) = metadata {
@@ -1290,7 +1326,17 @@ fn lock_shape(
                 .join(", ")
         ));
     }
+    // A `[[package]]` lock (uv 0.2.35 and later, and every script lock)
+    // names its grammar in its header, so a hit with no sibling is still
+    // restorable. A pylock and a uv 0.2 `[[distribution]]` lock record
+    // nothing that tells their writers' artifact shapes apart.
+    let versioned = !pep751 && collection == "package";
+    let mut assumed = Assumed::default();
     let (registry, index) = match registries.pop_first() {
+        None if versioned => {
+            assumed.registry = true;
+            (DEFAULT_INDEX.to_string(), true)
+        }
         None => {
             return Err(
                 "no sibling registry package shows the registry and artifact fields the lock \
@@ -1299,7 +1345,7 @@ fn lock_shape(
             )
         }
         Some(SiblingRegistry::Named(registry)) => (registry.to_string(), true),
-        Some(SiblingRegistry::PypiFiles) => ("https://pypi.org/simple".to_string(), false),
+        Some(SiblingRegistry::PypiFiles) => (DEFAULT_INDEX.to_string(), false),
         Some(SiblingRegistry::Files(host)) => {
             return Err(format!(
                 "the lock's packages record no `index` and carry files from {host}, which is \
@@ -1313,10 +1359,22 @@ fn lock_shape(
              re-derived"
         ));
     }
-    let (keys, datetime, multiline, tables, hash_tables, package_keys) = shape.ok_or(
-        "no sibling registry package records an artifact, so which artifact fields the lock \
-         records is not derivable",
-    )?;
+    let (keys, datetime, multiline, tables, hash_tables, package_keys) =
+        match shape {
+            Some(learned) => learned,
+            // uv's own layout: inline tables, string timestamps, one wheel per
+            // line.
+            None if versioned => {
+                assumed.artifacts = true;
+                let keys = revision_artifact_keys(doc)?;
+                (keys, false, true, false, false, Vec::new())
+            }
+            None => return Err(
+                "no sibling registry package records an artifact, so which artifact fields the \
+                 lock records is not derivable"
+                    .to_string(),
+            ),
+        };
     let known = ["url", "hash", "hashes", "size", "name"];
     if let Some(unknown) = keys
         .iter()
@@ -1337,7 +1395,131 @@ fn lock_shape(
         hash_tables,
         selected_only: pep751 && doc.get("created-by").and_then(Item::as_str) == Some("pip"),
         package_keys,
+        assumed,
     })
+}
+
+/// The registry uv resolves from when nothing configures another, as it
+/// spells it in a lock's `source = { registry = … }`.
+const DEFAULT_INDEX: &str = "https://pypi.org/simple";
+
+/// A `[[package]]` lock's `revision` (absent before uv 0.6.0, read as 0).
+fn lock_revision(doc: &DocumentMut) -> Option<i64> {
+    match doc.get("revision") {
+        None => Some(0),
+        Some(revision) => revision.as_integer(),
+    }
+}
+
+/// The artifact fields uv records for a registry file in a `[[package]]`
+/// lock, by the lock's `revision`, as real `uv lock` output of uv 0.2.35
+/// through 0.12.17 shows them: `url`, `hash` and `size` with no revision
+/// (uv 0.2.35–0.5) and at revision 1 (uv 0.6.0–0.6.14), and those plus
+/// `upload-time` at revisions 2 (uv 0.6.15–0.8.3) and 3 (uv 0.8.4 and
+/// later). uv 0.6.15–0.6.17 spell the timestamp `upload_time`; they and
+/// every later release read both spellings, so the later one is written.
+/// A newer revision may record fields unknown here: `Err`.
+fn revision_artifact_keys(doc: &DocumentMut) -> Result<Vec<String>, String> {
+    let keys: &[&str] = match lock_revision(doc) {
+        Some(0 | 1) => &["url", "hash", "size"],
+        Some(2 | 3) => &["url", "hash", "size", "upload-time"],
+        revision => {
+            return Err(format!(
+                "no other registry package of the lock shows the artifact fields uv records at \
+                 its `revision` ({}), and socket-patch knows them only up to revision 3",
+                revision.map_or("not an integer".to_string(), |r| r.to_string())
+            ))
+        }
+    };
+    Ok(keys.iter().map(|key| key.to_string()).collect())
+}
+
+/// The `upstream_uv_entry_rebuilt` detail: `entries` came back with no
+/// sibling to copy the shape from ([`Assumed`]), so say what they were
+/// rebuilt as and how to check the result.
+fn rebuilt_detail(rel: &str, doc: &DocumentMut, shape: &Shape, entries: &[String]) -> String {
+    let revision = match lock_revision(doc) {
+        Some(0) | None => "a lock with no `revision`".to_string(),
+        Some(revision) => format!("lock revision {revision}"),
+    };
+    let fields: Vec<String> = shape.keys.iter().map(|key| format!("`{key}`")).collect();
+    let index = if shape.assumed.registry {
+        format!(" on the default index {}", shape.registry)
+    } else {
+        String::new()
+    };
+    // Both spellings read alike in every uv that writes revision 2.
+    let spelling =
+        if shape.keys.iter().any(|key| key == "upload-time") && lock_revision(doc) == Some(2) {
+            " (uv 0.6.15–0.6.17 spell `upload-time` as `upload_time`, and read both)"
+        } else {
+            ""
+        };
+    let check = match crate::utils::python_lock::script_of_lock(rel) {
+        Some(script) => format!("uv lock --check --script {script}"),
+        None => "uv lock --check".to_string(),
+    };
+    format!(
+        "{rel}: no other registry package of the lock shows how it records one, so {} was \
+         rebuilt from PyPI{index} with the artifact fields uv records for {revision} ({}){spelling}; \
+         run `{check}` to confirm the lock is current",
+        entries.join(", "),
+        fields.join(", ")
+    )
+}
+
+/// The uv settings that name a package index. With one set, uv may resolve
+/// a registry package from somewhere other than PyPI's default index.
+const INDEX_SETTINGS: [&str; 5] = [
+    "index",
+    "index-url",
+    "extra-index-url",
+    "find-links",
+    "no-index",
+];
+
+/// The environment variables that set [`INDEX_SETTINGS`].
+const INDEX_ENV: [&str; 6] = [
+    "UV_INDEX",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_NO_INDEX",
+];
+
+/// `Err(why)` when uv is configured with a package index for the lock
+/// `rel`: in its paired metadata's `[tool.uv]`, the settings file uv reads
+/// beside it, the user's or the system's `uv.toml`, or the environment. A
+/// lock whose registry packages are all hosted shows no registry
+/// ([`Assumed::registry`]), so they go back on PyPI's default index only
+/// when nothing names another one.
+async fn refuse_configured_index(
+    view: &mut View<'_>,
+    rel: &str,
+    metadata: Option<&Metadata>,
+) -> Result<(), String> {
+    let consequence = "and no other registry package of the lock shows which registry it \
+                       resolves from, so the entry's registry is not derivable";
+    if let Some(name) = INDEX_ENV.iter().find(|name| env_set(name)) {
+        return Err(format!(
+            "`{name}` is set in this environment, {consequence}"
+        ));
+    }
+    let names_index = |uv: &dyn TableLike| INDEX_SETTINGS.iter().find(|key| uv.contains_key(key));
+    if let Some(meta) = metadata {
+        if let Some(key) = tool_uv(&meta.doc).and_then(names_index) {
+            return Err(format!("{} sets uv `{key}`, {consequence}", meta.rel));
+        }
+    }
+    let project = pip_settings(view, rel).await?;
+    let global = global_uv_settings(&|name| std::env::var_os(name), cfg!(windows)).await?;
+    for (path, settings) in project.iter().chain(&global) {
+        if let Some(key) = names_index(settings) {
+            return Err(format!("{path} sets uv `{key}`, {consequence}"));
+        }
+    }
+    Ok(())
 }
 
 /// The artifact timestamp key, in both spellings uv has written:

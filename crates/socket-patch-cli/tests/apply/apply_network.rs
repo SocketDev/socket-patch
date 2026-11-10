@@ -4,7 +4,8 @@
 //!
 //! Verifies:
 //!   - `apply` (default, online) fetches missing blobs from the API
-//!     and writes them to an OS tempdir (NOT `.socket/`).
+//!     into a transient stage under `.socket/` that it removes again
+//!     (never into the persistent `.socket/blobs/` cache).
 //!   - a cold-cache apply fetches only per-file blobs, never a diff
 //!     archive (v5 removed the diff download path).
 //!   - `apply` against installed packages writes patched content to
@@ -156,6 +157,82 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
             "apply must not write blobs to .socket/blobs/; found: {entries:?}"
         );
     }
+}
+
+/// The download overlay is staged beside the blob cache, under `.socket/`,
+/// not in the system temp dir: there the next lock holder's sweep finds it
+/// if the run is killed before it can remove it, and the cached blobs are
+/// hardlinked rather than copied across filesystems. So `apply` no longer
+/// needs a usable `$TMPDIR` to fetch a blob, and a finished run leaves
+/// neither a stage nor a cache entry behind.
+#[tokio::test]
+async fn apply_stages_downloads_beside_the_blob_cache() {
+    let before = b"before\n";
+    let after = b"after\n";
+    let after_hash = git_sha256(after);
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    install_npm_pkg(tmp.path(), "apply-stage-test", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/apply-stage-test@1.0.0": patch_record(
+            "12121212-1212-4121-8121-121212121212",
+            one_file("package/index.js", before, after),
+        )}),
+    );
+
+    // A temp dir that does not exist: a stage created there would fail.
+    let no_tmp = tmp.path().join("no-such-tmp");
+    let out = hermetic::command(&binary())
+        .args(["apply", "--json"])
+        .current_dir(tmp.path())
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test")
+        .env("SOCKET_ORG_SLUG", ORG_SLUG)
+        .env("TMPDIR", &no_tmp)
+        .env("TMP", &no_tmp)
+        .env("TEMP", &no_tmp)
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/apply-stage-test/index.js")).unwrap(),
+        after
+    );
+
+    let mut left: Vec<String> = std::fs::read_dir(tmp.path().join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["blobs", "manifest.json"],
+        "no stage (and no lock) is left under .socket/"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join(".socket/blobs"))
+            .unwrap()
+            .count(),
+        0,
+        "the fetched blob never enters the persistent cache"
+    );
+    assert!(!no_tmp.exists(), "nothing recreated the temp dir");
 }
 
 // ---------------------------------------------------------------------------

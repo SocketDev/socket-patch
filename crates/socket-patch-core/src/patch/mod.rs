@@ -4,6 +4,7 @@ pub mod apply_lock;
 pub mod copy_tree;
 pub(crate) mod file_hash;
 pub mod gem_ext;
+pub mod gem_refresh;
 pub mod jvm_jar;
 pub(crate) mod npm_bin;
 pub mod package;

@@ -28,7 +28,8 @@ use crate::commands::vendored_backend::{
     KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::ecosystem_dispatch::{
-    distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
+    distinct_npm_copies, find_all_packages_for_rollback, partition_purls,
+    unsupported_ecosystem_report, unsupported_keys, JvmScope, UnsupportedKey,
 };
 use crate::json_envelope::{
     Command as EnvelopeCommand, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent,
@@ -801,6 +802,28 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
     event.with_details(details)
 }
 
+/// The line under the not-installed warning for the `dropped` entries
+/// whose manifest record the run removes (would remove, on a dry run).
+/// "No installed package" can also be a copy the crawl did not reach
+/// (another `--cwd`, a layout it does not know): with the record gone no
+/// later `rollback` finds the patch, so the note says nothing was restored
+/// and names the remedy that still works. `None` when no record is dropped.
+fn format_not_installed_note(dropped: usize, dry_run: bool) -> Option<String> {
+    let removed = match (dropped, dry_run) {
+        (0, _) => return None,
+        (1, false) => "it and its record was removed",
+        (1, true) => "it and its record would be removed",
+        (_, false) => "them and their records were removed",
+        (_, true) => "them and their records would be removed",
+    };
+    let remedy = if dropped == 1 {
+        "a copy this run did not find stays patched until the package is reinstalled"
+    } else {
+        "copies this run did not find stay patched until the packages are reinstalled"
+    };
+    Some(format!("Nothing was restored for {removed}: {remedy}."))
+}
+
 /// An in-scope manifest entry with no installed package: `skipped`
 /// `package_not_installed` (apply's event, rollback-side). It never fails
 /// the run — rollback exits 0 even when ALL in-scope targets land here
@@ -808,7 +831,8 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
 fn not_installed_event(purl: &str, uuid: Option<&str>) -> PatchEvent {
     let event = PatchEvent::new(PatchAction::Skipped, purl).with_reason(
         "package_not_installed",
-        "no installed package matches this manifest entry",
+        "no installed package matches this manifest entry, so nothing was restored; \
+         reinstall the package to restore a copy this run did not find",
     );
     match uuid {
         Some(uuid) => event.with_uuid(uuid),
@@ -941,6 +965,13 @@ async fn unledgered_vendor_wiring(
 /// Report a top-level rollback error: the error envelope on `--json`
 /// (message verbatim), an `Error:` stderr line otherwise. Errors print even
 /// under --silent ("errors only", never "nothing").
+/// The line for a rollback that found a manifest with no patch in it and
+/// no patch of another mode: the same words as a project with no manifest
+/// at all, since both mean there is nothing to roll back.
+fn no_patches_left(common: &GlobalArgs) -> String {
+    crate::ui::no_patches_message("roll back", common)
+}
+
 fn emit_rollback_error(json: bool, dry_run: bool, code: &str, msg: &str) {
     if json {
         println!(
@@ -1097,6 +1128,12 @@ struct RollbackReport<'a> {
     manifest: &'a PatchManifest,
     results: &'a [RollbackResult],
     not_installed: &'a [String],
+    /// The `skipped` `unsupported_ecosystem` events: in-scope manifest
+    /// entries of an ecosystem this CLI has no crawler for (kept).
+    unsupported_skips: &'a [PatchEvent],
+    /// In-scope manifest keys that are not purls, with why (`failed`
+    /// `invalid_purl`; kept).
+    invalid_keys: &'a [(String, String)],
     /// Manifest entries a global run left to the project's vendor ledger:
     /// the project's own NuGet install (#489).
     project_owned: &'a [String],
@@ -1160,6 +1197,17 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     }
     for purl in report.not_installed {
         env.record(not_installed_event(purl, manifest_uuid(purl)));
+    }
+    for event in report.unsupported_skips {
+        let uuid = event.purl.as_deref().and_then(manifest_uuid);
+        env.record(with_uuid(event.clone(), uuid));
+    }
+    for (key, why) in report.invalid_keys {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Failed, key.as_str())
+                .with_error(UnsupportedKey::NotAPurl.code(), why.clone()),
+            manifest_uuid(key),
+        ));
     }
     for purl in report.project_owned {
         env.record(with_uuid(
@@ -1351,7 +1399,171 @@ pub(crate) async fn retire_legacy_redirect_ledger(common: &GlobalArgs) -> Option
     }
 }
 
+/// Whether `--cwd` holds nothing a rollback would undo or refuse around:
+/// no patch in any store, no pre-v5 hosted ledger to retire, and no
+/// lockfile still wired to a vendored artifact its ledger lost.
+async fn nothing_to_roll_back_here(common: &GlobalArgs) -> bool {
+    if crate::commands::projects_below::cwd_is_patched(common).await {
+        return false;
+    }
+    let root = common.project_root();
+    let legacy = root.join(socket_patch_core::patch::redirect::REDIRECT_STATE_REL);
+    tokio::fs::symlink_metadata(&legacy).await.is_err()
+        && crate::commands::vendored_backend::repair::scan_vendor_references(&root)
+            .await
+            .is_empty()
+}
+
+/// ` --preserve-state` when the run was given it: part of the command a
+/// message tells the user to run in another directory.
+fn preserve_state_flag(args: &RollbackArgs) -> &'static str {
+    if args.preserve_state {
+        " --preserve-state"
+    } else {
+        ""
+    }
+}
+
 pub async fn run(args: RollbackArgs) -> i32 {
+    use crate::commands::projects_below::{self, Work};
+    apply_env_toggles(&args.common);
+    // What `scan` patched from this directory, `rollback` undoes from it:
+    // with nothing to undo at `--cwd` itself, look to the project
+    // directories below. A directory that holds patch state of its own is
+    // the one project this run is about.
+    let below = if projects_below::searches_below(&args.common)
+        && nothing_to_roll_back_here(&args.common).await
+    {
+        projects_below::patched(&args.common, projects_below::Depth::All).await
+    } else {
+        Default::default()
+    };
+    let loud = !args.common.json && !args.common.silent;
+    if loud {
+        below.print_notes();
+    }
+    if below.projects.is_empty() {
+        return run_project(args, Vec::new()).await;
+    }
+    if args.targets.is_empty() {
+        return roll_back_projects(args, below).await;
+    }
+    // A target names a patch of one project, so the run stays the
+    // single-project one it was; where it finds no patch at all, it says
+    // which directories hold the one it was asked for, and the command to
+    // run there: this one, flags included.
+    let targets: Vec<String> = args
+        .targets
+        .iter()
+        .map(|t| crate::ui::shell_word(t))
+        .collect();
+    let command = format!(
+        "rollback {}{}",
+        targets.join(" "),
+        preserve_state_flag(&args)
+    );
+    let advice = below.advice(&args.common, &command, Work::Any, &args.targets);
+    let code = run_project(args, advice.warnings()).await;
+    if loud && code == 1 {
+        advice.print();
+    }
+    code
+}
+
+/// Roll back each patched project directory below `--cwd` as if it were
+/// `--cwd`, under the heading `scan` printed for it: only the directories
+/// in `below`, each to the end whatever the one before it did. The exit
+/// code is the worst of the runs. `--json` takes one directory, so stdout
+/// stays one document.
+async fn roll_back_projects(
+    args: RollbackArgs,
+    below: crate::commands::projects_below::Below,
+) -> i32 {
+    use crate::commands::projects_below::heading;
+    let total = plural(
+        below.projects.len(),
+        "project directory",
+        "project directories",
+    );
+    if args.common.json && below.projects.len() > 1 {
+        return crate::json_envelope::usage_error(
+            crate::json_envelope::Command::Rollback,
+            args.common.json,
+            args.common.dry_run,
+            "invalid_args",
+            &format!(
+                "--json takes one project directory ({} hold patches: {}); run one rollback \
+                 per directory, e.g. `{}`",
+                below.counted(),
+                below.names(),
+                below.projects[0].command(
+                    &args.common,
+                    &format!("rollback --json{}", preserve_state_flag(&args))
+                ),
+            ),
+        );
+    }
+    // One question for the whole run, naming every directory it reaches;
+    // each project's own run then asks nothing. As in a single project,
+    // none for a preview or a `--preserve-state` run (they delete no local
+    // state).
+    let loud = !args.common.json && !args.common.silent;
+    if !args.common.dry_run && !args.preserve_state {
+        let prompt = format!(
+            "Roll back every Socket patch in {} ({})?",
+            below.counted(),
+            below.names()
+        );
+        if !crate::ui::confirm(&prompt, true, &args.common) {
+            if loud {
+                println!("{}", crate::ui::CANCELLED);
+            }
+            return 0;
+        }
+    }
+    let mut code = 0;
+    let mut failed: Vec<&str> = Vec::new();
+    for project in &below.projects {
+        if loud {
+            println!("{}", heading(&project.shown));
+        }
+        let mut common = project.common(&args.common);
+        common.yes = true;
+        let child = RollbackArgs {
+            targets: Vec::new(),
+            common,
+            preserve_state: args.preserve_state,
+        };
+        let project_code = Box::pin(run_project(child, Vec::new())).await;
+        if project_code != 0 {
+            failed.push(&project.shown);
+        }
+        code = code.max(project_code);
+    }
+    if failed.is_empty() {
+        if loud {
+            let done = if args.common.dry_run {
+                "Would roll back"
+            } else {
+                "Rolled back"
+            };
+            println!("\n{done} {}.", below.counted());
+        }
+    } else if !args.common.json {
+        // Errors print even under --silent.
+        eprintln!(
+            "Error: Rollback failed in {} of {total}: {}",
+            failed.len(),
+            failed.join(", ")
+        );
+    }
+    code
+}
+
+/// Roll back the project at `--cwd`. `below` is the advice of a targeted
+/// run made above patched project directories (see [`run`]): the warnings
+/// its "nothing here" envelope carries.
+async fn run_project(args: RollbackArgs, below: Vec<crate::json_envelope::RunWarning>) -> i32 {
     apply_env_toggles(&args.common);
 
     // Classify targets up front: the glob validation is a pre-network
@@ -1525,11 +1737,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 "path",
                 serde_json::json!(manifest_path.display().to_string()),
             );
+            env.warnings.extend(below);
             println!("{}", env.to_pretty_json());
         } else {
             // Errors print even under --silent ("errors only", never
             // "nothing"): exit 1 with no message would be undiagnosable.
-            eprintln!("Error: Manifest not found at {}", manifest_path.display());
+            eprintln!(
+                "Error: {}",
+                crate::ui::no_patches_message("roll back", &args.common)
+            );
         }
         return 1;
     }
@@ -1843,6 +2059,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     }
 
+    // Records no crawler of this CLI can look for cannot be rolled back
+    // here. They leave the scope, so the prompt does not count them and the
+    // manifest cleanup keeps them (a newer CLI can still restore them), and
+    // each is named: skipped for an unsupported ecosystem, failed for a key
+    // that is not a purl.
+    let unsupported = unsupported_keys(&args.common, &manifest_scope);
+    manifest_scope.retain(|purl| !unsupported.iter().any(|(key, _)| key == purl));
+
     // `--ecosystems` narrows every leg. The agent engine scopes the
     // manifest side again internally; narrowing it here too keeps the
     // confirmation prompt's count honest (an npm-only manifest under
@@ -1887,6 +2111,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
             ),
         ));
     }
+    let (unsupported_skips, unsupported_warning) =
+        match unsupported_ecosystem_report(&unsupported, "rolled back") {
+            Some((events, warning)) => (events, Some(warning)),
+            None => (Vec::new(), None),
+        };
+    run_warnings.extend(unsupported_warning.map(|w| (w.code, w.detail)));
+    let invalid_keys: Vec<(String, String)> = unsupported
+        .iter()
+        .filter(|(_, kind)| *kind == UnsupportedKey::NotAPurl)
+        .map(|(key, kind)| (key.clone(), kind.detail(key)))
+        .collect();
 
     // ── confirmation ────────────────────────────────────────────────────
     // The default run deletes manifest entries, vendored artifacts, ledger
@@ -1896,7 +2131,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let has_work =
         !manifest_scope.is_empty() || !vendor_scope.is_empty() || !hosted_scope.is_empty();
     // Everything in scope was filtered out by `--ecosystems`: say so,
-    // instead of the misleading "No patches found in manifest".
+    // instead of the misleading "No patches in this project".
     let eco_filtered_everything = !has_work && scope_before_eco_filter > 0;
     if eco_filtered_everything && !args.common.json && !args.common.silent {
         println!(
@@ -1955,14 +2190,18 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 
     // ── agent leg (in-place restore) ────────────────────────────────────
-    // The "No patches found in manifest" line is for an unscoped run with
+    // The "No patches in this project" line is for an unscoped run with
     // nothing to do anywhere: a hosted-/vendored-only project has work in
     // the other legs and is not "no patches". A manifest-less project, or
     // one whose scope `--ecosystems` filtered out entirely (announced
     // above), is not told its manifest is empty either.
     let selection = InnerSelection::Scope {
         purls: &manifest_scope,
-        announce_empty: !scoped && !manifest_missing && !has_work && !eco_filtered_everything,
+        announce_empty: !scoped
+            && !manifest_missing
+            && !has_work
+            && !eco_filtered_everything
+            && unsupported.is_empty(),
     };
     let agent_leg = rollback_patches_inner(
         &args.common,
@@ -2193,7 +2432,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             // ── GC ───────────────────────────────────────────────────────
-            // Removal retains originals for active patches and crawler misses.
+            // Removal retains originals for active patches. Those of a dropped
+            // not-installed entry (possibly a crawler miss) are kept out of
+            // this sweep too, but nothing reads them once the record is gone
+            // (see `format_not_installed_note`): the next sweep takes them.
             let mut gc: Option<GcReport> = None;
             if cleanup_allowed {
                 let references = ArtifactReferences::after_removal(
@@ -2332,7 +2574,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 && hosted_leg.failed.is_empty()
                 && contested.is_none()
                 && !vendor_corrupt
-                && manifest_write_failed.is_none();
+                && manifest_write_failed.is_none()
+                && invalid_keys.is_empty();
             // Telemetry's count spans every leg (#1066), like the envelope's
             // `summary.rolledBack`.
             let rolled_back_total = results
@@ -2373,6 +2616,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     manifest: &manifest,
                     results: &results,
                     not_installed: &not_installed,
+                    unsupported_skips: &unsupported_skips,
+                    invalid_keys: &invalid_keys,
                     project_owned: if project_state {
                         &[]
                     } else {
@@ -2453,6 +2698,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 for purl in &not_installed {
                     eprintln!("  - {purl}");
                 }
+                // The ones whose record this run drops are tracked by
+                // nothing afterwards: say what that leaves, and the remedy.
+                let dropped = not_installed
+                    .iter()
+                    .filter(|purl| removed.contains(purl))
+                    .count();
+                if let Some(note) = format_not_installed_note(dropped, args.common.dry_run) {
+                    eprintln!("{note}");
+                }
             }
 
             if !args.common.json && !args.common.silent {
@@ -2503,6 +2757,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .filter(|key| {
                         !restored.contains(strip_purl_qualifiers(key))
                             && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                            // A gem the hosted leg already brought back to
+                            // its upstream build.
+                            && !hosted_leg.refreshed_installs.contains(key.as_str())
                     })
                     .count();
                 if still_patched > 0 {
@@ -2532,6 +2789,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // exit 1, so a silent run must still say why. Printed after
             // the summary blocks so they are the last thing on screen.
             if !args.common.json {
+                for (key, why) in &invalid_keys {
+                    eprintln!("{}", format_rollback_failure(key, why));
+                }
                 for (key, reason) in &vendored_leg.kept {
                     eprintln!("Error: Kept vendored state for {key}: {reason}");
                 }
@@ -2619,14 +2879,14 @@ pub(crate) async fn rollback_patches_inner(
             }
             InnerSelection::Identifier(None) => {
                 if !common.silent && !common.json {
-                    println!("No patches found in manifest");
+                    println!("{}", no_patches_left(common));
                 }
             }
             InnerSelection::Scope { announce_empty, .. } => {
                 // No-match errors were the resolver's job; an empty scoped
                 // selection here just means the work lives in other legs.
                 if *announce_empty && !common.silent && !common.json {
-                    println!("No patches found in manifest");
+                    println!("{}", no_patches_left(common));
                 }
             }
         }
@@ -3004,10 +3264,14 @@ pub(crate) async fn rollback_patches_inner(
     // already-cached before-blobs in, and let any download below land there
     // too. `tempdir_in(socket_dir)` keeps it on the same filesystem for
     // hardlinks and is auto-removed on drop, like the `.socket-stage-*`
-    // atomic-write siblings.
+    // atomic-write siblings; one a killed run leaves behind is swept by
+    // the next lock holder (`sweep_stale_stage_entries`).
     let _dry_run_blob_stage: Option<tempfile::TempDir> = if common.dry_run {
         let stage = tempfile::Builder::new()
-            .prefix(".socket-stage-dryrun-blobs-")
+            .prefix(&format!(
+                "{}dryrun-blobs-",
+                socket_patch_core::utils::socket_dir::STAGE_PREFIX
+            ))
             .tempdir_in(socket_dir)
             .map_err(|e| e.to_string())?;
         let staged_path = stage.path().to_path_buf();
@@ -5561,7 +5825,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        // silent=false so the "No patches found in manifest" announce path
+        // silent=false so the "No patches in this project" announce path
         // actually executes (its output is not capturable here; the
         // contract under test is the quiet Ok).
         let (success, results, vendored_skipped, not_installed) =
@@ -5928,6 +6192,28 @@ mod tests {
         );
     }
 
+    /// Dropping the record of a package the crawl did not find leaves a
+    /// possibly patched copy tracked by nothing: the note says so and
+    /// names the remedy, and is absent when no such record is dropped.
+    #[test]
+    fn not_installed_note_says_what_dropping_the_record_leaves() {
+        assert_eq!(format_not_installed_note(0, false), None);
+        assert_eq!(
+            format_not_installed_note(1, false).as_deref(),
+            Some(
+                "Nothing was restored for it and its record was removed: a copy this run \
+                 did not find stays patched until the package is reinstalled."
+            )
+        );
+        assert_eq!(
+            format_not_installed_note(3, true).as_deref(),
+            Some(
+                "Nothing was restored for them and their records would be removed: copies \
+                 this run did not find stay patched until the packages are reinstalled."
+            )
+        );
+    }
+
     #[test]
     fn dry_run_counts_block() {
         let p = Path::new("/p");
@@ -6214,6 +6500,8 @@ mod tests {
             manifest,
             results,
             not_installed: &[],
+            unsupported_skips: &[],
+            invalid_keys: &[],
             project_owned: &[],
             vendored,
             vendor_entries: &[],

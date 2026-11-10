@@ -31,9 +31,10 @@
 //! BOTH files are CRLF (a fresh `yarn.lock`, and a `package.json` it first
 //! pretty-prints) — and keeps each file's majority ending on every later
 //! write; a `core.autocrlf` checkout makes them CRLF on any OS. The lock
-//! entry is spliced in the file's own terminator and `package.json` is
-//! re-serialized in its own layout ([`JsonLayout`]: BOM, indent, terminator,
-//! trailing newline), so vendor + revert round-trip both byte-exactly. A
+//! entry is spliced in the file's own terminator and the `resolutions`
+//! entry is spliced into `package.json` as a span edit
+//! ([`super::npm_dir::splice_json`]: every other byte of the manifest stays
+//! as it is), so vendor + revert round-trip both byte-exactly. A
 //! file mixing CRLF and LF is refused before any write
 //! (`vendor_yarn_berry_mixed_line_endings`, see
 //! [`refuse_mixed_line_endings`]); a revert never refuses on line endings.
@@ -44,7 +45,6 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
 use crate::formats::yarn::berry_prune::{
@@ -62,20 +62,21 @@ use crate::utils::fs::{
 };
 use crate::utils::line_endings::LineEndings;
 use crate::utils::npm_range::npm_range_admits;
-use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
 #[cfg(test)]
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused};
 use super::npm_common::{
     guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
     NpmVendorRequest, WireCx,
 };
+use super::npm_dir::splice_manifest;
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
-use super::state::{VendorEntry, WiringAction, WiringRecord};
+use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::yarn_classic_lock::{
     forget_block_scans, lines_to_json, read_yarn_lock, revert_recorded_block, scan_blocks_shared,
 };
@@ -446,6 +447,7 @@ impl NpmLockBackend for YarnBerryBackend {
 
         // ── 11. Build both new byte images, then commit pkg-first/lock-second
         let existing_entry = existing_res.is_some();
+        let created_resolutions = !pkg_obj.contains_key("resolutions");
         let mut new_pkg = (*pkg).clone();
         {
             let obj = new_pkg.as_object_mut().expect("validated above");
@@ -457,9 +459,9 @@ impl NpmLockBackend for YarnBerryBackend {
             };
             res_obj.insert(name.to_string(), Value::String(spec.clone()));
         }
-        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
-            .render(&new_pkg)
-            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        // package.json is the user's file: the entry goes in as a span
+        // edit and every other byte stays as it is.
+        let new_pkg_bytes = splice_manifest(PACKAGE_JSON, &pkg_bytes, &new_pkg)?;
         let mut new_lock_text = replace_block(
             &lock_text,
             target,
@@ -551,6 +553,13 @@ impl NpmLockBackend for YarnBerryBackend {
         }));
         Ok(Some(NpmCommit {
             wiring,
+            // Whether this run created the `resolutions` table, in the
+            // ledger's package.json table flag (shared across a project's
+            // entries, so whichever revert empties the table drops it).
+            pnpm: Some(PnpmMeta {
+                created_overrides_table: created_resolutions,
+                ..PnpmMeta::default()
+            }),
             yarn_berry10c0: packed
                 .yarn_berry10c0
                 .clone()
@@ -889,9 +898,36 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
+    // Both files are read, parsed and edited in memory before either is
+    // written: a `package.json` that cannot be parsed or edited fails the
+    // revert here, with the lock still wired to the `resolutions` entry it
+    // pairs with. A missing file is not a failure (its warning is raised
+    // where the file's records are handled).
+    let lock_path = project_root.join(YARN_LOCK);
+    let pkg_path = project_root.join(PACKAGE_JSON);
+    let mut pkg_state: Option<(Value, Vec<u8>)> = None;
+    let mut pkg_missing = false;
+    if !pkg_recs.is_empty() {
+        match read_regular_to_bytes(&pkg_path).await {
+            Ok(bytes) => match parse_json_manifest(&bytes) {
+                Ok(pkg) => pkg_state = Some((pkg, bytes)),
+                // Fail-closed: rewriting a manifest we cannot parse risks
+                // destroying it.
+                Err(e) => {
+                    return RevertOutcome::failed(format!(
+                        "{PACKAGE_JSON} is not parseable JSON ({e}); nothing was reverted — fix \
+                         it and re-run revert"
+                    ))
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => pkg_missing = true,
+            Err(e) => return RevertOutcome::failed(format!("cannot read {PACKAGE_JSON}: {e}")),
+        }
+    }
+
     // yarn.lock fragments (reverse application order).
+    let mut lock_out: Option<String> = None;
     if !lock_recs.is_empty() {
-        let lock_path = project_root.join(YARN_LOCK);
         match read_regular_to_string(&lock_path).await {
             Ok(mut text) => {
                 let mut changed = false;
@@ -977,12 +1013,7 @@ pub async fn revert_yarn_berry_opts(
                     if rebased || merged {
                         text = doc.render(&moved);
                     }
-                    forget_block_scans();
-                    if let Err(e) =
-                        atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await
-                    {
-                        return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
-                    }
+                    lock_out = Some(text);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -995,132 +1026,67 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
-    // package.json resolutions entries.
-    if !pkg_recs.is_empty() {
-        let pkg_path = project_root.join(PACKAGE_JSON);
-        match read_regular_to_bytes(&pkg_path).await {
-            Ok(bytes) => {
-                let mut pkg: Value = match parse_json_manifest(&bytes) {
-                    Ok(v) => v,
-                    // Fail-closed: rewriting a manifest we cannot parse
-                    // risks destroying it.
-                    Err(e) => {
-                        return RevertOutcome::failed(format!(
-                            "{PACKAGE_JSON} is not parseable JSON ({e}); fix it and re-run revert"
-                        ))
-                    }
-                };
-                let mut changed = false;
-                for rec in pkg_recs {
-                    revert_resolution_record(
-                        &mut pkg,
-                        rec,
-                        &entry.uuid,
-                        &mut changed,
-                        &mut outcome.warnings,
-                    );
-                }
-                if changed {
-                    // The file's current layout — the one vendoring kept —
-                    // so the restore lands byte-identical on the pre-vendor
-                    // bytes (CRLF, BOM and trailing newline included).
-                    match JsonLayout::of(&String::from_utf8_lossy(&bytes)).render(&pkg) {
-                        Ok(out) => {
-                            PKG_JSON_MEMO.invalidate();
-                            if let Err(e) =
-                                atomic_write_bytes_preserving_mode(&pkg_path, &out).await
-                            {
-                                return RevertOutcome::failed(format!(
-                                    "cannot write {PACKAGE_JSON}: {e}"
-                                ));
-                            }
-                        }
-                        Err(e) => {
-                            return RevertOutcome::failed(format!(
-                                "cannot serialize {PACKAGE_JSON}: {e}"
-                            ))
-                        }
-                    }
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                outcome.warnings.push(VendorWarning::new(
-                    "vendor_lockfile_missing",
-                    format!("{PACKAGE_JSON} is missing; the resolutions entry cannot be removed"),
-                ));
-            }
-            Err(e) => return RevertOutcome::failed(format!("cannot read {PACKAGE_JSON}: {e}")),
-        }
-    }
-
-    // LOSSINESS GUARD: when any wiring record was left
-    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
-    // what the lock — or the redirect ledger's recorded originals — still
-    // points at. Keep it (and let the CLI keep the ledger entry) instead of
-    // deleting evidence out from under a lock we just refused to touch.
-    if outcome.drift_skipped() {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-
-    // `--preserve-state` (`keep_artifact`): the wiring restore above already
-    // ran; the artifact dir stays behind (and the caller keeps the ledger
-    // entry), so the deletion — and the still-wired probes that exist only
-    // to protect it — are skipped.
-    if keep_artifact {
-        return outcome;
-    }
-
-    if super::npm_flavor::keep_artifact_while_lock_references_it(
-        &mut outcome,
-        project_root,
-        &[YARN_LOCK, PACKAGE_JSON],
-        &entry.uuid,
-        &uuid_dir_rel,
-    )
-    .await
-    {
-        return outcome;
-    }
-
-    // FAIL-CLOSED (same brick class as the unwired guard above, twin of
-    // npm_lock's post-restore probe): the restore only rewrites the
-    // fragments the wiring recorded, but yarn can still resolve through the
-    // artifact via a lock entry or resolutions value the wiring never named
-    // (hand-copied or re-keyed since vendoring). Deleting the uuid dir then
-    // fails every subsequent install on the missing tarball, silently. Both
-    // wired files are probed independently; absent or unprovable keeps the
-    // wired revert's existing missing-file tolerance.
-    for wired in [YARN_LOCK, PACKAGE_JSON] {
-        if super::npm_flavor::lock_text_mentions_uuid(project_root, &[wired], &entry.uuid).await
-            == Some(true)
-        {
-            let detail = format!(
-                "refusing to remove {uuid_dir_rel}: after restoring the recorded wiring, \
-                 {wired} still resolves through it (was the entry re-keyed or hand-copied \
-                 since vendoring?) — deleting the artifact would make every subsequent \
-                 install fail; restore the pre-vendor {wired} (or remove the dependency and \
-                 re-lock) and re-run `vendor --revert`"
+    // package.json resolutions entries. The emptied table goes only when
+    // vendoring created it; an entry recorded before that was tracked
+    // keeps the old rule (an emptied table is taken for vendor residue).
+    let created_resolutions = entry
+        .pnpm
+        .as_ref()
+        .is_none_or(|meta| meta.created_overrides_table);
+    let mut pkg_out: Option<Vec<u8>> = None;
+    if let Some((mut pkg, bytes)) = pkg_state {
+        let mut changed = false;
+        for rec in &pkg_recs {
+            revert_resolution_record(
+                &mut pkg,
+                rec,
+                &entry.uuid,
+                created_resolutions,
+                &mut changed,
+                &mut outcome.warnings,
             );
-            outcome.success = false;
-            outcome.error = Some(detail.clone());
-            outcome.warnings.push(VendorWarning::new(
-                "vendor_lock_still_wired_revert_blocked",
-                detail,
-            ));
-            return outcome;
+        }
+        if changed {
+            // The entry comes out as a span edit, the inverse of the one
+            // vendoring made, so the restore lands on the pre-vendor bytes.
+            match splice_manifest(PACKAGE_JSON, &bytes, &pkg) {
+                Ok(out) => pkg_out = Some(out),
+                Err(why) => return RevertOutcome::failed(format!("{why}; nothing was reverted")),
+            }
+        }
+    }
+    if pkg_missing {
+        outcome.warnings.push(VendorWarning::new(
+            "vendor_lockfile_missing",
+            format!("{PACKAGE_JSON} is missing; the resolutions entry cannot be removed"),
+        ));
+    }
+
+    // Writes, lock first.
+    if let Some(text) = lock_out {
+        forget_block_scans();
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await {
+            return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
+        }
+    }
+    if let Some(bytes) = pkg_out {
+        PKG_JSON_MEMO.invalidate();
+        if let Err(e) = atomic_write_bytes_preserving_mode(&pkg_path, &bytes).await {
+            return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
         }
     }
 
-    // The last npm-family entry leaves `.socket/vendor/npm/` (and
-    // `.socket/vendor/`) empty: the shared helper prunes them so a reverted
-    // project carries no vendor residue (non-recursive: siblings keep them).
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-        return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
-    }
-
-    outcome
+    // The artifact goes only once neither wired file resolves through it:
+    // a fragment left alone or vanished keeps it while one still names it,
+    // and a lock entry or resolutions value the wiring never recorded
+    // (hand-copied or re-keyed since vendoring) refuses the deletion. See
+    // [`KeepPolicy::NpmFamily`].
+    let policy = KeepPolicy::NpmFamily {
+        locks: &[YARN_LOCK, PACKAGE_JSON],
+        wired: &[YARN_LOCK, PACKAGE_JSON],
+        uuid: &entry.uuid,
+    };
+    revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
@@ -1220,12 +1186,14 @@ fn restore_pruned_entry(
 }
 
 /// Remove our resolutions entry iff the live value still points into our
-/// uuid dir; drop the `resolutions` table when that leaves it empty (we only
-/// ever ADD entries — an empty table would be vendor residue).
+/// uuid dir; drop the `resolutions` table when that leaves it empty and
+/// vendoring created it (`created_table`) — an empty table the user
+/// already had stays theirs.
 fn revert_resolution_record(
     pkg: &mut Value,
     rec: &WiringRecord,
     entry_uuid: &str,
+    created_table: bool,
     changed: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -1298,7 +1266,7 @@ fn revert_resolution_record(
         return;
     }
     res_obj.shift_remove(key);
-    if res_obj.is_empty() {
+    if res_obj.is_empty() && created_table {
         obj.shift_remove("resolutions");
     }
     *changed = true;
@@ -4415,8 +4383,8 @@ __metadata:
     }
 
     /// Revert tolerates a deleted wired file (warn + restore the rest +
-    /// prune the artifact) but fails CLOSED on a corrupt package.json —
-    /// after the lock restore already ran (the partial-restore contract).
+    /// prune the artifact) but fails CLOSED on a corrupt package.json,
+    /// before the lock is touched.
     #[tokio::test]
     async fn revert_tolerates_missing_wired_files_and_fails_closed_on_corrupt_manifest() {
         // yarn.lock deleted: warn, restore package.json, prune the artifact.
@@ -4474,31 +4442,42 @@ __metadata:
             "the missing manifest is not resurrected"
         );
 
-        // Corrupt package.json: fail closed AFTER the lock restore ran.
+        // Corrupt package.json: fail closed BEFORE either file is written.
+        // A lock restored around a `resolutions` entry still naming the
+        // vendored tarball is a pair yarn re-resolves on the next install.
         let fx = fixture().await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
+        let vendored_lock = tokio::fs::read(fx.lock_path()).await.unwrap();
         tokio::fs::write(fx.pkg_path(), b"{bad").await.unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(!outcome.success, "corrupt manifest must fail the revert");
+        let error = outcome.error.as_deref().unwrap_or("");
         assert!(
-            outcome
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not parseable JSON"),
-            "{:?}",
-            outcome.error
+            error.contains("not parseable JSON") && error.contains("nothing was reverted"),
+            "{error}"
         );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes,
-            "the lock restore already ran when the manifest failed (partial restore)"
+            vendored_lock,
+            "the lock stays wired while the manifest cannot be edited"
         );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), b"{bad");
         assert!(
             fx.tgz_path().exists(),
             "artifact survives the failed revert"
         );
+
+        // Once the manifest is repaired the same revert converges.
+        tokio::fs::write(fx.pkg_path(), B3_AFTER_PKG).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+        assert!(!fx.tgz_path().exists());
     }
 
     /// Write failures fail closed on unix: a read-only project root makes
@@ -4647,6 +4626,7 @@ __metadata:
             &mut pkg,
             &rec(KIND_RESOLUTION, None),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -4668,6 +4648,7 @@ __metadata:
             &mut pkg,
             &rec("bogus", Some("left-pad")),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -4688,6 +4669,7 @@ __metadata:
             &mut pkg,
             &rec(KIND_RESOLUTION, Some("left-pad")),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -5185,6 +5167,96 @@ __metadata:
             );
             assert!(!fx.tgz_path().exists(), "{label}: artifact removed");
         }
+    }
+
+    /// A manifest that is not in `JSON.stringify` form (inline arrays,
+    /// `\u` escapes, exponent and oversized numbers, duplicate keys, one
+    /// line, …) keeps every byte vendoring does not own: the vendored file
+    /// is the original with the `resolutions` entry inserted, and the
+    /// revert restores the original bytes. A re-serialized manifest
+    /// reflowed the file and changed number values.
+    #[tokio::test]
+    async fn vendor_and_revert_change_only_the_resolutions_bytes_of_package_json() {
+        use crate::vendor::test_support::{handwritten_manifests, sole_insertion};
+        const VERSION: &str = "  \"version\": \"1.0.0\",\n";
+        let mut cases = handwritten_manifests(B3_BEFORE_PKG);
+        // A `resolutions` table the user already had stays theirs.
+        for (tag, table) in [
+            ("existing-resolutions", "{ \"zzz\": \"1.0.0\" }"),
+            (
+                "existing-block-resolutions",
+                "{\n    \"zzz\": \"1.0.0\"\n  }",
+            ),
+            ("empty-resolutions", "{}"),
+            ("empty-padded-resolutions", "{ }"),
+        ] {
+            cases.push((
+                tag,
+                B3_BEFORE_PKG.replace(VERSION, &format!("{VERSION}  \"resolutions\": {table},\n")),
+            ));
+        }
+        for (tag, before) in cases {
+            let fx = fixture_with(&before, B3_BEFORE_LOCK).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            let vendored = tokio::fs::read(fx.pkg_path()).await.unwrap();
+            let added = sole_insertion(before.as_bytes(), &vendored).unwrap_or_else(|| {
+                panic!(
+                    "{tag}: vendoring changed bytes it does not own:\n{}",
+                    String::from_utf8_lossy(&vendored)
+                )
+            });
+            let added = String::from_utf8(added).unwrap();
+            assert!(
+                added.contains("\"left-pad\"") && added.contains(UUID),
+                "{tag}: {added}"
+            );
+            let doc = parse_json_manifest(&vendored).unwrap();
+            assert_eq!(
+                doc["resolutions"]["left-pad"],
+                format!("file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                "{tag}"
+            );
+
+            let outcome = revert_yarn_berry(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(
+                String::from_utf8(tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap(),
+                before,
+                "{tag}: package.json byte-restored"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                fx.lock_bytes,
+                "{tag}: yarn.lock byte-restored"
+            );
+        }
+    }
+
+    /// Who created `resolutions` is recorded in the ledger: an entry from a
+    /// release that did not record it keeps that release's rule, under
+    /// which the emptied table goes whoever wrote it.
+    #[tokio::test]
+    async fn revert_of_an_entry_without_the_table_flag_drops_the_emptied_resolutions() {
+        const VERSION: &str = "  \"version\": \"1.0.0\",\n";
+        let before =
+            B3_BEFORE_PKG.replace(VERSION, &format!("{VERSION}  \"resolutions\": {{}},\n"));
+        let fx = fixture_with(&before, B3_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        assert_eq!(
+            entry.pnpm.as_ref().map(|meta| meta.created_overrides_table),
+            Some(false),
+            "the table was the project's"
+        );
+        entry.pnpm = None;
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+            B3_BEFORE_PKG
+        );
     }
 
     /// A lock or manifest mixing CRLF and LF (or holding a bare CR) has no

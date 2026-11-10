@@ -1097,6 +1097,55 @@ fn failed_swap_restores_every_copy() {
     }
 }
 
+/// When the copy already swapped cannot be put back either, its result
+/// says so: it still holds the service jar, and is not reported rolled
+/// back. The engine's failpoint fails the second jar write and then the
+/// write that would restore the first copy.
+#[test]
+fn failed_swap_reports_a_copy_it_could_not_put_back() {
+    let f = fx("    mavenLocal()\n    mavenCentral()\n");
+    let m2 = f.m2(&as_refs(&pristine_files()));
+    let version = f.gradle(&as_refs(&pristine_files()));
+    f.member_manifest();
+    let (_rt, server) = service(&service_jar());
+
+    let out = f.run_env(
+        &["apply", "--vendor-url", &server.uri()],
+        &[(
+            "SOCKET_PATCH_FAILPOINT",
+            "patch_file_commit@2~fail,patch_file_commit@3~fail",
+        )],
+    );
+    out.failed();
+    let errors: Vec<String> = out.json["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .filter_map(|e| e["error"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        errors.iter().any(|e| e.contains("left changed")),
+        "the copy that kept the service jar must say so: {}",
+        out.json
+    );
+    assert!(
+        !errors.iter().any(|e| e.contains("rolled back")),
+        "no copy was put back: {}",
+        out.json
+    );
+    let jars = [
+        std::fs::read(m2.join(JAR)).unwrap(),
+        hash_copies(&version, JAR)[0].1.clone(),
+    ];
+    assert_eq!(
+        jars.iter().filter(|jar| **jar == service_jar()).count(),
+        1,
+        "exactly the first copy written still holds the service jar"
+    );
+    assert_eq!(jars.iter().filter(|jar| **jar == pristine_jar()).count(), 1);
+}
+
 /// Windows: a hash-dir jar held open without delete sharing (how a Gradle
 /// daemon's `JarFile` holds it) refuses the write with
 /// `gradle_jar_locked_by_daemon` — the rename fails with

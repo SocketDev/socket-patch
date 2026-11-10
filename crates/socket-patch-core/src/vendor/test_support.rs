@@ -672,3 +672,63 @@ pub(crate) fn relayout(text: &str, bom: bool, crlf: bool, tab: bool) -> String {
     }
     out
 }
+
+/// Hand-formatted spellings of `canonical` — an LF, two-space manifest
+/// holding the lines `  "version": "1.0.0",` and `    "left-pad": "1.3.0"`
+/// — that a parse-and-print round trip does not reproduce, each with a tag
+/// for assertion messages: inline arrays and objects, `\u` and `\/`
+/// escapes, exponent and oversized numbers, `{ }`, duplicate keys, a
+/// one-line document, uneven indentation, and the same text in CRLF, with a
+/// BOM, without a trailing newline and tab-indented.
+pub(crate) fn handwritten_manifests(canonical: &str) -> Vec<(&'static str, String)> {
+    const VERSION: &str = "  \"version\": \"1.0.0\",\n";
+    const DEP: &str = "    \"left-pad\": \"1.3.0\"";
+    assert!(canonical.contains(VERSION) && canonical.contains(DEP));
+    let with = |extra: &str| canonical.replace(VERSION, &format!("{VERSION}{extra}"));
+    let handwritten = with(concat!(
+        "  \"author\": \"Jos\\u00e9 <jose@example.com>\",\n",
+        "  \"homepage\": \"https:\\/\\/example.com\\/\",\n",
+        "  \"files\": [\"dist\", \"src\"],\n",
+        "  \"config\": { \"port\": 8080, \"ratio\": 1e3, \"tiny\": 4.670e-22, ",
+        "\"wide\": 5.173e28, \"big\": 18446744073709551616, \"zero\": -0 },\n",
+        "  \"scripts\": { },\n",
+    ));
+    let one_line = {
+        let doc: serde_json::Value = serde_json::from_str(canonical).unwrap();
+        format!("{}\n", serde_json::to_string(&doc).unwrap())
+    };
+    vec![
+        ("handwritten", handwritten.clone()),
+        (
+            "handwritten+crlf",
+            relayout(&handwritten, false, true, false),
+        ),
+        (
+            "handwritten+bom",
+            relayout(&handwritten, true, false, false),
+        ),
+        (
+            "handwritten+tabs",
+            relayout(&handwritten, false, false, true),
+        ),
+        (
+            "no-trailing-newline",
+            handwritten.trim_end_matches('\n').to_string(),
+        ),
+        (
+            "duplicate-keys",
+            with("  \"license\": \"MIT\",\n  \"license\": \"ISC\",\n"),
+        ),
+        ("one-line", one_line),
+        ("uneven-indent", canonical.replace(DEP, &format!("  {DEP}"))),
+    ]
+}
+
+/// The run of bytes `after` has and `before` lacks, when `after` is
+/// `before` with exactly one run inserted and every other byte in place.
+pub(crate) fn sole_insertion(before: &[u8], after: &[u8]) -> Option<Vec<u8>> {
+    let kept = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let tail = &before[kept..];
+    (after.len() >= before.len() && after.ends_with(tail))
+        .then(|| after[kept..after.len() - tail.len()].to_vec())
+}

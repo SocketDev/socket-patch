@@ -21,6 +21,8 @@ use socket_patch_core::crawlers::npm_crawler::{
     get_bun_global_prefix, get_npm_global_prefix, get_pnpm_global_prefix, get_yarn_global_prefix,
 };
 use socket_patch_core::crawlers::types::CrawlerOptions;
+#[cfg(unix)]
+use socket_patch_core::crawlers::PythonCrawler;
 use socket_patch_core::crawlers::{ComposerCrawler, RubyCrawler};
 
 /// Set (or remove) env vars and the cwd for the guard's lifetime; restored
@@ -284,6 +286,177 @@ async fn global_gem_paths_come_from_the_installed_gem_shim() {
         paths.contains(&gem_home.join("gems")),
         "global gem paths must include the `gem env` home; got {paths:?}"
     );
+}
+
+// ─────────────────────── where interpreter probes run ───────────────────────
+
+/// Install a fake `name` in `bin` that appends the directory it runs from
+/// to `log` (one line per run) and then runs `body`. A version manager's
+/// shim (rbenv, pyenv, asdf, mise) picks the interpreter from that
+/// directory's `.ruby-version` / `.python-version` / `.tool-versions`.
+#[cfg(unix)]
+fn logging_tool(bin: &Path, name: &str, log: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(bin).unwrap();
+    let path = bin.join(name);
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\npwd -P >> '{}'\n{body}\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The directories the logging tool ran from, one per run.
+#[cfg(unix)]
+fn ran_from(log: &Path) -> Vec<PathBuf> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(unix)]
+fn assert_every_probe_ran_from(log: &Path, dir: &Path, what: &str) {
+    let dirs = ran_from(log);
+    assert!(!dirs.is_empty(), "{what}: the probe never ran");
+    assert!(
+        dirs.iter().all(|ran| ran == dir),
+        "{what}: every probe must run from {}; they ran from {dirs:?}",
+        dir.display()
+    );
+}
+
+/// A fake `gem` answering `gem env gemdir` / `gempath` with `gem_home`.
+#[cfg(unix)]
+fn logging_gem(l: &Layout, log: &Path) -> PathBuf {
+    let gem_home = l.home.join("ruby-gems");
+    std::fs::create_dir_all(gem_home.join("gems")).unwrap();
+    let body = format!("printf '%s\\n' '{}'", gem_home.display());
+    logging_tool(&l.bin, "gem", log, &body);
+    gem_home
+}
+
+/// A fake `python3` answering `--version` and the `site` query.
+#[cfg(unix)]
+fn logging_python(l: &Layout, log: &Path) {
+    let site = l.home.join("py-site-packages");
+    std::fs::create_dir_all(&site).unwrap();
+    let body = format!(
+        "case \"$1\" in\n--version) echo 'Python 3.12.0' ;;\n*) printf '%s\\n' '{}' ;;\nesac",
+        site.display()
+    );
+    logging_tool(&l.bin, "python3", log, &body);
+}
+
+/// `--global` asks `gem env` from the neutral directory, like the npm and
+/// Composer global probes: run from the project the shell happens to be
+/// in, an rbenv shim would follow that project's `.ruby-version` and the
+/// scan would cover another Ruby's gem homes.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn global_gem_probe_runs_outside_the_current_project() {
+    let l = layout();
+    let log = l.home.join("gem-ran-from.log");
+    let gem_home = logging_gem(&l, &log);
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    env.set("GEM_HOME", None).set("GEM_PATH", None);
+    env.chdir(&l.proj);
+
+    let paths = RubyCrawler::new()
+        .get_gem_paths(&global_options(&l.proj))
+        .await
+        .unwrap();
+    assert!(paths.contains(&gem_home.join("gems")), "{paths:?}");
+    assert_every_probe_ran_from(&log, &l.home, "gem env under --global");
+}
+
+/// A project scan asks `gem env` from `--cwd`, not from the directory the
+/// CLI was started in: the project's own `.ruby-version` picks the Ruby
+/// whose gem homes hold its gems.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn project_gem_probe_runs_from_the_project_dir() {
+    let l = layout();
+    let log = l.home.join("gem-ran-from.log");
+    let gem_home = logging_gem(&l, &log);
+    std::fs::write(l.proj.join("Gemfile"), "source 'https://rubygems.org'\n").unwrap();
+    let elsewhere = l.home.join("started-here");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    env.set("GEM_HOME", None)
+        .set("GEM_PATH", None)
+        .set("BUNDLE_PATH", None)
+        .set("BUNDLE_GEMFILE", None)
+        .set("BUNDLE_APP_CONFIG", None);
+    env.chdir(&elsewhere);
+
+    let options = CrawlerOptions {
+        cwd: l.proj.clone(),
+        global: false,
+        global_prefix: None,
+    };
+    let paths = RubyCrawler::new().get_gem_paths(&options).await.unwrap();
+    assert!(paths.contains(&gem_home.join("gems")), "{paths:?}");
+    assert_every_probe_ran_from(&log, &l.proj, "gem env for a project");
+}
+
+/// `--global` asks Python for its site-packages from the neutral
+/// directory, not from the project the shell is in (a pyenv shim would
+/// follow that project's `.python-version`).
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn global_python_probe_runs_outside_the_current_project() {
+    let l = layout();
+    let log = l.home.join("python-ran-from.log");
+    logging_python(&l, &log);
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    env.chdir(&l.proj);
+
+    PythonCrawler::new()
+        .get_site_packages_paths(&global_options(&l.proj))
+        .await
+        .unwrap();
+    assert_every_probe_ran_from(&log, &l.home, "python3 under --global");
+}
+
+/// A Python project without an environment of its own falls back to the
+/// interpreter's site-packages, asked from `--cwd` (the project's
+/// `.python-version`), not from where the CLI was started.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn project_python_probe_runs_from_the_project_dir() {
+    let l = layout();
+    let log = l.home.join("python-ran-from.log");
+    logging_python(&l, &log);
+    std::fs::write(l.proj.join("requirements.txt"), "requests==2.31.0\n").unwrap();
+    let elsewhere = l.home.join("started-here");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let mut env = Env::new();
+    point_env_at(&mut env, &l);
+    env.set("VIRTUAL_ENV", None)
+        .set("CONDA_PREFIX", None)
+        .set("WORKON_HOME", None);
+    env.chdir(&elsewhere);
+
+    let options = CrawlerOptions {
+        cwd: l.proj.clone(),
+        global: false,
+        global_prefix: None,
+    };
+    PythonCrawler::new()
+        .get_site_packages_paths(&options)
+        .await
+        .unwrap();
+    assert_every_probe_ran_from(&log, &l.proj, "python3 for a project");
 }
 
 // ───────────────────────────────── Composer (#438) ─────────────────────────────────

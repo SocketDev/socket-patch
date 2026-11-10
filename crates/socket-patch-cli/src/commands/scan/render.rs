@@ -132,6 +132,74 @@ pub(super) fn vuln_cell(vulns: &super::discovery::VulnIds, verbose: bool) -> Str
     }
 }
 
+/// Advisory ids one list of a coverage line names before `(+N more)`
+/// (unless `--verbose`).
+const COVERAGE_IDS_SHOWN: usize = 8;
+
+fn coverage_ids(ids: &[String], verbose: bool) -> String {
+    if verbose || ids.len() <= COVERAGE_IDS_SHOWN {
+        return ids.join(", ");
+    }
+    format!(
+        "{} (+{} more)",
+        ids[..COVERAGE_IDS_SHOWN].join(", "),
+        ids.len() - COVERAGE_IDS_SHOWN
+    )
+}
+
+/// The lines under a mode's result line, one per patched package: the
+/// advisories its patch fixes and the ones it leaves unpatched (other
+/// patches of the package name them, and only one is applied). A closing
+/// line says why and what fixes them when any package keeps one. `dry_run`
+/// puts it in the future tense. A package whose patches name no advisory
+/// gets no line; `color` highlights what stays unpatched.
+pub(crate) fn coverage_lines(
+    coverage: &[&super::discovery::AdvisoryCoverage],
+    dry_run: bool,
+    verbose: bool,
+    color: bool,
+) -> Vec<String> {
+    let (fixes, stays) = if dry_run {
+        ("would fix", "would stay unpatched")
+    } else {
+        ("fixes", "still unpatched")
+    };
+    let mut lines = Vec::new();
+    let mut incomplete = 0usize;
+    for c in coverage {
+        if c.fixes.is_empty() && c.unpatched.is_empty() {
+            continue;
+        }
+        let mut line = format!(
+            "  {}: ",
+            socket_patch_core::utils::purl::normalize_purl(&c.purl)
+        );
+        if c.fixes.is_empty() {
+            line.push_str("its patch names no advisory");
+        } else {
+            line.push_str(&format!("{fixes} {}", coverage_ids(&c.fixes, verbose)));
+        }
+        if !c.unpatched.is_empty() {
+            incomplete += 1;
+            let rest = format!("{stays}: {}", coverage_ids(&c.unpatched, verbose));
+            line.push_str(&format!("; {}", ui::paint(&rest, "33", color)));
+        }
+        lines.push(line);
+    }
+    if incomplete > 0 {
+        lines.push(format!(
+            "Only one patch is applied per package version. Upgrade {} to fix the advisories \
+             still unpatched.",
+            if incomplete == 1 {
+                "the package"
+            } else {
+                "those packages"
+            }
+        ));
+    }
+    lines
+}
+
 /// The line under the table: how many packages have patches and how many
 /// of those patches this account can download.
 pub(super) fn summary_line(packages: usize, patches: usize, all_accessible: bool) -> String {
@@ -174,6 +242,17 @@ pub(super) fn lockfile_only_note(n: usize) -> String {
     )
 }
 
+/// What an empty crawl says when `warnings` lockfiles or layouts could not
+/// be read (each has its warning on stderr): that is why nothing was found,
+/// so the generic "install first" hint would send the user the wrong way.
+pub(crate) fn no_packages_unreadable(warnings: usize) -> String {
+    if warnings == 1 {
+        "No packages found (see the warning).".to_string()
+    } else {
+        "No packages found (see the warnings).".to_string()
+    }
+}
+
 /// What an empty crawl says, naming the filter that emptied it when there
 /// was one (`--ecosystems`, PATH scoping) instead of a generic
 /// "install first" hint.
@@ -197,13 +276,33 @@ pub(crate) fn no_packages_message(
     "No packages found. Run your package manager's install first.".to_string()
 }
 
-/// A discovered project directory as the scan names it: relative to
-/// `--cwd`, `/`-separated.
-pub(super) fn shown_project_dir(cwd: &std::path::Path, dir: &std::path::Path) -> String {
-    dir.strip_prefix(cwd)
-        .unwrap_or(dir)
-        .to_string_lossy()
-        .replace('\\', "/")
+/// What a scan says when the consent gate held back every package it
+/// found: `declared` packages the project patches itself, and `unreadable`
+/// ones held back only because a project file could not be read. A broken
+/// file is fixed, not overridden, so only the first line names
+/// `--allow-patch-conflicts`.
+pub(crate) fn user_patch_withheld_lines(declared: usize, unreadable: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if unreadable > 0 {
+        lines.push(format!(
+            "{} not scanned: this project's own patches could not be checked (see the \
+             warnings). Fix the file they name and run again.",
+            plural(unreadable, "package was", "packages were")
+        ));
+    }
+    if declared > 0 {
+        let (was, them) = if declared == 1 {
+            ("was", "it")
+        } else {
+            ("were", "them")
+        };
+        lines.push(format!(
+            "{} protected by this project's own patches and {was} not scanned (see the \
+             warnings). Pass --allow-patch-conflicts to scan {them} anyway.",
+            plural(declared, "package is", "packages are")
+        ));
+    }
+    lines
 }
 
 /// What a bare scan's search for project directories left out, one line
@@ -858,6 +957,15 @@ mod tests {
             no_packages_message(false, Some(&ecos), &[]),
             "No pypi/cargo packages found."
         );
+        // A lockfile that could not be read explains the empty result.
+        assert_eq!(
+            no_packages_unreadable(1),
+            "No packages found (see the warning)."
+        );
+        assert_eq!(
+            no_packages_unreadable(2),
+            "No packages found (see the warnings)."
+        );
         let generic = no_packages_message(false, Some(&[]), &[]);
         assert_eq!(
             generic,
@@ -908,6 +1016,106 @@ mod tests {
             "[dry-run] Would download and vendor 1 of 4 patches (2 already vendored, \
              1 would be refused). No changes made."
         );
+    }
+
+    fn coverage(
+        purl: &str,
+        fixes: &[&str],
+        unpatched: &[&str],
+    ) -> crate::commands::scan::discovery::AdvisoryCoverage {
+        let strs = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        crate::commands::scan::discovery::AdvisoryCoverage {
+            purl: purl.to_string(),
+            uuids: vec!["u".to_string()],
+            fixes: strs(fixes),
+            unpatched: strs(unpatched),
+            fixed_ids: strs(fixes),
+            unfixed_ids: strs(unpatched),
+        }
+    }
+
+    #[test]
+    fn coverage_lines_name_fixed_and_unpatched_advisories_per_package() {
+        let complete = coverage("pkg:npm/%40scope/a@1.0.0", &["CVE-1"], &[]);
+        let partial = coverage("pkg:pypi/urllib3@1.26.18", &["CVE-2"], &["CVE-3", "CVE-4"]);
+        let silent = coverage("pkg:npm/b@1.0.0", &[], &[]);
+        let unnamed = coverage("pkg:npm/c@1.0.0", &[], &["CVE-5"]);
+        // Every advisory fixed: one line, no closing note. A package whose
+        // patches name no advisory has nothing to say.
+        assert_eq!(
+            coverage_lines(&[&complete, &silent], false, false, false),
+            ["  pkg:npm/@scope/a@1.0.0: fixes CVE-1"]
+        );
+        assert_eq!(
+            coverage_lines(&[&complete, &partial], false, false, false),
+            [
+                "  pkg:npm/@scope/a@1.0.0: fixes CVE-1",
+                "  pkg:pypi/urllib3@1.26.18: fixes CVE-2; still unpatched: CVE-3, CVE-4",
+                "Only one patch is applied per package version. Upgrade the package to fix \
+                 the advisories still unpatched.",
+            ]
+        );
+        // A dry run says it in the future tense; the note is for both
+        // packages.
+        assert_eq!(
+            coverage_lines(&[&partial, &unnamed], true, false, false),
+            [
+                "  pkg:pypi/urllib3@1.26.18: would fix CVE-2; would stay unpatched: CVE-3, CVE-4",
+                "  pkg:npm/c@1.0.0: its patch names no advisory; would stay unpatched: CVE-5",
+                "Only one patch is applied per package version. Upgrade those packages to \
+                 fix the advisories still unpatched.",
+            ]
+        );
+        assert!(coverage_lines(&[], false, false, false).is_empty());
+    }
+
+    #[test]
+    fn coverage_lines_bound_a_long_id_list_unless_verbose() {
+        let ids: Vec<String> = (1..=11).map(|i| format!("CVE-2024-{i:04}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let many = coverage("pkg:npm/a@1.0.0", &["CVE-1"], &ids);
+        let line = &coverage_lines(&[&many], false, false, false)[0];
+        assert!(
+            line.ends_with("CVE-2024-0007, CVE-2024-0008 (+3 more)"),
+            "{line}"
+        );
+        let line = &coverage_lines(&[&many], false, true, false)[0];
+        assert!(line.ends_with("CVE-2024-0010, CVE-2024-0011"), "{line}");
+        // Color wraps only the unpatched clause.
+        let line = &coverage_lines(&[&many], false, true, true)[0];
+        assert!(
+            line.starts_with("  pkg:npm/a@1.0.0: fixes CVE-1; \u{1b}[33mstill unpatched: "),
+            "{line:?}"
+        );
+    }
+
+    #[test]
+    fn user_patch_withheld_lines_separate_broken_files_from_declared_patches() {
+        assert_eq!(
+            user_patch_withheld_lines(0, 2),
+            [
+                "2 packages were not scanned: this project's own patches could not be checked \
+              (see the warnings). Fix the file they name and run again."
+            ]
+        );
+        assert_eq!(
+            user_patch_withheld_lines(3, 0),
+            [
+                "3 packages are protected by this project's own patches and were not scanned \
+              (see the warnings). Pass --allow-patch-conflicts to scan them anyway."
+            ]
+        );
+        let both = user_patch_withheld_lines(1, 1);
+        assert_eq!(both.len(), 2);
+        assert!(
+            both[0].starts_with("1 package was not scanned: "),
+            "{both:?}"
+        );
+        assert!(
+            both[1].starts_with("1 package is protected by this project's own patches and was "),
+            "{both:?}"
+        );
+        assert!(user_patch_withheld_lines(0, 0).is_empty());
     }
 
     #[test]

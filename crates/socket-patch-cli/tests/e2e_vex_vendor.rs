@@ -471,12 +471,16 @@ fn vendored_marker_survives_no_verify() {
     );
     assert_eq!(
         impact_for(stmts, "GHSA-vend-dddd"),
-        format!("Patched via Socket patch {UUID} (vendored)"),
-        "--no-verify must not lose the (vendored) provenance marker"
+        format!("Patched via Socket patch {UUID} (vendored); not verified on disk"),
+        "--no-verify must not lose the (vendored) provenance marker, and says what it skipped"
     );
     assert!(
         !impact_for(stmts, "GHSA-npm-control").contains("(vendored)"),
         "the agent-mode npm patch is not vendored:\n{stdout}"
+    );
+    assert!(
+        impact_for(stmts, "GHSA-npm-control").ends_with("; not verified on disk"),
+        "the agent-mode npm patch was not verified either:\n{stdout}"
     );
 }
 
@@ -2750,9 +2754,14 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
         assert_eq!(code, Some(0), "{extra:?}: {env}");
         let doc: Value =
             serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
+        let unverified = if extra.contains(&"--no-verify") {
+            "; not verified on disk"
+        } else {
+            ""
+        };
         assert_eq!(
             doc["statements"][0]["impact_statement"],
-            format!("Patched via Socket patch {uuid} (vendored)"),
+            format!("Patched via Socket patch {uuid} (vendored){unverified}"),
             "{extra:?}: {doc}"
         );
     }
@@ -2771,6 +2780,155 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
         "vendor_unwired",
         "{env}"
     );
+}
+
+/// A vendor ledger with one detached npm entry for `foo@1.0.0` (record
+/// embedded, artifact a tarball holding `patched`) recording `wiring`.
+fn write_foo_ledger(cwd: &Path, uuid: &str, patched: &[u8], wiring: &[(&str, &str)]) -> String {
+    let purl = "pkg:npm/foo@1.0.0";
+    let rel = format!(".socket/vendor/npm/{uuid}/foo-1.0.0.tgz");
+    write_member_tgz(&cwd.join(&rel), "package/index.js", patched);
+    let mut state = VendorState::new();
+    state.entries.insert(
+        purl.to_string(),
+        VendorEntry {
+            detached: true,
+            record: Some(make_record(
+                uuid,
+                "package/index.js",
+                &compute_git_sha256_from_bytes(patched),
+                "GHSA-stal-aaaa",
+                &["CVE-2026-41"],
+            )),
+            ..VendorEntry::new(
+                "npm".to_string(),
+                purl.to_string(),
+                uuid.to_string(),
+                VendorArtifact {
+                    yarn_berry10c0: None,
+                    path: rel.clone(),
+                    sha256: String::new(),
+                    size: None,
+                    platform_locked: None,
+                    file_inventory: None,
+                },
+                wiring
+                    .iter()
+                    .map(|(file, kind)| WiringRecord {
+                        file: file.to_string(),
+                        kind: kind.to_string(),
+                        action: WiringAction::Added,
+                        key: None,
+                        original: None,
+                        new: None,
+                    })
+                    .collect(),
+            )
+        },
+    );
+    std::fs::create_dir_all(cwd.join(".socket/vendor")).unwrap();
+    std::fs::write(
+        cwd.join(".socket/vendor/state.json"),
+        serde_json::to_string_pretty(&state).unwrap(),
+    )
+    .unwrap();
+    rel
+}
+
+/// Every run of `vex` over `cwd` omits `purl` as `vendor_unwired` and
+/// writes no document: by default, with `--no-verify`, and with an
+/// installed copy present.
+fn assert_never_attested(cwd: &Path, purl: &str) {
+    for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+        let (code, env) = vex_json(cwd, extra);
+        assert_eq!(code, Some(1), "{extra:?}: nothing may attest: {env}");
+        assert_eq!(env["error"]["code"], "no_applicable_patches", "{env}");
+        assert_eq!(
+            skipped_event(&env, purl)["errorCode"],
+            "vendor_unwired",
+            "{extra:?}: {env}"
+        );
+        assert!(!cwd.join("out.vex.json").exists(), "{extra:?}: {env}");
+    }
+}
+
+/// A pnpm project vendored normally (the ledger records the
+/// `package.json` `pnpm.overrides` entry and the lock), whose
+/// `pnpm-lock.yaml` a merge then reverted to the registry resolution while
+/// the override stayed in `package.json`. The lock is what `pnpm install
+/// --frozen-lockfile` consumes, and it resolves the package from the
+/// registry: the leftover override text must not keep the entry attested,
+/// with or without an (unpatched) installed copy.
+#[test]
+fn reverted_pnpm_lock_is_not_attested_from_a_leftover_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "55555555-5555-4555-8555-555555555555";
+    let purl = "pkg:npm/foo@1.0.0";
+    let rel = write_foo_ledger(
+        cwd,
+        uuid,
+        b"patched foo\n",
+        &[("package.json", "override"), ("pnpm-lock.yaml", "lock")],
+    );
+    std::fs::write(
+        cwd.join("package.json"),
+        format!(
+            r#"{{"name":"app","version":"0.1.0","dependencies":{{"foo":"1.0.0"}},"pnpm":{{"overrides":{{"foo@1.0.0":"file:{rel}"}}}}}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\n\nsettings:\n  autoInstallPeers: true\n  \
+         excludeLinksFromLockfile: false\n\nimporters:\n\n  .:\n    dependencies:\n      foo:\n        \
+         specifier: 1.0.0\n        version: 1.0.0\n\npackages:\n\n  foo@1.0.0:\n    \
+         resolution: {integrity: sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==}\n\n\
+         snapshots:\n\n  foo@1.0.0: {}\n",
+    )
+    .unwrap();
+    assert_never_attested(cwd, purl);
+
+    // The registry bytes the lock installs, unpatched.
+    let installed = cwd.join("node_modules/foo");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{"name":"foo","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(installed.join("index.js"), b"original foo\n").unwrap();
+    assert_never_attested(cwd, purl);
+}
+
+/// The vendor ledger is committed, tamper-able data. An entry whose
+/// `wiring` names an arbitrary project file that merely spells the vendored
+/// dir is not live while `package-lock.json` resolves the package from the
+/// registry.
+#[test]
+fn ledger_named_file_is_no_vendored_wiring() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let uuid = "44444444-4444-4444-8444-444444444444";
+    let purl = "pkg:npm/foo@1.0.0";
+    let rel = write_foo_ledger(cwd, uuid, b"patched foo\n", &[("docs/notes.txt", "lock")]);
+    std::fs::create_dir_all(cwd.join("docs")).unwrap();
+    std::fs::write(
+        cwd.join("docs/notes.txt"),
+        format!("see {rel} for the patch\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"app","version":"0.1.0","dependencies":{"foo":"1.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cwd.join("package-lock.json"),
+        r#"{"name":"app","version":"0.1.0","lockfileVersion":3,"requires":true,"packages":{"":{"name":"app","version":"0.1.0","dependencies":{"foo":"1.0.0"}},"node_modules/foo":{"version":"1.0.0","resolved":"https://registry.npmjs.org/foo/-/foo-1.0.0.tgz","integrity":"sha512-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}}}"#,
+    )
+    .unwrap();
+    assert_never_attested(cwd, purl);
 }
 
 /// REVIEW (#1033, audit B04): a pnpm lock that also holds a package with

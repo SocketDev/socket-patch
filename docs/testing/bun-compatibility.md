@@ -49,6 +49,7 @@ other npm lockfile flavors.
 | A package on Bun's default trusted list (better-sqlite3, esbuild, sharp, …) in a project that declares no `trustedDependencies` (root `package.json`, or mirrored in `bun.lock`) (#371) | Rewired (text and binary lock), with warning `redirect_bun_default_trust_lost`: Bun 1.3.5+ apply the default list only to npm-registry resolutions, so a hosted URL makes `bun install` skip the package's install scripts with exit 0 (measured: 1.3.4 runs them, 1.3.5–1.4.2 do not). The remedy is adding the package to `trustedDependencies`, which replaces the default list. | Same, `vendor_bun_default_trust_lost`, for the local tarball tuple (text and binary lock). | Not affected: the installed tree keeps its registry resolution. |
 | Truncated, corrupt or unrecognized binary `bun.lockb` | Refused with `redirect_bun_lockb_invalid`, preserving the lock. | Refused with `vendor_bun_lockb_invalid` before downloads or artifact creation. | The inventory reports the malformed lock. |
 | `bun.lock` with a `lockfileVersion` ≥ 3, no integer version, or a `packages` section outside bun's single-line grammar | Refused `redirect_bun_lock_unsupported`. | Refused `vendor_lockfile_version_unsupported` (preflight and engine). | The inventory skips the lock. |
+| `bun.lock` listing the patched package's `packages` key on more than one line (a merge that kept both sides) | No duplicate check: the line grammar takes each line as an entry. | Refused `vendor_lockfile_version_unsupported` for that package before any write (a revert finds its line by key); a ledger written before this refusal still reverts, each record restoring its own line. | Each line is read as an entry. |
 
 One detail text serves both modes for the version gate: a newer version says
 "update socket-patch, or re-lock with a Bun release that writes
@@ -103,6 +104,14 @@ offsets fail closed.
 
 Vendoring uses per-package binary snapshots in its ledger. This allows a scoped
 rollback or mode switch to restore one package while keeping other packages wired.
+Every snapshot of one lock also records the same pre-vendor lock (the length of
+its string buffer and, when the edit had to normalize it, its exact bytes), so
+reverting the last vendored package returns `bun.lockb` to its exact pre-vendor
+bytes whatever order the packages are reverted in. A ledger written by 5.0 or
+5.1 records that lock with the package vendored first only: `vendor --revert`
+of all its packages in one run is still exact, while reverting that package
+alone and the others in a later run leaves an equivalent lock that keeps the
+normalization.
 Hosted mode (v5.0) keeps no ledger. The hosted → vendored takeover (and the
 eject) rebuild a hosted `bun.lockb` entry as Bun's npm registry record from the
 registry's `dist.tarball` / `dist.integrity`; the hosted rewrite keeps the
@@ -124,13 +133,17 @@ input is promoted directly to binary format 2 when needed for tarball resolution
 with an exact original snapshot for rollback. When `bun.lock` also exists, it
 takes precedence, matching modern Bun's installer.
 
-Binary workspace vendoring records byte-identical tarball copies under each
-workspace's `.socket/vendor/npm/<uuid>/` directory as well as the canonical root
-artifact. This supports Bun releases that interpret local-tarball paths relative
-to the workspace and those that interpret them relative to the lockfile. Commit
-these copies along with the root artifact. Repair rebuilds missing or corrupt
-copies, including recovery when the local ledger is missing; rollback and mode
-switches remove the tracked copies with drift checks.
+Binary workspace vendoring records a byte-identical tarball copy under the
+`.socket/vendor/npm/<uuid>/` directory of each workspace whose dependencies
+(direct, or through other packages) reach the patched package, as well as the
+canonical root artifact. This supports Bun releases that interpret local-tarball
+paths relative to the workspace that declares the dependency and those that
+interpret them relative to the lockfile. A workspace that does not depend on
+the package gets no copy (5.0 and 5.1 copied every tarball into every
+workspace; those copies stay tracked in the ledger and are removed with the
+package). Commit these copies along with the root artifact. Repair rebuilds
+missing or corrupt copies, including recovery when the local ledger is missing;
+rollback and mode switches remove the tracked copies with drift checks.
 
 Bun 1.2 and newer can still write native binary locks. Use the following project
 configuration in `bunfig.toml` when creating a new binary lock:

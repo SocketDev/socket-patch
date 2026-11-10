@@ -76,7 +76,48 @@ The backend writes:
 - Rewrites of conflicting base-version literals and resolved local properties,
   including profiles and local parent POMs outside the module list.
 - Two lines in `.mvn/maven.config`: offline file protocol access and the local
-  repository tail at `${session.rootDirectory}/.socket/vendor/maven2`.
+  repository tail at `${session.rootDirectory}/.socket/vendor/maven2`. A
+  `maven.config` that is not UTF-8 is edited byte for byte, and reverts to
+  its original bytes.
+
+The suffixed POM is the upstream POM with its own version suffixed and its own
+`${project.version}` references written out. Maven interpolates a POM after
+merging its parents into it, so a `${project.version}` in a parent POM reads
+the suffixed version too. A sibling the parent manages that way (log4j,
+logback) would then resolve at `<base>-socket.<hex8>`, which nothing serves.
+`vendor` therefore reads the upstream parent chain, from the local caches or
+the registry like other upstream metadata, and declares in the suffixed POM
+what it inherits through such a reference, at the base version:
+
+- a property a dependency version reads;
+- the parents' managed dependencies and dependencies, up to the last one that
+  names the version, in the order Maven inherits them (a child's own
+  declarations come first, so declaring one entry alone would reorder the
+  classpath and the imported BOMs).
+
+The additions sit between `<!-- socket-patch:inherited:begin -->` and
+`<!-- socket-patch:inherited:end -->`. A parent that names the version only
+where no consumer reads it (plugin configuration, a release property), or only
+for the patched artifact itself, changes nothing, so those POMs stay byte for
+byte what 5.1 wrote. Planning ends by reading the result the way Maven does,
+and refuses a POM that would still resolve or manage a suffixed version the
+tree does not serve. Refused with `vendor_jvm_upstream_unavailable`:
+
+- `parent_unavailable`: a first vendoring whose parents are in no cache and
+  cannot be fetched. A committed tree re-planned offline keeps the POM it has.
+- `inherited_version_unresolvable`: a shape the additions cannot express,
+  because a child's declaration always beats a parent's. That is a parent
+  profile that declares such a version or may set a copied property or entry,
+  a management key or repository URL built from the version, and a parent
+  that names the version but cannot be parsed.
+
+`vendor --check` reads the parents from `--local-repo` and the machine's Maven
+and Gradle caches, never the network. A tree vendored by 5.0 or 5.1 whose POM
+resolves a dependency or imports a BOM at the suffixed version fails the
+check, with the dependency and the parent named; `socket-patch vendor`
+rewrites the POM. Management the POM does not use is not read by Maven 3, so
+such a tree keeps passing (the next `vendor` still rewrites it). With the
+parents in no cache the POM is not judged.
 
 Parent chains must remain within the checkout. Local parent coordinates are
 checked before using their properties. Range selectors, unresolved properties,
@@ -88,8 +129,10 @@ fallback repository and warns that the tail requires Maven 3.9.2 or newer.
 A local root's pin beats every management from outside the checkout, so it is
 weighed against that management first: the parents a local root resolves from
 a repository (`<relativePath/>`, a corporate or Spring Boot parent) and every
-`<scope>import</scope>` BOM of the reactor and of those parents, read from the
-local caches or the registry like other upstream metadata. Properties follow
+`<scope>import</scope>` BOM of the reactor and of those parents. A copy in a
+local cache is the one the build reads, so it decides whatever the registry
+says of it (a corporate parent is on no public registry); only a POM no cache
+holds is fetched. Properties follow
 Maven's order (the reactor's own values override an external parent's). When
 that management, or a literal an external parent declares, sets the artifact to
 another version than the patch's base, the root is not pinned
@@ -121,7 +164,9 @@ later clears both.
 Gradle 6.8+ is supported, including Groovy and Kotlin settings, multi-project
 builds, buildSrc, and literal `includeBuild` paths inside the checkout. A
 wrapper proving a version below 6.8 is refused before writes; the generated
-script also checks the running Gradle version.
+script also checks the running Gradle version. `gradle-wrapper.properties` is
+read as Java reads a properties file, so `distributionUrl = …`,
+`distributionUrl: …` and `https\://` name the same distribution.
 
 Run vendoring from the Gradle root. A directory an ancestor settings file
 includes (literally, through a relocated `projectDir`, or possibly, when its
@@ -146,7 +191,10 @@ upstream POM and module, and every classifier jar a build script or catalog
 declares (plus the `sources` jar when a cache or the registry has it, so IDE
 source attachment keeps working). A declared classifier that cannot be sourced
 refuses with `classifier_unavailable`: `exclusiveContent` claims every file of
-the GAV, so a missing one would stop resolving. A classifier jar that carries
+the GAV, so a missing one would stop resolving. For the same reason a
+classifier a script computes (`…:${osdetector.classifier}`,
+`classifier = natives`) refuses the GAV with `gradle_classifier_computed`: no
+static read names that jar, so the tree cannot hold it. A classifier jar that carries
 an unpatched copy of a patched member is degraded (`classifier_unpatched_copy`).
 The tree marker lists the patched members beside classifier jars, so `vex`
 re-runs that check from the committed tree and withholds attestation.
@@ -164,6 +212,9 @@ Lockfiles, version catalogs and project build scripts stay unchanged. Settings
 files receive an apply line for `.socket/gradle/socket-patch.settings.gradle`.
 Settings plugin and buildscript classpaths receive an in-block exclusive
 repository entry because those classpaths resolve before the apply line runs.
+A `pluginManagement {}` block vendor has to create goes after the file
+annotations (`@file:Suppress(…)`), the `package` line and the imports, which
+Kotlin requires ahead of every statement.
 
 Because lockfiles stay unchanged, a lock that pins the patched module at
 another version wins over the vendored GAV: Gradle resolves the locked version
@@ -215,6 +266,15 @@ records supplementary entries as shared fragments so either patch can be
 reverted first. Existing verification policy and unrelated checksums are kept.
 A verification file is never created automatically.
 
+Revert puts the recorded entry back. When the file was re-serialised since
+vendoring (`./gradlew --write-verification-metadata`, an XML formatter), the
+patched jar's entry is found by its component, artifact name and sha256
+instead of by its text: the user's entry replaces it, and an entry or
+component vendor added is removed. If the patched hash is still listed where
+that cannot be done, nothing of the entry is reverted (the build keeps
+verifying the patched jar it resolves) and `vendor_lock_entry_drifted` says
+what to put back.
+
 The checks read the whole statically known script graph: settings, every
 project's build script, buildSrc and included builds with their convention
 plugins and plugin sources, `apply from` targets and version catalogs.
@@ -234,7 +294,7 @@ tree is refused nowhere and degraded nowhere.
 
 ## Artifact identity and integrity
 
-Service jars pass transfer-integrity and patched-member checks. The server constructs jars and strips invalidated signatures; the CLI never rebuilds jar archives. Online vendoring authenticates upstream POM and Gradle module metadata against registry sidecars. Metadata fetches use a separate HTTP client and do not send Socket API credentials. `SOCKET_MAVEN_REGISTRY` supports a private mirror.
+Service jars pass transfer-integrity and patched-member checks. The server constructs jars and strips invalidated signatures; the CLI never rebuilds jar archives. Online vendoring authenticates upstream POM and Gradle module metadata against registry sidecars. A POM or module that a local cache holds and the registry gives no checksum for is the file the build resolved: it is used, and the entry is recorded unverified (`vendor_jvm_upstream_unverified`), as an offline one is. Bytes that differ from a published checksum are refused. Metadata fetches use a separate HTTP client and do not send Socket API credentials. `SOCKET_MAVEN_REGISTRY` supports a private mirror.
 
 Maven v5 does not enable Resolver trusted-checksum processors at build time.
 Those processors crash some release reactors and system-scope dependencies,
@@ -271,7 +331,9 @@ control. In-place ledger reconstruction remains outside v5's repair contract.
 
 The implementation is covered by planner, disk-safety, lifecycle and command
 integration tests. Real-tool capstones exercise a Maven reactor from fresh
-checkouts, root and module invocations, Gradle strict locking and repository
+checkouts, root and module invocations, an artifact whose sibling's version
+comes from its parent's `${project.version}` (`log4j-core`, in
+`e2e_vendor_maven_build`), Gradle strict locking and repository
 mode, existing verification metadata, offline builds, tamper detection and
 byte-exact revert; `e2e_vendor_gradle_build` covers each Gradle rule above
 against a fake Central, asserting on the jar Gradle actually consumes. PR and

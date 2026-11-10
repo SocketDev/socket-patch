@@ -36,6 +36,14 @@ directory: each directory with its own lockfile is scanned as its own project, u
 and `socket.yml` path filters apply. `--json` and `--vex` still report on one directory:
 they scan the current one and list the others in a `projects_not_scanned` warning.
 
+What that scan patched can be seen and undone from the same directory. When the
+current directory holds no patches of its own, `list` shows the patches of each project
+directory below it under the same headings, and `rollback` with no target rolls each of
+them back after one confirmation that names them (`rollback --json` takes one project
+directory). `vex`, `apply`, `repair`, `remove` and `rollback <target>` still act on one
+project: run there, they name the project directories that hold patches and the
+`--cwd <dir>` command for each.
+
 To make selection consistent across contributors and CI, commit a
 [repository policy](configuration.md#repository-patch-policy). To target a specific
 advisory or patch:
@@ -61,6 +69,17 @@ Automatic selection ranks downloadable patches by severity, advisory count, then
 publication date. Reruns upgrade existing patches only when a better-ranked patch
 is available. See the [ranking contract](../crates/socket-patch-cli/CLI_CONTRACT.md#which-patch-gets-selected)
 for tie-breaking and upgrade rules.
+
+One patch is applied per package version. When a package has several patches for
+different advisories, `scan` applies the top-ranked one and names the rest:
+
+```text
+Switched 1 package to hosted patches; rewrote 1 file.
+  pkg:pypi/urllib3@1.26.18: fixes CVE-2025-66418; still unpatched: CVE-2025-66471, CVE-2026-21441
+Only one patch is applied per package version. Upgrade the package to fix the advisories still unpatched.
+```
+
+`scan --json` lists the same ids as `packages[].fixedIds` and `packages[].unfixedIds`.
 
 ## CI and automation
 
@@ -196,8 +215,15 @@ ledger when offline attestation is required. A reference no longer used by the
 project is excluded even with `--no-verify`; that flag bypasses file-hash checks,
 not reference validation. A patch record alone does not prove it is consumed.
 
+`--no-verify` (or `SOCKET_VEX_NO_VERIFY` in the environment) attests without checking
+any file, so it also attests an agent-mode patch whose files are unpatched or missing.
+It never does so silently: the run warns how many statements it emitted that way, and
+each one ends its impact statement with `; not verified on disk`.
+
 The product identifier is inferred from the Git origin or project metadata. Use
-`--product <identifier>` when inference is unavailable or unsuitable. `--json`
+`--product <identifier>` when inference is unavailable or unsuitable. A project
+with neither (an application with no Git remote and no named project file) must
+pass one; the error suggests `--product pkg:generic/<directory name>`. `--json`
 requires `--output` so the document and command result do not share stdout.
 
 `scan`, `apply`, and `vendor` accept `--vex <path>`. Generation is skipped for
@@ -236,7 +262,7 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 | `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
 | `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
-| `repair` | Restore missing agent patch data or missing/corrupt vendored artifacts using existing records, and clean unused data |
+| `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
 
 Use `--dry-run` to preview. `rollback --preserve-state` and

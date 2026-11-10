@@ -148,6 +148,154 @@ pub fn partition_purls(
     map
 }
 
+/// Why [`partition_purls`] has no ecosystem for a manifest key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedKey {
+    /// A purl whose type this CLI has no crawler for: an ecosystem a newer
+    /// socket-patch recorded, or a known type in another case (`pkg:NPM/…`;
+    /// every lookup here compares the lowercase type).
+    Ecosystem,
+    /// Not a `pkg:<type>/<name>` purl at all: no version of the CLI can
+    /// match it to a package.
+    NotAPurl,
+}
+
+impl UnsupportedKey {
+    /// The event `errorCode`: `unsupported_ecosystem` is a skip (a newer
+    /// CLI's ecosystem in a committed manifest must not fail an older CLI's
+    /// run, as the scan prune exempts it: [`crawl_covers_purl`]),
+    /// `invalid_purl` a failure.
+    pub fn code(self) -> &'static str {
+        match self {
+            UnsupportedKey::Ecosystem => "unsupported_ecosystem",
+            UnsupportedKey::NotAPurl => "invalid_purl",
+        }
+    }
+
+    /// Why `key`'s patch was left alone.
+    pub fn detail(self, key: &str) -> String {
+        match self {
+            UnsupportedKey::Ecosystem => match recased_type(key) {
+                Some(lower) => format!(
+                    "purl types are lowercase: this version of socket-patch reads the key \
+                     only as `pkg:{lower}/`, so its patch was left alone"
+                ),
+                None => format!(
+                    "this version of socket-patch does not support `{}` packages (a newer \
+                     version may have recorded the patch), so it was left alone",
+                    key.split_once('/').map_or(key, |(prefix, _)| prefix)
+                ),
+            },
+            UnsupportedKey::NotAPurl => {
+                "the manifest key is not a package URL (`pkg:<type>/<name>@<version>`), so its \
+                 patch cannot be matched to a package; correct the key in the manifest or \
+                 remove the entry"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// The lowercase spelling of `key`'s purl type when only its case keeps it
+/// from being a supported ecosystem (`pkg:NPM/x` → `npm`).
+fn recased_type(key: &str) -> Option<String> {
+    let (ty, rest) = key.strip_prefix("pkg:")?.split_once('/')?;
+    let lower = ty.to_ascii_lowercase();
+    Ecosystem::from_purl(&format!("pkg:{lower}/{rest}")).map(|_| lower)
+}
+
+/// The manifest keys in `purls` that no crawler of this CLI can look for,
+/// sorted. [`partition_purls`] drops them whatever the filter, so a command
+/// that partitions the manifest must name them itself: a clean run over
+/// records it never looked at reads as "patched" (or "rolled back").
+///
+/// Empty under `--ecosystems`: the user scoped the run to ecosystems this
+/// CLI knows, and such a key is in none of them
+/// ([`GlobalArgs::purl_ecosystem_selected`]).
+pub fn unsupported_keys<'a>(
+    common: &GlobalArgs,
+    purls: impl IntoIterator<Item = &'a String>,
+) -> Vec<(String, UnsupportedKey)> {
+    let mut keys: Vec<(String, UnsupportedKey)> = purls
+        .into_iter()
+        .filter(|purl| Ecosystem::from_purl(purl).is_none() && common.purl_ecosystem_selected(purl))
+        .map(|purl| {
+            let well_formed = purl
+                .strip_prefix("pkg:")
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(ty, name)| {
+                    !name.is_empty()
+                        && ty.starts_with(|c: char| c.is_ascii_alphabetic())
+                        && ty
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+                });
+            let kind = if well_formed {
+                UnsupportedKey::Ecosystem
+            } else {
+                UnsupportedKey::NotAPurl
+            };
+            (purl.clone(), kind)
+        })
+        .collect();
+    keys.sort_by(|a, b| a.0.cmp(&b.0));
+    keys
+}
+
+/// The `skipped` events for the unsupported-ecosystem keys among `keys`
+/// (`what` is what the command would have done: "applied", "checked",
+/// "rolled back"), and the one run warning naming them; `None` without any.
+pub fn unsupported_ecosystem_report(
+    keys: &[(String, UnsupportedKey)],
+    what: &str,
+) -> Option<(
+    Vec<crate::json_envelope::PatchEvent>,
+    crate::json_envelope::RunWarning,
+)> {
+    use crate::json_envelope::{PatchAction, PatchEvent, RunWarning};
+    let skipped: Vec<&String> = keys
+        .iter()
+        .filter(|(_, kind)| *kind == UnsupportedKey::Ecosystem)
+        .map(|(key, _)| key)
+        .collect();
+    if skipped.is_empty() {
+        return None;
+    }
+    let events = skipped
+        .iter()
+        .map(|key| {
+            PatchEvent::new(PatchAction::Skipped, key.as_str()).with_reason(
+                UnsupportedKey::Ecosystem.code(),
+                UnsupportedKey::Ecosystem.detail(key),
+            )
+        })
+        .collect();
+    let one = skipped.len() == 1;
+    let named: Vec<String> = skipped
+        .iter()
+        .map(|key| match recased_type(key) {
+            Some(lower) => format!("{key} (purl types are lowercase: use `pkg:{lower}/`)"),
+            None => key.to_string(),
+        })
+        .collect();
+    let detail = format!(
+        "{} not {what}: {} this version of socket-patch does not support (a newer version \
+         may have recorded {}): {}",
+        crate::ui::plural(skipped.len(), "manifest patch was", "manifest patches were"),
+        if one {
+            "its purl has a type"
+        } else {
+            "their purls have types"
+        },
+        if one { "it" } else { "them" },
+        named.join(", "),
+    );
+    Some((
+        events,
+        RunWarning::new(UnsupportedKey::Ecosystem.code(), detail),
+    ))
+}
+
 /// Standard scan-one-ecosystem pattern: discover source paths, run
 /// `find_by_purls` on each, and merge results into `$out` keyed by PURL
 /// with the ecosystem's `$on_match` merge (first-wins, or every copy for
@@ -1971,6 +2119,77 @@ mod tests {
         let purls = vec!["pkg:weirdo/x@1".to_string()];
         let map = partition_purls(&purls, None);
         assert!(map.is_empty());
+    }
+
+    /// What `partition_purls` drops is classified, never lost: an unknown
+    /// or mis-cased purl type is an unsupported ecosystem, anything that is
+    /// not `pkg:<type>/<name>` is not a purl. `--ecosystems` scopes the run
+    /// to known ecosystems, so nothing is reported under it.
+    #[test]
+    fn unsupported_keys_classifies_what_the_partition_drops() {
+        let purls: Vec<String> = [
+            "pkg:npm/ok@1.0.0",
+            "pkg:swift/github.com/apple/swift-nio@2.60.0",
+            "pkg:NPM/left-pad@1.3.0",
+            "left-pad@1.3.0",
+            "pkg:npm",
+            "pkg:/x@1",
+            "pkg:sw ift/x@1",
+            "pkg:swift/",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let common = GlobalArgs::default();
+        let keys = unsupported_keys(&common, &purls);
+        let of = |kind: UnsupportedKey| -> Vec<&str> {
+            keys.iter()
+                .filter(|(_, k)| *k == kind)
+                .map(|(key, _)| key.as_str())
+                .collect()
+        };
+        assert_eq!(
+            of(UnsupportedKey::Ecosystem),
+            vec![
+                "pkg:NPM/left-pad@1.3.0",
+                "pkg:swift/github.com/apple/swift-nio@2.60.0"
+            ]
+        );
+        assert_eq!(
+            of(UnsupportedKey::NotAPurl),
+            vec![
+                "left-pad@1.3.0",
+                "pkg:/x@1",
+                "pkg:npm",
+                "pkg:sw ift/x@1",
+                "pkg:swift/"
+            ]
+        );
+
+        let scoped = GlobalArgs {
+            ecosystems: Some(vec!["npm".to_string()]),
+            ..GlobalArgs::default()
+        };
+        assert!(unsupported_keys(&scoped, &purls).is_empty());
+
+        let (events, warning) =
+            unsupported_ecosystem_report(&keys, "applied").expect("two unsupported records");
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .all(|e| e.error_code.as_deref() == Some("unsupported_ecosystem")));
+        assert_eq!(warning.code, "unsupported_ecosystem");
+        assert_eq!(
+            warning.detail,
+            "2 manifest patches were not applied: their purls have types this version of \
+             socket-patch does not support (a newer version may have recorded them): \
+             pkg:NPM/left-pad@1.3.0 (purl types are lowercase: use `pkg:npm/`), \
+             pkg:swift/github.com/apple/swift-nio@2.60.0"
+        );
+        assert!(unsupported_ecosystem_report(&keys[..0], "applied").is_none());
+        assert!(UnsupportedKey::Ecosystem
+            .detail("pkg:swift/x@1")
+            .contains("`pkg:swift` packages"));
     }
 
     #[test]

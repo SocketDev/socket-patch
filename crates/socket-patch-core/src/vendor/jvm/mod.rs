@@ -76,18 +76,7 @@ pub fn wrapper_version(read: ReadFn<'_>, tool: &str) -> Option<(u32, u32, u32)> 
         "gradle" => "gradle/wrapper/gradle-wrapper.properties",
         _ => return None,
     };
-    let bytes = read(path)?;
-    let text = std::str::from_utf8(&bytes).ok()?;
-    let url = text
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("distributionUrl="))?;
-    let re = regex::Regex::new(&format!(r"{tool}-(\d+)\.(\d+)(?:\.(\d+))?")).ok()?;
-    let caps = re.captures(url)?;
-    Some((
-        caps[1].parse().ok()?,
-        caps[2].parse().ok()?,
-        caps.get(3).map_or(Some(0), |m| m.as_str().parse().ok())?,
-    ))
+    crate::crawlers::gradle_cache::wrapper_distribution_version(&read(path)?, tool)
 }
 
 /// Reads a project-relative, forward-slash path. `None` = missing or
@@ -182,6 +171,13 @@ pub struct JvmPatch<'a> {
     pub jar: &'a [u8],
     /// The upstream pom, verbatim.
     pub upstream_pom: &'a [u8],
+    /// The upstream poms of `upstream_pom`'s parent chain, nearest first and
+    /// complete (empty when it has no `<parent>`): what a suffixed pom is
+    /// checked against, since Maven reads an inherited `${project.version}`
+    /// as the suffixed version (see `maven_reactor::suffixed_pom`). `None`
+    /// when the caller could not read them (a probe, a committed tree
+    /// re-planned with cold caches): the pom is then suffixed as it is.
+    pub upstream_parents: Option<&'a [Vec<u8>]>,
     /// The upstream Gradle module metadata, verbatim, when published.
     pub upstream_module: Option<&'a [u8]>,
     /// Classifier artifacts served beside the jar (Gradle only).
@@ -819,10 +815,80 @@ mod tests {
             uuid: "5E6F7081-92a3-4b4c-8d5e-6f708192a3b4",
             jar: b"jar",
             upstream_pom: b"pom",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
         }
+    }
+
+    /// A72: every spelling a Java properties file allows names the same
+    /// distribution. Requiring the exact prefix `distributionUrl=` read
+    /// `distributionUrl = …gradle-6.7…` as "no wrapper", which let a Gradle
+    /// 6.7 build past the 6.8 gate and into a script it cannot run.
+    #[test]
+    fn wrapper_version_reads_every_properties_spelling() {
+        let gradle = "https\\://services.gradle.org/distributions/gradle-6.7-bin.zip";
+        for line in [
+            format!("distributionUrl={gradle}"),
+            format!("distributionUrl = {gradle}"),
+            format!("distributionUrl:{gradle}"),
+            format!("distributionUrl\t{gradle}"),
+            format!("  distributionUrl={gradle}\r"),
+            "distributionUrl=https\\://services.gradle.org/\\\n    distributions/gradle-6.7-bin.zip"
+                .to_string(),
+            format!("#distributionUrl=x/gradle-9.9-bin.zip\ndistributionBase=GRADLE_USER_HOME\ndistributionUrl={gradle}"),
+        ] {
+            let props = format!("{line}\nzipStoreBase=GRADLE_USER_HOME\n");
+            let read = |rel: &str| {
+                (rel == "gradle/wrapper/gradle-wrapper.properties").then(|| props.clone().into_bytes())
+            };
+            assert_eq!(wrapper_version(&read, "gradle"), Some((6, 7, 0)), "{line}");
+            assert_eq!(wrapper_version(&read, "maven"), None, "{line}");
+            // The gate the version feeds: refused before anything is written.
+            let files: std::collections::BTreeMap<String, Vec<u8>> = [
+                ("gradle/wrapper/gradle-wrapper.properties", props.as_str()),
+                ("settings.gradle", "rootProject.name = 'app'\n"),
+            ]
+            .into_iter()
+            .map(|(rel, body)| (rel.to_string(), body.as_bytes().to_vec()))
+            .collect();
+            let refused = plan(
+                Shape::Gradle,
+                &|rel: &str| files.get(rel).cloned(),
+                &|dir: &str| testing::list_of(&files, dir),
+                &mixed_patch(),
+            )
+            .unwrap_err();
+            assert!(
+                refused.detail.starts_with("reason: gradle_below_6_8:"),
+                "{line}: {}",
+                refused.detail
+            );
+        }
+        let maven = |url: &str| {
+            let props = format!("distributionUrl = {url}\n").into_bytes();
+            wrapper_version(
+                &|rel: &str| {
+                    (rel == ".mvn/wrapper/maven-wrapper.properties").then(|| props.clone())
+                },
+                "maven",
+            )
+        };
+        assert_eq!(
+            maven("https\\://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.9.9/apache-maven-3.9.9-bin.zip"),
+            Some((3, 9, 9))
+        );
+        assert_eq!(
+            maven("https://example.com/maven-mvnd-1.0.2-linux-amd64.zip"),
+            None
+        );
+        assert_eq!(
+            maven("https://example.com/apache-maven-4.0.0-rc-4-bin.zip"),
+            Some((4, 0, 0))
+        );
+        assert_eq!(wrapper_version(&|_: &str| None, "gradle"), None);
+        assert_eq!(wrapper_version(&|_: &str| Some(Vec::new()), "ant"), None);
     }
 
     #[test]
@@ -960,6 +1026,7 @@ mod tests {
             uuid: MIXED_UUID,
             jar: b"PATCHED-JAR",
             upstream_pom: b"<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId><artifactId>commons-text</artifactId><version>1.10.0</version></project>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -1133,6 +1200,89 @@ mod tests {
         std::fs::write(bom_dir.join("corp-bom-2.pom"), bom("1.11.0")).unwrap();
         let drift = apply::check_entry(&root, &entry, Some(&repo)).unwrap_err();
         assert!(drift.contains("drifted"), "{drift}");
+    }
+
+    /// VJ-D1: a tree 5.0 / 5.1 vendored holds the upstream pom with only
+    /// its own version suffixed. When a local cache holds the parent,
+    /// `vendor --check` reads it: a parent managing a sibling the pom
+    /// depends on at `${project.version}` makes the build ask for
+    /// `<sibling>:<suffixed>`, which nothing serves, and the check fails
+    /// naming it. Management the pom does not use is not read by Maven 3,
+    /// so that tree, and one whose parent is in no cache, keep passing.
+    #[tokio::test]
+    async fn check_names_a_tree_whose_parent_moves_a_sibling_to_the_suffixed_version() {
+        let core = "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+            <groupId>org.apache.commons</groupId>\n    <artifactId>commons-parent</artifactId>\n    \
+            <version>54</version>\n  </parent>\n  <artifactId>commons-text</artifactId>\n  \
+            <version>1.10.0</version>\n  <dependencies>\n    <dependency>\n      \
+            <groupId>org.apache.commons</groupId>\n      <artifactId>commons-lang3</artifactId>\n    \
+            </dependency>\n  </dependencies>\n</project>\n";
+        let parent = |managed: &str| {
+            format!(
+                "<project><modelVersion>4.0.0</modelVersion><groupId>org.apache.commons</groupId>\
+                 <artifactId>commons-parent</artifactId><version>54</version>\
+                 <packaging>pom</packaging><dependencyManagement><dependencies><dependency>\
+                 <groupId>org.apache.commons</groupId><artifactId>{managed}</artifactId>\
+                 <version>${{project.version}}</version></dependency></dependencies>\
+                 </dependencyManagement></project>"
+            )
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let repo = dir.path().join("m2");
+        testing::populate(&root, &[("pom.xml", MIXED_POM)]);
+        let mut ledger = std::collections::BTreeMap::new();
+        // As 5.1 vendored it: the parents were never read.
+        let legacy = JvmPatch {
+            upstream_pom: core.as_bytes(),
+            ..mixed_patch()
+        };
+        testing::vendor(&root, Shape::MavenReactor, &legacy, &mut ledger)
+            .await
+            .unwrap();
+        let entry = ledger.values().next().unwrap().clone();
+        apply::check_entry(&root, &entry, None).expect("no cache is read");
+        apply::check_entry(&root, &entry, Some(&repo)).expect("the parent is in no cache");
+        let parent_dir = repo.join("org/apache/commons/commons-parent/54");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let parent_pom = parent_dir.join("commons-parent-54.pom");
+        std::fs::write(&parent_pom, parent("commons-dev-tools")).unwrap();
+        apply::check_entry(&root, &entry, Some(&repo)).expect("management the pom never uses");
+        std::fs::write(&parent_pom, parent("commons-lang3")).unwrap();
+        let broken = apply::check_entry(&root, &entry, Some(&repo)).unwrap_err();
+        assert!(
+            broken.contains("org.apache.commons:commons-lang3:1.10.0-socket.1d3c1fd2")
+                && broken.contains("org.apache.commons:commons-parent:54")
+                && broken.contains("socket-patch vendor"),
+            "{broken}"
+        );
+        // The same through a machine cache rather than `--local-repo`.
+        let caches = [crate::crawlers::jvm_cache::JvmCacheRoot::new(
+            repo.clone(),
+            crate::crawlers::jvm_cache::JvmCacheLayout::Maven2,
+        )];
+        assert_eq!(
+            apply::check_entry_in(&root, &entry, None, &caches).unwrap_err(),
+            broken
+        );
+        // Vendoring again with the parent at hand rewrites the pom, and
+        // the check passes with or without the parent.
+        let parents = vec![parent("commons-lang3").into_bytes()];
+        let fixed = JvmPatch {
+            upstream_parents: Some(&parents),
+            ..legacy.clone()
+        };
+        let plan = testing::vendor(&root, Shape::MavenReactor, &fixed, &mut ledger)
+            .await
+            .unwrap();
+        assert!(
+            plan.writes.iter().any(|w| w.rel.ends_with(".pom")),
+            "{:?}",
+            plan.writes.iter().map(|w| &w.rel).collect::<Vec<_>>()
+        );
+        let entry = ledger.values().next().unwrap().clone();
+        apply::check_entry(&root, &entry, Some(&repo)).expect("rewritten, parent at hand");
+        apply::check_entry(&root, &entry, None).expect("rewritten, no parent");
     }
 
     /// #395: a refusal by either half writes nothing for the other.

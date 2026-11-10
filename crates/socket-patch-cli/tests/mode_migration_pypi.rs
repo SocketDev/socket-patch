@@ -2916,8 +2916,7 @@ async fn dry_run_previews_root_pin_takeover() {
 }
 
 /// uv.lock resolving `six` 1.17.0, either as a direct `six>=1.15` or
-/// through `python-dateutil`. Vendoring the manifest's `six@1.16.0` pins
-/// the lock entry down to 1.16.0, so the revert brings 1.17.0 back.
+/// through `python-dateutil`, while the manifest patches `six@1.16.0`.
 const UV_LOCK_DRIFTED_DIRECT: &str = r#"version = 1
 revision = 2
 requires-python = ">=3.9"
@@ -2980,10 +2979,14 @@ wheels = [
 ]
 "#;
 
-/// #723: vendor a uv project whose lock resolves `six` 1.17.0 while the
-/// manifest patches `six@1.16.0`; vendored uv pins the lock down to the
-/// patch version.
-fn drifted_uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+/// The lock's `six` `[[package]]` unit (its last one), without the final
+/// newline: the fragment a `uv_lock_package` ledger record holds.
+fn six_unit(lock: &str) -> &str {
+    lock[lock.find("[[package]]\nname = \"six\"\n").unwrap()..].trim_end()
+}
+
+/// A uv project declaring `dependency`, with `lock` as its uv.lock.
+fn uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let (tmp, root) = project();
     std::fs::write(
         root.join("pyproject.toml"),
@@ -2993,8 +2996,177 @@ fn drifted_uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::
     )
     .unwrap();
     std::fs::write(root.join("uv.lock"), lock).unwrap();
-    vendor_project(&root, &["uv.lock", "pyproject.toml"]);
     (tmp, root)
+}
+
+/// #723: a uv project whose lock resolved `six` 1.17.0 while the manifest
+/// patched `six@1.16.0`, as earlier releases vendored it: the
+/// lock entry pinned down to the patch version, and the 1.17.0 entry in the
+/// ledger as its pre-vendor original. Vendored uv now refuses such a patch
+/// (see `uv_patch_for_another_version_than_the_lock_is_refused`), so the
+/// state is rebuilt from a lock at 1.16.0 and the ledger given the 1.17.0
+/// entry those releases recorded.
+fn drifted_uv_project(dependency: &str, lock: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let locked = six_unit(lock);
+    let patched = six_unit(UV_LOCK)
+        .replace("WHEEL_SHA", WHEEL_SHA)
+        .replace("SDIST_SHA", SDIST_SHA);
+    let (tmp, root) = uv_project(dependency, &lock.replace(locked, &patched));
+    vendor_project(&root, &["uv.lock", "pyproject.toml"]);
+    let state_path = root.join(".socket/vendor/state.json");
+    let mut state: Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+    let records: Vec<&mut Value> = state["entries"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .flat_map(|entry| entry["wiring"].as_array_mut().unwrap().iter_mut())
+        .filter(|record| record["kind"] == "uv_lock_package")
+        .collect();
+    let [record] = records.try_into().expect("one package record");
+    assert_eq!(record["original"], json!(patched), "{record:#}");
+    record["original"] = json!(locked);
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    (tmp, root)
+}
+
+/// A manifest patch for another release of a package than uv.lock resolves
+/// (an entry a dependency bump left behind) is refused, declared or
+/// transitive: wiring it would move the lock entry, and with it the
+/// project's install, back to the patch's version. `vendor` used to exit 0
+/// with the lock at `six` 1.16.0. Nothing is written and no artifact stays.
+#[test]
+fn uv_patch_for_another_version_than_the_lock_is_refused() {
+    for (dependency, lock) in [
+        ("six>=1.15", UV_LOCK_DRIFTED_DIRECT),
+        ("python-dateutil==2.9.0.post0", UV_LOCK_DRIFTED_TRANSITIVE),
+    ] {
+        let (_tmp, root) = uv_project(dependency, lock);
+        let pyproject = std::fs::read_to_string(root.join("pyproject.toml")).unwrap();
+        stage_manifest(&root);
+        let (code, env) = run_cli(&root, &["vendor"], &[]);
+        assert_eq!(code, 1, "{dependency}: {env:#}");
+        let failed: Vec<&Value> = env["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["action"] == "failed")
+            .collect();
+        assert!(
+            matches!(failed.as_slice(), [e]
+                if e["purl"] == PURL
+                    && e["errorCode"] == "pypi_uv_lock_package_missing"
+                    && e["error"].as_str().is_some_and(|d| d.contains("1.17.0"))),
+            "{dependency}: {env:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("uv.lock")).unwrap(),
+            lock,
+            "{dependency}: the lock keeps the release it resolves"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("pyproject.toml")).unwrap(),
+            pyproject,
+            "{dependency}"
+        );
+        assert!(
+            !root.join(".socket/vendor/pypi").exists(),
+            "{dependency}: no artifact is left behind"
+        );
+    }
+}
+
+/// With patches for two releases of one package in the manifest, the one
+/// for the release uv.lock resolves is the one wired, and the lock entry
+/// keeps its version. The other is refused: it used to be wired first,
+/// which pinned the lock down and then blocked the right patch
+/// (`pypi_uv_source_already_exists`).
+#[test]
+fn uv_patch_for_the_locked_version_is_the_one_wired() {
+    const UUID_NEXT: &str = "5c3e1a2b-7d4f-4e6a-9b8c-1d2e3f4a5b6e";
+    const PURL_NEXT: &str = "pkg:pypi/six@1.17.0";
+    const ORIG_NEXT: &[u8] = b"# six\nVERSION = '1.17.0'\n";
+    const PATCHED_NEXT: &[u8] = b"# six\nVERSION = '1.17.0'\nSOCKET_PATCHED = 1\n";
+    let (_tmp, root) = uv_project("six>=1.15", UV_LOCK_DRIFTED_DIRECT);
+    stage_manifest(&root);
+    let manifest_path = root.join(".socket/manifest.json");
+    let mut manifest: Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    let after = compute_git_sha256_from_bytes(PATCHED_NEXT);
+    manifest["patches"][PURL_NEXT] = json!({
+        "uuid": UUID_NEXT,
+        "exportedAt": "2026-01-01T00:00:00Z",
+        "files": { "six.py": {
+            "beforeHash": compute_git_sha256_from_bytes(ORIG_NEXT),
+            "afterHash": after,
+        }},
+        "vulnerabilities": {},
+        "description": "pypi mode takeover fixture",
+        "license": "MIT",
+        "tier": "free"
+    });
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(root.join(".socket/blobs").join(after), PATCHED_NEXT).unwrap();
+
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 1, "the stale patch is still reported: {env:#}");
+    let outcome = |purl: &str| -> Vec<(String, String)> {
+        env["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|e| e["purl"] == purl && e["action"] != "skipped")
+            .map(|e| {
+                (
+                    e["action"].as_str().unwrap_or_default().to_string(),
+                    e["errorCode"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        outcome(PURL),
+        [(
+            "failed".to_string(),
+            "pypi_uv_lock_package_missing".to_string()
+        )],
+        "{env:#}"
+    );
+    assert!(
+        matches!(outcome(PURL_NEXT).as_slice(), [(action, code)] if action != "failed" && code.is_empty()),
+        "{env:#}"
+    );
+    let lock = std::fs::read_to_string(root.join("uv.lock")).unwrap();
+    assert!(
+        lock.contains(&format!(
+            "name = \"six\"\nversion = \"1.17.0\"\nsource = {{ path = \".socket/vendor/pypi/{UUID_NEXT}/six-1.17.0-"
+        )),
+        "{lock}"
+    );
+    assert!(!lock.contains(UUID) && !lock.contains("1.16.0"), "{lock}");
+    assert!(!root.join(format!(".socket/vendor/pypi/{UUID}")).exists());
+
+    // A re-run changes nothing: the wired patch is in sync, the stale one
+    // is refused again.
+    let (code, env) = run_cli(&root, &["vendor"], &[]);
+    assert_eq!(code, 1, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("uv.lock")).unwrap(),
+        lock,
+        "{env:#}"
+    );
+
+    // The revert brings the lock's own entry back.
+    let (code, env) = run_cli(&root, &["vendor", "--revert"], &[]);
+    assert_eq!(code, 0, "{env:#}");
+    assert_eq!(
+        std::fs::read_to_string(root.join("uv.lock")).unwrap(),
+        UV_LOCK_DRIFTED_DIRECT
+    );
 }
 
 fn drifted_uv_direct() -> (tempfile::TempDir, std::path::PathBuf) {

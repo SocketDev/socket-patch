@@ -17,6 +17,9 @@
 //! go on: the call site returns the error a real fault at that point would
 //! (a write that fails), so a test can drive the code that handles it.
 //!
+//! [`hit_or_error`] is the same point for an I/O step, with the failure
+//! already an `io::Error`.
+//!
 //! Release builds compile [`hit`] and [`fails`] to nothing, so no
 //! environment variable can make a shipped binary stop or fail half-way;
 //! the same goes for [`switched_off`]. The `failpoints` feature compiles
@@ -90,6 +93,17 @@ pub fn fails(name: &str) -> bool {
         let _ = name;
         false
     }
+}
+
+/// A named failure point for an I/O step: the injected failure comes back
+/// as the `Err` the step itself would return (see [`fails`]).
+pub fn hit_or_error(name: &str) -> std::io::Result<()> {
+    if fails(name) {
+        return Err(std::io::Error::other(format!(
+            "failpoint `{name}` injected an error"
+        )));
+    }
+    Ok(())
 }
 
 /// Whether a debug build was asked to switch the named mechanism off

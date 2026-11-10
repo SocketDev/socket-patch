@@ -303,6 +303,61 @@ fn native_patch_that_does_not_build_is_put_back() {
     assert_eq!(walk_files(&ext_dir), built_before);
 }
 
+/// The installed gemspec is a Ruby program, and a committed `vendor/bundle`
+/// lets the scanned repository supply it. It is read as text to decide
+/// whether a record needs a rebuild and only loaded by the build itself,
+/// after the record's files verified: never by a dry run, and never for a
+/// record that does not match the installed copy.
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn the_installed_gemspec_is_not_evaluated_before_the_record_verifies() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let patched = c_source(2);
+    let fx = Fixture::new(&abi, &patched);
+    let spec = fx
+        .home
+        .join("specifications")
+        .join(format!("{FULL_NAME}.gemspec"));
+    let evaluated = fx.home.join("gemspec-was-evaluated");
+    // The spec must stay the value of the file, and its stub lines first.
+    let text = std::fs::read_to_string(&spec).unwrap();
+    let planted = text.replacen(
+        "Gem::Specification.new do |s|",
+        &format!(
+            "File.write({:?}, \"x\")\nGem::Specification.new do |s|",
+            evaluated.display().to_string()
+        ),
+        1,
+    );
+    assert_ne!(planted, text, "the installed spec has the to_ruby shape");
+    std::fs::write(&spec, planted).unwrap();
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json", "--dry-run"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(!evaluated.exists(), "a dry run evaluated the gemspec");
+    assert!(stdout.contains("apply would"), "{stdout}");
+    assert_eq!(fx.c_file(), c_source(1));
+
+    // A copy that matches neither side of the record.
+    std::fs::write(fx.gem_dir.join(C_KEY), c_source(7)).unwrap();
+    let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(
+        !evaluated.exists(),
+        "the gemspec was evaluated for a record that does not verify"
+    );
+    std::fs::write(fx.gem_dir.join(C_KEY), c_source(1)).unwrap();
+
+    let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert!(evaluated.exists(), "the build loads the gemspec");
+    assert_eq!(fx.value(), "2", "Ruby must load the rebuilt extension");
+}
+
 /// An `extconf.rb` that, like nokogiri's (which activates `mini_portile2`),
 /// loads a helper gem installed beside the copy in the same home.
 const EXTCONF_WITH_HELPER: &str = "gem \"sp_helper\"\nrequire \"sp_helper\"\n\
@@ -487,6 +542,435 @@ fn run_without_ruby(proj: &Path, args: &[&str]) -> (i32, String, String) {
     std::fs::create_dir_all(&empty).unwrap();
     let path = empty.display().to_string();
     common::run_with_env(proj, args, &[("PATH", path.as_str())])
+}
+
+/// A stand-in `ruby`, alone on the `PATH` the CLI is run with: a shell
+/// script that says it builds extensions into [`fake_native_gem`]'s
+/// `extensions/x86_64-linux/3.4.0` and "builds" one by writing a new shared
+/// object and its `lib/` copy. Each run appends its mode to `<state>/calls`
+/// and writes the environment it saw to `<state>/env.<mode>`.
+///
+/// After [`FakeRuby::hang_builds`] a build never finishes instead: it
+/// starts a "compiler" (a `sleep` of its own), records both pids and waits,
+/// like a real build caught mid-compile.
+#[cfg(unix)]
+struct FakeRuby {
+    _tmp: tempfile::TempDir,
+    bin: PathBuf,
+    state: PathBuf,
+}
+
+#[cfg(unix)]
+impl FakeRuby {
+    fn new() -> FakeRuby {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let state = tmp.path().join("state");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        // argv: -e <program> extensions_dir <gem home>
+        //       -e <program> build <gemspec> <extension dir> <require path>
+        let script = format!(
+            r#"#!/bin/sh
+PATH=/usr/bin:/bin
+state='{state}'
+mode="$3"
+echo "$mode" >> "$state/calls"
+env > "$state/env.$mode"
+case "$mode" in
+extensions_dir)
+  printf 'sp_extensions_dir\t%s\n' "$4/extensions/x86_64-linux/3.4.0"
+  ;;
+build)
+  home=$(dirname "$(dirname "$4")")
+  full=$(basename "$4" .gemspec)
+  ext="$5"
+  lib="$home/gems/$full/$6"
+  if [ -e "$state/hang" ]; then
+    if [ -e "$state/hang-half-built" ]; then
+      mkdir -p "$ext/sp_native"
+      printf 'half-built' > "$ext/sp_native/sp_native.so"
+      printf 'half-built' > "$lib/sp_native/sp_native.so"
+    fi
+    echo $$ > "$state/build.pid"
+    sleep 600 &
+    echo $! > "$state/compiler.pid"
+    : > "$state/building"
+    wait
+    exit 1
+  fi
+  mkdir -p "$ext/sp_native" "$lib/sp_native"
+  printf 'rebuilt' > "$ext/sp_native/sp_native.so"
+  cp "$ext/sp_native/sp_native.so" "$lib/sp_native/sp_native.so"
+  : > "$ext/gem.build_complete"
+  ;;
+*)
+  echo "fake ruby: unexpected mode $mode" >&2
+  exit 1
+  ;;
+esac
+"#,
+            state = state.display()
+        );
+        let ruby = bin.join("ruby");
+        std::fs::write(&ruby, script).unwrap();
+        std::fs::set_permissions(&ruby, std::fs::Permissions::from_mode(0o755)).unwrap();
+        FakeRuby {
+            _tmp: tmp,
+            bin,
+            state,
+        }
+    }
+
+    /// Run the CLI in `proj` with this Ruby as the only program on `PATH`.
+    fn run(&self, proj: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, String) {
+        let path = self.bin.display().to_string();
+        let mut all = vec![("PATH", path.as_str())];
+        all.extend_from_slice(env);
+        common::run_with_env(proj, args, &all)
+    }
+
+    /// The modes this Ruby was run in, in order.
+    fn calls(&self) -> Vec<String> {
+        std::fs::read_to_string(self.state.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The environment the `mode` run saw, as `env` printed it.
+    fn env_seen(&self, mode: &str) -> String {
+        std::fs::read_to_string(self.state.join(format!("env.{mode}"))).unwrap()
+    }
+
+    /// Make every later build hang. With `half_built` it first leaves a
+    /// partial extension dir and a replaced `lib/` copy, as a build
+    /// interrupted late does; without, it has written nothing yet.
+    fn hang_builds(&self, half_built: bool) {
+        std::fs::write(self.state.join("hang"), b"").unwrap();
+        if half_built {
+            std::fs::write(self.state.join("hang-half-built"), b"").unwrap();
+        }
+    }
+
+    /// Let later builds finish again.
+    fn finish_builds(&self) {
+        for flag in ["hang", "hang-half-built", "building"] {
+            let _ = std::fs::remove_file(self.state.join(flag));
+        }
+    }
+
+    /// Start the CLI in `proj` (this Ruby alone on `PATH`) and wait until
+    /// its build hangs. Returns the CLI and the build's process group.
+    fn spawn_until_building(
+        &self,
+        proj: &Path,
+        args: &[&str],
+    ) -> (std::process::Child, BuildGroup) {
+        use std::time::{Duration, Instant};
+        let mut cmd = common::hermetic_command(&common::binary());
+        common::jvm_env::isolate_cli(&mut cmd);
+        cmd.args(args)
+            .current_dir(proj)
+            .env("PATH", &self.bin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn socket-patch");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.state.join("building").exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the CLI exited ({status}) before its build started");
+            }
+            assert!(Instant::now() < deadline, "the build never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = |file: &str| -> i32 {
+            std::fs::read_to_string(self.state.join(file))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let group = BuildGroup {
+            leader: pid("build.pid"),
+            compiler: pid("compiler.pid"),
+        };
+        (child, group)
+    }
+}
+
+/// The stand-in build's processes: `ruby` leads its own process group and
+/// the "compiler" it started is in it. Dropping this kills whatever is
+/// left, so a failing test leaves no `sleep` behind.
+#[cfg(unix)]
+struct BuildGroup {
+    leader: i32,
+    compiler: i32,
+}
+
+#[cfg(unix)]
+impl BuildGroup {
+    /// Whether any process of the build is still there. Polls briefly: a
+    /// killed process is a zombie until its (new) parent reaps it.
+    fn outlives_the_cli(&self) -> bool {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only checks for the group and the pid.
+            let alive =
+                unsafe { libc::kill(-self.leader, 0) == 0 || libc::kill(self.compiler, 0) == 0 };
+            if !alive || Instant::now() >= deadline {
+                return alive;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BuildGroup {
+    fn drop(&mut self) {
+        // SAFETY: SIGKILL to the process group this test's CLI started.
+        unsafe {
+            libc::kill(-self.leader, libc::SIGKILL);
+        }
+    }
+}
+
+/// The Ruby that rebuilds an extension runs the gem's own build scripts and
+/// the compiler: none of that is handed the Socket token the run was given,
+/// while a package manager's own registry auth still reaches it.
+#[cfg(unix)]
+#[test]
+fn the_rebuild_does_not_hand_the_socket_token_to_ruby() {
+    const SECRET: &str = "sktsec_e2e_child_env_marker";
+    let (_tmp, proj, _gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+
+    let (code, stdout, stderr) = ruby.run(
+        &proj,
+        &["apply", "--json", "--offline"],
+        &[
+            ("SOCKET_API_TOKEN", SECRET),
+            ("SOCKET_CLI_API_TOKEN", SECRET),
+            ("SOCKET_SECURITY_API_TOKEN", SECRET),
+            ("NPM_TOKEN", "registry-auth"),
+        ],
+    );
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    let calls = ruby.calls();
+    assert_eq!(calls.last().map(String::as_str), Some("build"), "{calls:?}");
+    for mode in &calls {
+        let seen = ruby.env_seen(mode);
+        assert!(
+            !seen.contains(SECRET),
+            "`ruby` ({mode}) was handed the Socket token:\n{seen}"
+        );
+        for gone in [
+            "SOCKET_API_TOKEN=",
+            "SOCKET_CLI_API_TOKEN=",
+            "SOCKET_SECURITY_API_TOKEN=",
+            "SOCKET_OFFLINE=",
+        ] {
+            assert!(
+                !seen.lines().any(|line| line.starts_with(gone)),
+                "`ruby` ({mode}) inherited {gone}:\n{seen}"
+            );
+        }
+        assert!(
+            seen.lines().any(|line| line == "NPM_TOKEN=registry-auth"),
+            "`ruby` ({mode}) lost the registry auth:\n{seen}"
+        );
+    }
+}
+
+/// What an interrupted rebuild is followed by.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Next {
+    Apply,
+    Rollback,
+}
+
+/// Ctrl-C or a CI cancel (SIGTERM) during a native rebuild: the build runs
+/// in its own process group, so nothing but the CLI can end it. The build
+/// is gone by the time the CLI is, the lock is not left behind, and the
+/// copy stays one the next run puts right: `apply` moves the parked
+/// install-time build back and completes the rebuild, `rollback` restores
+/// the original sources and build. That holds whether the interrupt lands
+/// before the build wrote anything (the extension dir does not exist) or
+/// with the extension dir and a `lib/` copy half replaced.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_rebuild_is_ended_with_the_cli_and_the_next_run_recovers() {
+    use std::os::unix::process::ExitStatusExt;
+    const ORIGINAL: &[u8] = b"\x7fELF original";
+
+    for (signal, half_built, next) in [
+        (libc::SIGTERM, true, Next::Apply),
+        (libc::SIGINT, false, Next::Apply),
+        (libc::SIGTERM, true, Next::Rollback),
+        (libc::SIGINT, false, Next::Rollback),
+    ] {
+        let case = format!("signal {signal}, half built {half_built}, then {next:?}");
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+        let ext_root = proj.join("vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0");
+        let ext = ext_root.join(FULL_NAME);
+        let parked = ext_root.join(format!(".{FULL_NAME}.socket-patch-old"));
+        let ext_so = ext.join("sp_native/sp_native.so");
+        let lib_so = gem_dir.join("lib/sp_native/sp_native.so");
+        let lock = proj.join(".socket/apply.lock");
+        let ruby = FakeRuby::new();
+        ruby.hang_builds(half_built);
+
+        let (mut cli, build) = ruby.spawn_until_building(&proj, &["apply", "--json"]);
+        assert!(
+            lock.is_file(),
+            "{case}: the rebuilding apply holds the lock"
+        );
+        assert!(parked.is_dir(), "{case}: the install-time build is parked");
+        // SAFETY: plain kill(2) on our own child's pid.
+        assert_eq!(unsafe { libc::kill(cli.id() as libc::pid_t, signal) }, 0);
+        let status = cli.wait().unwrap();
+        assert_eq!(status.signal(), Some(signal), "{case}: got {status}");
+        assert!(
+            !build.outlives_the_cli(),
+            "{case}: the build kept running after the interrupted CLI was gone"
+        );
+        assert!(!lock.exists(), "{case}: apply.lock was left behind");
+
+        ruby.finish_builds();
+        match next {
+            Next::Apply => {
+                let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json"], &[]);
+                assert_eq!(
+                    code, 0,
+                    "{case}: apply after the interrupt:\n{stdout}\n{stderr}"
+                );
+                assert_eq!(std::fs::read(&ext_so).unwrap(), b"rebuilt", "{case}");
+                assert_eq!(std::fs::read(&lib_so).unwrap(), b"rebuilt", "{case}");
+                assert!(ext.join("gem.build_complete").is_file(), "{case}");
+                assert!(
+                    gem_dir.join(".socket-patch-native-build.json").is_file(),
+                    "{case}: the completed build is recorded"
+                );
+                assert!(!parked.exists(), "{case}: the parked build is gone");
+                let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+                assert_eq!(code, 0, "{case}: {stdout}\n{stderr}");
+                // And the install-time build is still what rollback restores.
+                let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json"], &[]);
+                assert_eq!(code, 0, "{case}: rollback:\n{stdout}\n{stderr}");
+            }
+            Next::Rollback => {
+                let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json"], &[]);
+                assert_eq!(
+                    code, 0,
+                    "{case}: rollback after the interrupt:\n{stdout}\n{stderr}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&ext_so).unwrap(), ORIGINAL, "{case}");
+        assert_eq!(std::fs::read(&lib_so).unwrap(), ORIGINAL, "{case}");
+        assert!(ext.join("gem.build_complete").is_file(), "{case}");
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(1),
+            "{case}"
+        );
+        for leftover in [
+            parked.clone(),
+            gem_dir.join(".socket-patch-native-build.json"),
+            gem_dir.join(".socket-patch-native-orig"),
+        ] {
+            assert!(!leftover.exists(), "{case}: {} is left", leftover.display());
+        }
+    }
+}
+
+/// A dry run starts no Ruby at all: it verifies the record against the
+/// installed copy, says the extension would be rebuilt, and changes nothing.
+#[cfg(unix)]
+#[test]
+fn a_dry_run_starts_no_ruby_and_reports_the_rebuild() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json", "--dry-run"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(ruby.calls(), Vec::<String>::new(), "a dry run ran Ruby");
+    assert!(
+        stdout.contains("native_extension_rebuilt") && stdout.contains("apply would"),
+        "the dry run must say a rebuild is pending: {stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(1)
+    );
+    assert_eq!(walk_files(&proj.join("vendor")), tree_before);
+}
+
+/// No Ruby runs for a record whose files do not verify against the
+/// installed copy: until they match, nothing says this is the package the
+/// patch is for.
+#[cfg(unix)]
+#[test]
+fn ruby_does_not_run_for_a_record_that_does_not_verify() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    // Neither the record's beforeHash nor its afterHash.
+    std::fs::write(gem_dir.join(C_KEY), c_source(7)).unwrap();
+    let ruby = FakeRuby::new();
+    let tree_before = walk_files(&proj.join("vendor"));
+
+    for args in [&["apply", "--json"][..], &["apply", "--json", "--dry-run"]] {
+        let (code, stdout, stderr) = ruby.run(&proj, args, &[]);
+        assert_eq!(code, 1, "{args:?}: {stdout}\n{stderr}");
+        assert_eq!(event_action(&stdout), "failed", "{args:?}: {stdout}");
+        assert_eq!(
+            ruby.calls(),
+            Vec::<String>::new(),
+            "{args:?}: Ruby ran before the record verified"
+        );
+        assert_eq!(walk_files(&proj.join("vendor")), tree_before, "{args:?}");
+    }
+}
+
+/// A real run asks the host Ruby where it builds extensions (a question
+/// that loads nothing of the gem), then builds: the installed gemspec is
+/// only loaded by the build itself.
+#[cfg(unix)]
+#[test]
+fn a_real_run_asks_ruby_for_its_extension_dir_then_builds() {
+    let (_tmp, proj, gem_dir) = fake_native_gem(true);
+    write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+    let ruby = FakeRuby::new();
+
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json"], &[]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
+    assert_eq!(
+        std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+        c_source(2)
+    );
+    assert_eq!(
+        std::fs::read(gem_dir.join("lib/sp_native/sp_native.so")).unwrap(),
+        b"rebuilt"
+    );
+    assert!(gem_dir.join(".socket-patch-native-build.json").is_file());
+    assert!(gem_dir.join(".socket-patch-native-orig").is_dir());
+
+    // Built from these sources: nothing more to run.
+    let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert_eq!(ruby.calls(), ["extensions_dir", "build"]);
 }
 
 #[test]

@@ -21,6 +21,13 @@
 //!   their `.sha1` sidecars, and the informational marker.
 //!   [`super::fs::atomic_write_artifact`] writes and renames them WITHOUT an
 //!   fsync and records them here instead.
+//! * **In-place package files** — what the patch engine replaces inside an
+//!   installed dependency (`crate::patch::apply::PackageWrite`). A torn one
+//!   is a hash mismatch nothing rebuilds, so each stage is `fsync`ed when it
+//!   is written, like a commit point's; but a package is a batch, so the
+//!   device cache is flushed once for all its stages before the first
+//!   rename ([`flush_devices_blocking`]) and once more with the directory
+//!   syncs after the last ([`sync_dirs_blocking`]), not twice per file.
 //!
 //! # The barrier
 //!
@@ -256,6 +263,35 @@ fn sync_all_blocking(files: &[PathBuf], dirs: &BTreeSet<PathBuf>) -> std::io::Re
     Ok(())
 }
 
+/// Flush the write cache of every device holding one of `dirs`, once per
+/// device: what a batch of staged files synced with [`plain_fsync`] still
+/// needs before the first of them is renamed into place. Nothing to do
+/// where a plain `fsync` is already the durability point. A directory that
+/// cannot be opened (no read permission) is skipped, as a directory sync
+/// is.
+pub(crate) fn flush_devices_blocking(dirs: &BTreeSet<PathBuf>) -> std::io::Result<()> {
+    if !cfg!(target_vendor = "apple") {
+        return Ok(());
+    }
+    let mut flush: BTreeMap<u64, std::fs::File> = BTreeMap::new();
+    for dir in dirs {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            keep_for_flush(&mut flush, handle);
+        }
+    }
+    for handle in flush.values() {
+        device_flush(handle)?;
+    }
+    Ok(())
+}
+
+/// Sync each of `dirs` (the renames and unlinks made in them), then flush
+/// each device once: the directory half of [`barrier`], for a caller that
+/// replaced files it had already synced itself.
+pub(crate) fn sync_dirs_blocking(dirs: &BTreeSet<PathBuf>) -> std::io::Result<()> {
+    sync_all_blocking(&[], dirs)
+}
+
 fn keep_for_flush(flush: &mut BTreeMap<u64, std::fs::File>, handle: std::fs::File) {
     #[cfg(unix)]
     {
@@ -273,7 +309,7 @@ fn keep_for_flush(flush: &mut BTreeMap<u64, std::fs::File>, handle: std::fs::Fil
 /// `fsync(2)` without Apple's `F_FULLFSYNC` (std's `sync_all` issues that
 /// one on Apple platforms): data and metadata reach the device.
 #[cfg(unix)]
-fn plain_fsync(handle: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn plain_fsync(handle: &std::fs::File) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
     // SAFETY: `fsync` on a descriptor this function borrows for the call.
     if unsafe { libc::fsync(handle.as_raw_fd()) } == 0 {
@@ -284,7 +320,7 @@ fn plain_fsync(handle: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn plain_fsync(handle: &std::fs::File) -> std::io::Result<()> {
+pub(crate) fn plain_fsync(handle: &std::fs::File) -> std::io::Result<()> {
     handle.sync_all()
 }
 

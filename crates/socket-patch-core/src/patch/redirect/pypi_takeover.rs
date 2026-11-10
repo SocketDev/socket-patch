@@ -76,11 +76,13 @@ fn preflight_sibling_requirements_takeover(entry: &VendorEntry) -> Result<(), Re
     })
 }
 
-/// Vendored uv pins the lock's `[[package]]` unit to the patch's version
-/// even when the lock resolved another one (#723). The revert restores the
-/// recorded pre-vendor unit, and the hosted uv rewriter only pins an entry
-/// whose `version` equals the patch's (`matching_package`), so a recorded
-/// unit at another version can never be taken over.
+/// A ledger entry can record a pre-vendor `[[package]]` unit at another
+/// version than the patch: earlier releases vendored a uv package whose
+/// lock resolved another release by pinning the unit down to the patch's
+/// version (#723; vendored uv now refuses such a patch). The revert
+/// restores the recorded unit, and the hosted uv rewriter only pins an
+/// entry whose `version` equals the patch's (`matching_package`), so a
+/// recorded unit at another version can never be taken over.
 fn preflight_uv_takeover(entry: &VendorEntry) -> Result<(), RewriteWarning> {
     let Some((_, raw_version)) = entry.base_purl.rsplit_once('@') else {
         return Ok(());

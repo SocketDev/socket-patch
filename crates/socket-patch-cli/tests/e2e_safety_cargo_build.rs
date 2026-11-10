@@ -689,107 +689,98 @@ fn apply_reports_cargo_checksum_in_sidecars_updated() {
     );
 }
 
+/// What a cargo sidecar fixup that fails must leave and report: the
+/// crate's source as it was (a patched crate whose checksum file was not
+/// brought in line is one cargo refuses to build), exit 1 with
+/// `partialFailure`, a `failed` event that names the cause, and the
+/// structured `sidecar_fixup_failed` record so consumers can branch on
+/// `advisory.code` rather than parse text. Returns the record's message.
+fn assert_failed_fixup_left_the_crate_untouched(
+    consumer: &Path,
+    (code, stdout, stderr): (i32, String, String),
+) -> String {
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        ORIGINAL_LIB_RS,
+        "a failed sidecar fixup must put the patched source back"
+    );
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(
+        code, 1,
+        "a failed sidecar fixup fails the command.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert_eq!(env["status"], "partialFailure", "got {env}");
+    let failed = env["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .find(|e| e["purl"] == FIXTURE_PURL)
+        .unwrap_or_else(|| panic!("no event for {FIXTURE_PURL}: {env}"));
+    assert_eq!(failed["action"], "failed", "got {env}");
+    assert_eq!(failed["errorCode"], "apply_failed", "got {env}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("sidecar fixup failed")),
+        "the failed event must say the sidecar fixup failed; got {env}"
+    );
+    let cargo = env["sidecars"]
+        .as_array()
+        .unwrap_or_else(|| panic!("envelope must carry `sidecars`.\nstdout:\n{stdout}"))
+        .iter()
+        .find(|s| s["ecosystem"] == "cargo")
+        .unwrap_or_else(|| panic!("envelope.sidecars must contain a cargo record: {env}"));
+    let advisory = cargo
+        .get("advisory")
+        .unwrap_or_else(|| panic!("a failed fixup carries an advisory: {cargo}"));
+    assert_eq!(advisory["code"], "sidecar_fixup_failed", "got {advisory}");
+    assert_eq!(advisory["severity"], "error", "got {advisory}");
+    // The rewriter aborted before touching anything.
+    assert!(
+        cargo["files"].as_array().expect("files array").is_empty(),
+        "failed fixup must not report any rewritten files; got {cargo}"
+    );
+    advisory["message"].as_str().unwrap_or("").to_string()
+}
+
 /// Sidecar-fixup-failure boundary: when `.cargo-checksum.json` is
-/// malformed, `sidecars::cargo::fixup` returns `Err(SidecarError)`.
-/// The boundary in `apply_package_patch` converts that into a
-/// `SidecarRecord` carrying `advisory.code = "sidecar_fixup_failed"`
-/// + `severity = "error"`.
-///
-/// The patch itself MUST still apply (the bytes were committed
-/// atomically before the sidecar runs). The envelope must surface
-/// the structured error so downstream consumers can branch on
-/// `advisory.code == "sidecar_fixup_failed"` rather than parsing
-/// free-form text.
+/// malformed, `sidecars::cargo::fixup` returns `Err(SidecarError)`, and
+/// the package fails with its source put back (see
+/// [`assert_failed_fixup_left_the_crate_untouched`]).
 #[test]
 fn apply_with_malformed_checksum_reports_sidecar_fixup_failed() {
     let root = tempfile::tempdir().unwrap();
     let consumer = stage_consumer(root.path());
-    let cargo_home = root.path().join(".cargo-home");
-    let _ = cargo_home; // unused here; lockfile + cargo check not needed
     stage_socket_manifest(&consumer);
 
     // Corrupt the checksum file so cargo::fixup hits the
-    // `serde_json::from_slice` Malformed error path. The fixup runs
-    // AFTER the patch is committed atomically, so the patch itself
-    // succeeds; only the sidecar emits an Error-severity advisory.
+    // `serde_json::from_slice` Malformed error path.
     let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
     std::fs::write(&checksum, b"{this is not valid json").unwrap();
 
-    let (code, stdout, stderr) = run(
+    let out = run(
         &consumer,
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
     );
+    let msg = assert_failed_fixup_left_the_crate_untouched(&consumer, out);
 
-    // The patched bytes are on disk — atomic write committed before
-    // the sidecar's failure.
-    assert_eq!(
-        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
-        PATCHED_LIB_RS,
-        "patch must apply even when sidecar fixup fails"
-    );
-
-    let env = parse_json_envelope(&stdout);
-    // Contract: a best-effort sidecar failure does NOT fail the command.
-    // The patch applied atomically, so apply exits 0 and reports the
-    // top-level status as `success`; the error-severity advisory in
-    // `sidecars[]` is the ONLY failure signal. Pin both so a regression
-    // that bubbled the sidecar error up to a non-zero exit / a
-    // `partialFailure`/`error` status (or, conversely, dropped the
-    // advisory because it "looked successful") fails loudly.
-    assert_eq!(
-        code, 0,
-        "best-effort sidecar failure must not fail the command (exit).\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(
-        env["status"], "success",
-        "sidecar fixup failure must not flip the top-level status; got {env}"
-    );
-    let sidecars = env["sidecars"].as_array().unwrap_or_else(|| {
-        panic!("envelope must carry `sidecars` array.\nstdout:\n{stdout}\nstderr:\n{stderr}")
-    });
-    let cargo_record = sidecars
-        .iter()
-        .find(|s| s["ecosystem"] == "cargo")
-        .unwrap_or_else(|| {
-            panic!("envelope.sidecars must contain a cargo record.\nstdout:\n{stdout}")
-        });
-    let advisory = cargo_record.get("advisory").unwrap_or_else(|| {
-        panic!("malformed checksum should produce an advisory.\nrecord: {cargo_record}")
-    });
-    assert_eq!(
-        advisory["code"], "sidecar_fixup_failed",
-        "advisory.code must be sidecar_fixup_failed; got {advisory}"
-    );
-    assert_eq!(
-        advisory["severity"], "error",
-        "boundary-converted sidecar errors are severity=error"
-    );
-    // Message must carry enough to diagnose: the on-disk path of the
-    // file that failed to parse. `!is_empty()` was vacuous — the
-    // boundary prefixes a fixed "sidecar fixup failed (patch still
-    // applied): " string, so it can never be empty regardless of
-    // whether the underlying detail survived. Pin the path instead so
-    // a regression that swallowed the source error (generic message)
-    // is caught.
-    let msg = advisory["message"].as_str().unwrap_or("");
+    // The message must carry enough to diagnose: the on-disk path of
+    // the file that failed to parse.
     assert!(
         msg.contains(".cargo-checksum.json"),
         "advisory.message must reference the checksum path that failed to parse; got {msg:?}"
     );
-    // No `files[]` entries on the failure path — the rewriter
-    // didn't get far enough to touch anything.
-    let files = cargo_record["files"].as_array().expect("files array");
-    assert!(
-        files.is_empty(),
-        "failed fixup must not report any rewritten files; got {cargo_record}"
+    assert_eq!(
+        std::fs::read(&checksum).unwrap(),
+        b"{this is not valid json",
+        "the checksum file is not ours to repair"
     );
 }
 
 /// Second branch of the cargo sidecar Malformed path: the JSON
 /// parses but lacks a top-level `files` object. The cargo fixup
 /// surfaces this as `SidecarError::Malformed { detail: "missing or
-/// non-object `files` field" }` which the apply boundary converts
-/// to a `sidecar_fixup_failed` advisory at severity `error`.
+/// non-object `files` field" }`, which fails the package the same way.
 ///
 /// Distinct from the parse-error case (above) — exercises the
 /// shape-check after deserialization, which the prior test can't
@@ -810,45 +801,75 @@ fn apply_with_missing_files_field_reports_sidecar_fixup_failed() {
     )
     .unwrap();
 
-    let (code, stdout, stderr) = run(
+    let out = run(
         &consumer,
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
     );
+    let message = assert_failed_fixup_left_the_crate_untouched(&consumer, out);
 
-    // Patch still committed atomically.
-    assert_eq!(
-        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
-        PATCHED_LIB_RS,
-    );
-
-    let env = parse_json_envelope(&stdout);
-    // Same best-effort contract as the parse-error arm: exit 0, status
-    // success, advisory is the only failure signal.
-    assert_eq!(
-        code, 0,
-        "best-effort sidecar failure must not fail the command.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(env["status"], "success", "got {env}");
-    let sidecars = env["sidecars"].as_array().expect("sidecars array");
-    let cargo = sidecars
-        .iter()
-        .find(|s| s["ecosystem"] == "cargo")
-        .expect("cargo record");
-    let advisory = cargo.get("advisory").expect("advisory");
-    assert_eq!(advisory["code"], "sidecar_fixup_failed");
-    assert_eq!(advisory["severity"], "error");
     // Message must mention the `files` field to be diagnostically
     // useful — distinguishes this Malformed arm from the parse arm.
-    let message = advisory["message"].as_str().unwrap_or("");
     assert!(
         message.contains("files"),
         "advisory message must mention the missing `files` field; got {message:?}"
     );
-    // Failed fixup reports no rewritten files (matches the parse-error
-    // arm) — proves the rewriter aborted before touching anything.
+}
+
+/// A run that died between its last rename and the sidecar fixup leaves
+/// the source patched under a checksum file that still describes the
+/// original, a crate cargo refuses to build. The next `apply` finds every
+/// file already patched and writes none, and must still bring the
+/// checksum file in line.
+#[test]
+fn apply_resyncs_the_checksum_of_an_already_patched_crate() {
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    stage_socket_manifest(&consumer);
+    let lib = consumer.join("vendor/safety-fixture/src/lib.rs");
+    let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
+    let listed = || {
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&checksum).unwrap()).unwrap();
+        json["files"]["src/lib.rs"].as_str().unwrap().to_string()
+    };
+
+    // The engine's failpoint ends the process right after the rename.
+    let (code, _, stderr) = common::run_with_env(
+        &consumer,
+        &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+        &[("SOCKET_PATCH_FAILPOINT", "patch_file_committed")],
+    );
+    assert_eq!(code, 86, "the failpoint must end the run; stderr={stderr}");
+    assert_eq!(std::fs::read_to_string(&lib).unwrap(), PATCHED_LIB_RS);
+    assert_eq!(listed(), sha256_hex(ORIGINAL_LIB_RS.as_bytes()));
+
+    let (code, stdout, stderr) = run(
+        &consumer,
+        &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+    );
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        listed(),
+        sha256_hex(PATCHED_LIB_RS.as_bytes()),
+        "the checksum file must list the patched source"
+    );
+    let env = parse_json_envelope(&stdout);
+    let cargo = env["sidecars"]
+        .as_array()
+        .and_then(|s| s.iter().find(|s| s["ecosystem"] == "cargo"))
+        .unwrap_or_else(|| panic!("the repair must be reported in sidecars[]: {env}"));
+    assert_eq!(cargo["files"][0]["action"], "rewritten", "got {cargo}");
+
+    // A third run has nothing to repair and says nothing.
+    let (code, stdout, _) = run(
+        &consumer,
+        &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
+    );
+    assert_eq!(code, 0);
+    let env = parse_json_envelope(&stdout);
     assert!(
-        cargo["files"].as_array().expect("files array").is_empty(),
-        "failed fixup must not report any rewritten files; got {cargo}"
+        env["sidecars"].as_array().is_none_or(|s| s.is_empty()),
+        "an in-sync checksum file is not rewritten: {env}"
     );
 }
 
@@ -950,8 +971,7 @@ fn apply_with_readonly_checksum_still_rewrites_it() {
 /// is a *directory* rather than a file. `read_regular_to_bytes`'s
 /// regular-file check rejects it with a non-`NotFound` I/O error, so the
 /// fixup hits the generic `Err(source)` arm and returns
-/// `SidecarError::Io`. The boundary converts that to a
-/// `sidecar_fixup_failed` advisory.
+/// `SidecarError::Io`, which fails the package with its source put back.
 ///
 /// Picks the "directory in place of file" route over chmod tricks
 /// because chmod-based negative tests silently no-op when run as
@@ -969,45 +989,43 @@ fn apply_with_checksum_directory_reports_sidecar_fixup_failed() {
     std::fs::remove_file(&checksum).unwrap();
     std::fs::create_dir(&checksum).unwrap();
 
-    let (code, stdout, stderr) = run(
+    let out = run(
         &consumer,
         &["apply", "--json", "--cwd", consumer.to_str().unwrap()],
     );
+    let msg = assert_failed_fixup_left_the_crate_untouched(&consumer, out);
 
-    // Source write still succeeded — the directory-as-file ruse
-    // only affects the sidecar's read step.
-    assert_eq!(
-        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
-        PATCHED_LIB_RS,
-    );
-
-    let env = parse_json_envelope(&stdout);
-    // Best-effort contract: exit 0, status success, advisory only.
-    assert_eq!(
-        code, 0,
-        "best-effort sidecar failure must not fail the command.\nstdout:\n{stdout}\nstderr:\n{stderr}"
-    );
-    assert_eq!(env["status"], "success", "got {env}");
-    let cargo = env["sidecars"]
-        .as_array()
-        .expect("sidecars array")
-        .iter()
-        .find(|s| s["ecosystem"] == "cargo")
-        .expect("cargo record");
-    let advisory = cargo.get("advisory").expect("advisory");
-    assert_eq!(advisory["code"], "sidecar_fixup_failed");
-    assert_eq!(advisory["severity"], "error");
     // Message must reference the checksum path so operators can
     // locate the problem on disk.
-    let msg = advisory["message"].as_str().unwrap_or("");
     assert!(
         msg.contains(".cargo-checksum.json"),
         "advisory message must reference the checksum path; got {msg:?}"
     );
-    // Failed fixup reports no rewritten files.
+}
+
+/// The human output of the same failure: the package's `Failed to patch`
+/// line carries the sidecar's reason on stderr and the run exits 1.
+#[test]
+fn failed_sidecar_fixup_is_reported_without_json() {
+    let root = tempfile::tempdir().unwrap();
+    let consumer = stage_consumer(root.path());
+    stage_socket_manifest(&consumer);
+    let checksum = consumer.join("vendor/safety-fixture/.cargo-checksum.json");
+    std::fs::write(&checksum, b"{this is not valid json").unwrap();
+
+    let (code, stdout, stderr) = run(&consumer, &["apply", "--cwd", consumer.to_str().unwrap()]);
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(
-        cargo["files"].as_array().expect("files array").is_empty(),
-        "failed fixup must not report any rewritten files; got {cargo}"
+        stderr.contains("sidecar fixup failed") && stderr.contains(".cargo-checksum.json"),
+        "the failure must be printed with its cause.\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Patched packages:"),
+        "nothing was patched.\nstdout:\n{stdout}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(consumer.join("vendor/safety-fixture/src/lib.rs")).unwrap(),
+        ORIGINAL_LIB_RS
     );
 }
 

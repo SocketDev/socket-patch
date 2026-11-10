@@ -225,7 +225,21 @@ pub fn yarn_classic_berry_migration_risk(project_root: &Path) -> Option<VendorWa
 /// `yarn workspace <name> …`, which runs there) fails with "Tarball is not
 /// in network and can not be located in cache", whether or not the member
 /// depends on the patched package. No relative spelling works from both
-/// (measured on yarn 1.7.0, 1.10.1 and 1.22.22). Returns the warning when
+/// (measured on yarn 1.7.0, 1.10.1 and 1.22.22).
+///
+/// Nothing is written to make those installs work, because each way of
+/// doing so costs the project something it did not ask for (measured on
+/// yarn 1.22.19). A copy of the tarball is needed in EVERY member, not
+/// only the ones that depend on the package (yarn fetches the whole
+/// workspace from any of them), so members × packages tarballs. A
+/// `yarn-offline-mirror` makes yarn save every tarball it downloads into
+/// the mirror from then on. A `.socket` symlink in each member breaks on a
+/// checkout without symlink support and hands a socket-patch run from the
+/// member the root's manifest and ledger. And `--install.cwd` in the root
+/// `.yarnrc` makes a member-directory install run the root's lifecycle
+/// scripts instead of the member's own. So the warning names the two
+/// commands that do install: from the root, and `yarn install --cwd
+/// <workspace root>` from a member. Returns the warning when
 /// `yarn.lock` is classic with such a `file:./` resolution and the root
 /// `package.json` declares workspaces. State-based, like
 /// [`yarn_classic_berry_migration_risk`].
@@ -244,9 +258,10 @@ pub fn yarn_classic_workspace_member_risk(project_root: &Path) -> Option<VendorW
          resolve `file:./.socket/vendor/…` tarballs, which yarn 1 looks up relative to the \
          directory it runs in: on a cold yarn cache, `yarn install`, `yarn add` or `yarn \
          workspace <name> …` run from a workspace member directory fails (\"Tarball is not \
-         in network\"). Run `yarn install` from the workspace root (which also warms the \
-         cache for later member-directory commands), or patch this project with `--mode \
-         hosted`.",
+         in network\"), whether or not that member depends on a patched package. Run `yarn \
+         install` from the workspace root, or as `yarn install --cwd <workspace root>` from \
+         a member directory (either also warms the cache for later member-directory \
+         commands), or patch this project with `--mode hosted`.",
     ))
 }
 
@@ -2176,6 +2191,14 @@ mod berry_migration_risk_tests {
             assert!(
                 w.detail.contains("member directory") && w.detail.contains("workspace root"),
                 "detail names the trap and the remedy: {}",
+                w.detail
+            );
+            // The trap is every member, not only those that depend on a
+            // patched package, and there is a remedy that needs no `cd`.
+            assert!(
+                w.detail.contains("whether or not that member depends")
+                    && w.detail.contains("yarn install --cwd <workspace root>"),
+                "{}",
                 w.detail
             );
         }

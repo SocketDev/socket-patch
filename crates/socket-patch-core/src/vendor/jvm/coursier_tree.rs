@@ -295,6 +295,7 @@ mod tests {
             uuid,
             jar: b"PATCHED JAR",
             upstream_pom: b"<project/>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],

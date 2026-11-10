@@ -196,7 +196,11 @@ fn multi_manifest_auto_detect_warns_in_the_envelope() {
     cmd.arg("--no-verify");
     let (o, env) = run_json(cmd, &out);
     assert_eq!(o.status.code(), Some(0), "{env}");
-    assert_eq!(warning_codes(&env), ["product_multiple_manifests"], "{env}");
+    assert_eq!(
+        warning_codes(&env),
+        ["product_multiple_manifests", "vex_not_verified"],
+        "{env}"
+    );
     assert!(
         env["warnings"][0]["detail"]
             .as_str()

@@ -16,7 +16,7 @@ use crate::vendor::npm_flavor::NpmLockFlavor;
 use super::bun::{bun_text_lock_drives, inventory_bun_binary_in, inventory_bun_in};
 #[cfg(test)]
 use super::dedup_prefer_integrity;
-use super::npm::inventory_package_lock_in;
+use super::npm::{invalid_package_lock_in, inventory_package_lock_in};
 use super::pnpm::{
     inventory_pnpm_lock_in, inventory_pnpm_lock_rel_in, inventory_pnpm_member_locks_in,
     inventory_rush_pnpm_locks_in, is_rush,
@@ -217,7 +217,14 @@ async fn inventory_npm_router_lock_raw_in(
         }
     };
     let raw = match flavor {
-        NpmLockFlavor::PackageLock => inventory_package_lock_in(view).await,
+        NpmLockFlavor::PackageLock => match inventory_package_lock_in(view).await {
+            Some(entries) => Some(entries),
+            // A lock that is not JSON is unreadable, not empty: say so.
+            None => match invalid_package_lock_in(view).await {
+                Some(diagnosis) => return Err(diagnosis),
+                None => None,
+            },
+        },
         // The pnpm reader is grammar-agnostic (it also serves legacy
         // 5.4/6.0 locks through the version-refusal fallback above), so
         // both pnpm flavors share it.

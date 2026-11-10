@@ -89,6 +89,70 @@ pub(crate) async fn mock_discovery(server: &MockServer, purl: &str, uuid: &str) 
         .await;
 }
 
+/// One patch of [`mock_discovery_patches`]: `(uuid, severity, cve, ghsa)`.
+/// An empty `cve` is an advisory that has no CVE id.
+pub(crate) type PatchSpec<'a> = (&'a str, &'a str, &'a str, &'a str);
+
+/// Batch discovery + per-package search for one package with several
+/// patches, each fixing one advisory.
+pub(crate) async fn mock_discovery_patches(
+    server: &MockServer,
+    purl: &str,
+    patches: &[PatchSpec<'_>],
+) {
+    let cves = |cve: &str| -> Vec<String> {
+        if cve.is_empty() {
+            Vec::new()
+        } else {
+            vec![cve.to_string()]
+        }
+    };
+    let batch: Vec<Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            json!({
+                "uuid": uuid, "purl": purl, "tier": "free",
+                "cveIds": cves(cve), "ghsaIds": [ghsa], "severity": severity,
+                "title": "covgap hosted fixture"
+            })
+        })
+        .collect();
+    let by_package: Vec<Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            json!({
+                "uuid": uuid, "purl": purl,
+                "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "x", "license": "MIT", "tier": "free",
+                "vulnerabilities": {
+                    *ghsa: {
+                        "cves": cves(cve), "summary": "s",
+                        "severity": severity, "description": "d"
+                    }
+                }
+            })
+        })
+        .collect();
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [{ "purl": purl, "patches": batch }],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(format!(
+            "^/v0/orgs/{ORG}/patches/by-package/.+$"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "patches": by_package,
+            "canAccessPaidPatches": false,
+        })))
+        .mount(server)
+        .await;
+}
+
 /// The reference endpoint with an arbitrary `results` object — the seam the
 /// bad-purl / no-url server shapes are injected through.
 pub(crate) async fn mock_reference_results(server: &MockServer, results: Value) {

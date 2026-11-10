@@ -641,6 +641,24 @@ pub fn checkout_remedy(files: &[String]) -> String {
     )
 }
 
+/// The files a refused pin's remedy names: the ones wiring it and, for a
+/// uv lock, the paired `pyproject.toml` / script the hosted rewrite pointed
+/// at the same patch (`[tool.uv.sources]`). Discovery lists only the lock,
+/// and a checkout of the lock alone would leave that source live, so the
+/// next `uv lock` would wire the patch straight back in.
+async fn remedy_files(view: &mut View<'_>, pin: &HostedPin) -> Vec<String> {
+    let mut files: BTreeSet<String> = pin.files.iter().cloned().collect();
+    for lock in &pin.files {
+        let Some(paired) = crate::utils::python_lock::paired_metadata_path(lock) else {
+            continue;
+        };
+        if matches!(view.read(&paired).await, Ok(Some(text)) if text.contains(&pin.uuid)) {
+            files.insert(paired);
+        }
+    }
+    files.into_iter().collect()
+}
+
 /// The staged project view the restorers work over: reads fall through to
 /// disk, writes stay in memory until [`restore_upstream`] flushes them.
 pub(crate) struct View<'a> {
@@ -923,6 +941,27 @@ pub async fn gem_stale_cache_after_unwind(
     gem::unwound_stale_cache(root, purl, offline).await
 }
 
+/// The upstream `.gem` of a gem `purl` that is back on its registry entry
+/// in the project at `root`: `(sha256, download url)`. The sha256 is what
+/// the restored lock pins (its `CHECKSUMS` entry, else the rubygems.org
+/// compact index, unless `offline`); the url is set when the lock resolves
+/// the gem from rubygems.org. `staged` is a restore's
+/// [`RestoreOutcome::staged_text`]: the restored lock is read from it when
+/// it is there (a dry run's lock is not on disk), else from disk. `None`
+/// when nothing proves the sha256, so there is nothing to judge an
+/// installed copy or a cached archive by.
+pub async fn gem_upstream_archive(
+    root: &Path,
+    staged: &BTreeMap<String, Option<String>>,
+    purl: &str,
+    offline: bool,
+) -> Option<(String, Option<String>)> {
+    let restored = crate::formats::gem::BUNDLER_LOCKS
+        .iter()
+        .find_map(|lock| staged.get(*lock)?.as_deref());
+    gem::upstream_archive(root, restored, purl, offline).await
+}
+
 /// Restore every pin in `pins` to its default upstream registry entry.
 /// See the module docs for the contract.
 pub async fn restore_upstream(
@@ -941,7 +980,7 @@ pub async fn restore_upstream(
     // yet refused over a FRESH view; a pass that refuses a new pin is rerun
     // without it, so the final view restores exactly the surviving set.
     let mut refused: BTreeMap<String, String> = BTreeMap::new();
-    let (view, result) = loop {
+    let (mut view, result) = loop {
         let active: Vec<&HostedPin> = pins
             .iter()
             .filter(|p| !refused.contains_key(&p.uuid))
@@ -998,23 +1037,24 @@ pub async fn restore_upstream(
             },
         };
 
-    let pins_out = pins
-        .iter()
-        .map(|pin| PinResult {
+    let mut pins_out = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let status = match refused.get(&pin.uuid) {
+            Some(why) => PinStatus::Refused(format!(
+                "cannot restore {} to its upstream registry entry: {why}; {}",
+                pin.purl,
+                checkout_remedy(&remedy_files(&mut view, pin).await)
+            )),
+            None if flush_error.is_some() => PinStatus::Unwritten,
+            None => PinStatus::Restored,
+        };
+        pins_out.push(PinResult {
             purl: pin.purl.clone(),
             uuid: pin.uuid.clone(),
-            status: match refused.get(&pin.uuid) {
-                Some(why) => PinStatus::Refused(format!(
-                    "cannot restore {} to its upstream registry entry: {why}; {}",
-                    pin.purl,
-                    checkout_remedy(&pin.files)
-                )),
-                None if flush_error.is_some() => PinStatus::Unwritten,
-                None => PinStatus::Restored,
-            },
+            status,
             files: pin.files.clone(),
-        })
-        .collect();
+        });
+    }
 
     RestoreOutcome {
         pins: pins_out,

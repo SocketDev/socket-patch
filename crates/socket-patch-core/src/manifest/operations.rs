@@ -92,14 +92,121 @@ pub async fn manifest_exists(path: impl AsRef<Path>) -> Result<bool, std::io::Er
 /// (apply/list/remove/rollback/repair) rather than degrading gracefully.
 /// Staging + rename guarantees readers only ever observe the old or the new
 /// manifest, never a partial one.
+///
+/// The manifest is a file the project commits and other tools write (a
+/// newer CLI, the TS tool), so a rewrite keeps what this version does not
+/// own: the file's permission bits and owner, and every top-level and
+/// per-record field it does not know, where the file had them (see
+/// [`keep_unknown_fields`]). A manifest without such fields is written
+/// exactly as the schema serializes it.
 pub async fn write_manifest(
     path: impl AsRef<Path>,
     manifest: &PatchManifest,
 ) -> Result<(), std::io::Error> {
     let path = path.as_ref();
-    let content = serde_json::to_string_pretty(manifest)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    crate::utils::fs::atomic_write_bytes(path, content.as_bytes()).await
+    let invalid = |e| std::io::Error::new(std::io::ErrorKind::InvalidData, e);
+    let merged = match existing_document(path).await {
+        Some(existing) => {
+            let mut document = serde_json::to_value(manifest).map_err(invalid)?;
+            keep_unknown_fields(&existing, &mut document).then_some(document)
+        }
+        None => None,
+    };
+    let content = match merged {
+        Some(document) => serde_json::to_string_pretty(&document),
+        None => serde_json::to_string_pretty(manifest),
+    }
+    .map_err(invalid)?;
+    crate::utils::fs::atomic_write_bytes_preserving_mode(path, content.as_bytes()).await
+}
+
+/// The keys this version writes at the top level of a manifest and in a
+/// patch record. Any other key in a manifest on disk belongs to another
+/// writer.
+const MANIFEST_KEYS: &[&str] = &["patches", "setup"];
+const RECORD_KEYS: &[&str] = &[
+    "uuid",
+    "exportedAt",
+    "files",
+    "vulnerabilities",
+    "description",
+    "license",
+    "tier",
+];
+
+/// The manifest now at `path` as a JSON object; `None` when there is none
+/// or it is not one (nothing to keep).
+async fn existing_document(path: &Path) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let text = crate::utils::fs::read_regular_to_string(path).await.ok()?;
+    match serde_json::from_str(crate::formats::text::strip_bom(&text)).ok()? {
+        serde_json::Value::Object(document) => Some(document),
+        _ => None,
+    }
+}
+
+/// Carry the fields of `existing` (the manifest on disk) that this version
+/// does not know into `document` (the manifest about to replace it): the
+/// top-level ones, and those of every record that is still the same patch
+/// (same `uuid`; a record another patch replaced does not inherit them, and
+/// a removed record takes its own along). Returns whether there were any.
+fn keep_unknown_fields(
+    existing: &serde_json::Map<String, serde_json::Value>,
+    document: &mut serde_json::Value,
+) -> bool {
+    use serde_json::Value;
+    let Some(document) = document.as_object_mut() else {
+        return false;
+    };
+    let mut kept = false;
+    if let (Some(old_records), Some(records)) = (
+        existing.get("patches").and_then(Value::as_object),
+        document.get_mut("patches").and_then(Value::as_object_mut),
+    ) {
+        for (purl, record) in records.iter_mut() {
+            let (Some(old), Some(record)) = (
+                old_records.get(purl).and_then(Value::as_object),
+                record.as_object_mut(),
+            ) else {
+                continue;
+            };
+            if old.get("uuid") == record.get("uuid") {
+                kept |= keep_unknown_keys(old, record, RECORD_KEYS);
+            }
+        }
+    }
+    kept |= keep_unknown_keys(existing, document, MANIFEST_KEYS);
+    kept
+}
+
+/// Rebuild `new` with the keys of `old` outside `known` put back at the
+/// positions `old` had them: `old`'s key order, each known key holding
+/// `new`'s value, then the keys only `new` has. Untouched (and `false`)
+/// when `old` has no such key, so the common manifest keeps the schema's
+/// own key order.
+fn keep_unknown_keys(
+    old: &serde_json::Map<String, serde_json::Value>,
+    new: &mut serde_json::Map<String, serde_json::Value>,
+    known: &[&str],
+) -> bool {
+    if old.keys().all(|key| known.contains(&key.as_str())) {
+        return false;
+    }
+    let mut merged = serde_json::Map::new();
+    for (key, value) in old {
+        match new.get(key) {
+            Some(value) => merged.insert(key.clone(), value.clone()),
+            None if !known.contains(&key.as_str()) => merged.insert(key.clone(), value.clone()),
+            // A known key the new manifest no longer has.
+            None => None,
+        };
+    }
+    for (key, value) in new.iter() {
+        if !merged.contains_key(key) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    *new = merged;
+    true
 }
 
 #[cfg(test)]
@@ -590,6 +697,155 @@ mod tests {
         }
         // Final file must be a single, fully-readable manifest.
         assert_eq!(read_manifest(&path).await.unwrap().unwrap(), manifest);
+    }
+
+    /// A manifest carrying fields this version does not know (a newer
+    /// CLI's, the TS tool's), at the top level and in a record.
+    const MANIFEST_WITH_UNKNOWN_FIELDS: &str = r#"{
+  "schemaVersion": 2,
+  "patches": {
+    "pkg:npm/pkg-a@1.0.0": {
+      "uuid": "11111111-1111-4111-8111-111111111111",
+      "futureRecordField": {
+        "kept": [
+          1,
+          "two"
+        ]
+      },
+      "exportedAt": "2024-01-01T00:00:00Z",
+      "files": {},
+      "vulnerabilities": {},
+      "description": "a",
+      "license": "MIT",
+      "tier": "free"
+    },
+    "pkg:npm/pkg-b@2.0.0": {
+      "uuid": "22222222-2222-4222-8222-222222222222",
+      "exportedAt": "2024-02-01T00:00:00Z",
+      "files": {},
+      "vulnerabilities": {},
+      "description": "b",
+      "license": "MIT",
+      "tier": "free",
+      "addedBy": "another tool"
+    }
+  },
+  "futureTopLevel": true
+}"#;
+
+    /// A rewrite that changes nothing leaves a manifest with unknown fields
+    /// byte for byte as it was: the fields survive, where they were.
+    #[tokio::test]
+    async fn test_write_manifest_keeps_unknown_fields_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        tokio::fs::write(&path, MANIFEST_WITH_UNKNOWN_FIELDS)
+            .await
+            .unwrap();
+
+        let manifest = read_manifest(&path).await.unwrap().unwrap();
+        write_manifest(&path, &manifest).await.unwrap();
+
+        assert_eq!(
+            tokio::fs::read_to_string(&path).await.unwrap(),
+            MANIFEST_WITH_UNKNOWN_FIELDS
+        );
+    }
+
+    /// Removing one record keeps the other record's unknown fields and the
+    /// top-level ones; the removed record takes its own along, and a record
+    /// another patch replaced (a new `uuid`) does not inherit them.
+    #[tokio::test]
+    async fn test_write_manifest_unknown_fields_follow_their_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        tokio::fs::write(&path, MANIFEST_WITH_UNKNOWN_FIELDS)
+            .await
+            .unwrap();
+
+        let mut manifest = read_manifest(&path).await.unwrap().unwrap();
+        manifest.patches.remove("pkg:npm/pkg-a@1.0.0");
+        write_manifest(&path, &manifest).await.unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(written["schemaVersion"], 2);
+        assert_eq!(written["futureTopLevel"], true);
+        assert!(written["patches"].get("pkg:npm/pkg-a@1.0.0").is_none());
+        assert_eq!(
+            written["patches"]["pkg:npm/pkg-b@2.0.0"]["addedBy"],
+            "another tool"
+        );
+        assert!(!written.to_string().contains("futureRecordField"));
+
+        let record = manifest.patches.get_mut("pkg:npm/pkg-b@2.0.0").unwrap();
+        record.uuid = TEST_UUID_1.to_string();
+        write_manifest(&path, &manifest).await.unwrap();
+        let written: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&path).await.unwrap()).unwrap();
+        assert_eq!(
+            written["patches"]["pkg:npm/pkg-b@2.0.0"]["uuid"],
+            TEST_UUID_1
+        );
+        assert!(written["patches"]["pkg:npm/pkg-b@2.0.0"]
+            .get("addedBy")
+            .is_none());
+        assert_eq!(written["futureTopLevel"], true);
+    }
+
+    /// A manifest without unknown fields is written exactly as the schema
+    /// serializes it (no trailing newline), whatever was on disk before.
+    #[tokio::test]
+    async fn test_write_manifest_plain_rewrite_is_byte_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let manifest = create_test_manifest();
+        let expected = serde_json::to_string_pretty(&manifest).unwrap();
+
+        write_manifest(&path, &manifest).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), expected);
+        write_manifest(&path, &manifest).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), expected);
+
+        // Something that is not a manifest holds nothing to keep.
+        tokio::fs::write(&path, b"[1, 2").await.unwrap();
+        write_manifest(&path, &manifest).await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(&path).await.unwrap(), expected);
+    }
+
+    /// The known-key lists are the schema's own keys: a field added to the
+    /// schema without its key here would be treated as another writer's.
+    #[test]
+    fn test_known_keys_match_the_schema() {
+        let mut manifest = create_test_manifest();
+        manifest.setup = Some(crate::manifest::schema::SetupConfig {
+            exclude: vec!["packages/a".to_string()],
+            manual: Vec::new(),
+        });
+        let document = serde_json::to_value(&manifest).unwrap();
+        let keys = |value: &serde_json::Value| -> Vec<String> {
+            value.as_object().unwrap().keys().cloned().collect()
+        };
+        assert_eq!(keys(&document), MANIFEST_KEYS);
+        let record = document["patches"].as_object().unwrap().values().next();
+        assert_eq!(keys(record.unwrap()), RECORD_KEYS);
+    }
+
+    /// A rewrite keeps the manifest's permission bits: a private `0600`
+    /// manifest does not become world-readable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_manifest_keeps_the_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.json");
+        let manifest = create_test_manifest();
+        write_manifest(&path, &manifest).await.unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_manifest(&path, &manifest).await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
     }
 
     // Regression: a failed write_manifest must NOT clobber an existing, valid

@@ -43,10 +43,11 @@
 //! vendor ledger; both ledgers deleted → still attested from the lock +
 //! the patch API (and by the embedded `apply --vex` / `vendor --vex`,
 //! which touch nothing); `--offline` without ledgers → `record_unavailable`
-//! with zero requests; lock-only revert (Gemfile keeps `path:`) → still
-//! attested, and the real bundler re-wires the PATH section on the next
-//! unfrozen install (a frozen one refuses the pair); full registry revert
-//! (ledgers + artifact kept) → `vendor_unwired`, also under `--no-verify`.
+//! with zero requests; lock-only revert (Gemfile keeps `path:`) →
+//! `vendor_unwired` until the real bundler re-wires the PATH section on the
+//! next unfrozen install (a frozen one refuses the pair), after which it is
+//! attested again; full registry revert (ledgers + artifact kept) →
+//! `vendor_unwired`, also under `--no-verify`.
 //!
 //! VERSION MATRIX: every capstone runs on bundler 1.17 → 4.x (verified
 //! 1.17.3, 2.0.2 … 2.7.2, 4.0.15, 4.0.21 — the pair edit's PATH +
@@ -234,10 +235,11 @@ struct Vendored<'a> {
 ///      the record comes from the patch API; the embedded `apply --vex` and
 ///      `vendor --vex` agree and touch nothing;
 ///   3. `--offline` with no ledgers: `record_unavailable`, ZERO requests;
-///   4. lock-only revert (the Gemfile keeps `path:`): still attested with
-///      the ledger — the REAL bundler re-resolves the gem from the path on
-///      the next unfrozen install (a frozen one refuses the pair), after
-///      which the ledger-less lock attests again;
+///   4. lock-only revert (the Gemfile keeps `path:`): `vendor_unwired`,
+///      because the lock an install is checked against resolves the gem
+///      from the registry again — the REAL bundler re-resolves the gem from
+///      the path on the next unfrozen install (a frozen one refuses the
+///      pair), after which the ledger-less lock attests again;
 ///   5. the manifest pair reverted to its registry version (ledgers +
 ///      artifact kept): `vendor_unwired`, online / offline, with and without
 ///      `--no-verify`.
@@ -335,12 +337,13 @@ fn vendored_manifestless_vex_matrix(v: &Vendored<'_>) {
         std::fs::copy(f.path(), copy.join(".socket/vendor").join(f.file_name())).unwrap();
     }
     let out = run_vex(&bin, &copy, &run(VexRun::offline()));
-    assert_eq!(
+    assert_ne!(
         out.code,
         Some(0),
         "Gemfile `path:` kept, lock reverted, ledger kept: {out}\n{ctx}"
     );
-    assert_attested(out.doc(), v.purl, UUID, Marker::Vendored, VULNS);
+    assert_absent(out.doc.as_ref(), v.purl);
+    assert_not_attested(&out.envelope, v.purl, "vendor_unwired");
     let frozen = bundle(&copy, &["install"], true);
     assert!(
         !frozen.status.success(),

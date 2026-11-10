@@ -998,7 +998,11 @@ fn assert_manifestless_vendored_vex(
             put(path, bytes);
         }
 
-        // 6. Only the lock reverted; the overrides still wire the tarball.
+        // 6. Only the lock reverted; the overrides still name the tarball.
+        //    The lock is what an install is checked against and it resolves
+        //    the package from the registry again, so nothing is attested
+        //    until pnpm has brought the two back in line: a frozen install
+        //    refuses the pair, a plain one re-applies the overrides.
         let lock_pristine = pristine
             .iter()
             .find(|(rel, _)| *rel == "pnpm-lock.yaml")
@@ -1006,8 +1010,9 @@ fn assert_manifestless_vendored_vex(
             .expect("the pristine lock");
         std::fs::write(&lock, &lock_pristine).unwrap();
         let out = run_vex(&bin, fresh, &VexRun::online(&api));
-        assert_eq!(out.code, Some(0), "[{tag}] lock-only revert: {out}");
-        assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+        assert_ne!(out.code, Some(0), "[{tag}] lock-only revert: {out}");
+        assert_absent(out.doc.as_ref(), purl);
+        assert_not_attested(&out.envelope, purl, "vendor_unwired");
         let store = fresh.with_file_name("store-lock-only-revert");
         let store = store.to_str().unwrap();
         // A new store under an existing node_modules makes pnpm prompt to
@@ -1045,7 +1050,13 @@ fn assert_manifestless_vendored_vex(
             patched,
             "[{tag}] a plain install must re-apply the overrides (vendored bytes)"
         );
-        eprintln!("VEX-CELL vendored [{tag}] lock-only-revert(overrides kept): attested");
+        // The lock pnpm just rewrote wires the artifact again.
+        let out = run_vex(&bin, fresh, &VexRun::online(&api));
+        assert_eq!(out.code, Some(0), "[{tag}] reinstalled: {out}");
+        assert_attested(out.doc(), purl, UUID, Marker::Vendored, VENDOR_VULNS);
+        eprintln!(
+            "VEX-CELL vendored [{tag}] lock-only-revert(overrides kept): attested once reinstalled"
+        );
         std::fs::write(&lock, &lock_wired).unwrap();
     });
     eprintln!("MANIFEST-LESS VENDORED VEX OK ({tag})");

@@ -3,7 +3,7 @@
 use super::bun_lock_text::{
     decode_json_string, packages_bounds, parse_entry_line, split_name_spec, user_tarball_version,
 };
-use super::bun_lockb::{BinaryPackage, BunLockb};
+use super::bun_lockb::{BinaryPackage, BunLockb, Origin};
 use super::common::refused;
 use super::npm_common::{
     gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, NpmCommit, NpmCoords,
@@ -19,6 +19,7 @@ use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes_sync, read_regular_to_string,
 };
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 
 pub(crate) const LOCK: &str = "bun.lockb";
 pub(crate) const KIND: &str = "bun_lockb_package";
@@ -224,15 +225,22 @@ impl NpmLockBackend for BunBinaryBackend {
         let mut wiring = Vec::new();
         let (matches, merged) =
             merge_duplicates(&mut lock, matches, &staged.rel_tgz, coords, &leaf, warnings)?;
+        // The lock every record snapshot of this run restores toward, read
+        // off the lock before its first edit.
+        let mut origin = None;
         for package in matches {
             if package.resolution == staged.rel_tgz
                 && package.integrity.as_deref() == Some(&staged.packed.integrity)
             {
                 continue;
             }
-            let original = lock.snapshot(package.id)?;
+            if origin.is_none() {
+                origin = Some(unvendored_lock(root, &lock).await);
+            }
+            let origin = origin.as_ref().expect("set just above");
+            let original = lock.snapshot_toward(package.id, origin)?;
             lock.set_package(package.id, &staged.rel_tgz, &staged.packed.integrity)?;
-            let mut new = lock.snapshot(package.id)?;
+            let mut new = lock.rewritten_snapshot(package.id)?;
             if is_ours(&package, &coords.name, &leaf) {
                 // Bun may renumber packages on re-save. Preserve the semantic
                 // predecessor so ledger carry-forward can recover the correct
@@ -257,8 +265,9 @@ impl NpmLockBackend for BunBinaryBackend {
         }
         // Bun 0.5.9–1.3 resolves workspace local tarballs relative to the
         // declaring member. Preserve the same portable resolution for every
-        // consumer by committing identical tarballs at those member-relative
-        // locations as well as the canonical root artifact.
+        // consumer by committing identical tarballs at the member-relative
+        // locations of the members that depend on the package, as well as
+        // the canonical root artifact.
         let artifact = read_regular_to_bytes_sync(&root.join(&staged.rel_tgz))
             .map_err(|e| format!("cannot read staged tarball: {e}"))?;
         let lock_changed = merged || !wiring.is_empty();
@@ -325,6 +334,40 @@ impl NpmLockBackend for BunBinaryBackend {
             ),
         )
     }
+}
+
+/// `lock` with every package the ledger records as vendored into it
+/// restored: the lock a full revert would leave now, which each snapshot
+/// taken of `lock` records as its origin ([`BunLockb::snapshot_toward`]),
+/// so the packages of one lock all restore toward the same one. A record
+/// that no longer matches the lock, or cannot be restored, stays as it is,
+/// as it would in that revert.
+async fn unvendored_lock(root: &Path, lock: &BunLockb) -> BunLockb {
+    let mut origin = lock.clone();
+    let Ok(state) = super::state::load_state(root).await else {
+        return origin;
+    };
+    let mut earlier = Origin::default();
+    let records = state
+        .entries
+        .values()
+        .flat_map(|entry| entry.wiring.iter().rev())
+        .filter(|rec| rec.file == LOCK && rec.kind == KIND);
+    for rec in records {
+        let (Some(original), Some(new)) = (&rec.original, &rec.new) else {
+            continue;
+        };
+        let Some(id) = rec.key.as_deref().and_then(|key| key.parse().ok()) else {
+            continue;
+        };
+        let Ok(Some(id)) = origin.find_snapshot_id(id, new) else {
+            continue;
+        };
+        if origin.restore_toward(id, original, &earlier).is_ok() {
+            earlier.merge(&Origin::of(original));
+        }
+    }
+    origin
 }
 
 /// The binary lock, parsed and validated for mutation before any write,
@@ -461,21 +504,25 @@ pub(super) fn preflight_package(
             ),
         )));
     }
-    let mirrors = match project.lock.workspace_paths().and_then(|paths| {
-        paths
-            .into_iter()
-            .map(|workspace| {
-                let rel = format!(
-                    "{}/{}/{}",
-                    workspace.trim_start_matches("./"),
-                    coords.uuid_dir_rel,
-                    leaf
-                );
-                validate_mirror_path(root, &rel)?;
-                Ok((workspace, rel))
-            })
-            .collect::<Result<Vec<_>, String>>()
-    }) {
+    let targets: Vec<usize> = matches.iter().map(|p| p.id).collect();
+    let mirrors = match project
+        .lock
+        .workspace_paths_reaching(&targets)
+        .and_then(|paths| {
+            paths
+                .into_iter()
+                .map(|workspace| {
+                    let rel = format!(
+                        "{}/{}/{}",
+                        workspace.trim_start_matches("./"),
+                        coords.uuid_dir_rel,
+                        leaf
+                    );
+                    validate_mirror_path(root, &rel)?;
+                    Ok((workspace, rel))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        }) {
         Ok(v) => v,
         Err(e) => return Err(Box::new(refused("vendor_bun_lockb_invalid", e))),
     };
@@ -504,6 +551,33 @@ pub(super) async fn preflight_packages(
                 .map_err(|o| refusal_code(&o))
         },
     )
+}
+
+/// The [`Origin`] of the `bun.lockb` at each project root, as the entries
+/// reverted there so far in this process recorded it. A revert undoes one
+/// ledger entry, and the caller drops that entry before it asks for the
+/// next. A ledger written before every snapshot recorded the lock's one
+/// origin holds the pre-vendor lock in the entry vendored first only; when
+/// that entry is not the last one reverted, this is how the last one still
+/// gets it. Forgotten once the lock holds no vendored package.
+static REVERTED_ORIGINS: Mutex<Vec<(PathBuf, Origin)>> = Mutex::new(Vec::new());
+
+fn reverted_origin(root: &Path) -> Origin {
+    let origins = REVERTED_ORIGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let known = origins.iter().find(|(known, _)| known == root);
+    known.map(|(_, origin)| origin.clone()).unwrap_or_default()
+}
+
+fn remember_reverted_origin(root: &Path, origin: Option<Origin>) {
+    let mut origins = REVERTED_ORIGINS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    origins.retain(|(known, _)| known != root);
+    if let Some(origin) = origin {
+        origins.push((root.to_path_buf(), origin));
+    }
 }
 
 /// Validate and stage every inverse before changing the lock or removing its
@@ -594,6 +668,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         }),
         RevertLock::Migrated(_) => false,
     };
+    let earlier = reverted_origin(root);
     let mut mirrors_to_remove = Vec::new();
     for rec in entry.wiring.iter().rev() {
         if rec.kind == MIRROR_KIND {
@@ -712,7 +787,7 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
                 None if unreferenced => return Ok(true),
                 None => return Err("binary package resolution has drifted".into()),
             };
-            lock.restore(id, original).map(|()| false)
+            lock.restore_toward(id, original, &earlier).map(|()| false)
         })();
         match restore {
             Ok(true) => outcome.warnings.push(VendorWarning::new(
@@ -733,6 +808,33 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
         outcome.keep_artifact(&dir);
         return outcome;
     }
+    // The artifact goes only when no record still installs from it: one the
+    // ledger has no record of wiring keeps it (and its member copies), with
+    // the recorded ones restored. Checked on a dry run too.
+    if let (RevertLock::Binary(lock), false) = (&lock, opts.keep_artifact) {
+        let wired = lock.packages().map(|packages| {
+            packages.into_iter().find(|p| {
+                parse_vendor_path(&p.resolution)
+                    .is_some_and(|path| path.eco == "npm" && path.uuid == entry.uuid)
+            })
+        });
+        let unrecorded = match wired {
+            Ok(None) => None,
+            Ok(Some(package)) => Some(format!("package #{} ({})", package.id, package.name)),
+            Err(e) => Some(format!("package table ({e})")),
+        };
+        if let Some(what) = unrecorded {
+            outcome.warnings.push(VendorWarning::new(
+                super::RESIDUAL_REFERENCE_CODE,
+                format!(
+                    "{LOCK} {what} still installs from {dir} and the vendor ledger has no \
+                     record of wiring it; point it back at the registry release (`bun install` \
+                     after restoring the dependency's version) and re-run the revert"
+                ),
+            ));
+            outcome.keep_artifact_for_reference(&dir);
+        }
+    }
     if opts.dry_run {
         return outcome;
     }
@@ -745,7 +847,21 @@ pub(crate) async fn revert(entry: &VendorEntry, root: &Path, opts: RevertOpts) -
             return RevertOutcome::failed(format!("cannot write {}: {e}", lock.file()));
         }
     }
-    if !opts.keep_artifact {
+    if let RevertLock::Binary(lock) = &lock {
+        let mut origin = earlier;
+        for original in entry.wiring.iter().filter(|rec| rec.kind == KIND) {
+            if let Some(original) = &original.original {
+                origin.merge(&Origin::of(original));
+            }
+        }
+        let still_vendored = lock.packages().is_ok_and(|packages| {
+            packages
+                .iter()
+                .any(|p| parse_vendor_path(&p.resolution).is_some())
+        });
+        remember_reverted_origin(root, still_vendored.then_some(origin));
+    }
+    if !opts.keep_artifact && !outcome.kept_artifact {
         if matches!(lock, RevertLock::Migrated(_))
             && super::npm_flavor::keep_artifact_while_lock_references_it(
                 &mut outcome,
@@ -941,9 +1057,10 @@ fn mirror_uuid_dir_rel(rel: &str) -> Option<String> {
 }
 
 /// The member uuid dirs (`<member>/.socket/vendor/npm/<uuid>`) a
-/// `bun.lockb` workspace mirrors `uuid`'s tarball into, as the backend's
-/// pre-flight lists them; empty when no readable binary lock drives the
-/// installs.
+/// `bun.lockb` workspace may mirror `uuid`'s tarball into: every member's,
+/// since only the package (which this caller does not have) says which of
+/// them depend on it, as the backend's own pre-flight asks. Empty when no
+/// readable binary lock drives the installs.
 pub(crate) fn workspace_mirror_dirs(root: &Path, uuid: &str) -> Vec<String> {
     if super::lock_inventory::bun_text_lock_drives(&super::lock_inventory::ProjectView::Disk(root))
     {
@@ -1258,6 +1375,9 @@ mod rebuild_tests {
     pub(super) struct Fixture {
         tmp: tempfile::TempDir,
         record: PatchRecord,
+        /// The package the fixture vendors.
+        name: &'static str,
+        version: &'static str,
     }
 
     impl Fixture {
@@ -1265,7 +1385,13 @@ mod rebuild_tests {
             self.tmp.path()
         }
         fn installed(&self) -> PathBuf {
-            self.root().join("node_modules/minimist")
+            self.root().join("node_modules").join(self.name)
+        }
+        fn purl(&self) -> String {
+            format!("pkg:npm/{}@{}", self.name, self.version)
+        }
+        fn leaf(&self) -> String {
+            format!("{}-{}.tgz", self.name, self.version)
         }
     }
 
@@ -1274,13 +1400,13 @@ mod rebuild_tests {
             self.root()
         }
         fn flip_key(&self) -> String {
-            PURL.to_string()
+            self.purl()
         }
         fn flip_uuid(&self) -> String {
             UUID.to_string()
         }
         fn flip_artifact_rel(&self) -> String {
-            format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz")
+            format!(".socket/vendor/npm/{UUID}/{}", self.leaf())
         }
         /// The lock plus every workspace mirror the ledger records.
         fn flip_files(&self) -> Vec<String> {
@@ -1305,13 +1431,35 @@ mod rebuild_tests {
     }
 
     fn fixture_with(lock: &[u8]) -> Fixture {
+        fixture_for(lock, "minimist", "1.2.2")
+    }
+
+    /// The workspace fixture vendoring left-pad, the one package its
+    /// `packages/helper` member depends on: the package that gets a
+    /// member-relative tarball copy.
+    fn member_fixture() -> Fixture {
+        fixture_for(ORIGINAL, "left-pad", "1.3.0")
+    }
+
+    /// `name@version` as an installed package: the tree a local pack reads.
+    fn install(root: &Path, name: &str, version: &str) -> PathBuf {
+        let installed = root.join("node_modules").join(name);
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(installed.join("package.json"), package_json(name, version)).unwrap();
+        std::fs::write(installed.join("index.js"), BEFORE).unwrap();
+        installed
+    }
+
+    fn package_json(name: &str, version: &str) -> Vec<u8> {
+        format!(r#"{{"name":"{name}","version":"{version}"}}"#).into_bytes()
+    }
+
+    fn fixture_for(lock: &[u8], name: &'static str, version: &'static str) -> Fixture {
+        assert!(name != "minimist" || package_json(name, version) == PACKAGE);
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join(LOCK), lock).unwrap();
-        let installed = root.join("node_modules/minimist");
-        std::fs::create_dir_all(&installed).unwrap();
-        std::fs::write(installed.join("package.json"), PACKAGE).unwrap();
-        std::fs::write(installed.join("index.js"), BEFORE).unwrap();
+        install(root, name, version);
         let blobs = root.join(".socket/blobs");
         std::fs::create_dir_all(&blobs).unwrap();
         let after_hash = compute_git_sha256_from_bytes(AFTER);
@@ -1322,13 +1470,18 @@ mod rebuild_tests {
             }}, "vulnerabilities": {}, "description": "", "license": "MIT", "tier": "free",
         }))
         .unwrap();
-        Fixture { tmp, record }
+        Fixture {
+            tmp,
+            record,
+            name,
+            version,
+        }
     }
 
     pub(super) async fn flip_run(fx: &Fixture, cfg: Option<&VendorServiceConfig>) -> VendorOutcome {
         let blobs = fx.root().join(".socket/blobs");
         crate::vendor::test_support::vendor_bun(
-            PURL,
+            &fx.purl(),
             &fx.installed(),
             fx.root(),
             &fx.record,
@@ -1459,12 +1612,12 @@ mod rebuild_tests {
         assert_eq!(planned, looped, "no lock: routed alike");
     }
 
-    fn prebuilt_archive() -> Vec<u8> {
+    fn prebuilt_archive_of(package_json: &[u8]) -> Vec<u8> {
         let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
             Vec::new(),
             flate2::Compression::default(),
         ));
-        for (name, bytes) in [("package.json", PACKAGE), ("index.js", AFTER)] {
+        for (name, bytes) in [("package.json", package_json), ("index.js", AFTER)] {
             let mut header = tar::Header::new_gnu();
             header.set_size(bytes.len() as u64);
             header.set_mode(0o644);
@@ -1491,19 +1644,19 @@ mod rebuild_tests {
     /// request.
     #[tokio::test]
     async fn same_uuid_prebuilt_then_outage_reuses_the_committed_archive() {
-        let archive = prebuilt_archive();
+        let fx = member_fixture();
+        let archive = prebuilt_archive_of(&package_json(fx.name, fx.version));
         let server = MockServer::start().await;
-        ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
-        let fx = flip_fixture().await;
+        ts::mount_granted(&server, UUID, &fx.leaf(), &archive).await;
         let config = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let (result, entry, warnings) = ts::expect_done(flip_run(&fx, Some(&config)).await);
         assert!(result.success, "{result:?}");
         assert!(ts::has_warning(&warnings, "vendor_prebuilt_downloaded"));
-        ts::persist(fx.root(), PURL, entry.unwrap()).await;
+        ts::persist(fx.root(), &fx.purl(), entry.unwrap()).await;
         let before = ts::snapshot(&fx).await;
         assert!(
             before.len() > 2,
-            "fixture wires workspace mirrors: {:?}",
+            "fixture wires a workspace mirror: {:?}",
             before.iter().map(|b| &b.0).collect::<Vec<_>>()
         );
 
@@ -1519,6 +1672,397 @@ mod rebuild_tests {
         );
         assert_eq!(ts::snapshot(&fx).await, before);
         assert_eq!(ts::request_count(&server).await, 0);
+    }
+
+    /// REGRESSION (VBV-S2): a ledger whose copy of the original lock was
+    /// cut short (and its recorded total raised to match) ended `vendor
+    /// --revert` in a slice panic. The record is left alone as drift, with
+    /// the reason, and the lock, the artifact and the entry stay.
+    #[tokio::test]
+    async fn revert_refuses_a_torn_layout_snapshot_in_the_ledger() {
+        use base64::Engine as _;
+        let pristine = include_bytes!("../../tests/fixtures/bun-lockb/0.8.1-production/bun.lockb");
+        let fx = fixture_with(pristine);
+        let root = fx.root();
+        let (result, entry, _) = ts::expect_done(flip_run(&fx, None).await);
+        assert!(result.success, "{result:?}");
+        let mut entry = entry.expect("vendoring wires the binary lock");
+        let vendored = std::fs::read(root.join(LOCK)).unwrap();
+        let mut torn = pristine.to_vec();
+        torn.extend_from_slice(b"xxx");
+        let total_at = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n".len() + 4 + 32;
+        let total = (torn.len() as u64).to_le_bytes();
+        torn[total_at..total_at + 8].copy_from_slice(&total);
+        let record = entry.wiring.iter_mut().find(|r| r.kind == KIND).unwrap();
+        let original = record.original.as_mut().unwrap();
+        assert!(original["layout_original"].is_string());
+        original["layout_original"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&torn));
+        for dry_run in [true, false] {
+            let outcome = revert(&entry, root, RevertOpts::new(dry_run)).await;
+            assert!(outcome.success && outcome.kept_artifact, "{outcome:?}");
+            let drift = outcome
+                .warnings
+                .iter()
+                .find(|w| w.code == "vendor_lock_entry_drifted")
+                .unwrap_or_else(|| panic!("{outcome:?}"));
+            assert!(drift.detail.contains("layout_original"), "{drift:?}");
+            assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), vendored);
+            assert!(root.join(&entry.artifact.path).exists());
+        }
+    }
+
+    // ── several packages in one lock (VBV-D1, VBV-P2, VBV-P5) ────────────
+
+    const UUID_B: &str = "22222222-2222-4222-8222-222222222222";
+
+    /// Vendor `name@version` (patch `uuid`) beside whatever the fixture
+    /// already holds and record it in the ledger, as the CLI does after
+    /// each package.
+    async fn vendor_package(
+        fx: &Fixture,
+        name: &str,
+        version: &str,
+        uuid: &str,
+    ) -> (String, VendorEntry) {
+        let root = fx.root();
+        let purl = format!("pkg:npm/{name}@{version}");
+        let installed = install(root, name, version);
+        let blobs = root.join(".socket/blobs");
+        let (result, entry, _) = ts::expect_done(
+            ts::vendor_bun(
+                &purl,
+                &installed,
+                root,
+                &ts::with_uuid(&fx.record, uuid),
+                &PatchSources::blobs_only(&blobs),
+                "",
+                false,
+                false,
+                None,
+            )
+            .await,
+        );
+        assert!(result.success, "{purl}: {result:?}");
+        let entry = entry.unwrap_or_else(|| panic!("{purl}: vendoring wires the lock"));
+        ts::persist(root, &purl, entry.clone()).await;
+        (purl, entry)
+    }
+
+    /// Revert the ledger entries `keys` in that order the way
+    /// `vendor --revert` does: each from the ledger as it stands, each
+    /// dropped from it once reverted. After each one the lock must still be
+    /// one this codec edits, with the packages not yet reverted still wired.
+    async fn revert_in_order(root: &Path, keys: &[&str], label: &str) {
+        for (done, key) in keys.iter().enumerate() {
+            let mut state = crate::vendor::state::load_state(root).await.unwrap();
+            let entry = state.entries[*key].clone();
+            let outcome = revert(&entry, root, RevertOpts::new(false)).await;
+            assert!(
+                outcome.success && !outcome.kept_artifact && outcome.warnings.is_empty(),
+                "{label}, {key}: {outcome:?}"
+            );
+            assert!(!root.join(&entry.artifact.path).exists(), "{label}, {key}");
+            state.entries.remove(*key);
+            crate::vendor::state::save_state(root, &state)
+                .await
+                .unwrap();
+            let lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+            lock.validate_mutation()
+                .unwrap_or_else(|e| panic!("{label}, {key}: {e}"));
+            let wired: Vec<String> = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .filter(|p| parse_vendor_path(&p.resolution).is_some())
+                .map(|p| p.resolution)
+                .collect();
+            let expected: Vec<String> = keys[done + 1..]
+                .iter()
+                .map(|key| state.entries[*key].artifact.path.clone())
+                .collect();
+            assert_eq!(
+                wired.iter().collect::<std::collections::BTreeSet<_>>(),
+                expected.iter().collect::<std::collections::BTreeSet<_>>(),
+                "{label}, after {key}"
+            );
+        }
+    }
+
+    /// `(label, pristine lock, the second package to vendor)`: a current
+    /// lock, one whose workspace dependency flags an edit normalizes, a
+    /// format-1 lock an edit promotes, and one whose string buffer an edit
+    /// rebuilds. minimist@1.2.2 is the first package in each.
+    const TWO_PACKAGE_LOCKS: [(&str, &[u8], (&str, &str)); 4] = [
+        (
+            "1.1.45",
+            include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb"),
+            ("is-number", "7.0.0"),
+        ),
+        ("1.1.45 workspace", ORIGINAL, ("left-pad", "1.3.0")),
+        (
+            "0.1.1 (format 1)",
+            include_bytes!("../../tests/fixtures/bun-lockb/0.1.1/bun.lockb"),
+            ("is-number", "7.0.0"),
+        ),
+        (
+            "0.8.1 production",
+            include_bytes!("../../tests/fixtures/bun-lockb/0.8.1-production-complex/bun.lockb"),
+            ("is-number", "7.0.0"),
+        ),
+    ];
+
+    /// REGRESSION (VBV-D1): two packages vendored into one `bun.lockb`
+    /// revert to its exact pre-vendor bytes whichever is reverted first.
+    /// Reverted in vendoring order (the order of their purls, which is the
+    /// order `vendor --revert` uses), the first package's tarball path used
+    /// to stay in the string buffer behind the second's, and a lock an edit
+    /// had to normalize stayed normalized: its exact bytes were recorded
+    /// with the first package only and went with that ledger entry.
+    #[tokio::test]
+    async fn packages_of_one_lock_revert_to_its_exact_bytes_in_either_order() {
+        for (label, pristine, (name, version)) in TWO_PACKAGE_LOCKS {
+            for first_vendored_first in [true, false] {
+                let label = format!("{label}, first vendored first: {first_vendored_first}");
+                let fx = fixture_with(pristine);
+                let root = fx.root();
+                let (first, _) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+                let (second, _) = vendor_package(&fx, name, version, UUID_B).await;
+                let mut order = [first.as_str(), second.as_str()];
+                if !first_vendored_first {
+                    order.reverse();
+                }
+                revert_in_order(root, &order, &label).await;
+                assert!(
+                    std::fs::read(root.join(LOCK)).unwrap() == pristine,
+                    "{label}: the reverted lock is the pre-vendor lock"
+                );
+                assert!(!root.join(".socket/vendor").exists(), "{label}");
+            }
+        }
+    }
+
+    /// The ledger socket-patch 5.0 and 5.1 wrote for two packages of
+    /// `pristine`: each record snapshots the lock as its own vendoring
+    /// found it (so only the first holds the pre-vendor lock), and the
+    /// rewritten record repeats the layout snapshot.
+    async fn stepwise_ledger(root: &Path, pristine: &[u8], second: (&str, &str)) -> [String; 2] {
+        use base64::Engine as _;
+        let mut lock = BunLockb::parse(pristine).unwrap();
+        let mut state = crate::vendor::state::VendorState::new();
+        let mut keys = Vec::new();
+        for ((name, version), uuid) in [("minimist", "1.2.2"), second]
+            .into_iter()
+            .zip([UUID, UUID_B])
+        {
+            let id = lock
+                .packages()
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == name && p.version.as_deref() == Some(version))
+                .unwrap()
+                .id;
+            let rel = format!(".socket/vendor/npm/{uuid}/{name}-{version}.tgz");
+            let tarball = format!("{name} tarball");
+            std::fs::create_dir_all(root.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(root.join(&rel), &tarball).unwrap();
+            let integrity = format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(<sha2::Sha512 as sha2::Digest>::digest(&tarball))
+            );
+            let original = lock.snapshot(id).unwrap();
+            lock.set_package(id, &rel, &integrity).unwrap();
+            let rewritten = lock.snapshot(id).unwrap();
+            let purl = format!("pkg:npm/{name}@{version}");
+            let entry: VendorEntry = serde_json::from_value(serde_json::json!({
+                "ecosystem": "npm", "basePurl": purl, "uuid": uuid, "flavor": "bun",
+                "artifact": { "path": rel, "sha256": "" },
+                "wiring": [{
+                    "file": LOCK, "kind": KIND, "action": "rewritten", "key": id.to_string(),
+                    "original": original, "new": rewritten,
+                }],
+            }))
+            .unwrap();
+            state.entries.insert(purl.clone(), entry);
+            keys.push(purl);
+        }
+        std::fs::write(root.join(LOCK), lock.bytes()).unwrap();
+        crate::vendor::state::save_state(root, &state)
+            .await
+            .unwrap();
+        [keys.remove(0), keys.remove(0)]
+    }
+
+    /// VBV-D1 for a ledger an earlier release wrote: reverted in one run,
+    /// in either order, its packages still come back to the exact lock.
+    /// The pre-vendor lock is recorded with the first package only, so that
+    /// package's revert hands it on to the ones reverted after it.
+    #[tokio::test]
+    async fn an_earlier_releases_ledger_reverts_to_the_exact_lock_in_either_order() {
+        for (label, pristine, second) in TWO_PACKAGE_LOCKS {
+            for first_vendored_first in [true, false] {
+                let label = format!("{label}, first vendored first: {first_vendored_first}");
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path();
+                let [first, second] = stepwise_ledger(root, pristine, second).await;
+                let mut order = [first.as_str(), second.as_str()];
+                if !first_vendored_first {
+                    order.reverse();
+                }
+                revert_in_order(root, &order, &label).await;
+                assert!(
+                    std::fs::read(root.join(LOCK)).unwrap() == pristine,
+                    "{label}: the reverted lock is the pre-vendor lock"
+                );
+            }
+        }
+    }
+
+    /// REGRESSION (VBV-P2): a lock an edit must normalize is recorded whole
+    /// so a revert can put its exact bytes back. It is recorded with the
+    /// pre-vendor record only: the copy that used to sit in the rewritten
+    /// record too was never read, and doubled a ledger that already holds
+    /// one copy per package.
+    #[tokio::test]
+    async fn a_normalized_lock_is_recorded_once_per_wiring_record() {
+        let pristine =
+            include_bytes!("../../tests/fixtures/bun-lockb/0.8.1-production-complex/bun.lockb");
+        let fx = fixture_with(pristine);
+        let (_, first) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        let (_, second) = vendor_package(&fx, "is-number", "7.0.0", UUID_B).await;
+        for entry in [&first, &second] {
+            let record = entry.wiring.iter().find(|r| r.kind == KIND).unwrap();
+            let original = record.original.as_ref().unwrap();
+            let layout = original["layout_original"].as_str().expect("the lock");
+            let rewritten = record.new.as_ref().unwrap();
+            assert!(rewritten.get("layout_original").is_none(), "{rewritten}");
+            assert!(
+                serde_json::to_string(record).unwrap().len() < layout.len() + 2048,
+                "one copy of the lock per record"
+            );
+        }
+        let ledger = std::fs::read(fx.root().join(".socket/vendor/state.json")).unwrap();
+        assert!(
+            ledger.len() < 2 * (pristine.len() * 4 / 3 + 4096),
+            "{} bytes for two packages of a {}-byte lock",
+            ledger.len(),
+            pristine.len()
+        );
+    }
+
+    /// REGRESSION (VBV-P5): a member gets its own copy of a vendored
+    /// tarball only when its dependencies reach the package. The fixture's
+    /// root depends on minimist and its `packages/helper` member on
+    /// left-pad alone: minimist is not copied into the member, left-pad is.
+    #[tokio::test]
+    async fn a_member_gets_a_tarball_copy_only_of_what_it_depends_on() {
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let (minimist, entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        assert_eq!(mirror_rels(&entry), [] as [String; 0]);
+        assert!(!root.join("packages/helper/.socket").exists());
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+
+        let (left_pad, entry) = vendor_package(&fx, "left-pad", "1.3.0", UUID_B).await;
+        let copy = format!("packages/helper/.socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        assert_eq!(mirror_rels(&entry), [copy.clone()]);
+        assert_eq!(
+            std::fs::read(root.join(&copy)).unwrap(),
+            std::fs::read(root.join(&entry.artifact.path)).unwrap()
+        );
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+        assert!(!root
+            .join(format!("packages/helper/.socket/vendor/npm/{UUID}"))
+            .exists());
+
+        revert_in_order(root, &[&left_pad, &minimist], "member copies").await;
+        assert!(std::fs::read(root.join(LOCK)).unwrap() == ORIGINAL);
+        assert!(!root.join("packages/helper/.socket").exists());
+    }
+
+    /// VBV-P5: releases before this one copied every vendored tarball into
+    /// every member. Such a copy is still in the ledger: a revert removes
+    /// it, and a health check does not ask for it back.
+    #[tokio::test]
+    async fn a_copy_an_earlier_release_made_in_every_member_is_still_reverted() {
+        let fx = flip_fixture().await;
+        let root = fx.root();
+        let (minimist, mut entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        let copy = format!("packages/helper/.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        let tarball = std::fs::read(root.join(&entry.artifact.path)).unwrap();
+        std::fs::create_dir_all(root.join(&copy).parent().unwrap()).unwrap();
+        std::fs::write(root.join(&copy), &tarball).unwrap();
+        restore_mirror_metadata(root, &copy).await.unwrap();
+        entry.wiring.push(WiringRecord {
+            file: copy.clone(),
+            kind: MIRROR_KIND.into(),
+            action: WiringAction::Added,
+            key: Some("packages/helper".into()),
+            original: None,
+            new: Some(serde_json::Value::String(
+                crate::utils::digest::sha256_hex_of(&tarball),
+            )),
+        });
+        ts::persist(root, &minimist, entry.clone()).await;
+        super::super::bun_workspace::verify(root, &entry)
+            .await
+            .unwrap();
+
+        revert_in_order(root, &[&minimist], "earlier copy").await;
+        assert!(std::fs::read(root.join(LOCK)).unwrap() == ORIGINAL);
+        assert!(!root.join("packages/helper/.socket").exists());
+    }
+
+    /// The artifact goes only when no record still installs from it
+    /// (VBV-D3's invariant, for the binary lock): a record the ledger has
+    /// no wiring for that resolves into the uuid dir keeps the tarball and
+    /// the ledger entry, while the recorded one is restored.
+    #[tokio::test]
+    async fn a_record_the_ledger_never_wired_keeps_the_artifact() {
+        let pristine = include_bytes!("../../tests/fixtures/bun-lockb/1.1.45/bun.lockb");
+        let fx = fixture_with(pristine);
+        let root = fx.root();
+        let (_, entry) = vendor_package(&fx, "minimist", "1.2.2", UUID).await;
+        let mut lock = BunLockb::parse(&std::fs::read(root.join(LOCK)).unwrap()).unwrap();
+        let packages = lock.packages().unwrap();
+        let minimist = packages.iter().find(|p| p.name == "minimist").unwrap();
+        let other = packages.iter().find(|p| p.name == "is-number").unwrap();
+        lock.set_package(
+            other.id,
+            &entry.artifact.path,
+            minimist.integrity.as_deref().unwrap(),
+        )
+        .unwrap();
+        let both = lock.bytes();
+        std::fs::write(root.join(LOCK), &both).unwrap();
+
+        for dry_run in [true, false] {
+            let outcome = revert(&entry, root, RevertOpts::new(dry_run)).await;
+            assert!(outcome.success && outcome.kept_artifact, "{outcome:?}");
+            assert!(outcome.kept_for_residual_reference(), "{outcome:?}");
+            assert!(
+                outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.detail.contains("is-number")),
+                "{outcome:?}"
+            );
+            assert!(root.join(&entry.artifact.path).exists());
+            let live = std::fs::read(root.join(LOCK)).unwrap();
+            assert_eq!(live == both, dry_run, "only the wet run restores");
+            let packages = BunLockb::parse_packages(&live).unwrap();
+            let version = |name: &str| {
+                let package = packages.iter().find(|p| p.name == name).unwrap();
+                package.version.clone()
+            };
+            assert_eq!(version("minimist").is_some(), !dry_run);
+            assert_eq!(version("is-number"), None, "still the tarball");
+        }
     }
 
     /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)
@@ -1579,23 +2123,20 @@ mod rebuild_tests {
     /// registry predecessor, and revert must restore everything exactly.
     #[tokio::test]
     async fn same_uuid_redownload_reverts_exact_binary_and_mirrors() {
-        let archive = prebuilt_archive();
+        let fx = member_fixture();
+        let archive = prebuilt_archive_of(&package_json(fx.name, fx.version));
         let server = MockServer::start().await;
-        ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &archive).await;
-        let fx = flip_fixture().await;
+        ts::mount_granted(&server, UUID, &fx.leaf(), &archive).await;
         let root = fx.tmp.path();
         let config = ts::service_cfg(&server.uri(), VendorSource::Service, false);
         let mut prior: Option<VendorEntry> = None;
         for prebuilt in [true, false] {
             if !prebuilt {
                 server.reset().await;
-                ts::mount_granted(&server, UUID, "minimist-1.2.2.tgz", &ts::regzip(&archive)).await;
+                ts::mount_granted(&server, UUID, &fx.leaf(), &ts::regzip(&archive)).await;
                 // The committed artifact is missing (deleted, never
                 // committed): reuse cannot apply, so acquisition runs.
-                std::fs::remove_file(
-                    root.join(format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz")),
-                )
-                .unwrap();
+                std::fs::remove_file(root.join(ts::FlipFixture::flip_artifact_rel(&fx))).unwrap();
             }
             let VendorOutcome::Done {
                 result,
@@ -1627,10 +2168,11 @@ mod rebuild_tests {
                 .unwrap());
             let bytes = std::fs::read(root.join(&entry.artifact.path)).unwrap();
             assert_eq!(bytes == archive, prebuilt);
+            assert_eq!(mirror_rels(&entry).len(), 1, "the member's copy");
             for mirror in entry.wiring.iter().filter(|r| r.kind == MIRROR_KIND) {
                 assert_eq!(std::fs::read(root.join(&mirror.file)).unwrap(), bytes);
             }
-            ts::persist(root, PURL, entry.clone()).await;
+            ts::persist(root, &fx.purl(), entry.clone()).await;
             prior = Some(entry);
         }
         let entry = prior.unwrap();
@@ -1662,7 +2204,7 @@ mod rebuild_tests {
     /// `.socket/`.
     #[tokio::test]
     async fn a_tgz_rule_still_commits_every_workspace_mirror() {
-        let fx = flip_fixture().await;
+        let fx = member_fixture();
         let root = fx.root();
         if ts::git_project(root, "node_modules\n*.tgz\n").is_none() {
             return;
@@ -1718,7 +2260,7 @@ mod rebuild_tests {
             )
             .unwrap();
         }
-        ts::persist(root, PURL, entry.clone()).await;
+        ts::persist(root, &fx.purl(), entry.clone()).await;
         let outcome = revert(&entry, root, RevertOpts::new(false)).await;
         assert!(outcome.success, "{outcome:?}");
         assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), ORIGINAL);
@@ -1757,7 +2299,7 @@ mod rebuild_tests {
         ];
         for (label, file, rules) in &shapes {
             for dry_run in [true, false] {
-                let fx = flip_fixture().await;
+                let fx = member_fixture();
                 let root = fx.root();
                 if ts::git_project(root, "node_modules\n").is_none() {
                     return;
@@ -1775,7 +2317,7 @@ mod rebuild_tests {
                 );
                 let blobs = root.join(".socket/blobs");
                 let outcome = crate::vendor::test_support::vendor_bun(
-                    PURL,
+                    &fx.purl(),
                     &fx.installed(),
                     root,
                     &fx.record,

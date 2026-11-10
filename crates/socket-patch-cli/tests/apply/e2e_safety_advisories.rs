@@ -171,6 +171,81 @@ fn find_sidecar_record<'a>(env: &'a serde_json::Value, ecosystem: &str) -> &'a s
 // PyPI — advisory-only, code = pypi_record_stale
 // ─────────────────────────────────────────────────────────────────────
 
+/// Without `--json` a sidecar advisory is a `Warning:` line on stderr,
+/// the same advisory of two packages printed once; `--silent` mutes it,
+/// and a run that writes nothing has none to print.
+#[test]
+fn sidecar_advisory_is_printed_in_human_output() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cwd = tmp.path();
+    let site_packages = cwd.join("site-packages");
+    let (original, patched) = (b"# original\n", b"# patched\n");
+    let (before, after) = (git_sha256(original), git_sha256(patched));
+    let socket_dir = cwd.join(".socket");
+    let mut patches = serde_json::Map::new();
+    for name in ["requests", "urllib3"] {
+        let dist_info = site_packages.join(format!("{name}-2.28.0.dist-info"));
+        std::fs::create_dir_all(&dist_info).unwrap();
+        std::fs::write(
+            dist_info.join("METADATA"),
+            format!("Metadata-Version: 2.1\nName: {name}\nVersion: 2.28.0\n"),
+        )
+        .unwrap();
+        std::fs::write(site_packages.join(format!("{name}.py")), original).unwrap();
+        patches.insert(
+            format!("pkg:pypi/{name}@2.28.0"),
+            serde_json::json!({
+                "uuid": format!("20000001-0000-4001-8001-0000000000{:02}", patches.len()),
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { format!("package/{name}.py"): { "beforeHash": before, "afterHash": after } },
+                "vulnerabilities": {},
+                "description": "advisory fixture",
+                "license": "MIT",
+                "tier": "free"
+            }),
+        );
+    }
+    std::fs::create_dir_all(&socket_dir).unwrap();
+    std::fs::write(
+        socket_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({ "patches": patches })).unwrap(),
+    )
+    .unwrap();
+    write_blob(&socket_dir, &after, patched);
+    let apply = |extra: &[&str]| {
+        let mut args = vec![
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--global-prefix",
+            site_packages.to_str().unwrap(),
+        ];
+        args.extend_from_slice(extra);
+        run_with_env(cwd, &args, &[])
+    };
+    let advisories = |stderr: &str| stderr.matches("Warning: PyPI: run `pip check`").count();
+
+    let (code, stdout, stderr) = apply(&[]);
+    assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(
+        advisories(&stderr),
+        1,
+        "one advisory for the two packages.\nstderr:\n{stderr}"
+    );
+
+    // Everything is already patched: nothing written, nothing to advise.
+    let (code, _, stderr) = apply(&[]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(advisories(&stderr), 0, "stderr:\n{stderr}");
+
+    for name in ["requests", "urllib3"] {
+        std::fs::write(site_packages.join(format!("{name}.py")), original).unwrap();
+    }
+    let (code, _, stderr) = apply(&["--silent"]);
+    assert_eq!(code, 0, "stderr:\n{stderr}");
+    assert_eq!(advisories(&stderr), 0, "--silent mutes warnings:\n{stderr}");
+}
+
 /// PyPI: patching a file inside a `dist-info`-discovered package
 /// emits a `pypi_record_stale` advisory at severity `warning`.
 ///
@@ -581,8 +656,9 @@ fn nuget_apply_with_non_utf8_filename_in_pkg_dir() {
 /// NuGet sidecar I/O-error boundary: when `.nupkg.metadata` exists
 /// as a *directory* (not a file), `tokio::fs::remove_file` fails
 /// with a non-NotFound error and `nuget::fixup` returns
-/// `SidecarError::Io`. The boundary in `apply_package_patch`
-/// converts that into a `sidecar_fixup_failed` advisory.
+/// `SidecarError::Io`. The boundary in `apply_package_patch` fails the
+/// package: the patched file is put back, the event is `failed`, and the
+/// `sidecar_fixup_failed` record carries the reason.
 ///
 /// Covers the non-NotFound arm of the remove_file match in
 /// `patch/sidecars/nuget.rs::fixup` — the path the existing
@@ -626,17 +702,35 @@ fn nuget_apply_with_metadata_directory_reports_sidecar_fixup_failed() {
     );
     write_blob(&socket_dir, &after, patched);
 
-    let env = apply_and_parse(
+    let (code, stdout, stderr) = run_with_env(
         cwd,
-        &packages,
+        &[
+            "apply",
+            "--json",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--global-prefix",
+            packages.to_str().unwrap(),
+        ],
         &[("NUGET_PACKAGES", packages.to_str().unwrap())],
     );
+    assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(env["status"], "partialFailure", "{env}");
 
-    // Patch landed (atomic write commits before the sidecar runs).
-    assert_eq!(std::fs::read(&target).unwrap(), patched);
+    // The package is as it was: the patched file was put back.
+    assert_eq!(std::fs::read(&target).unwrap(), original);
 
     let record = find_sidecar_record(&env, "nuget");
-    assert_sidecar_joins_applied_event(&env, record);
+    let events = env["events"].as_array().expect("events array");
+    assert!(
+        events.iter().any(|e| e["purl"] == record["purl"]
+            && e["action"] == "failed"
+            && e["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("sidecar fixup failed"))),
+        "the record must join a `failed` event that names the sidecar: {env}"
+    );
     let advisory = record.get("advisory").expect("advisory");
     assert_eq!(advisory["code"], "sidecar_fixup_failed");
     assert_eq!(advisory["severity"], "error");

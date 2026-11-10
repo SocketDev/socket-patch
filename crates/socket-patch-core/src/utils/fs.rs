@@ -526,10 +526,11 @@ pub(crate) async fn atomic_write_bytes(path: &Path, content: &[u8]) -> std::io::
 /// plain writer resets a user-owned file's mode — a 0600 private package.json
 /// silently becomes 0644, a 0664 group-writable one locks the group out. Use
 /// this variant for files the *user* owns and we merely edit (package.json,
-/// Gemfile, …), matching npm's write-file-atomic. The patch engine keeps the
-/// plain writer: `restore_file_permissions` re-applies pre-patch mode + uid/gid
-/// itself after the rename. `pub` (not `pub(crate)`): the CLI's hosted
-/// redirect writes user-owned lockfiles through it too.
+/// Gemfile, …), matching npm's write-file-atomic. The patch engine stages
+/// its files through the same [`stage_blocking`], naming the mode and owner
+/// itself (a patch-added file has no destination to copy them from). `pub`
+/// (not `pub(crate)`): the CLI's hosted redirect writes user-owned lockfiles
+/// through it too.
 pub async fn atomic_write_bytes_preserving_mode(
     path: &Path,
     content: &[u8],
@@ -805,58 +806,164 @@ fn stage_open_options(perms: Option<&std::fs::Permissions>) -> std::fs::OpenOpti
     options
 }
 
-/// Give a mode-preserving stage the destination's owner and group before
-/// the rename, best-effort like npm's write-file-atomic: the fresh inode
-/// belongs to the euid/egid of this process, so a root run over a user's
-/// checkout (a Docker bind mount, `sudo`) would otherwise hand their
-/// `poetry.lock` to root, and a run in a shared group checkout would move it
-/// to the runner's primary group (#1635). An unprivileged caller can't give
-/// a file away (EPERM), but it may still keep the group when it belongs to
-/// it; failing that, the stage keeps the runner's ownership, as before.
-#[cfg(unix)]
-fn keep_owner(stage: &std::fs::File, dest: &std::fs::Metadata) {
-    use std::os::unix::fs::{fchown, MetadataExt};
-    let Ok(now) = stage.metadata() else {
-        return;
-    };
-    let (uid, gid) = (dest.uid(), dest.gid());
-    if (now.uid(), now.gid()) == (uid, gid) {
-        return;
-    }
-    if fchown(stage, Some(uid), Some(gid)).is_err() && now.gid() != gid {
-        let _ = fchown(stage, None::<u32>, Some(gid));
+/// The permission bits a staged file is given before its rename.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum StageMode {
+    /// What the umask leaves of `0o666`.
+    #[default]
+    Default,
+    /// The bits of an existing file, bit for bit (setuid, setgid and
+    /// sticky included).
+    Of(std::fs::Permissions),
+    /// Read-only for everyone: `0o444`, the read-only attribute off Unix.
+    ReadOnly,
+}
+
+/// The mode and owner a staged file carries BEFORE it is renamed into
+/// place, so the rename is the only step that changes what the destination
+/// holds: no reader, and no interruption, finds the new bytes under other
+/// permission bits or another owner.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StageAttrs {
+    pub mode: StageMode,
+    /// Unix uid and gid, best-effort (see [`Staged::owner_error`]); `None`
+    /// keeps the creating process's. Ignored off Unix.
+    pub owner: Option<(u32, u32)>,
+}
+
+impl StageAttrs {
+    /// The mode and owner of the existing file `meta` describes.
+    pub(crate) fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let owner = {
+            use std::os::unix::fs::MetadataExt;
+            Some((meta.uid(), meta.gid()))
+        };
+        #[cfg(not(unix))]
+        let owner = None;
+        Self {
+            mode: StageMode::Of(meta.permissions()),
+            owner,
+        }
     }
 }
 
-/// Stage `content` next to `path` and rename it over `path` — the one
-/// stage-and-rename core every writer above runs. `preserve_mode` keeps the
-/// destination's permission bits and, where the caller may set them, its
-/// owner and group; `durable` fsyncs the stage before the rename and the
-/// parent directory after it.
+/// When a stage's bytes reach the disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageSync {
+    /// At the next durability barrier, which reopens the file by path
+    /// (`super::durability::record`). Off Unix the stage is synced here
+    /// instead, through its own handle (see [`stage_blocking`]).
+    Deferred,
+    /// `fsync` here, without the device-cache flush: the caller stages a
+    /// batch and flushes each device once
+    /// (`super::durability::flush_devices_blocking`) before the first
+    /// rename.
+    Batched,
+    /// Durable on return (`sync_all`).
+    Now,
+}
+
+/// A file staged beside its destination, complete: content, owner and mode.
+/// [`Staged::commit`] renames it into place; [`Staged::discard`] removes it.
+#[derive(Debug)]
+pub(crate) struct Staged {
+    stage: PathBuf,
+    dest: PathBuf,
+    /// Why the stage could not be given the owner [`StageAttrs::owner`]
+    /// asked for (an unprivileged caller cannot give a file away). The
+    /// stage keeps the creating process's uid; the group is still kept when
+    /// the caller belongs to it.
+    pub owner_error: Option<std::io::Error>,
+    /// Off Unix a patch-added file's read-only attribute is set after the
+    /// rename, as it always was there.
+    #[cfg(not(unix))]
+    read_only_after: bool,
+}
+
+impl Staged {
+    /// Where the staged file sits until it is committed.
+    pub(crate) fn stage(&self) -> &Path {
+        &self.stage
+    }
+
+    /// Rename the stage onto its destination. The stage is left in place
+    /// when the rename fails, for [`Staged::discard`].
+    pub(crate) fn commit(&self) -> std::io::Result<()> {
+        std::fs::rename(&self.stage, &self.dest)?;
+        #[cfg(not(unix))]
+        if self.read_only_after {
+            if let Ok(meta) = std::fs::metadata(&self.dest) {
+                let mut perms = meta.permissions();
+                perms.set_readonly(true);
+                let _ = std::fs::set_permissions(&self.dest, perms);
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove a stage that was not (or could not be) committed.
+    pub(crate) fn discard(&self) {
+        let _ = std::fs::remove_file(&self.stage);
+    }
+}
+
+/// Give a stage the uid and gid `owner`, best-effort like npm's
+/// write-file-atomic: the fresh inode belongs to the euid/egid of this
+/// process, so a root run over a user's checkout (a Docker bind mount,
+/// `sudo`) would otherwise hand their `poetry.lock` to root, and a run in a
+/// shared group checkout would move it to the runner's primary group
+/// (#1635). An unprivileged caller can't give a file away (EPERM), but it
+/// may still keep the group when it belongs to it; the error of the full
+/// change is returned either way.
+#[cfg(unix)]
+fn give_owner(stage: &std::fs::File, (uid, gid): (u32, u32)) -> std::io::Result<()> {
+    use std::os::unix::fs::{fchown, MetadataExt};
+    let now = stage.metadata()?;
+    if (now.uid(), now.gid()) == (uid, gid) {
+        return Ok(());
+    }
+    fchown(stage, Some(uid), Some(gid)).inspect_err(|_| {
+        if now.gid() != gid {
+            let _ = fchown(stage, None::<u32>, Some(gid));
+        }
+    })
+}
+
+/// Stage `content` next to `dest` with the mode and owner of `attrs`: the
+/// first half of every atomic write, and the only code that gives a stage
+/// its permissions. Nothing is left behind on `Err`.
 ///
 /// Off Unix every stage is fsynced here, through its own writable handle:
 /// Windows' `FlushFileBuffers` needs write access, so the barrier cannot
 /// sync the file later by reopening its path (a read-only open is refused
 /// with `ERROR_ACCESS_DENIED`, and a write open is refused for a read-only
 /// artifact) — see `super::durability::sync_all_blocking`.
-fn stage_and_rename_blocking(
-    path: &Path,
+pub(crate) fn stage_blocking(
+    dest: &Path,
     content: &[u8],
-    preserve_mode: bool,
-    durable: bool,
-) -> std::io::Result<()> {
+    attrs: &StageAttrs,
+    sync: StageSync,
+) -> std::io::Result<Staged> {
     use std::io::Write as _;
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let dest = preserve_mode
-        .then(|| std::fs::metadata(path).ok())
-        .flatten();
-    let perms = dest.as_ref().map(|m| m.permissions());
-    let sync_file = durable || !super::durability::DEFERS_FILE_SYNC;
-    let stage = stage_path(path, ".socket-stage-");
+    let perms = match &attrs.mode {
+        StageMode::Default => None,
+        StageMode::Of(perms) => Some(perms.clone()),
+        #[cfg(unix)]
+        StageMode::ReadOnly => {
+            use std::os::unix::fs::PermissionsExt;
+            Some(std::fs::Permissions::from_mode(0o444))
+        }
+        #[cfg(not(unix))]
+        StageMode::ReadOnly => None,
+    };
+    let stage = stage_path(dest, ".socket-stage-");
 
     // `create_new` failing leaves no stage to clean up; every step after it
     // does, so they share one error arm.
     let mut file = stage_open_options(perms.as_ref()).open(&stage)?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut owner_error = None;
     let written = (|| {
         // An unbuffered `std::fs::File`: a failed stage write (ENOSPC, EIO,
         // quota) surfaces here, before the truncated stage could be renamed
@@ -866,26 +973,87 @@ fn stage_and_rename_blocking(
         // before the mode: `chown(2)` clears setuid/setgid, so the chmod
         // below must run last to restore the bits exactly.
         #[cfg(unix)]
-        if let Some(dest) = &dest {
-            keep_owner(&file, dest);
+        if let Some(owner) = attrs.owner {
+            owner_error = give_owner(&file, owner).err();
         }
-        if sync_file {
-            file.sync_all()?;
+        match sync {
+            StageSync::Now => file.sync_all()?,
+            StageSync::Batched if super::durability::DEFERS_FILE_SYNC => {
+                super::durability::plain_fsync(&file)?
+            }
+            StageSync::Deferred if super::durability::DEFERS_FILE_SYNC => {}
+            StageSync::Batched | StageSync::Deferred => file.sync_all()?,
         }
-        // Set the preserved mode on the stage *before* the rename so the
-        // file never appears at the destination with the wrong bits, even
-        // briefly. The content is already written through the open handle,
-        // so a restrictive mode (0400, 0000) cannot fail the write.
-        if let Some(p) = perms {
-            file.set_permissions(p)?;
+        // The mode goes on the stage *before* the rename so the file never
+        // appears at the destination with the wrong bits, even briefly. The
+        // content is already written through the open handle, so a
+        // restrictive mode (0400, 0000) cannot fail the write. A stage that
+        // already has the bits is left alone: a filesystem without
+        // permissions (vfat, some CIFS mounts) refuses every chmod, and
+        // there every file has the same bits anyway.
+        if let Some(perms) = perms {
+            if !has_mode(&file, &perms) {
+                file.set_permissions(perms)?;
+            }
         }
-        // Closed before the rename (Windows refuses to rename an open file)
-        // and before the error arm's unlink.
-        drop(file);
-        std::fs::rename(&stage, path)
+        Ok(())
     })();
+    // Closed before the rename (Windows refuses to rename an open file) and
+    // before the error arm's unlink.
+    drop(file);
     if let Err(e) = written {
         let _ = std::fs::remove_file(&stage);
+        return Err(e);
+    }
+    Ok(Staged {
+        stage,
+        dest: dest.to_path_buf(),
+        owner_error,
+        #[cfg(not(unix))]
+        read_only_after: matches!(attrs.mode, StageMode::ReadOnly),
+    })
+}
+
+/// Whether the open `file` already carries the permission bits `perms`.
+fn has_mode(file: &std::fs::File, perms: &std::fs::Permissions) -> bool {
+    let Ok(now) = file.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        now.permissions().mode() & 0o7777 == perms.mode() & 0o7777
+    }
+    #[cfg(not(unix))]
+    {
+        now.permissions().readonly() == perms.readonly()
+    }
+}
+
+/// Stage `content` next to `path` and rename it over `path` — the one
+/// stage-and-rename core every writer above runs. `preserve_mode` keeps the
+/// destination's permission bits and, where the caller may set them, its
+/// owner and group; `durable` fsyncs the stage before the rename and the
+/// parent directory after it.
+fn stage_and_rename_blocking(
+    path: &Path,
+    content: &[u8],
+    preserve_mode: bool,
+    durable: bool,
+) -> std::io::Result<()> {
+    let attrs = preserve_mode
+        .then(|| std::fs::metadata(path).ok())
+        .flatten()
+        .map(|dest| StageAttrs::of(&dest))
+        .unwrap_or_default();
+    let sync = if durable {
+        StageSync::Now
+    } else {
+        StageSync::Deferred
+    };
+    let staged = stage_blocking(path, content, &attrs, sync)?;
+    if let Err(e) = staged.commit() {
+        staged.discard();
         return Err(e);
     }
 
@@ -894,12 +1062,11 @@ fn stage_and_rename_blocking(
     // only.
     #[cfg(unix)]
     if durable {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
         if let Ok(dir) = std::fs::File::open(parent) {
             let _ = dir.sync_all();
         }
     }
-    #[cfg(not(unix))]
-    let _ = parent;
     Ok(())
 }
 

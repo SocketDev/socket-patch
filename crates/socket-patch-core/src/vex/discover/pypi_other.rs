@@ -1523,8 +1523,9 @@ mod tests {
     }
 
     /// A `--patch-server-url` origin counts (scheme + host + port), and a
-    /// layout without the `patch/pypi/…` levels falls back to the artifact
-    /// filename.
+    /// layout without the `<name>/<version>` levels falls back to the
+    /// artifact filename. A path the patch server serves no patch under is
+    /// no reference there either.
     #[tokio::test]
     async fn configured_origin_and_filename_fallback() {
         let p = Project::new().with_origin("http://127.0.0.1:4545");
@@ -1532,7 +1533,8 @@ mod tests {
             "requirements.txt",
             format!(
                 "urllib3 @ http://127.0.0.1:4545/patch/pypi/urllib3/1.26.18/tok/{UUID_A}/{WHEEL} --hash=sha256:{SHA}\n\
-                 six @ http://127.0.0.1:4545/p/{UUID_B}/six-1.16.0.tar.gz\n\
+                 six @ http://127.0.0.1:4545/patch/pypi/tok/{UUID_B}/six-1.16.0.tar.gz\n\
+                 attrs @ http://127.0.0.1:4545/p/{UUID_B}/attrs-23.1.0.tar.gz\n\
                  idna @ http://127.0.0.1:9999/patch/pypi/idna/3.6/tok/{UUID_B}/idna-3.6-py3-none-any.whl\n"
             ),
         );

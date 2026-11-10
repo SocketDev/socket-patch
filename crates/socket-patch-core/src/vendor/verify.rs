@@ -1007,12 +1007,14 @@ mod tests {
         use base64::Engine as _;
         use sha2::Digest;
         let root = tempfile::tempdir().unwrap();
-        let rel = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        // left-pad is the package the fixture's `packages/helper` member
+        // depends on, so the one Bun may read from the member's own copy.
+        let rel = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
         std::fs::create_dir_all(root.path().join(&rel).parent().unwrap()).unwrap();
         write_tgz(&root.path().join(&rel), "package/index.js", PATCHED);
         let bytes = std::fs::read(root.path().join(&rel)).unwrap();
         let mut entry = entry("npm", UUID, &rel);
-        entry.base_purl = "pkg:npm/minimist@1.2.2".into();
+        entry.base_purl = "pkg:npm/left-pad@1.3.0".into();
         entry.flavor = Some("bun".into());
         entry.artifact.sha256 = hex::encode(sha2::Sha256::digest(&bytes));
         let record = record(UUID, "index.js");
@@ -1024,7 +1026,7 @@ mod tests {
             .packages()
             .unwrap()
             .into_iter()
-            .find(|p| p.name == "minimist")
+            .find(|p| p.name == "left-pad")
             .unwrap()
             .id;
         let sri = format!(

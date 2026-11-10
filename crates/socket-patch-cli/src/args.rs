@@ -369,6 +369,38 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_gem_native_rebuild: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): do NOT refresh the gems Bundler already holds for
+    /// the project (an installed gem under the project and its cached
+    /// `.gem`, an archive in `vendor/cache`) after `Gemfile.lock` is
+    /// repointed or restored. Bundler keeps an installed gem whatever
+    /// source the lock names, so opting out means reinstalling those gems
+    /// by hand (the run's `redirect_gem_stale_install` warning names the
+    /// files). Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-gem-install-refresh",
+        env = "SOCKET_NO_GEM_INSTALL_REFRESH",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_gem_install_refresh: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): also refresh gems in a gem home OUTSIDE the project
+    /// (the system gems, `~/.gem`, an rbenv or asdf home). Off by default:
+    /// another project on the machine may pin the other build of the same
+    /// gem version, and its `bundle pristine` would then fail on the
+    /// replaced archive's checksum. Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "gem-refresh-shared",
+        env = "SOCKET_GEM_REFRESH_SHARED",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub gem_refresh_shared: bool,
 }
 
 impl GlobalArgs {
@@ -649,8 +681,10 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
 /// flags: without the mirror `--offline` still sent telemetry, and an
 /// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.
 /// Empty URLs mean "unset" and are not mirrored. `--api-token` / `--org` are
-/// deliberately not mirrored: exporting a secret into the process env would
-/// leak it to every spawned package-manager child.
+/// deliberately not mirrored: the client takes them as explicit overrides,
+/// and a secret given as a flag stays out of the process environment. (No
+/// spawned child inherits these variables either way: core's
+/// `utils::process::CHILD_ENV_SCRUB`.)
 pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
@@ -699,6 +733,8 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
     "SOCKET_NO_GEM_NATIVE_REBUILD",
+    "SOCKET_NO_GEM_INSTALL_REFRESH",
+    "SOCKET_GEM_REFRESH_SHARED",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -768,6 +804,8 @@ impl Default for GlobalArgs {
             no_npm_allow_remote_config: false,
             no_vlt_install_cleanup: false,
             no_gem_native_rebuild: false,
+            no_gem_install_refresh: false,
+            gem_refresh_shared: false,
         }
     }
 }
@@ -838,6 +876,63 @@ mod tests {
         with_env_cleared(GLOBAL_ARG_ENV_VARS, || {
             with_env_cleared(LOCAL_ARG_ENV_VARS, f);
         });
+    }
+
+    /// Every env var a flag of the real `Cli` binds, on any subcommand,
+    /// with whether clap hides its value (`hide_env_values`: a secret).
+    fn clap_env_bindings() -> Vec<(String, bool)> {
+        fn walk(command: &clap::Command, out: &mut Vec<(String, bool)>) {
+            for arg in command.get_arguments() {
+                if let Some(env) = arg.get_env() {
+                    out.push((
+                        env.to_string_lossy().into_owned(),
+                        arg.is_hide_env_values_set(),
+                    ));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&<crate::Cli as clap::CommandFactory>::command(), &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// No child process inherits a variable the CLI reads for itself: every
+    /// env binding a flag declares, here or in a command file, is on core's
+    /// scrub list. A new token-bearing binding (`SOCKET_API_TOKEN` is the
+    /// one today) that the list lacked would reach every package manager,
+    /// interpreter and gem build script the CLI runs.
+    #[test]
+    fn every_flag_env_binding_is_scrubbed_from_child_processes() {
+        use socket_patch_core::utils::process::CHILD_ENV_SCRUB;
+
+        let bindings = clap_env_bindings();
+        assert!(
+            bindings.contains(&("SOCKET_API_TOKEN".to_string(), true)),
+            "the walk must see the token binding, hidden: {bindings:?}"
+        );
+        assert!(
+            bindings.contains(&("SOCKET_VEX_OUTPUT".to_string(), false)),
+            "the walk must reach the subcommands' own bindings: {bindings:?}"
+        );
+        let declared = bindings.iter().map(|(name, _)| name.as_str());
+        let listed = GLOBAL_ARG_ENV_VARS
+            .iter()
+            .chain(LOCAL_ARG_ENV_VARS)
+            .copied();
+        let missing: std::collections::BTreeSet<&str> = declared
+            .chain(listed)
+            .filter(|name| !CHILD_ENV_SCRUB.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these flag env bindings to socket_patch_core::utils::process::CHILD_ENV_SCRUB, \
+             or every spawned child inherits them: {missing:?}"
+        );
     }
 
     /// Clear the extra env the core telemetry gate reads beyond the

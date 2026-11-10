@@ -410,6 +410,7 @@ fn serve_patch_views(views: Vec<(&str, Value)>) -> (tokio::runtime::Runtime, wir
         .unwrap();
     let server = rt.block_on(async {
         let server = MockServer::start().await;
+        vex_e2e_common::mount_empty_patch_search(&server).await;
         for (uuid, body) in views {
             Mock::given(method("GET"))
                 .and(path(format!("/patch/view/{uuid}")))
@@ -585,7 +586,10 @@ fn assert_attested(
     );
     assert_eq!(
         s["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{cell}: {doc}"
     );
     assert!(

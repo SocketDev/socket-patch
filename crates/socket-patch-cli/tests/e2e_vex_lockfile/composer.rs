@@ -500,7 +500,11 @@ fn assert_attests(out: &VexOutcome, purl: &str, uuid: &str, mode: Mode, cell: &s
     assert_eq!(stmts[0]["products"][0]["@id"], PRODUCT, "{cell}");
     assert_eq!(
         stmts[0]["impact_statement"],
-        format!("Patched via Socket patch {uuid} {}", mode.marker_text()),
+        format!(
+            "Patched via Socket patch {uuid} {}{}",
+            mode.marker_text(),
+            crate::vex_e2e_common::unverified_suffix(&out.envelope)
+        ),
         "{cell}"
     );
 }

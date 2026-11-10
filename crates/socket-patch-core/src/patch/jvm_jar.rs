@@ -531,12 +531,13 @@ pub async fn apply_jar_swap(
             Err(e) => {
                 // Put every copy already swapped back, then fail them all:
                 // a half-swapped GAV is worse than an unpatched one.
+                let failed = dir.join(swap.jar_leaf);
                 for (j, original, _) in &swapped {
-                    let dir = PathBuf::from(&results[*j].package_path);
-                    let _ = write_jar(&dir, swap.jar_leaf, original).await;
-                    results[*j].error = Some(format!(
-                        "rolled back: writing {} failed",
-                        dir.join(swap.jar_leaf).display()
+                    let copy = PathBuf::from(&results[*j].package_path);
+                    let restored = write_jar(&copy, swap.jar_leaf, original).await;
+                    results[*j].error = Some(put_back_note(
+                        &format!("writing {} failed", failed.display()),
+                        restored,
                     ));
                 }
                 results[*i].error = Some(format!("{}: {e}", dir.join(swap.jar_leaf).display()));
@@ -558,11 +559,9 @@ pub async fn apply_jar_swap(
         .into_iter()
         .map(|(k, _)| k.clone())
         .collect();
-    for (i, _, pre) in swapped {
+    for (i, original, pre) in swapped {
         let dir = PathBuf::from(&results[i].package_path);
-        results[i].success = true;
-        results[i].files_patched = patched_keys.clone();
-        results[i].sidecar = match sidecars::dispatch_fixup_with(
+        match sidecars::dispatch_fixup_with(
             swap.purl,
             &dir,
             &[swap.jar_leaf.to_string()],
@@ -570,14 +569,37 @@ pub async fn apply_jar_swap(
         )
         .await
         {
-            Ok(record) => record,
-            Err(e) => Some(sidecars::fixup_failed_record(
-                swap.purl,
-                format!("sidecar fixup failed (patch still applied): {e}"),
-            )),
-        };
+            Ok(record) => {
+                results[i].success = true;
+                results[i].files_patched = patched_keys.clone();
+                results[i].sidecar = record;
+            }
+            // A copy whose checksum files could not follow the jar fails,
+            // with the original jar (and what was already rewritten) put
+            // back, as the generic engine does.
+            Err(e) => {
+                let restored = write_jar(&dir, swap.jar_leaf, original).await;
+                if let Some(pre) = &pre {
+                    let _ = maven_sidecars::resync(&dir, pre).await;
+                }
+                let message = put_back_note(&format!("sidecar fixup failed: {e}"), restored);
+                results[i].error = Some(message.clone());
+                results[i].sidecar = Some(sidecars::fixup_failed_record(swap.purl, message));
+            }
+        }
     }
     Ok(results)
+}
+
+/// What became of a copy that was written and then had to be put back
+/// because of `why`: `restored` is the outcome of writing its previous jar
+/// over it again. A copy that could not be put back says so; it still holds
+/// the bytes the failed operation wrote.
+fn put_back_note(why: &str, restored: std::io::Result<Option<String>>) -> String {
+    match restored {
+        Ok(_) => format!("rolled back: {why}"),
+        Err(e) => format!("left changed: {why}, and putting the previous jar back failed: {e}"),
+    }
 }
 
 // ── rollback ────────────────────────────────────────────────────────────
@@ -768,26 +790,38 @@ pub async fn rollback_jar_swap(
         };
         match write_jar(dir, restore.jar_leaf, &original).await {
             Ok(note) => {
-                result.success = true;
-                result.error = note;
-                result.files_rolled_back = files_in_order(restore.files)
-                    .into_iter()
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if let Some(pre) = pre.filter(|p| !p.is_empty()) {
-                    result.sidecar = match maven_sidecars::resync(dir, &pre).await {
-                        Ok(files) if files.is_empty() => None,
-                        Ok(files) => Some(sidecars::SidecarRecord {
+                let resynced = match pre.as_ref().filter(|p| !p.is_empty()) {
+                    Some(pre) => maven_sidecars::resync(dir, pre).await,
+                    None => Ok(Vec::new()),
+                };
+                match resynced {
+                    Ok(files) => {
+                        result.success = true;
+                        result.error = note;
+                        result.files_rolled_back = files_in_order(restore.files)
+                            .into_iter()
+                            .map(|(k, _)| k.clone())
+                            .collect();
+                        result.sidecar = (!files.is_empty()).then(|| sidecars::SidecarRecord {
                             purl: restore.purl.to_string(),
                             ecosystem: "maven".to_string(),
                             files,
                             advisory: None,
-                        }),
-                        Err(e) => Some(sidecars::fixup_failed_record(
-                            restore.purl,
-                            format!("sidecar resync failed (rollback still applied): {e}"),
-                        )),
-                    };
+                        });
+                    }
+                    // The copy stays what its record says, patched: the
+                    // patched jar goes back, and the checksum files with
+                    // it (apply's twin).
+                    Err(e) => {
+                        let restored = write_jar(dir, restore.jar_leaf, &current).await;
+                        if let Some(pre) = &pre {
+                            let _ = maven_sidecars::resync(dir, pre).await;
+                        }
+                        let message =
+                            put_back_note(&format!("sidecar resync failed: {e}"), restored);
+                        result.error = Some(message.clone());
+                        result.sidecar = Some(sidecars::fixup_failed_record(restore.purl, message));
+                    }
                 }
             }
             Err(e) => {
