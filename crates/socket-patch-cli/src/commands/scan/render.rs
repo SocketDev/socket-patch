@@ -197,15 +197,6 @@ pub(crate) fn no_packages_message(
     "No packages found. Run your package manager's install first.".to_string()
 }
 
-/// A discovered project directory as the scan names it: relative to
-/// `--cwd`, `/`-separated.
-pub(super) fn shown_project_dir(cwd: &std::path::Path, dir: &std::path::Path) -> String {
-    dir.strip_prefix(cwd)
-        .unwrap_or(dir)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
 /// What a bare scan's search for project directories left out, one line
 /// each: roots under an ignored path, and a walk that gave up.
 pub(super) fn discovery_notes(ignored: usize, truncated: bool) -> Vec<String> {

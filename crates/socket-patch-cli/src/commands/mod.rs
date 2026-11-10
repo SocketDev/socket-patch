@@ -8,6 +8,7 @@ pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
+pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;

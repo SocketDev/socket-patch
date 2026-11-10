@@ -20,7 +20,8 @@ use socket_patch_core::utils::purl::normalize_purl;
 use socket_patch_core::utils::purl_key::PurlKey;
 
 use super::ScanArgs;
-use crate::hosted_memory::roots::{marker_ecosystem, UNSUPPORTED_MARKERS};
+pub(crate) use crate::commands::projects_below::dir_markers;
+use crate::commands::projects_below::{lock_markers, RepoPolicy};
 
 /// Why the policy could not be loaded.
 pub(crate) enum PolicyLoadError {
@@ -73,77 +74,18 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
             scanned_dirs: Default::default(),
         });
     }
-    let (repo_root, mut warnings) = find_repo_root_with_warnings(&cwd);
-    let in_git_repo = socket_patch_core::utils::repo_root::find_git_repo(&cwd)
-        .is_some_and(|repo| repo.trusted && repo.root == repo_root);
-    let (policy, load_warnings) = SelectionPolicy::load(&DiskPolicyFs::new(&repo_root), &overrides)
-        .map_err(PolicyLoadError::Policy)?;
-    warnings.extend(load_warnings);
+    // The repository's file, read the way every command that looks for
+    // project directories reads it.
+    let repo = RepoPolicy::load(&cwd, &overrides).map_err(PolicyLoadError::Policy)?;
     Ok(InvocationPolicy {
-        policy,
-        repo_root,
-        warnings,
+        policy: repo.policy,
+        repo_root: repo.repo_root,
+        warnings: repo.warnings,
         warned: Default::default(),
-        in_git_repo,
+        in_git_repo: repo.in_git_repo,
         scanned_dirs: Default::default(),
     })
 }
-
-/// The marker files of a disk project root: the same lock markers the
-/// in-memory engine detects roots by, plus the maven/nuget markers disk
-/// scans support. When a directory has none of those, its manifests
-/// ([`MANIFEST_MARKERS`] and the JVM build files) are its markers instead;
-/// the in-memory engine has no such fallback (manifests alone never make
-/// a root there), so for a lockless directory the two engines disagree.
-pub(crate) fn dir_markers(dir: &Path) -> Vec<String> {
-    let mut markers = lock_markers(dir);
-    if markers.is_empty() {
-        // No lockfile: the manifests say what the project is. Every name
-        // here, JVM build files included, must be a regular file: the
-        // root-marker report lists files, so it deliberately keeps
-        // `is_file` rather than `layout::marker_present` (which lets a
-        // directory named like a build file mark a JVM build).
-        markers = MANIFEST_MARKERS
-            .iter()
-            .chain(socket_patch_core::vendor::jvm::layout::JVM_PROJECT_MARKERS)
-            .filter(|name| dir.join(name).is_file())
-            .map(|name| name.to_string())
-            .collect();
-    }
-    markers.sort();
-    markers
-}
-
-/// The lockfile markers in `dir` (unsorted): what makes a directory a
-/// project root of its own rather than a member of an enclosing one.
-fn lock_markers(dir: &Path) -> Vec<String> {
-    std::fs::read_dir(dir)
-        .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_file() || t.is_symlink()))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|name| {
-                    marker_ecosystem(name).is_some()
-                        || UNSUPPORTED_MARKERS
-                            .iter()
-                            .any(|(_, names)| names.contains(&name.as_str()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Manifests that stand in as markers for a root with no lockfile (plus
-/// every JVM build file, `layout::JVM_PROJECT_MARKERS`).
-const MANIFEST_MARKERS: [&str; 6] = [
-    "package.json",
-    "pyproject.toml",
-    "setup.py",
-    "Cargo.toml",
-    "composer.json",
-    "Gemfile",
-];
 
 #[derive(Default)]
 struct Report {
