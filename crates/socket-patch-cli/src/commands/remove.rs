@@ -204,36 +204,44 @@ fn format_rollback_counts(dry_run: bool, rolled_back: usize, already: usize) -> 
 }
 
 /// The crawler-miss warning for removed entries whose rollback was
-/// skipped. Kept revert data is claimed only for entries whose beforeHash
-/// blobs actually exist in `.socket/blobs` (`with_blobs`).
+/// skipped. Their records are gone, so no later `rollback` can find them
+/// and the kept beforeHash blobs restore nothing by themselves: the remedy
+/// named is a reinstall. Where those blobs exist in `.socket/blobs`
+/// (`with_blobs`), it also says what they are still good for (a rollback
+/// once the patch is recorded again) and for how long.
 fn format_not_installed_warning(with_blobs: &[&str], without_blobs: &[&str]) -> Vec<String> {
     let mut lines = Vec::new();
-    let mut group = |purls: &[&str], tail: &dyn Fn(bool) -> &'static str| {
+    let mut group = |purls: &[&str], blobs_kept: bool| {
         if purls.is_empty() {
             return;
         }
         let one = purls.len() == 1;
-        let tail = tail(one);
+        let mut remedy = if one {
+            "To restore a copy this run did not find, reinstall the package".to_string()
+        } else {
+            "To restore copies this run did not find, reinstall the packages".to_string()
+        };
+        if blobs_kept {
+            remedy.push_str(if one {
+                ", or record the patch again with `socket-patch get` and roll it back; its \
+                 original blobs stay in .socket/blobs only until the next blob cleanup \
+                 (`repair`, `scan --prune`)"
+            } else {
+                ", or record the patches again with `socket-patch get` and roll them back; \
+                 their original blobs stay in .socket/blobs only until the next blob \
+                 cleanup (`repair`, `scan --prune`)"
+            });
+        }
         lines.push(String::new());
         lines.push(format!(
-            "Warning: {} no matching installed package, so {} rollback was skipped (a \
-             crawler miss would look the same); {tail}:",
+            "Warning: {} no matching installed package, so nothing was restored (a crawler \
+             miss would look the same). {remedy}:",
             plural(purls.len(), "removed patch had", "removed patches had"),
-            if one { "its" } else { "their" },
         ));
         lines.extend(purls.iter().map(|p| format!("  - {p}")));
     };
-    group(with_blobs, &|_| {
-        "the revert data (beforeHash blobs) was kept in .socket/blobs"
-    });
-    group(without_blobs, &|one| {
-        if one {
-            "no local revert data exists, so reinstall the package to restore its original files"
-        } else {
-            "no local revert data exists, so reinstall the packages to restore their original \
-             files"
-        }
-    });
+    group(with_blobs, true);
+    group(without_blobs, false);
     lines
 }
 
@@ -992,14 +1000,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
         }
     }
 
-    // FAIL-CLOSED (crawler-miss guard): dropped entries whose nested
-    // rollback was skipped as not-installed were never actually reverted,
-    // and the miss may be a crawler layout gap with the patched bytes
-    // still on disk. Sweeping their beforeHash blobs would permanently
-    // destroy the only local revert data, so they are pinned into the
-    // sweep's keep set; a warning event + stderr line surface each one.
-    // Entries genuinely rolled back (or already original) appear in the
-    // rollback's results, never here.
+    // Crawler-miss guard: dropped entries whose nested rollback was skipped
+    // as not-installed were never actually reverted, and the miss may be a
+    // crawler layout gap with the patched bytes still on disk. Their
+    // beforeHash blobs are pinned into THIS sweep's keep set, but with the
+    // record gone no command reads them (a rollback needs the patch
+    // recorded again) and the next sweep collects them, so the warning
+    // event + stderr line say exactly that and name the reinstall remedy,
+    // never a restore from the blobs alone. Entries genuinely rolled back
+    // (or already original) appear in the rollback's results, never here.
     let retained_not_installed: Vec<&str> = rollback_not_installed
         .iter()
         .map(String::as_str)
@@ -1147,9 +1156,11 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 PatchEvent::new(PatchAction::Skipped, (*purl).to_string())
                     .with_reason(
                         "rollback_not_installed",
-                        "rollback skipped: no installed package found (a crawler \
-                         miss would look the same); beforeHash blobs kept in \
-                         .socket/blobs so a later rollback/repair can still restore",
+                        "rollback skipped: no installed package found (a crawler miss \
+                         would look the same), so nothing was restored and the record \
+                         was removed; reinstall the package to restore a copy this run \
+                         did not find. Its beforeHash blobs stay in .socket/blobs only \
+                         until the next blob cleanup (`repair`, `scan --prune`)",
                     )
                     .with_details(serde_json::json!({ "beforeBlobsRetained": kept })),
             );
@@ -2106,16 +2117,21 @@ mod tests {
         assert!(format_rollback_counts(false, 0, 0).is_empty());
     }
 
+    /// The record is gone, so the warning never offers the kept blobs as a
+    /// way back on their own: reinstalling is the remedy, and the blobs are
+    /// mentioned (only where they exist) with what they still need.
     #[test]
-    fn not_installed_warning_claims_kept_blobs_only_when_present() {
+    fn not_installed_warning_names_a_remedy_that_works() {
         let with = format_not_installed_warning(&["pkg:npm/a@1"], &[]);
         assert_eq!(
             with,
             vec![
                 "",
-                "Warning: 1 removed patch had no matching installed package, so its rollback \
-                 was skipped (a crawler miss would look the same); the revert data \
-                 (beforeHash blobs) was kept in .socket/blobs:",
+                "Warning: 1 removed patch had no matching installed package, so nothing was \
+                 restored (a crawler miss would look the same). To restore a copy this run \
+                 did not find, reinstall the package, or record the patch again with \
+                 `socket-patch get` and roll it back; its original blobs stay in \
+                 .socket/blobs only until the next blob cleanup (`repair`, `scan --prune`):",
                 "  - pkg:npm/a@1",
             ]
         );
@@ -2123,18 +2139,26 @@ mod tests {
             format_not_installed_warning(&[], &["pkg:npm/b@1", "pkg:npm/c@1"]),
             vec![
                 "",
-                "Warning: 2 removed patches had no matching installed package, so their \
-                 rollback was skipped (a crawler miss would look the same); no local revert \
-                 data exists, so reinstall the packages to restore their original files:",
+                "Warning: 2 removed patches had no matching installed package, so nothing \
+                 was restored (a crawler miss would look the same). To restore copies this \
+                 run did not find, reinstall the packages:",
                 "  - pkg:npm/b@1",
                 "  - pkg:npm/c@1",
             ]
         );
         assert_eq!(
             format_not_installed_warning(&[], &["pkg:npm/b@1"])[1],
-            "Warning: 1 removed patch had no matching installed package, so its rollback \
-             was skipped (a crawler miss would look the same); no local revert data exists, \
-             so reinstall the package to restore its original files:"
+            "Warning: 1 removed patch had no matching installed package, so nothing was \
+             restored (a crawler miss would look the same). To restore a copy this run did \
+             not find, reinstall the package:"
+        );
+        assert_eq!(
+            format_not_installed_warning(&["pkg:npm/a@1", "pkg:npm/d@1"], &[])[1],
+            "Warning: 2 removed patches had no matching installed package, so nothing was \
+             restored (a crawler miss would look the same). To restore copies this run did \
+             not find, reinstall the packages, or record the patches again with \
+             `socket-patch get` and roll them back; their original blobs stay in \
+             .socket/blobs only until the next blob cleanup (`repair`, `scan --prune`):"
         );
         assert!(format_not_installed_warning(&[], &[]).is_empty());
     }

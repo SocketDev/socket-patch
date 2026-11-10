@@ -805,6 +805,28 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
     event.with_details(details)
 }
 
+/// The line under the not-installed warning for the `dropped` entries
+/// whose manifest record the run removes (would remove, on a dry run).
+/// "No installed package" can also be a copy the crawl did not reach
+/// (another `--cwd`, a layout it does not know): with the record gone no
+/// later `rollback` finds the patch, so the note says nothing was restored
+/// and names the remedy that still works. `None` when no record is dropped.
+fn format_not_installed_note(dropped: usize, dry_run: bool) -> Option<String> {
+    let removed = match (dropped, dry_run) {
+        (0, _) => return None,
+        (1, false) => "it and its record was removed",
+        (1, true) => "it and its record would be removed",
+        (_, false) => "them and their records were removed",
+        (_, true) => "them and their records would be removed",
+    };
+    let remedy = if dropped == 1 {
+        "a copy this run did not find stays patched until the package is reinstalled"
+    } else {
+        "copies this run did not find stay patched until the packages are reinstalled"
+    };
+    Some(format!("Nothing was restored for {removed}: {remedy}."))
+}
+
 /// An in-scope manifest entry with no installed package: `skipped`
 /// `package_not_installed` (apply's event, rollback-side). It never fails
 /// the run — rollback exits 0 even when ALL in-scope targets land here
@@ -812,7 +834,8 @@ fn agent_result_event(result: &RollbackResult, uuid: Option<&str>, dry_run: bool
 fn not_installed_event(purl: &str, uuid: Option<&str>) -> PatchEvent {
     let event = PatchEvent::new(PatchAction::Skipped, purl).with_reason(
         "package_not_installed",
-        "no installed package matches this manifest entry",
+        "no installed package matches this manifest entry, so nothing was restored; \
+         reinstall the package to restore a copy this run did not find",
     );
     match uuid {
         Some(uuid) => event.with_uuid(uuid),
@@ -2232,7 +2255,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
             }
 
             // ── GC ───────────────────────────────────────────────────────
-            // Removal retains originals for active patches and crawler misses.
+            // Removal retains originals for active patches. Those of a dropped
+            // not-installed entry (possibly a crawler miss) are kept out of
+            // this sweep too, but nothing reads them once the record is gone
+            // (see `format_not_installed_note`): the next sweep takes them.
             let mut gc: Option<GcReport> = None;
             if cleanup_allowed {
                 let references = ArtifactReferences::after_removal(
@@ -2493,6 +2519,15 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 );
                 for purl in &not_installed {
                     eprintln!("  - {purl}");
+                }
+                // The ones whose record this run drops are tracked by
+                // nothing afterwards: say what that leaves, and the remedy.
+                let dropped = not_installed
+                    .iter()
+                    .filter(|purl| removed.contains(purl))
+                    .count();
+                if let Some(note) = format_not_installed_note(dropped, args.common.dry_run) {
+                    eprintln!("{note}");
                 }
             }
 
@@ -5975,6 +6010,28 @@ mod tests {
         assert_eq!(
             format_rollback_failed(true),
             "Error: Some patches cannot be rolled back."
+        );
+    }
+
+    /// Dropping the record of a package the crawl did not find leaves a
+    /// possibly patched copy tracked by nothing: the note says so and
+    /// names the remedy, and is absent when no such record is dropped.
+    #[test]
+    fn not_installed_note_says_what_dropping_the_record_leaves() {
+        assert_eq!(format_not_installed_note(0, false), None);
+        assert_eq!(
+            format_not_installed_note(1, false).as_deref(),
+            Some(
+                "Nothing was restored for it and its record was removed: a copy this run \
+                 did not find stays patched until the package is reinstalled."
+            )
+        );
+        assert_eq!(
+            format_not_installed_note(3, true).as_deref(),
+            Some(
+                "Nothing was restored for them and their records would be removed: copies \
+                 this run did not find stay patched until the packages are reinstalled."
+            )
         );
     }
 

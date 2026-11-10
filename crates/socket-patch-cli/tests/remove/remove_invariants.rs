@@ -897,6 +897,37 @@ fn remove_not_installed_keeps_before_blob_and_warns() {
         vec!["pkg:npm/__remove_test_a__@1.0.0"],
         "expected a rollback_not_installed warning event; envelope={v}"
     );
+    // The warning tells the truth about what is left: nothing was restored
+    // and the record is gone, so no later `rollback` can find the patch and
+    // `repair` restores no installed file. It names the remedy that works
+    // (reinstall) and never promises a restore from the kept blobs alone.
+    let reason = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["errorCode"] == "rollback_not_installed")
+        .and_then(|e| e["reason"].as_str())
+        .expect("the warning event's reason");
+    assert!(
+        reason.contains("nothing was restored") && reason.contains("reinstall the package"),
+        "{reason}"
+    );
+    assert!(
+        !reason.contains("can still restore"),
+        "no command can restore from the kept blobs once the record is gone: {reason}"
+    );
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &[
+            "rollback",
+            "pkg:npm/__remove_test_a__@1.0.0",
+            "--json",
+            "--offline",
+        ],
+        &[],
+    );
+    assert_eq!(code, 1, "the record is gone: {stdout}");
+    assert!(stdout.contains("patch_not_found"), "{stdout}");
 
     // (b) ...and A's beforeHash blob SURVIVES the sweep: it is the only
     // local revert data for bytes that may still be patched on disk.
