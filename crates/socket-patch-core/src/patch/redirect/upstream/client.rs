@@ -70,17 +70,22 @@ fn crates_index_base() -> String {
         .unwrap_or_else(|| DEFAULT_CRATES_INDEX.to_string())
 }
 
-/// The sparse-index path of a crate (`cargo`'s `index_path` layout), or
-/// `None` for a name crates.io cannot hold. Its names are non-empty ASCII
-/// letters, digits, `-` and `_`; the name here comes from a `Cargo.lock`,
-/// so anything else is refused rather than cut at byte offsets (which is
-/// only sound for ASCII) or placed in a URL path.
-fn crates_index_path(name: &str) -> Option<String> {
-    let crates_io_name = !name.is_empty()
+/// Whether crates.io can hold a crate of this name: non-empty ASCII
+/// letters, digits, `-` and `_`.
+pub(super) fn is_crates_io_name(name: &str) -> bool {
+    !name.is_empty()
         && name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if !crates_io_name {
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// The sparse-index path of a crate (`cargo`'s `index_path` layout), or
+/// `None` for a name crates.io cannot hold ([`is_crates_io_name`]). The
+/// name here comes from a `Cargo.lock`, so anything else is refused rather
+/// than cut at byte offsets (which is only sound for ASCII) or placed in a
+/// URL path.
+fn crates_index_path(name: &str) -> Option<String> {
+    if !is_crates_io_name(name) {
         return None;
     }
     let lower = name.to_ascii_lowercase();

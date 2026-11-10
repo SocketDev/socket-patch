@@ -90,6 +90,22 @@ pub(crate) async fn restore(
                 source: source.clone(),
             });
         }
+        // The rewriter only pins crates.io crates, so a hosted block named
+        // as no crates.io crate can be is not its work. The pin is refused
+        // whole, before any lookup: its other blocks are left as they are
+        // too, rather than restored around one that cannot be.
+        for hit in &hits {
+            if !super::client::is_crates_io_name(&hit.name) {
+                result.refuse(
+                    &hit.uuid,
+                    format!(
+                        "{}@{}: {:?} is not a crates.io crate name",
+                        hit.name, hit.version, hit.name
+                    ),
+                );
+            }
+        }
+        hits.retain(|hit| !result.refused.contains_key(&hit.uuid));
         // A hit whose name@version crates.io ALSO locks (a dependency added
         // after the pin resolved its own crates.io copy, which cargo cannot
         // unify with the Socket one, #679) merges into that block: splicing
@@ -891,6 +907,36 @@ mod tests {
                 std::fs::read_to_string(tmp.path().join("Cargo.toml")).unwrap(),
                 manifest("")
             );
+        }
+    }
+
+    /// Such a block refuses its pin whole, wherever it sits: a block of
+    /// the same hosted source that could be restored is left alone too,
+    /// and no lookup is made for it (its answer would otherwise be spliced
+    /// into both).
+    #[tokio::test]
+    async fn restore_refuses_the_whole_pin_beside_a_block_named_like_no_crate() {
+        let socket = socket_source(B);
+        let block = |name: &str| {
+            format!(
+                "[[package]]\nname = \"{name}\"\nversion = \"1.0.4\"\n\
+                 source = \"{socket}\"\nchecksum = \"{SOCKET_CKSUM}\"\n\n"
+            )
+        };
+        for (first, second) in [("é", "cfg-if"), ("cfg-if", "é")] {
+            let lock = format!(
+                "version = 4\n\n[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n{}{}",
+                block(first),
+                block(second)
+            );
+            let (outcome, after) = restore_lock(&lock).await;
+            let refusals: Vec<&str> = outcome.refused().map(|(_, why)| why).collect();
+            assert_eq!(refusals.len(), 1, "{:?}", outcome.pins);
+            assert!(
+                refusals[0].contains("\"é\" is not a crates.io crate name"),
+                "{first} then {second}: {refusals:?}"
+            );
+            assert_eq!(after, lock, "{first} then {second}");
         }
     }
 
