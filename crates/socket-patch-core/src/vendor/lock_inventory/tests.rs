@@ -4198,9 +4198,15 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// * the only registry downloads are the hosted → vendored takeover's
 ///   upstream restore (`patch::redirect::upstream::client`), which
 ///   re-resolves the entry from the registry's own metadata and never
-///   reads the hosted pin's URL or hash, and the JVM backend's Maven
+///   reads the hosted pin's URL or hash, the JVM backend's Maven
 ///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
-///   coordinates and checked against the upstream checksum files.
+///   coordinates and checked against the upstream checksum files, and the
+///   gem refresh after a hosted unwind (`patch::gem_refresh`), which
+///   fetches `<rubygems base>/gems/<name>-<version>.gem`, a URL built from
+///   the gem's name and version, and uses the bytes only when their sha256
+///   is the one the restore re-pinned from the registry's compact index
+///   (`upstream::gem::upstream_archive`); a lock still on its hosted entry
+///   yields no URL at all.
 ///
 /// [`PINNED_REFERENCES`] lists every production reference to those three
 /// functions in this crate, by file and line text. What the check catches:
@@ -4214,6 +4220,11 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// Those stay a review matter: read the pristine source from the
 /// registry, never from a lock entry that might be Socket-hosted.
 const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
+    (
+        "patch/gem_refresh.rs",
+        "download",
+        "crate::vendor::registry_fetch::download(&client, url).await",
+    ),
     (
         "patch/redirect/upstream/client.rs",
         "download",
