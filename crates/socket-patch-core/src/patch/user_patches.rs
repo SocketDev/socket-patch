@@ -1232,7 +1232,12 @@ impl Bound {
                     )
             }
             Bound::Disk { root, repo } => {
-                !normalize_lexically_keeping_escapes(&root.join(rel)).starts_with(repo)
+                // `repo` is canonical (`\\?\C:\...` on Windows) while a
+                // script names a directory as users type it (`C:\...`), and
+                // `starts_with` treats the two prefixes as different.
+                use crate::utils::pnpm_workspace::without_verbatim_prefix;
+                !without_verbatim_prefix(normalize_lexically_keeping_escapes(&root.join(rel)))
+                    .starts_with(without_verbatim_prefix(repo.clone()))
             }
         }
     }
@@ -2115,11 +2120,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let repo = std::fs::canonicalize(tmp.path()).unwrap();
         write(&repo, ".git/HEAD", "ref: refs/heads/main\n");
-        let fixes = repo.join("fixes");
-        // Built as JSON so a Windows path's backslashes are escaped.
+        // Spelled as a user types it: on Windows without the `\\?\` prefix
+        // `canonicalize` adds to `repo`, quoted in case the temp dir has a
+        // space, and built as JSON so its backslashes are escaped.
+        let fixes =
+            crate::utils::pnpm_workspace::without_verbatim_prefix(repo.clone()).join("fixes");
         let manifest = serde_json::json!({
             "scripts": {
-                "postinstall": format!("patch-package --patch-dir {}", fixes.display())
+                "postinstall": format!("patch-package --patch-dir \"{}\"", fixes.display())
             }
         });
         write(&repo, "package.json", &manifest.to_string());
