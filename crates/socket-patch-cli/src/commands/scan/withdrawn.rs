@@ -45,7 +45,8 @@ pub(super) const PATCH_WITHDRAWN: &str = "patch_withdrawn";
 
 /// Warning: a withdrawn pin could not be restored upstream (the restore
 /// refused it, the restored files could not be written, or the apply lock
-/// was held). The pin is unchanged; the detail names the remedy.
+/// was held). The pin is unchanged; the detail names the remedy. The one
+/// exception stops the run instead ([`WithdrawnSweep::half_restored`]).
 pub(super) const REDIRECT_WITHDRAWN_RESTORE_FAILED: &str = "redirect_withdrawn_restore_failed";
 
 /// Warning: the reference lookup for the pinned uuids failed, so the run
@@ -68,6 +69,8 @@ pub(super) struct WithdrawnSweep {
     warnings: Vec<RunWarning>,
     /// The reference endpoint's answers, when the lookup succeeded.
     references: Option<KnownReferences>,
+    /// See [`Self::half_restored`].
+    half_restored: Option<String>,
 }
 
 /// Reference answers the sweep already has, for the redirect to reuse.
@@ -111,6 +114,14 @@ impl WithdrawnSweep {
     /// The reference answers the sweep fetched, for the redirect to reuse.
     pub(super) fn take_references(&mut self) -> Option<KnownReferences> {
         self.references.take()
+    }
+
+    /// Why the run must stop before the rewrite, if it must: writing the
+    /// restored files failed part-way and not every file already written
+    /// could be put back, so the lockfiles are neither pinned nor restored.
+    /// The reason names each such file and the state it is in.
+    pub(super) fn half_restored(&self) -> Option<&str> {
+        self.half_restored.as_deref()
     }
 
     /// Fold the outcome into the scan envelope.
@@ -236,6 +247,7 @@ pub(super) async fn sweep(
 
     let to_restore: Vec<HostedPin> = gone.iter().map(|(pin, _)| pin.clone()).collect();
     let leg = crate::commands::hosted_unwind::run_hosted_leg(common, &to_restore).await;
+    out.half_restored = leg.half_applied().map(str::to_string);
 
     let action = if common.dry_run {
         PatchAction::Verified
@@ -266,10 +278,21 @@ pub(super) async fn sweep(
         ));
     }
     // `run_hosted_leg` already printed each failure to stderr.
-    for (purl, why) in leg.failed {
+    for (key, why) in &leg.failed {
+        // A write failure is no one pin's: the restore is all or nothing,
+        // so it kept every pin that was not refused on its own.
+        let subject = if key == crate::commands::hosted_unwind::WRITE_FAILURE_KEY {
+            gone.iter()
+                .map(|(pin, _)| pin.purl.as_str())
+                .filter(|purl| !leg.failed.iter().any(|(refused, _)| refused == purl))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            key.clone()
+        };
         out.warnings.push(RunWarning::new(
             REDIRECT_WITHDRAWN_RESTORE_FAILED,
-            format!("{purl}: {why}"),
+            format!("{subject}: {why}"),
         ));
     }
     for (code, detail) in leg.warnings {

@@ -942,6 +942,45 @@ fn hosted_restore_write_failure_prints_human_error_line() {
         stderr.contains("Error: Writing the restored lockfiles failed"),
         "the human write-failure line must print on stderr; stderr=\n{stderr}"
     );
+    assert!(
+        !stdout.contains("Restored ") && !stdout.contains("unwired"),
+        "a pin whose lockfile was not written is not reported restored; stdout=\n{stdout}"
+    );
+}
+
+/// Human twin of `hosted_restore_over_a_symlinked_file_writes_nothing`:
+/// the wet run and its `--dry-run` preview both print the refusal and no
+/// restore line.
+#[cfg(unix)]
+#[test]
+fn hosted_restore_over_a_symlinked_file_prints_only_the_refusal() {
+    for (dry_run, line, restore) in [
+        (
+            false,
+            "Error: Writing the restored lockfiles failed: pom.xml is a symbolic link",
+            "Restored ",
+        ),
+        (
+            true,
+            "Error: Writing the restored lockfiles would fail: pom.xml is a symbolic link",
+            "Would restore ",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_maven_hosted_fixture(tmp.path());
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::fs::rename(tmp.path().join("pom.xml"), tmp.path().join("real/pom.xml")).unwrap();
+        std::os::unix::fs::symlink("real/pom.xml", tmp.path().join("pom.xml")).unwrap();
+
+        let mut args = vec!["rollback", "--yes", "--offline"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run(tmp.path(), &args);
+        assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+        assert!(stderr.contains(line), "stderr=\n{stderr}");
+        assert!(!stdout.contains(restore), "stdout=\n{stdout}");
+    }
 }
 
 /// A hosted bun.lock pin restores to the registry 4-tuple

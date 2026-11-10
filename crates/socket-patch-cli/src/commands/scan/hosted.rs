@@ -2072,8 +2072,9 @@ async fn run_redirect_selected_untracked(
 /// index and script under `.socket/gradle/`, which only the captured settings
 /// line makes live) is written first, straight to disk, and put back when a
 /// later step fails. `Err` is the error line: on a failed commit nothing was
-/// left changed, or an interrupted commit's journal is kept for the next
-/// locked command to finish.
+/// left changed, or it names each file that could not be put back and the
+/// state it is in ([`write_failure`]), or an interrupted commit's journal is
+/// kept for the next locked command to finish.
 async fn commit_hosted_writes(
     common: &crate::args::GlobalArgs,
     group: socket_patch_core::utils::group_commit::GroupCommit,
@@ -2081,7 +2082,7 @@ async fn commit_hosted_writes(
     vendor_state: &std::io::Result<socket_patch_core::vendor::VendorState>,
     takeover_migrated: &[String],
 ) -> Result<(), String> {
-    use socket_patch_core::utils::group_commit::{captures, is_pending};
+    use socket_patch_core::utils::group_commit::{captures, is_pending, left_replaced};
     let files: Vec<(&String, &[u8])> = rewrite
         .files
         .iter()
@@ -2091,30 +2092,32 @@ async fn commit_hosted_writes(
     // Uncaptured files first: the commit below is the step that makes the
     // pins live. Each one's previous bytes are kept to put it back.
     let (staged, direct): (Vec<_>, Vec<_>) = files.into_iter().partition(|(rel, _)| captures(rel));
-    let mut written: Vec<(std::path::PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut written: Vec<(&str, Option<Vec<u8>>)> = Vec::new();
     let result = async {
         for (rel, content) in direct.into_iter().chain(staged) {
             let path = common.cwd.join(rel);
-            if !captures(rel) {
+            let previous = if captures(rel) {
+                None
+            } else {
                 if let Some(parent) = path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| format!("failed to create the directory of {rel}: {e}"))?;
                 }
-                let previous =
-                    match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
-                        Ok(bytes) => Some(bytes),
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                        Err(e) => {
-                            return Err(format!("failed to read {rel}: {e} (nothing was changed)"))
-                        }
-                    };
-                written.push((path.clone(), previous));
-            }
+                match socket_patch_core::utils::fs::read_regular_to_bytes(&path).await {
+                    Ok(bytes) => Some(Some(bytes)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+                    Err(e) => return Err(format!("failed to read {rel}: {e}")),
+                }
+            };
             // Atomic stage+rename, mode-preserving (the vendored backend's
             // writer); captured by the group until the commit.
             socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, content)
                 .await
-                .map_err(|e| format!("failed to write {rel}: {e} (nothing was changed)"))?;
+                .map_err(|e| format!("failed to write {rel}: {e}"))?;
+            // Only a file that reached the disk has anything to put back.
+            if let Some(previous) = previous {
+                written.push((rel.as_str(), previous));
+            }
         }
         if !takeover_migrated.is_empty() {
             if let Ok(state) = vendor_state {
@@ -2122,8 +2125,8 @@ async fn commit_hosted_writes(
                     .await
                     .map_err(|e| {
                         format!(
-                            "failed to update .socket/vendor/state.json: {e} (nothing was \
-                             changed: the vendored packages stay vendored)"
+                            "failed to update .socket/vendor/state.json: {e}; the vendored \
+                             packages stay vendored"
                         )
                     })?;
             }
@@ -2132,8 +2135,7 @@ async fn commit_hosted_writes(
     }
     .await;
     if let Err(e) = result {
-        put_back(&written).await;
-        return Err(e);
+        return Err(write_failure(&e, &put_back(&common.cwd, &written).await));
     }
     // A takeover's commit spans the project and the vendored ledger, so it
     // is journaled (`.socket/vendor/` is in use anyway). A hosted-only run
@@ -2152,25 +2154,62 @@ async fn commit_hosted_writes(
              the next socket-patch command finishes it)"
         )),
         Err(e) => {
-            put_back(&written).await;
-            Err(format!(
-                "failed to write the hosted pins: {e} (nothing was changed)"
+            // The commit put its own files back, or says which it could
+            // not; the direct writes are put back here.
+            let (cause, mut left) = match left_replaced(&e) {
+                Some(left) => (left.cause.to_string(), left.files.clone()),
+                None => (e.to_string(), Vec::new()),
+            };
+            left.extend(put_back(&common.cwd, &written).await);
+            Err(write_failure(
+                &format!("failed to write the hosted pins: {cause}"),
+                &left,
             ))
         }
     }
 }
 
-/// Put the files [`commit_hosted_writes`] wrote straight to disk back to
-/// their previous bytes (removing the ones it created), best-effort.
-async fn put_back(written: &[(std::path::PathBuf, Option<Vec<u8>>)]) {
-    for (path, previous) in written.iter().rev() {
-        let _ = match previous {
-            Some(bytes) => {
-                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(path, bytes).await
-            }
-            None => tokio::fs::remove_file(path).await,
+/// Put the files [`commit_hosted_writes`] wrote straight to disk (`written`:
+/// root-relative path and previous bytes) back to those bytes, removing the
+/// ones it created. Every file is tried, newest first; the result is one
+/// line per file that could not be put back, naming the state it is left in.
+async fn put_back(root: &std::path::Path, written: &[(&str, Option<Vec<u8>>)]) -> Vec<String> {
+    let mut left = Vec::new();
+    for (rel, previous) in written.iter().rev() {
+        let path = root.join(rel);
+        let (result, state) = match previous {
+            Some(bytes) => (
+                socket_patch_core::utils::fs::atomic_write_bytes_preserving_mode(&path, bytes)
+                    .await,
+                "with its new content",
+            ),
+            None => (
+                match tokio::fs::remove_file(&path).await {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                    _ => Ok(()),
+                },
+                "created",
+            ),
         };
+        if let Err(e) = result {
+            left.push(format!("{rel} is left {state} ({e})"));
+        }
     }
+    left
+}
+
+/// The error line of a hosted write that failed with `failure`: it may say
+/// `nothing was changed` only when every file already written was put back.
+/// Otherwise it lists `left`, one entry per file that was not.
+fn write_failure(failure: &str, left: &[String]) -> String {
+    if left.is_empty() {
+        return format!("{failure} (nothing was changed)");
+    }
+    format!(
+        "{failure}; putting back what was already written failed as well: {}; every other \
+         file is unchanged",
+        left.join(", ")
+    )
 }
 
 /// Warning codes that report a SUCCESSFUL vendored→hosted migration. They
@@ -2622,6 +2661,75 @@ mod tests {
     use socket_patch_core::hosted::engine::REDIRECT_CANDIDATE_FILES;
     use socket_patch_core::patch::redirect::DepOverride;
     use socket_patch_core::utils::concurrent::API_CONCURRENCY_ENV;
+
+    /// A failed hosted write may say `nothing was changed` only when every
+    /// file already written was put back; otherwise it names the rest.
+    #[test]
+    fn a_write_failure_claims_an_unchanged_project_only_when_all_was_put_back() {
+        use super::write_failure;
+        assert_eq!(
+            write_failure("failed to write the hosted pins: disk full", &[]),
+            "failed to write the hosted pins: disk full (nothing was changed)"
+        );
+        let left = ["a.lock is left with its new content (disk full)".to_string()];
+        let line = write_failure("failed to write the hosted pins: disk full", &left);
+        assert_eq!(
+            line,
+            "failed to write the hosted pins: disk full; putting back what was already \
+             written failed as well: a.lock is left with its new content (disk full); every \
+             other file is unchanged"
+        );
+        assert!(!line.contains("nothing was changed"));
+    }
+
+    /// `put_back` tries every file and reports each one it could not put
+    /// back with the state it is left in, instead of dropping the error.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn put_back_names_each_file_it_could_not_put_back() {
+        use super::put_back;
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for dir in ["ok", "ro"] {
+            std::fs::create_dir(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("rewritten"), "new\n").unwrap();
+            std::fs::write(root.join(dir).join("created"), "new\n").unwrap();
+        }
+        let written = [
+            ("ok/rewritten", Some(b"old\n".to_vec())),
+            ("ro/rewritten", Some(b"old\n".to_vec())),
+            ("ro/created", None),
+            ("ok/created", None),
+            // Already gone: nothing to put back, and nothing to report.
+            ("ok/never-written", None),
+        ];
+        let read_only = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(root.join("ro"), read_only).unwrap();
+        // A root process ignores the mode this test relies on.
+        let enforced = std::fs::write(root.join("ro/probe"), "").is_err();
+        let left = put_back(root, &written).await;
+        let writable = std::fs::Permissions::from_mode(0o755);
+        std::fs::set_permissions(root.join("ro"), writable).unwrap();
+        if !enforced {
+            return;
+        }
+
+        assert_eq!(left.len(), 2, "{left:?}");
+        assert!(
+            left[0].starts_with("ro/created is left created ("),
+            "{left:?}"
+        );
+        assert!(
+            left[1].starts_with("ro/rewritten is left with its new content ("),
+            "{left:?}"
+        );
+        let read = |rel: &str| std::fs::read_to_string(root.join(rel)).ok();
+        assert_eq!(read("ok/rewritten").as_deref(), Some("old\n"));
+        assert_eq!(read("ok/created"), None);
+        assert_eq!(read("ro/rewritten").as_deref(), Some("new\n"));
+        assert_eq!(read("ro/created").as_deref(), Some("new\n"));
+    }
 
     /// The post-write classification reuses an already-made discovery only
     /// when it provably describes the project the run left behind, and

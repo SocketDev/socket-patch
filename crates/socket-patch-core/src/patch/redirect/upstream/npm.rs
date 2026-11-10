@@ -2887,7 +2887,10 @@ pub(crate) async fn cleanup_side_config(
         const WORKSPACE: &str = "pnpm-workspace.yaml";
         if let Ok(Some(ws)) = view.read(WORKSPACE).await {
             let lines = crate::hosted::guidance::TRUST_SCAFFOLD_LINES;
-            if ws == format!("{}\n", lines.join("\n")) {
+            let created = format!("{}\n", lines.join("\n"));
+            // In either line ending: a `core.autocrlf` checkout of the
+            // created file is still that file.
+            if crate::utils::line_endings::eol_eq(ws.as_bytes(), created.as_bytes()) {
                 view.remove(WORKSPACE);
             } else if let Some(original) =
                 crate::formats::pnpm::workspace::strip_keyless_splice(&ws, &lines)

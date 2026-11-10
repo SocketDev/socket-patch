@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
-use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
+use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome, WRITE_FAILURE_KEY};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
     KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
@@ -1073,10 +1073,6 @@ async fn run_vendored_leg(
     out
 }
 
-/// Hosted-leg failure keys that are not purls: `run_hosted_leg`'s lockfile
-/// write failure (an artifact-level event, `hosted_write_failed`).
-const HOSTED_WRITE_FAILURE_KEY: &str = "files";
-
 /// Why a global run leaves a copy to the project's vendor ledger (#489): the
 /// `skipped` / `vendored` event detail `rollback -g` and `remove -g` share.
 pub(crate) const PROJECT_OWNED_INSTALL: &str =
@@ -1244,7 +1240,7 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
         ));
     }
     for (purl, error) in &leg.failed {
-        let event = if purl == HOSTED_WRITE_FAILURE_KEY {
+        let event = if purl == WRITE_FAILURE_KEY {
             PatchEvent::artifact(PatchAction::Failed)
                 .with_error("hosted_write_failed", error.clone())
         } else {
@@ -6309,10 +6305,7 @@ mod tests {
             reverted: vec!["pkg:npm/h@1.0.0".to_string()],
             failed: vec![
                 ("pkg:npm/hf@1.0.0".to_string(), "refused".to_string()),
-                (
-                    HOSTED_WRITE_FAILURE_KEY.to_string(),
-                    "disk full".to_string(),
-                ),
+                (WRITE_FAILURE_KEY.to_string(), "disk full".to_string()),
             ],
             edited_files: ["package-lock.json".to_string()].into(),
             ..Default::default()
