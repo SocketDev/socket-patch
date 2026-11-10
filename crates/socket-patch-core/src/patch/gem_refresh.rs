@@ -378,6 +378,16 @@ async fn refresh_installed(
             if !is_real_dir(&install.gem_dir) {
                 return Err(format!("{} is not a directory", install.gem_dir.display()));
             }
+            // The stage is emptied and written under the gem home. A link
+            // planted where it goes would move both somewhere else.
+            for dir in [install.home.join(STAGE_DIR), install.stage()] {
+                if std::fs::symlink_metadata(&dir).is_ok_and(|meta| !meta.is_dir()) {
+                    return Err(format!(
+                        "its stage directory {} is not a directory",
+                        dir.display()
+                    ));
+                }
+            }
             let spec = crate::utils::fs::read_regular_to_string_sync(&install.spec())
                 .map_err(|e| format!("its installed gemspec is unreadable: {e}"))?;
             if crate::vendor::gem::gemspec_declares_extensions(&spec) != archive.native {
@@ -786,6 +796,42 @@ mod tests {
             assert_eq!(mode("bin/rackup") & 0o111, 0o111);
             assert_eq!(mode("lib/rack.rb") & 0o111, 0);
         }
+    }
+
+    /// A link planted where the stage directory goes would move the
+    /// staging, and the removal of an interrupted run's leftovers, out of
+    /// the gem home: the refresh refuses and touches nothing.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_linked_stage_directory_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let gem_dir = install(&home, "VULNERABLE\n", &upstream());
+        let archive = tmp.path().join("patched.gem");
+        std::fs::write(&archive, patched()).unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(outside.join("rack-2.2.3")).unwrap();
+        std::fs::write(outside.join("rack-2.2.3/keep"), b"mine").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join(STAGE_DIR)).unwrap();
+
+        let out = refresh(
+            &wanted(&patched(), &[&archive]),
+            &[Target::Installed(gem_dir.clone())],
+            &Source::DiskOnly,
+            &ruby(tmp.path()),
+        )
+        .await;
+        let why = out[0].clone().expect_err("a linked stage is refused");
+        assert!(why.contains("is not a directory"), "{why}");
+        assert_eq!(
+            std::fs::read(outside.join("rack-2.2.3/keep")).unwrap(),
+            b"mine",
+            "nothing outside the gem home is removed"
+        );
+        assert_eq!(
+            std::fs::read(gem_dir.join("lib/rack.rb")).unwrap(),
+            UPSTREAM_LIB
+        );
     }
 
     #[tokio::test]

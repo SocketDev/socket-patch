@@ -1777,11 +1777,8 @@ async fn run_project_dirs(
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
-            let shown = dir.strip_prefix(&args.common.cwd).unwrap_or(dir);
-            println!(
-                "{}",
-                crate::commands::projects_below::heading(&shown.display().to_string())
-            );
+            let shown = crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir);
+            println!("{}", crate::commands::projects_below::heading(&shown));
         }
         let mut child = args.clone();
         child.paths.clear();

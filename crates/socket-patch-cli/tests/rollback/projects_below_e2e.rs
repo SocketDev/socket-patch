@@ -380,55 +380,67 @@ fn a_failing_project_does_not_stop_the_others() {
     );
 }
 
-/// `--json` is one document, so it takes one project: with several below
-/// it refuses the way scan does, naming them, before anything is written.
+/// `--json` reports on one project directory, the one at `--cwd`, and
+/// never changes another: with nothing to roll back there it fails as it
+/// always did, and its envelope names the directories below that hold
+/// patches and the command for each. Several below, or exactly one.
 #[test]
-fn rollback_json_refuses_several_projects() {
-    let (tmp, _) = monorepo();
-    let before = tree(tmp.path());
+fn rollback_json_never_reaches_below_cwd() {
+    let (several, _) = monorepo();
+    let one = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(one.path().join(".git")).unwrap();
+    write_hosted_project(&one.path().join("web"), &yarn_redirected_block());
     let registry = registry();
-    let (code, stdout, stderr) = run_hosted(
-        tmp.path(),
-        &["rollback", "--json", "--yes"],
-        Some(&registry),
-    );
-    assert_eq!(code, 2, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
-    assert_eq!(envelope["error"]["code"], "invalid_args");
-    let message = envelope["error"]["message"].as_str().unwrap();
-    assert!(
-        message.contains("--json takes one project directory"),
-        "{message}"
-    );
-    assert!(message.contains("api, svc, web"), "{message}");
-    assert!(
-        message.contains("socket-patch rollback --json --cwd api"),
-        "{message}"
-    );
-    assert_eq!(tree(tmp.path()), before);
+    for (root, names, first) in [
+        (several.path(), "api, svc, web", "api"),
+        (one.path(), "web", "web"),
+    ] {
+        let before = tree(root);
+        let (code, stdout, stderr) =
+            run_hosted(root, &["rollback", "--json", "--yes"], Some(&registry));
+        assert_eq!(code, 1, "stdout:\n{stdout}\nstderr:\n{stderr}");
+        let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
+        assert_eq!(envelope["error"]["code"], "manifest_not_found", "{stdout}");
+        let detail = warning(&envelope, "patched_projects_below").expect("the warning");
+        assert!(detail.contains(names), "{detail}");
+        assert!(
+            detail.contains(&format!("socket-patch rollback --json --cwd {first}")),
+            "{detail}"
+        );
+        assert_eq!(tree(root), before, "{names}: nothing is rolled back");
+    }
 }
 
-/// With one patched project below, `--json` rolls it back: its envelope is
-/// the one document.
+/// A bare scan from an agent-mode project covers that project alone, so a
+/// bare rollback from it does too: the hosted project below keeps its pin
+/// and the run names it.
 #[test]
-fn rollback_json_takes_the_one_project_below() {
+fn rollback_from_an_agent_mode_project_leaves_the_projects_below() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
-    write_hosted_project(&tmp.path().join("web"), &yarn_redirected_block());
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    let pkg = write_agent_project(root);
+    write_hosted_project(&root.join("web"), &yarn_redirected_block());
     let registry = registry();
-    let (code, stdout, stderr) = run_hosted(
-        tmp.path(),
-        &["rollback", "--json", "--yes"],
-        Some(&registry),
-    );
+    let (code, stdout, stderr) = run_hosted(root, &["rollback", "--yes"], Some(&registry));
     assert_eq!(code, 0, "stdout:\n{stdout}\nstderr:\n{stderr}");
-    let envelope: Value = serde_json::from_str(stdout.trim()).expect("one JSON document");
-    assert_eq!(envelope["command"], "rollback");
-    assert_eq!(envelope["status"], "success");
     assert_eq!(
-        read(tmp.path(), "web/yarn.lock"),
-        yarn_lock_content(&yarn_original_block())
+        std::fs::read(pkg.join("index.js")).unwrap(),
+        BEFORE,
+        "the agent-mode project at --cwd is rolled back"
     );
+    assert_eq!(
+        read(root, "web/yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block()),
+        "the project below is left as it was"
+    );
+    assert!(headings(&stdout).is_empty(), "{stdout}");
+    let said = format!("{stdout}{stderr}");
+    assert!(
+        said.contains("were not rolled back (web)") || said.contains("was not rolled back (web)"),
+        "{said}"
+    );
+    assert!(said.contains("socket-patch rollback --cwd web"), "{said}");
 }
 
 /// An identifier names one project's patch, so the run does not fan out:

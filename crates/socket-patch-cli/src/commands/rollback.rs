@@ -1428,127 +1428,157 @@ fn preserve_state_flag(args: &RollbackArgs) -> &'static str {
 /// below `--cwd` (see [`run`]).
 #[derive(Default)]
 struct BelowNotes {
-    /// For a target that matches no patch at `--cwd`: the directories
-    /// below that hold a match, said with the run's own error.
-    unmatched: crate::commands::projects_below::Advice,
-    /// For a `--json` run, which reports on one directory: the ones it
-    /// left alone, as a warning of its envelope.
+    /// For a run that finds nothing to roll back at `--cwd` (no patch, or
+    /// none its target matches): how to say which directories below hold
+    /// one.
+    unmatched: Unmatched,
+    /// The directories the run left alone, as warnings of the run.
     left: Vec<(String, String)>,
 }
 
+/// Where a run that found nothing at `--cwd` gets its advice from.
+#[derive(Default)]
+enum Unmatched {
+    /// Nothing to say.
+    #[default]
+    None,
+    /// The directories were already searched.
+    Ready(crate::commands::projects_below::Advice),
+    /// Search them only now: a run whose target matches at `--cwd` never
+    /// walks the checkout. `command` is the run to advise (this one, flags
+    /// included) and `targets` its identifiers.
+    Search {
+        command: String,
+        targets: Vec<String>,
+    },
+}
+
 impl BelowNotes {
-    /// Below the error of a run whose target matched no patch at `--cwd`:
-    /// where it does match (a human run; `--json` carries it in the error
-    /// envelope's `warnings[]`).
-    fn say_unmatched(&self, common: &GlobalArgs) {
-        if !common.json {
-            self.unmatched.print();
+    /// The advice for a run that found nothing at `--cwd`: a human run
+    /// prints it below its error, `--json` carries its `warnings()`.
+    async fn unmatched(&self, common: &GlobalArgs) -> crate::commands::projects_below::Advice {
+        use crate::commands::projects_below::{patched, Depth, Work};
+        match &self.unmatched {
+            Unmatched::None => Default::default(),
+            Unmatched::Ready(advice) => advice.clone(),
+            Unmatched::Search { command, targets } => {
+                if common.silent && !common.json {
+                    return Default::default();
+                }
+                let below = patched(common, Depth::All).await;
+                if !common.json {
+                    below.print_notes();
+                }
+                below.advice(common, command, Work::Any, targets)
+            }
         }
     }
 }
 
-/// Warning code: a `--json` rollback rolled back the project at `--cwd`
-/// and left the patched project directories below it.
+/// Warning code: a rollback rolled back the project at `--cwd` and left
+/// the patched project directories below it.
 const PROJECTS_NOT_ROLLED_BACK: &str = "projects_not_rolled_back";
 
 pub async fn run(args: RollbackArgs) -> i32 {
     use crate::commands::projects_below::{self, Depth, Work};
     apply_env_toggles(&args.common);
-    // What `scan` patched from this directory, `rollback` undoes from it:
-    // the project at `--cwd` and the patched project directories below it.
-    // With none below, this is the single-project run it always was.
-    let below = projects_below::patched(&args.common, Depth::All).await;
     let loud = !args.common.json && !args.common.silent;
+    if !args.targets.is_empty() {
+        // A target names a patch of one project, so the run stays the
+        // single-project one it was. Where the target matches nothing at
+        // `--cwd`, the error says which directories below hold a match and
+        // the command to run there: this one, flags included.
+        let targets: Vec<String> = args
+            .targets
+            .iter()
+            .map(|t| crate::ui::shell_word(t))
+            .collect();
+        let notes = BelowNotes {
+            unmatched: Unmatched::Search {
+                command: format!(
+                    "rollback {}{}",
+                    targets.join(" "),
+                    preserve_state_flag(&args)
+                ),
+                targets: args.targets.clone(),
+            },
+            left: Vec::new(),
+        };
+        return run_project(args, notes).await;
+    }
+    // What a bare `scan` patched from this directory, a bare `rollback`
+    // undoes from it: the project at `--cwd` and the patched project
+    // directories below it. With none below, this is the single-project
+    // run it always was.
+    let below = projects_below::patched(&args.common, Depth::All).await;
     if loud {
         below.print_notes();
     }
     if below.projects.is_empty() {
         return run_project(args, BelowNotes::default()).await;
     }
-    if !args.targets.is_empty() {
-        // A target names a patch of one project, so the run stays the
-        // single-project one it was. Where the target matches nothing at
-        // `--cwd`, the error says which directories below hold a match and
-        // the command to run there: this one, flags included.
-        let unmatched = if loud || args.common.json {
-            let targets: Vec<String> = args
-                .targets
-                .iter()
-                .map(|t| crate::ui::shell_word(t))
-                .collect();
-            let command = format!(
-                "rollback {}{}",
-                targets.join(" "),
-                preserve_state_flag(&args)
-            );
-            below.advice(&args.common, &command, Work::Any, &args.targets)
-        } else {
-            Default::default()
-        };
+    // `--cwd` is one of the run's directories when it holds something to
+    // undo itself.
+    let here = !nothing_to_roll_back_here(&args.common).await;
+    // A bare scan looks below `--cwd` only for a hosted or vendored
+    // project (or a directory that is none yet); from an agent-mode
+    // project it covers that project alone, and so does its rollback.
+    let scan_looks_below = !here
+        || !matches!(
+            crate::commands::mode_from_project_state(&args.common).await,
+            Ok(crate::commands::scan::ScanMode::Agent)
+        );
+    if !args.common.json && scan_looks_below {
+        return roll_back_projects(args, below, here).await;
+    }
+    // One directory, the one at `--cwd`: `--json` reports on one project
+    // directory, and an agent-mode project's run is the one it has always
+    // been. The run names the directories it left.
+    let command = format!(
+        "rollback{}{}",
+        if args.common.json { " --json" } else { "" },
+        preserve_state_flag(&args)
+    );
+    if !here {
         let notes = BelowNotes {
-            unmatched,
+            unmatched: Unmatched::Ready(below.advice(&args.common, &command, Work::Any, &[])),
             left: Vec::new(),
         };
         return run_project(args, notes).await;
     }
-    // `--cwd` is one of the run's directories when it holds something to
-    // undo itself.
-    let here = !nothing_to_roll_back_here(&args.common).await;
-    if here && args.common.json {
-        // `--json` reports on one project directory, and the one at `--cwd`
-        // is the run it has always been: it is rolled back alone and names
-        // the directories it left, as a `--json` scan does.
-        let one = below.projects.len() == 1;
-        let detail = format!(
-            "{} {} Socket patches and {} not rolled back ({}): --json takes one project \
-             directory. Run one rollback per directory, e.g. `{}`",
-            below.counted(),
-            if one { "holds" } else { "hold" },
-            if one { "was" } else { "were" },
-            below.names(),
-            below.projects[0].command(
-                &args.common,
-                &format!("rollback --json{}", preserve_state_flag(&args))
-            ),
-        );
-        let notes = BelowNotes {
-            left: vec![(PROJECTS_NOT_ROLLED_BACK.to_string(), detail)],
-            ..BelowNotes::default()
-        };
-        return run_project(args, notes).await;
-    }
-    roll_back_projects(args, below, here).await
+    let one = below.projects.len() == 1;
+    let why = if args.common.json {
+        "--json takes one project directory"
+    } else {
+        "a rollback from an agent-mode project covers that project alone, as a scan from it does"
+    };
+    let detail = format!(
+        "{} {} Socket patches and {} not rolled back ({}): {why}. Run one rollback per \
+         directory, e.g. `{}`",
+        below.counted(),
+        if one { "holds" } else { "hold" },
+        if one { "was" } else { "were" },
+        below.names(),
+        below.projects[0].command(&args.common, &command),
+    );
+    let notes = BelowNotes {
+        left: vec![(PROJECTS_NOT_ROLLED_BACK.to_string(), detail)],
+        ..BelowNotes::default()
+    };
+    run_project(args, notes).await
 }
 
 /// Roll back each patched project directory as if it were `--cwd`, under
 /// the heading `scan` printed for it: `--cwd` first when it is one of them
 /// (`here`), then the directories in `below`, and no other; each to the
 /// end whatever the one before it did. The exit code is the worst of the
-/// runs. `--json` takes one directory, so stdout stays one document.
+/// runs. Never a `--json` run: that one reports on `--cwd` alone.
 async fn roll_back_projects(
     args: RollbackArgs,
     below: crate::commands::projects_below::Below,
     here: bool,
 ) -> i32 {
     use crate::commands::projects_below::{heading, CWD_NAME};
-    if args.common.json && below.projects.len() > 1 {
-        return crate::json_envelope::usage_error(
-            crate::json_envelope::Command::Rollback,
-            args.common.json,
-            args.common.dry_run,
-            "invalid_args",
-            &format!(
-                "--json takes one project directory ({} hold patches: {}); run one rollback \
-                 per directory, e.g. `{}`",
-                below.counted(),
-                below.names(),
-                below.projects[0].command(
-                    &args.common,
-                    &format!("rollback --json{}", preserve_state_flag(&args))
-                ),
-            ),
-        );
-    }
     // One question for the whole run, naming every directory it reaches;
     // each project's own run then asks nothing. As in a single project,
     // none for a preview or a `--preserve-state` run (they delete no local
@@ -1792,7 +1822,8 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 "path",
                 serde_json::json!(manifest_path.display().to_string()),
             );
-            env.warnings.extend(below.unmatched.warnings());
+            env.warnings
+                .extend(below.unmatched(&args.common).await.warnings());
             println!("{}", env.to_pretty_json());
         } else {
             // Errors print even under --silent ("errors only", never
@@ -1801,8 +1832,8 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                 "Error: {}",
                 crate::ui::no_patches_message("roll back", &args.common)
             );
+            below.unmatched(&args.common).await.print();
         }
-        below.say_unmatched(&args.common);
         return 1;
     }
 
@@ -2023,12 +2054,13 @@ async fn run_project(args: RollbackArgs, below: BelowNotes) -> i32 {
                     args.common.dry_run,
                     EnvelopeError::new("patch_not_found", msg),
                 );
-                env.warnings.extend(below.unmatched.warnings());
+                env.warnings
+                    .extend(below.unmatched(&args.common).await.warnings());
                 println!("{}", env.to_pretty_json());
             } else {
                 eprintln!("Error: {msg}");
+                below.unmatched(&args.common).await.print();
             }
-            below.say_unmatched(&args.common);
             return 1;
         }
     }

@@ -40,8 +40,10 @@ What that scan patched can be seen and undone from the same directory. `list` sh
 the patches of the current directory (headed `== . ==`, as in the scan) and of each
 patched project directory below it, and `rollback` with no target rolls all of them
 back after one confirmation that names them. `rollback --json` reports on one project
-directory: it rolls back the current one and names the others in a
-`projects_not_rolled_back` warning. `vex`, `apply`, `repair`, `remove` and
+directory and never changes another: it rolls back the current one and names the
+others in a warning. A rollback from an agent-mode project also covers that project
+alone, as a scan from it does. Submodules and nested clones are other repositories:
+run socket-patch inside them. `vex`, `apply`, `repair`, `remove` and
 `rollback <target>` still act on one project: when the current directory holds nothing
 for them, they name the project directories below that do and the `--cwd <dir>` command
 for each.

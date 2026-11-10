@@ -617,6 +617,11 @@ struct FileOp {
 /// The sibling name an original is kept under during a [`PackageWrite`].
 const SAVED_PREFIX: &str = ".socket-orig-";
 
+/// The sibling name an original is left under when [`PackageWrite::undo`]
+/// could not put it back. [`sweep_stale_stages`] never removes it: it is
+/// the only copy of what the file held.
+const KEPT_PREFIX: &str = ".socket-kept-";
+
 /// How old a leftover of an interrupted [`PackageWrite`] must be before
 /// [`sweep_stale_stages`] removes it: far longer than any write holds one,
 /// so a write another project's run is making in a shared cache is never
@@ -630,7 +635,8 @@ pub(crate) const STALE_STAGE_AGE: std::time::Duration = std::time::Duration::fro
 /// Neither is the package's content: a stage holds bytes that were never
 /// committed, and a set-aside original is what a file held before a rename
 /// that already happened, or a second name of the file itself.
-/// Best-effort; directories and any other name are left alone.
+/// Best-effort; directories and any other name are left alone, an original
+/// a failed undo kept (`.socket-kept-…`) among them.
 pub(crate) async fn sweep_stale_stages(
     pkg_path: &Path,
     files: &HashMap<String, PatchFileInfo>,
@@ -952,10 +958,16 @@ impl PackageWrite {
             match op.saved.take() {
                 Some(saved) => {
                     if let Err(e) = std::fs::rename(&saved, &op.dest) {
+                        // Under a name no later run sweeps as a leftover.
+                        let kept = crate::utils::fs::stage_path(&op.dest, KEPT_PREFIX);
+                        let at = match std::fs::rename(&saved, &kept) {
+                            Ok(()) => kept,
+                            Err(_) => saved,
+                        };
                         not_restored.push(format!(
                             "{}: {e} (its original is kept at {})",
                             op.file,
-                            saved.display()
+                            at.display()
                         ));
                     }
                 }
@@ -4424,6 +4436,8 @@ mod tests {
             ".socket-stage-notes".to_string(),
             format!(".socket-stage--{uuid}"),
             format!(".socket-other-a.js-{uuid}"),
+            // The original a failed undo could not put back.
+            format!("{KEPT_PREFIX}a.js-{uuid}"),
         ];
         for name in [&stage, &saved, &nested].into_iter().chain(&kept) {
             std::fs::write(pkg.join(name), b"x").unwrap();

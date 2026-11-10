@@ -208,21 +208,31 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 /// and whether the walk was cut short.
 ///
 /// The in-memory engine is handed the files git tracks. On disk the walk
-/// stands in for that list: it honours the repository's ignore files (a
-/// build directory's copy of a lockfile is not a project), never enters an
-/// [`EXCLUDED_ROOT_SEGMENTS`] directory and never follows a link. A marker
-/// that is itself a symlink still counts, as it does for the root the user
-/// names.
+/// stands in for that list: it honours git's ignore rules (a build
+/// directory's copy of a lockfile is not a project) and no other tool's
+/// (a `.ignore` file hides files from search tools, not from git), never
+/// enters an [`EXCLUDED_ROOT_SEGMENTS`] directory, never follows a link,
+/// and never enters another repository: a directory below `dir` holding a
+/// `.git` entry is a submodule or a nested clone, whose files this
+/// repository does not track and whose own policy a run from here has not
+/// read. A marker that is itself a symlink still counts, as it does for
+/// the root the user names.
 fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
     let walk = ignore::WalkBuilder::new(dir)
         .hidden(false)
+        .ignore(false)
         .follow_links(false)
         .filter_entry(|entry| {
-            !(entry.file_type().is_some_and(|t| t.is_dir())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|name| EXCLUDED_ROOT_SEGMENTS.contains(&name)))
+            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            let excluded = entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| EXCLUDED_ROOT_SEGMENTS.contains(&name));
+            let other_repository =
+                entry.depth() > 0 && entry.path().join(".git").symlink_metadata().is_ok();
+            !excluded && !other_repository
         })
         .build();
     let mut markers: Vec<String> = Vec::new();
@@ -531,6 +541,33 @@ mod tests {
     /// pnpm member's lock under `sharedWorkspaceLockfile: false`. A member
     /// holding another lock stays, and so does every member when the
     /// workspace root is not going to be scanned.
+    /// A submodule or nested clone is another repository, and a `.ignore`
+    /// file is not one of git's: neither changes what this repository's
+    /// projects are.
+    #[tokio::test]
+    async fn roots_below_stays_in_this_repository_and_reads_only_gits_ignores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let put = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        std::fs::create_dir(root.join(".git")).unwrap();
+        put("web/package-lock.json", "{}");
+        // A submodule (a `.git` file) and a nested clone (a `.git` dir).
+        put("third_party/lib/.git", "gitdir: ../../.git/modules/lib\n");
+        put("third_party/lib/package-lock.json", "{}");
+        std::fs::create_dir_all(root.join("vendor/clone/.git")).unwrap();
+        put("vendor/clone/sub/yarn.lock", "");
+        // Hidden from search tools, tracked by git.
+        put(".ignore", "*.lock\npackage-lock.json\n");
+        put("svc/Cargo.lock", "");
+        let found = roots_below(root, None, |_| true).await;
+        assert_eq!(found.roots, vec!["svc".to_string(), "web".to_string()]);
+        assert!(!found.truncated);
+    }
+
     #[tokio::test]
     async fn roots_below_leaves_member_locks_to_the_workspace_root() {
         let tmp = tempfile::tempdir().unwrap();

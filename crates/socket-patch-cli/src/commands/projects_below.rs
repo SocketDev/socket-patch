@@ -456,7 +456,7 @@ pub(crate) const PATCHED_PROJECTS_BELOW: &str = "patched_projects_below";
 
 /// What such a command says: which project directories below `--cwd` hold
 /// patches, and the run that reaches each. Empty when there are none.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Advice {
     /// The sentence naming the directories (no final period).
     headline: String,
