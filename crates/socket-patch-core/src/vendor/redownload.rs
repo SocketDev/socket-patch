@@ -545,17 +545,6 @@ async fn restore_maven_metadata(
         });
     }
     let patched: Vec<String> = record.files.keys().cloned().collect();
-    let patch = super::jvm::JvmPatch {
-        group_id: &group,
-        artifact_id: &artifact,
-        version: &version,
-        uuid: &record.uuid,
-        jar,
-        upstream_pom: &pom,
-        upstream_module: module.as_deref(),
-        extra_artifacts: &extras,
-        patched_members: &patched,
-    };
     let reader = super::jvm::apply::ProjectReader::new(root);
     let read = |rel: &str| {
         if rel.starts_with(".socket/vendor/") {
@@ -571,38 +560,79 @@ async fn restore_maven_metadata(
         .wiring
         .iter()
         .any(|w| super::jvm::op_of(w) == "config_none");
-    let plan =
-        super::jvm::plan_with_config(shape, &read, &list, &patch, enabled).map_err(|e| e.detail)?;
-    if reader.escaped().is_some() {
-        return Err("Maven project path escapes the checkout".into());
-    }
-    let tree: Vec<_> = plan.writes.into_iter().filter(|w| w.tree).collect();
+    let recorded = |rel: &str| {
+        entry
+            .wiring
+            .iter()
+            .find(|w| w.kind == super::jvm::TREE_KIND && w.file == rel)
+            .and_then(|w| w.new.as_ref())
+            .and_then(serde_json::Value::as_str)
+    };
+    let recorded_files = entry
+        .wiring
+        .iter()
+        .filter(|w| w.kind == super::jvm::TREE_KIND)
+        .count();
+    // A suffixed pom is the upstream one with its version suffixed and,
+    // when its parents name the pom's version, what it inherits from them
+    // declared at the base version. Most entries are reproduced without
+    // the parents, so those are downloaded only when the pom is not.
+    let mut parents: Option<Vec<Vec<u8>>> = None;
+    let tree = loop {
+        let patch = super::jvm::JvmPatch {
+            group_id: &group,
+            artifact_id: &artifact,
+            version: &version,
+            uuid: &record.uuid,
+            jar,
+            upstream_pom: &pom,
+            upstream_parents: parents.as_deref(),
+            upstream_module: module.as_deref(),
+            extra_artifacts: &extras,
+            patched_members: &patched,
+        };
+        let plan = super::jvm::plan_with_config(shape, &read, &list, &patch, enabled)
+            .map_err(|e| e.detail)?;
+        if reader.escaped().is_some() {
+            return Err("Maven project path escapes the checkout".into());
+        }
+        let tree: Vec<_> = plan.writes.into_iter().filter(|w| w.tree).collect();
+        let mismatch = if tree.len() != recorded_files {
+            Some("download did not reproduce the complete recorded JVM tree")
+        } else if tree.iter().any(|w| recorded(&w.rel).is_none()) {
+            Some("download produced an unrecorded JVM tree file")
+        } else if tree
+            .iter()
+            .any(|w| recorded(&w.rel) != Some(hex::encode(Sha256::digest(&w.bytes)).as_str()))
+        {
+            Some("downloaded JVM metadata does not match the recorded tree")
+        } else {
+            None
+        };
+        match mismatch {
+            None => break tree,
+            Some(why) if parents.is_none() => {
+                let chain = super::maven_repo::upstream_parent_chain(
+                    &pom,
+                    &super::maven_repo::LocalSources::none(),
+                    Some(service),
+                )
+                .await;
+                match chain {
+                    Ok(chain) => parents = Some(chain),
+                    Err(_) => return Err(why.into()),
+                }
+            }
+            Some(why) => return Err(why.into()),
+        }
+    };
     let mut dirs: Vec<String> = tree
         .iter()
         .filter_map(|w| w.rel.rsplit_once('/').map(|(d, _)| d.to_string()))
         .collect();
     dirs.sort();
     dirs.dedup();
-    if tree.len()
-        != entry
-            .wiring
-            .iter()
-            .filter(|w| w.kind == super::jvm::TREE_KIND)
-            .count()
-    {
-        return Err("download did not reproduce the complete recorded JVM tree".into());
-    }
     for write in tree {
-        let expected = entry
-            .wiring
-            .iter()
-            .find(|w| w.kind == super::jvm::TREE_KIND && w.file == write.rel)
-            .and_then(|w| w.new.as_ref())
-            .and_then(serde_json::Value::as_str)
-            .ok_or("download produced an unrecorded JVM tree file")?;
-        if hex::encode(Sha256::digest(&write.bytes)) != expected {
-            return Err("downloaded JVM metadata does not match the recorded tree".into());
-        }
         let path = stage_root.join(&write.rel);
         tokio::fs::create_dir_all(path.parent().ok_or("tree file has no parent")?)
             .await

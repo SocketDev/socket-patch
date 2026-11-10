@@ -121,10 +121,21 @@ fn socket(cwd: &Path, m2: &Path, args: &[&str]) -> (Option<i32>, serde_json::Val
 /// What `get` saves for an agent-mode patch: the manifest record + the
 /// after-hash blob (input to the artifact fixture service).
 fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
+    stage_manifest_of(proj, &purl(), MEMBER, member_before, member_after);
+}
+
+/// [`stage_manifest`] for the jar member `member` of `purl`.
+fn stage_manifest_of(
+    proj: &Path,
+    purl: &str,
+    member: &str,
+    member_before: &[u8],
+    member_after: &[u8],
+) {
     let record = serde_json::json!({
         "uuid": UUID,
         "exportedAt": "2026-01-01T00:00:00Z",
-        "files": { MEMBER: {
+        "files": { member: {
             "beforeHash": git_sha256(member_before),
             "afterHash": git_sha256(member_after),
         } },
@@ -135,7 +146,7 @@ fn stage_manifest(proj: &Path, member_before: &[u8], member_after: &[u8]) {
         "license": "MIT",
         "tier": "free",
     });
-    let manifest = serde_json::json!({ "patches": { purl(): record } });
+    let manifest = serde_json::json!({ "patches": { purl: record } });
     std::fs::create_dir_all(proj.join(".socket/blobs")).unwrap();
     std::fs::write(
         proj.join(".socket/manifest.json"),
@@ -498,4 +509,126 @@ fn maven_vendor_fresh_checkout_install_and_manifestless_vex() {
         },
     );
     assert_eq!(out.code, Some(2), "{out}");
+}
+
+/// The log4j shape, on the real artifact: `log4j-core:2.17.1` has no
+/// `<version>` of its own and names `log4j-api` without one; both come from
+/// its parent pom, which manages every sibling at `${project.version}`.
+/// Maven interpolates a pom after merging its parents into it, so in a pom
+/// that only had its own version suffixed that reference named
+/// `log4j-api:2.17.1-socket.<hex8>`, which nothing serves: `vendor` and
+/// `vendor --check` reported success and the build failed. The vendored
+/// pom must resolve what the upstream pom does, so a fresh checkout builds
+/// with the patched jar and the sibling at its base version.
+#[test]
+#[ignore = "real Maven + Maven Central (fixture); run with --ignored"]
+fn maven_vendor_keeps_a_sibling_the_parent_manages_at_the_base_version() {
+    const G: &str = "org.apache.logging.log4j";
+    const A: &str = "log4j-core";
+    const V: &str = "2.17.1";
+    const SIBLING: &str = "log4j-api-2.17.1.jar";
+    const NOTICE: &str = "META-INF/NOTICE";
+    let sv = format!("{V}-socket.5e6f7081");
+    let Some(mvn) = Mvn::detect(SUITE) else {
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let root: PathBuf = tmp.path().canonicalize().unwrap();
+    let (m2, proj) = (root.join("m2"), root.join("proj"));
+    let settings = root.join("settings.xml");
+    write_settings(&settings, &[]);
+    let copy_dependencies = |cwd: &Path, settings: &Path, extra: &[&str]| {
+        let _ = std::fs::remove_dir_all(cwd.join("target"));
+        let goal = format!("{DEPENDENCY_PLUGIN}:copy-dependencies");
+        let mut args = vec![goal.as_str(), "-DoutputDirectory=target/dep"];
+        args.extend_from_slice(extra);
+        mvn.run(cwd, &m2, settings, &args)
+    };
+    let copied = |cwd: &Path| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(cwd.join("target/dep"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+
+    // 1. The ACTUAL registry bytes: the jar, its pom and the parent chain.
+    std::fs::create_dir_all(&proj).unwrap();
+    let pom = consumer_pom(V).replace(GROUP, G).replace(ARTIFACT, A);
+    std::fs::write(proj.join("pom.xml"), &pom).unwrap();
+    let out = with_central_fallback(SUITE, "log4j warm-up", &settings, |s, extra| {
+        copy_dependencies(&proj, s, extra)
+    });
+    if !ok(&out) {
+        skip(
+            SUITE,
+            &format!(
+                "log4j warm-up against Maven Central failed:\n{}",
+                dump(&out)
+            ),
+        );
+        return;
+    }
+    assert_eq!(
+        copied(&proj),
+        [SIBLING.to_string(), format!("{A}-{V}.jar")],
+        "the pristine build resolves log4j-core and its sibling"
+    );
+    std::fs::remove_dir_all(proj.join("target")).unwrap();
+    let cached = m2.join(G.replace('.', "/")).join(A).join(V);
+    let jar = std::fs::read(cached.join(format!("{A}-{V}.jar"))).unwrap();
+    let upstream_pom = std::fs::read_to_string(cached.join(format!("{A}-{V}.pom"))).unwrap();
+    assert!(
+        upstream_pom.contains("<parent>")
+            && upstream_pom.contains("<artifactId>log4j-api</artifactId>"),
+        "fixture: log4j-core names its sibling and inherits from a parent"
+    );
+
+    // 2. A marker patch, then the real writer.
+    let orig = jar_member(&jar, NOTICE).expect("NOTICE in the upstream jar");
+    let mut patched = orig.clone();
+    patched.extend_from_slice(format!("\n{MARKER} log4j\n").as_bytes());
+    stage_manifest_of(
+        &proj,
+        &format!("pkg:maven/{G}/{A}@{V}"),
+        NOTICE,
+        &orig,
+        &patched,
+    );
+    let cwd = proj.to_str().unwrap();
+    let (code, env, stderr) = socket(&proj, &m2, &["vendor", "--json", "--offline", "--cwd", cwd]);
+    assert_eq!(code, Some(0), "vendor: {env}\n{stderr}");
+    assert_eq!(env["summary"]["applied"], 1, "{env}");
+    let tree = proj.join(format!(
+        ".socket/vendor/maven2/{}/{A}/{sv}",
+        G.replace('.', "/")
+    ));
+    let tree_pom = std::fs::read_to_string(tree.join(format!("{A}-{sv}.pom"))).unwrap();
+    assert!(
+        tree_pom.contains("socket-patch:inherited:begin")
+            && !tree_pom.contains("${project.version}"),
+        "the suffixed pom declares what it inherited through the pom's version:\n{tree_pom}"
+    );
+
+    // 3. `--check` agrees, and a fresh checkout builds: the patched jar,
+    // and the sibling at the version upstream resolves.
+    let (code, env, stderr) = socket(&proj, &m2, &["vendor", "--check", "--json", "--cwd", cwd]);
+    assert_eq!(code, Some(0), "vendor --check: {env}\n{stderr}");
+    let fresh = root.join("fresh");
+    fresh_checkout(&proj, &fresh);
+    let out = copy_dependencies(&fresh, &settings, &[]);
+    assert!(ok(&out), "fresh resolve failed:\n{}", dump(&out));
+    assert_eq!(
+        copied(&fresh),
+        [SIBLING.to_string(), format!("{A}-{sv}.jar")],
+        "Maven resolves the vendored jar and the sibling at its base version"
+    );
+    let resolved = std::fs::read(fresh.join(format!("target/dep/{A}-{sv}.jar"))).unwrap();
+    assert_eq!(
+        jar_member(&resolved, NOTICE).as_deref(),
+        Some(patched.as_slice()),
+        "Maven consumes the committed, patched jar"
+    );
 }

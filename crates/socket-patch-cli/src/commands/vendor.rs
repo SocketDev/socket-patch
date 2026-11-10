@@ -1357,6 +1357,9 @@ async fn run_check(args: &VendorArgs) -> i32 {
     };
     let go_sync_issues =
         socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
+    // Read only: the parents of a suffixed Maven pom, when a cache of this
+    // machine holds them, say whether the pom resolves what its upstream does.
+    let jvm_caches = socket_patch_core::crawlers::jvm_cache::all_local_roots(root);
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1367,7 +1370,12 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
-            match vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()) {
+            match vendor::jvm::apply::check_entry_in(
+                root,
+                entry,
+                local_repo.as_deref(),
+                &jvm_caches,
+            ) {
                 Ok(None) => {}
                 // Intact and wired, but `vex` will not attest it: a
                 // declaration may still build the base. Re-vendoring cannot

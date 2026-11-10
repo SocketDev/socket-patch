@@ -229,8 +229,19 @@ struct Scanned {
     end: usize,
 }
 
+/// Deepest nesting of a string inside a `${…}` template inside a string
+/// that is scanned. Real scripts nest two or three; past this the rest of
+/// the file reads as one unterminated string, so the script is not
+/// [`well_formed`] instead of costing a stack frame per level.
+const MAX_TEMPLATE_DEPTH: usize = 64;
+
 /// Scan the string literal whose opening quote is at `start`.
 fn scan_string(src: &str, start: usize, dsl: Dsl) -> Scanned {
+    scan_string_at(src, start, dsl, 0)
+}
+
+/// [`scan_string`] for a string `depth` templates deep.
+fn scan_string_at(src: &str, start: usize, dsl: Dsl, depth: usize) -> Scanned {
     let b = src.as_bytes();
     let q = b[start];
     let triple = b[start..].starts_with(&[q, q, q]) && !(dsl == Dsl::Kotlin && q == b'\'');
@@ -294,7 +305,7 @@ fn scan_string(src: &str, start: usize, dsl: Dsl) -> Scanned {
         if b[i] == b'$' && templates {
             if b.get(i + 1) == Some(&b'{') {
                 literal = false;
-                let end = skip_template(src, i + 1, dsl);
+                let end = skip_template(src, i + 1, dsl, depth);
                 value.push_str(&src[i..end]);
                 i = end;
                 continue;
@@ -345,8 +356,10 @@ fn decode_escape(src: &str, i: usize) -> Option<(Option<char>, usize)> {
 }
 
 /// The end (one past the `}`) of the `${…}` template whose `{` is at
-/// `open`; nested strings and braces are skipped.
-fn skip_template(src: &str, open: usize, dsl: Dsl) -> usize {
+/// `open`, in a string `nesting` templates deep; nested strings and braces
+/// are skipped. The end of the source when it is unterminated, or holds a
+/// string nested past [`MAX_TEMPLATE_DEPTH`].
+fn skip_template(src: &str, open: usize, dsl: Dsl, nesting: usize) -> usize {
     let b = src.as_bytes();
     let mut depth = 0usize;
     let mut i = open;
@@ -360,7 +373,10 @@ fn skip_template(src: &str, open: usize, dsl: Dsl) -> usize {
                 }
             }
             b'\'' | b'"' => {
-                i = scan_string(src, i, dsl).end;
+                if nesting >= MAX_TEMPLATE_DEPTH {
+                    return b.len();
+                }
+                i = scan_string_at(src, i, dsl, nesting + 1).end;
                 continue;
             }
             _ => {}
@@ -675,6 +691,48 @@ mod tests {
                 Tok::Punct(c) => format!("P:{}", c as char),
             })
             .collect()
+    }
+
+    /// VJ-S2: `scan_string` and `skip_template` call each other once per
+    /// nested `"${`, so an 80 KiB script nesting 16,000 deep overflowed
+    /// the walk thread's stack and aborted the process. Past the cap the
+    /// script is simply not well-formed, which its readers refuse.
+    #[test]
+    fn deeply_nested_templates_are_not_well_formed_and_do_not_recurse() {
+        let nested = |depth: usize| {
+            format!(
+                "def s = {}x{}\ninclude ':a'\n",
+                "\"${".repeat(depth),
+                "}\"".repeat(depth)
+            )
+        };
+        for dsl in [Dsl::Groovy, Dsl::Kotlin] {
+            // What scripts write is scanned through: the string closes and
+            // the rest of the file is tokens.
+            let shallow = nested(8);
+            assert!(well_formed(&shallow, dsl));
+            assert!(render(&shallow, dsl).ends_with(&["I:include".into(), "S::a".into()]));
+            assert!(well_formed(&nested(MAX_TEMPLATE_DEPTH + 1), dsl));
+            // On a small stack: the scanner used to need a pair of frames
+            // per level, and now needs a fixed number.
+            for deep in [nested(MAX_TEMPLATE_DEPTH + 2), "\"${".repeat(16_000)] {
+                let (toks, ok) = std::thread::Builder::new()
+                    .stack_size(256 * 1024)
+                    .spawn(move || (tokens(&deep, dsl), well_formed(&deep, dsl)))
+                    .unwrap()
+                    .join()
+                    .expect("the scanner must not overflow its stack");
+                assert!(!ok);
+                // The unterminated string swallows the rest of the file.
+                assert!(
+                    matches!(
+                        toks.last().map(|t| &t.tok),
+                        Some(Tok::Str { literal: false, .. })
+                    ),
+                    "{toks:?}"
+                );
+            }
+        }
     }
 
     #[test]

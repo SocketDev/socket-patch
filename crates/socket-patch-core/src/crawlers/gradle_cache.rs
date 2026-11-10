@@ -740,6 +740,31 @@ fn parse_properties(bytes: &[u8]) -> HashMap<String, String> {
     out
 }
 
+/// The `major.minor.patch` (patch 0 when absent) of the `tool` (`gradle`,
+/// `maven`) distribution a wrapper properties file names: the
+/// `<tool>-<version>` in its `distributionUrl`. The one reader of that
+/// property for every version gate, read as Java reads a properties file
+/// ([`parse_properties`]): `distributionUrl = …`, `distributionUrl: …` and
+/// `https\://` all name the same URL. `None` when the file names no such
+/// distribution.
+pub fn wrapper_distribution_version(properties: &[u8], tool: &str) -> Option<(u32, u32, u32)> {
+    static NAMED: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[^A-Za-z0-9])([A-Za-z]+)-(\d+)\.(\d+)(?:\.(\d+))?")
+            .expect("valid wrapper regex")
+    });
+    let url = parse_properties(properties).remove("distributionUrl")?;
+    // The distribution's file, not a directory of the same shape on the
+    // way to it (`…/apache-maven/3.9.9/apache-maven-3.9.9-bin.zip`).
+    let file = url.trim().rsplit('/').next()?;
+    let caps = named.captures_iter(file).find(|caps| &caps[1] == tool)?;
+    Some((
+        caps[2].parse().ok()?,
+        caps[3].parse().ok()?,
+        caps.get(4).map_or(Some(0), |m| m.as_str().parse().ok())?,
+    ))
+}
+
 /// What `gradle/wrapper/gradle-wrapper.properties` says about where the
 /// wrapper's distribution unpacks.
 #[derive(Debug, Clone, PartialEq, Eq)]
