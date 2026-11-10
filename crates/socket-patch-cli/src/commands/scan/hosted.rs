@@ -632,8 +632,6 @@ pub(super) async fn run_redirect(
     can_access_paid_patches: bool,
     policy: &super::policy::ScanPolicy,
     mut scan_result: Envelope,
-    // Flushed by `discover_selected` before anything below writes to stdout.
-    telemetry: &mut socket_patch_core::telemetry::PendingTelemetry,
     // Scan's npm crawl (`Some` only when an embedded `--vex` will run),
     // handed to the VEX step so it does not walk the tree for the npm
     // roots again.
@@ -661,7 +659,6 @@ pub(super) async fn run_redirect(
         false,
         false,
         false,
-        telemetry,
         Some(&mut scan_result),
     )
     .await

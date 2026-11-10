@@ -5,7 +5,7 @@
 //! and the home-dir redaction were uncovered.
 //!
 //! Hardening notes: every disable-gate test runs inside `with_clean_env`,
-//! which scrubs ALL three disabling vars first. Each test then proves
+//! which scrubs ALL the disabling vars first. Each test then proves
 //! *causation*, not mere correlation:
 //!   1. clean env => NOT disabled  (kills an always-`true` impl + ambient
 //!      `SOCKET_OFFLINE=1` masking the result),
@@ -18,7 +18,13 @@ use socket_patch_core::telemetry::{is_telemetry_disabled, sanitize_error_message
 
 /// Every environment variable that can independently disable telemetry.
 /// Scrubbing the full set is what makes the per-var causation asserts honest.
-const DISABLE_VARS: &[&str] = &["SOCKET_TELEMETRY_DISABLED", "VITEST", "SOCKET_OFFLINE"];
+const DISABLE_VARS: &[&str] = &[
+    "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_PATCH_TELEMETRY_DISABLED",
+    "DO_NOT_TRACK",
+    "VITEST",
+    "SOCKET_OFFLINE",
+];
 
 /// Run `f` with all telemetry-disabling vars removed, restoring the prior
 /// values afterward even if `f` panics (so one failing assert can't poison
@@ -88,20 +94,90 @@ fn telemetry_disabled_when_socket_telemetry_disabled_eq_true() {
     });
 }
 
-/// Falsy / non-canonical values must NOT engage the gate — pins the exact
-/// `"1" | "true"` match so a broadened `unwrap_or_default() != ""`-style
-/// regression is caught.
+/// The opt-out reads the CLI's boolean vocabulary (`env_truthy`), not only
+/// `1` / `true`: a library caller exporting `=yes` is opted out the same as
+/// one going through the CLI's `--no-telemetry` parse.
+#[test]
+#[serial]
+fn telemetry_disabled_by_the_whole_truthy_vocabulary() {
+    with_clean_env(|| {
+        for v in ["1", "true", "TRUE", "True", "yes", "on", "y", "t", " 1 "] {
+            std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
+            assert!(
+                is_telemetry_disabled(),
+                "SOCKET_TELEMETRY_DISABLED={v:?} must disable telemetry"
+            );
+        }
+        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+        assert!(!is_telemetry_disabled(), "removing it re-enables telemetry");
+    });
+}
+
+/// Falsy and non-boolean values must NOT engage the gate — a broadened
+/// `unwrap_or_default() != ""`-style regression is caught.
 #[test]
 #[serial]
 fn telemetry_not_disabled_when_socket_telemetry_disabled_falsy() {
     with_clean_env(|| {
-        for v in ["0", "", "false", "no", "yes", "TRUE", "True"] {
+        for v in ["0", "", "false", "no", "off", "n", "f", "2", "enabled"] {
             std::env::set_var("SOCKET_TELEMETRY_DISABLED", v);
             assert!(
                 !is_telemetry_disabled(),
                 "SOCKET_TELEMETRY_DISABLED={v:?} must NOT disable telemetry"
             );
         }
+    });
+}
+
+/// The v3/v4 name still opts out: a user who turned telemetry off before
+/// the rename must not be opted back in by upgrading.
+#[test]
+#[serial]
+fn telemetry_disabled_by_the_v4_variable_name() {
+    with_clean_env(|| {
+        assert!(!is_telemetry_disabled(), "baseline must be enabled");
+        for v in ["1", "true"] {
+            std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
+            assert!(
+                is_telemetry_disabled(),
+                "SOCKET_PATCH_TELEMETRY_DISABLED={v} must disable telemetry"
+            );
+        }
+        for v in ["0", "false", ""] {
+            std::env::set_var("SOCKET_PATCH_TELEMETRY_DISABLED", v);
+            assert!(
+                !is_telemetry_disabled(),
+                "SOCKET_PATCH_TELEMETRY_DISABLED={v:?} must NOT disable telemetry"
+            );
+        }
+        std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+        assert!(!is_telemetry_disabled(), "removing it re-enables telemetry");
+    });
+}
+
+/// `DO_NOT_TRACK` (https://consoledonottrack.com): set to anything means
+/// "do not", except an explicit `0` / `false` or the empty string.
+#[test]
+#[serial]
+fn telemetry_disabled_by_do_not_track() {
+    with_clean_env(|| {
+        assert!(!is_telemetry_disabled(), "baseline must be enabled");
+        for v in ["1", "true", "TRUE", "yes", "on", "2", "please"] {
+            std::env::set_var("DO_NOT_TRACK", v);
+            assert!(
+                is_telemetry_disabled(),
+                "DO_NOT_TRACK={v:?} must disable telemetry"
+            );
+        }
+        for v in ["0", "false", "FALSE", "", " 0 "] {
+            std::env::set_var("DO_NOT_TRACK", v);
+            assert!(
+                !is_telemetry_disabled(),
+                "DO_NOT_TRACK={v:?} must NOT disable telemetry"
+            );
+        }
+        std::env::remove_var("DO_NOT_TRACK");
+        assert!(!is_telemetry_disabled(), "removing it re-enables telemetry");
     });
 }
 

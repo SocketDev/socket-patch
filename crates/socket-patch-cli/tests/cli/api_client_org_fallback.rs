@@ -414,12 +414,49 @@ async fn unresolved_org_routes_the_whole_scan_vex_run_to_the_proxy_once() {
     );
 }
 
+/// An `app` project whose manifest patches the installed `needs-blob`
+/// package, with the patched blob NOT cached: `apply` must download it.
+/// Returns the blob's hash and bytes.
+fn write_project_needing_a_blob(cwd: &std::path::Path) -> (String, &'static [u8]) {
+    let (before, after): (&[u8], &'static [u8]) = (b"before\n", b"after\n");
+    let after_hash = crate::common::git_sha256(after);
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    let pkg = cwd.join("node_modules/needs-blob");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"needs-blob","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), before).unwrap();
+    std::fs::create_dir_all(cwd.join(".socket")).unwrap();
+    std::fs::write(
+        cwd.join(".socket/manifest.json"),
+        serde_json::json!({ "patches": { "pkg:npm/needs-blob@1.0.0": {
+            "uuid": UUID,
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": crate::common::git_sha256(before), "afterHash": after_hash
+            }},
+            "vulnerabilities": {}, "description": "x", "license": "MIT", "tier": "free"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    (after_hash, after)
+}
+
 /// #648: `apply` and `vendor` seed their embedded `--vex` with the run's
 /// client, which suppresses the VEX plan's own `api_auth_fallback` note on
 /// the promise that the host reports it. So, like `scan` / `get`, their
-/// `--json` envelopes must carry the downgrade in `warnings[]` (here on a
-/// project whose manifest lists no patches: the host path still builds the
-/// client, resolves the org once and prints its envelope).
+/// `--json` envelopes must carry the downgrade in `warnings[]` whenever
+/// they built the client: `vendor` always does (here on a manifest with
+/// no patches); `apply` does once it has a blob to download, which the
+/// proxy then serves.
 #[tokio::test]
 async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
     for command in ["apply", "vendor"] {
@@ -443,13 +480,23 @@ async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
 
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
-        std::fs::write(
-            cwd.join("package.json"),
-            r#"{"name":"app","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        std::fs::create_dir_all(cwd.join(".socket")).unwrap();
-        std::fs::write(cwd.join(".socket/manifest.json"), r#"{"patches":{}}"#).unwrap();
+        if command == "apply" {
+            let (hash, bytes) = write_project_needing_a_blob(cwd);
+            Mock::given(method("GET"))
+                .and(path(format!("/patch/blob/{hash}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+                .expect(1)
+                .mount(&mock)
+                .await;
+        } else {
+            std::fs::write(
+                cwd.join("package.json"),
+                r#"{"name":"app","version":"1.0.0"}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(cwd.join(".socket")).unwrap();
+            std::fs::write(cwd.join(".socket/manifest.json"), r#"{"patches":{}}"#).unwrap();
+        }
         let uri = mock.uri();
         let token = format!("sktsec_{}_api", "x".repeat(44));
         let mut cmd = hermetic_command(&binary());
@@ -472,5 +519,64 @@ async fn unresolved_org_reaches_apply_and_vendor_json_warnings() {
         let v = output_envelope(&out);
         assert_eq!(v["command"], command, "{v}");
         assert_api_auth_fallback(&v, command);
+    }
+}
+
+/// CA-U07: the downgrade is something that happens to a fetch. An `apply`
+/// with nothing to fetch (a manifest with no patches) builds no client: it
+/// never asks for the org, so an org that cannot be resolved is neither
+/// warned about on stderr nor reported in `warnings[]`.
+#[tokio::test]
+async fn unresolvable_org_is_not_reported_by_an_apply_that_fetches_nothing() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+        .expect(0)
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    std::fs::write(
+        cwd.join("package.json"),
+        r#"{"name":"app","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(cwd.join(".socket")).unwrap();
+    std::fs::write(cwd.join(".socket/manifest.json"), r#"{"patches":{}}"#).unwrap();
+    let uri = mock.uri();
+    let token = format!("sktsec_{}_api", "x".repeat(44));
+    for json in [true, false] {
+        let mut cmd = hermetic_command(&binary());
+        cmd.args([
+            "apply",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--api-url",
+            &uri,
+            "--proxy-url",
+            &uri,
+            "--api-token",
+            &token,
+        ])
+        .current_dir(cwd);
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().expect("run socket-patch apply");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+        assert!(
+            !stderr.contains("Could not determine your organization"),
+            "no fetch, no fallback to warn about (json={json}); stderr={stderr}"
+        );
+        if json {
+            let v = output_envelope(&out);
+            assert!(
+                !warning_codes(&v).iter().any(|c| c == "api_auth_fallback"),
+                "no fetch, no fallback to report: {v}"
+            );
+        }
     }
 }

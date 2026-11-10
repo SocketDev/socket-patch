@@ -1,6 +1,5 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{fetch_blobs_by_hash, format_fetch_result};
-use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::{CrawlerOptions, Ecosystem};
 use socket_patch_core::manifest::cleanup_blobs::ArtifactReferences;
 use socket_patch_core::manifest::operations::{
@@ -13,9 +12,7 @@ use socket_patch_core::patch::rollback::{
     cannot_rollback_error, rollback_package_patch, verify_file_rollback, RollbackResult,
     VerifyRollbackResult, VerifyRollbackStatus,
 };
-use socket_patch_core::telemetry::{
-    track_patch_rollback_failed, track_patch_rolled_back, TelemetryAuth,
-};
+use socket_patch_core::telemetry::{track_patch_rollback_failed, track_patch_rolled_back};
 use socket_patch_core::utils::purl::strip_purl_qualifiers;
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::utils::target::{is_path_shaped, Target, TargetKind};
@@ -24,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs};
+use crate::args::{apply_env_toggles, is_local_go, parse_bool_flag, GlobalArgs, RunApiClient};
 use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome, WRITE_FAILURE_KEY};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
@@ -1390,9 +1387,12 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     };
 
-    let (telemetry_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let telemetry = TelemetryAuth::for_client(&telemetry_client);
+    // The run's API client is built only if a before-blob must be
+    // downloaded (see `RunApiClient`): a rollback that restores from disk
+    // pays no config read, stderr advisory or org-slug round-trip. Until
+    // then telemetry's route comes from the credentials alone.
+    let api_client = RunApiClient::new();
+    let telemetry = args.common.telemetry_auth_for(&api_client);
 
     let manifest_path = args.common.resolved_manifest_path();
     let cwd = args.common.cwd.clone();
@@ -1964,17 +1964,20 @@ pub async fn run(args: RollbackArgs) -> i32 {
         purls: &manifest_scope,
         announce_empty: !scoped && !manifest_missing && !has_work && !eco_filtered_everything,
     };
-    match rollback_patches_inner(
+    let agent_leg = rollback_patches_inner(
         &args.common,
         &socket_dir,
         &manifest,
         &vendored_keys,
         selection,
         &superseded_by_hosted(&manifest, &hosted_pins),
-        Some(&telemetry_client),
+        &api_client,
     )
-    .await
-    {
+    .await;
+    // The agent leg built the client if it had blobs to download: from
+    // here the run's events follow that client's route.
+    let telemetry = args.common.telemetry_auth_for(&api_client);
+    match agent_leg {
         Ok(RollbackOutcome {
             success: agent_success,
             results,
@@ -2588,11 +2591,11 @@ pub(crate) async fn rollback_patches_inner(
     // record with ([`superseded_by_hosted`]); empty when no hosted pin
     // replaces a recorded patch.
     superseded: &HashMap<String, String>,
-    // The client the caller already built. Constructing one per phase
-    // printed the core client's "No SOCKET_API_TOKEN set" notice once per
-    // construction — twice in a single rollback. `None` builds one on
-    // demand, only when the blob download below actually fires.
-    api_client: Option<&ApiClient>,
+    // The run's client, built here only when the blob download below
+    // actually fires (and then once: constructing one per phase printed
+    // the core client's "No SOCKET_API_TOKEN set" notice once per
+    // construction).
+    api_client: &RunApiClient,
 ) -> Result<RollbackOutcome, String> {
     let mut blobs_path = socket_dir.join("blobs");
 
@@ -3145,6 +3148,10 @@ pub(crate) async fn rollback_patches_inner(
             });
         }
 
+        // The first point this run needs the network: the client's
+        // advisories print here, ahead of the status line.
+        let client = common.api_client(api_client).await;
+
         // Transient progress on stderr; the result line replaces it.
         let mut status = StatusLine::stderr(common.json, common.silent);
         status.set(format!(
@@ -3152,16 +3159,6 @@ pub(crate) async fn rollback_patches_inner(
             plural(missing_blobs.len(), "missing blob", "missing blobs")
         ));
 
-        let built_client;
-        let client = match api_client {
-            Some(c) => c,
-            None => {
-                built_client = get_api_client_with_overrides(common.api_client_overrides())
-                    .await
-                    .0;
-                &built_client
-            }
-        };
         let fetch_result = fetch_blobs_by_hash(&missing_blobs, &blobs_path, client, None).await;
 
         status.finish_with(format_fetch_result(&fetch_result));
@@ -3940,7 +3937,7 @@ mod tests {
             &vendored_keys,
             InnerSelection::Identifier(target.as_ref()),
             &HashMap::new(),
-            None,
+            &RunApiClient::new(),
         )
         .await?;
         Ok((

@@ -20,7 +20,7 @@ use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::api::types::{BatchPackagePatches, PatchResponse, PatchSearchResult};
 use socket_patch_core::manifest::operations::{read_manifest, write_manifest};
 use socket_patch_core::manifest::schema::PatchRecord;
-use socket_patch_core::telemetry::{track_patch_vendor_failed, PendingTelemetry, TelemetryAuth};
+use socket_patch_core::telemetry::{track_patch_vendor_failed, TelemetryAuth};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::refusals::{vendor_refusals, RefusalScope, VendorRefusal};
 use socket_patch_core::vendor::{load_state, lookup_entry, save_state, VendorState};
@@ -726,9 +726,6 @@ async fn run_vendor_json_path(
     vendored_purls: &HashSet<PurlKey>,
     prune: bool,
     telemetry_auth: &TelemetryAuth,
-    // Scan's pending telemetry, flushed by `discover_selected` before
-    // anything below writes to stdout.
-    telemetry: &mut PendingTelemetry,
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
 ) -> i32 {
@@ -743,7 +740,6 @@ async fn run_vendor_json_path(
         false,
         false,
         false,
-        telemetry,
         Some(&mut *env),
     )
     .await
@@ -1055,7 +1051,6 @@ pub(super) fn boxed_vendor_json_path<'a>(
     vendored_purls: &'a HashSet<PurlKey>,
     prune: bool,
     telemetry_auth: &'a TelemetryAuth,
-    telemetry: &'a mut PendingTelemetry,
     prior: Option<&'a NpmCrawlSnapshot>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_json_path(
@@ -1075,7 +1070,6 @@ pub(super) fn boxed_vendor_json_path<'a>(
         vendored_purls,
         prune,
         telemetry_auth,
-        telemetry,
         prior,
     ))
 }

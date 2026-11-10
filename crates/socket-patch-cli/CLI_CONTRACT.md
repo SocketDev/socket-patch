@@ -94,7 +94,7 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 | `--manifest-path` | — | `SOCKET_MANIFEST_PATH` | `.socket/manifest.json` | path | Manifest location (resolved relative to `--cwd`). v5.0 (#745): it also selects the project whose stores every command reads and writes — the root the RESOLVED manifest path implies: its `.socket` parent's parent when the manifest sits in a `.socket/` directory (exactly `--cwd` for the default path), else `--cwd` — a manifest file elsewhere (`state/patches.json`, `/etc/socket/manifest.json`) relocates only the manifest and its lock/artifact directory, not the project (v5.0; previously the file's own directory). All sources always come from that SAME project: `list`, `apply` (incl. `--check`), `rollback`, `remove`, `repair`, `vex`, `vendor --check` and agent-mode `scan`/`get` load (and `rollback`/`remove`/`repair`/`scan --prune` revert and save) that project's vendor ledger and its `.socket/vendor/` artifacts, under the manifest's apply lock, never `--cwd`'s; `list`, `vex`, `rollback`, `remove` and `repair` likewise read (and `rollback`/`remove` unwind) that project's lockfile hosted pins and pre-v5 redirect ledger. Installed copies are still found from `--cwd` (or the global scope). The forms that rewire `--cwd`'s lockfiles — `scan`/`get --mode hosted\|vendored` and `vendor` other than `--check` — refuse a manifest in another project: usage error (exit 2), code `manifest_path_foreign_project`, checked before anything is read or locked. So does an embedded `--vex` on `apply` (not `--check`) and agent-mode or report-only `scan`: those runs patch `--cwd`'s installed copies, while the document would attest the manifest's project; standalone `vex` runs wholly in the manifest's project and is allowed. A manifest that resolves into `--cwd`'s own project (the default path, `./.socket/manifest.json`, or a `..` detour back into `--cwd`) is never refused. |
 | `--api-url` | — | `SOCKET_API_URL` | `https://api.socket.dev` | string | Authenticated API endpoint |
 | `--api-token` | — | `SOCKET_API_TOKEN` | (none) | string | Auth token (absence selects the public proxy) |
-| `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug. Resolved once per run from the token (`GET /v0/organizations`) when omitted; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
+| `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug. When omitted it is resolved from the token (`GET /v0/organizations`) once per run, the first time the run needs the patch API (see [API client construction](#api-client-construction)); if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
 | `--proxy-url` | — | `SOCKET_PROXY_URL` | `https://patches-api.socket.dev` | string | Public proxy when no token |
 | `--ecosystems` | `-e` | `SOCKET_ECOSYSTEMS` | (all) | CSV → `Vec<String>` | Restrict to these ecosystems: `npm`, `pypi`, `cargo`, `gem`, `golang`, `maven`, `composer`, `nuget`, `deno`. Names are case-insensitive, and the names output prints (`python`, `ruby`, `go`, `php`) and everyday ones (`pip`, `rubygems`, `rust`, `crates`, `java`, `gradle`, `sbt`, `dotnet`, `packagist`, `jsr`, and `node`/`pnpm`/`yarn`/`bun`/`vlt` for `npm`) are accepted and normalized to the slug; `socket.yml` `patches.ecosystems` takes the same names (additive/MINOR). Anything else is a usage error listing the slugs |
 | `--vendor-source` | — | `SOCKET_VENDOR_SOURCE` | **`service`** | enum: `service` \| `auto` (alias) | How `vendor` acquires the installable artifact (see "Prebuilt vendor artifacts") |
@@ -113,7 +113,7 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 | `--yes` | `-y` | `SOCKET_YES` | `false` | bool | Skip prompts (`scan` never prompts) |
 | `--lock-timeout` | — | `SOCKET_LOCK_TIMEOUT` | (none) | seconds (u64) | How long to wait for `<.socket>/apply.lock`. Unset and `0` both mean a single non-blocking try; a positive value retries with a 100 ms backoff. Only meaningful on the lock-taking subcommands — `apply`, `rollback`, `repair`, `remove`, `vendor`, and `scan`/`get` whenever they write (agent-mode download + apply, vendored, hosted) |
 | `--debug` | — | `SOCKET_DEBUG` | `false` | bool | Verbose debug logs to stderr |
-| `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable anonymous usage telemetry |
+| `--no-telemetry` | — | `SOCKET_TELEMETRY_DISABLED` | `false` | bool | Disable usage telemetry (every switch: [Telemetry](#telemetry)) |
 | `--no-trust-lockfile-config` | — | `SOCKET_NO_TRUST_LOCKFILE_CONFIG` | `false` | bool | Opt out of hosted mode's automatic `trustLockfile: true` write to `pnpm-workspace.yaml` (see the pnpm trust-config note under the scan arguments) |
 | `--no-npm-allow-remote-config` | — | `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` | `false` | bool | Opt out of hosted mode's automatic `allow-remote=all` write to the project `.npmrc` (see the npm allow-remote note under the scan arguments). Read by `scan --mode hosted` and `get --mode hosted`; other subcommands accept it silently |
 | `--no-vlt-install-cleanup` | — | `SOCKET_NO_VLT_INSTALL_CLEANUP` | `false` | bool | Opt out of hosted mode's warm-tree heal for vlt: stale installed copies (`node_modules/.vlt-lock.json` and the stale `node_modules/.vlt/<DepID>` entries) are left in place after `vlt-lock.json` is repointed (`scan`/`get --mode hosted`) or restored (`rollback`/`remove`), and the `redirect_vlt_reinstall_required` advisory tells you to run `vlt ci` instead. Stale copies of optional dependencies are always left in place (see `redirect_vlt_reinstall_required`). Other subcommands accept it silently |
@@ -1416,15 +1416,34 @@ The notice is preceded by one blank line (it follows the command's own output, o
 
 - At most one release-metadata fetch per 24 h (cached in the state file below; a failed fetch also counts), and at most one notice per 24 h while an update is pending.
 - Never under `--json`, `--silent`, `--offline`/`SOCKET_OFFLINE`, in CI (`CI`/`GITHUB_ACTIONS` env), when stderr is not a terminal, or when `SOCKET_NO_UPDATE_CHECK` is truthy. Silenced means **zero network I/O**, not just no output.
-- Never changes a command's exit code or stdout; adds at most ~500 ms to a run (the background check is abandoned past that grace budget and retried on a later run).
+- Never changes a command's exit code or stdout; adds at most ~500 ms to a run (the background check is abandoned past that grace budget and retried on a later run). The wait runs concurrently with telemetry's 300 ms exit grace, so the two cost the longer one, not the sum.
 - State-file corruption, clock skew, or an unwritable cache dir degrade to "never checked" — they can never break a command.
 - Independent of telemetry: `--no-telemetry` does not affect the update check (it fetches public release metadata with no identifying payload beyond the CLI User-Agent); `SOCKET_OFFLINE` kills both.
 
 State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Windows) + `/socket-patch/update-check.json` (camelCase JSON: `schemaVersion`, `lastCheckAt`, `latestSeen`, `lastNotifiedAt`; unix seconds). A completed `--update` refreshes `latestSeen`, so the notifier never nags about a version the user just installed.
 
-## Telemetry events
+## Telemetry
 
-Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Every event's `context.version` is the client version. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
+Telemetry is **on by default**. Each command reports its outcome as one JSON event per row of the table below (a `scan` or `get` that also applies sends two).
+
+**What is sent.** `{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event. `context` is the client version, `std::env::consts::OS` / `ARCH` and the subcommand. `session_id` is a random UUID generated per process and never stored, so it links the events of one run and nothing else. `metadata` holds only the per-event fields in the table. `error.message` (failure events) has every URL redacted (userinfo, grant tokens, signed query values) and the home directory replaced by `~`; it can otherwise quote a package name or a path. The request carries `User-Agent: SocketPatchCLI/<version>` and, on the org route, `Authorization: Bearer <token>`. Nothing else is sent: no package list, no file contents, no machine identifier.
+
+**Where.** `POST <api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously `POST <proxy>/patch/telemetry` (`--api-url` / `--proxy-url` and their env vars move both). The route is the run's API client's when the run built one, so telemetry follows the same host and org as its API calls. A run that built no client (see [API client construction](#api-client-construction)) takes the route from the configured credentials alone (flag → env → socket-cli config, no network): a token with no configured org then reports anonymously, because the org is never looked up only to address an event.
+
+**Delivery never holds a command back.** A send starts where its event fires and runs beside the command; nothing waits for it before printing, prompting or deciding the exit code. After all output, the exit waits at most **300 ms** in total for sends still in flight, then drops them — whatever the endpoint does (refuses, drops packets, accepts and never answers). A failed or dropped send changes no output, no stderr and no exit code; only `--debug` shows it (`[socket-patch telemetry] …`). Delivery is therefore best effort: an event is lost when its send has not finished by then, and when the process ends early (a closed stdout pipe's SIGPIPE, Ctrl-C).
+
+**Opting out.** Any one of these sends nothing:
+
+| Switch | Notes |
+|---|---|
+| `--no-telemetry` | Per invocation. |
+| `SOCKET_TELEMETRY_DISABLED` | The flag's env binding; the CLI bool vocabulary (`1`/`true`/`yes`/`on`/…). A value that is not a boolean is a usage error (exit 2). |
+| `SOCKET_PATCH_TELEMETRY_DISABLED` | The v3/v4 name, still honored (truthy vocabulary; other values are ignored) so an opt-out made before v5 keeps holding. |
+| `DO_NOT_TRACK` | The cross-tool convention: any value except `0`, `false` and empty. |
+| `--offline` / `SOCKET_OFFLINE` | Strict airgap: no network at all. |
+| `VITEST=true` | Guard for socket-cli's vitest suite, which spawns this binary. |
+
+Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
 
 | Command | Success | Failure | Metadata |
 |---|---|---|---|
@@ -1440,7 +1459,7 @@ Each command POSTs its outcome as one JSON event (`{event_sender_created_at, eve
 
 ## Environment variables
 
-Public configuration uses the `SOCKET_*` names below. The three deprecated v3/v4 environment aliases and `SOCKET_FORCE` were removed in v5; see [Removed env vars](#removed-env-vars).
+Public configuration uses the `SOCKET_*` names below. Two deprecated v3/v4 environment aliases and `SOCKET_FORCE` were removed in v5 (the third alias, `SOCKET_PATCH_TELEMETRY_DISABLED`, still opts out of telemetry); see [Removed env vars](#removed-env-vars).
 
 Four `SOCKET_CLI_*` names from the sibling JS Socket CLI are additionally accepted as **peer aliases** (supported, not deprecated — no warning): `SOCKET_CLI_API_TOKEN` → `SOCKET_API_TOKEN`, `SOCKET_CLI_ORG_SLUG` → `SOCKET_ORG_SLUG`, `SOCKET_CLI_API_BASE_URL` → `SOCKET_API_URL`, `SOCKET_CLI_NO_API_TOKEN` → `SOCKET_NO_API_TOKEN`. The canonical `SOCKET_*` name always wins when both are set; promotion is silent and happens in-process before clap parses. Other socket-cli names (`SOCKET_CLI_CONFIG`, `SOCKET_CLI_API_PROXY`, `SOCKET_CLI_DEBUG`) are deliberately **not** honored.
 
@@ -1452,7 +1471,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_MANIFEST_PATH` | `--manifest-path` | `.socket/manifest.json` | — |
 | `SOCKET_API_URL` | `--api-url` | `https://api.socket.dev` | — |
 | `SOCKET_API_TOKEN` | `--api-token` | (none) | Absence selects the public proxy. |
-| `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | Resolved once per run from the token (`GET /v0/organizations`) when omitted; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
+| `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | When omitted, resolved from the token (`GET /v0/organizations`) once per run, the first time the run needs the patch API; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
 | `SOCKET_PROXY_URL` | `--proxy-url` | `https://patches-api.socket.dev` | — |
 | `SOCKET_ECOSYSTEMS` | `--ecosystems` / `-e` | (all) | Comma-separated list. |
 | `SOCKET_VENDOR_SOURCE` | `--vendor-source` | `service` | `auto` is a compatibility alias for `service`; `build` is rejected. |
@@ -1469,7 +1488,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_YES` | `--yes` / `-y` | `false` | Skips the prompts of `get`, `rollback`, `remove` and `--update`; `scan` never prompts, so it has no effect there. |
 | `SOCKET_LOCK_TIMEOUT` | `--lock-timeout` | (none) | Seconds to wait for `apply.lock` on the lock-taking subcommands (incl. hosted/vendored `scan`/`get`); unset/`0` = single non-blocking try. |
 | `SOCKET_DEBUG` | `--debug` | `false` | — |
-| `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | — |
+| `SOCKET_TELEMETRY_DISABLED` | `--no-telemetry` | `false` | One of several opt-outs; see [Telemetry](#telemetry). |
 | `SOCKET_NO_TRUST_LOCKFILE_CONFIG` | `--no-trust-lockfile-config` | `false` | Hosted mode: skip the `trustLockfile: true` write to `pnpm-workspace.yaml`. |
 | `SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG` | `--no-npm-allow-remote-config` | `false` | Hosted mode: skip the `allow-remote=all` write to the project `.npmrc`. |
 | `SOCKET_NO_VLT_INSTALL_CLEANUP` | `--no-vlt-install-cleanup` | `false` | Hosted mode, `rollback`, `remove`: keep stale vlt installed copies. |
@@ -1525,6 +1544,21 @@ Contract properties:
 - **Repo-level files never carry endpoints, credentials, or interlock-disablers**: configuration for those comes only from flags, env vars, this user-level file, and built-in defaults — never from files inside the repository being patched (manifest, socket.yml, `.env`, …). A repository file may **narrow or pace** what `scan` patches (socket.yml's `patches` block and `projectIgnorePaths`, see "socket.yml patch policy"). It may never name an endpoint or credential, pick a mode or download format, turn off a safety check, or make `scan` patch anything it would not patch with no file present; the one exception is negating the built-in test/fixture path ignores, which are repo policy by nature.
 - `--debug` names the source on stderr whenever a setting resolves from the socket-cli config (the token value itself is never echoed).
 
+### API client construction
+
+Building the API client is what reads the token, prints the client's stderr advisories (`No SOCKET_API_TOKEN set … using the public patch API proxy`, the token-shape warning, `Could not determine your organization …`) and, with a token and no org, makes the `GET /v0/organizations` round-trip. A command builds it once per run, at the first step that needs the patch API, so a run that needs nothing from it makes no API request, prints none of those advisories and carries no `api_auth_fallback` warning:
+
+| Command | Builds the client |
+|---|---|
+| `scan`, `get`, `vendor` (not its no-op / `--revert`) | Always (their work is remote). |
+| `apply` | When a patched blob is missing from `.socket/blobs` and must be downloaded; when a Maven patch is in scope (the patched-jar service); when the embedded `--vex` must fetch a record. Not for an apply that finds every blob cached (including a no-op), a missing manifest, or `--check`. |
+| `rollback`, `remove` | When a before-blob the restore needs is missing and must be downloaded. Not for a restore from cached blobs. |
+| `repair` | When an artifact must be downloaded. |
+| `vex` | When it must fetch a patch record or a patched file that is not on disk. |
+| `list` | Never. |
+
+Telemetry does not build it: see [Telemetry](#telemetry) for the route a client-less run reports on.
+
 ### Registry override env vars
 
 Env-only knobs used for hosted upstream restoration and JVM metadata verification. They do not enable local artifact construction. Trailing slashes are trimmed and empty values use the default.
@@ -1551,11 +1585,12 @@ These exist for mirrors and testing. They are **internal**: names, semantics, an
 | `SOCKET_UPDATE_STATE_DIR` | Overrides the per-user dir holding `update-check.json` + `update.lock` (tests point it into a tempdir). |
 | `SOCKET_UPDATE_TIMEOUT_MS` | Caps the update fetches' connect/metadata/download budgets (defaults 10 s / 30 s / 300 s; the notice's fetch defaults to 2 s). Doubles as the slow-network escape hatch. |
 | `SOCKET_UPDATE_NOTIFIER_FORCE` | Test hook: bypasses the update notice's stderr-TTY guard — and nothing else (opt-out, offline, `--silent`, `--json`, CI all still win). |
+| `SOCKET_TELEMETRY_GRACE_MS` | Test hook: overrides how long the exit waits for telemetry still in flight (default 300 ms). Lets the e2e suite count the events a loopback mock received without racing a loaded runner; a send's own 5 s request timeout still ends the wait. |
 | `SOCKET_UPDATE_GRACE_MS` | Test hook: overrides the notice's post-command join grace (default 500 ms — how long the run waits for the background check before abandoning it and exiting). Lets the e2e suite await the loopback fetch to completion so its observable effect is deterministic; production keeps the tight 500 ms ceiling. |
 
 ### Removed env vars
 
-The v3.0 legacy names `SOCKET_PATCH_PROXY_URL`, `SOCKET_PATCH_DEBUG` and `SOCKET_PATCH_TELEMETRY_DISABLED` were removed in v5.0 and are ignored; use `SOCKET_PROXY_URL`, `SOCKET_DEBUG` and `SOCKET_TELEMETRY_DISABLED`.
+The v3.0 legacy names `SOCKET_PATCH_PROXY_URL` and `SOCKET_PATCH_DEBUG` were removed in v5.0 and are ignored; use `SOCKET_PROXY_URL` and `SOCKET_DEBUG`. `SOCKET_PATCH_TELEMETRY_DISABLED` was removed with them and is honored again as an opt-out alias of `SOCKET_TELEMETRY_DISABLED` (see [Telemetry](#telemetry)): a privacy opt-out must survive the rename.
 
 `SOCKET_FORCE` was removed in v5.0 and is ignored without a warning (#615). `apply --force`, `vendor --force` and `--update --force` are flag-only: exporting the variable for one command no longer weakens the checks of the others. A stale export now leaves the beforeHash check and the managed-install refusal on.
 
