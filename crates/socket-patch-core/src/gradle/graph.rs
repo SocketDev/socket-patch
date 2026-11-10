@@ -199,7 +199,30 @@ pub struct Decl {
     /// The version (selector) text; `None` when absent or not literal.
     pub version: Option<String>,
     pub rich: Option<RichVersion>,
+    /// The classifier requested. One the script computes
+    /// (`…:${osdetector.classifier}`, `classifier = natives`) is kept as
+    /// its source text marked with a `$` ([`is_computed_classifier`]): the
+    /// declaration still asks for a classifier artifact, of a name no
+    /// static read can tell.
     pub classifier: Option<String>,
+}
+
+/// Whether a [`Decl::classifier`] is one the script computes rather than a
+/// literal name. No classifier holds a `$`.
+pub fn is_computed_classifier(classifier: &str) -> bool {
+    classifier.contains('$')
+}
+
+/// A classifier argument `toks[first..last]` that is not one literal
+/// string, as [`Decl::classifier`] keeps it.
+fn computed_classifier(text: &str, toks: &[Token], first: usize, last: usize) -> Option<String> {
+    let (start, end) = (toks.get(first)?, toks.get(last.checked_sub(1)?)?);
+    let source = text.get(start.start..end.end)?.trim();
+    Some(if is_computed_classifier(source) {
+        source.to_string()
+    } else {
+        format!("${{{source}}}")
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1681,13 +1704,19 @@ fn closure_details(
                 continue;
             }
             // `classifier = 'c'`, `classifier("c")` or `classifier 'c'`.
-            let v = if is_punct(inner.get(i + 1), b'=') || is_punct(inner.get(i + 1), b'(') {
-                literal_of(inner.get(i + 2))
+            let at = if is_punct(inner.get(i + 1), b'=') || is_punct(inner.get(i + 1), b'(') {
+                i + 2
             } else {
-                literal_of(inner.get(i + 1))
+                i + 1
             };
-            if let Some(v) = v {
-                classifier = Some(v.to_string());
+            // Anything but a literal there (`classifier = natives`) is a
+            // classifier the script computes.
+            match (literal_of(inner.get(at)), inner.get(at)) {
+                (Some(v), _) => classifier = Some(v.to_string()),
+                (None, Some(t)) if !matches!(t.tok, Tok::Punct(b'}' | b')')) => {
+                    classifier = computed_classifier(text, inner, at, at + 1).or(classifier)
+                }
+                _ => {}
             }
         }
     }
@@ -1749,10 +1778,9 @@ fn script_decls(s: &Script, g: &str, a: &str) -> Vec<(Decl, usize)> {
             if !literal && version.as_deref().is_some_and(|v| v.contains('$')) {
                 version = None;
             }
-            let classifier = parts
-                .get(3)
-                .map(|c| strip_ext(c))
-                .filter(|c| !c.is_empty() && !c.contains('$'));
+            // A `$`-interpolated classifier is kept as written: the
+            // declaration asks for a classifier artifact all the same.
+            let classifier = parts.get(3).map(|c| strip_ext(c)).filter(|c| !c.is_empty());
             let rich = version.as_deref().and_then(bang_bang);
             let closure = (is_punct(toks.get(i.wrapping_sub(1)), b'(')
                 && is_punct(toks.get(i + 1), b')')
@@ -1775,7 +1803,11 @@ fn script_decls(s: &Script, g: &str, a: &str) -> Vec<(Decl, usize)> {
                     call.args.iter().filter(|x| x.name.is_none()).collect();
                 if pos.len() >= 2 && pos[0].first == i {
                     let version = pos.get(2).and_then(|x| x.literal.clone());
-                    let classifier = pos.get(4).and_then(|x| x.literal.clone());
+                    let classifier = pos.get(4).and_then(|x| {
+                        x.literal
+                            .clone()
+                            .or_else(|| computed_classifier(text, &toks, x.first, x.last))
+                    });
                     let rich = version.as_deref().and_then(bang_bang);
                     push(i, version, rich, classifier, call.closure);
                 }
@@ -1807,7 +1839,15 @@ fn script_decls(s: &Script, g: &str, a: &str) -> Vec<(Decl, usize)> {
             continue;
         }
         let version = call.named("version").flatten().map(str::to_string);
-        let classifier = call.named("classifier").flatten().map(str::to_string);
+        let classifier = call
+            .args
+            .iter()
+            .find(|x| x.name.as_deref() == Some("classifier"))
+            .and_then(|x| {
+                x.literal
+                    .clone()
+                    .or_else(|| computed_classifier(text, &toks, x.first, x.last))
+            });
         let rich = version.as_deref().and_then(bang_bang);
         push(i, version, rich, classifier, call.closure);
     }
@@ -2615,6 +2655,61 @@ other = { group = \"x\", name = \"y\", version = \"1\" }
         );
         assert!(d.iter().all(|d| d.kind == DeclKind::Classifier));
         assert!(d.iter().all(|d| d.version.as_deref() == Some("1.10.0")));
+    }
+
+    /// A classifier a script computes is still a classifier request: it is
+    /// kept, `$`-marked, instead of reading as a plain declaration.
+    #[test]
+    fn a_computed_classifier_is_kept_as_one() {
+        let g = graph(&[
+            ("settings.gradle", "include ':k'\n"),
+            (
+                "build.gradle",
+                "dependencies {
+    runtimeOnly \"com.socketfixture:victim:1.10.0:${osdetector.classifier}\"
+    runtimeOnly \"com.socketfixture:victim:1.10.0:$natives@jar\"
+    runtimeOnly group: 'com.socketfixture', name: 'victim', version: '1.10.0', classifier: osdetector.classifier
+    runtimeOnly 'com.socketfixture:victim:1.10.0'
+}
+",
+            ),
+            (
+                "k/build.gradle.kts",
+                "dependencies {
+    runtimeOnly(group = \"com.socketfixture\", name = \"victim\", version = \"1.10.0\", classifier = natives)
+    runtimeOnly(\"com.socketfixture:victim:1.10.0\") {
+        artifact {
+            classifier = osdetector.classifier
+        }
+    }
+    runtimeOnly(\"com.socketfixture\", \"victim\", \"1.10.0\", null, \"natives-$os\")
+}
+",
+            ),
+        ]);
+        let d = g.declarations_of(G, A);
+        let got: Vec<(&str, usize, Option<&str>)> = d
+            .iter()
+            .map(|d| (d.rel.as_str(), d.line, d.classifier.as_deref()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("build.gradle", 2, Some("${osdetector.classifier}")),
+                ("build.gradle", 3, Some("$natives")),
+                ("build.gradle", 5, None),
+                ("build.gradle", 4, Some("${osdetector.classifier}")),
+                ("k/build.gradle.kts", 3, Some("${osdetector}")),
+                ("k/build.gradle.kts", 8, Some("\"natives-$os\"")),
+                ("k/build.gradle.kts", 2, Some("${natives}")),
+            ]
+        );
+        for d in &d {
+            let computed = d.classifier.as_deref().is_some_and(is_computed_classifier);
+            assert_eq!(computed, d.classifier.is_some(), "{d:?}");
+            assert_eq!(d.kind == DeclKind::Classifier, computed, "{d:?}");
+        }
+        assert!(!is_computed_classifier("tests"));
     }
 
     // ── mavenLocal ───────────────────────────────────────────────────────────────

@@ -801,11 +801,36 @@ fn check_graph(
     }
 
     // #533: `exclusiveContent` claims every file of the GAV, so a declared
-    // classifier the tree does not hold stops resolving.
+    // classifier the tree does not hold stops resolving. One a script
+    // computes (`…:${osdetector.classifier}`) names a jar no static read
+    // can tell, so the tree cannot be made to hold it.
+    let computed = decls.iter().find(|d| {
+        d.classifier
+            .as_deref()
+            .is_some_and(crate::gradle::graph::is_computed_classifier)
+            // A declaration of another exact version is not the tree's.
+            && d.version
+                .as_deref()
+                .is_none_or(|ver| admits(&parse_selector(ver), v) != Some(false))
+    });
+    if let Some(d) = computed {
+        return Err(shape_refusal(
+            "gradle_classifier_computed",
+            format!(
+                "{}:{} requests {g}:{a} with a classifier the script computes (`{}`); the \
+                 vendored repository would claim every file of {g}:{a}:{v} without holding \
+                 that jar, so the build could not resolve it",
+                d.rel,
+                d.line,
+                d.classifier.as_deref().unwrap_or_default()
+            ),
+        ));
+    }
     let mut classifiers: Vec<String> = decls
         .iter()
         .filter(|d| d.kind == DeclKind::Classifier)
         .filter_map(|d| d.classifier.clone())
+        .filter(|c| !crate::gradle::graph::is_computed_classifier(c))
         .collect();
     classifiers.sort();
     classifiers.dedup();
@@ -4872,6 +4897,69 @@ mod tests {
         };
         let files = fs(&[("settings.gradle", "")]);
         assert_eq!(run(&files, &p).unwrap_err().code, "unsafe_coordinates");
+    }
+
+    /// VJ-D3: a classifier written through a variable (the usual way a
+    /// native jar is declared) was dropped, the tree held the main jar
+    /// alone and `exclusiveContent` claimed the whole GAV, so Gradle could
+    /// not find the classifier jar. No static read names that jar, so the
+    /// GAV is refused. (Asserted on the plan: Gradle is not run here.)
+    #[test]
+    fn a_classifier_the_script_computes_refuses_the_gav() {
+        let extras = [extra("sources", b"SOURCES-JAR")];
+        let p = JvmPatch {
+            extra_artifacts: &extras,
+            ..patch()
+        };
+        for (rel, src) in [
+            (
+                "build.gradle",
+                "dependencies { runtimeOnly \"com.google.code.gson:gson:2.10.1:${osdetector.classifier}\" }",
+            ),
+            (
+                "build.gradle",
+                "dependencies { runtimeOnly \"com.google.code.gson:gson:2.10.1:$natives\" }",
+            ),
+            (
+                "build.gradle",
+                "dependencies { runtimeOnly group: 'com.google.code.gson', name: 'gson', version: '2.10.1', classifier: osdetector.classifier }",
+            ),
+            (
+                "build.gradle.kts",
+                "dependencies { runtimeOnly(group = \"com.google.code.gson\", name = \"gson\", version = \"2.10.1\", classifier = natives) }",
+            ),
+            (
+                "build.gradle.kts",
+                "dependencies { runtimeOnly(\"com.google.code.gson:gson:2.10.1\") { artifact { classifier = osdetector.classifier } } }",
+            ),
+            // No version of its own (a platform or catalog may give 2.10.1).
+            (
+                "build.gradle",
+                "dependencies { runtimeOnly \"com.google.code.gson:gson::$natives\" }",
+            ),
+        ] {
+            let files = fs(&[("settings.gradle", ""), (rel, src)]);
+            let read = |r: &str| files.get(r).cloned();
+            // Nothing to source: the name is unknown.
+            assert!(
+                declared_classifiers(&read, &|d: &str| list_of(&files, d), "com.google.code.gson", "gson")
+                    .is_empty(),
+                "{src}"
+            );
+            let err = run(&files, &p).unwrap_err();
+            assert_eq!(err.code, "vendor_jvm_shape_unsupported", "{src}");
+            assert_eq!(refusal_reason(&err), "gradle_classifier_computed", "{src}");
+            assert!(err.detail.contains(&format!("{rel}:1")), "{}", err.detail);
+        }
+        // Another exact version is not the tree's to serve.
+        let files = fs(&[
+            ("settings.gradle", ""),
+            (
+                "build.gradle",
+                "dependencies { implementation 'com.google.code.gson:gson:2.10.1'; runtimeOnly \"com.google.code.gson:gson:2.9.0:$natives\" }",
+            ),
+        ]);
+        assert!(run(&files, &p).is_ok());
     }
 
     fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {

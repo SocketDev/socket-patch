@@ -189,7 +189,10 @@ upstream POM and module, and every classifier jar a build script or catalog
 declares (plus the `sources` jar when a cache or the registry has it, so IDE
 source attachment keeps working). A declared classifier that cannot be sourced
 refuses with `classifier_unavailable`: `exclusiveContent` claims every file of
-the GAV, so a missing one would stop resolving. A classifier jar that carries
+the GAV, so a missing one would stop resolving. For the same reason a
+classifier a script computes (`…:${osdetector.classifier}`,
+`classifier = natives`) refuses the GAV with `gradle_classifier_computed`: no
+static read names that jar, so the tree cannot hold it. A classifier jar that carries
 an unpatched copy of a patched member is degraded (`classifier_unpatched_copy`).
 The tree marker lists the patched members beside classifier jars, so `vex`
 re-runs that check from the committed tree and withholds attestation.
