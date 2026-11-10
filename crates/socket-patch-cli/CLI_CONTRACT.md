@@ -2734,7 +2734,8 @@ match it, withholds the statement:
 | Code | Kind | Meaning |
 |---|---|---|
 | `vex_gradle_unpatched_copy` | run warning | A copy a build may load does not carry the patch; no statement until every copy does. |
-| `gradle_unpatched_copy` | `failed[].reason` | The purl the warning above withheld. |
+| `gradle_unpatched_copy` | `failed[].reason` | The purl the warning above (or `vex_gradle_derived_cache_check_failed`) withheld. |
+| `vex_gradle_derived_cache_check_failed` | run warning | The derived-cache check of an attested Gradle copy did not finish (it crashed), so a copy derived from the unpatched jar cannot be ruled out; no statement for that purl. |
 | `vex_gradle_lock_above_base` | run warning and `failed[].reason` | A hosted pin is wired, but a lock file records a release above its base, which that build resolves instead of the patch; no statement until it is re-locked or the patch is rolled back. |
 | `vex_pnpm_bundled_copy` | run warning and `failed[].reason` | An npm pin is wired, but its pnpm lock names a package whose `bundledDependencies` may ship an unpatched copy of it (the lock does not record that copy's version); no statement while that package bundles it. `vendor --check` and `scan` still treat the wiring as live. |
 | `vex_deno_lock_copy` | run warning and `failed[].reason` | An npm pin is wired, but `deno.lock` locks the same `name@version`, which `deno install` installs without the wiring; no statement while it does. `vendor --check` and `scan` still treat the wiring as live. |

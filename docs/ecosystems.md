@@ -1118,7 +1118,8 @@ Gradle hash directory, and the suffixed copies of a hosted pin. A derived copy p
 to come from the unpatched jar, or an older one that does not match the patched jar,
 withholds the statement (`vex_gradle_unpatched_copy`). A derived-cache walk cut short
 on a very large cache warns `vex_gradle_derived_cache_unchecked` and does not
-withhold.
+withhold; a derived-cache check that does not finish at all withholds the statement
+(`vex_gradle_derived_cache_check_failed`).
 
 ## Scala build tools: sbt, Mill, scala-cli
 

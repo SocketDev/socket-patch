@@ -897,6 +897,7 @@ async fn generate_vex(
             manifest,
             &package_paths,
             &plan.hosted,
+            socket_patch_core::patch::jvm_jar::derived_copies_in,
             common,
             warnings,
         )
@@ -1464,6 +1465,14 @@ async fn narrow_gem_variant_copies(
     sets.extend(narrowed);
 }
 
+/// The derived-cache check [`withhold_unpatched_jvm_copies`] runs per hash
+/// directory: `socket_patch_core::patch::jvm_jar::derived_copies_in`.
+type DerivedCopiesIn = fn(
+    &socket_patch_core::patch::jvm_jar::DerivedCache,
+    &Path,
+    &str,
+) -> Option<socket_patch_core::patch::jvm_jar::DerivedVerdict>;
+
 /// Maven / Gradle: withhold the statement of every purl a build may still
 /// load unpatched, naming the copy (`vex_gradle_unpatched_copy`): a copy
 /// the record check found unpatched while others are patched, and — for
@@ -1471,12 +1480,15 @@ async fn narrow_gem_variant_copies(
 /// `files-2.1` (`caches/transforms-*`, `jars-*`) or one older than the
 /// patched jar that cannot be matched to it. A derived-cache walk cut
 /// short is a warning (`vex_gradle_derived_cache_unchecked`), not a reason
-/// to withhold.
+/// to withhold; a check that did not finish at all (its task panicked)
+/// withholds the purl (`vex_gradle_derived_cache_check_failed`), because
+/// nothing it would have found is known.
 async fn withhold_unpatched_jvm_copies(
     outcome: &mut VerifyOutcome,
     manifest: &PatchManifest,
     copies: &HashMap<String, Vec<PathBuf>>,
     hosted: &std::collections::BTreeMap<String, crate::commands::vex_sources::HostedWiring>,
+    derived_copies_in: DerivedCopiesIn,
     common: &GlobalArgs,
     warnings: &mut Vec<RunWarning>,
 ) {
@@ -1491,6 +1503,7 @@ async fn withhold_unpatched_jvm_copies(
     });
     let mut derived: Vec<(String, PathBuf)> = Vec::new();
     let mut unchecked: Vec<String> = Vec::new();
+    let mut check_failed: Vec<(String, PathBuf, String)> = Vec::new();
     let cache = jvm_jar::DerivedCache::default();
     for purl in &outcome.applied {
         let (Some(record), Some(paths)) = (manifest.patches.get(purl), copies.get(purl)) else {
@@ -1512,10 +1525,19 @@ async fn withhold_unpatched_jvm_copies(
             for leaf in &leaves {
                 for dir in jvm_jar::jar_copies(path, leaf) {
                     let (leaf, cache) = (leaf.clone(), cache.clone());
-                    let check = move || jvm_jar::derived_copies_in(&cache, &dir, &leaf);
-                    let Some(verdict) = tokio::task::spawn_blocking(check).await.ok().flatten()
-                    else {
-                        continue;
+                    let checked = dir.clone();
+                    let check = move || derived_copies_in(&cache, &dir, &leaf);
+                    let verdict = match tokio::task::spawn_blocking(check).await {
+                        Ok(Some(verdict)) => verdict,
+                        // Not a writable Gradle hash dir: nothing is
+                        // derived from it.
+                        Ok(None) => continue,
+                        // The check died, so what it would have found is
+                        // unknown: never a clean verdict.
+                        Err(e) => {
+                            check_failed.push((purl.clone(), checked, e.to_string()));
+                            continue;
+                        }
                     };
                     derived.extend(
                         verdict
@@ -1531,8 +1553,12 @@ async fn withhold_unpatched_jvm_copies(
             }
         }
     }
-    let withheld: std::collections::BTreeSet<String> =
-        derived.iter().map(|(purl, _)| purl.clone()).collect();
+    let withheld: std::collections::BTreeSet<String> = derived
+        .iter()
+        .map(|(purl, _)| purl)
+        .chain(check_failed.iter().map(|(purl, ..)| purl))
+        .cloned()
+        .collect();
     outcome.applied.retain(|purl| !withheld.contains(purl));
     outcome
         .failed
@@ -1554,6 +1580,22 @@ async fn withhold_unpatched_jvm_copies(
                 "{purl}: Gradle's derived caches (caches/transforms-*, jars-*) are too large to \
                  check completely; a copy derived from the unpatched jar there would not be \
                  seen (`gradle --stop` and clearing them removes any)."
+            ),
+        );
+    }
+    check_failed.sort();
+    check_failed.dedup();
+    for (purl, dir, error) in check_failed {
+        note_warning(
+            warnings,
+            common,
+            "vex_gradle_derived_cache_check_failed",
+            format!(
+                "{purl}: checking Gradle's derived caches for copies of {} failed ({error}); \
+                 a copy derived from the unpatched jar cannot be ruled out, so no statement is \
+                 emitted (`gradle --stop` and clearing caches/transforms-* and jars-* removes \
+                 any).",
+                dir.display()
             ),
         );
     }
@@ -2895,6 +2937,102 @@ mod mirror_refusal_tests {
                 assert_eq!(summary.failed[0].reason, "mirror_overrides_source");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod derived_cache_tests {
+    use super::*;
+    use socket_patch_core::manifest::schema::PatchRecord;
+    use socket_patch_core::patch::jvm_jar::{DerivedCache, DerivedVerdict};
+    use std::collections::BTreeMap;
+
+    const PURL: &str = "pkg:maven/com.x/lib@1.0";
+
+    /// An attested Gradle copy of [`PURL`]: `(outcome, view, copies)` over
+    /// one `files-2.1` hash dir under `home` holding `lib-1.0.jar`.
+    fn attested_gradle_copy(
+        home: &Path,
+    ) -> (VerifyOutcome, PatchManifest, HashMap<String, Vec<PathBuf>>) {
+        let version_dir = home.join("caches/modules-2/files-2.1/com.x/lib/1.0");
+        let hash_dir = version_dir.join("0123456789abcdef0123456789abcdef01234567");
+        std::fs::create_dir_all(&hash_dir).unwrap();
+        std::fs::write(hash_dir.join("lib-1.0.jar"), b"patched jar").unwrap();
+        let record: PatchRecord = serde_json::from_value(serde_json::json!({
+            "uuid": "00000000-0000-4000-8000-000000000000",
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {"lib-1.0.jar": {"beforeHash": "a".repeat(64), "afterHash": "b".repeat(64)}},
+            "vulnerabilities": {"GHSA-derived-0000": {"cves": [], "summary": "test", "severity": "high", "description": "test"}},
+            "description": "test", "license": "MIT", "tier": "free"
+        }))
+        .unwrap();
+        let mut view = PatchManifest::new();
+        view.patches.insert(PURL.to_string(), record);
+        let outcome = VerifyOutcome {
+            applied: vec![PURL.to_string()],
+            ..Default::default()
+        };
+        let copies = HashMap::from([(PURL.to_string(), vec![version_dir])]);
+        (outcome, view, copies)
+    }
+
+    async fn withhold(check: DerivedCopiesIn) -> (VerifyOutcome, Vec<RunWarning>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = GlobalArgs {
+            cwd: tmp.path().to_path_buf(),
+            json: true,
+            no_telemetry: true,
+            ..Default::default()
+        };
+        let (mut outcome, view, copies) = attested_gradle_copy(tmp.path());
+        let mut warnings = Vec::new();
+        withhold_unpatched_jvm_copies(
+            &mut outcome,
+            &view,
+            &copies,
+            &BTreeMap::new(),
+            check,
+            &common,
+            &mut warnings,
+        )
+        .await;
+        (outcome, warnings)
+    }
+
+    /// A derived-cache check that dies proves nothing about the copies it
+    /// would have found: the purl is withheld, never attested by default.
+    #[tokio::test]
+    async fn a_derived_cache_check_that_panics_withholds_the_purl() {
+        fn clean(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            Some(DerivedVerdict::default())
+        }
+        fn not_a_hash_dir(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            None
+        }
+        fn dies(_: &DerivedCache, _: &Path, _: &str) -> Option<DerivedVerdict> {
+            panic!("derived-cache walk died")
+        }
+        for (what, check) in [
+            ("clean", clean as DerivedCopiesIn),
+            ("not a hash dir", not_a_hash_dir),
+        ] {
+            let (outcome, warnings) = withhold(check).await;
+            assert_eq!(outcome.applied, vec![PURL.to_string()], "{what}");
+            assert!(outcome.failed.is_empty(), "{what}: {:?}", outcome.failed);
+            assert!(warnings.is_empty(), "{what}: {warnings:?}");
+        }
+        let (outcome, warnings) = withhold(dies).await;
+        assert!(outcome.applied.is_empty(), "{:?}", outcome.applied);
+        assert_eq!(
+            outcome.failed,
+            vec![FailedPatch {
+                purl: PURL.to_string(),
+                reason: "gradle_unpatched_copy".to_string(),
+            }]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, "vex_gradle_derived_cache_check_failed");
+        assert!(warnings[0].detail.starts_with(PURL), "{warnings:?}");
     }
 }
 
