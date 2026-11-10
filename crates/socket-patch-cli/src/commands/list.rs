@@ -409,14 +409,18 @@ pub async fn run(args: ListArgs) -> i32 {
         }
     }
     // A broken vendor ledger degrades to nothing-to-list here (every path
-    // that writes or attests from it fails closed instead), but says so.
+    // that writes or attests from it fails closed instead), but says so:
+    // on stderr, or in `warnings[]` under --json, where a `success`
+    // envelope would otherwise read as "no vendored patches".
     let vendor_state = match &loaded.vendor {
         Ok(state) => Some(state),
         Err(e) => {
-            if !args.common.silent {
-                eprintln!(
-                    "Warning: unreadable vendor ledger ({e}); its vendored patches are not listed"
-                );
+            let detail =
+                format!("unreadable vendor ledger ({e}); its vendored patches are not listed");
+            if args.common.json {
+                warnings.push(RunWarning::new("vendor_state_unreadable", detail));
+            } else if !args.common.silent {
+                eprintln!("Warning: {detail}");
             }
             None
         }

@@ -135,6 +135,102 @@ fn rollback_unknown_identifier_emits_error() {
     // The human `Error:` line is rendered in `rollback_render.rs`.
 }
 
+/// A record whose purl type has no crawler in this CLI (a newer CLI's
+/// ecosystem, a type in another case) cannot be rolled back here. The run
+/// used to count it in the confirmation prompt, then do nothing and report
+/// a bare success. It is named instead (a `skipped` /
+/// `unsupported_ecosystem` event, a `warnings[]` entry, a stderr warning),
+/// kept out of the prompt, and its record stays in the manifest.
+#[test]
+fn rollback_names_records_of_an_unsupported_ecosystem_and_keeps_them() {
+    const SWIFT: &str = "pkg:swift/github.com/apple/swift-nio@2.60.0";
+    const CASE: &str = "pkg:NPM/left-pad@1.3.0";
+    let before = git_sha256(crate::rollback_fixture::ORIG_INDEX);
+    let after = git_sha256(crate::rollback_fixture::PATCHED_INDEX);
+    let project = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        crate::rollback_fixture::write_socket_manifest(
+            tmp.path(),
+            &[
+                crate::rollback_fixture::manifest_entry(
+                    SWIFT,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    &before,
+                    &after,
+                ),
+                crate::rollback_fixture::manifest_entry(
+                    CASE,
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    &before,
+                    &after,
+                ),
+            ],
+        );
+        tmp
+    };
+    let recorded = |root: &Path| -> Vec<String> {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(".socket/manifest.json")).expect("manifest"),
+        )
+        .expect("manifest JSON");
+        let mut keys: Vec<String> = manifest["patches"]
+            .as_object()
+            .expect("patches")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    let tmp = project();
+    let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["status"], "success", "{v:#}");
+    for purl in [SWIFT, CASE] {
+        assert_eq!(
+            event_for(&v, "skipped", purl)["errorCode"],
+            "unsupported_ecosystem",
+            "{v:#}"
+        );
+    }
+    assert!(
+        codes_in(&v["warnings"]).contains(&"unsupported_ecosystem".to_string()),
+        "{v:#}"
+    );
+    assert_eq!(
+        recorded(tmp.path()),
+        vec![CASE, SWIFT],
+        "nothing was rolled back, so the records stay"
+    );
+
+    // Human mode: no prompt over patches the run cannot touch (stdin is not
+    // a terminal here, so a prompt would print its auto-accept note), and
+    // the records are named.
+    let tmp = project();
+    let out = rollback_cmd(tmp.path())
+        .args(["--offline"])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Non-interactive mode detected"),
+        "no confirmation over records it cannot roll back: stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Warning:") && stderr.contains(SWIFT) && stderr.contains(CASE),
+        "{stderr}"
+    );
+    assert_eq!(recorded(tmp.path()), vec![CASE, SWIFT]);
+}
+
 /// The beforeHash pinned in `MANIFEST_JSON` (deliberately not staged on
 /// disk by the missing-blob tests).
 const MISSING_BEFORE_HASH: &str =

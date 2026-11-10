@@ -13,15 +13,19 @@
 //! Only an uncatchable kill (SIGKILL, power loss) can still leave the file,
 //! and the next lock-taking command reclaims and removes it.
 //!
-//! On Unix, [`install`] also resets SIGPIPE to its default disposition
-//! (unconditionally, unlike the signals above), so a pipe consumer that
-//! closes stdout ends the process quietly instead of a panic on EPIPE.
-//! Network writes still suppress SIGPIPE through std/socket2.
+//! A closed stdout or stderr pipe (`socket-patch apply | head -1`) is not an
+//! interrupt and must not end the run: killed at a `println!`, a mutating
+//! command would stop between two of its writes with the lock still on
+//! disk. [`install`] therefore keeps SIGPIPE ignored (on Unix) and turns a
+//! broken pipe into "stop printing" for every print macro in both crates
+//! (`socket_patch_core::utils::stdio`), so the command finishes, drops its
+//! lock and exits with its own code. Spawned children still get the default
+//! disposition: std resets it when it execs them.
 
 use socket_patch_core::patch::apply_lock::cleanup_held_lock_on_interrupt;
 
-/// Install the interrupt handlers (and, on Unix, the default SIGPIPE
-/// disposition). Call once, first thing in `main`, before any output.
+/// Install the interrupt handlers and make a closed output pipe harmless.
+/// Call once, first thing in `main`, before any output.
 ///
 /// Unix: a signal the process started with ignored (`nohup`, a launcher
 /// that ignores Ctrl-C) keeps being ignored. The prompt's cursor guard
@@ -30,6 +34,7 @@ use socket_patch_core::patch::apply_lock::cleanup_held_lock_on_interrupt;
 /// lock removed second.
 pub fn install() {
     imp::install();
+    socket_patch_core::utils::stdio::tolerate_broken_pipes();
 }
 
 #[cfg(unix)]
@@ -51,9 +56,12 @@ mod imp {
     }
 
     pub(super) fn install() {
-        // SAFETY: SIG_DFL is a valid disposition for SIGPIPE.
+        // The Rust runtime already ignores SIGPIPE; said here because the
+        // broken-pipe handling above depends on the write returning EPIPE
+        // rather than the signal ending the process.
+        // SAFETY: SIG_IGN is a valid disposition for SIGPIPE.
         unsafe {
-            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
         }
         for sig in SIGNALS {
             // SAFETY: plain sigaction calls with zeroed, then filled,

@@ -116,6 +116,15 @@ fn human_wet_reports_already_original_and_not_installed() {
             && stderr.contains(&format!("  - {ghost_purl}")),
         "the not-installed warning block must print on stderr; stderr=\n{stderr}"
     );
+    // Its record is dropped with nothing restored: the warning says what
+    // that leaves if the crawl merely missed a copy, and the remedy.
+    assert!(
+        stderr.contains(
+            "Nothing was restored for it and its record was removed: a copy this run did \
+             not find stays patched until the package is reinstalled."
+        ),
+        "stderr=\n{stderr}"
+    );
 }
 
 /// `--verbose` per-file details on a hash-mismatch failure: the humanized

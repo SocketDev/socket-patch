@@ -5,8 +5,9 @@ use socket_patch_core::utils::socket_cli_config;
 #[tokio::main]
 async fn main() {
     // Must precede any output: clap help writes to a possibly-already-closed
-    // pipe. Ctrl-C / SIGTERM / SIGHUP remove a held `.socket/apply.lock`
-    // before the signal ends the process (see `interrupt`).
+    // pipe, which from here on stops the printing rather than the run.
+    // Ctrl-C / SIGTERM / SIGHUP remove a held `.socket/apply.lock` before
+    // the signal ends the process (see `interrupt`).
     socket_patch_cli::interrupt::install();
 
     // Accept the JS socket-cli's SOCKET_CLI_* peer names (silently —

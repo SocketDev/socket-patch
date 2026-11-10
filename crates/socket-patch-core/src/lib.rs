@@ -1,3 +1,41 @@
+// The four print macros, crate-wide: every call site in the modules below
+// goes through `utils::stdio::print`, so a closed stdout or stderr pipe
+// stops the printing instead of panicking mid-run once the binary has
+// opted in (see `utils::stdio`). Declared before the modules: a
+// `macro_rules!` shadows std's macro only in what follows it. All four are
+// defined whether or not core prints with each today, so the next call
+// site cannot slip past.
+#[allow(unused_macros)]
+macro_rules! println {
+    () => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stdout, true, ::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stdout, true, ::std::format_args!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+macro_rules! eprintln {
+    () => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stderr, true, ::std::format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stderr, true, ::std::format_args!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stdout, false, ::std::format_args!($($arg)*))
+    };
+}
+#[allow(unused_macros)]
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        $crate::utils::stdio::print($crate::utils::stdio::Stream::Stderr, false, ::std::format_args!($($arg)*))
+    };
+}
+
 pub mod api;
 pub mod constants;
 pub mod crawlers;
