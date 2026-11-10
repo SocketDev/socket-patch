@@ -39,6 +39,14 @@ pub(crate) struct InvocationPolicy {
     /// Set once the invocation's warnings were printed (a PATH list runs
     /// one scan per directory; the file was read once).
     pub warned: std::sync::atomic::AtomicBool,
+    /// Whether `repo_root` is a git checkout (rather than `--cwd` standing
+    /// in for one). A bare scan looks for project directories only inside
+    /// a checkout: its root bounds the walk.
+    pub in_git_repo: bool,
+    /// Every project directory this invocation scans (canonical), set when
+    /// it scans more than one: a project among them needs no "scan it
+    /// separately" advice from another's run.
+    pub scanned_dirs: std::sync::OnceLock<Vec<PathBuf>>,
 }
 
 /// Load the policy for `args` (4.5): `--global` scans have no repo and read
@@ -61,9 +69,13 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
             repo_root: cwd,
             warnings: Vec::new(),
             warned: Default::default(),
+            in_git_repo: false,
+            scanned_dirs: Default::default(),
         });
     }
     let (repo_root, mut warnings) = find_repo_root_with_warnings(&cwd);
+    let in_git_repo = socket_patch_core::utils::repo_root::find_git_repo(&cwd)
+        .is_some_and(|repo| repo.trusted && repo.root == repo_root);
     let (policy, load_warnings) = SelectionPolicy::load(&DiskPolicyFs::new(&repo_root), &overrides)
         .map_err(PolicyLoadError::Policy)?;
     warnings.extend(load_warnings);
@@ -72,6 +84,8 @@ pub(crate) fn load_invocation_policy(args: &ScanArgs) -> Result<InvocationPolicy
         repo_root,
         warnings,
         warned: Default::default(),
+        in_git_repo,
+        scanned_dirs: Default::default(),
     })
 }
 
@@ -882,6 +896,8 @@ mod tests {
             repo_root: repo.to_path_buf(),
             warnings,
             warned: Default::default(),
+            in_git_repo: false,
+            scanned_dirs: Default::default(),
         }
     }
 

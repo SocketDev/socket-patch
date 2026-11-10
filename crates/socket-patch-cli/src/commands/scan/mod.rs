@@ -1609,10 +1609,88 @@ fn project_dirs(
     Ok(dirs)
 }
 
-/// Run a hosted or vendored scan once per project directory its PATHs
-/// name, as if each were `--cwd`. The exit code is the worst of the runs.
-/// `--json` takes one directory, so stdout stays one document. Every
-/// directory must be inside the repository root the policy was read from.
+/// The project directories a bare hosted or vendored scan covers, found
+/// by [`discovered_project_dirs`].
+struct DiscoveredDirs {
+    /// `--cwd` (when it is a project) and every project root below it,
+    /// sorted; the flag is [`project_dirs`]'s: only `--cwd` is explicit.
+    dirs: Vec<(PathBuf, bool)>,
+    /// Roots the socket.yml path policy (its built-in test and fixture
+    /// ignores included) left out.
+    ignored: usize,
+    /// The walk gave up before it had seen the whole tree.
+    truncated: bool,
+}
+
+/// Whether this run finds its project directories itself: a hosted or
+/// vendored scan with no PATH, of a project rather than the global
+/// installs, that is the invocation's own run (not one of its
+/// directories), inside a git checkout. The checkout bounds the walk: a
+/// scan from a home directory never goes looking for every project below.
+fn discovers_projects(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
+    args.paths.is_empty()
+        && !args.common.is_global()
+        && args.rollout.carry.is_none()
+        && invocation.in_git_repo
+        && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+}
+
+/// The projects at and below `--cwd`: the roots the in-memory engine
+/// detects for the same checkout (`roots_below`), less the ones the
+/// socket.yml path policy leaves out of a discovered set. `--cwd` itself
+/// is the user's choice, so it is explicit and stays in whenever it is a
+/// project at all (a lockless one included, as before).
+async fn discovered_project_dirs(args: &ScanArgs, invocation: &InvocationPolicy) -> DiscoveredDirs {
+    use socket_patch_core::hosted::memory::roots::roots_below;
+    let cwd = &args.common.cwd;
+    // The socket.yml path policy's verdict on a root (`""` is `--cwd`,
+    // which the user named).
+    let admitted = |rel: &str| {
+        let dir = if rel.is_empty() {
+            cwd.clone()
+        } else {
+            cwd.join(rel)
+        };
+        let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        let Some(project) =
+            socket_patch_core::policy::repo_relative_checked(&invocation.repo_root, &resolved)
+        else {
+            return false;
+        };
+        invocation
+            .policy
+            .admits_root(&socket_patch_core::policy::Root {
+                rel_dir: &project,
+                markers: &policy::dir_markers(&dir),
+                explicit: rel.is_empty(),
+            })
+            .is_ok()
+    };
+    let found = roots_below(cwd, args.common.ecosystems.as_deref(), admitted).await;
+    let mut dirs = Vec::new();
+    let mut ignored = 0;
+    if found.governs_members || !policy::dir_markers(cwd).is_empty() {
+        dirs.push((cwd.clone(), true));
+    }
+    for rel in found.roots.iter().filter(|rel| !rel.is_empty()) {
+        if admitted(rel) {
+            dirs.push((cwd.join(rel), false));
+        } else {
+            ignored += 1;
+        }
+    }
+    DiscoveredDirs {
+        dirs,
+        ignored,
+        truncated: found.truncated,
+    }
+}
+
+/// Run a hosted or vendored scan once per project directory, as if each
+/// were `--cwd`: the directories its PATHs name, or the ones a bare scan
+/// found. The exit code is the worst of the runs. `--json` takes one
+/// directory, so stdout stays one document. Every directory must be
+/// inside the repository root the policy was read from.
 ///
 /// `mode_inferred`: the mode came from `--cwd`'s state rather than
 /// `--mode`, so each directory takes its mode from its own state.
@@ -1621,6 +1699,7 @@ async fn run_project_dirs(
     telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
     mode_inferred: bool,
+    dirs: Vec<(PathBuf, bool)>,
 ) -> i32 {
     let usage = |code: &str, message: &str| {
         usage_error(
@@ -1630,10 +1709,6 @@ async fn run_project_dirs(
             code,
             message,
         )
-    };
-    let dirs = match project_dirs(&args.common.cwd, &args.paths) {
-        Ok(dirs) => dirs,
-        Err((code, message)) => return usage(code, &message),
     };
     if !args.common.is_global() {
         for (dir, _) in &dirs {
@@ -1684,6 +1759,13 @@ async fn run_project_dirs(
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     let carry = rollout::RolloutCarry::new(configured, root);
+    if dirs.len() > 1 {
+        let _ = invocation.scanned_dirs.set(
+            dirs.iter()
+                .map(|(dir, _)| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+                .collect(),
+        );
+    }
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
@@ -1809,7 +1891,50 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
+        let dirs = match project_dirs(&args.common.cwd, &args.paths) {
+            Ok(dirs) => dirs,
+            Err((code, message)) => return scan_usage_error(&args, code, &message),
+        };
+        return Box::pin(run_project_dirs(
+            args,
+            telemetry,
+            invocation,
+            mode_inferred,
+            dirs,
+        ))
+        .await;
+    }
+    // A bare one names none and finds them: every project in the checkout
+    // at or below `--cwd`. `--json` and `--vex` take one directory, so they
+    // scan `--cwd` alone and say which projects were left.
+    let mut unscanned_projects = None;
+    if discovers_projects(&args, invocation) {
+        let found = discovered_project_dirs(&args, invocation).await;
+        let others: Vec<String> = found
+            .dirs
+            .iter()
+            .filter(|(_, explicit)| !explicit)
+            .map(|(dir, _)| render::shown_project_dir(&args.common.cwd, dir))
+            .collect();
+        if !args.common.json && !args.common.silent {
+            for line in render::discovery_notes(found.ignored, found.truncated) {
+                eprintln!("{line}");
+            }
+        }
+        if !others.is_empty() {
+            if args.common.json || args.vex.vex.is_some() {
+                unscanned_projects = Some(others);
+            } else {
+                return Box::pin(run_project_dirs(
+                    args,
+                    telemetry,
+                    invocation,
+                    mode_inferred,
+                    found.dirs,
+                ))
+                .await;
+            }
+        }
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
@@ -1943,6 +2068,13 @@ async fn run_scan(
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
+    if let Some(others) = &unscanned_projects {
+        let detail = render::unscanned_projects_detail(others, args.common.json);
+        if !args.common.json && !args.common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+    }
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
     // consumers get it on the same run-level `warnings[]` channel.
@@ -2591,6 +2723,7 @@ async fn run_scan(
             &filtered_crawled,
             &lockfile_only.entries,
             &all_packages_with_patches,
+            invocation.scanned_dirs.get().map_or(&[], Vec::as_slice),
         ))
         .await;
         if !skipped.is_empty() {

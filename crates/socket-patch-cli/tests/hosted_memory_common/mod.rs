@@ -495,6 +495,7 @@ const SCAN_LEVEL_WARNING_PREFIXES: &[&str] = &[
     "patch_details_failed",
     "gradle_",
     "path_scope_",
+    "projects_not_scanned",
     "vendor_ledger_entry_unwired",
     "manifest_",
     "api_auth_fallback",

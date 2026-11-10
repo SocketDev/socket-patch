@@ -29,6 +29,13 @@ repeated or comma-separated. Hosted and vendored PATH arguments name project
 directories; quote globs to let the CLI expand them. Use one directory per invocation
 with `--json`. Use one project and a distinct output path per `scan --vex` run.
 
+In a monorepo, run `scan` from the repository root. With no PATH, a hosted or vendored
+scan covers every project directory in the git checkout at or below the current
+directory: each directory with its own lockfile is scanned as its own project, under a
+`== <dir> ==` heading. Test and fixture directories are left out unless you name them,
+and `socket.yml` path filters apply. `--json` and `--vex` still report on one directory:
+they scan the current one and list the others in a `projects_not_scanned` warning.
+
 To make selection consistent across contributors and CI, commit a
 [repository policy](configuration.md#repository-patch-policy). To target a specific
 advisory or patch:
