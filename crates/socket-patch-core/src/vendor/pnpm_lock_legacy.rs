@@ -63,9 +63,9 @@ use crate::patch::apply::PatchSources;
 use super::common::refused;
 use super::path::parse_vendor_path_or_machine_absolute;
 use super::pnpm_lock::{
-    dep_entries, drifted, lines_value, lock_has_target_package, ref_record_blocks, removed,
-    revert_block, revert_overrides_line, target_block, DepPair, DepRef, EditCtx, PnpmDialect,
-    KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
+    check_rebuilt_entry, dep_entries, drifted, entry_fields, lines_value, lock_has_target_package,
+    ref_record_blocks, removed, revert_block, revert_overrides_line, target_block, DepPair, DepRef,
+    EditCtx, PnpmDialect, KIND_LOCK_OVERRIDES, KIND_LOCK_PACKAGE,
 };
 use super::source::PackageSource;
 use super::state::{VendorEntry, WiringAction, WiringRecord};
@@ -224,6 +224,7 @@ pub async fn vendor_pnpm_legacy<'a>(
 
 /// Legacy-only lock state: its captured grammar and the canonical root
 /// that pnpm 7/8 embeds in direct dependency specifiers.
+#[derive(Clone)]
 pub(super) struct LegacyLock {
     pub(super) lines: Vec<String>,
     grammar: PnpmLockGrammar,
@@ -641,23 +642,21 @@ fn edit_packages(
         // file: keys are emitted bare by pnpm (never quoted) — captured.
         new_lines.push(format!("  {new_key}:"));
         let mut replaced_resolution = false;
-        for line in &original_lines[1..] {
-            if let Some((field, _repr, _rest)) = parse_key_line(line, 4) {
-                match field {
-                    "resolution" => {
-                        new_lines.push(expected_resolution.clone());
-                        new_lines.push(expected_name.clone());
-                        new_lines.push(format!("    version: {}", ctx.version));
-                        replaced_resolution = true;
-                        continue;
-                    }
-                    // Re-emitted canonically after resolution / dropped
-                    // (pnpm drops `deprecated:` for file: entries — captured).
-                    "name" | "version" | "deprecated" => continue,
-                    _ => {}
+        // Field by field ([`entry_fields`]), so a dropped field goes with
+        // the lines under it (a `deprecated:` block scalar).
+        for (field, lines) in entry_fields(&original_lines[1..]) {
+            match field {
+                Some("resolution") => {
+                    new_lines.push(expected_resolution.clone());
+                    new_lines.push(expected_name.clone());
+                    new_lines.push(format!("    version: {}", ctx.version));
+                    replaced_resolution = true;
                 }
+                // Re-emitted canonically after resolution / dropped
+                // (pnpm drops `deprecated:` for file: entries — captured).
+                Some("name" | "version" | "deprecated") => {}
+                _ => new_lines.extend(lines.iter().cloned()),
             }
-            new_lines.push(line.clone());
         }
         if !replaced_resolution {
             return Err(format!(
@@ -665,6 +664,14 @@ fn edit_packages(
                 block.key
             ));
         }
+        check_rebuilt_entry(
+            &original_lines,
+            &new_lines,
+            &["resolution", "name", "version", "deprecated"],
+            (ctx.integrity, ctx.spec),
+            &[("name", ctx.name), ("version", ctx.version)],
+        )
+        .map_err(|why| format!("{why} (`{}`)", block.key))?;
         let old_key = block.key.clone();
         swap_block_sorted(lines, "packages", &old_key, &new_key, &new_lines)?;
         wiring.push(WiringRecord {
@@ -2697,6 +2704,38 @@ packages:
             !fx.root().join(fx.rel_tgz()).exists(),
             "an artifact nothing references is removed"
         );
+    }
+
+    /// The legacy rebuild drops `deprecated:` whole: a message pnpm wrote
+    /// as a block scalar goes with its continuation lines, which used to
+    /// stay behind without their key and leave a lock that is not YAML.
+    #[tokio::test]
+    async fn packages_entry_rebuild_drops_a_multi_line_deprecation_whole() {
+        const ONE_LINE: &str = "CoEA==}\n    deprecated: use String.prototype.padStart()\n";
+        for (before, tag) in [(T7_BEFORE_LOCK, "5.4"), (T8_BEFORE_LOCK, "6.0")] {
+            assert_eq!(before.matches(ONE_LINE).count(), 1, "{tag}");
+            let lock = before.replace(
+                ONE_LINE,
+                "CoEA==}\n    deprecated: |-\n      use String.prototype.padStart()\n      \
+                 it is in every engine now\n",
+            );
+            let fx = fixture_with(T_BEFORE_PKG, &lock).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            let vendored = fx.read(PNPM_LOCK).await;
+            assert!(
+                !vendored.contains("it is in every engine now"),
+                "{tag}: {vendored}"
+            );
+            assert!(
+                vendored.contains("    name: left-pad\n    version: 1.3.0\n    dev: false\n"),
+                "{tag}: {vendored}"
+            );
+
+            let outcome = revert_pnpm_legacy(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert_eq!(fx.read(PNPM_LOCK).await, lock, "{tag}: lock byte-restored");
+        }
     }
 
     /// LIVENESS CONTRACT ([`RevertOutcome::drift_skipped`]): a pair already

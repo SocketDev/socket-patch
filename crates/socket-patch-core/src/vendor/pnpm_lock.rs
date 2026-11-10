@@ -360,6 +360,13 @@ impl NpmLockBackend for PnpmBackend {
         let (lock_changed, lock_warning) = lock
             .edit(&ctx, &mut wiring)
             .map_err(|e| format!("{PNPM_LOCK} surgery failed: {e}"))?;
+        if lock_changed && !lock.reads_back(&ctx).unwrap_or(false) {
+            return Err(format!(
+                "{PNPM_LOCK} surgery failed: the rewritten lock does not read back as vendored \
+                 for {}@{}; nothing was written",
+                ctx.name, ctx.version
+            ));
+        }
 
         // Only modern locks mirror overrides into pnpm-workspace.yaml.
         // Legacy pnpm reads package.json alone; creating a workspace changes
@@ -525,6 +532,32 @@ impl ProjectLock {
                 Ok((changed, None))
             }
             Self::Legacy(lock) => lock.edit(ctx, wiring),
+        }
+    }
+
+    /// Whether the edited lock reads back as vendored: the same edit, run
+    /// over a copy of the lines it produced, must find nothing left to do,
+    /// as the next run's in-sync check will. A splice the line reader does
+    /// not see as the entry it wrote would be re-edited on every run, so it
+    /// is caught here, before the lock is written.
+    fn reads_back(&self, ctx: &EditCtx<'_>) -> Result<bool, String> {
+        let mut scratch = Vec::new();
+        match self {
+            Self::V9(lines) => {
+                let mut copy: Vec<String> = lines.read().clone();
+                let mut changed = false;
+                for edit in [
+                    edit_overrides::<Vec<String>>,
+                    edit_importers::<Vec<String>>,
+                    edit_packages::<Vec<String>>,
+                    edit_snapshot_rekey::<Vec<String>>,
+                    edit_snapshot_refs::<Vec<String>>,
+                ] {
+                    changed |= edit(&mut copy, ctx, &mut scratch)?;
+                }
+                Ok(!changed)
+            }
+            Self::Legacy(lock) => Ok(!lock.clone().edit(ctx, &mut scratch)?.0),
         }
     }
 }
@@ -2617,19 +2650,22 @@ fn edit_packages<L: EditLines>(
             block.rest_suffix()
         ));
         let mut replaced_resolution = false;
-        for line in &original_lines[1..] {
-            if line.trim_start().starts_with("resolution:") {
-                new_lines.push(expected_resolution.clone());
-                new_lines.push(format!("    version: {}", ctx.version));
-                replaced_resolution = true;
-            } else if line.starts_with("    deprecated:") || line.starts_with("    version:") {
-                // deprecated: dropped (pnpm drops it for file: entries);
-                // version: re-inserted canonically after resolution. Exact
-                // 4-space match: `version`/`deprecated` are also real npm
-                // package names, and a PEER DEP on one puts the same
-                // spelling at 6-space indent — those lines stay verbatim.
-            } else {
-                new_lines.push(line.clone());
+        // Field by field ([`entry_fields`]): `resolution`, `version` and
+        // `deprecated` are also real npm package names, and a peer
+        // dependency on one puts the same spelling one level deeper, in
+        // another field's lines, which stay as they are.
+        for (field, lines) in entry_fields(&original_lines[1..]) {
+            match field {
+                Some("resolution") => {
+                    new_lines.push(expected_resolution.clone());
+                    new_lines.push(format!("    version: {}", ctx.version));
+                    replaced_resolution = true;
+                }
+                // deprecated: dropped (pnpm drops it for file: entries),
+                // with the lines of a block scalar under it. version:
+                // re-inserted canonically after resolution.
+                Some("deprecated" | "version") => {}
+                _ => new_lines.extend(lines.iter().cloned()),
             }
         }
         if !replaced_resolution {
@@ -2638,6 +2674,14 @@ fn edit_packages<L: EditLines>(
                 block.key
             ));
         }
+        check_rebuilt_entry(
+            &original_lines,
+            &new_lines,
+            &["resolution", "version", "deprecated"],
+            (ctx.integrity, ctx.spec),
+            &[("version", ctx.version)],
+        )
+        .map_err(|why| format!("{why} (`{}`)", block.key))?;
         lines
             .write()
             .splice(block.header..block.end, new_lines.clone());
@@ -4224,6 +4268,87 @@ async fn unwind_override_surfaces(
             let _ = atomic_write_bytes_preserving_mode(&ws_path, orig).await;
         }
     }
+}
+
+// ───────────────────────── packages entry rebuild ─────────────────────────
+
+/// The body of a packages entry (its lines after the key line) as fields:
+/// each 4-space key line with every line under it — a nested map's
+/// entries, a block scalar's continuation lines — so the rebuild carries
+/// over, replaces or drops a field whole. Lines ahead of the first key
+/// form a field with no name.
+pub(super) fn entry_fields(body: &[String]) -> Vec<(Option<&str>, &[String])> {
+    let mut fields = Vec::new();
+    let mut name = None;
+    let mut start = 0;
+    for (i, line) in body.iter().enumerate() {
+        let Some((field, _repr, _rest)) = parse_key_line(line, 4) else {
+            continue;
+        };
+        if i > start || name.is_some() {
+            fields.push((name, &body[start..i]));
+        }
+        name = Some(field);
+        start = i;
+    }
+    if start < body.len() {
+        fields.push((name, &body[start..]));
+    }
+    fields
+}
+
+/// Refuse a rebuilt packages entry that does not read back as the
+/// original with only the rebuild's own fields changed. Both blocks are
+/// parsed as YAML (the reader pnpm applies, where the splices use a line
+/// grammar): the rebuilt one must parse, resolve to `integrity` /
+/// `tarball`, read each of `scalars` (`(field, value)`) as written, and
+/// hold every field outside `owned` exactly as the original did. An
+/// original this parser cannot read is not judged; its unowned lines are
+/// carried over as they are either way.
+pub(super) fn check_rebuilt_entry(
+    original: &[String],
+    rebuilt: &[String],
+    owned: &[&str],
+    (integrity, tarball): (&str, &str),
+    scalars: &[(&str, &str)],
+) -> Result<(), String> {
+    let read = |lines: &[String]| -> Option<serde_json::Map<String, Value>> {
+        let doc: Value = serde_saphyr::from_str(&lines.join("\n")).ok()?;
+        let mut entries = doc.as_object()?.values();
+        match (entries.next()?, entries.next()) {
+            (Value::Object(entry), None) => Some(entry.clone()),
+            _ => None,
+        }
+    };
+    let Some(before) = read(original) else {
+        return Ok(());
+    };
+    let after = read(rebuilt).ok_or("the rewritten packages entry is not valid YAML")?;
+    let resolution = after.get("resolution");
+    let field = |name: &str| resolution.and_then(|r| r.get(name)).and_then(Value::as_str);
+    if field("integrity") != Some(integrity) || field("tarball") != Some(tarball) {
+        return Err(
+            "the rewritten packages entry does not resolve to the vendored tarball".to_string(),
+        );
+    }
+    // A line left behind without its key folds into the scalar above it,
+    // which still parses: the value is what gives it away.
+    for (name, value) in scalars {
+        if after.get(*name).and_then(Value::as_str) != Some(*value) {
+            return Err(format!(
+                "the rewritten packages entry does not read `{name}` back as {value}"
+            ));
+        }
+    }
+    let unowned = |name: &&String| !owned.contains(&name.as_str());
+    for name in before.keys().chain(after.keys()).filter(unowned) {
+        if before.get(name) != after.get(name) {
+            return Err(format!(
+                "the rewritten packages entry does not carry `{name}` over unchanged"
+            ));
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────────────── wiring record helpers ──────────────────────────
@@ -6847,6 +6972,91 @@ snapshots:
         );
         assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
         assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
+    /// The packages entry rebuild owns three fields — `resolution`,
+    /// `version`, `deprecated` — and carries every other line through as it
+    /// is. A deprecation message pnpm wrote as a block scalar goes with its
+    /// continuation lines, and a peer dependency NAMED `resolution` (a
+    /// deeper line of the same spelling) is not the entry's resolution. The
+    /// rebuild used to keep the scalar's continuation lines without their
+    /// key and rewrite each deeper `resolution:` line, leaving a lock that
+    /// is not YAML while reporting the package vendored.
+    #[tokio::test]
+    async fn packages_entry_rebuild_carries_untouched_fields_whole() {
+        const TAIL: &str = "    deprecated: use String.prototype.padStart()\n\nsnapshots:\n";
+        assert_eq!(P1_BEFORE_LOCK.matches(TAIL).count(), 1);
+        let lock = P1_BEFORE_LOCK.replace(
+            TAIL,
+            "    engines: {node: '>=4'}\n    deprecated: |-\n      use String.prototype.padStart()\n      \
+             it is in every engine now\n    peerDependencies:\n      resolution: '*'\n    \
+             peerDependenciesMeta:\n      resolution:\n        optional: true\n\nsnapshots:\n",
+        );
+        let fx = fixture_with(P1_BEFORE_PKG, &lock).await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success, "{:?}", result.error);
+        let rel = fx.rel_tgz();
+        let vendored = fx.read(PNPM_LOCK).await;
+        let block = format!(
+            "  left-pad@file:{rel}:\n    resolution: {{integrity: {}, tarball: file:{rel}}}\n    \
+             version: 1.3.0\n    engines: {{node: '>=4'}}\n    peerDependencies:\n      \
+             resolution: '*'\n    peerDependenciesMeta:\n      resolution:\n        \
+             optional: true\n\nsnapshots:\n",
+            fx.actual_integrity().await
+        );
+        assert!(vendored.contains(&block), "{vendored}");
+        assert!(
+            !vendored.contains("it is in every engine now"),
+            "{vendored}"
+        );
+
+        let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(fx.read(PNPM_LOCK).await, lock, "lock byte-restored");
+    }
+
+    /// The rebuilt entry is read back as YAML before it is spliced in: it
+    /// must parse, carry the resolution it was built for, and hold every
+    /// field the rebuild does not own exactly as the original did.
+    #[test]
+    fn a_rebuilt_packages_entry_that_does_not_read_back_is_refused() {
+        let lines = |text: &str| -> Vec<String> { text.lines().map(str::to_string).collect() };
+        let original = lines(
+            "  left-pad@1.3.0:\n    resolution: {integrity: sha512-AAAA}\n    engines: {node: '>=4'}\n    \
+             deprecated: old\n    peerDependencies:\n      resolution: '*'",
+        );
+        let owned = ["resolution", "version", "deprecated"];
+        let check = |rebuilt: &str| {
+            check_rebuilt_entry(
+                &original,
+                &lines(rebuilt),
+                &owned,
+                ("sha512-BBBB", "file:x.tgz"),
+                &[("version", "1.3.0")],
+            )
+        };
+        const HEAD: &str = "  left-pad@file:x.tgz:\n    resolution: {integrity: sha512-BBBB, tarball: file:x.tgz}\n    version: 1.3.0\n";
+        let good = format!(
+            "{HEAD}    engines: {{node: '>=4'}}\n    peerDependencies:\n      resolution: '*'"
+        );
+        assert_eq!(check(&good), Ok(()));
+
+        // Not YAML: a continuation line left without its key.
+        let orphan = format!("{HEAD}      second line\n    engines: {{node: '>=4'}}\n    peerDependencies:\n      resolution: '*'");
+        assert!(check(&orphan).is_err());
+        // A field the rebuild does not own, lost and changed.
+        let lost = format!("{HEAD}    peerDependencies:\n      resolution: '*'");
+        let error = check(&lost).unwrap_err();
+        assert!(error.contains("`engines`"), "{error}");
+        let changed = format!(
+            "{HEAD}    engines: {{node: '>=4'}}\n    peerDependencies:\n      resolution: '^1'"
+        );
+        let error = check(&changed).unwrap_err();
+        assert!(error.contains("`peerDependencies`"), "{error}");
+        // A resolution other than the one the entry was rebuilt for.
+        let other = good.replace("sha512-BBBB", "sha512-CCCC");
+        assert!(check(&other).is_err());
     }
 
     #[tokio::test]
