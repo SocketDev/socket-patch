@@ -2460,16 +2460,25 @@ async fn scan_project(
     // Protect before querying/selecting, in every mode and in dry-run previews.
     let user_patches = super::user_patches::inspect(&args.common).await;
     let mut user_patch_withheld = 0usize;
+    // Of those, the ones held back only because a project file could not
+    // be read: a broken file, not a patch the project declares.
+    let mut user_patch_unreadable = 0usize;
     let mut user_patch_skips = Vec::new();
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
             return true;
         }
-        let detail =
-            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts);
+        let unreadable = user_patches.unreadable_only(&package.purl);
+        let detail = super::user_patches::detail(
+            &package.purl,
+            &sources,
+            args.common.allow_patch_conflicts,
+            unreadable,
+        );
         if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
+            user_patch_unreadable += usize::from(unreadable);
             if !user_patch_skips
                 .iter()
                 .any(|event: &PatchEvent| event.purl.as_deref() == Some(package.purl.as_str()))
@@ -2602,8 +2611,19 @@ async fn scan_project(
             // A project the policy skipped as a whole is not an empty one,
             // and neither is one whose every package the consent gate held.
             if user_patch_withheld > 0 {
+                for line in render::user_patch_withheld_lines(
+                    user_patch_withheld - user_patch_unreadable,
+                    user_patch_unreadable,
+                ) {
+                    println!("{line}");
+                }
+            } else if !lockfile_only.unsupported.is_empty() {
+                // A lockfile or layout that could not be read is why
+                // nothing was found (its warning is on stderr): an install
+                // is not the fix.
                 println!(
-                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-patch-conflicts to scan them anyway."
+                    "{}",
+                    render::no_packages_unreadable(lockfile_only.unsupported.len())
                 );
             } else if !policy.root_excluded() {
                 println!(

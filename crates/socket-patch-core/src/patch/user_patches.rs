@@ -31,6 +31,10 @@ struct Evidence {
     name: String,
     version: Option<String>,
     source: String,
+    /// The file could not be read or parsed, so what it declares is not
+    /// known: it protects its ecosystem, and the remedy is to fix the
+    /// file (see [`UserPatchIndex::unreadable_only`]).
+    unreadable: bool,
 }
 
 impl UserPatchIndex {
@@ -132,11 +136,7 @@ impl UserPatchIndex {
         // A read the repository bound refused carries the `NotFound` kind,
         // but the lock is there.
         if crate::utils::repo_root::is_refused_read(e) || e.kind() != std::io::ErrorKind::NotFound {
-            self.unknown(
-                "npm",
-                Path::new(rel),
-                &format!("cannot inspect patch metadata: {e}"),
-            );
+            self.unreadable("npm", Path::new(rel), &format!("cannot be read: {e}"));
         }
     }
 
@@ -434,11 +434,7 @@ impl UserPatchIndex {
             // Fail closed when the refused file can't be read through the
             // link either, instead of reading as absent.
             Err(e) if refused || crate::utils::repo_root::is_refused_read(&e) => {
-                self.unknown(
-                    ecosystem,
-                    &file.shown,
-                    &format!("cannot inspect patch metadata: {e}"),
-                );
+                self.unreadable(ecosystem, &file.shown, &format!("cannot be read: {e}"));
                 None
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -458,11 +454,7 @@ impl UserPatchIndex {
                 None
             }
             Err(e) => {
-                self.unknown(
-                    ecosystem,
-                    &file.shown,
-                    &format!("cannot inspect patch metadata: {e}"),
-                );
+                self.unreadable(ecosystem, &file.shown, &format!("cannot be read: {e}"));
                 None
             }
         }
@@ -731,6 +723,26 @@ impl UserPatchIndex {
     /// protect every version of that name; known exact versions don't block an
     /// unrelated release. Scoped npm identities remain case-sensitive.
     pub fn conflicts(&self, purl: &str) -> Vec<String> {
+        self.evidence_for(purl)
+            .into_iter()
+            .map(|e| e.source.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
+    /// Whether `purl` is protected only by files that could not be read or
+    /// parsed (invalid JSON or YAML, a permission error), and by no patch or
+    /// replacement the project is known to declare. Its
+    /// [`Self::conflicts`] then name a broken file, not a conflict: the
+    /// remedy is to fix the file. False when nothing protects `purl`.
+    pub fn unreadable_only(&self, purl: &str) -> bool {
+        let evidence = self.evidence_for(purl);
+        !evidence.is_empty() && evidence.iter().all(|e| e.unreadable)
+    }
+
+    /// Every entry that protects this release.
+    fn evidence_for(&self, purl: &str) -> Vec<&Evidence> {
         let normalized = normalize_purl(purl);
         let base = strip_purl_qualifiers(&normalized);
         let Some((ecosystem, coordinate)) =
@@ -777,9 +789,6 @@ impl UserPatchIndex {
                             }
                     })
             })
-            .map(|e| e.source.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
             .collect()
     }
 
@@ -789,15 +798,33 @@ impl UserPatchIndex {
             name: name.into(),
             version: version.map(str::to_owned),
             source: path.display().to_string(),
+            unreadable: false,
         });
     }
 
+    /// Metadata that was read but cannot be resolved to packages (a
+    /// malformed declaration, a dynamic patch directory): it protects every
+    /// package of `ecosystem`.
     fn unknown(&mut self, ecosystem: &'static str, path: &Path, reason: &str) {
         self.entries.push(Evidence {
             ecosystem,
             name: String::new(),
             version: None,
             source: format!("{} ({reason})", path.display()),
+            unreadable: false,
+        });
+    }
+
+    /// A file that could not be read or parsed (`reason` says which, with
+    /// the error): what it declares is not known, so it protects every
+    /// package of `ecosystem` until it is fixed.
+    fn unreadable(&mut self, ecosystem: &'static str, path: &Path, reason: &str) {
+        self.entries.push(Evidence {
+            ecosystem,
+            name: String::new(),
+            version: None,
+            source: format!("{} ({reason})", path.display()),
+            unreadable: true,
         });
     }
 
@@ -806,11 +833,7 @@ impl UserPatchIndex {
             Ok(text) => Some(strip_bom(&text).to_owned()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
-                self.unknown(
-                    ecosystem,
-                    path,
-                    &format!("cannot inspect patch metadata: {e}"),
-                );
+                self.unreadable(ecosystem, path, &format!("cannot be read: {e}"));
                 None
             }
         }
@@ -825,11 +848,7 @@ impl UserPatchIndex {
         match serde_json::from_str(&crate::vendor::bun_lock_text::strip_jsonc(text)) {
             Ok(value) => Some(value),
             Err(e) => {
-                self.unknown(
-                    ecosystem,
-                    path,
-                    &format!("cannot inspect patch metadata: {e}"),
-                );
+                self.unreadable(ecosystem, path, &format!("not valid JSON: {e}"));
                 None
             }
         }
@@ -899,7 +918,7 @@ impl UserPatchIndex {
                 documents
             }
             Err(e) => {
-                self.unknown("npm", path, &format!("cannot inspect patch metadata: {e}"));
+                self.unreadable("npm", path, &format!("not valid YAML: {e}"));
                 Vec::new()
             }
         }
@@ -1987,6 +2006,58 @@ mod tests {
                 .conflicts("pkg:golang/example.com/other@v1.0.0")
                 .is_empty());
         }
+    }
+
+    /// A file that cannot be parsed protects its ecosystem like any
+    /// unknown metadata, but it is told apart from a patch the project
+    /// declares: the remedy is to fix the file, and the source says what is
+    /// wrong with it.
+    #[tokio::test]
+    async fn an_unparseable_file_is_told_apart_from_a_declared_patch() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "package.json", "{ \"name\": ");
+        let index = UserPatchIndex::discover(tmp.path()).await;
+        let sources = index.conflicts("pkg:npm/lodash@4.17.20");
+        assert_eq!(sources.len(), 1, "{sources:?}");
+        assert!(
+            sources[0].ends_with(
+                "package.json (not valid JSON: EOF while parsing a value at line 1 column 10)"
+            ),
+            "{sources:?}"
+        );
+        assert!(index.unreadable_only("pkg:npm/lodash@4.17.20"));
+        assert!(!index.unreadable_only("pkg:pypi/lodash@4.17.20"));
+
+        // A declared patch, and metadata that is readable but not
+        // understood, are not "fix the file" cases.
+        for text in [
+            r#"{"pnpm":{"patchedDependencies":{"lodash":"x.patch"}}}"#,
+            r#"{"patchedDependencies": "invalid"}"#,
+            r#"{"scripts":{"postinstall":"patch-package --patch-dir $PATCH_DIR"}}"#,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), "package.json", text);
+            let index = UserPatchIndex::discover(tmp.path()).await;
+            assert!(
+                !index.conflicts("pkg:npm/lodash@4.17.20").is_empty(),
+                "{text}"
+            );
+            assert!(!index.unreadable_only("pkg:npm/lodash@4.17.20"), "{text}");
+        }
+
+        // An unreadable lock is the same class.
+        let mut index = UserPatchIndex::default();
+        index.unreadable_lock(
+            "pnpm-lock.yaml",
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(index.unreadable_only("pkg:npm/lodash@4.17.20"));
+        assert!(
+            index.conflicts("pkg:npm/lodash@4.17.20")[0]
+                .starts_with("pnpm-lock.yaml (cannot be read: "),
+            "{:?}",
+            index.conflicts("pkg:npm/lodash@4.17.20")
+        );
     }
 
     #[tokio::test]

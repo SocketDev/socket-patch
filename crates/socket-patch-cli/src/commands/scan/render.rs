@@ -242,6 +242,17 @@ pub(super) fn lockfile_only_note(n: usize) -> String {
     )
 }
 
+/// What an empty crawl says when `warnings` lockfiles or layouts could not
+/// be read (each has its warning on stderr): that is why nothing was found,
+/// so the generic "install first" hint would send the user the wrong way.
+pub(crate) fn no_packages_unreadable(warnings: usize) -> String {
+    if warnings == 1 {
+        "No packages found (see the warning).".to_string()
+    } else {
+        "No packages found (see the warnings).".to_string()
+    }
+}
+
 /// What an empty crawl says, naming the filter that emptied it when there
 /// was one (`--ecosystems`, PATH scoping) instead of a generic
 /// "install first" hint.
@@ -263,6 +274,35 @@ pub(crate) fn no_packages_message(
         return format!("No {} packages found.", list.join("/"));
     }
     "No packages found. Run your package manager's install first.".to_string()
+}
+
+/// What a scan says when the consent gate held back every package it
+/// found: `declared` packages the project patches itself, and `unreadable`
+/// ones held back only because a project file could not be read. A broken
+/// file is fixed, not overridden, so only the first line names
+/// `--allow-patch-conflicts`.
+pub(crate) fn user_patch_withheld_lines(declared: usize, unreadable: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if unreadable > 0 {
+        lines.push(format!(
+            "{} not scanned: this project's own patches could not be checked (see the \
+             warnings). Fix the file they name and run again.",
+            plural(unreadable, "package was", "packages were")
+        ));
+    }
+    if declared > 0 {
+        let (was, them) = if declared == 1 {
+            ("was", "it")
+        } else {
+            ("were", "them")
+        };
+        lines.push(format!(
+            "{} protected by this project's own patches and {was} not scanned (see the \
+             warnings). Pass --allow-patch-conflicts to scan {them} anyway.",
+            plural(declared, "package is", "packages are")
+        ));
+    }
+    lines
 }
 
 /// A discovered project directory as the scan names it: relative to
@@ -926,6 +966,15 @@ mod tests {
             no_packages_message(false, Some(&ecos), &[]),
             "No pypi/cargo packages found."
         );
+        // A lockfile that could not be read explains the empty result.
+        assert_eq!(
+            no_packages_unreadable(1),
+            "No packages found (see the warning)."
+        );
+        assert_eq!(
+            no_packages_unreadable(2),
+            "No packages found (see the warnings)."
+        );
         let generic = no_packages_message(false, Some(&[]), &[]);
         assert_eq!(
             generic,
@@ -1047,6 +1096,35 @@ mod tests {
             line.starts_with("  pkg:npm/a@1.0.0: fixes CVE-1; \u{1b}[33mstill unpatched: "),
             "{line:?}"
         );
+    }
+
+    #[test]
+    fn user_patch_withheld_lines_separate_broken_files_from_declared_patches() {
+        assert_eq!(
+            user_patch_withheld_lines(0, 2),
+            [
+                "2 packages were not scanned: this project's own patches could not be checked \
+              (see the warnings). Fix the file they name and run again."
+            ]
+        );
+        assert_eq!(
+            user_patch_withheld_lines(3, 0),
+            [
+                "3 packages are protected by this project's own patches and were not scanned \
+              (see the warnings). Pass --allow-patch-conflicts to scan them anyway."
+            ]
+        );
+        let both = user_patch_withheld_lines(1, 1);
+        assert_eq!(both.len(), 2);
+        assert!(
+            both[0].starts_with("1 package was not scanned: "),
+            "{both:?}"
+        );
+        assert!(
+            both[1].starts_with("1 package is protected by this project's own patches and was "),
+            "{both:?}"
+        );
+        assert!(user_patch_withheld_lines(0, 0).is_empty());
     }
 
     #[test]

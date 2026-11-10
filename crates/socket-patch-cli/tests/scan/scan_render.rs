@@ -361,6 +361,107 @@ async fn scan_human_preview_renders_vulnerability_details() {
     }
 }
 
+/// A `package.json` that is not valid JSON may declare project patches
+/// nobody can read, so its packages are left alone. The run says that the
+/// file is broken and to fix it. It does not call the packages "protected
+/// by project patches", and it does not advise switching the check off.
+#[tokio::test]
+async fn scan_human_invalid_package_json_says_to_fix_the_file() {
+    let mock = MockServer::start().await;
+    let tmp = minimist_project(b"x\n");
+    std::fs::write(tmp.path().join("package.json"), "{ \"name\": ").unwrap();
+
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "1 package was not scanned: this project's own patches could not be checked (see the \
+         warnings). Fix the file they name and run again.\n"
+    );
+    let warning = stderr
+        .lines()
+        .find(|l| l.starts_with("Warning: pkg:npm/minimist@1.2.2: "))
+        .unwrap_or_else(|| panic!("the package's warning must print; stderr={stderr}"));
+    assert!(
+        warning.starts_with(
+            "Warning: pkg:npm/minimist@1.2.2: not patched, because this project's own patches \
+             for it could not be checked: "
+        ) && warning.ends_with(
+            "package.json (not valid JSON: EOF while parsing a value at line 1 column 10). Fix \
+             that file and run again."
+        ),
+        "{warning}"
+    );
+    for output in [&stdout, &stderr] {
+        assert!(!output.contains("--allow-patch-conflicts"), "{output}");
+        assert!(!output.contains("protected by"), "{output}");
+    }
+    assert!(recorded(&mock).await.is_empty(), "nothing was queried");
+
+    // A patch the project does declare keeps the consent wording.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"pnpm":{"patchedDependencies":{"minimist":"missing.patch"}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "1 package is protected by this project's own patches and was not scanned (see the \
+         warnings). Pass --allow-patch-conflicts to scan it anyway.\n"
+    );
+    assert!(
+        stderr.contains("protected by project patch/replacement metadata in "),
+        "{stderr}"
+    );
+}
+
+/// A `package-lock.json` that is not JSON, with nothing installed: the
+/// scan finds no package, and says why. Before, it printed only "Run your
+/// package manager's install first", which is not the problem.
+#[tokio::test]
+async fn scan_human_unparseable_package_lock_warns_and_names_the_file() {
+    let mock = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"x","version":"1.0.0","dependencies":{"minimist":"1.2.2"}}"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("package-lock.json"), "this is not json").unwrap();
+
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), extra);
+        assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+        assert!(
+            stderr.contains(
+                "Warning: package-lock.json is not valid JSON (expected ident at line 1 column \
+                 2), so the packages it lists were NOT scanned. Fix or regenerate it (`npm \
+                 install --package-lock-only`) and run again."
+            ),
+            "stderr={stderr}"
+        );
+        assert_eq!(
+            stdout, "No packages found (see the warning).\n",
+            "stderr={stderr}"
+        );
+    }
+
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert!(
+        doc["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "npm_lock_invalid"
+                && w["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("package-lock.json is not valid JSON ")))),
+        "{doc:#}"
+    );
+}
+
 /// When every detail fetch fails, the human path prints ONE Error line that
 /// names the package and the cause (no per-package Warning repeating it).
 #[tokio::test]

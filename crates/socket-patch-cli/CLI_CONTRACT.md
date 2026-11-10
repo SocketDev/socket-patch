@@ -252,7 +252,19 @@ the named package conservatively. Matching is conservative across copies and
 workspace members: one declaration protects every selected copy of that release.
 Unreadable/malformed metadata, dynamic patch directories, or a workspace glob the
 bounded reader cannot inspect protect the affected ecosystem with an explanatory
-conflict diagnostic. Filesystem inspection never executes hooks or fetches patch
+conflict diagnostic. A file that could not be read or parsed at all (a
+`package.json` that is not valid JSON, a lock that is not valid YAML, a permission
+error) is a broken file, not a conflict, and is reported as one: the
+`user_patch_conflict` text reads `<purl>: not patched, because this project's own
+patches for it could not be checked: <file> (not valid JSON: <error>). Fix that
+file and run again.`, and a scan whose every package was held back this way ends
+`N packages were not scanned: this project's own patches could not be checked (see
+the warnings). Fix the file they name and run again.` Neither names
+`--allow-patch-conflicts`: switching the check off is not the remedy for a syntax
+error (the flag still lifts the gate, as before). The code, the `skipped` events
+and the exit code are unchanged. A scan held back by patches the project does
+declare ends `N packages are protected by this project's own patches and were not
+scanned (see the warnings). Pass --allow-patch-conflicts to scan them anyway.` Filesystem inspection never executes hooks or fetches patch
 URLs. Arbitrary scripts, external build pipelines, unrecorded edits to files the
 Socket patch does not touch, and global-install patch declarations cannot be
 identified reliably; rejecting unknown file drift remains the fallback. This is
@@ -2084,6 +2096,7 @@ outcome for a selected record, rather than inferring a write from exit 0.
 | `serialize_failed`    | vex                              | The built document could not be serialized (exit 2). |
 | `apply_failed`        | apply                            | apply pipeline error before any patch ran (never a manifest load failure — see `manifest_invalid` / `manifest_unreadable`), or the run-level code of a run whose patches failed. |
 | `yarn_pnp_unsupported` | apply                           | A yarn-berry Plug'n'Play layout with an npm patch in scope: refused, nothing written (exit 1). |
+| `npm_lock_invalid` | scan run-level `warnings[]` | scan (additive): `package-lock.json` / `npm-shrinkwrap.json` is there but is not JSON (truncated, a merge conflict), so the packages it lists were not read. `<file> is not valid JSON (<error>), so the packages it lists were NOT scanned. Fix or regenerate it (\`npm install --package-lock-only\`) and run again.` Human: one `Warning:` line on stderr, and a scan that then finds no package at all ends `No packages found (see the warning).` instead of advising an install (the same line follows any other unreadable-lockfile or layout warning: `bun_lockb_invalid`, `gem_lock_unsupported`, the Plug'n'Play refusals). Status and exit are unchanged (0): before, the lockfile was not mentioned at all. The hosted in-memory engine reports the same code among its warnings. |
 | `repair_failed`       | repair                           | repair pipeline error (an invalid `--download-mode`); never a manifest load failure. |
 | `remove_failed`       | remove                           | Could not write the modified manifest. |
 | `not_found`           | remove                           | `status: "notFound"`: no manifest entry, vendor-ledger entry or hosted pin matches the identifier (exit 1). |
