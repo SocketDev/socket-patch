@@ -5250,8 +5250,10 @@ mod tests {
     // ---- hostile-ledger tamper guards (path traversal) ----------------------
     // The ledgers are committed files an attacker can edit: a recorded
     // lockfile name must never make the wiring probes READ outside the
-    // project root. With nothing discovered the probes fall back to the
-    // ledger's recorded files, which is the path under test.
+    // project root. With nothing discovered the hosted probe and the
+    // vendored prune GC's keep check fall back to the ledger's recorded
+    // files, which is the path under test; vendored LIVENESS reads no file
+    // the ledger names at all.
 
     #[tokio::test]
     async fn hosted_wiring_text_proof_never_reads_outside_the_project() {
@@ -5341,8 +5343,17 @@ mod tests {
             !nothing_discovered.vendor_entry_live(&root, &escaping).await,
             "a '../'-escaping wiring file must never be read"
         );
+        assert_eq!(
+            nothing_discovered
+                .vendor_entry_in_use(&root, &escaping)
+                .await,
+            None,
+            "nor may it keep the entry in use: undecided, as with no wiring recorded"
+        );
 
-        // Positive control: same content, in-project name ⇒ proven live.
+        // Same content under an in-project name the ledger supplies: the
+        // prune GC keeps the entry (the positive control for the guard
+        // above), but a ledger-named file is no liveness proof.
         tokio::fs::write(
             root.join("inside.lock"),
             format!("resolved file:{marker}/minimist-1.2.2.tgz\n"),
@@ -5351,11 +5362,18 @@ mod tests {
         .unwrap();
         let in_project: socket_patch_core::vendor::VendorEntry =
             serde_json::from_value(entry_json("inside.lock")).unwrap();
-        assert!(
+        assert_eq!(
             nothing_discovered
+                .vendor_entry_in_use(&root, &in_project)
+                .await,
+            Some(true),
+            "the identical in-project wiring file keeps the entry from the prune GC"
+        );
+        assert!(
+            !nothing_discovered
                 .vendor_entry_live(&root, &in_project)
                 .await,
-            "the identical in-project wiring file must prove vendored wiring"
+            "raw text never proves vendored wiring: only a discovered reference does"
         );
     }
 

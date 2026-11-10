@@ -43,14 +43,17 @@
 //!   for the ledger's exact version — core `UnlockedPin`),
 //!   whatever raw text survives. Only for a uuid no read file mentions
 //!   (formats no extractor reads, patch servers outside the host allowlist)
-//!   does the ledger's own recorded wiring decide — only files that PIN the
-//!   resolution, never a leftover registry definition — and a hosted
+//!   does a HOSTED ledger's own recorded wiring decide — only files that
+//!   PIN the resolution, never a leftover registry definition — and a hosted
 //!   record whose lock entry or recorded wiring routes the uuid through a
 //!   hosted-shaped url on an origin this run was not given is never
-//!   attested (core `RecordLiveness::Undecided`, fail closed); a vendor entry
-//!   recording no wiring (repair's reconstruction) probes its ecosystem's
-//!   root locks; a lock inventory entry resolving the purl elsewhere is
-//!   dead. A reverted lockfile plus a leftover ledger or artifact must not
+//!   attested (core `RecordLiveness::Undecided`, fail closed); a lock
+//!   inventory entry resolving the purl elsewhere is dead. A VENDOR entry
+//!   has no such fallback: it is live only while a discovered reference
+//!   wires its package to its artifact (repair's reconstructed entries,
+//!   which record no wiring, included), never because a `package.json`
+//!   override or any other file its ledger names still spells the vendored
+//!   dir. A reverted lockfile plus a leftover ledger or artifact must not
 //!   keep attesting.
 //!   A dead vendor claim falls through to a live hosted claim for the same
 //!   key (hosted takeover of a vendored package). A manifest-owned purl whose REDIRECT
@@ -1840,9 +1843,10 @@ mod tests {
     /// redirect ledger record whose patches the lockfiles MENTION only in
     /// shapes the extractors rejected are dead — `vendor_unwired` /
     /// `redirect_unwired`, with a note naming the file and the extractor's
-    /// reason — although the raw-text fallbacks would call both live (the
-    /// files hold each uuid in pin position; the unrecognized control run
-    /// proves it).
+    /// reason — although the files hold each uuid in pin position: the
+    /// hosted ledger's raw-text fallback would call its record live (the
+    /// unrecognized control run proves it), and the vendor ledger has no
+    /// raw-text fallback at all.
     #[tokio::test]
     async fn recognized_but_rejected_uuids_are_dead_whatever_the_raw_text_says() {
         use socket_patch_core::vendor::state::{WiringAction, WiringRecord};
@@ -1914,8 +1918,9 @@ mod tests {
             hosted_uuids: Vec::new(),
         };
 
-        // Control — nothing recognized: the ledgers' own recorded files
-        // decide, and both claims are live.
+        // Control — nothing recognized: the hosted ledger's own recorded
+        // files decide, and its claim is live. The vendor claim is dead
+        // without a discovered reference, whatever its recorded file says.
         let live = plan(
             &common(root),
             sources(Discovery::default()),
@@ -1923,8 +1928,8 @@ mod tests {
             &RunApiClient::new(),
         )
         .await;
-        assert!(live.gated.is_empty(), "{:?}", live.gated);
-        assert!(live.view.patches.contains_key("pkg:npm/x@1.0.0"));
+        assert_eq!(live.gated, vec![failed("pkg:npm/x@1.0.0", VENDOR_UNWIRED)]);
+        assert!(!live.view.patches.contains_key("pkg:npm/x@1.0.0"));
         assert_eq!(live.redirected, vec!["pkg:cargo/y@1.0.0".to_string()]);
 
         // The extractors rejected both mentions: dead, with the reason.

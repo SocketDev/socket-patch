@@ -1193,10 +1193,11 @@ async fn generate_vex(
     outcome.failed.extend(plan.gated.iter().cloned());
 
     // Vendored disclosure: the committed artifact verified (the attestation
-    // stands — the committables are what the lockfile consumes) but the LIVE
-    // installed tree is present and running different bytes. Say so — a
-    // build that bypasses the vendor wiring is unpatched until the next
-    // package-manager install.
+    // stands — the plan only takes the vendored basis for an artifact a
+    // discovered lockfile / config reference, or the JVM wiring check, shows
+    // wired in) but the LIVE installed tree is present and running different
+    // bytes. Say so — a build that bypasses the vendor wiring is unpatched
+    // until the next package-manager install.
     // A Hatch env is never resynced by an install: Hatch keeps a present
     // release (#335), so name the remedy that recreates it.
     let hatch_note = if outcome.vendored_out_of_sync.is_empty() || common.is_global() {
@@ -1236,9 +1237,10 @@ async fn generate_vex(
             "vendored_tree_out_of_sync",
             format!(
                 "{purl}: the installed tree does not match its vendored artifact; the \
-                 attestation is based on the committed .socket/vendor artifact (the lockfile \
-                 consumes it), but the live tree carries different bytes — re-run your \
-                 package manager's install to resync it.{hatch_note}{pdm_note}"
+                 attestation is based on the committed .socket/vendor artifact (the project's \
+                 lockfile or package-manager config wires it in), but the live tree carries \
+                 different bytes — re-run your package manager's install to resync it.\
+                 {hatch_note}{pdm_note}"
             ),
         );
     }
