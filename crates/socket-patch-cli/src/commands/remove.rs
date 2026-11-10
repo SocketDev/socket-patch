@@ -389,12 +389,21 @@ pub async fn run(args: RemoveArgs) -> i32 {
                 );
                 return 1;
             }
-            emit_error_envelope(
-                args.common.json,
-                args.common.dry_run,
-                "manifest_not_found",
-                format!("Manifest not found at {}", manifest_path.display()),
-            );
+            // `--json` keeps its `manifest_not_found` message; a person is
+            // told what that means for the command they ran.
+            if args.common.json {
+                emit_error_envelope(
+                    true,
+                    args.common.dry_run,
+                    "manifest_not_found",
+                    format!("Manifest not found at {}", manifest_path.display()),
+                );
+            } else {
+                eprintln!(
+                    "Error: {}",
+                    crate::ui::no_patches_message("remove", &args.common)
+                );
+            }
             return 1;
         }
     }

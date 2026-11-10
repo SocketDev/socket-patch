@@ -77,6 +77,23 @@ pub(crate) fn agent_next_steps(
     numbered_next_steps(&steps)
 }
 
+/// What a command says in a project that holds no patch of any mode (no
+/// manifest, no vendored patch, no hosted patch in its lockfiles), in place
+/// of "Manifest not found": hosted mode, the default, never has a manifest,
+/// so the word tells its users nothing. `nothing_to` is what the command
+/// would have done (`roll back`). `moved_manifest` is the manifest path a
+/// `--manifest-path` moved it to: it is named, so a mistyped one shows.
+pub(crate) fn no_patches_message(
+    nothing_to: &str,
+    moved_manifest: Option<&std::path::Path>,
+) -> String {
+    let base = format!("No patches in this project; nothing to {nothing_to}");
+    match moved_manifest {
+        None => format!("{base}."),
+        Some(path) => format!("{base} (no manifest at {}).", path.display()),
+    }
+}
+
 /// Short, display-only prefix of a UUID for log lines. Returns
 /// the first 8 bytes when they fall on a char boundary, otherwise the
 /// whole string. A naive `&uuid[..8]` panics on a malformed/short UUID in
@@ -519,6 +536,18 @@ mod tests {
                 assert!(sentence.split_whitespace().count() <= 25, "{sentence}");
             }
         }
+    }
+
+    #[test]
+    fn no_patches_message_names_only_a_manifest_path_of_the_users_own() {
+        assert_eq!(
+            no_patches_message("roll back", None),
+            "No patches in this project; nothing to roll back."
+        );
+        assert_eq!(
+            no_patches_message("remove", Some(std::path::Path::new("ops/patches.json"))),
+            "No patches in this project; nothing to remove (no manifest at ops/patches.json)."
+        );
     }
 
     #[test]

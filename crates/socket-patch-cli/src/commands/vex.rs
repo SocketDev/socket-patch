@@ -441,6 +441,16 @@ pub async fn run(args: VexArgs) -> i32 {
                         .to_string(),
                     1,
                 ),
+                // `--json` keeps the message its consumers know; a person
+                // is told what it means, without a manifest hosted mode
+                // never has.
+                "manifest_not_found" if !args.common.json => (
+                    format!(
+                        "{} Run `socket-patch scan` first.",
+                        crate::ui::no_patches_message("attest", &args.common)
+                    ),
+                    2,
+                ),
                 "manifest_not_found" => (
                     format_manifest_not_found_hint(&e.message, &args.common.manifest_path),
                     2,

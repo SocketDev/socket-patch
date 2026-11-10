@@ -155,8 +155,8 @@ fn repair_manifest_not_found_human_mode_prints_to_stderr() {
         "expected exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     assert!(
-        stderr.contains("Manifest not found at"),
-        "human mode must report the missing manifest on stderr; stderr=\n{stderr}"
+        stderr.ends_with("Error: No patches in this project; nothing to repair.\n"),
+        "human mode must say there is nothing to repair on stderr; stderr=\n{stderr}"
     );
     assert!(
         stdout.trim().is_empty(),

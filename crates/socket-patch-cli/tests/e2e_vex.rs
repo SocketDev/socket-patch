@@ -441,7 +441,10 @@ fn missing_manifest_exits_non_zero() {
     );
     assert!(out.stdout.is_empty(), "no doc when manifest is missing");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("Manifest not found"), "got: {stderr}");
+    assert!(
+        stderr.contains("No patches in this project; nothing to attest."),
+        "got: {stderr}"
+    );
 }
 
 #[test]

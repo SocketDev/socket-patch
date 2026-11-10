@@ -38,6 +38,26 @@ fn remove_corrupt_vendor_ledger_fails_closed_human() {
     );
 }
 
+/// A project with no patch of any mode: the human error says there is
+/// nothing to remove (exit 1) instead of naming a manifest a hosted user
+/// never had, and creates no `.socket/`.
+#[test]
+fn remove_in_a_project_without_patches_says_nothing_to_remove() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let (code, stdout, stderr) = run_remove(
+        tmp.path(),
+        &["pkg:npm/foo@1.0.0", "--yes", "--offline"],
+        &[],
+    );
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.ends_with("Error: No patches in this project; nothing to remove.\n"),
+        "stderr=\n{stderr}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+}
+
 /// `--preserve-state` still restores hosted pins (hosted has no
 /// preservable local state) and the human run must say so on stderr —
 /// while the manifest entry survives and the final preserve summary

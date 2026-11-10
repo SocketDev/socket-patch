@@ -28,6 +28,14 @@ pub(crate) use text::{
     short_uuid, sweep_failure, truncate,
 };
 
+/// [`text::no_patches_message`] for this run: the manifest path is named
+/// only when `--manifest-path` moved it.
+pub(crate) fn no_patches_message(nothing_to: &str, common: &GlobalArgs) -> String {
+    let moved = (common.manifest_path != socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH)
+        .then(|| common.resolved_manifest_path());
+    text::no_patches_message(nothing_to, moved.as_deref())
+}
+
 /// A global run's scope as one pasteable argument: `--global-prefix <dir>`
 /// (shell-quoted when needed) or `-g`; `None` for a project run.
 pub(crate) fn global_scope_arg(common: &GlobalArgs) -> Option<String> {

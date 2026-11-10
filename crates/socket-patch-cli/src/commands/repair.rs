@@ -129,8 +129,10 @@ pub async fn run(args: RepairArgs) -> i32 {
                 }
                 return 0;
             }
-            let msg = format!("Manifest not found at {}", manifest_path.display());
+            // `--json` keeps its `manifest_not_found` message; a person is
+            // told what that means for the command they ran.
             if args.common.json {
+                let msg = format!("Manifest not found at {}", manifest_path.display());
                 let env = error_envelope(
                     Command::Repair,
                     args.common.dry_run,
@@ -139,7 +141,10 @@ pub async fn run(args: RepairArgs) -> i32 {
                 );
                 crate::ui::print_json(&env.to_value());
             } else {
-                eprintln!("Error: {msg}");
+                eprintln!(
+                    "Error: {}",
+                    crate::ui::no_patches_message("repair", &args.common)
+                );
             }
             return 1;
         }

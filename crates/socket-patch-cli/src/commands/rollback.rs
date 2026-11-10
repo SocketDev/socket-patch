@@ -965,6 +965,13 @@ async fn unledgered_vendor_wiring(
 /// Report a top-level rollback error: the error envelope on `--json`
 /// (message verbatim), an `Error:` stderr line otherwise. Errors print even
 /// under --silent ("errors only", never "nothing").
+/// The line for a rollback that found a manifest with no patch in it and
+/// no patch of another mode: the same words as a project with no manifest
+/// at all, since both mean there is nothing to roll back.
+fn no_patches_left(common: &GlobalArgs) -> String {
+    crate::ui::no_patches_message("roll back", common)
+}
+
 fn emit_rollback_error(json: bool, dry_run: bool, code: &str, msg: &str) {
     if json {
         println!(
@@ -1570,7 +1577,10 @@ pub async fn run(args: RollbackArgs) -> i32 {
         } else {
             // Errors print even under --silent ("errors only", never
             // "nothing"): exit 1 with no message would be undiagnosable.
-            eprintln!("Error: Manifest not found at {}", manifest_path.display());
+            eprintln!(
+                "Error: {}",
+                crate::ui::no_patches_message("roll back", &args.common)
+            );
         }
         return 1;
     }
@@ -1956,7 +1966,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     let has_work =
         !manifest_scope.is_empty() || !vendor_scope.is_empty() || !hosted_scope.is_empty();
     // Everything in scope was filtered out by `--ecosystems`: say so,
-    // instead of the misleading "No patches found in manifest".
+    // instead of the misleading "No patches in this project".
     let eco_filtered_everything = !has_work && scope_before_eco_filter > 0;
     if eco_filtered_everything && !args.common.json && !args.common.silent {
         println!(
@@ -2015,7 +2025,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     }
 
     // ── agent leg (in-place restore) ────────────────────────────────────
-    // The "No patches found in manifest" line is for an unscoped run with
+    // The "No patches in this project" line is for an unscoped run with
     // nothing to do anywhere: a hosted-/vendored-only project has work in
     // the other legs and is not "no patches". A manifest-less project, or
     // one whose scope `--ecosystems` filtered out entirely (announced
@@ -2701,14 +2711,14 @@ pub(crate) async fn rollback_patches_inner(
             }
             InnerSelection::Identifier(None) => {
                 if !common.silent && !common.json {
-                    println!("No patches found in manifest");
+                    println!("{}", no_patches_left(common));
                 }
             }
             InnerSelection::Scope { announce_empty, .. } => {
                 // No-match errors were the resolver's job; an empty scoped
                 // selection here just means the work lives in other legs.
                 if *announce_empty && !common.silent && !common.json {
-                    println!("No patches found in manifest");
+                    println!("{}", no_patches_left(common));
                 }
             }
         }
@@ -5647,7 +5657,7 @@ mod tests {
             offline: true,
             ..crate::args::GlobalArgs::default()
         };
-        // silent=false so the "No patches found in manifest" announce path
+        // silent=false so the "No patches in this project" announce path
         // actually executes (its output is not capturable here; the
         // contract under test is the quiet Ok).
         let (success, results, vendored_skipped, not_installed) =
