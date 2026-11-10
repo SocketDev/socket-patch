@@ -7,7 +7,7 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::composer_version::composer_versions_equivalent;
 use crate::utils::fs::{is_dir, is_dir_sync, is_file, run_blocking};
-use crate::utils::process::{CommandRunner, EnvKeyedMemo, GlobalProbeRunner};
+use crate::utils::process::{CommandRunner, EnvKeyedMemo, ProbeRunner};
 use crate::utils::relpath::normalize_lexically;
 
 #[cfg(test)]
@@ -495,8 +495,10 @@ async fn get_composer_home() -> Option<PathBuf> {
     // Try `composer global config home` (a subprocess: on the blocking pool;
     // memoized for an unchanged environment, see `COMPOSER_GLOBAL_HOME`)
     let stdout = run_blocking(|| {
-        COMPOSER_GLOBAL_HOME
-            .get_or_run(|| GlobalProbeRunner.run("composer", &["global", "config", "home"]))
+        let runner = ProbeRunner::global();
+        COMPOSER_GLOBAL_HOME.get_or_run(runner.dir(), || {
+            runner.run("composer", &["global", "config", "home"])
+        })
     })
     .await;
     if let Some(stdout) = stdout {

@@ -6,7 +6,7 @@ use super::types::{CrawledPackage, CrawlerOptions};
 use crate::utils::fs::{
     is_dir, is_dir_sync, read_regular_to_string, read_regular_to_string_sync, run_blocking,
 };
-use crate::utils::process::{CommandRunner, EnvKeyedMemo, SystemCommandRunner};
+use crate::utils::process::{CommandRunner, EnvKeyedMemo, ProbeRunner};
 
 #[cfg(test)]
 mod oracle;
@@ -21,15 +21,10 @@ mod pdm_site;
 /// Find a working Python command on the system.
 ///
 /// Tries `python3`, `python`, and `py` (Windows launcher) in order,
-/// returning the first one that responds to `--version`.
-fn find_python_command() -> Option<&'static str> {
-    find_python_command_with(&SystemCommandRunner)
-}
-
-/// Version of `find_python_command` that accepts an injected
-/// `CommandRunner`. Tests inject a `MockCommandRunner` that returns
-/// `Some(...)` for `python3 --version` to exercise the success arm
-/// without a real Python on PATH.
+/// returning the first one that responds to `--version` when asked through
+/// `runner` (a [`ProbeRunner`] in production; tests inject a
+/// `MockCommandRunner` that answers `python3 --version` to exercise the
+/// success arm without a real Python on PATH).
 pub fn find_python_command_with(runner: &dyn CommandRunner) -> Option<&'static str> {
     ["python3", "python", "py"]
         .into_iter()
@@ -2763,21 +2758,21 @@ fn pipenv_workon_home_venvs(
     found
 }
 
-/// The interpreter's site-packages answer (the `find_python_command` probe
-/// plus the `site` query — two process spawns), per environment (`PATH`
-/// picks the interpreter; `HOME`, `PYTHONUSERBASE`, `PYTHONHOME`, … shape
-/// its answer; see [`EnvKeyedMemo`]): a
+/// The interpreter's site-packages answer (the `find_python_command_with`
+/// probe plus the `site` query — two process spawns), per environment
+/// (`PATH` and the directory the probe runs in pick the interpreter; `HOME`,
+/// `PYTHONUSERBASE`, `PYTHONHOME`, … shape its answer; see
+/// [`EnvKeyedMemo`]): a
 /// scan asks it once for its crawl and again when it vendors, in the same
 /// environment, so the second ask re-spawned both processes for the same
 /// output.
 static SITE_QUERY_MEMO: EnvKeyedMemo<String> = EnvKeyedMemo::new();
 
 /// The unmemoized interpreter query: probe for a python and ask it for its
-/// site-packages. [`SITE_QUERY_MEMO`] wraps this; tests call it directly as
-/// the oracle the memoized answer must equal.
-fn run_site_query() -> Option<String> {
-    let python_cmd = find_python_command()?;
-    let runner = SystemCommandRunner;
+/// site-packages, both through `runner`. [`SITE_QUERY_MEMO`] wraps this;
+/// tests call it directly as the oracle the memoized answer must equal.
+fn run_site_query(runner: &ProbeRunner) -> Option<String> {
+    let python_cmd = find_python_command_with(runner)?;
     runner.run(
         python_cmd,
         &[
@@ -2787,13 +2782,30 @@ fn run_site_query() -> Option<String> {
     )
 }
 
+/// [`run_site_query`], memoized per environment and probe directory.
+fn memoized_site_query(runner: &ProbeRunner) -> Option<String> {
+    SITE_QUERY_MEMO.get_or_run(runner.dir(), || run_site_query(runner))
+}
+
 /// Get global/system Python `site-packages` directories.
 ///
 /// Queries `python3` for site-packages paths, then checks well-known system
 /// locations including Homebrew, conda, uv tools and interpreters, pipx
 /// venvs, Poetry's installer venv, PDM's global project and interpreters,
 /// pip --user, etc.
+///
+/// The interpreter is asked from the neutral directory, never from a
+/// project: under `--global` no project's `.python-version` picks the
+/// Python a pyenv shim runs.
 pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
+    system_python_site_packages(ProbeRunner::global()).await
+}
+
+/// [`get_global_python_site_packages`] with the interpreter asked through
+/// `runner`: a project that installs into the system Python asks from its
+/// own directory (`--cwd`), so a version manager's shim follows that
+/// project's `.python-version`.
+async fn system_python_site_packages(runner: ProbeRunner) -> Vec<PathBuf> {
     let mut results = Vec::new();
     let mut seen = HashSet::new();
 
@@ -2809,7 +2821,7 @@ pub async fn get_global_python_site_packages() -> Vec<PathBuf> {
     }
 
     // 1. Ask Python for site-packages (subprocesses: on the blocking pool)
-    let site_output = run_blocking(|| SITE_QUERY_MEMO.get_or_run(run_site_query)).await;
+    let site_output = run_blocking(move || memoized_site_query(&runner)).await;
     if let Some(stdout) = site_output {
         for p in parse_python_site_packages_output(&stdout) {
             add_path(p, &mut seen, &mut results);
@@ -3443,7 +3455,7 @@ async fn local_site_packages_with(
         return Vec::new();
     }
     if is_python_project(cwd).await {
-        return get_global_python_site_packages().await;
+        return system_python_site_packages(ProbeRunner::project(cwd)).await;
     }
     Vec::new()
 }
@@ -7838,7 +7850,7 @@ G=
     fn test_find_python_command() {
         // On any platform with Python installed, this should return Some
         // In CI environments, Python is typically available
-        let cmd = find_python_command();
+        let cmd = find_python_command_with(&ProbeRunner::global());
         // We don't assert Some because Python may not be installed,
         // but if it is, the command should be valid
         if let Some(c) = cmd {
@@ -8043,13 +8055,14 @@ G=
     #[serial_test::serial]
     fn site_query_memo_follows_the_environment() {
         use crate::test_env::EnvGuard;
-        let memoized = || SITE_QUERY_MEMO.get_or_run(run_site_query);
+        let runner = ProbeRunner::global();
+        let memoized = || memoized_site_query(&runner);
 
         let base_a = tempfile::tempdir().unwrap();
         let base_b = tempfile::tempdir().unwrap();
         for base in [&base_a, &base_b] {
             let _env = EnvGuard::set("PYTHONUSERBASE", base.path());
-            let oracle = run_site_query();
+            let oracle = run_site_query(&runner);
             assert_eq!(memoized(), oracle);
             assert_eq!(memoized(), oracle);
             if let Some(out) = &oracle {

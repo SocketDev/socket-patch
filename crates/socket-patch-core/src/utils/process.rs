@@ -8,13 +8,13 @@
 //! installing the binary: the success arm (binary present, stdout
 //! parsed) and the spawn-Err arm (binary missing or unspawnable).
 //!
-//! This module provides a `CommandRunner` trait whose default impl,
-//! `SystemCommandRunner`, performs the real spawn, and whose test
-//! double (`MockCommandRunner` in `tests/common/mod.rs`) maps
-//! `(bin, args)` to canned stdout. Each shell-out helper accepts a
+//! This module provides a `CommandRunner` trait whose real impl,
+//! `ProbeRunner`, performs the spawn from a directory chosen by the
+//! probe's scope (the project, or a neutral one for a global question),
+//! and whose test double (`MockCommandRunner` in `tests/common/mod.rs`)
+//! maps `(bin, args)` to canned stdout. Each shell-out helper accepts a
 //! `&dyn CommandRunner` argument so tests can inject the mock;
-//! production callers either build the helper with the default
-//! runner or thread a singleton.
+//! production callers build the helper with a `ProbeRunner`.
 
 use std::ffi::OsString;
 use std::io::Read;
@@ -413,7 +413,18 @@ pub trait CommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String>;
 }
 
-/// Default runner: spawns the real binary via `std::process::Command`.
+/// The real runner: spawns the binary, from a directory chosen by what the
+/// probe asks about. Never from wherever the CLI happens to have been
+/// started: a version manager's shim (rbenv, pyenv, asdf, mise) picks the
+/// interpreter from the `.ruby-version` / `.python-version` /
+/// `.tool-versions` of the directory it runs in.
+///
+/// * [`ProbeRunner::project`]: a question about one project (`gem env`
+///   for its Gemfile, the Python whose site-packages hold its packages)
+///   runs from that project's directory (`--cwd`).
+/// * [`ProbeRunner::global`]: a question about the machine-wide install
+///   (`npm root -g`, `gem env` and the system Python under `--global`)
+///   runs from [`neutral_probe_dir`], so no project's files steer it.
 ///
 /// The program is looked up with [`resolve_tool`] and the RESOLVED path is
 /// spawned, never the bare name: on Windows `std` appends only `.exe`, so a
@@ -422,23 +433,45 @@ pub trait CommandRunner {
 /// silently answered "not installed". The lookup also skips relative `PATH`
 /// entries, so a tool planted in the scanned project is never run.
 ///
-/// The child inherits the caller's working directory: some probes must ask
-/// from the project (`gem env` follows rbenv's `.ruby-version` there). A
-/// probe about the machine-wide install uses [`GlobalProbeRunner`].
-///
-/// `output()` nulls stdin so the child can't block waiting for
-/// input. stdout is captured; stderr is captured and dropped (we
-/// don't surface CLI diagnostics — the helpers fall back to other
-/// discovery paths on any failure).
-pub(crate) struct SystemCommandRunner;
+/// stdin is null so the child can't block waiting for input. stdout is
+/// captured; stderr is dropped (we don't surface CLI diagnostics — the
+/// helpers fall back to other discovery paths on any failure).
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeRunner {
+    /// Where the child runs. `None`: no neutral directory could be
+    /// determined, and the probe is not run at all.
+    dir: Option<PathBuf>,
+}
 
-impl CommandRunner for SystemCommandRunner {
-    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        run_resolved(bin, args, None)
+impl ProbeRunner {
+    /// A probe about the project at `cwd`. Made absolute now, so the memo
+    /// key built from [`Self::dir`] names one directory whatever the
+    /// process's own working directory is later.
+    pub(crate) fn project(cwd: &Path) -> Self {
+        let dir = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        Self { dir: Some(dir) }
+    }
+
+    /// A probe about the machine-wide install.
+    pub(crate) fn global() -> Self {
+        Self {
+            dir: neutral_probe_dir(),
+        }
+    }
+
+    /// The directory the child runs in.
+    pub(crate) fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 }
 
-/// [`SystemCommandRunner`] for a question about a package manager's GLOBAL
+impl CommandRunner for ProbeRunner {
+    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
+        run_resolved(bin, args, self.dir.as_deref()?)
+    }
+}
+
+/// [`ProbeRunner::global`] for a question about a package manager's GLOBAL
 /// install (`npm root -g`, `yarn global dir`, ...): the child runs from
 /// [`neutral_probe_dir`], never from the scanned project. From inside a
 /// project the tool reads that project's configuration — Yarn Berry has no
@@ -450,7 +483,7 @@ pub(crate) struct GlobalProbeRunner;
 
 impl CommandRunner for GlobalProbeRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        run_resolved(bin, args, Some(&neutral_probe_dir()?))
+        ProbeRunner::global().run(bin, args)
     }
 }
 
@@ -479,19 +512,14 @@ pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) ->
 }
 
 /// Spawn `bin` (looked up with [`resolve_tool`]; a value that already
-/// names a path is spawned as given) with `args`, optionally from `cwd`,
-/// and return its trimmed stdout under the [`CommandRunner`] contract.
-fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+/// names a path is spawned as given) with `args` from `cwd`, and return
+/// its trimmed stdout under the [`CommandRunner`] contract.
+fn run_resolved(bin: &str, args: &[&str], cwd: &Path) -> Option<String> {
     run_resolved_within(bin, args, cwd, PROBE_TIMEOUT)
 }
 
 /// [`run_resolved`] under an explicit budget (tests).
-fn run_resolved_within(
-    bin: &str,
-    args: &[&str],
-    cwd: Option<&Path>,
-    budget: Duration,
-) -> Option<String> {
+fn run_resolved_within(bin: &str, args: &[&str], cwd: &Path, budget: Duration) -> Option<String> {
     let program = if Path::new(bin).components().count() > 1 {
         PathBuf::from(bin)
     } else {
@@ -509,10 +537,7 @@ fn run_resolved_within(
         }
     };
     let mut command = command_for(&program);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
+    command.args(args).current_dir(cwd);
     let output = match output_within(command, budget) {
         Ok(output) => output,
         Err(BoundedError::TimedOut) => {
@@ -539,23 +564,24 @@ fn run_resolved_within(
 }
 
 /// What a probe subprocess inherits: the (sorted) environment and the
-/// working directory. Sorted so a `remove_var`/`set_var` round-trip that
+/// directory it runs in. Sorted so a `remove_var`/`set_var` round-trip that
 /// restores an identical environment still matches (`vars_os` yields
 /// `environ`'s order, which such a round-trip permutes).
 pub(crate) type EnvKey = (Vec<(OsString, OsString)>, Option<PathBuf>);
 
-/// The [`EnvKey`] of the process right now.
-pub(crate) fn env_key() -> EnvKey {
+/// The [`EnvKey`] of a probe run from `dir` right now.
+pub(crate) fn env_key_in(dir: Option<&Path>) -> EnvKey {
     let mut vars: Vec<_> = std::env::vars_os().collect();
     vars.sort();
-    (vars, std::env::current_dir().ok())
+    (vars, dir.map(Path::to_path_buf))
 }
 
 /// A process-wide memo of one subprocess answer, reused only while the
-/// whole environment (every variable, and the working directory) is exactly
-/// what it was when the answer was produced: the subprocess's only inputs
-/// the CLI controls. A different environment re-runs it and replaces the
-/// entry; concurrent first callers may each run it.
+/// whole environment (every variable, and the directory the subprocess
+/// runs in) is exactly what it was when the answer was produced: the
+/// subprocess's only inputs the CLI controls. A different environment
+/// re-runs it and replaces the entry; concurrent first callers may each
+/// run it.
 ///
 /// Only an answer is kept. A failed probe (spawn error under fd pressure,
 /// a non-zero exit, empty stdout) is asked again by the next caller, so a
@@ -573,12 +599,17 @@ impl<V: Clone> EnvKeyedMemo<V> {
         }
     }
 
-    pub(crate) fn get_or_run(&self, run: impl FnOnce() -> Option<V>) -> Option<V> {
-        self.get_or_run_keyed(env_key(), |ran_under| {
+    /// The answer of `run`, a subprocess run from `dir`.
+    pub(crate) fn get_or_run(
+        &self,
+        dir: Option<&Path>,
+        run: impl FnOnce() -> Option<V>,
+    ) -> Option<V> {
+        self.get_or_run_keyed(env_key_in(dir), |ran_under| {
             let answer = run();
             // Keepable only if the environment is, once the subprocess
             // returns, still the one we keyed on.
-            (answer, env_key() == *ran_under)
+            (answer, env_key_in(dir) == *ran_under)
         })
     }
 
@@ -702,7 +733,7 @@ pub(crate) mod tests {
         std::env::remove_var(VAR);
         let memo = EnvKeyedMemo::new();
         let runs = std::cell::Cell::new(0);
-        let answer = memo.get_or_run(|| {
+        let answer = memo.get_or_run(None, || {
             runs.set(runs.get() + 1);
             std::env::set_var(VAR, "moved");
             Some("moved".to_string())
@@ -713,7 +744,7 @@ pub(crate) mod tests {
             runs.set(runs.get() + 1);
             Some("fresh".to_string())
         };
-        assert_eq!(memo.get_or_run(fresh).as_deref(), Some("fresh"));
+        assert_eq!(memo.get_or_run(None, fresh).as_deref(), Some("fresh"));
         assert_eq!(runs.get(), 2);
     }
 
@@ -721,8 +752,69 @@ pub(crate) mod tests {
     /// same variables still hits, whatever order `vars_os` yields.
     #[test]
     fn env_key_is_sorted() {
-        let (vars, _) = env_key();
+        let (vars, _) = env_key_in(None);
         assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
+    }
+
+    /// An answer asked from one directory is not reused for another: a
+    /// version manager's shim answers per directory.
+    #[test]
+    #[serial_test::serial]
+    fn env_keyed_memo_asks_again_from_another_directory() {
+        let memo = EnvKeyedMemo::new();
+        let runs = std::cell::Cell::new(0);
+        let ask = |dir: &str| {
+            memo.get_or_run(Some(Path::new(dir)), || {
+                runs.set(runs.get() + 1);
+                Some(dir.to_string())
+            })
+        };
+        assert_eq!(ask("/proj-a").as_deref(), Some("/proj-a"));
+        assert_eq!(ask("/proj-a").as_deref(), Some("/proj-a"));
+        assert_eq!(ask("/proj-b").as_deref(), Some("/proj-b"));
+        assert_eq!(runs.get(), 2);
+    }
+
+    /// A project probe runs from the project directory, whatever the
+    /// process's own working directory is, and a relative `--cwd` names
+    /// that same directory in the memo key.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_probe_runs_from_the_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_ne!(std::env::current_dir().unwrap(), project);
+        let runner = ProbeRunner::project(&project);
+        assert_eq!(runner.dir(), Some(project.as_path()));
+        let ran_from = runner.run("sh", &["-c", "pwd -P"]).expect("sh runs");
+        assert_eq!(Path::new(&ran_from), project);
+
+        let relative = ProbeRunner::project(Path::new("."));
+        assert!(
+            relative.dir().is_some_and(Path::is_absolute),
+            "{relative:?}"
+        );
+    }
+
+    /// A global probe runs from the neutral directory, never from the
+    /// process's working directory. `#[serial]`: it reads `HOME`, which
+    /// other env tests in this binary swap.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_global_probe_runs_from_the_neutral_dir() {
+        let runner = ProbeRunner::global();
+        let neutral = neutral_probe_dir().expect("a home dir or the drive root");
+        assert_eq!(runner.dir(), Some(neutral.as_path()));
+        let ran_from = runner.run("sh", &["-c", "pwd -P"]).expect("sh runs");
+        assert_eq!(
+            Path::new(&ran_from),
+            std::fs::canonicalize(&neutral).unwrap()
+        );
+        assert_eq!(
+            GlobalProbeRunner.run("sh", &["-c", "pwd -P"]).as_deref(),
+            Some(ran_from.as_str())
+        );
     }
 
     /// Confirm the real runner returns Some for a tiny command we
@@ -731,7 +823,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_stdout_for_real_binary() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("echo", &["hello"]).expect("echo should succeed");
         assert_eq!(out, "hello");
     }
@@ -750,7 +842,7 @@ pub(crate) mod tests {
         let out = run_resolved_within(
             shim.to_str().unwrap(),
             &["env", "gemdir"],
-            None,
+            tmp.path(),
             Duration::from_millis(300),
         );
         assert_eq!(out, None);
@@ -869,7 +961,7 @@ pub(crate) mod tests {
     /// that should never be on PATH.
     #[test]
     fn system_runner_returns_none_on_spawn_failure() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("definitely-not-a-real-binary-1234567", &[]);
         assert_eq!(out, None);
     }
@@ -878,7 +970,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_none_on_non_zero_exit() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("false", &[]);
         assert_eq!(out, None);
     }
@@ -889,7 +981,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_none_on_empty_stdout_despite_success() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("true", &[]);
         assert_eq!(out, None);
     }
@@ -900,7 +992,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_treats_whitespace_only_stdout_as_empty() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '  \\t\\n  '"]);
         assert_eq!(out, None);
     }
@@ -911,7 +1003,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_trims_surrounding_whitespace() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '  /some/path  \\n'"]);
         assert_eq!(out.as_deref(), Some("/some/path"));
     }
@@ -922,7 +1014,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_ignores_stderr_when_stdout_empty() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf 'diagnostic' >&2"]);
         assert_eq!(out, None);
     }
@@ -932,7 +1024,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_only_stdout_when_both_streams_used() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf 'good\\n'; printf 'bad\\n' >&2"]);
         assert_eq!(out.as_deref(), Some("good"));
     }
@@ -943,7 +1035,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_forwards_all_args_in_order() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '%s' \"$1\"", "sh", "forwarded"]);
         assert_eq!(out.as_deref(), Some("forwarded"));
     }

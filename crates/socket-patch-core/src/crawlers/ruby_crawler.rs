@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use super::types::{CrawledPackage, CrawlerOptions};
 use crate::patch::path_safety;
 use crate::utils::fs::{entry_is_dir, home_dir, is_dir, is_file, list_dir_entries, run_blocking};
-use crate::utils::process::{env_key, CommandRunner, EnvKey, SystemCommandRunner};
+use crate::utils::process::{env_key_in, CommandRunner, EnvKey, ProbeRunner};
 use crate::utils::relpath::normalize_lexically;
 use crate::vendor::lock_inventory::ProjectView;
 
@@ -139,7 +139,7 @@ impl RubyCrawler {
         // `--user-install` puts them under `~/.gem`/`$XDG_DATA_HOME`).
         if !discovery.default_root_has_stores && Self::has_bundler_manifest(&options.cwd).await {
             let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
-            for gems_dir in Self::gem_env_gems_dirs().await {
+            for gems_dir in Self::gem_env_gems_dirs(ProbeRunner::project(&options.cwd)).await {
                 if seen.insert(gems_dir.clone()) {
                     paths.push(gems_dir);
                 }
@@ -291,11 +291,16 @@ impl RubyCrawler {
     /// ruby boot), once per process ([`Self::gem_env_homes`]); their
     /// answers are consumed in the fixed order above. The directory probes
     /// are re-run on every call.
-    async fn gem_env_gems_dirs() -> Vec<PathBuf> {
+    ///
+    /// `runner` says where `gem` runs: the project (`--cwd`) for a
+    /// project's gems, so an rbenv / asdf shim follows that project's
+    /// `.ruby-version`, and the neutral directory under `--global`, so no
+    /// project's files pick the Ruby a global scan covers.
+    async fn gem_env_gems_dirs(runner: ProbeRunner) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         let mut seen = HashSet::new();
 
-        let (gemdir, gempath) = Self::gem_env_homes().await;
+        let (gemdir, gempath) = Self::gem_env_homes(runner).await;
 
         if let Some(gemdir) = gemdir {
             let gems_path = PathBuf::from(gemdir).join("gems");
@@ -785,7 +790,7 @@ impl RubyCrawler {
             None => Vec::new(),
         };
         let system_homes = if Self::bundler_uses_system_gems(&options.cwd, &discovery).await {
-            Self::gem_env_gems_dirs().await
+            Self::gem_env_gems_dirs(ProbeRunner::project(&options.cwd)).await
         } else {
             Vec::new()
         };
@@ -813,7 +818,7 @@ impl RubyCrawler {
         if Self::bundler_uses_system_gems(&options.cwd, &discovery).await {
             return Vec::new();
         }
-        Self::gem_env_gems_dirs()
+        Self::gem_env_gems_dirs(ProbeRunner::project(&options.cwd))
             .await
             .into_iter()
             .filter(|home| !discovery.stores.contains(home))
@@ -933,8 +938,8 @@ impl RubyCrawler {
 
     /// Get global gem paths by querying `gem env` and checking well-known locations.
     async fn get_global_gem_paths() -> Vec<PathBuf> {
-        // gem env gemdir + gem env gempath
-        let mut paths = Self::gem_env_gems_dirs().await;
+        // gem env gemdir + gem env gempath, asked from outside any project
+        let mut paths = Self::gem_env_gems_dirs(ProbeRunner::global()).await;
         let mut seen: HashSet<PathBuf> = paths.iter().cloned().collect();
 
         // Fallback well-known paths (none without a home directory)
@@ -998,20 +1003,24 @@ impl RubyCrawler {
     /// paths, the hosted stale probe and rollback lookup — two ruby boots
     /// (100-400 ms) each time — and the answers are RubyGems configuration
     /// that nothing in a run changes. The memo is keyed on everything the
-    /// subprocess inherits (the environment and working directory), so a
-    /// caller that swaps `PATH` or `GEM_HOME` still asks afresh. Only a
+    /// subprocess inherits (the environment and the directory `runner`
+    /// runs it in), so a caller that swaps `PATH` or `GEM_HOME`, or asks
+    /// for another project, still asks afresh. Only a
     /// complete answer is kept: a failed ask (spawn error under fd pressure,
     /// a non-zero exit from a racing shim, empty output) is asked again by
     /// the next caller — and so is an answer the environment changed under,
     /// which the key would misfile.
-    async fn gem_env_homes() -> GemEnvHomes {
+    async fn gem_env_homes(runner: ProbeRunner) -> GemEnvHomes {
         static MEMO: once_cell::sync::Lazy<GemEnvMemo> =
             once_cell::sync::Lazy::new(Default::default);
-        let key = env_key();
+        let key = env_key_in(runner.dir());
         let cell = gem_env_cell(&MEMO, key.clone());
         memoize_gem_env_homes(&cell, || async move {
-            let homes = tokio::join!(Self::run_gem_env("gemdir"), Self::run_gem_env("gempath"));
-            let env_unchanged = env_key() == key;
+            let homes = tokio::join!(
+                Self::run_gem_env("gemdir", runner.clone()),
+                Self::run_gem_env("gempath", runner.clone())
+            );
+            let env_unchanged = env_key_in(runner.dir()) == key;
             (homes, env_unchanged)
         })
         .await
@@ -1019,9 +1028,9 @@ impl RubyCrawler {
 
     /// Run `gem env <key>` (on the blocking pool — it waits on a
     /// subprocess) and return the trimmed stdout.
-    async fn run_gem_env(key: &'static str) -> Option<String> {
+    async fn run_gem_env(key: &'static str, runner: ProbeRunner) -> Option<String> {
         run_blocking(move || {
-            let stdout = SystemCommandRunner.run("gem", &["env", key]);
+            let stdout = runner.run("gem", &["env", key]);
             parse_gem_env_output(stdout.as_deref().unwrap_or(""))
         })
         .await
