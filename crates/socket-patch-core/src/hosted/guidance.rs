@@ -377,11 +377,15 @@ pub const TRUST_SCAFFOLD_LINES: [&str; 3] = [
 /// workspace surgery: untouched lines stay byte-identical, so a revert can
 /// remove exactly what was added.
 pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
-    use crate::formats::pnpm::workspace::{block_insert_point, top_level_key, yaml_scalar};
+    use crate::formats::pnpm::workspace::{
+        block_insert_point, splice_lines, top_level_key, yaml_scalar,
+    };
     let Some(text) = existing else {
         return TrustPlan::Create("packages:\n  - '.'\ntrustLockfile: true\n".to_string());
     };
     let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    // The lines added below end as the file's own lines do.
+    let eol = crate::utils::line_endings::terminator(text);
     if crate::formats::pnpm::workspace::is_keyless(text) {
         // Several (empty) documents: a splice would land in the last one,
         // while pnpm reads the first.
@@ -389,7 +393,7 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
             Ok(anchor) => anchor,
             Err(why) => return TrustPlan::Unsupported(why),
         };
-        lines.splice(anchor..anchor, TRUST_SCAFFOLD_LINES.map(str::to_string));
+        splice_lines(&mut lines, anchor, &TRUST_SCAFFOLD_LINES, eol);
         return TrustPlan::Scaffold(lines.join("\n"));
     }
     // Where the key would go — refused when the document is not a single
@@ -417,7 +421,7 @@ pub fn plan_workspace_trust(existing: Option<&str>) -> TrustPlan {
     // After the document's last non-empty line (no blank separator; before a
     // `...` end marker): a revert removes exactly one line and the file's
     // trailing bytes stay put.
-    lines.insert(anchor, "trustLockfile: true".to_string());
+    splice_lines(&mut lines, anchor, &["trustLockfile: true"], eol);
     TrustPlan::Append(lines.join("\n"))
 }
 
@@ -808,6 +812,60 @@ mod tests {
                 assert_eq!(text, "packages:\n  - '.'\ntrustLockfile: true");
             }
             _ => panic!("expected Append"),
+        }
+    }
+
+    /// A CRLF workspace file keeps its line endings: the lines the trust
+    /// edit adds end in CRLF like the rest (as does a last line that had no
+    /// ending until they followed it), every other byte stays put, and the
+    /// scaffold comes back out of a file with no keys.
+    #[test]
+    fn plan_workspace_trust_keeps_crlf_line_endings() {
+        for (user, want) in [
+            (
+                "packages:\r\n  - \"packages/*\"\r\n",
+                "packages:\r\n  - \"packages/*\"\r\ntrustLockfile: true\r\n",
+            ),
+            (
+                "packages:\r\n  - '.'",
+                "packages:\r\n  - '.'\r\ntrustLockfile: true",
+            ),
+            (
+                "packages:\r\n  - '.'\r\n\r\n# tail\r\n\r\n",
+                "packages:\r\n  - '.'\r\n\r\n# tail\r\ntrustLockfile: true\r\n\r\n",
+            ),
+            (
+                "packages:\r\n  - '.'\r\n...\r\n",
+                "packages:\r\n  - '.'\r\ntrustLockfile: true\r\n...\r\n",
+            ),
+            // Mixed endings: the majority's, and no other line touched.
+            (
+                "packages:\r\n  - 'a'\r\n  - 'b'\n",
+                "packages:\r\n  - 'a'\r\n  - 'b'\ntrustLockfile: true\r\n",
+            ),
+        ] {
+            match plan_workspace_trust(Some(user)) {
+                TrustPlan::Append(text) => assert_eq!(text, want, "{user:?}"),
+                _ => panic!("expected Append: {user:?}"),
+            }
+        }
+        const ADDED: &str = "packages:\r\n  - '.'\r\ntrustLockfile: true";
+        for (user, want) in [
+            ("# settings\r\n", format!("# settings\r\n{ADDED}\r\n")),
+            ("\r\n", format!("{ADDED}\r\n\r\n")),
+            ("---\r\n...\r\n", format!("---\r\n{ADDED}\r\n...\r\n")),
+            ("# a\r\n# b", format!("# a\r\n# b\r\n{ADDED}")),
+        ] {
+            let TrustPlan::Scaffold(text) = plan_workspace_trust(Some(user)) else {
+                panic!("a keyless file must plan a Scaffold: {user:?}");
+            };
+            assert_eq!(text, want, "{user:?}");
+            assert_eq!(
+                crate::formats::pnpm::workspace::strip_keyless_splice(&text, &TRUST_SCAFFOLD_LINES)
+                    .as_deref(),
+                Some(user),
+                "rollback takes the scaffold back out"
+            );
         }
     }
 

@@ -518,6 +518,66 @@ async fn hosted_trust_edit_scaffolds_packages_in_a_keyless_workspace_yaml() {
     );
 }
 
+/// A CRLF pnpm-workspace.yaml stays CRLF through the trust edit: the key
+/// it appends, and the scaffold a file with no keys gains, end in CRLF
+/// like the lines around them. `rollback` takes the scaffold back out byte
+/// for byte, and removes the file hosted mode created in either line
+/// ending (a `core.autocrlf` checkout).
+#[tokio::test]
+#[serial]
+async fn hosted_trust_edit_keeps_a_crlf_workspace_yaml_crlf() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    // (the user's file, the file after the scan, the file after rollback)
+    let appended = "packages:\r\n  - '.'\r\n  - 'tools/*'\r\ntrustLockfile: true\r\n";
+    for (user_ws, wired, rolled_back) in [
+        (
+            "packages:\r\n  - '.'\r\n  - 'tools/*'\r\n",
+            appended,
+            // A key appended to a file with keys is never taken back out.
+            appended,
+        ),
+        (
+            "# pnpm settings go here\r\n",
+            "# pnpm settings go here\r\npackages:\r\n  - '.'\r\ntrustLockfile: true\r\n",
+            "# pnpm settings go here\r\n",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+
+        assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            wired,
+            "the added lines end in CRLF ({user_ws:?})"
+        );
+        assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            rolled_back,
+            "{user_ws:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    let created = std::fs::read_to_string(&ws_path).unwrap();
+    assert_eq!(created, "packages:\n  - '.'\ntrustLockfile: true\n");
+    std::fs::write(&ws_path, created.replace('\n', "\r\n")).unwrap();
+    assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+    assert!(
+        !ws_path.exists(),
+        "the created file goes with the pin, checked out as CRLF or not"
+    );
+}
+
 /// #903 / #904: a `pnpm-lock.yaml` and `pnpm-workspace.yaml` saved with a
 /// UTF-8 BOM read like their plain twins. The BOM lock gets the
 /// `trustLockfile: true` auto-config (it used to read as unversioned and
