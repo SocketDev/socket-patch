@@ -61,11 +61,12 @@ use crate::utils::fs::{
     atomic_write_bytes_preserving_mode, read_regular_to_bytes, read_regular_to_string,
 };
 
-use super::common::{parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused};
 use super::npm_common::{
     gate_packages, guard_revert_uuid_dir, refusal_code, tgz_rel_leaf, vendor_npm_family, NpmCommit,
     NpmCoords, NpmLockBackend, NpmStagedPack, NpmVendorRequest, WireCx,
 };
+use super::npm_dir::splice_manifest;
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::pnpm_build_approvals as build_approvals;
@@ -410,12 +411,12 @@ impl NpmLockBackend for PnpmBackend {
 
         // ── 6. Commit: package.json + pnpm-workspace.yaml FIRST, lock
         //    second, unwind the override surfaces on a lock failure (P3
-        //    desync safety). Re-render package.json in its own layout (BOM,
-        //    indent, line ending, trailer) so a Windows / autocrlf manifest
-        //    diffs only in the override.
-        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
-            .render(&pkg)
-            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        //    desync safety). package.json is the user's file: the override
+        //    goes in as a span edit and every other byte stays as it is.
+        let new_pkg_bytes = match pkg_changed {
+            true => Some(splice_manifest(PACKAGE_JSON, &pkg_bytes, &pkg)?),
+            false => None,
+        };
         // An env document ahead of the project lock is carried over verbatim.
         // Each file is written back in its own line endings (`read_pnpm_text`).
         let lock_out = format!("{lock_prefix}{}", lock.lines().join("\n"));
@@ -423,7 +424,7 @@ impl NpmLockBackend for PnpmBackend {
         let ws_was = ws_text.as_deref().map(|t| ws_eol.restore(t));
         commit_surfaces(
             project_root,
-            pkg_changed.then_some(new_pkg_bytes.as_slice()),
+            new_pkg_bytes.as_deref(),
             &pkg_bytes,
             ws_out.as_deref().map(str::as_bytes),
             ws_was.as_deref().map(str::as_bytes),
@@ -1114,14 +1115,13 @@ pub(super) async fn revert_pnpm_dialect(
         Some(Err(e)) => return RevertOutcome::failed(format!("cannot read {PNPM_LOCK}: {e}")),
         None => LineEndings::None,
     };
-    let mut pkg_state: Option<(Value, JsonLayout)> = None;
+    // The parsed manifest and the bytes it was read from, which the
+    // restore is spliced into.
+    let mut pkg_state: Option<(Value, Vec<u8>)> = None;
     if touches_pkg {
         match read_regular_to_bytes(&project_root.join(PACKAGE_JSON)).await {
             Ok(bytes) => match parse_json_manifest(&bytes) {
-                Ok(doc) if doc.is_object() => {
-                    let layout = JsonLayout::of(&String::from_utf8_lossy(&bytes));
-                    pkg_state = Some((doc, layout));
-                }
+                Ok(doc) if doc.is_object() => pkg_state = Some((doc, bytes)),
                 // Fail-closed: editing a manifest we cannot parse risks
                 // destroying it; the user must repair it first.
                 _ => {
@@ -1199,6 +1199,16 @@ pub(super) async fn revert_pnpm_dialect(
         }
     }
 
+    // Every surface is computed before the first write: a manifest that
+    // cannot be edited in place fails here, with nothing reverted yet.
+    let pkg_out = match &pkg_state {
+        Some((doc, bytes)) if pkg_dirty => match splice_manifest(PACKAGE_JSON, bytes, doc) {
+            Ok(out) => Some(out),
+            Err(why) => return RevertOutcome::failed(format!("{why}; nothing was reverted")),
+        },
+        _ => None,
+    };
+
     // Reverse write order: lock first, package.json second.
     if lock_dirty {
         if let Some(lines) = &lock_lines {
@@ -1214,19 +1224,11 @@ pub(super) async fn revert_pnpm_dialect(
             }
         }
     }
-    if pkg_dirty {
-        if let Some((doc, layout)) = &pkg_state {
-            let bytes = match layout.render(doc) {
-                Ok(b) => b,
-                Err(e) => {
-                    return RevertOutcome::failed(format!("cannot serialize {PACKAGE_JSON}: {e}"))
-                }
-            };
-            if let Err(e) =
-                atomic_write_bytes_preserving_mode(&project_root.join(PACKAGE_JSON), &bytes).await
-            {
-                return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
-            }
+    if let Some(bytes) = pkg_out {
+        if let Err(e) =
+            atomic_write_bytes_preserving_mode(&project_root.join(PACKAGE_JSON), &bytes).await
+        {
+            return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
         }
     }
 
@@ -6364,6 +6366,75 @@ snapshots:
                 "{tag}: package.json byte-restored"
             );
             assert_eq!(fx.read(PNPM_LOCK).await, P1_BEFORE_LOCK, "{tag}");
+        }
+    }
+
+    /// A manifest that is not in `JSON.stringify` form (inline arrays,
+    /// `\u` escapes, exponent and oversized numbers, duplicate keys, one
+    /// line, …) keeps every byte vendoring does not own: the vendored file
+    /// is the original with the override inserted, and the revert restores
+    /// the original bytes. A re-serialized manifest reflowed the file and
+    /// changed number values (`5.173e28` came back another double).
+    #[tokio::test]
+    async fn vendor_and_revert_change_only_the_override_bytes_of_package_json() {
+        use crate::vendor::test_support::{handwritten_manifests, sole_insertion};
+        const PRIVATE: &str = "  \"private\": true,\n";
+        let mut cases: Vec<(&str, String, String)> = handwritten_manifests(P1_BEFORE_PKG)
+            .into_iter()
+            .map(|(tag, pkg)| (tag, pkg, P1_BEFORE_LOCK.to_string()))
+            .collect();
+        // Override tables the user already had stay theirs: one holding
+        // another package's pin (mirrored in the lock, as pnpm keeps it),
+        // and empty ones.
+        cases.push((
+            "existing-overrides",
+            P1_BEFORE_PKG.replace(
+                PRIVATE,
+                &format!("{PRIVATE}  \"pnpm\": {{ \"overrides\": {{ \"zzz\": \"1.0.0\" }} }},\n"),
+            ),
+            P1_BEFORE_LOCK.replace("importers:\n", "overrides:\n  zzz: 1.0.0\n\nimporters:\n"),
+        ));
+        for (tag, table) in [
+            ("empty-overrides", "{\n    \"overrides\": {}\n  }"),
+            ("empty-inline-overrides", "{ \"overrides\": { } }"),
+            ("empty-pnpm", "{}"),
+        ] {
+            cases.push((
+                tag,
+                P1_BEFORE_PKG.replace(PRIVATE, &format!("{PRIVATE}  \"pnpm\": {table},\n")),
+                P1_BEFORE_LOCK.to_string(),
+            ));
+        }
+        for (tag, before, lock) in cases {
+            let fx = fixture_with(&before, &lock).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            let vendored = fx.read(PACKAGE_JSON).await;
+            let added =
+                sole_insertion(before.as_bytes(), vendored.as_bytes()).unwrap_or_else(|| {
+                    panic!("{tag}: vendoring changed bytes it does not own:\n{vendored}")
+                });
+            let added = String::from_utf8(added).unwrap();
+            assert!(
+                added.contains("left-pad@1.3.0") && added.contains(UUID),
+                "{tag}: {added}"
+            );
+            let doc = parse_json_manifest(vendored.as_bytes()).unwrap();
+            assert_eq!(
+                doc["pnpm"]["overrides"]["left-pad@1.3.0"],
+                format!("file:{}", fx.rel_tgz()),
+                "{tag}: {vendored}"
+            );
+
+            let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(
+                fx.read(PACKAGE_JSON).await,
+                before,
+                "{tag}: package.json byte-restored"
+            );
+            assert_eq!(fx.read(PNPM_LOCK).await, lock, "{tag}");
         }
     }
 

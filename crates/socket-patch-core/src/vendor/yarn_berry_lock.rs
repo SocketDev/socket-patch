@@ -31,9 +31,10 @@
 //! BOTH files are CRLF (a fresh `yarn.lock`, and a `package.json` it first
 //! pretty-prints) — and keeps each file's majority ending on every later
 //! write; a `core.autocrlf` checkout makes them CRLF on any OS. The lock
-//! entry is spliced in the file's own terminator and `package.json` is
-//! re-serialized in its own layout ([`JsonLayout`]: BOM, indent, terminator,
-//! trailing newline), so vendor + revert round-trip both byte-exactly. A
+//! entry is spliced in the file's own terminator and the `resolutions`
+//! entry is spliced into `package.json` as a span edit
+//! ([`super::npm_dir::splice_json`]: every other byte of the manifest stays
+//! as it is), so vendor + revert round-trip both byte-exactly. A
 //! file mixing CRLF and LF is refused before any write
 //! (`vendor_yarn_berry_mixed_line_endings`, see
 //! [`refuse_mixed_line_endings`]); a revert never refuses on line endings.
@@ -67,15 +68,16 @@ use crate::utils::uri::encode_uri_component;
 
 #[cfg(test)]
 use super::berry_zip::berry_cache_checksum_10c0;
-use super::common::{parse_json_manifest, refused, JsonLayout};
+use super::common::{parse_json_manifest, refused};
 use super::npm_common::{
     guard_revert_uuid_dir, vendor_npm_family, NpmCommit, NpmCoords, NpmLockBackend, NpmStagedPack,
     NpmVendorRequest, WireCx,
 };
+use super::npm_dir::splice_manifest;
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
 use super::source::PackageSource;
-use super::state::{VendorEntry, WiringAction, WiringRecord};
+use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::yarn_classic_lock::{
     forget_block_scans, lines_to_json, read_yarn_lock, revert_recorded_block, scan_blocks_shared,
 };
@@ -446,6 +448,7 @@ impl NpmLockBackend for YarnBerryBackend {
 
         // ── 11. Build both new byte images, then commit pkg-first/lock-second
         let existing_entry = existing_res.is_some();
+        let created_resolutions = !pkg_obj.contains_key("resolutions");
         let mut new_pkg = (*pkg).clone();
         {
             let obj = new_pkg.as_object_mut().expect("validated above");
@@ -457,9 +460,9 @@ impl NpmLockBackend for YarnBerryBackend {
             };
             res_obj.insert(name.to_string(), Value::String(spec.clone()));
         }
-        let new_pkg_bytes = JsonLayout::of(&String::from_utf8_lossy(&pkg_bytes))
-            .render(&new_pkg)
-            .map_err(|e| format!("cannot serialize {PACKAGE_JSON}: {e}"))?;
+        // package.json is the user's file: the entry goes in as a span
+        // edit and every other byte stays as it is.
+        let new_pkg_bytes = splice_manifest(PACKAGE_JSON, &pkg_bytes, &new_pkg)?;
         let mut new_lock_text = replace_block(
             &lock_text,
             target,
@@ -551,6 +554,13 @@ impl NpmLockBackend for YarnBerryBackend {
         }));
         Ok(Some(NpmCommit {
             wiring,
+            // Whether this run created the `resolutions` table, in the
+            // ledger's package.json table flag (shared across a project's
+            // entries, so whichever revert empties the table drops it).
+            pnpm: Some(PnpmMeta {
+                created_overrides_table: created_resolutions,
+                ..PnpmMeta::default()
+            }),
             yarn_berry10c0: packed
                 .yarn_berry10c0
                 .clone()
@@ -995,7 +1005,13 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
-    // package.json resolutions entries.
+    // package.json resolutions entries. The emptied table goes only when
+    // vendoring created it; an entry recorded before that was tracked
+    // keeps the old rule (an emptied table is taken for vendor residue).
+    let created_resolutions = entry
+        .pnpm
+        .as_ref()
+        .is_none_or(|meta| meta.created_overrides_table);
     if !pkg_recs.is_empty() {
         let pkg_path = project_root.join(PACKAGE_JSON);
         match read_regular_to_bytes(&pkg_path).await {
@@ -1016,15 +1032,16 @@ pub async fn revert_yarn_berry_opts(
                         &mut pkg,
                         rec,
                         &entry.uuid,
+                        created_resolutions,
                         &mut changed,
                         &mut outcome.warnings,
                     );
                 }
                 if changed {
-                    // The file's current layout — the one vendoring kept —
-                    // so the restore lands byte-identical on the pre-vendor
-                    // bytes (CRLF, BOM and trailing newline included).
-                    match JsonLayout::of(&String::from_utf8_lossy(&bytes)).render(&pkg) {
+                    // The entry comes out as a span edit, the inverse of
+                    // the one vendoring made, so the restore lands on the
+                    // pre-vendor bytes.
+                    match splice_manifest(PACKAGE_JSON, &bytes, &pkg) {
                         Ok(out) => {
                             PKG_JSON_MEMO.invalidate();
                             if let Err(e) =
@@ -1035,11 +1052,7 @@ pub async fn revert_yarn_berry_opts(
                                 ));
                             }
                         }
-                        Err(e) => {
-                            return RevertOutcome::failed(format!(
-                                "cannot serialize {PACKAGE_JSON}: {e}"
-                            ))
-                        }
+                        Err(why) => return RevertOutcome::failed(why),
                     }
                 }
             }
@@ -1220,12 +1233,14 @@ fn restore_pruned_entry(
 }
 
 /// Remove our resolutions entry iff the live value still points into our
-/// uuid dir; drop the `resolutions` table when that leaves it empty (we only
-/// ever ADD entries — an empty table would be vendor residue).
+/// uuid dir; drop the `resolutions` table when that leaves it empty and
+/// vendoring created it (`created_table`) — an empty table the user
+/// already had stays theirs.
 fn revert_resolution_record(
     pkg: &mut Value,
     rec: &WiringRecord,
     entry_uuid: &str,
+    created_table: bool,
     changed: &mut bool,
     warnings: &mut Vec<VendorWarning>,
 ) {
@@ -1298,7 +1313,7 @@ fn revert_resolution_record(
         return;
     }
     res_obj.shift_remove(key);
-    if res_obj.is_empty() {
+    if res_obj.is_empty() && created_table {
         obj.shift_remove("resolutions");
     }
     *changed = true;
@@ -4647,6 +4662,7 @@ __metadata:
             &mut pkg,
             &rec(KIND_RESOLUTION, None),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -4668,6 +4684,7 @@ __metadata:
             &mut pkg,
             &rec("bogus", Some("left-pad")),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -4688,6 +4705,7 @@ __metadata:
             &mut pkg,
             &rec(KIND_RESOLUTION, Some("left-pad")),
             UUID,
+            true,
             &mut changed,
             &mut warnings,
         );
@@ -5185,6 +5203,96 @@ __metadata:
             );
             assert!(!fx.tgz_path().exists(), "{label}: artifact removed");
         }
+    }
+
+    /// A manifest that is not in `JSON.stringify` form (inline arrays,
+    /// `\u` escapes, exponent and oversized numbers, duplicate keys, one
+    /// line, …) keeps every byte vendoring does not own: the vendored file
+    /// is the original with the `resolutions` entry inserted, and the
+    /// revert restores the original bytes. A re-serialized manifest
+    /// reflowed the file and changed number values.
+    #[tokio::test]
+    async fn vendor_and_revert_change_only_the_resolutions_bytes_of_package_json() {
+        use crate::vendor::test_support::{handwritten_manifests, sole_insertion};
+        const VERSION: &str = "  \"version\": \"1.0.0\",\n";
+        let mut cases = handwritten_manifests(B3_BEFORE_PKG);
+        // A `resolutions` table the user already had stays theirs.
+        for (tag, table) in [
+            ("existing-resolutions", "{ \"zzz\": \"1.0.0\" }"),
+            (
+                "existing-block-resolutions",
+                "{\n    \"zzz\": \"1.0.0\"\n  }",
+            ),
+            ("empty-resolutions", "{}"),
+            ("empty-padded-resolutions", "{ }"),
+        ] {
+            cases.push((
+                tag,
+                B3_BEFORE_PKG.replace(VERSION, &format!("{VERSION}  \"resolutions\": {table},\n")),
+            ));
+        }
+        for (tag, before) in cases {
+            let fx = fixture_with(&before, B3_BEFORE_LOCK).await;
+            let (result, entry, _) = expect_done(fx.vendor(false).await);
+            assert!(result.success, "{tag}: {:?}", result.error);
+            let vendored = tokio::fs::read(fx.pkg_path()).await.unwrap();
+            let added = sole_insertion(before.as_bytes(), &vendored).unwrap_or_else(|| {
+                panic!(
+                    "{tag}: vendoring changed bytes it does not own:\n{}",
+                    String::from_utf8_lossy(&vendored)
+                )
+            });
+            let added = String::from_utf8(added).unwrap();
+            assert!(
+                added.contains("\"left-pad\"") && added.contains(UUID),
+                "{tag}: {added}"
+            );
+            let doc = parse_json_manifest(&vendored).unwrap();
+            assert_eq!(
+                doc["resolutions"]["left-pad"],
+                format!("file:./.socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz"),
+                "{tag}"
+            );
+
+            let outcome = revert_yarn_berry(&entry.unwrap(), fx.root(), false).await;
+            assert!(outcome.success, "{tag}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{tag}: {:?}", outcome.warnings);
+            assert_eq!(
+                String::from_utf8(tokio::fs::read(fx.pkg_path()).await.unwrap()).unwrap(),
+                before,
+                "{tag}: package.json byte-restored"
+            );
+            assert_eq!(
+                tokio::fs::read(fx.lock_path()).await.unwrap(),
+                fx.lock_bytes,
+                "{tag}: yarn.lock byte-restored"
+            );
+        }
+    }
+
+    /// Who created `resolutions` is recorded in the ledger: an entry from a
+    /// release that did not record it keeps that release's rule, under
+    /// which the emptied table goes whoever wrote it.
+    #[tokio::test]
+    async fn revert_of_an_entry_without_the_table_flag_drops_the_emptied_resolutions() {
+        const VERSION: &str = "  \"version\": \"1.0.0\",\n";
+        let before =
+            B3_BEFORE_PKG.replace(VERSION, &format!("{VERSION}  \"resolutions\": {{}},\n"));
+        let fx = fixture_with(&before, B3_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        assert_eq!(
+            entry.pnpm.as_ref().map(|meta| meta.created_overrides_table),
+            Some(false),
+            "the table was the project's"
+        );
+        entry.pnpm = None;
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(fx.pkg_path()).await.unwrap(),
+            B3_BEFORE_PKG
+        );
     }
 
     /// A lock or manifest mixing CRLF and LF (or holding a bare CR) has no
