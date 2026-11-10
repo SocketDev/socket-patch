@@ -12,7 +12,7 @@ use socket_patch_core::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use socket_patch_core::utils::purl_key::PurlKey;
 use socket_patch_core::vendor::lock_inventory::LockfileEntry;
 use socket_patch_core::vendor::VendorState;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::args::GlobalArgs;
 
@@ -547,6 +547,162 @@ pub(super) fn collect_vuln_ids(pkg: &BatchPackagePatches) -> VulnIds {
         primary,
         all: cves.into_iter().chain(ghsas).collect(),
         count,
+    }
+}
+
+/// What the patch a run selected for one package fixes, and which of the
+/// advisories the package's patches name it leaves unfixed (see
+/// [`advisory_coverage`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvisoryCoverage {
+    /// The package purl as the scan table spells it.
+    pub(crate) purl: String,
+    /// The selected patches, sorted: one per release variant of the package
+    /// (a wheel and its sdist, a gem platform).
+    pub(crate) uuids: Vec<String>,
+    /// The ids to show for what the selection fixes: its CVEs, then the
+    /// advisory ids that have no CVE.
+    pub(crate) fixes: Vec<String>,
+    /// The ids to show for what stays unfixed, picked like `fixes`.
+    pub(crate) unpatched: Vec<String>,
+    /// Every CVE and advisory id behind `fixes` (CVEs first, each group
+    /// sorted), for `--json`.
+    pub(crate) fixed_ids: Vec<String>,
+    /// Every CVE and advisory id behind `unpatched`, for `--json`.
+    pub(crate) unfixed_ids: Vec<String>,
+}
+
+/// The CVE and advisory (GHSA) ids of a set of patches.
+#[derive(Default, Clone)]
+struct AdvisoryIds<'a> {
+    cves: BTreeSet<&'a str>,
+    advisories: BTreeSet<&'a str>,
+}
+
+impl<'a> AdvisoryIds<'a> {
+    fn extend(&mut self, other: &AdvisoryIds<'a>) {
+        self.cves.extend(&other.cves);
+        self.advisories.extend(&other.advisories);
+    }
+
+    fn retain_common(&mut self, other: &AdvisoryIds<'a>) {
+        self.cves.retain(|id| other.cves.contains(id));
+        self.advisories.retain(|id| other.advisories.contains(id));
+    }
+
+    fn without(&self, other: &AdvisoryIds<'a>) -> AdvisoryIds<'a> {
+        AdvisoryIds {
+            cves: self.cves.difference(&other.cves).copied().collect(),
+            advisories: self
+                .advisories
+                .difference(&other.advisories)
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// CVEs, then advisory ids.
+    fn all(&self) -> Vec<String> {
+        let ids = self.cves.iter().chain(&self.advisories);
+        ids.map(|id| (*id).to_string()).collect()
+    }
+
+    /// The ids to show: every CVE, then the advisory ids in `no_cve`. Any
+    /// other advisory id is taken for the alias of a CVE listed with it, so
+    /// it is shown only when nothing else would be.
+    fn shown(&self, no_cve: &BTreeSet<&str>) -> Vec<String> {
+        let own = self.advisories.iter().filter(|id| no_cve.contains(*id));
+        let shown: Vec<String> = self
+            .cves
+            .iter()
+            .chain(own)
+            .map(|id| (*id).to_string())
+            .collect();
+        if shown.is_empty() {
+            self.all()
+        } else {
+            shown
+        }
+    }
+}
+
+/// For each package of `packages` that `selected` holds a patch for: what
+/// the selection fixes and what it leaves unfixed, in `packages` order.
+///
+/// One patch is applied per package release, so every advisory that only
+/// the package's other patches name (paid ones included) stays unfixed. A
+/// selected patch's ids are the ones its batch entry lists plus the ones
+/// its own record lists; a package whose release variants selected
+/// different patches counts as fixed only what every one of them fixes.
+/// The batch data does not pair an advisory id with its CVE, so an alias
+/// the selected patch does not list is reported unfixed, never the reverse.
+pub(crate) fn advisory_coverage(
+    packages: &[BatchPackagePatches],
+    selected: &[PatchSearchResult],
+) -> Vec<AdvisoryCoverage> {
+    let mut by_package: HashMap<PurlKey, Vec<&PatchSearchResult>> = HashMap::new();
+    for patch in selected {
+        by_package
+            .entry(PurlKey::new(&patch.purl))
+            .or_default()
+            .push(patch);
+    }
+    packages
+        .iter()
+        .filter_map(|pkg| {
+            let selected = by_package.get(&PurlKey::new(&pkg.purl))?;
+            Some(package_coverage(pkg, selected))
+        })
+        .collect()
+}
+
+fn package_coverage(
+    pkg: &BatchPackagePatches,
+    selected: &[&PatchSearchResult],
+) -> AdvisoryCoverage {
+    let mut known = AdvisoryIds::default();
+    // Advisory ids some patch lists with no CVE at all: they have none.
+    let mut no_cve: BTreeSet<&str> = BTreeSet::new();
+    let mut listed: HashMap<&str, AdvisoryIds> = HashMap::new();
+    for info in &pkg.patches {
+        let ids = AdvisoryIds {
+            cves: info.cve_ids.iter().map(String::as_str).collect(),
+            advisories: info.ghsa_ids.iter().map(String::as_str).collect(),
+        };
+        if ids.cves.is_empty() {
+            no_cve.extend(&ids.advisories);
+        }
+        known.extend(&ids);
+        listed.entry(info.uuid.as_str()).or_default().extend(&ids);
+    }
+    let mut fixed: Option<AdvisoryIds> = None;
+    for patch in selected {
+        let mut ids = listed.get(patch.uuid.as_str()).cloned().unwrap_or_default();
+        for (advisory, vuln) in &patch.vulnerabilities {
+            ids.advisories.insert(advisory.as_str());
+            ids.cves.extend(vuln.cves.iter().map(String::as_str));
+            if vuln.cves.is_empty() {
+                no_cve.insert(advisory.as_str());
+            }
+        }
+        known.extend(&ids);
+        match &mut fixed {
+            Some(fixed) => fixed.retain_common(&ids),
+            None => fixed = Some(ids),
+        }
+    }
+    let fixed = fixed.unwrap_or_default();
+    let unfixed = known.without(&fixed);
+    let mut uuids: Vec<String> = selected.iter().map(|p| p.uuid.clone()).collect();
+    uuids.sort();
+    uuids.dedup();
+    AdvisoryCoverage {
+        purl: pkg.purl.clone(),
+        uuids,
+        fixes: fixed.shown(&no_cve),
+        unpatched: unfixed.shown(&no_cve),
+        fixed_ids: fixed.all(),
+        unfixed_ids: unfixed.all(),
     }
 }
 
@@ -1631,6 +1787,134 @@ mod tests {
             title: String::new(),
             published_at: None,
         }
+    }
+
+    /// A by-package record for `uuid` naming `advisories` as
+    /// `(advisory id, cves)`.
+    fn selected_patch(purl: &str, uuid: &str, advisories: &[(&str, &[&str])]) -> PatchSearchResult {
+        PatchSearchResult {
+            uuid: uuid.to_string(),
+            purl: purl.to_string(),
+            published_at: String::new(),
+            description: String::new(),
+            license: String::new(),
+            tier: "free".to_string(),
+            vulnerabilities: advisories
+                .iter()
+                .map(|(id, cves)| {
+                    let vuln = socket_patch_core::api::types::VulnerabilityResponse {
+                        cves: strs(cves),
+                        summary: String::new(),
+                        severity: "high".to_string(),
+                        description: String::new(),
+                    };
+                    ((*id).to_string(), vuln)
+                })
+                .collect(),
+        }
+    }
+
+    /// urllib3 1.26.18: three patches, one advisory each. The selected one
+    /// fixes its own; the other two stay unfixed, shown by CVE, with every
+    /// id in the JSON lists.
+    #[test]
+    fn advisory_coverage_names_what_the_other_patches_fix_as_unfixed() {
+        let pkg = BatchPackagePatches {
+            purl: "pkg:pypi/urllib3@1.26.18".to_string(),
+            patches: vec![
+                patch_with("u1", &["CVE-2025-66418"], &["GHSA-gm62-xv2j-4w53"]),
+                patch_with("u2", &["CVE-2025-66471"], &["GHSA-2xpw-w6gg-jr37"]),
+                patch_with("u3", &["CVE-2026-21441"], &["GHSA-38jv-5279-wg99"]),
+            ],
+        };
+        // The patch purl is the release variant's; the package's has none.
+        let selected = selected_patch(
+            "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl",
+            "u1",
+            &[("GHSA-gm62-xv2j-4w53", &["CVE-2025-66418"])],
+        );
+        let coverage = advisory_coverage(std::slice::from_ref(&pkg), &[selected]);
+        assert_eq!(
+            coverage,
+            vec![AdvisoryCoverage {
+                purl: "pkg:pypi/urllib3@1.26.18".to_string(),
+                uuids: strs(&["u1"]),
+                fixes: strs(&["CVE-2025-66418"]),
+                unpatched: strs(&["CVE-2025-66471", "CVE-2026-21441"]),
+                fixed_ids: strs(&["CVE-2025-66418", "GHSA-gm62-xv2j-4w53"]),
+                unfixed_ids: strs(&[
+                    "CVE-2025-66471",
+                    "CVE-2026-21441",
+                    "GHSA-2xpw-w6gg-jr37",
+                    "GHSA-38jv-5279-wg99",
+                ]),
+            }]
+        );
+        // No patch selected for the package: no entry at all.
+        assert!(advisory_coverage(&[pkg], &[]).is_empty());
+    }
+
+    /// A merged patch that fixes everything leaves nothing unfixed, an
+    /// advisory with no CVE is shown by its own id, and a paid patch the
+    /// account cannot download still counts: its advisory is not fixed.
+    #[test]
+    fn advisory_coverage_counts_merged_no_cve_and_paid_patches() {
+        let mut paid = patch_with("u3", &["CVE-3"], &["GHSA-c"]);
+        paid.tier = "paid".to_string();
+        let pkg = BatchPackagePatches {
+            purl: "pkg:npm/foo@1.0".to_string(),
+            patches: vec![
+                patch_with("merged", &["CVE-1"], &["GHSA-a", "GHSA-b"]),
+                patch_with("u1", &["CVE-1"], &["GHSA-a"]),
+                patch_with("u2", &[], &["GHSA-b"]),
+                paid,
+            ],
+        };
+        let merged = selected_patch(
+            "pkg:npm/foo@1.0",
+            "merged",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-b", &[])],
+        );
+        let c = &advisory_coverage(std::slice::from_ref(&pkg), &[merged])[0];
+        assert_eq!(c.fixes, strs(&["CVE-1", "GHSA-b"]));
+        assert_eq!(c.unpatched, strs(&["CVE-3"]));
+        assert_eq!(c.unfixed_ids, strs(&["CVE-3", "GHSA-c"]));
+
+        let single = selected_patch("pkg:npm/foo@1.0", "u1", &[("GHSA-a", &["CVE-1"])]);
+        let c = &advisory_coverage(&[pkg], &[single])[0];
+        assert_eq!(c.fixes, strs(&["CVE-1"]));
+        assert_eq!(c.unpatched, strs(&["CVE-3", "GHSA-b"]));
+    }
+
+    /// A recorded patch the batch no longer offers is described by its own
+    /// record. Release variants that selected different patches count as
+    /// fixed only what both fix: the rest is unfixed in one of them.
+    #[test]
+    fn advisory_coverage_reads_an_unlisted_patch_and_intersects_variants() {
+        let pkg = BatchPackagePatches {
+            purl: "pkg:pypi/foo@1.0".to_string(),
+            patches: vec![patch_with("new", &["CVE-2"], &["GHSA-b"])],
+        };
+        let kept = selected_patch("pkg:pypi/foo@1.0", "old", &[("GHSA-a", &["CVE-1"])]);
+        let c = &advisory_coverage(std::slice::from_ref(&pkg), &[kept])[0];
+        assert_eq!(c.uuids, strs(&["old"]));
+        assert_eq!(c.fixes, strs(&["CVE-1"]));
+        assert_eq!(c.unpatched, strs(&["CVE-2"]));
+
+        let wheel = selected_patch(
+            "pkg:pypi/foo@1.0?artifact_id=whl",
+            "w",
+            &[("GHSA-a", &["CVE-1"]), ("GHSA-c", &["CVE-3"])],
+        );
+        let sdist = selected_patch(
+            "pkg:pypi/Foo@1.0?artifact_id=tar-gz",
+            "s",
+            &[("GHSA-a", &["CVE-1"])],
+        );
+        let c = &advisory_coverage(&[pkg], &[wheel, sdist])[0];
+        assert_eq!(c.uuids, strs(&["s", "w"]));
+        assert_eq!(c.fixes, strs(&["CVE-1"]));
+        assert_eq!(c.unpatched, strs(&["CVE-2", "CVE-3"]));
     }
 
     #[test]

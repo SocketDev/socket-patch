@@ -650,6 +650,7 @@ Human (non-`--json`) output is not a stable interface, but these rules hold:
 * Hosted mode is called "hosted" in human text (`Switched N packages to hosted patches; rewrote M files.`); JSON keys and codes keep their `redirect*` names.
 * npm's `allow-remote` notice prints as one line (`Note: set \`allow-remote=all\` in .npmrc …` or `Warning: npm >=12 refuses the hosted patches until …`); the full `redirect_npm_allow_remote` detail is in `--json` and under `--verbose`.
 * Hosted and vendored runs that change the project end with one shared `Next steps:` block (commit, reinstall + `socket-patch vex`, then any extra step).
+* `scan` says which advisories a run leaves unpatched. One patch is applied per package version, while the results table lists the ids of every candidate patch. So under its result line (`Switched …`, `Vendored …`, the agent apply's `Summary: …`, the `--dry-run` line), every mode prints one line per package it patched: `  <purl>: fixes <ids>`, plus `; still unpatched: <ids>` for the advisories only the package's other patches fix (paid ones included). A dry run says `would fix` / `would stay unpatched`; a re-run that finds the patch in place repeats the line. When any package keeps an unpatched advisory, one closing line follows: `Only one patch is applied per package version. Upgrade the package to fix the advisories still unpatched.` A list longer than eight ids ends `(+N more)` unless `--verbose`. Only a patch the run applied (or found applied) gets a line; a patch whose records name no advisory gets none. `--json` carries the same facts on `packages[]` (see [`scan` and `get` JSON](#scan-and-get-json-v50-major)).
 * A declined prompt prints `Cancelled; no changes made.`; the paid-plan upsell is `Upgrade to a paid Socket plan to access all patches: https://socket.dev/pricing`.
 * `-h` lists about eight common options per command; `--help` lists all of them.
 * **A closed output pipe never ends a run.** When the reader of stdout or stderr goes away (`socket-patch apply | head -1`, `| grep -q …`), the command stops printing to that stream and otherwise carries on: it finishes every write, releases `apply.lock` and exits with the code its work earned (`0` for a successful `apply`), not with SIGPIPE's 141 and not with a panic. This holds for `--json` too (the envelope is simply not delivered). Before, the default SIGPIPE disposition killed the process at the line it was printing, between two of a mutating command's writes and with the lock file left behind.
@@ -2143,7 +2144,7 @@ One command is **intentionally not** plain-envelope and will stay that way (not 
 
   // scan payload (not events)
   "scannedPackages": 12, "lockfileOnlyPackages": 0, "canAccessPaidPatches": false,
-  "packages": [ ... ],               // discovery: one entry per package with patches (batch records)
+  "packages": [ ... ],               // discovery: one entry per package with patches (batch records), plus what the run selected (below)
   "paths": [], "updates": [ { "purl": "...", "oldUuid": "...", "newUuid": "..." } ],
   "rollout": { ... }, "policy": { ... }, "redirectState": { ... },   // as documented above
   "redirect": { "mode": "hosted", "rewrittenFiles": [ "package-lock.json" ] },  // hosted only
@@ -2153,6 +2154,17 @@ One command is **intentionally not** plain-envelope and will stay that way (not 
   "purl": "pkg:npm/foo@1.0.0", "options": [ { "uuid", "tier", "publishedAt", "description", "vulnerabilities" } ]
 }
 ```
+
+**What a run selects, and what that leaves unfixed (additive).** One patch is applied per package version (see [Which patch gets selected](#which-patch-gets-selected)), so `packages[].patches[]` usually lists more advisories than the run fixes. Each `packages[]` entry the run selected a patch for carries three more keys; an entry it selected nothing for (paid-only, filtered by the socket.yml policy, a failed detail lookup) carries none of them:
+
+```jsonc
+{ "purl": "pkg:pypi/urllib3@1.26.18", "patches": [ ... ],
+  "selectedUuids": ["e828efa5-…"],                              // the selected patch (one per release variant: a wheel and its sdist, a gem platform), sorted
+  "fixedIds":   ["CVE-2025-66418", "GHSA-gm62-xv2j-4w53"],     // every CVE and advisory id the selection names, CVEs first, each group sorted
+  "unfixedIds": ["CVE-2025-66471", "CVE-2026-21441", "GHSA-2xpw-w6gg-jr37", "GHSA-38jv-5279-wg99"] }  // ids only the package's other patches name; [] when none
+```
+
+The keys describe the selection, on every `scan --json` run that fetches the by-package records (every mode, a dry run and a report-only run included). Whether a selected patch landed is its event (`applied`, `verified`, `skipped`, `failed`). `unfixedIds` counts a patch the account cannot download (`tier: "paid"`) like any other. When a package's release variants selected different patches, `fixedIds` holds only the ids every one of them names. The batch records do not pair an advisory id with its CVE, so an alias the selected patch does not list is reported unfixed, never the reverse.
 
 **Events per mode.** Agent mode (`get`, `scan --mode agent` / `--sync`): a fetched patch is `downloaded` (new manifest record) or `updated` (+`oldUuid`: it replaced another uuid), one already recorded at the same uuid is `skipped` / `already_in_manifest` (it is still re-applied), a patch that could not be fetched or recorded is `failed` (`download_failed`, `patch_no_applicable_files`, `blob_write_failed`); then the nested apply adds `applied` only for each recorded patch it actually patched, `skipped` with `errorCode` / `reason` for each recorded patch it left untouched (including `already_patched`, `vendored`, `package_not_installed`, and `user_patch_conflict`) plus a `skipped` / `user_patch_conflict` event for any other manifest package it left untouched for a user patch, and `failed` (apply's `apply_failed` / `package_not_installed` with its `error`, #424) for each it failed — a failing manifest patch the run did not select (the nested apply covers the whole `--ecosystems`-scoped manifest) gets its own `failed` event, and a failure no single patch explains (an unreadable manifest, the yarn PnP refusal, unavailable patch sources) is a purl-less `failed` event, so a failed apply is always `partialFailure` (exit 1). The apply's mismatch overwrites (#1004) are `content_mismatch_overwritten` warnings; a record whose purl the vendor ledger wires at another uuid adds a `vendored_uuid_drift` warning. A run that leaves patches recorded in a manifest git would not commit (inside a git work tree, `git check-ignore` matches the manifest's project-relative path, e.g. a `manifest.json`, `*.json` or `.socket/` rule; a tracked manifest never warns) adds a `manifest_gitignored` warning naming the rule: a fresh checkout's `apply` would find no manifest and apply nothing (#1638). It stays a warning (exit unchanged) because a pipeline that scans and applies in one job never commits `.socket/`. Vendor-owned and lockfile-only selections are `skipped` / `vendored` and `skipped` / `package_not_installed` before any download. Hosted and vendored events are described under "Scan modes" above; every one carries `details.mode`. `get`'s narrowing adds `skipped` events (`package_not_installed`, `yarn_pnp_unsupported`, `pnpm_pnp_unsupported`) and `paidRequired` runs one `skipped` / `paid_required` event per patch found.
 
@@ -2245,7 +2257,9 @@ patches:" listing, and the `selectionRequired` `options[]` array — so
 `updates[].newUuid` names that same patch.
 
 `scan` never shows a picker: it always takes the top-ranked downloadable
-patch. Neither does hosted or vendored `get` (v5.0): no picker, no
+patch, and says which advisories that leaves unpatched (the `still
+unpatched` lines of its human output, `packages[].unfixedIds` in
+`--json`). Neither does hosted or vendored `get` (v5.0): no picker, no
 confirmation, no `selectionRequired` — the top-ranked accessible patch per
 package, in `--json` too. On agent-mode `get`, free/unauthorized callers with more than one candidate
 for a PURL still get the interactive picker (or `selectionRequired` in

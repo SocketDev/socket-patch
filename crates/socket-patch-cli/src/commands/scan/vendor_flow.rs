@@ -37,7 +37,9 @@ use crate::commands::lock_cli::lock_failure;
 use crate::commands::vendor::{
     note_classic_migration_risk, symlinked_wiring_warnings, track_outcomes_for_vendor,
 };
-use crate::commands::vendored_backend::{records_manifest, ApplyRequest, VendoredBackend};
+use crate::commands::vendored_backend::{
+    records_manifest, ApplyRequest, ClosingLines, VendoredBackend,
+};
 use crate::ecosystem_dispatch::NpmCrawlSnapshot;
 use crate::json_envelope::{
     Command as EnvelopeCommand, Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning,
@@ -170,6 +172,16 @@ impl VendorPreview {
                 }),
             );
         }
+    }
+
+    /// The uuids of the rows the wet run would vendor or already holds:
+    /// every row it would not refuse.
+    pub(crate) fn landing_uuids(&self) -> HashSet<&str> {
+        self.rows
+            .iter()
+            .filter(|r| !matches!(r.verdict, PreviewVerdict::WouldRefuse { .. }))
+            .map(|r| r.uuid.as_str())
+            .collect()
     }
 
     /// How many rows the ledger already holds at their uuid.
@@ -445,6 +457,9 @@ pub(crate) struct VendorStep<'a> {
     /// and its telemetry must not report a clean vendoring.
     pub(crate) download_errors: bool,
     pub(crate) telemetry_auth: &'a TelemetryAuth,
+    /// Lines for the human close to print under its summary line (see
+    /// [`VendoredBackend::with_closing_lines`]).
+    pub(crate) closing_lines: Option<&'a ClosingLines<'a>>,
 }
 
 /// The one vendored-apply entry of `scan --mode vendored` (JSON and
@@ -474,6 +489,7 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         prior,
         download_errors,
         telemetry_auth,
+        closing_lines,
     } = step;
     let outcome = vendor_under_lock(
         common,
@@ -482,6 +498,7 @@ async fn run_vendor_step(step: VendorStep<'_>) -> VendorStepResult {
         use_public_proxy,
         report_empty,
         prior,
+        closing_lines,
     )
     .await;
     match &outcome {
@@ -512,6 +529,7 @@ async fn vendor_under_lock(
     use_public_proxy: bool,
     report_empty: bool,
     prior: Option<&NpmCrawlSnapshot>,
+    closing_lines: Option<&ClosingLines<'_>>,
 ) -> VendorStepResult {
     let mut env = Envelope::new(EnvelopeCommand::Vendor);
     env.dry_run = common.dry_run;
@@ -544,6 +562,7 @@ async fn vendor_under_lock(
     // `scan --mode vendored` and `vendor` commit byte-identical artifacts.
     let service = common.vendor_service_config(Some(client), use_public_proxy);
     let applied = VendoredBackend::new(common, Some(&service))
+        .with_closing_lines(closing_lines)
         .apply(
             ApplyRequest {
                 manifest: &manifest,
@@ -820,6 +839,7 @@ async fn run_vendor_json_path(
         prior,
         download_errors: dl_code != 0,
         telemetry_auth,
+        closing_lines: None,
     })
     .await
     {
@@ -896,7 +916,21 @@ async fn run_vendor_interactive_path(
     telemetry_auth: &TelemetryAuth,
     // The npm half of scan's crawl, for the vendor engine to reuse.
     prior: Option<&NpmCrawlSnapshot>,
+    // What each selected patch fixes and leaves unpatched.
+    coverage: &[super::discovery::AdvisoryCoverage],
 ) -> i32 {
+    // Under the engine's summary line: the advisory lines of the packages
+    // it vendored or found already vendored.
+    let verbose = args.common.verbose;
+    let closing_lines = move |vendored: &[&str]| -> Vec<String> {
+        let keys: HashSet<PurlKey> = vendored.iter().map(|purl| PurlKey::new(purl)).collect();
+        let landed: HashSet<&str> = coverage
+            .iter()
+            .filter(|c| keys.contains(&PurlKey::new(&c.purl)))
+            .flat_map(|c| c.uuids.iter().map(String::as_str))
+            .collect();
+        super::coverage_lines_for(coverage, &landed, false, verbose)
+    };
     // The download phase is quiet about its own header in vendored mode
     // (only the manifest-mode download prints it), so this arm does.
     if !args.common.silent && !selected.is_empty() {
@@ -922,6 +956,7 @@ async fn run_vendor_interactive_path(
         prior,
         download_errors: dl_code != 0,
         telemetry_auth,
+        closing_lines: Some(&closing_lines),
     })
     .await
     {
@@ -1091,6 +1126,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
     prune: bool,
     telemetry_auth: &'a TelemetryAuth,
     prior: Option<&'a NpmCrawlSnapshot>,
+    coverage: &'a [super::discovery::AdvisoryCoverage],
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = i32> + 'a>> {
     Box::pin(run_vendor_interactive_path(
         args,
@@ -1106,6 +1142,7 @@ pub(super) fn boxed_vendor_interactive_path<'a>(
         prune,
         telemetry_auth,
         prior,
+        coverage,
     ))
 }
 

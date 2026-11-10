@@ -132,6 +132,74 @@ pub(super) fn vuln_cell(vulns: &super::discovery::VulnIds, verbose: bool) -> Str
     }
 }
 
+/// Advisory ids one list of a coverage line names before `(+N more)`
+/// (unless `--verbose`).
+const COVERAGE_IDS_SHOWN: usize = 8;
+
+fn coverage_ids(ids: &[String], verbose: bool) -> String {
+    if verbose || ids.len() <= COVERAGE_IDS_SHOWN {
+        return ids.join(", ");
+    }
+    format!(
+        "{} (+{} more)",
+        ids[..COVERAGE_IDS_SHOWN].join(", "),
+        ids.len() - COVERAGE_IDS_SHOWN
+    )
+}
+
+/// The lines under a mode's result line, one per patched package: the
+/// advisories its patch fixes and the ones it leaves unpatched (other
+/// patches of the package name them, and only one is applied). A closing
+/// line says why and what fixes them when any package keeps one. `dry_run`
+/// puts it in the future tense. A package whose patches name no advisory
+/// gets no line; `color` highlights what stays unpatched.
+pub(crate) fn coverage_lines(
+    coverage: &[&super::discovery::AdvisoryCoverage],
+    dry_run: bool,
+    verbose: bool,
+    color: bool,
+) -> Vec<String> {
+    let (fixes, stays) = if dry_run {
+        ("would fix", "would stay unpatched")
+    } else {
+        ("fixes", "still unpatched")
+    };
+    let mut lines = Vec::new();
+    let mut incomplete = 0usize;
+    for c in coverage {
+        if c.fixes.is_empty() && c.unpatched.is_empty() {
+            continue;
+        }
+        let mut line = format!(
+            "  {}: ",
+            socket_patch_core::utils::purl::normalize_purl(&c.purl)
+        );
+        if c.fixes.is_empty() {
+            line.push_str("its patch names no advisory");
+        } else {
+            line.push_str(&format!("{fixes} {}", coverage_ids(&c.fixes, verbose)));
+        }
+        if !c.unpatched.is_empty() {
+            incomplete += 1;
+            let rest = format!("{stays}: {}", coverage_ids(&c.unpatched, verbose));
+            line.push_str(&format!("; {}", ui::paint(&rest, "33", color)));
+        }
+        lines.push(line);
+    }
+    if incomplete > 0 {
+        lines.push(format!(
+            "Only one patch is applied per package version. Upgrade {} to fix the advisories \
+             still unpatched.",
+            if incomplete == 1 {
+                "the package"
+            } else {
+                "those packages"
+            }
+        ));
+    }
+    lines
+}
+
 /// The line under the table: how many packages have patches and how many
 /// of those patches this account can download.
 pub(super) fn summary_line(packages: usize, patches: usize, all_accessible: bool) -> String {
@@ -907,6 +975,77 @@ mod tests {
             dry_run_line(vendor(4, 1, 2)),
             "[dry-run] Would download and vendor 1 of 4 patches (2 already vendored, \
              1 would be refused). No changes made."
+        );
+    }
+
+    fn coverage(
+        purl: &str,
+        fixes: &[&str],
+        unpatched: &[&str],
+    ) -> crate::commands::scan::discovery::AdvisoryCoverage {
+        let strs = |ids: &[&str]| ids.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        crate::commands::scan::discovery::AdvisoryCoverage {
+            purl: purl.to_string(),
+            uuids: vec!["u".to_string()],
+            fixes: strs(fixes),
+            unpatched: strs(unpatched),
+            fixed_ids: strs(fixes),
+            unfixed_ids: strs(unpatched),
+        }
+    }
+
+    #[test]
+    fn coverage_lines_name_fixed_and_unpatched_advisories_per_package() {
+        let complete = coverage("pkg:npm/%40scope/a@1.0.0", &["CVE-1"], &[]);
+        let partial = coverage("pkg:pypi/urllib3@1.26.18", &["CVE-2"], &["CVE-3", "CVE-4"]);
+        let silent = coverage("pkg:npm/b@1.0.0", &[], &[]);
+        let unnamed = coverage("pkg:npm/c@1.0.0", &[], &["CVE-5"]);
+        // Every advisory fixed: one line, no closing note. A package whose
+        // patches name no advisory has nothing to say.
+        assert_eq!(
+            coverage_lines(&[&complete, &silent], false, false, false),
+            ["  pkg:npm/@scope/a@1.0.0: fixes CVE-1"]
+        );
+        assert_eq!(
+            coverage_lines(&[&complete, &partial], false, false, false),
+            [
+                "  pkg:npm/@scope/a@1.0.0: fixes CVE-1",
+                "  pkg:pypi/urllib3@1.26.18: fixes CVE-2; still unpatched: CVE-3, CVE-4",
+                "Only one patch is applied per package version. Upgrade the package to fix \
+                 the advisories still unpatched.",
+            ]
+        );
+        // A dry run says it in the future tense; the note is for both
+        // packages.
+        assert_eq!(
+            coverage_lines(&[&partial, &unnamed], true, false, false),
+            [
+                "  pkg:pypi/urllib3@1.26.18: would fix CVE-2; would stay unpatched: CVE-3, CVE-4",
+                "  pkg:npm/c@1.0.0: its patch names no advisory; would stay unpatched: CVE-5",
+                "Only one patch is applied per package version. Upgrade those packages to \
+                 fix the advisories still unpatched.",
+            ]
+        );
+        assert!(coverage_lines(&[], false, false, false).is_empty());
+    }
+
+    #[test]
+    fn coverage_lines_bound_a_long_id_list_unless_verbose() {
+        let ids: Vec<String> = (1..=11).map(|i| format!("CVE-2024-{i:04}")).collect();
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let many = coverage("pkg:npm/a@1.0.0", &["CVE-1"], &ids);
+        let line = &coverage_lines(&[&many], false, false, false)[0];
+        assert!(
+            line.ends_with("CVE-2024-0007, CVE-2024-0008 (+3 more)"),
+            "{line}"
+        );
+        let line = &coverage_lines(&[&many], false, true, false)[0];
+        assert!(line.ends_with("CVE-2024-0010, CVE-2024-0011"), "{line}");
+        // Color wraps only the unpatched clause.
+        let line = &coverage_lines(&[&many], false, true, true)[0];
+        assert!(
+            line.starts_with("  pkg:npm/a@1.0.0: fixes CVE-1; \u{1b}[33mstill unpatched: "),
+            "{line:?}"
         );
     }
 

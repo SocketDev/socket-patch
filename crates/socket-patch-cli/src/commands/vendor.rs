@@ -2440,7 +2440,7 @@ async fn run_eject(
         // The vendored summary and its "Next steps:", deferred until the
         // eject is known to stand: a failed one is rolled back (or needs
         // the manual restore its error names), so neither applies.
-        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true);
+        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true, None);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     drop(guard);
@@ -3179,7 +3179,7 @@ pub(crate) async fn vendor_records(
     ledger: std::io::Result<VendorState>,
 ) -> bool {
     vendor_records_reusing(
-        common, records, sources, detached, force, env, service, ledger, None, None,
+        common, records, sources, detached, force, env, service, ledger, None, None, None,
     )
     .await
 }
@@ -3202,6 +3202,9 @@ pub(crate) async fn vendor_records_reusing(
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
     mut eject: Option<&mut EjectCapture>,
+    // Lines for the human close to print under its summary line (see
+    // `VendoredBackend::with_closing_lines`).
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) -> bool {
     let mut has_errors = false;
     // This run's events start here (`scan --mode vendored` hands over an
@@ -4364,28 +4367,51 @@ pub(crate) async fn vendor_records_reusing(
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
         Some(capture) => capture.wired_flavors = wired_flavors,
-        None => print_vendor_closing(common, env, dry_in_sync, &wired_flavors, !commit_failed),
+        None => print_vendor_closing(
+            common,
+            env,
+            dry_in_sync,
+            &wired_flavors,
+            !commit_failed,
+            closing_lines,
+        ),
     }
 
     has_errors
 }
 
-/// The human close of a vendor run: the summary line, then — when
-/// something was vendored and `next_steps` (the run's commit landed) — the
-/// commit and reinstall "Next steps:" for the lockfile flavors the run
-/// wired.
+/// The human close of a vendor run: the summary line, the caller's
+/// `closing_lines` for the packages the run vendored or found already
+/// vendored, then — when something was vendored and `next_steps` (the run's
+/// commit landed) — the commit and reinstall "Next steps:" for the lockfile
+/// flavors the run wired.
 fn print_vendor_closing(
     common: &GlobalArgs,
     env: &Envelope,
     dry_in_sync: u32,
     wired_flavors: &HashSet<String>,
     next_steps: bool,
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) {
     if common.json || common.silent {
         return;
     }
     let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
     println!("{}", format_vendor_summary(common.dry_run, &tally));
+    if let Some(lines) = closing_lines {
+        let vendored: Vec<&str> = env
+            .events
+            .iter()
+            .filter(|e| {
+                e.action == PatchAction::Applied
+                    || e.error_code.as_deref() == Some("already_vendored")
+            })
+            .filter_map(|e| e.purl.as_deref())
+            .collect();
+        for line in lines(&vendored) {
+            println!("{line}");
+        }
+    }
     if env.summary.applied > 0 && !common.dry_run && next_steps {
         // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
         // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired

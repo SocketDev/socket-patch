@@ -247,7 +247,7 @@ pub async fn mount_by_package_500(mock: &MockServer, purl: &str) {
 
 /// The patch view for `uuid` with an inline blob turning `before` into
 /// `after\n` in `package/index.js`, so the apply step needs no blob endpoint.
-async fn mount_view(mock: &MockServer, purl: &str, uuid: &str, before: &[u8]) {
+pub async fn mount_view(mock: &MockServer, purl: &str, uuid: &str, before: &[u8]) {
     Mock::given(method("GET"))
         .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/view/{uuid}")))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({

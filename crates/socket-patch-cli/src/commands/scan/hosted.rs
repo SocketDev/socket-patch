@@ -705,6 +705,7 @@ pub(super) async fn run_redirect(
             rows,
             prior,
             references,
+            coverage: Vec::new(),
         }),
         "scan",
     )
@@ -1973,6 +1974,20 @@ async fn run_redirect_selected_untracked(
                 "{}",
                 format_redirect_summary(confirmed.len(), human_files.len(), common.dry_run)
             );
+            // Under it, per package on a hosted patch: the advisories that
+            // patch fixes and the ones it leaves unpatched.
+            if let Some(gate) = &rollout {
+                let pinned: std::collections::HashSet<&str> =
+                    confirmed.iter().map(|(_, uuid)| uuid.as_str()).collect();
+                for line in super::coverage_lines_for(
+                    &gate.coverage,
+                    &pinned,
+                    common.dry_run,
+                    common.verbose,
+                ) {
+                    println!("{line}");
+                }
+            }
             let human_warnings: Vec<(&str, &str)> = warnings
                 .iter()
                 .map(|w| (w.code.as_str(), w.detail.as_str()))

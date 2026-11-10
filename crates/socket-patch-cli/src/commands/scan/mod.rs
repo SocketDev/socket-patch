@@ -62,8 +62,9 @@ pub(crate) mod vendor_flow;
 mod withdrawn;
 
 use self::discovery::{
-    collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
-    preverify_vendor_baselines, vendored_ledger_supplement, LockfileSupplement,
+    advisory_coverage, collect_vuln_ids, detect_updates, lockfile_only_contains,
+    lockfile_supplement, preverify_vendor_baselines, vendored_ledger_supplement, AdvisoryCoverage,
+    LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the lockfile
 // and vendored-ledger crawl supplements. `pub(crate)` re-exports because
@@ -635,8 +636,34 @@ fn classified_rows(
     if let Some(env) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
+        coverage_into_packages_json(env, &advisory_coverage(packages, &writers_of(&rows)));
     }
     rows
+}
+
+/// Say on each `packages[]` entry which patch the run selected for the
+/// package and what that leaves unfixed: `selectedUuids`, `fixedIds` and
+/// `unfixedIds`, absent on a package the run selected no patch for. Whether
+/// a selected patch landed is its event.
+fn coverage_into_packages_json(env: &mut Envelope, coverage: &[AdvisoryCoverage]) {
+    let Some(packages) = env
+        .extra
+        .get_mut("packages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for pkg in packages {
+        let Some(c) = coverage
+            .iter()
+            .find(|c| pkg["purl"].as_str() == Some(c.purl.as_str()))
+        else {
+            continue;
+        };
+        pkg["selectedUuids"] = serde_json::json!(c.uuids);
+        pkg["fixedIds"] = serde_json::json!(c.fixed_ids);
+        pkg["unfixedIds"] = serde_json::json!(c.unfixed_ids);
+    }
 }
 
 /// `common` for `select_patches`: scan never prompts, so it always takes
@@ -736,6 +763,49 @@ fn select_accessible(
         .filter(|p| can_access_paid_patches || p.tier == "free")
         .collect();
     policy.select(accessible)
+}
+
+/// The advisory lines ([`render::coverage_lines`]) of the packages whose
+/// selected patch is one of `landed`: only a patch the run applied (or, on
+/// a dry run, would apply) is said to fix anything.
+pub(super) fn coverage_lines_for(
+    coverage: &[AdvisoryCoverage],
+    landed: &HashSet<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> Vec<String> {
+    let patched: Vec<&AdvisoryCoverage> = coverage
+        .iter()
+        .filter(|c| c.uuids.iter().any(|uuid| landed.contains(uuid.as_str())))
+        .collect();
+    render::coverage_lines(&patched, dry_run, verbose, ui::stdout_color())
+}
+
+/// Print [`coverage_lines_for`] on stdout, under the mode's result line.
+fn print_coverage(
+    coverage: &[AdvisoryCoverage],
+    landed: &HashSet<&str>,
+    dry_run: bool,
+    verbose: bool,
+) {
+    for line in coverage_lines_for(coverage, landed, dry_run, verbose) {
+        println!("{line}");
+    }
+}
+
+/// The uuids of the patches an agent run left applied: the ones its nested
+/// apply wrote, and the ones it found already in place.
+fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
+    outcome
+        .events
+        .iter()
+        .filter(|event| match event.action {
+            PatchAction::Applied => true,
+            PatchAction::Skipped => event.error_code.as_deref() == Some("already_patched"),
+            _ => false,
+        })
+        .filter_map(|event| event.uuid.as_deref())
+        .collect()
 }
 
 /// Print the blank stdout line that opens a paragraph, once: `opened`
@@ -3299,6 +3369,9 @@ async fn scan_project(
             }
         }
     };
+    // What each package's selected patch fixes and leaves unpatched: every
+    // mode prints it under its result line, for the packages it patched.
+    let coverage = advisory_coverage(&all_packages_with_patches, &writers_of(&rows));
 
     // Presentational only, so `--silent` skips it wholesale.
     if !silent {
@@ -3454,6 +3527,7 @@ async fn scan_project(
                 rows,
                 prior: prior_discovery,
                 references: sweep_references,
+                coverage,
             }),
             "scan",
         )
@@ -3628,6 +3702,20 @@ async fn scan_project(
                     render::dry_run_line(render::Plan::Apply(selected.len()))
                 ),
             }
+            // What the wet run would patch: the vendored preview's rows
+            // less its refusals, or the agent selection with the recorded
+            // patches it re-applies.
+            let landing: HashSet<&str> = match &preview {
+                Some(preview) => preview.landing_uuids(),
+                None => selected
+                    .iter()
+                    .chain(&already_recorded)
+                    .map(|p| p.uuid.as_str())
+                    .collect(),
+            };
+            if !report_only {
+                print_coverage(&coverage, &landing, true, verbose);
+            }
         }
         print_rollout_human(&stage, true, silent);
         return finish_human(0).await;
@@ -3713,6 +3801,7 @@ async fn scan_project(
             prune,
             &telemetry_auth,
             npm_crawl.as_ref(),
+            &coverage,
         )
         .await
     } else {
@@ -3720,12 +3809,15 @@ async fn scan_project(
         // record and the nested apply re-applies them (a no-op on disk
         // when the installed copy is still patched).
         let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
-        let (code, _) = download_and_apply_patches_with(
+        let (code, outcome) = download_and_apply_patches_with(
             &to_download,
             &params,
             &download_run(&args, &api_client),
         )
         .await;
+        if !silent {
+            print_coverage(&coverage, &patched_uuids(&outcome), false, verbose);
+        }
         code
     };
 

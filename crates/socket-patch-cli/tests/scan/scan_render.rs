@@ -894,6 +894,148 @@ async fn scan_human_agent_mode_applies_without_prompting() {
     }
 }
 
+/// Mount a package with two patches: `UUID` (critical, CVE-2021-0001) and
+/// `UUID_B` (high, CVE-2021-0002). Only `UUID` has a patch view: it is the
+/// one the ranking selects.
+async fn mount_two_patches(mock: &MockServer, purl: &str, before: &[u8]) {
+    let patches = [
+        (UUID, "critical", "CVE-2021-0001", "GHSA-aaaa-aaaa-aaaa"),
+        (UUID_B, "high", "CVE-2021-0002", "GHSA-bbbb-bbbb-bbbb"),
+    ];
+    let batch: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [cve],
+                "ghsaIds": [ghsa], "severity": severity, "title": "covgap test patch"
+            })
+        })
+        .collect();
+    let details: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Covgap test patch", "license": "MIT", "tier": "free",
+                "vulnerabilities": { *ghsa: {
+                    "cves": [cve], "summary": "s", "severity": severity, "description": "d"
+                } }
+            })
+        })
+        .collect();
+    mount_batch(
+        mock,
+        serde_json::json!([{ "purl": purl, "patches": batch }]),
+        false,
+    )
+    .await;
+    mount_by_package_body(
+        mock,
+        purl,
+        serde_json::json!({ "patches": details, "canAccessPaidPatches": false }),
+    )
+    .await;
+    mount_view(mock, purl, UUID, before).await;
+}
+
+const UNPATCHED_NOTE: &str = "Only one patch is applied per package version. Upgrade the \
+    package to fix the advisories still unpatched.";
+
+/// Agent mode applies one of a package's two patches. Under the apply
+/// summary the run names the advisory it fixed and the one it left
+/// unpatched; a re-run that finds the package already patched says the same.
+#[tokio::test]
+async fn scan_human_agent_names_unpatched_advisories() {
+    let mock = MockServer::start().await;
+    let before = b"before\n";
+    mount_two_patches(&mock, MINIMIST, before).await;
+    let tmp = minimist_project(before);
+    let expected = format!(
+        "Summary: 1 of 1 targeted patch applied, 0 already patched, 0 not found on disk\n  \
+         {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
+         {UNPATCHED_NOTE}\n"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"after\n"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "  {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+}
+
+/// The agent dry run says what the patch would fix and leave unpatched,
+/// and prints no next steps: nothing was recorded.
+#[tokio::test]
+async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense() {
+    let mock = MockServer::start().await;
+    mount_two_patches(&mock, MINIMIST, b"before\n").await;
+    let tmp = minimist_project(b"before\n");
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "[dry-run] Would download and apply 1 patch. No changes made.\n  \
+             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+
+    // The vendored preview ends the same way.
+    let (code, stdout, stderr) = run_scan_api(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "[dry-run] Would download and vendor 1 patch. No changes made.\n  \
+             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    // `--json` carries the same facts on the package's discovery entry.
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    let package = &doc["packages"][0];
+    assert_eq!(
+        package["selectedUuids"],
+        serde_json::json!([UUID]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["fixedIds"],
+        serde_json::json!(["CVE-2021-0001", "GHSA-aaaa-aaaa-aaaa"]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["unfixedIds"],
+        serde_json::json!(["CVE-2021-0002", "GHSA-bbbb-bbbb-bbbb"]),
+        "{doc:#}"
+    );
+}
+
 /// The post-apply GC line, both pluralization arms, for each spelling of
 /// apply-and-collect (`--sync`, `--mode agent --prune`). The pruned
 /// manifest and swept blobs are pinned in `scan_failure_paths.rs`.

@@ -2391,6 +2391,7 @@ async fn run_get_vendored(
         prior: None,
         download_errors: dl_code != 0,
         telemetry_auth: telemetry,
+        closing_lines: None,
     })
     .await
     {

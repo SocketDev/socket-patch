@@ -531,6 +531,92 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     );
 }
 
+/// A package with three patches gets one of them. The run names the
+/// advisory that patch fixes and the two it leaves unpatched (a CVE, and an
+/// advisory that has only a GHSA id), in the future tense on a dry run and
+/// again on a re-run that rewrites nothing. `--json` carries the same facts
+/// on the package's `packages[]` entry.
+#[tokio::test]
+async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
+    const UUID_B: &str = "33333333-3333-4333-8333-333333333333";
+    const UUID_C: &str = "44444444-4444-4444-8444-444444444444";
+    const LINE: &str = "  pkg:npm/covgap-hosted@1.0.0: fixes CVE-2026-0001; still unpatched: \
+        CVE-2026-0002, GHSA-cccc-cccc-cccc\n";
+    const NOTE: &str = "Only one patch is applied per package version. Upgrade the package to \
+        fix the advisories still unpatched.\n";
+
+    let server = MockServer::start().await;
+    mock_discovery_patches(
+        &server,
+        PURL,
+        &[
+            (UUID, "critical", "CVE-2026-0001", "GHSA-aaaa-aaaa-aaaa"),
+            (UUID_B, "high", "CVE-2026-0002", "GHSA-bbbb-bbbb-bbbb"),
+            (UUID_C, "high", "", "GHSA-cccc-cccc-cccc"),
+        ],
+    )
+    .await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        format!(
+            "Would switch 1 package to hosted patches and rewrite 2 files (--dry-run: nothing \
+             was changed).\n  pkg:npm/covgap-hosted@1.0.0: would fix CVE-2026-0001; would stay \
+             unpatched: CVE-2026-0002, GHSA-cccc-cccc-cccc\n{NOTE}"
+        ),
+        "stderr=\n{stderr}"
+    );
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let package = &doc["packages"][0];
+    assert_eq!(package["selectedUuids"], json!([UUID]), "{doc:#}");
+    assert_eq!(
+        package["fixedIds"],
+        json!(["CVE-2026-0001", "GHSA-aaaa-aaaa-aaaa"]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["unfixedIds"],
+        json!([
+            "CVE-2026-0002",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["patches"].as_array().map(Vec::len),
+        Some(3),
+        "the existing discovery payload is unchanged: {doc:#}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    let engine = engine_stdout(&stdout);
+    assert!(
+        engine.starts_with(&format!(
+            "Switched 1 package to hosted patches; rewrote 2 files.\n{LINE}{NOTE}Next steps:\n"
+        )),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        format!("1 package is already on hosted patches; nothing to rewrite.\n{LINE}{NOTE}"),
+        "stderr=\n{stderr}"
+    );
+}
+
 /// A granted patch whose package has no lock entry is listed by purl on
 /// stderr (not just hinted at by a raw rewriter warning), under a
 /// `No patches could be redirected:` headline when nothing was.
