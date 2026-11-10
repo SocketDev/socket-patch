@@ -125,6 +125,13 @@ impl GemCopy {
     /// The copy at `pkg_path`, when it sits in a RubyGems `gems/` dir.
     /// Whether its spec exists is checked by the caller.
     fn of(pkg_path: &Path) -> Option<GemCopy> {
+        // Absolute, because a build runs Ruby from the project dir and
+        // `extconf.rb` from the ext dir: a relative crawl root (`--cwd .`,
+        // `--cwd proj`) would leave the spec path and `GEM_PATH` pointing
+        // nowhere, and an `extconf.rb` that loads `mini_portile2` (nokogiri)
+        // from the copy's own home would fail to build.
+        let pkg_path = std::path::absolute(pkg_path).ok()?;
+        let pkg_path = pkg_path.as_path();
         let full_name = pkg_path.file_name()?.to_str()?.to_string();
         let gems = pkg_path.parent()?;
         if gems.file_name()? != "gems" {
