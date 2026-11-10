@@ -3643,6 +3643,9 @@ async fn scan_project(
     if !silent && !selected.is_empty() {
         if vendor {
             println!("\nPatches to vendor:\n");
+        } else if report_only {
+            // This run applies none of them.
+            println!("\nPatches available:\n");
         } else {
             println!("\nPatches to apply:\n");
         }
@@ -3683,6 +3686,38 @@ async fn scan_project(
         }
     }
 
+    // A report-only run applies nothing, with or without `--dry-run`: both
+    // end with how to apply what was found, and the `--prune` GC (a
+    // read-only preview on a dry run). The preview never says it would
+    // download and apply.
+    if report_only {
+        // The "Patches available:" listing already ends with a blank line.
+        if !silent {
+            for line in render::report_only_hint(&args.common) {
+                println!("{line}");
+            }
+        }
+        if prune {
+            gc::run_human_gc(
+                &args.common,
+                &manifest_path,
+                &socket_dir,
+                &scanned_purls,
+                &vendored_purls,
+            )
+            .await;
+        }
+        return embed_vex_human(
+            &args.common,
+            &args.vex,
+            &api_client,
+            &manifest_path,
+            0,
+            hosted,
+        )
+        .await;
+    }
+
     // `--dry-run` is a non-mutating preview: stop here, having printed the
     // table and the per-patch plan above, before the download/apply and the
     // prune GC (which runs as a read-only preview instead).
@@ -3692,8 +3727,8 @@ async fn scan_project(
             // rendered as `[skip]` and `[would-refuse]` lines so a preview
             // never advertises vendoring the wet run would skip or refuse.
             let preview = if vendor {
-                // `vendor` is never report-only, so the planning pass
-                // above always computed it.
+                // The planning pass above always computed it for a
+                // vendored run.
                 let mut preview = vendor_preview
                     .take()
                     .expect("the vendored planning pass computed the preview");
@@ -3720,40 +3755,10 @@ async fn scan_project(
                     .map(|p| p.uuid.as_str())
                     .collect(),
             };
-            if !report_only {
-                print_coverage(&coverage, &landing, true, verbose);
-            }
+            print_coverage(&coverage, &landing, true, verbose);
         }
         print_rollout_human(&stage, true, silent, &[]);
         return finish_human(0).await;
-    }
-
-    if report_only {
-        // The "Patches to apply:" listing already ends with a blank line.
-        if !silent {
-            for line in render::report_only_hint(&args.common) {
-                println!("{line}");
-            }
-        }
-        if prune {
-            gc::run_human_gc(
-                &args.common,
-                &manifest_path,
-                &socket_dir,
-                &scanned_purls,
-                &vendored_purls,
-            )
-            .await;
-        }
-        return embed_vex_human(
-            &args.common,
-            &args.vex,
-            &api_client,
-            &manifest_path,
-            0,
-            hosted,
-        )
-        .await;
     }
 
     // Vendor mode: pre-verify baselines so a content mismatch is reported

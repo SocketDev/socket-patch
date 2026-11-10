@@ -783,8 +783,12 @@ async fn scan_prune_without_a_mode_is_report_only() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches to apply:") && stdout.contains(MINIMIST),
+        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
         "the per-patch preview still prints; got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("Patches to apply:"),
+        "a run that applies nothing must not head its listing `to apply`; got {stdout:?}"
     );
     assert!(
         stdout.contains("To apply these patches in place, run:")
@@ -799,6 +803,21 @@ async fn scan_prune_without_a_mode_is_report_only() {
         !tmp.path().join(".socket").exists(),
         "a report-only scan must not create .socket/"
     );
+
+    // The preview of a report-only run is the report: the real run applies
+    // nothing, so `--dry-run` must not say it would download and apply.
+    let (code, dry_stdout, stderr) =
+        run_scan_api(tmp.path(), &mock.uri(), &["--prune", "--dry-run"]);
+    assert_eq!(code, 0, "stdout={dry_stdout}; stderr={stderr}");
+    assert!(
+        !dry_stdout.contains("Would download and apply"),
+        "the preview promises an apply the real run does not make; got {dry_stdout:?}"
+    );
+    assert_eq!(
+        dry_stdout, stdout,
+        "a report-only run and its preview say the same thing"
+    );
+    assert!(!tmp.path().join(".socket").exists());
     assert_eq!(
         std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
         b"x\n",
@@ -840,9 +859,17 @@ async fn scan_global_report_only_hint_keeps_the_global_scope() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches to apply:") && stdout.contains(MINIMIST),
+        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
         "the global scan must find the patch; got {stdout:?}"
     );
+    // Its preview is the same report, never "Would download and apply".
+    let (code, dry_stdout, stderr) = run_scan_api(
+        &cwd,
+        &mock.uri(),
+        &["--global-prefix", prefix_arg, "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={dry_stdout}; stderr={stderr}");
+    assert_eq!(dry_stdout, stdout);
     let quoted = if cfg!(windows) {
         format!("\"{prefix_arg}\"")
     } else {
