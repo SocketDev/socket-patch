@@ -649,6 +649,11 @@ const DEPENDENCY_MANIFEST_UNVERIFIABLE: &str = "dependency_manifest_unverifiable
 /// not judge (see [`VexBuildParams::unjudged`]).
 const STALE_INSTALL_UNVERIFIED: &str = "stale_install_unverified";
 
+/// Omission tag: a hosted Composer pin that would attest from the lock
+/// alone, while composer.json sends the install to a `vendor-dir` outside
+/// the project that holds an install the crawler does not read (#686).
+const COMPOSER_INSTALL_UNREAD: &str = "composer_install_unread";
+
 /// Largest patched `package.json` blob [`patched_blob`] reads.
 const MAX_PATCHED_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
 
@@ -931,16 +936,31 @@ async fn generate_vex(
         };
         let hidden =
             |purl: &str| purl.starts_with("pkg:npm/") && (npm_store_hidden || pnp_unconsumed(purl));
+        //
+        // Nor did it look when composer.json sends the install to a
+        // `vendor-dir` outside the project: the crawler reads no tree there
+        // (apply would write into it), so a Composer purl not found may be
+        // installed, and unpatched since before the lock was redirected
+        // (#686). The pin stays evidence while nothing is installed there.
+        let composer_unread =
+            socket_patch_core::crawlers::composer_crawler::local_install_unread(&common.cwd);
+        let unread = |purl: &str| purl.starts_with("pkg:composer/") && composer_unread;
+        let pin_excuses = |f: &FailedPatch| {
+            f.reason == "package_not_found"
+                && plan.lockfile_basis.contains(&f.purl)
+                && !mirror_refused(&f.purl)
+                && crawled(&f.purl)
+                && !hidden(&f.purl)
+        };
+        for f in outcome.failed.iter_mut() {
+            if pin_excuses(f) && unread(&f.purl) {
+                f.reason = COMPOSER_INSTALL_UNREAD.to_string();
+            }
+        }
         let excusable: HashSet<String> = outcome
             .failed
             .iter()
-            .filter(|f| {
-                f.reason == "package_not_found"
-                    && plan.lockfile_basis.contains(&f.purl)
-                    && !mirror_refused(&f.purl)
-                    && crawled(&f.purl)
-                    && !hidden(&f.purl)
-            })
+            .filter(|f| pin_excuses(f))
             .map(|f| f.purl.clone())
             .collect();
         // A yarn classic pin attests from the lock only when the lock
@@ -2341,6 +2361,11 @@ fn omission_phrase(reason: &str) -> &'static str {
             "the patched native-extension sources were not compiled into the extension Ruby \
              loads; run socket-patch apply to rebuild it"
         }
+        COMPOSER_INSTALL_UNREAD => {
+            "composer.json's config.vendor-dir puts the install outside the project, where \
+             socket-patch reads nothing, so the installed copy was not checked; run with \
+             COMPOSER_VENDOR_DIR set to that directory to have it checked"
+        }
         DEPENDENCY_NOT_INSTALLED => {
             "the patched package.json declares a dependency that is not installed beside \
              the package"
@@ -2561,6 +2586,7 @@ mod tests {
             "vendor_manifest_unverifiable",
             "stale_install",
             STALE_INSTALL_UNVERIFIED,
+            COMPOSER_INSTALL_UNREAD,
             "mirror_overrides_source",
             DEPENDENCY_NOT_INSTALLED,
             DEPENDENCY_MANIFEST_UNVERIFIABLE,
