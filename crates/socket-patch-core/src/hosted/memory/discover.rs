@@ -171,7 +171,8 @@ pub(crate) fn supplement_purl(purl: &str) -> Option<String> {
 pub(crate) struct RootBatch {
     /// Packages with at least one patch, purl-sorted.
     pub(crate) packages: Vec<BatchPackagePatches>,
-    /// How many of the root's purls sat in a failed chunk.
+    /// How many of the root's purls sat in a failed chunk, or got no
+    /// answer in a chunk that otherwise succeeded.
     pub(crate) failed_purls: usize,
     pub(crate) last_error: Option<String>,
 }
@@ -235,6 +236,16 @@ pub(crate) async fn batch_search(
             Ok(response) => {
                 if response.can_access_paid_patches {
                     outcome.can_access_paid_patches = true;
+                }
+                // A purl the lookup got no answer for was not checked: it
+                // counts with the purls of a failed chunk.
+                for miss in &response.unanswered {
+                    for root in owners.get(miss.purl.as_str()).into_iter().flatten() {
+                        if let Some(entry) = outcome.roots.get_mut(*root) {
+                            entry.failed_purls += 1;
+                            entry.last_error = Some(miss.error.clone());
+                        }
+                    }
                 }
                 for pkg in response.packages {
                     if pkg.patches.is_empty() {
@@ -493,8 +504,9 @@ mod tests {
     }
 
     /// Answers every batch with the mixed-case NuGet spelling of
-    /// `pkg:nuget/newtonsoft.json@13.0.1`, as the API does.
-    struct CasedNuget;
+    /// `pkg:nuget/newtonsoft.json@13.0.1`, as the API does, and reports
+    /// the given purls as unanswered.
+    struct CasedNuget(Vec<crate::api::types::UnansweredPurl>);
 
     impl PatchApi for CasedNuget {
         fn uses_public_proxy(&self) -> bool {
@@ -504,7 +516,8 @@ mod tests {
             &'a self,
             _purls: &'a [String],
         ) -> ApiFuture<'a, crate::api::types::BatchSearchResponse> {
-            Box::pin(async {
+            let unanswered = self.0.clone();
+            Box::pin(async move {
                 Ok(crate::api::types::BatchSearchResponse {
                     packages: vec![crate::api::types::BatchPackagePatches {
                         purl: "pkg:nuget/Newtonsoft.Json@13.0.1".to_string(),
@@ -520,6 +533,7 @@ mod tests {
                         }],
                     }],
                     can_access_paid_patches: false,
+                    unanswered,
                 })
             })
         }
@@ -541,8 +555,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_search_counts_an_unanswered_purl_as_failed_for_its_asker() {
+        // A purl the client got no answer for was not checked: it is a
+        // failed purl of the root that asked, not a package with no patch.
+        let miss = crate::api::types::UnansweredPurl {
+            purl: "pkg:npm/left-pad@1.3.0".to_string(),
+            error: "API request failed with status 500".to_string(),
+        };
+        let provider = Provider::new(Arc::new(CasedNuget(vec![miss])), Duration::from_secs(5), 2);
+        let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        roots.insert(
+            "a".to_string(),
+            vec!["pkg:nuget/newtonsoft.json@13.0.1".to_string()],
+        );
+        roots.insert("b".to_string(), vec!["pkg:npm/left-pad@1.3.0".to_string()]);
+        let outcome = batch_search(&provider, &roots, 10).await;
+        assert_eq!(outcome.roots["b"].failed_purls, 1);
+        assert_eq!(
+            outcome.roots["b"].last_error.as_deref(),
+            Some("API request failed with status 500")
+        );
+        assert_eq!(outcome.roots["a"].failed_purls, 0);
+        assert_eq!(outcome.roots["a"].packages.len(), 1);
+    }
+
+    #[tokio::test]
     async fn batch_search_credits_a_respelled_response_only_to_its_asker() {
-        let provider = Provider::new(Arc::new(CasedNuget), Duration::from_secs(5), 2);
+        let provider = Provider::new(Arc::new(CasedNuget(Vec::new())), Duration::from_secs(5), 2);
         let mut roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
         roots.insert(
             "a".to_string(),

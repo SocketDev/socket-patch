@@ -1190,6 +1190,14 @@ pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retaine
 /// envelope instead.)
 pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
 
+/// A package the patch API gave no answer for while it answered for
+/// others (the public proxy's per-package path), so it was not checked for
+/// patches: the `errorCode` of its `failed` event, and the code of the one
+/// run-level warning naming every such package. The run is a partial
+/// failure (exit 1). (No package answered is the all-batches-failed error
+/// envelope instead.)
+pub(super) const PATCH_LOOKUP_FAILED: &str = "patch_lookup_failed";
+
 /// Run-level `--json` warning: one package's patch-detail query failed
 /// (after the client's bounded 429 / 503 retry) while others succeeded, so
 /// its patch was left out of the selection. The detail is the human
@@ -1729,11 +1737,40 @@ fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &Scan
 
 /// `invocation` is the policy a PATH-list parent already loaded (`None`
 /// loads it here); `explicit` says whether the user named this root.
+///
+/// The one place a scan's exit code is settled: a run that left packages
+/// unchecked (the patch API gave no answer for them) is a partial failure
+/// whatever the mode it went on to run reported, so it never exits 0.
 async fn run_scan(
+    args: ScanArgs,
+    telemetry: &mut PendingTelemetry,
+    invocation: Option<&InvocationPolicy>,
+    explicit: bool,
+) -> i32 {
+    let mut unchecked = 0usize;
+    let code = Box::pin(scan_project(
+        args,
+        telemetry,
+        invocation,
+        explicit,
+        &mut unchecked,
+    ))
+    .await;
+    if unchecked > 0 && code == 0 {
+        1
+    } else {
+        code
+    }
+}
+
+/// [`run_scan`]'s body. `unchecked` is set to the number of packages the
+/// patch API gave no answer for (already reported; see `run_scan`).
+async fn scan_project(
     mut args: ScanArgs,
     telemetry: &mut PendingTelemetry,
     invocation: Option<&InvocationPolicy>,
     explicit: bool,
+    unchecked: &mut usize,
 ) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -2467,6 +2504,11 @@ async fn run_scan(
     // chunk order, surfaced as run-level `warnings[]` when some batch
     // succeeded (all failing is the error envelope below).
     let mut failed_batches: Vec<(usize, String)> = Vec::new();
+    // Packages of an answered batch the patch API gave no answer for (the
+    // public proxy's per-package path), as `(purl, error)` in chunk order.
+    // They were not checked, so the run reports them and is a partial
+    // failure; treating them as patch-free would be a false clean.
+    let mut unanswered: Vec<(String, String)> = Vec::new();
 
     // Fold one batch outcome; callers consume outcomes strictly in chunk
     // order.
@@ -2482,6 +2524,7 @@ async fn run_scan(
                     all_packages_with_patches.push(pkg);
                 }
             }
+            unanswered.extend(response.unanswered.into_iter().map(|u| (u.purl, u.error)));
         }
         Err(e) => {
             batch_error_count += 1;
@@ -2628,6 +2671,22 @@ async fn run_scan(
         return 1;
     }
 
+    // Some packages got no answer: the run goes on with the answered ones,
+    // says which were left unchecked (even under `--silent`: this is why
+    // the run exits 1), and no later step may read their absence as "no
+    // patches".
+    *unchecked = unanswered.len();
+    let unanswered_detail = (!unanswered.is_empty())
+        .then(|| render::unanswered_lookups(&unanswered, query_purls.len()));
+    if let Some(detail) = &unanswered_detail {
+        if !args.common.json {
+            status.println(format!("Warning: {detail}"));
+        }
+    }
+    // A package the lookup missed could have been NEW, like one in a
+    // failed batch.
+    let lookup_incomplete = batch_error_count > 0 || !unanswered.is_empty();
+
     let total_patches_found: usize = all_packages_with_patches
         .iter()
         .map(|p| p.patches.len())
@@ -2770,6 +2829,18 @@ async fn run_scan(
             let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
             env.warn(API_BATCH_FAILED, detail);
         }
+        // A package the patch API gave no answer for: one warning naming
+        // them, and a `failed` event each, which makes the run a partial
+        // failure whatever the mode below reports.
+        if let Some(detail) = &unanswered_detail {
+            env.warn(PATCH_LOOKUP_FAILED, detail.as_str());
+            for (purl, error) in &unanswered {
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.as_str())
+                        .with_error(PATCH_LOOKUP_FAILED, error.as_str()),
+                );
+            }
+        }
         policy.fold_into_envelope(&mut env);
 
         // Hosted mode: the redirect engine records its events into this
@@ -2788,7 +2859,7 @@ async fn run_scan(
                 telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &mut stage,
                 prior_discovery,
                 sweep_references,
@@ -2840,7 +2911,7 @@ async fn run_scan(
                         &mut stage,
                         &discovered,
                         &recorded,
-                        batch_error_count > 0,
+                        lookup_incomplete,
                         &all_packages_with_patches,
                         Some(&mut env),
                     );
@@ -2877,7 +2948,7 @@ async fn run_scan(
                 &mut stage,
                 &discovered,
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &all_packages_with_patches,
                 Some(&mut env),
             );
@@ -2970,7 +3041,7 @@ async fn run_scan(
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &mut stage,
                 &policy,
                 &mut env,
@@ -3063,7 +3134,13 @@ async fn run_scan(
     // a wiped `.socket/vendor/` is `repair`'s job).
     if all_packages_with_patches.is_empty() {
         if !silent {
-            println!("\nNo patches available for installed packages.");
+            // Only a lookup the service answered in full may say it of
+            // every installed package.
+            if lookup_incomplete {
+                println!("\n{}", render::NO_PATCHES_AMONG_CHECKED);
+            } else {
+                println!("\nNo patches available for installed packages.");
+            }
         }
         return finish_human(0).await;
     }
@@ -3101,7 +3178,7 @@ async fn run_scan(
                     &mut stage,
                     &discovered,
                     &recorded,
-                    batch_error_count > 0,
+                    lookup_incomplete,
                     &all_packages_with_patches,
                     None,
                 );

@@ -98,6 +98,69 @@ fn status_error(head: &str, status: StatusCode, text: &str) -> String {
     }
 }
 
+/// The message of an error body in the patch service's own shape: the org
+/// API's `{"error":{"message":"…"}}`, or the public proxy's
+/// `{"error":"…","message":"…"}`. `None` for anything else (an HTML page,
+/// plain text, an empty body, another service's JSON).
+///
+/// This is how an answer from the patch service is told apart from one a
+/// different host wrote: a mistyped URL, a captive portal and a forward
+/// proxy all answer with a status the service also uses, so the status
+/// alone cannot say whether the question about patches was answered.
+fn service_error_message(text: &str) -> Option<String> {
+    let body: serde_json::Value = serde_json::from_str(text.trim()).ok()?;
+    let body = body.as_object()?;
+    match body.get("error")? {
+        serde_json::Value::Object(error) => error.get("message")?.as_str().map(str::to_string),
+        // The proxy's shape has nothing but these two keys; a generic
+        // `{"status":404,"error":"Not Found","path":…}` is not it.
+        serde_json::Value::String(label)
+            if body.keys().all(|key| key == "error" || key == "message") =>
+        {
+            Some(match body.get("message").and_then(|m| m.as_str()) {
+                Some(message) => format!("{label}: {message}"),
+                None => label.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Whether a patch-service error message says the ROUTE is not there — an
+/// unknown organization, or a path / method the server does not serve —
+/// rather than the thing the route was asked for. The wording is a
+/// cross-repo contract with the Socket API (`Organization not found`,
+/// `API route not found`, `API method not found`) and the public proxy's
+/// catch-all (`Unsupported endpoint`).
+fn is_route_miss(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "organization not found",
+        "route not found",
+        "method not found",
+        "unsupported endpoint",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+/// The start of a response body on one line, for an error message about a
+/// body that is not the patch service's (often a whole HTML page).
+fn body_excerpt(text: &str) -> String {
+    let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_to_chars(&line, 120)
+}
+
+/// The `host[:port]` that sent `resp` (after any redirect).
+fn response_host(resp: &reqwest::Response) -> String {
+    let url = resp.url();
+    match (url.host_str(), url.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => redact_url(url.as_str()).into_owned(),
+    }
+}
+
 /// Log debug messages when debug mode is enabled. Every URL in `message`
 /// is redacted first: debug lines quote grant URLs and `--api-url`s, and
 /// debug output is routinely pasted into CI logs and bug reports.
@@ -297,6 +360,11 @@ pub struct ApiClient {
     /// `SOCKET_API_CONCURRENCY` and a tight `RLIMIT_NOFILE` lower it as in
     /// every other patch-API window (#614).
     proxy_batch_slots: Arc<tokio::sync::Semaphore>,
+    /// Set once the patch service has answered a batch query of this
+    /// client (shared by clones): the host is then known to be the
+    /// service, which settles how a search route's 404 with no body is
+    /// read ([`Self::search_bare_404`]).
+    service_confirmed: Arc<AtomicBool>,
     /// The vendor loop's download plan, while one is attached
     /// ([`Self::prefetch_vendor_packages`]): [`Self::fetch_vendor_package`]
     /// takes a planned uuid's outcome from it instead of requesting it.
@@ -322,6 +390,20 @@ enum Sent {
         /// when retries are off (the message stays the pre-retry one).
         gave_up: Option<String>,
     },
+}
+
+/// How a JSON call reads a 404 with no body, which nothing ties to the
+/// patch service (its own 404s carry its error body).
+#[derive(Debug, Clone, Copy)]
+enum Bare404 {
+    /// "Not there": the lookup of one resource by id, or a search on a
+    /// host already known to be the service
+    /// ([`ApiClient::search_bare_404`]).
+    NotFound,
+    /// A failed query. A search route answers "nothing matched" with a
+    /// 200 and an empty list, so its 404 is a route that does not exist —
+    /// reading it as "no patches" would turn a wrong URL into a clean scan.
+    Failure,
 }
 
 /// Retry policy for the vendoring service's package-reference POST and
@@ -470,6 +552,7 @@ impl ApiClient {
             vendor_retry: VendorRetryPolicy::default(),
             vendor_outage: Arc::new(AtomicU32::new(0)),
             proxy_batch_slots: Arc::new(tokio::sync::Semaphore::new(proxy_batch_cap)),
+            service_confirmed: Arc::new(AtomicBool::new(false)),
             vendor_prefetch: Arc::new(std::sync::Mutex::new(None)),
             api_retry: ApiRetry::from_env(),
         }
@@ -670,10 +753,13 @@ impl ApiClient {
         }
     }
 
-    /// Internal GET that deserialises JSON. Returns `Ok(None)` on 404.
+    /// Internal GET that deserialises JSON. Returns `Ok(None)` on a 404
+    /// that says the resource is not there (see
+    /// [`Self::handle_json_response`]).
     async fn get_json<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
+        bare_404: Bare404,
     ) -> Result<Option<T>, ApiError> {
         let url = format!("{}{}", self.api_url, path);
         debug_log(&format!("GET {}", url));
@@ -685,10 +771,12 @@ impl ApiClient {
                 |status, text| !is_patch_api_unconfigured(status, text),
             )
             .await?;
-        Self::handle_json_response(sent, self.uses_public_proxy()).await
+        self.handle_json_response(sent, bare_404).await
     }
 
-    /// Internal POST that deserialises JSON. Returns `Ok(None)` on 404.
+    /// Internal POST that deserialises JSON. Returns `Ok(None)` on a 404
+    /// that says the resource is not there (see
+    /// [`Self::handle_json_response`]).
     async fn post_json<T: serde::de::DeserializeOwned, B: Serialize>(
         &self,
         path: &str,
@@ -709,14 +797,23 @@ impl ApiClient {
                 |status, text| !is_patch_api_unconfigured(status, text),
             )
             .await?;
-        Self::handle_json_response(sent, self.uses_public_proxy()).await
+        self.handle_json_response(sent, Bare404::NotFound).await
     }
 
-    /// Map an HTTP response to `Ok(Some(T))`, `Ok(None)` (404), or `Err`.
+    /// Map an HTTP response to `Ok(Some(T))`, `Ok(None)` or `Err`.
+    ///
+    /// `Ok(None)` is a 404 that says the thing asked for is not there: one
+    /// whose body is the patch service's own error (and not its "no such
+    /// organization / route"), or one with no body at all when the caller
+    /// reads that as not-found ([`Bare404`]). Every other 404 is an error:
+    /// it came from a host that is not the patch service, or from a route
+    /// that does not exist, and says nothing about patches.
     async fn handle_json_response<T: serde::de::DeserializeOwned>(
+        &self,
         sent: Sent,
-        use_public_proxy: bool,
+        bare_404: Bare404,
     ) -> Result<Option<T>, ApiError> {
+        let use_public_proxy = self.uses_public_proxy();
         let resp = match sent {
             Sent::Response(resp) => resp,
             Sent::Throttled {
@@ -726,26 +823,108 @@ impl ApiClient {
             } => return Err(throttled_error(status, &text, use_public_proxy, gave_up)),
         };
         let status = resp.status();
+        let host = response_host(&resp);
 
         if status == StatusCode::OK {
             let body = resp
                 .json::<T>()
                 .await
-                .map_err(|e| json_response_error(e, "response"))?;
+                .map_err(|e| self.json_body_error(e, &host))?;
             return Ok(Some(body));
         }
         if status == StatusCode::NOT_FOUND {
-            return Ok(None);
+            let text = resp.text().await.unwrap_or_default();
+            let not_found = match service_error_message(&text) {
+                Some(message) => !is_route_miss(&message),
+                None => text.trim().is_empty() && matches!(bare_404, Bare404::NotFound),
+            };
+            return if not_found {
+                Ok(None)
+            } else {
+                Err(ApiError::Other(
+                    self.misdirected_error(status, &host, &text),
+                ))
+            };
         }
         if let Some(err) = classify_auth_error(status, use_public_proxy) {
             return Err(err);
         }
         let text = resp.text().await.unwrap_or_default();
-        Err(ApiError::Other(status_error(
-            "API request failed with status",
-            status,
-            &text,
-        )))
+        if status == StatusCode::BAD_REQUEST
+            && service_error_message(&text).is_some_and(|message| !is_route_miss(&message))
+        {
+            return Err(ApiError::InvalidRequest(status_error(
+                "API request failed with status",
+                status,
+                &text,
+            )));
+        }
+        Err(self.status_failure(status, &host, &text))
+    }
+
+    /// The error for a non-2xx answer that is neither auth, throttling nor
+    /// a 404: the plain status error, or [`Self::misdirected_error`] for a
+    /// 4xx the patch service did not write.
+    fn status_failure(&self, status: StatusCode, host: &str, text: &str) -> ApiError {
+        let foreign = service_error_message(text).is_none_or(|message| is_route_miss(&message));
+        ApiError::Other(if status.is_client_error() && foreign {
+            self.misdirected_error(status, host, text)
+        } else {
+            status_error("API request failed with status", status, text)
+        })
+    }
+
+    /// The error text for an answer that says nothing about patches because
+    /// the request did not reach a route of the patch service: another
+    /// host's error page, a captive portal's or forward proxy's own reply,
+    /// or the service's "no such organization / route". The usual cause is
+    /// a mistyped URL or org slug, so it names the host that answered and
+    /// the settings that pointed the run at it.
+    fn misdirected_error(&self, status: StatusCode, host: &str, text: &str) -> String {
+        let said = match service_error_message(text) {
+            Some(message) => format!("{message} (answered by {host})"),
+            None => {
+                let excerpt = body_excerpt(text);
+                if excerpt.is_empty() {
+                    format!("{host} did not answer like the Socket patch API")
+                } else {
+                    format!("{host} did not answer like the Socket patch API ({excerpt})")
+                }
+            }
+        };
+        format!(
+            "API request failed with status {}: {said} — check {}",
+            status.as_u16(),
+            self.route_settings()
+        )
+    }
+
+    /// The settings that decide where this client's requests go, for an
+    /// error about an answer from the wrong place.
+    fn route_settings(&self) -> String {
+        match &self.route {
+            ApiRoute::Proxy => "--proxy-url / SOCKET_PROXY_URL".to_string(),
+            // The org-resolution client has no slug yet.
+            ApiRoute::Org { slug } if slug.is_empty() => "--api-url / SOCKET_API_URL".to_string(),
+            ApiRoute::Org { slug } => format!(
+                "--api-url / SOCKET_API_URL and the organization slug '{slug}' \
+                 (--org / SOCKET_ORG_SLUG)"
+            ),
+        }
+    }
+
+    /// The error for a 200 whose body could not be read as the expected
+    /// JSON. When it was read but is not that JSON (a login page, another
+    /// service's reply), the message names the host and the setting to
+    /// check, like [`Self::misdirected_error`].
+    fn json_body_error(&self, error: reqwest::Error, host: &str) -> ApiError {
+        match json_response_error(error, "response") {
+            ApiError::Parse(message) => ApiError::Parse(format!(
+                "{message} ({host} did not answer like the Socket patch API — check {})",
+                self.route_settings()
+            )),
+            other => other,
+        }
     }
 
     /// Path of a patches JSON endpoint: `/patch/{suffix}` on the public
@@ -766,21 +945,27 @@ impl ApiClient {
     /// Returns `Ok(None)` when the patch is not found (404).
     pub async fn fetch_patch(&self, uuid: &str) -> Result<Option<PatchResponse>, ApiError> {
         let path = self.patches_path(&format!("view/{uuid}"));
-        self.get_json(&path).await
+        self.get_json(&path, Bare404::NotFound).await
     }
 
     /// Shared implementation for `search_patches_by_{cve,ghsa,package}`.
     /// `route` is the `by-<x>` URL segment — the rest of the path layout
     /// is identical across the three endpoints.
+    ///
+    /// An empty result means the service answered: a 200 with no patches,
+    /// or a 404 that is its own (see [`Self::handle_json_response`] and
+    /// `bare_404`). Anything else is an `Err`, so a caller never reports
+    /// "no patches" for a question nobody answered.
     async fn search_patches_by_route(
         &self,
         route: &str,
         identifier: &str,
+        bare_404: Bare404,
     ) -> Result<SearchResponse, ApiError> {
         let encoded = urlencoding_encode(identifier);
         let path = self.patches_path(&format!("{route}/{encoded}"));
         let mut result = self
-            .get_json::<SearchResponse>(&path)
+            .get_json::<SearchResponse>(&path, bare_404)
             .await?
             .unwrap_or_else(|| SearchResponse {
                 patches: Vec::new(),
@@ -790,14 +975,29 @@ impl ApiClient {
         Ok(result)
     }
 
+    /// How a search reads a 404 with no body. From a host that has already
+    /// answered this client's batch query it is the service saying "nothing
+    /// here" (a scan's per-package detail queries follow its batch answer).
+    /// From a host nothing has vouched for — `get`'s searches — it is a
+    /// route that does not exist, and so a failed query.
+    fn search_bare_404(&self) -> Bare404 {
+        if self.service_confirmed.load(Ordering::Relaxed) {
+            Bare404::NotFound
+        } else {
+            Bare404::Failure
+        }
+    }
+
     /// Search patches by CVE ID.
     pub async fn search_patches_by_cve(&self, cve_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-cve", cve_id).await
+        self.search_patches_by_route("by-cve", cve_id, self.search_bare_404())
+            .await
     }
 
     /// Search patches by GHSA ID.
     pub async fn search_patches_by_ghsa(&self, ghsa_id: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-ghsa", ghsa_id).await
+        self.search_patches_by_route("by-ghsa", ghsa_id, self.search_bare_404())
+            .await
     }
 
     /// Search patches by package PURL.
@@ -805,7 +1005,8 @@ impl ApiClient {
     /// The PURL must be a valid Package URL starting with `pkg:`.
     /// Examples: `pkg:npm/lodash@4.17.21`, `pkg:pypi/django@3.2.0`
     pub async fn search_patches_by_package(&self, purl: &str) -> Result<SearchResponse, ApiError> {
-        self.search_patches_by_route("by-package", purl).await
+        self.search_patches_by_route("by-package", purl, self.search_bare_404())
+            .await
     }
 
     /// Search patches for multiple packages (batch).
@@ -819,6 +1020,11 @@ impl ApiClient {
     /// chunk's validation.
     ///
     /// Maximum 500 PURLs per request.
+    ///
+    /// `Ok` means the service answered. On the per-package path a lookup
+    /// that got no answer is listed in
+    /// [`BatchSearchResponse::unanswered`] beside the packages that did;
+    /// when no lookup of the request was answered, the call is an `Err`.
     ///
     /// Every return path is normalized through [`sort_batch_response`], so
     /// callers may rely on each package's `patches` being best-first.
@@ -845,6 +1051,7 @@ impl ApiClient {
                 )));
             };
             sort_batch_response(&mut result);
+            self.service_confirmed.store(true, Ordering::Relaxed);
             return Ok(result);
         }
 
@@ -860,6 +1067,7 @@ impl ApiClient {
             }
         };
         sort_batch_response(&mut response);
+        self.service_confirmed.store(true, Ordering::Relaxed);
         Ok(response)
     }
 
@@ -903,10 +1111,13 @@ impl ApiClient {
     ///    Batch validation is all-or-nothing, so a single crawled PURL of
     ///    a type the server doesn't recognize (e.g. `pkg:jsr/…` from the
     ///    Deno crawler) rejects every package in the chunk. The
-    ///    per-package GET path tolerates such PURLs individually — each
-    ///    failure is swallowed per-package — which is the scan semantic
+    ///    per-package GET path tolerates such PURLs individually — the
+    ///    service refuses each one by itself — which is the scan semantic
     ///    that predates the batch optimization and must be preserved: one
-    ///    exotic package must not turn a whole scan into an error.
+    ///    exotic package must not turn a whole scan into an error. Only a
+    ///    400 in the service's own error shape is this case: a 400 some
+    ///    other host wrote (a forward proxy, a WAF) is an error here, not
+    ///    one more request per package to the same wrong host.
     ///
     /// Auth / rate-limit statuses are classified via `classify_auth_error`
     /// exactly like the JSON transport — 401/403 keep feeding
@@ -944,20 +1155,23 @@ impl ApiClient {
             )
             .await?;
 
-        let (status, text) = match sent {
+        // `host`: who answered, for the error about an answer that is not
+        // the service's (a throttled answer never needs it).
+        let (status, text, host) = match sent {
             Sent::Response(resp) => {
                 let status = resp.status();
+                let host = response_host(&resp);
                 if status == StatusCode::OK {
                     let parsed = resp
                         .json::<BatchSearchResponse>()
                         .await
-                        .map_err(|e| json_response_error(e, "response"))?;
+                        .map_err(|e| self.json_body_error(e, &host))?;
                     return Ok(Some(parsed));
                 }
                 if let Some(err) = classify_auth_error(status, true) {
                     return Err(err);
                 }
-                (status, resp.text().await.unwrap_or_default())
+                (status, resp.text().await.unwrap_or_default(), host)
             }
             Sent::Throttled {
                 status,
@@ -965,7 +1179,7 @@ impl ApiClient {
                 gave_up,
             } => {
                 if is_batch_unsupported(status, &text) {
-                    (status, text)
+                    (status, text, String::new())
                 } else {
                     return Err(throttled_error(status, &text, true, gave_up));
                 }
@@ -973,7 +1187,7 @@ impl ApiClient {
         };
         let fallback_reason = if is_batch_unsupported(status, &text) {
             Some("proxy batch endpoint unavailable")
-        } else if status == StatusCode::BAD_REQUEST {
+        } else if status == StatusCode::BAD_REQUEST && service_error_message(&text).is_some() {
             // All-or-nothing batch validation rejected the chunk; the
             // per-package path resolves the valid subset (see doc above).
             Some("proxy batch validation rejected the chunk")
@@ -989,11 +1203,7 @@ impl ApiClient {
             ));
             return Ok(None);
         }
-        Err(ApiError::Other(status_error(
-            "API request failed with status",
-            status,
-            &text,
-        )))
+        Err(self.status_failure(status, &host, &text))
     }
 
     /// Internal: fall back to individual GET requests per PURL when the
@@ -1005,17 +1215,25 @@ impl ApiClient {
     /// any concurrent ones on the same client keep at most the proxy's
     /// in-flight cap between them, and a slow or throttled GET holds one
     /// slot rather than stalling a whole group.
+    ///
+    /// A package counts as answered when the service returned its patch
+    /// list, or refused the PURL itself ([`ApiError::InvalidRequest`]: it
+    /// has nothing for a PURL it does not serve). Every other outcome — a
+    /// transport error, a 5xx, a throttle that outlasted its retries, a
+    /// response that is not the service's — leaves the package unchecked:
+    /// it is returned in [`BatchSearchResponse::unanswered`], and when no
+    /// package was answered the first such error (in input order) fails
+    /// the call. Dropping it instead would report a package nobody looked
+    /// at as having no patches.
     async fn search_patches_batch_via_individual_queries(
         &self,
         purls: &[String],
     ) -> Result<BatchSearchResponse, ApiError> {
-        // Collect all (purl, response) pairs
-        let mut all_results: Vec<(String, Option<SearchResponse>)> = Vec::new();
-        // The first (in input order) package still throttled after its
-        // retries. Its error fails the whole call — a per-package miss is
-        // swallowed for an unresolvable PURL, but swallowing a throttle
-        // would drop the package from the scan without a word.
-        let mut throttled: Option<(usize, ApiError)> = None;
+        // One slot per purl, filled as its lookup completes; a slot still
+        // empty at the end belongs to a task that died without reporting.
+        let mut outcomes: Vec<Option<Result<Option<SearchResponse>, ApiError>>> =
+            purls.iter().map(|_| None).collect();
+        let mut task_failure: Option<String> = None;
 
         let mut join_set = tokio::task::JoinSet::new();
         for (index, purl) in purls.iter().enumerate() {
@@ -1023,14 +1241,22 @@ impl ApiClient {
             let client = self.clone();
             join_set.spawn(async move {
                 let slot = client.proxy_batch_slot().await;
-                let resp = client.search_patches_by_package(&purl).await;
+                // These lookups ARE the question, asked of a host whose
+                // batch route did not answer it: a 404 with no body is no
+                // answer, whatever an earlier chunk established.
+                let resp = client
+                    .search_patches_by_route("by-package", &purl, Bare404::Failure)
+                    .await;
                 drop(slot);
                 match resp {
-                    Ok(r) => (index, purl, Ok(Some(r))),
-                    Err(e) if is_throttle_error(&e) => (index, purl, Err(e)),
+                    Ok(r) => (index, Ok(Some(r))),
+                    Err(ApiError::InvalidRequest(e)) => {
+                        debug_log(&format!("No patches for unresolvable {}: {}", purl, e));
+                        (index, Ok(None))
+                    }
                     Err(e) => {
                         debug_log(&format!("Error fetching patches for {}: {}", purl, e));
-                        (index, purl, Ok(None))
+                        (index, Err(e))
                     }
                 }
             });
@@ -1038,23 +1264,44 @@ impl ApiClient {
 
         while let Some(result) = join_set.join_next().await {
             match result {
-                Ok((_, purl, Ok(resp))) => all_results.push((purl, resp)),
-                Ok((index, _, Err(e))) => {
-                    if throttled.as_ref().is_none_or(|(first, _)| index < *first) {
-                        throttled = Some((index, e));
-                    }
-                }
+                Ok((index, outcome)) => outcomes[index] = Some(outcome),
                 Err(e) => {
                     debug_log(&format!("Task join error: {}", e));
+                    task_failure = Some(e.to_string());
                 }
             }
         }
-        if let Some((_, e)) = throttled {
-            return Err(e);
+
+        let mut answered: Vec<(String, Option<SearchResponse>)> = Vec::new();
+        let mut unanswered: Vec<(String, ApiError)> = Vec::new();
+        for (purl, outcome) in purls.iter().zip(outcomes) {
+            match outcome {
+                Some(Ok(response)) => answered.push((purl.clone(), response)),
+                Some(Err(e)) => unanswered.push((purl.clone(), e)),
+                None => unanswered.push((
+                    purl.clone(),
+                    ApiError::Other(format!(
+                        "patch lookup did not finish: {}",
+                        task_failure.as_deref().unwrap_or("task ended early")
+                    )),
+                )),
+            }
+        }
+        // Nothing was answered: the first failure is the call's error.
+        if answered.is_empty() && !unanswered.is_empty() {
+            return Err(unanswered.swap_remove(0).1);
         }
 
         // Convert the individual SearchResponse results into the batch shape.
-        Ok(assemble_batch_from_individual(all_results))
+        let mut response = assemble_batch_from_individual(answered);
+        response.unanswered = unanswered
+            .into_iter()
+            .map(|(purl, e)| UnansweredPurl {
+                purl,
+                error: e.to_string(),
+            })
+            .collect();
+        Ok(response)
     }
 
     /// Resolve the org slug from the API token by querying `/v0/organizations`.
@@ -1064,7 +1311,10 @@ impl ApiClient {
     /// If there are none, returns an error.
     async fn resolve_org_slug(&self) -> Result<String, ApiError> {
         let orgs = match self
-            .get_json::<crate::api::types::OrganizationsResponse>("/v0/organizations")
+            .get_json::<crate::api::types::OrganizationsResponse>(
+                "/v0/organizations",
+                Bare404::NotFound,
+            )
             .await?
         {
             Some(resp) => resp.organizations.into_values().collect(),
@@ -2441,17 +2691,6 @@ fn classify_auth_error(status: StatusCode, use_public_proxy: bool) -> Option<Api
     }
 }
 
-/// Is `e` a throttling answer (429, or an over-capacity 503) the retry
-/// loop left final? Keyed on the variants [`throttled_error`] produces —
-/// never on message text — so the proxy's permanent "not configured" 503
-/// (an [`ApiError::Other`]) is not one.
-fn is_throttle_error(e: &ApiError) -> bool {
-    matches!(
-        e,
-        ApiError::RateLimited(_) | ApiError::ServiceUnavailable(_)
-    )
-}
-
 /// The public proxy's permanent "Patch API is not configured" 503
 /// (patch endpoints disabled on that deployment). Not throttling: no JSON
 /// path retries it, and it stays the plain [`ApiError::Other`] status
@@ -2662,7 +2901,9 @@ pub fn sort_batch_response(response: &mut BatchSearchResponse) {
 /// Assemble a [`BatchSearchResponse`] from the per-PURL [`SearchResponse`]s
 /// gathered by the public-proxy fallback (one GET per package).
 ///
-/// A `None` entry is a query that errored and is skipped. The
+/// A `None` entry is a purl the service refused as one it does not serve:
+/// it lists no patches. (A lookup that got no answer is not passed here;
+/// the caller reports it as unanswered.) The
 /// `can_access_paid_patches` capability is OR-aggregated across **every**
 /// successful response — independent of whether that response carried any
 /// patches — because it is a global capability signal, not a per-package
@@ -2702,6 +2943,7 @@ fn assemble_batch_from_individual(
     BatchSearchResponse {
         packages,
         can_access_paid_patches,
+        unanswered: Vec::new(),
     }
 }
 
@@ -2736,6 +2978,15 @@ pub enum ApiError {
     #[error("{0}")]
     InvalidHash(String),
 
+    /// An HTTP 400 in the patch service's own error shape: it understood
+    /// the request and refused what was asked (a PURL of a type it does
+    /// not serve, a malformed advisory id). The text is the plain status
+    /// error. Unlike every other failure this IS an answer — the service
+    /// has nothing for that input — which is why the legacy per-package
+    /// path counts such a package as checked.
+    #[error("{0}")]
+    InvalidRequest(String),
+
     #[error("{0}")]
     Other(String),
 }
@@ -2755,7 +3006,9 @@ pub trait PatchApi: Send + Sync {
     fn uses_public_proxy(&self) -> bool;
 
     /// `POST …/patches/batch` for up to 500 purls, normalized through
-    /// [`sort_batch_response`].
+    /// [`sort_batch_response`]. A purl that could not be checked must not
+    /// be left out silently: fail the call, or list it in
+    /// [`BatchSearchResponse::unanswered`].
     fn search_patches_batch<'a>(
         &'a self,
         purls: &'a [String],
@@ -4295,8 +4548,9 @@ mod tests {
     }
 
     #[test]
-    fn assemble_batch_skips_errored_and_empty_responses() {
-        // None = query errored; an empty patch list contributes no package.
+    fn assemble_batch_skips_refused_and_empty_responses() {
+        // None = the service refused the purl; an empty patch list
+        // contributes no package.
         let results = vec![
             ("pkg:npm/err@1".to_string(), None),
             (
@@ -6151,6 +6405,356 @@ mod authenticated_batch_tests {
 }
 
 #[cfg(test)]
+mod not_found_tests {
+    //! A 404 reads as "not there" only when the patch service says so. A
+    //! 404 for an unknown organization or route, or one a different host
+    //! wrote, is an error: the question about patches was not answered.
+    use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const UUID: &str = "11111111-2222-4333-8444-555555555555";
+
+    fn org_client(uri: String, slug: &str) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: Some("sktsec_token_placeholder_value_api".into()),
+            route: ApiRoute::org(slug),
+        })
+    }
+
+    fn proxy_client(uri: String) -> ApiClient {
+        ApiClient::new(ApiClientOptions {
+            api_url: uri,
+            api_token: None,
+            route: ApiRoute::Proxy,
+        })
+    }
+
+    /// The Socket API's error body.
+    fn api_error(status: u16, message: &str) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_json(json!({
+            "error": { "message": message, "details": null }
+        }))
+    }
+
+    fn html_page(status: u16) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_raw(
+            "<!doctype html>\n<html>\n  <body>Not Found</body>\n</html>",
+            "text/html",
+        )
+    }
+
+    async fn answering(template: ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(template)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[test]
+    fn service_error_message_reads_only_the_services_shapes() {
+        assert_eq!(
+            service_error_message(r#"{"error":{"message":"Patch not found","details":null}}"#)
+                .as_deref(),
+            Some("Patch not found")
+        );
+        assert_eq!(
+            service_error_message(
+                r#"{"error":"Unsupported endpoint","message":"Endpoint GET /x is not supported."}"#
+            )
+            .as_deref(),
+            Some("Unsupported endpoint: Endpoint GET /x is not supported.")
+        );
+        assert_eq!(
+            service_error_message(r#"{"error":"Invalid JSON body"}"#).as_deref(),
+            Some("Invalid JSON body")
+        );
+        for foreign in [
+            "",
+            "Not Found",
+            "<html><body>404</body></html>",
+            r#"{"message":"Not Found","documentation_url":"https://example.com"}"#,
+            r#"{"timestamp":"2026-01-01","status":404,"error":"Not Found","path":"/x"}"#,
+            r#"{"error":{"code":404}}"#,
+            r#"{"error":null}"#,
+            r#"["error"]"#,
+        ] {
+            assert_eq!(service_error_message(foreign), None, "{foreign}");
+        }
+    }
+
+    #[test]
+    fn route_miss_is_the_organization_or_the_route_never_the_resource() {
+        for miss in [
+            "Organization not found",
+            "API route not found",
+            "API method not found",
+            "Unsupported endpoint: Endpoint POST /patch/batch is not supported.",
+        ] {
+            assert!(is_route_miss(miss), "{miss}");
+        }
+        for answer in ["Patch not found", "Invalid PURL format.", "Not found"] {
+            assert!(!is_route_miss(answer), "{answer}");
+        }
+    }
+
+    #[test]
+    fn body_excerpt_is_one_bounded_line() {
+        assert_eq!(
+            body_excerpt("  <html>\n  <body>x</body>\n"),
+            "<html> <body>x</body>"
+        );
+        let long = "x".repeat(500);
+        assert_eq!(body_excerpt(&long).chars().count(), 123);
+        assert_eq!(body_excerpt(""), "");
+    }
+
+    /// A mistyped `--org`: the API answers every org route with its
+    /// "Organization not found". None of the search routes may read that
+    /// as "no patches", and the patch view may not read it as "no such
+    /// patch"; the error names the slug to check.
+    #[tokio::test]
+    async fn an_unknown_organization_is_an_error_on_every_route() {
+        let server = answering(api_error(404, "Organization not found")).await;
+        let client = org_client(server.uri(), "typo-org");
+        let errors = [
+            client
+                .search_patches_by_cve("CVE-2021-23337")
+                .await
+                .map(|_| ())
+                .expect_err("by-cve"),
+            client
+                .search_patches_by_ghsa("GHSA-aaaa-bbbb-cccc")
+                .await
+                .map(|_| ())
+                .expect_err("by-ghsa"),
+            client
+                .search_patches_by_package("pkg:npm/lodash@4.17.20")
+                .await
+                .map(|_| ())
+                .expect_err("by-package"),
+            client
+                .fetch_patch(UUID)
+                .await
+                .map(|_| ())
+                .expect_err("view"),
+            client
+                .fetch_registry_references(&[UUID.to_string()])
+                .await
+                .map(|_| ())
+                .expect_err("package references"),
+            client
+                .search_patches_batch(&["pkg:npm/lodash@4.17.20".to_string()])
+                .await
+                .map(|_| ())
+                .expect_err("batch"),
+        ];
+        for err in errors {
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("API request failed with status 404: Organization not found"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("'typo-org'") && msg.contains("--org / SOCKET_ORG_SLUG"),
+                "the error must name the slug to check: {msg}"
+            );
+            assert!(msg.contains("--api-url"), "{msg}");
+            assert!(!is_fallback_candidate(&err), "{msg}");
+        }
+    }
+
+    /// A wrong `--api-url` / `--proxy-url`: the host answers with its own
+    /// 404 page. The error names that host and the setting to check, and
+    /// quotes the page on one bounded line.
+    #[tokio::test]
+    async fn a_404_page_from_another_host_is_an_error_naming_it() {
+        let server = answering(html_page(404)).await;
+        let host = server.address().to_string();
+
+        let org = org_client(server.uri(), "acme");
+        for err in [
+            org.search_patches_by_package("pkg:npm/lodash@4.17.20")
+                .await
+                .map(|_| ())
+                .expect_err("by-package"),
+            org.fetch_patch(UUID).await.map(|_| ()).expect_err("view"),
+        ] {
+            let msg = err.to_string();
+            assert_eq!(
+                msg,
+                format!(
+                    "API request failed with status 404: {host} did not answer like the \
+                     Socket patch API (<!doctype html> <html> <body>Not Found</body> </html>) \
+                     — check --api-url / SOCKET_API_URL and the organization slug 'acme' \
+                     (--org / SOCKET_ORG_SLUG)"
+                )
+            );
+        }
+
+        let err = proxy_client(server.uri())
+            .search_patches_by_cve("CVE-2021-23337")
+            .await
+            .expect_err("by-cve on the proxy");
+        let msg = err.to_string();
+        assert!(msg.contains(&host), "{msg}");
+        assert!(
+            msg.ends_with("— check --proxy-url / SOCKET_PROXY_URL"),
+            "{msg}"
+        );
+    }
+
+    /// A 404 with no body says nothing about who answered. A search route
+    /// answers "nothing matched" with a 200, so from a host nothing has
+    /// vouched for it is a failed query; a lookup of one patch by id keeps
+    /// reading it as "not there".
+    #[tokio::test]
+    async fn a_bare_404_fails_a_search_but_not_a_lookup_by_id() {
+        let server = answering(ResponseTemplate::new(404)).await;
+        let host = server.address().to_string();
+        let client = proxy_client(server.uri());
+
+        for err in [
+            client
+                .search_patches_by_package("pkg:npm/lodash@4.17.20")
+                .await
+                .expect_err("by-package"),
+            client
+                .search_patches_by_ghsa("GHSA-aaaa-bbbb-cccc")
+                .await
+                .expect_err("by-ghsa"),
+        ] {
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "API request failed with status 404: {host} did not answer like the \
+                     Socket patch API — check --proxy-url / SOCKET_PROXY_URL"
+                )
+            );
+        }
+        assert!(client.fetch_patch(UUID).await.expect("view").is_none());
+        assert!(client
+            .fetch_registry_references(&[UUID.to_string()])
+            .await
+            .expect("package references")
+            .is_empty());
+    }
+
+    /// Once the service has answered the client's batch query, the host is
+    /// known: a per-package detail query's 404 with no body is "no
+    /// records". The answer is shared with the client's clones; a client
+    /// that never got it still fails.
+    #[tokio::test]
+    async fn a_bare_404_is_an_empty_search_once_the_batch_query_was_answered() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v0/orgs/acme/patches/batch"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "packages": [],
+                "canAccessPaidPatches": false
+            })))
+            .mount(&server)
+            .await;
+        let purl = "pkg:npm/lodash@4.17.20";
+        let client = org_client(server.uri(), "acme");
+        let clone = client.clone();
+
+        client
+            .search_patches_by_package(purl)
+            .await
+            .expect_err("nothing has vouched for the host yet");
+        client
+            .search_patches_batch(&[purl.to_string()])
+            .await
+            .expect("batch");
+        for client in [&client, &clone] {
+            let found = client
+                .search_patches_by_package(purl)
+                .await
+                .expect("the service answered the batch query");
+            assert!(found.patches.is_empty());
+        }
+        // A fresh client for the same host starts over.
+        org_client(server.uri(), "acme")
+            .search_patches_by_package(purl)
+            .await
+            .expect_err("a new client has no answer to go by");
+    }
+
+    /// The service's own 404 is an answer: the patch is not there, and a
+    /// search has nothing to list.
+    #[tokio::test]
+    async fn the_services_own_404_is_not_found() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/acme/patches/view/{UUID}")))
+            .respond_with(api_error(404, "Patch not found"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex("^/v0/orgs/acme/patches/by-package/"))
+            .respond_with(api_error(404, "Not found"))
+            .mount(&server)
+            .await;
+        let client = org_client(server.uri(), "acme");
+
+        assert!(client.fetch_patch(UUID).await.expect("view").is_none());
+        let found = client
+            .search_patches_by_package("pkg:npm/lodash@4.17.20")
+            .await
+            .expect("by-package");
+        assert!(found.patches.is_empty());
+    }
+
+    /// The service refusing the request's content is `InvalidRequest`; a
+    /// 400 some other host wrote is not, and names that host.
+    #[tokio::test]
+    async fn a_400_is_an_invalid_request_only_in_the_services_shape() {
+        let server = answering(api_error(400, "Invalid PURL format.")).await;
+        let err = proxy_client(server.uri())
+            .search_patches_by_package("pkg:jsr/@std/path@0.220.0")
+            .await
+            .expect_err("400");
+        assert!(matches!(err, ApiError::InvalidRequest(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "API request failed with status 400: Invalid PURL format."
+        );
+
+        let server = answering(html_page(400)).await;
+        let err = proxy_client(server.uri())
+            .search_patches_by_package("pkg:npm/lodash@4.17.20")
+            .await
+            .expect_err("400");
+        assert!(matches!(err, ApiError::Other(_)), "{err:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&server.address().to_string()) && msg.contains("--proxy-url"),
+            "{msg}"
+        );
+    }
+
+    /// A 5xx is the plain status error: an outage of the right host must
+    /// not be blamed on the URL.
+    #[tokio::test]
+    async fn a_5xx_page_keeps_the_plain_status_error() {
+        let server = answering(ResponseTemplate::new(502).set_body_string("Bad Gateway")).await;
+        let err = proxy_client(server.uri())
+            .search_patches_by_package("pkg:npm/lodash@4.17.20")
+            .await
+            .expect_err("502");
+        assert_eq!(
+            err.to_string(),
+            "API request failed with status 502: Bad Gateway"
+        );
+    }
+}
+
+#[cfg(test)]
 mod proxy_batch_path_cap_tests {
     //! Concurrent `search_patches_batch` calls on one public-proxy client
     //! (scan's batch windows) must share the batch path's in-flight cap,
@@ -6243,7 +6847,9 @@ mod proxy_batch_path_cap_tests {
         // GETs (one exotic PURL per chunk is enough in the wild).
         Mock::given(method("POST"))
             .and(path("/patch/batch"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad purl"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": { "message": "Invalid PURL format.", "details": null }
+            })))
             .mount(&server)
             .await;
         let arrivals = Arc::new(Mutex::new(Vec::new()));

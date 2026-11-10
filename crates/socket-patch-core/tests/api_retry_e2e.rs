@@ -355,9 +355,14 @@ async fn other_statuses_are_not_retried() {
         let p = purl(5);
         let route = by_package_route(&p);
         let server = MockServer::start().await;
+        // The service's own error body: a 404 without it is not its answer
+        // (`proxy_batch_e2e.rs` and the client's unit tests pin that).
+        let answer = ResponseTemplate::new(status).set_body_json(json!({
+            "error": { "message": "Not found", "details": null }
+        }));
         Mock::given(method("GET"))
             .and(path(&route))
-            .respond_with(ResponseTemplate::new(status))
+            .respond_with(answer)
             .mount(&server)
             .await;
         let (c, log) = client(&server.uri(), ApiRetryPolicy::default());
@@ -367,7 +372,7 @@ async fn other_statuses_are_not_retried() {
                 is_fallback_candidate(result.as_ref().expect_err("auth error")),
                 "{status}"
             ),
-            // 404 on by-package is "no patches" (unchanged).
+            // The service's 404 on by-package is "no patches" (unchanged).
             404 => assert!(result.expect("404 is empty").patches.is_empty()),
             _ => assert!(result.is_err(), "{status}"),
         }
@@ -592,11 +597,12 @@ async fn proxy_batch_retries_over_capacity_but_not_unconfigured() {
     assert!(waits(&log).is_empty());
 }
 
-/// The legacy per-package proxy path swallows an unresolvable PURL, but a
-/// package still throttled after its retries fails the call — it must not
-/// vanish from the result.
+/// On the legacy per-package proxy path a package still throttled after
+/// its retries must not vanish from the result: the answered packages are
+/// returned with it listed as unanswered, and when it is all there was to
+/// ask the call fails with its error.
 #[tokio::test]
-async fn legacy_proxy_path_surfaces_an_exhausted_throttle() {
+async fn legacy_proxy_path_reports_an_exhausted_throttle() {
     let ok = purl(30);
     let stuck = purl(31);
     let server = MockServer::start().await;
@@ -623,11 +629,96 @@ async fn legacy_proxy_path_surfaces_an_exhausted_throttle() {
     let (hooks, log) = virtual_clock(0);
     let c = ApiClient::new(options(&server.uri(), true))
         .with_api_retry(ApiRetryPolicy::default(), hooks);
-    let err = c
+    let got = c
         .search_patches_batch(&[ok.clone(), stuck.clone()])
         .await
-        .expect_err("a throttled package fails the call");
+        .expect("the answered package is returned");
+    assert_eq!(got.packages.len(), 1);
+    assert_eq!(got.packages[0].purl, ok);
+    assert_eq!(got.unanswered.len(), 1, "{:?}", got.unanswered);
+    assert_eq!(got.unanswered[0].purl, stuck);
+    assert_eq!(
+        got.unanswered[0].error,
+        "Rate limit exceeded (HTTP 429, gave up after 3 retries). Please try again later."
+    );
+    assert_eq!(waits(&log).len(), 3);
+
+    let (hooks, log) = virtual_clock(0);
+    let c = ApiClient::new(options(&server.uri(), true))
+        .with_api_retry(ApiRetryPolicy::default(), hooks);
+    let err = c
+        .search_patches_batch(std::slice::from_ref(&stuck))
+        .await
+        .expect_err("nothing was answered: the throttle fails the call");
     assert!(matches!(err, ApiError::RateLimited(_)), "{err:?}");
+    assert_eq!(waits(&log).len(), 3);
+}
+
+/// The same for an over-capacity 503 behind a batch POST the proxy rejects
+/// with a 400: the healthy answers are used (a package with a patch, one
+/// with none), and the package still failing after its retries is named.
+#[tokio::test]
+async fn legacy_proxy_path_names_a_package_still_503_after_its_retries() {
+    let patched = purl(32);
+    let clean = purl(33);
+    let down = purl(34);
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": "Unsupported endpoint",
+            "message": "Endpoint POST /patch/batch is not supported."
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let route = |p: &str| {
+        format!(
+            "/patch/by-package/{}",
+            p.replace(':', "%3A")
+                .replace('/', "%2F")
+                .replace('@', "%40")
+        )
+    };
+    Mock::given(method("GET"))
+        .and(path(route(&patched)))
+        .respond_with(ResponseTemplate::new(200).set_body_json(search_body(&patched, 32)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(route(&clean)))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({ "patches": [], "canAccessPaidPatches": false })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(route(&down)))
+        .respond_with(
+            ResponseTemplate::new(503).set_body_string("Service temporarily over capacity"),
+        )
+        .expect(4)
+        .mount(&server)
+        .await;
+    let (hooks, log) = virtual_clock(0);
+    let c = ApiClient::new(options(&server.uri(), true))
+        .with_api_retry(ApiRetryPolicy::default(), hooks);
+    let got = c
+        .search_patches_batch(&[patched.clone(), clean.clone(), down.clone()])
+        .await
+        .expect("the answered packages are returned");
+    assert_eq!(got.packages.len(), 1, "{:?}", got.packages);
+    assert_eq!(got.packages[0].purl, patched);
+    assert_eq!(got.unanswered.len(), 1, "{:?}", got.unanswered);
+    assert_eq!(got.unanswered[0].purl, down);
+    assert_eq!(
+        got.unanswered[0].error,
+        "API request failed with status 503: Service temporarily over capacity \
+         (gave up after 3 retries)"
+    );
     assert_eq!(waits(&log).len(), 3);
 }
 
@@ -679,9 +770,9 @@ async fn package_references_and_patch_view_retry_too() {
 
 /// The proxy's permanent `503 "Patch API is not configured"` is not
 /// throttling on ANY JSON path: the per-package lookups and the patch view
-/// answer it once, with no wait, as the plain `Other` status error — so
-/// the legacy per-package path still skips such packages (an empty result,
-/// not a failed batch), exactly as before retries existed.
+/// answer it once, with no wait, as the plain `Other` status error. A proxy
+/// that serves no patches answered nothing, so on the legacy per-package
+/// path that error fails the call rather than reading as "no patches".
 #[tokio::test]
 async fn unconfigured_503_is_never_retried_on_per_package_or_view_calls() {
     let unconfigured = || {
@@ -723,11 +814,15 @@ async fn unconfigured_503_is_never_retried_on_per_package_or_view_calls() {
     let c = ApiClient::new(options(&server.uri(), true))
         .with_api_retry(ApiRetryPolicy::default(), hooks);
 
-    let got = c
+    let err = c
         .search_patches_batch(&purls)
         .await
-        .expect("unconfigured packages are skipped, not a failed batch");
-    assert!(got.packages.is_empty(), "{:?}", got.packages);
+        .expect_err("a proxy that serves no patches did not answer");
+    assert!(matches!(err, ApiError::Other(_)), "{err:?}");
+    assert_eq!(
+        err.to_string(),
+        "API request failed with status 503: Patch API is not configured on this server"
+    );
 
     let err = c.fetch_patch(uuid).await.expect_err("503");
     assert!(matches!(err, ApiError::Other(_)), "{err:?}");
