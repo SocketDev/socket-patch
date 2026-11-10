@@ -25,9 +25,15 @@ For the token, organization, and authenticated API URL, precedence is:
 | Authenticated API | `--api-url` | `SOCKET_API_URL` | `SOCKET_CLI_API_BASE_URL` | `apiBaseUrl` |
 
 With a token but no organization from any of these sources, Socket Patch asks
-the API for it (`GET /v0/organizations`) once per run. If that fails, the whole
-run uses the public patch API without the token (free patches only) and warns;
-set `--org` or `SOCKET_ORG_SLUG` to use your organization's patches.
+the API for it (`GET /v0/organizations`) once per run, the first time the run
+needs the patch API. If that fails, the whole run uses the public patch API
+without the token (free patches only) and warns; set `--org` or
+`SOCKET_ORG_SLUG` to use your organization's patches. `apply`, `rollback`,
+`remove`, and `repair` set the API client up only when they have a patch file
+to download, so a run that finds everything on disk makes no API request and
+prints no API notice; `list` and `apply --check` never contact the API. (One
+exception: an `apply` with Maven patches in scope always sets the client up,
+because a Maven patch may need its patched jar from the patch service.)
 
 The separate Socket CLI writes that file through `socket login` or `socket config`.
 Socket Patch only reads it. Missing configuration is silent; an unreadable or

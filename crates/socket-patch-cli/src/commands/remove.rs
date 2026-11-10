@@ -1,6 +1,5 @@
 use clap::Args;
 use socket_patch_core::api::blob_fetcher::{DIFF_ARCHIVE, PACKAGE_ARCHIVE};
-use socket_patch_core::api::client::get_api_client_with_overrides;
 use socket_patch_core::ledgers::hosted_pins_matching;
 use socket_patch_core::manifest::cleanup_blobs::{
     format_bytes, format_cleanup_result_for, ArtifactReferences,
@@ -18,7 +17,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use super::rollback::{rollback_patches_inner, InnerSelection};
-use crate::args::{apply_env_toggles, GlobalArgs};
+use crate::args::{apply_env_toggles, GlobalArgs, RunApiClient};
 use crate::commands::hosted_unwind::{run_hosted_leg, HostedLegOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vendored_backend::{
@@ -316,9 +315,13 @@ pub async fn run(args: RemoveArgs) -> i32 {
         );
     }
 
-    let (telemetry_client, _) =
-        get_api_client_with_overrides(args.common.api_client_overrides()).await;
-    let telemetry = TelemetryAuth::for_client(&telemetry_client);
+    // The run's API client is built only if the rollback below must
+    // download a before-blob (see `RunApiClient`): a remove that restores
+    // from disk pays no config read, stderr advisory or org-slug
+    // round-trip. Until then telemetry's route comes from the credentials
+    // alone.
+    let api_client = RunApiClient::new();
+    let mut telemetry = args.common.telemetry_auth_for(&api_client);
     let loud = !args.common.json && !args.common.silent;
 
     let manifest_path = args.common.resolved_manifest_path();
@@ -645,17 +648,20 @@ pub async fn run(args: RemoveArgs) -> i32 {
             ecosystems: None,
             ..args.common.clone()
         };
-        match rollback_patches_inner(
+        let rollback = rollback_patches_inner(
             &delegated,
             &socket_dir,
             &manifest,
             &vendored_keys,
             InnerSelection::Identifier(Some(&target)),
             &super::rollback::superseded_by_hosted(&manifest, &hosted_pins),
-            Some(&telemetry_client),
+            &api_client,
         )
-        .await
-        {
+        .await;
+        // The rollback built the client if it had blobs to download: from
+        // here the run's events follow that client's route.
+        telemetry = args.common.telemetry_auth_for(&api_client);
+        match rollback {
             Ok(outcome) => {
                 rollback_not_installed = outcome.not_installed;
                 if !project_state {

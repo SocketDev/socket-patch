@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use socket_patch_core::api::client::{
-    resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
+    get_api_client_with_overrides, resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
 };
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
@@ -547,6 +547,17 @@ impl GlobalArgs {
         }
     }
 
+    /// The run's API client, built from these flags the first time a
+    /// request needs it (see [`RunApiClient`]) and the same one ever after.
+    pub(crate) async fn api_client<'a>(&self, run: &'a RunApiClient) -> &'a ApiClient {
+        run.get_or_init(|| async {
+            get_api_client_with_overrides(self.api_client_overrides())
+                .await
+                .0
+        })
+        .await
+    }
+
     /// Telemetry's route for a run that built no API client, resolved
     /// through the client's own credential chain (flag, the
     /// `SOCKET_NO_API_TOKEN` veto, env, `socket login` config) without a
@@ -558,6 +569,14 @@ impl GlobalArgs {
         let (api_token, org_slug) =
             resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
         TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
+    }
+
+    /// Telemetry's route for the run as it stands: the client's when the
+    /// run has built one, else [`Self::telemetry_auth`]. A client is never
+    /// built, and the org never looked up, only to address an event.
+    pub(crate) fn telemetry_auth_for(&self, run: &RunApiClient) -> TelemetryAuth {
+        run.get()
+            .map_or_else(|| self.telemetry_auth(), TelemetryAuth::for_client)
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,
@@ -580,6 +599,16 @@ impl GlobalArgs {
         }
     }
 }
+
+/// The run's API client, built at most once and only when a request needs
+/// it ([`GlobalArgs::api_client`]). Building one reads the socket-cli
+/// config, prints the public-proxy and token-shape advisories and, with a
+/// token but no org, asks the API for the org — none of which a run that
+/// fetches nothing should pay for or print. A command hands this cell to
+/// the steps that may fetch instead of a client built up front; a host
+/// that already holds a client seeds it (`RunApiClient::new_with`), so a
+/// nested step reuses the run's one org resolution.
+pub(crate) type RunApiClient = tokio::sync::OnceCell<ApiClient>;
 
 /// [`GlobalArgs::project_root`] for a caller holding a resolved manifest
 /// path: the manifest's `.socket` parent's parent in the standard layout,
@@ -1121,6 +1150,46 @@ mod tests {
                 let auth = empty.telemetry_auth();
                 assert!(!auth.is_authenticated());
                 assert!(auth.url().ends_with("/patch/telemetry"), "{}", auth.url());
+            });
+        });
+    }
+
+    /// A run's telemetry route is its API client's once it has built one
+    /// and, until then, what the credentials alone select: a token with no
+    /// org reports anonymously instead of building a client (and asking
+    /// the API for the org) just to address an event.
+    #[test]
+    #[serial_test::serial]
+    fn telemetry_auth_for_follows_the_client_only_once_built() {
+        use socket_patch_core::api::client::{ApiClientOptions, ApiRoute};
+
+        // Keep a developer's `socket login` config out of the chain.
+        with_env_cleared(&["SOCKET_NO_CONFIG"], || {
+            std::env::set_var("SOCKET_NO_CONFIG", "1");
+            with_clean_socket_env(|| {
+                let args = GlobalArgs {
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    ..GlobalArgs::default()
+                };
+
+                let run = RunApiClient::new();
+                let auth = args.telemetry_auth_for(&run);
+                assert_eq!(auth, args.telemetry_auth());
+                assert!(!auth.is_authenticated(), "no org is known yet");
+                assert!(!run.initialized(), "reading the route builds nothing");
+
+                // The client a fetch built, its org resolved by the API.
+                let run = RunApiClient::new_with(Some(ApiClient::new(ApiClientOptions {
+                    api_url: "https://api.example.test".to_string(),
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    route: ApiRoute::org("resolved-org"),
+                })));
+                let auth = args.telemetry_auth_for(&run);
+                assert_eq!(
+                    auth.url(),
+                    "https://api.example.test/v0/orgs/resolved-org/telemetry"
+                );
+                assert!(auth.is_authenticated());
             });
         });
     }

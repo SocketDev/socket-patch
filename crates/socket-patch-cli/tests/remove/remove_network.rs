@@ -281,3 +281,79 @@ async fn remove_offline_does_not_fetch_and_keeps_entry() {
             .collect::<Vec<_>>()
     );
 }
+
+/// CA-P01: a `remove` whose rollback finds its before-blob cached needs no
+/// API client. With a token and no org, building one asks the API for the
+/// org (`GET /v0/organizations`); this run must not. Its only request is
+/// its telemetry event, on the route the credentials alone select (no org
+/// is known, so the anonymous proxy).
+#[tokio::test]
+async fn remove_with_a_cached_before_blob_never_asks_for_the_org() {
+    let before = b"before\n";
+    let after = b"after\n";
+    let before_hash = git_sha256(before);
+    let after_hash = git_sha256(after);
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Lazy", "image": null, "plan": "free", "slug": ORG_SLUG
+            }}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    write_manifest(&socket, &before_hash, &after_hash);
+    install_patched_package(tmp.path(), after);
+    let blobs = socket.join("blobs");
+    std::fs::create_dir_all(&blobs).expect("create blobs dir");
+    std::fs::write(blobs.join(&before_hash), before).expect("stage before blob");
+
+    let mut cmd = hermetic_command(&binary());
+    cmd.args(["remove", PURL, "--json", "--yes"])
+        .current_dir(tmp.path());
+    // Telemetry on (the builder forces it off), token set, org absent, and
+    // both hosts pinned to the mock so every request is seen.
+    let out = cmd
+        .env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env(
+            "SOCKET_API_TOKEN",
+            "sktsec_00000000000000000000000000000000000000000000_api",
+        )
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!manifest_has_entry(&socket), "stdout={stdout}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/remove-network-test/index.js")).unwrap(),
+        before,
+        "the cached blob restored the file"
+    );
+
+    let reqs = mock.received_requests().await.expect("recording enabled");
+    let log: Vec<String> = reqs
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(
+        log,
+        ["POST /patch/telemetry"],
+        "a remove that fetches nothing sends only its telemetry event"
+    );
+}

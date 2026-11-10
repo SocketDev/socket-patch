@@ -980,6 +980,133 @@ fn rollback_honors_manifest_path_override() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The API client is built only for a before-blob download
+// ---------------------------------------------------------------------------
+
+/// A project whose one package is installed at its patched bytes, with
+/// the before-blob cached: `rollback` restores it from disk.
+fn write_offline_satisfiable_project(root: &Path) -> PathBuf {
+    let before = b"lazy rollback before\n";
+    let after = b"lazy rollback after\n";
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "rollback-lazy-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg_dir = root.join("node_modules/rollback-lazy");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "rollback-lazy", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), after).unwrap();
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({ "patches": { "pkg:npm/rollback-lazy@1.0.0": {
+            "uuid": "66666666-6666-4666-8666-666666666666",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": git_sha256(before), "afterHash": git_sha256(after)
+            }},
+            "vulnerabilities": {}, "description": "x", "license": "MIT", "tier": "free"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(before)), before).unwrap();
+    pkg_dir.join("index.js")
+}
+
+/// CA-P01: with a token and no org, building the API client asks the API
+/// for the org (`GET /v0/organizations`). A rollback that restores from
+/// cached blobs needs no client, so it must not ask: its only request is
+/// its telemetry event, on the route the credentials alone select (no org
+/// is known, so the anonymous proxy).
+#[tokio::test]
+async fn rollback_from_cached_blobs_never_asks_for_the_org() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Lazy", "image": null, "plan": "free", "slug": "lazy-org"
+            }}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let index_js = write_offline_satisfiable_project(tmp.path());
+
+    // Telemetry on (the builder forces it off), token set, org absent, and
+    // both hosts pinned to the mock so every request is seen.
+    let out = rollback_cmd(tmp.path())
+        .arg("--json")
+        .env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env(
+            "SOCKET_API_TOKEN",
+            "sktsec_00000000000000000000000000000000000000000000_api",
+        )
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(index_js).unwrap(),
+        b"lazy rollback before\n",
+        "the cached blob restored the file"
+    );
+
+    let reqs = mock.received_requests().await.expect("recording enabled");
+    let log: Vec<String> = reqs
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(
+        log,
+        ["POST /patch/telemetry"],
+        "a rollback that fetches nothing sends only its telemetry event"
+    );
+}
+
+/// CA-U07: the "No SOCKET_API_TOKEN set — using the public patch API
+/// proxy" advisory describes where a fetch goes; a tokenless rollback that
+/// fetches nothing must not print it. (The run that does download prints
+/// it once: `rollback_undownloadable_blob_envelope_names_blob`.)
+#[test]
+fn tokenless_rollback_from_cached_blobs_prints_no_proxy_advisory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_offline_satisfiable_project(tmp.path());
+    let out = rollback_cmd(tmp.path())
+        .args(["--proxy-url", "http://127.0.0.1:1/"])
+        .output()
+        .expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert!(
+        !stderr.contains("public patch API proxy"),
+        "nothing was fetched, so no proxy is in use; stderr={stderr}"
+    );
+}
+
 use crate::vlt_hosted_common;
 use crate::vlt_vendored;
 

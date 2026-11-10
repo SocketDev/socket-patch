@@ -16,12 +16,13 @@
 //!    output (the OUT OF SYNC report was muted).
 //!
 //! Stderr assertions ignore the "No SOCKET_API_TOKEN set" client warning:
-//! it's printed by `get_api_client_with_overrides` in core for every ONLINE
-//! command (offline runs suppress it — see
-//! `apply_offline_suppresses_public_proxy_notice`) and is out of scope for
-//! `apply`'s `--silent` gating. `apply` builds that client only once a
-//! manifest exists and `--check` is not set, so the no-manifest hook path
-//! never prints it at all.
+//! it's printed by `get_api_client_with_overrides` in core when an ONLINE
+//! command builds its API client (offline runs suppress it) and is out of
+//! scope for `apply`'s `--silent` gating. `apply` builds that client only
+//! when it has something to download — see
+//! `apply_prints_the_public_proxy_notice_only_when_it_fetches` — so the
+//! no-manifest hook path, `--check` and a fully cached apply never print
+//! it at all.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -62,6 +63,40 @@ fn write_corrupt_manifest(root: &Path) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(&socket).unwrap();
     std::fs::write(socket.join("manifest.json"), "{ not json").unwrap();
+}
+
+/// An installed npm package with a manifest patch whose patched blob is
+/// not in `.socket/blobs`: applying it needs a download.
+fn write_uncached_patch(root: &Path) {
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"silent-root","version":"0.0.0"}"#,
+    )
+    .unwrap();
+    let pkg = root.join("node_modules/uncached");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(
+        pkg.join("package.json"),
+        r#"{"name":"uncached","version":"1.0.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(pkg.join("index.js"), b"before\n").unwrap();
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({ "patches": { "pkg:npm/uncached@1.0.0": {
+            "uuid": "77777777-7777-4777-8777-777777777777",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": common::git_sha256(b"before\n"),
+                "afterHash": common::git_sha256(b"after\n"),
+            }},
+            "vulnerabilities": {}, "description": "x", "license": "MIT", "tier": "free"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
 }
 
 fn write_empty_manifest(root: &Path) {
@@ -208,30 +243,43 @@ fn apply_check_silent_drift_keeps_error_output() {
 /// `--offline` promises "never contact the network" (CLI_CONTRACT.md strict
 /// airgap), but the tokenless client-construction advisory claims the run is
 /// "using the public patch API proxy" — implied network use that misleads
-/// airgapped operators. Offline runs must suppress it; online tokenless runs
-/// must keep it (anti-vacuous half).
+/// airgapped operators. Offline runs must suppress it, and so must an online
+/// run that fetches nothing (no client is built); an online tokenless run
+/// that downloads keeps it (anti-vacuous half).
 #[test]
-fn apply_offline_suppresses_public_proxy_notice() {
-    // An EMPTY manifest: apply exits 0 ("No patches to apply") either way,
-    // so the only stderr difference is the advisory under test. (A dir with
-    // no manifest at all never reaches client construction — see the next
-    // test — so it cannot serve the anti-vacuous half.)
+fn apply_prints_the_public_proxy_notice_only_when_it_fetches() {
+    // An EMPTY manifest: apply exits 0 ("No patches to apply") and has
+    // nothing to fetch, online or offline.
     let tmp = tempfile::tempdir().expect("create tempdir");
     write_empty_manifest(tmp.path());
+    for args in [&["--offline"][..], &[]] {
+        let (code, _stdout, stderr) = run_apply(tmp.path(), args);
+        assert_eq!(code, 0, "empty-manifest apply is a clean no-op: {stderr}");
+        assert!(
+            !stderr.contains("public patch API proxy"),
+            "apply {args:?} fetched nothing and must not claim proxy use; \
+             stderr was: {stderr:?}"
+        );
+    }
 
+    // A patch whose blob is not cached, for an installed package. Offline
+    // it cannot be fetched (and the notice stays away); online the run
+    // downloads through the proxy (a closed loopback port here) and says
+    // so.
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    write_uncached_patch(tmp.path());
     let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"]);
-    assert_eq!(code, 0, "empty-manifest apply is a clean no-op: {stderr}");
+    assert_eq!(code, 1, "no local source offline: {stderr}");
     assert!(
         !stderr.contains("public patch API proxy"),
         "--offline must not claim proxy (network) use; stderr was: {stderr:?}"
     );
-
-    let (code, _stdout, stderr) = run_apply(tmp.path(), &[]);
-    assert_eq!(code, 0, "empty-manifest apply is a clean no-op: {stderr}");
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--proxy-url", "http://127.0.0.1:1/"]);
+    assert_eq!(code, 1, "the download fails: {stderr}");
     assert!(
         stderr.contains("public patch API proxy"),
-        "anti-vacuous: the same tokenless run WITHOUT --offline must keep the \
-         advisory; stderr was: {stderr:?}"
+        "anti-vacuous: a tokenless run that downloads must keep the advisory; \
+         stderr was: {stderr:?}"
     );
 }
 

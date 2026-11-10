@@ -179,28 +179,17 @@ pub async fn run(args: RepairArgs) -> i32 {
     // client's public-proxy advisory ahead of its own output.
     let mut client: Option<ApiClient> = None;
     let result = repair_inner(&args, &manifest_path, &mut client, vendor_references).await;
-    // Only the download phase's client served this run; one built below for
-    // telemetry alone fetched nothing, so its org state is not a run warning.
     let auth_fallback = client
         .as_ref()
         .and_then(crate::commands::vex_sources::api_auth_fallback_warning);
 
-    // Telemetry credentials come from an API client, as in apply/rollback/
-    // remove, so env-provided tokens and the org auto-resolve apply. One is
-    // built only when a token is available: without one telemetry goes to
-    // the public endpoint whatever the org, and building it would print the
-    // proxy advisory.
-    if client.is_none() && api_token_available(&args.common) {
-        client = Some(
-            get_api_client_with_overrides(args.common.api_client_overrides())
-                .await
-                .0,
-        );
-    }
-    let telemetry = client.as_ref().map_or_else(
-        || TelemetryAuth::from_credentials(None, None),
-        TelemetryAuth::for_client,
-    );
+    // Telemetry follows the download phase's client when one was built.
+    // A repair that downloaded nothing takes the route from the credential
+    // chain alone, as apply/rollback/remove do: a client is never built,
+    // and the org never looked up, only to address an event.
+    let telemetry = client
+        .as_ref()
+        .map_or_else(|| args.common.telemetry_auth(), TelemetryAuth::for_client);
 
     match result {
         Ok((mut env, counts)) => {
@@ -420,23 +409,6 @@ async fn download_pass(
         }
     }
     pass
-}
-
-/// Whether an API token will be found, mirroring the client's chain: the
-/// `--api-token` flag (clap also maps SOCKET_API_TOKEN into it), then —
-/// unless `SOCKET_NO_API_TOKEN` vetoes ambient tokens — the env var and the
-/// socket-cli config. Checked without building a client, which would print
-/// the public-proxy advisory when there is none.
-fn api_token_available(common: &GlobalArgs) -> bool {
-    use socket_patch_core::utils::socket_cli_config;
-    if common.api_token.as_deref().is_some_and(|t| !t.is_empty()) {
-        return true;
-    }
-    if socket_cli_config::no_api_token_veto() {
-        return false;
-    }
-    std::env::var("SOCKET_API_TOKEN").is_ok_and(|t| !t.is_empty())
-        || socket_cli_config::load().is_some_and(|c| c.api_token.is_some())
 }
 
 async fn repair_inner(

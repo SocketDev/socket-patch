@@ -94,7 +94,7 @@ Every subcommand accepts the same set of "global" flags via a single shared `Glo
 | `--manifest-path` | — | `SOCKET_MANIFEST_PATH` | `.socket/manifest.json` | path | Manifest location (resolved relative to `--cwd`). v5.0 (#745): it also selects the project whose stores every command reads and writes — the root the RESOLVED manifest path implies: its `.socket` parent's parent when the manifest sits in a `.socket/` directory (exactly `--cwd` for the default path), else `--cwd` — a manifest file elsewhere (`state/patches.json`, `/etc/socket/manifest.json`) relocates only the manifest and its lock/artifact directory, not the project (v5.0; previously the file's own directory). All sources always come from that SAME project: `list`, `apply` (incl. `--check`), `rollback`, `remove`, `repair`, `vex`, `vendor --check` and agent-mode `scan`/`get` load (and `rollback`/`remove`/`repair`/`scan --prune` revert and save) that project's vendor ledger and its `.socket/vendor/` artifacts, under the manifest's apply lock, never `--cwd`'s; `list`, `vex`, `rollback`, `remove` and `repair` likewise read (and `rollback`/`remove` unwind) that project's lockfile hosted pins and pre-v5 redirect ledger. Installed copies are still found from `--cwd` (or the global scope). The forms that rewire `--cwd`'s lockfiles — `scan`/`get --mode hosted\|vendored` and `vendor` other than `--check` — refuse a manifest in another project: usage error (exit 2), code `manifest_path_foreign_project`, checked before anything is read or locked. So does an embedded `--vex` on `apply` (not `--check`) and agent-mode or report-only `scan`: those runs patch `--cwd`'s installed copies, while the document would attest the manifest's project; standalone `vex` runs wholly in the manifest's project and is allowed. A manifest that resolves into `--cwd`'s own project (the default path, `./.socket/manifest.json`, or a `..` detour back into `--cwd`) is never refused. |
 | `--api-url` | — | `SOCKET_API_URL` | `https://api.socket.dev` | string | Authenticated API endpoint |
 | `--api-token` | — | `SOCKET_API_TOKEN` | (none) | string | Auth token (absence selects the public proxy) |
-| `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug. Resolved once per run from the token (`GET /v0/organizations`) when omitted; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
+| `--org` | `-o` | `SOCKET_ORG_SLUG` | (auto-resolve) | string | Org slug. When omitted it is resolved from the token (`GET /v0/organizations`) once per run, the first time the run needs the patch API (see [API client construction](#api-client-construction)); if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
 | `--proxy-url` | — | `SOCKET_PROXY_URL` | `https://patches-api.socket.dev` | string | Public proxy when no token |
 | `--ecosystems` | `-e` | `SOCKET_ECOSYSTEMS` | (all) | CSV → `Vec<String>` | Restrict to these ecosystems |
 | `--vendor-source` | — | `SOCKET_VENDOR_SOURCE` | **`service`** | enum: `service` \| `auto` (alias) | How `vendor` acquires the installable artifact (see "Prebuilt vendor artifacts") |
@@ -1409,7 +1409,7 @@ State lives at `$XDG_CACHE_HOME`|`~/.cache` (Unix/macOS) or `%LOCALAPPDATA%` (Wi
 
 ## Telemetry events
 
-Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Every event's `context.version` is the client version. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
+Each command POSTs its outcome as one JSON event (`{event_sender_created_at, event_type, context: {version, platform, arch, command}, session_id, metadata?, error?: {type, message}}`; no `event_kind`, so the backend stores it as a required event) to `<api>/v0/orgs/<org>/telemetry` with the bearer when the run has a token and an org, else anonymously to `<proxy>/patch/telemetry`. The route is the run's API client's when the run built one; a run that built none (see [API client construction](#api-client-construction)) takes it from the configured credentials alone (flag → env → socket-cli config, no network), so a token with no configured org then reports anonymously: the org is never looked up only to address an event. `--no-telemetry`/`SOCKET_TELEMETRY_DISABLED`, `SOCKET_OFFLINE`/`--offline` and `VITEST=true` send nothing. Every event's `context.version` is the client version. Error messages have the home directory replaced by `~`. Every `event_type` must be in depscan's patch event map (`telemetry-discriminators.ts`), or it is stored as `external` and drops out of the patch dashboards; `telemetry.rs` pins that list in a test.
 
 | Command | Success | Failure | Metadata |
 |---|---|---|---|
@@ -1437,7 +1437,7 @@ Empty string means unset at every layer: exported-but-empty flag-bound vars are 
 | `SOCKET_MANIFEST_PATH` | `--manifest-path` | `.socket/manifest.json` | — |
 | `SOCKET_API_URL` | `--api-url` | `https://api.socket.dev` | — |
 | `SOCKET_API_TOKEN` | `--api-token` | (none) | Absence selects the public proxy. |
-| `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | Resolved once per run from the token (`GET /v0/organizations`) when omitted; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
+| `SOCKET_ORG_SLUG` | `--org` / `-o` | (auto-resolve) | When omitted, resolved from the token (`GET /v0/organizations`) once per run, the first time the run needs the patch API; if that fails, the whole run uses the public proxy anonymously (free patches only) and warns. |
 | `SOCKET_PROXY_URL` | `--proxy-url` | `https://patches-api.socket.dev` | — |
 | `SOCKET_ECOSYSTEMS` | `--ecosystems` / `-e` | (all) | Comma-separated list. |
 | `SOCKET_VENDOR_SOURCE` | `--vendor-source` | `service` | `auto` is a compatibility alias for `service`; `build` is rejected. |
@@ -1509,6 +1509,21 @@ Contract properties:
 - `--offline` semantics are unchanged: reading the local file is not network contact; a config-sourced token is inert offline.
 - **Repo-level files never carry endpoints, credentials, or interlock-disablers**: configuration for those comes only from flags, env vars, this user-level file, and built-in defaults — never from files inside the repository being patched (manifest, socket.yml, `.env`, …). A repository file may **narrow or pace** what `scan` patches (socket.yml's `patches` block and `projectIgnorePaths`, see "socket.yml patch policy"). It may never name an endpoint or credential, pick a mode or download format, turn off a safety check, or make `scan` patch anything it would not patch with no file present; the one exception is negating the built-in test/fixture path ignores, which are repo policy by nature.
 - `--debug` names the source on stderr whenever a setting resolves from the socket-cli config (the token value itself is never echoed).
+
+### API client construction
+
+Building the API client is what reads the token, prints the client's stderr advisories (`No SOCKET_API_TOKEN set … using the public patch API proxy`, the token-shape warning, `Could not determine your organization …`) and, with a token and no org, makes the `GET /v0/organizations` round-trip. A command builds it once per run, at the first step that needs the patch API, so a run that needs nothing from it makes no API request, prints none of those advisories and carries no `api_auth_fallback` warning:
+
+| Command | Builds the client |
+|---|---|
+| `scan`, `get`, `vendor` (not its no-op / `--revert`) | Always (their work is remote). |
+| `apply` | When a patched blob is missing from `.socket/blobs` and must be downloaded; when a Maven patch is in scope (the patched-jar service); when the embedded `--vex` must fetch a record. Not for an apply that finds every blob cached (including a no-op), a missing manifest, or `--check`. |
+| `rollback`, `remove` | When a before-blob the restore needs is missing and must be downloaded. Not for a restore from cached blobs. |
+| `repair` | When an artifact must be downloaded. |
+| `vex` | When it must fetch a patch record or a patched file that is not on disk. |
+| `list` | Never. |
+
+Telemetry does not build it: see [Telemetry events](#telemetry-events) for the route a client-less run reports on.
 
 ### Registry override env vars
 

@@ -818,6 +818,69 @@ async fn repair_json_reports_unresolved_org_fallback_in_warnings() {
     );
 }
 
+/// CA-P01: a repair that finds every blob present downloads nothing, so
+/// it needs no API client. With a token and no org, building one asks the
+/// API for the org (`GET /v0/organizations`), and repair used to build one
+/// only to address its telemetry. Its one request is now the telemetry
+/// event, on the route the credentials alone select (no org is known, so
+/// the anonymous proxy).
+#[tokio::test]
+async fn repair_with_nothing_to_download_never_asks_for_the_org() {
+    let content = b"patched-content\n";
+    let after_hash = git_sha256(content);
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Lazy", "image": null, "plan": "free", "slug": ORG_SLUG
+            }}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = MANIFEST_JSON.replace(REFERENCED_HASH, &after_hash);
+    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
+    write_blob(&socket, &after_hash, content);
+
+    // Telemetry on (the builder forces it off), token set, org absent, and
+    // both hosts pinned to the mock so every request is seen.
+    let out = socket_cmd(tmp.path())
+        .args(["repair", "--json"])
+        .env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", format!("sktsec_{}_api", "x".repeat(44)))
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    let reqs = mock.received_requests().await.expect("recording enabled");
+    let log: Vec<String> = reqs
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(
+        log,
+        ["POST /patch/telemetry"],
+        "a repair that downloads nothing sends only its telemetry event"
+    );
+}
+
 #[tokio::test]
 async fn repair_online_downloads_missing_blob() {
     // Manifest references a blob whose content we control. The blob is

@@ -1,5 +1,4 @@
 use clap::Args;
-use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
@@ -26,7 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, is_local_go, GlobalArgs};
+use crate::args::{apply_env_toggles, is_local_go, GlobalArgs, RunApiClient};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
@@ -1212,12 +1211,12 @@ pub async fn run(args: ApplyArgs) -> i32 {
         return run_check(&args, &manifest_path).await;
     }
 
-    // The run's ONE API client — built past both read-only exits above (a
-    // hook on a manifest-less project or a CI `--check` never pays its
-    // config read, stderr advisory or org-slug round-trip) and BEFORE the
-    // lock, so none of that lengthens the lock hold. It serves the staging
-    // fetch, the mismatch blob top-up and telemetry.
-    let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    // The run's ONE API client, built by the first step that fetches (see
+    // `RunApiClient`): the staging download, the Maven jar service or an
+    // embedded `--vex`. An apply that finds every blob cached — the run a
+    // CI job or install hook makes after every install — never pays its
+    // config read, stderr advisory or org-slug round-trip.
+    let client = RunApiClient::new();
 
     // Serialize against concurrent socket-patch runs targeting the same
     // `.socket/` directory; see `socket_patch_core::patch::apply_lock`.
@@ -1377,17 +1376,19 @@ fn collect_apply_outcomes(
 /// `scan --mode agent` call this straight after their manifest write, so
 /// download → manifest write → apply is ONE lock window (a same-process
 /// re-acquire would contend) and the nested apply never builds a second
-/// client. `lock` is released explicitly once every mutation is done
-/// (output and a possibly slow telemetry POST must not keep a sibling
+/// client (they seed `client` with theirs; [`run`] passes an empty one,
+/// built only if this apply has something to fetch). `lock` is released
+/// explicitly once every mutation is done (output must not keep a sibling
 /// waiting), otherwise on return. The returned [`ApplyRunReport`] carries
 /// the exit code plus what failed, for a nested caller's envelope.
 pub(crate) async fn run_locked(
     args: ApplyArgs,
     manifest_path: PathBuf,
-    client: &ApiClient,
+    client: &RunApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
-    let telemetry = TelemetryAuth::for_client(client);
+    // Read where each event fires: the client may be built in between.
+    let telemetry = || args.common.telemetry_auth_for(client);
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -1402,7 +1403,7 @@ pub(crate) async fn run_locked(
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
             );
-            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry).await;
+            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry()).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
@@ -1410,7 +1411,7 @@ pub(crate) async fn run_locked(
             // One manifest-load mapping for every command (#931):
             // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry()).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
@@ -1665,7 +1666,7 @@ pub(crate) async fn run_locked(
             // `no_applicable_patches`, and would write an attestation
             // file during --dry-run. Skip instead.
             let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
-                let params = args.vex.to_build_params(Some(client));
+                let params = args.vex.to_build_params(client.get());
                 Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
@@ -1747,11 +1748,13 @@ pub(crate) async fn run_locked(
                 env.warnings.extend(run_warnings.iter().cloned());
                 // A token whose org could not be resolved put the run on the
                 // proxy (stderr already said so); the embedded `--vex` reuses
-                // this client and leaves reporting it to the host.
-                env.warnings
-                    .extend(crate::commands::vex_sources::api_auth_fallback_warning(
-                        client,
-                    ));
+                // this client and leaves reporting it to the host. A run
+                // that built no client fell back to nothing.
+                env.warnings.extend(
+                    client
+                        .get()
+                        .and_then(crate::commands::vex_sources::api_auth_fallback_warning),
+                );
                 if !success {
                     env.mark_partial_failure();
                 }
@@ -1821,12 +1824,12 @@ pub(crate) async fn run_locked(
 
             // Track telemetry
             if success {
-                track_patch_applied(patched_count, args.common.dry_run, &telemetry).await;
+                track_patch_applied(patched_count, args.common.dry_run, &telemetry()).await;
             } else {
                 track_patch_apply_failed(
                     "One or more patches failed to apply",
                     args.common.dry_run,
-                    &telemetry,
+                    &telemetry(),
                 )
                 .await;
             }
@@ -1895,7 +1898,7 @@ pub(crate) async fn run_locked(
         Err(e) => {
             lock.release();
             let err = EnvelopeError::new("apply_failed", e.clone());
-            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry()).await;
             ApplyRunReport {
                 skipped: user_patch_skips,
                 ..ApplyRunReport::run_failure(code, "apply_failed", e)
@@ -2303,7 +2306,7 @@ async fn apply_patches_inner(
     args: &ApplyArgs,
     mut manifest: PatchManifest,
     user_patched: &HashSet<String>,
-    client: &ApiClient,
+    client: &RunApiClient,
 ) -> Result<ApplyOutcome, String> {
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
     // tempdir + download the gap). Shared with `vendor` via fetch_stage.
@@ -2578,10 +2581,16 @@ async fn apply_patches_inner(
     } else {
         None
     };
-    let jvm_service = jvm_scope.as_ref().map(|_| {
-        args.common
-            .vendor_service_config(Some(client.clone()), client.uses_public_proxy())
-    });
+    let jvm_service = match &jvm_scope {
+        Some(_) => {
+            let client = args.common.api_client(client).await;
+            Some(
+                args.common
+                    .vendor_service_config(Some(client.clone()), client.uses_public_proxy()),
+            )
+        }
+        None => None,
+    };
 
     let jvm_derived = socket_patch_core::patch::jvm_jar::DerivedCache::default();
 

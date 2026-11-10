@@ -493,10 +493,10 @@ impl Cand {
 }
 
 /// The run's API client, built at most once: a host command (`scan`,
-/// `apply`, `vendor`) seeds it with the client it already built, so
-/// embedded `--vex` reuses the run's one org resolution; standalone `vex`
-/// leaves it empty and [`fetch_records`] builds it on first need.
-pub(crate) type RunApiClient = tokio::sync::OnceCell<ApiClient>;
+/// `apply`, `vendor`) seeds it with the client it has built, so embedded
+/// `--vex` reuses the run's one org resolution; standalone `vex` leaves it
+/// empty and [`fetch_records`] builds it on first need.
+pub(crate) use crate::args::RunApiClient;
 
 /// Merge `sources` into a verified-input [`Plan`]. `assume_live` is the
 /// in-run `scan --mode hosted --vex` confirmed set (qualifier-insensitive):

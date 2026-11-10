@@ -1415,7 +1415,9 @@ pub(crate) async fn run_nested_apply(
             report_user_patch_skips,
         }),
     };
-    let mut report = super::apply::run_locked(apply_args, manifest_path, client, lock).await;
+    // The nested apply runs on the host's client: seeded, never rebuilt.
+    let client = crate::args::RunApiClient::new_with(Some(client.clone()));
+    let mut report = super::apply::run_locked(apply_args, manifest_path, &client, lock).await;
     // Scan already printed its selection-time skips. A selected package that
     // the locked recheck now skips is NEW evidence and must still be visible.
     if !report_user_patch_skips {
