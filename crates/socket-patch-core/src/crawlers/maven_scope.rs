@@ -31,6 +31,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::formats::maven::interpolate_strict;
 use crate::vendor::jvm::maven_reactor::{
     implicit_subprojects, may_discover_subprojects, pom_model, PomDecl, PomModel, MAVEN_CONFIG,
 };
@@ -42,8 +43,11 @@ type Gav = (String, String, String);
 const MAX_NODES: usize = 50_000;
 /// Deepest parent chain / BOM import nesting followed.
 const MAX_DEPTH: usize = 32;
-/// Property interpolation depth cap.
-const MAX_INTERPOLATION: usize = 16;
+/// Property lookups a walk may make before any pom is read, and per byte
+/// of pom it reads: the work is then linear in what was read, whatever the
+/// poms say.
+const BASE_LOOKUPS: usize = 1_000_000;
+const LOOKUPS_PER_POM_BYTE: usize = 16;
 /// Most reactor poms read.
 const MAX_REACTOR: usize = 4_096;
 
@@ -75,9 +79,18 @@ pub(crate) fn project_scope(cwd: &Path, repo: &Path) -> Option<ProjectScope> {
         queued: HashSet::new(),
         reactor_chains: Vec::new(),
         reactor_managed: HashMap::new(),
+        work: Work::new(),
     };
-    walk.reactor()?;
-    walk.run()?;
+    let walked = walk.reactor().and_then(|()| walk.run());
+    if walk.work.spent() {
+        super::jvm_cache::debug_log(&format!(
+            "maven: the poms under {} interpolate more than their size allows; the Maven \
+             local repository is left unscoped",
+            cwd.display()
+        ));
+        return None;
+    }
+    walked?;
     Some(walk.scope)
 }
 
@@ -106,6 +119,8 @@ struct Walk<'w> {
     reactor_chains: Vec<Chain>,
     /// [`Walk::managed_version`] of each reactor chain, by artifact.
     reactor_managed: HashMap<(usize, String, String), Option<Option<String>>>,
+    /// The property lookups left to this walk.
+    work: std::rc::Rc<Work>,
 }
 
 impl Walk<'_> {
@@ -113,7 +128,7 @@ impl Walk<'_> {
         if let Some(found) = self.models.get(path) {
             return found.clone();
         }
-        let parsed = read_model(path, include_profiles);
+        let parsed = read_model(path, include_profiles, &self.work);
         self.models.insert(path.to_path_buf(), parsed.clone());
         parsed
     }
@@ -125,8 +140,9 @@ impl Walk<'_> {
             .filter_map(|gav| self.repo_pom(gav))
             .filter(|path| !self.models.contains_key(path))
             .collect();
+        let work = std::rc::Rc::clone(&self.work);
         let parsed = paths.into_iter().map(|path| {
-            let model = read_model(&path, false);
+            let model = read_model(&path, false, &work);
             (path, model)
         });
         self.models.extend(parsed);
@@ -164,6 +180,7 @@ impl Walk<'_> {
     /// `relativePath` (default `../pom.xml`) when that pom is the declared
     /// one, else the parent's pom in the repository.
     fn chain(&mut self, node: Node) -> Chain {
+        let work = std::rc::Rc::clone(&self.work);
         let mut chain = vec![node];
         while chain.len() < MAX_DEPTH {
             let cur = chain.last().expect("non-empty").clone();
@@ -171,7 +188,8 @@ impl Walk<'_> {
                 break;
             };
             let props = chain.clone();
-            let resolve = |v: &Option<String>| v.as_deref().and_then(|v| interpolate(v, &props));
+            let resolve =
+                |v: &Option<String>| v.as_deref().and_then(|v| interpolate(v, &props, &work));
             let (pg, pa, pv) = (resolve(&pg), resolve(&pa), resolve(&pv));
             let local = if cur.local && rel.as_deref() != Some("") {
                 let rel = rel.unwrap_or_else(|| "../pom.xml".to_string());
@@ -232,7 +250,7 @@ impl Walk<'_> {
             .ok()
             .map(|b| String::from_utf8_lossy(&b).into_owned());
         while let Some(node) = pending.pop() {
-            if seen.len() > MAX_REACTOR {
+            if seen.len() > MAX_REACTOR || self.work.spent() {
                 return None;
             }
             let dir = node.path.parent().unwrap_or(self.cwd).to_path_buf();
@@ -268,7 +286,7 @@ impl Walk<'_> {
             // Imported BOMs and parents are part of the build too.
             for decl in chain.iter().flat_map(|n| n.model.managed.clone()) {
                 if is_import(&decl) {
-                    if let Some(gav) = decl_gav(&decl, chain) {
+                    if let Some(gav) = decl_gav(&decl, chain, &self.work) {
                         self.admit(&gav);
                     }
                 }
@@ -283,8 +301,10 @@ impl Walk<'_> {
     fn declare(&mut self, decl: &PomDecl, chain: &Chain, direct: bool) {
         // Coordinates interpolate like the version (`${project.groupId}`):
         // a raw placeholder never names a repository path or crawl entry.
-        let group = interpolate(&decl.group, chain).unwrap_or_else(|| decl.group.clone());
-        let artifact = interpolate(&decl.artifact, chain).unwrap_or_else(|| decl.artifact.clone());
+        let work = std::rc::Rc::clone(&self.work);
+        let group = interpolate(&decl.group, chain, &work).unwrap_or_else(|| decl.group.clone());
+        let artifact =
+            interpolate(&decl.artifact, chain, &work).unwrap_or_else(|| decl.artifact.clone());
         if !direct {
             let reactor = std::mem::take(&mut self.reactor_chains);
             for (i, rc) in reactor.iter().enumerate() {
@@ -304,7 +324,7 @@ impl Walk<'_> {
             self.reactor_chains = reactor;
         }
         let version = match &decl.version {
-            Some(raw) => Some(interpolate(raw, chain)),
+            Some(raw) => Some(interpolate(raw, chain, &work)),
             None => self
                 .managed_version(chain, &group, &artifact, 0)
                 .or(Some(None)),
@@ -322,18 +342,23 @@ impl Walk<'_> {
         a: &str,
         depth: usize,
     ) -> Option<Option<String>> {
+        let work = std::rc::Rc::clone(&self.work);
         let is_ga = |d: &PomDecl| {
             let coord = |raw: &str, want: &str| {
-                raw == want || interpolate(raw, chain).is_some_and(|v| v == want)
+                raw == want || interpolate(raw, chain, &work).is_some_and(|v| v == want)
             };
             coord(&d.group, g) && coord(&d.artifact, a) && !is_import(d)
         };
         for node in chain {
             if let Some(decl) = node.model.managed.iter().find(|d| is_ga(d)) {
-                return Some(decl.version.as_deref().and_then(|v| interpolate(v, chain)));
+                return Some(
+                    decl.version
+                        .as_deref()
+                        .and_then(|v| interpolate(v, chain, &work)),
+                );
             }
         }
-        if depth >= MAX_DEPTH {
+        if depth >= MAX_DEPTH || work.spent() {
             return Some(None);
         }
         let imports: Vec<PomDecl> = chain
@@ -341,7 +366,7 @@ impl Walk<'_> {
             .flat_map(|n| n.model.managed.iter().filter(|d| is_import(d)).cloned())
             .collect();
         for decl in imports {
-            let Some(gav) = decl_gav(&decl, chain) else {
+            let Some(gav) = decl_gav(&decl, chain, &work) else {
                 continue;
             };
             let Some(path) = self.repo_pom(&gav) else {
@@ -422,7 +447,7 @@ impl Walk<'_> {
     /// Admit `gav` and queue its own transitive dependencies.
     fn visit(&mut self, gav: Gav) -> Option<()> {
         {
-            if self.scope.gavs.len() > MAX_NODES {
+            if self.scope.gavs.len() > MAX_NODES || self.work.spent() {
                 return None;
             }
             self.admit(&gav);
@@ -442,7 +467,7 @@ impl Walk<'_> {
                     local: false,
                 }];
                 let part = |p: Option<String>, own: &str| match p {
-                    Some(p) => interpolate(&p, &props),
+                    Some(p) => interpolate(&p, &props, &self.work),
                     None => Some(own.to_string()),
                 };
                 if let (Some(rg), Some(ra), rv) = (part(rg, g), part(ra, a), part(rv, v)) {
@@ -503,11 +528,13 @@ fn discovered_subprojects(path: &Path, dir: &Path, config: Option<&str>) -> Vec<
     out
 }
 
-/// The pom at `path` parsed, when it is readable.
-fn read_model(path: &Path, include_profiles: bool) -> Option<Arc<PomModel>> {
-    crate::utils::fs::read_regular_to_bytes_sync(path)
+/// The pom at `path` parsed, when it is readable. Its size adds to the
+/// lookups the walk may make.
+fn read_model(path: &Path, include_profiles: bool, work: &Work) -> Option<Arc<PomModel>> {
+    let bytes = crate::utils::fs::read_regular_to_bytes_sync(path).ok()?;
+    work.grant(bytes.len());
+    String::from_utf8(bytes)
         .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
         .and_then(|text| pom_model(&text, include_profiles).ok())
         .map(Arc::new)
 }
@@ -516,11 +543,11 @@ fn is_import(decl: &PomDecl) -> bool {
     decl.scope.as_deref() == Some("import") && decl.kind.as_deref() == Some("pom")
 }
 
-fn decl_gav(decl: &PomDecl, chain: &Chain) -> Option<Gav> {
+fn decl_gav(decl: &PomDecl, chain: &Chain, work: &Work) -> Option<Gav> {
     Some((
-        interpolate(&decl.group, chain)?,
-        interpolate(&decl.artifact, chain)?,
-        interpolate(decl.version.as_deref()?, chain)?,
+        interpolate(&decl.group, chain, work)?,
+        interpolate(&decl.artifact, chain, work)?,
+        interpolate(decl.version.as_deref()?, chain, work)?,
     ))
 }
 
@@ -529,17 +556,16 @@ fn is_range(version: &str) -> bool {
 }
 
 /// `${name}` interpolation in `chain`'s context: the model's own version
-/// expressions, then `<properties>` up the chain (nearest first).
-fn interpolate(value: &str, chain: &Chain) -> Option<String> {
-    interpolate_at(value, chain, 0)
-}
-
-fn interpolate_at(value: &str, chain: &Chain, depth: usize) -> Option<String> {
+/// expressions, then `<properties>` up the chain (nearest first), through
+/// the one bounded interpolator ([`interpolate_strict`]: depth, lookups and
+/// length capped, cycles refused), so a pom whose properties name each
+/// other many times over costs a fixed amount, not one that doubles with
+/// every level. `None` when a name is undefined or a bound is hit: the
+/// value is then one this walk cannot determine. Every lookup also draws
+/// on `work`, the walk's budget.
+fn interpolate(value: &str, chain: &Chain, work: &Work) -> Option<String> {
     if !value.contains("${") {
         return Some(value.to_string());
-    }
-    if depth > MAX_INTERPOLATION {
-        return None;
     }
     let own = &chain.first()?.model;
     let parent_field = |i: usize| -> Option<String> {
@@ -547,6 +573,9 @@ fn interpolate_at(value: &str, chain: &Chain, depth: usize) -> Option<String> {
         [g, a, v][i].clone()
     };
     let lookup = |name: &str| -> Option<String> {
+        if !work.spend() {
+            return None;
+        }
         match name {
             "project.version" | "pom.version" | "version" => {
                 own.version.clone().or_else(|| parent_field(2))
@@ -560,18 +589,39 @@ fn interpolate_at(value: &str, chain: &Chain, depth: usize) -> Option<String> {
             _ => chain.iter().find_map(|n| n.model.props.get(name).cloned()),
         }
     };
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(at) = rest.find("${") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + 2..];
-        let close = after.find('}')?;
-        let raw = lookup(&after[..close])?;
-        out.push_str(&interpolate_at(&raw, chain, depth + 1)?);
-        rest = &after[close + 1..];
+    interpolate_strict(value, &lookup)
+}
+
+/// The property lookups one walk may still make. A project's poms name a
+/// property a few times per declaration; a walk that runs out was fed poms
+/// built to make it spin, and is abandoned ([`project_scope`] is `None`).
+struct Work(std::cell::Cell<usize>);
+
+impl Work {
+    fn new() -> std::rc::Rc<Work> {
+        std::rc::Rc::new(Work(std::cell::Cell::new(BASE_LOOKUPS)))
     }
-    out.push_str(rest);
-    Some(out)
+
+    /// A pom of `bytes` was read: the walk may look up that much more.
+    fn grant(&self, bytes: usize) {
+        let more = bytes.saturating_mul(LOOKUPS_PER_POM_BYTE);
+        self.0.set(self.0.get().saturating_add(more));
+    }
+
+    /// Take one lookup; `false` once none is left.
+    fn spend(&self) -> bool {
+        match self.0.get().checked_sub(1) {
+            Some(left) => {
+                self.0.set(left);
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn spent(&self) -> bool {
+        self.0.get() == 0
+    }
 }
 
 /// `path` with `.` / `..` components folded (no filesystem access);
@@ -967,6 +1017,118 @@ mod tests {
         let scope = project_scope(&cwd, &repo).unwrap();
         assert!(scope.admits("org.example", "lib", "1.0"));
         assert!(scope.admits("org.example", "transitive", "2"));
+    }
+
+    /// Sixteen properties, each naming the next `fanout` times, over a
+    /// literal: `${p0}` names `fanout^15` values.
+    fn chained_properties(fanout: usize) -> String {
+        let props: String = (0..16)
+            .map(|i| {
+                let value = match i {
+                    15 => "1.0".to_string(),
+                    _ => format!("${{p{}}}", i + 1).repeat(fanout),
+                };
+                format!("<p{i}>{value}</p{i}>")
+            })
+            .collect();
+        format!("<properties>{props}</properties>")
+    }
+
+    /// `project_scope` on a worker, so a walk that never ends fails the
+    /// test instead of hanging it.
+    fn scope_within(
+        cwd: &Path,
+        repo: &Path,
+        seconds: u64,
+    ) -> Result<Option<ProjectScope>, &'static str> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (cwd, repo) = (cwd.to_path_buf(), repo.to_path_buf());
+        std::thread::spawn(move || {
+            let _ = tx.send(project_scope(&cwd, &repo));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(seconds))
+            .map_err(|_| "the walk did not finish")
+    }
+
+    /// VJ-S1: a 2.8 KiB pom whose sixteen properties each name the next
+    /// thirty times made the walk expand 30^15 references. The bounded
+    /// interpolator gives up on the value, which is then a version the
+    /// walk cannot determine: every cached one.
+    #[test]
+    fn a_property_bomb_is_a_version_the_walk_cannot_determine() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        cache(&repo, "org.x", "lib", "1.0", "");
+        cache(&repo, "org.x", "lib", "2.0", "");
+        let project = |fanout: usize| {
+            pom(
+                "com.example",
+                "app",
+                "1",
+                &format!(
+                    "{}{}",
+                    chained_properties(fanout),
+                    deps(&[dep("org.x", "lib", Some("${p0}"), "")])
+                ),
+            )
+        };
+        // One reference per property is the literal it ends in.
+        write(&cwd, "pom.xml", &project(1));
+        let scope = scope_within(&cwd, &repo, 30).unwrap().unwrap();
+        assert!(scope.admits("org.x", "lib", "1.0") && !scope.admits("org.x", "lib", "2.0"));
+        write(&cwd, "pom.xml", &project(30));
+        let scope = scope_within(&cwd, &repo, 30).unwrap().unwrap();
+        assert!(scope.admits("org.x", "lib", "1.0") && scope.admits("org.x", "lib", "2.0"));
+    }
+
+    /// A pom built so that every declaration costs the interpolator its
+    /// whole per-value bound draws more lookups than its size grants: the
+    /// walk is abandoned (the crawl stays unscoped) instead of running on.
+    #[test]
+    fn a_walk_out_of_lookups_is_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cwd, repo) = (dir.path().join("p"), dir.path().join("m2"));
+        let bombs: Vec<String> = (0..1500)
+            .map(|_| dep("${p0}", "${p0}", Some("${p0}"), ""))
+            .collect();
+        write(
+            &cwd,
+            "pom.xml",
+            &pom(
+                "com.example",
+                "app",
+                "1",
+                &format!("{}{}", chained_properties(30), deps(&bombs)),
+            ),
+        );
+        assert!(scope_within(&cwd, &repo, 120).unwrap().is_none());
+        // The same declarations over a property that resolves are a scope.
+        write(
+            &cwd,
+            "pom.xml",
+            &pom(
+                "com.example",
+                "app",
+                "1",
+                &format!("{}{}", chained_properties(1), deps(&bombs)),
+            ),
+        );
+        assert!(scope_within(&cwd, &repo, 120).unwrap().is_some());
+    }
+
+    #[test]
+    fn work_is_granted_by_the_bytes_read() {
+        let work = Work::new();
+        assert!(!work.spent());
+        for _ in 0..BASE_LOOKUPS {
+            assert!(work.spend());
+        }
+        assert!(work.spent() && !work.spend());
+        work.grant(2);
+        for _ in 0..2 * LOOKUPS_PER_POM_BYTE {
+            assert!(work.spend());
+        }
+        assert!(!work.spend());
     }
 
     #[test]
