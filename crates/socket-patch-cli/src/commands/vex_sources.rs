@@ -288,6 +288,13 @@ const NOTE_SBT_PIN_BYPASSED: &str = "vex_sbt_pin_bypassed";
 /// governing workspace keeps from the build (`vex::Unattested`,
 /// `UnattestedKind::GoWorkspaceOverride`).
 pub(crate) const GO_WORKSPACE_OVERRIDE: &str = "go_workspace_override";
+/// Omission tag and note: a vendored npm-family pin sits in a lock the
+/// project's own configuration tells the package manager not to read (npm
+/// `package-lock=false`, yarn 1 `--install.no-lockfile`, a yarn berry
+/// `lockfileFilename`, pnpm `lockfile: false` with no override routing the
+/// package to the artifact; `vex::Unattested`,
+/// `UnattestedKind::LockNotRead`).
+const NOTE_LOCK_NOT_READ: &str = "vex_lock_not_read";
 
 /// The omission tag of an [`Unattested`](socket_patch_core::vex::Unattested)
 /// ref, and the remedy its note ends with.
@@ -393,6 +400,12 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             GO_WORKSPACE_OVERRIDE,
             "not attested while the Go workspace in effect keeps it from the build; the wiring \
              itself is intact, so re-running `scan` / `vendor` does not change this",
+        ),
+        UnattestedKind::LockNotRead => (
+            NOTE_LOCK_NOT_READ,
+            "not attested while the project's configuration keeps the package manager from \
+             reading that lock; the wiring itself is intact, so re-running `scan` / `vendor` \
+             does not change this (drop the setting so the lock is read again)",
         ),
     }
 }
@@ -2135,10 +2148,15 @@ mod tests {
             UnattestedKind::MavenClassifierUnpatched,
             UnattestedKind::PnpmGitBranchLock,
             UnattestedKind::UserPatchedDependency,
+            UnattestedKind::LockNotRead,
         ];
         let tags: std::collections::BTreeSet<&str> =
             kinds.iter().map(|k| unattested_note(*k).0).collect();
         assert_eq!(tags.len(), kinds.len(), "{tags:?}");
+        assert_eq!(
+            unattested_note(UnattestedKind::LockNotRead).0,
+            "vex_lock_not_read"
+        );
         assert_eq!(
             unattested_note(UnattestedKind::PnpmGitBranchLock).0,
             "vex_pnpm_git_branch_lockfile"

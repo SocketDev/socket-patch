@@ -125,11 +125,58 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         );
         return;
     }
-    if is_berry_lock(text) {
+    let berry = is_berry_lock(text);
+    if berry {
         extract_berry(ctx, berry_entries(text), out).await;
     } else {
         extract_classic(ctx, classic_entries(text), out).await;
     }
+    if let Some(why) = yarn_lock_turned_off(ctx, berry).await {
+        out.unpin_lock_not_read(YARN_LOCK, &why);
+        out.unattest_vendored_not_read(YARN_LOCK, &why, |_| false);
+    }
+}
+
+/// What the project's own yarn rc does when it keeps yarn from reading
+/// `yarn.lock`, for the yarn that reads this lock's grammar (yarn 1 never
+/// reads `.yarnrc.yml`, berry never `.yarnrc`):
+///
+/// * classic: a `no-lockfile` flag in `.yarnrc`, for `install`, for every
+///   command (`--*.`) or bare. `yarn install` then neither reads nor writes
+///   the lock, `--frozen-lockfile` included, and resolves every dependency
+///   from the registry (measured on yarn 1.22.19). yarn turns the flag on
+///   for any value but a literal `false`;
+/// * berry: `lockfileFilename` in `.yarnrc.yml` naming another file. yarn
+///   2 and 3 read and write that file and never `yarn.lock`; yarn 4 rejects
+///   the setting and installs nothing (measured on 2.4.3, 3.8.7, 4.5.3).
+///
+/// Either way the lock's pins prove nothing about what installs.
+async fn yarn_lock_turned_off(ctx: &DiscoverCtx<'_>, berry: bool) -> Option<String> {
+    use crate::formats::yarn::classic_rc::{settings, RcScalar};
+    if berry {
+        let rc = ctx.read_advisory_text(".yarnrc.yml").await?;
+        let name = crate::formats::yarn::rc::raw_setting(&rc, "lockfileFilename")?;
+        return (name != YARN_LOCK).then(|| {
+            format!(
+                "`lockfileFilename: {name}` in .yarnrc.yml makes yarn 2 and 3 read and write \
+                 that file instead of {YARN_LOCK} (yarn 4 rejects the setting and installs \
+                 nothing)"
+            )
+        });
+    }
+    let rc = ctx.read_advisory_text(".yarnrc").await?;
+    let settings = settings(&rc)?;
+    let flag = ["--install.no-lockfile", "--*.no-lockfile", "--no-lockfile"]
+        .into_iter()
+        .find(|flag| {
+            settings
+                .get(*flag)
+                .is_some_and(|value| *value != RcScalar::Bool(false))
+        })?;
+    Some(format!(
+        "`{flag}` in .yarnrc makes yarn 1 neither read nor write {YARN_LOCK}, so `yarn install` \
+         resolves every dependency from the registry"
+    ))
 }
 
 /// The first column-0 line that is neither blank, a `#` comment, nor an
@@ -1064,6 +1111,114 @@ mod tests {
             "resolutions": res,
         })
         .to_string()
+    }
+
+    /// What a lock yarn is configured not to read still proves: a hosted
+    /// ref keeps no lockfile basis, a vendored one is marked
+    /// [`UnattestedKind::LockNotRead`], and the refs stay refs.
+    fn assert_lock_not_read(out: &Discovery, off: bool, what: &str) {
+        assert_refs(
+            out,
+            &[
+                ("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted),
+                ("pkg:npm/@scope/pkg@2.0.0", UUID_B, WiringMode::Vendored),
+            ],
+        );
+        let hosted = out.refs.iter().find(|r| r.uuid == UUID_A).unwrap();
+        assert_eq!(hosted.lockfile_basis_ok(), !off, "{what}");
+        let marks: Vec<(&str, UnattestedKind)> = out
+            .unattested
+            .iter()
+            .map(|u| (u.purl.as_str(), u.kind))
+            .collect();
+        let expected: &[(&str, UnattestedKind)] = if off {
+            &[("pkg:npm/@scope/pkg@2.0.0", UnattestedKind::LockNotRead)]
+        } else {
+            &[]
+        };
+        assert_eq!(marks, expected, "{what}");
+        let unread = out.diagnostics.iter().any(|d| {
+            d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("pkg:npm/left-pad@1.3.0")
+        });
+        assert_eq!(unread, off, "{what}: {:#?}", out.diagnostics);
+    }
+
+    /// yarn 1's `no-lockfile` flag set in the project `.yarnrc` (for
+    /// `install`, for every command, or bare) makes `yarn install` neither
+    /// read nor write yarn.lock, `--frozen-lockfile` included (measured on
+    /// yarn 1.22.19): every dependency resolves from the registry, so the
+    /// lock's pins prove nothing about what installs.
+    #[tokio::test]
+    async fn classic_lock_turned_off_in_yarnrc_attests_nothing_from_the_lock_alone() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:./.socket/vendor/npm/{UUID_B}/@scope/pkg-2.0.0.tgz#{SHA1}");
+        let lock = classic(&[
+            classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI)),
+            classic_block("\"@scope/pkg@2.0.0\"", "2.0.0", &vendored, Some(SRI)),
+        ]);
+        for (yarnrc, off) in [
+            ("--install.no-lockfile true\n", true),
+            ("--*.no-lockfile true\n", true),
+            ("--no-lockfile true\n", true),
+            ("\"--install.no-lockfile\" true\n", true),
+            ("--install.no-lockfile false\n", false),
+            ("--install.pure-lockfile true\n", false),
+            ("--add.no-lockfile true\n", false),
+            ("no-lockfile true\n", false),
+            ("# --install.no-lockfile true\n", false),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", &lock);
+            p.write(".yarnrc", yarnrc);
+            assert_lock_not_read(&run(&p).await, off, yarnrc);
+        }
+        // Berry never reads `.yarnrc`.
+        let p = Project::new();
+        p.write("yarn.lock", &lock);
+        assert_lock_not_read(&run(&p).await, false, "no .yarnrc");
+    }
+
+    /// A berry `lockfileFilename` naming another file makes yarn 2 and 3
+    /// read and write that file and never yarn.lock, and yarn 4 rejects the
+    /// setting and installs nothing (measured on 2.4.3, 3.8.7 and 4.5.3).
+    /// Either way yarn.lock is not what installs.
+    #[tokio::test]
+    async fn berry_lock_renamed_in_yarnrc_yml_attests_nothing_from_yarn_lock_alone() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = berry(&[
+            berry_block(
+                "left-pad@npm:1.3.0",
+                "1.3.0",
+                &format!("left-pad@{hosted}"),
+                Some(CHECKSUM),
+            ),
+            berry_vendored_block("@scope/pkg", "2.0.0", UUID_B),
+        ]);
+        let manifest = package_json_with_resolutions(serde_json::json!({
+            "@scope/pkg": format!("file:./.socket/vendor/npm/{UUID_B}/@scope/pkg-2.0.0.tgz"),
+        }));
+        for (rc, off) in [
+            ("lockfileFilename: real.lock\n", true),
+            ("lockfileFilename: \"locks/yarn.lock\"\n", true),
+            (
+                "nodeLinker: node-modules\nlockfileFilename: ${LOCK}\n",
+                true,
+            ),
+            ("lockfileFilename: yarn.lock\n", false),
+            ("nodeLinker: node-modules\n", false),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", &lock);
+            p.write("package.json", &manifest);
+            p.write(".yarnrc.yml", rc);
+            assert_lock_not_read(&run(&p).await, off, rc);
+        }
+        // Yarn classic never reads `.yarnrc.yml`, and berry no `.yarnrc`.
+        let p = Project::new();
+        p.write("yarn.lock", &lock);
+        p.write("package.json", &manifest);
+        p.write(".yarnrc", "--install.no-lockfile true\n");
+        assert_lock_not_read(&run(&p).await, false, "a classic rc beside a berry lock");
     }
 
     // ── classic ──────────────────────────────────────────────────────────

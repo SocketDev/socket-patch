@@ -784,6 +784,16 @@ pub enum UnattestedKind {
     /// replaces the same module elsewhere — exactly where the hosted and
     /// vendored writers refuse to write one.
     GoWorkspaceOverride,
+    /// A vendored npm-family pin in a lock the project's own configuration
+    /// tells the package manager not to read
+    /// ([`Discovery::unattest_vendored_not_read`]): npm's `package-lock=false`
+    /// (`npm install` resolves from the registry; only `npm ci` reads the
+    /// lock), yarn 1's `--install.no-lockfile`, a yarn berry
+    /// `lockfileFilename` naming another file, or pnpm's `lockfile: false`
+    /// with no override routing the package to the artifact. The committed
+    /// artifact is the vendored basis, and nothing installs it through a
+    /// lock nothing reads.
+    LockNotRead,
 }
 
 impl UnattestedKind {
@@ -1713,6 +1723,72 @@ impl Discovery {
             detail,
             kind,
         });
+    }
+
+    /// Take the lock pin from every hosted ref of root-relative lock `file`,
+    /// because the project's own configuration tells the package manager
+    /// not to read that lock (`why` names the setting and what it does):
+    /// what installs is then resolved afresh, so the pin fixes no bytes
+    /// and the ref has no lockfile basis ([`PatchedRef::lockfile_basis_ok`]).
+    /// Only an installed tree whose every copy verifies attests it. One
+    /// [`DIAG_REF_UNATTRIBUTABLE`] names the pins. Called once the
+    /// extractor has pushed `file`'s refs; the vendored half is
+    /// [`Discovery::unattest_vendored_not_read`].
+    pub(crate) fn unpin_lock_not_read(&mut self, file: &str, why: &str) {
+        let mut unpinned: BTreeSet<String> = BTreeSet::new();
+        for r in self.refs.iter_mut().filter(|r| {
+            r.mode == WiringMode::Hosted && r.source_file == Path::new(file) && r.integrity_required
+        }) {
+            r.locked_integrity = None;
+            unpinned.insert(r.purl.clone());
+        }
+        if unpinned.is_empty() {
+            return;
+        }
+        self.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {why}, so its hosted pins of {} are not attested from the lock alone, \
+                 only from an installed tree whose every copy verifies",
+                unpinned.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+
+    /// Mark every vendored ref of root-relative lock `file`
+    /// [`UnattestedKind::LockNotRead`], because the project's own
+    /// configuration tells the package manager not to read that lock
+    /// (`why`, as in [`Discovery::unpin_lock_not_read`]): the vendored basis
+    /// is the committed artifact, which nothing installs through a lock
+    /// nothing reads. `wired` exempts a ref that a file the package manager
+    /// does read routes to the same artifact (a pnpm override). The refs
+    /// stay refs: the wiring is intact, and no `scan` / `vendor` re-run
+    /// clears a setting.
+    pub(crate) fn unattest_vendored_not_read(
+        &mut self,
+        file: &str,
+        why: &str,
+        wired: impl Fn(&PatchedRef) -> bool,
+    ) {
+        let marks: Vec<UnwiredCopy> = self
+            .refs
+            .iter()
+            .filter(|r| r.mode == WiringMode::Vendored && r.source_file == Path::new(file))
+            .filter(|r| !wired(r))
+            .map(|r| UnwiredCopy {
+                scope: Some((r.source_file.clone(), r.part)),
+                // Only while the ref survives every contest.
+                target: CopyTarget::Ref {
+                    purl: r.purl.clone(),
+                    uuid: r.uuid.clone(),
+                },
+                file: r.source_file.clone(),
+                detail: format!("its pin is in {file}, and {why}"),
+                kind: UnattestedKind::LockNotRead,
+            })
+            .collect();
+        self.unwired_copies.extend(marks);
     }
 
     /// Record a copy some build installs where no Socket wiring reaches,
