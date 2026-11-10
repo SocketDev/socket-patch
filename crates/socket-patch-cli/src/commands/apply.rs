@@ -1252,6 +1252,26 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // `.socket/vendor/`) and still nothing for `apply` to do.
             println!("No patch manifest found; nothing to apply.");
         }
+        // Nothing to apply here, but a bare scan patches every project
+        // directory of the checkout: the ones below that hold a manifest
+        // are where this command has work. Only their manifests are looked
+        // for (no lockfile is parsed), and a `--silent` run (an install
+        // hook) prints nothing, so it does not look at all.
+        let below = if args.common.json || !args.common.silent {
+            use crate::commands::projects_below::{patched, Depth, Work};
+            let command = if args.check { "apply --check" } else { "apply" };
+            patched(&args.common, Depth::Local).await.advice(
+                &args.common,
+                command,
+                Work::Manifest,
+                &[],
+            )
+        } else {
+            Default::default()
+        };
+        if !args.common.json {
+            below.print();
+        }
         let vex_result = if !args.common.dry_run && !args.check && args.vex.vex.is_some() {
             let params = args.vex.to_build_params(None);
             Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
@@ -1268,6 +1288,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             let mut env = Envelope::new(Command::Apply);
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
+            env.warnings.extend(below.warnings());
             match &vex_result {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {

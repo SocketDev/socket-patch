@@ -1602,81 +1602,20 @@ fn project_dirs(
     Ok(dirs)
 }
 
-/// The project directories a bare hosted or vendored scan covers, found
-/// by [`discovered_project_dirs`].
-struct DiscoveredDirs {
-    /// `--cwd` (when it is a project) and every project root below it,
-    /// sorted; the flag is [`project_dirs`]'s: only `--cwd` is explicit.
-    dirs: Vec<(PathBuf, bool)>,
-    /// Roots the socket.yml path policy (its built-in test and fixture
-    /// ignores included) left out.
-    ignored: usize,
-    /// The walk gave up before it had seen the whole tree.
-    truncated: bool,
-}
-
-/// Whether this run finds its project directories itself: a hosted or
-/// vendored scan with no PATH, of a project rather than the global
-/// installs, that is the invocation's own run (not one of its
-/// directories), inside a git checkout. The checkout bounds the walk: a
-/// scan from a home directory never goes looking for every project below.
+/// Whether this run finds its project directories itself
+/// ([`projects_below::discovered`]): a hosted or vendored scan with no
+/// PATH, of a project rather than the global installs, that is the
+/// invocation's own run (not one of its directories), inside a git
+/// checkout. The checkout bounds the walk: a scan from a home directory
+/// never goes looking for every project below.
+///
+/// [`projects_below::discovered`]: crate::commands::projects_below::discovered
 fn discovers_projects(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
     args.paths.is_empty()
         && !args.common.is_global()
         && args.rollout.carry.is_none()
         && invocation.in_git_repo
         && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
-}
-
-/// The projects at and below `--cwd`: the roots the in-memory engine
-/// detects for the same checkout (`roots_below`), less the ones the
-/// socket.yml path policy leaves out of a discovered set. `--cwd` itself
-/// is the user's choice, so it is explicit and stays in whenever it is a
-/// project at all (a lockless one included, as before).
-async fn discovered_project_dirs(args: &ScanArgs, invocation: &InvocationPolicy) -> DiscoveredDirs {
-    use socket_patch_core::hosted::memory::roots::roots_below;
-    let cwd = &args.common.cwd;
-    // The socket.yml path policy's verdict on a root (`""` is `--cwd`,
-    // which the user named).
-    let admitted = |rel: &str| {
-        let dir = if rel.is_empty() {
-            cwd.clone()
-        } else {
-            cwd.join(rel)
-        };
-        let resolved = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-        let Some(project) =
-            socket_patch_core::policy::repo_relative_checked(&invocation.repo_root, &resolved)
-        else {
-            return false;
-        };
-        invocation
-            .policy
-            .admits_root(&socket_patch_core::policy::Root {
-                rel_dir: &project,
-                markers: &policy::dir_markers(&dir),
-                explicit: rel.is_empty(),
-            })
-            .is_ok()
-    };
-    let found = roots_below(cwd, args.common.ecosystems.as_deref(), admitted).await;
-    let mut dirs = Vec::new();
-    let mut ignored = 0;
-    if found.governs_members || !policy::dir_markers(cwd).is_empty() {
-        dirs.push((cwd.clone(), true));
-    }
-    for rel in found.roots.iter().filter(|rel| !rel.is_empty()) {
-        if admitted(rel) {
-            dirs.push((cwd.join(rel), false));
-        } else {
-            ignored += 1;
-        }
-    }
-    DiscoveredDirs {
-        dirs,
-        ignored,
-        truncated: found.truncated,
-    }
 }
 
 /// Run a hosted or vendored scan once per project directory, as if each
@@ -1762,7 +1701,10 @@ async fn run_project_dirs(
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
             let shown = dir.strip_prefix(&args.common.cwd).unwrap_or(dir);
-            println!("\n== {} ==", shown.display());
+            println!(
+                "{}",
+                crate::commands::projects_below::heading(&shown.display().to_string())
+            );
         }
         let mut child = args.clone();
         child.paths.clear();
@@ -1910,12 +1852,19 @@ async fn scan_project(
     // scan `--cwd` alone and say which projects were left.
     let mut unscanned_projects = None;
     if discovers_projects(&args, invocation) {
-        let found = discovered_project_dirs(&args, invocation).await;
+        let found = crate::commands::projects_below::discovered(
+            &args.common,
+            &invocation.policy,
+            &invocation.repo_root,
+        )
+        .await;
         let others: Vec<String> = found
             .dirs
             .iter()
             .filter(|(_, explicit)| !explicit)
-            .map(|(dir, _)| render::shown_project_dir(&args.common.cwd, dir))
+            .map(|(dir, _)| {
+                crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir)
+            })
             .collect();
         if !args.common.json && !args.common.silent {
             for line in render::discovery_notes(found.ignored, found.truncated) {

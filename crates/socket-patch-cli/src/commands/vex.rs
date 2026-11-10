@@ -427,6 +427,23 @@ pub async fn run(args: VexArgs) -> i32 {
         // telemetry, so these emit-only sinks must not re-track.
         Err(mut e) => {
             run_warnings.append(&mut e.warnings);
+            // Nothing to attest at `--cwd`: when scan patched the project
+            // directories below it instead, name them and their run.
+            let below = match e.code {
+                "manifest_not_found" | "no_patches" if args.common.json || !args.common.silent => {
+                    use crate::commands::projects_below::{patched, Depth, Work};
+                    patched(&args.common, Depth::All).await.advice(
+                        &args.common,
+                        "vex",
+                        Work::Any,
+                        &[],
+                    )
+                }
+                _ => Default::default(),
+            };
+            if args.common.json {
+                run_warnings.extend(below.warnings());
+            }
             let (message, exit) = match e.code {
                 "no_applicable_patches" => (e.message, 1),
                 // Standalone-only remediation hints: after an embedded
@@ -448,6 +465,9 @@ pub async fn run(args: VexArgs) -> i32 {
                 _ => (e.message, 2),
             };
             emit_envelope_error(&args, e.code, &message, &e.failed, &run_warnings);
+            if !args.common.json {
+                below.print();
+            }
             exit
         }
     }
