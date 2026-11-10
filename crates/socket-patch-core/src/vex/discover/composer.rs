@@ -775,6 +775,60 @@ mod tests {
         assert!(out.diagnostics.is_empty(), "{:?}", out.diagnostics);
     }
 
+    /// A `dist.url` whose host depends on who parses it is no reference.
+    /// The WHATWG parser reads `\` as `/` (host `patch.socket.dev`), while
+    /// libcurl, which Composer downloads dists through, connects to the
+    /// host after the `@` (curl 8.7.1 sends
+    /// `https://patch.socket.dev\@127.0.0.1:9/…` to 127.0.0.1:9). A
+    /// tampered lock would install foreign bytes under a Socket statement.
+    /// The uuid stays recognized, so a ledger record for it is dead.
+    #[tokio::test]
+    async fn a_dist_url_whose_host_depends_on_the_parser_is_not_a_ref() {
+        let tail = format!("/patch/composer/acme/w/1.0.0/{TOKEN}/{UUID_A}/w.zip");
+        for url in [
+            format!("https://patch.socket.dev\\@evil.example{tail}"),
+            format!("https://patch.socket.dev\\\\@evil.example{tail}"),
+            format!("https:\\\\patch.socket.dev{tail}"),
+            format!("https://patch.socket.dev\t@evil.example{tail}"),
+            format!("https://patch.socket.dev{tail}\r\nHost: evil.example"),
+        ] {
+            let p = Project::new();
+            p.write(
+                "composer.lock",
+                lock(
+                    json!([hosted_entry("acme/w", "1.0.0", &url, Some(SHA1))]),
+                    json!([]),
+                ),
+            );
+            let out = run(&p).await;
+            assert!(out.refs.is_empty(), "{url:?}: {:#?}", out.refs);
+            assert_ne!(
+                out.hosted_claim("pkg:composer/acme/w@1.0.0", UUID_A),
+                Some(true),
+                "{url:?}"
+            );
+        }
+        // The same url with nothing odd in it is the reference.
+        let p = Project::new();
+        p.write(
+            "composer.lock",
+            lock(
+                json!([hosted_entry(
+                    "acme/w",
+                    "1.0.0",
+                    &format!("https://patch.socket.dev{tail}"),
+                    Some(SHA1)
+                )]),
+                json!([]),
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:composer/acme/w@1.0.0", UUID_A, WiringMode::Hosted)],
+        );
+    }
+
     /// A hosted entry whose pin was lost or mangled (hand-edited): still a
     /// ref — an installed tree can verify it — but not lockfile-attestable,
     /// since the rewriter always writes a 40-hex sha1. An uppercase pin is

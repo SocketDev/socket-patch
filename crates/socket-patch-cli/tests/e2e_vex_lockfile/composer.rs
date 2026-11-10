@@ -787,11 +787,14 @@ fn f_uuid_on_a_foreign_host_is_not_a_patch_reference() {
     for flavor in ALL_FLAVORS {
         // The exact Socket path shape (uuid-shaped token + uuid segments) on
         // someone else's host, a Socket-lookalike suffix host, a userinfo
-        // trick, and plain http to the real host.
+        // trick, the same trick behind a backslash (Socket's host to a
+        // WHATWG parser, `evil.example` to the libcurl Composer downloads
+        // with), and plain http to the real host.
         for origin in [
             "https://patch.evil.example",
             "https://patch.socket.dev.evil.example",
             "https://patch.socket.dev@evil.example",
+            "https://patch.socket.dev\\@evil.example",
             "http://patch.socket.dev",
         ] {
             let cell = format!("{flavor:?} {origin}");
