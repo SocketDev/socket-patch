@@ -4,10 +4,11 @@
 //! ([`discovered`]), so what it patches is spread over several directories,
 //! each with its own lockfiles and `.socket/`. Whatever `scan` does from a
 //! directory must be visible and undoable from that directory, so the
-//! commands that read or undo patches look for the same directories when
-//! `--cwd` holds no patches of its own ([`patched`]): `list` and a bare
-//! `rollback` cover each of them, and the commands that act on one project
-//! name them and the run that reaches each ([`Advice`]).
+//! commands that read or undo patches look for the same directories
+//! ([`patched`]): `list` and a bare `rollback` cover the project at
+//! `--cwd` and each patched one below it, and the commands that act on one
+//! project name the ones below, and the run that reaches each, when `--cwd`
+//! holds nothing for them ([`Advice`]).
 //!
 //! One search serves both, so no command sees a project another does not:
 //! the in-memory engine's root detection over a walk of the checkout, less
@@ -187,8 +188,14 @@ pub(crate) fn shown_project_dir(cwd: &Path, dir: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The heading a run prints above one project directory's output.
+/// The name of `--cwd` itself among the project directories of a run.
+pub(crate) const CWD_NAME: &str = ".";
+
+/// The heading a run prints above one project directory's output. `shown`
+/// is the directory relative to `--cwd`; `--cwd` itself, whose relative
+/// path is empty, is headed [`CWD_NAME`].
 pub(crate) fn heading(shown: &str) -> String {
+    let shown = if shown.is_empty() { CWD_NAME } else { shown };
     format!("\n== {shown} ==")
 }
 
@@ -390,7 +397,7 @@ pub(crate) enum Depth {
 }
 
 /// The project directories below `--cwd` that hold patches (in the stores
-/// `depth` reads), for a run that found none at `--cwd` itself.
+/// `depth` reads). `--cwd` itself is never among them: the caller reads it.
 ///
 /// It never reaches a project a bare scan would not: nothing outside
 /// [`searches_below`], and only the directories [`discovered`] returns
@@ -562,6 +569,23 @@ impl Below {
     pub(crate) fn counted(&self) -> String {
         format!(
             "{} below this one",
+            plural(
+                self.projects.len(),
+                "project directory",
+                "project directories"
+            )
+        )
+    }
+
+    /// What a run over these directories covers, `--cwd` among them when
+    /// it is patched too (`here`): `this directory and 3 project
+    /// directories below it`, else [`Self::counted`].
+    pub(crate) fn covered(&self, here: bool) -> String {
+        if !here {
+            return self.counted();
+        }
+        format!(
+            "this directory and {} below it",
             plural(
                 self.projects.len(),
                 "project directory",
@@ -854,6 +878,31 @@ mod tests {
             ]
         );
         assert_eq!(advice.warnings().len(), 1);
+    }
+
+    /// `--cwd` has a name among a run's headings and totals: its path
+    /// relative to itself is empty, which reads as nothing at all.
+    #[test]
+    fn cwd_itself_is_named_among_the_directories() {
+        assert_eq!(heading(""), "\n== . ==");
+        assert_eq!(heading(CWD_NAME), "\n== . ==");
+        assert_eq!(heading("services/api"), "\n== services/api ==");
+        assert_eq!(shown_project_dir(Path::new("mono"), Path::new("mono")), "");
+
+        let below = below(".");
+        assert_eq!(below.covered(false), "2 project directories below this one");
+        assert_eq!(
+            below.covered(true),
+            "this directory and 2 project directories below it"
+        );
+        let one = Below {
+            projects: vec![project(".", "web", MINIMIST, false)],
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            one.covered(true),
+            "this directory and 1 project directory below it"
+        );
     }
 
     #[test]
