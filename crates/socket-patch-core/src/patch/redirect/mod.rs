@@ -19,7 +19,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::Regex;
+use regex::{NoExpand, Regex};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -44,6 +44,7 @@ pub(crate) mod generation;
 #[cfg(test)]
 mod golang_equivalence_tests;
 pub mod golang_local;
+pub(crate) mod grant;
 #[cfg(test)]
 mod group_equivalence_tests;
 #[cfg(test)]
@@ -3934,7 +3935,7 @@ fn plan_cargo_toml(
                     } else if is_repinnable_registry_name(&value) {
                         let old_line = lines[line_idx];
                         let new_text = registry_val_re
-                            .replace(old_line, format!("registry = \"{reg}\"").as_str())
+                            .replace(old_line, NoExpand(&format!("registry = \"{reg}\"")))
                             .into_owned();
                         pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
                             idx: line_idx,
@@ -4079,7 +4080,7 @@ fn plan_cargo_toml(
                     }
                 } else if is_repinnable_registry_name(&value) {
                     let new_text = registry_val_re
-                        .replace(raw, format!("registry = \"{reg}\"").as_str())
+                        .replace(raw, NoExpand(&format!("registry = \"{reg}\"")))
                         .into_owned();
                     pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
                         idx,
@@ -4276,7 +4277,7 @@ fn plan_cargo_toml(
             }
             Some((idx, Some(value))) if is_repinnable_registry_name(&value) => {
                 let new_text = registry_val_re
-                    .replace(lines[idx], format!("registry = \"{reg}\"").as_str())
+                    .replace(lines[idx], NoExpand(&format!("registry = \"{reg}\"")))
                     .into_owned();
                 pending.push(Pending::Action(CargoTomlAction::ReplaceLine {
                     idx,
@@ -8357,15 +8358,13 @@ fn rewrite_gem(
                     });
                 }
             } else if checksums_re.is_match(lk) {
+                // A closure, not a template: the entry is written as it
+                // is, in the header's own line ending (the capture).
                 *lk = checksums_re
-                    .replace(
-                        lk,
-                        format!(
-                            "CHECKSUMS${{1}}\n  {} ({}) sha256={sha256}${{1}}",
-                            dep.name, dep.version
-                        )
-                        .as_str(),
-                    )
+                    .replace(lk, |header: &regex::Captures<'_>| {
+                        let cr = &header[1];
+                        format!("CHECKSUMS{cr}\n  {new_val}{cr}")
+                    })
                     .to_string();
                 lock_changed = true;
                 result.edits.push(FileEdit {
@@ -18460,6 +18459,48 @@ mod tests {
         }
     }
 
+    /// An entry added under an empty CHECKSUMS header goes in through a
+    /// regex replacement, in the header's own line ending. The checksum is
+    /// written as it is, never read as replacement syntax: `${1}` in one
+    /// (the hosted engine refuses such a grant before any rewriter sees it)
+    /// used to expand to the header's captured line ending.
+    #[test]
+    fn gem_checksum_added_under_an_empty_header_is_never_expanded() {
+        for (sha, crlf) in [
+            ("f".repeat(64), false),
+            ("f".repeat(64), true),
+            ("dead${1}beef$0".to_string(), false),
+        ] {
+            let nl = if crlf { "\r\n" } else { "\n" };
+            let mut dep = gem_override("rails", "7.0.0");
+            dep.registry_override
+                .as_mut()
+                .unwrap()
+                .identifiers
+                .gem_checksum_sha256 = Some(sha.clone());
+            let mut files = BTreeMap::new();
+            files.insert(
+                "Gemfile".to_string(),
+                "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\"\n".replace('\n', nl),
+            );
+            files.insert(
+                "Gemfile.lock".to_string(),
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n    rails (7.0.0)\n\n\
+                 PLATFORMS\n  ruby\n\nDEPENDENCIES\n  rails (= 7.0.0)\n\n\
+                 CHECKSUMS\n\nBUNDLED WITH\n   2.6.2\n"
+                    .replace('\n', nl),
+            );
+            let r = rewrite_registry_redirect(&files, &[dep]);
+            let out = &r.files["Gemfile.lock"];
+            assert!(
+                out.contains(&format!(
+                    "CHECKSUMS{nl}  rails (7.0.0) sha256={sha}{nl}{nl}BUNDLED WITH"
+                )),
+                "{sha} (crlf: {crlf}): {out:?}"
+            );
+        }
+    }
+
     /// The edit must splice by the regex match's byte range: a substring
     /// replace of the matched line's TEXT finds an identical commented-out
     /// duplicate earlier in the file first and corrupts the comment while the
@@ -22741,6 +22782,36 @@ snapshots:
             second.files.keys(),
             second.edits
         );
+    }
+
+    /// The dist `url` and `shasum` go in through regex replacements. Both
+    /// are written as they are, never read as replacement syntax: `${1}` in
+    /// the URL (the hosted engine refuses such a grant before any rewriter
+    /// sees it) used to expand to the matched `"url": "` prefix.
+    #[test]
+    fn composer_dist_values_are_never_expanded() {
+        let lock = composer_lock_with(
+            "
+            \"dist\": {
+                \"type\": \"zip\",
+                \"url\": \"https://example.test/acme/target/zipball/cafe\",
+                \"reference\": \"cafe\",
+                \"shasum\": \"\"
+            }",
+        );
+        let mut dep = composer_override("1.0.0");
+        dep.artifact_url = format!("{COMPOSER_ARTIFACT_URL}?x=${{1}}y$0");
+        dep.integrity.sha1 = Some("abc${2}def$1".into());
+        let files = BTreeMap::from([("composer.lock".to_string(), lock)]);
+        let r = rewrite_registry_redirect(&files, &[dep]);
+        let out = &r.files["composer.lock"];
+        assert!(
+            out.contains(&format!(
+                "\"url\": \"{COMPOSER_ARTIFACT_URL}?x=${{1}}y$0\",\n"
+            )) && out.contains("\"shasum\": \"abc${2}def$1\"\n"),
+            "{out}"
+        );
+        assert!(serde_json::from_str::<Value>(out).is_ok(), "{out}");
     }
 
     /// The locked version must match the patched one. Matching on name alone
@@ -31087,6 +31158,45 @@ mod owned_pin_generation_matrix {
             "{:?}",
             fresh.get(MVN_CHECKSUMS)
         );
+    }
+
+    /// The pom rewriter writes its values as element text. One holding
+    /// markup (the hosted engine refuses such a grant before any rewriter
+    /// sees it) stays text: the pom gains no element of the value's making
+    /// and is still one the rewriter reads. A group id holding
+    /// `</dependency>` used to end the authored element early and panic.
+    #[test]
+    fn maven_values_holding_markup_stay_element_text() {
+        let tok = "22222222-3333-4444-8555-666666666666";
+        let edits: [fn(&mut RegistryOverride); 3] = [
+            |ov| ov.identifiers.maven_group_id = Some("org.other</dependency>".into()),
+            |ov| {
+                ov.identifiers.maven_suffixed_version = Some(
+                    "3.12.0-socket.aaaaaaaa</version><scope>system</scope>\
+                     <systemPath>/tmp/evil.jar</systemPath><version>x"
+                        .into(),
+                )
+            },
+            |ov| ov.index_url.push_str("?a=1&b=2</url><!-- injected -->"),
+        ];
+        for edit in edits {
+            let mut dep = maven(A, tok);
+            edit(dep.registry_override.as_mut().unwrap());
+            let (wired, _) = plan(&pom_project(), &dep);
+            let pom = &wired["pom.xml"];
+            for markup in ["<scope>", "<systemPath>", "<!-- injected -->", "&b="] {
+                assert!(!pom.contains(markup), "{markup} was written:\n{pom}");
+            }
+            assert_eq!(
+                pom.matches("<dependency>").count(),
+                pom.matches("</dependency>").count(),
+                "{pom}"
+            );
+            assert!(
+                maven_index::PomIndex::build(pom, &Default::default()).is_ok(),
+                "{pom}"
+            );
+        }
     }
 
     /// #266: a rotated grant token (same uuid, new token path segment)

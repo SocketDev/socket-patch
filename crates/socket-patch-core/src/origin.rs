@@ -142,15 +142,7 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
     let socket_host = parsed.scheme() == "https"
         && parsed.host_str() == Some(SOCKET_PATCH_SERVER_HOST)
         && parsed.port_or_known_default() == Some(443);
-    let configured = extra_origins.iter().any(|origin| {
-        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
-            o.scheme() == parsed.scheme()
-                && o.host_str().is_some()
-                && o.host_str() == parsed.host_str()
-                && o.port_or_known_default() == parsed.port_or_known_default()
-        })
-    });
-    if !socket_host && !configured {
+    if !socket_host && !on_configured_origin(&parsed, extra_origins) {
         return None;
     }
     Some(
@@ -160,6 +152,20 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
             .filter(|segment| is_canonical_uuid(segment))
             .collect(),
     )
+}
+
+/// Whether `url` is on one of `origins` (the operator's `--patch-server-url`
+/// deployments), compared on scheme + host + port: the one rule by which a
+/// configured origin is recognized, a plain-`http` one included.
+pub(crate) fn on_configured_origin(url: &reqwest::Url, origins: &[String]) -> bool {
+    origins.iter().any(|origin| {
+        reqwest::Url::parse(origin.trim()).is_ok_and(|o| {
+            o.scheme() == url.scheme()
+                && o.host_str().is_some()
+                && o.host_str() == url.host_str()
+                && o.port_or_known_default() == url.port_or_known_default()
+        })
+    })
 }
 
 /// The host of `url` when it is a PLAIN `http(s)` url — printable ASCII

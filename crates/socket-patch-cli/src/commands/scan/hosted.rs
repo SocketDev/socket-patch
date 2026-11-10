@@ -870,6 +870,8 @@ async fn run_redirect_selected_untracked(
     let view = ProjectView::Disk(&common.cwd);
     let mut skipped: Vec<SkippedPatch> = Vec::new();
     let mut candidates: Vec<Candidate> = Vec::new();
+    // One warning per grant refused for its shape or its plain-http URL.
+    let mut grant_warnings: Vec<socket_patch_core::patch::redirect::RewriteWarning> = Vec::new();
     // The network phases below (reference grants, wheel metadata, patch
     // records) would otherwise be silent gaps on a terminal. Inert under
     // --json/--silent and off a terminal.
@@ -947,7 +949,13 @@ async fn run_redirect_selected_untracked(
             .as_ref()
             .is_none_or(|gate| gate.stage.reference_failed.is_none())
         {
-            candidates = engine::build_candidates(selected, &references, &mut skipped);
+            candidates = engine::build_candidates(
+                selected,
+                &references,
+                &crate::commands::hosted_unwind::patch_server_origins(common),
+                &mut skipped,
+                &mut grant_warnings,
+            );
         }
     }
     // The rollout rows key on the selection's purl spelling; the server's
@@ -1840,6 +1848,7 @@ async fn run_redirect_selected_untracked(
     // rewriter's own warnings first (e.g. `no package-lock.json`), then the
     // package-manager, stale-install, takeover and prune warnings.
     let mut engine_warnings = rewrite.warnings.clone();
+    engine_warnings.extend(grant_warnings);
     engine_warnings.extend(user_patch_warnings);
     engine_warnings.extend(done.rush_warnings.iter().cloned());
     engine_warnings.extend(done.pnpm_warnings.iter().cloned());
@@ -2368,6 +2377,16 @@ fn describe_skip_reason(reason: &str) -> String {
         "withdrawn" => "the patch was withdrawn".into(),
         "bad_purl" => "the server returned an unparseable package URL".into(),
         "no_url" => "the server returned no artifact URL".into(),
+        "redirect_grant_malformed" => {
+            "the patch server's reference for it is malformed, so nothing was written for it \
+             (see the warning)"
+                .into()
+        }
+        "redirect_grant_insecure_url" => {
+            "the patch server's reference for it names a plain-http URL, so nothing was \
+             written for it (see the warning)"
+                .into()
+        }
         "vendored_revert_failed" => {
             "its vendored state could not be reverted (see the warning)".into()
         }
@@ -4353,6 +4372,8 @@ mod tests {
             "withdrawn",
             "bad_purl",
             "no_url",
+            socket_patch_core::hosted::engine::GRANT_MALFORMED,
+            socket_patch_core::hosted::engine::GRANT_INSECURE_URL,
             "python_metadata_unavailable",
         ] {
             let text = describe_skip_reason(code);

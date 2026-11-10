@@ -34,7 +34,7 @@ const NAME: &str = "dryrun-vendored-takeover";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/dryrun-vendored-takeover@1.0.0";
 const UUID: &str = "44444444-4444-4444-8444-444444444444";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/dryrun-vendored-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/dryrun-vendored-takeover-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/dryrun-vendored-takeover/1.0.0/55555555-5555-4555-8555-555555555555/44444444-4444-4444-8444-444444444444/dryrun-vendored-takeover-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const ORIG_INDEX: &[u8] = b"module.exports = () => 'orig';\n";

@@ -45,6 +45,8 @@ const UPURL: &str = "pkg:golang/example.com/upstream@v1.0.0";
 const HOSTED_UUID: &str = "5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d";
 const VENDOR_UUID: &str = "6c7d8e9f-0a1b-4c2d-8e3f-4a5b6c7d8e9f";
 const SVER: &str = "v1.0.0-socketpatch.1";
+/// The origin a hosted grant's artifact and goproxy index URLs name.
+const PATCH_SERVER: &str = "https://patch.socket.dev";
 const GHSA: &str = "GHSA-gowk-spac-e001";
 const CVE: &str = "CVE-2026-6161";
 const PRISTINE_LIB: &str = "package upstream\n\nfunc Greeting() string { return \"PRISTINE\" }\n";
@@ -552,7 +554,7 @@ struct GrantApi {
 }
 
 impl GrantApi {
-    fn start(proxy: &str, smod: &str, zip_h1: &str, mod_h1: &str) -> Self {
+    fn start(smod: &str, zip_h1: &str, mod_h1: &str) -> Self {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -560,7 +562,10 @@ impl GrantApi {
             .enable_all()
             .build()
             .unwrap();
-        let artifact = format!("{proxy}/{smod}/@v/{SVER}.zip");
+        // The grant's URLs name the patch server, as production's do. Go
+        // resolves the socket module by its path through GOPROXY (the file
+        // proxy), never through these.
+        let artifact = format!("{PATCH_SERVER}/{smod}/@v/{SVER}.zip");
         let server = rt.block_on(async {
             let server = MockServer::start().await;
             let mut view = patch_view(
@@ -585,7 +590,7 @@ impl GrantApi {
                         "artifacts": [{ "kind": "tarball", "url": &artifact, "integrity": {} }],
                         "registryOverride": {
                             "kind": "goproxy",
-                            "indexUrl": proxy,
+                            "indexUrl": PATCH_SERVER,
                             "identifiers": {
                                 "name": UMOD, "version": UVER,
                                 "goModulePath": smod, "goModuleVersion": SVER,
@@ -675,7 +680,7 @@ fn go_work_hosted_members_build_patched_and_attest_without_manifest() {
     let ws = stage_workspace(tmp.path(), Some(&smod));
     let root = &ws.root;
     let (zip_h1, mod_h1) = harvest(tmp.path(), &ws.proxy, &smod, SVER);
-    let api = GrantApi::start(&ws.proxy, &smod, &zip_h1, &mod_h1);
+    let api = GrantApi::start(&smod, &zip_h1, &mod_h1);
 
     let m1 = Machine::new(tmp.path(), "get");
     warm(tmp.path(), &m1, &ws.proxy, &[(UMOD, UVER)]);
@@ -817,7 +822,7 @@ fn stage_members(tmp: &Path, a_ver: &str, b_ver: &str) -> Members {
         )
         .unwrap();
     }
-    let api = GrantApi::start(&proxy, &smod, &pin.0, &pin.1);
+    let api = GrantApi::start(&smod, &pin.0, &pin.1);
     Members {
         root,
         proxy,

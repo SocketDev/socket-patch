@@ -49,7 +49,7 @@ const OMIT_RESOLVED: &str = "redirect_npm_omit_lockfile_registry_resolved";
 
 fn hosted_url() -> String {
     format!(
-        "http://patch.test/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz"
+        "https://patch.test/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz"
     )
 }
 
@@ -279,7 +279,7 @@ fn run_warning<'a>(doc: &'a Value, code: &str) -> Option<&'a str> {
 fn hosted_unwind_env(server: &MockServer) -> (String, [&'static str; 2]) {
     (
         format!("{}/npm-registry", server.uri()),
-        ["--patch-server-url", "http://patch.test"],
+        ["--patch-server-url", "https://patch.test"],
     )
 }
 

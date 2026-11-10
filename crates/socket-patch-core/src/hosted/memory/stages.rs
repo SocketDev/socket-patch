@@ -171,16 +171,17 @@ pub(crate) async fn plan(
     references: &HashMap<String, PackageVendorResult>,
 ) -> Result<Planned, Refusal> {
     let mut skipped: Vec<SkippedPatch> = Vec::new();
+    let mut pre_warnings = Vec::new();
     let mut candidates = if selected.is_empty() {
         Vec::new()
     } else {
-        engine::build_candidates(selected, references, &mut skipped)
+        // The in-memory host configures no patch server of its own.
+        engine::build_candidates(selected, references, &[], &mut skipped, &mut pre_warnings)
     };
     let view = ProjectView::Memory(&project);
     if engine::bun_lockb_symlinked(&view, &candidates) {
         return Err(engine::bun_lockb_symlink_refusal());
     }
-    let mut pre_warnings = Vec::new();
     refuse_takeovers(&project, &mut candidates, &mut skipped, &mut pre_warnings);
 
     let read = if candidates.is_empty() {

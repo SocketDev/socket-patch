@@ -159,9 +159,10 @@ pub struct GlobalArgs {
     /// scheme + host (+ port) of the returned URL to this base, preserving the
     /// path. `vex` and `scan` also accept lockfile URLs on this origin as
     /// hosted patch references (attested, and counted as live hosted wiring)
-    /// next to patch.socket.dev. Mainly for local-dev / testing, where the
-    /// host the server bakes into the URL is not the one to actually fetch
-    /// from.
+    /// next to patch.socket.dev, and hosted mode writes a plain http patch
+    /// URL into a lockfile only for this origin or a loopback address.
+    /// Mainly for local-dev / testing, where the host the server bakes into
+    /// the URL is not the one to actually fetch from.
     // A dev/testing knob: listed in `--help`, left out of the `-h` summary.
     #[arg(
         help_heading = GLOBAL_OPTIONS,

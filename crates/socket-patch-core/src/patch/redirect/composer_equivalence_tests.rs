@@ -157,6 +157,7 @@ fn dep(rng: &mut Rng, pool: usize, n: usize) -> DepOverride {
     };
     let url = match rng.below(6) {
         0 => format!("https://patch.socket.dev/composer/{}.zip", rng.below(pool)),
+        // Written as it is: a `$` is never read as a capture reference.
         1 => "https://patch.socket.dev/composer/with$1dollar.zip".to_string(),
         _ => format!("https://patch.socket.dev/composer/{n}/{bare}.zip"),
     };

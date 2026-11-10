@@ -40,7 +40,7 @@ const PURL1: &str = "pkg:npm/getmodes-pkg@1.0.0";
 const UUID2: &str = "22222222-2222-4222-8222-222222222222";
 const PURL2: &str = "pkg:npm/getmodes-pkg@2.0.0";
 
-const HOSTED_URL1: &str = "http://patch.test/patch/npm/getmodes-pkg/1.0.0/33333333-3333-4333-8333-333333333333/11111111-1111-4111-8111-111111111111/getmodes-pkg-1.0.0.tgz";
+const HOSTED_URL1: &str = "https://patch.test/patch/npm/getmodes-pkg/1.0.0/33333333-3333-4333-8333-333333333333/11111111-1111-4111-8111-111111111111/getmodes-pkg-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 
 const BEFORE_BYTES: &[u8] = b"vulnerable\n";
@@ -1261,7 +1261,7 @@ async fn get_modes_state_attests_manifest_less() {
                         },
                         vulns: &[(GHSA, &["CVE-2024-1234"])],
                         api: &api,
-                        patch_server_url: hosted.then(|| "http://patch.test".to_string()),
+                        patch_server_url: hosted.then(|| "https://patch.test".to_string()),
                         registry_locks: vec![("package-lock.json", pristine.clone())],
                         embedded: &[vex_e2e_common::VexVia::Apply],
                     });

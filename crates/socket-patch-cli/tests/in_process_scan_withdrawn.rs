@@ -31,11 +31,11 @@ const NAME: &str = "in-proc-redirect";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 /// The replacement patch a superseding offer pins.
 const UUID2: &str = "33333333-3333-4333-8333-333333333333";
-const HOSTED_URL2: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL2: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512_2: &str = "sha512-REPLACEMENTreplacementREPLACEMENT0123456==";
 
 fn scan_args(cwd: &Path, api_url: String, dry_run: bool) -> ScanArgs {
@@ -49,7 +49,7 @@ fn scan_args(cwd: &Path, api_url: String, dry_run: bool) -> ScanArgs {
             api_token: Some("fake".to_string()),
             api_url: Some(api_url),
             // The mock patch host's pins count as hosted.
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             json: true,
             yes: true,
             dry_run,
@@ -505,7 +505,7 @@ async fn the_envelope_reports_the_restored_pin() {
             "--api-url",
             &server.uri(),
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             tmp.path().to_str().unwrap(),
         ])

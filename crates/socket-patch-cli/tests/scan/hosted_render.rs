@@ -255,7 +255,7 @@ async fn human_supersedes_warning_names_the_superseded_package() {
     let root = tmp.path();
     write_superseded_vendored_project(root);
 
-    let psu = ["--patch-server-url", "http://patch.test"];
+    let psu = ["--patch-server-url", "https://patch.test"];
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(

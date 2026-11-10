@@ -10,6 +10,8 @@ use crate::formats::maven::{
     classpath_copy, is_executable_classifier, is_executable_variant, is_variant, management_key,
     may_name, may_shadow, variant_label, CoordinateAlternative, PomScope,
 };
+use std::borrow::Cow;
+
 use crate::formats::xml::{child_text, children, elements, Element};
 
 /// One `<dependency>` outside ignored sections.
@@ -69,10 +71,27 @@ pub(super) struct PomIndex {
     project_close: usize,
 }
 
+/// `value` as element text. Every value the rewriter writes goes through
+/// this, so the markup it authors is all the markup it adds: a value can
+/// neither close the element it sits in nor open one of its own, and
+/// [`authored_element`] always finds the close tag it wrote.
+fn text(value: &str) -> Cow<'_, str> {
+    if !value.contains(['&', '<', '>']) {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;"),
+    )
+}
+
 /// The `<repository>` block the rewriter inserts (releases enabled with
 /// `checksumPolicy=fail` for the transport check against the served
 /// `.jar.sha1`; snapshots disabled).
 fn repository_block(id: &str, url: &str) -> String {
+    let (id, url) = (text(id), text(url));
     format!(
         "    <repository>\n      <id>{id}</id>\n      <url>{url}</url>\n      <releases>\n        <enabled>true</enabled>\n        <checksumPolicy>fail</checksumPolicy>\n      </releases>\n      <snapshots>\n        <enabled>false</enabled>\n      </snapshots>\n    </repository>"
     )
@@ -80,6 +99,7 @@ fn repository_block(id: &str, url: &str) -> String {
 
 /// The `<dependencyManagement>` entry the rewriter inserts.
 fn managed_block(group: &str, artifact: &str, version: &str) -> String {
+    let (group, artifact, version) = (text(group), text(artifact), text(version));
     format!(
         "      <dependency>\n        <groupId>{group}</groupId>\n        <artifactId>{artifact}</artifactId>\n        <version>{version}</version>\n      </dependency>"
     )
@@ -483,8 +503,9 @@ impl PomIndex {
     /// Rewrite dependency `i`'s literal version to `version`.
     pub(super) fn set_version(&mut self, pom: &mut String, i: usize, version: &str) {
         let (s, e) = self.deps[i].version_inner.expect("a literal version");
-        self.splice(pom, s, e, version);
-        self.deps[i].version_inner = Some((s, s + version.len()));
+        let written = text(version);
+        self.splice(pom, s, e, &written);
+        self.deps[i].version_inner = Some((s, s + written.len()));
         self.deps[i].version_text = Some(version.to_string());
     }
 
@@ -543,7 +564,7 @@ impl PomIndex {
         self.deps.push(IndexedDep {
             group: Some(group.to_string()),
             artifact: Some(artifact.to_string()),
-            version_inner: Some((v, v + version.len())),
+            version_inner: Some((v, v + text(version).len())),
             version_text: Some(version.to_string()),
             type_text: None,
             classifier: None,
@@ -642,10 +663,11 @@ impl PomIndex {
         let Some((s, e)) = repo.url_inner else {
             return false;
         };
+        let url = text(url);
         if pom[s..e].trim() == url {
             return false;
         }
-        self.splice(pom, s, e, url);
+        self.splice(pom, s, e, &url);
         self.repos[i].url_inner = Some((s, s + url.len()));
         true
     }

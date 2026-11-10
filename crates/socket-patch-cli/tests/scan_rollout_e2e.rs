@@ -18,7 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const ORG: &str = "test-org";
 const TOKEN: &str = "22222222-2222-4222-8222-222222222222";
-const HOST: &str = "http://patch.test";
+const HOST: &str = "https://patch.test";
 
 /// `(name, severities)`: one advisory per severity; none = unknown.
 const PACKAGES: [(&str, &[&str]); 9] = [

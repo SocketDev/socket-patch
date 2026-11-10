@@ -5,7 +5,8 @@
 //!
 //! The stages, in the order both callers run them:
 //!
-//! 1. [`build_candidates`] — reference grants → rewriter overrides.
+//! 1. [`build_candidates`] — reference grants → rewriter overrides, each
+//!    grant's fields checked for the shape the project's files take.
 //! 2. [`bun_lockb_symlinked`] — the binary-lock symlink refusal.
 //! 3. (caller) the apply lock and the vendored→hosted takeover.
 //! 4. [`read_candidate_files`] → [`wheel_targets`] → (caller) wheel metadata,
@@ -233,14 +234,38 @@ fn undecodable_refusal(rel: &str) -> Refusal {
     }
 }
 
+/// Skip reason and warning code of a grant with a field that is not in the
+/// shape the project's files take verbatim (a digest of the wrong length,
+/// a URL or coordinate holding a quote, whitespace or markup).
+pub const GRANT_MALFORMED: &str = "redirect_grant_malformed";
+
+/// Skip reason and warning code of a grant whose artifact or registry
+/// index URL is plain `http` on an origin that is neither a loopback
+/// address nor a configured patch server.
+pub const GRANT_INSECURE_URL: &str = "redirect_grant_insecure_url";
+
 /// Reference grants → candidates. A selection without a usable grant is
 /// recorded in `skipped` (`not_found`, the reference status, `bad_purl`,
 /// `no_url`).
+///
+/// This is the one place a grant's fields are checked
+/// ([`grant::check`]): everything past it — the takeover, the artifact
+/// fetches, every rewriter — takes a candidate's strings as safe to write.
+/// A grant that fails is skipped with [`GRANT_MALFORMED`] or
+/// [`GRANT_INSECURE_URL`] and one warning of the same code and detail in
+/// `warnings`; the package stays as it is. `patch_server_origins` are the
+/// operator's own patch servers (`--patch-server-url`), whose plain-`http`
+/// URLs are accepted.
+///
+/// [`grant::check`]: crate::patch::redirect::grant::check
 pub fn build_candidates(
     selected: &[(String, String)],
     references: &HashMap<String, PackageVendorResult>,
+    patch_server_origins: &[String],
     skipped: &mut Vec<SkippedPatch>,
+    warnings: &mut Vec<RewriteWarning>,
 ) -> Vec<Candidate> {
+    use crate::patch::redirect::grant::{self, Flaw};
     let mut candidates = Vec::new();
     for (sel_purl, sel_uuid) in selected {
         let Some(reference) = references.get(sel_uuid) else {
@@ -311,19 +336,47 @@ pub fn build_candidates(
             .and_then(|o| crate::patch::redirect::grant_token_path_segment(&o.index_url, sel_uuid))
             .or_else(|| crate::patch::redirect::grant_token_path_segment(&url, sel_uuid))
             .unwrap_or_default();
+        let dep = DepOverride {
+            ecosystem,
+            name,
+            namespace: None,
+            version,
+            token,
+            patch_uuid: sel_uuid.clone(),
+            artifact_url: url,
+            registry_override: reference.registry_override.clone(),
+            integrity,
+        };
+        // The served purl is printed and recorded as it is: a line break in
+        // one would forge a line of the run's output.
+        let checked = if purl.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            Err(Flaw::Malformed(
+                "its package URL holds whitespace".to_string(),
+            ))
+        } else {
+            grant::check(&dep, patch_server_origins)
+        };
+        if let Err(flaw) = checked {
+            let (code, reason) = match flaw {
+                Flaw::Malformed(reason) => (GRANT_MALFORMED, reason),
+                Flaw::InsecureUrl(reason) => (GRANT_INSECURE_URL, reason),
+            };
+            // Keyed and worded by the selection's purl, the spelling the
+            // project's own files gave: the served one is what failed.
+            let detail = format!(
+                "{sel_purl}: the patch server's reference for it was refused ({reason}); \
+                 nothing was written for it, so it stays unpatched"
+            );
+            warnings.push(warning(code, detail.clone()));
+            skipped.push(SkippedPatch {
+                detail: Some(detail),
+                ..SkippedPatch::new(sel_purl, sel_uuid, code)
+            });
+            continue;
+        }
         candidates.push(Candidate {
             purl: purl.to_string(),
-            dep: DepOverride {
-                ecosystem,
-                name,
-                namespace: None,
-                version,
-                token,
-                patch_uuid: sel_uuid.clone(),
-                artifact_url: url,
-                registry_override: reference.registry_override.clone(),
-                integrity,
-            },
+            dep,
         });
     }
     candidates
@@ -4272,10 +4325,10 @@ mod tests {
             reference(serde_json::json!({"status": "granted", "purl": "pkg:npm/b@1"})),
         );
         refs.insert(
-            "u-ok".into(),
+            PATCH_UUID.into(),
             reference(serde_json::json!({
                 "status": "reused",
-                "url": "https://patch.example/patch/npm/c/1/tok/u-ok/c-1.tgz",
+                "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
                 "purl": "pkg:npm/c@1",
                 "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha512": "sha512-x"}}],
                 "registryOverride": null
@@ -4285,12 +4338,14 @@ mod tests {
             ("pkg:npm/a@1".to_string(), "u-missing".to_string()),
             ("pkg:npm/p@1".to_string(), "u-pending".to_string()),
             ("pkg:npm/b@1".to_string(), "u-nourl".to_string()),
-            ("pkg:npm/c@1".to_string(), "u-ok".to_string()),
+            ("pkg:npm/c@1".to_string(), PATCH_UUID.to_string()),
         ];
         let mut skipped = Vec::new();
-        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        let mut warnings = Vec::new();
+        let candidates = build_candidates(&selected, &refs, &[], &mut skipped, &mut warnings);
         let reasons: Vec<&str> = skipped.iter().map(|s| s.reason.as_str()).collect();
         assert_eq!(reasons, vec!["not_found", "pending_build", "no_url"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].dep.token, "tok");
         assert_eq!(
@@ -4299,6 +4354,113 @@ mod tests {
         );
     }
 
+    /// A granted reference with a field no project file takes verbatim, or
+    /// a plain-http URL on some other host, never becomes a candidate: it
+    /// is skipped under the selection's purl with the field named, and
+    /// warned once with the same detail. A configured patch server's
+    /// plain-http URL is taken.
+    #[test]
+    fn candidates_refuse_a_malformed_or_plain_http_grant() {
+        const SEL: &str = "pkg:npm/c@1";
+        let grant = |edit: fn(&mut serde_json::Value)| {
+            let mut value = serde_json::json!({
+                "status": "granted",
+                "url": format!("https://patch.example/patch/npm/c/1/tok/{PATCH_UUID}/c-1.tgz"),
+                "purl": SEL,
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {
+                    "sha512": "sha512-x", "sha1": "a".repeat(40)
+                }}],
+                "registryOverride": null
+            });
+            edit(&mut value);
+            HashMap::from([(PATCH_UUID.to_string(), reference(value))])
+        };
+        let selected = vec![(SEL.to_string(), PATCH_UUID.to_string())];
+        let build = |refs: &HashMap<String, PackageVendorResult>, origins: &[String]| {
+            let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+            let candidates =
+                build_candidates(&selected, refs, origins, &mut skipped, &mut warnings);
+            (candidates, skipped, warnings)
+        };
+        type Edit = fn(&mut serde_json::Value);
+        let cases: [(&str, &str, Edit); 4] = [
+            (GRANT_MALFORMED, "its sha1 is not 40 hex digits", |v| {
+                v["artifacts"][0]["integrity"]["sha1"] =
+                    format!("{}\"\n  evil \"pwned", "a".repeat(40)).into();
+            }),
+            (GRANT_MALFORMED, "its package name or version is not", |v| {
+                v["purl"] = "pkg:npm/c%0Aevil@1".into();
+            }),
+            (GRANT_MALFORMED, "its package URL holds whitespace", |v| {
+                v["purl"] = "pkg:npm/c@1?x=a\nb".into();
+            }),
+            (
+                GRANT_INSECURE_URL,
+                "its artifact URL is plain http on patch.example,",
+                |v| {
+                    let url = v["url"].as_str().unwrap().replace("https://", "http://");
+                    v["url"] = url.into();
+                },
+            ),
+        ];
+        for (code, reason, edit) in cases {
+            let (candidates, skipped, warnings) = build(&grant(edit), &[]);
+            assert!(candidates.is_empty(), "{reason}");
+            assert_eq!(skipped.len(), 1, "{reason}");
+            assert_eq!(
+                (skipped[0].purl.as_str(), skipped[0].uuid.as_str()),
+                (SEL, PATCH_UUID)
+            );
+            assert_eq!(skipped[0].reason, code, "{reason}");
+            let detail = skipped[0].detail.as_deref().unwrap();
+            assert!(
+                detail.starts_with(&format!(
+                    "{SEL}: the patch server's reference for it was refused ({reason}"
+                )) && detail.ends_with("nothing was written for it, so it stays unpatched"),
+                "{detail}"
+            );
+            assert!(
+                !detail.contains("pwned") && !detail.contains('\n'),
+                "{detail:?}"
+            );
+            assert_eq!(warnings, vec![warning(code, detail.to_string())]);
+        }
+
+        // The operator's own patch server may be plain http; the selection's
+        // uuid is held to the canonical shape like every other field.
+        let plain_http: Edit = |v| {
+            let url = v["url"].as_str().unwrap().replace("https://", "http://");
+            v["url"] = url.into();
+        };
+        let (candidates, skipped, warnings) =
+            build(&grant(plain_http), &["http://patch.example".to_string()]);
+        assert_eq!(candidates.len(), 1, "{skipped:?}");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let mut refs = grant(|_| {});
+        let reference = refs.remove(PATCH_UUID).unwrap();
+        refs.insert("u-ok".to_string(), reference);
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let candidates = build_candidates(
+            &[(SEL.to_string(), "u-ok".to_string())],
+            &refs,
+            &[],
+            &mut skipped,
+            &mut warnings,
+        );
+        assert!(candidates.is_empty());
+        assert_eq!(skipped[0].reason, GRANT_MALFORMED);
+        assert!(
+            skipped[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("its patch uuid is not"),
+            "{skipped:?}"
+        );
+    }
+
+    /// A granted cargo reference for `uuid` (a canonical uuid), with no
+    /// registry override.
     fn cargo_reference(
         uuid: &str,
     ) -> (Vec<(String, String)>, HashMap<String, PackageVendorResult>) {
@@ -4310,11 +4472,23 @@ mod tests {
                 "status": "granted",
                 "url": format!("https://patch.example/patch/cargo/serde/1.0.190/tok/{uuid}/serde-1.0.190.crate"),
                 "purl": purl,
-                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab"}}],
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab".repeat(32)}}],
                 "registryOverride": null
             })),
         );
         (vec![(purl.to_string(), uuid.to_string())], refs)
+    }
+
+    /// [`build_candidates`] with no configured patch server, for a fixture
+    /// whose grants are all well formed.
+    fn candidates_of(
+        selected: &[(String, String)],
+        refs: &HashMap<String, PackageVendorResult>,
+    ) -> Vec<Candidate> {
+        let (mut skipped, mut warnings) = (Vec::new(), Vec::new());
+        let candidates = build_candidates(selected, refs, &[], &mut skipped, &mut warnings);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        candidates
     }
 
     /// #653: the toolchain files are the cargo planner's declared-floor
@@ -4322,13 +4496,12 @@ mod tests {
     /// (never edited, and naming no ecosystem to refuse).
     #[tokio::test]
     async fn the_cargo_toolchain_files_are_read_as_advisory_input() {
-        let (selected, refs) = cargo_reference("u-1");
+        let (selected, refs) = cargo_reference(PATCH_UUID);
         let mut p = MemoryProject::new();
         p.insert_text("Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         p.insert_text("rust-toolchain.toml", "[toolchain]\nchannel = \"1.67.1\"\n");
         p.insert_text("rust-toolchain", "1.56.0\n");
-        let mut skipped = Vec::new();
-        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        let candidates = candidates_of(&selected, &refs);
         let view = ProjectView::Memory(&p);
         let read = read_candidate_files(&view, &BTreeSet::new(), &candidates).await;
         assert_eq!(
@@ -4346,7 +4519,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unreadable_candidate_file_refuses_its_ecosystem() {
-        let (selected, refs) = cargo_reference("u-1");
+        let (selected, refs) = cargo_reference(PATCH_UUID);
         let mut p = MemoryProject::new();
         p.insert_text("Cargo.toml", "[dependencies]\nserde = \"1\"\n");
         p.insert_text(
@@ -4372,8 +4545,7 @@ mod tests {
             patch_server_origins: Vec::new(),
             prior_discovery: None,
         };
-        let mut skipped = Vec::new();
-        let candidates = build_candidates(&selected, &refs, &mut skipped);
+        let candidates = candidates_of(&selected, &refs);
         let view = ProjectView::Memory(&p);
         let unreadable = BTreeSet::from([".cargo/config".to_string()]);
         let read = read_candidate_files(&view, &unreadable, &candidates).await;
@@ -4396,7 +4568,7 @@ mod tests {
     #[tokio::test]
     async fn an_undecodable_candidate_file_refuses_its_ecosystem() {
         let purl = "pkg:pypi/six@1.16.0";
-        let uuid = "u-721";
+        let uuid = PATCH_UUID;
         let mut refs = HashMap::new();
         refs.insert(
             uuid.to_string(),
@@ -4404,14 +4576,13 @@ mod tests {
                 "status": "granted",
                 "url": format!("https://patch.example/patch/pypi/six/1.16.0/tok/{uuid}/six-1.16.0-py2.py3-none-any.whl"),
                 "purl": purl,
-                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab"}}],
+                "artifacts": [{"kind": "tarball", "url": null, "integrity": {"sha256": "ab".repeat(32)}}],
                 "registryOverride": null
             })),
         );
         let selected = vec![(purl.to_string(), uuid.to_string())];
-        let mut skipped = Vec::new();
-        let candidates = build_candidates(&selected, &refs, &mut skipped);
-        assert_eq!(candidates.len(), 1, "{skipped:?}");
+        let candidates = candidates_of(&selected, &refs);
+        assert_eq!(candidates.len(), 1);
         let utf16: Vec<u8> = [0xFF, 0xFE]
             .into_iter()
             .chain(
@@ -4458,8 +4629,8 @@ mod tests {
             );
 
             // Another ecosystem's run is not blocked by it.
-            let (cargo_selected, cargo_refs) = cargo_reference("u-2");
-            let cargo = build_candidates(&cargo_selected, &cargo_refs, &mut Vec::new());
+            let (cargo_selected, cargo_refs) = cargo_reference(FIXTURE_UUID);
+            let cargo = candidates_of(&cargo_selected, &cargo_refs);
             let read = read_candidate_files(&view, &BTreeSet::new(), &cargo).await;
             let done = rewrite(&view, read, &cargo, BTreeMap::new(), options()).await;
             assert!(guard(&view, &done, &cargo).is_none());
@@ -6834,9 +7005,9 @@ snapshots:
 
     // ── #492: `sharedWorkspaceLockfile: false` member locks ──
 
-    const MEMBER_UUID: &str = "u-member";
-    const MEMBER_URL: &str =
-        "https://patch.example/patch/npm/is-number/7.0.0/tok/u-member/is-number-7.0.0.tgz";
+    const MEMBER_UUID: &str = "492a492a-492a-4492-8492-492a492a492a";
+    const MEMBER_URL: &str = "https://patch.example/patch/npm/is-number/7.0.0/tok/\
+                              492a492a-492a-4492-8492-492a492a492a/is-number-7.0.0.tgz";
 
     fn is_number_candidates() -> Vec<Candidate> {
         let mut refs: HashMap<String, PackageVendorResult> = HashMap::new();
@@ -6855,7 +7026,7 @@ snapshots:
             "pkg:npm/is-number@7.0.0".to_string(),
             MEMBER_UUID.to_string(),
         )];
-        build_candidates(&selected, &refs, &mut Vec::new())
+        candidates_of(&selected, &refs)
     }
 
     fn v9_member_lock(direct: bool) -> String {

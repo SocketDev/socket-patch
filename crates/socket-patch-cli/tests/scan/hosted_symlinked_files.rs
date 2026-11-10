@@ -40,7 +40,7 @@ const NPM_NAME: &str = "symlink-hosted";
 const NPM_VERSION: &str = "1.0.0";
 const NPM_PURL: &str = "pkg:npm/symlink-hosted@1.0.0";
 const NPM_UUID: &str = "11111111-1111-4111-8111-111111111111";
-const NPM_HOSTED_URL: &str = "http://patch.test/patch/npm/symlink-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/symlink-hosted-1.0.0.tgz";
+const NPM_HOSTED_URL: &str = "https://patch.test/patch/npm/symlink-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/symlink-hosted-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 

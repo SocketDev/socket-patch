@@ -22,6 +22,7 @@ mod vlt_vendored;
 mod hosted_dryrun_vendored;
 mod hosted_failure_paths;
 mod hosted_fixture;
+mod hosted_grant_validation;
 mod hosted_management_refusals;
 mod hosted_render;
 mod hosted_symlinked_files;

@@ -44,7 +44,7 @@ const NAME: &str = "in-proc-redirect";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 /// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
 const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
@@ -709,7 +709,7 @@ async fn mock_reference_with_berry_sha512(server: &MockServer, hosted_url: &str,
                     "artifacts": [
                         { "kind": "tarball", "url": hosted_url,
                           "integrity": { "sha512": sha512 } },
-                        { "kind": "yarn-berry-zip", "url": "http://patch.test/berry.zip",
+                        { "kind": "yarn-berry-zip", "url": "https://patch.test/berry.zip",
                           "integrity": { "yarnBerry10c0": BERRY_CHECKSUM } }
                     ],
                     "registryOverride": null
@@ -836,7 +836,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
     mock_discovery(&server).await;
     mock_reference_with_berry_url(
         &server,
-        &HOSTED_URL.replace("http://patch.test", &server.uri()),
+        &HOSTED_URL.replace("https://patch.test", &server.uri()),
     )
     .await;
     mock_view(&server).await;
@@ -847,7 +847,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
         Some(tarball),
     )
     .await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
 
     for (label, bom) in [("crlf", ""), ("bom+crlf", "\u{feff}")] {
         let tmp = tempfile::tempdir().unwrap();
@@ -941,7 +941,7 @@ async fn scan_redirect_rewrites_crlf_and_bom_yarn_berry_locks_and_rollback_resto
 async fn yarn_berry_pin_drops_the_implicit_node_gyp_and_rollback_restores_it() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     let tarball = upstream_tarball();
     mock_reference_with_berry_sha512(
         &server,
@@ -1061,7 +1061,7 @@ async fn yarn_berry_pin_drops_the_implicit_node_gyp_and_rollback_restores_it() {
 async fn yarn_berry_catalog_dependency_is_pinned_and_rolled_back() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let tarball = upstream_tarball();
@@ -1152,7 +1152,7 @@ async fn yarn_berry_rollback_refuses_a_pin_wrapped_by_a_user_yarn_patch() {
     for command in ["rollback", "remove"] {
         let server = MockServer::start().await;
         mock_discovery(&server).await;
-        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
         mock_reference_with_berry_url(&server, &hosted_url).await;
         mock_view(&server).await;
         let tarball = upstream_tarball();
@@ -1246,7 +1246,7 @@ async fn yarn_berry_rollback_refuses_a_pin_wrapped_by_a_user_yarn_patch() {
 async fn yarn_berry_legacy_archive_url_pin_is_rolled_back_and_repinned() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let tarball = upstream_tarball();
@@ -1503,7 +1503,7 @@ fn bun_manifestless_vex(root: &Path, registry_lock: &[u8], tag: &str) {
         vulns: &[(GHSA, &["CVE-2024-9"])],
         lock: "bun.lock",
         registry_lock: registry_lock.to_vec(),
-        patch_server_url: Some("http://patch.test".to_string()),
+        patch_server_url: Some("https://patch.test".to_string()),
     };
     bun_vex::run_bun_vex_matrix(root, scratch.path(), &case, |_| {});
 }
@@ -2157,12 +2157,12 @@ async fn bun_rollback_keeps_the_bunfig_registry_tarball_url() {
 const INVALID_LOCKB_BYTES: &[u8] = b"\x00BUN-BINARY\xff\xfe\x00LOCK";
 
 /// `rollback --json --yes` as a subprocess, with the mock patch host
-/// recognized (`--patch-server-url http://patch.test`, so lockfile
+/// recognized (`--patch-server-url https://patch.test`, so lockfile
 /// discovery finds the hosted pins) and the upstream restore's npm registry
 /// pointed at `registry` (`SOCKET_NPM_REGISTRY`, see [`mock_npm_registry`]);
 /// returns (exit code, parsed envelope).
 fn rollback_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
-    rollback_json_with_origin(cwd, registry, "http://patch.test")
+    rollback_json_with_origin(cwd, registry, "https://patch.test")
 }
 
 fn rollback_json_with_origin(
@@ -3842,7 +3842,7 @@ async fn pnpm_trust_respects_an_explicit_user_false() {
 /// in CI logs via both stderr and the persisted `--json` envelope:
 ///
 /// 1. USERINFO NEVER LEAKS. A credentialed artifact URL
-///    (`http://alice:s3cret@patch.test/…`) is spliced into the lock verbatim,
+///    (`https://alice:s3cret@patch.test/…`) is spliced into the lock verbatim,
 ///    but the warning must name `host[:port]` only — printing the URL
 ///    authority wholesale leaked `alice:s3cret` into CI logs.
 /// 2. ONLY SPLICED HOSTS ARE NAMED. The host list must come from the URLs
@@ -3860,8 +3860,8 @@ async fn pnpm_warning_strips_userinfo_and_names_only_spliced_hosts() {
     const SIBLING_VERSION: &str = "2.0.0";
     const SIBLING_PURL: &str = "pkg:npm/sibling-npm-only@2.0.0";
     const SIBLING_UUID: &str = "33333333-3333-4333-8333-333333333333";
-    const SIBLING_URL: &str = "http://other-host.test/patch/npm/sibling-npm-only/2.0.0/44444444-4444-4444-8444-444444444444/33333333-3333-4333-8333-333333333333/sibling-npm-only-2.0.0.tgz";
-    const CRED_URL: &str = "http://alice:s3cret@patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+    const SIBLING_URL: &str = "https://other-host.test/patch/npm/sibling-npm-only/2.0.0/44444444-4444-4444-8444-444444444444/33333333-3333-4333-8333-333333333333/sibling-npm-only-2.0.0.tgz";
+    const CRED_URL: &str = "https://alice:s3cret@patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 
     let server = MockServer::start().await;
     // Discovery: BOTH installed packages have a granted patch.
@@ -4250,7 +4250,7 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
     const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
     const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
     const CKSUM: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    let index_url = "sparse+http://patch.test/cargo/idx/";
+    let index_url = "sparse+https://patch.test/cargo/idx/";
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -4289,11 +4289,11 @@ async fn cargo_redirect_writes_the_legacy_dot_cargo_config() {
             "results": {
                 CARGO_UUID: {
                     "status": "granted",
-                    "url": "http://patch.test/serde-1.0.190.crate",
+                    "url": "https://patch.test/serde-1.0.190.crate",
                     "purl": CARGO_PURL,
                     "artifacts": [{
                         "kind": "tarball",
-                        "url": "http://patch.test/serde-1.0.190.crate",
+                        "url": "https://patch.test/serde-1.0.190.crate",
                         "integrity": { "sha256": CKSUM }
                     }],
                     "registryOverride": {
@@ -4843,7 +4843,7 @@ async fn scan_updates_reports_superseding_patch_for_a_lock_pinned_project() {
             "scan",
             "--json",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             tmp.path().to_str().unwrap(),
             "--api-url",
@@ -4937,7 +4937,7 @@ async fn hosted_prune_emits_explicit_ignored_warning() {
 
 const COMPOSER_PURL: &str = "pkg:composer/monolog/monolog@2.0.0";
 const COMPOSER_UUID: &str = "66666666-6666-4666-8666-666666666666";
-const COMPOSER_URL: &str = "http://patch.test/patch/composer/monolog/monolog/2.0.0/\
+const COMPOSER_URL: &str = "https://patch.test/patch/composer/monolog/monolog/2.0.0/\
                             77777777-7777-4777-8777-777777777777/\
                             66666666-6666-4666-8666-666666666666/monolog-2.0.0.zip";
 const COMPOSER_SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";
@@ -5171,11 +5171,11 @@ async fn mock_cargo_patch(
             "results": {
                 uuid: {
                     "status": "granted",
-                    "url": format!("http://patch.test/{name}-{version}.crate"),
+                    "url": format!("https://patch.test/{name}-{version}.crate"),
                     "purl": purl,
                     "artifacts": [{
                         "kind": "tarball",
-                        "url": format!("http://patch.test/{name}-{version}.crate"),
+                        "url": format!("https://patch.test/{name}-{version}.crate"),
                         "integrity": { "sha256": cksum }
                     }],
                     "registryOverride": {
@@ -5244,7 +5244,7 @@ async fn cargo_granted_but_nothing_pinned_is_not_confirmed_or_attested() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "11111111-1111-4111-8111-111111111111";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
 
     let server = MockServer::start().await;
     mock_cargo_patch(
@@ -5326,7 +5326,7 @@ async fn cargo_transitive_only_crate_is_refused_loudly_and_not_attested() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "22222222-2222-4222-8222-222222222222";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,
@@ -5425,7 +5425,7 @@ async fn cargo_member_outside_the_project_or_behind_a_symlink_refuses_the_crate(
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.0";
     const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,
@@ -5513,7 +5513,7 @@ async fn cargo_table_form_without_lock_is_pinned_and_attested() {
     const CARGO_PURL: &str = "pkg:cargo/serde@1.0.190";
     const CARGO_UUID: &str = "55555555-5555-4555-8555-555555555555";
     let cksum = "11".repeat(32);
-    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
 
     let server = MockServer::start().await;
     mock_cargo_patch(
@@ -5614,7 +5614,7 @@ async fn in_process_hosted_scan_state_attests_manifest_less() {
                     marker: vex_e2e_common::Marker::Redirected,
                     vulns: &[(GHSA, &["CVE-2024-9"])],
                     api: &api,
-                    patch_server_url: Some("http://patch.test".to_string()),
+                    patch_server_url: Some("https://patch.test".to_string()),
                     registry_locks: vec![("package-lock.json", pristine.clone())],
                     embedded: &[vex_e2e_common::VexVia::Apply],
                 });
@@ -5671,7 +5671,7 @@ async fn mock_npm_registry_advertising(server: &MockServer, integrity: &str, tar
 async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let advertised = format!(
@@ -5741,7 +5741,7 @@ async fn yarn_berry_rollback_restores_the_registry_archive_url_binding() {
 async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let conventional = format!(
@@ -5790,7 +5790,7 @@ async fn yarn_berry_rollback_keeps_a_bare_locator_for_conventional_urls() {
 async fn yarn_berry_unwind_merges_into_a_registry_entry_added_after_pinning() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     mock_npm_registry_advertising(
@@ -5874,7 +5874,7 @@ async fn yarn_berry_unwind_merges_into_a_registry_entry_added_after_pinning() {
 async fn yarn_berry_unwind_drops_a_descriptor_no_entry_declares() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     mock_npm_registry_advertising(
@@ -5962,7 +5962,7 @@ async fn yarn_berry_unwind_drops_a_descriptor_no_entry_declares() {
 async fn yarn_berry_rollback_reads_the_tarball_from_the_project_registry() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
@@ -6046,7 +6046,7 @@ async fn yarn_berry_unwind_keeps_a_default_registry_url_behind_a_mirror() {
     for command in ["rollback", "remove"] {
         let server = MockServer::start().await;
         mock_discovery(&server).await;
-        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
         mock_reference_with_berry_url(&server, &hosted_url).await;
         mock_view(&server).await;
         let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
@@ -6379,7 +6379,7 @@ async fn pnpm_rollback_reads_the_workspace_mirror_on_pnpm_11() {
 
 /// The scoped package and hosted URL of the #919 scope-registry case.
 const SCOPED_NAME: &str = "@socktest/scoped-pkg";
-const SCOPED_HOSTED_URL: &str = "http://patch.test/patch/npm/%40socktest/scoped-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/scoped-pkg-1.0.0.tgz";
+const SCOPED_HOSTED_URL: &str = "https://patch.test/patch/npm/%40socktest/scoped-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/scoped-pkg-1.0.0.tgz";
 
 /// A v9 pnpm lock resolving `SCOPED_NAME@VERSION` with `resolution`.
 fn scoped_pnpm_lock(resolution: &str) -> String {
@@ -6547,7 +6547,7 @@ async fn pnpm_12_restore_keeps_the_scoped_registry_tarball() {
             } else {
                 &["remove", "pkg:npm/%40socktest/scoped-pkg@1.0.0"]
             };
-            let (code, env) = hosted_unwind_json(tmp.path(), &server, "http://patch.test", args);
+            let (code, env) = hosted_unwind_json(tmp.path(), &server, "https://patch.test", args);
             assert_eq!(code, Some(0), "pnpm {pnpm} {command}: {env:#}");
             let restored = std::fs::read_to_string(tmp.path().join("pnpm-lock.yaml")).unwrap();
             assert_eq!(
@@ -6608,7 +6608,7 @@ async fn pnpm_rollback_falls_back_from_an_unreadable_mirror_and_warns() {
 
 /// `remove <PURL>` as a subprocess, like [`rollback_json`].
 fn remove_json(cwd: &Path, registry: &MockServer) -> (Option<i32>, serde_json::Value) {
-    hosted_unwind_json(cwd, registry, "http://patch.test", &["remove", PURL])
+    hosted_unwind_json(cwd, registry, "https://patch.test", &["remove", PURL])
 }
 
 /// The `node_modules/.modules.yaml` install record pnpm 10+ writes (JSON),
@@ -6996,7 +6996,7 @@ async fn cargo_hosted_scan_from_workspace_member_refuses() {
     const CARGO_PURL: &str = "pkg:cargo/cfg-if@1.0.4";
     const CARGO_UUID: &str = "33333333-3333-4333-8333-333333333333";
     let cksum = "cd".repeat(32);
-    let index_url = format!("sparse+http://patch.test/registry/cargo/{CARGO_UUID}/index/");
+    let index_url = format!("sparse+https://patch.test/registry/cargo/{CARGO_UUID}/index/");
     let server = MockServer::start().await;
     mock_cargo_patch(
         &server,
@@ -7185,7 +7185,7 @@ async fn yarn_berry_rollback_reads_the_registry_from_every_yarn_source() {
     ] {
         let server = MockServer::start().await;
         mock_discovery(&server).await;
-        let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+        let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
         mock_reference_with_berry_url(&server, &hosted_url).await;
         mock_view(&server).await;
         let integrity = vlt_hosted_common::sha512_sri(&upstream_tarball());
@@ -7307,7 +7307,7 @@ async fn yarn_berry_rollback_reads_the_registry_from_every_yarn_source() {
 async fn yarn_berry_rollback_warns_when_the_registry_cannot_be_known() {
     let server = MockServer::start().await;
     mock_discovery(&server).await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
     mock_reference_with_berry_url(&server, &hosted_url).await;
     mock_view(&server).await;
     let conventional = format!(
@@ -7381,7 +7381,7 @@ async fn yarn_berry_rollback_restores_the_registry_bin_spelling() {
         })))
         .mount(&server)
         .await;
-    let hosted_url = HOSTED_URL.replace("http://patch.test", &server.uri());
+    let hosted_url = HOSTED_URL.replace("https://patch.test", &server.uri());
 
     let pristine_pkg = format!(
         "{{\n  \"name\": \"consumer\",\n  \"version\": \"0.0.0\",\n  \"dependencies\": {{\n    \

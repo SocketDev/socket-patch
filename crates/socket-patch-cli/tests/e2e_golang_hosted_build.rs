@@ -561,7 +561,11 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
     let _cleanup = ChmodGuard(tmp.path().to_path_buf());
     let fx = stage_hosted_project(tmp.path());
     let purl = format!("pkg:golang/{UMOD}@{UVER}");
-    let artifact_url = format!("{}/{}/@v/{SVER}.zip", fx.proxy_url, fx.smod);
+    // The grant's URLs name the patch server, as production's do. Go
+    // resolves the socket module by its path through GOPROXY (the file
+    // proxy), never through these.
+    const PATCH_SERVER: &str = "https://patch.socket.dev";
+    let artifact_url = format!("{PATCH_SERVER}/{}/@v/{SVER}.zip", fx.smod);
 
     // API mocks: `view/{uuid}` (the record the hosted run fetches for its
     // VEX) + the reference grant whose goproxy override carries the module
@@ -608,7 +612,7 @@ async fn golang_get_uuid_hosted_day2_machine_builds() {
                     }],
                     "registryOverride": {
                         "kind": "goproxy",
-                        "indexUrl": &fx.proxy_url,
+                        "indexUrl": PATCH_SERVER,
                         "identifiers": {
                             "name": UMOD,
                             "version": UVER,
