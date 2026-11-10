@@ -1651,18 +1651,22 @@ pub async fn download_and_apply_patches_into(
     // drop removes `apply.lock` and prunes an otherwise-empty `.socket/`, so
     // a run that records nothing leaves no residue. The nested apply runs
     // under this SAME guard (one lock window; see `run_nested_apply`).
-    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
-        Ok(guard) => guard,
-        Err(e) => {
-            env.mark_error(report_lock_failure(
-                params.json,
-                &socket_dir,
-                &e,
-                lock_timeout,
-            ));
-            return 1;
-        }
-    };
+    // This is the wet download: a dry run previews without it.
+    let guard =
+        match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout, false) {
+            Ok(guard) => guard,
+            Err(e) => {
+                env.mark_error(report_lock_failure(
+                    params.json,
+                    &socket_dir,
+                    &e,
+                    lock_timeout,
+                ));
+                return 1;
+            }
+        };
+    env.warnings
+        .extend(crate::commands::lock_cli::commit_recovery_warning(&guard));
 
     let mut manifest = match read_manifest(&manifest_path).await {
         Ok(Some(m)) => m,

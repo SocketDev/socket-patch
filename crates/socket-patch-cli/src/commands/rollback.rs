@@ -1542,7 +1542,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // same `.socket/` directory. See
     // `socket_patch_core::patch::apply_lock`.
     let socket_dir = crate::args::socket_dir_of(&manifest_path, &cwd);
-    let _lock = match acquire_or_emit(
+    let lock = match acquire_or_emit(
         &socket_dir,
         EnvelopeCommand::Rollback,
         args.common.json,
@@ -1552,6 +1552,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
         Ok(guard) => guard,
         Err(code) => return code,
     };
+    // Held to the end of the run. What taking it did about an interrupted
+    // run's commit is on stderr; this is the envelope's copy.
+    let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&lock);
 
     // Load the state stores UNDER the lock (see the discovery note above),
     // each exactly once: the agent leg below receives the manifest and the
@@ -2364,6 +2367,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     };
                     run_warnings.push(("gc_skipped".into(), format!("artifact GC skipped: {why}")));
                 }
+                run_warnings.extend(commit_recovery.map(|w| (w.code, w.detail)));
                 let env = build_rollback_envelope(&RollbackReport {
                     dry_run: args.common.dry_run,
                     success,

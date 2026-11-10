@@ -158,7 +158,52 @@ pub enum LockError {
         #[source]
         source: std::io::Error,
     },
+
+    /// [`acquire_dry_run`] found the group commit an interrupted vendored
+    /// run left at `journal`. A dry run writes nothing, so it cannot finish
+    /// the commit, and the files the journal covers (`files`, as the
+    /// journal spells them; empty when it cannot be parsed) may be half
+    /// replaced, so it must not preview over them either. Nothing was
+    /// written; the next acquire that is not a dry run finishes the commit.
+    #[error("{}", commit_pending_message(.journal, .files))]
+    CommitPending {
+        journal: PathBuf,
+        files: Vec<String>,
+    },
 }
+
+/// Every path is named, however many: a dry run exists to show what the
+/// real run would touch, and a shortened list could hide one.
+fn commit_pending_message(journal: &Path, files: &[String]) -> String {
+    let covers = if files.is_empty() {
+        "it could not be parsed".to_string()
+    } else {
+        format!("it covers {}", listed(files))
+    };
+    format!(
+        "a previous run was interrupted before its vendored commit finished (journal: {}; \
+         {covers}), and --dry-run writes nothing; run without --dry-run to finish it",
+        journal.display()
+    )
+}
+
+/// What acquiring the lock did about the group commit an interrupted
+/// vendored run left (see [`crate::utils::group_commit`]). The acquire
+/// already printed `detail` on stderr as a `Warning:` line; a host with a
+/// machine-readable report repeats it there under `code`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitRecovery {
+    /// [`COMMIT_RECOVERED`] or [`COMMIT_SET_ASIDE`].
+    pub code: &'static str,
+    /// What was done, naming every file the replay rewrote.
+    pub detail: String,
+}
+
+/// [`CommitRecovery::code`]: the journal was replayed as written.
+pub const COMMIT_RECOVERED: &str = "vendor_commit_recovered";
+/// [`CommitRecovery::code`]: the journal could not be replayed as written
+/// and was renamed aside.
+pub const COMMIT_SET_ASIDE: &str = "vendor_commit_set_aside";
 
 /// RAII guard for the apply lock.
 ///
@@ -183,9 +228,17 @@ pub struct LockGuard {
     /// This guard's entry in the interrupt-cleanup table, if it got one
     /// (see [`cleanup_held_lock_on_interrupt`]).
     registration: Option<interrupt::Registration>,
+    /// See [`LockGuard::commit_recovery`].
+    recovery: Option<CommitRecovery>,
 }
 
 impl LockGuard {
+    /// What this acquire did about an interrupted vendored run's group
+    /// commit; `None` when it found no journal.
+    pub fn commit_recovery(&self) -> Option<&CommitRecovery> {
+        self.recovery.as_ref()
+    }
+
     /// Release the lock now — unlink, close, prune — instead of at the
     /// end of the guard's scope.
     pub fn release(self) {
@@ -569,16 +622,62 @@ mod interrupt {
 /// [`crate::utils::group_commit`]), now that no other command can be
 /// writing the files it covers. Every locked command runs it before reading
 /// any of them, so the lockfiles and ledgers are never observed half-new.
-/// A replay that cannot run as a whole (a file edited by hand since the
-/// crash) sets the journal aside and says what it did. A replay that fails
-/// on I/O leaves the journal for the next locked command and fails this
-/// acquire: the command must not read or write over a torn commit.
-fn recover_group_commit(socket_dir: &Path) -> Result<(), LockError> {
-    use crate::utils::group_commit::{recover, Recovery, SetAsideOutcome};
-    let Some(project_root) = socket_dir.parent() else {
-        return Ok(());
+/// A replay is never silent, because the journal it trusts is a file in
+/// the working tree: what it did is printed on stderr and returned, naming
+/// the files it rolled forward, or, when it cannot run as a whole (a file
+/// edited by hand since the crash, a path it must not write), that the
+/// journal was set aside and what was done instead. A replay that fails on
+/// I/O leaves the journal for the next locked command and fails this
+/// acquire: the command must not read or write over a torn commit. A dry
+/// run replays nothing and, for that same reason, does not proceed either:
+/// it fails the acquire with [`LockError::CommitPending`].
+fn recover_group_commit(
+    socket_dir: &Path,
+    dry_run: bool,
+) -> Result<Option<CommitRecovery>, LockError> {
+    use crate::utils::group_commit::{
+        pending, recover, Recovery, SetAsideOutcome, COMMIT_JOURNAL_REL,
     };
-    match recover(project_root) {
+    let Some(project_root) = socket_dir.parent() else {
+        return Ok(None);
+    };
+    let unfinished = |what: &str, source: std::io::Error| LockError::Io {
+        path: project_root.join(COMMIT_JOURNAL_REL),
+        source: std::io::Error::new(
+            source.kind(),
+            format!(
+                "could not {what} an interrupted vendored run's commit: {source}; the journal \
+                 is kept for the next command"
+            ),
+        ),
+    };
+    if dry_run {
+        return match pending(project_root) {
+            Ok(None) => Ok(None),
+            Ok(Some(found)) => Err(LockError::CommitPending {
+                journal: found.journal,
+                files: found.files,
+            }),
+            Err(source) => Err(unfinished("check for", source)),
+        };
+    }
+    let recovery = match recover(project_root) {
+        Ok(Recovery::Clean) => return Ok(None),
+        Ok(Recovery::RolledForward(files)) if files.is_empty() => CommitRecovery {
+            code: COMMIT_RECOVERED,
+            detail: "an interrupted vendored run's commit had already replaced every file it \
+                     covers; its leftover journal was removed"
+                .to_string(),
+        },
+        Ok(Recovery::RolledForward(files)) => CommitRecovery {
+            code: COMMIT_RECOVERED,
+            detail: format!(
+                "an interrupted vendored run's commit was finished from its journal: rolled \
+                 forward {}; if no run was interrupted in this checkout, the journal came \
+                 with the checkout, so review those files",
+                listed(&files)
+            ),
+        },
         Ok(Recovery::SetAside { journal, outcome }) => {
             let done = match outcome {
                 SetAsideOutcome::Refused => {
@@ -597,33 +696,38 @@ fn recover_group_commit(socket_dir: &Path) -> Result<(), LockError> {
                     format!("the files it had replaced were put back{}", named(&files))
                 }
             };
-            eprintln!(
-                "Warning: an interrupted vendored run's commit could not be finished as \
-                 written: {done}; the journal was set aside at {} — run `socket-patch \
-                 repair` to check the vendored wiring",
-                journal.display()
-            );
-            Ok(())
-        }
-        Ok(_) => Ok(()),
-        Err(source) => Err(LockError::Io {
-            path: project_root.join(crate::utils::group_commit::COMMIT_JOURNAL_REL),
-            source: std::io::Error::new(
-                source.kind(),
-                format!(
-                    "could not finish an interrupted vendored run's commit: {source}; the \
-                     journal is kept for the next command"
+            CommitRecovery {
+                code: COMMIT_SET_ASIDE,
+                detail: format!(
+                    "an interrupted vendored run's commit could not be finished as written: \
+                     {done}; the journal was set aside at {} — run `socket-patch repair` to \
+                     check the vendored wiring",
+                    journal.display()
                 ),
-            ),
-        }),
-    }
+            }
+        }
+        Err(source) => return Err(unfinished("finish", source)),
+    };
+    eprintln!("Warning: {}", recovery.detail);
+    Ok(Some(recovery))
+}
+
+/// The journaled paths a replay wrote, for a message. They come from a
+/// file in the working tree, so nothing that could drive a terminal is
+/// printed.
+fn listed(files: &[String]) -> String {
+    files
+        .iter()
+        .map(|file| crate::policy::strip_unsafe(file))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn named(files: &[String]) -> String {
     if files.is_empty() {
         String::new()
     } else {
-        format!(" ({})", files.join(", "))
+        format!(" ({})", listed(files))
     }
 }
 
@@ -642,7 +746,24 @@ fn named(files: &[String]) -> String {
 /// loop, because a finished holder prunes an empty `.socket/` on exit).
 /// A failed acquire prunes it again if it is still empty, so a refused
 /// lock leaves no residue.
+///
+/// Once the lock is held, a group commit an interrupted vendored run left
+/// is finished before this returns; [`LockGuard::commit_recovery`] says
+/// what that did. A command that must write nothing takes the lock with
+/// [`acquire_dry_run`] instead.
 pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
+    acquire_as(socket_dir, timeout, false)
+}
+
+/// [`acquire`] for a dry run. The lock is taken the same way (and is as
+/// residue-free), but an interrupted vendored run's group commit is not
+/// finished, because that rewrites project files: it fails the acquire
+/// with [`LockError::CommitPending`] and everything is left as it was.
+pub fn acquire_dry_run(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockError> {
+    acquire_as(socket_dir, timeout, true)
+}
+
+fn acquire_as(socket_dir: &Path, timeout: Duration, dry_run: bool) -> Result<LockGuard, LockError> {
     let path = socket_dir.join(LOCK_FILE_NAME);
 
     // Use `checked_add` so an astronomically large `timeout` (the flag
@@ -667,7 +788,7 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
             Attempt::Acquired(mut guard) => {
                 guard.registration = interrupt::register(&guard);
                 // On failure the guard drops here, releasing the lock.
-                recover_group_commit(socket_dir)?;
+                guard.recovery = recover_group_commit(socket_dir, dry_run)?;
                 // Debug-only hook: the interrupt tests park the process
                 // here, lock held, and signal it.
                 crate::utils::failpoint::hit("apply_lock.acquired");
@@ -826,6 +947,7 @@ fn attempt(path: &Path, socket_dir: &Path) -> Attempt {
             path: path.to_path_buf(),
             socket_dir: socket_dir.to_path_buf(),
             registration: None,
+            recovery: None,
         }),
         // The path names a replacement: a releaser unlinked the inode we
         // locked between our open and our lock, and a newcomer created
@@ -1013,7 +1135,7 @@ mod tests {
         let err = acquire(&socket, Duration::from_millis(250)).unwrap_err();
         match err {
             LockError::Io { path, .. } => assert_eq!(path, socket),
-            LockError::Held => panic!("a squatting file is an I/O fault, not contention"),
+            other => panic!("a squatting file is an I/O fault, got {other:?}"),
         }
         assert_eq!(std::fs::read(&socket).unwrap(), b"not a directory");
     }
@@ -1466,7 +1588,7 @@ mod tests {
                             // correct outcome; only a double hold or an
                             // I/O fault is a failure.
                             Err(LockError::Held) => {}
-                            Err(e @ LockError::Io { .. }) => faults.push(e.to_string()),
+                            Err(e) => faults.push(e.to_string()),
                         }
                     }
                     faults
@@ -1540,9 +1662,7 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => {
-                panic!("a genuine flock fault must not be mislabelled as contention")
-            }
+            other => panic!("a genuine flock fault must surface as Io, got {other:?}"),
         }
         // The fault arm returns without ever entering the retry/backoff
         // path: nowhere near the 5 s budget.
@@ -1576,9 +1696,7 @@ mod tests {
                     fs2::lock_contended_error().raw_os_error()
                 );
             }
-            LockError::Held => {
-                panic!("try-once mode must not mislabel a genuine flock fault as Held")
-            }
+            other => panic!("try-once mode must surface a flock fault as Io, got {other:?}"),
         }
     }
 
@@ -1608,5 +1726,177 @@ mod tests {
             "clamped sleep should keep us near the budget, got {:?}",
             elapsed
         );
+    }
+
+    /// The journal an interrupted group commit leaves under `root`: each
+    /// entry is `(path, old bytes, new bytes)`, the file still at its old
+    /// bytes (`None`: not there yet).
+    fn interrupted_commit(root: &Path, files: &[(&str, Option<&[u8]>, &[u8])]) -> PathBuf {
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        let entries: Vec<serde_json::Value> = files
+            .iter()
+            .map(|(path, old, new)| {
+                if let Some(old) = old {
+                    std::fs::write(root.join(path), old).unwrap();
+                }
+                serde_json::json!({
+                    "path": path,
+                    "before": old.map(|old| hex::encode(sha2::Sha256::digest(old))),
+                    "original": old.map(b64),
+                    "after": b64(new),
+                })
+            })
+            .collect();
+        let journal = root.join(crate::utils::group_commit::COMMIT_JOURNAL_REL);
+        std::fs::create_dir_all(journal.parent().unwrap()).unwrap();
+        std::fs::write(
+            &journal,
+            serde_json::to_vec(&serde_json::json!({ "version": 1, "files": entries })).unwrap(),
+        )
+        .unwrap();
+        journal
+    }
+
+    const INTERRUPTED: &[(&str, Option<&[u8]>, &[u8])] = &[
+        ("package.json", Some(b"old\n"), b"new\n"),
+        ("pnpm-lock.yaml", Some(b"lock-old\n"), b"lock-new\n"),
+        ("pnpm-workspace.yaml", None, b"overrides: {}\n"),
+    ];
+
+    /// A genuine journal still rolls forward under the next acquire, and
+    /// the guard says which files that rewrote.
+    #[test]
+    fn acquire_finishes_an_interrupted_commit_and_reports_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let socket = socket_dir(&dir);
+        let journal = interrupted_commit(root, INTERRUPTED);
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        for (path, _, new) in INTERRUPTED {
+            assert_eq!(std::fs::read(root.join(path)).unwrap(), *new, "{path}");
+        }
+        assert!(!journal.exists(), "the journal is consumed");
+        let recovery = guard.commit_recovery().expect("the replay is reported");
+        assert_eq!(recovery.code, COMMIT_RECOVERED);
+        assert!(
+            recovery
+                .detail
+                .contains("rolled forward package.json, pnpm-lock.yaml, pnpm-workspace.yaml"),
+            "{}",
+            recovery.detail
+        );
+        drop(guard);
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        assert_eq!(guard.commit_recovery(), None, "nothing left to finish");
+    }
+
+    /// A dry run takes the lock but replays nothing: a pending journal
+    /// fails the acquire, naming what it covers, and the project and the
+    /// journal stay byte for byte as they were. The next acquire that is
+    /// not a dry run finishes the commit.
+    #[test]
+    fn a_dry_run_acquire_refuses_a_pending_commit_and_writes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let socket = socket_dir(&dir);
+        let clean = acquire_dry_run(&socket, Duration::ZERO).unwrap();
+        assert_eq!(clean.commit_recovery(), None);
+        drop(clean);
+
+        let journal = interrupted_commit(root, INTERRUPTED);
+        let journaled = std::fs::read(&journal).unwrap();
+        let err = acquire_dry_run(&socket, Duration::ZERO).unwrap_err();
+        match &err {
+            LockError::CommitPending { journal: at, files } => {
+                assert_eq!(at, &journal);
+                assert_eq!(
+                    files,
+                    &["package.json", "pnpm-lock.yaml", "pnpm-workspace.yaml"]
+                );
+            }
+            other => panic!("expected CommitPending, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.contains("--dry-run")
+                && message.contains("package.json, pnpm-lock.yaml, pnpm-workspace.yaml"),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(root.join("package.json")).unwrap(), b"old\n");
+        assert_eq!(
+            std::fs::read(root.join("pnpm-lock.yaml")).unwrap(),
+            b"lock-old\n"
+        );
+        assert!(!root.join("pnpm-workspace.yaml").exists());
+        assert_eq!(std::fs::read(&journal).unwrap(), journaled);
+        assert!(
+            !socket.join("apply.lock").exists(),
+            "the refused dry run releases the lock"
+        );
+
+        let guard = acquire(&socket, Duration::ZERO).unwrap();
+        assert_eq!(
+            guard.commit_recovery().map(|r| r.code),
+            Some(COMMIT_RECOVERED)
+        );
+        assert_eq!(std::fs::read(root.join("package.json")).unwrap(), b"new\n");
+    }
+
+    /// A journal naming a path no commit writes (here a git hook) is set
+    /// aside with nothing applied, and the guard reports that as well.
+    #[test]
+    fn acquire_reports_a_journal_it_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        let journal = interrupted_commit(
+            root,
+            &[
+                ("package.json", Some(b"old\n"), b"forged\n"),
+                (".git/hooks/post-checkout", None, b"#!/bin/sh\n"),
+            ],
+        );
+
+        let guard = acquire(&socket_dir(&dir), Duration::ZERO).unwrap();
+        let recovery = guard.commit_recovery().expect("the refusal is reported");
+        assert_eq!(recovery.code, COMMIT_SET_ASIDE);
+        assert!(
+            recovery.detail.contains("nothing of it was applied"),
+            "{}",
+            recovery.detail
+        );
+        assert_eq!(std::fs::read(root.join("package.json")).unwrap(), b"old\n");
+        assert_eq!(
+            std::fs::read_dir(root.join(".git/hooks")).unwrap().count(),
+            0
+        );
+        assert!(!journal.exists(), "set aside, so the next acquire is clean");
+    }
+
+    /// Journaled paths come from a file in the working tree: a message
+    /// names every one of them, without the characters that could drive a
+    /// terminal or hide text.
+    #[test]
+    fn journal_paths_are_made_safe_to_print() {
+        assert_eq!(
+            listed(&["a\u{1b}[2J.lock".to_string(), "b.lock".to_string()]),
+            "a[2J.lock, b.lock"
+        );
+        let many: Vec<String> = (0..40).map(|i| format!("f{i}")).collect();
+        let message = commit_pending_message(Path::new("j"), &many);
+        assert!(message.contains("f38, f39)"), "none is left out: {message}");
+        let hostile = commit_pending_message(
+            Path::new("j"),
+            &["\u{1b}]0;x\u{7}".to_string(), "a\u{202e}b".to_string()],
+        );
+        assert!(
+            !hostile.contains(['\u{1b}', '\u{7}', '\u{202e}']),
+            "{hostile:?}"
+        );
+        assert!(commit_pending_message(Path::new("j"), &[]).contains("could not be parsed"));
     }
 }

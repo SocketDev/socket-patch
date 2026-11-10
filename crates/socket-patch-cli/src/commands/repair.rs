@@ -149,7 +149,7 @@ pub async fn run(args: RepairArgs) -> i32 {
     // ledger-less project); the guard's drop removes `apply.lock` and an
     // otherwise-empty `.socket/` on every exit path.
     let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
-    let _lock = match acquire_or_emit(
+    let lock = match acquire_or_emit(
         &socket_dir,
         Command::Repair,
         args.common.json,
@@ -159,6 +159,9 @@ pub async fn run(args: RepairArgs) -> i32 {
         Ok(guard) => guard,
         Err(code) => return code,
     };
+    // Held to the end of the run. What taking it did about an interrupted
+    // run's commit is on stderr; this is the envelope's copy.
+    let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&lock);
 
     // Lockfile references are read under the lock (a concurrent vendor run
     // rewrites them under the same lock) unless the gate above already
@@ -204,6 +207,7 @@ pub async fn run(args: RepairArgs) -> i32 {
 
     match result {
         Ok((mut env, counts)) => {
+            env.warnings.extend(commit_recovery);
             env.warnings.extend(auth_fallback);
             let had_failure = matches!(env.status, Status::PartialFailure | Status::Error);
             if had_failure {
@@ -226,7 +230,9 @@ pub async fn run(args: RepairArgs) -> i32 {
         Err(e) => {
             track_patch_repair_failed(&e.message, &telemetry).await;
             if args.common.json {
-                let env = error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
+                let mut env =
+                    error_envelope(Command::Repair, args.common.dry_run, &e.code, &e.message);
+                env.warnings.extend(commit_recovery);
                 crate::ui::print_json(&env.to_value());
             } else {
                 eprintln!("Error: {}", e.message);

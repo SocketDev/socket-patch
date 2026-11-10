@@ -527,11 +527,14 @@ async fn vendor_under_lock(
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
     // The guard lives to the end of the step so the ledger migration runs
     // under the lock too.
-    let _guard =
-        crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout).map_err(|e| {
-            let (code, message) = lock_failure(&e, timeout);
-            (code, message, None)
-        })?;
+    let guard =
+        crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout, common.dry_run)
+            .map_err(|e| {
+                let (code, message) = lock_failure(&e, timeout);
+                (code, message, None)
+            })?;
+    env.warnings
+        .extend(crate::commands::lock_cli::commit_recovery_warning(&guard));
 
     // Staging probes blobs by the records' hashes; a manifest VIEW over the
     // in-memory records (a move, not a clone) is all it needs.

@@ -208,8 +208,13 @@ pub(super) async fn sweep(
     } else {
         let socket_dir = common.socket_dir();
         let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-        match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
-            Ok(guard) => Some(guard),
+        match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout, common.dry_run) {
+            Ok(guard) => {
+                // Stderr has it from the acquire; this is the envelope's.
+                out.warnings
+                    .extend(crate::commands::lock_cli::commit_recovery_warning(&guard));
+                Some(guard)
+            }
             Err(err) => {
                 let (_, message) = crate::commands::lock_cli::lock_failure(&err, timeout);
                 for (pin, status) in &gone {

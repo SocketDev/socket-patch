@@ -395,7 +395,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
     // drop removes `apply.lock` (and an emptied `.socket/`) on every exit
     // path.
     let socket_dir = crate::args::socket_dir_of(&manifest_path, &args.common.cwd);
-    let _lock = match acquire_or_emit(
+    let lock = match acquire_or_emit(
         &socket_dir,
         Command::Remove,
         args.common.json,
@@ -405,6 +405,10 @@ pub async fn run(args: RemoveArgs) -> i32 {
         Ok(guard) => guard,
         Err(code) => return code,
     };
+    // Held to the end of the run. What taking it did about an interrupted
+    // run's commit is on stderr; this is the copy for the envelope of
+    // whichever removal path runs.
+    let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&lock);
 
     // Read the manifest to show what will be removed and confirm. On the
     // ledger-only path there is no manifest to read or mutate; an empty
@@ -501,7 +505,15 @@ pub async fn run(args: RemoveArgs) -> i32 {
         if let Ok(state) = vendor_state_result {
             let ledger_matches = vendor_entries_matching(&state, None, &target);
             if !ledger_matches.is_empty() {
-                return remove_ledger_only(&args, &target, ledger_matches, state, &telemetry).await;
+                return remove_ledger_only(
+                    &args,
+                    &target,
+                    ledger_matches,
+                    state,
+                    &telemetry,
+                    commit_recovery,
+                )
+                .await;
             }
         }
 
@@ -510,7 +522,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         // per-purl exit path (restoring the upstream entry IS the removal).
         let hosted_matches = hosted_pins_matching(&hosted_pins, &target, &[]);
         if !hosted_matches.is_empty() {
-            return remove_hosted_only(&args, hosted_matches, &telemetry).await;
+            return remove_hosted_only(&args, hosted_matches, &telemetry, commit_recovery).await;
         }
 
         let msg = format!("No patch found matching identifier: {}", args.identifier);
@@ -1149,6 +1161,7 @@ pub async fn run(args: RemoveArgs) -> i32 {
         for ev in vendor_skipped {
             env.record(ev);
         }
+        env.warnings.extend(commit_recovery);
         env.warnings.extend(
             rollback_warnings
                 .iter()
@@ -1559,6 +1572,7 @@ async fn remove_hosted_only(
     args: &RemoveArgs,
     hosted_matches: Vec<HostedPin>,
     telemetry: &TelemetryAuth,
+    commit_recovery: Option<crate::json_envelope::RunWarning>,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1621,6 +1635,7 @@ async fn remove_hosted_only(
     };
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
+    env.warnings.extend(commit_recovery);
     let mut warnings = leg.warnings;
     if args.preserve_state && !leg.reverted.is_empty() {
         warnings.push(note_hosted_state_not_preservable(&args.common));
@@ -1662,6 +1677,7 @@ async fn remove_ledger_only(
     matches: Vec<(String, VendorEntry)>,
     mut state: VendorState,
     telemetry: &TelemetryAuth,
+    commit_recovery: Option<crate::json_envelope::RunWarning>,
 ) -> i32 {
     let loud = !args.common.json && !args.common.silent;
     if args.skip_rollback {
@@ -1733,6 +1749,7 @@ async fn remove_ledger_only(
 
     let mut env = Envelope::new(Command::Remove);
     env.dry_run = args.common.dry_run;
+    env.warnings.extend(commit_recovery);
     // The reverts ARE the removal: every event is recorded, so
     // `summary.removed` counts the reverted entries (`summary.verified`
     // the would-be removals on --dry-run).
