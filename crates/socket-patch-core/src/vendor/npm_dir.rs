@@ -458,7 +458,7 @@ impl JsonStyle {
         match place {
             JsonPlace::Line { eol, indent } => {
                 let inner = JsonPlace::Line {
-                    eol: *eol,
+                    eol,
                     indent: format!("{indent}{}", self.unit),
                 };
                 for (i, (key, item)) in items.iter().enumerate() {
@@ -553,7 +553,7 @@ fn insert_item(
             JsonPlace::Line { eol, indent } => {
                 let deeper = format!("{indent}{}", style.unit);
                 let inner = JsonPlace::Line {
-                    eol: *eol,
+                    eol,
                     indent: deeper.clone(),
                 };
                 (format!("{eol}{deeper}"), inner, format!("{eol}{indent}"))
