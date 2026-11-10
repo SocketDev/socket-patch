@@ -574,6 +574,35 @@ pub(super) async fn wire_pipenv_superseding(
     Ok((wiring, PipenvMeta { sections }))
 }
 
+/// Why a `pipenv_lock_entry` record is not one this backend writes for
+/// `entry`: its `<section>:<name>` key names the lock entry the revert
+/// replaces, and vendoring only ever rewrites the vendored package's own,
+/// to a reference into this patch's artifact dir.
+fn ledger_record_refusal(entry: &VendorEntry, rec: &WiringRecord) -> Option<String> {
+    let purl = crate::utils::purl::strip_purl_qualifiers(&entry.base_purl);
+    let Some((package, _)) = crate::utils::purl::parse_pypi_purl(purl) else {
+        return Some("belongs to an entry that names no PyPI release".to_string());
+    };
+    let (_, name) = rec.key.as_deref()?.split_once(':')?;
+    if canonicalize_pypi_name(name) != canonicalize_pypi_name(&package) {
+        return Some(format!(
+            "restores the {LOCK_FILE} entry of another package ({})",
+            super::state::terminal_safe(name)
+        ));
+    }
+    let ours = rec.new.as_ref().is_some_and(|new| {
+        ["file", "path"]
+            .iter()
+            .filter_map(|key| new.get(key)?.as_str())
+            .any(|reference| {
+                parse_vendor_path(reference)
+                    .is_some_and(|parts| parts.eco == "pypi" && parts.uuid == entry.uuid)
+            })
+    });
+    (!ours)
+        .then(|| "replaces an entry that is not this patch's vendored wheel reference".to_string())
+}
+
 /// Reverse the wiring: restore the verbatim original entries (deep-equality
 /// gated). An entry that no longer matches what we wrote is left alone with
 /// a `vendor_lock_entry_drifted` warning — revert never clobbers third-party
@@ -737,6 +766,13 @@ pub(super) async fn revert_pipenv(
             }
             warnings.push(drifted());
             continue;
+        }
+        // The live entry is about to be replaced or removed. The record's
+        // key picked it, and the ledger is committed: only the vendored
+        // package's own entry is this record's to write (nothing has been
+        // written yet).
+        if let Some(why) = ledger_record_refusal(entry, rec) {
+            return RevertOutcome::failed(super::state::refused_record(entry, rec, &why));
         }
         match (rec.action, rec.original.as_ref()) {
             (WiringAction::Rewritten, Some(orig)) => {
@@ -2415,8 +2451,9 @@ mod tests {
     }
 
     /// The Added arm removes a lock entry — a destructive edit driven by
-    /// tamper-able state.json, gated ONLY by the live==rec.new deep-equality
-    /// check. wire_pipenv never emits Added (forward-compat/defensive), so
+    /// tamper-able state.json, gated by the live==rec.new deep-equality
+    /// check and by that entry being this patch's own wheel reference.
+    /// wire_pipenv never emits Added (forward-compat/defensive), so
     /// pin the gate: deep-equal removes exactly that entry; anything else
     /// drifts and the lock stays byte-intact.
     #[tokio::test]
@@ -2437,14 +2474,17 @@ mod tests {
             sections: vec!["default".into()],
         };
 
-        // Deep-equal: the recorded entry is removed, nothing else touched.
-        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
-        let outcome = revert_pipenv(
-            &entry_for(added(six_registry.clone()), meta()),
-            tmp.path(),
-            false,
-        )
-        .await;
+        // Deep-equal: the recorded entry — this patch's wheel reference —
+        // is removed, nothing else touched.
+        let six_vendored = serde_json::json!({
+            "file": format!("./{REL_WHEEL}"),
+            "hashes": [format!("sha256:{WHEEL_SHA}")],
+        });
+        let mut wired: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
+        wired["default"]["six"] = six_vendored.clone();
+        let tmp = write_lock(&pipenv_dumps(&wired)).await;
+        let outcome =
+            revert_pipenv(&entry_for(added(six_vendored), meta()), tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         let mut expected: Value = serde_json::from_str(LOCK_DIRECT_REGISTRY).unwrap();
@@ -2454,6 +2494,27 @@ mod tests {
             pipenv_dumps(&expected),
             "only default.six removed"
         );
+
+        // Deep-equal to an entry that is NOT this patch's wheel reference
+        // (the registry one): the committed ledger does not get to delete
+        // it. The revert fails and the lock stays byte-intact.
+        let tmp = write_lock(LOCK_DIRECT_REGISTRY).await;
+        let outcome = revert_pipenv(
+            &entry_for(added(six_registry.clone()), meta()),
+            tmp.path(),
+            false,
+        )
+        .await;
+        assert!(!outcome.success);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("ledger record")),
+            "{:?}",
+            outcome.error
+        );
+        assert_eq!(read_lock(tmp.path()).await, LOCK_DIRECT_REGISTRY);
 
         // Not deep-equal: the gate refuses the removal — drift warning, the
         // entry survives, and the lock is not even re-serialized.

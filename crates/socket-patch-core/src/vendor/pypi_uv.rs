@@ -1205,6 +1205,24 @@ pub(super) async fn revert_uv(entry: &VendorEntry, root: &Path, dry_run: bool) -
             ),
         ));
     }
+    if !drift_kept {
+        // The fragments come from the committed ledger and are spliced in
+        // by text: before anything is written (and on a dry run, so the
+        // preview says what the wet run would), the restore may only have
+        // touched the vendored package's own entries in either file.
+        for (file, before, after) in [
+            ("uv.lock", &lock_before, &lock_text),
+            ("pyproject.toml", &pyproject_before, &pyproject_text),
+        ] {
+            let refusal = match super::pypi_lock::entry_package(entry) {
+                None => Some("the ledger entry names no PyPI release".to_string()),
+                Some(name) => super::pypi_lock::confinement_refusal(before, after, &name),
+            };
+            if let Some(why) = refusal {
+                return super::pypi_lock::unconfined(entry, file, &why);
+            }
+        }
+    }
     if !dry_run && !drift_kept {
         // Reverse of the wire order: the lock first, then the pyproject.
         let write = atomic_write_bytes_preserving_mode(&lock_path, lock_text.as_bytes()).await;
@@ -4314,7 +4332,10 @@ wheels = [
         );
 
         // revert byte-restores the original registry lock + pyproject.
-        let entry = entry_for(wiring, meta);
+        let entry = VendorEntry {
+            base_purl: "pkg:pypi/widget@1.0.0".into(),
+            ..entry_for(wiring, meta)
+        };
         let outcome = revert_uv(&entry, tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);

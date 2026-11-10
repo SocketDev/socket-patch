@@ -1084,13 +1084,189 @@ async fn read_existing(path: &Path) -> Result<Option<String>, Failure> {
     }
 }
 
+/// Why writing `after` over `before` — a Python project or lock file, as
+/// TOML — is more than a revert of the vendored package `canon` does, or
+/// `None` when the two differ only in that package's own entries.
+///
+/// The ledger is committed, and a revert writes what its records hold: a
+/// whole pre-vendor document, or a fragment spliced over the one vendoring
+/// wrote. Checked against the file as it stands, right before the write,
+/// that restore may only touch what a vendoring of `canon` writes — its
+/// lock units, the requirement and dependency entries that name it, its
+/// `sources` / `files` / `hashes` key, the Hatch direct-reference
+/// permission, and the tables those leave empty ([`drop_package`]).
+/// Anything else (another package's source or hashes, a build backend, a
+/// script entry point) is not the ledger's to change, and a file that does
+/// not parse cannot be judged: the caller fails the revert and writes
+/// nothing.
+pub(super) fn confinement_refusal(before: &str, after: &str, canon: &str) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    let apart = |text: &str| -> Result<serde_json::Value, String> {
+        let document = TOML_MEMO
+            .parse(text.as_bytes(), || {
+                crate::formats::text::strip_bom(text)
+                    .parse::<DocumentMut>()
+                    .map(|document| toml_json(document.as_item()))
+            })
+            .map_err(|error| error.to_string())?;
+        let mut value = (*document).clone();
+        drop_package(&mut value, "", canon);
+        Ok(value)
+    };
+    match (apart(before), apart(after)) {
+        (Ok(before), Ok(after)) if before == after => None,
+        (Ok(_), Ok(_)) => Some(format!(
+            "the ledger record for it would change entries other than {canon}'s own, which is \
+             not an edit socket-patch makes"
+        )),
+        (Err(error), _) | (_, Err(error)) => Some(format!(
+            "what the ledger record for it would change cannot be checked: the file, or the \
+             text recorded for it, is not valid TOML ({})",
+            error.trim()
+        )),
+    }
+}
+
+/// [`confinement_refusal`] for a PEP 723 script: the code around the
+/// inline-metadata block stays byte for byte, and the block is held to the
+/// same rule as any other document.
+pub(super) fn script_confinement_refusal(before: &str, after: &str, canon: &str) -> Option<String> {
+    if before == after {
+        return None;
+    }
+    let (Ok((span_before, block_before)), Ok((span_after, block_after))) =
+        (script_metadata(before), script_metadata(after))
+    else {
+        return Some(
+            "the ledger record for it would change a script that has no PEP 723 block".into(),
+        );
+    };
+    if before[..span_before.start] != after[..span_after.start]
+        || before[span_before.end..] != after[span_after.end..]
+    {
+        return Some(
+            "the ledger record for it would change the script outside its PEP 723 block".into(),
+        );
+    }
+    confinement_refusal(&block_before, &block_after, canon)
+}
+
+/// The run's parses for [`confinement_refusal`]: one revert's "after" is
+/// the next package's "before".
+static TOML_MEMO: ParseMemo<serde_json::Value, 4> = ParseMemo::new();
+
+/// A TOML item as plain data, for comparing two documents whatever their
+/// layout, comments or key order.
+fn toml_json(item: &Item) -> serde_json::Value {
+    use serde_json::Value as Json;
+    fn plain(value: &Value) -> Json {
+        match value {
+            Value::String(s) => Json::String(s.value().clone()),
+            Value::Integer(i) => Json::from(*i.value()),
+            Value::Float(f) => Json::String(f.value().to_string()),
+            Value::Boolean(b) => Json::Bool(*b.value()),
+            Value::Datetime(d) => Json::String(d.value().to_string()),
+            Value::Array(items) => Json::Array(items.iter().map(plain).collect()),
+            Value::InlineTable(table) => Json::Object(
+                table
+                    .iter()
+                    .map(|(key, item)| (key.to_string(), plain(item)))
+                    .collect(),
+            ),
+        }
+    }
+    match item {
+        Item::None => Json::Null,
+        Item::Value(v) => plain(v),
+        Item::Table(table) => Json::Object(
+            table
+                .iter()
+                .map(|(key, item)| (key.to_string(), toml_json(item)))
+                .collect(),
+        ),
+        Item::ArrayOfTables(tables) => Json::Array(
+            tables
+                .iter()
+                .map(|table| {
+                    Json::Object(
+                        table
+                            .iter()
+                            .map(|(key, item)| (key.to_string(), toml_json(item)))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// Take everything a vendoring of `canon` writes out of `value`, the value
+/// of the key `parent`: array elements that name the package (a
+/// requirement string, a `{ name = … }` entry, a lock unit), its key in a
+/// `sources` table or in a lock's `files` / `hashes` table (Poetry's and
+/// PDM's older formats, the latter keyed `<name> <version>`), the Hatch
+/// direct-reference permission, and then every table and array left
+/// empty.
+fn drop_package(value: &mut serde_json::Value, parent: &str, canon: &str) {
+    use serde_json::Value as Json;
+    let names = |name: &str| canonicalize_pypi_name(name) == canon;
+    match value {
+        Json::Object(map) => {
+            let keyed = matches!(parent, "sources" | "files" | "hashes");
+            map.retain(|key, _| {
+                key != "allow-direct-references"
+                    && !(keyed && names(key.split_whitespace().next().unwrap_or_default()))
+            });
+            for (key, child) in map.iter_mut() {
+                drop_package(child, key, canon);
+            }
+            map.retain(|_, child| match child {
+                Json::Object(map) => !map.is_empty(),
+                Json::Array(items) => !items.is_empty(),
+                _ => true,
+            });
+        }
+        Json::Array(items) => {
+            items.retain(|item| match item {
+                Json::String(spec) => !names(crate::vendor::common::pep508_name(spec)),
+                Json::Object(entry) => !entry.get("name").and_then(Json::as_str).is_some_and(names),
+                _ => true,
+            });
+            for item in items.iter_mut() {
+                drop_package(item, parent, canon);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The PEP 503 name of the package `entry` vendors.
+pub(super) fn entry_package(entry: &VendorEntry) -> Option<String> {
+    let purl = crate::utils::purl::strip_purl_qualifiers(&entry.base_purl);
+    crate::utils::purl::parse_pypi_purl(purl).map(|(name, _)| canonicalize_pypi_name(&name))
+}
+
+/// The failure of a revert whose restore of `file` is not confined to the
+/// entry's package ([`confinement_refusal`]).
+pub(super) fn unconfined(entry: &VendorEntry, file: &str, why: &str) -> RevertOutcome {
+    RevertOutcome::failed(format!(
+        "refusing to revert {}: for {file}, {why}. Nothing was changed for this package; \
+         restore {} (or {file}, if that is the damaged one) from version control, or undo the \
+         vendoring by hand",
+        super::state::terminal_safe(&entry.base_purl),
+        super::state::VENDOR_STATE_REL,
+    ))
+}
+
 /// The pair a wired file belongs to: a `.py.lock` goes with its script, and
 /// every other file (a script, a PEP 751 lock) names its own pair.
 fn pair_of(file: &str) -> &str {
     script_of_lock(file).unwrap_or(file)
 }
 
-fn allowed_file(file: &str, kind: &str) -> bool {
+pub(super) fn allowed_file(file: &str, kind: &str) -> bool {
     Path::new(file).file_name().and_then(|name| name.to_str()) == Some(file)
         && ((kind == KIND && is_python_lock_name(file) && file != "uv.lock")
             || (kind == SCRIPT_KIND && file.ends_with(".py")))
@@ -1573,6 +1749,23 @@ pub(super) async fn revert_python_locks(
     let drift_kept = warnings
         .iter()
         .any(|w| w.code == "vendor_lock_entry_drifted");
+    if !drift_kept {
+        // Before anything is written (and on a dry run, so the preview says
+        // what the wet run would): the restore may only touch the vendored
+        // package's own entries, and only the PEP 723 block of a script.
+        for (file, live, restored) in &edits {
+            let refusal = match package_name.as_deref() {
+                None => Some("the ledger entry names no PyPI release".to_string()),
+                Some(name) if file.ends_with(".py") => {
+                    script_confinement_refusal(live, restored, name)
+                }
+                Some(name) => confinement_refusal(live, restored, name),
+            };
+            if let Some(why) = refusal {
+                return unconfined(entry, file, &why);
+            }
+        }
+    }
     if !dry_run && !drift_kept {
         // A refused write fails the revert outright: the artifact and the
         // ledger entry stay so the restore can be retried once the link is
@@ -3424,5 +3617,140 @@ mod tests {
                 .contains(UUID),
             "nothing is written"
         );
+    }
+
+    /// What a revert may change in a lock: the vendored package's units and
+    /// the entries naming it, in any layout.
+    #[test]
+    fn confinement_allows_the_packages_own_lock_entries() {
+        let registry = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\nwheels = [{ url = \"https://files.example/idna.whl\", hashes = { sha256 = \"aa\" } }]\n\n[[packages]]\nname = \"Six\"\nversion = \"1.16.0\"\nwheels = [{ url = \"https://files.example/six.whl\", hashes = { sha256 = \"bb\" } }]\n";
+        let vendored = registry.replace(
+            "wheels = [{ url = \"https://files.example/six.whl\", hashes = { sha256 = \"bb\" } }]",
+            "archive = { path = \".socket/vendor/pypi/u/six.whl\", hashes = { sha256 = \"cc\" } }",
+        );
+        assert_ne!(vendored, registry);
+        assert_eq!(confinement_refusal(&vendored, registry, "six"), None);
+        assert_eq!(confinement_refusal(registry, registry, "six"), None);
+        // Layout, comments and key order are not entries.
+        let relaid = registry
+            .replace(
+                "lock-version = \"1.0\"\n",
+                "# relocked\nlock-version = \"1.0\"\n",
+            )
+            .replace(
+                "name = \"idna\"\nversion = \"3.7\"",
+                "version = \"3.7\"\nname = \"idna\"",
+            );
+        assert_eq!(confinement_refusal(&vendored, &relaid, "six"), None);
+
+        // A uv script lock: the unit, the manifest requirement, the
+        // override, and the `[manifest]` table that held nothing else.
+        let script_lock = "version = 1\n\n[manifest]\nrequirements = [{ name = \"six\", path = \".socket/vendor/pypi/u/six.whl\" }]\noverrides = [{ name = \"six\", path = \".socket/vendor/pypi/u/six.whl\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { path = \".socket/vendor/pypi/u/six.whl\" }\n\n[package.metadata]\nrequires-dist = [{ name = \"idna\" }]\n";
+        let restored = "version = 1\n\n[manifest]\nrequirements = [{ name = \"six\", specifier = \"==1.16.0\" }]\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\n";
+        assert_eq!(confinement_refusal(script_lock, restored, "six"), None);
+
+        // Poetry's and PDM's older locks key the package's files by name.
+        for (table, key) in [
+            ("files", "six"),
+            ("hashes", "six"),
+            ("files", "\"six 1.16.0\""),
+        ] {
+            let wired = format!("[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[package.source]\ntype = \"file\"\n\n[metadata]\ncontent-hash = \"h\"\n\n[metadata.{table}]\nidna = []\n{key} = [{{ file = \"six.whl\", hash = \"sha256:cc\" }}]\n");
+            let restored = format!("[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n\n[metadata]\ncontent-hash = \"h\"\n\n[metadata.{table}]\nidna = []\n{key} = [{{ file = \"six.whl\", hash = \"sha256:bb\" }}]\n");
+            assert_eq!(
+                confinement_refusal(&wired, &restored, "six"),
+                None,
+                "{table}"
+            );
+            let poisoned = restored.replace(
+                "idna = []",
+                "idna = [{ file = \"idna.whl\", hash = \"sha256:ee\" }]",
+            );
+            assert!(
+                confinement_refusal(&wired, &poisoned, "six").is_some(),
+                "{table}"
+            );
+        }
+    }
+
+    /// ...and what it may not: another package, a setting, or anything in a
+    /// file it cannot read as TOML.
+    #[test]
+    fn confinement_refuses_changes_beyond_the_package() {
+        let live = "lock-version = \"1.0\"\n\n[[packages]]\nname = \"idna\"\nversion = \"3.7\"\nwheels = [{ url = \"https://files.example/idna.whl\" }]\n\n[[packages]]\nname = \"six\"\nversion = \"1.16.0\"\narchive = { path = \".socket/vendor/pypi/u/six.whl\" }\n";
+        for (what, after) in [
+            (
+                "another package's artifact",
+                live.replace("files.example/idna.whl", "evil.example/idna.whl"),
+            ),
+            (
+                "a package added",
+                format!("{live}\n[[packages]]\nname = \"evil\"\nversion = \"6.6.6\"\n"),
+            ),
+            (
+                "a package dropped",
+                live.replace(
+                    "[[packages]]\nname = \"idna\"\nversion = \"3.7\"\nwheels = [{ url = \"https://files.example/idna.whl\" }]\n\n",
+                    "",
+                ),
+            ),
+            ("a setting", live.replace("lock-version = \"1.0\"", "lock-version = \"9.9\"")),
+            ("not TOML", "import os\nos.system('x')\n".to_string()),
+        ] {
+            let refusal = confinement_refusal(live, &after, "six");
+            assert!(refusal.is_some(), "{what}");
+        }
+        assert!(
+            confinement_refusal("not = [toml", live, "six").is_some(),
+            "a live file that is not TOML cannot be judged"
+        );
+        // The package's name as a key means something only where a
+        // vendoring keys by it.
+        let named = "[tool.six]\nrun = \"a\"\n\n[tool.uv.sources]\nsix = { path = \"w.whl\" }\n";
+        assert!(confinement_refusal(named, "[tool.six]\nrun = \"b\"\n", "six").is_some());
+        assert_eq!(
+            confinement_refusal(named, "[tool.six]\nrun = \"a\"\n", "six"),
+            None
+        );
+    }
+
+    /// A project file: the package's source, its override and requirement
+    /// strings, the Hatch permission, and the tables those leave empty —
+    /// never the build system or a script.
+    #[test]
+    fn confinement_covers_project_files() {
+        let wired = "[project]\nname = \"app\"\ndependencies = [\"idna==3.7\", \"six @ {root:uri}/.socket/vendor/pypi/u/six.whl\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n\n[tool.hatch.metadata]\nallow-direct-references = true\n\n[tool.uv]\noverride-dependencies = [\"six==1.16.0\"]\n\n[tool.uv.sources]\nsix = { path = \".socket/vendor/pypi/u/six.whl\" }\n";
+        let restored = "[project]\nname = \"app\"\ndependencies = [\"idna==3.7\", \"six==1.16.0\"]\n\n[build-system]\nrequires = [\"hatchling\"]\nbuild-backend = \"hatchling.build\"\n";
+        assert_eq!(confinement_refusal(wired, restored, "six"), None);
+        for after in [
+            restored.replace("hatchling.build", "evil_backend"),
+            restored.replace("idna==3.7", "idna @ https://evil.example/idna.whl"),
+            format!("{restored}\n[project.scripts]\nrun = \"evil:main\"\n"),
+            format!("{restored}\n[tool.uv]\nindex-url = \"https://evil.example/simple\"\n"),
+        ] {
+            assert!(
+                confinement_refusal(wired, &after, "six").is_some(),
+                "{after}"
+            );
+        }
+    }
+
+    /// A script: only its PEP 723 block, and in it only the package.
+    #[test]
+    fn script_confinement_keeps_the_code_and_the_other_dependencies() {
+        let wired = "#!/usr/bin/env python3\n# /// script\n# dependencies = [\"six==1.16.0\", \"idna\"]\n#\n# [tool.uv.sources]\n# six = { path = \".socket/vendor/pypi/u/six.whl\" }\n# ///\nimport six\n";
+        let restored = "#!/usr/bin/env python3\n# /// script\n# dependencies = [\"six==1.16.0\", \"idna\"]\n# ///\nimport six\n";
+        assert_eq!(script_confinement_refusal(wired, restored, "six"), None);
+        for after in [
+            restored.replace("import six\n", "import os; os.system('x')\n"),
+            restored.replace("#!/usr/bin/env python3\n", "#!/bin/sh\n"),
+            restored.replace("\"idna\"", "\"idna\", \"evil\""),
+            "import os\n".to_string(),
+        ] {
+            assert!(
+                script_confinement_refusal(wired, &after, "six").is_some(),
+                "{after}"
+            );
+        }
     }
 }

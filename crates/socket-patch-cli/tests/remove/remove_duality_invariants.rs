@@ -887,10 +887,11 @@ fn hosted_only_refused_restore_remove_without_manifest_fails_closed() {
 const DK_PURL: &str = "pkg:npm/__remove_dual_test__@1.0.0";
 const DK_UUID: &str = "33333333-3333-4333-8333-333333333333";
 
-/// A wiring record naming a file the npm revert backend does not edit: the
+/// A wiring record the npm revert backend leaves alone (a kind this build
+/// does not know, in a file it does not edit): the
 /// revert drift-keeps (`kept_artifact`) — fixture copied from
 /// cli_remove_silent.rs (do not edit that file).
-const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
+const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }]"#;
 
 /// When EVERY matching entry's vendored revert drift-keeps, the remove did
 /// not happen: exit 1, `status: partialFailure`, top-level

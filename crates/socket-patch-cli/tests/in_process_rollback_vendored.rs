@@ -468,10 +468,10 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
     );
     std::fs::write(socket.join("manifest.json"), &original_manifest).unwrap();
 
-    // Vendor ledger entry wired with a fragment the lock does not contain —
-    // cli_remove_silent.rs's DRIFTED_WIRING shape (the npm revert backend
-    // classifies the vanished `node_modules/x` entry as third-party drift
-    // and keeps the artifact + wiring untouched).
+    // Vendor ledger entry wired with a record the npm revert backend leaves
+    // alone — cli_remove_silent.rs's DRIFTED_WIRING shape (a kind this
+    // build does not know, in a file it does not edit: drift, so the
+    // artifact + wiring stay untouched).
     let artifact_dir = socket.join("vendor/npm").join(DRIFT_UUID);
     std::fs::create_dir_all(&artifact_dir).unwrap();
     std::fs::write(artifact_dir.join("package.tgz"), b"tgz").unwrap();
@@ -484,7 +484,7 @@ async fn drift_keep_exits_partial_failure_and_holds_manifest() {
       "basePurl": "{DRIFT_PURL}",
       "uuid": "{DRIFT_UUID}",
       "artifact": {{ "path": ".socket/vendor/npm/{DRIFT_UUID}/package.tgz" }},
-      "wiring": [{{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }}]
+      "wiring": [{{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }}]
     }}
   }}
 }}"#

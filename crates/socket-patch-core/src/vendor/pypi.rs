@@ -2718,6 +2718,14 @@ async fn superseded_entry(
     if hits.next().is_some() {
         return None;
     }
+    // Its revert is about to be replayed: the committed ledger's records
+    // are held to the files a PyPI backend edits, as for `vendor --revert`.
+    if super::state::wiring_refusal(&prev, project_root)
+        .await
+        .is_some()
+    {
+        return None;
+    }
     let files = superseded_files(&prev, flavor)?;
     // Lifts a refusal, so case is folded only where the disk folds it.
     let needle =

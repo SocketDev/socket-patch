@@ -107,6 +107,13 @@ file the CLI reports. The ledger stores patch records, artifact fingerprints, an
 reversal information. A checkout can install the committed patched packages without
 Socket API access or a Socket Patch binary.
 
+The ledger holds no credentials: a `nuget.config` is recorded without its
+`<packageSourceCredentials>`, API keys, passwords and URL user info. Because the
+ledger is committed, a revert (`vendor --revert`, `remove`, `rollback`, `scan --prune`)
+treats it as untrusted: it only undoes the edits vendoring makes, in the files
+vendoring edits, and fails a package whose ledger entry describes anything else
+without writing to it. Restore the ledger from version control if that happens.
+
 This does not vendor unpatched dependencies. Provision those through your normal
 mirror or package-manager cache, and test a clean offline install before relying
 on an airgapped build. Integrity enforcement and cache behavior differ by package

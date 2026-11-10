@@ -71,7 +71,7 @@ const SNAPSHOT_REF: &str = "snapshot";
 const OPS: &str = "ops";
 
 /// The wiring records of a serialized ledger, mutably.
-fn records_mut(ledger: &mut Value) -> impl Iterator<Item = &mut Map<String, Value>> {
+pub(crate) fn records_mut(ledger: &mut Value) -> impl Iterator<Item = &mut Map<String, Value>> {
     ledger
         .get_mut("entries")
         .and_then(Value::as_object_mut)
