@@ -784,6 +784,26 @@ when every dependency is optional (0.0.0-30 … 1.0.4 install none from the lock
 optional dependency (a plain `vlt install` keeps the link to the removed vendored
 directory) or a link still into the vendored directory.
 
+`vendor --revert` undoes every recorded surface or none, and removes the directory only
+when nothing the project installs from still names it. A lock edge the ledger never
+recorded that still reaches the vendored node, such as the edge of a workspace that was
+pointed at the vendored copy after vendoring, leaves the whole revert alone as drift
+(`vendor_lock_entry_drifted` names the edge and its `package.json`): undoing the node
+under it would leave that edge dangling. Anything else that still names the uuid
+directory (an importer `package.json` with no lock edge behind it yet) keeps the directory
+and the ledger entry (`vendor_revert_residual_reference` names it) with the recorded
+wiring restored.
+`vendor --revert --dry-run` replays the same records without writing, so it reports the
+same keeps, failures and reinstall advice as the real run.
+
+A workspace directory that is a symbolic link is never written through: vendoring refuses
+the package (`vendor_lock_entry_unsupported`) before anything is staged, and a revert
+leaves a record for its `package.json` alone as drift. The `nodes` and `edges` sections are
+edited line by line, so a lock is taken as canonical only when the lines found for them
+are the top-level members themselves; one with a same-named member nested elsewhere at
+that indent is refused (`vendor_lockfile_version_unsupported`) by vendoring and revert
+alike.
+
 **Workspace members.** vlt installs a workspace member from the root's `vlt-lock.json`
 and ignores any lock in the member, so a hosted or vendored run from a member is refused
 (`redirect_workspace_lockfile_elsewhere`, `vendor_lockfile_missing`) and names the root
