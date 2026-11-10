@@ -1067,6 +1067,12 @@ pub(crate) async fn abort_package(write: PackageWrite) {
     crate::utils::fs::run_blocking(move || drop(write)).await
 }
 
+/// [`PackageWrite::undo`], then close the write: the package is back as it
+/// was, except for the files returned (`<file>: <why>`).
+pub(crate) async fn undo_package(mut write: PackageWrite) -> Vec<String> {
+    crate::utils::fs::run_blocking(move || write.undo()).await
+}
+
 /// Close a committed write, making it final. Returns warnings (see
 /// [`PackageWrite::close`]).
 pub(crate) async fn finish_package(mut write: PackageWrite) -> Vec<String> {
@@ -1613,11 +1619,19 @@ async fn apply_package_patch_at(
         .files_verified
         .iter()
         .all(|v| v.status == VerifyStatus::AlreadyPatched);
+    // ... or either already patched or not found (force mode skip).
+    let all_done_or_skipped = result
+        .files_verified
+        .iter()
+        .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
 
-    // Maven: retry a Coursier sidecar resync an earlier apply could not
-    // finish (see `sidecars::coursier::retry_record`) when this run writes
-    // nothing: every file already patched, or (`--force`) skipped.
-    let coursier_retry = |result: &mut ApplyResult| {
+    if all_done_or_skipped {
+        // This run writes nothing, so it never reaches the sidecar fixup
+        // below. The sidecars of the files an earlier run patched are
+        // still brought in line with them: that run may have died after
+        // its last rename, and then cargo refuses the crate while every
+        // file reads as patched. A sidecar that cannot be fixed fails the
+        // package: its files are patched, but it is not usable as patched.
         if !dry_run {
             let keys: Vec<String> = result
                 .files_verified
@@ -1625,43 +1639,37 @@ async fn apply_package_patch_at(
                 .filter(|v| v.status == VerifyStatus::AlreadyPatched)
                 .map(|v| v.file.clone())
                 .collect();
-            let failed = "sidecar fixup failed (patch still applied)";
-            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+            result.sidecar = crate::patch::sidecars::recheck(
                 package_key,
                 pkg_path,
                 &keys,
-                failed,
+                false,
+                "sidecar fixup failed (the files are already patched)",
+            )
+            .await;
+            if let Some(why) = result.sidecar.as_ref().and_then(|s| s.fixup_failure()) {
+                result.error = Some(why.to_string());
+                return result;
+            }
+        }
+        result.success = true;
+        let mut notes = bytecode_warnings;
+        if !all_already_patched {
+            // Some or all files were not found but skipped via --force
+            let not_found_count = result
+                .files_verified
+                .iter()
+                .filter(|v| v.status == VerifyStatus::NotFound)
+                .count();
+            notes.insert(
+                0,
+                format!(
+                    "All patch files were skipped: {} not found on disk (--force)",
+                    not_found_count
+                ),
             );
         }
-    };
-
-    if all_already_patched {
-        coursier_retry(&mut result);
-        result.success = true;
-        result.error = join_notes(bytecode_warnings);
-        return result;
-    }
-
-    // Check if all files are either already patched or not found (force mode skip)
-    let all_done_or_skipped = result
-        .files_verified
-        .iter()
-        .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
-
-    if all_done_or_skipped {
-        // Some or all files were not found but skipped via --force
-        coursier_retry(&mut result);
-        let not_found_count = result
-            .files_verified
-            .iter()
-            .filter(|v| v.status == VerifyStatus::NotFound)
-            .count();
-        result.success = true;
-        let skipped = format!(
-            "All patch files were skipped: {} not found on disk (--force)",
-            not_found_count
-        );
-        result.error = join_notes([skipped].into_iter().chain(bytecode_warnings).collect());
+        result.error = join_notes(notes);
         return result;
     }
 
@@ -1819,6 +1827,59 @@ async fn apply_package_patch_at(
             return result;
         }
     };
+    // Ecosystem sidecar fixup, before the write is closed. A sidecar that
+    // cannot be brought in line fails the package, and the files just
+    // written are put back: patched files under a sidecar that describes
+    // other bytes are neither state (cargo refuses to build such a crate).
+    // The failure also rides a `SidecarRecord` carrying
+    // `SidecarAdvisoryCode::SidecarFixupFailed`, so consumers see one
+    // shape whether the fixup succeeded, was advisory-only, or failed.
+    {
+        use crate::patch::sidecars::{
+            dispatch_fixup_with, dispatch_rollback_fixup, fixup_failed_record, maven,
+        };
+        // Include files verified `AlreadyPatched` alongside the ones
+        // written this run: a previous apply that stopped partway left
+        // them patched on disk but never reached this boundary, so their
+        // sidecar entries (e.g. `.cargo-checksum.json` hashes) are still
+        // pre-patch. They exist at their after-hash, so rehashing changes
+        // nothing in the common already-synced case.
+        let fixup_files: Vec<String> = written
+            .iter()
+            .map(|file| (*file).clone())
+            .chain(
+                result
+                    .files_verified
+                    .iter()
+                    .filter(|v| v.status == VerifyStatus::AlreadyPatched)
+                    .map(|v| v.file.clone()),
+            )
+            .collect();
+        match dispatch_fixup_with(package_key, pkg_path, &fixup_files, maven_pre.as_ref()).await {
+            Ok(record) => result.sidecar = record,
+            Err(e) => {
+                let not_restored = undo_package(write).await;
+                // Whatever the failed fixup had already rewritten is put
+                // back in line with the restored files. Best-effort.
+                let _ = dispatch_rollback_fixup(package_key, pkg_path, &fixup_files).await;
+                if let Some(pre) = &maven_pre {
+                    let _ = maven::resync(pkg_path, pre).await;
+                }
+                let message = if not_restored.is_empty() {
+                    format!("sidecar fixup failed (the patched files were put back): {e}")
+                } else {
+                    format!(
+                        "sidecar fixup failed: {e}{}",
+                        not_restored_note(&not_restored)
+                    )
+                };
+                result.error = Some(format!("Cannot apply patch: {message}"));
+                result.sidecar = Some(fixup_failed_record(package_key, message));
+                return result;
+            }
+        }
+    }
+
     for file_name in written {
         // A rewritten `.py` file can't be trusted to invalidate its
         // bytecode (#819): drop it so the next import compiles the new
@@ -1831,46 +1892,6 @@ async fn apply_package_patch_at(
             .insert(file_name.clone(), AppliedVia::Blob);
     }
     warnings.extend(finish_package(write).await);
-
-    // Ecosystem sidecar fixup. Best-effort: a failing sidecar does
-    // NOT undo the patch (the bytes were committed atomically via
-    // stage+rename; nothing to roll back). The error path is
-    // converted at this boundary into a `SidecarRecord` carrying
-    // `SidecarAdvisoryCode::SidecarFixupFailed` so downstream
-    // consumers see a uniform shape regardless of whether the
-    // fixup succeeded, was advisory-only, or raised an error.
-    if !result.files_patched.is_empty() {
-        use crate::patch::sidecars::{dispatch_fixup_with, fixup_failed_record};
-        // Include files verified `AlreadyPatched` alongside the ones
-        // written this run: a previous apply that failed partway left
-        // them patched on disk but returned before this boundary, so
-        // their sidecar entries (e.g. `.cargo-checksum.json` hashes)
-        // are still pre-patch — and this retry is the only chance to
-        // resync them. They exist at their after-hash, so rehashing is
-        // a no-op rewrite in the common already-synced case.
-        let fixup_files: Vec<String> = result
-            .files_patched
-            .iter()
-            .cloned()
-            .chain(
-                result
-                    .files_verified
-                    .iter()
-                    .filter(|v| v.status == VerifyStatus::AlreadyPatched)
-                    .map(|v| v.file.clone()),
-            )
-            .collect();
-        match dispatch_fixup_with(package_key, pkg_path, &fixup_files, maven_pre.as_ref()).await {
-            Ok(Some(record)) => result.sidecar = Some(record),
-            Ok(None) => {}
-            Err(e) => {
-                result.sidecar = Some(fixup_failed_record(
-                    package_key,
-                    format!("sidecar fixup failed (patch still applied): {}", e),
-                ));
-            }
-        }
-    }
 
     result.error = join_notes(warnings);
     result.success = true;
@@ -2605,6 +2626,133 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 1);
         assert!(result.error.is_none());
+    }
+
+    /// A vendored crate with `lib.rs` (original bytes) and a
+    /// `.cargo-checksum.json` holding `checksum`; returns the package dir,
+    /// the blobs dir and the patch's files.
+    async fn cargo_fixture(
+        checksum: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        HashMap<String, PatchFileInfo>,
+    ) {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let (original, patched) = (b"original content", b"patched content");
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(pkg_dir.path().join("lib.rs"), original)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg_dir.path().join(".cargo-checksum.json"), checksum)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "lib.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(original),
+                after_hash,
+            },
+        )]);
+        (pkg_dir, blobs_dir, files)
+    }
+
+    async fn apply_cargo(
+        pkg: &Path,
+        blobs: &Path,
+        files: &HashMap<String, PatchFileInfo>,
+    ) -> ApplyResult {
+        apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            files,
+            &PatchSources::blobs_only(blobs),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await
+    }
+
+    /// The `files` entry `.cargo-checksum.json` lists for `lib.rs`.
+    fn listed_checksum(pkg: &Path) -> String {
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(pkg.join(".cargo-checksum.json")).unwrap())
+                .unwrap();
+        json["files"]["lib.rs"].as_str().unwrap().to_string()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        crate::utils::digest::sha256_hex_of(bytes)
+    }
+
+    /// A sidecar that cannot be brought in line fails the package and the
+    /// file just written is put back: patched sources under a checksum
+    /// file that does not describe them are a crate cargo refuses to
+    /// build, and the run used to report it applied.
+    #[tokio::test]
+    async fn test_apply_sidecar_failure_fails_the_package_and_puts_files_back() {
+        let (pkg_dir, blobs_dir, files) = cargo_fixture("not json").await;
+        let pkg = pkg_dir.path();
+
+        let result = apply_cargo(pkg, blobs_dir.path(), &files).await;
+
+        assert!(!result.success, "a failed sidecar fixup fails the package");
+        assert!(result.files_patched.is_empty());
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("sidecar fixup failed") && error.contains(".cargo-checksum.json"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(pkg.join("lib.rs")).unwrap(),
+            b"original content"
+        );
+        assert_eq!(names_in(pkg), [".cargo-checksum.json", "lib.rs"]);
+        assert!(result.sidecar.is_some_and(|s| s.fixup_failure().is_some()));
+    }
+
+    /// A package whose files are all already patched still has its
+    /// sidecar brought in line (a run that died after its last rename
+    /// never ran the fixup), reports the repair, and reports nothing once
+    /// the sidecar agrees; a sidecar that cannot be fixed fails it.
+    #[tokio::test]
+    async fn test_apply_rechecks_the_sidecar_of_an_already_patched_package() {
+        let stale = format!(
+            r#"{{"files":{{"lib.rs":"{}"}},"package":"x"}}"#,
+            sha256_hex(b"original content")
+        );
+        let (pkg_dir, blobs_dir, files) = cargo_fixture(&stale).await;
+        let pkg = pkg_dir.path();
+        // What the interrupted run left: the patched file, the old checksum.
+        std::fs::write(pkg.join("lib.rs"), b"patched content").unwrap();
+
+        let result = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_patched.is_empty());
+        assert_eq!(listed_checksum(pkg), sha256_hex(b"patched content"));
+        let record = result.sidecar.expect("the repair is reported");
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+        assert!(record.advisory.is_none());
+
+        let again = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(again.success);
+        assert!(again.sidecar.is_none(), "nothing left to repair");
+
+        std::fs::write(pkg.join(".cargo-checksum.json"), b"not json").unwrap();
+        let broken = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(!broken.success, "an unfixable sidecar fails the package");
+        assert!(broken
+            .error
+            .is_some_and(|e| e.contains("sidecar fixup failed")));
+        assert_eq!(
+            std::fs::read(pkg.join("lib.rs")).unwrap(),
+            b"patched content"
+        );
     }
 
     #[tokio::test]

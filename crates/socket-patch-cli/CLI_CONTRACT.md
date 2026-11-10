@@ -682,7 +682,9 @@ are patched by `socket-patch apply` like every other ecosystem:
   every `.cargo/config*` cargo reads (the working directory and each ancestor, then `$CARGO_HOME`'s),
   wherever it points (#338). A `vendor/` no config wires is not crawled, and a configured directory
   that is missing yields nothing rather than the registry copy cargo ignores. The
-  `.cargo-checksum.json` sidecar is rewritten so `cargo build` accepts the modified files. Rollback
+  `.cargo-checksum.json` sidecar is rewritten so `cargo build` accepts the modified files; when it
+  cannot be (unreadable, not the JSON cargo writes) the crate is left unpatched and the patch fails
+  (see "`sidecars[]` and failure"). Rollback
   restores the original bytes from the `beforeHash` blobs. *(Note: a non-vendored crate patches the
   **shared** registry cache, which affects other projects on the machine and is reset by `cargo clean`
   / a cache prune. Vendor the dependency for a project-local, committable patch. After apply or
@@ -825,8 +827,9 @@ that existed are rewritten to the new bytes (digest first, then checksum; each s
 interruption leaves a stale checksum). md5 stays deleted (not restored by rollback); `.checked` is left
 alone. The envelope's `sidecars[]` carries one `maven` record listing those files (`rewritten` / `deleted`,
 paths relative to the package directory); a resync that fails is the usual `sidecar_fixup_failed` record
-with the patch still applied, and the next `apply` / `rollback` (every file already at its target) retries
-it when the sidecars show the resync unfinished (a sha checksum or digest disagreeing with the bytes, or md5
+and fails the copy, its file put back (see "`sidecars[]` and failure" below). When a run was interrupted
+between writing the file and the resync, the next `apply` / `rollback` (every file already at its target)
+makes it when the sidecars show the resync unfinished (a sha checksum or digest disagreeing with the bytes, or md5
 left without a matching sha1); a copy Coursier left consistent, such as a pristine one a rollback finds
 already original, is not touched and gets no record. `~/.m2` and Ivy copies produce no record. No new codes. A running sbt server, Bloop or Metals may hold
 the old classpath: restart it after an agent apply.
@@ -1599,6 +1602,8 @@ command's integration tests check its output.
 **`details.mode`.** An event about a vendored-mode or hosted-mode patch carries `details.mode: "vendored" | "hosted"` (`list`; v5.0 also `remove`'s vendored/hosted legs and `repair`'s vendored phase); an agent-mode (manifest) event carries none. `repair`'s download carrier names its artifact kind `details.downloadMode` (`"diff"` / `"file"`; v5.0, MAJOR: was `details.mode`).
 
 **`sidecars[]` value tags (v5.0).** `files[].action` (`rewritten` / `deleted`) and `advisory.severity` (`info` / `warning` / `error`) follow the envelope's camelCase enum convention; `advisory.code` is a routing tag and stays snake_case (`pypi_record_stale`, `sidecar_fixup_failed`, …).
+
+**`sidecars[]` and failure.** A sidecar that cannot be brought in line with the files (`sidecar_fixup_failed`, severity `error`: cargo's `.cargo-checksum.json`, NuGet's `.nupkg.metadata`, the Maven / Coursier checksum files) fails its package: the event is `failed` (`apply_failed` / `rollback_failed`, its `error` starting `sidecar fixup failed` / `sidecar resync failed`), the run is `partialFailure` and exits 1, and the files the run had written are put back, so an apply leaves the package unpatched and a rollback leaves it patched (the manifest record is kept). Patched sources under a checksum file that describes other bytes are a crate cargo refuses to build, so the package is never left that way. A run that finds every file already at its target writes none, but still checks those sidecars and repairs them (a run killed after its last rename never reached them): the repair is a `sidecars[]` record beside the `skipped` / `already_patched` event, an in-sync sidecar is not rewritten and gets no record, and one that cannot be repaired fails the package with the files left as they are (`sidecar fixup failed (the files are already patched)`). The `~/.m2` `.sha1` / `.md5` files are not part of that re-check (only the bytes they described before the write tell whether they are the CLI's to rewrite). Without `--json`, `apply` prints each distinct `info` / `warning` advisory once on stderr (`Note: <message>` / `Warning: <message>`, muted by `--silent`); an `error` one is its package's `Failed to patch` line.
 
 ### `PatchEvent` shape
 

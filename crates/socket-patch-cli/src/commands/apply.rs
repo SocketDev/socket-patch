@@ -1615,6 +1615,44 @@ pub(crate) async fn run_locked(
                 for skip in &fallback_skips {
                     eprintln!("Warning: {}", skip.detail());
                 }
+                // A package's sidecar advisory (the PyPI `RECORD`, a gem
+                // `--redownload`, `go mod verify`, a signed NuGet package,
+                // a Gradle cache copy) is `sidecars[]` under `--json`; a
+                // person reads it here, each distinct one once. An
+                // error-severity record is its package's failure and is
+                // printed with it.
+                let mut advised = HashSet::new();
+                for result in &results {
+                    use socket_patch_core::patch::sidecars::SidecarSeverity;
+                    let Some(record) = &result.sidecar else {
+                        continue;
+                    };
+                    let gradle = record
+                        .advisory
+                        .as_ref()
+                        .is_some_and(|a| a.code == SidecarAdvisoryCode::GradleRefreshReverts);
+                    let extra = if gradle {
+                        maven_sidecars::gradle_extra_records(
+                            &result.package_key,
+                            Path::new(&result.package_path),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    for advisory in std::iter::once(record)
+                        .chain(&extra)
+                        .filter_map(|r| r.advisory.as_ref())
+                    {
+                        let label = match advisory.severity {
+                            SidecarSeverity::Info => "Note",
+                            SidecarSeverity::Warning => "Warning",
+                            SidecarSeverity::Error => continue,
+                        };
+                        if advised.insert(advisory.message.clone()) {
+                            eprintln!("{label}: {}", advisory.message);
+                        }
+                    }
+                }
             }
 
             // Human per-package report BEFORE the embedded VEX runs, so

@@ -691,21 +691,29 @@ async fn rollback_package_patch_at(
         .await;
     }
     if all_original || dry_run {
-        // Maven: retry a Coursier sidecar resync an earlier rollback could
-        // not finish (see `sidecars::coursier::retry_record`).
+        // This run restores nothing, so it never reaches the sidecar
+        // resync below; an earlier rollback that died after its last
+        // rename left the sidecars describing the patched bytes (apply's
+        // twin, see `sidecars::recheck`). A sidecar that cannot be resynced
+        // fails the package, which keeps its record for the next run.
         if !dry_run {
             let keys: Vec<String> = result
                 .files_verified
                 .iter()
                 .map(|v| v.file.clone())
                 .collect();
-            let failed = "sidecar resync failed (files still rolled back)";
-            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+            result.sidecar = crate::patch::sidecars::recheck(
                 package_key,
                 pkg_path,
                 &keys,
-                failed,
-            );
+                true,
+                "sidecar resync failed (the files are already restored)",
+            )
+            .await;
+            if let Some(why) = result.sidecar.as_ref().and_then(|s| s.fixup_failure()) {
+                result.error = Some(why.to_string());
+                return result;
+            }
         }
         result.success = true;
         return result;
@@ -863,6 +871,60 @@ async fn rollback_package_patch_at(
             return result;
         }
     };
+    // Ecosystem sidecar resync — the rollback-side twin of apply's
+    // `dispatch_fixup` boundary, and like it made before the write is
+    // closed. Apply rewrote integrity sidecars to the patched hashes; with
+    // the original bytes now restored those hashes are stale in the other
+    // direction (cargo refuses to build a vendored crate whose
+    // `.cargo-checksum.json` disagrees with its sources). A resync that
+    // fails fails the package and the restored files are put back, so the
+    // package stays what its record says: patched. It also rides an
+    // `Error`-severity `sidecar_fixup_failed` record.
+    {
+        use crate::patch::sidecars::{
+            dispatch_fixup_with, dispatch_rollback_fixup, fixup_failed_record,
+        };
+        // Include files verified `AlreadyOriginal` alongside the ones
+        // restored this run: a previous rollback that stopped partway
+        // restored them but never reached this boundary, so their sidecar
+        // entries still carry the PATCHED hashes apply's fixup wrote. They
+        // exist at their before-hash (or, for patch-added files, are
+        // already deleted, which the resync handles by dropping the
+        // entry), so the rehash changes nothing in the common
+        // already-synced case.
+        let resync_files: Vec<String> = changed
+            .iter()
+            .map(|(file, _)| (*file).clone())
+            .chain(
+                result
+                    .files_verified
+                    .iter()
+                    .filter(|v| v.status == VerifyRollbackStatus::AlreadyOriginal)
+                    .map(|v| v.file.clone()),
+            )
+            .collect();
+        match dispatch_rollback_fixup(package_key, pkg_path, &resync_files).await {
+            Ok(record) => result.sidecar = record,
+            Err(e) => {
+                let not_restored = crate::patch::apply::undo_package(write).await;
+                // Whatever the failed resync had already rewritten is put
+                // back in line with the patched files. Best-effort.
+                let _ = dispatch_fixup_with(package_key, pkg_path, &resync_files, None).await;
+                let message = if not_restored.is_empty() {
+                    format!("sidecar resync failed (the restored files were put back): {e}")
+                } else {
+                    format!(
+                        "sidecar resync failed: {e}{}",
+                        crate::patch::apply::not_restored_note(&not_restored)
+                    )
+                };
+                result.error = Some(message.clone());
+                result.sidecar = Some(fixup_failed_record(package_key, message));
+                return result;
+            }
+        }
+    }
+
     warnings.extend(finish_package(write).await);
     for (file_name, deleted) in changed {
         let filepath = pkg_path.join(normalize_file_path(file_name));
@@ -880,49 +942,6 @@ async fn rollback_package_patch_at(
             prune_emptied_parents(pkg_path, &filepath).await;
         }
         result.files_rolled_back.push(file_name.clone());
-    }
-
-    // Ecosystem sidecar resync — the rollback-side twin of apply's
-    // `dispatch_fixup` boundary. Apply rewrote integrity sidecars to the
-    // patched hashes; with the original bytes now restored those hashes
-    // are stale in the other direction (cargo refuses to build a vendored
-    // crate whose `.cargo-checksum.json` disagrees with its sources).
-    // Best-effort, exactly like apply: a failing resync does NOT undo the
-    // rollback — the restored bytes are already committed — it surfaces
-    // as an `Error`-severity `sidecar_fixup_failed` advisory instead.
-    if !result.files_rolled_back.is_empty() {
-        use crate::patch::sidecars::{dispatch_rollback_fixup, fixup_failed_record};
-        // Include files verified `AlreadyOriginal` alongside the ones
-        // restored this run: a previous rollback that failed partway
-        // restored them but returned before this boundary, so their
-        // sidecar entries still carry the PATCHED hashes apply's fixup
-        // wrote — and this retry is the only chance to resync them.
-        // They exist at their before-hash (or, for patch-added files,
-        // are already deleted, which the resync handles by dropping the
-        // entry), so the rehash is a no-op rewrite in the common
-        // already-synced case.
-        let resync_files: Vec<String> = result
-            .files_rolled_back
-            .iter()
-            .cloned()
-            .chain(
-                result
-                    .files_verified
-                    .iter()
-                    .filter(|v| v.status == VerifyRollbackStatus::AlreadyOriginal)
-                    .map(|v| v.file.clone()),
-            )
-            .collect();
-        match dispatch_rollback_fixup(package_key, pkg_path, &resync_files).await {
-            Ok(Some(record)) => result.sidecar = Some(record),
-            Ok(None) => {}
-            Err(e) => {
-                result.sidecar = Some(fixup_failed_record(
-                    package_key,
-                    format!("sidecar resync failed (files still rolled back): {}", e),
-                ));
-            }
-        }
     }
 
     if !warnings.is_empty() {
@@ -2303,12 +2322,82 @@ mod tests {
         assert!(sidecar.advisory.is_none());
     }
 
-    /// Best-effort boundary: a malformed `.cargo-checksum.json` must not
-    /// fail the rollback (the bytes are already restored) — it surfaces
-    /// as an `Error`-severity `sidecar_fixup_failed` advisory, mirroring
-    /// apply's boundary in `apply_package_patch`.
+    /// A rollback that died after its last rename left every file original
+    /// under a `.cargo-checksum.json` that still lists the patched hashes
+    /// (and an entry for the patch-added file it deleted). The next
+    /// rollback restores nothing and must still resync the checksum file;
+    /// once it agrees, nothing is rewritten or reported.
     #[tokio::test]
-    async fn test_rollback_package_patch_cargo_sidecar_failure_is_best_effort() {
+    async fn test_rollback_rechecks_the_sidecar_of_an_already_original_package() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+        let (original, patched, added) = (b"original content", b"patched content", b"added");
+        let sha256_hex = |bytes: &[u8]| crate::utils::digest::sha256_hex_of(bytes);
+        tokio::fs::write(pkg.join("lib.rs"), original)
+            .await
+            .unwrap();
+        let checksum_path = pkg.join(".cargo-checksum.json");
+        let stale = serde_json::json!({
+            "files": { "lib.rs": sha256_hex(patched), "new.rs": sha256_hex(added) },
+            "package": "x",
+        });
+        tokio::fs::write(&checksum_path, stale.to_string())
+            .await
+            .unwrap();
+        let files = HashMap::from([
+            (
+                "lib.rs".to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(original),
+                    after_hash: compute_git_sha256_from_bytes(patched),
+                },
+            ),
+            (
+                "new.rs".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: compute_git_sha256_from_bytes(added),
+                },
+            ),
+        ]);
+        let rollback = || {
+            rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:cargo/demo@1.0.0",
+                pkg,
+                &files,
+                blobs_dir.path(),
+                false,
+            )
+        };
+
+        let result = rollback().await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_rolled_back.is_empty());
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum_path).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            post["files"],
+            serde_json::json!({ "lib.rs": sha256_hex(original) })
+        );
+        let record = result.sidecar.expect("the repair is reported");
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+
+        let again = rollback().await;
+        assert!(again.success);
+        assert!(again.sidecar.is_none(), "nothing left to repair");
+    }
+
+    /// A malformed `.cargo-checksum.json` cannot be resynced, so the
+    /// rollback fails and the restored file is put back: the package stays
+    /// patched, as its record says, instead of original sources under a
+    /// checksum of the patched ones. The failure also rides an
+    /// `Error`-severity `sidecar_fixup_failed` record, mirroring apply's
+    /// boundary in `apply_package_patch`.
+    #[tokio::test]
+    async fn test_rollback_package_patch_cargo_sidecar_failure_keeps_the_package_patched() {
         use crate::patch::sidecars::{SidecarAdvisoryCode, SidecarSeverity};
 
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -2346,15 +2435,24 @@ mod tests {
         )
         .await;
 
+        assert!(!result.success, "a failed resync fails the rollback");
+        assert!(result.files_rolled_back.is_empty());
+        let error = result.error.expect("a failure names its cause");
         assert!(
-            result.success,
-            "sidecar resync failure must not fail the rollback"
+            error.contains("sidecar resync failed") && error.contains(".cargo-checksum.json"),
+            "{error}"
         );
         assert_eq!(
             tokio::fs::read(pkg.join("lib.rs")).await.unwrap(),
-            original,
-            "the file restore itself must have happened"
+            patched,
+            "the restored file must have been put back"
         );
+        let names: Vec<String> = std::fs::read_dir(pkg)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".socket-"))
+            .collect();
+        assert!(names.is_empty(), "no stage may be left: {names:?}");
         let sidecar = result
             .sidecar
             .expect("failure must surface as a sidecar record");
@@ -2363,6 +2461,25 @@ mod tests {
             .expect("failure record carries an advisory");
         assert_eq!(advisory.code, SidecarAdvisoryCode::SidecarFixupFailed);
         assert_eq!(advisory.severity, SidecarSeverity::Error);
+
+        // Every file already original and the checksum file still broken:
+        // nothing to restore, and the resync still cannot be made.
+        tokio::fs::write(pkg.join("lib.rs"), original)
+            .await
+            .unwrap();
+        let again = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+        assert!(!again.success);
+        assert!(again
+            .error
+            .is_some_and(|e| e.contains("sidecar resync failed")));
     }
 
     /// Retried partial rollback must not wedge cargo: a previous

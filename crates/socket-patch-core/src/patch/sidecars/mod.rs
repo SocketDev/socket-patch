@@ -194,6 +194,52 @@ pub async fn dispatch_fixup_with(
     }))
 }
 
+/// Bring the sidecars of a package in line with files that already hold
+/// their target bytes: `files` were all already patched (`rolled_back:
+/// false`) or already original (`true`) when this run looked, so it writes
+/// none of them and never reaches its fixup boundary. A run that was
+/// interrupted after its last rename, or whose fixup failed, leaves exactly
+/// that: cargo refusing to build a crate whose `.cargo-checksum.json` still
+/// describes the other bytes, a `.nupkg.metadata` apply meant to delete, a
+/// Coursier checksum that reverts the patch.
+///
+/// Reports only what it had to change: `None` when the sidecars already
+/// agree with the files (one read each), and for ecosystems whose
+/// "sidecar" is an advisory about a write that did not happen this run. A
+/// failure is the uniform `sidecar_fixup_failed` record, `failed` naming
+/// the direction.
+pub(crate) async fn recheck(
+    package_key: &str,
+    pkg_path: &Path,
+    files: &[String],
+    rolled_back: bool,
+    failed: &str,
+) -> Option<SidecarRecord> {
+    if files.is_empty() {
+        return None;
+    }
+    let ecosystem = Ecosystem::from_purl(package_key)?;
+    let payload = match ecosystem {
+        Ecosystem::Cargo if rolled_back => cargo::resync_after_rollback(pkg_path, files).await,
+        Ecosystem::Cargo => cargo::fixup(pkg_path, files).await,
+        // Rollback has nothing to put back: apply deleted the metadata.
+        Ecosystem::Nuget if !rolled_back => nuget::fixup(pkg_path)
+            .await
+            .map(|payload| payload.filter(|p| !p.files.is_empty())),
+        Ecosystem::Maven => return coursier::retry_record(package_key, pkg_path, files, failed),
+        _ => return None,
+    };
+    match payload {
+        Ok(payload) => payload.map(|p| SidecarRecord {
+            purl: package_key.to_string(),
+            ecosystem: ecosystem.cli_name().to_string(),
+            files: p.files,
+            advisory: p.advisory,
+        }),
+        Err(e) => Some(fixup_failed_record(package_key, format!("{failed}: {e}"))),
+    }
+}
+
 /// Both halves of a payload: the files of each, the first advisory.
 fn merge_payloads(a: Option<SidecarPayload>, b: Option<SidecarPayload>) -> Option<SidecarPayload> {
     match (a, b) {
@@ -261,6 +307,40 @@ mod tests {
             .await
             .unwrap();
         assert!(out.is_none());
+    }
+
+    /// A re-check of files this run did not write reports what it repaired
+    /// and nothing else: no advisory about a write that did not happen
+    /// (PyPI, a signed NuGet package), a NuGet `.nupkg.metadata` an
+    /// earlier run left behind deleted once, and nothing after a rollback
+    /// (apply's deletion is not undone).
+    #[tokio::test]
+    async fn recheck_reports_only_repairs() {
+        let files = ["package/lib/a.dll".to_string()];
+        let failed = "sidecar fixup failed";
+        let d = tempfile::tempdir().unwrap();
+        let pkg = d.path();
+        assert!(
+            recheck("pkg:pypi/requests@2.28.0", pkg, &files, false, failed)
+                .await
+                .is_none()
+        );
+
+        let nuget = "pkg:nuget/Newtonsoft.Json@13.0.3";
+        std::fs::write(pkg.join("newtonsoft.json.13.0.3.nupkg.sha512"), b"sig").unwrap();
+        assert!(
+            recheck(nuget, pkg, &files, false, failed).await.is_none(),
+            "the signed-package advisory alone is not a repair"
+        );
+        std::fs::write(pkg.join(nuget::METADATA_FILE), b"{}").unwrap();
+        assert!(recheck(nuget, pkg, &files, true, failed).await.is_none());
+        assert!(pkg.join(nuget::METADATA_FILE).exists());
+        let record = recheck(nuget, pkg, &files, false, failed)
+            .await
+            .expect("the deleted metadata is reported");
+        assert_eq!(record.files[0].action, SidecarFileAction::Deleted);
+        assert!(!pkg.join(nuget::METADATA_FILE).exists());
+        assert!(recheck(nuget, pkg, &files, false, failed).await.is_none());
     }
 
     #[tokio::test]
