@@ -668,6 +668,12 @@ pub fn acquire(socket_dir: &Path, timeout: Duration) -> Result<LockGuard, LockEr
                 guard.registration = interrupt::register(&guard);
                 // On failure the guard drops here, releasing the lock.
                 recover_group_commit(socket_dir)?;
+                // The lock proves no live run owns a staging entry left
+                // here: clear what an interrupted one could not.
+                crate::utils::socket_dir::sweep_stale_stage_entries(
+                    socket_dir,
+                    crate::utils::socket_dir::STALE_STAGE_AGE,
+                );
                 // Debug-only hook: the interrupt tests park the process
                 // here, lock held, and signal it.
                 crate::utils::failpoint::hit("apply_lock.acquired");

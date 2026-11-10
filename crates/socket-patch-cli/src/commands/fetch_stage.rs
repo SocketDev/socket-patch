@@ -1,8 +1,9 @@
 //! Patch-source staging for `apply`: where the patch pipeline reads
 //! per-file blobs from, downloading what's missing into a transient overlay
-//! tempdir. The persistent `.socket/blobs` cache is only ever read;
-//! downloads are discarded when the tempdir drops (filling the cache is
-//! `repair`'s job, keeping `apply` read-only against `.socket/`).
+//! (a `.socket-stage-apply-blobs-*` directory under `.socket/`). The
+//! persistent `.socket/blobs` cache is only ever read; downloads are
+//! discarded when the overlay drops (filling the cache is `repair`'s job,
+//! so `apply` leaves `.socket/` as it found it).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -190,8 +191,20 @@ pub(crate) async fn stage_patch_sources(
     }
 
     // The pipeline reads only from the overlay; dropping `StagedSources`
-    // removes it and any downloaded bytes.
-    let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
+    // removes it and any downloaded bytes. It sits under `.socket/`, beside
+    // the cache it mirrors: the same filesystem, so the mirror hardlinks
+    // instead of copying, and the place the next lock holder sweeps
+    // (`sweep_stale_stage_entries`) if this run is killed before that drop
+    // (nothing looks for a stage in the system temp dir). The system temp
+    // dir is only the fallback for a `.socket/` that cannot hold it.
+    let stage = tempfile::Builder::new()
+        .prefix(&format!(
+            "{}apply-blobs-",
+            socket_patch_core::utils::socket_dir::STAGE_PREFIX
+        ))
+        .tempdir_in(socket_dir)
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|e| e.to_string())?;
     let staged = StagedSources {
         blobs: stage.path().join("blobs"),
         _stage: Some(stage),

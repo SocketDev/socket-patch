@@ -3083,10 +3083,14 @@ pub(crate) async fn rollback_patches_inner(
     // already-cached before-blobs in, and let any download below land there
     // too. `tempdir_in(socket_dir)` keeps it on the same filesystem for
     // hardlinks and is auto-removed on drop, like the `.socket-stage-*`
-    // atomic-write siblings.
+    // atomic-write siblings; one a killed run leaves behind is swept by
+    // the next lock holder (`sweep_stale_stage_entries`).
     let _dry_run_blob_stage: Option<tempfile::TempDir> = if common.dry_run {
         let stage = tempfile::Builder::new()
-            .prefix(".socket-stage-dryrun-blobs-")
+            .prefix(&format!(
+                "{}dryrun-blobs-",
+                socket_patch_core::utils::socket_dir::STAGE_PREFIX
+            ))
             .tempdir_in(socket_dir)
             .map_err(|e| e.to_string())?;
         let staged_path = stage.path().to_path_buf();

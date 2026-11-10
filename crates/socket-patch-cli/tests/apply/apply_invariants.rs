@@ -4,8 +4,9 @@
 //! deploy hooks and CI pipelines:
 //!
 //! 1. `apply` is read-only against `.socket/`. Even when fetching missing
-//!    sources over the network, downloaded bytes go to an OS tempdir and
-//!    `.socket/` itself is byte-identical before and after the run.
+//!    sources over the network, downloaded bytes go to a transient stage
+//!    that the run removes, and `.socket/` itself is byte-identical before
+//!    and after the run.
 //! 2. `apply --offline` against a manifest with no usable local source
 //!    surfaces a `partial_failure` JSON envelope and exits non-zero —
 //!    the documented airgap behavior.

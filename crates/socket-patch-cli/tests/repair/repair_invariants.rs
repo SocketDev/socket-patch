@@ -275,6 +275,52 @@ fn repair_with_invalid_manifest_emits_manifest_invalid_envelope() {
     assert_eq!(v["events"].as_array().expect("events array").len(), 0);
 }
 
+/// A run killed by a signal never runs the destructor that removes its
+/// staging directory, so `rollback --dry-run`'s blob stage (and now
+/// `apply`'s download overlay, and a torn atomic write's stage file) stayed
+/// under `.socket/` for good: nothing looked for them. Every lock-taking
+/// command now sweeps the `.socket-stage-*` leftovers once it holds the
+/// lock. Only entries older than an hour go: a younger one could belong to
+/// a run on a filesystem whose locks do not exclude.
+#[cfg(unix)]
+#[test]
+fn lock_holders_sweep_stale_stage_leftovers() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = make_socket_dir(tmp.path());
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
+
+    let age = |path: &Path| {
+        let two_hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        std::fs::File::open(path)
+            .and_then(|f| f.set_modified(two_hours_ago))
+            .expect("backdate the entry");
+    };
+    let stale_dir = socket.join(".socket-stage-dryrun-blobs-AbC123");
+    std::fs::create_dir_all(&stale_dir).unwrap();
+    std::fs::write(stale_dir.join(REFERENCED_HASH), REFERENCED_BYTES).unwrap();
+    age(&stale_dir);
+    let stale_file = socket.join(".socket-stage-manifest.json-0000");
+    std::fs::write(&stale_file, b"{").unwrap();
+    age(&stale_file);
+    let fresh_dir = socket.join(".socket-stage-apply-blobs-XyZ789");
+    std::fs::create_dir_all(&fresh_dir).unwrap();
+    // Not a stage: never touched, however old.
+    let unrelated = socket.join("notes.txt");
+    std::fs::write(&unrelated, b"keep").unwrap();
+    age(&unrelated);
+
+    let (code, stdout) = run_repair(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout=\n{stdout}");
+    assert!(!stale_dir.exists(), "the stale stage dir is swept");
+    assert!(!stale_file.exists(), "the stale stage file is swept");
+    assert!(fresh_dir.exists(), "a recent stage is left alone");
+    assert!(unrelated.exists(), "only stage entries are swept");
+    assert!(
+        socket.join("blobs").join(REFERENCED_HASH).exists(),
+        "the cache entry a stale stage hardlinked is untouched"
+    );
+}
+
 /// `--offline` (strict airgap, no network) and `--download-only`
 /// (network-only, skip cleanup) are mutually exclusive — the
 /// command rejects the combination up-front with exit code 2 and
