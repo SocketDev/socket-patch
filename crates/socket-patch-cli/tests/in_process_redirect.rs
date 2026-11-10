@@ -4516,7 +4516,17 @@ fn assert_write_failure_envelope(out: &std::process::Output, leg: &str) {
 /// Shared driver for the write-failure legs: a hosted `scan --mode hosted --json`
 /// subprocess against the obstructed project in `tmp`.
 async fn run_hosted_json_scan(tmp: &std::path::Path, server: &MockServer) -> std::process::Output {
+    run_hosted_json_scan_with(tmp, server, &[]).await
+}
+
+/// [`run_hosted_json_scan`] with `env` added to the child.
+async fn run_hosted_json_scan_with(
+    tmp: &std::path::Path,
+    server: &MockServer,
+    env: &[(&str, &str)],
+) -> std::process::Output {
     scrubbed_cli()
+        .envs(env.iter().copied())
         .args([
             "scan",
             "--mode=hosted",
@@ -4564,6 +4574,68 @@ async fn redirect_json_mode_write_failures_emit_error_envelope() {
     let out = run_hosted_json_scan(tmp.path(), &server).await;
     std::fs::set_permissions(&lock_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_write_failure_envelope(&out, "lockfile-write failure");
+}
+
+/// A hosted rewrite of two locks whose second cannot be written (its
+/// directory is read-only): the first, already replaced, is put back and
+/// the error says nothing was changed. When that put-back fails as well,
+/// the error names the lock left rewritten instead of claiming so.
+///
+/// unix-only: a read-only directory does not block file creation on Windows.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_failed_hosted_write_says_which_files_it_could_not_put_back() {
+    use std::os::unix::fs::PermissionsExt;
+    const COMMON_LOCK: &str = "common/config/rush/pnpm-lock.yaml";
+    const SUBSPACE_LOCK: &str = "common/config/subspaces/frontend/pnpm-lock.yaml";
+
+    for put_back_fails in [false, true] {
+        let server = MockServer::start().await;
+        mock_discovery(&server).await;
+        mock_reference(&server).await;
+        mock_view(&server).await;
+        let tmp = tempfile::tempdir().unwrap();
+        write_rush_project(tmp.path(), false);
+        let pristine = rush_pnpm_lock(NAME);
+        // The common lock is replaced first; the subspace lock then fails.
+        let subspace_dir = tmp.path().join(SUBSPACE_LOCK).parent().unwrap().to_owned();
+        std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let env: &[(&str, &str)] = if put_back_fails {
+            &[("SOCKET_PATCH_FAILPOINT", "group_commit_restore~fail")]
+        } else {
+            &[]
+        };
+        let out = run_hosted_json_scan_with(tmp.path(), &server, env).await;
+        std::fs::set_permissions(&subspace_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .is_ok_and(|o| o.stdout.starts_with(b"0\n"))
+        {
+            // A root process ignores the read-only mode: nothing fails.
+            return;
+        }
+
+        assert_write_failure_envelope(&out, "second lock unwritable");
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["error"]["code"], "lockfile_write_failed", "{v:#}");
+        let message = v["error"]["message"].as_str().unwrap();
+        let read = |rel: &str| std::fs::read_to_string(tmp.path().join(rel)).unwrap();
+        assert_eq!(read(SUBSPACE_LOCK), pristine, "never written");
+        if put_back_fails {
+            assert!(
+                message.contains(&format!("{COMMON_LOCK} is left with its new content"))
+                    && message.ends_with("every other file is unchanged")
+                    && !message.contains("nothing was changed"),
+                "{message}"
+            );
+            assert_ne!(read(COMMON_LOCK), pristine, "left rewritten, as reported");
+        } else {
+            assert!(message.ends_with("(nothing was changed)"), "{message}");
+            assert_eq!(read(COMMON_LOCK), pristine, "put back");
+        }
+    }
 }
 
 /// v5 hosted mode writes nothing under `.socket/`, so a read-only

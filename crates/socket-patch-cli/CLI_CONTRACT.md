@@ -1876,7 +1876,7 @@ outcome for a selected record, rather than inferring a write from exit 0.
 | `patch_details_failed` | scan                            | Every patch-detail query failed. |
 | `api_batch_failed`    | scan                             | Every batch query failed. |
 | `reference_resolve_failed` | scan (hosted)               | Hosted patch references could not be resolved; nothing changed. |
-| `lockfile_write_failed` | scan (hosted)                  | A rewritten lockfile (or, on a takeover, the vendored ledger) could not be written. Also raised, before any rewrite, when a withdrawn pin's restore failed part-way and could not put a file back (see "Withdrawn pins"). |
+| `lockfile_write_failed` | scan (hosted)                  | A rewritten lockfile (or, on a takeover, the vendored ledger) could not be written. The files already written are put back and the message ends `(nothing was changed)`; when one cannot be put back either, the message names it and the state it is left in instead (`<file> is left with its new content` / `is left created` / `is left deleted`). Also raised, before any rewrite, when a withdrawn pin's restore failed part-way and could not put a file back (see "Withdrawn pins"). |
 | `socket_yml_invalid` / `socket_yml_ambiguous` | scan     | The socket.yml patch policy cannot be honored (see socket.yml patch policy). |
 | `patch_not_found`     | rollback                         | No manifest, ledger or hosted patch matches the identifier. |
 | `path_glob_no_match`  | rollback, scan                   | rollback: a path target matched no patched package (exit 1). scan: a PATH glob matched no directory (usage error, exit 2). |

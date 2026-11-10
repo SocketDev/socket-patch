@@ -583,6 +583,35 @@ pub fn symlinked_target(error: &std::io::Error) -> Option<&str> {
         .map(|t| t.0.as_str())
 }
 
+/// The error an unjournaled commit returns when a file replacement failed
+/// AND a file already replaced could not be put back. No journal exists to
+/// finish that commit from, so those files keep the commit's state while
+/// every other file has its pre-commit bytes. See [`left_replaced`].
+#[derive(Debug)]
+pub struct LeftReplaced {
+    /// Why the commit failed.
+    pub cause: std::io::Error,
+    /// One line per file that could not be put back:
+    /// `<path> is left <state> (<why>)`.
+    pub files: Vec<String>,
+}
+
+impl std::fmt::Display for LeftReplaced {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}; {}", self.cause, self.files.join(", "))
+    }
+}
+
+impl std::error::Error for LeftReplaced {}
+
+/// What a failed [`GroupCommit::commit_unjournaled`] had replaced and could
+/// not put back; `None` when the failed commit left every file as it was.
+pub fn left_replaced(error: &std::io::Error) -> Option<&LeftReplaced> {
+    error
+        .get_ref()
+        .and_then(|e| e.downcast_ref::<LeftReplaced>())
+}
+
 /// An open group commit (see the module docs). Dropping it without
 /// [`Self::commit`] discards every captured write — the crash semantics.
 pub struct GroupCommit {
@@ -691,9 +720,10 @@ impl GroupCommit {
     /// [`Self::commit`] without the crash journal, for a run that must
     /// write nothing under `.socket/` (hosted mode without a takeover): the
     /// files are replaced one by one, and a failed replacement puts the
-    /// ones already replaced back. A crash part-way leaves the files
-    /// replaced so far (the pre-journal behavior); nothing is ever left
-    /// half-written.
+    /// ones already replaced back. When one of those cannot be put back
+    /// either, the error names it ([`left_replaced`]). A crash part-way
+    /// leaves the files replaced so far (the pre-journal behavior); no
+    /// single file is ever left half-written.
     pub async fn commit_unjournaled(mut self) -> std::io::Result<Vec<String>> {
         self.close();
         let changed = self.write(false).await?;
@@ -762,8 +792,12 @@ impl GroupCommit {
         if !journaled {
             for (at, change) in changes.iter().enumerate() {
                 if let Err(e) = apply_durably(&root, change).await {
-                    let _ = restore(&root, &changes[..at]).await;
-                    return Err(e);
+                    return Err(match restore(&root, &changes[..at]).await {
+                        Ok(()) => e,
+                        Err(files) => {
+                            std::io::Error::new(e.kind(), LeftReplaced { cause: e, files })
+                        }
+                    });
                 }
             }
             return Ok(committed(changes));
@@ -997,12 +1031,11 @@ thread_local! {
     static FAIL_RESTORE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Put `applied` back to their pre-commit bytes (a failed commit).
-async fn restore(root: &Path, applied: &[Change]) -> std::io::Result<()> {
-    #[cfg(test)]
-    if FAIL_RESTORE.with(std::cell::Cell::get) {
-        return Err(std::io::Error::other("injected restore failure"));
-    }
+/// Put `applied` back to their pre-commit bytes (a failed commit), newest
+/// first and every one of them. `Err` holds one line per file that could
+/// not be put back, naming the state it is left in.
+async fn restore(root: &Path, applied: &[Change]) -> Result<(), Vec<String>> {
+    let mut left = Vec::new();
     for change in applied.iter().rev() {
         let back = Change {
             rel: change.rel.clone(),
@@ -1010,9 +1043,29 @@ async fn restore(root: &Path, applied: &[Change]) -> std::io::Result<()> {
             after: change.before.clone(),
             preserve_mode: change.preserve_mode,
         };
-        apply_durably(root, &back).await?;
+        #[cfg(test)]
+        let injected = FAIL_RESTORE.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let injected = false;
+        let put_back = if injected || crate::utils::failpoint::fails("group_commit_restore") {
+            Err(std::io::Error::other("injected restore failure"))
+        } else {
+            apply_durably(root, &back).await
+        };
+        if let Err(e) = put_back {
+            let state = match (&change.before, &change.after) {
+                (_, None) => "deleted",
+                (Some(_), Some(_)) => "with its new content",
+                (None, Some(_)) => "created",
+            };
+            left.push(format!("{} is left {state} ({e})", rel_string(&change.rel)));
+        }
     }
-    Ok(())
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(left)
+    }
 }
 
 fn sync_dir(dir: Option<&Path>) {
@@ -2012,6 +2065,15 @@ mod tests {
     /// read-only, so creating `d/sub/` fails after `a.lock` was replaced.
     #[cfg(unix)]
     async fn commit_that_fails_on_its_second_file(root: &Path) -> std::io::Result<Vec<String>> {
+        commit_failing_on_its_second_file(root, true).await
+    }
+
+    /// [`commit_that_fails_on_its_second_file`], journaled or not.
+    #[cfg(unix)]
+    async fn commit_failing_on_its_second_file(
+        root: &Path,
+        journaled: bool,
+    ) -> std::io::Result<Vec<String>> {
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::write(root.join("a.lock"), b"a-old").unwrap();
         std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
@@ -2024,9 +2086,59 @@ mod tests {
         super::super::fs::atomic_write_bytes(&root.join("d/sub/x.lock"), b"x")
             .await
             .unwrap();
-        let result = group.commit().await;
+        let result = if journaled {
+            group.commit().await
+        } else {
+            group.commit_unjournaled().await
+        };
         std::fs::set_permissions(root.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
         result
+    }
+
+    /// An unjournaled commit that fails part-way puts the files already
+    /// replaced back, like a journaled one.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_unjournaled_commit_puts_the_replaced_files_back() {
+        if running_as_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let err = commit_failing_on_its_second_file(root, false)
+            .await
+            .unwrap_err();
+        assert!(left_replaced(&err).is_none(), "{err}");
+        assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-old");
+        assert!(!root.join("d/sub").exists());
+    }
+
+    /// An unjournaled commit keeps no journal to finish from: when putting
+    /// a replaced file back fails too, the error names that file and the
+    /// state it is left in, so the caller cannot report an unchanged
+    /// project.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_unjournaled_commit_names_the_files_it_could_not_put_back() {
+        if running_as_root() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        FAIL_RESTORE.with(|f| f.set(true));
+        let result = commit_failing_on_its_second_file(root, false).await;
+        FAIL_RESTORE.with(|f| f.set(false));
+        let err = result.unwrap_err();
+        assert!(!is_pending(&err), "{err}");
+        assert_eq!(std::fs::read(root.join("a.lock")).unwrap(), b"a-new");
+        assert!(!root.join(COMMIT_JOURNAL_REL).exists());
+        assert!(err.to_string().contains("a.lock"), "{err}");
+        let left = left_replaced(&err).expect("the error says what was left");
+        assert_eq!(
+            left.files,
+            ["a.lock is left with its new content (injected restore failure)"]
+        );
+        assert_eq!(left.cause.kind(), err.kind());
     }
 
     /// A root process ignores the read-only mode the tests rely on.
