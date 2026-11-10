@@ -1523,11 +1523,7 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // A bare scan looks below `--cwd` only for a hosted or vendored
     // project (or a directory that is none yet); from an agent-mode
     // project it covers that project alone, and so does its rollback.
-    let scan_looks_below = !here
-        || !matches!(
-            crate::commands::mode_from_project_state(&args.common).await,
-            Ok(crate::commands::scan::ScanMode::Agent)
-        );
+    let scan_looks_below = !here || !crate::commands::bare_scan_is_agent_mode(&args.common).await;
     if !args.common.json && scan_looks_below {
         return roll_back_projects(args, below, here).await;
     }

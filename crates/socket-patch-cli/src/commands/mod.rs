@@ -87,6 +87,16 @@ pub(crate) async fn vendor_owned_keys(
     nuget
 }
 
+/// Whether a bare `scan` at `--cwd` runs in agent mode, the mode the
+/// project's own state keeps ([`mode_from_project_state`]). Such a scan
+/// covers `--cwd` alone, so the commands that undo it do too.
+pub(crate) async fn bare_scan_is_agent_mode(common: &crate::args::GlobalArgs) -> bool {
+    matches!(
+        mode_from_project_state(common).await,
+        Ok(scan::ScanMode::Agent)
+    )
+}
+
 /// The mode a `scan`/`get` run with no `--mode` uses for the project
 /// (CLI_CONTRACT.md, Mode resolution): the mode the project's own patch
 /// state already records, so a bare run never converts the project to
