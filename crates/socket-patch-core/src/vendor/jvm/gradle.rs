@@ -1299,6 +1299,22 @@ pub fn unplan(read: ReadFn<'_>, c: &Coords<'_>, records: &[WiringRecord]) -> Jvm
         };
         match undo_replace_eol(t, from, to) {
             Some(undone) => *t = undone,
+            // The patched jar's entry in another shape (the file was
+            // re-serialised): left there, the next build would hold the
+            // upstream jar to the patched hash.
+            None if w.key.as_deref().is_some_and(|k| k.starts_with("hash:")) => {
+                match undo_reserialised(t, c, from, to) {
+                    Reserialised::Restored(undone) => *t = undone,
+                    Reserialised::Gone => {}
+                    Reserialised::Stuck(why) => {
+                        return JvmUnplan {
+                            changes: Vec::new(),
+                            drifted: vec![why],
+                            still_wired: true,
+                        }
+                    }
+                }
+            }
             None if holds_to(t) => drifted.push(format!(
                 "{} holds the patched hash for {}:{}:{} in an unexpected shape",
                 w.file, c.group_id, c.artifact_id, c.version
@@ -1483,6 +1499,130 @@ fn undo_replace_eol(text: &str, from: &str, to: &str) -> Option<String> {
         );
         undo_replace(text, &from, &to)
     })
+}
+
+/// What became of the patched jar's verification entry once the file no
+/// longer holds the recorded text `to` byte for byte.
+enum Reserialised {
+    /// The file with the entry undone.
+    Restored(String),
+    /// The file no longer lists the patched hash.
+    Gone,
+    /// It still lists it, in a shape that cannot be undone: the drift
+    /// message, which says what to put back.
+    Stuck(String),
+}
+
+/// `(artifact name, sha256)` of each `<artifact>` in a recorded fragment.
+fn recorded_hashes(fragment: &str) -> Vec<(String, String)> {
+    let masked = masked_or_blank(fragment);
+    top_elements(&masked, "artifact")
+        .iter()
+        .filter_map(|art| {
+            let name = xml::attr(art.open_tag(&masked), "name")?;
+            Some((name.to_string(), sha256_of(&masked, art)?))
+        })
+        .collect()
+}
+
+/// The `value` of the artifact element's first `<sha256>`.
+fn sha256_of(masked: &str, art: &Element) -> Option<String> {
+    child_elements(masked, art, "sha256")
+        .iter()
+        .find_map(|sha| xml::attr(sha.open_tag(masked), "value").map(str::to_string))
+}
+
+/// Undo the `hash:` record `from` -> `to` of `c` in a verification file
+/// that was re-serialised since (`./gradlew --write-verification-metadata`,
+/// an XML formatter): the entry is found by its component, artifact name
+/// and patched sha256 instead of by its text. The user's recorded entry
+/// goes back in its place; an entry or component vendoring added is
+/// removed, a component only while it holds nothing else.
+fn undo_reserialised(text: &str, c: &Coords<'_>, from: &str, to: &str) -> Reserialised {
+    let (g, a, v) = (c.group_id, c.artifact_id, c.version);
+    let jar = format!("{a}-{v}.jar");
+    let recorded = recorded_hashes(to);
+    let Some(sha) = recorded
+        .iter()
+        .find(|(name, _)| *name == jar)
+        .map(|(_, sha)| sha.as_str())
+    else {
+        return Reserialised::Gone;
+    };
+    let stuck = |how: &str| {
+        let remedy = if from.trim().is_empty() {
+            format!("delete the <artifact name=\"{jar}\"> entry holding it (vendoring added it)")
+        } else {
+            format!(
+                "put the entry vendoring replaced back in place of that <artifact \
+                 name=\"{jar}\"> ({})",
+                from.split_whitespace().collect::<Vec<_>>().join(" ")
+            )
+        };
+        Reserialised::Stuck(format!(
+            "{VERIFICATION_REL} still lists the patched jar of {g}:{a}:{v} (sha256 {sha}) {how}, \
+             so nothing was reverted: the upstream jar would fail verification against it. \
+             To revert, {remedy} and run the revert again"
+        ))
+    };
+    let masked = masked_or_blank(text);
+    let component = top_elements(&masked, "component").into_iter().find(|comp| {
+        let tag = comp.open_tag(&masked);
+        xml::attr(tag, "group") == Some(g)
+            && xml::attr(tag, "name") == Some(a)
+            && xml::attr(tag, "version") == Some(v)
+    });
+    let artifacts = component
+        .as_ref()
+        .map(|comp| child_elements(&masked, comp, "artifact"))
+        .unwrap_or_default();
+    let name_of = |art: &Element| xml::attr(art.open_tag(&masked), "name").map(str::to_string);
+    let listed = artifacts.iter().find(|art| {
+        name_of(art).as_deref() == Some(jar.as_str())
+            && sha256_of(&masked, art).as_deref() == Some(sha)
+    });
+    let (Some(component), Some(listed)) = (component.as_ref(), listed) else {
+        return if text.contains(sha) {
+            stuck("outside the entry vendoring wrote")
+        } else {
+            Reserialised::Gone
+        };
+    };
+    let (start, end, replacement) = if to.trim_start().starts_with("<component") {
+        // The whole component is vendoring's while it holds exactly what
+        // vendoring wrote.
+        let ours = artifacts.len() == recorded.len()
+            && artifacts.iter().all(|art| {
+                let entry = name_of(art).zip(sha256_of(&masked, art));
+                entry.is_some_and(|entry| recorded.contains(&entry))
+            });
+        if !ours {
+            return stuck("in a component that holds other entries now");
+        }
+        (component.start, component.end, "")
+    } else if from.trim().is_empty() {
+        (listed.start, listed.end, "")
+    } else if from.trim_start().starts_with("<artifact") {
+        (listed.start, listed.end, from)
+    } else {
+        return stuck("in a shape vendoring did not write");
+    };
+    // What vendoring added goes with its line.
+    let (start, end) = if replacement.is_empty() && line_start(text, start) < start {
+        let rest = &text[end..];
+        let eol = rest
+            .strip_prefix("\r\n")
+            .or_else(|| rest.strip_prefix('\n'))
+            .map_or(0, |after| rest.len() - after.len());
+        (line_start(text, start), end + eol)
+    } else {
+        (start, end)
+    };
+    let undone = format!("{}{replacement}{}", &text[..start], &text[end..]);
+    if undone.contains(sha) {
+        return stuck("more than once");
+    }
+    Reserialised::Restored(undone)
 }
 
 /// Whether the root settings file applies the script and the index lists
@@ -3488,6 +3628,95 @@ mod tests {
             reverted(&win, &undo)[VERIFICATION_REL],
             crlf(&files, &[VERIFICATION_REL])[VERIFICATION_REL],
         );
+    }
+
+    /// VJ-D6: once anything re-serialised the verification file after
+    /// vendoring (one space before `/>` is enough, and `./gradlew
+    /// --write-verification-metadata` rewrites it whole), the recorded
+    /// text is not found. Revert then reported success and left the
+    /// patched jar's sha256 where the user's `<pgp>` and `<sha512>` were,
+    /// so the next build failed verification against the upstream jar.
+    /// The entry is found by component, artifact and hash instead.
+    #[test]
+    fn a_reserialised_verification_entry_is_still_reverted() {
+        const GSON: &str =
+            "      <component group=\"com.google.code.gson\" name=\"gson\" version=\"2.10.1\">\n";
+        let user = "         <artifact name=\"gson-2.10.1.jar\">\n            \
+            <pgp value=\"ABCDEF\"/>\n            \
+            <sha512 value=\"s512\" origin=\"Generated by Gradle\"/>\n         </artifact>\n";
+        let pom = "         <artifact name=\"gson-2.10.1.pom\">\n            \
+            <sha256 value=\"pomsha\" origin=\"Generated by Gradle\"/>\n         </artifact>\n";
+        let p = patch();
+        let patched = sha256_hex(p.jar);
+        // The user's entry replaced; an entry added to their component; a
+        // component added whole.
+        for body in [
+            format!("{GSON}{user}{pom}      </component>\n"),
+            format!("{GSON}{pom}      </component>\n"),
+            String::new(),
+        ] {
+            let before = format!("{VM_HEAD}{body}{VM_TAIL}");
+            let files = fs(&[("settings.gradle", ""), (VERIFICATION_REL, &before)]);
+            let plan = run(&files, &p).unwrap();
+            let after = applied(&files, &plan);
+            let vendored = String::from_utf8(after[VERIFICATION_REL].clone()).unwrap();
+            assert!(
+                vendored.contains(&patched) && !vendored.contains("pgp"),
+                "{vendored}"
+            );
+            let undo_of = |text: String| {
+                let mut drifted = after.clone();
+                drifted.insert(VERIFICATION_REL.into(), text.into_bytes());
+                let undo = unplan(&|rel| drifted.get(rel).cloned(), &p.coords(), &plan.records);
+                let text = String::from_utf8(reverted(&drifted, &undo)[VERIFICATION_REL].clone());
+                (undo, text.unwrap())
+            };
+            // One space: the entry goes back byte for byte.
+            let spaced =
+                vendored.replace("origin=\"socket-patch\"/>", "origin=\"socket-patch\" />");
+            assert_ne!(spaced, vendored);
+            let (undo, restored) = undo_of(spaced);
+            assert!(undo.drifted.is_empty() && !undo.still_wired, "{undo:?}");
+            assert_eq!(restored, before);
+            // Gradle's own rewrite: its origin, its indentation.
+            let regenerated = vendored
+                .replace(
+                    "origin=\"socket-patch\"/>",
+                    "origin=\"Generated by Gradle\"/>",
+                )
+                .replace(
+                    "         <artifact name=\"gson-2.10.1.jar\">",
+                    "\t <artifact name=\"gson-2.10.1.jar\">",
+                );
+            let (undo, restored) = undo_of(regenerated);
+            assert!(undo.drifted.is_empty() && !undo.still_wired, "{undo:?}");
+            assert!(!restored.contains(&patched), "{restored}");
+            assert_eq!(
+                restored.contains("<pgp value=\"ABCDEF\"/>"),
+                body.contains("pgp")
+            );
+            // The hash moved where it cannot be undone: nothing is
+            // reverted, the entry stays, and the message says what to do.
+            let moved = vendored
+                .replace("origin=\"socket-patch\"/>", "origin=\"socket-patch\" />")
+                .replace(
+                    "name=\"gson\" version=\"2.10.1\"",
+                    "name=\"gson\" version=\"2.10.2\"",
+                );
+            let (undo, kept) = undo_of(moved.clone());
+            assert!(undo.still_wired && undo.changes.is_empty(), "{undo:?}");
+            assert_eq!(kept, moved);
+            let why = undo.drifted.join("\n");
+            assert!(
+                why.contains("nothing was reverted") && why.contains(&patched),
+                "{why}"
+            );
+            assert_eq!(
+                why.contains("<pgp value=\"ABCDEF\"/>"),
+                body.contains("pgp"),
+                "{why}"
+            );
+        }
     }
 
     /// #646 review: an index that exists but is not UTF-8 is unreadable,

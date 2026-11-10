@@ -261,6 +261,15 @@ records supplementary entries as shared fragments so either patch can be
 reverted first. Existing verification policy and unrelated checksums are kept.
 A verification file is never created automatically.
 
+Revert puts the recorded entry back. When the file was re-serialised since
+vendoring (`./gradlew --write-verification-metadata`, an XML formatter), the
+patched jar's entry is found by its component, artifact name and sha256
+instead of by its text: the user's entry replaces it, and an entry or
+component vendor added is removed. If the patched hash is still listed where
+that cannot be done, nothing of the entry is reverted (the build keeps
+verifying the patched jar it resolves) and `vendor_lock_entry_drifted` says
+what to put back.
+
 The checks read the whole statically known script graph: settings, every
 project's build script, buildSrc and included builds with their convention
 plugins and plugin sources, `apply from` targets and version catalogs.
