@@ -49,7 +49,7 @@ const MANIFEST_JSON: &str = r#"{
       "files": {
         "package/index.js": {
           "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-          "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
+          "afterHash":  "765b5c40e14fd7c5d6a2b8063c4aa7dc6571e09f6817f8572f2cc9febf51a44b"
         }
       },
       "vulnerabilities": {},
@@ -60,7 +60,11 @@ const MANIFEST_JSON: &str = r#"{
   }
 }"#;
 
-const REFERENCED_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+/// The manifest's one `afterHash`: the git-sha256 of [`REFERENCED_BYTES`],
+/// so the blob the fixtures write under it verifies (`repair` re-hashes
+/// every referenced blob it finds).
+const REFERENCED_HASH: &str = "765b5c40e14fd7c5d6a2b8063c4aa7dc6571e09f6817f8572f2cc9febf51a44b";
+const REFERENCED_BYTES: &[u8] = b"patched content";
 
 fn make_socket_dir(root: &Path) -> PathBuf {
     let socket = root.join(".socket");
@@ -328,7 +332,7 @@ fn repair_offline_with_no_orphans_succeeds_quietly() {
     // orphans, nothing to download (offline), nothing to clean up.
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
     assert_eq!(code, 0, "expected exit 0; stdout=\n{stdout}");
@@ -359,7 +363,7 @@ fn repair_offline_removes_orphan_blob() {
     // referenced one.
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     let orphan_hash = "deadbeef".repeat(8); // 64 chars
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
@@ -410,7 +414,7 @@ fn repair_dry_run_does_not_remove_orphan_blob() {
     // With `--dry-run`, the orphan should be REPORTED but stay on disk.
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     let orphan_hash = "cafebabe".repeat(8);
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
@@ -477,7 +481,7 @@ fn repair_download_only_skips_cleanup() {
     // the test stays hermetic (no network).
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     let orphan_hash = "feedface".repeat(8);
     write_blob(&socket, &orphan_hash, b"orphaned content");
 
@@ -538,7 +542,7 @@ fn repair_cleanup_failure_is_reported_in_json_and_silent_modes() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"kept");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     let orphan = "0badf00d".repeat(8); // 64 chars, not referenced
     write_blob(&socket, &orphan, b"orphan bytes");
     let blobs_dir = socket.join("blobs");
@@ -648,7 +652,7 @@ fn take_external_lock(socket_dir: &Path) -> std::fs::File {
 fn repair_deletes_leftover_lock_file_on_success() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
@@ -666,7 +670,7 @@ fn repair_deletes_leftover_lock_file_on_success() {
 fn repair_deletes_probe_created_lock_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     assert!(!socket.join("apply.lock").exists());
 
     let (code, stdout) = run_repair(tmp.path(), &[]);
@@ -685,7 +689,7 @@ fn repair_deletes_probe_created_lock_file() {
 fn repair_dry_run_also_removes_leftover_lock_file() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
 
     let (code, stdout) = run_repair(tmp.path(), &["--dry-run"]);
@@ -909,6 +913,152 @@ async fn repair_online_downloads_missing_blob() {
     assert_eq!(format!("{}", blob_hits[0].method), "GET");
 }
 
+/// A blob that is on disk with the wrong bytes (a `core.autocrlf` checkout
+/// of a committed `.socket/blobs/`, a truncated file) used to read as
+/// "present": `repair` said all blobs were there and `apply` failed on it
+/// forever. `repair` re-hashes every referenced blob and downloads a
+/// mismatching one again, replacing it — the before blob as well as the
+/// after blob.
+#[tokio::test]
+async fn repair_online_redownloads_corrupt_blobs() {
+    let patched = b"patched\ncontent\n";
+    let original = b"original\ncontent\n";
+    let after_hash = git_sha256(patched);
+    let before_hash = git_sha256(original);
+
+    let mock = MockServer::start().await;
+    for (hash, content) in [(&after_hash, &patched[..]), (&before_hash, &original[..])] {
+        Mock::given(method("GET"))
+            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/blob/{hash}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(content.to_vec()))
+            .expect(1)
+            .mount(&mock)
+            .await;
+    }
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    let manifest = MANIFEST_JSON
+        .replace(REFERENCED_HASH, &after_hash)
+        .replace(&"0".repeat(64), &before_hash);
+    std::fs::write(socket.join("manifest.json"), manifest).unwrap();
+    // The CRLF form of the after blob and a truncated before blob.
+    write_blob(&socket, &after_hash, b"patched\r\ncontent\r\n");
+    write_blob(&socket, &before_hash, &original[..5]);
+
+    let run = |extra: &[&str]| {
+        let mut args = vec!["repair"];
+        args.extend_from_slice(extra);
+        let out = socket_cmd(tmp.path())
+            .args(&args)
+            .env("SOCKET_API_URL", mock.uri())
+            .env("SOCKET_API_TOKEN", "fake-token-for-test")
+            .env("SOCKET_ORG_SLUG", ORG_SLUG)
+            .output()
+            .expect("run socket-patch");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // A dry run says what it found and changes nothing.
+    let (code, stdout, stderr) = run(&["--dry-run"]);
+    assert_eq!(code, Some(0), "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("Found 2 corrupt blobs") && stdout.contains("Would download:"),
+        "stdout={stdout}"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join(&after_hash)).unwrap(),
+        b"patched\r\ncontent\r\n"
+    );
+
+    let (code, stdout, stderr) = run(&["--json"]);
+    assert_eq!(code, Some(0), "stdout={stdout}; stderr={stderr}");
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).expect("valid JSON");
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(v["summary"]["downloaded"], 1, "one aggregate event: {v}");
+    let downloaded = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "downloaded")
+        .unwrap_or_else(|| panic!("no downloaded event: {v}"));
+    assert_eq!(downloaded["details"]["count"], 2, "{v}");
+    assert_eq!(downloaded["details"]["corrupt"], 2, "{v}");
+
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join(&after_hash)).unwrap(),
+        patched,
+        "the corrupt after blob was replaced"
+    );
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join(&before_hash)).unwrap(),
+        original,
+        "the corrupt before blob was replaced"
+    );
+
+    // Healed: a second run has nothing to fetch (the mocks expect one GET
+    // each) and says so.
+    let (code, stdout, stderr) = run(&[]);
+    assert_eq!(code, Some(0), "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.contains("All blobs are present locally."),
+        "stdout={stdout}"
+    );
+}
+
+/// A corrupt blob whose re-download fails stays on disk (a failed download
+/// never deletes), and the run is a failure: `repair` must not say
+/// "complete" over a blob `apply` will refuse.
+#[tokio::test]
+async fn repair_reports_a_corrupt_blob_it_could_not_redownload() {
+    let patched = b"patched\ncontent\n";
+    let after_hash = git_sha256(patched);
+    // No blob route: the fetch 404s.
+    let mock = MockServer::start().await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        MANIFEST_JSON.replace(REFERENCED_HASH, &after_hash),
+    )
+    .unwrap();
+    write_blob(&socket, &after_hash, b"patched\r\ncontent\r\n");
+
+    let out = socket_cmd(tmp.path())
+        .args(["repair"])
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test")
+        .env("SOCKET_ORG_SLUG", ORG_SLUG)
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(stdout.contains("Found 1 corrupt blob"), "stdout={stdout}");
+    assert!(
+        stderr.contains("Failed to download 1 blob")
+            && stderr.contains("Repair finished with errors"),
+        "stderr={stderr}"
+    );
+    assert!(!stdout.contains("Repair complete."), "stdout={stdout}");
+    assert_eq!(
+        std::fs::read(socket.join("blobs").join(&after_hash)).unwrap(),
+        b"patched\r\ncontent\r\n",
+        "a failed download leaves the entry as it was"
+    );
+}
+
 #[test]
 fn repair_honors_manifest_path_override() {
     // Put the manifest somewhere other than `.socket/manifest.json` and
@@ -918,6 +1068,9 @@ fn repair_honors_manifest_path_override() {
     let custom_dir = tmp.path().join("custom");
     std::fs::create_dir_all(&custom_dir).unwrap();
     std::fs::write(custom_dir.join("patches.json"), MANIFEST_JSON).unwrap();
+    // The manifest's blob sits beside it, so the offline run has nothing
+    // to fetch (a missing blob fails an offline repair).
+    write_blob(&custom_dir, REFERENCED_HASH, REFERENCED_BYTES);
 
     // Negative control: with NO `.socket/manifest.json` and no override,
     // repair must fail to find a manifest. This proves the success below is
@@ -951,10 +1104,11 @@ fn repair_honors_manifest_path_override() {
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(v["command"], "repair");
     assert_eq!(v["status"], "success");
-    // The override manifest references one blob with no blob on disk, but
-    // offline mode fetches nothing and there are no orphans to remove.
+    // The override manifest's one blob is on disk beside it and there are
+    // no orphans to remove.
     assert_eq!(v["summary"]["removed"], 0);
     assert_eq!(v["summary"]["downloaded"], 0);
+    assert!(custom_dir.join("blobs").join(REFERENCED_HASH).exists());
 }
 
 /// Regression: download failures are ERRORS, and `--silent` suppresses
@@ -1045,7 +1199,7 @@ fn repair_silent_suppresses_human_stdout() {
     let socket = make_socket_dir(tmp.path());
     // Keep the referenced blob (survives) plus an orphan (swept) so cleanup
     // has something to announce in the non-silent control.
-    write_blob(&socket, REFERENCED_HASH, b"kept");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     let orphan = "deadbeef".repeat(8); // 64 hex chars, not referenced
     write_blob(&socket, &orphan, b"orphan bytes");
 

@@ -53,7 +53,7 @@ const MANIFEST_JSON: &str = r#"{
       "files": {
         "package/index.js": {
           "beforeHash": "0000000000000000000000000000000000000000000000000000000000000000",
-          "afterHash":  "1111111111111111111111111111111111111111111111111111111111111111"
+          "afterHash":  "765b5c40e14fd7c5d6a2b8063c4aa7dc6571e09f6817f8572f2cc9febf51a44b"
         }
       },
       "vulnerabilities": {},
@@ -64,7 +64,11 @@ const MANIFEST_JSON: &str = r#"{
   }
 }"#;
 
-const REFERENCED_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+/// The manifest's one `afterHash`: the git-sha256 of [`REFERENCED_BYTES`],
+/// so the blob the fixtures write under it verifies (`repair` re-hashes
+/// every referenced blob it finds).
+const REFERENCED_HASH: &str = "765b5c40e14fd7c5d6a2b8063c4aa7dc6571e09f6817f8572f2cc9febf51a44b";
+const REFERENCED_BYTES: &[u8] = b"patched content";
 const REFERENCED_UUID: &str = "11111111-1111-4111-8111-111111111111";
 
 fn make_socket_dir(root: &Path) -> PathBuf {
@@ -210,7 +214,7 @@ fn repair_failed_human_mode_prints_error_to_stderr() {
 fn repair_all_present_human_mode_prints_summary() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"patched content");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
 
     let out = socket_cmd(tmp.path())
         .args(["repair", "--offline"])
@@ -237,52 +241,114 @@ fn repair_all_present_human_mode_prints_summary() {
     );
 }
 
-/// The offline warning lists at most 5 missing ids and folds the rest into
-/// "  ... and N more". With 12 missing file artifacts that's 5 items + 7.
+/// `repair --offline` cannot fetch a missing blob, and the next
+/// `apply --offline` fails on it and says to run `repair`: the run exits 1
+/// and never closes on "Repair complete.". The error lists at most 5
+/// missing ids and folds the rest into "  ... and N more" (12 missing: 5
+/// items + 7), and prints even under `--silent`.
 #[test]
-fn repair_offline_warning_truncates_missing_list_after_five() {
+fn repair_offline_missing_blobs_fail_and_list_at_most_five() {
     let tmp = tempfile::tempdir().expect("tempdir");
     write_twelve_file_manifest(tmp.path());
     // No blobs on disk → all 12 afterHashes are missing.
 
+    for silent in [false, true] {
+        let mut args = vec!["repair", "--offline"];
+        if silent {
+            args.push("--silent");
+        }
+        let out = socket_cmd(tmp.path())
+            .args(&args)
+            .output()
+            .expect("run socket-patch");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // The error (and its list) is diagnostic output: stderr.
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "blobs an offline repair cannot restore fail the run; stdout=\n{stdout}"
+        );
+        assert!(
+            stderr.contains("Error: 12 blobs are missing (offline mode - not downloading):"),
+            "the error header must carry the full missing count; stderr=\n{stderr}"
+        );
+        assert!(
+            !stdout.contains("Error") && !stdout.contains("Repair complete."),
+            "stdout must neither carry the error nor claim completion; stdout=\n{stdout}"
+        );
+        let items = item_lines(&stderr);
+        assert_eq!(
+            items.len(),
+            5,
+            "the offline error must list exactly 5 missing ids; stderr=\n{stderr}"
+        );
+        for item in &items {
+            // "  - " + 12 truncated chars + "..." — the ids are 64-hex here.
+            assert_eq!(
+                item.len(),
+                "  - ".len() + 12 + 3,
+                "each listed id must be truncated to 12 chars + ellipsis; got {item:?}"
+            );
+        }
+        assert!(
+            stderr.contains("  ... and 7 more"),
+            "the overflow line must report the remaining 12 - 5 = 7 ids; stderr=\n{stderr}"
+        );
+        assert_eq!(
+            stderr.contains(
+                "Repair finished with errors: 12 blobs could not be restored in offline mode. \
+                 Re-run without --offline to download them."
+            ),
+            !silent,
+            "the closing line is the human summary, muted by --silent; stderr=\n{stderr}"
+        );
+        assert!(
+            !tmp.path().join(".socket/apply.lock").exists(),
+            "the failed run still removes its lock"
+        );
+    }
+}
+
+/// The `--json` twin: one `failed` event per blob the offline run could
+/// not restore (`offline_missing_sources`, `details.hash`), and
+/// `partialFailure` / exit 1. It used to be `success` with no event.
+#[test]
+fn repair_offline_missing_blobs_json_names_each_blob() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_twelve_file_manifest(tmp.path());
+
     let out = socket_cmd(tmp.path())
-        .args(["repair", "--offline"])
+        .args(["repair", "--offline", "--json"])
         .output()
         .expect("run socket-patch");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The warning (and its list) is diagnostic output: stderr.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "offline missing artifacts are a warning, not a failure; stdout=\n{stdout}"
-    );
-    assert!(
-        stderr.contains("Warning: 12 blobs are missing (offline mode - not downloading):"),
-        "the warning header must carry the full missing count; stderr=\n{stderr}"
-    );
-    assert!(
-        !stdout.contains("Warning"),
-        "the warning must not pollute stdout; stdout=\n{stdout}"
-    );
-    let items = item_lines(&stderr);
-    assert_eq!(
-        items.len(),
-        5,
-        "the offline warning must list exactly 5 missing ids; stdout=\n{stdout}"
-    );
-    for item in &items {
-        // "  - " + 12 truncated chars + "..." — the ids are 64-hex here.
-        assert_eq!(
-            item.len(),
-            "  - ".len() + 12 + 3,
-            "each listed id must be truncated to 12 chars + ellipsis; got {item:?}"
-        );
-    }
-    assert!(
-        stderr.contains("  ... and 7 more"),
-        "the overflow line must report the remaining 12 - 5 = 7 ids; stderr=\n{stderr}"
-    );
+    assert_eq!(out.status.code(), Some(1), "stdout=\n{stdout}");
+    let env = parse_json_envelope(&stdout);
+    assert_eq!(json_string(&env, "status"), Some("partialFailure"));
+    let failed: Vec<&serde_json::Value> = env["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|e| e["action"] == "failed")
+        .collect();
+    assert_eq!(failed.len(), 12, "one failed event per missing blob: {env}");
+    let mut hashes: Vec<&str> = failed
+        .iter()
+        .map(|e| {
+            assert_eq!(e["errorCode"], "offline_missing_sources", "{e}");
+            assert_eq!(e["details"]["state"], "missing", "{e}");
+            assert!(
+                e["error"].as_str().is_some_and(|m| m.contains("--offline")),
+                "{e}"
+            );
+            e["details"]["hash"].as_str().expect("details.hash")
+        })
+        .collect();
+    hashes.dedup();
+    let expected: Vec<String> = (1..=12u32).map(|i| format!("{i:02}").repeat(32)).collect();
+    assert_eq!(hashes, expected, "sorted, one per blob");
+    assert_eq!(env["summary"]["failed"], 12);
 }
 
 /// The dry-run preview lists at most 10 missing ids and folds the rest into
@@ -340,7 +406,7 @@ fn repair_dry_run_preview_truncates_missing_list_after_ten() {
 fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"kept");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     write_archive(&socket, "diffs", REFERENCED_UUID, b"kept-diff");
     write_archive(&socket, "packages", REFERENCED_UUID, b"kept-package");
     const ORPHAN_DIFF: &str = "99999999-9999-4999-8999-999999999999";
@@ -420,7 +486,7 @@ fn repair_removes_orphan_archives_human_mode_prints_relabeled_summary() {
 fn repair_archive_cleanup_failure_warns_and_continues() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"kept");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     std::fs::write(socket.join("diffs"), b"not a dir").expect("stage diffs-as-file");
     const ORPHAN_PKG: &str = "77777777-7777-4777-8777-777777777777";
     write_archive(&socket, "packages", ORPHAN_PKG, b"orphan pkg bytes");
@@ -515,7 +581,7 @@ fn repair_exits_zero_and_stays_quiet_when_lock_file_unremovable() {
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let socket = make_socket_dir(tmp.path());
-    write_blob(&socket, REFERENCED_HASH, b"kept");
+    write_blob(&socket, REFERENCED_HASH, REFERENCED_BYTES);
     std::fs::write(socket.join("apply.lock"), b"leftover").expect("stage stale lock");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o555))
         .expect("chmod .socket read-only");

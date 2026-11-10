@@ -106,6 +106,17 @@ impl<'a> PatchSources<'a> {
             mem_blobs: None,
         }
     }
+
+    /// The message for a write of blob `hash`'s bytes that failed with `e`
+    /// ([`blob_write_error`]). An overlay blob is not a cache file, so its
+    /// error stands as it is.
+    fn write_error(&self, e: &std::io::Error, hash: &str) -> String {
+        if self.mem_blobs.is_some_and(|m| m.contains_key(hash)) {
+            e.to_string()
+        } else {
+            blob_write_error(e, hash)
+        }
+    }
 }
 
 /// Result of applying patches to a single package.
@@ -449,6 +460,59 @@ async fn variant_installed_at(
     false
 }
 
+/// Bytes that do not hash to the hash they are recorded under: what
+/// [`apply_file_patch_at`] (and npm's bin-form twin) refuses before any
+/// disk write. Typed, so a caller that fed it a cached blob can say that
+/// the blob is what is wrong ([`blob_write_error`]).
+#[derive(Debug)]
+struct ContentHashMismatch {
+    expected: String,
+    actual: String,
+}
+
+impl std::fmt::Display for ContentHashMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Hash verification failed before patch. Expected: {}, Got: {}",
+            self.expected, self.actual
+        )
+    }
+}
+
+impl std::error::Error for ContentHashMismatch {}
+
+/// The refusal of content that hashes to `actual`, not `expected`.
+pub(crate) fn content_hash_mismatch(expected: &str, actual: String) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        ContentHashMismatch {
+            expected: expected.to_string(),
+            actual,
+        },
+    )
+}
+
+/// The message for a write of the cached blob `blob_hash` that failed with
+/// `e`. When the blob's own bytes were refused for not hashing to its name
+/// (a line-ending-converting checkout, a truncated file), the cache entry
+/// is what is wrong and re-running the command cannot help: name the file
+/// and the command that replaces it. The mismatch was already computed by
+/// the refused write, so a healthy run never hashes a blob for this.
+pub(crate) fn blob_write_error(e: &std::io::Error, blob_hash: &str) -> String {
+    match e
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<ContentHashMismatch>())
+    {
+        Some(mismatch) if mismatch.expected == blob_hash => format!(
+            "Hash verification failed before patch: blob .socket/blobs/{blob_hash} is corrupt \
+             (its content hashes to {}). Run `socket-patch repair` to download it again.",
+            mismatch.actual
+        ),
+        _ => e.to_string(),
+    }
+}
+
 /// Apply a patch to a single file.
 ///
 /// **Permission policy** (per the user-visible contract — patched
@@ -507,13 +571,7 @@ pub(crate) async fn apply_file_patch_at(
     // upstream blob errors out before any disk write.
     let content_hash = compute_git_sha256_from_bytes(patched_content);
     if content_hash != expected_hash {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!(
-                "Hash verification failed before patch. Expected: {}, Got: {}",
-                expected_hash, content_hash
-            ),
-        ));
+        return Err(content_hash_mismatch(expected_hash, content_hash));
     }
 
     // Snapshot pre-patch metadata so `restore_file_permissions` can
@@ -1321,7 +1379,7 @@ async fn apply_package_patch_at(
         {
             Ok(write) => write,
             Err(e) => {
-                result.error = Some(e.to_string());
+                result.error = Some(sources.write_error(&e, &file_info.after_hash));
                 return result;
             }
         };
@@ -1349,7 +1407,7 @@ async fn apply_package_patch_at(
                         )),
                     });
                 }
-                result.error = Some(e.to_string());
+                result.error = Some(sources.write_error(&e, &file_info.after_hash));
                 return result;
             }
         }
@@ -2173,6 +2231,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(content, original);
+    }
+
+    /// A cached blob whose bytes changed (here the CRLF form a
+    /// `core.autocrlf` checkout leaves) fails the package without writing,
+    /// and the error names the cache entry and the command that replaces
+    /// it: re-running `apply` can never fix it.
+    #[tokio::test]
+    async fn test_apply_package_patch_corrupt_blob_names_the_blob_and_repair() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+
+        let original = b"original\ncontent\n";
+        let patched = b"patched\ncontent\n";
+        let before_hash = compute_git_sha256_from_bytes(original);
+        let after_hash = compute_git_sha256_from_bytes(patched);
+
+        tokio::fs::write(pkg_dir.path().join("index.js"), original)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            blobs_dir.path().join(&after_hash),
+            b"patched\r\ncontent\r\n",
+        )
+        .await
+        .unwrap();
+
+        let mut files = HashMap::new();
+        files.insert(
+            "index.js".to_string(),
+            PatchFileInfo {
+                before_hash,
+                after_hash: after_hash.clone(),
+            },
+        );
+
+        let result = apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            &PatchSources::blobs_only(blobs_dir.path()),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await;
+
+        assert!(!result.success);
+        let err = result.error.expect("a corrupt blob is an error");
+        assert!(
+            err.contains(&format!(".socket/blobs/{after_hash}")),
+            "the error names the blob file: {err}"
+        );
+        assert!(
+            err.contains("is corrupt") && err.contains("`socket-patch repair`"),
+            "the error says what is wrong and what fixes it: {err}"
+        );
+        assert_eq!(
+            tokio::fs::read(pkg_dir.path().join("index.js"))
+                .await
+                .unwrap(),
+            original,
+            "nothing was written"
+        );
+    }
+
+    /// Only a mismatch against the blob's own name is the blob's fault: a
+    /// write refused for any other reason keeps its own message.
+    #[test]
+    fn blob_write_error_blames_the_blob_only_for_its_own_mismatch() {
+        let hash = "a".repeat(64);
+        let mismatch = content_hash_mismatch(&hash, "b".repeat(64));
+        assert!(blob_write_error(&mismatch, &hash).contains("is corrupt"));
+        assert_eq!(
+            blob_write_error(&mismatch, &"c".repeat(64)),
+            mismatch.to_string()
+        );
+        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(blob_write_error(&denied, &hash), "denied");
     }
 
     #[tokio::test]

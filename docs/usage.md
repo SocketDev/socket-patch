@@ -222,7 +222,7 @@ The removed `setup` command is covered in the [migration guide](migrating-to-v5.
 | `rollback [NAME\|PURL\|UUID\|PATH]...` | Restore selected patches, or all patches when no target is given, and remove their local state |
 | `remove <NAME\|PURL\|UUID>` | Restore and remove matching patches; a name or versionless PURL selects every recorded version |
 | `vendor --revert` | Undo vendoring from its recorded edits and remove the vendored artifacts |
-| `repair` | Restore missing agent patch data or missing/corrupt vendored artifacts using existing records, and clean unused data |
+| `repair` | Restore missing or corrupt agent patch data and vendored artifacts using existing records, and clean unused data |
 | `scan --mode agent --prune` | Patch discovered packages and remove records for dependencies that left the project |
 
 Use `--dry-run` to preview. `rollback --preserve-state` and

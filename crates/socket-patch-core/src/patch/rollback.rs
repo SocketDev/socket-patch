@@ -829,7 +829,10 @@ async fn rollback_package_patch_at(
         {
             Ok(write) => write,
             Err(e) => {
-                result.error = Some(e.to_string());
+                result.error = Some(crate::patch::apply::blob_write_error(
+                    &e,
+                    &file_info.before_hash,
+                ));
                 return result;
             }
         };
@@ -858,7 +861,10 @@ async fn rollback_package_patch_at(
                         )),
                     });
                 }
-                result.error = Some(e.to_string());
+                result.error = Some(crate::patch::apply::blob_write_error(
+                    &e,
+                    &file_info.before_hash,
+                ));
                 return result;
             }
         }
@@ -2905,7 +2911,7 @@ mod tests {
         files.insert(
             "index.js".to_string(),
             PatchFileInfo {
-                before_hash,
+                before_hash: before_hash.clone(),
                 after_hash,
             },
         );
@@ -2925,6 +2931,12 @@ mod tests {
         let err = result.error.unwrap();
         assert!(
             err.contains("Hash verification failed"),
+            "unexpected error: {err}"
+        );
+        // It names the cache entry and the command that replaces it.
+        assert!(
+            err.contains(&format!(".socket/blobs/{before_hash}"))
+                && err.contains("`socket-patch repair`"),
             "unexpected error: {err}"
         );
         // The patched file must NOT have been overwritten with the bad bytes.
