@@ -929,7 +929,11 @@ pub struct Discovery {
     /// (a bundled copy unpacked from its parent's tarball, or a same-lock
     /// [`Discovery::unpatched_copy`]), or, for a vendored bun ref, may
     /// install one (a git / folder / URL copy whose version bun does not
-    /// record, #1600), each diagnosed
+    /// record, #1600), or because the lock entry is one the package
+    /// manager's next resolve drops: a hosted `Cargo.lock` entry no
+    /// declaration cargo honors routes to the patch (or one in a workspace
+    /// member, whose lock cargo never reads), a Bundler lock section whose
+    /// source the Gemfile does not give the gem. Each is diagnosed
     /// [`DIAG_REF_UNATTRIBUTABLE`]. Never attested, but the wiring itself
     /// is the rewriters' own output and names exactly one package version,
     /// so the management commands (rollback, remove, list, the vendored

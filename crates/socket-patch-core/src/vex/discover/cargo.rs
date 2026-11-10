@@ -40,11 +40,13 @@
 //!
 //! * not declared in any of them and routed by no `[patch]` registry pin
 //!   (only registry dependents declare the crate), or no / unparseable root
-//!   manifest → no ref, [`DIAG_REF_INVALID`]: a dependency resolves from
-//!   the source its declaration names, so cargo takes the crate from
-//!   crates.io and rewrites the lock (or fails under `--locked`). No Socket
-//!   writer produces that state (the rewriter pins a declaration or skips
-//!   the crate);
+//!   manifest → withheld ([`unrouted`]: [`DIAG_REF_UNATTRIBUTABLE`], the
+//!   entry kept only as a pin the management commands unwind,
+//!   [`Discovery::shadowed`]): a dependency resolves from the source its
+//!   declaration names, so cargo takes the crate from crates.io and
+//!   rewrites the lock (or fails under `--locked`). No Socket writer
+//!   produces that state (the rewriter pins a declaration or skips the
+//!   crate);
 //! * some declaration names `socket-patch-<uuid>` (the same uuid) → ref,
 //!   when a declaration cargo honors routes this version to the patch
 //!   ([`Decl::routes`]: a live dependency pinned to it whose requirement
@@ -58,8 +60,8 @@
 //!   `[workspace.dependencies]` template counts only when a manifest
 //!   inherits it. A name that sits only where cargo does not act on it (a
 //!   `[patch]` entry cargo ignores, a template nothing inherits, a pin for
-//!   another version) with nothing else to withhold the ref → no ref,
-//!   [`DIAG_REF_INVALID`];
+//!   another version) with nothing else to withhold the ref → withheld the
+//!   same way ([`unrouted`]);
 //! * declarations pin only OTHER `socket-patch-<V>` registries → the lock
 //!   ref AND a `Cargo.toml` ref for `<V>` at the locked version (no pin):
 //!   the files disagree and the CLI gates the package as `wiring_conflict`;
@@ -178,11 +180,41 @@ const DEP_TABLES: [&str; 5] = [
 
 pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let root = read_toml(ctx, CARGO_TOML, out).await;
-    if let Some(doc) = &root {
-        if workspace_member(ctx, doc, out).await {
-            return;
+    let member = match &root {
+        Some(doc) => workspace_member(ctx, doc).await,
+        None => None,
+    };
+    let Some(detail) = member else {
+        return extract_root(ctx, root, out).await;
+    };
+    // A workspace member: nothing in it is wiring. It is read as a root
+    // only to know what it holds: each hosted pin stays among the pins the
+    // management commands unwind ([`Discovery::shadowed`]), and nothing
+    // else of that reading is kept.
+    let mut as_root = Discovery::default();
+    extract_root(ctx, root, &mut as_root).await;
+    for r in as_root.refs.into_iter().chain(as_root.shadowed) {
+        if r.mode == super::WiringMode::Hosted {
+            out.shadow(r);
         }
     }
+    for rel in [CARGO_TOML, CARGO_LOCK, CONFIG_TOML, CONFIG_LEGACY] {
+        let Ok(bytes) = ctx.view.read_bytes(rel).await else {
+            continue;
+        };
+        ctx.recognize_ignored(rel).await;
+        let text = String::from_utf8_lossy(&bytes);
+        if text.contains(PIN_NAME_PREFIX)
+            || !super::socket_identities(&text, &ctx.origin).is_empty()
+        {
+            out.diag(DIAG_REF_UNATTRIBUTABLE, rel, format!("{rel}: {detail}"));
+        }
+    }
+}
+
+/// [`extract`] for a project directory that is the workspace root cargo
+/// builds from, `root` being its parsed manifest.
+async fn extract_root(ctx: &DiscoverCtx<'_>, root: Option<DocumentMut>, out: &mut Discovery) {
     let lock = load_lock(ctx, out).await;
     let config = read_config(ctx, out).await;
     // Every `[patch]` entry pointing at a Socket copy, the root manifest's
@@ -291,43 +323,20 @@ const MEMBER_HINT: &str = "cargo reads `[patch]` and Cargo.lock only at the work
                            from the workspace root (the directory holding its Cargo.toml and \
                            Cargo.lock)";
 
-/// Whether the project directory is not the workspace root cargo builds
-/// from ([`crate::vendor::cargo::workspace_root_refusal`], the check both
-/// writers refuse a project by): a workspace member, whose `[patch]` cargo
-/// ignores and whose own `Cargo.lock` cargo never reads (the workspace
-/// root's decides what builds). Nothing in it is wiring. Its Socket
-/// identities are still recognized (rule 11), so a ledger claim they alone
-/// mention is dead, and each file carrying one is diagnosed (which also
-/// keeps a vendored artifact from the prune GC). Disk runs only: an
-/// in-memory project has no ancestors.
-async fn workspace_member(
-    ctx: &DiscoverCtx<'_>,
-    manifest: &DocumentMut,
-    out: &mut Discovery,
-) -> bool {
+/// Why the project directory is not the workspace root cargo builds from,
+/// when it is not ([`crate::vendor::cargo::workspace_root_refusal`], the
+/// check both writers refuse a project by): a workspace member, whose
+/// `[patch]` cargo ignores and whose own `Cargo.lock` cargo never reads
+/// (the workspace root's decides what builds). Nothing in it is wiring
+/// ([`extract`]): its Socket identities are still recognized (rule 11), so
+/// a ledger claim they alone mention is dead, and each file carrying one is
+/// diagnosed with this detail (which also keeps a vendored artifact from
+/// the prune GC). Disk runs only: an in-memory project has no ancestors.
+async fn workspace_member(ctx: &DiscoverCtx<'_>, manifest: &DocumentMut) -> Option<String> {
     // Of the project's files the check reads only the manifest; the rest
     // are its ancestors', which no overlay of the project's files changes.
-    let Some(dir) = ctx.disk_root_reading([CARGO_TOML]) else {
-        return false;
-    };
-    let Some(detail) =
-        crate::vendor::cargo::workspace_root_refusal(dir, manifest, MEMBER_HINT).await
-    else {
-        return false;
-    };
-    for rel in [CARGO_TOML, CARGO_LOCK, CONFIG_TOML, CONFIG_LEGACY] {
-        let Ok(bytes) = ctx.view.read_bytes(rel).await else {
-            continue;
-        };
-        ctx.recognize_ignored(rel).await;
-        let text = String::from_utf8_lossy(&bytes);
-        if text.contains(PIN_NAME_PREFIX)
-            || !super::socket_identities(&text, &ctx.origin).is_empty()
-        {
-            out.diag(DIAG_REF_UNATTRIBUTABLE, rel, format!("{rel}: {detail}"));
-        }
-    }
-    true
+    let dir = ctx.disk_root_reading([CARGO_TOML])?;
+    crate::vendor::cargo::workspace_root_refusal(dir, manifest, MEMBER_HINT).await
 }
 
 /// Diagnose Socket-tagged sourceless lock entries that no visible
@@ -965,16 +974,14 @@ fn hosted_from_lock(
             if routed || withheld {
                 out.push(lock_ref);
             } else {
-                out.diag(
-                    DIAG_REF_INVALID,
-                    CARGO_LOCK,
+                unrouted(
+                    out,
+                    lock_ref,
                     format!(
-                        "{CARGO_LOCK}: {purl} resolves from Socket patch {uuid}, but the only \
-                         registry = \"{reg}\" for {} (in {}) is one cargo does not apply to \
-                         this version (a [patch] entry it ignores, a [workspace.dependencies] \
-                         entry nothing inherits, a path or git source beside it, or a \
-                         requirement that excludes {}) — cargo re-resolves it from the source \
-                         its dependents declare; not counted",
+                        "the only registry = \"{reg}\" for {} (in {}) is one cargo does not \
+                         apply to this version (a [patch] entry it ignores, a \
+                         [workspace.dependencies] entry nothing inherits, a path or git source \
+                         beside it, or a requirement that excludes {})",
                         pkg.name,
                         decl_files(naming),
                         pkg.version
@@ -990,8 +997,7 @@ fn hosted_from_lock(
             let why = if decls.is_some() {
                 format!(
                     "no {CARGO_TOML} declares {} with registry = \"{reg}\" and no [patch] \
-                     entry routes it there — cargo re-resolves it from the source its \
-                     dependents declare",
+                     entry routes it there",
                     pkg.name
                 )
             } else {
@@ -1000,14 +1006,7 @@ fn hosted_from_lock(
                     pkg.name
                 )
             };
-            out.diag(
-                DIAG_REF_INVALID,
-                CARGO_LOCK,
-                format!(
-                    "{CARGO_LOCK}: {purl} resolves from Socket patch {uuid}, but {why}; not \
-                     counted"
-                ),
-            );
+            unrouted(out, lock_ref, why);
             continue;
         }
         // Pins to another Socket patch that may select this version; one
@@ -1057,6 +1056,27 @@ fn hosted_from_lock(
             ));
         }
     }
+}
+
+/// Withhold `lock_ref`, a Socket-sourced lock entry that no declaration
+/// cargo honors routes to its patch (`why`): cargo resolves a dependency
+/// from the source its declaration names, so the next resolve takes the
+/// crate from there and rewrites the entry (`--locked` fails instead). It
+/// is never attested and wires no ledger claim, but the entry is still one
+/// package version's pin in the lock, so it stays among the pins the
+/// management commands unwind ([`Discovery::shadowed`]).
+fn unrouted(out: &mut Discovery, lock_ref: PatchedRef, why: String) {
+    out.diag(
+        DIAG_REF_UNATTRIBUTABLE,
+        CARGO_LOCK,
+        format!(
+            "{CARGO_LOCK}: {} resolves from Socket patch {}, but {why}: cargo re-resolves it \
+             from the source its dependents declare (crates.io) and rewrites this entry, or \
+             fails under --locked; not attested",
+            lock_ref.purl, lock_ref.uuid
+        ),
+    );
+    out.shadow(lock_ref);
 }
 
 /// The root and member manifests, and their texts as the hosted rewriter's
@@ -2303,20 +2323,31 @@ mod tests {
     }
 
     /// Asserts the Socket-sourced `foo` of [`transitive_foo`] is no ref, is
-    /// diagnosed against the lock, and leaves a ledger record for it dead.
+    /// diagnosed against the lock, and leaves a ledger record for it dead,
+    /// while the lock entry stays a pin `rollback` / `remove` unwind.
     fn assert_foo_unrouted(out: &Discovery, what: &str) {
         assert_refs(out, &[]);
         assert!(
-            out.diagnostics.iter().any(|d| d.code == DIAG_REF_INVALID
-                && d.file == std::path::Path::new("Cargo.lock")
-                && d.detail.contains("pkg:cargo/foo@1.0.0")
-                && d.detail.contains("not counted")),
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.file == std::path::Path::new("Cargo.lock")
+                    && d.detail.contains("pkg:cargo/foo@1.0.0")
+                    && d.detail.contains("not attested")),
             "{what}: {:#?}",
             out.diagnostics
         );
         assert_eq!(
             out.hosted_claim("pkg:cargo/foo@1.0.0", UUID_A),
             Some(false),
+            "{what}"
+        );
+        assert_eq!(
+            out.shadowed
+                .iter()
+                .map(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode))
+                .collect::<Vec<_>>(),
+            [("pkg:cargo/foo@1.0.0", UUID_A, WiringMode::Hosted)],
             "{what}"
         );
     }
@@ -2446,7 +2477,8 @@ mod tests {
     /// (real cargo 1.93 builds the workspace lock's crates.io crate from
     /// inside the member, `--locked`). Nothing in a member is wiring; its
     /// identities stay recognized, so a ledger record is dead, and each file
-    /// carrying one says where to run.
+    /// carrying one says where to run. The member's hosted pin stays one
+    /// `rollback` / `remove` unwind.
     #[tokio::test]
     async fn a_workspace_member_is_not_read_as_the_root() {
         let both = [
@@ -2465,6 +2497,14 @@ mod tests {
             let out = run(&p).await;
             assert_refs(&out, &[]);
             assert!(out.unattested.is_empty(), "{what}: {:#?}", out.unattested);
+            assert_eq!(
+                out.shadowed
+                    .iter()
+                    .map(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode))
+                    .collect::<Vec<_>>(),
+                [("pkg:cargo/serde@1.0.1", UUID_A, WiringMode::Hosted)],
+                "{what}"
+            );
             for file in ["Cargo.toml", "Cargo.lock"] {
                 assert!(
                     out.diagnostics
@@ -3410,7 +3450,7 @@ mod tests {
         );
         let out = run(&p).await;
         assert_refs(&out, &[]);
-        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
 
         p.write(
             "Cargo.toml",

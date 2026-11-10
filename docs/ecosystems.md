@@ -1510,15 +1510,17 @@ version = "1.0.4+socket.<uuid>"
   cargo ignores (a `[patch."https://github.com/rust-lang/crates.io-index"]` table
   replaces `[patch.crates-io]`) or on a `[workspace.dependencies]` entry nothing
   inherits, or for a lock with no readable `Cargo.toml` beside it. The run warns
-  `patched_ref_invalid` and names the lock entry.
+  `patched_ref_unattributable` and names the lock entry; `rollback` and `remove`
+  still restore it.
 - **Run it from the workspace root.** Cargo ignores `[patch]` in a workspace
   member and reads `Cargo.lock` only at the workspace root. Run from a member (a
   directory an ancestor `[workspace]` does not `exclude`, or a package with
   `package.workspace`), `vex` reads no cargo wiring: a `[patch]` path entry, a
   registry pin and a `Cargo.lock` left beside the member attest nothing. Each
   member file that names a Socket patch gets a `patched_ref_unattributable`
-  warning that names the workspace root. Hosted scan and `vendor` refuse the
-  same directories (`cargo_manifest_not_workspace_root`).
+  warning that names the workspace root; `rollback` and `remove` still unwind a
+  hosted pin left there. Hosted scan and `vendor` refuse the same directories
+  (`cargo_manifest_not_workspace_root`).
 
 ## Go: directory replaces and go.sum
 
