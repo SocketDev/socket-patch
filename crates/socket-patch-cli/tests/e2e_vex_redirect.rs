@@ -947,6 +947,54 @@ fn uuid_on_a_foreign_host_is_not_a_patch_reference() {
     );
 }
 
+/// A `resolved` that only looks like Socket's is no patch reference either,
+/// however available the patch record: a host that depends on who parses
+/// the URL (`patch.socket.dev\@evil.example` is Socket's host to a WHATWG
+/// parser and `evil.example` to libcurl), a path the patch server serves no
+/// patch under, or one a percent-encoded `/` can lead out of. With no
+/// manifest the run finds nothing to attest and asks the API for nothing.
+#[test]
+fn look_alike_socket_urls_are_not_patch_references() {
+    let tail = format!("{TOKEN}/{UUID}/left-pad-1.3.0.tgz");
+    for resolved in [
+        format!("https://patch.socket.dev\\@evil.example/patch/npm/left-pad/1.3.0/{tail}"),
+        format!("https://patch.socket.dev/x/{tail}"),
+        format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/..%2f..%2fleft-pad-1.3.0.tgz"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::write(
+            cwd.join("package-lock.json"),
+            serde_json::json!({
+                "name": "app",
+                "version": "1.0.0",
+                "lockfileVersion": 3,
+                "packages": {
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": {
+                        "version": "1.3.0",
+                        "resolved": resolved,
+                        "integrity": SRI
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (rt, server) =
+            serve_patch_views(vec![(UUID.to_string(), left_pad_view(&"b".repeat(64)))]);
+        let (code, env) = vex_json(cwd, &["--proxy-url", &server.uri()]);
+        assert_eq!(code, Some(2), "{resolved}: {env}");
+        assert_eq!(
+            env["error"]["code"], "manifest_not_found",
+            "{resolved}: {env}"
+        );
+        assert!(!cwd.join("out.vex.json").exists(), "{resolved}");
+        let asked = rt.block_on(server.received_requests()).unwrap_or_default();
+        assert!(asked.is_empty(), "{resolved}: {asked:?}");
+    }
+}
+
 /// `--patch-server-url` (staging / self-hosted / test servers): hosted
 /// references on the operator's configured patch-server origin count.
 #[test]

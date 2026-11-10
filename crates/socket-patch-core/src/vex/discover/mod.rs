@@ -3668,13 +3668,15 @@ mod tests {
     fn hosted_shape_uuid_normalizes_like_hosted_patch_uuid() {
         const U: &str = "11111111-2222-4333-8444-555555555555";
         for url in [
-            format!("https://mirror.example/patch/{U}/x.tgz"),
-            format!("https:\\/\\/mirror.example\\/patch\\/{U}\\/x.tgz"),
-            format!("https%3A%2F%2Fmirror.example%2Fpatch%2F{U}%2Fx.tgz"),
-            format!("sparse+https://mirror.example/patch/{U}/"),
-            format!("registry+https://mirror.example/patch/{U}/"),
-            format!("https://patch.socket.dev@mirror.example/patch/{U}/x.tgz"),
-            format!("https://user:pw@patch.socket.dev/patch/{U}/x.tgz"),
+            format!("https://mirror.example/patch/npm/tok/{U}/x.tgz"),
+            format!("https:\\/\\/mirror.example\\/patch\\/npm\\/tok\\/{U}\\/x.tgz"),
+            format!("https%3A%2F%2Fmirror.example%2Fpatch%2Fnpm%2Ftok%2F{U}%2Fx.tgz"),
+            format!("sparse+https://mirror.example/patch-registry/cargo/tok/{U}/index/"),
+            format!("registry+https://mirror.example/patch-registry/cargo/tok/{U}/index/"),
+            format!("https://mirror.example/base/patch/npm/tok/{U}/x.tgz"),
+            format!("https://mirror.example/gopatch/{U}"),
+            format!("https://patch.socket.dev@mirror.example/patch/npm/tok/{U}/x.tgz"),
+            format!("https://user:pw@patch.socket.dev/patch/npm/tok/{U}/x.tgz"),
         ] {
             assert_eq!(
                 crate::origin::hosted_shape_uuid(&url).as_deref(),
@@ -3682,10 +3684,13 @@ mod tests {
                 "{url}"
             );
         }
-        // A url merely ending in the uuid is not a patch server's.
+        // A url merely ending in the uuid is not a patch server's, nor is
+        // one whose `patch` level is followed by no ecosystem.
         for url in [
             format!("https://artifacts.corp/blobs/{U}/x-1.0.0.tgz"),
             format!("https://evil.example/{U}/x.tgz"),
+            format!("https://mirror.example/patch/{U}/x.tgz"),
+            format!("https://mirror.example\\@evil.example/patch/npm/tok/{U}/x.tgz"),
         ] {
             assert_eq!(crate::origin::hosted_shape_uuid(&url), None, "{url}");
         }
@@ -4867,6 +4872,40 @@ mod tests {
         lockless.write("docs/notes.txt", &note);
         let discovery = lockless.discover().await;
         assert!(!discovery.vendor_entry_live(lockless.root(), &entry).await);
+    }
+
+    /// A `resolved` url whose host depends on who parses it (the WHATWG
+    /// parser reads `patch.socket.dev\@evil.example` as Socket's host,
+    /// libcurl as `evil.example`), or whose path the patch server serves
+    /// no patch under, wires nothing. Its uuid is still recognized, so no
+    /// ledger claim for it is decided from raw text.
+    #[tokio::test]
+    async fn a_look_alike_hosted_url_wires_nothing_and_stays_recognized() {
+        let tail = format!("{TOKEN}/{UUID_A}/foo-1.0.0.tgz");
+        for resolved in [
+            format!("https://patch.socket.dev\\\\@evil.example/patch/npm/foo/1.0.0/{tail}"),
+            format!("https://patch.socket.dev/x/{tail}"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID_A}/..%2f..%2ffoo-1.0.0.tgz"),
+        ] {
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                format!(
+                    "{{\"name\":\"app\",\"version\":\"0.1.0\",\"lockfileVersion\":3,\"packages\":{{\"\":\
+                     {{\"name\":\"app\",\"version\":\"0.1.0\",\"dependencies\":{{\"foo\":\"1.0.0\"}}}},\
+                     \"node_modules/foo\":{{\"version\":\"1.0.0\",\"resolved\":\"{resolved}\",\
+                     \"integrity\":\"sha512-{}==\"}}}}}}",
+                    "A".repeat(86)
+                ),
+            );
+            let out = p.discover().await;
+            assert_refs(&out, &[]);
+            assert_eq!(
+                out.hosted_claim("pkg:npm/foo@1.0.0", UUID_A),
+                Some(false),
+                "{resolved}"
+            );
+        }
     }
 
     /// Cross-package-manager union: one root carrying the committed hosted

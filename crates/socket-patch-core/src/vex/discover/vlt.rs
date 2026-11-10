@@ -879,7 +879,7 @@ mod tests {
         let token_only = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID_A}/b-1.0.0.tgz");
         for (what, location, wired) in [
             ("scope as two segments", at("@a/b"), true),
-            ("scope percent-encoded", at("%40a%2Fb"), true),
+            ("scope `@` percent-encoded", at("%40a/b"), true),
             ("token-only", token_only, true),
             ("wrong-url-scope", at("@c/b"), false),
             ("scope dropped", at("b"), false),
@@ -897,6 +897,21 @@ mod tests {
                 assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{what}");
             }
         }
+        // A percent-encoded `/` is not Socket's spelling of a scope: hosted
+        // identity refuses the url, so the node wires nothing, and its uuid
+        // stays one discovery decides.
+        let out = discover(&lock(
+            Some(1),
+            &[node(
+                "~npm~@a+b@1.0.0",
+                "@a/b",
+                Some(SRI),
+                Some(&at("%40a%2Fb")),
+            )],
+        ))
+        .await;
+        assert!(out.refs.is_empty(), "{:?}", out.refs);
+        assert!(out.recognizes(UUID_A, WiringMode::Hosted));
     }
 
     #[tokio::test]

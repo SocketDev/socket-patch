@@ -11,8 +11,9 @@
 //! stack moves them here (`docs/design/lock-model-unification.md`).
 //!
 //! * **hosted** — [`hosted_patch_uuid`]: an `http(s)` url on Socket's patch
-//!   server or on an operator-configured origin, the patch uuid its last
-//!   canonical-uuid path segment. `OriginPolicy::hosted_uuid` answers the
+//!   server or on an operator-configured origin, under a path the server
+//!   serves patches from, the patch uuid its last canonical-uuid path
+//!   segment. `OriginPolicy::hosted_uuid` answers the
 //!   same question with a memoized fast path for the plain registry urls
 //!   every lock is full of;
 //! * **vendored** — [`vendor_ref`] / [`vendor_ref_decorated`] /
@@ -57,9 +58,18 @@ pub const SOCKET_PATCH_SERVER_HOST: &str = "patch.socket.dev";
 ///   port. A uuid inside any other host's URL is a user's own dependency
 ///   source, never a patch reference;
 /// * no userinfo — a Socket-written URL never carries credentials;
-/// * the uuid is the LAST path segment passing the canonical-uuid grammar:
-///   hosted URLs carry the grant token in the level before the uuid
-///   (`…/patch/npm/<name>/<ver>/<token>/<uuid>/<leaf>`,
+/// * no backslash, whitespace or control character: url parsers disagree
+///   about them (the WHATWG parser this reads with takes `\` for `/` and
+///   drops tabs and newlines; libcurl and PHP read
+///   `https://patch.socket.dev\@evil.example/…` as host `evil.example`), so
+///   the host such a url names depends on the client that fetches it;
+/// * the path is one the patch server serves a patch under
+///   ([`served_tail`]): `patch/<eco>/…`, `patch-registry/<eco>/…` or
+///   `gopatch/…`, with no percent-encoded `/` or `\`, which a server may
+///   decode into a path that leaves the patch;
+/// * the uuid is the LAST segment of that path passing the canonical-uuid
+///   grammar: hosted URLs carry the grant token in the level before the
+///   uuid (`…/patch/npm/<name>/<ver>/<token>/<uuid>/<leaf>`,
 ///   `…/patch-registry/<eco>/<token>/<uuid>/…`), and grant tokens may
 ///   themselves be uuid-shaped, so "the first uuid" would elect the token.
 ///
@@ -67,17 +77,65 @@ pub const SOCKET_PATCH_SERVER_HOST: &str = "patch.socket.dev";
 /// `#fragment` (yarn classic `#<sha1>`, pip `#sha256=`) and a `?query` are
 /// ignored; `\/`-escaped slashes (older composer locks) are unescaped; a
 /// wholly percent-encoded URL (yarn berry's `__archiveUrl=` binding) is
-/// decoded; a cargo source-kind prefix (`sparse+`, `registry+`) is dropped.
-/// Path segments are percent-decoded AFTER splitting, so an encoded `/`
-/// can never manufacture a segment.
+/// decoded; a cargo source-kind prefix (`sparse+`, `registry+`) is dropped;
+/// surrounding whitespace is trimmed. Path segments are percent-decoded
+/// AFTER splitting, so an encoded `/` can never manufacture a segment.
 pub fn hosted_patch_uuid(url: &str, extra_origins: &[String]) -> Option<String> {
-    hosted_patch_url_uuids(url, extra_origins)?.pop()
+    use crate::utils::purl::percent_decode_purl_component;
+
+    let (parsed, socket_host) = accepted_hosted_url(url, extra_origins)?;
+    let path = parsed.path().to_ascii_lowercase();
+    if path.contains("%2f") || path.contains("%5c") {
+        return None;
+    }
+    let segments: Vec<&str> = parsed.path_segments()?.collect();
+    served_tail(&segments, !socket_host)?
+        .iter()
+        .rev()
+        .map(|segment| percent_decode_purl_component(segment).into_owned())
+        .find(|segment| is_canonical_uuid(segment))
+}
+
+/// The path levels under which the patch server serves a patch's artifacts
+/// and registry indexes, each followed by the ecosystem.
+const SERVE_ROOTS: [&str; 2] = ["patch", "patch-registry"];
+
+/// The root of the Go module namespace, followed by the patch uuid
+/// ([`crate::vendor::go_mod_edit::HOSTED_GO_MODULE_PREFIX`]).
+const GO_SERVE_ROOT: &str = "gopatch";
+
+/// The path segments below the level a patch is served under —
+/// `patch/<eco>/`, `patch-registry/<eco>/` (`<eco>` one of
+/// [`ECOSYSTEM_DIRS`]) or `gopatch/` — or `None` when the path has no such
+/// level: any other path of the host (another endpoint, a uuid that merely
+/// appears in it) names no patch. Socket's own server serves these levels
+/// first in the path; an operator's deployment may sit under a path prefix
+/// (`prefixed`), where the first such level counts.
+fn served_tail<'a>(segments: &'a [&'a str], prefixed: bool) -> Option<&'a [&'a str]> {
+    let tail_at = |i: usize| {
+        let root = *segments.get(i)?;
+        if root == GO_SERVE_ROOT {
+            Some(i + 1)
+        } else if SERVE_ROOTS.contains(&root) && ECOSYSTEM_DIRS.contains(segments.get(i + 1)?) {
+            Some(i + 2)
+        } else {
+            None
+        }
+    };
+    let start = if prefixed {
+        (0..segments.len()).find_map(tail_at)?
+    } else {
+        tail_at(0)?
+    };
+    segments.get(start..)
 }
 
 /// `url` normalized the way [`hosted_patch_url_uuids`] reads it: `\/`
 /// unescaped, a percent-encoded `http(s)://` url decoded, and a Cargo
 /// `sparse+` / `registry+` source prefix stripped. `None` without a
-/// `://`.
+/// `://`, and for a url holding a backslash, whitespace or a control
+/// character once normalized: no two url parsers read those alike (see
+/// [`hosted_patch_uuid`]), so the url is refused before any parser sees it.
 fn normalized_hosted_url(url: &str) -> Option<String> {
     use crate::utils::purl::percent_decode_purl_component;
 
@@ -88,6 +146,12 @@ fn normalized_hosted_url(url: &str) -> Option<String> {
     } else {
         unescaped
     };
+    if decoded
+        .chars()
+        .any(|c| c == '\\' || c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
     // `sparse+https://…` / `registry+https://…` (Cargo.lock `source`).
     let (scheme, _) = decoded.split_once("://")?;
     Some(match scheme.rsplit_once('+') {
@@ -101,36 +165,26 @@ fn normalized_hosted_url(url: &str) -> Option<String> {
 /// The patch uuid `url` names when read as a hosted url of its OWN origin
 /// ([`hosted_patch_uuid`]'s grammar with the url's origin taken as
 /// configured): what a lock entry on an origin a run was not given claims
-/// to resolve from. Only a url in a Socket patch server's path shape (a
-/// `patch`, `patch-registry` or `gopatch` segment) counts: any other url
-/// merely ending in the uuid (an artifact store's blob path) resolves from
+/// to resolve from. Only a url in a Socket patch server's path shape
+/// ([`served_tail`], under any path prefix) counts: any other url merely
+/// ending in the uuid (an artifact store's blob path) resolves from
 /// elsewhere. Userinfo is dropped first: Socket never writes one, so
 /// `https://patch.socket.dev@evil.example/patch/…` is a look-alike on the
 /// host after the `@`, never an accepted origin.
 pub(crate) fn hosted_shape_uuid(url: &str) -> Option<String> {
     let normalized = normalized_hosted_url(url)?;
     let mut parsed = reqwest::Url::parse(&normalized).ok()?;
-    if !parsed
-        .path_segments()?
-        .any(|s| matches!(s, "patch" | "patch-registry" | "gopatch"))
-    {
-        return None;
-    }
     let _ = parsed.set_username("");
     let _ = parsed.set_password(None);
     let origin = parsed.origin().ascii_serialization();
     hosted_patch_uuid(parsed.as_str(), &[origin])
 }
 
-/// EVERY canonical-uuid path segment of a Socket-HOSTED url, in path order
-/// (the grant token first when it is uuid-shaped, the patch uuid last), or
-/// `None` when `url` is not on an accepted origin — [`hosted_patch_uuid`]'s
-/// exact acceptance rules, without electing one segment. `vex` discovery
-/// uses it to RECOGNIZE every Socket identity a lockfile mentions, including
-/// the malformed or rejected shapes whose "last uuid" is not a patch.
-pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
-    use crate::utils::purl::percent_decode_purl_component;
-
+/// `url` parsed, when it is an `http(s)` url with no userinfo on an
+/// accepted origin — Socket's patch server or one of `extra_origins` — and
+/// whether that origin is Socket's own: the origin half of
+/// [`hosted_patch_uuid`]'s rules, after [`normalized_hosted_url`].
+fn accepted_hosted_url(url: &str, extra_origins: &[String]) -> Option<(reqwest::Url, bool)> {
     let text = normalized_hosted_url(url)?;
     let parsed = reqwest::Url::parse(&text).ok()?;
     if !matches!(parsed.scheme(), "https" | "http")
@@ -150,9 +204,21 @@ pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec
                 && o.port_or_known_default() == parsed.port_or_known_default()
         })
     });
-    if !socket_host && !configured {
-        return None;
-    }
+    (socket_host || configured).then_some((parsed, socket_host))
+}
+
+/// EVERY canonical-uuid path segment of a url on an accepted origin
+/// ([`hosted_patch_uuid`]'s origin rules), in path order (the grant token
+/// first when it is uuid-shaped, the patch uuid last), or `None` when `url`
+/// is not on one. Deliberately wider than [`hosted_patch_uuid`], which also
+/// demands a served path: `vex` discovery uses this to RECOGNIZE every
+/// Socket identity a lockfile mentions, including the malformed or
+/// rejected shapes whose "last uuid" is not a patch, so that no ledger
+/// claim for such a uuid is decided from raw text.
+pub fn hosted_patch_url_uuids(url: &str, extra_origins: &[String]) -> Option<Vec<String>> {
+    use crate::utils::purl::percent_decode_purl_component;
+
+    let (parsed, _) = accepted_hosted_url(url, extra_origins)?;
     Some(
         parsed
             .path_segments()?
@@ -661,6 +727,154 @@ mod hosted_patch_uuid_tests {
         let default = format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/x.tgz");
         assert_eq!(hosted_patch_uuid(&default, &origins).as_deref(), Some(UUID));
         assert_eq!(hosted_patch_uuid(&url, &["not a url".to_string()]), None);
+    }
+
+    /// Every `url` the classifiers accept, for a list none may accept.
+    fn accepted(urls: &[String], origins: &[String]) -> Vec<String> {
+        urls.iter()
+            .filter(|url| {
+                hosted_patch_uuid(url, origins).is_some()
+                    || OriginPolicy::new(origins).hosted_uuid(url).is_some()
+                    || hosted_patch_url_uuids(url, origins).is_some()
+                    || hosted_shape_uuid(url).is_some()
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Url parsers disagree about `\`, whitespace and control characters:
+    /// the WHATWG parser reads `\` as `/` and drops tabs and newlines, while
+    /// libcurl and PHP's `parse_url` (Composer's `dist.url`) read
+    /// `https://patch.socket.dev\@evil.example/…` as host `evil.example`
+    /// with userinfo `patch.socket.dev\`. A url whose host depends on who
+    /// parses it is never Socket's, in any spelling the readers normalize.
+    #[test]
+    fn urls_whose_host_depends_on_the_parser_are_refused() {
+        let tail = format!("/patch/npm/foo/1.0.0/{TOKEN}/{UUID}/foo-1.0.0.tgz");
+        let urls = [
+            format!("https://patch.socket.dev\\@evil.example{tail}"),
+            format!("https://patch.socket.dev\\\\@evil.example{tail}"),
+            format!("https:\\\\patch.socket.dev{tail}"),
+            format!("https://patch.socket.dev\\patch\\npm\\{TOKEN}\\{UUID}\\foo-1.0.0.tgz"),
+            // The `\/` unescape leaves the stray backslash in place.
+            format!(
+                "https:\\/\\/patch.socket.dev\\\\@evil.example{}",
+                tail.replace('/', "\\/")
+            ),
+            // A wholly percent-encoded url decodes to one.
+            format!(
+                "https%3A%2F%2Fpatch.socket.dev%5C%40evil.example{}",
+                tail.replace('/', "%2F")
+            ),
+            format!("https://pat\tch.socket.dev{tail}"),
+            format!("https://patch.socket.dev\n{tail}"),
+            format!("https://patch.socket.dev/patch/npm/fo o/1.0.0/{TOKEN}/{UUID}/foo-1.0.0.tgz"),
+            format!("https://patch.socket.dev{tail}\r\nHost: evil.example"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/foo\u{0}.tgz"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/foo\u{7f}.tgz"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/foo\u{a0}.tgz"),
+            format!("https%3A%2F%2Fpatch.socket.dev%2Fpatch%2Fnpm%2F{TOKEN}%2F{UUID}%2Ffoo%09.tgz"),
+        ];
+        assert_eq!(accepted(&urls, &none()), Vec::<String>::new());
+        // A foreign origin's look-alike is no hosted shape either.
+        let foreign = [format!("https://mirror.example\\@evil.example{tail}")];
+        assert_eq!(
+            accepted(&foreign, &["https://mirror.example".to_string()]),
+            Vec::<String>::new()
+        );
+        // Surrounding whitespace is the lock format's, not the url's.
+        assert_eq!(
+            hosted_patch_uuid(&format!(" \thttps://patch.socket.dev{tail}\n"), &none()).as_deref(),
+            Some(UUID)
+        );
+    }
+
+    /// A patch is served under `patch/<eco>/…`, `patch-registry/<eco>/…` or
+    /// `gopatch/…` — first in the path on Socket's own server. A uuid
+    /// anywhere else on the host names no patch, and neither does one a
+    /// percent-encoded `/` or `\` could move the request away from.
+    #[test]
+    fn only_a_served_path_names_a_patch() {
+        let refused = [
+            format!("https://patch.socket.dev/x/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/patch/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/patch/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/patch/telemetry/{UUID}"),
+            format!("https://patch.socket.dev/patch-registry/{TOKEN}/{UUID}/"),
+            format!("https://patch.socket.dev/patch-registry/jsr/{TOKEN}/{UUID}/"),
+            format!("https://patch.socket.dev/gem/{TOKEN}/{UUID}/"),
+            // The root is not first, or the uuid comes before it.
+            format!("https://patch.socket.dev/files/patch/npm/{TOKEN}/{UUID}/x.tgz"),
+            format!("https://patch.socket.dev/{UUID}/patch/npm/x.tgz"),
+            format!("https://patch.socket.dev/{UUID}/gopatch/x"),
+            format!("https://patch.socket.dev/patch/{UUID}/npm/x.tgz"),
+            // Encoded separators.
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/..%2f..%2fother"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/..%2F..%2Fother"),
+            format!("https://patch.socket.dev/patch/npm/{TOKEN}/{UUID}/..%5c..%5Cother"),
+            format!("https://patch.socket.dev/patch/npm/a%2fb/1.0.0/{TOKEN}/{UUID}/b-1.0.0.tgz"),
+            format!("https://patch.socket.dev/patch%2fnpm/{TOKEN}/{UUID}/x.tgz"),
+            format!("sparse+https://patch.socket.dev/x/{TOKEN}/{UUID}/index/"),
+        ];
+        for url in &refused {
+            assert_eq!(hosted_patch_uuid(url, &none()), None, "{url}");
+            assert_eq!(OriginPolicy::new(&[]).hosted_uuid(url), None, "{url}");
+        }
+        for url in [
+            format!("https://patch.socket.dev/gopatch/{UUID}"),
+            format!("https://patch.socket.dev/gopatch/{UUID}/v2"),
+            format!(
+                "https://patch.socket.dev/patch-registry/golang/patch.socket.dev/gopatch/{UUID}/@v/v1.4.2-socketpatch.1.zip"
+            ),
+            format!("https://patch.socket.dev/patch/npm/@scope/pkg/2.0.0/{TOKEN}/{UUID}/pkg-2.0.0.tgz"),
+            format!("https://patch.socket.dev/patch/npm/%40scope/pkg/2.0.0/{TOKEN}/{UUID}/pkg-2.0.0.tgz"),
+            format!(
+                "https://patch.socket.dev/patch/composer/monolog/monolog/3.0.2/{TOKEN}/{UUID}/monolog-3.0.2.zip"
+            ),
+            format!(
+                "https://patch.socket.dev/patch/maven/com.google.code.gson/gson/2.10.1/{TOKEN}/{UUID}/gson-2.10.1.jar"
+            ),
+            format!(
+                "https://patch.socket.dev/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+            ),
+            format!("https://patch.socket.dev/patch/cargo/serde/1.0.0/{TOKEN}/{UUID}/serde-1.0.0.crate"),
+            format!("https://patch.socket.dev/patch-registry/pypi/{TOKEN}/{UUID}/simple/"),
+            format!("https://patch.socket.dev/patch-registry/npm/{TOKEN}/{UUID}/"),
+            format!(
+                "https://patch.socket.dev/patch-registry/maven/{TOKEN}/{UUID}/maven2/com/google/code/gson/gson/2.10.1-socket.7c8d9e0f/gson-2.10.1-socket.7c8d9e0f.jar"
+            ),
+            format!(
+                "https://patch.socket.dev/patch-registry/nuget/{TOKEN}/{UUID}/flatcontainer/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+            ),
+        ] {
+            assert_eq!(
+                hosted_patch_uuid(&url, &none()).as_deref(),
+                Some(UUID),
+                "{url}"
+            );
+        }
+        // An operator's deployment may serve the same shape under a path
+        // prefix; a uuid outside that shape is still no patch there.
+        let origins = vec!["https://patches.internal.example/socket".to_string()];
+        let served = format!(
+            "https://patches.internal.example/socket/patch/pypi/six/1.16.0/{TOKEN}/{UUID}/six-1.16.0-py2.py3-none-any.whl"
+        );
+        assert_eq!(hosted_patch_uuid(&served, &origins).as_deref(), Some(UUID));
+        for url in [
+            format!("https://patches.internal.example/socket/{TOKEN}/{UUID}/x.whl"),
+            format!("https://patches.internal.example/{UUID}/patch/pypi/x.whl"),
+            format!("https://patches.internal.example/socket/patch/pypi/{TOKEN}/{UUID}/..%2fx.whl"),
+        ] {
+            assert_eq!(hosted_patch_uuid(&url, &origins), None, "{url}");
+        }
+        // Recognition stays wider than identity: a uuid on the host that
+        // names no patch is still one discovery is authoritative for.
+        assert_eq!(
+            hosted_patch_url_uuids(&refused[0], &none()),
+            Some(vec![UUID.to_string()])
+        );
     }
 
     /// The Go hosted namespace lives on the same host the URL allowlist
