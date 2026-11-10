@@ -4875,12 +4875,28 @@ fn vendored_unwind_names_the_patched_cached_archive(fx: &RedirectFixture, comman
     ];
     let envs = [("SOCKET_RUBYGEMS_URL", upstream.as_str())];
 
+    // What bundler already holds when the takeover runs: the patched gem
+    // it installed from the patch registry, and the patched archive.
+    let installed = fresh_installed_lib(&dir, &format!("{DEP}-{DEP_VERSION}"), "vuln_gem.rb");
+    let held = (
+        std::fs::read(&installed).unwrap(),
+        std::fs::read(&archive).unwrap(),
+    );
+    assert!(held.0 == patched_lib().into_bytes(), "{command}: premise");
+
     let mut takeover = vec!["get", UUID, "--mode", "vendored", "--yes"];
     takeover.extend(common);
     let (code, stdout, stderr) = run_socket_env(&dir, &takeover, &envs);
     assert_eq!(
         code, 0,
         "{command}: takeover:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The takeover leaves them alone: bundler loads the vendored copy from
+    // now on, and resetting an unused copy to upstream would only cost a
+    // download and leave an unpatched leftover.
+    assert!(
+        std::fs::read(&installed).unwrap() == held.0 && std::fs::read(&archive).unwrap() == held.1,
+        "{command}: the takeover changed a gem bundler already held"
     );
     let gemfile = std::fs::read_to_string(dir.join(fx.gemfile_name)).unwrap();
     assert!(

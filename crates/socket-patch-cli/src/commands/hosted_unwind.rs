@@ -70,6 +70,13 @@ pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<Str
 /// note per refreshed materialization and a warning per stale one. An
 /// archive in Bundler's cache dir the refresh replaced no longer needs the
 /// restore's own `upstream_gem_stale_cache` advisory.
+///
+/// Only this leg refreshes, because only its callers leave the gem on its
+/// upstream entry. A hosted → vendored takeover restores the pins itself
+/// (`restore_upstream`, on its way to the `path:` source) and must stay
+/// off this path: Bundler loads the vendored copy from then on, so the
+/// installed one is an unused leftover that a refresh would only make
+/// unpatched, at the cost of a registry download vendored mode never needs.
 async fn refresh_restored_gems(
     common: &GlobalArgs,
     outcome: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
