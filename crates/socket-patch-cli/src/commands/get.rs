@@ -30,11 +30,12 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 // the engine itself lives in the shared `agent_download` helper.
 use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
-    filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
-    record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
-    unwind_new_blobs, vendored_download_refusals, warn_if_manifest_gitignored,
-    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
-    ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    filter_to_installed_releases, max_vuln_severity, nested_apply_args,
+    next_steps as agent_next_steps, patch_event_metadata, record_apply_outcome, recorded_purls,
+    report_lock_failure, run_nested_apply, run_outcome, tag_mode, unwind_new_blobs,
+    vendored_download_refusals, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
+    write_all_patch_blobs, DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED,
+    RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -1809,6 +1810,15 @@ pub async fn run(args: GetArgs) -> i32 {
     let code = download_and_apply_patches_into(&selected, &params, &run, &mut env).await;
     if args.common.json {
         emit(&env);
+    } else if !quiet && code == 0 && !args.common.is_global() {
+        for line in agent_next_steps(
+            &recorded_purls(&env),
+            &args.common.socket_dir(),
+            &args.common.project_root(),
+            args.save_only,
+        ) {
+            println!("{line}");
+        }
     }
     code
 }
@@ -2135,6 +2145,17 @@ async fn save_and_apply_patch(
     // status `error` above — so only the apply step can degrade us.
     let apply_failed = !apply_succeeded && !args.save_only;
     let exit_code = run_outcome(false, apply_failed);
+
+    if !quiet && changed && exit_code == 0 && !args.common.is_global() {
+        for line in agent_next_steps(
+            &[patch.purl.as_str()],
+            &socket_dir,
+            &args.common.project_root(),
+            args.save_only,
+        ) {
+            println!("{line}");
+        }
+    }
 
     if args.common.json {
         let mut env = new_envelope(&args.common);

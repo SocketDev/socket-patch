@@ -24,8 +24,8 @@ pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
-    manifest_error_message, next_steps, plural, sentence_case, shell_word, short_uuid,
-    sweep_failure, truncate,
+    agent_next_steps, manifest_error_message, next_steps, plural, sentence_case, shell_word,
+    short_uuid, sweep_failure, truncate,
 };
 
 /// A global run's scope as one pasteable argument: `--global-prefix <dir>`

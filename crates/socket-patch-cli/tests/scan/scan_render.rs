@@ -978,6 +978,35 @@ async fn scan_human_agent_names_unpatched_advisories() {
     );
 }
 
+/// Agent mode ends a run that recorded a patch with the two steps the mode
+/// needs: commit `.socket/`, and re-apply after every install (named for
+/// the project's package manager). A re-run that records nothing new
+/// prints no steps.
+#[tokio::test]
+async fn scan_human_agent_ends_with_commit_and_reapply_next_steps() {
+    let mock = MockServer::start().await;
+    let before = b"before\n";
+    mount_two_patches(&mock, MINIMIST, before).await;
+    let tmp = minimist_project(before);
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "{UNPATCHED_NOTE}\n\
+             Next steps:\n  \
+             1. Commit .socket/ to keep the patches.\n  \
+             2. Run `socket-patch apply` after every `npm install`, locally and in CI. A \
+             fresh install removes the patches.\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(!stdout.contains("Next steps:"), "{stdout}");
+}
+
 /// The agent dry run says what the patch would fix and leave unpatched,
 /// and prints no next steps: nothing was recorded.
 #[tokio::test]

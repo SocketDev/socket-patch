@@ -729,9 +729,11 @@ pub(super) fn finish_rollout_json(stage: &rollout::Stage, env: &mut Envelope) {
     }
 }
 
-/// The human `Rollout:` line and the Next-steps lines about deferred
-/// patches, for the agent and vendored summaries.
-fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool) {
+/// The human `Rollout:` line and the "Next steps:" block, for the agent
+/// and vendored summaries: the mode's `own_steps` (a whole block with its
+/// header; empty when the mode printed its own or has none), then the
+/// lines about deferred patches.
+fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool, own_steps: &[String]) {
     if silent {
         return;
     }
@@ -742,8 +744,13 @@ fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool) {
     if let Some(line) = line {
         println!("\n{line}");
     }
+    for step in own_steps {
+        println!("{step}");
+    }
     if !next.is_empty() {
-        println!("Next steps:");
+        if own_steps.is_empty() {
+            println!("Next steps:");
+        }
         for step in next {
             println!("  {step}");
         }
@@ -3628,7 +3635,7 @@ async fn scan_project(
                 println!("{}", render::ALL_ALREADY_RECORDED);
             }
         }
-        print_rollout_human(&stage, args.common.dry_run, silent);
+        print_rollout_human(&stage, args.common.dry_run, silent, &[]);
         return finish_human(0).await;
     }
 
@@ -3717,7 +3724,7 @@ async fn scan_project(
                 print_coverage(&coverage, &landing, true, verbose);
             }
         }
-        print_rollout_human(&stage, true, silent);
+        print_rollout_human(&stage, true, silent, &[]);
         return finish_human(0).await;
     }
 
@@ -3785,6 +3792,7 @@ async fn scan_project(
         &args, /*save_only=*/ vendor, /*json=*/ false, silent,
     );
 
+    let mut agent_steps: Vec<String> = Vec::new();
     let code = if vendor {
         // Boxed for the same Windows 1 MiB frame reason as the JSON path.
         boxed_vendor_interactive_path(
@@ -3818,6 +3826,16 @@ async fn scan_project(
         if !silent {
             print_coverage(&coverage, &patched_uuids(&outcome), false, verbose);
         }
+        // A project run that recorded a patch has something to commit, and
+        // a re-apply to wire up after every install.
+        if code == 0 && !args.common.is_global() {
+            agent_steps = crate::commands::agent_download::next_steps(
+                &crate::commands::agent_download::recorded_purls(&outcome),
+                &socket_dir,
+                &args.common.project_root(),
+                false,
+            );
+        }
         code
     };
 
@@ -3835,8 +3853,8 @@ async fn scan_project(
         }
     }
 
-    // The deferred next steps assume a run that landed.
-    print_rollout_human(&stage, false, silent || code != 0);
+    // The next steps assume a run that landed.
+    print_rollout_human(&stage, false, silent || code != 0, &agent_steps);
 
     // Post-apply GC: only with `--prune` or `--sync`; otherwise an agent
     // apply leaves every other manifest entry alone (`socket-patch repair`

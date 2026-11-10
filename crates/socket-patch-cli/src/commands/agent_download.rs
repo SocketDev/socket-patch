@@ -1826,6 +1826,93 @@ pub async fn download_and_apply_patches_into(
     run_outcome(batch.failed > 0, apply_failed)
 }
 
+/// The install command whose fresh run undoes the in-place patches of an
+/// ecosystem's packages: the package manager the project's lockfile names
+/// (`has_file` answers for the project root), else the ecosystem's default.
+/// `None` where no one install step does (Maven, Gradle, sbt), or where
+/// none undoes the patch (Go builds from the committed copies).
+fn install_command(ecosystem: Ecosystem, has_file: &dyn Fn(&str) -> bool) -> Option<&'static str> {
+    use socket_patch_core::constants::npm_family::{BUN_LOCK, BUN_LOCKB, PNPM_LOCK, VLT_LOCK};
+    Some(match ecosystem {
+        Ecosystem::Npm if has_file(PNPM_LOCK) => "pnpm install",
+        Ecosystem::Npm if has_file("yarn.lock") => "yarn install",
+        Ecosystem::Npm if has_file(BUN_LOCK) || has_file(BUN_LOCKB) => "bun install",
+        Ecosystem::Npm if has_file(VLT_LOCK) => "vlt install",
+        Ecosystem::Npm => "npm install",
+        Ecosystem::Pypi if has_file("uv.lock") => "uv sync",
+        Ecosystem::Pypi if has_file("poetry.lock") => "poetry install",
+        Ecosystem::Pypi if has_file("Pipfile.lock") => "pipenv install",
+        Ecosystem::Pypi if has_file("pdm.lock") => "pdm install",
+        Ecosystem::Pypi => "pip install",
+        Ecosystem::Gem => "bundle install",
+        Ecosystem::Composer => "composer install",
+        Ecosystem::Cargo => "cargo fetch",
+        Ecosystem::Nuget => "dotnet restore",
+        Ecosystem::Golang | Ecosystem::Maven | Ecosystem::Deno => return None,
+    })
+}
+
+/// The "Next steps:" block that ends a wet agent-mode run (`get`,
+/// `scan --mode agent`) which recorded the patches `recorded` (purls) in
+/// the manifest: commit `.socket/`, and run `socket-patch apply` after
+/// every install, named for the package managers of the patched
+/// ecosystems. Empty when the run recorded nothing: there is nothing new
+/// to commit. `save_only` is a `--save-only` run, which has not applied
+/// the patches yet.
+pub(crate) fn next_steps(
+    recorded: &[&str],
+    socket_dir: &Path,
+    project_root: &Path,
+    save_only: bool,
+) -> Vec<String> {
+    if recorded.is_empty() {
+        return Vec::new();
+    }
+    let mut ecosystems: Vec<Ecosystem> = Vec::new();
+    for purl in recorded {
+        // A purl of an ecosystem this CLI does not know names no install.
+        if let Some(ecosystem) = Ecosystem::from_purl(purl) {
+            if !ecosystems.contains(&ecosystem) {
+                ecosystems.push(ecosystem);
+            }
+        }
+    }
+    let has_file = |name: &str| project_root.join(name).is_file();
+    let mut installs: Vec<&str> = ecosystems
+        .iter()
+        .filter_map(|ecosystem| install_command(*ecosystem, &has_file))
+        .collect();
+    installs.sort_unstable();
+    installs.dedup();
+    let shown_dir = socket_dir
+        .strip_prefix(project_root)
+        .unwrap_or(socket_dir)
+        .to_string_lossy()
+        .replace('\\', "/");
+    // An in-place Go patch is a committed copy under `.socket/go-patches/`
+    // plus a `replace` in go.mod (go.work for a workspace's shared module).
+    let go = ecosystems.contains(&Ecosystem::Golang);
+    let commit = if go {
+        format!("{shown_dir}/ and go.mod (or go.work)")
+    } else {
+        format!("{shown_dir}/")
+    };
+    // No install removes a Go patch, so a Go-only run has nothing to
+    // re-apply.
+    let reapply = ecosystems.iter().any(|e| *e != Ecosystem::Golang) || ecosystems.is_empty();
+    crate::ui::agent_next_steps(&commit, &installs, save_only, reapply)
+}
+
+/// The purls of the patches a run recorded in the manifest: its
+/// `downloaded` (new record) and `updated` (replaced record) events.
+pub(crate) fn recorded_purls(env: &Envelope) -> Vec<&str> {
+    env.events
+        .iter()
+        .filter(|e| matches!(e.action, EventAction::Downloaded | EventAction::Updated))
+        .filter_map(|e| e.purl.as_deref())
+        .collect()
+}
+
 /// Decode a patch view's `blobContent` (canonical base64 as the API
 /// produces it; line breaks and missing padding are tolerated). An invalid
 /// byte keeps the `Invalid base64 character: <b>` message (pinned by a
@@ -1847,4 +1934,96 @@ pub(crate) fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         }
         other => format!("Invalid base64: {other}"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn steps(recorded: &[&str], root: &Path) -> Vec<String> {
+        next_steps(recorded, &root.join(".socket"), root, false)
+    }
+
+    #[test]
+    fn next_steps_name_the_install_of_each_patched_ecosystem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(steps(&[], root).is_empty());
+
+        // The defaults, with no lockfile to say otherwise.
+        let gem = steps(&["pkg:gem/rack@2.2.3?platform=ruby"], root);
+        assert_eq!(gem[1], "  1. Commit .socket/ to keep the patches.");
+        assert!(gem[2].contains("after every `bundle install`,"), "{gem:?}");
+        let mixed = steps(
+            &[
+                "pkg:pypi/urllib3@1.26.18",
+                "pkg:npm/minimist@1.2.2",
+                "pkg:npm/lodash@4.17.20",
+            ],
+            root,
+        );
+        assert!(
+            mixed[2].contains("after every `npm install` and `pip install`,"),
+            "{mixed:?}"
+        );
+
+        // The project's lockfile names its package manager.
+        for (lock, purl, install) in [
+            ("pnpm-lock.yaml", "pkg:npm/a@1", "pnpm install"),
+            ("yarn.lock", "pkg:npm/a@1", "yarn install"),
+            ("bun.lock", "pkg:npm/a@1", "bun install"),
+            ("uv.lock", "pkg:pypi/a@1", "uv sync"),
+            ("poetry.lock", "pkg:pypi/a@1", "poetry install"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(lock), "").unwrap();
+            let named = steps(&[purl], dir.path());
+            assert!(
+                named[2].contains(&format!("after every `{install}`,")),
+                "{lock}: {named:?}"
+            );
+        }
+
+        // No single install command: the step still says when to re-apply.
+        let maven = steps(&["pkg:maven/g/a@1"], root);
+        assert!(
+            maven[2].contains("after every dependency install,"),
+            "{maven:?}"
+        );
+    }
+
+    #[test]
+    fn next_steps_for_go_commit_the_replace_and_skip_the_reapply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert_eq!(
+            steps(&["pkg:golang/github.com/jackc/pgx/v5@v5.7.0"], root),
+            [
+                "Next steps:",
+                "  1. Commit .socket/ and go.mod (or go.work) to keep the patches.",
+            ]
+        );
+        // Beside another ecosystem the re-apply step is back.
+        let both = steps(
+            &["pkg:golang/example.com/m@v1.0.0", "pkg:gem/rack@2.2.3"],
+            root,
+        );
+        assert_eq!(both.len(), 3, "{both:?}");
+        assert!(
+            both[2].contains("after every `bundle install`,"),
+            "{both:?}"
+        );
+
+        // A manifest outside the default directory is named as it is.
+        let elsewhere = next_steps(
+            &["pkg:gem/rack@2.2.3"],
+            &root.join("ops/patches"),
+            root,
+            false,
+        );
+        assert_eq!(
+            elsewhere[1],
+            "  1. Commit ops/patches/ to keep the patches."
+        );
+    }
 }
