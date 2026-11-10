@@ -1138,6 +1138,66 @@ worse, lets a warm cache silently serve unpatched bytes):
   manifest embeds `record` too, as a fallback copy, but never `detached` — the manifest record stays
   authoritative while the manifest covers the entry (ledger key or base purl); `vex` and `list`
   read the fallback copy only when it does not, `repair` only with no manifest at all.
+* **The ledger is untrusted input.** It is committed, so a checkout (a pull request's) can carry
+  any ledger, and a revert (`vendor --revert`, `remove`, `rollback`, `scan --prune`, the
+  hosted→vendored takeover, a superseding re-vendor) replays its records as writes. A record may
+  only describe undoing the edit vendoring makes; one that does not fails THAT package's revert
+  (`revert_failed` / `vendor_revert_failed`, exit 1, the message names the record's kind, file and
+  key) with nothing written for it — its artifact and ledger entry stay — while the other packages
+  still revert:
+  * **Where.** Every record's `file` is a normalized path below the project root — not absolute,
+    drive-qualified or climbing (in either separator), with no `.git` level in any spelling a
+    filesystem folds to it, and not below a symlinked directory. A kind this build writes names
+    only the files its backend edits: the npm family's own lock per flavor (`package-lock.json` /
+    `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock`, `bun.lockb`, `vlt-lock.json`),
+    the root `package.json` (yarn berry, pnpm), `pnpm-workspace.yaml`, an importer's `package.json`
+    (vlt) and a workspace's mirrored `.socket/vendor/npm/…tgz` (bun); `pyproject.toml` and `uv.lock`
+    (uv), `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `pyproject.toml` / `hatch.toml` (Hatch), a
+    root-level `pylock.toml` / `pylock.<name>.toml` / `<script>.py.lock` and that lock's
+    `<script>.py`, and for requirements the root `requirements.txt`, an in-root `-r` include it
+    reaches or a `*.txt` / `*.in` file; `Gemfile` and `Gemfile.lock`; `Cargo.toml` (or the pre-v5
+    `.cargo/config(.toml)`) and `Cargo.lock`; `go.mod` / `go.work`; `composer.lock`; the root
+    `nuget.config` (any of NuGet's three spellings) and a `packages.lock.json` /
+    `packages.<Project>.lock.json` outside hidden directories or the lock a project's
+    `NuGetLockFilePath` names; the root `pom.xml` (pre-v5 Maven). The JVM kinds are held to their
+    own per-kind paths. A kind this build does not know is never replayed (a
+    `vendor_lock_entry_drifted` warning, as before).
+  * **What.** Checked against the file as it stands, right before the write, so a record whose
+    pre-vendor state is already back writes nothing and still converges. A `package-lock.json`
+    entry is replaced only while its `resolved` points into this patch's artifact dir (the
+    `resolved` the record claims vendoring wrote does not make an entry ours). A requirements record
+    replaces this patch's own wheel line with the ONE exact `name==version` pin it replaced (its
+    marker, `--hash` options and continuation lines included). A PyPI lock or project restore
+    (`uv.lock` / `pyproject.toml`, `poetry.lock`, `pdm.lock`, `pylock*.toml`, a script lock, a
+    Hatch file) may change only the vendored package's own entries — its lock units, the
+    requirement and dependency entries naming it, its `sources` / `files` key, the Hatch
+    direct-reference permission — and in a PEP 723 script only inside the inline-metadata block; a
+    `Pipfile.lock` record restores only that package's entry, over this patch's wheel reference. A
+    gem record replaces this patch's `path:` declaration (or managed block) with ONE top-level
+    declaration of the same gem — no source option, the keyword options the vendored line still
+    carries, and positional arguments that evaluate nothing (literals, constants, local variables,
+    one `[…]` / `.fetch(…)` lookup in them such as `ENV["V"]`, and strings interpolating those) —
+    and this patch's `PATH` section with the gem's own spec block, `remote:` and
+    dependency entry. A NuGet lock record swaps two contentHashes, in a lock that pins this package
+    at the recorded one; the `nuget.config` (and pre-v5 `pom.xml`) whole-file snapshot is restored
+    only when it differs from the vendored file by nothing but the lines vendoring adds — any other
+    pair is undone element by element, the recorded text never written.
+  * **Gem rewrite.** Because the revert restores only such declarations, the vendored rewrite
+    refuses (`gemfile_declaration_not_editable`, before any write) a `gem` line whose positional
+    argument is computed — a method call (`File.read("V").strip`, `helper(:x)`), a string
+    interpolating one, or a hash naming a source. Constants, splats, local variables, `ENV` and
+    other one-key lookups (and any option, which the vendored line keeps verbatim) are rewritten
+    as before.
+  * **No credentials (NuGet).** The `nuget.config` snapshots are recorded without the config's
+    credentials: everything inside `<packageSourceCredentials>` and `<apikeys>`, the `value` of an
+    `<add>` whose key mentions a password, and the `user:secret` of a source URL are replaced by
+    `socket-patch:redacted`. The revert compares the live config in the same form and puts its own
+    credentials back, so the restore stays byte-exact. A config without credentials is recorded as
+    before. A ledger written before this still reverts exactly, and loses the credentials it holds
+    the next time any command saves the ledger (they stay in the repository's history: rotate
+    them). A 5.x CLI older than this reads the redacted snapshots as a config that changed since
+    vendoring, so it excises this patch's source and mapping instead of restoring the file: a
+    `<packageSourceMapping>` section vendoring created stays behind.
 * **Re-vendor carries originals forward**: re-vendoring under a newer patch uuid rewrites the
   previous run's own wiring (`original: None` from the backend — it must never record a dangling
   `.socket/vendor/` pointer as pre-vendor state); the engine merges the TRUE pre-vendor originals

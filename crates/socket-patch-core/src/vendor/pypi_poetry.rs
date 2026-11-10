@@ -1015,13 +1015,19 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
             .unwrap()
     }
 
+    /// The ledger entry of the package `wiring` vendors (its records are
+    /// keyed by the package name; `six` when there are none).
     fn entry_for(wiring: Vec<WiringRecord>, meta: PoetryMeta) -> VendorEntry {
+        let name = wiring
+            .first()
+            .and_then(|record| record.key.clone())
+            .unwrap_or_else(|| "six".to_string());
         VendorEntry {
             flavor: Some("poetry".into()),
             poetry: Some(meta),
             ..VendorEntry::new(
                 "pypi".into(),
-                "pkg:pypi/six@1.16.0".into(),
+                format!("pkg:pypi/{name}@1.16.0"),
                 UUID.into(),
                 VendorArtifact {
                     yarn_berry10c0: None,

@@ -402,6 +402,20 @@ pub(super) async fn revert(entry: &VendorEntry, root: &Path, dry_run: bool) -> R
             }
         }
     }
+    // Before anything is written (and on a dry run): the restore may only
+    // touch the vendored package's own references and the direct-reference
+    // permission.
+    for (file, restored) in &edits {
+        let refusal = match super::pypi_lock::entry_package(entry) {
+            None => Some("the ledger entry names no PyPI release".to_string()),
+            Some(name) => files
+                .get(file)
+                .and_then(|live| super::pypi_lock::confinement_refusal(live, restored, &name)),
+        };
+        if let Some(why) = refusal {
+            return super::pypi_lock::unconfined(entry, file, &why);
+        }
+    }
     if !dry_run {
         if let Err(error) = write_files(root, &files, &edits).await {
             return RevertOutcome::failed(error);

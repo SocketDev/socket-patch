@@ -1469,8 +1469,8 @@ fn revert_one_record(
         return;
     }
 
-    // Ours iff resolved is exactly what we wrote, or still points into OUR
-    // uuid dir (a re-serialized but unmoved entry). A legacy mirror node
+    // Ours iff resolved still points into OUR uuid dir (as we wrote it, or
+    // in a re-serialized but unmoved entry). A legacy mirror node
     // with NO `resolved` but the vendored `integrity` is ours too (#1937,
     // the #879 rule `vex` and `vendor --check` use): npm 7-12 never write
     // `resolved` for a `file:` resolution in the mirror, so every plain
@@ -1482,12 +1482,11 @@ fn revert_one_record(
             .and_then(|n| n.get(field))
             .and_then(Value::as_str)
     };
-    let new_resolved = new_field("resolved");
+    // What the record says we wrote does not make an entry ours: the ledger
+    // is committed, and a record naming a registry entry's own `resolved`
+    // would have the restore replace that entry.
     let ours = match live_resolved {
-        Some(r) => {
-            Some(r) == new_resolved
-                || parse_vendor_path(r).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid)
-        }
+        Some(r) => parse_vendor_path(r).is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid),
         None => {
             rec.kind == KIND_LOCK_LEGACY_ENTRY
                 && new_field("integrity").is_some_and(|new_integrity| {
@@ -4584,6 +4583,50 @@ mod tests {
                 .exists(),
             "the artifact is kept while an entry is left alone"
         );
+    }
+
+    /// The ledger is committed, so a record can name any lock entry and
+    /// claim to have written its `resolved`. An entry is only ours while it
+    /// points into this patch's vendor dir: a registry entry the record
+    /// describes is left byte for byte, whatever the record would restore.
+    #[tokio::test]
+    async fn revert_never_replaces_an_entry_that_does_not_point_at_our_artifact() {
+        let fx = fixture().await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+
+        // A second, registry-resolved package, and a record that names it.
+        let mut live = fx.read_lock().await;
+        let registry = json!({
+            "version": "1.0.0",
+            "resolved": "https://registry.npmjs.org/other/-/other-1.0.0.tgz",
+            "integrity": "sha512-b3RoZXI=",
+        });
+        live["packages"]["node_modules/other"] = registry.clone();
+        tokio::fs::write(fx.lock_path(), serialize_json(&live, "  ").unwrap())
+            .await
+            .unwrap();
+        entry.wiring.push(WiringRecord {
+            file: PACKAGE_LOCK.to_string(),
+            kind: KIND_LOCK_ENTRY.to_string(),
+            action: WiringAction::Rewritten,
+            key: Some("node_modules/other".to_string()),
+            original: Some(json!({
+                "version": "1.0.0",
+                "resolved": "https://evil.example/other-1.0.0.tgz",
+                "integrity": "sha512-ZXZpbA==",
+            })),
+            new: Some(registry.clone()),
+        });
+
+        let outcome = revert_npm(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        let after = fx.read_lock().await;
+        assert_eq!(
+            after["packages"]["node_modules/other"], registry,
+            "the registry entry is never rewritten"
+        );
+        assert!(!after.to_string().contains("evil"));
     }
 
     /// #665: the user dropped the patched dependency (`npm uninstall

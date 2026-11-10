@@ -687,7 +687,7 @@ fn drift_keep_prints_human_notice() {
     );
     std::fs::write(socket.join("manifest.json"), &original_manifest).unwrap();
 
-    // Ledger wired with a fragment the lock does not contain (the
+    // Ledger wired with a record the npm revert backend leaves alone (the
     // in_process_rollback_vendored.rs drift shape).
     let artifact_dir = socket.join("vendor/npm").join(DRIFT_UUID);
     std::fs::create_dir_all(&artifact_dir).unwrap();
@@ -701,7 +701,7 @@ fn drift_keep_prints_human_notice() {
       "basePurl": "{DRIFT_PURL}",
       "uuid": "{DRIFT_UUID}",
       "artifact": {{ "path": ".socket/vendor/npm/{DRIFT_UUID}/package.tgz" }},
-      "wiring": [{{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }}]
+      "wiring": [{{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }}]
     }}
   }}
 }}"#

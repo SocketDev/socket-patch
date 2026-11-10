@@ -128,10 +128,11 @@ pub(crate) fn write_vendor_ledger_entry(
     artifact_dir
 }
 
-/// A wiring record naming a file the npm revert backend does not edit: the
+/// A wiring record the npm revert backend leaves alone (a kind this build
+/// does not know, in a file it does not edit): the
 /// revert drift-keeps (`kept_artifact`) — fixture copied from
 /// remove_duality_invariants.rs.
-pub(crate) const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
+pub(crate) const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }]"#;
 
 pub(crate) const NPM_PURL: &str = "pkg:npm/left-pad@1.3.0";
 

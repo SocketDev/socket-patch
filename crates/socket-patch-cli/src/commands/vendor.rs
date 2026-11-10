@@ -446,6 +446,12 @@ pub(crate) async fn dispatch_revert_one_opts(
     {
         return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
     }
+    // Before any read or write: the ledger is committed, so every record is
+    // held to the files its ecosystem's backend edits (a pull request's
+    // ledger must not aim a revert at `.git/config` or a workflow).
+    if let Some(refusal) = vendor::state::wiring_refusal(entry, project_root).await {
+        return RevertOutcome::failed(refusal);
+    }
     match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,

@@ -1641,8 +1641,10 @@ async fn revert_repo_record(
 
     // (a) Byte-identical to what we wrote → the whole-file restore is provably
     //     safe (nothing changed since vendoring). This also cheaply covers the
-    //     lone-patch common case.
-    if new.is_some_and(|n| &live == n) {
+    //     lone-patch common case. The ledger is committed, so its snapshots
+    //     are not trusted to say what the pom was: the restore is only taken
+    //     when they differ by nothing but our `<repository>` element.
+    if new.is_some_and(|n| &live == n && only_adds_our_repository(original, n, uuid_dir_rel)) {
         if dry_run {
             return Ok(true);
         }
@@ -1674,6 +1676,51 @@ async fn revert_repo_record(
             )
         })?;
     Ok(true)
+}
+
+/// Whether the pom snapshot `new` is `original` with nothing but lines of a
+/// `<repository>` element for this patch's vendored repo added (and the
+/// `<repositories>` section around it): what the pre-v5 backend wrote. The
+/// whole-file restore puts `original` back, so this is what makes it the
+/// undo of that edit and nothing more — a ledger whose snapshots differ in
+/// any other way (a dependency, a plugin, another repository) is not
+/// followed, and the element is excised instead.
+fn only_adds_our_repository(original: &str, new: &str, uuid_dir_rel: &str) -> bool {
+    let between = |line: &str, tag: &str| {
+        line.strip_prefix(&format!("<{tag}>"))
+            .and_then(|rest| rest.strip_suffix(&format!("</{tag}>")))
+            .map(str::to_string)
+    };
+    let kept: Vec<&str> = original.lines().collect();
+    let mut next = 0;
+    let mut ours = false;
+    for line in new.lines() {
+        if kept.get(next) == Some(&line) {
+            next += 1;
+            continue;
+        }
+        let line = line.trim();
+        let element = matches!(
+            line,
+            "<repositories>"
+                | "</repositories>"
+                | "<repository>"
+                | "</repository>"
+                | "<releases>"
+                | "</releases>"
+                | "<snapshots>"
+                | "</snapshots>"
+        ) || between(line, "id").is_some_and(|id| !id.contains(['<', '>']))
+            || between(line, "enabled").is_some_and(|v| matches!(v.as_str(), "true" | "false"))
+            || between(line, "checksumPolicy").is_some_and(|v| !v.contains(['<', '>']));
+        let url = between(line, "url")
+            .is_some_and(|url| url == format!("{VENDOR_REPO_URL_PREFIX}{uuid_dir_rel}"));
+        ours |= url;
+        if !element && !url {
+            return false;
+        }
+    }
+    next == kept.len() && ours
 }
 
 /// After excising our `<repository>`, drop a `<repositories>` section left with
@@ -2279,6 +2326,83 @@ mod tests {
             !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
             "uuid dir removed"
         );
+    }
+
+    /// The ledger is committed, so the pom snapshot it records is not
+    /// trusted to say what the pom was: one that differs from the vendored
+    /// pom by more than our `<repository>` is never written. The element is
+    /// excised from the live pom instead.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn revert_never_writes_a_pom_snapshot_that_is_not_the_pom_minus_our_repository() {
+        let (dir, _, _, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_before = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        let mut entry = legacy_vendor(root, &record).await;
+        let evil = pom_before.replace(
+            "</project>",
+            "  <build><plugins><plugin><artifactId>exec-maven-plugin</artifactId></plugin></plugins></build>\n</project>",
+        );
+        assert_ne!(evil, pom_before);
+        entry.wiring[0].original = Some(Value::String(evil));
+
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            pom_before,
+            "our repository is excised; the ledger's text is not written"
+        );
+    }
+
+    #[test]
+    fn a_pom_snapshot_pair_differs_only_by_our_repository() {
+        let rel = format!(".socket/vendor/maven/{UUID}");
+        let original = "<project>\n  <modelVersion>4.0.0</modelVersion>\n</project>\n";
+        let block = repository_block("socket-patch-vendor-x", &rel);
+        let new = original.replace(
+            "</project>",
+            &format!("  <repositories>\n{block}  </repositories>\n</project>"),
+        );
+        assert!(only_adds_our_repository(original, &new, &rel));
+        // In a section the pom already had.
+        let sectioned = "<project>\n  <repositories>\n  </repositories>\n</project>\n";
+        let wired = sectioned.replace("  </repositories>", &format!("{block}  </repositories>"));
+        assert!(only_adds_our_repository(sectioned, &wired, &rel));
+
+        for (what, original, new) in [
+            (
+                "nothing of ours added",
+                original.to_string(),
+                original.to_string(),
+            ),
+            (
+                "a line dropped",
+                original.to_string(),
+                new.replace("  <modelVersion>4.0.0</modelVersion>\n", ""),
+            ),
+            (
+                "a line the original has and the pom does not",
+                original.replace("</project>", "  <build />\n</project>"),
+                new.clone(),
+            ),
+            (
+                "another repository",
+                original.to_string(),
+                new.replace(&rel, ".socket/vendor/maven/other"),
+            ),
+            (
+                "a plugin among the added lines",
+                original.to_string(),
+                new.replace("</project>", "  <build />\n</project>"),
+            ),
+        ] {
+            assert!(!only_adds_our_repository(&original, &new, &rel), "{what}");
+        }
     }
 
     #[tokio::test]

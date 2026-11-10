@@ -13,7 +13,10 @@
 //! trusted to *name paths for deletion or hashing* without re-validating
 //! through `path_safety` / `vendor::path` first; the artifact contents are
 //! always re-verified against the manifest's afterHashes, never against this
-//! file alone.
+//! file alone. Nor is a wiring record trusted to say which file a revert
+//! rewrites or what it writes there: [`wiring_refusal`] holds every record
+//! to the files its backend edits before an entry is replayed, and each
+//! backend checks what a record would write against the file as it stands.
 //!
 //! Forward compatibility: the schema evolves by ADDING optional fields and
 //! new [`WiringRecord::kind`] STRINGS — never new [`WiringAction`] variants
@@ -941,6 +944,9 @@ fn ledger_value(state: &VendorState) -> std::io::Result<serde_json::Value> {
         serde_json::to_value(&shared)
     }
     .map_err(std::io::Error::other)?;
+    // The ledger is committed: no credential of a recorded `nuget.config`
+    // goes to disk, whichever build recorded it.
+    super::nuget_feed::redact_ledger(&mut ledger);
     super::ledger_snapshots::encode(&mut ledger);
     Ok(ledger)
 }
@@ -1092,6 +1098,206 @@ pub async fn file_gitignored(project_root: &Path, rel: &str) -> Option<String> {
         .await
         .ok()?
         .map(|lines| super::npm_dir::summarize_rules(&lines))
+}
+
+// ── what a ledger record may say ────────────────────────────────────────
+
+/// Why `entry`'s wiring is not something socket-patch records for its
+/// ecosystem, or `None` when every record passes.
+///
+/// The ledger is committed, so a checkout (a pull request's) can carry any
+/// ledger. A revert replays its records: it rewrites the file a record
+/// names with the text the record holds. Every caller that hands a ledger
+/// entry to a revert asks this first, and a refusal fails that entry's
+/// revert before anything is read or written for it. A record passes when:
+///
+/// * its `file` is a normalized project-relative path with no `.git`
+///   level, reached through no linked directory ([`wiring_path_refusal`]);
+/// * a kind this build writes names a file its backend edits
+///   ([`wiring_file_refusal`]: the per-kind sets, each taken from the
+///   backend's own writer) — an unknown kind (a newer build's) is left to
+///   its backend, which never replays it.
+///
+/// What a record may put INTO its file is each backend's to check where it
+/// writes, against the file as it stands (a ledger whose text is already
+/// back in the file has nothing left to write, and must still converge).
+///
+/// The message names the record, so the user can find it in
+/// [`VENDOR_STATE_REL`].
+pub async fn wiring_refusal(entry: &VendorEntry, project_root: &Path) -> Option<String> {
+    for rec in &entry.wiring {
+        let why = match wiring_path_refusal(&rec.file) {
+            Some(why) => Some(why.to_string()),
+            None => match wiring_file_refusal(rec, project_root).await {
+                Some(why) => Some(why),
+                None => linked_parent_refusal(project_root, &rec.file),
+            },
+        };
+        if let Some(why) = why {
+            return Some(refused_record(entry, rec, &why));
+        }
+    }
+    None
+}
+
+/// The failure of a revert that will not replay `rec` because it `why`:
+/// one wording for the path checks here and for each backend's check of
+/// what a record would write.
+pub(crate) fn refused_record(entry: &VendorEntry, rec: &WiringRecord, why: &str) -> String {
+    format!(
+        "refusing to revert {}: its ledger record `{}` for `{}` (key {}) {why}. \
+         {VENDOR_STATE_REL} does not describe an edit socket-patch makes there, so nothing was \
+         changed for this package; restore the ledger from version control, or undo the \
+         vendoring by hand",
+        terminal_safe(&entry.base_purl),
+        terminal_safe(&rec.kind),
+        terminal_safe(&rec.file),
+        rec.key_label(),
+    )
+}
+
+/// Why `file` is not a path a wiring record names: every backend records a
+/// forward-slashed path below the project root. Backslashes are read as
+/// separators too, so a Windows spelling cannot hide a level.
+fn wiring_path_refusal(file: &str) -> Option<&'static str> {
+    if file.is_empty() {
+        return Some("names no file");
+    }
+    if file.chars().any(char::is_control) {
+        return Some("names a path with a control character");
+    }
+    // A drive (`C:x`), a device or an NTFS stream: `Path::join` would
+    // replace the project root with it.
+    if file.contains(':') {
+        return Some("names a drive or stream path");
+    }
+    let normalized = file.replace('\\', "/");
+    if normalized.starts_with('/') {
+        return Some("names an absolute path");
+    }
+    for level in normalized.split('/') {
+        if level.is_empty() || level == "." || level == ".." {
+            return Some("names a path that is not normalized or leaves the project");
+        }
+        if is_git_dir_name(level) {
+            return Some("points into the repository's .git directory");
+        }
+    }
+    None
+}
+
+/// Whether a path level is `.git` as some filesystem reads it: any case,
+/// the trailing dots and spaces Windows drops, NTFS's short name, and the
+/// zero-width code points HFS+ ignores.
+fn is_git_dir_name(level: &str) -> bool {
+    let visible: String = level
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
+            )
+        })
+        .collect();
+    let name = visible.trim_end_matches(['.', ' ']);
+    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
+}
+
+/// The refusal for a record whose file sits below a symlinked (or
+/// junctioned) directory: the write would land wherever the link points —
+/// outside the project, or inside `.git` under another name.
+fn linked_parent_refusal(project_root: &Path, file: &str) -> Option<String> {
+    let path = project_root.join(file.replace('\\', "/"));
+    let parent = path.parent().filter(|parent| *parent != project_root)?;
+    let link = crate::utils::containment::linked_level(project_root, parent)?;
+    let shown = link.strip_prefix(project_root).unwrap_or(&link);
+    Some(format!(
+        "is reached through the symbolic link {}",
+        shown.display()
+    ))
+}
+
+/// Why a record of a kind this build writes names a file that kind's
+/// backend does not edit. Each set is the one the backend's own writer
+/// records (and its revert accepts); an unknown kind answers `None`.
+async fn wiring_file_refusal(rec: &WiringRecord, project_root: &Path) -> Option<String> {
+    use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB, NPM_LOCKS, PNPM_LOCK, VLT_LOCK};
+    let file = rec.file.as_str();
+    let one_of = |names: &[&str]| {
+        (!names.contains(&file)).then(|| {
+            format!(
+                "names a file that kind of record never edits (it edits {})",
+                names.join(" or ")
+            )
+        })
+    };
+    let unless = |allowed: bool, edits: &str| {
+        (!allowed).then(|| format!("names a file that kind of record never edits ({edits})"))
+    };
+    match rec.kind.as_str() {
+        // npm family: each flavor's own lock, the root manifest the
+        // override flavors edit, and vlt's importer manifests.
+        "npm_lock_entry" | "npm_lock_legacy_entry" => one_of(&NPM_LOCKS),
+        "yarn_lock_block" => one_of(&["yarn.lock"]),
+        "yarn_berry_resolution" | "yarn_berry_lock_entry" | "yarn_berry_lock_entry_pruned" => {
+            one_of(&["yarn.lock", "package.json"])
+        }
+        kind if kind.starts_with("pnpm_lock_")
+            || kind.starts_with("pnpm_pkg_")
+            || kind.starts_with("pnpm_ws_") =>
+        {
+            one_of(&[PNPM_LOCK, "package.json", "pnpm-workspace.yaml"])
+        }
+        "bun_lock_package" => one_of(&[BUN_LOCK]),
+        "bun_lockb_package" => one_of(&[BUN_LOCKB]),
+        "bun_lockb_workspace_artifact" => unless(
+            file.contains("/.socket/vendor/npm/") && file.ends_with(".tgz"),
+            "a workspace's mirrored .socket/vendor/npm tarball",
+        ),
+        "vlt_lock_node" | "vlt_lock_edge" => one_of(&[VLT_LOCK]),
+        "vlt_pkg_dep" => unless(
+            file == "package.json" || file.ends_with("/package.json"),
+            "an importer's package.json",
+        ),
+        // PyPI.
+        "uv_sources_entry" | "uv_override" => one_of(&["pyproject.toml"]),
+        "uv_lock_package"
+        | "uv_lock_requires_dist"
+        | "uv_lock_requires_dev"
+        | "uv_lock_manifest_overrides"
+        | "uv_lock_manifest_constraints" => one_of(&["uv.lock"]),
+        "poetry_lock_package" => one_of(&["poetry.lock"]),
+        "pdm_lock_package" => one_of(&["pdm.lock"]),
+        "pipenv_lock_entry" => one_of(&["Pipfile.lock"]),
+        "hatch_document" | "hatch_permission" => one_of(&["pyproject.toml", "hatch.toml"]),
+        kind if super::pypi_lock::is_python_lock_kind(kind) => unless(
+            super::pypi_lock::allowed_file(file, kind),
+            "a pylock.toml, pylock.<name>.toml or <script>.py.lock at the project root, or that \
+             lock's script",
+        ),
+        super::pypi_requirements::RECORD_KIND => {
+            super::pypi_requirements::ledger_file_refusal(project_root, file).await
+        }
+        // The rest.
+        "gemfile_line" => one_of(&["Gemfile"]),
+        "gemfile_lock_spec" | "gemfile_lock_checksum" => one_of(&["Gemfile.lock"]),
+        "cargo_patch_entry" => one_of(&[
+            super::cargo_manifest::CARGO_TOML,
+            super::cargo_config::CONFIG_TOML,
+            super::cargo_config::CONFIG_LEGACY,
+        ]),
+        "cargo_lock_entry" => one_of(&["Cargo.lock"]),
+        "go_replace" => one_of(&["go.mod", "go.work"]),
+        "composer_lock_package" => one_of(&["composer.lock"]),
+        "nuget_config_source" | "nuget_config_mapping" => {
+            one_of(&crate::patch::redirect::NUGET_CONFIG_FILE_NAMES)
+        }
+        "nuget_lock_entry" => super::nuget_feed::ledger_lock_file_refusal(project_root, file),
+        "maven_pom_repository" => one_of(&[super::jvm::layout::POM_FILE]),
+        // The JVM kinds: `jvm::apply` checks each record's path against its
+        // kind before it reads anything. Any other kind is a newer build's.
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -2473,5 +2679,210 @@ mod tests {
             serde_json::to_value(&dir).unwrap(),
             serde_json::json!({"path": "dir", "fileInventory": inventory})
         );
+    }
+
+    /// An entry of `ecosystem` with one record `kind` for `file`.
+    fn entry_with(ecosystem: &str, kind: &str, file: &str) -> VendorEntry {
+        VendorEntry::new(
+            ecosystem.to_string(),
+            format!("pkg:{ecosystem}/alpha@1.0.0"),
+            UUID.to_string(),
+            VendorArtifact::dir(
+                format!(".socket/vendor/{ecosystem}/{UUID}/alpha"),
+                BTreeMap::new(),
+            ),
+            vec![WiringRecord {
+                file: file.to_string(),
+                kind: kind.to_string(),
+                action: WiringAction::Rewritten,
+                key: Some("alpha".to_string()),
+                original: None,
+                new: None,
+            }],
+        )
+    }
+
+    /// A wiring record names a normalized path below the project root:
+    /// never absolute, drive-qualified or climbing, in either separator,
+    /// and never the repository's `.git` under any spelling a filesystem
+    /// folds to it. An unknown kind is held to the same rule.
+    #[tokio::test]
+    async fn wiring_refusal_rejects_paths_out_of_the_project_and_into_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        for file in [
+            "",
+            "/etc/passwd",
+            "//server/share/x",
+            "C:/Windows/win.ini",
+            "C:evil",
+            "\\\\server\\share\\x",
+            "../outside.txt",
+            "a/../../outside.txt",
+            "a\\..\\..\\outside.txt",
+            "./requirements.txt",
+            "a//b.txt",
+            "a/b.txt/",
+            "a\nb.txt",
+            ".git/config",
+            ".GIT/config",
+            ".git./config",
+            ".git /config",
+            "GIT~1/config",
+            ".g\u{200c}it/config",
+            "sub/.git/hooks/pre-commit",
+            ".git\\config",
+            "file.txt:stream",
+        ] {
+            for kind in ["requirements_line", "a_newer_builds_kind"] {
+                let refusal = wiring_refusal(&entry_with("pypi", kind, file), tmp.path()).await;
+                let refusal = refusal.unwrap_or_else(|| panic!("{file:?} ({kind}) passed"));
+                assert!(refusal.contains("ledger record"), "{refusal}");
+            }
+        }
+        // A plain in-root path under a kind this build does not know is the
+        // backend's to leave alone, not a refusal.
+        assert_eq!(
+            wiring_refusal(
+                &entry_with("pypi", "a_newer_builds_kind", "conf/new.toml"),
+                tmp.path()
+            )
+            .await,
+            None
+        );
+    }
+
+    /// Each kind names only the files its backend edits.
+    #[tokio::test]
+    async fn wiring_refusal_holds_each_kind_to_its_backends_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(
+            root.join("requirements.txt"),
+            "-r deps/base.pip\nalpha==1.0.0\n",
+        )
+        .unwrap();
+        std::fs::create_dir(root.join("deps")).unwrap();
+        std::fs::write(root.join("deps/base.pip"), "beta==1.0.0\n").unwrap();
+        let passes = [
+            ("npm", "npm_lock_entry", "package-lock.json"),
+            ("npm", "npm_lock_entry", "npm-shrinkwrap.json"),
+            ("npm", "yarn_lock_block", "yarn.lock"),
+            ("npm", "yarn_berry_resolution", "package.json"),
+            ("npm", "pnpm_ws_override", "pnpm-workspace.yaml"),
+            ("npm", "pnpm_lock_package", "pnpm-lock.yaml"),
+            ("npm", "bun_lock_package", "bun.lock"),
+            ("npm", "bun_lockb_package", "bun.lockb"),
+            (
+                "npm",
+                "bun_lockb_workspace_artifact",
+                "packages/a/.socket/vendor/npm/9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f/alpha-1.0.0.tgz",
+            ),
+            ("npm", "vlt_lock_node", "vlt-lock.json"),
+            ("npm", "vlt_pkg_dep", "packages/a/package.json"),
+            ("pypi", "uv_sources_entry", "pyproject.toml"),
+            ("pypi", "uv_lock_package", "uv.lock"),
+            ("pypi", "poetry_lock_package", "poetry.lock"),
+            ("pypi", "pdm_lock_package", "pdm.lock"),
+            ("pypi", "pipenv_lock_entry", "Pipfile.lock"),
+            ("pypi", "hatch_document", "hatch.toml"),
+            ("pypi", "python_lock_document", "pylock.toml"),
+            ("pypi", "python_lock_document", "pylock.dev.toml"),
+            ("pypi", "python_lock_document", "job.py.lock"),
+            ("pypi", "python_script_metadata", "job.py"),
+            ("pypi", "requirements_line", "requirements.txt"),
+            // An include the root reaches, whatever it is called.
+            ("pypi", "requirements_line", "deps/base.pip"),
+            // One that left the tree, named like a requirements file.
+            ("pypi", "requirements_line", "requirements/dev.txt"),
+            ("gem", "gemfile_line", "Gemfile"),
+            ("gem", "gemfile_lock_spec", "Gemfile.lock"),
+            ("cargo", "cargo_patch_entry", "Cargo.toml"),
+            ("cargo", "cargo_patch_entry", ".cargo/config.toml"),
+            ("cargo", "cargo_lock_entry", "Cargo.lock"),
+            ("golang", "go_replace", "go.work"),
+            ("composer", "composer_lock_package", "composer.lock"),
+            ("nuget", "nuget_config_source", "NuGet.Config"),
+            ("nuget", "nuget_lock_entry", "src/App/packages.lock.json"),
+            ("nuget", "nuget_lock_entry", "packages.App.lock.json"),
+            ("maven", "maven_pom_repository", "pom.xml"),
+        ];
+        for (ecosystem, kind, file) in passes {
+            assert_eq!(
+                wiring_refusal(&entry_with(ecosystem, kind, file), root).await,
+                None,
+                "{kind} for {file}"
+            );
+        }
+        let refused = [
+            ("npm", "npm_lock_entry", "package.json"),
+            ("npm", "yarn_lock_block", "package.json"),
+            ("npm", "pnpm_lock_package", "Cargo.toml"),
+            ("npm", "bun_lock_package", "bun.lockb"),
+            ("npm", "bun_lockb_workspace_artifact", "packages/a/index.js"),
+            ("npm", "vlt_pkg_dep", "packages/a/tsconfig.json"),
+            ("pypi", "uv_sources_entry", "setup.py"),
+            ("pypi", "uv_lock_package", "pyproject.toml"),
+            ("pypi", "poetry_lock_package", "pyproject.toml"),
+            ("pypi", "hatch_document", "setup.cfg"),
+            ("pypi", "python_lock_document", "uv.lock"),
+            ("pypi", "python_lock_document", "sub/pylock.toml"),
+            ("pypi", "python_script_metadata", "tools/job.py"),
+            ("pypi", "python_script_metadata", "job.sh"),
+            ("pypi", "requirements_line", ".github/workflows/ci.yml"),
+            ("pypi", "requirements_line", "manage.py"),
+            ("pypi", "requirements_line", ".socket/vendor/notes.txt"),
+            ("gem", "gemfile_line", "Rakefile"),
+            ("gem", "gemfile_lock_spec", "Gemfile"),
+            ("cargo", "cargo_patch_entry", "build.rs"),
+            ("golang", "go_replace", "main.go"),
+            ("composer", "composer_lock_package", "composer.json"),
+            ("nuget", "nuget_config_source", "Directory.Build.props"),
+            ("nuget", "nuget_lock_entry", "tools/build.json"),
+            ("nuget", "nuget_lock_entry", ".config/packages.lock.json"),
+            ("maven", "maven_pom_repository", "module/pom.xml"),
+        ];
+        for (ecosystem, kind, file) in refused {
+            let refusal = wiring_refusal(&entry_with(ecosystem, kind, file), root).await;
+            let refusal = refusal.unwrap_or_else(|| panic!("{kind} for {file} passed"));
+            assert!(
+                refusal.contains(kind) && refusal.contains(file),
+                "the refusal names the record: {refusal}"
+            );
+        }
+    }
+
+    /// A record below a linked directory is refused: the write would land
+    /// wherever the link points (outside the project, or inside `.git`
+    /// under another name). The project path itself being a link is fine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn wiring_refusal_rejects_a_file_below_a_linked_directory() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(real.join("requirements")).unwrap();
+        std::fs::create_dir_all(real.join(".git")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, real.join("linked")).unwrap();
+        symlink(real.join(".git"), real.join("meta")).unwrap();
+        symlink(&real, tmp.path().join("alias")).unwrap();
+
+        for file in ["linked/base.txt", "meta/base.txt"] {
+            let refusal = wiring_refusal(&entry_with("pypi", "requirements_line", file), &real)
+                .await
+                .unwrap_or_else(|| panic!("{file} passed"));
+            assert!(refusal.contains("symbolic link"), "{refusal}");
+        }
+        for root in [real.clone(), tmp.path().join("alias")] {
+            for file in ["requirements.txt", "requirements/base.txt"] {
+                assert_eq!(
+                    wiring_refusal(&entry_with("pypi", "requirements_line", file), &root).await,
+                    None,
+                    "{file} under {}",
+                    root.display()
+                );
+            }
+        }
     }
 }
