@@ -1679,9 +1679,46 @@ async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_tr
     assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
 }
 
+/// A listed member's own `pnpm-lock.yaml` under the default shared
+/// workspace lock is one pnpm never reads: `pnpm install` in the member
+/// installs from the workspace root's lock and leaves the member's alone
+/// (pnpm 10.34 and 11.27). A pin written there would never be installed, so
+/// the scan refuses and names the workspace root instead of reporting a
+/// patch nothing delivers.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_with_an_unread_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws = "packages:\n  - 'packages/*'\n";
+    std::fs::write(&root_ws, ws).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+    let lock = member.join("pnpm-lock.yaml");
+    let before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_refused_workspace_lock_elsewhere("pnpm member", code, &doc, &lock, &before, &member);
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&root.display().to_string()),
+        "the refusal names the workspace root to run from: {message}"
+    );
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+}
+
 /// #880: an explicit `trustLockfile: false` in the root file is the user's
 /// call, respected as in a single project: the member pins, nothing is
-/// nested, and the warning names the root file.
+/// nested, and the warning names the root file. The workspace turns the
+/// shared lock off, so the member's own lock is the one pnpm installs it
+/// from.
 #[tokio::test]
 #[serial]
 async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
@@ -1692,7 +1729,7 @@ async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
     let tmp = tempfile::tempdir().unwrap();
     let root = member_root(&tmp);
     let root_ws = root.join("pnpm-workspace.yaml");
-    let ws = "packages:\n  - 'packages/*'\ntrustLockfile: false\n";
+    let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ntrustLockfile: false\n";
     std::fs::write(&root_ws, ws).unwrap();
     let member = root.join("packages/a");
     std::fs::create_dir_all(&member).unwrap();

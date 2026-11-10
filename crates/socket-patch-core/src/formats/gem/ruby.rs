@@ -665,8 +665,8 @@ pub(crate) fn masked_source(text: &str) -> String {
             blank(&mut out);
             continue;
         }
-        let bom = if n == 0 && line.starts_with('\u{feff}') {
-            '\u{feff}'.len_utf8()
+        let bom = if n == 0 {
+            crate::formats::text::split_bom(line).0.len()
         } else {
             0
         };

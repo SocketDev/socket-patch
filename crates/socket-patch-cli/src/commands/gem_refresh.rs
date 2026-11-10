@@ -10,6 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::patch::gem_ext::RubyEnv;
 use socket_patch_core::patch::gem_refresh::{refresh, Source, Target, Wanted};
 
@@ -703,7 +704,10 @@ pub(crate) async fn after_restore(
     let direction = Direction::Upstream;
     let mut shas: BTreeMap<String, String> = BTreeMap::new();
     let mut urls: BTreeMap<String, Option<String>> = BTreeMap::new();
-    for purl in restored.iter().filter(|p| p.starts_with("pkg:gem/")) {
+    for purl in restored
+        .iter()
+        .filter(|p| Ecosystem::from_purl(p) == Some(Ecosystem::Gem))
+    {
         if let Some((sha, url)) =
             gem_upstream_archive(&common.cwd, staged, purl, common.offline).await
         {
