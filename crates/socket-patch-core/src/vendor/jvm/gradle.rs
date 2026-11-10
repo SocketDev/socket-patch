@@ -2280,16 +2280,27 @@ fn line_indent(text: &str, at: usize) -> String {
         .collect()
 }
 
-/// Byte offset of the start of the first line holding code other than an
-/// `import` (Kotlin and Groovy both require imports first).
+/// Byte offset of the start of the first line holding a statement: past
+/// the file annotations (`@file:Suppress("UnstableApiUsage")`), a `package`
+/// line and the `import`s, which Kotlin (and, for imports, Groovy) requires
+/// ahead of every statement. Comments and a shebang are no tokens.
 fn first_statement_offset(text: &str, toks: &[Token]) -> usize {
     let mut i = 0;
-    while is_ident(toks.get(i), "import") {
-        let line_end = text[toks[i].start..]
-            .find('\n')
-            .map_or(text.len(), |j| toks[i].start + j);
-        while i < toks.len() && toks[i].start < line_end {
-            i += 1;
+    loop {
+        if is_ident(toks.get(i), "import") || is_ident(toks.get(i), "package") {
+            let line_end = text[toks[i].start..]
+                .find('\n')
+                .map_or(text.len(), |j| toks[i].start + j);
+            while i < toks.len() && toks[i].start < line_end {
+                i += 1;
+            }
+        } else if is_punct(toks.get(i), b'@')
+            && is_ident(toks.get(i + 1), "file")
+            && is_punct(toks.get(i + 2), b':')
+        {
+            i = file_annotation_end(toks, i + 3);
+        } else {
+            break;
         }
     }
     // Never in front of a byte-order mark.
@@ -2298,6 +2309,28 @@ fn first_statement_offset(text: &str, toks: &[Token]) -> usize {
         Some(t) => text[..t.start].rfind('\n').map_or(0, |j| j + 1).max(bom),
         None => text.len(),
     }
+}
+
+/// Token index one past the Kotlin file annotation whose body starts at
+/// `at` (after `@file:`): `[A("x") B]`, or one `a.b.Name` with optional
+/// arguments. The end of the tokens when a bracket is unbalanced.
+fn file_annotation_end(toks: &[Token], at: usize) -> usize {
+    let past = |open: usize| matching_close(toks, open).map_or(toks.len(), |close| close + 1);
+    if is_punct(toks.get(at), b'[') {
+        return past(at);
+    }
+    let mut i = at;
+    while matches!(toks.get(i).map(|t| &t.tok), Some(Tok::Ident(_))) {
+        i += 1;
+        if !is_punct(toks.get(i), b'.') {
+            break;
+        }
+        i += 1;
+    }
+    if is_punct(toks.get(i), b'(') {
+        i = past(i);
+    }
+    i
 }
 
 // ── tree marker and index ───────────────────────────────────────────────────────
@@ -3262,6 +3295,42 @@ mod tests {
         );
         assert_eq!(text_of(&plan, "settings.gradle.kts"), expect);
         assert_idempotent(&files, &patch());
+    }
+
+    /// VJ-D4: Kotlin puts file annotations ahead of every statement, so a
+    /// `pluginManagement {}` written above `@file:Suppress(…)` (the usual
+    /// first line beside `dependencyResolutionManagement` on Gradle 7)
+    /// stops the settings script compiling. (Asserted on the text written:
+    /// neither Gradle nor kotlinc is run here.)
+    #[test]
+    fn in_block_creates_plugin_management_after_file_annotations() {
+        let entry = in_block_line(true, "", &patch().coords());
+        let block = format!(
+            "pluginManagement {{\n  repositories {{\n    {entry}\n    gradlePluginPortal()\n  }}\n}}\n"
+        );
+        let rest = "plugins {\n  id(\"x\") version \"1\"\n}\nrootProject.name = \"r\"\n";
+        for head in [
+            "@file:Suppress(\"UnstableApiUsage\")\n\n",
+            "#!/usr/bin/env kotlin\n// settings\n@file:Suppress(\"UnstableApiUsage\")\n",
+            "@file:[Suppress(\"UnstableApiUsage\") JvmName(\"S\")]\n@file:kotlin.Suppress(\"x\")\n\
+             import java.io.File\n",
+            "/* licence */\n@file:JvmName(\"S\")\npackage x\nimport java.io.File\n\n",
+        ] {
+            let files = fs(&[("settings.gradle.kts", &format!("{head}{rest}"))]);
+            let plan = run(&files, &patch()).unwrap();
+            assert_eq!(
+                text_of(&plan, "settings.gradle.kts"),
+                format!("{head}{block}{rest}{}\n", vendored_line(true, "")),
+                "{head}"
+            );
+            assert_idempotent(&files, &patch());
+        }
+        // The offset alone, on shapes with nothing after the annotation.
+        let offset = |text: &str| first_statement_offset(text, &dsl::tokens(text, Dsl::Kotlin));
+        assert_eq!(offset("@file:Suppress(\"x\")\n"), 20);
+        assert_eq!(offset("@file:Suppress(\"x\")\nplugins {}\n"), 20);
+        assert_eq!(offset("@file:[Suppress(\"x\")\n"), 21);
+        assert_eq!(offset("@Suppress(\"x\")\nval a = 1\n"), 0);
     }
 
     #[test]

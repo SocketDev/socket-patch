@@ -210,6 +210,9 @@ Lockfiles, version catalogs and project build scripts stay unchanged. Settings
 files receive an apply line for `.socket/gradle/socket-patch.settings.gradle`.
 Settings plugin and buildscript classpaths receive an in-block exclusive
 repository entry because those classpaths resolve before the apply line runs.
+A `pluginManagement {}` block vendor has to create goes after the file
+annotations (`@file:Suppress(…)`), the `package` line and the imports, which
+Kotlin requires ahead of every statement.
 
 Because lockfiles stay unchanged, a lock that pins the patched module at
 another version wins over the vendored GAV: Gradle resolves the locked version
