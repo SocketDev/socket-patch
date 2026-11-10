@@ -1179,28 +1179,11 @@ fn wiring_path_refusal(file: &str) -> Option<&'static str> {
         if level.is_empty() || level == "." || level == ".." {
             return Some("names a path that is not normalized or leaves the project");
         }
-        if is_git_dir_name(level) {
+        if crate::utils::containment::names_dot_dir(level, ".git") {
             return Some("points into the repository's .git directory");
         }
     }
     None
-}
-
-/// Whether a path level is `.git` as some filesystem reads it: any case,
-/// the trailing dots and spaces Windows drops, NTFS's short name, and the
-/// zero-width code points HFS+ ignores.
-fn is_git_dir_name(level: &str) -> bool {
-    let visible: String = level
-        .chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'
-            )
-        })
-        .collect();
-    let name = visible.trim_end_matches(['.', ' ']);
-    name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
 }
 
 /// The refusal for a record whose file sits below a symlinked (or

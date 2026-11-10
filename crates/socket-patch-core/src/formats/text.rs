@@ -86,6 +86,9 @@ mod tests {
         // Output sanitizing drops U+FEFF anywhere as an invisible
         // formatting character; it is not a leading-BOM rule.
         "policy/mod.rs",
+        // U+FEFF is one of the code points HFS+ ignores in a file name
+        // (`names_dot_dir`); it is not a leading-BOM rule.
+        "utils/containment.rs",
         // vlt cannot read a BOM lock, so the sniff refuses it unstripped.
         "vendor/vlt_lock_text.rs",
     ];

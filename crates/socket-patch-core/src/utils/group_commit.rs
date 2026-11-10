@@ -96,6 +96,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use base64::Engine as _;
 use sha2::{Digest, Sha256};
 
+use crate::utils::containment::names_dot_dir;
+
 /// Journal location, relative to the project root.
 pub const COMMIT_JOURNAL_REL: &str = ".socket/vendor/.commit-journal.json";
 
@@ -197,49 +199,6 @@ fn relative_to(root: &Path, path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
-/// Whether a path component names the dot-directory `dir` (`.git`,
-/// `.socket`) on some filesystem this CLI runs on, by the rules git guards
-/// its own tree with (`is_ntfs_dotgit`, `is_hfs_dotgit`): ASCII case is
-/// folded (APFS, HFS+, NTFS), the code points HFS+ ignores are skipped,
-/// the 8.3 short name NTFS gives it counts (`git~1`), and NTFS drops
-/// trailing dots and spaces and reads `:` as the start of a stream name.
-fn names_dot_dir(component: &std::ffi::OsStr, dir: &str) -> bool {
-    let name = component.to_string_lossy();
-    let mut chars = name
-        .chars()
-        .filter(|c| {
-            !matches!(
-                c,
-                '\u{200C}'..='\u{200F}'
-                    | '\u{202A}'..='\u{202E}'
-                    | '\u{206A}'..='\u{206F}'
-                    | '\u{FEFF}'
-            )
-        })
-        .peekable();
-    let (stem, short) = match chars.peek() {
-        Some('.') => (dir, ""),
-        Some(_) => (&dir[1..], "~1"),
-        None => return false,
-    };
-    for expected in stem.chars().chain(short.chars()) {
-        if !chars
-            .next()
-            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
-        {
-            return false;
-        }
-    }
-    for c in chars {
-        match c {
-            '.' | ' ' => {}
-            ':' | '\\' => return true,
-            _ => return false,
-        }
-    }
-    true
-}
-
 /// Whether a project-relative path is a captured commit point.
 fn is_captured(rel: &Path) -> bool {
     if rel.as_os_str().is_empty() {
@@ -247,7 +206,7 @@ fn is_captured(rel: &Path) -> bool {
     }
     let below = |dir: &str| {
         rel.components()
-            .any(|c| matches!(c, Component::Normal(p) if names_dot_dir(p, dir)))
+            .any(|c| matches!(c, Component::Normal(p) if names_dot_dir(&p.to_string_lossy(), dir)))
     };
     // No backend's commit point is inside a git directory, and the journal
     // (which replays exactly the captured set, from a file the checkout can
@@ -1536,7 +1495,7 @@ mod tests {
             (".git", false),
         ] {
             assert_eq!(
-                names_dot_dir(std::ffi::OsStr::new(name), ".socket"),
+                names_dot_dir(name, ".socket"),
                 socket,
                 "{name:?}"
             );
@@ -1568,7 +1527,7 @@ mod tests {
             ("", false),
         ] {
             assert_eq!(
-                names_dot_dir(std::ffi::OsStr::new(name), ".git"),
+                names_dot_dir(name, ".git"),
                 git,
                 "{name:?}"
             );

@@ -85,6 +85,52 @@ pub fn ensure_unlinked(root: &Path, path: &Path, action: &str) -> std::io::Resul
     }
 }
 
+/// Whether a path component names the dot-directory `dir` (`.git`,
+/// `.socket`) on some filesystem this CLI runs on, by the rules git guards
+/// its own tree with (`is_ntfs_dotgit`, `is_hfs_dotgit`): ASCII case is
+/// folded (APFS, HFS+, NTFS), the code points HFS+ ignores are skipped,
+/// the 8.3 short name NTFS gives it counts (`git~1`), and NTFS drops
+/// trailing dots and spaces and reads `:` as the start of a stream name.
+///
+/// The one spelling rule for every path a repository-supplied file names
+/// (a commit journal's entries, a vendor ledger's records): none of them
+/// may reach `.git` under a name a plain comparison would miss.
+pub fn names_dot_dir(component: &str, dir: &str) -> bool {
+    let mut chars = component
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '\u{200C}'..='\u{200F}'
+                    | '\u{202A}'..='\u{202E}'
+                    | '\u{206A}'..='\u{206F}'
+                    | '\u{FEFF}'
+            )
+        })
+        .peekable();
+    let (stem, short) = match chars.peek() {
+        Some('.') => (dir, ""),
+        Some(_) => (&dir[1..], "~1"),
+        None => return false,
+    };
+    for expected in stem.chars().chain(short.chars()) {
+        if !chars
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
+        {
+            return false;
+        }
+    }
+    for c in chars {
+        match c {
+            '.' | ' ' => {}
+            ':' | '\\' => return true,
+            _ => return false,
+        }
+    }
+    true
+}
+
 /// Whether `dir` really (canonically) lives inside `root`. Both must
 /// exist; an unresolvable path is reported as contained, so the caller's
 /// own missing-file handling runs instead of a spurious refusal.
