@@ -185,7 +185,7 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
     const PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let url = format!(
-        "http://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
+        "https://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
     );
 
     let server = MockServer::start().await;
@@ -250,7 +250,7 @@ async fn pypi_requirements_hosted_rewrites_pinned_line() {
         marker: vex_e2e_common::Marker::Redirected,
         vulns: Some(&[("GHSA-hhhh-eeee-xxxx", &["CVE-2024-4321"])]),
         records: vex_pipenv_pip_steps::Records::Mock(vec![(UUID.into(), view_json(UUID, PURL))]),
-        patch_server_url: Some("http://patch.test".into()),
+        patch_server_url: Some("https://patch.test".into()),
         product: "pkg:pypi/app@1.0.0",
         revert: &|p: &Path| {
             std::fs::write(
@@ -276,7 +276,7 @@ async fn pypi_requirements_hosted_rewrites_pep440_equivalent_pin() {
     const PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let url = format!(
-        "http://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
+        "https://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
     );
 
     for pin in ["requests==2.31", "requests==2.31.0.0", "Requests==02.31.0"] {
@@ -325,7 +325,7 @@ async fn pypi_requirements_hosted_refuses_a_utf16_file() {
     const PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let url = format!(
-        "http://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
+        "https://patch.test/patch/pypi/requests/2.31.0/{TOKEN}/{UUID}/requests-2.31.0-py3-none-any.whl"
     );
 
     let text = "flask==2.0.1\r\nrequests==2.31.0\r\n";
@@ -387,9 +387,9 @@ async fn maven_pom_hosted_pins_suffixed_version_fail_closed() {
     const SUFFIXED: &str = "3.12.0-socket.b2b2b2b2";
     const JAR_SHA256: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
     const POM_SHA256: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
-    let index_url = format!("http://patch.test/patch-registry/maven/{TOKEN}/{UUID}/maven2");
+    let index_url = format!("https://patch.test/patch-registry/maven/{TOKEN}/{UUID}/maven2");
     let url = format!(
-        "http://patch.test/patch/maven/org.apache.commons/commons-lang3/3.12.0/{TOKEN}/{UUID}/commons-lang3-{SUFFIXED}.jar"
+        "https://patch.test/patch/maven/org.apache.commons/commons-lang3/3.12.0/{TOKEN}/{UUID}/commons-lang3-{SUFFIXED}.jar"
     );
 
     let server = MockServer::start().await;
@@ -494,7 +494,7 @@ async fn maven_pom_hosted_pins_suffixed_version_fail_closed() {
 
     // The committed hosted state has no manifest: the standalone vex must
     // attest it from the pom wiring (the patch server here is the
-    // configured `http://patch.test` origin). Blocking child processes +
+    // configured `https://patch.test` origin). Blocking child processes +
     // the stand-in's own runtime: off the async test's runtime.
     let project = tmp.path().to_path_buf();
     std::thread::spawn(move || {
@@ -516,9 +516,9 @@ async fn maven_profile_scoped_dependency_is_not_redirected() {
     const UUID: &str = "b3b3b3b3-b3b3-4b3b-8b3b-b3b3b3b3b3b3";
     const PURL: &str = "pkg:maven/org.apache.commons/commons-lang3@3.12.0";
     const SUFFIXED: &str = "3.12.0-socket.b3b3b3b3";
-    let index_url = format!("http://patch.test/patch-registry/maven/{TOKEN}/{UUID}/maven2");
+    let index_url = format!("https://patch.test/patch-registry/maven/{TOKEN}/{UUID}/maven2");
     let url = format!(
-        "http://patch.test/patch/maven/org.apache.commons/commons-lang3/3.12.0/{TOKEN}/{UUID}/commons-lang3-{SUFFIXED}.jar"
+        "https://patch.test/patch/maven/org.apache.commons/commons-lang3/3.12.0/{TOKEN}/{UUID}/commons-lang3-{SUFFIXED}.jar"
     );
     let server = MockServer::start().await;
     mock_view(&server, UUID, PURL).await;
@@ -614,7 +614,7 @@ fn maven_hosted_get_state_attests_without_manifest(
     let m2 = tempfile::tempdir().unwrap();
     let run = VexRun {
         product: Some("pkg:maven/dev.socket.test/consumer@1.0.0".to_string()),
-        patch_server_url: Some("http://patch.test".to_string()),
+        patch_server_url: Some("https://patch.test".to_string()),
         ..VexRun::online(&api)
     }
     .env("MAVEN_REPO_LOCAL", m2.path().as_os_str());
@@ -698,9 +698,9 @@ async fn nuget_hosted_wires_source_mapping_and_lock_hash() {
         "sha512-NUGETPATCHEDcontenthashbase64NUGETPATCHEDcontenthashAA==";
     const PATCHED_CONTENT_HASH: &str = "NUGETPATCHEDcontenthashbase64NUGETPATCHEDcontenthashAA==";
     const UPSTREAM_CONTENT_HASH: &str = "UPSTREAMnugetHASHupstream==";
-    let index_url = format!("http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/index.json");
+    let index_url = format!("https://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/index.json");
     let url = format!(
-        "http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+        "https://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
     );
 
     let server = MockServer::start().await;
@@ -818,9 +818,9 @@ async fn nuget_hosted_wires_source_mapping_and_lock_hash() {
 async fn nuget_hosted_wires_mixed_case_config_in_place() {
     const UUID: &str = "c4c4c4c4-c4c4-4c4c-8c4c-c4c4c4c4c4c4";
     const PURL: &str = "pkg:nuget/Newtonsoft.Json@13.0.3";
-    let index_url = format!("http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/index.json");
+    let index_url = format!("https://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/index.json");
     let url = format!(
-        "http://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
+        "https://patch.test/patch-registry/nuget/{TOKEN}/{UUID}/flat/newtonsoft.json/13.0.3/newtonsoft.json.13.0.3.nupkg"
     );
 
     let server = MockServer::start().await;
@@ -878,7 +878,7 @@ async fn nuget_hosted_wires_mixed_case_config_in_place() {
 }
 
 /// The manifest-less VEX steps for a nuget hosted checkout `get` wired
-/// (`http://patch.test` is the configured patch-server origin; nothing is
+/// (`https://patch.test` is the configured patch-server origin; nothing is
 /// installed, so the lock's re-pinned `contentHash` is the evidence). v5
 /// `get` writes no ledger: attested from nuget.config, packages.lock.json
 /// and the API record; `--offline` with no local record →
@@ -898,7 +898,7 @@ fn nuget_hosted_manifestless_vex(root: &Path, uuid: &str, purl: &str) {
     let api = PatchApi::start(vec![(uuid.to_string(), view.clone())]);
     let run = |r: VexRun| {
         let r = VexRun {
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             product: Some("pkg:nuget/app@1.0.0".to_string()),
             ..r
         }
@@ -993,7 +993,7 @@ async fn composer_lock_hosted_repoints_dist_minding_escaped_slashes() {
     const PURL: &str = "pkg:composer/monolog/monolog@3.5.0";
     const SHA1: &str = "abcdef0123456789abcdef0123456789abcdef01";
     let url = format!(
-        "http://patch.test/patch/composer/monolog/monolog/3.5.0/{TOKEN}/{UUID}/monolog-3.5.0.zip"
+        "https://patch.test/patch/composer/monolog/monolog/3.5.0/{TOKEN}/{UUID}/monolog-3.5.0.zip"
     );
 
     let server = MockServer::start().await;
@@ -1116,7 +1116,7 @@ async fn deno_hosted_grant_lands_nothing() {
         let server = MockServer::start().await;
         mock_view(&server, uuid, purl).await;
         let url = format!(
-            "http://patch.test/patch/deno/std-path/0.220.0/{TOKEN}/{uuid}/std-path-0.220.0.tgz"
+            "https://patch.test/patch/deno/std-path/0.220.0/{TOKEN}/{uuid}/std-path-0.220.0.tgz"
         );
         mock_reference(
             &server,
@@ -1173,7 +1173,7 @@ async fn deno_hosted_grant_lands_nothing() {
             )]);
             for no_verify in [false, true] {
                 let mut r = VexRun::online(&api);
-                r.patch_server_url = Some("http://patch.test".to_string());
+                r.patch_server_url = Some("https://patch.test".to_string());
                 r.no_verify = no_verify;
                 let out = run_vex(&binary(), &root, &r);
                 assert_eq!(out.code, Some(2), "{p}: {out}");

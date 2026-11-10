@@ -1267,7 +1267,7 @@ async fn live_hosted_overlap_fires_redirect_supersedes_vendored() {
     let root = tmp.path();
     write_superseded_vendored_project(root);
 
-    let psu = ["--patch-server-url", "http://patch.test"];
+    let psu = ["--patch-server-url", "https://patch.test"];
     let (code, doc) = scan_hosted_json(root, &server.uri(), &psu, &[]);
     assert_eq!(
         code, 0,
@@ -1596,7 +1596,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
             "--vex-product",
             "pkg:npm/consumer@0.0.0",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
         ],
         &[],
     );
@@ -1640,7 +1640,7 @@ async fn shrinkwrap_only_project_warns_npm12_ignores_it_and_vex_omits_it() {
             "--vex-product",
             "pkg:npm/consumer@0.0.0",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
         ],
         &[],
     );
@@ -1670,7 +1670,7 @@ async fn deno_lock_of_the_redirected_version_warns_and_vex_omits_it() {
         "--vex-product",
         "pkg:npm/consumer@0.0.0",
         "--patch-server-url",
-        "http://patch.test",
+        "https://patch.test",
     ];
     let deno_lock = |version: &str| {
         format!(r#"{{"version":"5","npm":{{"{NAME}@{version}":{{"integrity":"sha512-X=="}}}}}}"#)

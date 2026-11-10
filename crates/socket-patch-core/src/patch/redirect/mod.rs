@@ -44,6 +44,7 @@ pub(crate) mod generation;
 #[cfg(test)]
 mod golang_equivalence_tests;
 pub mod golang_local;
+pub(crate) mod grant;
 #[cfg(test)]
 mod group_equivalence_tests;
 #[cfg(test)]

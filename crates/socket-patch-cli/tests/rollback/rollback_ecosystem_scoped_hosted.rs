@@ -27,7 +27,7 @@ use socket_patch_cli::commands::rollback::{run as rollback_run, RollbackArgs};
 use socket_patch_core::patch::redirect::{save_redirect_state, FileEdit, RedirectState};
 
 const PRISTINE_LINE: &str = "requests==2.31.0";
-const WIRED_LINE: &str = "requests @ http://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1/requests-2.31.0-py3-none-any.whl --hash=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const WIRED_LINE: &str = "requests @ https://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1/requests-2.31.0-py3-none-any.whl --hash=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn requirements_content(line: &str) -> String {
     format!("flask==2.0.1\n{line}\n")
@@ -80,7 +80,7 @@ async fn rollback_in_process(cwd: &Path, ecosystems: Option<Vec<String>>) -> i32
             json: true,
             yes: true,
             silent: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state: false,

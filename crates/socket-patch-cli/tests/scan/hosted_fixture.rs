@@ -46,7 +46,7 @@ pub(crate) const NAME: &str = "covgap-hosted";
 pub(crate) const VERSION: &str = "1.0.0";
 pub(crate) const PURL: &str = "pkg:npm/covgap-hosted@1.0.0";
 pub(crate) const UUID: &str = "11111111-1111-4111-8111-111111111111";
-pub(crate) const HOSTED_URL: &str = "http://patch.test/patch/npm/covgap-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-hosted-1.0.0.tgz";
+pub(crate) const HOSTED_URL: &str = "https://patch.test/patch/npm/covgap-hosted/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-hosted-1.0.0.tgz";
 pub(crate) const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 /// The grant's sha1: yarn classic pins it as `resolved`'s `#` fragment (#558).
 pub(crate) const PATCHED_SHA1: &str = "5ba15ba15ba15ba15ba15ba15ba15ba15ba15ba1";
@@ -535,6 +535,16 @@ pub(crate) fn write_yarn_classic_project(root: &Path, package_manager: Option<&s
 /// reads it, #558 / #591), with the grant's hashes matching it; returns its
 /// URL.
 pub(crate) async fn mock_served_classic_reference(server: &MockServer) -> String {
+    mock_served_classic_reference_with(server, |_| {}).await
+}
+
+/// [`mock_served_classic_reference`] with the grant's `integrity` object
+/// (the served tarball's own `sha512` and `sha1`) passed through `edit`
+/// before it is mounted.
+pub(crate) async fn mock_served_classic_reference_with(
+    server: &MockServer,
+    edit: impl FnOnce(&mut Value),
+) -> String {
     use base64::Engine as _;
     use sha1::Digest as _;
     let manifest = format!(r#"{{"name":"{NAME}","version":"{VERSION}"}}"#);
@@ -552,6 +562,14 @@ pub(crate) async fn mock_served_classic_reference(server: &MockServer) -> String
     let tgz = builder.into_inner().unwrap().finish().unwrap();
     let artifact = format!("/patch/npm/{NAME}/{VERSION}/22222222-2222-4222-8222-222222222222/{UUID}/{NAME}-{VERSION}.tgz");
     let url = format!("{}{artifact}", server.uri());
+    let mut integrity = json!({
+        "sha512": format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&tgz))
+        ),
+        "sha1": hex::encode(sha1::Sha1::digest(&tgz)),
+    });
+    edit(&mut integrity);
     mock_reference_results(
         server,
         json!({
@@ -562,14 +580,7 @@ pub(crate) async fn mock_served_classic_reference(server: &MockServer) -> String
                 "artifacts": [{
                     "kind": "tarball",
                     "url": url,
-                    "integrity": {
-                        "sha512": format!(
-                            "sha512-{}",
-                            base64::engine::general_purpose::STANDARD
-                                .encode(sha2::Sha512::digest(&tgz))
-                        ),
-                        "sha1": hex::encode(sha1::Sha1::digest(&tgz)),
-                    }
+                    "integrity": integrity
                 }],
                 "registryOverride": null
             }
@@ -589,14 +600,14 @@ pub(crate) const SUPER_X_PURL: &str = "pkg:npm/covgap-super-x@1.0.0";
 
 /// A project whose lock routes X (`SUPER_X_PURL`) to its hosted artifact (a
 /// lockfile hosted pin: v5 hosted state, recognized as such under
-/// `--patch-server-url http://patch.test`) while the vendored ledger still
+/// `--patch-server-url https://patch.test`) while the vendored ledger still
 /// claims X, and whose Y (= `NAME`) is still upstream.
 pub(crate) fn write_superseded_vendored_project(root: &Path) {
     const XNAME: &str = "covgap-super-x";
     const XPURL: &str = SUPER_X_PURL;
     const XUUID: &str = "66666666-6666-4666-8666-666666666666";
     let x_hosted = format!(
-        "http://patch.test/patch/npm/{XNAME}/1.0.0/77777777-7777-4777-8777-777777777777/{XUUID}/{XNAME}-1.0.0.tgz"
+        "https://patch.test/patch/npm/{XNAME}/1.0.0/77777777-7777-4777-8777-777777777777/{XUUID}/{XNAME}-1.0.0.tgz"
     );
     // Lock: X already hosted-wired (an earlier run), Y still upstream.
     std::fs::write(

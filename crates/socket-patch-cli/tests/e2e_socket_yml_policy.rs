@@ -37,7 +37,7 @@ impl Patch {
 
     fn hosted_url(&self) -> String {
         format!(
-            "http://patch.test/patch/npm/{n}/{v}/{TOKEN_SEGMENT}/{u}/{n}-{v}.tgz",
+            "https://patch.test/patch/npm/{n}/{v}/{TOKEN_SEGMENT}/{u}/{n}-{v}.tgz",
             n = self.name,
             v = self.version,
             u = self.uuid
@@ -414,7 +414,7 @@ fn run_cli(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> (i32, String, Str
     hermetic::scrub_extra(&mut cmd, &[hermetic::Extra::Venv, hermetic::Extra::Bundle]);
     cmd.env_remove("GIT_CEILING_DIRECTORIES");
     // The fixture's hosted pins name this origin; it makes them recorded.
-    cmd.env("SOCKET_PATCH_SERVER_URL", "http://patch.test");
+    cmd.env("SOCKET_PATCH_SERVER_URL", "https://patch.test");
     let absent = cwd.join(".absent-npm-config");
     for var in [
         "NPM_CONFIG_USERCONFIG",

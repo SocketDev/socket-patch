@@ -763,7 +763,7 @@ async fn all_detail_fetches_failed_reports_the_last_packages_error() {
 fn hosted_url(idx: usize) -> String {
     let name = NAMES[idx];
     format!(
-        "http://patch.test/patch/npm/{name}/{VERSION}/22222222-2222-4222-8222-222222222222/{}/{name}-{VERSION}.tgz",
+        "https://patch.test/patch/npm/{name}/{VERSION}/22222222-2222-4222-8222-222222222222/{}/{name}-{VERSION}.tgz",
         uuid(idx, AUTH)
     )
 }

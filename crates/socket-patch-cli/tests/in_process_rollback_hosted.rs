@@ -60,18 +60,18 @@ const NAME: &str = "in-proc-redirect";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const GHSA: &str = "GHSA-rbhr-aaaa-bbbb";
 
 // ── the hand-written hosted yarn.lock pins ──────────────────────────────────
 const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
 const LP_UUID: &str = "55555555-5555-4555-8555-555555555555";
-const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
+const LP_HOSTED_URL: &str = "https://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
 const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
-const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
+const IO_HOSTED_URL: &str = "https://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
 const GEM_UPSTREAM_REMOTE: &str = "https://rubygems.org/";
-const GEM_PATCH_REMOTE: &str = "http://patch.test/gems/t0k3nt0k3n/";
+const GEM_PATCH_REMOTE: &str = "https://patch.test/gems/t0k3nt0k3n/";
 
 fn hosted_scan_args(cwd: &Path, api_url: String) -> ScanArgs {
     ScanArgs {
@@ -109,7 +109,7 @@ async fn rollback_in_process(cwd: &Path, targets: Vec<String>, preserve_state: b
             json: true,
             yes: true,
             silent: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state,
@@ -154,7 +154,7 @@ async fn rollback_online(cwd: &Path, server: &MockServer) -> i32 {
             json: true,
             yes: true,
             silent: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state: false,
@@ -192,7 +192,7 @@ fn run_rollback_subprocess(cwd: &Path, extra: &[&str]) -> (i32, Value) {
             "--yes",
             "--offline",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -223,7 +223,7 @@ fn run_rollback_subprocess_online(cwd: &Path, server: &MockServer, extra: &[&str
             "--json",
             "--yes",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -643,7 +643,7 @@ async fn npm_hosted_dry_run_previews_cleanly() {
             yes: true,
             silent: true,
             dry_run: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state: false,
@@ -781,7 +781,7 @@ async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str,
     const PY_PURL: &str = "pkg:pypi/requests@2.31.0";
     const SHA256: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     let url = format!(
-        "http://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/{PY_UUID}/requests-2.31.0-py3-none-any.whl"
+        "https://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/{PY_UUID}/requests-2.31.0-py3-none-any.whl"
     );
 
     let py_view = serde_json::json!({
@@ -884,7 +884,7 @@ async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str,
         marker: vex_e2e_common::Marker::Redirected,
         vulns: Some(&[("GHSA-pypi-eeee-ffff", &["CVE-2024-2"])]),
         records: vex_pipenv_pip_steps::Records::Mock(vec![(PY_UUID.into(), py_view.clone())]),
-        patch_server_url: Some("http://patch.test".into()),
+        patch_server_url: Some("https://patch.test".into()),
         product: "pkg:pypi/app@1.0.0",
         revert: &|p: &Path| std::fs::write(p.join("requirements.txt"), pristine).unwrap(),
         envs: Vec::new(),
@@ -926,7 +926,7 @@ async fn pypi_requirements_round_trip(pristine: &'static str, includes: &[(&str,
             &vex_e2e_common::binary(),
             &dir,
             &vex_e2e_common::VexRun {
-                patch_server_url: Some("http://patch.test".into()),
+                patch_server_url: Some("https://patch.test".into()),
                 ..vex_e2e_common::VexRun::online(&api)
             },
         );
@@ -1437,7 +1437,7 @@ async fn npm_hosted_round_trip_manifest_less_vex() {
                     ),
                 )]);
                 let online = || VexRun {
-                    patch_server_url: Some("http://patch.test".to_string()),
+                    patch_server_url: Some("https://patch.test".to_string()),
                     ..VexRun::online(&api)
                 };
                 let out = run_vex(&vex_e2e_common::binary(), &wired, &online());
@@ -1601,7 +1601,7 @@ fn run_remove_subprocess_online(cwd: &Path, server: &MockServer, identifier: &st
             "--json",
             "--yes",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -1918,7 +1918,7 @@ fn run_cli_json(cwd: &Path, args: &[&str]) -> (i32, Value) {
             "--json",
             "--offline",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -2015,7 +2015,7 @@ fn remove_retires_a_berry_selector_left_by_yarn_remove() {
 
 const SIX_PURL: &str = "pkg:pypi/six@1.16.0";
 const SIX_UUID: &str = "66666666-6666-4666-8666-666666666666";
-const SIX_HOSTED_URL: &str = "http://patch.test/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/66666666-6666-4666-8666-666666666666/six-1.16.0-py2.py3-none-any.whl";
+const SIX_HOSTED_URL: &str = "https://patch.test/patch/pypi/six/1.16.0/22222222-2222-4222-8222-222222222222/66666666-6666-4666-8666-666666666666/six-1.16.0-py2.py3-none-any.whl";
 
 /// The project's pyproject.toml before the hosted run.
 const UV_PYPROJECT_PRISTINE: &str = "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n\

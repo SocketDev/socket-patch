@@ -29,7 +29,7 @@ const NAME: &str = "in-proc-redirect-pnpm";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect-pnpm@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-rdir-pnpm-bbbb";
@@ -58,7 +58,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             json: true,
             yes: true,
             silent: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state: false,
@@ -718,7 +718,7 @@ packages:
 async fn hosted_rewrites_pnpm_quoted_scoped_key() {
     const SCOPED_NAME: &str = "@socktest/in-proc-redirect-pnpm";
     const SCOPED_PURL: &str = "pkg:npm/%40socktest/in-proc-redirect-pnpm@1.0.0";
-    const SCOPED_HOSTED_URL: &str = "http://patch.test/patch/npm/%40socktest/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
+    const SCOPED_HOSTED_URL: &str = "https://patch.test/patch/npm/%40socktest/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -882,7 +882,7 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
 /// Manifest-less VEX after the in-process hosted rewrite of a v9 root lock
 /// AND a legacy shrinkwrap-3 lock (pnpm 1/2): the project carries no
 /// manifest (hosted mode never writes one), the hosted URL sits on the
-/// operator's patch server (`--patch-server-url http://patch.test`).
+/// operator's patch server (`--patch-server-url https://patch.test`).
 ///
 /// * not installed, no ledger (v5): the lockfile reference + the patch API
 ///   record attest `(redirected)` from the integrity pin, then
@@ -940,7 +940,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                 );
                 let api = PatchApi::start(vec![(UUID.to_string(), view.clone())]);
                 let online = |no_verify| VexRun {
-                    patch_server_url: Some("http://patch.test".to_string()),
+                    patch_server_url: Some("https://patch.test".to_string()),
                     no_verify,
                     ..VexRun::online(&api)
                 };
@@ -968,7 +968,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                     &bin,
                     root,
                     &VexRun {
-                        patch_server_url: Some("http://patch.test".to_string()),
+                        patch_server_url: Some("https://patch.test".to_string()),
                         ..VexRun::offline()
                     },
                 );
@@ -996,7 +996,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                     &bin,
                     root,
                     &VexRun {
-                        patch_server_url: Some("http://patch.test".to_string()),
+                        patch_server_url: Some("https://patch.test".to_string()),
                         ..VexRun::offline()
                     },
                 );
@@ -3222,7 +3222,7 @@ fn rollback_subprocess(
             "--json",
             "--yes",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -3376,7 +3376,7 @@ async fn issue_1268_rollback_of_a_member_lock_warns_trust_lockfile_left() {
 async fn issue_1268_member_lock_still_hosted_keeps_trust_without_warning() {
     const OTHER: &str = "other-pkg";
     const OTHER_VERSION: &str = "2.0.0";
-    const OTHER_HOSTED_URL: &str = "http://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    const OTHER_HOSTED_URL: &str = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
     let server = MockServer::start().await;
     mock_registry_version(&server, NAME, VERSION).await;
 
@@ -3481,7 +3481,7 @@ async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
     let out = discover_patched_refs_with(
         tmp.path(),
         &DiscoverOptions {
-            patch_server_origins: vec!["http://patch.test".to_string()],
+            patch_server_origins: vec!["https://patch.test".to_string()],
         },
     )
     .await;

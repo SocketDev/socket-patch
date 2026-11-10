@@ -34,10 +34,10 @@ pub const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
 // retired once no hosted pin remains.
 
 pub const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
-pub const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
+pub const LP_HOSTED_URL: &str = "https://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
 pub const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
-pub const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
-pub const PATCH_SERVER: &str = "http://patch.test";
+pub const IO_HOSTED_URL: &str = "https://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
+pub const PATCH_SERVER: &str = "https://patch.test";
 pub const UPSTREAM_INTEGRITY: &str = "sha512-UPSTREAMupstream==";
 
 pub const VLT_UUID: &str = "88888888-8888-4888-8888-888888888888";

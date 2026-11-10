@@ -1707,7 +1707,7 @@ async fn unwind_env(server: &MockServer, lock_before: &str) -> Vec<(String, Stri
 }
 
 /// [`unwind_env`] with the hosted origin given explicitly (the synthetic
-/// legs pin `http://patch.test`, not the mock server's own origin).
+/// legs pin `https://patch.test`, not the mock server's own origin).
 async fn unwind_env_for(
     server: &MockServer,
     patch_origin: &str,
@@ -1750,7 +1750,7 @@ async fn assert_rollback_restores_pristine(server: &MockServer, root: &Path, pri
         !root.join(".socket/vendor/redirect-state.json").exists(),
         "hosted mode writes no redirect ledger"
     );
-    let unwind = unwind_env_for(server, "http://patch.test", pristine).await;
+    let unwind = unwind_env_for(server, "https://patch.test", pristine).await;
     let (code, stdout, stderr) = run_socket_env(
         root,
         &[
@@ -1874,7 +1874,7 @@ packages:
 #[tokio::test(flavor = "multi_thread")]
 async fn pnpm_v5_lock_key_rewrite_splices_in_place() {
     let server = MockServer::start().await;
-    let hosted_url = hosted_url_for("http://patch.test");
+    let hosted_url = hosted_url_for("https://patch.test");
     mount_api_mocks(
         &server,
         &hosted_url,
@@ -1937,7 +1937,7 @@ async fn pnpm_v5_lock_key_rewrite_splices_in_place() {
 #[tokio::test(flavor = "multi_thread")]
 async fn pnpm_v6_plain_lock_key_rewrite_stays_supported() {
     let server = MockServer::start().await;
-    let hosted_url = hosted_url_for("http://patch.test");
+    let hosted_url = hosted_url_for("https://patch.test");
     mount_api_mocks(
         &server,
         &hosted_url,
