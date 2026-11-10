@@ -348,6 +348,7 @@ pub(super) enum UvTarget {
 pub(super) fn check_target_guards(
     p: &UvProject,
     canon_name: &str,
+    version: &str,
     record_uuid: &str,
 ) -> Result<UvTarget, (&'static str, String)> {
     // uv drops the [tool.uv.sources] entry under no-sources (or a
@@ -366,28 +367,41 @@ pub(super) fn check_target_guards(
         .map_err(|detail| ("pypi_uv_ancestor_settings", detail))?;
     // The same name at multiple versions/sources (platform forks) means one
     // surgical [[package]] rewrite would mispin the other forks — refuse.
-    let units = p
+    let mut units = p
         .lock
         .get("package")
         .and_then(Item::as_array_of_tables)
-        .map(|pkgs| {
-            pkgs.iter()
-                .filter(|t| t.get("name").and_then(Item::as_str) == Some(canon_name))
-                .count()
-        })
-        .unwrap_or(0);
-    if units == 0 {
+        .into_iter()
+        .flat_map(|pkgs| pkgs.iter())
+        .filter(|t| t.get("name").and_then(Item::as_str) == Some(canon_name));
+    let Some(unit) = units.next() else {
         return Err((
             "pypi_uv_lock_package_missing",
             format!("uv.lock has no [[package]] entry for {canon_name}; run `uv lock` first"),
         ));
-    }
-    if units > 1 {
+    };
+    if units.next().is_some() {
         return Err((
             "pypi_uv_lock_forked_package",
             format!(
                 "uv.lock resolves {canon_name} at multiple versions/sources (a forked \
                  resolution); vendoring would mispin the other forks"
+            ),
+        ));
+    }
+    // The wheel replaces the release the lock resolves, never another one:
+    // every manifest patch is a candidate, the ones for a release the
+    // project has since moved off included, and wiring one of those would
+    // move the project back to it.
+    let locked_version = unit.get("version").and_then(Item::as_str).unwrap_or("");
+    if !crate::utils::pep440::versions_equal(locked_version, version) {
+        return Err((
+            "pypi_uv_lock_package_missing",
+            format!(
+                "uv.lock resolves {canon_name} at {locked_version:?}, not the patched {version}; \
+                 the patch is for another release than the project locks, so nothing is wired \
+                 (drop it with `socket-patch remove pkg:pypi/{canon_name}@{version}`, or scan \
+                 again for a patch of the locked release)"
             ),
         ));
     }
@@ -567,7 +581,7 @@ pub(super) async fn wire_uv(
 ) -> Result<(Vec<WiringRecord>, UvMeta, Vec<VendorWarning>), (&'static str, String)> {
     // Before ANY write: a symlinked half would be replaced by the rename.
     refuse_symlinked(root, &UV_PAIR).await?;
-    match check_target_guards(p, canon_name, record_uuid)? {
+    match check_target_guards(p, canon_name, version, record_uuid)? {
         // Defensive: the orchestrator short-circuits in-sync pre-flight and
         // never calls wire on it (we must never re-record our own edit as an
         // "original", and a re-run requires-dist rewrite would append a
@@ -732,7 +746,6 @@ pub(super) async fn wire_uv(
     let (old_unit, new_unit) = rewrite_target_package_unit(
         &new_lock,
         canon_name,
-        version,
         rel_wheel,
         wheel_file_name,
         wheel_sha256_hex,
@@ -1769,8 +1782,9 @@ fn unit_is_root(lines: &[&str]) -> bool {
 
 /// Rewrite the target `[[package]]` unit to the path-wheel shape proven by
 /// the fixtures: `source = { path = ... }`, `sdist` dropped, `wheels` becomes
-/// the single `{ filename, hash }` element, `version` pinned to the vendored
-/// version. `metadata_block`, when present, is the reconstructed
+/// the single `{ filename, hash }` element. The `version` line stays the
+/// lock's own: [`check_target_guards`] admits only a patch for the release
+/// it names. `metadata_block`, when present, is the reconstructed
 /// `[package.metadata]` section a path source needs (registry packages omit
 /// it — see [`wheel_metadata_block`]); it is appended after the unit so the
 /// whole rewrite stays inside the single `uv_lock_package` wiring record and
@@ -1779,7 +1793,6 @@ fn unit_is_root(lines: &[&str]) -> bool {
 fn rewrite_target_package_unit(
     lock_text: &str,
     canon: &str,
-    version: &str,
     rel_wheel: &str,
     wheel_file_name: &str,
     wheel_sha256_hex: &str,
@@ -1816,9 +1829,7 @@ fn rewrite_target_package_unit(
     let mut i = 0;
     while i < unit.len() {
         let line = unit[i];
-        if line.starts_with("version = ") {
-            out.push(format!("version = \"{version}\""));
-        } else if line.starts_with("source = ") {
+        if line.starts_with("source = ") {
             out.push(format!("source = {{ path = \"{rel_wheel}\" }}"));
         } else if line.starts_with("sdist = ") {
             // dropped: a path-wheel source has no sdist (fixture-pinned)
@@ -2617,11 +2628,11 @@ wheels = [
 
 [[package]]
 name = "six"
-version = "1.17.0"
+version = "1.16.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/71/39/171f1c67cd00715f190ba0b100d606d440a28c93c7714febeca8b79af85e/six-1.16.0.tar.gz", hash = "sha256:1e61c37477a1626458e36f7b1d82aa5c9b094fa4802892072e49de9c60c4c926", size = 34041, upload-time = "2021-05-05T14:18:18.379Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+    { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
 ]
 "#;
 
@@ -2812,9 +2823,116 @@ wheels = [
         );
     }
 
+    /// The registry `[[package]]` unit of six 1.17.0, as uv writes it.
+    const SIX_1_17_UNIT: &str = r#"[[package]]
+name = "six"
+version = "1.17.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/94/e7/b2c673351809dca68a0e064b6af791aa332cf192da575fd474ed7d6f16a2/six-1.17.0.tar.gz", hash = "sha256:ff70335d468e7eb6ec65b95b99d3a2836546063f63acc5171de367e834932a81", size = 34031, upload-time = "2024-12-04T17:35:28.174Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/ce/149a00dd41f10bc29e5921b496af8b574d8413afcd5e30dfa0ed46c2cc5e/six-1.17.0-py2.py3-none-any.whl", hash = "sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274", size = 11050, upload-time = "2024-12-04T17:35:26.475Z" },
+]
+"#;
+
+    /// `lock` with its registry six 1.16.0 unit replaced by the 1.17.0 one:
+    /// the project moved on to the next release.
+    fn bumped_to_1_17(lock: &str) -> String {
+        let at = lock
+            .find("[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n")
+            .expect("the lock holds six 1.16.0");
+        assert!(lock[at..].contains("registry"), "a registry unit");
+        format!("{}{SIX_1_17_UNIT}", &lock[..at])
+    }
+
+    /// A patch for another release than the lock resolves (a manifest entry
+    /// left behind by a dependency bump) is refused, declared or transitive:
+    /// wiring it would move the project back to the patch's version. With
+    /// patches for both releases, the one the lock resolves is the one
+    /// wired, and the unit keeps the lock's own `version` line.
+    #[tokio::test]
+    async fn a_patch_for_another_version_than_the_lock_resolves_is_refused() {
+        const WHEEL_1_17: &str = "six-1.17.0-py2.py3-none-any.whl";
+        let rel_1_17 = format!(".socket/vendor/pypi/{UUID}/{WHEEL_1_17}");
+        for (label, pyproject, lock) in [
+            (
+                "direct",
+                DIRECT_REGISTRY_PYPROJECT.replace("six==1.16.0", "six>=1.16"),
+                bumped_to_1_17(DIRECT_REGISTRY_LOCK).replace("\"==1.16.0\"", "\">=1.16\""),
+            ),
+            (
+                "transitive",
+                TRANSITIVE_REGISTRY_PYPROJECT.to_string(),
+                bumped_to_1_17(TRANSITIVE_REGISTRY_LOCK),
+            ),
+        ] {
+            let tmp = write_pair(&pyproject, &lock).await;
+            let p = load_uv_project(tmp.path()).await.unwrap();
+            // The pre-flight refuses it, before any artifact is fetched.
+            let preflight = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
+            assert_eq!(preflight.0, "pypi_uv_lock_package_missing", "{label}");
+            assert_eq!(
+                check_target_guards(&p, "six", "1.17.0", UUID),
+                Ok(UvTarget::Fresh),
+                "{label}"
+            );
+            let err = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.16.0",
+                REL_WHEEL,
+                WHEEL_NAME,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.0, "pypi_uv_lock_package_missing", "{label}: {}", err.1);
+            assert!(
+                err.1.contains("1.17.0") && err.1.contains("1.16.0"),
+                "{label}: the refusal names both versions: {}",
+                err.1
+            );
+            assert_eq!(
+                read_pair(tmp.path()).await,
+                (pyproject.clone(), lock.clone()),
+                "{label}: a refused patch leaves both files untouched"
+            );
+
+            let (wiring, _, _) = wire_uv(
+                &p,
+                tmp.path(),
+                "six",
+                "1.17.0",
+                &rel_1_17,
+                WHEEL_1_17,
+                WHEEL_SHA,
+                UUID,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the locked release's patch wires: {e:?}"));
+            let (_, wired) = read_pair(tmp.path()).await;
+            assert!(
+                wired.contains(&format!(
+                    "name = \"six\"\nversion = \"1.17.0\"\nsource = {{ path = \"{rel_1_17}\" }}\n"
+                )),
+                "{label}: {wired}"
+            );
+            assert!(!wired.contains("1.16.0"), "{label}: {wired}");
+            let package = wiring
+                .iter()
+                .find(|w| w.kind == "uv_lock_package")
+                .expect("the package unit is recorded");
+            assert_eq!(
+                package.original.as_ref().and_then(|v| v.as_str()),
+                Some(SIX_1_17_UNIT.trim_end()),
+                "{label}: the recorded original is the lock's own unit"
+            );
+        }
+    }
+
     /// Transitive deps wire via override-dependencies, never
-    /// promotion — the result must byte-match the override-transitive pair,
-    /// including the lock's 1.17.0 → 1.16.0 version pin-down.
+    /// promotion — the result must byte-match the override-transitive pair.
     #[tokio::test]
     async fn override_wiring_matches_fixture_byte_identically() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
@@ -2859,7 +2977,8 @@ wheels = [
     #[tokio::test]
     async fn guards_refuse_shadowing_a_parents_uv_settings() {
         let target = |p: &UvProject| {
-            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+            check_target_guards(p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f")
+                .map(|_| ())
         };
         let nested = |parent: &'static str, text: &'static str| async move {
             let tmp = tempfile::tempdir().unwrap();
@@ -2967,7 +3086,8 @@ wheels = [
         // no-sources-package list naming the package, set in pyproject's
         // [tool.uv] or in a project uv.toml (which replaces it).
         let target = |p: &UvProject| {
-            check_target_guards(p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f").map(|_| ())
+            check_target_guards(p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f")
+                .map(|_| ())
         };
         for setting in ["no-sources = true", "no-sources-package = [\"Six\"]"] {
             let tmp = write_pair(
@@ -3116,7 +3236,7 @@ wheels = [
         assert_eq!(err.0, "pypi_uv_source_already_exists");
         assert!(err.1.contains("--revert"), "{}", err.1);
         assert_eq!(
-            check_target_guards(&p, "six", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
+            check_target_guards(&p, "six", "1.16.0", "9f6b2c4e-1d3a-4f6b-8c2d-7e5a9b1c3d5f"),
             Ok(UvTarget::InSync),
             "the same patch generation is in sync, not a refusal"
         );
@@ -3165,7 +3285,7 @@ wheels = [
         ] {
             let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let err = check_target_guards(&p, "six", UUID).unwrap_err();
+            let err = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             assert_eq!(err.0, "pypi_uv_source_already_exists", "{pyproject}");
             assert!(err.1.contains("PEP 508 direct reference"), "{}", err.1);
         }
@@ -3799,7 +3919,7 @@ wheels = [
         let tmp = write_pair(DIRECT_PATH_PYPROJECT, DIRECT_PATH_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::InSync),
             "precondition: the pair is in sync at this uuid"
         );
@@ -4796,7 +4916,7 @@ wheels = [
             let pyproject = format!("{DIRECT_REGISTRY_PYPROJECT}{extra}");
             let tmp = write_pair(&pyproject, DIRECT_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let guard = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             let wire = wire_uv(
                 &p,
                 tmp.path(),
@@ -4827,7 +4947,7 @@ wheels = [
             let pyproject = format!("{TRANSITIVE_REGISTRY_PYPROJECT}{extra}");
             let tmp = write_pair(&pyproject, TRANSITIVE_REGISTRY_LOCK).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let guard = check_target_guards(&p, "six", UUID).unwrap_err();
+            let guard = check_target_guards(&p, "six", "1.16.0", UUID).unwrap_err();
             let wire = wire_uv(
                 &p,
                 tmp.path(),
@@ -4868,7 +4988,7 @@ wheels = [
             };
             let tmp = write_pair(&format!("{base}{extra}"), lock).await;
             let p = load_uv_project(tmp.path()).await.unwrap();
-            let got = check_target_guards(&p, "six", UUID);
+            let got = check_target_guards(&p, "six", "1.16.0", UUID);
             if base == DIRECT_REGISTRY_PYPROJECT {
                 assert_eq!(got, Ok(UvTarget::Fresh), "{extra}");
             } else {
@@ -4897,7 +5017,7 @@ wheels = [
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::Fresh),
             "a sources entry for another package must not refuse"
         );
@@ -4911,7 +5031,7 @@ wheels = [
         .await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         assert_eq!(
-            check_target_guards(&p, "six", UUID),
+            check_target_guards(&p, "six", "1.16.0", UUID),
             Ok(UvTarget::Fresh),
             "an override pin for another package must not refuse"
         );
@@ -5676,11 +5796,10 @@ wheels = [
     /// never after it.
     #[test]
     fn sdist_only_unit_splices_wheels_before_a_package_subtable() {
-        let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.15.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
-        let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock_text, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
-        )
-        .unwrap();
+        let lock_text = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://e/six-1.16.0.tar.gz\", hash = \"sha256:aa\", size = 1 }\n\n[package.optional-dependencies]\nsocks = [\n    { name = \"pysocks\" },\n]\n";
+        let (old_unit, new_unit) =
+            rewrite_target_package_unit(lock_text, "six", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None)
+                .unwrap();
         assert!(lock_text.contains(&old_unit));
         assert_eq!(
             new_unit,
@@ -5899,10 +6018,11 @@ wheels = [
         );
     }
 
-    /// A version string that breaks the override TOML value (an embedded
-    /// quote) is reported as a parse failure BEFORE any write.
+    /// A version string that would break the override TOML value (an
+    /// embedded quote) is not the release the lock resolves, so it is
+    /// refused BEFORE any write and never reaches that value.
     #[tokio::test]
-    async fn wire_reports_an_unbuildable_override_value() {
+    async fn wire_refuses_a_version_that_would_break_the_override_value() {
         let tmp = write_pair(TRANSITIVE_REGISTRY_PYPROJECT, TRANSITIVE_REGISTRY_LOCK).await;
         let p = load_uv_project(tmp.path()).await.unwrap();
         let err = wire_uv(
@@ -5917,8 +6037,7 @@ wheels = [
         )
         .await
         .unwrap_err();
-        assert_eq!(err.0, "pypi_uv_lock_parse_failed");
-        assert!(err.1.contains("cannot build override value"), "{}", err.1);
+        assert_eq!(err.0, "pypi_uv_lock_package_missing", "{}", err.1);
         let (py, lock) = read_pair(tmp.path()).await;
         assert_eq!(
             py, TRANSITIVE_REGISTRY_PYPROJECT,
@@ -6337,11 +6456,10 @@ wheels = [
     /// append path.
     #[test]
     fn single_line_wheels_array_is_rewritten_in_place() {
-        let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.15.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
-        let (old_unit, new_unit) = rewrite_target_package_unit(
-            lock, "six", "1.16.0", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None,
-        )
-        .unwrap();
+        let lock = "version = 1\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = { registry = \"https://pypi.org/simple\" }\nsdist = { url = \"https://example.invalid/six.tar.gz\", hash = \"sha256:aa\", size = 1 }\nwheels = [{ url = \"https://example.invalid/six.whl\", hash = \"sha256:bb\" }]\n";
+        let (old_unit, new_unit) =
+            rewrite_target_package_unit(lock, "six", REL_WHEEL, WHEEL_NAME, WHEEL_SHA, None)
+                .unwrap();
         assert!(old_unit.contains("wheels = [{ url"), "{old_unit}");
         let expected_wheels = format!(
             "wheels = [\n    {{ filename = \"{WHEEL_NAME}\", hash = \"sha256:{WHEEL_SHA}\" }},\n]"

@@ -93,6 +93,16 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `--locked`, and ordinary installs). A lock that has metadata but no entry
   for the package is stale and is still refused with
   `pypi_uv_lock_package_missing`.
+- Vendored native wiring replaces the release the lock resolves, never
+  another one. Every manifest patch is a vendor candidate, including one for
+  a release the project has since moved off (a dependency bump, a manifest
+  shared across branches). When `uv.lock` resolves the package at another
+  version than the patch is for (compared as PEP 440 versions), the patch is
+  refused with `pypi_uv_lock_package_missing`, naming both versions, and
+  neither file is written; with patches for two releases in the manifest, the
+  one for the locked release is wired. The lock entry keeps its own
+  `version` line. Earlier releases wired such a patch by rewriting the
+  entry's version, which made `uv sync` install the patch's release.
 - Native lock versions other than `version = 1`, and PEP 751 versions other than
   `lock-version = "1.0"`, are refused. Lock `revision` values 1 (0.6.0–0.6.14),
   2 (0.6.15–0.8.3) and 3 (0.8.4 onward) are covered by the release-family runner.

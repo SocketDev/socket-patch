@@ -1102,7 +1102,7 @@ async fn pypi_prelude<'p>(
                 Ok(p) => p,
                 Err((code, detail)) => return Err(refused(code, detail)),
             };
-            match check_target_guards(&project, &canon_name, &record.uuid) {
+            match check_target_guards(&project, &canon_name, version, &record.uuid) {
                 Ok(UvTarget::InSync) => {
                     wired_pin = super::pypi_uv::wired_pin(&project, &canon_name, &record.uuid);
                     sibling_pending = super::pypi_requirements::sibling_pin_wirable(
@@ -2921,7 +2921,7 @@ async fn fresh_pyproject_plan(
     match flavor {
         PypiFlavor::UvProject => {
             let project = load_uv_project(project_root).await?;
-            match check_target_guards(&project, canon_name, uuid)? {
+            match check_target_guards(&project, canon_name, version, uuid)? {
                 UvTarget::Fresh => {
                     let warnings = project.warnings.clone();
                     // The revert just put the export's registry pin back
@@ -9517,6 +9517,31 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/5a/e7c31adbe875f2abbb91bd84cf2dc52d792b5a01506781dbcf25c91daf11/six-1.16.0-py2.py3-none-any.whl", hash = "sha256:8abb2f1d86890a2dfb989f9a77cfcfd3e47c2a354b01111771326f8aa26e0254", size = 11053, upload-time = "2021-05-05T14:18:17.237Z" },
 ]
 "#;
+
+    /// The preview (`scan` / `get --mode vendored --dry-run`) and the
+    /// pre-download guards share one prelude, so both refuse a uv patch for
+    /// another release than uv.lock resolves: of two patches for one
+    /// package, only the locked release's gets past them.
+    #[tokio::test]
+    async fn preview_refuses_a_uv_patch_for_another_version_than_the_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "pyproject.toml", UV_PYPROJECT).await;
+        touch(tmp.path(), "uv.lock", UV_LOCK_REGISTRY).await;
+        let stale = "pkg:pypi/six@1.15.0";
+        let refusals = preview_refusals(
+            tmp.path(),
+            &[(stale, UUID), ("pkg:pypi/six@1.16.0", SUPERSEDING_UUID)],
+            &[],
+        )
+        .await;
+        assert_eq!(refusals.keys().collect::<Vec<_>>(), [stale], "{refusals:?}");
+        let (code, detail) = &refusals[stale];
+        assert_eq!(*code, "pypi_uv_lock_package_missing");
+        assert!(
+            detail.contains("1.16.0") && detail.contains("1.15.0"),
+            "{detail}"
+        );
+    }
 
     /// Swap the e2e fixture's requirements flavor for a lockfile flavor.
     async fn swap_to_lock_flavor(fx: &E2eFixture, files: &[(&str, &str)]) {
