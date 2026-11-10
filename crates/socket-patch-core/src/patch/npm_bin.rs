@@ -49,9 +49,11 @@ pub(crate) fn fixed_for_write(
     };
     let content_hash = compute_git_sha256_from_bytes(content);
     if content_hash != expected_hash {
-        return Err(crate::patch::apply::content_hash_mismatch(
-            expected_hash,
-            content_hash,
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Hash verification failed before patch. Expected: {expected_hash}, Got: {content_hash}"
+            ),
         ));
     }
     let hash = compute_git_sha256_from_bytes(&fixed);

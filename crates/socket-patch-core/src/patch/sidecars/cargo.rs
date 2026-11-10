@@ -46,7 +46,8 @@ const CHECKSUM_FILE: &str = ".cargo-checksum.json";
 ///   * `Ok(Some(payload))` with one `SidecarFile{path: ".cargo-checksum.json", action: Rewritten}`
 ///     when the file existed and was rewritten;
 ///   * `Ok(None)` when there's no `.cargo-checksum.json` to fix up
-///     (some local-path deps don't ship one);
+///     (some local-path deps don't ship one), or it already lists the
+///     files' hashes (nothing is written);
 ///   * `Err(SidecarError)` on I/O or JSON parse failure.
 pub(crate) async fn fixup(
     pkg_path: &Path,
@@ -119,7 +120,13 @@ async fn sync_checksum(
             detail: "missing or non-object `files` field".to_string(),
         })?;
 
+    let before = files.clone();
     update_entries(files, pkg_path, patched, remove_missing).await?;
+    // Already in line with the files (a re-check of a package an earlier
+    // run patched): nothing to write, nothing to report.
+    if *files == before {
+        return Ok(None);
+    }
 
     // Pretty-print with two-space indent — matches what cargo
     // itself writes. Not strictly required (cargo accepts any

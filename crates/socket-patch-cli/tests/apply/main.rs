@@ -15,6 +15,7 @@ mod vlt_hosted_common;
 #[path = "../vlt_hosted_common/vendored.rs"]
 mod vlt_vendored;
 
+mod apply_atomicity;
 mod apply_failure_paths;
 mod apply_fixture;
 mod apply_invariants;

@@ -258,11 +258,11 @@ fn agent_m2_checksum_files_are_not_coursier_sidecars() {
 }
 
 /// A Coursier sidecar that cannot be resynced (here a directory squatting
-/// `__sha1`) leaves the patch on disk with a `sidecar_fixup_failed`
-/// advisory; once the obstacle is gone, the next apply (every file already
-/// patched, nothing written) still resyncs the sidecars.
+/// `__sha1`) fails the package: the jar is put back, the event is `failed`
+/// and the `sidecar_fixup_failed` record says why. Once the obstacle is
+/// gone the next apply patches the jar and resyncs the sidecars.
 #[test]
-fn agent_retry_resyncs_after_a_failed_fixup() {
+fn agent_failed_fixup_puts_the_jar_back() {
     let fx = fixture();
     let dir = write_coursier_artifact(&fx.home.coursier_cache(), CENTRAL, SLF4J, ORIGINAL);
     std::fs::write(hidden(&dir, "__sha1.computed"), Sha1::digest(ORIGINAL)).unwrap();
@@ -270,21 +270,67 @@ fn agent_retry_resyncs_after_a_failed_fixup() {
     std::fs::create_dir(hidden(&dir, "__sha1")).unwrap();
     stage_manifest(&fx.project, SLF4J);
 
-    let (_code, env, _stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
-    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), PATCHED, "{env}");
+    let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
+    assert_eq!(code, 1, "{env}\n{stderr}");
+    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), ORIGINAL, "{env}");
     let records = maven_sidecars(&env);
     assert_eq!(records.len(), 1, "{env}");
     assert_eq!(
         records[0]["advisory"]["code"], "sidecar_fixup_failed",
         "{env}"
     );
-    // The stale digest is still there: Coursier keeps the patch meanwhile.
+    assert!(
+        env["events"]
+            .as_array()
+            .is_some_and(|events| events.iter().any(|e| e["action"] == "failed"
+                && e["error"]
+                    .as_str()
+                    .is_some_and(|e| e.contains("sidecar fixup failed")))),
+        "{env}"
+    );
+    // The digest of the original jar is still there, beside that jar.
     assert_eq!(
         std::fs::read(hidden(&dir, "__sha1.computed")).unwrap(),
         Sha1::digest(ORIGINAL).to_vec()
     );
 
     std::fs::remove_dir(hidden(&dir, "__sha1")).unwrap();
+    let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
+    assert_eq!(code, 0, "retry: {env}\n{stderr}");
+    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), PATCHED, "{env}");
+    assert_eq!(
+        std::fs::read(hidden(&dir, "__sha1.computed")).unwrap(),
+        Sha1::digest(PATCHED).to_vec()
+    );
+}
+
+/// An apply that died right after renaming the jar into place left the
+/// sidecars describing the original bytes; the next apply (every file
+/// already patched, nothing written) still resyncs them.
+#[test]
+fn agent_retry_resyncs_after_an_interrupted_apply() {
+    let fx = fixture();
+    let dir = write_coursier_artifact(&fx.home.coursier_cache(), CENTRAL, SLF4J, ORIGINAL);
+    stage_manifest(&fx.project, SLF4J);
+
+    let mut interrupted = fx.home.isolated_env();
+    interrupted.push((
+        "SOCKET_PATCH_FAILPOINT".to_string(),
+        "patch_file_committed".to_string(),
+    ));
+    let interrupted: Vec<(&str, &str)> = interrupted
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let (code, _, stderr) =
+        common::run_with_env(&fx.project, &["apply", "--offline", "--json"], &interrupted);
+    assert_eq!(code, 86, "the failpoint must end the run: {stderr}");
+    assert_eq!(std::fs::read(dir.join(JAR)).unwrap(), PATCHED);
+    assert_eq!(
+        std::fs::read_to_string(hidden(&dir, "__sha1")).unwrap(),
+        sha1_hex(ORIGINAL)
+    );
+
     let (code, env, stderr) = run(&fx, &["apply", "--offline", "--json"], &[]);
     assert_eq!(code, 0, "retry: {env}\n{stderr}");
     let records = maven_sidecars(&env);

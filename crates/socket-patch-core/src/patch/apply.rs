@@ -106,17 +106,6 @@ impl<'a> PatchSources<'a> {
             mem_blobs: None,
         }
     }
-
-    /// The message for a write of blob `hash`'s bytes that failed with `e`
-    /// ([`blob_write_error`]). An overlay blob is not a cache file, so its
-    /// error stands as it is.
-    fn write_error(&self, e: &std::io::Error, hash: &str) -> String {
-        if self.mem_blobs.is_some_and(|m| m.contains_key(hash)) {
-            e.to_string()
-        } else {
-            blob_write_error(e, hash)
-        }
-    }
 }
 
 /// Result of applying patches to a single package.
@@ -460,87 +449,21 @@ async fn variant_installed_at(
     false
 }
 
-/// Bytes that do not hash to the hash they are recorded under: what
-/// [`apply_file_patch_at`] (and npm's bin-form twin) refuses before any
-/// disk write. Typed, so a caller that fed it a cached blob can say that
-/// the blob is what is wrong ([`blob_write_error`]).
-#[derive(Debug)]
-struct ContentHashMismatch {
-    expected: String,
-    actual: String,
-}
-
-impl std::fmt::Display for ContentHashMismatch {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Hash verification failed before patch. Expected: {}, Got: {}",
-            self.expected, self.actual
-        )
-    }
-}
-
-impl std::error::Error for ContentHashMismatch {}
-
-/// The refusal of content that hashes to `actual`, not `expected`.
-pub(crate) fn content_hash_mismatch(expected: &str, actual: String) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        ContentHashMismatch {
-            expected: expected.to_string(),
-            actual,
-        },
+/// The message for a cached blob whose bytes hash to `actual`, not to the
+/// hash it is named by (a line-ending-converting checkout, a truncated
+/// file). The cache entry is what is wrong and re-running the command
+/// cannot help, so it names the file and the command that replaces it.
+pub(crate) fn corrupt_blob_error(blob: &Path, actual: &str) -> String {
+    format!(
+        "Hash verification failed before patch: blob {} is corrupt (its content hashes to \
+         {actual}). Run `socket-patch repair` to download it again.",
+        blob.display()
     )
 }
 
-/// The message for a write of the cached blob `blob_hash` that failed with
-/// `e`. When the blob's own bytes were refused for not hashing to its name
-/// (a line-ending-converting checkout, a truncated file), the cache entry
-/// is what is wrong and re-running the command cannot help: name the file
-/// and the command that replaces it. The mismatch was already computed by
-/// the refused write, so a healthy run never hashes a blob for this.
-pub(crate) fn blob_write_error(e: &std::io::Error, blob_hash: &str) -> String {
-    match e
-        .get_ref()
-        .and_then(|inner| inner.downcast_ref::<ContentHashMismatch>())
-    {
-        Some(mismatch) if mismatch.expected == blob_hash => format!(
-            "Hash verification failed before patch: blob .socket/blobs/{blob_hash} is corrupt \
-             (its content hashes to {}). Run `socket-patch repair` to download it again.",
-            mismatch.actual
-        ),
-        _ => e.to_string(),
-    }
-}
-
-/// Apply a patch to a single file.
-///
-/// **Permission policy** (per the user-visible contract — patched
-/// files must look identical to pre-patch perms-wise):
-///
-/// 1. **Existing file**. Snapshot mode + owner + group before writing.
-///    The patched bytes land on a fresh inode (stage + rename), so a
-///    read-only target needs no write grant; only a read-only parent
-///    directory is relaxed for the write. After the rename, chown back
-///    to the pre-patch uid/gid, then restore the **exact** original mode.
-///
-/// 2. **New file** (created by the patch). Inherit owner + group from
-///    the parent directory and force mode `0o444` (read-only for all).
-///    Mirrors how an unpacked tarball treats new package files —
-///    consumers expect package sources to be read-only by default.
-///
-/// On Windows there is no `uid`/`gid`, so the owner/group step is a
-/// no-op; the read-only attribute is preserved on existing files and
-/// set on new files to honor the read-only-by-default policy.
-///
-/// The in-memory bytes are hash-checked against `expected_hash` BEFORE
-/// anything touches disk, then committed by stage + fsync + `rename(2)`
-/// (`utils::fs::atomic_write_bytes`). The rename replaces only the
-/// directory entry, which is also the copy-on-write isolation for shared
-/// inodes: a hardlinked sibling (pnpm's content-addressable store, the
-/// bun / uv caches, Go's module cache) keeps the old inode, and a symlink
-/// into a store is replaced by a private regular file instead of being
-/// written through.
+/// Apply a patch to a single file: a [`PackageWrite`] of one file, staged,
+/// committed and finished. See there for the permission policy and for
+/// what the stage + rename guarantees.
 ///
 /// This variant writes to exactly the one package root it is given; the
 /// pnpm peer-variant store copies are handled at package level by
@@ -548,94 +471,624 @@ pub(crate) fn blob_write_error(e: &std::io::Error, blob_hash: &str) -> String {
 /// copy.
 ///
 /// Returns `Ok(Some(warning))` when the bytes are committed but a
-/// best-effort post-write step failed — today only the ownership restore
-/// (an unprivileged caller cannot `chown` the fresh inode back to another
-/// uid/gid). The file IS patched; the caller reports the warning.
+/// best-effort step failed: the file's owner could not be kept (an
+/// unprivileged caller cannot give the fresh inode to another uid/gid) or
+/// stale Python bytecode could not be removed. The file IS patched; the
+/// caller reports the warning.
 pub(crate) async fn apply_file_patch_at(
     pkg_path: &Path,
     file_name: &str,
     patched_content: &[u8],
     expected_hash: &str,
 ) -> Result<Option<String>, std::io::Error> {
-    let normalized = normalize_file_path(file_name);
-    // SECURITY: refuse to write through a key that escapes the package dir.
-    if !is_safe_relative_subpath(normalized) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Unsafe patch path (escapes package directory): {file_name}"),
-        ));
-    }
-    let filepath = pkg_path.join(normalized);
-
-    // Hash-check the in-memory content BEFORE touching disk: a corrupt
-    // upstream blob errors out before any disk write.
-    let content_hash = compute_git_sha256_from_bytes(patched_content);
-    if content_hash != expected_hash {
-        return Err(content_hash_mismatch(expected_hash, content_hash));
-    }
-
-    // Snapshot pre-patch metadata so `restore_file_permissions` can
-    // re-apply the original mode + uid/gid to the post-rename inode.
-    // `None` means the file is being created by this patch — the
-    // new-file branch of restore_file_permissions inherits from the
-    // parent dir.
-    let existing_meta = tokio::fs::metadata(&filepath).await.ok();
-
-    // The stage+rename below needs write permission on the *parent
-    // directory*, not just on the file: Go's module cache (and some
-    // Nix/Bazel layouts) mark both files (0o444) and directories (0o555)
-    // read-only, so without a relax the stage-file creation fails with
-    // EACCES. ONE stat of the parent decides how:
-    //   * an existing directory is relaxed (if read-only) for the duration
-    //     of the write and put back exactly as found;
-    //   * a missing parent (a patch adding a file under a new subdir) is
-    //     materialized with `create_dir_all`, relaxing the nearest EXISTING
-    //     ancestor for the mkdir only — a freshly created directory is
-    //     owner-writable by construction, so the write needs no guard. A
-    //     non-directory sitting where the parent should be takes the same
-    //     path and fails inside `create_dir_all`, with the blocker's mode
-    //     restored.
-    let dir_guard = match filepath.parent() {
-        Some(parent) => match tokio::fs::metadata(parent).await {
-            Ok(meta) if meta.is_dir() => DirWriteGuard::from_metadata(parent, &meta).await,
-            _ => {
-                let mkdir_guard =
-                    DirWriteGuard::acquire(nearest_existing_ancestor(parent).await).await;
-                let mkdir_result = tokio::fs::create_dir_all(parent).await;
-                mkdir_guard.restore().await;
-                mkdir_result?;
-                DirWriteGuard::noop()
-            }
-        },
-        None => DirWriteGuard::noop(),
+    let change = FileChange::Write {
+        content: patched_content.to_vec(),
+        hash: expected_hash.to_string(),
     };
-
-    // Atomic write (`utils::fs::atomic_write_bytes`): stage in the parent
-    // directory, fsync, rename onto the target. POSIX `rename(2)` is
-    // atomic — observers see either the old bytes or the new bytes, never
-    // a truncated half-write — and it swaps the directory entry only, so a
-    // shared inode (pnpm store hardlink, symlink into a cache) is left
-    // untouched rather than written through. The stage file is created
-    // with the user's umask defaults, which is how a 0o444 target is never
-    // opened for write: a fresh inode is renamed over it and
-    // `restore_file_permissions` re-applies the pre-patch mode + uid/gid.
-    // The directory mode is restored whether or not the write succeeded,
-    // before any failure propagates.
-    let write_result = crate::utils::fs::atomic_write_bytes(&filepath, patched_content).await;
-    dir_guard.restore().await;
-    write_result?;
+    let (write, warning) = stage_change(PackageWrite::new(), pkg_path, file_name, change)
+        .await
+        .map_err(|e| e.source)?;
+    let write = commit_package(write).await.map_err(|e| e.source)?;
 
     // A rewritten `.py` file can't be trusted to invalidate its bytecode
     // (#819): drop it so the next import compiles the new source.
-    let bytecode_warning = remove_stale_bytecode(&filepath, StaleBytecode::All).await;
-
-    // Restore (or set) the final permissions on the post-rename inode.
-    // On Unix this includes chown back to the pre-patch uid/gid (or
-    // to the parent dir's uid/gid for new files); on Windows we only
-    // manage the readonly attribute.
-    let owner_warning = restore_file_permissions(&filepath, existing_meta.as_ref()).await?;
-    let warnings: Vec<String> = owner_warning.into_iter().chain(bytecode_warning).collect();
+    let filepath = pkg_path.join(normalize_file_path(file_name));
+    let mut warnings: Vec<String> = warning.into_iter().collect();
+    warnings.extend(remove_stale_bytecode(&filepath, StaleBytecode::All).await);
+    warnings.extend(finish_package(write).await);
     Ok((!warnings.is_empty()).then(|| warnings.join("; ")))
+}
+
+/// One file's change in a [`PackageWrite`].
+pub(crate) enum FileChange {
+    /// Replace (or create) the file with `content`, which must hash to
+    /// `hash`.
+    Write { content: Vec<u8>, hash: String },
+    /// Remove the file (rollback of a file the patch added).
+    Delete,
+}
+
+/// Why a [`PackageWrite`] could not be staged or committed. Every file is
+/// as it was before the write, except those `not_restored` names.
+#[derive(Debug)]
+pub(crate) struct PackageWriteError {
+    /// The manifest key of the file the failure is about; `None` for a
+    /// failure of the whole batch (the durability barrier).
+    pub file: Option<String>,
+    /// Whether the failed change was a [`FileChange::Delete`].
+    pub delete: bool,
+    pub source: std::io::Error,
+    /// Files that were already committed and could not be put back, each
+    /// as `<file>: <why>`.
+    pub not_restored: Vec<String>,
+}
+
+/// The end of a failure message when the unwind of a [`PackageWrite`] was
+/// incomplete (`not_restored` as [`PackageWrite::undo`] returns it); empty
+/// when every file was put back.
+pub(crate) fn not_restored_note(not_restored: &[String]) -> String {
+    if not_restored.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; these files could not be put back and are left changed: {}",
+            not_restored.join(", ")
+        )
+    }
+}
+
+/// The file changes of one package copy, made together: every change is
+/// staged in full before the first is committed, and a commit that fails
+/// part-way puts the files it already replaced back, so a failure leaves
+/// the package as it was.
+///
+/// **Staging** ([`PackageWrite::stage_write`]) hash-checks the bytes
+/// against the hash the caller expects BEFORE anything touches disk, then
+/// writes them to a sibling stage file that already carries the mode and
+/// owner the file will have:
+///
+/// 1. **Existing file**: its exact mode (setuid/setgid included) and its
+///    uid/gid. The bytes land on a fresh inode, so a read-only target needs
+///    no write grant; only a read-only parent directory is relaxed, until
+///    the write is closed.
+/// 2. **New file** (created by the patch): the parent directory's owner
+///    and mode `0o444`, as an unpacked tarball leaves package files.
+///
+/// On Windows there is no `uid`/`gid`; the read-only attribute is kept on
+/// existing files and set on new ones.
+///
+/// **Committing** ([`PackageWrite::commit`]) flushes the staged bytes to
+/// the device once, then renames each stage over its file. `rename(2)` is
+/// atomic: a reader, a crash or an interruption finds the old file or the
+/// new one, complete and with its final permissions, never a mix. It
+/// replaces only the directory entry, which is also the copy-on-write
+/// isolation for shared inodes: a hardlinked sibling (pnpm's
+/// content-addressable store, the bun / uv caches, Go's module cache)
+/// keeps the old inode, and a symlink into a store is replaced by a
+/// private regular file instead of being written through. Before the first
+/// rename every entry about to be replaced is given a second, sibling name
+/// ([`save_original`]); [`PackageWrite::undo`] renames those back, and
+/// closing the write removes them.
+///
+/// What an interruption can still leave is a package with some files
+/// renamed and the rest not (the renames run back to back, so the window
+/// is as short as it can be without a journal): the next `apply` (or
+/// `rollback`) finishes it, and sweeps the stages and second names the
+/// interrupted run left behind ([`sweep_stale_stages`]).
+///
+/// **Durability**: each stage's bytes are `fsync`ed when it is written and
+/// the device cache is flushed once before the first rename, so a file a
+/// crash finds renamed is never torn; the directories are synced, and the
+/// device flushed again, once when the write is closed (see
+/// `utils::durability`).
+///
+/// Blocking: run it on the blocking pool ([`stage_change`],
+/// [`commit_package`], [`finish_package`], [`abort_package`]).
+pub(crate) struct PackageWrite {
+    ops: Vec<FileOp>,
+    /// `ops[..committed]` are in place.
+    committed: usize,
+    /// Whether a directory entry changed since the directories were last
+    /// synced.
+    unsynced: bool,
+    /// Every directory holding a changed file: flushed before the commit
+    /// and synced when the write is closed.
+    dirs: std::collections::BTreeSet<PathBuf>,
+    /// Read-only directories relaxed for the stages and renames.
+    relaxed: Vec<DirWriteGuard>,
+    /// Directories created for patch-added files, parents first: removed
+    /// again, while empty, when the write is closed without its files.
+    created_dirs: Vec<PathBuf>,
+}
+
+struct FileOp {
+    /// The manifest key, for reports.
+    file: String,
+    dest: PathBuf,
+    /// The staged content to rename over `dest`; `None` removes `dest`.
+    staged: Option<crate::utils::fs::Staged>,
+    /// Whether `dest` held an entry when the change was staged.
+    existed: bool,
+    /// Where the entry `dest` held before the commit is kept until the
+    /// write is closed.
+    saved: Option<PathBuf>,
+}
+
+/// The sibling name an original is kept under during a [`PackageWrite`].
+const SAVED_PREFIX: &str = ".socket-orig-";
+
+/// How old a leftover of an interrupted [`PackageWrite`] must be before
+/// [`sweep_stale_stages`] removes it: far longer than any write holds one,
+/// so a write another project's run is making in a shared cache is never
+/// swept from under it.
+pub(crate) const STALE_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Remove what an interrupted [`PackageWrite`] left beside the patch files
+/// `files` of the package at `pkg_path`, once older than `older_than`:
+/// stages that were never renamed (`.socket-stage-<name>-<uuid>`) and
+/// originals that were never dropped (`.socket-orig-<name>-<uuid>`).
+/// Neither is the package's content: a stage holds bytes that were never
+/// committed, and a set-aside original is what a file held before a rename
+/// that already happened, or a second name of the file itself.
+/// Best-effort; directories and any other name are left alone.
+pub(crate) async fn sweep_stale_stages(
+    pkg_path: &Path,
+    files: &HashMap<String, PatchFileInfo>,
+    older_than: std::time::Duration,
+) {
+    let dirs: std::collections::BTreeSet<PathBuf> = files
+        .keys()
+        .map(|key| normalize_file_path(key))
+        .filter(|rel| is_safe_relative_subpath(rel))
+        .filter_map(|rel| pkg_path.join(rel).parent().map(Path::to_path_buf))
+        .collect();
+    crate::utils::fs::run_blocking(move || {
+        for dir in dirs {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let stale: Vec<PathBuf> = entries
+                .flatten()
+                .filter(|entry| is_stale_stage(entry, older_than))
+                .map(|entry| entry.path())
+                .collect();
+            if stale.is_empty() {
+                continue;
+            }
+            // Unlinking needs write permission on the directory.
+            let guard = std::fs::metadata(&dir)
+                .ok()
+                .map(|meta| DirWriteGuard::relax_blocking(&dir, &meta));
+            for path in stale {
+                let _ = std::fs::remove_file(path);
+            }
+            if let Some(guard) = guard {
+                guard.restore_blocking();
+            }
+        }
+    })
+    .await
+}
+
+/// Whether `entry` is a stage or set-aside original this engine names
+/// (`<prefix><file name>-<uuid>`), not a directory, and at least
+/// `older_than` old. The age is the entry's inode-change time on Unix (a
+/// set-aside original is a hard link, whose modification time is the
+/// file's own), its modification time elsewhere.
+fn is_stale_stage(entry: &std::fs::DirEntry, older_than: std::time::Duration) -> bool {
+    let name = entry.file_name();
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let named = [".socket-stage-", SAVED_PREFIX].iter().any(|prefix| {
+        name.strip_prefix(prefix)
+            // `-` and the 36 characters of a hyphenated uuid.
+            .and_then(|rest| rest.get(rest.len().checked_sub(37).filter(|at| *at > 0)?..))
+            .and_then(|suffix| suffix.strip_prefix('-'))
+            .is_some_and(|uuid| uuid::Uuid::try_parse(uuid).is_ok())
+    });
+    // `DirEntry::metadata` does not follow a symlink.
+    let Some(meta) = entry.metadata().ok().filter(|m| named && !m.is_dir()) else {
+        return false;
+    };
+    #[cfg(unix)]
+    let changed = {
+        use std::os::unix::fs::MetadataExt;
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs(meta.ctime().max(0) as u64)
+    };
+    #[cfg(not(unix))]
+    let changed = match meta.modified() {
+        Ok(time) => time,
+        Err(_) => return false,
+    };
+    // An entry stamped in the future (clock skew) is not stale.
+    changed.elapsed().is_ok_and(|age| age >= older_than)
+}
+
+/// Keep the entry at `dest` reachable as `saved` while a stage is renamed
+/// over it: a hard link, so [`PackageWrite::undo`] renames the very same
+/// inode back (bytes, mode, owner, times and its other links). Where the
+/// filesystem has no hard links, or refuses this one (Linux's
+/// `protected_hardlinks` for another user's file), a private copy with the
+/// same mode and owner stands in.
+fn save_original(dest: &Path, saved: &Path) -> std::io::Result<()> {
+    use crate::utils::fs::{stage_blocking, StageAttrs, StageSync};
+    if std::fs::hard_link(dest, saved).is_ok() {
+        return Ok(());
+    }
+    let meta = std::fs::metadata(dest)?;
+    let bytes = crate::utils::fs::read_regular_to_bytes_sync(dest)?;
+    // Synced like any stage: after an undo this copy IS the file.
+    let copy = stage_blocking(dest, &bytes, &StageAttrs::of(&meta), StageSync::Batched)?;
+    std::fs::rename(copy.stage(), saved).inspect_err(|_| copy.discard())
+}
+
+impl PackageWrite {
+    pub(crate) fn new() -> Self {
+        Self {
+            ops: Vec::new(),
+            committed: 0,
+            unsynced: false,
+            dirs: std::collections::BTreeSet::new(),
+            relaxed: Vec::new(),
+            created_dirs: Vec::new(),
+        }
+    }
+
+    /// Make `dir` ready to hold a stage: an existing directory is relaxed
+    /// when read-only (Go's module cache and some Nix/Bazel layouts mark
+    /// directories `0o555`, and creating a stage or renaming over an entry
+    /// needs write permission on the directory, not on the file); a missing
+    /// one (a patch adding a file under a new subdirectory) is created,
+    /// relaxing its nearest existing ancestor instead. A non-directory
+    /// sitting where `dir` should be fails inside `create_dir_all`.
+    fn open_dir(&mut self, dir: &Path) -> std::io::Result<()> {
+        if !self.dirs.insert(dir.to_path_buf()) {
+            return Ok(());
+        }
+        match std::fs::metadata(dir) {
+            Ok(meta) if meta.is_dir() => {
+                self.relaxed.push(DirWriteGuard::relax_blocking(dir, &meta));
+                Ok(())
+            }
+            _ => {
+                let mut missing = Vec::new();
+                let mut cur = Some(dir);
+                while let Some(p) = cur {
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        if self.dirs.insert(p.to_path_buf()) {
+                            self.relaxed.push(DirWriteGuard::relax_blocking(p, &meta));
+                        }
+                        break;
+                    }
+                    missing.push(p.to_path_buf());
+                    cur = p.parent();
+                }
+                // Recorded before the mkdir, so a chain that fails half-way
+                // is still removed when the write is closed.
+                self.dirs.extend(missing.iter().cloned());
+                self.created_dirs.extend(missing.into_iter().rev());
+                std::fs::create_dir_all(dir)
+            }
+        }
+    }
+
+    /// Stage `content` for the manifest key `file_name` of the package at
+    /// `pkg_path`. `Ok(Some(warning))` when the stage could not be given
+    /// the file's owner. Nothing the package holds has changed yet.
+    pub(crate) fn stage_write(
+        &mut self,
+        pkg_path: &Path,
+        file_name: &str,
+        content: &[u8],
+        expected_hash: &str,
+    ) -> std::io::Result<Option<String>> {
+        use crate::utils::fs::{stage_blocking, StageAttrs, StageMode, StageSync};
+        let normalized = normalize_file_path(file_name);
+        // SECURITY: refuse to write through a key that escapes the package dir.
+        if !is_safe_relative_subpath(normalized) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsafe patch path (escapes package directory): {file_name}"),
+            ));
+        }
+        let dest = pkg_path.join(normalized);
+
+        // Hash-check the in-memory content BEFORE touching disk: a corrupt
+        // blob errors out before any disk write.
+        let content_hash = compute_git_sha256_from_bytes(content);
+        if content_hash != expected_hash {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Hash verification failed before patch. Expected: {}, Got: {}",
+                    expected_hash, content_hash
+                ),
+            ));
+        }
+
+        // `None`: the file is created by this patch.
+        let existing = std::fs::metadata(&dest).ok();
+        let parent = dest.parent().map(Path::to_path_buf);
+        if let Some(parent) = &parent {
+            self.open_dir(parent)?;
+        }
+        let attrs = match &existing {
+            Some(meta) => StageAttrs::of(meta),
+            None => StageAttrs {
+                mode: StageMode::ReadOnly,
+                owner: parent
+                    .as_deref()
+                    .and_then(|parent| std::fs::metadata(parent).ok())
+                    .and_then(|meta| StageAttrs::of(&meta).owner),
+            },
+        };
+        // Inside an open group commit a commit point under its root is
+        // captured instead of written (see `utils::group_commit`).
+        if crate::utils::group_commit::capture_write(&dest, content, existing.is_some()) {
+            return Ok(None);
+        }
+        let staged = stage_blocking(&dest, content, &attrs, StageSync::Batched)?;
+        let warning = staged.owner_error.as_ref().map(|e| {
+            let (uid, gid) = attrs.owner.unwrap_or_default();
+            format!(
+                "{}: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid {uid} gid {gid}: {e}",
+                dest.display()
+            )
+        });
+        self.ops.push(FileOp {
+            file: file_name.to_string(),
+            // The directory ENTRY: a dangling symlink is one to keep too.
+            existed: std::fs::symlink_metadata(&dest).is_ok(),
+            dest,
+            staged: Some(staged),
+            saved: None,
+        });
+        Ok(warning)
+    }
+
+    /// Plan the removal of the manifest key `file_name` from the package
+    /// at `pkg_path`; the file is removed by [`PackageWrite::commit`].
+    pub(crate) fn stage_delete(&mut self, pkg_path: &Path, file_name: &str) -> std::io::Result<()> {
+        let normalized = normalize_file_path(file_name);
+        // SECURITY: a poisoned manifest entry (empty beforeHash + a
+        // `../../`/absolute key) must not unlink a file outside the
+        // package directory.
+        if !is_safe_relative_subpath(normalized) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unsafe patch path (escapes package directory): {file_name}"),
+            ));
+        }
+        let dest = pkg_path.join(normalized);
+        // Unlinking needs write permission on the parent directory.
+        if let Some(parent) = dest.parent() {
+            if let Ok(meta) = std::fs::metadata(parent) {
+                if self.dirs.insert(parent.to_path_buf()) {
+                    self.relaxed
+                        .push(DirWriteGuard::relax_blocking(parent, &meta));
+                }
+            }
+        }
+        self.ops.push(FileOp {
+            file: file_name.to_string(),
+            dest,
+            staged: None,
+            existed: true,
+            saved: None,
+        });
+        Ok(())
+    }
+
+    /// Make every staged change. On `Err` the changes already made were
+    /// put back (see [`PackageWriteError::not_restored`]).
+    pub(crate) fn commit(&mut self) -> Result<(), PackageWriteError> {
+        // Each stage's data was fsynced when it was written; one flush per
+        // device makes the whole batch durable before a rename names it.
+        if let Err(source) = crate::utils::durability::flush_devices_blocking(&self.dirs) {
+            return Err(PackageWriteError {
+                file: None,
+                delete: false,
+                source,
+                not_restored: Vec::new(),
+            });
+        }
+        self.unsynced = !self.ops.is_empty();
+        // Every original gets its second name before the first file
+        // changes, so the renames, the only steps between which the package
+        // is neither all old nor all new, run back to back.
+        for index in 0..self.ops.len() {
+            let op = &mut self.ops[index];
+            if op.staged.is_some() && op.existed {
+                let saved = crate::utils::fs::stage_path(&op.dest, SAVED_PREFIX);
+                if let Err(source) = save_original(&op.dest, &saved) {
+                    return Err(PackageWriteError {
+                        file: Some(op.file.clone()),
+                        delete: false,
+                        source,
+                        not_restored: Vec::new(),
+                    });
+                }
+                op.saved = Some(saved);
+            }
+        }
+        for index in 0..self.ops.len() {
+            if let Err(source) = self.commit_op(index) {
+                return Err(PackageWriteError {
+                    file: Some(self.ops[index].file.clone()),
+                    delete: self.ops[index].staged.is_none(),
+                    source,
+                    not_restored: self.undo(),
+                });
+            }
+            self.committed = index + 1;
+        }
+        Ok(())
+    }
+
+    fn commit_op(&mut self, index: usize) -> std::io::Result<()> {
+        let op = &mut self.ops[index];
+        crate::utils::failpoint::hit_or_error("patch_file_commit")?;
+        match &op.staged {
+            Some(staged) => staged.commit()?,
+            None => {
+                // Set aside, not unlinked: `undo` can still put it back.
+                let saved = crate::utils::fs::stage_path(&op.dest, SAVED_PREFIX);
+                std::fs::rename(&op.dest, &saved)?;
+                op.saved = Some(saved);
+            }
+        }
+        crate::utils::failpoint::hit("patch_file_committed");
+        Ok(())
+    }
+
+    /// Put back every change [`PackageWrite::commit`] made, newest first.
+    /// Returns the files that could not be put back, each as
+    /// `<file>: <why>`; an original that could not be renamed back stays
+    /// under the name the message gives.
+    pub(crate) fn undo(&mut self) -> Vec<String> {
+        let mut not_restored = Vec::new();
+        for op in self.ops[..self.committed].iter_mut().rev() {
+            match op.saved.take() {
+                Some(saved) => {
+                    if let Err(e) = std::fs::rename(&saved, &op.dest) {
+                        not_restored.push(format!(
+                            "{}: {e} (its original is kept at {})",
+                            op.file,
+                            saved.display()
+                        ));
+                    }
+                }
+                // A file the write created.
+                None => {
+                    if let Err(e) = std::fs::remove_file(&op.dest) {
+                        if !is_missing_path(&e) {
+                            not_restored.push(format!("{}: {e}", op.file));
+                        }
+                    }
+                }
+            }
+        }
+        self.committed = 0;
+        not_restored
+    }
+
+    /// Close the write as it stands: the stages not renamed and the
+    /// originals still set aside are removed (which makes a commit final),
+    /// directories created for files that are not there are removed, the
+    /// directories are synced, and the relaxed ones get their modes back.
+    /// Returns a warning per set-aside original that could not be removed.
+    fn close(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for op in self.ops.drain(..) {
+            if let Some(staged) = &op.staged {
+                staged.discard();
+            }
+            if let Some(saved) = op.saved {
+                if let Err(e) = std::fs::remove_file(&saved) {
+                    if !is_missing_path(&e) {
+                        warnings.push(format!(
+                            "could not remove {}, the pre-change copy of {}: {e}",
+                            saved.display(),
+                            op.file
+                        ));
+                    }
+                }
+            }
+        }
+        self.committed = 0;
+        // `remove_dir` refuses a directory that holds anything, so one a
+        // committed file now lives in stays.
+        for dir in self.created_dirs.drain(..).rev() {
+            let _ = std::fs::remove_dir(dir);
+        }
+        // The renames and unlinks only changed directory entries; sync the
+        // directories, once, so they survive a crash. Best-effort.
+        if std::mem::take(&mut self.unsynced) {
+            let _ = crate::utils::durability::sync_dirs_blocking(&self.dirs);
+        }
+        for guard in self.relaxed.drain(..).rev() {
+            guard.restore_blocking();
+        }
+        warnings
+    }
+}
+
+impl Drop for PackageWrite {
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
+/// Stage one more change, for the manifest key `file` of the package at
+/// `pkg_path`. Returns the write and the stage's ownership warning. On
+/// `Err` the write is closed: the package is untouched.
+pub(crate) async fn stage_change(
+    mut write: PackageWrite,
+    pkg_path: &Path,
+    file: &str,
+    change: FileChange,
+) -> Result<(PackageWrite, Option<String>), PackageWriteError> {
+    let (pkg_path, file) = (pkg_path.to_path_buf(), file.to_string());
+    crate::utils::fs::run_blocking(move || {
+        let staged = match &change {
+            FileChange::Write { content, hash } => {
+                write.stage_write(&pkg_path, &file, content, hash)
+            }
+            FileChange::Delete => write.stage_delete(&pkg_path, &file).map(|()| None),
+        };
+        match staged {
+            Ok(warning) => Ok((write, warning)),
+            Err(source) => Err(PackageWriteError {
+                file: Some(file),
+                delete: matches!(change, FileChange::Delete),
+                source,
+                not_restored: Vec::new(),
+            }),
+        }
+    })
+    .await
+}
+
+/// [`PackageWrite::commit`]. On `Err` the write is closed and the package
+/// is as it was (see [`PackageWriteError::not_restored`]).
+pub(crate) async fn commit_package(
+    mut write: PackageWrite,
+) -> Result<PackageWrite, PackageWriteError> {
+    // A durable commit point: every artifact written without an fsync so
+    // far is made durable first (see `utils::durability`).
+    let barrier = crate::utils::durability::barrier().await;
+    crate::utils::fs::run_blocking(move || {
+        if let Err(source) = barrier {
+            return Err(PackageWriteError {
+                file: None,
+                delete: false,
+                source,
+                not_restored: Vec::new(),
+            });
+        }
+        write.commit()?;
+        Ok(write)
+    })
+    .await
+}
+
+/// Close a write that was not committed: its stages are removed and the
+/// package is untouched.
+pub(crate) async fn abort_package(write: PackageWrite) {
+    crate::utils::fs::run_blocking(move || drop(write)).await
+}
+
+/// [`PackageWrite::undo`], then close the write: the package is back as it
+/// was, except for the files returned (`<file>: <why>`).
+pub(crate) async fn undo_package(mut write: PackageWrite) -> Vec<String> {
+    crate::utils::fs::run_blocking(move || write.undo()).await
+}
+
+/// Close a committed write, making it final. Returns warnings (see
+/// [`PackageWrite::close`]).
+pub(crate) async fn finish_package(mut write: PackageWrite) -> Vec<String> {
+    crate::utils::fs::run_blocking(move || write.close()).await
 }
 
 /// Which `__pycache__` entries of a module [`remove_stale_bytecode`]
@@ -815,6 +1268,29 @@ impl DirWriteGuard {
         Self::noop()
     }
 
+    /// Blocking twin of [`DirWriteGuard::from_metadata`], for
+    /// [`PackageWrite`].
+    fn relax_blocking(dir: &Path, meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = meta.permissions().mode();
+            if mode & 0o200 == 0
+                && std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o200))
+                    .is_ok()
+            {
+                return Self {
+                    relock: Some((dir.to_path_buf(), mode)),
+                };
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (dir, meta);
+        }
+        Self::noop()
+    }
+
     pub(crate) async fn restore(self) {
         #[cfg(unix)]
         {
@@ -825,124 +1301,17 @@ impl DirWriteGuard {
             }
         }
     }
-}
 
-/// Walk up from `path` and return the first ancestor that exists on
-/// disk. Used to find the directory whose write bit must be relaxed so
-/// `create_dir_all` can materialize a missing subdir chain. Returns
-/// `None` only if not even the filesystem root resolves (effectively
-/// never), in which case the caller's `DirWriteGuard::acquire(None)` is a
-/// no-op and `create_dir_all` proceeds unguarded.
-async fn nearest_existing_ancestor(path: &Path) -> Option<&Path> {
-    let mut cur = Some(path);
-    while let Some(p) = cur {
-        if tokio::fs::metadata(p).await.is_ok() {
-            return Some(p);
-        }
-        cur = p.parent();
-    }
-    None
-}
-
-/// Restore the post-write permission state on `filepath`.
-///
-/// * `pre_patch` = `Some(meta)` → the file existed before the patch;
-///   restore its exact mode + uid/gid.
-/// * `pre_patch` = `None` → the file is new; inherit owner/group from
-///   the parent dir and set mode `0o444`.
-///
-/// The bytes are already committed when this runs (the rename is done),
-/// so an ownership restore the caller is not privileged to perform — the
-/// pre-patch owner is another uid/gid and we are not root (`chown(2)`
-/// EPERM; a group-writable install populated by another user) — must not
-/// turn an applied patch into a reported failure: the mode is still
-/// restored and the failure comes back as a warning (`Ok(Some(..))`). A
-/// failing mode restore is still an error.
-///
-/// Split out of `apply_file_patch_at` to keep that function readable and
-/// to make the platform branching unit-testable.
-async fn restore_file_permissions(
-    filepath: &Path,
-    pre_patch: Option<&std::fs::Metadata>,
-) -> Result<Option<String>, std::io::Error> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        // Ownership FIRST, then the mode. Order matters — `chown(2)` clears
-        // the setuid/setgid bits for an unprivileged caller (even when the
-        // uid/gid are unchanged), so the chmod must run last to restore the
-        // mode bit-for-bit, setuid/setgid included.
-        let (owner, mode) = match pre_patch {
-            // Existing file: its original ownership and exact mode.
-            Some(meta) => (Some((meta.uid(), meta.gid())), meta.mode()),
-            // New file: inherit owner/group from the parent dir; read-only
-            // for all, like an unpacked tarball's package files.
-            None => {
-                let parent_owner = match filepath.parent() {
-                    Some(parent) => tokio::fs::metadata(parent)
-                        .await
-                        .ok()
-                        .map(|m| (m.uid(), m.gid())),
-                    None => None,
-                };
-                (parent_owner, 0o444)
-            }
-        };
-        let mut warning = None;
-        if let Some((uid, gid)) = owner {
-            if let Err(e) = chown_blocking(filepath.to_path_buf(), Some(uid), Some(gid)).await {
-                warning = Some(format!(
-                    "{}: patched, but {OWNERSHIP_NOT_RESTORED_MARKER} to uid {uid} gid {gid}: {e}",
-                    filepath.display()
-                ));
+    /// Blocking twin of [`DirWriteGuard::restore`].
+    fn restore_blocking(self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some((dir, mode)) = self.relock {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(mode));
             }
         }
-        tokio::fs::set_permissions(filepath, std::fs::Permissions::from_mode(mode)).await?;
-        Ok(warning)
     }
-
-    #[cfg(windows)]
-    {
-        match pre_patch {
-            Some(meta) => {
-                // Re-apply the pre-patch readonly state: the rename
-                // installed a fresh file that does not carry it.
-                let perms = meta.permissions();
-                tokio::fs::set_permissions(filepath, perms).await?;
-            }
-            None => {
-                // New file: read-only by default.
-                if let Ok(meta) = tokio::fs::metadata(filepath).await {
-                    let mut perms = meta.permissions();
-                    perms.set_readonly(true);
-                    tokio::fs::set_permissions(filepath, perms).await?;
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (filepath, pre_patch);
-        Ok(None)
-    }
-}
-
-/// Synchronous `chown` wrapped to run on the blocking pool so we don't
-/// stall the async runtime. `std::os::unix::fs::chown` is a thin
-/// syscall wrapper — fast in the no-op case (uid/gid already match)
-/// but still nominally blocking.
-#[cfg(unix)]
-async fn chown_blocking(
-    path: std::path::PathBuf,
-    uid: Option<u32>,
-    gid: Option<u32>,
-) -> Result<(), std::io::Error> {
-    tokio::task::spawn_blocking(move || std::os::unix::fs::chown(&path, uid, gid))
-        .await
-        .map_err(|e| std::io::Error::other(e.to_string()))?
 }
 
 /// Verify and apply patches for a single package.
@@ -1021,14 +1390,39 @@ impl crate::patch::store_copies::CopyFold for ApplyResult {
 }
 
 /// The substring every ownership advisory carries (see
-/// `restore_file_permissions`); the CLI's `ownership_not_restored` warning
-/// keys on the same text.
+/// [`PackageWrite::stage_write`]); the CLI's `ownership_not_restored`
+/// warning keys on the same text.
 pub const OWNERSHIP_NOT_RESTORED_MARKER: &str = "ownership could not be restored";
 
 /// The substring every failed bytecode cleanup carries (see
 /// [`remove_stale_bytecode`]); the CLI's `stale_bytecode_not_removed`
 /// warning keys on the same text.
 pub const STALE_BYTECODE_NOT_REMOVED_MARKER: &str = "could not remove stale Python bytecode";
+
+/// The substring of the advisory that names the patch files `--force`
+/// skipped because they are not on disk (see [`skipped_files_note`]); the
+/// CLI's `patch_files_skipped` warning keys on the same text.
+pub const FILES_SKIPPED_MARKER: &str = "not found on disk and skipped (--force)";
+
+/// The advisory naming the files of `verified` that `--force` skipped (a
+/// missing pre-existing file), `None` when it skipped none: a package that
+/// is reported applied, or already patched, with a file left out says
+/// which.
+fn skipped_files_note(verified: &[VerifyResult]) -> Option<String> {
+    let skipped: Vec<&str> = verified
+        .iter()
+        .filter(|v| v.status == VerifyStatus::NotFound)
+        .map(|v| v.file.as_str())
+        .collect();
+    (!skipped.is_empty()).then(|| {
+        format!(
+            "{} patch file{} {FILES_SKIPPED_MARKER}: {}",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" },
+            skipped.join(", ")
+        )
+    })
+}
 
 /// The run-level warning codes a successful apply's or rollback's advisory
 /// `note` (its `error` with `success: true`) carries, by marker. One note
@@ -1040,6 +1434,7 @@ pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
             STALE_BYTECODE_NOT_REMOVED_MARKER,
             "stale_bytecode_not_removed",
         ),
+        (FILES_SKIPPED_MARKER, "patch_files_skipped"),
     ]
     .into_iter()
     .filter(|(marker, _)| note.contains(marker))
@@ -1234,6 +1629,11 @@ async fn apply_package_patch_at(
         result.files_verified.push(verify_result);
     }
 
+    // An earlier run that was interrupted may have left stages behind.
+    if !dry_run {
+        sweep_stale_stages(pkg_path, files, STALE_STAGE_AGE).await;
+    }
+
     // A file an earlier run already patched may still have bytecode
     // compiled from the unpatched source beside it (written by a release
     // without the #819 fix, or a run that stopped between the rename and
@@ -1252,16 +1652,20 @@ async fn apply_package_patch_at(
     }
     let join_notes = |notes: Vec<String>| (!notes.is_empty()).then(|| notes.join("; "));
 
-    // Check if all files are already patched
-    let all_already_patched = result
+    // Check if all files are either already patched or not found (force
+    // mode skip).
+    let all_done_or_skipped = result
         .files_verified
         .iter()
-        .all(|v| v.status == VerifyStatus::AlreadyPatched);
+        .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
 
-    // Maven: retry a Coursier sidecar resync an earlier apply could not
-    // finish (see `sidecars::coursier::retry_record`) when this run writes
-    // nothing: every file already patched, or (`--force`) skipped.
-    let coursier_retry = |result: &mut ApplyResult| {
+    if all_done_or_skipped {
+        // This run writes nothing, so it never reaches the sidecar fixup
+        // below. The sidecars of the files an earlier run patched are
+        // still brought in line with them: that run may have died after
+        // its last rename, and then cargo refuses the crate while every
+        // file reads as patched. A sidecar that cannot be fixed fails the
+        // package: its files are patched, but it is not usable as patched.
         if !dry_run {
             let keys: Vec<String> = result
                 .files_verified
@@ -1269,43 +1673,42 @@ async fn apply_package_patch_at(
                 .filter(|v| v.status == VerifyStatus::AlreadyPatched)
                 .map(|v| v.file.clone())
                 .collect();
-            let failed = "sidecar fixup failed (patch still applied)";
-            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+            result.sidecar = crate::patch::sidecars::recheck(
                 package_key,
                 pkg_path,
                 &keys,
-                failed,
-            );
+                false,
+                "sidecar fixup failed (the files are already patched)",
+            )
+            .await;
+            if let Some(why) = result.sidecar.as_ref().and_then(|s| s.fixup_failure()) {
+                result.error = Some(why.to_string());
+                return result;
+            }
         }
-    };
-
-    if all_already_patched {
-        coursier_retry(&mut result);
         result.success = true;
-        result.error = join_notes(bytecode_warnings);
-        return result;
-    }
-
-    // Check if all files are either already patched or not found (force mode skip)
-    let all_done_or_skipped = result
-        .files_verified
-        .iter()
-        .all(|v| v.status == VerifyStatus::AlreadyPatched || v.status == VerifyStatus::NotFound);
-
-    if all_done_or_skipped {
-        // Some or all files were not found but skipped via --force
-        coursier_retry(&mut result);
-        let not_found_count = result
-            .files_verified
-            .iter()
-            .filter(|v| v.status == VerifyStatus::NotFound)
-            .count();
-        result.success = true;
-        let skipped = format!(
-            "All patch files were skipped: {} not found on disk (--force)",
-            not_found_count
-        );
-        result.error = join_notes([skipped].into_iter().chain(bytecode_warnings).collect());
+        // Some or all files were not found but skipped via --force: the
+        // note names them.
+        let mut notes: Vec<String> = skipped_files_note(&result.files_verified)
+            .into_iter()
+            .collect();
+        notes.extend(bytecode_warnings);
+        // Nothing was written, so this run applied nothing: with the
+        // skipped files out of the verified list the package reads as what
+        // it is, already patched as far as `--force` goes, instead of as
+        // an apply that wrote no file (the fan-out drops a store copy's
+        // skips for the same reason).
+        if !dry_run
+            && result
+                .files_verified
+                .iter()
+                .any(|v| v.status == VerifyStatus::AlreadyPatched)
+        {
+            result
+                .files_verified
+                .retain(|v| v.status != VerifyStatus::NotFound);
+        }
+        result.error = join_notes(notes);
         return result;
     }
 
@@ -1332,34 +1735,85 @@ async fn apply_package_patch_at(
         None
     };
 
-    // Advisory notes from writes that committed but could not fully restore
-    // metadata (see `apply_file_patch_at`); reported on `error` alongside
-    // `success` — the success-with-note shape the `--force` skip uses.
+    // Advisory notes from writes that committed but could not keep an
+    // owner or clean up after themselves (see `apply_file_patch_at`);
+    // reported on `error` alongside `success` — the success-with-note shape
+    // the `--force` skip uses.
     let mut warnings: Vec<String> = bytecode_warnings;
 
-    // Apply patches to files that need it.
-    for (file_name, file_info) in files_in_order(files) {
-        let verify_result = result.files_verified.iter().find(|v| v.file == *file_name);
-        if let Some(vr) = verify_result {
-            if vr.status == VerifyStatus::AlreadyPatched || vr.status == VerifyStatus::NotFound {
-                continue;
+    // A write failure (a corrupt blob, EACCES on a stage, ENOSPC, a refused
+    // rename) fails the package with every file as it was. It names the
+    // file; a Windows daemon holding a cached jar open gets the advisory
+    // that says which process to stop instead of a bare sharing violation.
+    let write_failed = |result: &mut ApplyResult, e: PackageWriteError| {
+        if let Some(file) = &e.file {
+            let target = pkg_path.join(normalize_file_path(file));
+            if package_key.starts_with("pkg:maven/")
+                && crate::patch::sidecars::maven::is_locked_by_daemon(&e.source, &target)
+            {
+                result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                    purl: package_key.to_string(),
+                    ecosystem: "maven".to_string(),
+                    files: Vec::new(),
+                    advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                        &target,
+                    )),
+                });
             }
         }
+        result.error = Some(format!(
+            "Cannot apply patch: {}{}{}",
+            e.file.map(|file| format!("{file} - ")).unwrap_or_default(),
+            e.source,
+            not_restored_note(&e.not_restored)
+        ));
+    };
 
+    // Stage every file that needs writing before the first is renamed into
+    // place: a blob that cannot be read or does not hold its hash's bytes,
+    // or a directory that cannot take a stage, stops the package with
+    // nothing changed. Single copy: the public `apply_package_patch`
+    // wrapper fans out to pnpm peer-variant copies itself, with per-copy
+    // verification.
+    let ready: std::collections::HashSet<&str> = result
+        .files_verified
+        .iter()
+        .filter(|v| v.status == VerifyStatus::Ready)
+        .map(|v| v.file.as_str())
+        .collect();
+    let mut write = PackageWrite::new();
+    let mut written: Vec<&String> = Vec::new();
+    for (file_name, file_info) in files_in_order(files) {
+        if !ready.contains(file_name.as_str()) {
+            continue;
+        }
         let normalized = normalize_file_path(file_name);
 
         // Resolve the patched bytes: the in-memory blob overlay first (the
         // vendor flows stage there, so vendoring writes no `.socket/blobs`
-        // entries), then the on-disk blob. Failing to read the blob fails
-        // the file.
-        let (patched_content, via): (Cow<'_, [u8]>, AppliedVia) =
+        // entries), then the on-disk blob, which must hold the bytes its
+        // name promises.
+        let patched_content: Cow<'_, [u8]> =
             if let Some(bytes) = sources.mem_blobs.and_then(|m| m.get(&file_info.after_hash)) {
-                (Cow::Borrowed(bytes.as_slice()), AppliedVia::Blob)
+                Cow::Borrowed(bytes.as_slice())
             } else {
-                match read_blob(sources.blobs_path, &file_info.after_hash).await {
-                    Ok(bytes) => (Cow::Owned(bytes), AppliedVia::Blob),
+                let blob = read_blob(sources.blobs_path, &file_info.after_hash)
+                    .await
+                    .and_then(|bytes| {
+                        let hash = compute_git_sha256_from_bytes(&bytes);
+                        if hash == file_info.after_hash {
+                            return Ok(bytes);
+                        }
+                        Err(corrupt_blob_error(
+                            &sources.blobs_path.join(&file_info.after_hash),
+                            &hash,
+                        ))
+                    });
+                match blob {
+                    Ok(bytes) => Cow::Owned(bytes),
                     Err(msg) => {
-                        result.error = Some(msg);
+                        abort_package(write).await;
+                        result.error = Some(format!("Cannot apply patch: {file_name} - {msg}"));
                         return result;
                     }
                 }
@@ -1367,7 +1821,7 @@ async fn apply_package_patch_at(
 
         // A bin npm installed with an LF shebang gets the patched bytes in
         // that form too (see `npm_bin`).
-        let (patched_content, written_hash) = match crate::patch::npm_bin::form_for_write(
+        let (content, hash) = match crate::patch::npm_bin::form_for_write(
             package_key,
             pkg_path,
             normalized,
@@ -1379,63 +1833,56 @@ async fn apply_package_patch_at(
         {
             Ok(write) => write,
             Err(e) => {
-                result.error = Some(sources.write_error(&e, &file_info.after_hash));
+                abort_package(write).await;
+                result.error = Some(format!("Cannot apply patch: {file_name} - {e}"));
                 return result;
             }
         };
 
-        // ONE write site for every source, so a write failure (EACCES on
-        // the stage, ENOSPC, a failed rename) is reported as what it is.
-        // Single copy:
-        // the public `apply_package_patch` wrapper fans out to pnpm
-        // peer-variant copies itself, with per-copy verification.
-        match apply_file_patch_at(pkg_path, file_name, &patched_content, &written_hash).await {
-            Ok(warning) => warnings.extend(warning),
+        let change = FileChange::Write {
+            content: content.into_owned(),
+            hash,
+        };
+        write = match stage_change(write, pkg_path, file_name, change).await {
+            Ok((write, warning)) => {
+                warnings.extend(warning);
+                write
+            }
             Err(e) => {
-                // A Windows daemon holding a cached jar open: say which
-                // process to stop instead of a bare sharing violation.
-                let target = pkg_path.join(normalized);
-                if package_key.starts_with("pkg:maven/")
-                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
-                {
-                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
-                        purl: package_key.to_string(),
-                        ecosystem: "maven".to_string(),
-                        files: Vec::new(),
-                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
-                            &target,
-                        )),
-                    });
-                }
-                result.error = Some(sources.write_error(&e, &file_info.after_hash));
+                write_failed(&mut result, e);
                 return result;
             }
-        }
-
-        result.files_patched.push(file_name.clone());
-        result.applied_via.insert(file_name.clone(), via);
+        };
+        written.push(file_name);
     }
 
-    // Ecosystem sidecar fixup. Best-effort: a failing sidecar does
-    // NOT undo the patch (the bytes were committed atomically via
-    // stage+rename; nothing to roll back). The error path is
-    // converted at this boundary into a `SidecarRecord` carrying
-    // `SidecarAdvisoryCode::SidecarFixupFailed` so downstream
-    // consumers see a uniform shape regardless of whether the
-    // fixup succeeded, was advisory-only, or raised an error.
-    if !result.files_patched.is_empty() {
-        use crate::patch::sidecars::{dispatch_fixup_with, fixup_failed_record};
+    let write = match commit_package(write).await {
+        Ok(write) => write,
+        Err(e) => {
+            write_failed(&mut result, e);
+            return result;
+        }
+    };
+    // Ecosystem sidecar fixup, before the write is closed. A sidecar that
+    // cannot be brought in line fails the package, and the files just
+    // written are put back: patched files under a sidecar that describes
+    // other bytes are neither state (cargo refuses to build such a crate).
+    // The failure also rides a `SidecarRecord` carrying
+    // `SidecarAdvisoryCode::SidecarFixupFailed`, so consumers see one
+    // shape whether the fixup succeeded, was advisory-only, or failed.
+    {
+        use crate::patch::sidecars::{
+            dispatch_fixup_with, dispatch_rollback_fixup, fixup_failed_record, maven,
+        };
         // Include files verified `AlreadyPatched` alongside the ones
-        // written this run: a previous apply that failed partway left
-        // them patched on disk but returned before this boundary, so
-        // their sidecar entries (e.g. `.cargo-checksum.json` hashes)
-        // are still pre-patch — and this retry is the only chance to
-        // resync them. They exist at their after-hash, so rehashing is
-        // a no-op rewrite in the common already-synced case.
-        let fixup_files: Vec<String> = result
-            .files_patched
+        // written this run: a previous apply that stopped partway left
+        // them patched on disk but never reached this boundary, so their
+        // sidecar entries (e.g. `.cargo-checksum.json` hashes) are still
+        // pre-patch. They exist at their after-hash, so rehashing changes
+        // nothing in the common already-synced case.
+        let fixup_files: Vec<String> = written
             .iter()
-            .cloned()
+            .map(|file| (*file).clone())
             .chain(
                 result
                     .files_verified
@@ -1445,16 +1892,44 @@ async fn apply_package_patch_at(
             )
             .collect();
         match dispatch_fixup_with(package_key, pkg_path, &fixup_files, maven_pre.as_ref()).await {
-            Ok(Some(record)) => result.sidecar = Some(record),
-            Ok(None) => {}
+            Ok(record) => result.sidecar = record,
             Err(e) => {
-                result.sidecar = Some(fixup_failed_record(
-                    package_key,
-                    format!("sidecar fixup failed (patch still applied): {}", e),
-                ));
+                let not_restored = undo_package(write).await;
+                // Whatever the failed fixup had already rewritten is put
+                // back in line with the restored files. Best-effort.
+                let _ = dispatch_rollback_fixup(package_key, pkg_path, &fixup_files).await;
+                if let Some(pre) = &maven_pre {
+                    let _ = maven::resync(pkg_path, pre).await;
+                }
+                let message = if not_restored.is_empty() {
+                    format!("sidecar fixup failed (the patched files were put back): {e}")
+                } else {
+                    format!(
+                        "sidecar fixup failed: {e}{}",
+                        not_restored_note(&not_restored)
+                    )
+                };
+                result.error = Some(format!("Cannot apply patch: {message}"));
+                result.sidecar = Some(fixup_failed_record(package_key, message));
+                return result;
             }
         }
     }
+
+    for file_name in written {
+        // A rewritten `.py` file can't be trusted to invalidate its
+        // bytecode (#819): drop it so the next import compiles the new
+        // source.
+        let source = pkg_path.join(normalize_file_path(file_name));
+        warnings.extend(remove_stale_bytecode(&source, StaleBytecode::All).await);
+        result.files_patched.push(file_name.clone());
+        result
+            .applied_via
+            .insert(file_name.clone(), AppliedVia::Blob);
+    }
+    warnings.extend(finish_package(write).await);
+    // Files `--force` skipped are named beside the ones just written.
+    warnings.splice(0..0, skipped_files_note(&result.files_verified));
 
     result.error = join_notes(warnings);
     result.success = true;
@@ -2191,6 +2666,133 @@ mod tests {
         assert!(result.error.is_none());
     }
 
+    /// A vendored crate with `lib.rs` (original bytes) and a
+    /// `.cargo-checksum.json` holding `checksum`; returns the package dir,
+    /// the blobs dir and the patch's files.
+    async fn cargo_fixture(
+        checksum: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        HashMap<String, PatchFileInfo>,
+    ) {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let (original, patched) = (b"original content", b"patched content");
+        let after_hash = compute_git_sha256_from_bytes(patched);
+        tokio::fs::write(pkg_dir.path().join("lib.rs"), original)
+            .await
+            .unwrap();
+        tokio::fs::write(pkg_dir.path().join(".cargo-checksum.json"), checksum)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_dir.path().join(&after_hash), patched)
+            .await
+            .unwrap();
+        let files = HashMap::from([(
+            "lib.rs".to_string(),
+            PatchFileInfo {
+                before_hash: compute_git_sha256_from_bytes(original),
+                after_hash,
+            },
+        )]);
+        (pkg_dir, blobs_dir, files)
+    }
+
+    async fn apply_cargo(
+        pkg: &Path,
+        blobs: &Path,
+        files: &HashMap<String, PatchFileInfo>,
+    ) -> ApplyResult {
+        apply_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            files,
+            &PatchSources::blobs_only(blobs),
+            false,
+            MismatchPolicy::Warn,
+        )
+        .await
+    }
+
+    /// The `files` entry `.cargo-checksum.json` lists for `lib.rs`.
+    fn listed_checksum(pkg: &Path) -> String {
+        let json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(pkg.join(".cargo-checksum.json")).unwrap())
+                .unwrap();
+        json["files"]["lib.rs"].as_str().unwrap().to_string()
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        crate::utils::digest::sha256_hex_of(bytes)
+    }
+
+    /// A sidecar that cannot be brought in line fails the package and the
+    /// file just written is put back: patched sources under a checksum
+    /// file that does not describe them are a crate cargo refuses to
+    /// build, and the run used to report it applied.
+    #[tokio::test]
+    async fn test_apply_sidecar_failure_fails_the_package_and_puts_files_back() {
+        let (pkg_dir, blobs_dir, files) = cargo_fixture("not json").await;
+        let pkg = pkg_dir.path();
+
+        let result = apply_cargo(pkg, blobs_dir.path(), &files).await;
+
+        assert!(!result.success, "a failed sidecar fixup fails the package");
+        assert!(result.files_patched.is_empty());
+        let error = result.error.unwrap();
+        assert!(
+            error.contains("sidecar fixup failed") && error.contains(".cargo-checksum.json"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read(pkg.join("lib.rs")).unwrap(),
+            b"original content"
+        );
+        assert_eq!(names_in(pkg), [".cargo-checksum.json", "lib.rs"]);
+        assert!(result.sidecar.is_some_and(|s| s.fixup_failure().is_some()));
+    }
+
+    /// A package whose files are all already patched still has its
+    /// sidecar brought in line (a run that died after its last rename
+    /// never ran the fixup), reports the repair, and reports nothing once
+    /// the sidecar agrees; a sidecar that cannot be fixed fails it.
+    #[tokio::test]
+    async fn test_apply_rechecks_the_sidecar_of_an_already_patched_package() {
+        let stale = format!(
+            r#"{{"files":{{"lib.rs":"{}"}},"package":"x"}}"#,
+            sha256_hex(b"original content")
+        );
+        let (pkg_dir, blobs_dir, files) = cargo_fixture(&stale).await;
+        let pkg = pkg_dir.path();
+        // What the interrupted run left: the patched file, the old checksum.
+        std::fs::write(pkg.join("lib.rs"), b"patched content").unwrap();
+
+        let result = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_patched.is_empty());
+        assert_eq!(listed_checksum(pkg), sha256_hex(b"patched content"));
+        let record = result.sidecar.expect("the repair is reported");
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+        assert!(record.advisory.is_none());
+
+        let again = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(again.success);
+        assert!(again.sidecar.is_none(), "nothing left to repair");
+
+        std::fs::write(pkg.join(".cargo-checksum.json"), b"not json").unwrap();
+        let broken = apply_cargo(pkg, blobs_dir.path(), &files).await;
+        assert!(!broken.success, "an unfixable sidecar fails the package");
+        assert!(broken
+            .error
+            .is_some_and(|e| e.contains("sidecar fixup failed")));
+        assert_eq!(
+            std::fs::read(pkg.join("lib.rs")).unwrap(),
+            b"patched content"
+        );
+    }
+
     #[tokio::test]
     async fn test_apply_package_patch_dry_run() {
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -2294,21 +2896,6 @@ mod tests {
             original,
             "nothing was written"
         );
-    }
-
-    /// Only a mismatch against the blob's own name is the blob's fault: a
-    /// write refused for any other reason keeps its own message.
-    #[test]
-    fn blob_write_error_blames_the_blob_only_for_its_own_mismatch() {
-        let hash = "a".repeat(64);
-        let mismatch = content_hash_mismatch(&hash, "b".repeat(64));
-        assert!(blob_write_error(&mismatch, &hash).contains("is corrupt"));
-        assert_eq!(
-            blob_write_error(&mismatch, &"c".repeat(64)),
-            mismatch.to_string()
-        );
-        let denied = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
-        assert_eq!(blob_write_error(&denied, &hash), "denied");
     }
 
     #[tokio::test]
@@ -2582,6 +3169,75 @@ mod tests {
         .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
+        let note = result.error.expect("the skipped file is named");
+        assert!(
+            note.contains("missing.js") && note.contains(FILES_SKIPPED_MARKER),
+            "{note}"
+        );
+    }
+
+    /// `--force` over a package with one target file missing: the run that
+    /// writes the others names the file it skipped, and so does the next
+    /// run, which writes nothing and reads as already patched rather than
+    /// as an apply of no file.
+    #[tokio::test]
+    async fn test_force_names_the_files_it_skips() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+        let mut files = HashMap::new();
+        for name in ["a.js", "b.js", "c.js"] {
+            let (original, patched) = (format!("original {name}"), format!("patched {name}"));
+            let after_hash = compute_git_sha256_from_bytes(patched.as_bytes());
+            if name != "b.js" {
+                std::fs::write(pkg.join(name), &original).unwrap();
+            }
+            std::fs::write(blobs_dir.path().join(&after_hash), &patched).unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(original.as_bytes()),
+                    after_hash,
+                },
+            );
+        }
+        let sources = PatchSources::blobs_only(blobs_dir.path());
+        let apply = || {
+            apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:npm/test@1.0.0",
+                pkg,
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::Force,
+            )
+        };
+        let expected = format!("1 patch file {FILES_SKIPPED_MARKER}: b.js");
+
+        let first = apply().await;
+        assert!(first.success);
+        assert_eq!(first.files_patched, ["a.js", "c.js"]);
+        assert_eq!(first.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            advisory_warning_codes(&expected),
+            ["patch_files_skipped"],
+            "the CLI reports the note as a warning"
+        );
+
+        let second = apply().await;
+        assert!(second.success);
+        assert!(second.files_patched.is_empty());
+        assert_eq!(second.error.as_deref(), Some(expected.as_str()));
+        assert!(
+            second
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "a run that wrote nothing must not read as an apply: {:?}",
+            second.files_verified
+        );
+        assert_eq!(second.files_verified.len(), 2);
     }
 
     /// With several missing files the error always names the first one
@@ -3594,13 +4250,13 @@ mod tests {
         );
     }
 
-    /// Ownership restore the caller is not privileged to make (`chown(2)`
-    /// EPERM: the pre-patch owner is another uid) is a WARNING, not a
-    /// failure — the bytes are already committed — and the mode is still
-    /// restored bit-for-bit.
+    /// An owner the caller is not privileged to give the stage (`chown(2)`
+    /// EPERM: the pre-patch owner is another uid) is reported, not a
+    /// failure, and the stage still gets the mode bit-for-bit.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn test_restore_file_permissions_ownership_failure_is_a_warning() {
+    #[test]
+    fn stage_with_an_unrestorable_owner_reports_it_and_keeps_the_mode() {
+        use crate::utils::fs::{stage_blocking, StageAttrs, StageSync};
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
         // A root-owned file stands in for "pre-patch owner is another uid".
@@ -3613,18 +4269,18 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("index.js");
-        tokio::fs::write(&path, b"patched").await.unwrap();
-
-        let warning = restore_file_permissions(&path, Some(&foreign))
-            .await
-            .expect("an unrestorable owner must not fail the write")
-            .expect("the failed chown must be reported");
+        let staged = stage_blocking(
+            &path,
+            b"patched",
+            &StageAttrs::of(&foreign),
+            StageSync::Batched,
+        )
+        .expect("an unrestorable owner must not fail the stage");
         assert!(
-            warning.contains("ownership could not be restored"),
-            "unexpected warning text: {warning}"
+            staged.owner_error.is_some(),
+            "the failed chown must be reported"
         );
-        let mode = tokio::fs::metadata(&path)
-            .await
+        let mode = std::fs::metadata(staged.stage())
             .unwrap()
             .permissions()
             .mode()
@@ -3632,8 +4288,190 @@ mod tests {
         assert_eq!(
             mode,
             foreign.mode() & 0o7777,
-            "the mode is still restored after the failed chown"
+            "the mode is still set after the failed chown"
         );
+        staged.discard();
+    }
+
+    /// The stage of an existing file carries that file's exact mode before
+    /// it is renamed into place, and a patch-added file's stage is `0o444`:
+    /// the rename is the only step left, so no interruption can leave the
+    /// new bytes under other permission bits.
+    #[cfg(unix)]
+    #[test]
+    fn staged_file_already_has_its_final_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("bin.sh");
+        std::fs::write(&script, b"old").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut write = PackageWrite::new();
+        let hash = |bytes: &[u8]| compute_git_sha256_from_bytes(bytes);
+        write
+            .stage_write(dir.path(), "bin.sh", b"new", &hash(b"new"))
+            .unwrap();
+        write
+            .stage_write(dir.path(), "added.js", b"added", &hash(b"added"))
+            .unwrap();
+        let mode_of = |op: &FileOp| {
+            let stage = op.staged.as_ref().unwrap().stage();
+            std::fs::metadata(stage).unwrap().permissions().mode() & 0o7777
+        };
+        assert_eq!(mode_of(&write.ops[0]), 0o755);
+        assert_eq!(mode_of(&write.ops[1]), 0o444);
+        // Nothing the package holds has changed yet.
+        assert_eq!(std::fs::read(&script).unwrap(), b"old");
+        assert!(!dir.path().join("added.js").exists());
+
+        write.commit().unwrap();
+        assert!(write.close().is_empty());
+        let mode = |name: &str| {
+            std::fs::metadata(dir.path().join(name))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777
+        };
+        assert_eq!((mode("bin.sh"), mode("added.js")), (0o755, 0o444));
+        assert_eq!(std::fs::read(&script).unwrap(), b"new");
+        assert_eq!(names_in(dir.path()), ["added.js", "bin.sh"]);
+    }
+
+    /// The sorted names in `dir`.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A commit that fails on its second file puts the first back: the
+    /// very inode it replaced (so its other hard links still reach it), a
+    /// planned delete undone, a created directory removed, no stage or
+    /// saved original left behind, and the error names the file.
+    #[cfg(unix)]
+    #[test]
+    fn commit_failing_midway_puts_every_file_back() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("pkg");
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        for (name, mode) in [("a.js", 0o755), ("b.js", 0o644), ("lib/gone.js", 0o600)] {
+            std::fs::write(pkg.join(name), format!("old {name}")).unwrap();
+            std::fs::set_permissions(pkg.join(name), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        // A store sibling of `a.js`: the same inode under another name.
+        let sibling = dir.path().join("store-a.js");
+        std::fs::hard_link(pkg.join("a.js"), &sibling).unwrap();
+        let inode = std::fs::metadata(&sibling).unwrap().ino();
+
+        let hash = |bytes: &[u8]| compute_git_sha256_from_bytes(bytes);
+        let mut write = PackageWrite::new();
+        write.stage_delete(&pkg, "lib/gone.js").unwrap();
+        write
+            .stage_write(&pkg, "a.js", b"new a", &hash(b"new a"))
+            .unwrap();
+        write
+            .stage_write(&pkg, "new/dir/added.js", b"added", &hash(b"added"))
+            .unwrap();
+        write
+            .stage_write(&pkg, "b.js", b"new b", &hash(b"new b"))
+            .unwrap();
+        // The last rename has nothing to rename: its stage is gone.
+        std::fs::remove_file(write.ops[3].staged.as_ref().unwrap().stage()).unwrap();
+
+        let err = write.commit().expect_err("the fourth change cannot commit");
+        assert_eq!(err.file.as_deref(), Some("b.js"));
+        assert!(err.not_restored.is_empty(), "{:?}", err.not_restored);
+        drop(write);
+
+        for (name, mode) in [("a.js", 0o755), ("b.js", 0o644), ("lib/gone.js", 0o600)] {
+            let meta = std::fs::metadata(pkg.join(name)).unwrap();
+            assert_eq!(
+                std::fs::read(pkg.join(name)).unwrap(),
+                format!("old {name}").as_bytes()
+            );
+            assert_eq!(meta.permissions().mode() & 0o7777, mode, "{name}");
+        }
+        assert_eq!(
+            std::fs::metadata(pkg.join("a.js")).unwrap().ino(),
+            inode,
+            "the original inode is back, still linked to its store sibling"
+        );
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"old a.js");
+        assert_eq!(names_in(&pkg), ["a.js", "b.js", "lib"]);
+        assert_eq!(names_in(&pkg.join("lib")), ["gone.js"]);
+    }
+
+    /// What an interrupted write left beside a patch's files is swept once
+    /// it is old enough: stages and set-aside originals by their exact
+    /// names, never a fresh one, a directory or any other file.
+    #[tokio::test]
+    async fn stale_stages_are_swept_by_name_and_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path();
+        std::fs::create_dir_all(pkg.join("lib")).unwrap();
+        let uuid = uuid::Uuid::new_v4();
+        let stage = format!(".socket-stage-a.js-{uuid}");
+        let saved = format!(".socket-orig-a.js-{uuid}");
+        let nested = format!("lib/.socket-stage-b.js-{uuid}");
+        let kept = [
+            "a.js".to_string(),
+            ".socket-stage-notes".to_string(),
+            format!(".socket-stage--{uuid}"),
+            format!(".socket-other-a.js-{uuid}"),
+        ];
+        for name in [&stage, &saved, &nested].into_iter().chain(&kept) {
+            std::fs::write(pkg.join(name), b"x").unwrap();
+        }
+        let stage_dir = format!(".socket-stage-dir-{uuid}");
+        std::fs::create_dir(pkg.join(&stage_dir)).unwrap();
+        let files: HashMap<String, PatchFileInfo> = ["package/a.js", "package/lib/b.js"]
+            .into_iter()
+            .map(|key| {
+                let info = PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: String::new(),
+                };
+                (key.to_string(), info)
+            })
+            .collect();
+
+        sweep_stale_stages(pkg, &files, STALE_STAGE_AGE).await;
+        assert!(pkg.join(&stage).exists(), "a fresh stage may be in use");
+
+        sweep_stale_stages(pkg, &files, std::time::Duration::ZERO).await;
+        let mut expected: Vec<String> = kept.to_vec();
+        expected.extend([stage_dir, "lib".to_string()]);
+        expected.sort();
+        assert_eq!(names_in(pkg), expected);
+        assert!(names_in(&pkg.join("lib")).is_empty());
+    }
+
+    /// Where an original cannot be hard-linked aside, a private copy with
+    /// its mode stands in, and an undo puts those bytes and that mode back.
+    #[cfg(unix)]
+    #[test]
+    fn save_original_falls_back_to_a_copy() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("a.js");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o750)).unwrap();
+        // A name that already exists: `hard_link` refuses it, as a
+        // filesystem without hard links refuses every one.
+        let saved = dir.path().join("saved");
+        std::fs::write(&saved, b"in the way").unwrap();
+
+        save_original(&dest, &saved).unwrap();
+        assert_eq!(std::fs::read(&saved).unwrap(), b"old");
+        let mode = std::fs::metadata(&saved).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o750);
+        assert_eq!(names_in(dir.path()), ["a.js", "saved"]);
     }
 
     /// The store fan-out merge: a failed copy fails the whole result with the
@@ -3679,7 +4517,7 @@ mod tests {
             &mut primary,
             copy,
             ApplyResult {
-                error: Some("All patch files were skipped: 1 not found on disk (--force)".into()),
+                error: Some(format!("1 patch file {FILES_SKIPPED_MARKER}: index.js")),
                 ..clean()
             },
         );
@@ -4184,7 +5022,11 @@ mod tests {
             advisory_warning_codes(&format!("{ownership}; {bytecode}")),
             ["ownership_not_restored", "stale_bytecode_not_removed"]
         );
-        assert!(advisory_warning_codes("All patch files were skipped").is_empty());
+        assert_eq!(
+            advisory_warning_codes(&format!("1 patch file {FILES_SKIPPED_MARKER}: a.js")),
+            ["patch_files_skipped"]
+        );
+        assert!(advisory_warning_codes("some other note").is_empty());
     }
 
     /// The tarball bytes of a bin published from Windows (CRLF shebang),
