@@ -14,10 +14,12 @@ use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::telemetry::TelemetryAuth;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
-/// Reject unknown ecosystems before they can produce a misleading empty scan.
+/// Reject unknown ecosystems before they can produce a misleading empty
+/// scan, and spell a recognized one (`Ecosystem::from_name`: `go`,
+/// `python`, `NPM`) the one way every later comparison expects.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
-    if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
-        return Ok(s.to_string());
+    if let Some(ecosystem) = Ecosystem::from_name(s) {
+        return Ok(ecosystem.cli_name().to_string());
     }
     let supported = Ecosystem::all()
         .iter()
@@ -115,7 +117,8 @@ pub struct GlobalArgs {
     #[arg(help_heading = GLOBAL_OPTIONS, long = "proxy-url", env = "SOCKET_PROXY_URL")]
     pub proxy_url: Option<String>,
 
-    /// Restrict to these ecosystems (comma-separated).
+    /// Restrict to these ecosystems (comma-separated): npm, pypi, cargo,
+    /// gem, golang, maven, composer, nuget, deno.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "ecosystems",
@@ -753,7 +756,7 @@ mod tests {
     #[test]
     fn ecosystem_rejection_messages() {
         let supported = "npm, pypi, cargo, gem, golang, maven, composer, nuget, deno";
-        for bad in ["bogus", "NPM", "py-pi"] {
+        for bad in ["bogus", "npm pypi", "py-pi"] {
             assert_eq!(
                 parse_supported_ecosystem(bad),
                 Err(format!(
@@ -1252,7 +1255,8 @@ mod tests {
     }
 
     /// `parse_supported_ecosystem` accepts every supported ecosystem name
-    /// and returns it verbatim.
+    /// and returns it verbatim; the names a run prints (`go`, `python`) and
+    /// other spellings come back as the flag's own name.
     #[test]
     fn parse_supported_ecosystem_accepts_supported_names() {
         for e in Ecosystem::all() {
@@ -1262,7 +1266,13 @@ mod tests {
                 Ok(name.to_string()),
                 "{name:?} is a supported ecosystem and must be accepted",
             );
+            assert_eq!(
+                parse_supported_ecosystem(e.display_name()),
+                Ok(name.to_string())
+            );
         }
+        assert_eq!(parse_supported_ecosystem("NPM"), Ok("npm".to_string()));
+        assert_eq!(parse_supported_ecosystem("pip"), Ok("pypi".to_string()));
     }
 
     /// End-to-end through clap: `--ecosystems` splits on commas, validates each

@@ -78,7 +78,7 @@ validate that block.
 | Key under `patches` | Meaning |
 | --- | --- |
 | `enabled` | `false` reports candidates without changing patches or running prune |
-| `ecosystems` | Limit selection to ecosystem slugs from the [support matrix](ecosystems.md) |
+| `ecosystems` | Limit selection to ecosystem slugs from the [support matrix](ecosystems.md). Like `--ecosystems`, it also accepts common names (`go`, `python`, `pip`, `rubygems`, `rust`, `dotnet`, ...) in any case |
 | `includePaths` / `ignorePaths` | Include or exclude project roots by their dependency-file paths |
 | `packages` / `ignorePackages` | Include or exclude package names or PURLs, optionally with exact versions |
 | `minSeverity` | Minimum severity: `critical`, `high`, `medium` (`moderate`), or `low`; omit for no floor |

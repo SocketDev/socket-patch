@@ -5,10 +5,7 @@ without waiting for an upstream release or upgrading the dependency.
 Socket Patch updates dependency files to use patched packages, which you install
 with your normal package manager.
 
-> This branch documents the v5 prerelease. Installation commands below select the
-> latest published release, which may have different behavior. To try this branch,
-> [build from source](docs/development.md#build). Existing users should read the
-> [v5 migration guide](docs/migrating-to-v5.md).
+> Upgrading from v4? Read the [v5 migration guide](docs/migrating-to-v5.md).
 
 ## Installation
 
