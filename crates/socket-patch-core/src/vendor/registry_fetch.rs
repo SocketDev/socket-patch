@@ -1145,6 +1145,22 @@ pub(crate) fn extract_gem_data_skipping(
     dest: &Path,
     skip_file_name: Option<&str>,
 ) -> Result<(), String> {
+    extract_gem_data_with(gem_bytes, dest, skip_file_name, /*strict=*/ false)
+}
+
+/// [`extract_gem_data`] that refuses the archive instead of skipping a
+/// symlink, hardlink, device or FIFO entry: the tree stands in for the one
+/// RubyGems would install, so nothing the gem carries may be dropped.
+pub(crate) fn extract_gem_data_strict(gem_bytes: &[u8], dest: &Path) -> Result<(), String> {
+    extract_gem_data_with(gem_bytes, dest, None, /*strict=*/ true)
+}
+
+fn extract_gem_data_with(
+    gem_bytes: &[u8],
+    dest: &Path,
+    skip_file_name: Option<&str>,
+    strict: bool,
+) -> Result<(), String> {
     use std::io::Read as _;
     let mut archive = tar::Archive::new(gem_bytes);
     for e in archive
@@ -1170,7 +1186,7 @@ pub(crate) fn extract_gem_data_skipping(
             dest,
             /*strip_first=*/ false,
             skip_file_name,
-            /*strict=*/ false,
+            strict,
         );
     }
     Err("the .gem carries no data.tar.gz".to_string())

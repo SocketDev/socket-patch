@@ -2582,6 +2582,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     .filter(|key| {
                         !restored.contains(strip_purl_qualifiers(key))
                             && !base_of(key).is_some_and(|b| restored.contains(b.as_str()))
+                            // A gem the hosted leg already brought back to
+                            // its upstream build.
+                            && !hosted_leg.refreshed_installs.contains(key.as_str())
                     })
                     .count();
                 if still_patched > 0 {

@@ -61,6 +61,15 @@
 //! ([`CHILD_ENV_SCRUB`](crate::utils::process::CHILD_ENV_SCRUB)),
 //! `RUBYOPT`, `RUBYLIB` and `BUNDLE*`.
 //!
+//! The hosted stale-install refresh ([`crate::patch::gem_refresh`]) builds
+//! a native gem a third way (`install_staged`, `RubyRun::Install`): the
+//! same Ruby, found by the same probe, installs a `.gem` archive whose
+//! sha256 the lock pins into an empty stage home. RubyGems reads the spec
+//! from the archive's own metadata and runs the archive's build scripts,
+//! so nothing the project's tree holds is evaluated, and nothing of the
+//! installed copy is touched until the finished gem and extension are
+//! swapped in together.
+//!
 //! # A rebuild that does not finish
 //!
 //! A build takes minutes, and the run can be interrupted or killed in the
@@ -160,6 +169,14 @@ const GENERATED_GRAMMAR_EXTENSIONS: &[&str] = &["y", "rl"];
 /// text was read for: the extension dir the probe was matched to, the
 /// require path the lib copies were located by, and at least one extension.
 /// Otherwise RubyGems would build into a dir that was not set aside.
+///
+/// `install <archive> <stage home> <installed home>` installs a `.gem` into
+/// an empty stage home with RubyGems' own installer, as Bundler would
+/// (no dependency resolution, no documentation), building its extensions
+/// with the build arguments RubyGems recorded for the installed copy
+/// (`<installed home>/build_info/`). It evaluates nothing of the project:
+/// the spec is the archive's own metadata and the build scripts are the
+/// archive's.
 const RUBY_SCRIPT: &str = "require 'rubygems'; mode, a, b, c = ARGV; \
 unless Gem::Specification.respond_to?(:load) && \
 Gem::Specification.method_defined?(:extension_dir) && \
@@ -171,6 +188,18 @@ if mode == 'extensions_dir' then \
 dir = (Gem.respond_to?(:default_ext_dir_for) && Gem.default_ext_dir_for(a)) || \
 File.join(a, 'extensions', Gem::Platform.local.to_s, Gem.extension_api_version); \
 puts \"sp_extensions_dir\\t#{File.expand_path(dir)}\"; \
+elsif mode == 'install' then \
+require 'rubygems/installer'; \
+abort(\"RubyGems #{Gem::VERSION} is older than 2.5, whose installer cannot stage a gem\") \
+unless Gem::Installer.respond_to?(:at); \
+Gem::DefaultUserInteraction.ui = Gem::SilentUI.new; \
+full = File.basename(a, '.gem'); \
+info = File.join(c, 'build_info', \"#{full}.info\"); \
+args = File.file?(info) ? File.readlines(info).map { |l| l.chomp } : []; \
+inst = Gem::Installer.at(a, :install_dir => b, :ignore_dependencies => true, :wrappers => true, \
+:env_shebang => true, :document => [], :post_install_message => false, :build_args => args); \
+inst.install; \
+puts \"sp_installed\\t#{inst.spec.full_name}\\t#{File.expand_path(inst.spec.extension_dir)}\"; \
 else \
 spec = Gem::Specification.load(a) or abort(\"cannot load #{a}\"); \
 unless File.expand_path(spec.extension_dir) == File.expand_path(b) then \
@@ -641,6 +670,12 @@ enum RubyRun<'a> {
     /// Build the copy's extensions into `probe.extension_dir`: loads the
     /// installed gemspec and runs the gem's build scripts.
     Build(&'a Probe),
+    /// Install the `.gem` at `archive` into the empty `stage_home`, building
+    /// its extensions there: runs the archive's own build scripts.
+    Install {
+        archive: &'a Path,
+        stage_home: &'a Path,
+    },
 }
 
 /// Run the Ruby program for `run` on `copy`, bounded by `budget` through
@@ -672,6 +707,22 @@ async fn run_ruby(
                 command.env("GEM_PATH", gem_path);
             }
             "build"
+        }
+        RubyRun::Install {
+            archive,
+            stage_home,
+        } => {
+            command
+                .arg("install")
+                .arg(archive)
+                .arg(stage_home)
+                .arg(&copy.home);
+            // The installed copy's home, where the gems its build scripts
+            // require were installed beside it.
+            if let Some(gem_path) = gem_path_for(&copy.home) {
+                command.env("GEM_PATH", gem_path);
+            }
+            "install"
         }
     };
     // A Bundler-run parent (`bundle exec`, the Bundler plugin) must not
@@ -1041,6 +1092,85 @@ async fn find_ruby(copy: &GemCopy, env: &RubyEnv, preflight: Preflight) -> Resul
         "no Ruby owning this install was found ({})",
         reasons.join("; ")
     ))
+}
+
+/// A `.gem` RubyGems installed into a stage home ([`install_staged`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedInstall {
+    /// `<stage home>/gems/<full_name>`: the extracted gem, with the built
+    /// artifacts' copies under its require dir.
+    pub gem_dir: PathBuf,
+    /// The extension dir the build left in the stage home.
+    pub extension_dir: PathBuf,
+    /// The installed copy's extension dir, which the staged one replaces:
+    /// the same `extensions/<platform>/<abi>/<full_name>` under its home.
+    pub installed_extension_dir: PathBuf,
+}
+
+/// The `sp_installed` line of a [`RubyRun::Install`] run: the installed
+/// gem's full name and its extension dir.
+fn parse_installed(stdout: &str) -> Option<(String, PathBuf)> {
+    stdout.lines().find_map(|line| {
+        let mut fields = line.split('\t');
+        (fields.next()? == "sp_installed").then_some(())?;
+        let (full_name, ext) = (fields.next()?, fields.next()?);
+        (!full_name.is_empty() && !ext.is_empty())
+            .then(|| (full_name.to_string(), PathBuf::from(ext)))
+    })
+}
+
+/// Install the verified `.gem` at `archive` into the empty `stage_home`
+/// with the Ruby that owns the installed copy at `installed`, so the gem
+/// and the extension RubyGems compiles from it can replace that copy's
+/// (the hosted stale-install refresh, [`crate::patch::gem_refresh`]).
+/// Nothing of the installed copy is changed. The Ruby is found as for a
+/// rebuild ([`find_ruby`]): the one whose extension dir for the gem is the
+/// installed one, so the staged build has the installed build's platform
+/// and ABI. `Err` says why there is no staged install to use.
+pub(crate) async fn install_staged(
+    installed: &Path,
+    archive: &Path,
+    stage_home: &Path,
+    env: &RubyEnv,
+) -> Result<StagedInstall, String> {
+    let copy = GemCopy::of(installed)
+        .ok_or_else(|| format!("{} is not a RubyGems install", installed.display()))?;
+    if let Err(e) = recover_interrupted_rebuild(&copy).await {
+        return Err(recovery_refusal(&copy, &e));
+    }
+    let preflight = rebuild_preflight(&copy, env).await?;
+    let probe = find_ruby(&copy, env, preflight).await?;
+    let label = ext_dir_label(&copy.home, &probe.extension_dir);
+    if confined_ext_dir(&copy, &label).is_none() {
+        return Err(format!(
+            "its extension is built into {}, outside its gem home",
+            probe.extension_dir.display()
+        ));
+    }
+    let run = RubyRun::Install {
+        archive,
+        stage_home,
+    };
+    let stdout = run_ruby(&probe.ruby, run, &copy, env, BUILD_TIMEOUT).await?;
+    let (full_name, built) = parse_installed(&stdout)
+        .ok_or_else(|| format!("{}: unreadable install output", probe.ruby.display()))?;
+    let staged = StagedInstall {
+        gem_dir: stage_home.join("gems").join(&copy.full_name),
+        extension_dir: stage_home.join(&label),
+        installed_extension_dir: probe.extension_dir,
+    };
+    if full_name != copy.full_name || !same_path(&built, &staged.extension_dir) {
+        return Err(format!(
+            "RubyGems installed {full_name} with its extension in {}, not {} in {}",
+            built.display(),
+            copy.full_name,
+            staged.extension_dir.display()
+        ));
+    }
+    if !is_real_dir(&staged.gem_dir) || !staged.extension_dir.join(BUILD_COMPLETE).is_file() {
+        return Err("the build exited cleanly but left no finished extension".to_string());
+    }
+    Ok(staged)
 }
 
 /// Every regular file under `dir`, relative, `/`-separated, sorted;

@@ -1507,6 +1507,51 @@ pub(super) async fn unwound_stale_cache(
     stale_cache_warning(root, purl, &name, &version, lock.as_deref(), &client).await
 }
 
+/// The upstream archive of the ruby-platform gem `purl`, as the lock at
+/// `root` pins it once the gem is back on its registry entry: its sha256
+/// (the `CHECKSUMS` entry, else the rubygems.org compact index, unless
+/// `offline`) and, when the lock resolves the gem from rubygems.org, the
+/// URL it is served at. `restored` is the lock's text when the caller holds
+/// it (a restore's staged text; a dry run never wrote it), else the lock is
+/// read from disk. `None` when nothing proves the sha256: a gem from
+/// another remote with no `CHECKSUMS` entry, an offline run, a registry
+/// error.
+pub(super) async fn upstream_archive(
+    root: &std::path::Path,
+    restored: Option<&str>,
+    purl: &str,
+    offline: bool,
+) -> Option<(String, Option<String>)> {
+    let (_, name, version) = crate::utils::purl::purl_parts(purl)?;
+    let mut lock = restored.map(str::to_string);
+    if lock.is_none() {
+        for file in BUNDLER_LOCKS {
+            if let Ok(text) = crate::utils::fs::read_regular_to_string(&root.join(file)).await {
+                lock = Some(text);
+                break;
+            }
+        }
+    }
+    let lock = lock?;
+    let lock = to_lf(&lock);
+    let rubygems = rubygems_locked(&lock, &name, &version);
+    let sha = match lock_checksum(&lock, &name, &version) {
+        Some(sha) => sha,
+        None if rubygems => UpstreamClient::new(offline)
+            .rubygems_sha256(&name, &version)
+            .await
+            .ok()?,
+        None => return None,
+    };
+    let url = rubygems.then(|| {
+        format!(
+            "{}/gems/{name}-{version}.gem",
+            super::rubygems_base().trim_end_matches('/')
+        )
+    });
+    Some((sha.to_ascii_lowercase(), url))
+}
+
 /// Whether `lock` resolves `name (version)` from a `GEM` section whose
 /// remote is rubygems.org (or the `SOCKET_RUBYGEMS_URL` stand-in).
 fn rubygems_locked(lock: &str, name: &str, version: &str) -> bool {

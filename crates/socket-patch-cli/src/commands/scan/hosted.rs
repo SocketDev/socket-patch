@@ -14,6 +14,7 @@ use socket_patch_core::utils::concurrent::api_concurrency;
 use socket_patch_core::utils::purl::purl_parts;
 
 use crate::commands::agent_download::tag_mode;
+use crate::commands::gem_refresh::{self, StaleGem};
 use crate::commands::vex::generate_vex_from_manifest_path;
 use crate::json_envelope::{
     Envelope, EnvelopeError, PatchAction, PatchEvent, RunWarning, VexSummary,
@@ -194,6 +195,9 @@ struct StaleInstallOutcome {
     /// `--offline`). Never assumed patched: the same-run `--vex` withholds
     /// them.
     unjudged_purls: std::collections::BTreeSet<String>,
+    /// The gem probe's stale materializations, one per warning, for the
+    /// refresh that follows it ([`refresh_stale_gems`]).
+    gems: Vec<StaleGem>,
 }
 
 /// The gem and Python stale-install probes' fallback: when a confirmed
@@ -254,92 +258,63 @@ impl<'a> ViewFallback<'a> {
     }
 }
 
-/// The `redirect_gem_stale_install` warning for one stale installed
-/// materialization (defect facts + verified/disproven remedies: the "Gem
-/// stale-install guard" section of CLI_CONTRACT.md). Wording splits on
-/// blast radius: a PROJECT-LOCAL dir gets the verified delete-list remedy —
-/// installed dir + cache `.gem` + `specifications` entry, plus the project's
-/// committed `vendor/cache` archive when the caller passes one (bundler
-/// installs from it in preference to fetching, so a remedy that leaves it
-/// behind silently reinstates the stale bytes) — while a SHARED gem-env
-/// home affects every project on the machine, so that flavor prefers moving
-/// the project to a local bundle path and only conditionally names the
-/// shared files. `project_local` also covers the project's own
-/// `.bundle/config` path when that path sits outside the tree.
-fn gem_stale_install_warning(
+/// One stale installed gem as the probe reports it: the installed dir,
+/// whether its gem home is the project's own (`project_local`, which also
+/// covers the project's own `.bundle/config` path when that sits outside
+/// the tree) or one other projects share, and, for a project-local copy,
+/// the project's committed cache-dir archive when it is stale too (bundler
+/// installs from it in preference to fetching, so the same refresh and the
+/// same remedy cover it).
+fn stale_installed_gem(
     purl: &str,
     gem_dir: &Path,
     leaf: &str,
     project_local: bool,
     project_cache_gem: Option<&Path>,
-) -> serde_json::Value {
-    let home = gem_dir
-        .parent()
-        .and_then(Path::parent)
-        .expect("crawler-resolved gem dirs always live under <home>/gems/<leaf>");
-    let cache = home.join("cache").join(format!("{leaf}.gem"));
-    let spec = home.join("specifications").join(format!("{leaf}.gemspec"));
-    let mut paths = vec![
-        gem_dir.display().to_string(),
-        cache.display().to_string(),
-        spec.display().to_string(),
-    ];
-    if let Some(extra) = project_cache_gem {
-        paths.push(extra.display().to_string());
+) -> StaleGem {
+    StaleGem {
+        purl: purl.to_string(),
+        leaf: leaf.to_string(),
+        installed: Some((gem_dir.to_path_buf(), project_local)),
+        cache_archive: project_cache_gem.map(Path::to_path_buf),
     }
-    let list = paths.join(", ");
-    let detail = if project_local {
-        format!(
-            "{purl} was switched to its hosted patch, but a stale \
-             UNPATCHED install is already materialized at {} — `bundle install` \
-             reuses the installed gem (and its cached .gem) without refetching, \
-             and `--force`/`--redownload` reinstall from the stale cache, so \
-             the vulnerable upstream code stays live. Remove the stale \
-             materialization — {list} — then run `bundle install` so bundler \
-             fetches the patched gem",
-            gem_dir.display()
-        )
-    } else {
-        format!(
-            "{purl} was switched to its hosted patch, but a stale \
-             UNPATCHED install is materialized in the shared gem home at {} — \
-             `bundle install` reuses it without refetching, so the vulnerable \
-             upstream code stays live. That gem home is shared by every \
-             project on this machine: prefer switching this project to a \
-             project-local bundle path (`bundle config set --local path \
-             vendor/bundle`, then `bundle install`); remove {list} directly \
-             only if no other project relies on the stale gem",
-            gem_dir.display()
-        )
-    };
-    serde_json::json!({ "code": "redirect_gem_stale_install", "detail": detail })
 }
 
-/// The vendor/cache flavor of `redirect_gem_stale_install`: the project's
-/// committed `bundle cache` archive (`vendor/cache/<leaf>.gem`) is not the
-/// patched artifact. Bundler installs from vendor/cache in preference to
-/// fetching, so every install — a fresh checkout included — re-materializes
-/// the unpatched bytes no matter what the redirected Gemfile + lock say.
-fn gem_stale_cache_warning(purl: &str, cache_path: &Path) -> serde_json::Value {
+/// The `redirect_gem_stale_install` warning for a stale materialization
+/// the run left as it is (defect facts and remedies: the "Gem stale-install
+/// guard" section of CLI_CONTRACT.md). `why` is why the refresh did not fix
+/// it; `None` describes it before any refresh.
+fn gem_stale_warning(gem: &StaleGem, why: Option<&gem_refresh::Why>) -> serde_json::Value {
+    let direction = gem_refresh::Direction::Patched;
     serde_json::json!({
-        "code": "redirect_gem_stale_install",
-        "detail": format!(
-            "{purl} was switched to its hosted patch, but the \
-             project's committed bundler cache still holds an UNPATCHED \
-             archive at {} — bundler installs from its cache dir in preference \
-             to fetching, so installs (fresh checkouts included) keep \
-             materializing the vulnerable upstream bytes. Remove that file, \
-             run `bundle install` so bundler fetches the patched gem, and \
-             re-run `bundle cache` if the project commits its cache",
-            cache_path.display()
-        ),
+        "code": direction.stale_code(),
+        "detail": gem_refresh::stale_detail(direction, gem, why),
     })
+}
+
+/// The cache-dir flavor: the project's committed `bundle cache` archive
+/// (`vendor/cache/<leaf>.gem`) is not the patched artifact, with no stale
+/// installed copy beside it. Bundler installs from its cache dir in
+/// preference to fetching, so every install (a fresh checkout included)
+/// fails on the pinned checksum or re-materializes the unpatched bytes.
+fn stale_cache_gem(purl: &str, cache_path: &Path) -> StaleGem {
+    let leaf = cache_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    StaleGem {
+        purl: purl.to_string(),
+        leaf,
+        installed: None,
+        cache_archive: Some(cache_path.to_path_buf()),
+    }
 }
 
 /// Post-rewrite stale-materialization probe for gem redirects: `bundle
 /// install` never refetches an already-materialized gem (see the "Gem
-/// stale-install guard" section of CLI_CONTRACT.md). Read-only: the remedy
-/// is prescribed, never applied.
+/// stale-install guard" section of CLI_CONTRACT.md). Read-only: what it
+/// finds stale is refreshed, or left with its warning, by
+/// [`refresh_stale_gems`].
 ///
 /// * An installed dir is judged by the archive RubyGems installed it from,
 ///   `<home>/cache/<leaf>.gem`: one whose sha256 is a patched artifact's is
@@ -544,13 +519,15 @@ async fn gem_stale_install_warnings(
         if folded_cache.is_some() {
             cache_covered.insert(j.purl.as_str());
         }
-        out.warnings.push(gem_stale_install_warning(
+        let gem = stale_installed_gem(
             &j.purl,
             dir,
             &j.leaf,
             j.project_local,
             folded_cache.as_deref(),
-        ));
+        );
+        out.warnings.push(gem_stale_warning(&gem, None));
+        out.gems.push(gem);
         // Every variant installed in this dir: VEX matches its exemptions
         // qualifier-insensitively, so one left out would re-exempt the dir.
         out.stale_purls.extend(j.purls.iter().cloned());
@@ -582,11 +559,152 @@ async fn gem_stale_install_warnings(
         if want_shas.contains(&got) {
             continue; // the PATCHED archive — healthy commit, nothing stale
         }
-        out.warnings
-            .push(gem_stale_cache_warning(purl, &cache_path));
+        let gem = stale_cache_gem(purl, &cache_path);
+        out.warnings.push(gem_stale_warning(&gem, None));
+        out.gems.push(gem);
         out.stale_purls.insert((*purl).to_string());
     }
     out
+}
+
+/// What [`refresh_stale_gems`] leaves for the run to report.
+#[derive(Default)]
+struct GemRefreshed {
+    /// The probe's verdict AFTER the refresh: what is still stale (its
+    /// `--json` warnings, the `--vex` exclusions), plus a note per
+    /// refreshed materialization.
+    outcome: StaleInstallOutcome,
+    /// Human progress lines for what was (on a dry run: would be) refreshed.
+    progress: Vec<String>,
+    /// The one human warning for what is still stale.
+    summary: Option<gem_refresh::Summary>,
+    /// The cache-dir archives replaced: files the project commits.
+    replaced_archives: Vec<std::path::PathBuf>,
+}
+
+/// The gem stale-install guard: probe ([`gem_stale_install_warnings`]),
+/// refresh what the policy allows from the patched archive the grant pins
+/// ([`gem_refresh::attempt`]), then probe again, so a copy the refresh
+/// fixed counts as patched only once the same evidence that called it
+/// stale says so (the `--vex` exclusions are the second probe's). A
+/// refresh that fails changes nothing and leaves the warning; it never
+/// fails the run. `locked` is whether the run holds the apply lock.
+#[allow(clippy::too_many_arguments)]
+async fn refresh_stale_gems(
+    common: &crate::args::GlobalArgs,
+    api_client: &socket_patch_core::api::client::ApiClient,
+    locked: bool,
+    confirmed: &[(String, String)],
+    local_records: &std::collections::BTreeMap<
+        String,
+        socket_patch_core::manifest::schema::PatchRecord,
+    >,
+    gem_artifact_shas: &std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    >,
+    overrides: &[DepOverride],
+    views: &mut ViewFallback<'_>,
+) -> GemRefreshed {
+    use socket_patch_core::patch::gem_refresh::{Source, Wanted};
+    let direction = gem_refresh::Direction::Patched;
+    let first = gem_stale_install_warnings(
+        &common.cwd,
+        common.global,
+        common.global_prefix.clone(),
+        confirmed,
+        local_records,
+        gem_artifact_shas,
+        views,
+    )
+    .await;
+    if first.gems.is_empty() {
+        return GemRefreshed {
+            outcome: if common.dry_run {
+                StaleInstallOutcome::default()
+            } else {
+                first
+            },
+            ..GemRefreshed::default()
+        };
+    }
+    let mut policy = gem_refresh::Policy::of(common);
+    policy.enabled &= common.dry_run || locked;
+    // The patched archive: what bundler itself would download from the
+    // patch registry (`<index>/gems/<leaf>.gem`), else the grant's own
+    // artifact, verified against the sha256 the lock pins.
+    let wanted = |gem: &StaleGem| {
+        let (name, version) = gem_sha_key(&gem.purl);
+        let sha256 = gem_artifact_shas
+            .get(&(name.clone(), version.clone()))?
+            .iter()
+            .map(|sha| sha.to_ascii_lowercase())
+            .collect();
+        let file = format!("{}.gem", gem.leaf);
+        let mut urls: Vec<String> = Vec::new();
+        for o in overrides
+            .iter()
+            .filter(|o| o.ecosystem == "gem" && o.name == name && o.version == version)
+        {
+            if let Some(ro) = &o.registry_override {
+                urls.push(format!(
+                    "{}/gems/{file}",
+                    ro.index_url.trim_end_matches('/')
+                ));
+            }
+            if o.artifact_url.ends_with(&format!("/{file}")) {
+                urls.push(o.artifact_url.clone());
+            }
+        }
+        urls.dedup();
+        Some(Wanted {
+            leaf: gem.leaf.clone(),
+            kind: "patched",
+            sha256,
+            urls,
+            on_disk: Vec::new(),
+        })
+    };
+    let source = if common.offline {
+        Source::DiskOnly
+    } else {
+        Source::PatchServer(api_client)
+    };
+    let pass = gem_refresh::attempt(&first.gems, wanted, &source, &policy, direction).await;
+    let mut outcome = if pass.changed(&policy) {
+        gem_stale_install_warnings(
+            &common.cwd,
+            common.global,
+            common.global_prefix.clone(),
+            confirmed,
+            local_records,
+            gem_artifact_shas,
+            views,
+        )
+        .await
+    } else {
+        first
+    };
+    let report = gem_refresh::report(direction, &outcome.gems, &pass, &policy);
+    outcome.warnings = report
+        .warnings
+        .iter()
+        .map(|(code, detail)| serde_json::json!({ "code": code, "detail": detail }))
+        .collect();
+    if common.dry_run {
+        outcome.stale_purls.clear();
+        outcome.unjudged_purls.clear();
+    }
+    GemRefreshed {
+        outcome,
+        progress: report.progress,
+        summary: report.summary,
+        replaced_archives: if common.dry_run {
+            Vec::new()
+        } else {
+            pass.replaced_archives().map(Path::to_path_buf).collect()
+        },
+    }
 }
 
 /// Whether the hosted flow's Pipenv probe is CERTAIN to run: the candidates
@@ -1564,58 +1682,57 @@ async fn run_redirect_selected_untracked(
 
     // The agent-mode manifest's records: local proof that an installed copy
     // was patched in place, for the stale-install probes below.
-    let local_records: std::collections::BTreeMap<String, PatchRecord> = if common.dry_run {
-        std::collections::BTreeMap::new()
-    } else {
+    let local_records: std::collections::BTreeMap<String, PatchRecord> =
         socket_patch_core::manifest::operations::read_manifest(common.resolved_manifest_path())
             .await
             .ok()
             .flatten()
             .map(|manifest| manifest.patches.into_iter().collect())
-            .unwrap_or_default()
-    };
+            .unwrap_or_default();
     // The gem and Python probes' shared patch-view fallback.
     let mut views = ViewFallback::new(api_client, common.offline);
-    // Gem stale-install probe (see `gem_stale_install_warnings`): runs after
-    // the writes so the warning describes the project as this run leaves it.
-    // Idempotent re-scans re-confirm and re-probe, so the warning keeps
-    // firing until the stale materialization is actually gone. Skipped
-    // EXPLICITLY on --dry-run: nothing was written, so the probe would
-    // judge state the run did not (re)create.
-    let gem_stale: StaleInstallOutcome = if common.dry_run {
-        StaleInstallOutcome::default()
-    } else {
-        // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
-        // override identifier, tarball integrity fallback; one per platform
-        // variant) — judges the installed and committed archives.
-        let mut gem_artifact_shas: std::collections::BTreeMap<
-            (String, String),
-            std::collections::BTreeSet<String>,
-        > = std::collections::BTreeMap::new();
-        for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
-            let sha = o
-                .registry_override
-                .as_ref()
-                .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
-                .or_else(|| o.integrity.sha256.clone());
-            if let Some(sha) = sha {
-                gem_artifact_shas
-                    .entry((o.name.clone(), o.version.clone()))
-                    .or_default()
-                    .insert(sha);
-            }
+    // Gem stale-install guard (see `refresh_stale_gems`): runs after the
+    // writes so it judges the project as this run leaves it. What it finds
+    // stale in the project is refreshed; the rest is warned about, and an
+    // idempotent re-scan re-probes, so the warning keeps firing until the
+    // stale materialization is gone. A dry run only says what it would
+    // refresh: nothing was rewritten, so nothing is stale yet.
+    //
+    // purl-coordinate → every PATCHED .gem artifact's sha256 (registry
+    // override identifier, tarball integrity fallback; one per platform
+    // variant) — judges the installed and committed archives, and verifies
+    // the archive a refresh installs.
+    let mut gem_artifact_shas: std::collections::BTreeMap<
+        (String, String),
+        std::collections::BTreeSet<String>,
+    > = std::collections::BTreeMap::new();
+    for o in done.overrides.iter().filter(|o| o.ecosystem == "gem") {
+        let sha = o
+            .registry_override
+            .as_ref()
+            .and_then(|ro| ro.identifiers.gem_checksum_sha256.clone())
+            .or_else(|| o.integrity.sha256.clone());
+        if let Some(sha) = sha {
+            gem_artifact_shas
+                .entry((o.name.clone(), o.version.clone()))
+                .or_default()
+                .insert(sha);
         }
-        gem_stale_install_warnings(
-            &common.cwd,
-            common.global,
-            common.global_prefix.clone(),
-            &confirmed,
-            &local_records,
-            &gem_artifact_shas,
-            &mut views,
-        )
-        .await
-    };
+    }
+    let gem_refreshed = refresh_stale_gems(
+        common,
+        api_client,
+        // The refresh writes into installed trees, like `apply`: only under
+        // the apply lock, which every wet run with a confirmed pin holds.
+        lock.is_some(),
+        &confirmed,
+        &local_records,
+        &gem_artifact_shas,
+        &done.overrides,
+        &mut views,
+    )
+    .await;
+    let gem_stale = &gem_refreshed.outcome;
     let python_stale = if common.dry_run {
         StaleInstallOutcome::default()
     } else {
@@ -1959,6 +2076,9 @@ async fn run_redirect_selected_untracked(
             for purl in &takeover_migrated {
                 eprintln!("{}", format_takeover_line(purl, common.dry_run));
             }
+            for line in &gem_refreshed.progress {
+                eprintln!("{line}");
+            }
             // The files a takeover's revert touched (or, on --dry-run,
             // would touch) count alongside the rewriters' own: a revert can
             // touch a wiring file the hosted rewriter never rewrites.
@@ -1978,8 +2098,13 @@ async fn run_redirect_selected_untracked(
                 .map(|w| (w.code.as_str(), w.detail.as_str()))
                 // The prune notice already printed up front (in `run`);
                 // successful takeovers printed above as progress lines.
+                // The refreshed gems printed above as progress lines; the
+                // gems still stale are one warning below, not one each.
                 .filter(|(code, _)| {
-                    *code != super::REDIRECT_PRUNE_IGNORED && !TAKEOVER_INFO_CODES.contains(code)
+                    *code != super::REDIRECT_PRUNE_IGNORED
+                        && !TAKEOVER_INFO_CODES.contains(code)
+                        && !gem_refresh::INFO_CODES.contains(code)
+                        && *code != gem_refresh::Direction::Patched.stale_code()
                 })
                 .collect();
             // Human output prints the bare strings — `Value`'s `Display`
@@ -2018,6 +2143,12 @@ async fn run_redirect_selected_untracked(
                 };
                 eprintln!("{}", format_warning(code, detail, width));
             }
+            if let Some(summary) = &gem_refreshed.summary {
+                eprintln!(
+                    "{}",
+                    render_warning(&format!("{}.", summary.headline), &summary.bullets, width)
+                );
+            }
             if let Some(statements) = vex_statements {
                 eprintln!(
                     "Wrote OpenVEX document with {} to {} (hosted patches are attested \
@@ -2051,9 +2182,16 @@ async fn run_redirect_selected_untracked(
             let mut next_steps = if common.dry_run {
                 Vec::new()
             } else {
+                // The cache-dir archives the gem refresh replaced are
+                // committed files too.
+                let mut commit_files = human_files.clone();
+                for archive in &gem_refreshed.replaced_archives {
+                    let rel = archive.strip_prefix(&common.cwd).unwrap_or(archive);
+                    commit_files.push(rel.to_string_lossy().replace('\\', "/"));
+                }
                 format_next_steps(
                     &common.cwd,
-                    &human_files,
+                    &commit_files,
                     &rewrite.edits,
                     !takeover_migrated.is_empty(),
                 )
@@ -2303,7 +2441,6 @@ fn split_sentences(text: &str) -> Vec<String> {
 /// terminal) every line is word-wrapped; without it (a pipe or a CI log)
 /// each sentence stays on one line so the text remains greppable.
 fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
-    let prefix = "Warning: ";
     let detail = crate::ui::sentence_case(detail.trim());
     let (headline, bullets) = if code == "redirect_pnpm_trust_lockfile" {
         let mut sentences = split_sentences(&detail).into_iter();
@@ -2312,11 +2449,18 @@ fn format_warning(code: &str, detail: &str, width: Option<usize>) -> String {
     } else {
         (detail, Vec::new())
     };
+    render_warning(&headline, &bullets, width)
+}
+
+/// `Warning: <headline>` over one `  - ` line per bullet, word-wrapped to
+/// `width` when stderr is a terminal.
+fn render_warning(headline: &str, bullets: &[String], width: Option<usize>) -> String {
+    let prefix = "Warning: ";
     let mut lines: Vec<String> = Vec::new();
     match width {
         Some(w) => {
-            lines.extend(wrap_words(&headline, w, prefix, "  "));
-            for b in &bullets {
+            lines.extend(wrap_words(headline, w, prefix, "  "));
+            for b in bullets {
                 lines.extend(wrap_words(b, w, "  - ", "    "));
             }
         }
@@ -2669,8 +2813,8 @@ mod tests {
         wrap_words, TAKEOVER_INFO_CODES,
     };
     use super::{
-        gem_stale_cache_warning, gem_stale_install_warning, gem_stale_install_warnings,
-        prune_ignored_warning, record_hosted_events, redirect_block,
+        gem_stale_install_warnings, gem_stale_warning, prune_ignored_warning, record_hosted_events,
+        redirect_block, stale_cache_gem, stale_installed_gem,
     };
     use super::{wheel_metadata_concurrency, WHEEL_METADATA_CONCURRENCY};
 
@@ -3188,16 +3332,36 @@ mod tests {
         .await
     }
 
+    /// The warning the probe raises for a stale installed gem, before any
+    /// refresh.
+    fn gem_stale_install_warning(
+        purl: &str,
+        gem_dir: &std::path::Path,
+        leaf: &str,
+        project_local: bool,
+        project_cache_gem: Option<&std::path::Path>,
+    ) -> serde_json::Value {
+        gem_stale_warning(
+            &stale_installed_gem(purl, gem_dir, leaf, project_local, project_cache_gem),
+            None,
+        )
+    }
+
+    /// The warning the probe raises for a stale cache-dir archive alone.
+    fn gem_stale_cache_warning(purl: &str, cache_path: &std::path::Path) -> serde_json::Value {
+        gem_stale_warning(&stale_cache_gem(purl, cache_path), None)
+    }
+
     fn detail_of(w: &serde_json::Value) -> &str {
         assert_eq!(w["code"], "redirect_gem_stale_install");
         w["detail"].as_str().expect("detail is a string")
     }
 
-    /// PROJECT-LOCAL flavor: names the purl and all three stale paths —
-    /// each built with the same joins production uses, so this holds on
-    /// Windows' backslash-joined paths too — steers away from the
-    /// empirically disproven `--force`/`--redownload`, and prescribes the
-    /// verified removal + `bundle install` remedy.
+    /// PROJECT-LOCAL flavor: names the purl, the stale install, and the two
+    /// files whose removal makes `bundle install` fetch the gem (its
+    /// `specifications` entry and cached `.gem`) — each built with the same
+    /// joins production uses, so this holds on Windows' backslash-joined
+    /// paths too.
     #[test]
     fn gem_stale_install_warning_project_local_names_paths_and_remedy() {
         let cwd = PathBuf::from("proj");
@@ -3219,14 +3383,9 @@ mod tests {
             .join(format!("{GEM_LEAF}.gemspec"));
         assert!(detail.contains(&cache.display().to_string()), "{detail}");
         assert!(detail.contains(&spec.display().to_string()), "{detail}");
-        assert!(detail.contains("UNPATCHED"), "{detail}");
+        assert!(detail.contains("unpatched install"), "{detail}");
         assert!(
-            detail.contains("--force") && detail.contains("--redownload"),
-            "the disproven flags must be steered away from: {detail}"
-        );
-        assert!(
-            detail.contains("Remove the stale materialization")
-                && detail.contains("`bundle install`"),
+            detail.contains("Remove ") && detail.ends_with("and run `bundle install`"),
             "the verified remedy must be prescribed: {detail}"
         );
         assert!(
@@ -3235,10 +3394,10 @@ mod tests {
         );
     }
 
-    /// SHARED-HOME flavor: a materialization outside the project must NOT
-    /// get an unconditional delete prescription — the home is shared by
-    /// every project on the machine — and must prefer the project-local
-    /// bundle-path migration instead.
+    /// SHARED-HOME flavor: a materialization outside the project is left
+    /// alone and never gets a delete prescription — the home is shared by
+    /// every project on the machine — only the project-local bundle-path
+    /// migration and the opt-in flag.
     #[test]
     fn gem_stale_install_warning_shared_home_prefers_local_path_over_deletion() {
         let cwd = PathBuf::from("proj");
@@ -3258,14 +3417,13 @@ mod tests {
             "the shared flavor must prefer the project-local migration: {detail}"
         );
         assert!(
-            detail.contains("only if no other project relies"),
-            "shared files must never get an unconditional delete: {detail}"
+            detail.contains("`--gem-refresh-shared`"),
+            "the opt-in flag must be named: {detail}"
         );
         assert!(
-            !detail.contains("Remove the stale materialization —"),
-            "the unconditional delete-list phrasing is project-local only: {detail}"
+            !detail.to_lowercase().contains("remove ") && !detail.contains("specifications"),
+            "shared files must never get a delete prescription: {detail}"
         );
-        // The paths are still named (inside the conditional clause).
         assert!(detail.contains(&gem_dir.display().to_string()), "{detail}");
     }
 
@@ -3733,8 +3891,8 @@ mod tests {
         let detail = detail_of(&out.warnings[0]);
         assert!(detail.contains(&gem_dir.display().to_string()), "{detail}");
         // The project's own bundle path, not a machine-wide gem home: the
-        // verified delete-list remedy, not the shared-home caveat.
-        assert!(detail.contains("Remove the stale"), "{detail}");
+        // verified removal remedy, not the shared-home caveat.
+        assert!(detail.contains("Remove "), "{detail}");
         assert!(!detail.contains("shared gem home"), "{detail}");
         assert_eq!(
             out.stale_purls,
@@ -4192,12 +4350,12 @@ mod tests {
         let detail = detail_of(&w);
         assert!(detail.contains(GEM_PURL), "{detail}");
         assert!(detail.contains(&cache.display().to_string()), "{detail}");
-        assert!(detail.contains("UNPATCHED"), "{detail}");
-        assert!(detail.contains("fresh checkouts included"), "{detail}");
+        assert!(detail.contains("unpatched archive"), "{detail}");
         assert!(
-            detail.contains("`bundle install`") && detail.contains("bundle cache"),
+            detail.contains("Bundler installs from that dir before it fetches"),
             "{detail}"
         );
+        assert!(detail.contains("`bundle cache`"), "{detail}");
     }
 
     #[test]

@@ -80,6 +80,8 @@ pub fn global_defaults() -> Globals {
         no_npm_allow_remote_config: false,
         no_vlt_install_cleanup: false,
         no_gem_native_rebuild: false,
+        no_gem_install_refresh: false,
+        gem_refresh_shared: false,
     })
 }
 
