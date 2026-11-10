@@ -41,8 +41,8 @@ use super::vlt_lock_text::{
     installs_outside_registry, is_default_registry, is_importer_dep_id, is_registry_url_segment,
     nodes_block, parse_edge_entry_text, parse_edge_line, parse_node_entry_text, parse_node_line,
     parse_vendored_dir_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, LockSniff,
-    ParsedLock, SectionSpan,
+    split_lines, vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, EdgeSortKey,
+    LockSniff, ParsedLock, SectionSpan,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -227,41 +227,42 @@ fn render_block(out: &mut Vec<String>, header: &str, entries: &[Entry], inline_c
     ));
 }
 
-impl LockDoc {
-    fn render(&self) -> String {
-        let mut spans: Vec<(SectionSpan, &Block)> = [&self.nodes, &self.edges]
-            .into_iter()
-            .filter_map(|b| b.span.map(|s| (s, b)))
-            .collect();
-        spans.sort_by_key(|(s, _)| match s {
-            SectionSpan::Inline { line } => *line,
-            SectionSpan::Block { open, .. } => *open,
-        });
-        let mut out = Vec::with_capacity(self.lines.len() + 4);
-        let mut i = 0;
-        for (span, block) in spans {
-            match span {
-                SectionSpan::Block { open, close } => {
-                    out.extend(self.lines[i..=open].iter().cloned());
-                    let last = block.entries.len().saturating_sub(1);
-                    for (j, e) in block.entries.iter().enumerate() {
-                        out.push(render_entry_line(&e.text(), j != last, e.cr));
-                    }
-                    i = close;
+/// The lock's lines with its two sections replaced by `nodes` and `edges`.
+fn render_lock(lines: &[String], nodes: &Block, edges: &Block) -> String {
+    let mut spans: Vec<(SectionSpan, &Block)> = [nodes, edges]
+        .into_iter()
+        .filter_map(|b| b.span.map(|s| (s, b)))
+        .collect();
+    spans.sort_by_key(|(s, _)| match s {
+        SectionSpan::Inline { line } => *line,
+        SectionSpan::Block { open, .. } => *open,
+    });
+    let mut out = Vec::with_capacity(lines.len() + 4);
+    let mut i = 0;
+    for (span, block) in spans {
+        match span {
+            SectionSpan::Block { open, close } => {
+                out.extend(lines[i..=open].iter().cloned());
+                let last = block.entries.len().saturating_sub(1);
+                for (j, e) in block.entries.iter().enumerate() {
+                    out.push(render_entry_line(&e.text(), j != last, e.cr));
                 }
-                SectionSpan::Inline { line } => {
-                    out.extend(self.lines[i..line].iter().cloned());
-                    let header = &self.lines[line];
-                    let comma = header.trim_end_matches('\r').ends_with(',');
-                    render_block(&mut out, header, &block.entries, comma);
-                    i = line + 1;
-                }
+                i = close;
+            }
+            SectionSpan::Inline { line } => {
+                out.extend(lines[i..line].iter().cloned());
+                let header = &lines[line];
+                let comma = header.trim_end_matches('\r').ends_with(',');
+                render_block(&mut out, header, &block.entries, comma);
+                i = line + 1;
             }
         }
-        out.extend(self.lines[i..].iter().cloned());
-        out.join("\n")
     }
+    out.extend(lines[i..].iter().cloned());
+    out.join("\n")
+}
 
+impl LockDoc {
     fn options(&self) -> Option<&serde_json::Map<String, Value>> {
         self.parsed.options()
     }
@@ -296,15 +297,60 @@ impl LockDoc {
 
 // ── placement ────────────────────────────────────────────────────────────
 
-fn node_cmp(a: &Entry, b: &Entry) -> Option<Ordering> {
-    vlt_collate(&a.key, &b.key)
+/// What a node sorts by: its DepID.
+struct NodeKey(String);
+
+fn node_key(entry: &Entry) -> Option<NodeKey> {
+    Some(NodeKey(entry.key.clone()))
 }
 
-fn edge_cmp(a: &Entry, b: &Entry) -> Option<Ordering> {
-    let a_text = a.text();
-    let b_text = b.text();
-    let a = parse_edge_entry_text(&a_text)?;
-    let b = parse_edge_entry_text(&b_text)?;
+fn node_cmp(a: &NodeKey, b: &NodeKey) -> Option<Ordering> {
+    vlt_collate(&a.0, &b.0)
+}
+
+/// What an edge sorts by (`from`, type and target, see [`vlt_edge_cmp`]).
+/// `None` for text outside the edge grammar, which compares as Unknown.
+struct EdgeKey {
+    from: String,
+    edge_type: String,
+    to: String,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`edge_key`] calls this thread made. Each one decodes an edge, so a
+    /// placement must make one per entry, not one per comparison (VBV-P1).
+    static EDGE_KEYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn edge_key(entry: &Entry) -> Option<EdgeKey> {
+    #[cfg(test)]
+    EDGE_KEYS_READ.with(|read| read.set(read.get() + 1));
+    let text = entry.text();
+    let edge = parse_edge_entry_text(&text)?;
+    let EdgeSortKey {
+        from,
+        edge_type,
+        to,
+    } = edge.sort_key();
+    Some(EdgeKey {
+        from: from.to_string(),
+        edge_type: edge_type.to_string(),
+        to: to.to_string(),
+    })
+}
+
+impl EdgeKey {
+    fn sort_key(&self) -> EdgeSortKey<'_> {
+        EdgeSortKey {
+            from: &self.from,
+            edge_type: &self.edge_type,
+            to: &self.to,
+        }
+    }
+}
+
+fn edge_cmp(a: &EdgeKey, b: &EdgeKey) -> Option<Ordering> {
     vlt_edge_cmp(a.sort_key(), b.sort_key())
 }
 
@@ -312,10 +358,16 @@ fn edge_cmp(a: &Entry, b: &Entry) -> Option<Ordering> {
 /// untouched entries keep their order, and each replacement (in the given
 /// order) goes before the first entry it sorts below. When any comparison
 /// is outside the collation table, every replacement stays in place.
-fn place(
+///
+/// `key` reads what an entry sorts by, once per entry: a lock has tens of
+/// thousands of entries, each replacement is compared with every one ahead
+/// of its place, and decoding an edge per comparison made that the cost of
+/// vendoring into a large lock.
+fn place<K>(
     entries: &[Entry],
     touched: &[(usize, Entry)],
-    cmp: fn(&Entry, &Entry) -> Option<Ordering>,
+    key: fn(&Entry) -> Option<K>,
+    cmp: fn(&K, &K) -> Option<Ordering>,
 ) -> Vec<Entry> {
     let touched_at: BTreeSet<usize> = touched.iter().map(|(i, _)| *i).collect();
     let mut list: Vec<Entry> = entries
@@ -324,10 +376,16 @@ fn place(
         .filter(|(i, _)| !touched_at.contains(i))
         .map(|(_, e)| e.clone())
         .collect();
+    let mut keys: Vec<Option<K>> = list.iter().map(key).collect();
     for (_, new) in touched {
+        let new_key = key(new);
         let mut at = list.len();
-        for (i, e) in list.iter().enumerate() {
-            match cmp(new, e) {
+        for (i, other) in keys.iter().enumerate() {
+            let order = match (&new_key, other) {
+                (Some(new), Some(other)) => cmp(new, other),
+                _ => None,
+            };
+            match order {
                 Some(Ordering::Less) => {
                     at = i;
                     break;
@@ -343,6 +401,7 @@ fn place(
             }
         }
         list.insert(at, new.clone());
+        keys.insert(at, new_key);
     }
     list
 }
@@ -778,7 +837,29 @@ pub async fn vlt_vendor_preflight(
 struct Wiring {
     records: Vec<WiringRecord>,
     pkgs: BTreeMap<String, String>,
-    lock: Option<String>,
+    /// The lock entries to replace, by index in their block.
+    node_touch: Vec<(usize, Entry)>,
+    edge_touch: Vec<(usize, Entry)>,
+}
+
+impl Wiring {
+    /// The new lock text, or `None` when the lock stays as it is. Placing
+    /// and rendering is the expensive half of a plan and decides nothing,
+    /// so only the run that writes the lock asks for it.
+    fn lock(&self, doc: &LockDoc) -> Option<String> {
+        if self.node_touch.is_empty() && self.edge_touch.is_empty() {
+            return None;
+        }
+        let nodes = Block {
+            span: doc.nodes.span,
+            entries: place(&doc.nodes.entries, &self.node_touch, node_key, node_cmp),
+        };
+        let edges = Block {
+            span: doc.edges.span,
+            entries: place(&doc.edges.entries, &self.edge_touch, edge_key, edge_cmp),
+        };
+        Some(render_lock(&doc.lines, &nodes, &edges))
+    }
 }
 
 fn wiring_record(file: &str, kind: &str, key: &str, original: String, new: String) -> WiringRecord {
@@ -986,28 +1067,11 @@ fn plan_wiring(
     if records.is_empty() {
         return Ok(None);
     }
-    let lock = if node_touch.is_empty() && edge_touch.is_empty() {
-        None
-    } else {
-        let next = LockDoc {
-            lines: doc.lines.clone(),
-            parsed: doc.parsed.clone(),
-            era: doc.era,
-            nodes: Block {
-                span: doc.nodes.span,
-                entries: place(&doc.nodes.entries, &node_touch, node_cmp),
-            },
-            edges: Block {
-                span: doc.edges.span,
-                entries: place(&doc.edges.entries, &edge_touch, edge_cmp),
-            },
-        };
-        Some(next.render())
-    };
     Ok(Some(Wiring {
         records,
         pkgs: new_pkgs,
-        lock,
+        node_touch,
+        edge_touch,
     }))
 }
 
@@ -1016,6 +1080,7 @@ fn plan_wiring(
 async fn commit(
     project_root: &Path,
     wiring: &Wiring,
+    lock: Option<&str>,
     originals: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let mut written: Vec<&String> = Vec::new();
@@ -1028,7 +1093,7 @@ async fn commit(
         }
         written.push(rel);
     }
-    if let Some(lock) = &wiring.lock {
+    if let Some(lock) = lock {
         if let Err(e) =
             atomic_write_bytes_preserving_mode(&project_root.join(VLT_LOCK), lock.as_bytes()).await
         {
@@ -1384,7 +1449,8 @@ pub(crate) async fn vendor_vlt<'a>(
         )
         .await;
     };
-    if let Err(e) = commit(project_root, &wiring, &analysis.pkgs).await {
+    let lock = wiring.lock(&analysis.doc);
+    if let Err(e) = commit(project_root, &wiring, lock.as_deref(), &analysis.pkgs).await {
         return done_failure_unstage(
             purl,
             e,
@@ -2038,11 +2104,12 @@ fn drop_unrecorded_file_edges(staged: &mut Staged, entry: &VendorEntry) {
 
 /// A block without its merged entries, the restored ones re-placed
 /// in the forward record order.
-fn restored_block(
+fn restored_block<K>(
     entries: &[Entry],
     touched: &[usize],
     merged: &BTreeSet<usize>,
-    cmp: fn(&Entry, &Entry) -> Option<Ordering>,
+    key: fn(&Entry) -> Option<K>,
+    cmp: fn(&K, &K) -> Option<Ordering>,
 ) -> Vec<Entry> {
     let kept: Vec<Entry> = entries
         .iter()
@@ -2055,7 +2122,7 @@ fn restored_block(
         .rev()
         .map(|&i| (i - merged.range(..i).count(), entries[i].clone()))
         .collect();
-    place(&kept, &touched, cmp)
+    place(&kept, &touched, key, cmp)
 }
 
 fn render_restored(doc: &LockDoc, staged: Staged) -> String {
@@ -2063,28 +2130,25 @@ fn render_restored(doc: &LockDoc, staged: Staged) -> String {
         &staged.nodes,
         &staged.touched_nodes,
         &staged.merged_nodes,
+        node_key,
         node_cmp,
     );
     let edges = restored_block(
         &staged.edges,
         &staged.touched_edges,
         &staged.merged_edges,
+        edge_key,
         edge_cmp,
     );
-    LockDoc {
-        lines: doc.lines.clone(),
-        parsed: doc.parsed.clone(),
-        era: doc.era,
-        nodes: Block {
-            span: doc.nodes.span,
-            entries: nodes,
-        },
-        edges: Block {
-            span: doc.edges.span,
-            entries: edges,
-        },
-    }
-    .render()
+    let nodes = Block {
+        span: doc.nodes.span,
+        entries: nodes,
+    };
+    let edges = Block {
+        span: doc.edges.span,
+        entries: edges,
+    };
+    render_lock(&doc.lines, &nodes, &edges)
 }
 
 #[cfg(test)]
@@ -2263,16 +2327,226 @@ mod tests {
             entry("~npm~d@1.0.0"),
             entry("~npm~f@1.0.0"),
         ];
-        let placed = place(&entries, &[(0, entry("~npm~e@1.0.0"))], node_cmp);
+        let placed = place(&entries, &[(0, entry("~npm~e@1.0.0"))], node_key, node_cmp);
         let keys: Vec<&str> = placed.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, ["~npm~d@1.0.0", "~npm~e@1.0.0", "~npm~f@1.0.0"]);
-        let placed = place(&entries, &[(1, entry("~npm~z@1.0.0"))], node_cmp);
+        let placed = place(&entries, &[(1, entry("~npm~z@1.0.0"))], node_key, node_cmp);
         assert_eq!(placed.last().unwrap().key, "~npm~z@1.0.0");
 
         // `é` is outside the collation table: every replacement stays put.
-        let placed = place(&entries, &[(0, entry("file~é"))], node_cmp);
+        let placed = place(&entries, &[(0, entry("file~é"))], node_key, node_cmp);
         let keys: Vec<&str> = placed.iter().map(|e| e.key.as_str()).collect();
         assert_eq!(keys, ["file~é", "~npm~d@1.0.0", "~npm~f@1.0.0"]);
+    }
+
+    /// `place` as first written: every comparison of two edges formats and
+    /// decodes both.
+    fn place_reference(
+        entries: &[Entry],
+        touched: &[(usize, Entry)],
+        cmp: fn(&Entry, &Entry) -> Option<Ordering>,
+    ) -> Vec<Entry> {
+        let touched_at: BTreeSet<usize> = touched.iter().map(|(i, _)| *i).collect();
+        let mut list: Vec<Entry> = entries
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !touched_at.contains(i))
+            .map(|(_, e)| e.clone())
+            .collect();
+        for (_, new) in touched {
+            let mut at = list.len();
+            for (i, e) in list.iter().enumerate() {
+                match cmp(new, e) {
+                    Some(Ordering::Less) => {
+                        at = i;
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        let mut in_place = entries.to_vec();
+                        for (i, replacement) in touched {
+                            in_place[*i] = replacement.clone();
+                        }
+                        return in_place;
+                    }
+                }
+            }
+            list.insert(at, new.clone());
+        }
+        list
+    }
+
+    fn node_cmp_reference(a: &Entry, b: &Entry) -> Option<Ordering> {
+        vlt_collate(&a.key, &b.key)
+    }
+
+    fn edge_cmp_reference(a: &Entry, b: &Entry) -> Option<Ordering> {
+        let a_text = a.text();
+        let b_text = b.text();
+        let a = parse_edge_entry_text(&a_text)?;
+        let b = parse_edge_entry_text(&b_text)?;
+        vlt_edge_cmp(a.sort_key(), b.sort_key())
+    }
+
+    /// Every `vlt-lock.json` under the test fixtures that is in vlt's
+    /// canonical layout.
+    fn fixture_docs() -> Vec<(String, LockDoc)> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut docs = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|name| name == VLT_LOCK) {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    if let Ok(doc) = parse_doc(&text) {
+                        let label = path.strip_prefix(&root).unwrap().display().to_string();
+                        docs.push((label, doc));
+                    }
+                }
+            }
+        }
+        docs.sort_by(|a, b| a.0.cmp(&b.0));
+        docs
+    }
+
+    /// VBV-P1: placing over sort keys read once per entry gives, entry for
+    /// entry, what comparing by decoding both edges each time gave: for
+    /// the nodes and the edges of every fixture lock, with one and with two
+    /// replacements that move to the front, the middle, the end, the `file`
+    /// range, stay where they are, or cannot be compared at all (a key
+    /// outside the collation table, text that is no edge).
+    #[test]
+    fn placement_agrees_with_the_per_comparison_decoding_it_replaces() {
+        let file = format!("file~.socket+vendor+npm+{UUID}+a-1.0.0+node__modules+a");
+        let node_keys = [
+            file.clone(),
+            "~npm~a@0.0.1".to_string(),
+            "~npm~zzzz@9.0.0".to_string(),
+            "·npm·m@1.0.0".to_string(),
+            "~npm~M@1.0.0".to_string(),
+            "file~é".to_string(),
+        ];
+        let edges = [
+            (
+                format!("{file} dep"),
+                "\"prod ^1.0.0 ~npm~a@1.0.0\"".to_string(),
+            ),
+            (
+                "file~_d zz".to_string(),
+                format!("\"prod file:./x {file}\""),
+            ),
+            (
+                "file~_d a".to_string(),
+                "\"dev 1.0.0 ~npm~a@1.0.0\"".to_string(),
+            ),
+            (
+                "workspace~packages+a a".to_string(),
+                "\"optional 1.0.0 MISSING\"".to_string(),
+            ),
+            (
+                "~npm~zzzz@9.0.0 a".to_string(),
+                "\"peer * ~npm~a@1.0.0\"".to_string(),
+            ),
+            (
+                "~npm~é@1.0.0 a".to_string(),
+                "\"prod 1.0.0 ~npm~a@1.0.0\"".to_string(),
+            ),
+            ("~npm~a@1.0.0 a".to_string(), "\"not an edge\"".to_string()),
+        ];
+        let docs = fixture_docs();
+        assert!(docs.len() >= 20, "{} canonical fixture locks", docs.len());
+        let (mut compared, mut fell_back) = (0, 0);
+        for (label, doc) in &docs {
+            for (block, is_nodes) in [(&doc.nodes, true), (&doc.edges, false)] {
+                let len = block.entries.len();
+                for seed in 0..14 {
+                    let replacement = |at: usize, pick: usize| {
+                        let current = &block.entries[at];
+                        if pick % 8 == 7 {
+                            return current.clone();
+                        }
+                        let (key, value) = if is_nodes {
+                            (
+                                node_keys[pick % node_keys.len()].clone(),
+                                current.value.clone(),
+                            )
+                        } else {
+                            edges[pick % edges.len()].clone()
+                        };
+                        Entry {
+                            key,
+                            value,
+                            cr: current.cr,
+                        }
+                    };
+                    let mut touched = Vec::new();
+                    if len > 0 {
+                        let first = (seed * 7 + 1) % len;
+                        touched.push((first, replacement(first, seed)));
+                        let second = (seed * 13 + 5) % len;
+                        if seed % 2 == 1 && second != first {
+                            touched.push((second, replacement(second, seed / 2)));
+                        }
+                    }
+                    let (placed, reference) = if is_nodes {
+                        (
+                            place(&block.entries, &touched, node_key, node_cmp),
+                            place_reference(&block.entries, &touched, node_cmp_reference),
+                        )
+                    } else {
+                        (
+                            place(&block.entries, &touched, edge_key, edge_cmp),
+                            place_reference(&block.entries, &touched, edge_cmp_reference),
+                        )
+                    };
+                    assert_eq!(placed, reference, "{label}, nodes: {is_nodes}, seed {seed}");
+                    compared += 1;
+                    let mut in_place = block.entries.clone();
+                    for (at, entry) in &touched {
+                        in_place[*at] = entry.clone();
+                    }
+                    fell_back += usize::from(placed == in_place && !touched.is_empty());
+                }
+            }
+        }
+        assert!(compared >= 500 && fell_back >= 50, "{compared} {fell_back}");
+    }
+
+    /// VBV-P1: an edge is decoded once per placement, not once per
+    /// comparison. Two replacements among 2,000 edges used to decode about
+    /// 7,000 edges; now it is 2,000, the 1,998 that stay and the two
+    /// replacements.
+    #[test]
+    fn a_placement_decodes_each_edge_once() {
+        let edges: Vec<Entry> = (0..2000)
+            .map(|i| Entry {
+                key: format!("file~_d p{i:04}"),
+                value: format!("\"prod 1.0.0 ~npm~p{i:04}@1.0.0\""),
+                cr: false,
+            })
+            .collect();
+        let moved = |i: usize, to: &str| Entry {
+            value: format!("\"prod file:./x {to}\""),
+            ..edges[i].clone()
+        };
+        let touched = [
+            (10, moved(10, "~npm~p1500@9.0.0")),
+            (1990, moved(1990, "file~z")),
+        ];
+        EDGE_KEYS_READ.with(|read| read.set(0));
+        let placed = place(&edges, &touched, edge_key, edge_cmp);
+        assert_eq!(EDGE_KEYS_READ.with(|read| read.get()), edges.len());
+        assert_eq!(
+            placed,
+            place_reference(&edges, &touched, edge_cmp_reference)
+        );
+        assert_eq!(placed.len(), edges.len());
+        assert_eq!(placed[1499].key, "file~_d p1500");
+        assert_eq!(placed[1500].key, "file~_d p0010", "after p1500's edge");
+        assert_eq!(placed.last().unwrap().key, "file~_d p1990");
     }
 
     #[test]
@@ -3179,7 +3453,8 @@ mod tests {
         let wiring = Wiring {
             records: Vec::new(),
             pkgs: BTreeMap::from([(PACKAGE_JSON.to_string(), "{}".to_string())]),
-            lock: Some("{}".to_string()),
+            node_touch: Vec::new(),
+            edge_touch: Vec::new(),
         };
         tokio::fs::remove_file(fx.root.join(VLT_LOCK))
             .await
@@ -3188,7 +3463,9 @@ mod tests {
             .await
             .unwrap();
         let originals = BTreeMap::from([(PACKAGE_JSON.to_string(), ROOT_PKG.to_string())]);
-        let err = commit(&fx.root, &wiring, &originals).await.unwrap_err();
+        let err = commit(&fx.root, &wiring, Some("{}"), &originals)
+            .await
+            .unwrap_err();
         assert!(err.contains("package.json files restored"), "{err}");
         assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
     }
