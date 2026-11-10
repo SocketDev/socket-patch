@@ -410,7 +410,7 @@ async fn git_output(
     stdin: Option<String>,
 ) -> Option<(i32, String)> {
     use tokio::io::AsyncWriteExt as _;
-    let mut child = tokio::process::Command::new(git)
+    let mut child = tokio::process::Command::from(crate::utils::process::command_for(git))
         .arg("-C")
         .arg(root)
         .args(args)

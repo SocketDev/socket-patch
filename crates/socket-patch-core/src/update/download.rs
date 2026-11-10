@@ -265,7 +265,7 @@ async fn sanity_exec(
     const ETXTBSY_ATTEMPTS: u64 = 10;
     let mut attempt = 0u64;
     let output = loop {
-        let mut cmd = std::process::Command::new(staged);
+        let mut cmd = crate::utils::process::command_for(staged);
         cmd.arg("--version");
         let result = match crate::utils::fs::run_blocking(move || {
             crate::utils::process::output_within(cmd, crate::utils::process::PROBE_TIMEOUT)

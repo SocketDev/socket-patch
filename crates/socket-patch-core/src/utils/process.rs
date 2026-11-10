@@ -8,18 +8,21 @@
 //! installing the binary: the success arm (binary present, stdout
 //! parsed) and the spawn-Err arm (binary missing or unspawnable).
 //!
-//! This module provides a `CommandRunner` trait whose default impl,
-//! `SystemCommandRunner`, performs the real spawn, and whose test
-//! double (`MockCommandRunner` in `tests/common/mod.rs`) maps
-//! `(bin, args)` to canned stdout. Each shell-out helper accepts a
+//! This module provides a `CommandRunner` trait whose real impl,
+//! `ProbeRunner`, performs the spawn from a directory chosen by the
+//! probe's scope (the project, or a neutral one for a global question),
+//! and whose test double (`MockCommandRunner` in `tests/common/mod.rs`)
+//! maps `(bin, args)` to canned stdout. Each shell-out helper accepts a
 //! `&dyn CommandRunner` argument so tests can inject the mock;
-//! production callers either build the helper with the default
-//! runner or thread a singleton.
+//! production callers build the helper with a `ProbeRunner`.
 
 use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long a crawler probe (`gem env gemdir`, `npm root -g`, `python3
@@ -27,6 +30,108 @@ use std::time::{Duration, Instant};
 /// information". The same budget the Pipenv and Hatch version probes and the
 /// self-update `--version` check use.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The environment variables no child process inherits
+/// ([`scrub_child_env`]).
+///
+/// Everything this CLI spawns is someone else's program: a package
+/// manager or its version-manager shim, an interpreter, a gem's
+/// `extconf.rb` and the compiler it starts. Some of it is chosen by the
+/// repository being scanned, and CI usually exports the Socket API token
+/// for the run. None of those programs needs a Socket credential, nor
+/// this CLI's own settings (the URL ones can carry credentials in their
+/// userinfo, and name the hosts the token is sent to).
+///
+/// Names are exact. A package manager's own settings (`HTTP_PROXY`,
+/// `HTTPS_PROXY`, `NO_PROXY`, `NPM_TOKEN` and other registry auth) reach
+/// the child untouched, and so does any other variable, `SOCKET_`-prefixed
+/// or not: an `.npmrc` or `.yarnrc.yml` may expand one.
+///
+/// The CLI's flag bindings are listed here because core runs the
+/// children; `socket-patch-cli`'s `args` tests fail when a binding is
+/// missing.
+pub const CHILD_ENV_SCRUB: &[&str] = &[
+    // The Socket API token, under each name a Socket tool reads it from
+    // (this CLI, socket-cli and its legacy spellings, the Python CLI, the
+    // SDKs).
+    "SOCKET_API_TOKEN",
+    "SOCKET_CLI_API_TOKEN",
+    "SOCKET_SECURITY_API_TOKEN",
+    "SOCKET_API_KEY",
+    "SOCKET_CLI_API_KEY",
+    "SOCKET_SECURITY_API_KEY",
+    // socket-cli's inline config (it can hold `apiToken`) and its forward
+    // proxy URL.
+    "SOCKET_CLI_CONFIG",
+    "SOCKET_CLI_API_PROXY",
+    // The other accepted socket-cli aliases (`env_compat::PEER_ENV_ALIASES`)
+    // and the canonical name of the one that is not a flag.
+    "SOCKET_CLI_ORG_SLUG",
+    "SOCKET_CLI_API_BASE_URL",
+    "SOCKET_CLI_NO_API_TOKEN",
+    "SOCKET_NO_API_TOKEN",
+    // Every flag binding of the CLI.
+    "SOCKET_CWD",
+    "SOCKET_MANIFEST_PATH",
+    "SOCKET_API_URL",
+    "SOCKET_ORG_SLUG",
+    "SOCKET_PROXY_URL",
+    "SOCKET_ECOSYSTEMS",
+    "SOCKET_VENDOR_SOURCE",
+    "SOCKET_VENDOR_URL",
+    "SOCKET_PATCH_SERVER_URL",
+    "SOCKET_OFFLINE",
+    "SOCKET_STRICT",
+    "SOCKET_GLOBAL",
+    "SOCKET_GLOBAL_PREFIX",
+    "SOCKET_JSON",
+    "SOCKET_VERBOSE",
+    "SOCKET_SILENT",
+    "SOCKET_DRY_RUN",
+    "SOCKET_YES",
+    "SOCKET_LOCK_TIMEOUT",
+    "SOCKET_DEBUG",
+    "SOCKET_TELEMETRY_DISABLED",
+    "SOCKET_NO_TRUST_LOCKFILE_CONFIG",
+    "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
+    "SOCKET_NO_VLT_INSTALL_CLEANUP",
+    "SOCKET_NO_GEM_NATIVE_REBUILD",
+    "SOCKET_PATCH_VERSION",
+    "SOCKET_SAVE_ONLY",
+    "SOCKET_ALL_RELEASES",
+    "SOCKET_SKIP_ROLLBACK",
+    "SOCKET_PRESERVE_STATE",
+    "SOCKET_DOWNLOAD_ONLY",
+    "SOCKET_VENDOR_REVERT",
+    "SOCKET_BATCH_SIZE",
+    "SOCKET_SCAN_PACKAGES",
+    "SOCKET_NO_SOCKET_YML",
+    "SOCKET_VEX",
+    "SOCKET_VEX_OUTPUT",
+    "SOCKET_VEX_PRODUCT",
+    "SOCKET_VEX_NO_VERIFY",
+    "SOCKET_VEX_DOC_ID",
+    "SOCKET_VEX_COMPACT",
+    // Socket-specific service URLs read from the environment alone.
+    "SOCKET_NPM_REGISTRY",
+    "SOCKET_PYPI_JSON_API",
+    "SOCKET_RUBYGEMS_URL",
+    "SOCKET_PACKAGIST_URL",
+    "SOCKET_CRATES_INDEX",
+    "SOCKET_GOPROXY",
+    "SOCKET_GOSUMDB_URL",
+    "SOCKET_MAVEN_REGISTRY",
+    "SOCKET_NUGET_URL",
+    "SOCKET_UPDATE_BASE_URL",
+];
+
+/// Take every [`CHILD_ENV_SCRUB`] variable out of `command`'s environment,
+/// inherited or set on it.
+pub fn scrub_child_env(command: &mut Command) {
+    for name in CHILD_ENV_SCRUB {
+        command.env_remove(name);
+    }
+}
 
 /// Why [`output_within`] produced no [`Output`].
 #[derive(Debug)]
@@ -49,8 +154,13 @@ pub enum BoundedError {
 /// version manager prompting for an install, a Ruby waiting on a network
 /// gem home) therefore costs at most `budget`, never the whole run.
 ///
+/// The child never sees a [`CHILD_ENV_SCRUB`] variable, whatever the
+/// caller did to the command's environment after [`command_for`] made it
+/// (an `env_clear().envs(..)` copy of the ambient one puts them back).
+///
 /// Blocking: async callers run it through `utils::fs::run_blocking`.
 pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    scrub_child_env(&mut command);
     let deadline = Instant::now() + budget;
     let mut child = command
         .stdin(Stdio::null())
@@ -103,8 +213,24 @@ pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, B
 /// a grandchild still holding one past that is killed with the group and its
 /// stream is returned as read so far.
 ///
+/// A group of its own is also one the terminal's Ctrl-C never reaches, so
+/// while the build runs its group is on record for the host's interrupt
+/// handler ([`kill_builds_on_interrupt`]), which ends it before the process
+/// goes. From then on this function does not return: its caller would act
+/// on the result (put files back, start the next build) in a process that
+/// is releasing its lock and dying.
+///
 /// Blocking: async callers run it through `utils::fs::run_blocking`.
-pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+pub fn build_output_within(command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    park_if_interrupted();
+    let result = run_build(command, budget);
+    park_if_interrupted();
+    result
+}
+
+/// [`build_output_within`], between its interrupt checks.
+fn run_build(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    scrub_child_env(&mut command);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -117,6 +243,9 @@ pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Out
         .stderr(Stdio::piped())
         .spawn()
         .map_err(BoundedError::Spawn)?;
+    let pid = child.id();
+    #[cfg(unix)]
+    let _running = RunningBuild::enter(pid);
     let drain = |mut pipe: Box<dyn Read + Send>| {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -128,13 +257,24 @@ pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Out
     };
     let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
     let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
-    let pid = child.id();
+    // An interrupt takes the child over: it kills the group and reaps the
+    // child itself, so past that point this thread must not signal or
+    // wait on a pid that may no longer be the build's.
     let kill_all = |child: &mut std::process::Child| {
+        park_if_interrupted();
         kill_process_group(pid);
         let _ = child.kill();
         let _ = child.wait();
     };
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        // The interrupt may have read the table before this build was on
+        // it, and then it is not coming back for it: end the build here.
+        kill_process_group(pid);
+        let _ = child.kill();
+        park_if_interrupted();
+    }
     let status = loop {
+        park_if_interrupted();
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
@@ -176,6 +316,125 @@ fn kill_process_group(pid: u32) {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+/// How many builds [`kill_builds_on_interrupt`] can end at once. A gem
+/// rebuild runs one at a time; the rest is headroom for a host that runs
+/// several. A build that finds no free slot runs unrecorded.
+#[cfg(unix)]
+const RUNNING_BUILD_SLOTS: usize = 8;
+
+/// The process groups of the builds [`build_output_within`] is running: a
+/// group id per slot, 0 when free. An atomic table, because the reader is
+/// a signal handler.
+#[cfg(unix)]
+static RUNNING_BUILDS: [AtomicI32; RUNNING_BUILD_SLOTS] =
+    [const { AtomicI32::new(0) }; RUNNING_BUILD_SLOTS];
+
+/// Set by [`kill_builds_on_interrupt`]: an interrupt is ending the process.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// A build's entry in [`RUNNING_BUILDS`], freed on drop.
+#[cfg(unix)]
+struct RunningBuild(Option<&'static AtomicI32>);
+
+#[cfg(unix)]
+impl RunningBuild {
+    /// Record the process group the child `pid` leads.
+    fn enter(pid: u32) -> Self {
+        let slot = i32::try_from(pid)
+            .ok()
+            .filter(|pgid| *pgid > 0)
+            .and_then(|pgid| {
+                RUNNING_BUILDS.iter().find(|slot| {
+                    slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                })
+            });
+        RunningBuild(slot)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RunningBuild {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            slot.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Never return once an interrupt is ending the process
+/// ([`kill_builds_on_interrupt`]).
+fn park_if_interrupted() {
+    while INTERRUPTED.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// End every build [`build_output_within`] is running and let it start no
+/// other: for the host's interrupt handler (SIGINT, SIGTERM, SIGHUP), to
+/// call BEFORE it releases the apply lock and lets the signal end the
+/// process.
+///
+/// A build leads its own process group, so the signal that ends the CLI
+/// does not reach it. Left alone it would go on compiling into a gem the
+/// next run is free to lock and patch, with nothing bounding it any more.
+/// Each recorded group is sent SIGKILL and waited for until no process of
+/// it is left, for about two seconds at most (SIGKILL cannot be caught, so
+/// a group lasts only as long as the kernel takes to tear it down and its
+/// parents to reap it). The build's own child is reaped here.
+///
+/// Async-signal-safe: atomics, `kill`, `waitpid` and `poll` only. Off
+/// Unix there is no group to signal (a console Ctrl-C reaches the build
+/// itself); only the flag is set.
+pub fn kill_builds_on_interrupt() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
+    {
+        let mut killed = [0; RUNNING_BUILD_SLOTS];
+        for _ in 0..400 {
+            let mut running = false;
+            for (slot, sent_to) in RUNNING_BUILDS.iter().zip(&mut killed) {
+                let pgid = slot.load(Ordering::SeqCst);
+                if pgid > 0 && !end_build_group(pgid, sent_to) {
+                    running = true;
+                }
+            }
+            if !running {
+                return;
+            }
+            // SAFETY: `poll` over no descriptors only waits, here 5 ms.
+            unsafe {
+                libc::poll(std::ptr::null_mut(), 0, 5);
+            }
+        }
+    }
+}
+
+/// One pass of [`kill_builds_on_interrupt`] over the process group `pgid`:
+/// SIGKILL it (once: `killed` remembers the group), reap its leader when
+/// it has exited, and say whether no process of the group is left.
+/// Async-signal-safe.
+#[cfg(unix)]
+fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
+    // SAFETY: plain syscalls on a process group this process created and
+    // on its own child; no memory is shared with the callee but `status`.
+    unsafe {
+        if *killed != pgid {
+            libc::kill(-pgid, libc::SIGKILL);
+            *killed = pgid;
+        }
+        let mut status = 0;
+        libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        let gone = libc::kill(-pgid, 0) != 0;
+        if gone {
+            // Where a zombie no longer counts as a member of its group
+            // (macOS), the leader may have died since the wait above.
+            libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        }
+        gone
+    }
 }
 
 /// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
@@ -271,6 +530,10 @@ fn is_executable(path: &Path) -> bool {
 /// cwd / env; `tokio::process::Command::from` lifts it into the async
 /// runtime unchanged.
 ///
+/// Every child process is made here, and none inherits a
+/// [`CHILD_ENV_SCRUB`] variable: the Socket token in the CLI's own
+/// environment is not for the programs it runs.
+///
 /// A Windows `.bat` / `.cmd` shim (npm-global `bun.cmd`, pyenv-win
 /// `pipenv.bat`) is spawned through this same path: since Rust 1.77.2 (the
 /// BatBadBut fix) `std` detects the batch extension on the resolved program
@@ -284,7 +547,9 @@ fn is_executable(path: &Path) -> bool {
 /// recognized". Nothing to add on top of `std`; a wrapper can only be
 /// less correct.
 pub fn command_for(program: &Path) -> Command {
-    Command::new(program)
+    let mut command = Command::new(program);
+    scrub_child_env(&mut command);
+    command
 }
 
 /// Run an external binary with the given args and return its
@@ -299,7 +564,18 @@ pub trait CommandRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String>;
 }
 
-/// Default runner: spawns the real binary via `std::process::Command`.
+/// The real runner: spawns the binary, from a directory chosen by what the
+/// probe asks about. Never from wherever the CLI happens to have been
+/// started: a version manager's shim (rbenv, pyenv, asdf, mise) picks the
+/// interpreter from the `.ruby-version` / `.python-version` /
+/// `.tool-versions` of the directory it runs in.
+///
+/// * [`ProbeRunner::project`]: a question about one project (`gem env`
+///   for its Gemfile, the Python whose site-packages hold its packages)
+///   runs from that project's directory (`--cwd`).
+/// * [`ProbeRunner::global`]: a question about the machine-wide install
+///   (`npm root -g`, `gem env` and the system Python under `--global`)
+///   runs from [`neutral_probe_dir`], so no project's files steer it.
 ///
 /// The program is looked up with [`resolve_tool`] and the RESOLVED path is
 /// spawned, never the bare name: on Windows `std` appends only `.exe`, so a
@@ -308,23 +584,45 @@ pub trait CommandRunner {
 /// silently answered "not installed". The lookup also skips relative `PATH`
 /// entries, so a tool planted in the scanned project is never run.
 ///
-/// The child inherits the caller's working directory: some probes must ask
-/// from the project (`gem env` follows rbenv's `.ruby-version` there). A
-/// probe about the machine-wide install uses [`GlobalProbeRunner`].
-///
-/// `output()` nulls stdin so the child can't block waiting for
-/// input. stdout is captured; stderr is captured and dropped (we
-/// don't surface CLI diagnostics — the helpers fall back to other
-/// discovery paths on any failure).
-pub(crate) struct SystemCommandRunner;
+/// stdin is null so the child can't block waiting for input. stdout is
+/// captured; stderr is dropped (we don't surface CLI diagnostics — the
+/// helpers fall back to other discovery paths on any failure).
+#[derive(Debug, Clone)]
+pub(crate) struct ProbeRunner {
+    /// Where the child runs. `None`: no neutral directory could be
+    /// determined, and the probe is not run at all.
+    dir: Option<PathBuf>,
+}
 
-impl CommandRunner for SystemCommandRunner {
-    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        run_resolved(bin, args, None)
+impl ProbeRunner {
+    /// A probe about the project at `cwd`. Made absolute now, so the memo
+    /// key built from [`Self::dir`] names one directory whatever the
+    /// process's own working directory is later.
+    pub(crate) fn project(cwd: &Path) -> Self {
+        let dir = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        Self { dir: Some(dir) }
+    }
+
+    /// A probe about the machine-wide install.
+    pub(crate) fn global() -> Self {
+        Self {
+            dir: neutral_probe_dir(),
+        }
+    }
+
+    /// The directory the child runs in.
+    pub(crate) fn dir(&self) -> Option<&Path> {
+        self.dir.as_deref()
     }
 }
 
-/// [`SystemCommandRunner`] for a question about a package manager's GLOBAL
+impl CommandRunner for ProbeRunner {
+    fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
+        run_resolved(bin, args, self.dir.as_deref()?)
+    }
+}
+
+/// [`ProbeRunner::global`] for a question about a package manager's GLOBAL
 /// install (`npm root -g`, `yarn global dir`, ...): the child runs from
 /// [`neutral_probe_dir`], never from the scanned project. From inside a
 /// project the tool reads that project's configuration — Yarn Berry has no
@@ -336,7 +634,7 @@ pub(crate) struct GlobalProbeRunner;
 
 impl CommandRunner for GlobalProbeRunner {
     fn run(&self, bin: &str, args: &[&str]) -> Option<String> {
-        run_resolved(bin, args, Some(&neutral_probe_dir()?))
+        ProbeRunner::global().run(bin, args)
     }
 }
 
@@ -365,19 +663,14 @@ pub(crate) fn neutral_probe_dir_with(var: &impl Fn(&str) -> Option<OsString>) ->
 }
 
 /// Spawn `bin` (looked up with [`resolve_tool`]; a value that already
-/// names a path is spawned as given) with `args`, optionally from `cwd`,
-/// and return its trimmed stdout under the [`CommandRunner`] contract.
-fn run_resolved(bin: &str, args: &[&str], cwd: Option<&Path>) -> Option<String> {
+/// names a path is spawned as given) with `args` from `cwd`, and return
+/// its trimmed stdout under the [`CommandRunner`] contract.
+fn run_resolved(bin: &str, args: &[&str], cwd: &Path) -> Option<String> {
     run_resolved_within(bin, args, cwd, PROBE_TIMEOUT)
 }
 
 /// [`run_resolved`] under an explicit budget (tests).
-fn run_resolved_within(
-    bin: &str,
-    args: &[&str],
-    cwd: Option<&Path>,
-    budget: Duration,
-) -> Option<String> {
+fn run_resolved_within(bin: &str, args: &[&str], cwd: &Path, budget: Duration) -> Option<String> {
     let program = if Path::new(bin).components().count() > 1 {
         PathBuf::from(bin)
     } else {
@@ -395,10 +688,7 @@ fn run_resolved_within(
         }
     };
     let mut command = command_for(&program);
-    command.args(args);
-    if let Some(cwd) = cwd {
-        command.current_dir(cwd);
-    }
+    command.args(args).current_dir(cwd);
     let output = match output_within(command, budget) {
         Ok(output) => output,
         Err(BoundedError::TimedOut) => {
@@ -425,23 +715,24 @@ fn run_resolved_within(
 }
 
 /// What a probe subprocess inherits: the (sorted) environment and the
-/// working directory. Sorted so a `remove_var`/`set_var` round-trip that
+/// directory it runs in. Sorted so a `remove_var`/`set_var` round-trip that
 /// restores an identical environment still matches (`vars_os` yields
 /// `environ`'s order, which such a round-trip permutes).
 pub(crate) type EnvKey = (Vec<(OsString, OsString)>, Option<PathBuf>);
 
-/// The [`EnvKey`] of the process right now.
-pub(crate) fn env_key() -> EnvKey {
+/// The [`EnvKey`] of a probe run from `dir` right now.
+pub(crate) fn env_key_in(dir: Option<&Path>) -> EnvKey {
     let mut vars: Vec<_> = std::env::vars_os().collect();
     vars.sort();
-    (vars, std::env::current_dir().ok())
+    (vars, dir.map(Path::to_path_buf))
 }
 
 /// A process-wide memo of one subprocess answer, reused only while the
-/// whole environment (every variable, and the working directory) is exactly
-/// what it was when the answer was produced: the subprocess's only inputs
-/// the CLI controls. A different environment re-runs it and replaces the
-/// entry; concurrent first callers may each run it.
+/// whole environment (every variable, and the directory the subprocess
+/// runs in) is exactly what it was when the answer was produced: the
+/// subprocess's only inputs the CLI controls. A different environment
+/// re-runs it and replaces the entry; concurrent first callers may each
+/// run it.
 ///
 /// Only an answer is kept. A failed probe (spawn error under fd pressure,
 /// a non-zero exit, empty stdout) is asked again by the next caller, so a
@@ -459,12 +750,17 @@ impl<V: Clone> EnvKeyedMemo<V> {
         }
     }
 
-    pub(crate) fn get_or_run(&self, run: impl FnOnce() -> Option<V>) -> Option<V> {
-        self.get_or_run_keyed(env_key(), |ran_under| {
+    /// The answer of `run`, a subprocess run from `dir`.
+    pub(crate) fn get_or_run(
+        &self,
+        dir: Option<&Path>,
+        run: impl FnOnce() -> Option<V>,
+    ) -> Option<V> {
+        self.get_or_run_keyed(env_key_in(dir), |ran_under| {
             let answer = run();
             // Keepable only if the environment is, once the subprocess
             // returns, still the one we keyed on.
-            (answer, env_key() == *ran_under)
+            (answer, env_key_in(dir) == *ran_under)
         })
     }
 
@@ -588,7 +884,7 @@ pub(crate) mod tests {
         std::env::remove_var(VAR);
         let memo = EnvKeyedMemo::new();
         let runs = std::cell::Cell::new(0);
-        let answer = memo.get_or_run(|| {
+        let answer = memo.get_or_run(None, || {
             runs.set(runs.get() + 1);
             std::env::set_var(VAR, "moved");
             Some("moved".to_string())
@@ -599,7 +895,7 @@ pub(crate) mod tests {
             runs.set(runs.get() + 1);
             Some("fresh".to_string())
         };
-        assert_eq!(memo.get_or_run(fresh).as_deref(), Some("fresh"));
+        assert_eq!(memo.get_or_run(None, fresh).as_deref(), Some("fresh"));
         assert_eq!(runs.get(), 2);
     }
 
@@ -607,8 +903,69 @@ pub(crate) mod tests {
     /// same variables still hits, whatever order `vars_os` yields.
     #[test]
     fn env_key_is_sorted() {
-        let (vars, _) = env_key();
+        let (vars, _) = env_key_in(None);
         assert!(vars.windows(2).all(|w| w[0] <= w[1]), "sorted env snapshot");
+    }
+
+    /// An answer asked from one directory is not reused for another: a
+    /// version manager's shim answers per directory.
+    #[test]
+    #[serial_test::serial]
+    fn env_keyed_memo_asks_again_from_another_directory() {
+        let memo = EnvKeyedMemo::new();
+        let runs = std::cell::Cell::new(0);
+        let ask = |dir: &str| {
+            memo.get_or_run(Some(Path::new(dir)), || {
+                runs.set(runs.get() + 1);
+                Some(dir.to_string())
+            })
+        };
+        assert_eq!(ask("/proj-a").as_deref(), Some("/proj-a"));
+        assert_eq!(ask("/proj-a").as_deref(), Some("/proj-a"));
+        assert_eq!(ask("/proj-b").as_deref(), Some("/proj-b"));
+        assert_eq!(runs.get(), 2);
+    }
+
+    /// A project probe runs from the project directory, whatever the
+    /// process's own working directory is, and a relative `--cwd` names
+    /// that same directory in the memo key.
+    #[cfg(unix)]
+    #[test]
+    fn a_project_probe_runs_from_the_project_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        assert_ne!(std::env::current_dir().unwrap(), project);
+        let runner = ProbeRunner::project(&project);
+        assert_eq!(runner.dir(), Some(project.as_path()));
+        let ran_from = runner.run("sh", &["-c", "pwd -P"]).expect("sh runs");
+        assert_eq!(Path::new(&ran_from), project);
+
+        let relative = ProbeRunner::project(Path::new("."));
+        assert!(
+            relative.dir().is_some_and(Path::is_absolute),
+            "{relative:?}"
+        );
+    }
+
+    /// A global probe runs from the neutral directory, never from the
+    /// process's working directory. `#[serial]`: it reads `HOME`, which
+    /// other env tests in this binary swap.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_global_probe_runs_from_the_neutral_dir() {
+        let runner = ProbeRunner::global();
+        let neutral = neutral_probe_dir().expect("a home dir or the drive root");
+        assert_eq!(runner.dir(), Some(neutral.as_path()));
+        let ran_from = runner.run("sh", &["-c", "pwd -P"]).expect("sh runs");
+        assert_eq!(
+            Path::new(&ran_from),
+            std::fs::canonicalize(&neutral).unwrap()
+        );
+        assert_eq!(
+            GlobalProbeRunner.run("sh", &["-c", "pwd -P"]).as_deref(),
+            Some(ran_from.as_str())
+        );
     }
 
     /// Confirm the real runner returns Some for a tiny command we
@@ -617,7 +974,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_stdout_for_real_binary() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("echo", &["hello"]).expect("echo should succeed");
         assert_eq!(out, "hello");
     }
@@ -636,7 +993,7 @@ pub(crate) mod tests {
         let out = run_resolved_within(
             shim.to_str().unwrap(),
             &["env", "gemdir"],
-            None,
+            tmp.path(),
             Duration::from_millis(300),
         );
         assert_eq!(out, None);
@@ -751,11 +1108,126 @@ pub(crate) mod tests {
         assert!(gone, "the grandchild {pid} outlived the deadline");
     }
 
+    /// Wait until `file` holds a pid, and read it.
+    #[cfg(unix)]
+    fn pid_written_to(file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pid = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            if let Some(pid) = pid {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} was never written",
+                file.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// While a build runs, its process group is on record for the
+    /// interrupt handler, and off it again once the build is over.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_build_is_on_record_for_the_interrupt_handler() {
+        let on_record = |pgid: i32| {
+            RUNNING_BUILDS
+                .iter()
+                .any(|slot| slot.load(Ordering::SeqCst) == pgid)
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("build.pid");
+        let done_file = tmp.path().join("done");
+        // The build runs until told to finish, so the checks below never
+        // race its end.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.05; done",
+            pid_file.display(),
+            done_file.display()
+        ));
+        let build =
+            std::thread::spawn(move || build_output_within(command, Duration::from_secs(120)));
+        let pgid = pid_written_to(&pid_file);
+        // The child can write its pid before the spawning thread has put
+        // the group on record.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !on_record(pgid) {
+            assert!(
+                Instant::now() < deadline,
+                "the running build {pgid} is not on record"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&done_file, b"").unwrap();
+        assert!(build.join().unwrap().unwrap().status.success());
+        assert!(
+            !on_record(pgid),
+            "the finished build {pgid} is still on record"
+        );
+    }
+
+    /// What the interrupt handler does to a build on record: the whole
+    /// process group is killed, the build's own child reaped, and the pass
+    /// reports the group gone only once no process of it is left, so the
+    /// lock is not released over a compiler that is still running. (The
+    /// handler itself is not run here: it marks the process as ending.)
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_pass_ends_the_whole_build_group() {
+        use std::os::unix::process::CommandExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("compiler.pid");
+        let mut build = Command::new("sh");
+        build
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pid_file.display()
+            ))
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = build.spawn().unwrap();
+        let pgid = i32::try_from(child.id()).unwrap();
+        let compiler = pid_written_to(&pid_file);
+
+        let mut killed = 0;
+        let start = Instant::now();
+        while !end_build_group(pgid, &mut killed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the build group {pgid} outlived SIGKILL"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(killed, pgid);
+        // Dead already; as a zombie it still answers signal 0 until init
+        // reaps it (macOS does not count zombies in the group).
+        let gone = (0..100).any(|_| {
+            // SAFETY: signal 0 only checks the pid; nothing is delivered.
+            let alive = unsafe { libc::kill(compiler, 0) } == 0;
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the build's compiler {compiler} is still there");
+        assert!(
+            child.try_wait().is_err(),
+            "the pass reaped the build's child itself"
+        );
+    }
+
     /// Spawn failure → None. The binary name is intentionally one
     /// that should never be on PATH.
     #[test]
     fn system_runner_returns_none_on_spawn_failure() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("definitely-not-a-real-binary-1234567", &[]);
         assert_eq!(out, None);
     }
@@ -764,7 +1236,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_none_on_non_zero_exit() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("false", &[]);
         assert_eq!(out, None);
     }
@@ -775,7 +1247,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_none_on_empty_stdout_despite_success() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("true", &[]);
         assert_eq!(out, None);
     }
@@ -786,7 +1258,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_treats_whitespace_only_stdout_as_empty() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '  \\t\\n  '"]);
         assert_eq!(out, None);
     }
@@ -797,7 +1269,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_trims_surrounding_whitespace() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '  /some/path  \\n'"]);
         assert_eq!(out.as_deref(), Some("/some/path"));
     }
@@ -808,7 +1280,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_ignores_stderr_when_stdout_empty() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf 'diagnostic' >&2"]);
         assert_eq!(out, None);
     }
@@ -818,7 +1290,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_returns_only_stdout_when_both_streams_used() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf 'good\\n'; printf 'bad\\n' >&2"]);
         assert_eq!(out.as_deref(), Some("good"));
     }
@@ -829,7 +1301,7 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn system_runner_forwards_all_args_in_order() {
-        let runner = SystemCommandRunner;
+        let runner = ProbeRunner::project(Path::new("."));
         let out = runner.run("sh", &["-c", "printf '%s' \"$1\"", "sh", "forwarded"]);
         assert_eq!(out.as_deref(), Some("forwarded"));
     }
@@ -854,6 +1326,126 @@ pub(crate) mod tests {
         let none = |_: &str| None::<OsString>;
         let root = neutral_probe_dir_with(&none).expect("the drive root");
         assert!(root.is_absolute() && root.parent().is_none(), "{root:?}");
+    }
+
+    // ───────────────────────── child environment ─────────────────────────
+
+    /// A Socket token under the names CI exports it, and the package
+    /// managers' own settings beside it.
+    #[cfg(unix)]
+    const SECRET: &str = "sktsec_child_env_marker";
+    #[cfg(unix)]
+    const SOCKET_SECRETS: &[&str] = &[
+        "SOCKET_API_TOKEN",
+        "SOCKET_CLI_API_TOKEN",
+        "SOCKET_SECURITY_API_TOKEN",
+    ];
+    #[cfg(unix)]
+    const TOOL_SETTINGS: &[(&str, &str)] = &[
+        ("NPM_TOKEN", "registry-auth"),
+        ("HTTPS_PROXY", "http://proxy.example:3128"),
+        ("NO_PROXY", "localhost"),
+    ];
+
+    /// `env`, with the token and the tool settings set on the command the
+    /// way a caller that rebuilds the child's environment from the ambient
+    /// one hands them over (the PDM site probe: `env_clear().envs(..)`).
+    #[cfg(unix)]
+    fn env_with_a_socket_token() -> Command {
+        let env_bin = resolve_tool("env").expect("`env` is on PATH");
+        let mut command = command_for(&env_bin);
+        command.env_clear();
+        for name in SOCKET_SECRETS {
+            command.env(name, SECRET);
+        }
+        command.envs(TOOL_SETTINGS.iter().copied());
+        command
+    }
+
+    #[cfg(unix)]
+    fn assert_no_socket_token(what: &str, output: &Output) {
+        let seen = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            !seen.contains(SECRET) && !SOCKET_SECRETS.iter().any(|name| seen.contains(name)),
+            "{what}: the child saw a Socket credential:\n{seen}"
+        );
+        for (name, value) in TOOL_SETTINGS {
+            assert!(
+                seen.lines().any(|line| line == format!("{name}={value}")),
+                "{what}: the child lost {name}, which its package manager needs:\n{seen}"
+            );
+        }
+    }
+
+    /// No spawned child sees the Socket token, whichever spawn runs it and
+    /// however its environment was put together; a package manager's own
+    /// proxy and registry settings still reach it.
+    #[cfg(unix)]
+    #[test]
+    fn spawned_children_do_not_see_socket_credentials() {
+        let probe = output_within(env_with_a_socket_token(), PROBE_TIMEOUT).unwrap();
+        assert_no_socket_token("output_within", &probe);
+        let build = build_output_within(env_with_a_socket_token(), PROBE_TIMEOUT).unwrap();
+        assert_no_socket_token("build_output_within", &build);
+    }
+
+    /// A command no bounded spawn runs (the `git` pipe) drops the ambient
+    /// token too: `command_for` removes it when the command is made.
+    #[test]
+    fn command_for_drops_the_inherited_socket_credentials() {
+        let command = command_for(Path::new("/x/git"));
+        let removed: Vec<_> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name.to_string_lossy().into_owned())
+            .collect();
+        for name in [
+            "SOCKET_API_TOKEN",
+            "SOCKET_CLI_API_TOKEN",
+            "SOCKET_SECURITY_API_TOKEN",
+        ] {
+            assert!(
+                removed.iter().any(|r| r == name),
+                "{name} is inherited: {removed:?}"
+            );
+        }
+        assert_eq!(removed.len(), CHILD_ENV_SCRUB.len(), "the whole list goes");
+        assert!(
+            command.get_envs().all(|(_, value)| value.is_none()),
+            "nothing is set"
+        );
+    }
+
+    /// The scrub list names every accepted socket-cli alias and its
+    /// canonical name, each once, and nothing but `SOCKET_*` names: a proxy
+    /// or registry credential of the package manager's is never on it.
+    #[test]
+    fn the_scrub_list_covers_the_peer_aliases_and_only_socket_names() {
+        for (canonical, alias) in crate::utils::env_compat::PEER_ENV_ALIASES {
+            for name in [canonical, alias] {
+                assert!(
+                    CHILD_ENV_SCRUB.contains(name),
+                    "{name} is read as Socket configuration but reaches child processes"
+                );
+            }
+        }
+        let mut sorted = CHILD_ENV_SCRUB.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            CHILD_ENV_SCRUB.len(),
+            "a name is listed twice"
+        );
+        for name in CHILD_ENV_SCRUB {
+            assert!(
+                name.starts_with("SOCKET_")
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+                "{name} is not a Socket variable"
+            );
+        }
     }
 
     // ───────────────────────── resolve_tool / command_for ─────────────────────────

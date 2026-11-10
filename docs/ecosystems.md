@@ -1749,6 +1749,11 @@ tail of the build output. When it can't rebuild at all (a precompiled platform g
 checkout, or no matching Ruby), nothing is written and the package fails with
 `native_extensions_unsupported`. Use hosted mode for those.
 
+The rebuild runs the gem's own build scripts (`extconf.rb`, `make`), as `gem install` did, and
+only after the patch's files verified against the installed gem. Nothing of the gem is run
+before that: `apply --dry-run` starts no Ruby and reports that a rebuild is pending. Ruby and the
+build run without the Socket token in their environment.
+
 A tool that compiles the extension itself after `apply` (as the patches evaluation harness does)
 passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sources are written
 without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
@@ -1757,6 +1762,11 @@ without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does
 `rollback` restores it without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
 installed extension: after `gem pristine` or a reinstall, run `apply` again.
+
+Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. The
+gem is then left with its patched sources and no finished extension until Socket Patch runs
+again: `apply` puts the previous build back and completes the rebuild, and `rollback` restores the
+original sources and build.
 
 ## Supported platforms
 
