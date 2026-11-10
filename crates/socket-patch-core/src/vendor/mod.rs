@@ -157,6 +157,12 @@ use crate::utils::fs::read_regular_to_string_sync;
 pub struct VendorWarning {
     pub code: &'static str,
     pub detail: String,
+    /// A `vendor_lock_entry_drifted` warning for a fragment that is still
+    /// in the lock and resolves somewhere else now
+    /// ([`revert::re_resolved`], the only place that sets it). Carried as
+    /// a flag because `detail` quotes ledger and lockfile text, which must
+    /// never decide what a revert deletes.
+    pub(crate) re_resolved: bool,
 }
 
 impl VendorWarning {
@@ -171,7 +177,11 @@ impl VendorWarning {
             std::borrow::Cow::Borrowed(_) => detail,
             std::borrow::Cow::Owned(redacted) => redacted,
         };
-        Self { code, detail }
+        Self {
+            code,
+            detail,
+            re_resolved: false,
+        }
     }
 }
 
@@ -807,6 +817,17 @@ impl RevertOutcome {
             error: Some(error.into()),
             kept_artifact: false,
         }
+    }
+
+    /// True when the revert removed the artifact although it left records
+    /// alone: each of them had been re-resolved since vendoring and no
+    /// file references the artifact any more
+    /// (`vendor_revert_dependency_moved_on`). Such a revert finished; its
+    /// drift warnings only say which entries had moved.
+    pub fn dependency_moved_on(&self) -> bool {
+        self.warnings
+            .iter()
+            .any(|w| w.code == revert::DEPENDENCY_MOVED_ON_CODE)
     }
 
     /// True when any wiring record was left alone during the restore —

@@ -8132,19 +8132,27 @@ fn plan_gem_redirect(
             }
             // A trailing argument whose value is unknown may be the call's
             // options hash (`gem "rack", OPTS`): with an option after it,
-            // bundler would read it as a version requirement instead. It
-            // is one only when the lock shows a requirement for every
-            // positional argument.
+            // bundler would read it as a version requirement instead, and
+            // the Gemfile would no longer load. It is a requirement only
+            // when the lock shows one for every positional argument. That
+            // count holds only while each other argument is ONE requirement
+            // (a plain string, not an array of them) and no gemspec can
+            // have added a requirement of its own to the lock's entry.
             if let Some(opaque) = decl.opaque_last(&gf) {
                 let positionals = decl.positionals().count();
                 let literals = decl
                     .positionals()
-                    .filter(|arg| arg.kind == ArgKind::Version)
+                    .filter(|arg| {
+                        arg.kind == ArgKind::Version
+                            && matches!(gf.as_bytes()[arg.start], b'"' | b'\'')
+                    })
                     .count();
                 let requirements = entry_text
                     .split_once(" (")
                     .map_or(0, |(_, list)| list.split(", ").count());
-                if literals + 1 != positionals || requirements != positionals {
+                let gemspec = crate::formats::gem::gemspec::gemspec_directives(&gf)
+                    .map_or(true, |directives| !directives.is_empty());
+                if literals + 1 != positionals || requirements != positionals || gemspec {
                     return Err(refuse(
                         "redirect_gem_unrecognized_declaration",
                         gem_uneditable_detail(
@@ -18916,6 +18924,38 @@ mod tests {
             "{out}: {:?}",
             r.warnings
         );
+        // The lock's count proves that only while every other argument is
+        // one requirement and no gemspec adds its own: an array literal is
+        // several requirements in one argument, so `OPTS` after it may be
+        // the options hash although the counts agree, and a gemspec's
+        // dependency on the gem can supply the requirement the lock shows.
+        // Appending the option to either would leave a Gemfile bundler
+        // cannot load.
+        for (gemfile, entry) in [
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rack\", [\">= 2.0\", \"< 3\"], OPTS\n",
+                "rack (>= 2.0, < 3)",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngem \"rack\", %w[>=2.0 <3], OPTS\n",
+                "rack (>= 2.0, < 3)",
+            ),
+            (
+                "source \"https://rubygems.org\"\n\ngemspec\n\ngem \"rack\", OPTS\n",
+                "rack (~> 2.2)",
+            ),
+        ] {
+            let lock = gem_lock_resolving(&[("rack", "2.2.3", &[])], &[entry]);
+            let (out, locked, r) = gem_redirect(gemfile, &lock, gem_override("rack", "2.2.3"));
+            assert!(r.files.is_empty() && r.edits.is_empty(), "{gemfile}");
+            assert_eq!((out.as_str(), locked), (gemfile, lock), "{gemfile}");
+            assert_eq!(
+                warning_codes(&r),
+                vec!["redirect_gem_unrecognized_declaration"],
+                "{gemfile}: {:?}",
+                r.warnings
+            );
+        }
     }
 
     /// A minimal Gemfile.lock with the given CHECKSUMS lines (rails 7.0.0).

@@ -33,10 +33,12 @@ const RE_RESOLVED: &str = "was re-resolved since vendoring";
 /// restore later, which [`KeepPolicy::NpmFamily`] reads back.
 pub(crate) fn re_resolved(what: std::fmt::Arguments<'_>, now: Option<&str>) -> VendorWarning {
     let now = now.map(|now| format!(" ({now})")).unwrap_or_default();
-    VendorWarning::new(
+    let mut warning = VendorWarning::new(
         "vendor_lock_entry_drifted",
         format!("{what} {RE_RESOLVED}{now}; left alone"),
-    )
+    );
+    warning.re_resolved = true;
+    warning
 }
 
 /// Whether every record `outcome` left alone was re-resolved elsewhere
@@ -49,7 +51,7 @@ fn only_re_resolved(outcome: &RevertOutcome) -> bool {
         .warnings
         .iter()
         .filter(|w| w.code == "vendor_lock_entry_drifted")
-        .all(|w| w.detail.contains(RE_RESOLVED))
+        .all(|w| w.re_resolved)
 }
 
 /// When a revert keeps the artifact instead of deleting it. `CLI_CONTRACT.md`

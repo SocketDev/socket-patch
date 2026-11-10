@@ -278,12 +278,15 @@ impl Takeover {
                          `scan --mode hosted`, and only then re-export the file from the rewired lock"
                     ),
                 }))
-            } else if outcome.kept_artifact || outcome.drift_skipped() {
+            } else if outcome.kept_artifact
+                || (outcome.drift_skipped() && !outcome.dependency_moved_on())
+            {
                 // A wiring record drifted or the revert kept the artifact,
                 // so the project may still resolve through it and the
                 // ledger entry holds the only recorded originals (the
                 // RevertOutcome contract): keep both and refuse, exactly as
-                // `vendor --revert` reports it skipped.
+                // `vendor --revert` reports it skipped. A revert that
+                // finished because the dependency had moved on is neither.
                 Some(serde_json::json!({
                     "code": REVERT_FAILED,
                     "detail": format!(
