@@ -1762,6 +1762,11 @@ without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
 installed extension: after `gem pristine` or a reinstall, run `apply` again.
 
+Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. The
+gem is then left with its patched sources and no finished extension until Socket Patch runs
+again: `apply` puts the previous build back and completes the rebuild, and `rollback` restores the
+original sources and build.
+
 ## Supported platforms
 
 Prebuilt binaries are published for:

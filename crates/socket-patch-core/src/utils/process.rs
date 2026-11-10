@@ -20,6 +20,9 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::AtomicI32;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long a crawler probe (`gem env gemdir`, `npm root -g`, `python3
@@ -210,8 +213,23 @@ pub fn output_within(mut command: Command, budget: Duration) -> Result<Output, B
 /// a grandchild still holding one past that is killed with the group and its
 /// stream is returned as read so far.
 ///
+/// A group of its own is also one the terminal's Ctrl-C never reaches, so
+/// while the build runs its group is on record for the host's interrupt
+/// handler ([`kill_builds_on_interrupt`]), which ends it before the process
+/// goes. From then on this function does not return: its caller would act
+/// on the result (put files back, start the next build) in a process that
+/// is releasing its lock and dying.
+///
 /// Blocking: async callers run it through `utils::fs::run_blocking`.
-pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
+pub fn build_output_within(command: Command, budget: Duration) -> Result<Output, BoundedError> {
+    park_if_interrupted();
+    let result = run_build(command, budget);
+    park_if_interrupted();
+    result
+}
+
+/// [`build_output_within`], between its interrupt checks.
+fn run_build(mut command: Command, budget: Duration) -> Result<Output, BoundedError> {
     scrub_child_env(&mut command);
     #[cfg(unix)]
     {
@@ -225,6 +243,9 @@ pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Out
         .stderr(Stdio::piped())
         .spawn()
         .map_err(BoundedError::Spawn)?;
+    let pid = child.id();
+    #[cfg(unix)]
+    let _running = RunningBuild::enter(pid);
     let drain = |mut pipe: Box<dyn Read + Send>| {
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -236,13 +257,24 @@ pub fn build_output_within(mut command: Command, budget: Duration) -> Result<Out
     };
     let stdout = drain(Box::new(child.stdout.take().expect("stdout is piped")));
     let stderr = drain(Box::new(child.stderr.take().expect("stderr is piped")));
-    let pid = child.id();
+    // An interrupt takes the child over: it kills the group and reaps the
+    // child itself, so past that point this thread must not signal or
+    // wait on a pid that may no longer be the build's.
     let kill_all = |child: &mut std::process::Child| {
+        park_if_interrupted();
         kill_process_group(pid);
         let _ = child.kill();
         let _ = child.wait();
     };
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        // The interrupt may have read the table before this build was on
+        // it, and then it is not coming back for it: end the build here.
+        kill_process_group(pid);
+        let _ = child.kill();
+        park_if_interrupted();
+    }
     let status = loop {
+        park_if_interrupted();
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
@@ -284,6 +316,125 @@ fn kill_process_group(pid: u32) {
     }
     #[cfg(not(unix))]
     let _ = pid;
+}
+
+/// How many builds [`kill_builds_on_interrupt`] can end at once. A gem
+/// rebuild runs one at a time; the rest is headroom for a host that runs
+/// several. A build that finds no free slot runs unrecorded.
+#[cfg(unix)]
+const RUNNING_BUILD_SLOTS: usize = 8;
+
+/// The process groups of the builds [`build_output_within`] is running: a
+/// group id per slot, 0 when free. An atomic table, because the reader is
+/// a signal handler.
+#[cfg(unix)]
+static RUNNING_BUILDS: [AtomicI32; RUNNING_BUILD_SLOTS] =
+    [const { AtomicI32::new(0) }; RUNNING_BUILD_SLOTS];
+
+/// Set by [`kill_builds_on_interrupt`]: an interrupt is ending the process.
+static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+/// A build's entry in [`RUNNING_BUILDS`], freed on drop.
+#[cfg(unix)]
+struct RunningBuild(Option<&'static AtomicI32>);
+
+#[cfg(unix)]
+impl RunningBuild {
+    /// Record the process group the child `pid` leads.
+    fn enter(pid: u32) -> Self {
+        let slot = i32::try_from(pid)
+            .ok()
+            .filter(|pgid| *pgid > 0)
+            .and_then(|pgid| {
+                RUNNING_BUILDS.iter().find(|slot| {
+                    slot.compare_exchange(0, pgid, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                })
+            });
+        RunningBuild(slot)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RunningBuild {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0 {
+            slot.store(0, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Never return once an interrupt is ending the process
+/// ([`kill_builds_on_interrupt`]).
+fn park_if_interrupted() {
+    while INTERRUPTED.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
+}
+
+/// End every build [`build_output_within`] is running and let it start no
+/// other: for the host's interrupt handler (SIGINT, SIGTERM, SIGHUP), to
+/// call BEFORE it releases the apply lock and lets the signal end the
+/// process.
+///
+/// A build leads its own process group, so the signal that ends the CLI
+/// does not reach it. Left alone it would go on compiling into a gem the
+/// next run is free to lock and patch, with nothing bounding it any more.
+/// Each recorded group is sent SIGKILL and waited for until no process of
+/// it is left, for about two seconds at most (SIGKILL cannot be caught, so
+/// a group lasts only as long as the kernel takes to tear it down and its
+/// parents to reap it). The build's own child is reaped here.
+///
+/// Async-signal-safe: atomics, `kill`, `waitpid` and `poll` only. Off
+/// Unix there is no group to signal (a console Ctrl-C reaches the build
+/// itself); only the flag is set.
+pub fn kill_builds_on_interrupt() {
+    INTERRUPTED.store(true, Ordering::SeqCst);
+    #[cfg(unix)]
+    {
+        let mut killed = [0; RUNNING_BUILD_SLOTS];
+        for _ in 0..400 {
+            let mut running = false;
+            for (slot, sent_to) in RUNNING_BUILDS.iter().zip(&mut killed) {
+                let pgid = slot.load(Ordering::SeqCst);
+                if pgid > 0 && !end_build_group(pgid, sent_to) {
+                    running = true;
+                }
+            }
+            if !running {
+                return;
+            }
+            // SAFETY: `poll` over no descriptors only waits, here 5 ms.
+            unsafe {
+                libc::poll(std::ptr::null_mut(), 0, 5);
+            }
+        }
+    }
+}
+
+/// One pass of [`kill_builds_on_interrupt`] over the process group `pgid`:
+/// SIGKILL it (once: `killed` remembers the group), reap its leader when
+/// it has exited, and say whether no process of the group is left.
+/// Async-signal-safe.
+#[cfg(unix)]
+fn end_build_group(pgid: i32, killed: &mut i32) -> bool {
+    // SAFETY: plain syscalls on a process group this process created and
+    // on its own child; no memory is shared with the callee but `status`.
+    unsafe {
+        if *killed != pgid {
+            libc::kill(-pgid, libc::SIGKILL);
+            *killed = pgid;
+        }
+        let mut status = 0;
+        libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        let gone = libc::kill(-pgid, 0) != 0;
+        if gone {
+            // Where a zombie no longer counts as a member of its group
+            // (macOS), the leader may have died since the wait above.
+            libc::waitpid(pgid, &mut status, libc::WNOHANG);
+        }
+        gone
+    }
 }
 
 /// The executable `name` on ABSOLUTE `PATH` entries only, or `None` when
@@ -955,6 +1106,121 @@ pub(crate) mod tests {
             !alive
         });
         assert!(gone, "the grandchild {pid} outlived the deadline");
+    }
+
+    /// Wait until `file` holds a pid, and read it.
+    #[cfg(unix)]
+    fn pid_written_to(file: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let pid = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+            if let Some(pid) = pid {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} was never written",
+                file.display()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// While a build runs, its process group is on record for the
+    /// interrupt handler, and off it again once the build is over.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_build_is_on_record_for_the_interrupt_handler() {
+        let on_record = |pgid: i32| {
+            RUNNING_BUILDS
+                .iter()
+                .any(|slot| slot.load(Ordering::SeqCst) == pgid)
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("build.pid");
+        let done_file = tmp.path().join("done");
+        // The build runs until told to finish, so the checks below never
+        // race its end.
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(format!(
+            "echo $$ > '{}'; until [ -e '{}' ]; do sleep 0.05; done",
+            pid_file.display(),
+            done_file.display()
+        ));
+        let build =
+            std::thread::spawn(move || build_output_within(command, Duration::from_secs(120)));
+        let pgid = pid_written_to(&pid_file);
+        // The child can write its pid before the spawning thread has put
+        // the group on record.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !on_record(pgid) {
+            assert!(
+                Instant::now() < deadline,
+                "the running build {pgid} is not on record"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::fs::write(&done_file, b"").unwrap();
+        assert!(build.join().unwrap().unwrap().status.success());
+        assert!(
+            !on_record(pgid),
+            "the finished build {pgid} is still on record"
+        );
+    }
+
+    /// What the interrupt handler does to a build on record: the whole
+    /// process group is killed, the build's own child reaped, and the pass
+    /// reports the group gone only once no process of it is left, so the
+    /// lock is not released over a compiler that is still running. (The
+    /// handler itself is not run here: it marks the process as ending.)
+    #[cfg(unix)]
+    #[test]
+    fn an_interrupt_pass_ends_the_whole_build_group() {
+        use std::os::unix::process::CommandExt as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("compiler.pid");
+        let mut build = Command::new("sh");
+        build
+            .arg("-c")
+            .arg(format!(
+                "sleep 30 & echo $! > '{}'; wait",
+                pid_file.display()
+            ))
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = build.spawn().unwrap();
+        let pgid = i32::try_from(child.id()).unwrap();
+        let compiler = pid_written_to(&pid_file);
+
+        let mut killed = 0;
+        let start = Instant::now();
+        while !end_build_group(pgid, &mut killed) {
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the build group {pgid} outlived SIGKILL"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(killed, pgid);
+        // Dead already; as a zombie it still answers signal 0 until init
+        // reaps it (macOS does not count zombies in the group).
+        let gone = (0..100).any(|_| {
+            // SAFETY: signal 0 only checks the pid; nothing is delivered.
+            let alive = unsafe { libc::kill(compiler, 0) } == 0;
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the build's compiler {compiler} is still there");
+        assert!(
+            child.try_wait().is_err(),
+            "the pass reaped the build's child itself"
+        );
     }
 
     /// Spawn failure → None. The binary name is intentionally one

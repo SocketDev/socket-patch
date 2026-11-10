@@ -60,6 +60,24 @@
 //! runs go without the Socket credentials
 //! ([`CHILD_ENV_SCRUB`](crate::utils::process::CHILD_ENV_SCRUB)),
 //! `RUBYOPT`, `RUBYLIB` and `BUNDLE*`.
+//!
+//! # A rebuild that does not finish
+//!
+//! A build takes minutes, and the run can be interrupted or killed in the
+//! middle of it. The build leads its own process group; the CLI's interrupt
+//! handler ends that group before it releases the apply lock
+//! ([`kill_builds_on_interrupt`](crate::utils::process::kill_builds_on_interrupt)),
+//! so no compiler is left writing into the gem. What the run leaves on
+//! disk is enough to put the copy right: while a build runs the previous
+//! build is parked beside the extension dir (`parked_build_path`), under
+//! an advisory lock that goes when its process does, and the previous
+//! marker stays in the gem dir until a finished build's replaces it. The
+//! next `apply` or `rollback` of the copy starts by moving the parked
+//! build back (`recover_interrupted_rebuild`). The sources stay patched,
+//! which is the state `apply` completes with a rebuild and `rollback`
+//! undoes. A parked build that a rebuild still running in another process
+//! holds (a gem home shared between projects) is left alone, and the purl
+//! is refused.
 
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
@@ -106,8 +124,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(60);
 /// takes minutes).
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+/// The file RubyGems leaves in an extension dir once every extension of
+/// the gem is built: without it the gem counts as not built, and RubyGems
+/// ignores it.
+const BUILD_COMPLETE: &str = "gem.build_complete";
+
 /// Files RubyGems writes into an extension dir that are not build products.
-const EXT_DIR_METADATA: &[&str] = &["gem.build_complete", "gem_make.out", "mkmf.log"];
+const EXT_DIR_METADATA: &[&str] = &[BUILD_COMPLETE, "gem_make.out", "mkmf.log"];
 
 /// Source and build-script extensions a native extension compiles.
 const NATIVE_SOURCE_EXTENSIONS: &[&str] = &[
@@ -701,8 +724,9 @@ fn stderr_tail(stderr: &str) -> String {
     }
 }
 
-/// The extension dirs of `full_name` under `home/extensions/*/*/`.
-fn installed_extension_dirs(copy: &GemCopy) -> Vec<PathBuf> {
+/// `<home>/extensions/<platform>/<abi>/<full_name>` for every platform and
+/// ABI dir of the home, whether or not the gem has a build there.
+fn extension_dir_slots(copy: &GemCopy) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(platforms) = std::fs::read_dir(copy.home.join("extensions")) else {
         return out;
@@ -712,14 +736,204 @@ fn installed_extension_dirs(copy: &GemCopy) -> Vec<PathBuf> {
             continue;
         };
         for abi in abis.flatten() {
-            let dir = abi.path().join(&copy.full_name);
-            if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
-                out.push(dir);
-            }
+            out.push(abi.path().join(&copy.full_name));
         }
     }
     out.sort();
     out
+}
+
+/// A directory, not a symlink to one.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// The extension dirs of `full_name` under `home/extensions/*/*/`: a build
+/// that is there, or one an unfinished rebuild left parked beside its
+/// place ([`parked_build_path`]). A real run moves that one back before it
+/// gets here ([`recover_interrupted_rebuild`]); a dry run only reads.
+fn installed_extension_dirs(copy: &GemCopy) -> Vec<PathBuf> {
+    extension_dir_slots(copy)
+        .into_iter()
+        .filter(|dir| is_real_dir(dir) || is_real_dir(&parked_build_path(dir)))
+        .collect()
+}
+
+/// Where a rebuild parks the previous build of the extension dir `ext`:
+/// beside it, so moving it there and back is a rename.
+fn parked_build_path(ext: &Path) -> PathBuf {
+    let leaf = ext
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    ext.with_file_name(format!(".{leaf}.socket-patch-old"))
+}
+
+/// Take the rebuild lock of a build dir (an extension dir about to be
+/// parked, or a parked one): an exclusive advisory lock on the directory
+/// itself. It follows the directory through its renames and goes when the
+/// holder's process ends, however that happens, so a parked build that can
+/// be locked belongs to no rebuild that is still running. The apply lock
+/// does not say that: it is per project, and a gem home can be shared.
+///
+/// `Ok(None)` where a directory cannot be locked (Windows, a filesystem
+/// without advisory locks): the caller goes ahead unguarded. `Err` of kind
+/// `WouldBlock`: another process is rebuilding this gem right now. `Err`
+/// of kind `NotFound`: `dir` is gone, or is no longer the directory that
+/// was locked (its rebuild finished in between).
+fn lock_build_dir(dir: &Path) -> std::io::Result<Option<std::fs::File>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let handle = std::fs::File::open(dir)?;
+        // A lock this process dropped a moment ago can linger for the time
+        // a child being spawned on another thread takes to exec: it holds
+        // a copy of the descriptor until then. A live rebuild holds on.
+        let mut attempts = 0;
+        loop {
+            match handle.try_lock() {
+                Ok(()) => break,
+                Err(std::fs::TryLockError::WouldBlock) if attempts < 5 => {
+                    attempts += 1;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "another socket-patch run is rebuilding this gem's extension",
+                    ));
+                }
+                Err(std::fs::TryLockError::Error(_)) => return Ok(None),
+            }
+        }
+        let (locked, named) = (handle.metadata()?, std::fs::symlink_metadata(dir)?);
+        if (locked.dev(), locked.ino()) != (named.dev(), named.ino()) {
+            return Err(std::io::ErrorKind::NotFound.into());
+        }
+        Ok(Some(handle))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        Ok(None)
+    }
+}
+
+/// Put `copy` back together after a rebuild of it that never finished: its
+/// process was interrupted, or killed, between parking the previous build
+/// and recording the new one. `Ok(true)` when something was put right.
+///
+/// The sign is a parked build ([`parked_build_path`]) that no live process
+/// holds. When the extension dir beside it is a finished build
+/// (`gem.build_complete`: the interrupted build got that far, or `gem
+/// pristine` ran since), that build stands and the parked one goes.
+/// Otherwise whatever the build left is dropped, the parked build is moved
+/// back, and the `lib/` copies of its artifacts are brought back in line
+/// with it ([`realign_lib_copies`]). The build marker never left the gem
+/// dir during the build, so it describes the build that is back.
+///
+/// The sources stay as the unfinished run left them, patched: with the
+/// previous build back that is the state of a copy whose sources were
+/// patched without a rebuild, which `apply` completes and `rollback`
+/// undoes.
+fn recover_interrupted_rebuild_sync(
+    copy: &GemCopy,
+    require_path: Option<&str>,
+) -> std::io::Result<bool> {
+    let mut recovered = false;
+    for ext in extension_dir_slots(copy) {
+        let parked = parked_build_path(&ext);
+        if !is_real_dir(&parked) {
+            continue;
+        }
+        let _lock = match lock_build_dir(&parked) {
+            Ok(lock) => lock,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if is_symlink(&ext) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("{} is a symlink, not an extension dir", ext.display()),
+            ));
+        }
+        if ext.join(BUILD_COMPLETE).is_file() {
+            remove_dir_if_exists(&parked)?;
+        } else {
+            remove_dir_if_exists(&ext)?;
+            std::fs::rename(&parked, &ext)?;
+            if let Some(require_path) = require_path {
+                realign_lib_copies(copy, &ext, require_path);
+            }
+        }
+        recovered = true;
+    }
+    Ok(recovered)
+}
+
+/// Bring the `lib/` copies of `ext`'s artifacts back in line with it:
+/// RubyGems installs them as copies of the extension dir's files, and a
+/// build stopped late has already replaced some. Only a copy that is there
+/// is rewritten. Best effort, as RubyGems loads the extension dir first.
+fn realign_lib_copies(copy: &GemCopy, ext: &Path, require_path: &str) {
+    for rel in artifact_rels(ext) {
+        let (built, lib) = (ext.join(&rel), copy.gem_dir.join(require_path).join(&rel));
+        let (Ok(bytes), Ok(current)) = (
+            read_regular_to_bytes_sync(&built),
+            read_regular_to_bytes_sync(&lib),
+        ) else {
+            continue;
+        };
+        if bytes == current {
+            continue;
+        }
+        let perms = std::fs::metadata(&built).map(|m| m.permissions());
+        let _ = replace_file(&lib, |stage| {
+            std::fs::write(stage, &bytes)?;
+            match &perms {
+                Ok(perms) => std::fs::set_permissions(stage, perms.clone()),
+                Err(_) => Ok(()),
+            }
+        });
+    }
+}
+
+/// [`recover_interrupted_rebuild_sync`] for `copy`, with the require path
+/// its gemspec's text names.
+async fn recover_interrupted_rebuild(copy: &GemCopy) -> std::io::Result<bool> {
+    let require_path = require_path_of(copy).await;
+    let copy = copy.clone();
+    crate::utils::fs::run_blocking(move || {
+        recover_interrupted_rebuild_sync(&copy, require_path.as_deref())
+    })
+    .await
+}
+
+/// Why an unfinished rebuild of `copy` could not be put right, as the
+/// reason of a refusal.
+fn recovery_refusal(copy: &GemCopy, error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        "another socket-patch run is rebuilding this gem's extension right now; run again \
+         when it has finished"
+            .to_string()
+    } else {
+        format!(
+            "a rebuild of this gem's extension that an earlier run did not finish could not \
+             be undone ({error}); run `gem pristine {} --extensions`",
+            gem_name_of(&copy.full_name)
+        )
+    }
+}
+
+/// The copy's first require path, from its gemspec's text: `None` when the
+/// spec cannot be read or names none inside the gem.
+async fn require_path_of(copy: &GemCopy) -> Option<String> {
+    crate::utils::fs::read_regular_to_string(&copy.spec_path)
+        .await
+        .ok()
+        .as_deref()
+        .and_then(parse_require_path)
+        .filter(|path| is_safe_relative_subpath(path))
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -760,18 +974,12 @@ async fn rebuild_preflight(copy: &GemCopy, env: &RubyEnv) -> Result<Preflight, S
             copy.home.join("extensions").display()
         ));
     }
-    let require_path = crate::utils::fs::read_regular_to_string(&copy.spec_path)
-        .await
-        .ok()
-        .as_deref()
-        .and_then(parse_require_path)
-        .filter(|path| is_safe_relative_subpath(path))
-        .ok_or_else(|| {
-            format!(
-                "{} does not name a require path inside the gem",
-                copy.spec_path.display()
-            )
-        })?;
+    let require_path = require_path_of(copy).await.ok_or_else(|| {
+        format!(
+            "{} does not name a require path inside the gem",
+            copy.spec_path.display()
+        )
+    })?;
     let candidates = ruby_candidates(copy, &env.cwd);
     if candidates.is_empty() {
         return Err("no `ruby` was found on PATH to rebuild it with".to_string());
@@ -1017,15 +1225,22 @@ fn snapshot_lib_copies(copy: &GemCopy, probe: &Probe, rels: &[String]) -> Vec<Li
 
 /// State a build moved aside, to put back if it fails.
 struct Aside {
-    /// The previous extension dir, renamed beside itself.
+    /// The previous extension dir, parked beside itself
+    /// ([`parked_build_path`]).
     old_ext: Option<PathBuf>,
     /// The previous build's lib copies.
     lib: Vec<LibSnapshot>,
-    /// The previous marker's bytes.
-    marker: Option<Vec<u8>>,
+    /// The rebuild lock on the parked dir ([`lock_build_dir`]), held until
+    /// the build is committed or put back.
+    _lock: Option<std::fs::File>,
 }
 
 /// Move the current build out of the way of a fresh one.
+///
+/// Everything a run that dies mid-build needs put right stays on disk:
+/// the previous build is parked, not deleted, and its marker (if it had
+/// one) is left where it is until a finished build's marker replaces it,
+/// so [`recover_interrupted_rebuild`] can put the copy back together.
 fn set_aside(copy: &GemCopy, probe: &Probe) -> std::io::Result<Aside> {
     let ext = &probe.extension_dir;
     let rels = if ext.is_dir() {
@@ -1034,37 +1249,26 @@ fn set_aside(copy: &GemCopy, probe: &Probe) -> std::io::Result<Aside> {
         Vec::new()
     };
     let lib = snapshot_lib_copies(copy, probe, &rels);
-    let marker_path = copy.gem_dir.join(MARKER_FILE);
-    let marker = read_regular_to_bytes_sync(&marker_path).ok();
-    let old_ext = if ext.is_dir() {
-        let leaf = ext
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let aside = ext.with_file_name(format!(".{leaf}.socket-patch-old"));
-        remove_dir_if_exists(&aside)?;
-        std::fs::rename(ext, &aside)?;
-        Some(aside)
+    let (old_ext, lock) = if ext.is_dir() {
+        // Locked before it is parked: from the moment the parked dir is
+        // there, another run sees a rebuild that is still alive.
+        let lock = lock_build_dir(ext)?;
+        let parked = parked_build_path(ext);
+        remove_dir_if_exists(&parked)?;
+        std::fs::rename(ext, &parked)?;
+        (Some(parked), lock)
     } else {
-        None
+        (None, None)
     };
-    if marker.is_some() {
-        if let Err(e) = std::fs::remove_file(&marker_path) {
-            if let Some(aside) = &old_ext {
-                let _ = std::fs::rename(aside, ext);
-            }
-            return Err(e);
-        }
-    }
     Ok(Aside {
         old_ext,
         lib,
-        marker,
+        _lock: lock,
     })
 }
 
 /// Undo a failed build: drop what it produced (its extension dir and any lib
-/// copy it created), and put the previous build and marker back.
+/// copy it created), and put the previous build back. Its marker never left.
 fn put_back(copy: &GemCopy, probe: &Probe, aside: Aside) -> std::io::Result<()> {
     let ext = &probe.extension_dir;
     let produced = if ext.is_dir() {
@@ -1089,9 +1293,6 @@ fn put_back(copy: &GemCopy, probe: &Probe, aside: Aside) -> std::io::Result<()> 
             std::fs::write(stage, bytes)?;
             std::fs::set_permissions(stage, perms.clone())
         })?;
-    }
-    if let Some(marker) = &aside.marker {
-        std::fs::write(copy.gem_dir.join(MARKER_FILE), marker)?;
     }
     Ok(())
 }
@@ -1291,6 +1492,25 @@ pub async fn apply_gem_package_patch(
         return plain().await;
     }
     let inputs = list_inputs(&scope);
+    // A rebuild of this copy that an earlier run started and did not finish
+    // (it was interrupted, or killed) left the previous build parked: the
+    // copy is put back together before anything else, so what follows
+    // sees a whole gem. A dry run changes nothing and reads the parked
+    // build where it is.
+    if let (false, Some(copy)) = (dry_run, &copy) {
+        if let Err(e) = recover_interrupted_rebuild(copy).await {
+            return refusal(
+                package_key,
+                pkg_path,
+                UNSUPPORTED_CODE,
+                format!(
+                    "the patch changes native-extension sources ({inputs}), and {}; nothing \
+                     was written",
+                    recovery_refusal(copy, &e)
+                ),
+            );
+        }
+    }
     // `--no-gem-native-rebuild`: the caller compiles the extension itself
     // (the patches evaluation harness does), so the sources are written as
     // before #1996, and the warning says the build is the caller's.
@@ -1397,16 +1617,26 @@ pub async fn apply_gem_package_patch(
                 .files_verified
                 .iter()
                 .all(|v| v.status == crate::patch::apply::VerifyStatus::AlreadyPatched);
+        let parked = preflight
+            .installed
+            .iter()
+            .any(|dir| is_real_dir(&parked_build_path(dir)));
+        let unfinished = if parked {
+            "; an earlier rebuild did not finish, and apply first puts back the build it parked"
+        } else {
+            ""
+        };
         let detail = if all_patched {
             format!(
                 "{package_key}: dry run: its sources are already patched, but its native \
-                 extension was not built from them ({inputs}); apply would rebuild it"
+                 extension was not built from them ({inputs}); apply would rebuild \
+                 it{unfinished}"
             )
         } else {
             format!(
                 "{package_key}: dry run: apply would write its patched sources and rebuild \
                  its native extension from them ({inputs}); no Ruby was run to check that \
-                 it can"
+                 it can{unfinished}"
             )
         };
         return GemApplied {
@@ -1521,12 +1751,17 @@ async fn revert_sources(
 /// right whether the current build is socket-patch's (marker present) or one
 /// whose marker never got written. Without a backup, a copy carrying a
 /// socket-patch build (a marker) is rebuilt from the restored sources.
-/// `Ok(true)` when a build was restored, `Ok(false)` when the copy carries
-/// neither.
+/// A rebuild an earlier run did not finish is put right first
+/// ([`recover_interrupted_rebuild`]), so the build parked by it is back
+/// before any of that. `Ok(true)` when a build was restored, `Ok(false)`
+/// when the copy carries neither.
 pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bool, String> {
     let Some(copy) = GemCopy::of(pkg_path) else {
         return Ok(false);
     };
+    let recovered = recover_interrupted_rebuild(&copy)
+        .await
+        .map_err(|e| recovery_refusal(&copy, &e))?;
     let marker = {
         let gem_dir = copy.gem_dir.clone();
         crate::utils::fs::run_blocking(move || read_marker_sync(&gem_dir)).await
@@ -1557,7 +1792,7 @@ pub async fn restore_original_build(pkg_path: &Path, env: &RubyEnv) -> Result<bo
             });
     }
     if marker.is_none() {
-        return Ok(false);
+        return Ok(recovered);
     }
     if !env.rebuild {
         return Err(format!(
@@ -1991,6 +2226,175 @@ mod tests {
         std::fs::remove_dir_all(home.join("extensions")).unwrap();
         let why = rebuild_preflight(&copy, &env).await.unwrap_err();
         assert!(why.contains("no compiled extension dir"), "{why}");
+    }
+
+    /// A rebuild interrupted before RubyGems created the new extension dir
+    /// leaves the install-time build parked beside where it was. That gem
+    /// is not one "installed by a RubyGems older than 2.2": its build is
+    /// there to put back.
+    #[tokio::test]
+    async fn a_parked_build_is_not_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let copy = installed_gem(&home, "lib");
+        let ext = home.join("extensions/p/3.4.0/a-1");
+        std::fs::rename(&ext, ext.with_file_name(".a-1.socket-patch-old")).unwrap();
+        let env = RubyEnv {
+            cwd: tmp.path().to_path_buf(),
+            rebuild: true,
+        };
+        // Without a `ruby` on PATH the preflight still refuses, for that.
+        match rebuild_preflight(&copy, &env).await {
+            Ok(preflight) => assert_eq!(preflight.installed, [ext]),
+            Err(why) => assert!(why.contains("no `ruby` was found"), "{why}"),
+        }
+    }
+
+    /// A gem whose rebuild was cut short: the install-time build parked
+    /// beside the extension dir, and whatever `left` says the build got to
+    /// in the extension dir and the `lib/` copy.
+    fn interrupted_gem(home: &Path, left: Option<(&str, bool)>) -> (GemCopy, PathBuf, PathBuf) {
+        let copy = installed_gem(home, "lib");
+        let ext = home.join("extensions/p/3.4.0/a-1");
+        let parked = ext.with_file_name(".a-1.socket-patch-old");
+        std::fs::create_dir_all(ext.join("a")).unwrap();
+        std::fs::write(ext.join("a/a.so"), b"original").unwrap();
+        std::fs::write(ext.join(BUILD_COMPLETE), b"").unwrap();
+        std::fs::create_dir_all(copy.gem_dir.join("lib/a")).unwrap();
+        std::fs::write(copy.gem_dir.join("lib/a/a.so"), b"original").unwrap();
+        std::fs::rename(&ext, &parked).unwrap();
+        if let Some((bytes, complete)) = left {
+            std::fs::create_dir_all(ext.join("a")).unwrap();
+            std::fs::write(ext.join("a/a.so"), bytes).unwrap();
+            std::fs::write(copy.gem_dir.join("lib/a/a.so"), bytes).unwrap();
+            if complete {
+                std::fs::write(ext.join(BUILD_COMPLETE), b"").unwrap();
+            }
+        }
+        (copy, ext, parked)
+    }
+
+    /// The parked build goes back where it was, with the `lib/` copy the
+    /// interrupted build replaced, whether that build had created the
+    /// extension dir yet or not. A second call finds nothing to do.
+    #[test]
+    fn an_interrupted_rebuild_is_put_back() {
+        for left in [None, Some(("half-built", false))] {
+            let tmp = tempfile::tempdir().unwrap();
+            let (copy, ext, parked) = interrupted_gem(tmp.path(), left);
+            assert!(
+                recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap(),
+                "{left:?}"
+            );
+            assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
+            assert!(ext.join(BUILD_COMPLETE).is_file(), "{left:?}");
+            assert_eq!(
+                std::fs::read(copy.gem_dir.join("lib/a/a.so")).unwrap(),
+                b"original",
+                "{left:?}"
+            );
+            assert!(!parked.exists(), "{left:?}");
+            assert!(!recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap());
+        }
+    }
+
+    /// A build that finished (the run died before recording it, or `gem
+    /// pristine` ran since) is not traded for the older parked one.
+    #[test]
+    fn a_finished_build_stands_over_a_parked_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, ext, parked) = interrupted_gem(tmp.path(), Some(("rebuilt", true)));
+        assert!(recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap());
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"rebuilt");
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("lib/a/a.so")).unwrap(),
+            b"rebuilt"
+        );
+        assert!(!parked.exists());
+    }
+
+    /// A parked build another process still holds belongs to a rebuild
+    /// that is running, not to an interrupted one: it is left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_rebuild_still_running_elsewhere_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (copy, ext, parked) = interrupted_gem(tmp.path(), Some(("half-built", false)));
+        let held = lock_build_dir(&parked).unwrap();
+        assert!(held.is_some(), "a directory can be locked here");
+        let refused = recover_interrupted_rebuild_sync(&copy, Some("lib")).unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(recovery_refusal(&copy, &refused).contains("right now"));
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"half-built");
+        assert_eq!(std::fs::read(parked.join("a/a.so")).unwrap(), b"original");
+
+        // The holder gone (its process ended), the build is put back. A
+        // sibling test forking right now keeps a copy of the descriptor,
+        // and the lock with it, until it execs.
+        drop(held);
+        let recovered = loop {
+            match recover_interrupted_rebuild_sync(&copy, Some("lib")) {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                recovered => break recovered.unwrap(),
+            }
+        };
+        assert!(recovered);
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"original");
+    }
+
+    /// Parking a build keeps what a run that dies mid-build needs: the
+    /// build itself (locked while the rebuild lives) and its marker. A
+    /// failed build puts the copy back as it was.
+    #[test]
+    fn a_parked_build_keeps_its_marker_and_goes_back_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        let copy = installed_gem(tmp.path(), "lib");
+        let ext = tmp.path().join("extensions/p/3.4.0/a-1");
+        std::fs::create_dir_all(ext.join("a")).unwrap();
+        std::fs::write(ext.join("a/a.so"), b"previous").unwrap();
+        std::fs::create_dir_all(copy.gem_dir.join("lib/a")).unwrap();
+        std::fs::write(copy.gem_dir.join("lib/a/a.so"), b"previous").unwrap();
+        std::fs::write(copy.gem_dir.join(MARKER_FILE), b"{}").unwrap();
+        let probe = Probe {
+            ruby: PathBuf::from("/r"),
+            gem_dir: copy.gem_dir.clone(),
+            extension_dir: ext.clone(),
+            require_path: "lib".to_string(),
+            lib_dir: copy.gem_dir.join("lib"),
+        };
+
+        let aside = set_aside(&copy, &probe).unwrap();
+        let parked = parked_build_path(&ext);
+        assert_eq!(aside.old_ext.as_deref(), Some(parked.as_path()));
+        assert!(!ext.exists() && parked.join("a/a.so").is_file());
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join(MARKER_FILE)).unwrap(),
+            b"{}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            lock_build_dir(&parked).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the rebuild holds its parked build"
+        );
+
+        // What a failed build leaves, then the way back.
+        std::fs::create_dir_all(ext.join("a")).unwrap();
+        std::fs::write(ext.join("a/a.so"), b"broken").unwrap();
+        std::fs::write(copy.gem_dir.join("lib/a/a.so"), b"broken").unwrap();
+        put_back(&copy, &probe, aside).unwrap();
+        assert_eq!(std::fs::read(ext.join("a/a.so")).unwrap(), b"previous");
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join("lib/a/a.so")).unwrap(),
+            b"previous"
+        );
+        assert_eq!(
+            std::fs::read(copy.gem_dir.join(MARKER_FILE)).unwrap(),
+            b"{}"
+        );
+        assert!(!parked.exists());
     }
 
     #[test]

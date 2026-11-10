@@ -549,6 +549,10 @@ fn run_without_ruby(proj: &Path, args: &[&str]) -> (i32, String, String) {
 /// `extensions/x86_64-linux/3.4.0` and "builds" one by writing a new shared
 /// object and its `lib/` copy. Each run appends its mode to `<state>/calls`
 /// and writes the environment it saw to `<state>/env.<mode>`.
+///
+/// After [`FakeRuby::hang_builds`] a build never finishes instead: it
+/// starts a "compiler" (a `sleep` of its own), records both pids and waits,
+/// like a real build caught mid-compile.
 #[cfg(unix)]
 struct FakeRuby {
     _tmp: tempfile::TempDir,
@@ -583,6 +587,19 @@ build)
   full=$(basename "$4" .gemspec)
   ext="$5"
   lib="$home/gems/$full/$6"
+  if [ -e "$state/hang" ]; then
+    if [ -e "$state/hang-half-built" ]; then
+      mkdir -p "$ext/sp_native"
+      printf 'half-built' > "$ext/sp_native/sp_native.so"
+      printf 'half-built' > "$lib/sp_native/sp_native.so"
+    fi
+    echo $$ > "$state/build.pid"
+    sleep 600 &
+    echo $! > "$state/compiler.pid"
+    : > "$state/building"
+    wait
+    exit 1
+  fi
   mkdir -p "$ext/sp_native" "$lib/sp_native"
   printf 'rebuilt' > "$ext/sp_native/sp_native.so"
   cp "$ext/sp_native/sp_native.so" "$lib/sp_native/sp_native.so"
@@ -626,6 +643,100 @@ esac
     /// The environment the `mode` run saw, as `env` printed it.
     fn env_seen(&self, mode: &str) -> String {
         std::fs::read_to_string(self.state.join(format!("env.{mode}"))).unwrap()
+    }
+
+    /// Make every later build hang. With `half_built` it first leaves a
+    /// partial extension dir and a replaced `lib/` copy, as a build
+    /// interrupted late does; without, it has written nothing yet.
+    fn hang_builds(&self, half_built: bool) {
+        std::fs::write(self.state.join("hang"), b"").unwrap();
+        if half_built {
+            std::fs::write(self.state.join("hang-half-built"), b"").unwrap();
+        }
+    }
+
+    /// Let later builds finish again.
+    fn finish_builds(&self) {
+        for flag in ["hang", "hang-half-built", "building"] {
+            let _ = std::fs::remove_file(self.state.join(flag));
+        }
+    }
+
+    /// Start the CLI in `proj` (this Ruby alone on `PATH`) and wait until
+    /// its build hangs. Returns the CLI and the build's process group.
+    fn spawn_until_building(
+        &self,
+        proj: &Path,
+        args: &[&str],
+    ) -> (std::process::Child, BuildGroup) {
+        use std::time::{Duration, Instant};
+        let mut cmd = common::hermetic_command(&common::binary());
+        common::jvm_env::isolate_cli(&mut cmd);
+        cmd.args(args)
+            .current_dir(proj)
+            .env("PATH", &self.bin)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("spawn socket-patch");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !self.state.join("building").exists() {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("the CLI exited ({status}) before its build started");
+            }
+            assert!(Instant::now() < deadline, "the build never started");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pid = |file: &str| -> i32 {
+            std::fs::read_to_string(self.state.join(file))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        let group = BuildGroup {
+            leader: pid("build.pid"),
+            compiler: pid("compiler.pid"),
+        };
+        (child, group)
+    }
+}
+
+/// The stand-in build's processes: `ruby` leads its own process group and
+/// the "compiler" it started is in it. Dropping this kills whatever is
+/// left, so a failing test leaves no `sleep` behind.
+#[cfg(unix)]
+struct BuildGroup {
+    leader: i32,
+    compiler: i32,
+}
+
+#[cfg(unix)]
+impl BuildGroup {
+    /// Whether any process of the build is still there. Polls briefly: a
+    /// killed process is a zombie until its (new) parent reaps it.
+    fn outlives_the_cli(&self) -> bool {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 only checks for the group and the pid.
+            let alive =
+                unsafe { libc::kill(-self.leader, 0) == 0 || libc::kill(self.compiler, 0) == 0 };
+            if !alive || Instant::now() >= deadline {
+                return alive;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BuildGroup {
+    fn drop(&mut self) {
+        // SAFETY: SIGKILL to the process group this test's CLI started.
+        unsafe {
+            libc::kill(-self.leader, libc::SIGKILL);
+        }
     }
 }
 
@@ -674,6 +785,110 @@ fn the_rebuild_does_not_hand_the_socket_token_to_ruby() {
             seen.lines().any(|line| line == "NPM_TOKEN=registry-auth"),
             "`ruby` ({mode}) lost the registry auth:\n{seen}"
         );
+    }
+}
+
+/// What an interrupted rebuild is followed by.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum Next {
+    Apply,
+    Rollback,
+}
+
+/// Ctrl-C or a CI cancel (SIGTERM) during a native rebuild: the build runs
+/// in its own process group, so nothing but the CLI can end it. The build
+/// is gone by the time the CLI is, the lock is not left behind, and the
+/// copy stays one the next run puts right: `apply` moves the parked
+/// install-time build back and completes the rebuild, `rollback` restores
+/// the original sources and build. That holds whether the interrupt lands
+/// before the build wrote anything (the extension dir does not exist) or
+/// with the extension dir and a `lib/` copy half replaced.
+#[cfg(unix)]
+#[test]
+fn an_interrupted_rebuild_is_ended_with_the_cli_and_the_next_run_recovers() {
+    use std::os::unix::process::ExitStatusExt;
+    const ORIGINAL: &[u8] = b"\x7fELF original";
+
+    for (signal, half_built, next) in [
+        (libc::SIGTERM, true, Next::Apply),
+        (libc::SIGINT, false, Next::Apply),
+        (libc::SIGTERM, true, Next::Rollback),
+        (libc::SIGINT, false, Next::Rollback),
+    ] {
+        let case = format!("signal {signal}, half built {half_built}, then {next:?}");
+        let (_tmp, proj, gem_dir) = fake_native_gem(true);
+        write_manifest(&proj.join(".socket"), &c_source(1), &c_source(2));
+        let ext_root = proj.join("vendor/bundle/ruby/3.4.0/extensions/x86_64-linux/3.4.0");
+        let ext = ext_root.join(FULL_NAME);
+        let parked = ext_root.join(format!(".{FULL_NAME}.socket-patch-old"));
+        let ext_so = ext.join("sp_native/sp_native.so");
+        let lib_so = gem_dir.join("lib/sp_native/sp_native.so");
+        let lock = proj.join(".socket/apply.lock");
+        let ruby = FakeRuby::new();
+        ruby.hang_builds(half_built);
+
+        let (mut cli, build) = ruby.spawn_until_building(&proj, &["apply", "--json"]);
+        assert!(
+            lock.is_file(),
+            "{case}: the rebuilding apply holds the lock"
+        );
+        assert!(parked.is_dir(), "{case}: the install-time build is parked");
+        // SAFETY: plain kill(2) on our own child's pid.
+        assert_eq!(unsafe { libc::kill(cli.id() as libc::pid_t, signal) }, 0);
+        let status = cli.wait().unwrap();
+        assert_eq!(status.signal(), Some(signal), "{case}: got {status}");
+        assert!(
+            !build.outlives_the_cli(),
+            "{case}: the build kept running after the interrupted CLI was gone"
+        );
+        assert!(!lock.exists(), "{case}: apply.lock was left behind");
+
+        ruby.finish_builds();
+        match next {
+            Next::Apply => {
+                let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--json"], &[]);
+                assert_eq!(
+                    code, 0,
+                    "{case}: apply after the interrupt:\n{stdout}\n{stderr}"
+                );
+                assert_eq!(std::fs::read(&ext_so).unwrap(), b"rebuilt", "{case}");
+                assert_eq!(std::fs::read(&lib_so).unwrap(), b"rebuilt", "{case}");
+                assert!(ext.join("gem.build_complete").is_file(), "{case}");
+                assert!(
+                    gem_dir.join(".socket-patch-native-build.json").is_file(),
+                    "{case}: the completed build is recorded"
+                );
+                assert!(!parked.exists(), "{case}: the parked build is gone");
+                let (code, stdout, stderr) = ruby.run(&proj, &["apply", "--check"], &[]);
+                assert_eq!(code, 0, "{case}: {stdout}\n{stderr}");
+                // And the install-time build is still what rollback restores.
+                let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json"], &[]);
+                assert_eq!(code, 0, "{case}: rollback:\n{stdout}\n{stderr}");
+            }
+            Next::Rollback => {
+                let (code, stdout, stderr) = ruby.run(&proj, &["rollback", "--json"], &[]);
+                assert_eq!(
+                    code, 0,
+                    "{case}: rollback after the interrupt:\n{stdout}\n{stderr}"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&ext_so).unwrap(), ORIGINAL, "{case}");
+        assert_eq!(std::fs::read(&lib_so).unwrap(), ORIGINAL, "{case}");
+        assert!(ext.join("gem.build_complete").is_file(), "{case}");
+        assert_eq!(
+            std::fs::read_to_string(gem_dir.join(C_KEY)).unwrap(),
+            c_source(1),
+            "{case}"
+        );
+        for leftover in [
+            parked.clone(),
+            gem_dir.join(".socket-patch-native-build.json"),
+            gem_dir.join(".socket-patch-native-orig"),
+        ] {
+            assert!(!leftover.exists(), "{case}: {} is left", leftover.display());
+        }
     }
 }
 
