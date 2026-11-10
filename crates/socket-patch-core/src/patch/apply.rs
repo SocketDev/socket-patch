@@ -1387,6 +1387,31 @@ pub const OWNERSHIP_NOT_RESTORED_MARKER: &str = "ownership could not be restored
 /// warning keys on the same text.
 pub const STALE_BYTECODE_NOT_REMOVED_MARKER: &str = "could not remove stale Python bytecode";
 
+/// The substring of the advisory that names the patch files `--force`
+/// skipped because they are not on disk (see [`skipped_files_note`]); the
+/// CLI's `patch_files_skipped` warning keys on the same text.
+pub const FILES_SKIPPED_MARKER: &str = "not found on disk and skipped (--force)";
+
+/// The advisory naming the files of `verified` that `--force` skipped (a
+/// missing pre-existing file), `None` when it skipped none: a package that
+/// is reported applied, or already patched, with a file left out says
+/// which.
+fn skipped_files_note(verified: &[VerifyResult]) -> Option<String> {
+    let skipped: Vec<&str> = verified
+        .iter()
+        .filter(|v| v.status == VerifyStatus::NotFound)
+        .map(|v| v.file.as_str())
+        .collect();
+    (!skipped.is_empty()).then(|| {
+        format!(
+            "{} patch file{} {FILES_SKIPPED_MARKER}: {}",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" },
+            skipped.join(", ")
+        )
+    })
+}
+
 /// The run-level warning codes a successful apply's or rollback's advisory
 /// `note` (its `error` with `success: true`) carries, by marker. One note
 /// can join several advisories with `"; "`.
@@ -1397,6 +1422,7 @@ pub fn advisory_warning_codes(note: &str) -> Vec<&'static str> {
             STALE_BYTECODE_NOT_REMOVED_MARKER,
             "stale_bytecode_not_removed",
         ),
+        (FILES_SKIPPED_MARKER, "patch_files_skipped"),
     ]
     .into_iter()
     .filter(|(marker, _)| note.contains(marker))
@@ -1614,12 +1640,8 @@ async fn apply_package_patch_at(
     }
     let join_notes = |notes: Vec<String>| (!notes.is_empty()).then(|| notes.join("; "));
 
-    // Check if all files are already patched
-    let all_already_patched = result
-        .files_verified
-        .iter()
-        .all(|v| v.status == VerifyStatus::AlreadyPatched);
-    // ... or either already patched or not found (force mode skip).
+    // Check if all files are either already patched or not found (force
+    // mode skip).
     let all_done_or_skipped = result
         .files_verified
         .iter()
@@ -1653,21 +1675,26 @@ async fn apply_package_patch_at(
             }
         }
         result.success = true;
-        let mut notes = bytecode_warnings;
-        if !all_already_patched {
-            // Some or all files were not found but skipped via --force
-            let not_found_count = result
+        // Some or all files were not found but skipped via --force: the
+        // note names them.
+        let mut notes: Vec<String> = skipped_files_note(&result.files_verified)
+            .into_iter()
+            .collect();
+        notes.extend(bytecode_warnings);
+        // Nothing was written, so this run applied nothing: with the
+        // skipped files out of the verified list the package reads as what
+        // it is, already patched as far as `--force` goes, instead of as
+        // an apply that wrote no file (the fan-out drops a store copy's
+        // skips for the same reason).
+        if !dry_run
+            && result
                 .files_verified
                 .iter()
-                .filter(|v| v.status == VerifyStatus::NotFound)
-                .count();
-            notes.insert(
-                0,
-                format!(
-                    "All patch files were skipped: {} not found on disk (--force)",
-                    not_found_count
-                ),
-            );
+                .any(|v| v.status == VerifyStatus::AlreadyPatched)
+        {
+            result
+                .files_verified
+                .retain(|v| v.status != VerifyStatus::NotFound);
         }
         result.error = join_notes(notes);
         return result;
@@ -1892,6 +1919,8 @@ async fn apply_package_patch_at(
             .insert(file_name.clone(), AppliedVia::Blob);
     }
     warnings.extend(finish_package(write).await);
+    // Files `--force` skipped are named beside the ones just written.
+    warnings.splice(0..0, skipped_files_note(&result.files_verified));
 
     result.error = join_notes(warnings);
     result.success = true;
@@ -3068,6 +3097,75 @@ mod tests {
         .await;
         assert!(result.success);
         assert_eq!(result.files_patched.len(), 0);
+        let note = result.error.expect("the skipped file is named");
+        assert!(
+            note.contains("missing.js") && note.contains(FILES_SKIPPED_MARKER),
+            "{note}"
+        );
+    }
+
+    /// `--force` over a package with one target file missing: the run that
+    /// writes the others names the file it skipped, and so does the next
+    /// run, which writes nothing and reads as already patched rather than
+    /// as an apply of no file.
+    #[tokio::test]
+    async fn test_force_names_the_files_it_skips() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+        let mut files = HashMap::new();
+        for name in ["a.js", "b.js", "c.js"] {
+            let (original, patched) = (format!("original {name}"), format!("patched {name}"));
+            let after_hash = compute_git_sha256_from_bytes(patched.as_bytes());
+            if name != "b.js" {
+                std::fs::write(pkg.join(name), &original).unwrap();
+            }
+            std::fs::write(blobs_dir.path().join(&after_hash), &patched).unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(original.as_bytes()),
+                    after_hash,
+                },
+            );
+        }
+        let sources = PatchSources::blobs_only(blobs_dir.path());
+        let apply = || {
+            apply_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:npm/test@1.0.0",
+                pkg,
+                &files,
+                &sources,
+                false,
+                MismatchPolicy::Force,
+            )
+        };
+        let expected = format!("1 patch file {FILES_SKIPPED_MARKER}: b.js");
+
+        let first = apply().await;
+        assert!(first.success);
+        assert_eq!(first.files_patched, ["a.js", "c.js"]);
+        assert_eq!(first.error.as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            advisory_warning_codes(&expected),
+            ["patch_files_skipped"],
+            "the CLI reports the note as a warning"
+        );
+
+        let second = apply().await;
+        assert!(second.success);
+        assert!(second.files_patched.is_empty());
+        assert_eq!(second.error.as_deref(), Some(expected.as_str()));
+        assert!(
+            second
+                .files_verified
+                .iter()
+                .all(|v| v.status == VerifyStatus::AlreadyPatched),
+            "a run that wrote nothing must not read as an apply: {:?}",
+            second.files_verified
+        );
+        assert_eq!(second.files_verified.len(), 2);
     }
 
     /// With several missing files the error always names the first one
@@ -4347,7 +4445,7 @@ mod tests {
             &mut primary,
             copy,
             ApplyResult {
-                error: Some("All patch files were skipped: 1 not found on disk (--force)".into()),
+                error: Some(format!("1 patch file {FILES_SKIPPED_MARKER}: index.js")),
                 ..clean()
             },
         );
@@ -4852,7 +4950,11 @@ mod tests {
             advisory_warning_codes(&format!("{ownership}; {bytecode}")),
             ["ownership_not_restored", "stale_bytecode_not_removed"]
         );
-        assert!(advisory_warning_codes("All patch files were skipped").is_empty());
+        assert_eq!(
+            advisory_warning_codes(&format!("1 patch file {FILES_SKIPPED_MARKER}: a.js")),
+            ["patch_files_skipped"]
+        );
+        assert!(advisory_warning_codes("some other note").is_empty());
     }
 
     /// The tarball bytes of a bin published from Windows (CRLF shebang),

@@ -3,7 +3,8 @@
 //! rename, a rename that fails half-way through a package, and a corrupt
 //! blob for a later file. The failures are injected with the engine's
 //! failpoints (`socket_patch_core::utils::failpoint`), which the test build
-//! of the binary carries.
+//! of the binary carries. Also what `apply --force` reports about a file it
+//! skipped.
 
 use serde_json::json;
 
@@ -211,4 +212,61 @@ fn a_corrupt_blob_for_a_later_file_writes_nothing() {
 
     assert_all_original(&pkg);
     assert_no_stage_litter(&pkg);
+}
+
+/// `apply --force` with one target file missing: the run that patches the
+/// other two names the file it skipped, and the next run, which writes
+/// nothing, is `already_patched` with the same warning, not an `applied`
+/// event without files.
+#[test]
+fn force_names_the_file_it_skipped() {
+    let tmp = tempfile::tempdir().unwrap();
+    let pkg = three_file_project(tmp.path());
+    std::fs::remove_file(pkg.join("f001.js")).unwrap();
+    let skipped_warning = |env: &serde_json::Value| {
+        env["warnings"].as_array().is_some_and(|warnings| {
+            warnings.iter().any(|w| {
+                w["code"] == "patch_files_skipped"
+                    && w["detail"]
+                        .as_str()
+                        .is_some_and(|d| d.contains("package/f001.js"))
+            })
+        })
+    };
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline", "--force"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    let applied = find_event(&env, "applied", None);
+    let paths: Vec<&str> = applied["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|f| f["path"].as_str())
+        .collect();
+    assert_eq!(paths, ["package/f000.js", "package/f002.js"], "{env}");
+    assert!(
+        skipped_warning(&env),
+        "the skipped file must be named: {env}"
+    );
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline", "--force"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    find_event(&env, "skipped", Some("already_patched"));
+    assert!(
+        events(&env).iter().all(|e| e["action"] != "applied"),
+        "a run that wrote nothing applied nothing: {env}"
+    );
+    assert!(
+        skipped_warning(&env),
+        "the skipped file must be named: {env}"
+    );
+
+    let (code, _, stderr) = run_apply(tmp.path(), &["--offline", "--force"], &[]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("package/f001.js"),
+        "the human output must name the skipped file: {stderr}"
+    );
 }
