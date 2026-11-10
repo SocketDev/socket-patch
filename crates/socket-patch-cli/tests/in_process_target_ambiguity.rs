@@ -334,6 +334,8 @@ async fn get_uuid_outside_the_ecosystems_sends_no_fetched_event() {
     std::env::set_var("SOCKET_API_TOKEN", "fake");
     std::env::set_var("SOCKET_ORG_SLUG", ORG);
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("DO_NOT_TRACK");
     std::env::remove_var("SOCKET_OFFLINE");
     std::env::remove_var("VITEST");
     let code = get_run(args).await;

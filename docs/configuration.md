@@ -60,6 +60,83 @@ For other settings, precedence is flag → environment → default, except for t
 repository policy scalars below. Socket Patch does not automatically load `.env`
 files, and repository files cannot set credentials, API endpoints, or safety options.
 
+## Telemetry
+
+Telemetry is on by default. Each command reports its outcome to Socket as one
+JSON event (two for a `scan` or `get` that also applies patches).
+
+### What is sent
+
+Every event has these fields:
+
+| Field | Value |
+| --- | --- |
+| `event_type` | One of the event names in the table below |
+| `event_sender_created_at` | UTC timestamp of the event |
+| `session_id` | A random UUID generated for that one run. It is not stored, so it links the events of a single run and nothing else |
+| `context.version` | The Socket Patch version |
+| `context.platform`, `context.arch` | Operating system and CPU architecture (for example `linux`, `x86_64`) |
+| `context.command` | The subcommand (`scan`, `apply`, …) |
+| `metadata` | The per-event fields in the table below, and nothing else |
+| `error.type`, `error.message` | Failure events only. URLs in the message are redacted (credentials, grant tokens, signed query values) and your home directory is replaced by `~`. The message can still quote a package name or a path in the project |
+
+| Command | Event on success | Event on failure | `metadata` fields |
+| --- | --- | --- | --- |
+| `scan` | `patch_scanned` | `patch_scan_failed` | `packages_scanned`, `free_patches`, `paid_patches`, `can_access_paid`, `ecosystems` (names such as `npm`, not packages), `fallback_to_proxy`, `mode`, `project_modes` |
+| `scan` / `get` in hosted mode | `patch_applied` | `patch_apply_failed` | `mode` (`hosted`), `patches_count`, `files_count`, `dry_run` |
+| `apply`, and `scan` / `get` in agent mode | `patch_applied` | `patch_apply_failed` | `mode` (`agent`), `patches_count`, `dry_run` |
+| `vendor`, and `scan` / `get` in vendored mode | `patch_vendored` | `patch_vendor_failed` | `patches_count`, `dry_run` |
+| `get` | `patch_fetched` | `patch_fetch_failed` | `uuid` (the patch UUID), `tier`, `ecosystem`, `download_mode`, `fallback_to_proxy` |
+| `remove` | `patch_removed` | `patch_remove_failed` | `removed_count` |
+| `rollback` | `patch_rolled_back` | `patch_rollback_failed` | `rolled_back_count` |
+| `list` | `patch_listed` | — | `patches_count` |
+| `repair` | `patch_repaired` | `patch_repair_failed` | `blobs_added`, `blobs_removed`, `bytes_freed` |
+| `vex` | `vex_generated` | `vex_failed` | `advisories_count`, `format`, `output_kind` |
+| `--update` | `cli_updated` | `cli_update_failed` | `from_version`, `to_version`, `channel`, `pinned`, `forced`; on failure `error_code` |
+
+A failure event carries the subset of its row's fields known when it failed;
+`patch_fetch_failed` reports `uuid` only when you asked for a patch by UUID.
+
+An event carries no dependency list, no file contents, and no machine
+identifier. The HTTP request has a `User-Agent` of `SocketPatchCLI/<version>`
+and, like any request, shows the server your IP address.
+
+### Where it goes
+
+With an API token and an organization, events are sent to
+`https://api.socket.dev/v0/orgs/<org>/telemetry`, authenticated with the token,
+so they are attributable to your organization. Otherwise they are sent without
+credentials to `https://patches-api.socket.dev/patch/telemetry`.
+`--api-url` / `SOCKET_API_URL` and `--proxy-url` / `SOCKET_PROXY_URL` move both.
+
+A run that never contacts the patch API (see
+[Authentication and endpoints](#authentication-and-endpoints)) does not look
+your organization up just to report: with a token but no `--org`,
+`SOCKET_ORG_SLUG`, or `socket login` organization, its event goes to the
+anonymous endpoint.
+
+### It never holds a command up
+
+Events are sent in the background while the command works. A command does not
+wait for telemetry before printing or prompting, and a failed send changes no
+output and no exit code (`--debug` shows it). When the command is done, it
+waits at most 300 ms for an event still being sent, then exits; an unreachable
+or stalled endpoint cannot add more than that. An event that is not delivered
+in time is dropped.
+
+### Turning it off
+
+Any one of these disables telemetry:
+
+- `--no-telemetry` on the command line.
+- `SOCKET_TELEMETRY_DISABLED=1` (also `true`, `yes`, `on`).
+- `DO_NOT_TRACK=1` (any value except `0`, `false`, or empty).
+- `SOCKET_PATCH_TELEMETRY_DISABLED=1`, the name Socket Patch v4 and earlier used.
+- `--offline` / `SOCKET_OFFLINE=1`, which prohibits all network access.
+
+Telemetry is also off when `VITEST=true`, so the Socket CLI's own test suite
+never reports.
+
 ## Repository patch policy
 
 Commit a root `socket.yml` to control what `scan` may patch:

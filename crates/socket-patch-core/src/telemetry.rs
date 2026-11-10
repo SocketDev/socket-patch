@@ -9,6 +9,7 @@ use crate::api::client::ApiRoute;
 use crate::constants::USER_AGENT;
 use crate::utils::env_compat::{is_offline_env, proxy_url_from_env};
 use crate::utils::fs::home_dir;
+use crate::utils::socket_cli_config::env_truthy;
 use crate::vex::time::unix_to_ymdhms;
 
 // ---------------------------------------------------------------------------
@@ -146,8 +147,15 @@ struct PatchTelemetryEvent {
 
 /// Check if telemetry is disabled via environment variables.
 ///
-/// Telemetry is disabled when:
-/// - `SOCKET_TELEMETRY_DISABLED` is `"1"` or `"true"`
+/// Telemetry is disabled when any of these holds:
+/// - `SOCKET_TELEMETRY_DISABLED` is truthy ([`env_truthy`], the vocabulary
+///   the CLI's boolean flags accept: a library caller's `=yes` opts out
+///   just as the CLI's does).
+/// - `SOCKET_PATCH_TELEMETRY_DISABLED` is truthy. The v3/v4 name; the other
+///   names of that generation are retired, but an opt-out has to survive
+///   the upgrade that renamed it.
+/// - `DO_NOT_TRACK` is set to anything but `0`, `false` or the empty
+///   string: the cross-tool convention (<https://consoledonottrack.com>).
 /// - `VITEST` is `"true"`. Load-bearing downstream dependency, not a relic:
 ///   socket-cli's vitest integration suite
 ///   (`packages/cli/test/integration/cli/cmd-patch*.test.mts`) spawns this
@@ -162,10 +170,22 @@ struct PatchTelemetryEvent {
 /// is set the CLI dispatcher sets `SOCKET_TELEMETRY_DISABLED=1` for the
 /// duration of the process so this check stays the single source of truth.
 pub fn is_telemetry_disabled() -> bool {
-    let env_value = std::env::var("SOCKET_TELEMETRY_DISABLED").unwrap_or_default();
-    let disabled_via_env = matches!(env_value.as_str(), "1" | "true");
-    let vitest = std::env::var("VITEST").unwrap_or_default() == "true";
-    disabled_via_env || vitest || is_offline_env()
+    env_truthy("SOCKET_TELEMETRY_DISABLED")
+        || env_truthy("SOCKET_PATCH_TELEMETRY_DISABLED")
+        || do_not_track()
+        || std::env::var("VITEST").unwrap_or_default() == "true"
+        || is_offline_env()
+}
+
+/// Whether `DO_NOT_TRACK` asks for no telemetry. The convention is "set
+/// means on", so unlike a `SOCKET_*` toggle every value counts except an
+/// explicit off (`0`, `false`) and the empty string.
+fn do_not_track() -> bool {
+    let value = std::env::var("DO_NOT_TRACK").unwrap_or_default();
+    !matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "" | "0" | "false"
+    )
 }
 
 /// Log debug messages when debug mode is enabled.
@@ -898,7 +918,13 @@ mod tests {
     use super::*;
 
     /// Every variable that can switch telemetry off.
-    const OPT_OUT_VARS: [&str; 3] = ["SOCKET_TELEMETRY_DISABLED", "VITEST", "SOCKET_OFFLINE"];
+    const OPT_OUT_VARS: [&str; 5] = [
+        "SOCKET_TELEMETRY_DISABLED",
+        "SOCKET_PATCH_TELEMETRY_DISABLED",
+        "DO_NOT_TRACK",
+        "VITEST",
+        "SOCKET_OFFLINE",
+    ];
 
     /// Telemetry switched on for one test: every opt-out variable is
     /// cleared, and restored when the guard drops. Tests that hold one are
@@ -1044,6 +1070,51 @@ mod tests {
         assert_eq!(in_flight().len(), in_flight_before);
     }
 
+    /// NT-U3: every documented opt-out switches telemetry off, each on its
+    /// own, and an explicit "off" value of the same variable does not.
+    #[test]
+    #[serial_test::serial]
+    fn every_documented_opt_out_disables_telemetry() {
+        let _on = TelemetryOn::new();
+        assert!(!is_telemetry_disabled(), "nothing set: telemetry is on");
+
+        for (var, value) in [
+            // The CLI's boolean vocabulary, not only `1` / `true`.
+            ("SOCKET_TELEMETRY_DISABLED", "1"),
+            ("SOCKET_TELEMETRY_DISABLED", "true"),
+            ("SOCKET_TELEMETRY_DISABLED", "TRUE"),
+            ("SOCKET_TELEMETRY_DISABLED", "yes"),
+            ("SOCKET_TELEMETRY_DISABLED", "on"),
+            // The v3/v4 name: an opt-out made then still holds.
+            ("SOCKET_PATCH_TELEMETRY_DISABLED", "1"),
+            ("SOCKET_PATCH_TELEMETRY_DISABLED", "true"),
+            // The cross-tool convention: set to anything but an "off".
+            ("DO_NOT_TRACK", "1"),
+            ("DO_NOT_TRACK", "true"),
+            ("DO_NOT_TRACK", "yes"),
+        ] {
+            std::env::set_var(var, value);
+            assert!(is_telemetry_disabled(), "{var}={value} must opt out");
+            std::env::remove_var(var);
+            assert!(!is_telemetry_disabled(), "unsetting {var} opts back in");
+        }
+
+        for var in [
+            "SOCKET_TELEMETRY_DISABLED",
+            "SOCKET_PATCH_TELEMETRY_DISABLED",
+            "DO_NOT_TRACK",
+        ] {
+            for value in ["", "0", "false", "FALSE"] {
+                std::env::set_var(var, value);
+                assert!(
+                    !is_telemetry_disabled(),
+                    "{var}={value:?} is not an opt-out"
+                );
+            }
+            std::env::remove_var(var);
+        }
+    }
+
     /// `flush` waits for sends that finish inside the grace and returns as
     /// soon as they have: the events are delivered, with the headers every
     /// event carries, and the rest of the grace is not spent.
@@ -1145,61 +1216,38 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 
-    /// Combined into a single test to avoid env-var races across parallel tests.
-    /// Exercises the `SOCKET_TELEMETRY_DISABLED` name and the airgap gate
-    /// via `SOCKET_OFFLINE`. Serialized: SOCKET_* env is process-global and the
+    /// The opt-outs that are not telemetry's own: the airgap gate
+    /// (`SOCKET_OFFLINE`, which the CLI normalizes to `1`) and the vitest
+    /// guard. Serialized: SOCKET_* env is process-global and the
     /// api/client.rs suite reads `SOCKET_OFFLINE` mid-test.
     #[test]
     #[serial_test::serial]
-    fn test_is_telemetry_disabled() {
-        // Save originals
-        let orig_new = std::env::var("SOCKET_TELEMETRY_DISABLED").ok();
-        let orig_vitest = std::env::var("VITEST").ok();
-        let orig_offline = std::env::var("SOCKET_OFFLINE").ok();
-
-        // Default: not disabled
-        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-        std::env::remove_var("VITEST");
-        std::env::remove_var("SOCKET_OFFLINE");
+    fn offline_and_vitest_disable_telemetry() {
+        let _on = TelemetryOn::new();
         assert!(!is_telemetry_disabled());
 
-        // Disabled via new var "1"
-        std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
-        assert!(is_telemetry_disabled());
-        std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
-
-        // Disabled via airgap: SOCKET_OFFLINE=1 implies "no network",
-        // which includes the telemetry endpoint.
-        std::env::set_var("SOCKET_OFFLINE", "1");
-        assert!(
-            is_telemetry_disabled(),
-            "SOCKET_OFFLINE=1 must disable telemetry (airgap)"
-        );
-        std::env::set_var("SOCKET_OFFLINE", "true");
-        assert!(
-            is_telemetry_disabled(),
-            "SOCKET_OFFLINE=true must disable telemetry (airgap)"
-        );
-        // Non-truthy values do not disable
-        std::env::set_var("SOCKET_OFFLINE", "0");
-        assert!(!is_telemetry_disabled());
-        std::env::set_var("SOCKET_OFFLINE", "");
-        assert!(!is_telemetry_disabled());
+        // SOCKET_OFFLINE=1 implies "no network", which includes the
+        // telemetry endpoint.
+        for value in ["1", "true"] {
+            std::env::set_var("SOCKET_OFFLINE", value);
+            assert!(
+                is_telemetry_disabled(),
+                "SOCKET_OFFLINE={value} must disable telemetry (airgap)"
+            );
+        }
+        for value in ["0", ""] {
+            std::env::set_var("SOCKET_OFFLINE", value);
+            assert!(!is_telemetry_disabled(), "SOCKET_OFFLINE={value:?}");
+        }
         std::env::remove_var("SOCKET_OFFLINE");
 
-        // Restore originals
-        match orig_new {
-            Some(v) => std::env::set_var("SOCKET_TELEMETRY_DISABLED", v),
-            None => std::env::remove_var("SOCKET_TELEMETRY_DISABLED"),
-        }
-        match orig_vitest {
-            Some(v) => std::env::set_var("VITEST", v),
-            None => std::env::remove_var("VITEST"),
-        }
-        match orig_offline {
-            Some(v) => std::env::set_var("SOCKET_OFFLINE", v),
-            None => std::env::remove_var("SOCKET_OFFLINE"),
-        }
+        std::env::set_var("VITEST", "true");
+        assert!(
+            is_telemetry_disabled(),
+            "VITEST=true must disable telemetry"
+        );
+        std::env::set_var("VITEST", "1");
+        assert!(!is_telemetry_disabled(), "only the literal `true` counts");
     }
 
     #[test]

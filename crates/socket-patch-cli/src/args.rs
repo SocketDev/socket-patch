@@ -290,7 +290,7 @@ pub struct GlobalArgs {
     )]
     pub debug: bool,
 
-    /// Disable anonymous usage telemetry.
+    /// Disable usage telemetry.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "no-telemetry",
@@ -639,7 +639,8 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
 
 /// Mirror the flags that core reads from the env (`SOCKET_OFFLINE`,
 /// `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL`,
-/// `SOCKET_PROXY_URL`) into it. Core's own parse matches only `"1" | "true"`,
+/// `SOCKET_PROXY_URL`) into it. Core's own parse of `SOCKET_OFFLINE` and
+/// `SOCKET_DEBUG` matches only `"1" | "true"`,
 /// and the telemetry kill-switch and endpoint resolvers never see the parsed
 /// flags: without the mirror `--offline` still sent telemetry, and an
 /// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.

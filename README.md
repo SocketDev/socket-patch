@@ -102,10 +102,33 @@ control. See [usage and recovery](docs/usage.md).
 Use `socket-patch <command> --help` for options and
 [`socket.yml`](docs/configuration.md#repository-patch-policy) for a shared rollout policy.
 
+## Telemetry
+
+Socket Patch sends usage telemetry by default: each command reports its outcome
+to Socket as a small JSON event. An event holds the event name (for example
+`patch_applied` or `patch_scan_failed`), the subcommand, the CLI version, the
+operating system and CPU architecture, a timestamp, a random ID generated for
+that one run, and a few counters and flags for the command (such as patches
+applied, packages scanned, ecosystems found, the patch mode, `dry_run`). `get`
+adds the patch UUID. A failure adds the error message, with URL credentials
+redacted and your home directory replaced by `~`. Apart from what an error
+message quotes, events hold no package names, file paths, file contents, or
+dependency lists.
+
+Events go to `api.socket.dev` with your API token when a token and organization
+are configured, otherwise anonymously to `patches-api.socket.dev`. They are sent
+in the background: a command never waits for telemetry before it prints, a
+failed send changes nothing, and an unreachable endpoint adds at most 300 ms to
+the exit.
+
+To turn telemetry off, pass `--no-telemetry` or set `SOCKET_TELEMETRY_DISABLED=1`
+or `DO_NOT_TRACK=1`. `--offline` / `SOCKET_OFFLINE=1` sends nothing either. See
+[configuration](docs/configuration.md#telemetry) for every event, field, and switch.
+
 ## Documentation
 
 - [Usage](docs/usage.md): targeting, CI, vendoring, agent mode, VEX, and recovery.
-- [Configuration](docs/configuration.md): authentication, environment, and rollout policy.
+- [Configuration](docs/configuration.md): authentication, environment, telemetry, and rollout policy.
 - [Ecosystem support](docs/ecosystems.md): package-manager formats and limitations.
 - [Migrating to v5](docs/migrating-to-v5.md): changed defaults and retired install hooks.
 - [CLI contract](crates/socket-patch-cli/CLI_CONTRACT.md): flags, JSON, diagnostics, and exit codes.

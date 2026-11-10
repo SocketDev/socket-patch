@@ -134,6 +134,30 @@ fn command_forces_telemetry_off() {
     );
 }
 
+/// A telemetry suite's `SOCKET_TELEMETRY_DISABLED=0` is the whole switch:
+/// the other opt-outs a developer's shell may carry (`DO_NOT_TRACK`, the v4
+/// name, `VITEST`) never reach the child, and the child's exit waits for
+/// its telemetry instead of racing the suite's event count.
+#[test]
+#[serial]
+fn command_removes_the_other_telemetry_opt_outs_and_lifts_the_exit_grace() {
+    with_ambient(
+        &[
+            ("DO_NOT_TRACK", "1"),
+            ("SOCKET_PATCH_TELEMETRY_DISABLED", "1"),
+            ("VITEST", "true"),
+            ("SOCKET_TELEMETRY_GRACE_MS", "0"),
+        ],
+        || {
+            let env = effective_env(&hermetic::command(Path::new("socket-patch")));
+            for gone in hermetic::TELEMETRY_OPT_OUT_ALIASES {
+                assert_eq!(get(&env, gone), None, "{gone} must not reach the child");
+            }
+            assert_eq!(get(&env, "SOCKET_TELEMETRY_GRACE_MS"), Some("30000"));
+        },
+    );
+}
+
 /// B69: every process `cargo test` / `cargo run` starts (and every child it
 /// spawns without a scrub) inherits the three opt-outs from the workspace
 /// `.cargo/config.toml` `[env]` table.

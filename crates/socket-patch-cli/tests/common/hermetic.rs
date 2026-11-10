@@ -54,6 +54,12 @@ pub const FORCED_OPT_OUTS: &[(&str, &str)] = &[
     ("SOCKET_TELEMETRY_DISABLED", "1"),
 ];
 
+/// The other variables that switch telemetry off (the v4 name, the
+/// cross-tool convention, the vitest guard). [`command`] removes them, so
+/// `SOCKET_TELEMETRY_DISABLED` alone decides whether a child sends.
+pub const TELEMETRY_OPT_OUT_ALIASES: &[&str] =
+    &["SOCKET_PATCH_TELEMETRY_DISABLED", "DO_NOT_TRACK", "VITEST"];
+
 /// A `Command` for `bin` with the hermetic environment: every flag-bound
 /// and every other ambient `SOCKET_*` removed (removing `SOCKET_API_TOKEN`
 /// also forces the public proxy), [`COLOR_ENV`] removed, and the three
@@ -92,6 +98,12 @@ pub fn command(bin: &Path) -> Command {
     // Telemetry suites opt back in with `SOCKET_TELEMETRY_DISABLED=0` and a
     // wiremock endpoint.
     cmd.envs(FORCED_OPT_OUTS.iter().copied());
+    // That opt-in must be the whole switch: the other opt-outs a
+    // developer's shell may carry would silently void a suite's event
+    // counts.
+    for k in TELEMETRY_OPT_OUT_ALIASES {
+        cmd.env_remove(k);
+    }
     // A suite that counts the events its mock received must not race the
     // binary's exit: lift the short grace it gives telemetry still in
     // flight (the send's own 5 s request timeout still ends the wait).

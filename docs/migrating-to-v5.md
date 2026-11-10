@@ -269,7 +269,7 @@ whole root, not a `vendor_jvm_degraded` warning on mixed Maven + Gradle roots.
 | `get --one-off`, `rollback --one-off`, `SOCKET_ONE_OFF` | No replacement; these had no implementation |
 | `SOCKET_PATCH_PROXY_URL` | `SOCKET_PROXY_URL` |
 | `SOCKET_PATCH_DEBUG` | `SOCKET_DEBUG` |
-| `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED` |
+| `SOCKET_PATCH_TELEMETRY_DISABLED` | `SOCKET_TELEMETRY_DISABLED`; the old name still turns [telemetry](configuration.md#telemetry) off |
 | `scan --apply` | `scan --mode agent` |
 | `scan --vendor` | `scan --mode vendored` |
 | `get --no-apply` | `get --save-only` (`SOCKET_SAVE_ONLY` is unchanged) |

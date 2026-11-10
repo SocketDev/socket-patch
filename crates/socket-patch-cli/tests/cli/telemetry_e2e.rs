@@ -1330,3 +1330,56 @@ fn a_stalled_telemetry_endpoint_costs_only_the_exit_grace() {
     );
     assert!(sent, "telemetry was on: the event must have been sent");
 }
+
+// ---------------------------------------------------------------------------
+// Every opt-out
+// ---------------------------------------------------------------------------
+
+/// Each documented opt-out, on its own, keeps `list` from sending anything
+/// at all; the same variables set to an explicit "off" do not (the
+/// anti-vacuous half: the event the opt-outs suppress is really sent).
+#[tokio::test]
+async fn every_opt_out_keeps_list_from_sending() {
+    let empty_batch = || serde_json::json!({ "packages": [], "canAccessPaidPatches": false });
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_empty_project(tmp.path());
+
+    let opt_outs: [(&[&str], &[(&str, &str)]); 7] = [
+        (&["--no-telemetry"], &[]),
+        (&[], &[("SOCKET_TELEMETRY_DISABLED", "1")]),
+        // The CLI's boolean vocabulary, not only `1` / `true`.
+        (&[], &[("SOCKET_TELEMETRY_DISABLED", "yes")]),
+        // The v3/v4 name: an opt-out made before v5 still holds.
+        (&[], &[("SOCKET_PATCH_TELEMETRY_DISABLED", "1")]),
+        (&[], &[("DO_NOT_TRACK", "1")]),
+        (&[], &[("DO_NOT_TRACK", "true")]),
+        (&["--offline"], &[]),
+    ];
+    for (args, env) in opt_outs {
+        let mock = setup_mock(empty_batch(), None).await;
+        let (code, _stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "list", args, env);
+        assert_eq!(code, 0, "list {args:?} {env:?}: stderr={stderr}");
+        let requests = mock.received_requests().await.expect("recording enabled");
+        assert!(
+            requests.is_empty(),
+            "list {args:?} {env:?} must send nothing; saw {} request(s)",
+            requests.len()
+        );
+    }
+
+    let not_opt_outs: [&[(&str, &str)]; 3] = [
+        &[("SOCKET_TELEMETRY_DISABLED", "false")],
+        &[("SOCKET_PATCH_TELEMETRY_DISABLED", "0")],
+        &[("DO_NOT_TRACK", "0")],
+    ];
+    for env in not_opt_outs {
+        let mock = setup_mock(empty_batch(), None).await;
+        let (code, _stdout, stderr) = run_cmd(tmp.path(), &mock.uri(), "list", &[], env);
+        assert_eq!(code, 0, "list {env:?}: stderr={stderr}");
+        assert_eq!(
+            telemetry_post_count(&mock, Some("patch_listed")).await,
+            1,
+            "list {env:?} is not opted out and must send its event"
+        );
+    }
+}
