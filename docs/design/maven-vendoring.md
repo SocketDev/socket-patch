@@ -331,7 +331,9 @@ control. In-place ledger reconstruction remains outside v5's repair contract.
 
 The implementation is covered by planner, disk-safety, lifecycle and command
 integration tests. Real-tool capstones exercise a Maven reactor from fresh
-checkouts, root and module invocations, Gradle strict locking and repository
+checkouts, root and module invocations, an artifact whose sibling's version
+comes from its parent's `${project.version}` (`log4j-core`, in
+`e2e_vendor_maven_build`), Gradle strict locking and repository
 mode, existing verification metadata, offline builds, tamper detection and
 byte-exact revert; `e2e_vendor_gradle_build` covers each Gradle rule above
 against a fake Central, asserting on the jar Gradle actually consumes. PR and
