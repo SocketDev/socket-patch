@@ -195,7 +195,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   and the scan names the copy (`redirect_copy_unpatched` in hosted mode,
   `vendor_copy_unpatched` in vendored mode); `vex` attests nothing for the
   package while the copy is in the lock. A directory's version is read from
-  its `package.json` (#935).
+  its `package.json` (#935); one that cannot be read (outside the project,
+  missing) may be any version, so `vex` withholds every pin of the package
+  the lock keys it by. The same holds for a copy pnpm fetches from a git
+  remote or a url tarball (`left-pad@git+https://…` with its `version:`
+  line), and, in pnpm 8 and older locks, for a second registry key of the
+  same `name@version` (one per peer set) left on the registry.
   A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
   in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
   run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is

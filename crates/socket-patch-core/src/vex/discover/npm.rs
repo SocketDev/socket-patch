@@ -779,7 +779,9 @@ fn entry_ref(
 ///   locks in scope, exactly the set `scan --mode hosted` collects and
 ///   rewrites (`commands/scan/hosted.rs`). Read whether or not a root lock
 ///   exists, like the rewriter (no precedence between files — rule 10).
-///   Vendoring refuses Rush (`npm_flavor`), so these only carry hosted refs.
+///   Vendoring refuses Rush (`npm_flavor`), so these only carry hosted
+///   refs: a vendored path in a Rush or per-member lock names a file under
+///   that lock's own directory and is diagnosed ([`pnpm_vendored_ref`]).
 ///
 /// Every document of a lock is read. pnpm 11+'s env lockfile document
 /// (config dependencies, the pinned package manager; identified by its
@@ -832,6 +834,12 @@ fn entry_ref(
 ///   registry-form key whose tarball was hand-pointed at a vendored
 ///   tarball is also a ref (pnpm fetches `file:` tarballs locally), under
 ///   the same leaf check.
+///
+/// Every other entry of the wired `name@version` is a copy pnpm installs
+/// beside it, and withholds the ref: a `file:` directory or tarball
+/// ([`record_pnpm_file_copies`]), a git remote or url tarball
+/// ([`record_pnpm_other_copy`]), and a second registry key of the release
+/// left on the registry ([`record_pnpm_registry_twins`]).
 ///
 /// A resolution the grammar refuses (duplicate keys, nested values,
 /// aliases) is a [`DIAG_REF_INVALID`] when it carries a Socket reference;
@@ -1151,11 +1159,13 @@ async fn extract_pnpm_document(
     let mut copies: Vec<PnpmFileCopy> = Vec::new();
     let mut bundles: Vec<(&str, Bundled<'_>)> = Vec::new();
     let mut withheld: BTreeSet<String> = BTreeSet::new();
+    let entries_from = out.elsewhere.len();
     for package in lock.packages_of(document) {
         let withhold = disabled.map(|_| &mut withheld);
         pnpm_entry_ref(ctx, tree, package, &mut copies, withhold, out);
         bundles.extend(entry_bundled(&package.entry).map(|b| (package.key, b)));
     }
+    record_pnpm_registry_twins(tree, entries_from, out);
     record_pnpm_file_copies(ctx, tree, copies, out).await;
     record_pnpm_bundled_copies(tree, bundles, out);
     let label = &tree.label;
@@ -1171,6 +1181,73 @@ async fn extract_pnpm_document(
                 withheld.into_iter().collect::<Vec<_>>().join(", ")
             ),
         );
+    }
+}
+
+/// Record each registry-keyed entry of this document that resolves a wired
+/// `name@version` from somewhere else as an unpatched copy of it. One
+/// `name@version` has several `packages:` keys where pnpm keys an entry
+/// per peer set (lockfileVersion 5 / 6, `/name@version(peer@…)`), and pnpm
+/// installs each one. `entries_from` is where this document's entries
+/// start in [`Discovery::elsewhere`], so nothing is recorded per entry of
+/// a lock that wires nothing.
+fn record_pnpm_registry_twins(tree: &PnpmTree<'_>, entries_from: usize, out: &mut Discovery) {
+    let wired: BTreeSet<&str> = out
+        .refs
+        .iter()
+        .filter(|r| r.source_file == Path::new(tree.file) && r.part == tree.part)
+        .map(|r| r.purl.as_str())
+        .collect();
+    if wired.is_empty() {
+        return;
+    }
+    let twins: BTreeSet<String> = out.elsewhere[entries_from..]
+        .iter()
+        .filter(|e| wired.contains(e.purl.as_str()))
+        .map(|e| e.purl.clone())
+        .collect();
+    for purl in twins {
+        let key = purl.strip_prefix("pkg:npm/").unwrap_or(&purl).to_string();
+        out.unpatched_copy_in(
+            tree.file,
+            tree.part,
+            Some(purl),
+            &key,
+            "(another `packages:` key of the same release) resolves it from elsewhere, not a \
+             Socket patch, and pnpm installs every entry",
+        );
+    }
+}
+
+/// Record a `packages:` entry keyed by something other than a registry
+/// version or a `file:` path (a git remote, a url tarball) as a copy of the
+/// package it installs: pnpm fetches it from that source, where no Socket
+/// wiring reaches. pnpm writes the package's own name into the key
+/// (`name@git+https://…`) or a `name:` line, and its version on a
+/// `version:` line; a copy that states no version may be any version of
+/// its package, and one that names no package any package at its version.
+/// An entry that says neither is left alone.
+fn record_pnpm_other_copy(tree: &PnpmTree<'_>, package: &PnpmPackage<'_>, out: &mut Discovery) {
+    let key = package.key;
+    if classify_pnpm_key(key) != PnpmKey::Other {
+        return;
+    }
+    // `[@scope/]name@<spec>`: the `@` after a scope's leading one.
+    let bare = key.trim_start_matches('/');
+    let key_name = bare
+        .get(1..)
+        .and_then(|rest| rest.find('@'))
+        .map(|at| &bare[..at + 1]);
+    let name = entry_field(&package.entry, "name").or(key_name);
+    let version = entry_field(&package.entry, "version");
+    let how = "installs it from a git remote or url, which no Socket wiring reaches (pnpm \
+               installs every packages entry)";
+    match (name, version) {
+        (Some(name), Some(version)) => {
+            out.unpatched_copy_in(tree.file, tree.part, npm_purl(name, version), key, how)
+        }
+        (None, None) => {}
+        (name, version) => out.unidentified_copy(tree.file, name, version, key, how),
     }
 }
 
@@ -1292,18 +1369,33 @@ async fn record_pnpm_file_copies(
             name = name.or_else(|| field("name"));
             version = version.or_else(|| field("version"));
         }
-        let (Some(name), Some(version)) = (name, version) else {
-            continue;
-        };
         let what = if copy.directory {
             "directory"
         } else {
             "tarball"
         };
+        let (Some(name), Some(version)) = (&name, &version) else {
+            // Outside the project, missing, or no package: nobody read
+            // which release it holds, so it may be any the lock leaves
+            // open (#1516's rule for yarn).
+            out.unidentified_copy(
+                tree.file,
+                name.as_deref(),
+                version.as_deref(),
+                &copy.key,
+                &format!(
+                    "installs the user's file: {what} {:?}, whose package.json can't be read \
+                     (outside the project, missing or not a package), so it may be any release \
+                     of the package the lock keys it by",
+                    copy.path
+                ),
+            );
+            continue;
+        };
         out.unpatched_copy_in(
             tree.file,
             tree.part,
-            npm_purl(&name, &version),
+            npm_purl(name, version),
             &copy.key,
             &format!(
                 "installs it from the user's file: {what} {:?}, which no Socket wiring \
@@ -1417,6 +1509,7 @@ fn pnpm_entry_ref(
         // A plain registry entry (integrity only) or a directory/git dep.
         out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, true));
+        record_pnpm_other_copy(tree, package, out);
         return;
     };
     let integrity = resolution
@@ -1460,10 +1553,11 @@ fn pnpm_entry_ref(
             PatchedRef::hosted(purl, uuid, file, Some(tarball), integrity, true).in_part(tree.part),
         );
     } else {
-        // A registry-keyed entry fetching some other tarball, or a user's
-        // `file:` tarball.
+        // A registry-keyed entry fetching some other tarball, a user's
+        // `file:` tarball, or a url-keyed one.
         out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, false));
+        record_pnpm_other_copy(tree, package, out);
     }
 }
 
@@ -1487,6 +1581,21 @@ fn pnpm_vendored_ref(
             ),
         );
     };
+    // pnpm resolves a lock's `file:` tarball against the lock's own
+    // directory, so only the root lock's root-relative path is the
+    // committed artifact. A member or Rush lock's names a file under its
+    // own directory, which nothing here hashes (no vendor backend writes
+    // one there).
+    if Path::new(tree.file)
+        .parent()
+        .is_some_and(|dir| dir != Path::new(""))
+    {
+        return invalid(
+            out,
+            "is a root-relative vendored path in a lock outside the project root, which pnpm \
+             resolves against the lock's own directory, not the committed artifact",
+        );
+    }
     // (name, the key's own `file:` path if the key was rekeyed).
     let (name, key_path) = match classify_pnpm_key(key) {
         // Legacy (v5.4 / v6.0): bare `file:<rel-tgz>` key + `name:` line.
@@ -3415,8 +3524,8 @@ mod tests {
 
     /// A `file:` directory's `package.json` is read past one leading BOM
     /// (`formats::text`): with one it still contests the ref; with two the
-    /// manifest does not parse, so the copy is left alone like any
-    /// unreadable one.
+    /// manifest does not parse, so like any unreadable copy it may be any
+    /// release of the package its key names, and withholds the ref too.
     #[tokio::test]
     async fn pnpm_file_directory_manifest_reads_past_one_bom_only() {
         let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -3440,10 +3549,10 @@ mod tests {
             "forks/left-pad/package.json",
             format!("\u{feff}\u{feff}{manifest}"),
         );
-        assert_refs(
-            &run(&p).await,
-            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
-        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        let detail = &out.diagnostics[0].detail;
+        assert!(detail.contains("package.json can't be read"), "{detail}");
     }
 
     /// pnpm unpacks a package's `bundledDependencies` from its own tarball
@@ -4111,6 +4220,165 @@ mod tests {
             .filter(|u| u.purl == purl)
             .map(|u| u.kind)
             .collect()
+    }
+
+    /// pnpm installs every `packages:` entry a snapshot reaches, so a second
+    /// entry of the wired `name@version` from a git remote, a url tarball
+    /// or a directory is an unpatched copy beside the patched one (real
+    /// pnpm 10.34.1 locks `github:stevemao/left-pad#v1.3.0` and
+    /// `file:../lp-fork` under the package's own name, exactly as below,
+    /// and installs both next to the registry entry). A copy whose
+    /// directory cannot be read may be any version of the package it is
+    /// keyed by. Another version, or another package, contests nothing.
+    #[tokio::test]
+    async fn pnpm_second_copy_from_git_url_or_directory_withholds_the_wiring() {
+        const PURL: &str = "pkg:npm/left-pad@1.3.0";
+        const SHA: &str = "ff8e7ba8b4122829cf66125ca8445cac7f073bce";
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = |second: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+                 specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    \
+                 resolution: {{integrity: {SRI}, tarball: {url}}}\n\n{second}"
+            )
+        };
+        let git = |name: &str, version: &str| {
+            format!(
+                "  {name}@git+https://git@github.com:stevemao/left-pad.git#{SHA}:\n    \
+                 resolution: {{commit: {SHA}, repo: git@github.com:stevemao/left-pad.git, type: git}}\n    \
+                 version: {version}\n"
+            )
+        };
+        let codeload = format!(
+            "  left-pad@https://codeload.github.com/stevemao/left-pad/tar.gz/{SHA}:\n    \
+             resolution: {{tarball: https://codeload.github.com/stevemao/left-pad/tar.gz/{SHA}}}\n    \
+             version: 1.3.0\n"
+        );
+        let directory = |path: &str| {
+            format!(
+                "  left-pad@file:{path}:\n    resolution: {{directory: {path}, type: directory}}\n"
+            )
+        };
+        let withheld = |second: &str, what: &str| {
+            let text = lock(second);
+            let what = what.to_string();
+            async move {
+                let p = Project::nested("app");
+                p.write("pnpm-lock.yaml", text);
+                p.write(
+                    "lp-other/package.json",
+                    r#"{"name":"left-pad","version":"2.0.0"}"#,
+                );
+                let out = run(&p).await;
+                let unattributable: Vec<&str> = out
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                    .map(|d| d.detail.as_str())
+                    .collect();
+                match out.refs.as_slice() {
+                    [] => {
+                        assert_eq!(out.shadowed.len(), 1, "{what}: {out:#?}");
+                        assert!(
+                            matches!(unattributable.as_slice(), [d] if d.contains(PURL)),
+                            "{what}: {unattributable:#?}"
+                        );
+                        true
+                    }
+                    [r] => {
+                        assert_eq!(r.purl, PURL, "{what}");
+                        assert!(unattributable.is_empty(), "{what}: {unattributable:#?}");
+                        false
+                    }
+                    refs => panic!("{what}: {refs:#?}"),
+                }
+            }
+        };
+        assert!(withheld(&git("left-pad", "1.3.0"), "a git copy").await);
+        assert!(withheld(&codeload, "a url tarball copy").await);
+        assert!(withheld(&directory("../lp-fork"), "a directory outside the project").await);
+        assert!(withheld(&directory("lp-missing"), "a directory that is not there").await);
+        // Controls.
+        assert!(!withheld("", "the wiring alone").await);
+        assert!(!withheld(&git("left-pad", "2.0.0"), "a git copy of another version").await);
+        assert!(!withheld(&git("right-pad", "1.3.0"), "a git copy of another package").await);
+        assert!(
+            !withheld(
+                &directory("lp-other"),
+                "a directory holding another version"
+            )
+            .await
+        );
+
+        // pnpm <= 8 keys a registry entry per peer set: one left on the
+        // registry beside the wired one installs unpatched.
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.3.0(react@18.2.0):\n    \
+                 resolution: {{integrity: {SRI}, tarball: {url}}}\n    dev: false\n\n  \
+                 /left-pad@1.3.0(react@17.0.2):\n    resolution: {{integrity: sha512-UP==}}\n    \
+                 dev: false\n"
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.shadowed.len(), 1, "{out:#?}");
+    }
+
+    /// pnpm resolves a lock's `file:` tarball against the lock's own
+    /// directory (real pnpm 10.34.1 and 11.27.0, `sharedWorkspaceLockfile:
+    /// false`: `packages/a/pnpm-lock.yaml`'s `file:vendor/x.tgz` installs
+    /// `packages/a/vendor/x.tgz`). A root-relative `.socket/vendor/…` path
+    /// in a member or Rush lock therefore names a file under that lock's
+    /// directory, never the committed artifact `vex` hashes, and no vendor
+    /// backend writes one there: it is diagnosed, not a ref.
+    #[tokio::test]
+    async fn pnpm_vendored_path_in_a_member_or_rush_lock_is_not_the_root_artifact() {
+        let rel = format!(".socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: file:{rel}\n        version: file:{rel}\n\npackages:\n\n  \
+             left-pad@file:{rel}:\n    resolution: {{integrity: {SRI}, tarball: file:{rel}}}\n    \
+             version: 1.3.0\n"
+        );
+        let refused = |out: &Discovery, file: &str| {
+            assert_refs(out, &[]);
+            let invalid: Vec<&Diag> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == DIAG_REF_INVALID)
+                .collect();
+            assert!(
+                matches!(invalid.as_slice(), [d] if d.file == Path::new(file)
+                    && d.detail.contains("the lock's own directory")),
+                "{file}: {:#?}",
+                out.diagnostics
+            );
+        };
+
+        // Control: the root lock's path is the committed artifact.
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &lock);
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_B, WiringMode::Vendored)],
+        );
+
+        let p = Project::new();
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &lock);
+        refused(&run(&p).await, "packages/a/pnpm-lock.yaml");
+
+        let p = Project::new();
+        p.write("rush.json", "{}");
+        p.write("common/config/rush/pnpm-lock.yaml", &lock);
+        refused(&run(&p).await, "common/config/rush/pnpm-lock.yaml");
     }
 
     /// With pnpm's lock off, a vendored entry of the unread lock installs
