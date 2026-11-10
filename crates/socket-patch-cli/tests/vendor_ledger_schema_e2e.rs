@@ -198,17 +198,14 @@ fn new_ledgers_compact_whole_file_snapshots_and_revert() {
 
         let (code, stdout, stderr) = f.vendor(&["--revert"], &[]);
         assert_eq!(code, 0, "{eco} revert: {stdout}\n{stderr}");
-        if !["pnpm", "nuget"].contains(eco) {
+        // pnpm included: the base binary re-printed the fixture's one-line
+        // package.json on vendor and on revert; this binary splices the
+        // override in and out, so the file comes back as it was.
+        if *eco != "nuget" {
             assert_eq!(masked_tree(&f.root), pristine, "{eco}: byte-exact restore");
         } else {
             let reverted = read_tree(&fixtures_dir().join(eco).join("reverted"));
-            for (rel, mut bytes) in reverted {
-                // The base binary always ended a re-rendered pnpm
-                // package.json with a newline; this binary keeps the
-                // file's own trailer, and the fixture's has none (#662).
-                if *eco == "pnpm" && rel == "package.json" {
-                    assert_eq!(bytes.pop(), Some(b'\n'), "{eco}: {rel}");
-                }
+            for (rel, bytes) in reverted {
                 assert_eq!(
                     std::fs::read(f.root.join(&rel)).unwrap(),
                     bytes,
