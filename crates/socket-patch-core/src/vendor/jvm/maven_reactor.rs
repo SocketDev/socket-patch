@@ -463,6 +463,7 @@ pub fn unplan(
     }
     let mut still_wired = false;
     let mut live = false;
+    let mut config_bytewise = false;
     for (rel, text) in &after {
         let Some(t) = text else { continue };
         let (masked, _) = mask(t);
@@ -498,7 +499,9 @@ pub fn unplan(
             .iter()
             .find(|w| w.kind == CONFIG_LINE_KIND && w.file == MAVEN_CONFIG && op_of(w) == "config")
         {
-            if let Some(text) = read(MAVEN_CONFIG).and_then(|b| String::from_utf8(b).ok()) {
+            if let Some(bytes) = read(MAVEN_CONFIG) {
+                let (text, bytewise) = config_text(&bytes);
+                config_bytewise = bytewise;
                 after.insert(MAVEN_CONFIG.to_string(), undo_config(&text, w));
                 before.insert(MAVEN_CONFIG.to_string(), Some(text));
             }
@@ -516,8 +519,18 @@ pub fn unplan(
             }
         }
     }
+    let mut changes = changes_between(&before, &after);
+    if config_bytewise {
+        for (rel, bytes) in changes.iter_mut().filter(|(rel, _)| rel == MAVEN_CONFIG) {
+            *bytes = after
+                .get(rel.as_str())
+                .cloned()
+                .flatten()
+                .map(|text| config_bytes(text, true));
+        }
+    }
     JvmUnplan {
-        changes: changes_between(&before, &after),
+        changes,
         drifted,
         still_wired,
     }
@@ -2906,7 +2919,7 @@ fn repository_edit(doc: &Doc) -> Edit {
 /// identical lines are adopted, the last (effective) tail gets our
 /// directory appended to its list, the last protocol list gets `file`.
 fn merge_maven_config(config: Option<&[u8]>) -> (Vec<u8>, Value) {
-    let text = config.map(String::from_utf8_lossy).unwrap_or_default();
+    let (text, bytewise) = config.map(config_text).unwrap_or_default();
     let nl = crate::utils::line_endings::terminator(&text);
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
     let arg_of = |line: &str| line.trim().to_string();
@@ -2956,7 +2969,29 @@ fn merge_maven_config(config: Option<&[u8]>) -> (Vec<u8>, Value) {
             "rewritten": rewritten,
         })
     };
-    (out.into_bytes(), op)
+    (config_bytes(out, bytewise), op)
+}
+
+/// `.mvn/maven.config` as text the edits can splice: UTF-8 as it is, and
+/// any other encoding (a Latin-1 `-Duser.name=José`, a Windows path) one
+/// `char` per byte, flagged `true`, so [`config_bytes`] writes every byte
+/// the edits leave alone back unchanged. The lines vendoring adds are
+/// ASCII in either reading; a lossy decode would rewrite the file.
+fn config_text(bytes: &[u8]) -> (String, bool) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), false),
+        Err(_) => (bytes.iter().map(|&b| char::from(b)).collect(), true),
+    }
+}
+
+/// The bytes of a [`config_text`] reading.
+fn config_bytes(text: String, bytewise: bool) -> Vec<u8> {
+    if bytewise {
+        // One char per byte went in and only ASCII was added.
+        text.chars().map(|c| c as u8).collect()
+    } else {
+        text.into_bytes()
+    }
 }
 
 /// `arg` (`<key><list>`) with `item` appended to its comma list, `None`
@@ -8504,6 +8539,49 @@ mod tests {
         assert!(refs(&format!("{PIN_TAG}{UUID_B}: g:a:1 -->")));
         assert!(!refs(&format!("{PIN_TAG}{UUID}: g:a:1 -->")));
         assert!(!refs("<version>1-socket.xyz</version>"));
+    }
+
+    /// VJ-D5: a `.mvn/maven.config` that is not UTF-8 (a Latin-1 user name,
+    /// a Windows path) was decoded lossily, so vendoring rewrote `e9` as
+    /// `ef bf bd` and revert, which reads UTF-8 only, left it and the added
+    /// lines there. Every byte the two edits do not touch survives both.
+    #[tokio::test]
+    async fn a_maven_config_that_is_not_utf8_keeps_its_bytes_and_reverts() {
+        let dir = disk(&[
+            ("pom.xml", ROOT),
+            ("a/pom.xml", &module("a", &dep("1.10.0"))),
+            ("b/pom.xml", &module("b", "")),
+        ]);
+        let root = dir.path();
+        let config: &[u8] = b"-Duser.name=Jos\xe9\r\n-Dmaven.repo.local.tail=/opt/r\xe9po\r\n";
+        std::fs::create_dir_all(root.join(".mvn")).unwrap();
+        std::fs::write(root.join(MAVEN_CONFIG), config).unwrap();
+        let pristine = testing::snapshot(root);
+        let mut ledger = BTreeMap::new();
+        testing::vendor(root, Shape::MavenReactor, &patch(), &mut ledger)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(root.join(MAVEN_CONFIG)).unwrap(),
+            [
+                b"-Duser.name=Jos\xe9\r\n-Dmaven.repo.local.tail=/opt/r\xe9po,".as_slice(),
+                TAIL_DIR.as_bytes(),
+                b"\r\n",
+                OFFLINE_LINE.as_bytes(),
+                b"\r\n",
+            ]
+            .concat()
+        );
+        assert!(replan_writes(root, &patch()).is_empty());
+        let out = testing::revert(root, &patch(), &mut ledger).await;
+        assert!(out.success && out.warnings.is_empty(), "{out:?}");
+        assert_eq!(testing::snapshot(root), pristine);
+        // The two readings round-trip on their own.
+        for bytes in [config, "-Dx=é\n".as_bytes(), b""] {
+            let (text, bytewise) = config_text(bytes);
+            assert_eq!(bytewise, std::str::from_utf8(bytes).is_err());
+            assert_eq!(config_bytes(text, bytewise), bytes);
+        }
     }
 
     /// A comment naming the suffixed version is not a reference: revert
