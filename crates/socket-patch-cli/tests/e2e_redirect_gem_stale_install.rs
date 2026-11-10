@@ -2453,6 +2453,27 @@ async fn refresh_leaves_a_shared_gem_home_alone_unless_asked() {
     assert_eq!(std::fs::read(&cache).unwrap(), patched);
 }
 
+/// rubygems.org's stand-in under `/upstream` (`SOCKET_RUBYGEMS_URL`): the
+/// compact index entry naming the upstream archive's sha256, and its
+/// download.
+async fn serve_upstream_gem(server: &MockServer, upstream: &[u8]) {
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/info/{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION} |checksum:{}\n",
+            sha256_of(upstream)
+        )))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/gems/{DEP}-{DEP_VERSION}.gem")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(upstream.to_vec(), "application/octet-stream"),
+        )
+        .mount(server)
+        .await;
+}
+
 /// The unwind direction: `rollback` puts the lock back on rubygems.org and
 /// the project's installed gem and archives back on the upstream gem,
 /// verified against the sha256 the compact index names.
@@ -2462,22 +2483,7 @@ async fn refresh_after_rollback_restores_the_upstream_gem() {
     let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
     mount_api_for(&server, None, &sha256_of(&patched)).await;
     serve_patched_gem(&server, patched.clone()).await;
-    // rubygems.org's stand-in: the compact index entry and the download.
-    Mock::given(method("GET"))
-        .and(path(format!("/upstream/info/{DEP}")))
-        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
-            "---\n{DEP_VERSION} |checksum:{}\n",
-            sha256_of(&upstream)
-        )))
-        .mount(&server)
-        .await;
-    Mock::given(method("GET"))
-        .and(path(format!("/upstream/gems/{DEP}-{DEP_VERSION}.gem")))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_raw(upstream.clone(), "application/octet-stream"),
-        )
-        .mount(&server)
-        .await;
+    serve_upstream_gem(&server, &upstream).await;
     let tmp = tempfile::tempdir().unwrap();
     let proj = tmp.path().join("proj");
     std::fs::create_dir_all(&proj).unwrap();
@@ -2553,4 +2559,226 @@ async fn refresh_after_rollback_restores_the_upstream_gem() {
             && warnings_with_code(&env, "upstream_gem_stale_install").is_empty(),
         "nothing is left on the patched build: {env}"
     );
+}
+
+/// The vendored half of the patch API for the fixture's patch: the grant
+/// names the patched `.gem` and the stub gemspec a path source loads, each
+/// with its sha512, beside the hosted registry override. Priority 1, so it
+/// answers `patches/package` in place of [`mount_api_for`]'s hosted-only
+/// grant.
+async fn mount_vendored_grant(server: &MockServer, patched: &[u8]) {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let sri = |bytes: &[u8]| {
+        format!(
+            "sha512-{}",
+            base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(bytes))
+        )
+    };
+    let stub = format!(
+        "Gem::Specification.new do |s|\n  s.name = \"{DEP}\".freeze\n  s.version = \
+         \"{DEP_VERSION}\".freeze\n  s.authors = [\"e2e\".freeze]\n  s.summary = \
+         \"fixture\".freeze\n  s.files = [\"lib/stale_probe_gem.rb\".freeze]\n  s.require_paths \
+         = [\"lib\".freeze]\nend\n"
+    )
+    .into_bytes();
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let base = format!("/artifacts/{UUID}");
+    let gem_url = format!("{}{base}/{leaf}.gem", server.uri());
+    let stub_url = format!("{}{base}/{leaf}.gemspec", server.uri());
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/package")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "results": {
+                UUID: {
+                    "status": "granted",
+                    "url": gem_url,
+                    "purl": PURL,
+                    "artifacts": [
+                        { "kind": "tarball", "url": gem_url,
+                          "integrity": { "sha512": sri(patched), "sha256": sha256_of(patched) } },
+                        { "kind": "gem-stub-gemspec", "url": stub_url,
+                          "integrity": { "sha512": sri(&stub) } }
+                    ],
+                    "registryOverride": {
+                        "kind": "rubygems-compact-index",
+                        "indexUrl": format!("{}/patch-registry/gem/{TOKEN}/{UUID}/", server.uri()),
+                        "identifiers": {
+                            "name": DEP,
+                            "version": DEP_VERSION,
+                            "gemChecksumSha256": sha256_of(patched),
+                        }
+                    }
+                }
+            }
+        })))
+        .with_priority(1)
+        .mount(server)
+        .await;
+    for (file, bytes) in [
+        (format!("{leaf}.gem"), patched.to_vec()),
+        (format!("{leaf}.gemspec"), stub),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(format!("{base}/{file}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .mount(server)
+            .await;
+    }
+}
+
+/// Every regular file under `dir`, relative, with its bytes.
+fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path, out);
+            } else {
+                out.insert(
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    std::fs::read(&path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// A hosted → vendored takeover (`get --mode vendored`, `scan --mode
+/// vendored`, and plain `vendor`, which ejects the lock's hosted pins) puts
+/// the gem back on its upstream entry only on its way to the `path:`
+/// source, which is what Bundler loads from then on. The gems
+/// Bundler already holds are unused leftovers: the takeover must not
+/// refresh them (the patched installed copy would become an unpatched one
+/// that `vex` then reports against the vendored artifact) and must download
+/// no gem for them (vendored mode needs no registry). The installed gem,
+/// its cached archive and the cache-dir archive stay byte-identical, and
+/// the takeover's own advisory about the cache-dir archive is unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_is_not_run_by_a_hosted_to_vendored_takeover() {
+    let takeovers: [&[&str]; 3] = [
+        &["get", UUID, "--mode", "vendored"],
+        &["scan", "--mode", "vendored"],
+        &["vendor"],
+    ];
+    for takeover in takeovers {
+        let server = MockServer::start().await;
+        let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+        mount_api_for(&server, None, &sha256_of(&patched)).await;
+        serve_patched_gem(&server, patched.clone()).await;
+        // Everything a refresh back to upstream would need is there to use.
+        serve_upstream_gem(&server, &upstream).await;
+        mount_vendored_grant(&server, &patched).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write_manifest_pair(&proj);
+        let home = project_home(&proj);
+        let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+        let leaf = format!("{DEP}-{DEP_VERSION}");
+        let committed = proj
+            .join("vendor")
+            .join("cache")
+            .join(format!("{leaf}.gem"));
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, &upstream).unwrap();
+
+        // The hosted state: the scan pins the gem and refreshes the
+        // project's copies; the lock is then as `bundle install` leaves it.
+        let uri = server.uri();
+        let (code, _, stderr) =
+            common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+        assert_eq!(code, 0, "{takeover:?}: hosted scan:\n{stderr}");
+        std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+        assert_eq!(
+            installed_lib(&gem_dir),
+            PATCHED_LIB,
+            "{takeover:?}: premise"
+        );
+        assert_eq!(
+            std::fs::read(&committed).unwrap(),
+            patched,
+            "{takeover:?}: premise"
+        );
+        let held_before = (snapshot(&home), snapshot(committed.parent().unwrap()));
+        let requests_before = server.received_requests().await.unwrap_or_default().len();
+
+        let rubygems = format!("{uri}/upstream");
+        let mut args = takeover.to_vec();
+        args.extend([
+            "--yes",
+            "--json",
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            uri.as_str(),
+        ]);
+        let (code, stdout, stderr) =
+            common::run_with_env(&proj, &args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())]);
+        let env = common::parse_json_envelope(&stdout);
+        assert_eq!(code, 0, "{takeover:?}: {env}\nstderr:\n{stderr}");
+        let gemfile = std::fs::read_to_string(proj.join("Gemfile")).unwrap();
+        assert!(
+            gemfile.contains(".socket/vendor/gem/") && !gemfile.contains("/patch-registry/"),
+            "{takeover:?}: the takeover vendored the gem:\n{gemfile}"
+        );
+
+        assert!(
+            (snapshot(&home), snapshot(committed.parent().unwrap())) == held_before,
+            "{takeover:?}: the takeover changed a gem Bundler already held: {env}"
+        );
+        let fetched: Vec<String> = server.received_requests().await.unwrap_or_default()
+            [requests_before..]
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|path| path.contains("/gems/"))
+            .collect();
+        assert!(
+            fetched.is_empty(),
+            "{takeover:?}: the takeover downloaded a gem for the installed copies: {fetched:?}"
+        );
+        let text = env.to_string();
+        for code in [
+            "upstream_gem_install_refreshed",
+            "upstream_gem_stale_install",
+            "redirect_gem_install_refreshed",
+            "redirect_gem_stale_install",
+        ] {
+            assert!(!text.contains(code), "{takeover:?}: {code} in {env}");
+        }
+        // The takeover's own advisory about the patched cache-dir archive,
+        // as it always was: the per-package takeover's event says the
+        // vendored copy shadows it for now, the eject passes on its
+        // restore's warning.
+        let archive = committed.display().to_string();
+        if takeover == ["vendor"] {
+            let details = warnings_with_code(&env, "upstream_gem_stale_cache");
+            assert!(
+                details.len() == 1 && details[0].contains(&archive),
+                "{takeover:?}: the eject names the archive: {env}"
+            );
+        } else {
+            let notice = env["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["errorCode"] == "upstream_gem_stale_cache")
+                .unwrap_or_else(|| panic!("{takeover:?}: the takeover names the archive: {env}"));
+            assert!(
+                notice["reason"].as_str().is_some_and(|r| {
+                    r.contains("while the gem stays vendored") && r.contains(&archive)
+                }),
+                "{takeover:?}: {notice}"
+            );
+        }
+    }
 }

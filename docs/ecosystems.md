@@ -1754,6 +1754,8 @@ with a native extension is installed into a staging directory by RubyGems, with 
 owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
 `--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
 and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
+Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
+they are: Bundler loads the vendored copy from then on.
 
 Nothing is changed when the patched gem cannot be downloaded or verified: the run still exits 0
 and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `--dry-run` only
