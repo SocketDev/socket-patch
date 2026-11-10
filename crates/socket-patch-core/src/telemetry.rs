@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::{Mutex, PoisonError};
+use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use uuid::Uuid;
@@ -254,11 +256,12 @@ fn chrono_now_iso() -> String {
 /// API's `/v0/orgs/<slug>/telemetry` with the token, or the public proxy's
 /// `/patch/telemetry` anonymously.
 ///
-/// A command that built an [`ApiClient`](crate::api::client::ApiClient)
-/// takes this from it ([`Self::for_client`]), so its telemetry follows the
-/// run's one [`ApiRoute`] — the same host and org as every API call. Only a
-/// command that never builds a client (`list`) uses
-/// [`Self::from_credentials`].
+/// A run that built an [`ApiClient`](crate::api::client::ApiClient) takes
+/// this from it ([`Self::for_client`]), so its telemetry follows the run's
+/// one [`ApiRoute`] — the same host and org as every API call. A run that
+/// built none (`list`, or an `apply` that had nothing to fetch) uses
+/// [`Self::from_credentials`]: a client is never built, and the org never
+/// looked up, only to address an event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelemetryAuth {
     url: String,
@@ -325,8 +328,8 @@ impl TelemetryAuth {
 
 /// A telemetry event with its destination resolved, ready to POST. Built
 /// synchronously where the event fires (timestamp, env and config reads,
-/// the "Sending telemetry" debug line), so sending it inline or from a
-/// background task posts the very same request.
+/// the "Sending telemetry" debug line); the send itself runs in the
+/// background ([`start_send`]).
 struct PreparedSend {
     event: PatchTelemetryEvent,
     url: String,
@@ -344,15 +347,13 @@ fn prepare_send(event: PatchTelemetryEvent, auth: &TelemetryAuth) -> PreparedSen
     }
 }
 
-/// Send a telemetry event to the API.
+/// POST one telemetry event. Errors are logged in debug mode and never
+/// propagated.
 ///
-/// This is fire-and-forget: errors are logged in debug mode but never
-/// propagated. Uses `reqwest` with a 5-second request timeout and a
-/// 2-second connect timeout: a command awaits every send before it exits
-/// (inline, or via [`PendingTelemetry::flush`]), so a network that
-/// blackholes the endpoint (dropped SYNs, no RST) must give up on the
-/// handshake quickly rather than stall even a read-only `scan --json` for
-/// the full request budget.
+/// Nothing awaits a send (see [`start_send`]), so the 2-second connect and
+/// 5-second request timeouts bound no command. They only end a send that
+/// cannot finish (a blackholed endpoint, a host that accepts and stalls)
+/// while a long-running command is still at work beside it.
 async fn send_telemetry_event(prepared: PreparedSend) {
     let PreparedSend { event, url, bearer } = prepared;
 
@@ -392,51 +393,72 @@ async fn send_telemetry_event(prepared: PreparedSend) {
     }
 }
 
-/// Telemetry sends a command started off its critical path. Each send is
-/// spawned where its event fires (the event is built right there, so its
-/// body and timestamp are what an inline send would have posted) and the
-/// command awaits [`Self::flush`] before its first stdout write after that
-/// point — the send overlaps only the work in between, and is delivered (or
-/// given up on within the same 2 s connect / 5 s request budget) before
-/// any output that could raise SIGPIPE, and before any prompt a Ctrl-C
-/// could interrupt, exactly as an inline send was.
-///
-/// One `--debug`-only difference is inherent to the overlap and accepted:
-/// the "Sending telemetry to …" line still prints where the event fires,
-/// but its "Telemetry sent successfully" twin now prints where the send
-/// finishes (by [`Self::flush`] at the latest), so the two are no longer
-/// adjacent — whatever the run did in between sits between them. Each
-/// line is still one atomic `eprintln!`, and no other stream is affected.
-#[derive(Debug, Default)]
-pub struct PendingTelemetry {
-    sends: Vec<tokio::task::JoinHandle<()>>,
+/// The sends this process has started and not yet waited for. Process-wide,
+/// like [`SESSION_ID`]: events fire at every depth of a command, and the one
+/// place that may wait for them is its exit ([`flush`]).
+static IN_FLIGHT: Mutex<Vec<tokio::task::JoinHandle<()>>> = Mutex::new(Vec::new());
+
+fn in_flight() -> std::sync::MutexGuard<'static, Vec<tokio::task::JoinHandle<()>>> {
+    // A list of join handles has no invariant a panic could break.
+    IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-impl PendingTelemetry {
-    pub fn new() -> Self {
-        Self::default()
-    }
+/// Start `prepared`'s send and return at once. The send runs beside
+/// whatever the command does next, so no output, prompt or exit status
+/// ever waits on the telemetry endpoint; only [`flush`] waits, briefly.
+///
+/// One `--debug`-only consequence: the "Sending telemetry to …" line
+/// prints where the event fires and its "Telemetry sent successfully"
+/// twin where the send finishes, with whatever the run printed in between.
+fn start_send(prepared: PreparedSend) {
+    // A tracker can be reached with no runtime to carry the send: the
+    // event is dropped rather than its caller panicked.
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        debug_log("No async runtime to send telemetry on, skipping event");
+        return;
+    };
+    in_flight().push(runtime.spawn(send_telemetry_event(prepared)));
+}
 
-    /// Await every send started so far, in start order. Idempotent: a
-    /// second flush with nothing started since returns at once.
-    pub async fn flush(&mut self) {
-        for send in std::mem::take(&mut self.sends) {
+/// How long a command's exit waits for telemetry still in flight
+/// ([`flush`]).
+///
+/// A send to a healthy endpoint is a DNS lookup, a TLS connection and one
+/// small POST, and it runs beside the command, so only a command that is
+/// done sooner than that (`list`, a no-op `apply`) waits here at all. 300 ms
+/// lets such a send finish from most networks. It is also the whole cost
+/// of an endpoint that never answers — once per process, however many
+/// events are in flight — and short enough that a hook running `apply`
+/// after every install does not read as stalled.
+pub const EXIT_GRACE: Duration = Duration::from_millis(300);
+
+/// Give the sends still in flight up to `grace` to finish, then abandon
+/// the rest. For the very end of a process, after all of the command's
+/// output: the CLI's `main` calls it with [`EXIT_GRACE`] and exits.
+///
+/// `grace` bounds the wait whatever the endpoint does (refuses, drops the
+/// packets, accepts and stalls) and whatever a send's own timeouts are. A
+/// send abandoned here is lost: telemetry is best effort, and a command
+/// that has finished does not stay alive for it.
+pub async fn flush(grace: Duration) {
+    let mut sends = std::mem::take(&mut *in_flight());
+    if sends.is_empty() {
+        return;
+    }
+    let finished = async {
+        for send in &mut sends {
             // A send never panics on its own; a JoinError here can only be
             // a runtime shutting down, which leaves nothing to deliver.
             let _ = send.await;
         }
-    }
-
-    fn spawn(&mut self, prepared: PreparedSend) {
-        self.sends
-            .push(tokio::spawn(send_telemetry_event(prepared)));
-    }
-
-    /// [`Self::spawn`] a prepared event, or do nothing when telemetry is
-    /// disabled (`prepare` returned `None`).
-    fn spawn_prepared(&mut self, prepared: Option<PreparedSend>) {
-        if let Some(prepared) = prepared {
-            self.spawn(prepared);
+    };
+    if tokio::time::timeout(grace, finished).await.is_err() {
+        let abandoned = sends.iter().filter(|send| !send.is_finished()).count();
+        debug_log(&format!(
+            "Telemetry not delivered within {grace:?}, abandoning {abandoned} event(s)"
+        ));
+        for send in &sends {
+            send.abort();
         }
     }
 }
@@ -444,23 +466,29 @@ impl PendingTelemetry {
 // ---------------------------------------------------------------------------
 // Per-event tracker wrappers (the public API)
 //
-// Each takes the run's `TelemetryAuth` (see `TelemetryAuth::for_client`).
+// Each takes the run's `TelemetryAuth` (see `TelemetryAuth::for_client`),
+// starts its event's send and returns. They are `async` for their callers'
+// sake only: awaiting one never waits on the network.
 // ---------------------------------------------------------------------------
 
-/// Build the event the tracker wrappers below send, or `None` when
-/// telemetry is disabled via environment variables. `metadata` is a
+/// Build one event and start its send: every tracker below is this call
+/// with its event's type, command and metadata. `metadata` is a
 /// `serde_json::json!({...})` object; non-object / empty values are dropped
 /// to avoid `.unwrap()` noise at every call site.
-fn prepare(
+///
+/// Never fails and never waits. An event that is disabled, cannot be sent
+/// or is not delivered is at most a debug line; it changes nothing else
+/// about the run.
+fn fire(
     event_type: PatchTelemetryEventType,
     command: &'static str,
     metadata: serde_json::Value,
     error: Option<impl std::fmt::Display>,
     auth: &TelemetryAuth,
-) -> Option<PreparedSend> {
+) {
     if is_telemetry_disabled() {
         debug_log("Telemetry is disabled, skipping event");
-        return None;
+        return;
     }
 
     let metadata = match metadata {
@@ -469,30 +497,7 @@ fn prepare(
     };
     let error = error.map(|e| ("Error".to_string(), e.to_string()));
     let event = build_telemetry_event(event_type, command, metadata, error);
-    Some(prepare_send(event, auth))
-}
-
-/// Shared fire-and-forget helper for the per-event tracker wrappers below.
-///
-/// Never returns errors: telemetry failures are logged in debug mode but
-/// do not affect CLI operation. Returns immediately when telemetry is
-/// disabled via environment variables.
-async fn fire(
-    event_type: PatchTelemetryEventType,
-    command: &'static str,
-    metadata: serde_json::Value,
-    error: Option<impl std::fmt::Display>,
-    auth: &TelemetryAuth,
-) {
-    fire_prepared(prepare(event_type, command, metadata, error, auth)).await;
-}
-
-/// Send a prepared event inline, or return at once when telemetry is
-/// disabled (`prepare` returned `None`).
-async fn fire_prepared(prepared: Option<PreparedSend>) {
-    if let Some(prepared) = prepared {
-        send_telemetry_event(prepared).await;
-    }
+    start_send(prepare_send(event, auth));
 }
 
 /// Track a successful in-place (agent mode) patch application.
@@ -507,8 +512,7 @@ pub async fn track_patch_applied(patches_count: usize, dry_run: bool, auth: &Tel
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed patch application.
@@ -526,8 +530,7 @@ pub async fn track_patch_apply_failed(
         serde_json::json!({ "dry_run": dry_run, "mode": "agent" }),
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a hosted-mode run (`scan`/`get --mode hosted`) that pinned
@@ -554,8 +557,7 @@ pub async fn track_patch_hosted(
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed hosted-mode run (see [`track_patch_hosted`]).
@@ -571,8 +573,7 @@ pub async fn track_patch_hosted_failed(
         serde_json::json!({ "dry_run": dry_run, "mode": "hosted" }),
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a successful vendor run (count = packages vendored).
@@ -583,8 +584,7 @@ pub async fn track_patch_vendored(vendored_count: u32, dry_run: bool, auth: &Tel
         serde_json::json!({ "patches_count": vendored_count, "dry_run": dry_run }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed vendor run.
@@ -599,8 +599,7 @@ pub async fn track_patch_vendor_failed(
         serde_json::json!({ "dry_run": dry_run }),
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a successful patch removal.
@@ -611,8 +610,7 @@ pub async fn track_patch_removed(removed_count: usize, auth: &TelemetryAuth) {
         serde_json::json!({ "removed_count": removed_count }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed patch removal. Accepts any `Display` type for the error.
@@ -623,8 +621,7 @@ pub async fn track_patch_remove_failed(error: impl std::fmt::Display, auth: &Tel
         serde_json::Value::Null,
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a successful patch rollback.
@@ -635,8 +632,7 @@ pub async fn track_patch_rolled_back(rolled_back_count: usize, auth: &TelemetryA
         serde_json::json!({ "rolled_back_count": rolled_back_count }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed patch rollback. Accepts any `Display` type for the error.
@@ -647,23 +643,26 @@ pub async fn track_patch_rollback_failed(error: impl std::fmt::Display, auth: &T
         serde_json::Value::Null,
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Read-side trackers: scan + get
 // ---------------------------------------------------------------------------
 
-/// The whole `patch_scanned` event — type, command and metadata (per-tier
-/// patch counts, whether the call was downgraded to the public proxy
-/// after an auth-endpoint 401/403, the mode the run was asked for —
-/// `hosted` / `vendored` / `agent`, or `report` with none — and the modes
-/// the project is already wired for, from its hosted lockfile pins, vendor
-/// ledger and agent manifest). Both wrappers below build their event here,
-/// so the inline and background paths can never drift apart.
+/// Track a successful `scan`. Reports per-tier patch counts, whether the
+/// call was downgraded to the public proxy after an auth-endpoint 401/403
+/// (`fallback_to_proxy`), the mode the run was asked for (`hosted` /
+/// `vendored` / `agent`, or `report` with none) and the modes the project
+/// is already wired for, from its hosted lockfile pins, vendor ledger and
+/// agent manifest.
+///
+/// The argument count intentionally mirrors the metadata fields the
+/// dashboard needs — grouping them into a struct would force callers
+/// to build a config object for a single fire-and-forget call, which
+/// is worse ergonomics for a tracker.
 #[allow(clippy::too_many_arguments)]
-fn prepare_patch_scanned(
+pub async fn track_patch_scanned(
     packages_scanned: usize,
     free_patches: usize,
     paid_patches: usize,
@@ -673,8 +672,8 @@ fn prepare_patch_scanned(
     mode: &str,
     project_modes: &[&str],
     auth: &TelemetryAuth,
-) -> Option<PreparedSend> {
-    prepare(
+) {
+    fire(
         PatchTelemetryEventType::PatchScanned,
         "scan",
         serde_json::json!({
@@ -689,112 +688,22 @@ fn prepare_patch_scanned(
         }),
         None::<&str>,
         auth,
-    )
+    );
 }
 
-/// Track a successful `scan`. Reports per-tier patch counts and whether
-/// the call was downgraded to the public proxy after an auth-endpoint
-/// 401/403 (`fallback_to_proxy`).
-///
-/// The argument count intentionally mirrors the metadata fields the
-/// dashboard needs — grouping them into a struct would force callers
-/// to build a config object for a single fire-and-forget call, which
-/// is worse ergonomics for a tracker.
-///
-/// The CLI's `scan` sends this event through [`spawn_patch_scanned`]; the
-/// inline tracker stays as this published crate's public API, alongside
-/// the inline tracker every other event has. Both build the event with
-/// [`prepare_patch_scanned`], so neither can describe it differently.
-#[allow(clippy::too_many_arguments)]
-pub async fn track_patch_scanned(
-    packages_scanned: usize,
-    free_patches: usize,
-    paid_patches: usize,
-    can_access_paid: bool,
-    ecosystems: &[String],
-    fallback_to_proxy: bool,
-    mode: &str,
-    project_modes: &[&str],
-    auth: &TelemetryAuth,
-) {
-    fire_prepared(prepare_patch_scanned(
-        packages_scanned,
-        free_patches,
-        paid_patches,
-        can_access_paid,
-        ecosystems,
-        fallback_to_proxy,
-        mode,
-        project_modes,
-        auth,
-    ))
-    .await;
-}
-
-/// [`track_patch_scanned`], sent in the background: the event is built
-/// now and its send joins `pending`, which the command flushes before it
-/// returns.
-#[allow(clippy::too_many_arguments)]
-pub fn spawn_patch_scanned(
-    pending: &mut PendingTelemetry,
-    packages_scanned: usize,
-    free_patches: usize,
-    paid_patches: usize,
-    can_access_paid: bool,
-    ecosystems: &[String],
-    fallback_to_proxy: bool,
-    mode: &str,
-    project_modes: &[&str],
-    auth: &TelemetryAuth,
-) {
-    pending.spawn_prepared(prepare_patch_scanned(
-        packages_scanned,
-        free_patches,
-        paid_patches,
-        can_access_paid,
-        ecosystems,
-        fallback_to_proxy,
-        mode,
-        project_modes,
-        auth,
-    ));
-}
-
-/// The whole `patch_scan_failed` event (see [`prepare_patch_scanned`]).
-fn prepare_patch_scan_failed(
-    error: impl std::fmt::Display,
-    fallback_to_proxy: bool,
-    auth: &TelemetryAuth,
-) -> Option<PreparedSend> {
-    prepare(
-        PatchTelemetryEventType::PatchScanFailed,
-        "scan",
-        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
-        Some(error),
-        auth,
-    )
-}
-
-/// Track a failed `scan`. The CLI sends it through
-/// [`spawn_patch_scan_failed`]; kept as public API like
-/// [`track_patch_scanned`].
+/// Track a failed `scan`.
 pub async fn track_patch_scan_failed(
     error: impl std::fmt::Display,
     fallback_to_proxy: bool,
     auth: &TelemetryAuth,
 ) {
-    fire_prepared(prepare_patch_scan_failed(error, fallback_to_proxy, auth)).await;
-}
-
-/// [`track_patch_scan_failed`], sent in the background (see
-/// [`spawn_patch_scanned`]).
-pub fn spawn_patch_scan_failed(
-    pending: &mut PendingTelemetry,
-    error: impl std::fmt::Display,
-    fallback_to_proxy: bool,
-    auth: &TelemetryAuth,
-) {
-    pending.spawn_prepared(prepare_patch_scan_failed(error, fallback_to_proxy, auth));
+    fire(
+        PatchTelemetryEventType::PatchScanFailed,
+        "scan",
+        serde_json::json!({ "fallback_to_proxy": fallback_to_proxy }),
+        Some(error),
+        auth,
+    );
 }
 
 /// Track a successful `get`. Reports patch identity and whether the call
@@ -820,8 +729,7 @@ pub async fn track_patch_fetched(
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// The `uuid` a `patch_fetch_failed` event reports: `identifier` when it
@@ -854,8 +762,7 @@ pub async fn track_patch_fetch_failed(
         }),
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -870,8 +777,7 @@ pub async fn track_patch_listed(patches_count: usize, auth: &TelemetryAuth) {
         serde_json::json!({ "patches_count": patches_count }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a successful `repair`. Reports blob deltas and bytes freed.
@@ -891,8 +797,7 @@ pub async fn track_patch_repaired(
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed `repair`.
@@ -903,8 +808,7 @@ pub async fn track_patch_repair_failed(error: impl std::fmt::Display, auth: &Tel
         serde_json::Value::Null,
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -929,8 +833,7 @@ pub async fn track_vex_generated(
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed `vex` generation.
@@ -941,8 +844,7 @@ pub async fn track_vex_failed(error: impl std::fmt::Display, auth: &TelemetryAut
         serde_json::Value::Null,
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -972,8 +874,7 @@ pub async fn track_cli_updated(
         }),
         None::<&str>,
         auth,
-    )
-    .await;
+    );
 }
 
 /// Track a failed self-update. `error_code` is the machine code the
@@ -989,58 +890,192 @@ pub async fn track_cli_update_failed(
         serde_json::json!({ "error_code": error_code }),
         Some(error),
         auth,
-    )
-    .await;
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A prepared event posted to `server`'s `/telemetry` route.
-    fn prepared_for(server: &wiremock::MockServer) -> PreparedSend {
-        let mut metadata = HashMap::new();
-        metadata.insert("packages_scanned".to_string(), serde_json::json!(3));
-        PreparedSend {
-            event: build_telemetry_event(
-                PatchTelemetryEventType::PatchScanned,
-                "scan",
-                Some(metadata),
-                None,
-            ),
+    /// Every variable that can switch telemetry off.
+    const OPT_OUT_VARS: [&str; 3] = ["SOCKET_TELEMETRY_DISABLED", "VITEST", "SOCKET_OFFLINE"];
+
+    /// Telemetry switched on for one test: every opt-out variable is
+    /// cleared, and restored when the guard drops. Tests that hold one are
+    /// `#[serial]` (the environment is process-global).
+    struct TelemetryOn(Vec<(&'static str, Option<String>)>);
+
+    impl TelemetryOn {
+        fn new() -> Self {
+            let saved = OPT_OUT_VARS
+                .iter()
+                .map(|&var| (var, std::env::var(var).ok()))
+                .collect();
+            for var in OPT_OUT_VARS {
+                std::env::remove_var(var);
+            }
+            Self(saved)
+        }
+    }
+
+    impl Drop for TelemetryOn {
+        fn drop(&mut self) {
+            for (var, value) in self.0.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(var, value),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+    }
+
+    /// The route to a loopback endpoint that accepts every connection and
+    /// never answers: a firewall that swallows the request, a stalled load
+    /// balancer. It lives as long as the test's runtime.
+    async fn stalled_endpoint() -> TelemetryAuth {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let url = format!("http://{}/telemetry", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((conn, _)) = listener.accept().await {
+                held.push(conn);
+            }
+        });
+        TelemetryAuth { url, bearer: None }
+    }
+
+    /// More grace than any send can use (its own request timeout is 5 s):
+    /// `flush(AMPLE)` returns when every send in flight has finished.
+    const AMPLE: Duration = Duration::from_secs(30);
+
+    /// The org-style route to `server`'s `/telemetry`, with a bearer.
+    fn route_to(server: &wiremock::MockServer) -> TelemetryAuth {
+        TelemetryAuth {
             url: format!("{}/telemetry", server.uri()),
             bearer: Some("tok".to_string()),
         }
     }
 
-    /// A background send posts exactly the request an inline send posts
-    /// (same body bytes and headers), and is delivered by `flush`.
+    /// NT-U1: a tracker starts its send and returns. Awaited inline, a
+    /// send to an endpoint that takes the request and never answers held
+    /// its command for the whole 5 s request timeout. The exit wait is
+    /// the grace, not that timeout, and the send it gives up on is gone.
     #[tokio::test]
-    async fn background_send_posts_the_inline_request_and_flush_delivers_it() {
+    #[serial_test::serial]
+    async fn trackers_return_without_waiting_for_the_endpoint() {
+        let _on = TelemetryOn::new();
+        let auth = stalled_endpoint().await;
+
+        let started = std::time::Instant::now();
+        track_patch_listed(3, &auth).await;
+        let held = started.elapsed();
+        assert!(
+            held < Duration::from_secs(1),
+            "the tracker held its caller for {held:?} on a stalled endpoint"
+        );
+
+        let grace = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        flush(grace).await;
+        let waited = started.elapsed();
+        assert!(
+            waited >= grace,
+            "flush returned after {waited:?} with a send still in flight"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "flush overran its {grace:?} grace: {waited:?}"
+        );
+
+        let started = std::time::Instant::now();
+        flush(AMPLE).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "an abandoned send is not waited for again"
+        );
+    }
+
+    /// A refused connection fails at once, and the wait ends with it
+    /// rather than at the grace.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_refused_connection_does_not_use_up_the_grace() {
+        let _on = TelemetryOn::new();
+        // Bound, then released: nothing listens on the port.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let auth = TelemetryAuth {
+            url: format!("http://127.0.0.1:{port}/telemetry"),
+            bearer: None,
+        };
+
+        track_patch_listed(3, &auth).await;
+        let started = std::time::Instant::now();
+        flush(AMPLE).await;
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_secs(10),
+            "flush waited {waited:?} on a refused connection"
+        );
+    }
+
+    /// A tracker reached with no async runtime drops its event instead of
+    /// panicking where it would spawn the send.
+    #[test]
+    #[serial_test::serial]
+    fn firing_without_a_runtime_drops_the_event() {
+        let _on = TelemetryOn::new();
+        let in_flight_before = in_flight().len();
+        fire(
+            PatchTelemetryEventType::PatchListed,
+            "list",
+            serde_json::Value::Null,
+            None::<&str>,
+            &TelemetryAuth {
+                url: "http://127.0.0.1:9/telemetry".to_string(),
+                bearer: None,
+            },
+        );
+        assert_eq!(in_flight().len(), in_flight_before);
+    }
+
+    /// `flush` waits for sends that finish inside the grace and returns as
+    /// soon as they have: the events are delivered, with the headers every
+    /// event carries, and the rest of the grace is not spent.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn flush_waits_for_sends_that_finish_within_the_grace() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let _on = TelemetryOn::new();
+        let delay = Duration::from_millis(300);
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/telemetry"))
-            .respond_with(ResponseTemplate::new(201))
+            .respond_with(ResponseTemplate::new(201).set_delay(delay))
             .mount(&server)
             .await;
 
-        let prepared = prepared_for(&server);
-        let twin = PreparedSend {
-            event: prepared.event.clone(),
-            url: prepared.url.clone(),
-            bearer: prepared.bearer.clone(),
-        };
-        send_telemetry_event(prepared).await;
-        let mut pending = PendingTelemetry::new();
-        pending.spawn(twin);
-        pending.flush().await;
+        let auth = route_to(&server);
+        track_patch_listed(3, &auth).await;
+        track_patch_listed(4, &auth).await;
+        let started = std::time::Instant::now();
+        flush(AMPLE).await;
+        let waited = started.elapsed();
+        assert!(waited >= delay, "flush must wait for the answers");
+        assert!(
+            waited < AMPLE / 2,
+            "flush returns when the sends finish, not at the grace: {waited:?}"
+        );
 
         let reqs = server.received_requests().await.unwrap();
-        assert_eq!(reqs.len(), 2);
-        assert_eq!(reqs[0].body, reqs[1].body);
+        assert_eq!(reqs.len(), 2, "both sends ran side by side");
         for req in &reqs {
             assert_eq!(req.headers.get("authorization").unwrap(), "Bearer tok");
             assert_eq!(req.headers.get("user-agent").unwrap(), USER_AGENT);
@@ -1048,172 +1083,66 @@ mod tests {
         }
     }
 
-    /// Spawning returns at once; `flush` waits for the slow responses.
-    #[tokio::test]
-    async fn spawn_does_not_block_and_flush_waits_for_the_response() {
-        use wiremock::matchers::method;
-        use wiremock::{Mock, MockServer, ResponseTemplate};
-
-        let delay = std::time::Duration::from_millis(400);
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .respond_with(ResponseTemplate::new(201).set_delay(delay))
-            .mount(&server)
-            .await;
-
-        let mut pending = PendingTelemetry::new();
-        pending.spawn(prepared_for(&server));
-        pending.spawn(prepared_for(&server));
-        // Nothing was awaited yet: both sends are still in flight.
-        assert_eq!(pending.sends.len(), 2);
-        assert!(pending.sends.iter().all(|s| !s.is_finished()));
-        let started = std::time::Instant::now();
-        pending.flush().await;
-        assert!(started.elapsed() >= delay, "flush must await the responses");
-        assert_eq!(server.received_requests().await.unwrap().len(), 2);
-    }
-
     /// Nothing started, nothing to wait for.
     #[tokio::test]
+    #[serial_test::serial]
     async fn flushing_nothing_returns() {
-        PendingTelemetry::new().flush().await;
+        flush(AMPLE).await;
+        let started = std::time::Instant::now();
+        flush(AMPLE).await;
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// Scan flushes at each output point after a send fires, so `flush`
-    /// drains: a later flush waits only for sends started since, and the
-    /// exit backstop after an early flush has nothing left to wait for.
+    /// `flush` drains: a later one waits only for sends started since.
     #[tokio::test]
+    #[serial_test::serial]
     async fn flush_drains_and_later_sends_join_the_next_flush() {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
+        let _on = TelemetryOn::new();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;
+        let auth = route_to(&server);
 
-        let mut pending = PendingTelemetry::new();
-        pending.spawn(prepared_for(&server));
-        pending.flush().await;
-        assert!(pending.sends.is_empty());
+        track_patch_listed(1, &auth).await;
+        flush(AMPLE).await;
+        assert!(in_flight().is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
-        pending.flush().await;
+        flush(AMPLE).await;
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
 
-        pending.spawn(prepared_for(&server));
-        pending.flush().await;
-        assert!(pending.sends.is_empty());
+        track_patch_listed(2, &auth).await;
+        flush(AMPLE).await;
+        assert!(in_flight().is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
     }
 
-    /// `scan`'s two events each have an inline tracker (this crate's public
-    /// API) and a background twin the CLI calls. Both must describe the
-    /// event identically — same event type, command and metadata — or a
-    /// rename would silently reach only one of them. Serialized: the
-    /// endpoint and the disable gate are read from process-global env.
+    /// A disabled run starts no send at all: nothing reaches the endpoint
+    /// and nothing is left in flight for the exit to wait on.
     #[tokio::test]
     #[serial_test::serial]
-    async fn inline_and_background_scan_trackers_post_the_same_event() {
-        use wiremock::matchers::{method, path};
+    async fn a_disabled_tracker_starts_no_send() {
+        use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// The request body with only its timestamp dropped (the session
-        /// id is process-global, so it matches).
-        fn descriptor(body: &[u8]) -> serde_json::Value {
-            let mut v: serde_json::Value = serde_json::from_slice(body).expect("event json");
-            v.as_object_mut()
-                .expect("event object")
-                .remove("event_sender_created_at")
-                .expect("every event is timestamped");
-            v
-        }
-
+        let _on = TelemetryOn::new();
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/patch/telemetry"))
             .respond_with(ResponseTemplate::new(201))
             .mount(&server)
             .await;
+        let auth = route_to(&server);
+        flush(AMPLE).await;
 
-        let saved: Vec<(&str, Option<String>)> = [
-            "SOCKET_PROXY_URL",
-            "SOCKET_TELEMETRY_DISABLED",
-            "SOCKET_OFFLINE",
-            "VITEST",
-        ]
-        .iter()
-        .map(|&k| (k, std::env::var(k).ok()))
-        .collect();
-        for (key, _) in &saved {
-            std::env::remove_var(key);
-        }
-        std::env::set_var("SOCKET_PROXY_URL", server.uri());
-
-        // No token / org: both events go to the proxy endpoint above.
-        let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
-        let auth = TelemetryAuth::from_credentials(None, None);
-        let mut pending = PendingTelemetry::new();
-        track_patch_scanned(
-            5,
-            3,
-            2,
-            true,
-            &ecosystems,
-            true,
-            "hosted",
-            &["vendored"],
-            &auth,
-        )
-        .await;
-        spawn_patch_scanned(
-            &mut pending,
-            5,
-            3,
-            2,
-            true,
-            &ecosystems,
-            true,
-            "hosted",
-            &["vendored"],
-            &auth,
-        );
-        pending.flush().await;
-        track_patch_scan_failed("all batches failed", true, &auth).await;
-        spawn_patch_scan_failed(&mut pending, "all batches failed", true, &auth);
-        pending.flush().await;
-
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-
-        let bodies: Vec<serde_json::Value> = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .map(|r| descriptor(&r.body))
-            .collect();
-        assert_eq!(bodies.len(), 4, "two events, two paths each");
-        assert_eq!(bodies[0], bodies[1], "patch_scanned inline vs background");
-        assert_eq!(
-            bodies[2], bodies[3],
-            "patch_scan_failed inline vs background"
-        );
-        assert_eq!(bodies[0]["event_type"], "patch_scanned");
-        assert_eq!(bodies[0]["context"]["command"], "scan");
-        assert_eq!(bodies[0]["metadata"]["free_patches"], 3);
-        assert_eq!(bodies[0]["metadata"]["mode"], "hosted");
-        assert_eq!(
-            bodies[0]["metadata"]["project_modes"],
-            serde_json::json!(["vendored"])
-        );
-        assert_eq!(bodies[2]["event_type"], "patch_scan_failed");
-        assert_eq!(bodies[2]["context"]["command"], "scan");
-        assert_eq!(bodies[2]["error"]["message"], "all batches failed");
+        std::env::set_var("SOCKET_TELEMETRY_DISABLED", "1");
+        track_patch_listed(1, &auth).await;
+        assert!(in_flight().is_empty());
+        flush(AMPLE).await;
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// Combined into a single test to avoid env-var races across parallel tests.
@@ -1535,31 +1464,39 @@ mod tests {
             .mount(&server)
             .await;
 
-        let saved: Vec<(&str, Option<String>)> =
-            ["SOCKET_TELEMETRY_DISABLED", "SOCKET_OFFLINE", "VITEST"]
-                .iter()
-                .map(|&k| (k, std::env::var(k).ok()))
-                .collect();
-        for (key, _) in &saved {
-            std::env::remove_var(key);
-        }
-
+        let _on = TelemetryOn::new();
         let auth = TelemetryAuth {
             url: format!("{}/v0/orgs/acme/telemetry", server.uri()),
             bearer: Some("tok".to_string()),
         };
+        // Sends run side by side, so each is waited for before the next
+        // fires: the requests then arrive in the order asserted below.
         track_patch_applied(3, false, &auth).await;
+        flush(AMPLE).await;
         track_patch_hosted("scan", 2, 1, false, &auth).await;
+        flush(AMPLE).await;
         track_patch_hosted_failed("get", "lockfile write failed", true, &auth).await;
+        flush(AMPLE).await;
         track_cli_updated("9.9.9", "standalone", false, false, &auth).await;
+        flush(AMPLE).await;
         track_cli_update_failed("managed_install", "managed by npm", &auth).await;
-
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
+        flush(AMPLE).await;
+        let ecosystems = vec!["npm".to_string(), "pypi".to_string()];
+        track_patch_scanned(
+            5,
+            3,
+            2,
+            true,
+            &ecosystems,
+            true,
+            "hosted",
+            &["vendored"],
+            &auth,
+        )
+        .await;
+        flush(AMPLE).await;
+        track_patch_scan_failed("all batches failed", true, &auth).await;
+        flush(AMPLE).await;
 
         let reqs = server.received_requests().await.unwrap();
         let bodies: Vec<serde_json::Value> = reqs
@@ -1569,7 +1506,7 @@ mod tests {
                 serde_json::from_slice(&r.body).unwrap()
             })
             .collect();
-        assert_eq!(bodies.len(), 5);
+        assert_eq!(bodies.len(), 7);
 
         assert_eq!(bodies[0]["event_type"], "patch_applied");
         assert_eq!(bodies[0]["context"]["command"], "apply");
@@ -1597,6 +1534,26 @@ mod tests {
         assert_eq!(bodies[4]["event_type"], "cli_update_failed");
         assert_eq!(bodies[4]["metadata"]["error_code"], "managed_install");
         assert_eq!(bodies[4]["error"]["message"], "managed by npm");
+
+        assert_eq!(bodies[5]["event_type"], "patch_scanned");
+        assert_eq!(bodies[5]["context"]["command"], "scan");
+        assert_eq!(bodies[5]["metadata"]["packages_scanned"], 5);
+        assert_eq!(bodies[5]["metadata"]["free_patches"], 3);
+        assert_eq!(bodies[5]["metadata"]["paid_patches"], 2);
+        assert_eq!(
+            bodies[5]["metadata"]["ecosystems"],
+            serde_json::json!(["npm", "pypi"])
+        );
+        assert_eq!(bodies[5]["metadata"]["mode"], "hosted");
+        assert_eq!(
+            bodies[5]["metadata"]["project_modes"],
+            serde_json::json!(["vendored"])
+        );
+
+        assert_eq!(bodies[6]["event_type"], "patch_scan_failed");
+        assert_eq!(bodies[6]["context"]["command"], "scan");
+        assert_eq!(bodies[6]["metadata"]["fallback_to_proxy"], true);
+        assert_eq!(bodies[6]["error"]["message"], "all batches failed");
     }
 
     #[test]

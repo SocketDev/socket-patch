@@ -93,10 +93,30 @@ async fn main() {
         Commands::HostedBundle(args) => commands::hosted_bundle::run(args).await,
     };
 
-    // Never delays exit beyond its 500 ms grace budget; never changes the
-    // exit code; prints (at most) its notice to stderr after all command
-    // output.
-    socket_patch_cli::update_notifier::finish(notifier).await;
+    // The tail of the run, after all command output. Telemetry sent beside
+    // the command gets a short grace to finish (`telemetry::EXIT_GRACE`),
+    // then is dropped. The notifier never delays exit beyond its 500 ms
+    // grace budget and prints (at most) its notice to stderr. Neither
+    // changes the exit code, and joined they cost the longer of the two
+    // waits, not the sum.
+    tokio::join!(
+        socket_patch_core::telemetry::flush(telemetry_grace()),
+        socket_patch_cli::update_notifier::finish(notifier),
+    );
 
     std::process::exit(exit_code);
+}
+
+/// How long the exit waits for telemetry still in flight: the production
+/// grace, or `SOCKET_TELEMETRY_GRACE_MS` — a test hook, so a suite that
+/// counts the events a loopback mock received is not racing a loaded
+/// runner (a send's own 5 s request timeout still ends the wait).
+fn telemetry_grace() -> std::time::Duration {
+    std::env::var("SOCKET_TELEMETRY_GRACE_MS")
+        .ok()
+        .and_then(|ms| ms.parse().ok())
+        .map_or(
+            socket_patch_core::telemetry::EXIT_GRACE,
+            std::time::Duration::from_millis,
+        )
 }

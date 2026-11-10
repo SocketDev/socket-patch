@@ -1,7 +1,9 @@
-//! End-to-end coverage that the new `track_patch_*` instrumentation
-//! actually fires HTTP POSTs against the configured telemetry endpoint
-//! for the apply/scan/get commands, and that `SOCKET_OFFLINE=1`
-//! (airgap mode) suppresses every one of them.
+//! End-to-end coverage that the `track_patch_*` instrumentation actually
+//! fires HTTP POSTs against the configured telemetry endpoint for the
+//! apply/scan/get commands, that `SOCKET_OFFLINE=1` (airgap mode)
+//! suppresses every one of them, and that telemetry never holds a command
+//! back: output comes first, and an endpoint that stalls costs only the
+//! short exit grace.
 //!
 //! Wiremock fronts both the patches endpoints (so scan/get succeed)
 //! and the telemetry endpoint (so we can assert the POST shape +
@@ -62,37 +64,13 @@ fn build_cmd(
     extra_args: &[&str],
     extra_env: &[(&str, &str)],
 ) -> Command {
-    build_cmd_with_token(
-        "fake-token-for-test",
-        cwd,
-        api_url,
-        subcommand,
-        extra_args,
-        extra_env,
-    )
-}
-
-/// A `sktsec_<44 chars>_api`-shaped token: the client's token-shape check
-/// stays quiet, so a run's stderr carries only what the command under test
-/// writes (the default fake token draws a warning before anything runs).
-const WELL_SHAPED_TOKEN: &str = "sktsec_00000000000000000000000000000000000000000000_api";
-
-/// [`build_cmd`] with an explicit `--api-token`.
-fn build_cmd_with_token(
-    api_token: &str,
-    cwd: &Path,
-    api_url: &str,
-    subcommand: &str,
-    extra_args: &[&str],
-    extra_env: &[(&str, &str)],
-) -> Command {
     let mut args = vec![
         subcommand,
         "--json",
         "--api-url",
         api_url,
         "--api-token",
-        api_token,
+        "fake-token-for-test",
         "--org",
         ORG_SLUG,
     ];
@@ -743,17 +721,19 @@ async fn list_skips_telemetry_in_airgap_mode() {
 }
 
 // ---------------------------------------------------------------------------
-// scan: background sends are flushed before exit
+// scan: sends still in flight get the exit grace
 // ---------------------------------------------------------------------------
 
-/// Scan sends its telemetry off the critical path but must flush it before
-/// the process exits. Against a telemetry endpoint that answers only after
-/// `TELEMETRY_DELAY`, each scan terminal — success, empty crawl, and
-/// all-batches-failed — must still deliver exactly its one event AND stay
-/// alive until the response arrives (the lower bound on wall time cannot
-/// flake under load: load only makes a run slower).
+/// Telemetry is sent beside the command, and the exit gives a send still
+/// in flight its grace to finish. Against a telemetry endpoint that
+/// answers only after `TELEMETRY_DELAY` — inside the grace this harness
+/// lifts — each scan terminal (success, empty crawl, all-batches-failed)
+/// must deliver exactly its one event AND stay alive until the response
+/// arrives (the lower bound on wall time cannot flake under load: load
+/// only makes a run slower). The production grace is pinned by
+/// `a_stalled_telemetry_endpoint_costs_only_the_exit_grace`.
 #[tokio::test]
-async fn scan_flushes_background_telemetry_before_exit() {
+async fn scan_waits_out_the_exit_grace_for_telemetry_in_flight() {
     const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1500);
 
     struct Case {
@@ -833,214 +813,6 @@ async fn scan_flushes_background_telemetry_before_exit() {
             elapsed >= TELEMETRY_DELAY,
             "{}: scan exited after {elapsed:?}, before its telemetry send completed",
             case.label
-        );
-    }
-}
-
-/// A consumer that exits early (`scan | head`, `scan | true`) closes
-/// stdout, and the CLI dies of SIGPIPE on its first result write (main
-/// restores SIG_DFL). The background send must already be delivered by
-/// then — flushed before that write —
-/// not lost with the process. Covers the empty-crawl and all-batches-failed
-/// terminals, which print right after the event fires (so they fail
-/// deterministically without the flush), and the hosted and vendored arms
-/// (flushed at `discover_selected`; the "plain envelope" case is a bare
-/// scan, i.e. hosted too). The hosted/vendored arms do enough work before
-/// printing that an unflushed send usually wins the race anyway, so for
-/// them this is a delivery check rather than a pin on the flush point.
-#[tokio::test]
-async fn scan_delivers_telemetry_before_writing_to_a_closed_stdout() {
-    const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
-
-    struct Case {
-        label: &'static str,
-        batch_status: u16,
-        install_package: bool,
-        extra_args: &'static [&'static str],
-        want_event: &'static str,
-    }
-    let cases = [
-        Case {
-            label: "plain envelope",
-            batch_status: 200,
-            install_package: true,
-            extra_args: &[],
-            want_event: "patch_scanned",
-        },
-        Case {
-            label: "empty crawl",
-            batch_status: 200,
-            install_package: false,
-            extra_args: &[],
-            want_event: "patch_scanned",
-        },
-        Case {
-            label: "all batches failed",
-            batch_status: 500,
-            install_package: true,
-            extra_args: &[],
-            want_event: "patch_scan_failed",
-        },
-        Case {
-            label: "hosted",
-            batch_status: 200,
-            install_package: true,
-            extra_args: &["--mode", "hosted", "--dry-run"],
-            want_event: "patch_scanned",
-        },
-        Case {
-            label: "vendored",
-            batch_status: 200,
-            install_package: true,
-            extra_args: &["--mode", "vendored", "--dry-run"],
-            want_event: "patch_scanned",
-        },
-    ];
-
-    for case in cases {
-        let mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(case.batch_status).set_body_json(
-                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
-            ))
-            .mount(&mock)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
-            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
-            .mount(&mock)
-            .await;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_root_package_json(tmp.path());
-        if case.install_package {
-            write_npm_package(tmp.path(), "minimist", "1.2.2");
-        }
-
-        let mut child = build_cmd(tmp.path(), &mock.uri(), "scan", case.extra_args, &[])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn socket-patch");
-        // Close the read end before the child can write anything: its
-        // first stdout write now raises SIGPIPE.
-        drop(child.stdout.take());
-        let status = child.wait().expect("wait socket-patch");
-
-        assert_eq!(
-            telemetry_post_count(&mock, Some(case.want_event)).await,
-            1,
-            "{}: the {} event must be delivered before stdout is written \
-             (exit status {status:?})",
-            case.label,
-            case.want_event
-        );
-        assert_eq!(
-            telemetry_post_count(&mock, None).await,
-            1,
-            "{}: no other telemetry event",
-            case.label
-        );
-    }
-}
-
-/// The stderr twin of the closed-stdout test above: with stderr closed
-/// from the start, the agent preview (`--mode agent --dry-run`) and the
-/// vendored arm must still deliver the delayed `patch_scanned` event.
-/// Before v5 a malformed hosted redirect ledger made these arms warn on
-/// stderr right after the event fired; v5 scan never reads that ledger (a
-/// pre-v5 one is ignored), so the project below keeps one to pin that no
-/// warning is written in that window at all, and the run still reaches its
-/// flush with the send delivered.
-#[tokio::test]
-async fn scan_delivers_telemetry_before_writing_to_a_closed_stderr() {
-    const TELEMETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
-
-    let cases: [(&str, &[&str]); 2] = [
-        ("agent preview", &["--mode", "agent", "--dry-run"]),
-        ("vendored", &["--mode", "vendored", "--dry-run"]),
-    ];
-    for (label, extra_args) in cases {
-        let mock = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
-            ))
-            .mount(&mock)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
-            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
-            .mount(&mock)
-            .await;
-
-        let tmp = tempfile::tempdir().expect("tempdir");
-        write_root_package_json(tmp.path());
-        write_npm_package(tmp.path(), "minimist", "1.2.2");
-        let ledger_dir = tmp.path().join(".socket").join("vendor");
-        std::fs::create_dir_all(&ledger_dir).expect("mkdir .socket/vendor");
-        std::fs::write(ledger_dir.join("redirect-state.json"), "{ not json")
-            .expect("write malformed pre-v5 redirect ledger");
-
-        // Sanity: with stderr open the pre-v5 ledger draws no warning.
-        let out = build_cmd_with_token(
-            WELL_SHAPED_TOKEN,
-            tmp.path(),
-            &mock.uri(),
-            "scan",
-            extra_args,
-            &[],
-        )
-        .output()
-        .expect("run socket-patch");
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            !stderr.contains("Warning") && !stderr.contains("redirect-state.json"),
-            "{label}: a pre-v5 redirect ledger is never read by scan; got: {stderr}"
-        );
-        mock.reset().await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/patches/batch")))
-            .respond_with(ResponseTemplate::new(200).set_body_json(
-                serde_json::json!({ "packages": [], "canAccessPaidPatches": false }),
-            ))
-            .mount(&mock)
-            .await;
-        Mock::given(method("POST"))
-            .and(path(format!("/v0/orgs/{ORG_SLUG}/telemetry")))
-            .respond_with(ResponseTemplate::new(201).set_delay(TELEMETRY_DELAY))
-            .mount(&mock)
-            .await;
-
-        let mut child = build_cmd_with_token(
-            WELL_SHAPED_TOKEN,
-            tmp.path(),
-            &mock.uri(),
-            "scan",
-            extra_args,
-            &[],
-        )
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn socket-patch");
-        // Close the read end before the child can write anything: its
-        // first stderr write now raises SIGPIPE.
-        drop(child.stderr.take());
-        let status = child.wait().expect("wait socket-patch");
-
-        assert_eq!(
-            telemetry_post_count(&mock, Some("patch_scanned")).await,
-            1,
-            "{label}: the patch_scanned event must be delivered before stderr \
-             is written (exit status {status:?})"
-        );
-        assert_eq!(
-            telemetry_post_count(&mock, None).await,
-            1,
-            "{label}: no other telemetry event"
         );
     }
 }
@@ -1157,9 +929,13 @@ async fn setup_hosted_mock(reference_status: u16) -> MockServer {
     mock
 }
 
-/// Every telemetry body the mock received, in order.
+/// Every telemetry body the mock received, in the order the events fired.
+/// Sends run side by side, so arrival order is not firing order: the
+/// bodies are sorted by the timestamp each event was built with (a stable
+/// sort, so events of the same millisecond keep their arrival order).
 async fn telemetry_bodies(mock: &MockServer) -> Vec<serde_json::Value> {
-    mock.received_requests()
+    let mut bodies: Vec<serde_json::Value> = mock
+        .received_requests()
         .await
         .expect("wiremock allows recording")
         .iter()
@@ -1169,7 +945,14 @@ async fn telemetry_bodies(mock: &MockServer) -> Vec<serde_json::Value> {
                 .ends_with(&format!("/v0/orgs/{ORG_SLUG}/telemetry"))
         })
         .map(|req| serde_json::from_slice(&req.body).expect("telemetry body is JSON"))
-        .collect()
+        .collect();
+    bodies.sort_by_key(|body| {
+        body["event_sender_created_at"]
+            .as_str()
+            .expect("every event is timestamped")
+            .to_string()
+    });
+    bodies
 }
 
 /// v5's default `scan` pins patched dependencies to the hosted patch
@@ -1334,36 +1117,6 @@ async fn hosted_scan_failure_reports_patch_apply_failed() {
     assert_eq!(failed["error"]["type"], "Error");
 }
 
-/// The `--json` failure envelope (every run here is `--json`) prints only
-/// after `patch_apply_failed` is sent: with stdout closed from the start,
-/// its first write raises SIGPIPE, and the event must already be out.
-#[tokio::test]
-async fn hosted_scan_failure_delivers_telemetry_before_a_closed_stdout() {
-    let mock = setup_hosted_mock(500).await;
-    let tmp = tempfile::tempdir().expect("tempdir");
-    write_hosted_npm_project(tmp.path());
-
-    let mut child = build_cmd(tmp.path(), &mock.uri(), "scan", &[], &[])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn socket-patch");
-    drop(child.stdout.take());
-    let status = child.wait().expect("wait socket-patch");
-    assert!(!status.success(), "{status:?}");
-
-    let bodies = telemetry_bodies(&mock).await;
-    let types: Vec<&str> = bodies
-        .iter()
-        .map(|b| b["event_type"].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        types,
-        ["patch_scanned", "patch_apply_failed"],
-        "{bodies:#?}"
-    );
-}
-
 /// `get --mode hosted` reports through the same path, under its own
 /// command name.
 #[tokio::test]
@@ -1390,4 +1143,190 @@ async fn hosted_get_reports_patch_applied_under_get() {
     assert_eq!(applied[0]["context"]["command"], "get");
     assert_eq!(applied[0]["metadata"]["mode"], "hosted");
     assert_eq!(applied[0]["metadata"]["patches_count"], 1);
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry never holds a command back
+// ---------------------------------------------------------------------------
+
+/// A telemetry endpoint the test answers by hand. It accepts one
+/// connection and reads one request, whose JSON body arrives on
+/// `received`; the `201` goes out only when the test sends on `answer`.
+/// Dropping the endpoint closes the connection unanswered.
+struct HeldEndpoint {
+    uri: String,
+    received: std::sync::mpsc::Receiver<serde_json::Value>,
+    answer: std::sync::mpsc::Sender<()>,
+}
+
+fn held_endpoint() -> HeldEndpoint {
+    use std::io::{Read, Write};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let uri = format!("http://{}", listener.local_addr().expect("local addr"));
+    let (received_tx, received) = std::sync::mpsc::channel();
+    let (answer, answer_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        // One HTTP/1.1 request: the head, then `content-length` bytes.
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let body = loop {
+            match conn.read(&mut chunk) {
+                Ok(n) if n > 0 => raw.extend_from_slice(&chunk[..n]),
+                _ => return,
+            }
+            let Some(head_end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&raw[..head_end]).to_ascii_lowercase();
+            let length: usize = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            let body_start = head_end + 4;
+            if raw.len() >= body_start + length {
+                break raw[body_start..body_start + length].to_vec();
+            }
+        };
+        let _ = received_tx.send(serde_json::from_slice(&body).unwrap_or_default());
+        if answer_rx.recv().is_ok() {
+            let _ = conn.write_all(
+                b"HTTP/1.1 201 Created\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            );
+        }
+    });
+    HeldEndpoint {
+        uri,
+        received,
+        answer,
+    }
+}
+
+/// A project with an empty manifest and nothing installed: `list` has
+/// nothing to list and `scan` nothing to query, so each command's only
+/// request is its telemetry event.
+fn write_empty_project(root: &Path) {
+    write_root_package_json(root);
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(&socket).unwrap();
+    std::fs::write(socket.join("manifest.json"), r#"{"patches":{}}"#).unwrap();
+}
+
+/// A command prints its result first and sends telemetry beside it: the
+/// whole `--json` document is on stdout while the telemetry request is
+/// still waiting for its answer, and the event is delivered once the
+/// answer comes. The endpoint answers only after the test has read the
+/// document, so this measures the order of events, never a duration: a
+/// command that waited for telemetry before printing could only print
+/// after its send had given up, and would report the send failed.
+#[test]
+fn commands_print_before_their_telemetry_is_answered() {
+    use std::io::Read;
+
+    for (command, event_type) in [("list", "patch_listed"), ("scan", "patch_scanned")] {
+        let endpoint = held_endpoint();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_empty_project(tmp.path());
+
+        // `--debug` reports the send's outcome on stderr.
+        let mut child = build_cmd(tmp.path(), &endpoint.uri, command, &["--debug"], &[])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn socket-patch");
+
+        // The process stays alive until its telemetry is answered, so read
+        // stdout as it is written rather than to EOF.
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        let mut printed = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let envelope: serde_json::Value = loop {
+            let n = stdout.read(&mut chunk).expect("read stdout");
+            assert!(
+                n > 0,
+                "{command}: stdout closed before a whole envelope: {}",
+                String::from_utf8_lossy(&printed)
+            );
+            printed.extend_from_slice(&chunk[..n]);
+            if let Ok(doc) = serde_json::from_slice(&printed) {
+                break doc;
+            }
+        };
+        assert_eq!(envelope["command"], command, "{envelope}");
+
+        let event = endpoint
+            .received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap_or_else(|e| panic!("{command}: no telemetry request arrived: {e}"));
+        assert_eq!(event["event_type"], event_type, "{command}: {event}");
+        endpoint.answer.send(()).expect("the endpoint is waiting");
+
+        let out = child.wait_with_output().expect("wait socket-patch");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(0), "{command}: stderr={stderr}");
+        assert!(
+            stderr.contains("Telemetry sent successfully"),
+            "{command}: the event must be delivered after the result is printed; \
+             stderr={stderr}"
+        );
+    }
+}
+
+/// A telemetry endpoint that takes the event and never answers costs a
+/// command its short exit grace and nothing else: stdout, stderr and the
+/// exit code are those of a run with telemetry off, and the run ends long
+/// before the 5 s the send itself is allowed.
+#[test]
+fn a_stalled_telemetry_endpoint_costs_only_the_exit_grace() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_empty_project(tmp.path());
+    let run = |uri: &str, extra_env: &[(&str, &str)]| {
+        let mut cmd = build_cmd(tmp.path(), uri, "list", &[], extra_env);
+        // The production grace, not the one the harness lifts.
+        cmd.env_remove("SOCKET_TELEMETRY_GRACE_MS");
+        let started = std::time::Instant::now();
+        let out = cmd.output().expect("run socket-patch");
+        (started.elapsed(), out)
+    };
+
+    let (_, quiet) = run("http://127.0.0.1:9", &[("SOCKET_TELEMETRY_DISABLED", "1")]);
+    assert_eq!(quiet.status.code(), Some(0));
+
+    // A stall is the same on every run and machine load is not, so the
+    // best of three runs decides.
+    let limit = std::time::Duration::from_millis(2500);
+    let mut best = std::time::Duration::MAX;
+    let mut sent = false;
+    for _ in 0..3 {
+        let endpoint = held_endpoint();
+        let (elapsed, out) = run(&endpoint.uri, &[]);
+        assert_eq!(out.status.code(), quiet.status.code());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&quiet.stdout),
+            "a stalled endpoint must not change stdout"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&quiet.stderr),
+            "a stalled endpoint must not change stderr"
+        );
+        sent |= endpoint
+            .received
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        best = best.min(elapsed);
+        if best < limit {
+            break;
+        }
+    }
+    assert!(
+        best < limit,
+        "list took {best:?} against a stalled telemetry endpoint"
+    );
+    assert!(sent, "telemetry was on: the event must have been sent");
 }

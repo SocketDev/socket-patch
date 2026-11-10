@@ -92,6 +92,10 @@ pub fn command(bin: &Path) -> Command {
     // Telemetry suites opt back in with `SOCKET_TELEMETRY_DISABLED=0` and a
     // wiremock endpoint.
     cmd.envs(FORCED_OPT_OUTS.iter().copied());
+    // A suite that counts the events its mock received must not race the
+    // binary's exit: lift the short grace it gives telemetry still in
+    // flight (the send's own 5 s request timeout still ends the wait).
+    cmd.env("SOCKET_TELEMETRY_GRACE_MS", "30000");
     cmd
 }
 

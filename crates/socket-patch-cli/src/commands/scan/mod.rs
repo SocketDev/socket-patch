@@ -20,9 +20,7 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{
-    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry, TelemetryAuth,
-};
+use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned, TelemetryAuth};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
@@ -557,15 +555,10 @@ async fn discover_selected(
     show_progress: bool,
     warn: bool,
     detail_error_line: bool,
-    telemetry: &mut PendingTelemetry,
     json_warnings: Option<&mut Envelope>,
 ) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
-    // The scan event's send overlapped the detail fetches; every caller's
-    // next output (the error line below, a `--json` envelope) must find it
-    // delivered.
-    telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures.last().map_or_else(
@@ -1552,15 +1545,7 @@ fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
-    // Scan's telemetry sends run off the critical path: each is spawned
-    // where its event fires and flushed before the first stdout write that
-    // follows it (so a closed pipe's SIGPIPE or a Ctrl-C still finds it
-    // delivered, as with an inline send). The flush here is the
-    // backstop that keeps every event ahead of the process exit.
-    let mut telemetry = PendingTelemetry::new();
-    let code = Box::pin(run_scan(args, &mut telemetry, None, true)).await;
-    telemetry.flush().await;
-    code
+    Box::pin(run_scan(args, None, true)).await
 }
 
 /// The project directories a hosted or vendored scan's PATHs name: each
@@ -1618,7 +1603,6 @@ fn project_dirs(
 /// `--mode`, so each directory takes its mode from its own state.
 async fn run_project_dirs(
     args: ScanArgs,
-    telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
     mode_inferred: bool,
 ) -> i32 {
@@ -1697,7 +1681,7 @@ async fn run_project_dirs(
         if mode_inferred {
             child.mode = None;
         }
-        code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
+        code = code.max(Box::pin(run_scan(child, Some(invocation), *explicit)).await);
     }
     code
 }
@@ -1731,7 +1715,6 @@ fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &Scan
 /// loads it here); `explicit` says whether the user named this root.
 async fn run_scan(
     mut args: ScanArgs,
-    telemetry: &mut PendingTelemetry,
     invocation: Option<&InvocationPolicy>,
     explicit: bool,
 ) -> i32 {
@@ -1809,7 +1792,7 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
+        return Box::pin(run_project_dirs(args, invocation, mode_inferred)).await;
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
@@ -2318,8 +2301,7 @@ async fn run_scan(
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        spawn_patch_scanned(
-            telemetry,
+        track_patch_scanned(
             0,
             0,
             0,
@@ -2329,9 +2311,8 @@ async fn run_scan(
             requested_mode,
             &project_modes,
             &telemetry_auth,
-        );
-        // The result prints right away: nothing to overlap the send with.
-        telemetry.flush().await;
+        )
+        .await;
         if args.common.json {
             // GC is intentionally skipped when the crawl finds nothing:
             // pruning every manifest entry is too destructive (`repair`
@@ -2609,9 +2590,7 @@ async fn run_scan(
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        spawn_patch_scan_failed(telemetry, &err, fallback_to_proxy, &telemetry_auth);
-        // The failure prints right away: nothing to overlap the send with.
-        telemetry.flush().await;
+        track_patch_scan_failed(&err, fallback_to_proxy, &telemetry_auth).await;
         if args.common.json {
             let mut env = scan_envelope(&args.common);
             env.set_extra("scannedPackages", serde_json::json!(package_count));
@@ -2677,8 +2656,7 @@ async fn run_scan(
     // Telemetry: record the scan outcome with the per-tier counts and the
     // ecosystems the crawl actually found (not the `--ecosystems` filter,
     // which is empty on a default run).
-    spawn_patch_scanned(
-        telemetry,
+    track_patch_scanned(
         package_count,
         free_patches,
         paid_patches,
@@ -2688,7 +2666,8 @@ async fn run_scan(
         requested_mode,
         &project_modes,
         &telemetry_auth,
-    );
+    )
+    .await;
 
     let mut updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
@@ -2785,7 +2764,6 @@ async fn run_scan(
                 can_access_paid_patches,
                 &policy,
                 env,
-                telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
                 batch_error_count > 0,
@@ -2830,7 +2808,6 @@ async fn run_scan(
                 false,
                 false,
                 false,
-                telemetry,
                 Some(&mut env),
             )
             .await
@@ -2862,7 +2839,6 @@ async fn run_scan(
                 false,
                 false,
                 false,
-                telemetry,
                 Some(&mut env),
             )
             .await
@@ -2980,15 +2956,10 @@ async fn run_scan(
                 &vendored_purls,
                 prune,
                 &telemetry_auth,
-                telemetry,
                 npm_crawl.as_ref(),
             )
             .await;
         }
-
-        // The GC and the VEX build below can write to stderr; the report-
-        // only arm may not have flushed the scan event yet.
-        telemetry.flush().await;
 
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
@@ -3018,9 +2989,6 @@ async fn run_scan(
         emit_scan(&env);
         return final_code;
     }
-
-    // Every human exit below prints first; the scan event goes out before.
-    telemetry.flush().await;
 
     let use_color = ui::stdout_color();
     let verbose = args.common.verbose;
@@ -3091,7 +3059,6 @@ async fn run_scan(
             human,
             !silent,
             !hosted,
-            telemetry,
             None,
         )
         .await
