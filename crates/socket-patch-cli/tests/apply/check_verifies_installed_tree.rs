@@ -153,6 +153,104 @@ fn check_passes_on_a_patched_npm_package() {
     assert_eq!(events[0]["errorCode"], "already_patched", "{env}");
 }
 
+/// Add a record under `key` (any string) to the project's manifest.
+fn add_record(root: &Path, key: &str) {
+    let path = root.join(".socket/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["patches"][key] = patch_record(
+        "28282828-2828-4282-8282-282828282828",
+        one_file("index.js", ORIGINAL, PATCHED),
+    );
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+}
+
+/// A record whose purl type has no crawler in this CLI is not verified, so
+/// `--check` must not print the bare "in sync" over it: the line counts
+/// what was left unchecked, the envelope carries a `skipped` /
+/// `unsupported_ecosystem` event and a warning, and the exit stays 0 (a
+/// newer CLI's ecosystem must not fail an older CLI's CI guard).
+#[test]
+fn check_says_which_records_it_could_not_check() {
+    const SWIFT: &str = "pkg:swift/github.com/apple/swift-nio@2.60.0";
+    let tmp = project(Some(PATCHED));
+    add_record(tmp.path(), SWIFT);
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.contains("1 patch not checked (unsupported ecosystem)"),
+        "the result line counts the unchecked record: {stdout}"
+    );
+    assert!(
+        !stdout.contains("Patches are in sync"),
+        "not a blanket in-sync claim: {stdout}"
+    );
+    assert!(
+        stderr.contains("Warning:") && stderr.contains(SWIFT),
+        "the unchecked record is named: {stderr}"
+    );
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 0, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert_eq!(env["status"], "success", "{env}");
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "skipped"
+            && e["errorCode"] == "unsupported_ecosystem"
+            && e["purl"] == SWIFT),
+        "{env}"
+    );
+    assert!(
+        env["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "unsupported_ecosystem")),
+        "{env}"
+    );
+
+    // Only unsupported records: nothing was checked, and it says so
+    // instead of "No patches to check." or "in sync".
+    let path = tmp.path().join(".socket/manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    manifest["patches"].as_object_mut().unwrap().remove(PURL);
+    std::fs::write(&path, serde_json::to_vec_pretty(&manifest).unwrap()).unwrap();
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        !stdout.contains("in sync") && !stdout.contains("No patches to check."),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("No patches checked") && stdout.contains("unsupported ecosystem"),
+        "{stdout}"
+    );
+}
+
+/// A manifest key that is not a purl can never be verified: drift, exit 1.
+#[test]
+fn check_fails_a_manifest_key_that_is_not_a_purl() {
+    let tmp = project(Some(PATCHED));
+    add_record(tmp.path(), "check-target@1.0.0");
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &[]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("OUT OF SYNC")
+            && stderr.contains("check-target@1.0.0")
+            && stderr.contains("not a package URL"),
+        "{stderr}"
+    );
+
+    let (code, stdout, stderr) = run_check(tmp.path(), &["--json"]);
+    assert_eq!(code, 1, "stderr={stderr}");
+    let env = parse_json_envelope(stdout.trim());
+    assert!(
+        events(&env).iter().any(|e| e["action"] == "failed"
+            && e["errorCode"] == "invalid_purl"
+            && e["purl"] == "check-target@1.0.0"),
+        "{env}"
+    );
+}
+
 /// A package with no installed copy is skipped — `apply` skips it too —
 /// and the success line says so instead of a bare "in sync".
 #[test]

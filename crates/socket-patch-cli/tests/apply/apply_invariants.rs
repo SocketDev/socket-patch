@@ -524,3 +524,173 @@ fn snapshot_dir(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
     }
     out
 }
+
+// ---------------------------------------------------------------------------
+// Manifest keys no crawler of this CLI can look for
+// ---------------------------------------------------------------------------
+
+/// A purl of an ecosystem this CLI has no crawler for (what a newer
+/// socket-patch would record) and a known type in another case.
+const UNSUPPORTED_SWIFT: &str = "pkg:swift/github.com/apple/swift-nio@2.60.0";
+const UNSUPPORTED_CASE: &str = "pkg:NPM/left-pad@1.3.0";
+
+/// The installed, applicable `scopedpkg` patch (blob staged) beside
+/// `extra` records, which share one staged blob of their own.
+fn write_project_with_extra_keys(root: &Path, extra: &[&str]) {
+    write_root_package_json(root);
+    install_npm_pkg(root, "scopedpkg", "1.0.0", Some(SCOPED_ORIGINAL));
+    let mut patches = serde_json::Map::new();
+    patches.insert(
+        SCOPED_NPM_PURL.to_string(),
+        patch_record(
+            "33333333-3333-4333-8333-333333333333",
+            one_file("package/index.js", SCOPED_ORIGINAL, SCOPED_PATCHED),
+        ),
+    );
+    for (i, key) in extra.iter().enumerate() {
+        patches.insert(
+            key.to_string(),
+            patch_record(
+                &format!("55555555-5555-4555-8555-{i:012}"),
+                one_file("package/index.js", b"other original\n", b"other patched\n"),
+            ),
+        );
+    }
+    write_manifest(root, serde_json::Value::Object(patches));
+    stage_blob(root, &git_sha256(SCOPED_PATCHED), SCOPED_PATCHED);
+    stage_blob(root, &git_sha256(b"other patched\n"), b"other patched\n");
+}
+
+/// Drop the `scopedpkg` record, leaving only the extra keys.
+fn drop_scoped_record(root: &Path) {
+    let manifest_path = root.join(".socket/manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    manifest["patches"]
+        .as_object_mut()
+        .unwrap()
+        .remove(SCOPED_NPM_PURL);
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).unwrap(),
+    )
+    .unwrap();
+}
+
+fn skipped_with(v: &serde_json::Value, code: &str) -> Vec<String> {
+    let mut purls: Vec<String> = v["events"]
+        .as_array()
+        .expect("events array")
+        .iter()
+        .filter(|e| e["action"] == "skipped" && e["errorCode"] == code)
+        .filter_map(|e| e["purl"].as_str().map(str::to_string))
+        .collect();
+    purls.sort();
+    purls
+}
+
+/// `partition_purls` drops a record whose purl type has no crawler, so
+/// `apply` used to pass over it unseen: "No patches to apply.", exit 0,
+/// `success` with no event. It now names each one (a `skipped` /
+/// `unsupported_ecosystem` event, a `warnings[]` entry, a stderr warning)
+/// and still exits 0: a newer CLI's ecosystem in a committed manifest must
+/// not break an older CLI's CI run.
+#[test]
+fn apply_names_records_of_an_unsupported_ecosystem() {
+    // Alone: nothing this CLI can apply, but not a silent "nothing to do".
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_project_with_extra_keys(tmp.path(), &[UNSUPPORTED_SWIFT, UNSUPPORTED_CASE]);
+    drop_scoped_record(tmp.path());
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(
+        code, 0,
+        "an unsupported ecosystem never fails apply; {v}\n{stderr}"
+    );
+    assert_eq!(v["status"], "success", "{v}");
+    assert_eq!(
+        skipped_with(&v, "unsupported_ecosystem"),
+        vec![UNSUPPORTED_CASE, UNSUPPORTED_SWIFT],
+        "{v}"
+    );
+    let warning = v["warnings"]
+        .as_array()
+        .and_then(|w| w.iter().find(|w| w["code"] == "unsupported_ecosystem"))
+        .unwrap_or_else(|| panic!("no unsupported_ecosystem warning: {v}"));
+    let detail = warning["detail"].as_str().unwrap();
+    assert!(
+        detail.contains(UNSUPPORTED_SWIFT) && detail.contains(UNSUPPORTED_CASE),
+        "the warning names the records: {detail}"
+    );
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("Warning:")
+            && stderr.contains(UNSUPPORTED_SWIFT)
+            && stderr.contains(UNSUPPORTED_CASE),
+        "the human run names them on stderr: {stderr}"
+    );
+    // The case variant gets the fix, not just the fact.
+    assert!(stderr.contains("`pkg:npm/`"), "{stderr}");
+
+    // Beside an applicable patch: that one applies, the other is named.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_project_with_extra_keys(tmp.path(), &[UNSUPPORTED_SWIFT]);
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 0, "{v}\n{stderr}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
+    assert_eq!(
+        skipped_with(&v, "unsupported_ecosystem"),
+        vec![UNSUPPORTED_SWIFT],
+        "{v}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/scopedpkg/index.js")).unwrap(),
+        SCOPED_PATCHED
+    );
+}
+
+/// A key that is not a purl at all (a hand-edited manifest) can never be
+/// matched to a package, by this CLI or a newer one: its patch fails by
+/// name (exit 1) while every other patch still applies.
+#[test]
+fn apply_fails_a_manifest_key_that_is_not_a_purl() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_project_with_extra_keys(tmp.path(), &["left-pad@1.3.0"]);
+
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 1, "{v}\n{stderr}");
+    assert_eq!(v["status"], "partialFailure", "{v}");
+    let failed = v["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["action"] == "failed")
+        .unwrap_or_else(|| panic!("no failed event: {v}"));
+    assert_eq!(failed["purl"], "left-pad@1.3.0", "{v}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("not a package URL")),
+        "{failed}"
+    );
+    assert_eq!(
+        v["summary"]["applied"], 1,
+        "the valid patch still applies: {v}"
+    );
+
+    // Alone, it is still a failure, not "No patches to apply." exit 0.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_project_with_extra_keys(tmp.path(), &["left-pad@1.3.0"]);
+    drop_scoped_record(tmp.path());
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--offline", "--silent"], &[]);
+    assert_eq!(code, 1, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stderr.contains("left-pad@1.3.0") && stderr.contains("not a package URL"),
+        "the error prints even under --silent: {stderr}"
+    );
+}

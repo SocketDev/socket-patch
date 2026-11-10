@@ -31,7 +31,8 @@ use crate::commands::vendored_backend::{
     KeepCause, RevertedEntry, VendorRevertStep, VendoredBackend,
 };
 use crate::ecosystem_dispatch::{
-    distinct_npm_copies, find_all_packages_for_rollback, partition_purls, JvmScope,
+    distinct_npm_copies, find_all_packages_for_rollback, partition_purls,
+    unsupported_ecosystem_report, unsupported_keys, JvmScope, UnsupportedKey,
 };
 use crate::json_envelope::{
     Command as EnvelopeCommand, Envelope, EnvelopeError, GcReport, PatchAction, PatchEvent,
@@ -1104,6 +1105,12 @@ struct RollbackReport<'a> {
     manifest: &'a PatchManifest,
     results: &'a [RollbackResult],
     not_installed: &'a [String],
+    /// The `skipped` `unsupported_ecosystem` events: in-scope manifest
+    /// entries of an ecosystem this CLI has no crawler for (kept).
+    unsupported_skips: &'a [PatchEvent],
+    /// In-scope manifest keys that are not purls, with why (`failed`
+    /// `invalid_purl`; kept).
+    invalid_keys: &'a [(String, String)],
     /// Manifest entries a global run left to the project's vendor ledger:
     /// the project's own NuGet install (#489).
     project_owned: &'a [String],
@@ -1167,6 +1174,17 @@ fn build_rollback_envelope(report: &RollbackReport<'_>) -> Envelope {
     }
     for purl in report.not_installed {
         env.record(not_installed_event(purl, manifest_uuid(purl)));
+    }
+    for event in report.unsupported_skips {
+        let uuid = event.purl.as_deref().and_then(manifest_uuid);
+        env.record(with_uuid(event.clone(), uuid));
+    }
+    for (key, why) in report.invalid_keys {
+        env.record(with_uuid(
+            PatchEvent::new(PatchAction::Failed, key.as_str())
+                .with_error(UnsupportedKey::NotAPurl.code(), why.clone()),
+            manifest_uuid(key),
+        ));
     }
     for purl in report.project_owned {
         env.record(with_uuid(
@@ -1844,6 +1862,14 @@ pub async fn run(args: RollbackArgs) -> i32 {
         }
     }
 
+    // Records no crawler of this CLI can look for cannot be rolled back
+    // here. They leave the scope, so the prompt does not count them and the
+    // manifest cleanup keeps them (a newer CLI can still restore them), and
+    // each is named: skipped for an unsupported ecosystem, failed for a key
+    // that is not a purl.
+    let unsupported = unsupported_keys(&args.common, &manifest_scope);
+    manifest_scope.retain(|purl| !unsupported.iter().any(|(key, _)| key == purl));
+
     // `--ecosystems` narrows every leg. The agent engine scopes the
     // manifest side again internally; narrowing it here too keeps the
     // confirmation prompt's count honest (an npm-only manifest under
@@ -1888,6 +1914,17 @@ pub async fn run(args: RollbackArgs) -> i32 {
             ),
         ));
     }
+    let (unsupported_skips, unsupported_warning) =
+        match unsupported_ecosystem_report(&unsupported, "rolled back") {
+            Some((events, warning)) => (events, Some(warning)),
+            None => (Vec::new(), None),
+        };
+    run_warnings.extend(unsupported_warning.map(|w| (w.code, w.detail)));
+    let invalid_keys: Vec<(String, String)> = unsupported
+        .iter()
+        .filter(|(_, kind)| *kind == UnsupportedKey::NotAPurl)
+        .map(|(key, kind)| (key.clone(), kind.detail(key)))
+        .collect();
 
     // ── confirmation ────────────────────────────────────────────────────
     // The default run deletes manifest entries, vendored artifacts, ledger
@@ -1963,7 +2000,11 @@ pub async fn run(args: RollbackArgs) -> i32 {
     // above), is not told its manifest is empty either.
     let selection = InnerSelection::Scope {
         purls: &manifest_scope,
-        announce_empty: !scoped && !manifest_missing && !has_work && !eco_filtered_everything,
+        announce_empty: !scoped
+            && !manifest_missing
+            && !has_work
+            && !eco_filtered_everything
+            && unsupported.is_empty(),
     };
     match rollback_patches_inner(
         &args.common,
@@ -2330,7 +2371,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                 && hosted_leg.failed.is_empty()
                 && contested.is_none()
                 && !vendor_corrupt
-                && manifest_write_failed.is_none();
+                && manifest_write_failed.is_none()
+                && invalid_keys.is_empty();
             // Telemetry's count spans every leg (#1066), like the envelope's
             // `summary.rolledBack`.
             let rolled_back_total = results
@@ -2370,6 +2412,8 @@ pub async fn run(args: RollbackArgs) -> i32 {
                     manifest: &manifest,
                     results: &results,
                     not_installed: &not_installed,
+                    unsupported_skips: &unsupported_skips,
+                    invalid_keys: &invalid_keys,
                     project_owned: if project_state {
                         &[]
                     } else {
@@ -2529,6 +2573,9 @@ pub async fn run(args: RollbackArgs) -> i32 {
             // exit 1, so a silent run must still say why. Printed after
             // the summary blocks so they are the last thing on screen.
             if !args.common.json {
+                for (key, why) in &invalid_keys {
+                    eprintln!("{}", format_rollback_failure(key, why));
+                }
                 for (key, reason) in &vendored_leg.kept {
                     eprintln!("Error: Kept vendored state for {key}: {reason}");
                 }
@@ -6217,6 +6264,8 @@ mod tests {
             manifest,
             results,
             not_installed: &[],
+            unsupported_skips: &[],
+            invalid_keys: &[],
             project_owned: &[],
             vendored,
             vendor_entries: &[],

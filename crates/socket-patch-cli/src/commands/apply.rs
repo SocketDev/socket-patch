@@ -34,7 +34,7 @@ use crate::commands::vex::{
 };
 use crate::ecosystem_dispatch::{
     distinct_install_dirs, distinct_npm_copies, find_all_packages_for_purls, partition_purls,
-    JvmScope,
+    unsupported_ecosystem_report, unsupported_keys, JvmScope, UnsupportedKey,
 };
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
@@ -325,6 +325,34 @@ async fn reconcile_local_go(
         .collect()
 }
 
+/// One failed result per manifest key that is not a purl at all
+/// ([`UnsupportedKey::NotAPurl`]). No crawler, in this CLI or a newer one,
+/// can match such a key to a package, so its patch is never applied: the
+/// run fails naming it instead of dropping it from the partition unseen.
+fn invalid_key_failures(args: &ApplyArgs, manifest_purls: &[String]) -> Vec<ApplyResult> {
+    unsupported_keys(&args.common, manifest_purls)
+        .into_iter()
+        .filter(|(_, kind)| *kind == UnsupportedKey::NotAPurl)
+        .map(|(key, kind)| {
+            let error = kind.detail(&key);
+            // Errors print even under --silent.
+            if args.prints_errors() {
+                eprintln!("{}", format_patch_failure(&key, &error));
+            }
+            ApplyResult {
+                package_key: key,
+                package_path: String::new(),
+                success: false,
+                files_verified: Vec::new(),
+                files_patched: Vec::new(),
+                applied_via: HashMap::new(),
+                error: Some(error),
+                sidecar: None,
+            }
+        })
+        .collect()
+}
+
 /// Read-only verification that the manifest's patches are in place, for CI
 /// / GitHub-App auditing. Lock-free, fetch-free, offline-safe, and it never
 /// writes. Exits 0 when in sync, 1 on drift.
@@ -382,6 +410,29 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
     )
     .await;
     let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
+
+    // Records no crawler here can look for are verified by nothing below.
+    // One of an ecosystem this CLI does not support is reported unchecked
+    // (the result line must not read "in sync" over it); a key that is not
+    // a purl can never be verified, which is drift.
+    let unsupported = unsupported_keys(&args.common, &manifest_purls);
+    for (key, kind) in &unsupported {
+        if *kind == UnsupportedKey::NotAPurl {
+            let detail = format!("{key}: {}", kind.detail(key));
+            drifts.push((key.clone(), kind.code().to_string(), detail));
+        }
+    }
+    let (unchecked_events, unchecked_warning) =
+        match unsupported_ecosystem_report(&unsupported, "checked") {
+            Some((events, warning)) => (events, Some(warning)),
+            None => (Vec::new(), None),
+        };
+    if let Some(warning) = unchecked_warning
+        .as_ref()
+        .filter(|_| !args.common.json && !args.common.silent)
+    {
+        eprintln!("Warning: {}", warning.detail);
+    }
 
     {
         use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
@@ -524,9 +575,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
             record_check_skips(&mut env, &in_sync, &not_installed);
+            for event in unchecked_events {
+                env.record(event);
+            }
+            env.warnings.extend(unchecked_warning);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            println!("{}", format_check_in_sync(checked, not_installed.len()));
+            println!(
+                "{}",
+                format_check_in_sync(checked, not_installed.len(), unchecked_events.len())
+            );
         }
         0
     } else {
@@ -539,6 +597,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 );
             }
             record_check_skips(&mut env, &in_sync, &not_installed);
+            for event in unchecked_events {
+                env.record(event);
+            }
+            env.warnings.extend(unchecked_warning);
             env.mark_partial_failure();
             println!("{}", env.to_pretty_json());
         } else {
@@ -783,8 +845,10 @@ fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
 
 /// The `apply --check` success line: how many patches were checked, and how
 /// many were skipped for having no installed copy, so a check over an
-/// uninstalled tree never reads as a vacuous "in sync".
-fn format_check_in_sync(checked: usize, not_installed: usize) -> String {
+/// uninstalled tree never reads as a vacuous "in sync". With `unchecked`
+/// records of an ecosystem this CLI does not support, the line claims "in
+/// sync" only for the patches it did check.
+fn format_check_in_sync(checked: usize, not_installed: usize, unchecked: usize) -> String {
     let skipped = if not_installed == 0 {
         String::new()
     } else {
@@ -793,12 +857,27 @@ fn format_check_in_sync(checked: usize, not_installed: usize) -> String {
             plural(not_installed, "patch", "patches")
         )
     };
-    if checked == 0 && not_installed == 0 {
-        "No patches to check.".to_string()
+    let nothing_checked = checked == 0 && not_installed == 0;
+    if unchecked == 0 {
+        return if nothing_checked {
+            "No patches to check.".to_string()
+        } else {
+            format!(
+                "Patches are in sync ({} checked{skipped}).",
+                plural(checked, "patch", "patches")
+            )
+        };
+    }
+    let unchecked = format!(
+        "{} not checked (unsupported ecosystem)",
+        plural(unchecked, "patch", "patches")
+    );
+    if nothing_checked {
+        format!("No patches checked: {unchecked}.")
     } else {
         format!(
-            "Patches are in sync ({} checked{skipped}).",
-            plural(checked, "patch", "patches")
+            "{} in sync{skipped}; {unchecked}.",
+            plural(checked, "checked patch is", "checked patches are")
         )
     }
 }
@@ -1427,6 +1506,21 @@ pub(crate) async fn run_locked(
         .iter()
         .filter_map(|e| e.purl.clone())
         .collect();
+    // Records of an ecosystem this CLI has no crawler for sit the run out
+    // too, each named: `partition_purls` drops them, and "No patches to
+    // apply." over them would read as patched. They ride the same skip
+    // channel as the project-patched ones, so every envelope this run can
+    // print carries them. (A key that is not a purl at all fails instead:
+    // see `invalid_key_failures`.)
+    let mut user_patch_skips = user_patch_skips;
+    let unsupported_warning = unsupported_ecosystem_report(
+        &unsupported_keys(&args.common, manifest.patches.keys()),
+        "applied",
+    )
+    .map(|(events, warning)| {
+        user_patch_skips.extend(events);
+        warning
+    });
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -1547,6 +1641,7 @@ pub(crate) async fn run_locked(
                 .map(|(code, detail)| RunWarning { code, detail })
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
+            run_warnings.extend(unsupported_warning);
             run_warnings.extend(results.iter().flat_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
                 socket_patch_core::patch::apply::advisory_warning_codes(note)
@@ -2358,7 +2453,10 @@ async fn apply_patches_inner(
         .chain(user_patched)
         .cloned()
         .collect();
-    let reconcile_failures = reconcile_local_go(args, &recorded).await;
+    let mut reconcile_failures = reconcile_local_go(args, &recorded).await;
+    // Beside them, the keys that are not purls: each fails by name below,
+    // on the empty-scope exit too.
+    reconcile_failures.extend(invalid_key_failures(args, &manifest_purls));
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
@@ -4408,20 +4506,35 @@ mod tests {
 
     #[test]
     fn check_in_sync_line() {
-        assert_eq!(format_check_in_sync(0, 0), "No patches to check.");
+        assert_eq!(format_check_in_sync(0, 0, 0), "No patches to check.");
         assert_eq!(
-            format_check_in_sync(1, 0),
+            format_check_in_sync(1, 0, 0),
             "Patches are in sync (1 patch checked)."
         );
         assert_eq!(
-            format_check_in_sync(3, 0),
+            format_check_in_sync(3, 0, 0),
             "Patches are in sync (3 patches checked)."
         );
         // A check that skipped uninstalled packages says so, never a bare
         // vacuous "in sync".
         assert_eq!(
-            format_check_in_sync(0, 2),
+            format_check_in_sync(0, 2, 0),
             "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
+        );
+        // Records of an unsupported ecosystem were not checked: "in sync"
+        // is claimed only for the ones that were.
+        assert_eq!(
+            format_check_in_sync(0, 0, 3),
+            "No patches checked: 3 patches not checked (unsupported ecosystem)."
+        );
+        assert_eq!(
+            format_check_in_sync(1, 0, 1),
+            "1 checked patch is in sync; 1 patch not checked (unsupported ecosystem)."
+        );
+        assert_eq!(
+            format_check_in_sync(2, 1, 2),
+            "2 checked patches are in sync; 1 patch not installed, skipped; 2 patches not \
+             checked (unsupported ecosystem)."
         );
     }
 

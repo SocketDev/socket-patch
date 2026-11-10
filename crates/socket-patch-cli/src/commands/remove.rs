@@ -527,6 +527,33 @@ pub async fn run(args: RemoveArgs) -> i32 {
         return 1;
     }
 
+    // A record no crawler of this CLI can look for (a newer CLI's
+    // ecosystem, a key that is not a purl) cannot be rolled back here, and
+    // the nested rollback would pass over it unseen. Dropping its record
+    // then would leave whatever it patched tracked by nothing, so refuse
+    // before any mutation; `--skip-rollback` is the explicit "forget it".
+    // The identifier is the scope, so `--ecosystems` does not narrow this.
+    if !args.skip_rollback {
+        let unscoped = GlobalArgs {
+            ecosystems: None,
+            ..args.common.clone()
+        };
+        if let Some((key, kind)) =
+            crate::ecosystem_dispatch::unsupported_keys(&unscoped, &matched_keys)
+                .into_iter()
+                .next()
+        {
+            let msg = format!(
+                "Cannot roll back {key}: {}. Use --skip-rollback to remove it from the \
+                 manifest without restoring files.",
+                kind.detail(&key)
+            );
+            track_patch_remove_failed(&msg, &telemetry).await;
+            emit_error_envelope(args.common.json, args.common.dry_run, kind.code(), msg);
+            return 1;
+        }
+    }
+
     // Show what will be removed and confirm. When a base PURL expanded
     // to multiple manifest entries (PyPI release variants), make the
     // blast radius explicit so the user understands why a single

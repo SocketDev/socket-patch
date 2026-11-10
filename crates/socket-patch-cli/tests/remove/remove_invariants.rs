@@ -1023,6 +1023,50 @@ fn remove_skip_rollback_sweep_semantics_unchanged() {
     );
 }
 
+/// A record whose purl type has no crawler in this CLI (a newer CLI's
+/// ecosystem) cannot be rolled back here. `remove` used to drop it with no
+/// rollback and no warning, leaving whatever it patched tracked by nothing.
+/// It refuses before any mutation; `--skip-rollback` still forgets it.
+#[test]
+fn remove_refuses_a_record_it_cannot_roll_back() {
+    const SWIFT: &str = "pkg:swift/github.com/apple/swift-nio@2.60.0";
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let socket = tmp.path().join(".socket");
+    std::fs::create_dir_all(&socket).expect("create .socket");
+    std::fs::write(
+        socket.join("manifest.json"),
+        TWO_PATCH_MANIFEST.replace("pkg:npm/__remove_test_a__@1.0.0", SWIFT),
+    )
+    .expect("write manifest");
+
+    let (code, stdout, _stderr) = common::run_with_env(
+        tmp.path(),
+        &["remove", SWIFT, "--json", "--yes", "--offline"],
+        &[],
+    );
+    assert_eq!(code, 1, "stdout=\n{stdout}");
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(v["error"]["code"], "unsupported_ecosystem", "{v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(SWIFT) && m.contains("--skip-rollback")),
+        "{v}"
+    );
+    assert_eq!(
+        read_manifest(&socket)["patches"].as_object().unwrap().len(),
+        2,
+        "nothing was removed"
+    );
+
+    let (code, stdout) = run_remove(tmp.path(), SWIFT, &[]);
+    assert_eq!(code, 0, "--skip-rollback forgets it; stdout=\n{stdout}");
+    assert!(!read_manifest(&socket)["patches"]
+        .as_object()
+        .unwrap()
+        .contains_key(SWIFT));
+}
+
 /// The full-path preview (no --skip-rollback) must not create `.socket/blobs`
 /// either (nor, online, download before-blobs into it) — that would leave
 /// new files a wet remove's sweep would have deleted. Offline keeps this hermetic: the preview reports the
