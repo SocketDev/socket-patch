@@ -1774,6 +1774,12 @@ installs under frozen and deployment mode (`BUNDLE_FROZEN=true`, `bundle install
   sha256 of the patched gem. A lock without the section cannot record it: the gem is pinned by
   its source alone, and the scan says so once (`redirect_gem_no_checksums_section`).
 
+A lock records the Bundler that wrote it (`BUNDLED WITH`), not the one that installs it, so the
+lock is converged for the one that wrote it. For a lock written by Bundler 1.17 to 2.1 the scan
+says which Bundler the pair is for (`redirect_gem_merged_lock_layout`): later Bundlers deprecate a
+`GEM` section with several remotes and from 2.5 on refuse it under frozen mode. If a newer
+Bundler installs the project, run `bundle lock` with it and re-run the scan.
+
 The scan output names what it changed:
 
 ```text

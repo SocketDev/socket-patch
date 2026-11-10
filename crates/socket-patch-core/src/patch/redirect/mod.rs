@@ -8722,6 +8722,28 @@ fn rewrite_gem(
         });
     }
 
+    // The lock is converged for the bundler that wrote it. Only the merged
+    // layout is one a later bundler turns down (2.4.22 installs it frozen
+    // with a deprecation warning; 2.5.23 and 4.0.15 refuse it), and a lock
+    // does not say which bundler installs it, so the run says which one
+    // the pair is for.
+    if lock_changed {
+        if let Some(LockLayout::Merged(bundler)) = &layout {
+            result.warnings.push(RewriteWarning {
+                code: "redirect_gem_merged_lock_layout".into(),
+                detail: format!(
+                    "{lock_name} was written by bundler {bundler}, which lists every gem source in \
+                     one GEM section, so the Socket patch registry was added to that section's \
+                     remotes: the pair installs with that bundler, frozen/deployment mode \
+                     included. Newer bundlers deprecate such a section, and from 2.5 on refuse \
+                     this pair under frozen/deployment mode — if a newer bundler installs this \
+                     project, run `bundle lock` with it, commit {lock_name} and re-run the \
+                     hosted scan"
+                ),
+            });
+        }
+    }
+
     // A MIXED pair breaks bundler's frozen/deployment mode: the lock's GEM
     // section still records the upstream source, so `bundle install` with
     // `frozen`/`--deployment` set rejects the Gemfile's source block. Only
@@ -29205,11 +29227,24 @@ packages:
             "{:?}",
             r.warnings
         );
+        // The pair is for the bundler that wrote the lock, and the run says
+        // so: a lock does not record which bundler installs it, and from 2.5
+        // on bundler refuses a section with several remotes frozen.
         assert_eq!(
             warning_codes(&r),
-            vec!["redirect_gem_no_checksums_section"],
+            vec![
+                "redirect_gem_no_checksums_section",
+                "redirect_gem_merged_lock_layout"
+            ],
             "{:?}",
             r.warnings
+        );
+        let detail = &r.warnings[1].detail;
+        assert!(
+            detail.contains("Gemfile.lock was written by bundler 2.1.4")
+                && detail.contains("from 2.5 on refuse")
+                && detail.contains("run `bundle lock` with it"),
+            "{detail}"
         );
         gem_carry(&mut files, &r);
         let again = rewrite_registry_redirect(&files, &overrides);
@@ -29217,6 +29252,12 @@ packages:
             again.files.is_empty() && again.edits.is_empty(),
             "a re-run changes nothing: {:?}",
             again.edits
+        );
+        assert_eq!(
+            warning_codes(&again),
+            vec!["redirect_gem_no_checksums_section"],
+            "the layout note is for the run that wrote the lock: {:?}",
+            again.warnings
         );
 
         // A source the Gemfile computes: the lock's remotes cannot be matched

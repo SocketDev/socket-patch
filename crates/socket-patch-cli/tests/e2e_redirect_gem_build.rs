@@ -1410,6 +1410,14 @@ async fn redirect_scanned_project(
         usize::from(!checksums_lock),
         "a lock that cannot record the artifact checksum must say so once: {env}"
     );
+    // The pair is converged for the bundler that wrote the lock. Only the
+    // one merged section of bundler < 2.2 is a layout later bundlers turn
+    // down, so only there does the run name the bundler the pair is for.
+    assert_eq!(
+        warning_codes.contains(&"redirect_gem_merged_lock_layout"),
+        !bundler.at_least(2, 2),
+        "a merged lock (bundler < 2.2) names the bundler it is converged for: {env}"
+    );
     match driver {
         Driver::ScanVex
         | Driver::ScanVexGroupBlock
