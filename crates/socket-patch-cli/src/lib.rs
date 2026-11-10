@@ -31,10 +31,20 @@ use socket_patch_core::utils::target::is_uuid_shaped;
     about = "Apply security fixes to the dependency versions you already use",
     version,
     propagate_version = true,
+    // Help wraps to the terminal, and to 100 columns when it is wider or
+    // not a terminal.
+    max_term_width = 100,
     after_help = "Quick start:\n  \
         socket-patch scan --dry-run   Preview patches and dependency-file changes\n  \
         socket-patch scan             Apply patches, then run your package manager's install\n  \
         socket-patch vex -O vex.json  Generate OpenVEX after installing\n\n\
+        Patch modes (scan --mode, get --mode):\n  \
+        hosted    Default. Lockfiles point at Socket-built patched packages, which your\n            \
+        package manager installs; nothing extra runs after an install\n  \
+        vendored  Patched packages are committed under .socket/vendor/; installs need no\n            \
+        Socket service\n  \
+        agent     Patches are recorded in .socket/ and written into installed packages;\n            \
+        run `socket-patch apply` after every install\n\n\
         Use 'socket-patch <command> -h' for common options, or '--help' for all options."
 )]
 pub struct Cli {

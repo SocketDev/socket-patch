@@ -235,17 +235,45 @@ fn vendor_and_repair_summaries_read_as_one_line() {
             == "  repair    Restore agent or vendored patch artifacts and clean up unused ones"),
         "{text}"
     );
+    // Help wraps to the terminal width, so compare the paragraph's words.
     let repair = long_help(&["repair"]);
-    assert!(
-        repair.starts_with(
-            "Restore agent or vendored patch artifacts and clean up unused ones\n\n\
-             Downloads missing agent patch data and redownloads missing or corrupt \
+    let mut paragraphs = repair.split("\n\n").map(|p| p.replace('\n', " "));
+    assert_eq!(
+        paragraphs.next().as_deref(),
+        Some("Restore agent or vendored patch artifacts and clean up unused ones"),
+        "{repair}"
+    );
+    assert_eq!(
+        paragraphs.next().as_deref(),
+        Some(
+            "Downloads missing agent patch data and redownloads missing or corrupt \
              vendored artifacts using the existing vendor ledger, then deletes \
              unreferenced artifacts. A lost `.socket/vendor/state.json` cannot be \
-             reconstructed; restore it from version control.\n"
+             reconstructed; restore it from version control."
         ),
         "{repair}"
     );
+}
+
+/// No help page prints a line wider than 100 columns: long flag
+/// descriptions wrap instead of running off the terminal's edge.
+#[test]
+fn help_lines_wrap_at_100_columns() {
+    let mut cmd = socket_patch_cli::cli_command();
+    cmd.build();
+    let mut pages = vec![
+        ("-h".to_string(), cmd.render_help().to_string()),
+        ("--help".to_string(), cmd.render_long_help().to_string()),
+    ];
+    for sub in cmd.get_subcommands_mut() {
+        let name = sub.get_name().to_string();
+        pages.push((format!("{name} -h"), sub.render_help().to_string()));
+        pages.push((format!("{name} --help"), sub.render_long_help().to_string()));
+    }
+    for (page, text) in pages {
+        let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        assert!(widest <= 100, "{page}: a {widest}-column line\n{text}");
+    }
 }
 
 /// `socket-patch --update --version` names the public binary, not the

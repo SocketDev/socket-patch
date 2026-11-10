@@ -96,6 +96,30 @@ impl Ecosystem {
             _ => self.cli_name(),
         }
     }
+
+    /// The ecosystem a user-typed name means, in any letter case: its
+    /// `--ecosystems` name, the name messages print for it
+    /// ([`Self::display_name`], so what a run prints can be typed back), or
+    /// the everyday name of its registry, language or package manager.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let name = name.trim().to_ascii_lowercase();
+        Some(match name.as_str() {
+            "node" | "pnpm" | "yarn" | "bun" | "vlt" => Ecosystem::Npm,
+            "pip" => Ecosystem::Pypi,
+            "rust" | "crates" | "crates.io" => Ecosystem::Cargo,
+            "rubygems" | "bundler" => Ecosystem::Gem,
+            "java" | "gradle" | "sbt" => Ecosystem::Maven,
+            "packagist" => Ecosystem::Composer,
+            "dotnet" => Ecosystem::Nuget,
+            "jsr" => Ecosystem::Deno,
+            _ => {
+                return Self::all()
+                    .iter()
+                    .copied()
+                    .find(|eco| name == eco.cli_name() || name == eco.display_name())
+            }
+        })
+    }
 }
 
 /// Represents a package discovered during crawling.
@@ -147,6 +171,36 @@ impl Default for CrawlerOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every name a run prints for an ecosystem can be typed back, in any
+    /// case, and so can the everyday names; nothing else resolves.
+    #[test]
+    fn from_name_accepts_cli_display_and_everyday_names() {
+        for eco in Ecosystem::all().iter().copied() {
+            assert_eq!(Ecosystem::from_name(eco.cli_name()), Some(eco));
+            assert_eq!(Ecosystem::from_name(eco.display_name()), Some(eco));
+            assert_eq!(
+                Ecosystem::from_name(&eco.cli_name().to_uppercase()),
+                Some(eco)
+            );
+        }
+        for (name, eco) in [
+            ("go", Ecosystem::Golang),
+            ("Python", Ecosystem::Pypi),
+            (" pip ", Ecosystem::Pypi),
+            ("rubygems", Ecosystem::Gem),
+            ("rust", Ecosystem::Cargo),
+            ("gradle", Ecosystem::Maven),
+            ("dotnet", Ecosystem::Nuget),
+            ("pnpm", Ecosystem::Npm),
+            ("jsr", Ecosystem::Deno),
+        ] {
+            assert_eq!(Ecosystem::from_name(name), Some(eco), "{name}");
+        }
+        for unknown in ["", "bogus", "py-pi", "npm,pypi"] {
+            assert_eq!(Ecosystem::from_name(unknown), None, "{unknown}");
+        }
+    }
 
     #[test]
     fn test_from_purl_npm() {
