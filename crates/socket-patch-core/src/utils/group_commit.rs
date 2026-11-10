@@ -1494,11 +1494,7 @@ mod tests {
             ("socket", false),
             (".git", false),
         ] {
-            assert_eq!(
-                names_dot_dir(name, ".socket"),
-                socket,
-                "{name:?}"
-            );
+            assert_eq!(names_dot_dir(name, ".socket"), socket, "{name:?}");
         }
         for (name, git) in [
             (".git", true),
@@ -1526,11 +1522,7 @@ mod tests {
             (".", false),
             ("", false),
         ] {
-            assert_eq!(
-                names_dot_dir(name, ".git"),
-                git,
-                "{name:?}"
-            );
+            assert_eq!(names_dot_dir(name, ".git"), git, "{name:?}");
         }
     }
 

@@ -788,6 +788,24 @@ pub fn patch_view(
     })
 }
 
+/// Answer the scan's patch lookup (`POST /patch/batch`) on `server` the way
+/// the public proxy answers for packages with no patch on offer: `200` and
+/// an empty result. A stand-in that 404s the route does not look like the
+/// patch API, and a scan stops on it rather than report "no patches".
+pub async fn mount_empty_patch_search(server: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [],
+                "canAccessPaidPatches": false,
+            })),
+        )
+        .mount(server)
+        .await;
+}
+
 /// A wiremock patch API serving patch views on both the public-proxy and
 /// org-scoped routes, recording every request. Anything unmounted is 404.
 /// Keep it alive for the whole CLI invocation.

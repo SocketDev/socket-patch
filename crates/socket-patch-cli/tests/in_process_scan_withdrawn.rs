@@ -560,7 +560,7 @@ fn scan_binary(root: &Path, server: &MockServer, env: &[(&str, &str)]) -> (Optio
             "--api-url",
             &server.uri(),
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             root.to_str().unwrap(),
         ])

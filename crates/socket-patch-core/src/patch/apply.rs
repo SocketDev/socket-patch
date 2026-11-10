@@ -2882,7 +2882,7 @@ mod tests {
         assert!(!result.success);
         let err = result.error.expect("a corrupt blob is an error");
         assert!(
-            err.contains(&format!(".socket/blobs/{after_hash}")),
+            err.contains(&blobs_dir.path().join(&after_hash).display().to_string()),
             "the error names the blob file: {err}"
         );
         assert!(

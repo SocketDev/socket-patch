@@ -1807,11 +1807,7 @@ fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &Scan
 /// The one place a scan's exit code is settled: a run that left packages
 /// unchecked (the patch API gave no answer for them) is a partial failure
 /// whatever the mode it went on to run reported, so it never exits 0.
-async fn run_scan(
-    args: ScanArgs,
-    invocation: Option<&InvocationPolicy>,
-    explicit: bool,
-) -> i32 {
+async fn run_scan(args: ScanArgs, invocation: Option<&InvocationPolicy>, explicit: bool) -> i32 {
     let mut unchecked = 0usize;
     let code = Box::pin(scan_project(args, invocation, explicit, &mut unchecked)).await;
     if unchecked > 0 && code == 0 {

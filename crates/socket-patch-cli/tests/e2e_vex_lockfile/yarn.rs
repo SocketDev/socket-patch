@@ -410,6 +410,7 @@ fn serve_patch_views(views: Vec<(&str, Value)>) -> (tokio::runtime::Runtime, wir
         .unwrap();
     let server = rt.block_on(async {
         let server = MockServer::start().await;
+        vex_e2e_common::mount_empty_patch_search(&server).await;
         for (uuid, body) in views {
             Mock::given(method("GET"))
                 .and(path(format!("/patch/view/{uuid}")))

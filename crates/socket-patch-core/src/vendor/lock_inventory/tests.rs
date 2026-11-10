@@ -4239,7 +4239,7 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
     (
         "vendor/maven_repo.rs",
         "fetch_registry_bytes",
-        "fetch_registry_bytes(",
+        "let bytes = fetch_registry_bytes(",
     ),
     (
         "vendor/maven_repo.rs",
