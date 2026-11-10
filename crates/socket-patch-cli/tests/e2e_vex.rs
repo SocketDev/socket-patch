@@ -811,6 +811,106 @@ fn empty_doc_id_flag_falls_back_to_generated_uuid() {
     }
 }
 
+/// `--product` and `--doc-id` are checked trimmed, so they are emitted
+/// trimmed: `--doc-id " urn:x "` must not write an `@id` no consumer can
+/// match by its IRI.
+#[test]
+fn product_and_doc_id_overrides_are_emitted_trimmed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    scaffold_autodetect_project(cwd);
+
+    let out = cli()
+        .args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--no-verify",
+            "--product",
+            "  pkg:npm/app@1.0.0\t",
+            "--doc-id",
+            " urn:uuid:fixed-test-id  ",
+        ])
+        .output()
+        .expect("invoke vex");
+    assert!(
+        out.status.success(),
+        "stderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let doc: Value = serde_json::from_slice(&out.stdout).expect("VEX JSON on stdout");
+    assert_eq!(doc["@id"], "urn:uuid:fixed-test-id", "{doc}");
+    assert_eq!(
+        doc["statements"][0]["products"][0]["@id"], "pkg:npm/app@1.0.0",
+        "{doc}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("is neither a PURL") && !stderr.contains("not an absolute IRI"),
+        "trimmed overrides with a scheme must not warn: {stderr}"
+    );
+}
+
+/// The document `@id` is spec-typed as an IRI like the product `@id`: an
+/// override with no scheme is honored (trimmed) but warned about, on stderr
+/// and in the `--json` envelope's `warnings[]`.
+#[test]
+fn doc_id_override_without_an_iri_scheme_warns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    scaffold_autodetect_project(cwd);
+    let vex_path = cwd.join("out.vex.json");
+    let run = |doc_id: &str| {
+        let out = cli()
+            .args([
+                "vex",
+                "--cwd",
+                cwd.to_str().unwrap(),
+                "--no-verify",
+                "--json",
+                "--output",
+                vex_path.to_str().unwrap(),
+                "--product",
+                "pkg:npm/app@1.0.0",
+                "--doc-id",
+                doc_id,
+            ])
+            .output()
+            .expect("invoke vex");
+        assert!(
+            out.status.success(),
+            "a non-IRI doc id is a warning, never a hard reject. stdout:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let env: Value = serde_json::from_slice(&out.stdout).expect("envelope JSON on stdout");
+        let doc: Value = serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+        let warned = env["warnings"]
+            .as_array()
+            .is_some_and(|ws| ws.iter().any(|w| w["code"] == "doc_id_not_iri"));
+        (warned, doc["@id"].as_str().unwrap().to_string(), env)
+    };
+
+    let (warned, id, env) = run(" not an iri ");
+    assert!(warned, "a doc id with no scheme must warn: {env}");
+    assert_eq!(id, "not an iri", "honored, trimmed");
+    let detail = env["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["code"] == "doc_id_not_iri")
+        .unwrap()["detail"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(detail.contains("--doc-id"), "{detail}");
+
+    for ok in ["urn:uuid:fixed-test-id", "https://example.com/vex/1"] {
+        let (warned, id, env) = run(ok);
+        assert!(!warned, "{ok:?} is an IRI: {env}");
+        assert_eq!(id, ok);
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // verify-mode tests — lay down patched files on disk and exercise the
 // hash-check pipeline. We bypass ecosystem-crawler resolution by writing

@@ -177,7 +177,7 @@ impl VexEmbedArgs {
             hosted_gem_mirror_check: false,
             // Embedded callers skip VEX entirely under `--dry-run`.
             dry_run: false,
-            product_flag: "--vex-product",
+            flag_prefix: "--vex-",
             npm_prior: None,
             hosted_uuids: Vec::new(),
         }
@@ -229,9 +229,10 @@ pub(crate) struct VexBuildParams {
     /// leave any previous document there alone. Printing to stdout is not a
     /// mutation, so it still happens.
     pub dry_run: bool,
-    /// The flag that carried `product`, named in the non-IRI advisory
-    /// (`--product` standalone, `--vex-product` embedded).
-    pub product_flag: &'static str,
+    /// How this run spells its flags, for the advisories that name one:
+    /// `--` standalone (`--product`, `--doc-id`, `--no-verify`), `--vex-`
+    /// embedded (`--vex-product`, …). See [`Self::flag`].
+    pub flag_prefix: &'static str,
     /// Embedded hosted `scan --vex` only: scan's npm crawl of the same
     /// tree earlier in this process. The installed-copy lookups take the
     /// npm `node_modules` roots (and, for the identity fallback, the
@@ -252,6 +253,12 @@ pub(crate) struct VexBuildParams {
 }
 
 impl VexBuildParams {
+    /// The flag this run spells `name` as (`product` → `--product`
+    /// standalone, `--vex-product` embedded).
+    fn flag(&self, name: &str) -> String {
+        format!("{}{name}", self.flag_prefix)
+    }
+
     /// Where this run's `vex_*` telemetry goes: the run client's route when
     /// one was built, else the no-client route from the credential chain
     /// (flag / env / socket-cli config), with no network.
@@ -379,7 +386,7 @@ pub async fn run(args: VexArgs) -> i32 {
         hosted_gem_mirror_refused: false,
         hosted_gem_mirror_check: false,
         dry_run: args.common.dry_run,
-        product_flag: "--product",
+        flag_prefix: "--",
         npm_prior: None,
         hosted_uuids: Vec::new(),
         api_client: RunApiClient::new(),
@@ -715,10 +722,32 @@ async fn generate_vex(
                      (pkg:...) nor an absolute IRI; it is emitted verbatim as the OpenVEX \
                      product @id, which the spec requires to be an IRI — strict consumers may \
                      reject the document. Prefer pkg:<type>/<name>@<version>.",
-                    params.product_flag
+                    params.flag("product")
                 ),
             );
         }
+    }
+    // The document `@id` is an IRI by the same spec, and consumers key
+    // re-issued documents on it: the same advisory for its override. Empty
+    // means unset: `@id` is a required field, so `--doc-id "$UNSET_VAR"`
+    // must not emit a literal `"@id": ""`.
+    let doc_id = params
+        .doc_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if let Some(d) = doc_id.filter(|d| !has_iri_scheme(d)) {
+        note_warning(
+            warnings,
+            common,
+            "doc_id_not_iri",
+            format!(
+                "Document id override {d:?} ({}) is not an absolute IRI; it is emitted \
+                 verbatim as the OpenVEX document @id, which the spec requires to be an IRI — \
+                 strict consumers may reject the document. Prefer urn:uuid:<uuid> or an https URL.",
+                params.flag("doc-id")
+            ),
+        );
     }
 
     // The plan's advisories (fetch failures, wiring conflicts, superseded
@@ -1260,12 +1289,8 @@ async fn generate_vex(
 
     let opts = BuildOptions {
         product_id,
-        // Empty means unset: the document `@id` is a required field, so
-        // `--doc-id "$UNSET_VAR"` must not emit a literal `"@id": ""`.
-        doc_id: params
-            .doc_id
-            .clone()
-            .filter(|d| !d.trim().is_empty())
+        doc_id: doc_id
+            .map(str::to_string)
             .unwrap_or_else(|| format!("urn:uuid:{}", uuid::Uuid::new_v4())),
         author: "Socket".to_string(),
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
@@ -1976,7 +2001,9 @@ async fn resolve_product_id(
     // An empty (or whitespace-only) override means "unset". `Product::id` is
     // `skip_serializing_if = "String::is_empty"`, so passing it through would
     // write a spec-invalid document about a product with no identifier.
-    if let Some(p) = product.filter(|p| !p.trim().is_empty()) {
+    // Surrounding whitespace is the shell's or the environment's, never
+    // part of an identifier: the id is emitted as it is checked, trimmed.
+    if let Some(p) = product.map(str::trim).filter(|p| !p.is_empty()) {
         return Ok(p.to_string());
     }
     let detect = detect_product(&common.cwd).await;
@@ -2662,7 +2689,7 @@ mod npm_prior_tests {
             hosted_gem_mirror_refused: false,
             hosted_gem_mirror_check: false,
             dry_run: false,
-            product_flag: "--vex-product",
+            flag_prefix: "--vex-",
             npm_prior: prior,
             hosted_uuids: Vec::new(),
             api_client: RunApiClient::new(),
