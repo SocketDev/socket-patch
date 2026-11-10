@@ -5,13 +5,15 @@
 
 mod properties;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 
+use properties::read_properties;
 pub(crate) use properties::{
     interpolate_keeping, interpolate_strict, lookup_property, profile_combinations, Definitions,
     Interpolate, PomLayer, MAX_COMBINED_PROFILES, MAX_INTERPOLATION_DEPTH,
 };
-use properties::{interpolate_lenient, read_properties};
 
 use super::xml::{blank_non_markup, child_text, elements, open_tags, Element};
 
@@ -138,6 +140,9 @@ pub(crate) enum MovedBy {
     TooManyProfiles,
     /// A `<profiles>` `<properties>` this reader cannot parse: fail closed.
     Unreadable(String),
+    /// The pom's declarations took more interpolation than one pom is
+    /// given ([`MAX_SCOPE_WORK`]): not worked out, fail closed.
+    PastWorkBound,
 }
 
 impl std::fmt::Display for MovedBy {
@@ -155,9 +160,52 @@ impl std::fmt::Display for MovedBy {
             MovedBy::Unreadable(e) => {
                 write!(f, "a <profiles> section this reader cannot parse ({e})")
             }
+            MovedBy::PastWorkBound => write!(
+                f,
+                "a pom whose properties take more interpolation than this reader works out"
+            ),
         }
     }
 }
+
+/// How a text of a declaration is interpolated: a version strictly
+/// ([`interpolate_strict`]), a coordinate keeping what it cannot resolve
+/// ([`interpolate_keeping`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum How {
+    Strict,
+    Keeping,
+}
+
+impl How {
+    fn interpolate(self, text: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+        match self {
+            How::Strict => interpolate_strict(text, lookup),
+            How::Keeping => interpolate_keeping(text, lookup),
+        }
+    }
+}
+
+/// The work one pom's declarations may take in all: a unit per property
+/// looked up, per profile definition read to list the combinations, and
+/// per 16 bytes of interpolated text kept or handed to a declaration. A
+/// declaration is read under up to 255 profile combinations of up to
+/// 1,024 lookups each, so a pom of crafted, all-different `${…}` texts
+/// costs that per declaration (half a minute per hundred kilobytes, before
+/// this bound). A real pom's declarations share a few texts of a few
+/// lookups each, every one interpolated once ([`PomScope::interpolated`]),
+/// and stay under a hundredth of it. Past it every `${…}` reads as
+/// unresolved: fail closed.
+const MAX_SCOPE_WORK: usize = 1 << 22;
+
+/// Most interpolations a scope keeps ([`PomScope::interpolated`]); the
+/// ones past that are worked out each time they are asked for.
+const MAX_KEPT_INTERPOLATIONS: usize = 1 << 16;
+
+/// One text, the profiles active, whether user properties are read, and
+/// how it is interpolated: what [`PomScope::interpolated`]'s answer
+/// depends on.
+type InterpolatedKey = (String, Vec<usize>, bool, How);
 
 /// One `<properties>` inside `<profiles>`: the `<profile>` element that
 /// holds it (when the scan finds one), that profile's `<id>`, and its
@@ -196,6 +244,15 @@ pub(crate) struct PomScope {
     /// Why [`Self::read_profiles`] could not read them (every `${…}` then
     /// fails closed in [`Self::resolve_in_build`]).
     profiles_unreadable: Option<String>,
+    /// The profiles (indices into [`Self::profile_properties`], in order)
+    /// that define each property name.
+    definers: BTreeMap<String, Vec<usize>>,
+    /// The work spent so far ([`MAX_SCOPE_WORK`]).
+    work: AtomicUsize,
+    /// What [`Self::interpolated`] already answered. Declarations share
+    /// their `${…}` texts (a BOM's `${x.version}`, `${project.version}`),
+    /// and the answer does not depend on which declaration asks.
+    interpolations: Mutex<HashMap<InterpolatedKey, Option<String>>>,
 }
 
 /// No user properties: the view of a version as the pom spells it.
@@ -242,7 +299,24 @@ impl PomScope {
             model,
             profile_properties: Vec::new(),
             profiles_unreadable: None,
+            definers: BTreeMap::new(),
+            work: AtomicUsize::new(0),
+            interpolations: Mutex::default(),
         })
+    }
+
+    /// The work spent so far.
+    #[cfg(test)]
+    fn work_spent(&self) -> usize {
+        self.work.load(Ordering::Relaxed)
+    }
+
+    /// Take `units` of the pom's work ([`MAX_SCOPE_WORK`]): `false` once
+    /// it is used up, and from then on (so `spend(0)` asks whether any is
+    /// left).
+    fn spend(&self, units: usize) -> bool {
+        let before = self.work.fetch_add(units, Ordering::Relaxed);
+        before.saturating_add(units) <= MAX_SCOPE_WORK
     }
 
     /// Read every `<properties>` inside `<profiles>`, which only
@@ -254,6 +328,17 @@ impl PomScope {
             Ok(found) => self.profile_properties = found,
             Err(e) => self.profiles_unreadable = Some(e),
         }
+        self.definers.clear();
+        for (i, profile) in self.profile_properties.iter().enumerate() {
+            for name in profile.props.keys() {
+                self.definers.entry(name.clone()).or_default().push(i);
+            }
+        }
+        // What was answered without the profiles no longer stands.
+        self.interpolations
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 
     /// The indices into [`Self::profile_properties`] of the profile that
@@ -277,6 +362,9 @@ impl PomScope {
     /// (indices, in pom order) active, with or without the build's user
     /// properties.
     fn lookup(&self, name: &str, active: &[usize], user: bool) -> Option<String> {
+        if !self.spend(1) {
+            return None;
+        }
         let layer = PomLayer {
             own: &self.properties,
             profiles: active
@@ -297,21 +385,57 @@ impl PomScope {
     /// otherwise the root's, every profile's (each but `own`, which is
     /// always active, may be the one read) and a bare model reference.
     fn definitions(&self, name: &str, own: &[usize]) -> Definitions {
+        let definers = self.definers.get(name).map_or(&[][..], Vec::as_slice);
+        // Past the work bound nothing is listed: the caller fails closed.
+        if !self.spend(1 + definers.len()) {
+            return Definitions::default();
+        }
         if let Some(fixed) = Definitions::fixed(name, &|n| self.model_ref(n), &self.user) {
             return fixed;
         }
         let mut d = Definitions::default();
         d.texts.extend(self.properties.get(name).cloned());
         d.texts.extend(self.model_ref(name));
-        for (i, p) in self.profile_properties.iter().enumerate() {
-            if let Some(v) = p.props.get(name) {
-                d.texts.push(v.clone());
-                if !own.contains(&i) {
-                    d.profiles.push(i);
-                }
+        for &i in definers {
+            d.texts
+                .extend(self.profile_properties[i].props.get(name).cloned());
+            if !own.contains(&i) {
+                d.profiles.push(i);
             }
         }
         d
+    }
+
+    /// `text` interpolated `how` with the profiles `active` active (and
+    /// the build's user properties, with `user`), worked out once per
+    /// scope: the answer does not depend on the declaration that holds the
+    /// text. Past the scope's work bound a text not yet worked out reads
+    /// as [`Self::lookup`] leaves it, unresolved.
+    fn interpolated(&self, text: &str, active: &[usize], user: bool, how: How) -> Option<String> {
+        let read = || how.interpolate(text, &|name| self.lookup(name, active, user));
+        if !text.contains("${") {
+            return read();
+        }
+        let key = (text.to_string(), active.to_vec(), user, how);
+        let memo = || {
+            self.interpolations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        let known = memo().get(&key).cloned();
+        if let Some(known) = known {
+            // Copying a long value out again is work too: a unit per
+            // kilobyte, so nothing for a version or a coordinate.
+            self.spend(known.as_ref().map_or(0, String::len) / 1024);
+            return known;
+        }
+        let value = read();
+        let kept = text.len() + value.as_ref().map_or(0, String::len);
+        let mut memo = memo();
+        if memo.len() < MAX_KEPT_INTERPOLATIONS && self.spend(1 + kept / 16) {
+            memo.insert(key, value.clone());
+        }
+        value
     }
 
     /// The `<version>` text of the declaration at `pos`, resolved as
@@ -322,7 +446,8 @@ impl PomScope {
             return (text.to_string(), text.to_string(), Vec::new());
         }
         let own = self.own_profile(pos);
-        let spelled = interpolate_strict(text, &|name| self.lookup(name, &own, false))
+        let spelled = self
+            .interpolated(text, &own, false, How::Strict)
             .unwrap_or_else(|| text.to_string());
         let (build, alternatives) = self.build_versions(text, pos);
         (spelled, build, alternatives)
@@ -352,10 +477,11 @@ impl PomScope {
     /// active profiles gives it ([`profile_combinations`], the vendored
     /// reactor's too), the smallest combination first; a combination that
     /// cannot resolve it gives the text as written. Fails closed: when the
-    /// combinations cannot be enumerated or a profile's `<properties>` is
-    /// unreadable, the text as written is an alternative.
+    /// combinations cannot be enumerated, a profile's `<properties>` is
+    /// unreadable or the pom's work bound is passed, the text as written
+    /// is an alternative.
     fn resolve_in_build(&self, text: &str, pos: usize) -> (Option<String>, Vec<Alternative>) {
-        let (mut base, readings) = self.resolve_all_in_build(&[(text, interpolate_strict)], pos);
+        let (mut base, readings) = self.resolve_all_in_build(&[(text, How::Strict)], pos);
         let mut alternatives: Vec<Alternative> = Vec::new();
         for (mut values, by) in readings {
             let value = values.remove(0).unwrap_or_else(|| text.to_string());
@@ -373,20 +499,19 @@ impl PomScope {
     /// the declaration, and each combination ([`profile_combinations`] of
     /// them all) under which any reads otherwise, the smallest first, with
     /// what they all read there. Fails closed: when the combinations cannot
-    /// be enumerated or a profile's `<properties>` is unreadable, every text
-    /// as written is one reading.
+    /// be enumerated, a profile's `<properties>` is unreadable or the pom's
+    /// work bound ([`MAX_SCOPE_WORK`]) is passed, every text as written is
+    /// one reading.
     fn resolve_all_in_build(
         &self,
-        texts: &[(&str, Interpolate)],
+        texts: &[(&str, How)],
         pos: usize,
     ) -> (Vec<Option<String>>, Vec<Reading>) {
         let own = self.own_profile(pos);
         let read = |active: &[usize]| -> Vec<Option<String>> {
             texts
                 .iter()
-                .map(|(text, interpolate)| {
-                    interpolate(text, &|name| self.lookup(name, active, true))
-                })
+                .map(|(text, how)| self.interpolated(text, active, true, *how))
                 .collect()
         };
         let base = read(&own);
@@ -425,6 +550,17 @@ impl PomScope {
                 readings.push((values, MovedBy::Profiles(ids)));
             }
         }
+        // The declaration keeps its readings, so handing them out is work
+        // as well. Past the bound, what was read above is not to be relied
+        // on either.
+        let handed: usize = readings
+            .iter()
+            .flat_map(|(values, _)| values.iter().flatten())
+            .map(String::len)
+            .sum();
+        if !self.spend(handed / 16) {
+            return (base, as_written(MovedBy::PastWorkBound));
+        }
         (base, readings)
     }
 
@@ -446,12 +582,10 @@ impl PomScope {
         if !group_text.contains("${") && !artifact_text.contains("${") {
             return Vec::new();
         }
-        let mut texts: Vec<(&str, Interpolate)> = vec![
-            (group_text, interpolate_keeping),
-            (artifact_text, interpolate_keeping),
-        ];
+        let mut texts: Vec<(&str, How)> =
+            vec![(group_text, How::Keeping), (artifact_text, How::Keeping)];
         if let Some(version) = dep.version_text.as_deref() {
-            texts.push((version, interpolate_strict));
+            texts.push((version, How::Strict));
         }
         let (_, readings) = self.resolve_all_in_build(&texts, dep.element.start);
         let mut out: Vec<CoordinateAlternative> = Vec::new();
@@ -484,7 +618,7 @@ impl PomScope {
     /// `${name}` the build defines interpolated, reading the declaration's
     /// own profile `<properties>` first when it sits in a profile (as its
     /// version is: that profile is always active with it), an undefined
-    /// one kept as written ([`interpolate_lenient`]). What other profiles
+    /// one kept as written ([`interpolate_keeping`]). What other profiles
     /// make of it is [`Self::coordinate_alternatives`]' job, which every
     /// coordinate check weighs.
     fn interpolate_coordinate(&self, text: &str, pos: usize) -> String {
@@ -492,7 +626,8 @@ impl PomScope {
             return text.to_string();
         }
         let own = self.own_profile(pos);
-        interpolate_lenient(text, &|name| self.lookup(name, &own, true))
+        self.interpolated(text, &own, true, How::Keeping)
+            .unwrap_or_else(|| text.to_string())
     }
 
     /// Inside a plugin / deploy section (never project resolution).
@@ -1497,6 +1632,179 @@ mod tests {
             }]
         ));
         assert!(deps[1].version_alternatives.is_empty());
+    }
+
+    /// A pom whose `${p0}` takes 1,023 property lookups to interpolate
+    /// (`p0` names `p1` twice, and so on down to `p9`), with eight
+    /// profiles that each redefine `p9`, so 255 combinations of them move
+    /// it, and `deps` declarations whose `<version>` is `version(i)`.
+    fn chained_pom(deps: usize, version: impl Fn(usize) -> String) -> String {
+        let chain: String = (0..9)
+            .map(|i| format!("<p{i}>${{p{n}}}${{p{n}}}</p{i}>", n = i + 1))
+            .collect();
+        let profiles: String = (0..8u8)
+            .map(|i| {
+                format!(
+                    "<profile><id>q{i}</id><properties><p9>{}</p9></properties></profile>",
+                    char::from(b'a' + i)
+                )
+            })
+            .collect();
+        let deps: String = (0..deps)
+            .map(|i| {
+                format!(
+                    "<dependency><groupId>g</groupId><artifactId>a{i}</artifactId>\
+                     <version>{}</version></dependency>",
+                    version(i)
+                )
+            })
+            .collect();
+        format!(
+            "<project><properties>{chain}<p9>1</p9></properties>\
+             <dependencies>{deps}</dependencies><profiles>{profiles}</profiles></project>"
+        )
+    }
+
+    /// Every declaration of a [`chained_pom`] read as [`super::parse_pom`]
+    /// reads it, and the work the scope spent on them.
+    fn read_chained(pom: &str) -> (Vec<(String, String, Vec<super::Alternative>)>, usize) {
+        let mut scope = PomScope::new(pom).unwrap();
+        scope.read_profiles();
+        let read = scope
+            .dependencies()
+            .unwrap()
+            .iter()
+            .map(|dep| {
+                assert!(scope.coordinate_alternatives(dep).is_empty());
+                let text = dep.version_text.as_deref().unwrap();
+                scope.resolve_version(text, dep.element.start)
+            })
+            .collect();
+        (read, scope.work_spent())
+    }
+
+    /// What every `${p0}` of a [`chained_pom`] reads: 512 `1`, and 512 of
+    /// each profile's letter under that profile alone (the smallest
+    /// combination that gives it).
+    fn chained_alternatives() -> Vec<super::Alternative> {
+        (0..8u8)
+            .map(|i| super::Alternative {
+                value: char::from(b'a' + i).to_string().repeat(512),
+                by: super::MovedBy::Profiles(vec![format!("q{i}")]),
+            })
+            .collect()
+    }
+
+    /// A thousand declarations of one `${p0}` (a 100 KB pom) cost what one
+    /// does: the text is interpolated once per profile combination, not
+    /// once per declaration and combination, which was 263 million
+    /// property lookups (28 s for `socket-patch list`). What they read is
+    /// unchanged.
+    #[test]
+    fn declarations_sharing_a_text_are_interpolated_once() {
+        let pom = chained_pom(1000, |_| "${p0}".to_string());
+        assert!((90_000..110_000).contains(&pom.len()), "{}", pom.len());
+        let (read, work) = read_chained(&pom);
+        assert_eq!(read.len(), 1000);
+        for (spelled, build, alternatives) in &read {
+            assert_eq!(*spelled, "1".repeat(512));
+            assert_eq!(*build, "1".repeat(512));
+            assert_eq!(*alternatives, chained_alternatives());
+        }
+        // One declaration's worth of lookups (1,023 for the version as
+        // spelled, as built, and under each of 255 combinations), then a
+        // few hundred units per declaration for the readings it is handed.
+        assert!((262_000..600_000).contains(&work), "{work} units of work");
+        assert!(work < super::MAX_SCOPE_WORK / 4);
+
+        // The whole reader gives every declaration the same.
+        let deps = super::parse_pom(&pom).unwrap().deps;
+        assert_eq!(deps.len(), 1000);
+        for d in [&deps[0], &deps[999]] {
+            assert_eq!(d.version, Some("1".repeat(512)));
+            assert_eq!(d.build_version, Some("1".repeat(512)));
+            assert_eq!(d.version_alternatives, chained_alternatives());
+        }
+    }
+
+    /// A pom whose declarations each spell a different text cannot share
+    /// anything, so its work is bounded instead: the declarations read
+    /// before the bound are worked out in full, and the ones after it read
+    /// as unresolved (fail closed), which says why.
+    #[test]
+    fn a_pom_past_its_work_bound_reads_as_unresolved() {
+        let pom = chained_pom(100, |i| format!("${{p0}}-{i}"));
+        let (read, work) = read_chained(&pom);
+        // Not a lookup more than the bound, plus the last call's own.
+        assert!(
+            (super::MAX_SCOPE_WORK..super::MAX_SCOPE_WORK + 4096).contains(&work),
+            "{work} units of work"
+        );
+        let (spelled, build, alternatives) = &read[0];
+        assert_eq!(*spelled, format!("{}-0", "1".repeat(512)));
+        assert_eq!(build, spelled);
+        let want: Vec<super::Alternative> = chained_alternatives()
+            .into_iter()
+            .map(|a| super::Alternative {
+                value: format!("{}-0", a.value),
+                by: a.by,
+            })
+            .collect();
+        assert_eq!(*alternatives, want);
+
+        let resolved = read
+            .iter()
+            .take_while(|(_, build, _)| !build.contains("${"))
+            .count();
+        assert!((10..20).contains(&resolved), "{resolved}");
+        // The declaration the bound falls in says so; the ones after it
+        // read as written, with nothing to tell apart from it.
+        let cut: Vec<&super::MovedBy> = read
+            .iter()
+            .flat_map(|(_, _, alternatives)| alternatives)
+            .map(|a| &a.by)
+            .filter(|by| !matches!(by, super::MovedBy::Profiles(_)))
+            .collect();
+        assert_eq!(cut, [&super::MovedBy::PastWorkBound]);
+        for (i, (spelled, build, alternatives)) in read.iter().enumerate().skip(resolved + 1) {
+            let text = format!("${{p0}}-{i}");
+            assert_eq!((spelled, build), (&text, &text));
+            assert!(alternatives.is_empty(), "{alternatives:?}");
+        }
+        assert_eq!(
+            super::MovedBy::PastWorkBound.to_string(),
+            "a pom whose properties take more interpolation than this reader works out"
+        );
+    }
+
+    /// Many profiles defining a name are found through the index, in pom
+    /// order, as reading every profile found them.
+    #[test]
+    fn definitions_list_the_profiles_in_pom_order() {
+        let profiles: String = (0..40)
+            .map(|i| {
+                let name = if i % 3 == 0 { "v" } else { "w" };
+                format!(
+                    "<profile><id>q{i}</id><properties><{name}>{i}</{name}></properties></profile>"
+                )
+            })
+            .collect();
+        let pom = format!(
+            "<project><properties><v>x</v></properties><dependencies/>\
+             <profiles>{profiles}</profiles></project>"
+        );
+        let mut scope = PomScope::new(&pom).unwrap();
+        scope.read_profiles();
+        let d = scope.definitions("v", &[3]);
+        let defining: Vec<usize> = (0..40).filter(|i| i % 3 == 0).collect();
+        let mut texts = vec!["x".to_string()];
+        texts.extend(defining.iter().map(usize::to_string));
+        assert_eq!(d.texts, texts);
+        assert_eq!(
+            d.profiles,
+            defining.into_iter().filter(|i| *i != 3).collect::<Vec<_>>()
+        );
+        assert!(scope.definitions("nope", &[]).texts.is_empty());
     }
 
     /// The shared interpolator's work bounds: a value naming the next

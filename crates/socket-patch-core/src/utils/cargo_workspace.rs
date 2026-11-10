@@ -11,7 +11,7 @@
 //! would follow it). Cargo still reads those manifests; the rewriter's
 //! Cargo.lock dependents check refuses a crate one of them depends on.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -160,14 +160,18 @@ async fn expand_glob_in(view: &ProjectView<'_>, pattern: &str, skip: &[&str]) ->
     let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
         return Vec::new();
     };
-    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let segments = glob_segments(&normalized);
     let mut out = Vec::new();
+    let mut walked = Walked::of(&segments);
     // [`expand_from`]'s recursion as an explicit stack, children pushed in
     // reverse so they are visited in the same order.
     let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
     while let Some((at, i)) = stack.pop() {
         if out.len() >= MAX_MANIFESTS {
             break;
+        }
+        if !walked.first_visit(&at, segments.len() - i) {
+            continue;
         }
         let Some(seg) = segments.get(i) else {
             out.push(at);
@@ -541,13 +545,47 @@ pub(crate) fn expand_glob_bounded(
     let Some(normalized) = normalize_rel("", pattern.trim_end_matches('/')) else {
         return (Vec::new(), false);
     };
-    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    let segments = glob_segments(&normalized);
     let mut out = Vec::new();
-    expand_from(tree, String::new(), &segments, skip, &mut out);
+    let mut walked = Walked::of(&segments);
+    expand_from(tree, String::new(), &segments, skip, &mut walked, &mut out);
     let truncated = out.len() >= MAX_MANIFESTS;
     out.sort();
     out.dedup();
     (out, truncated)
+}
+
+/// A normalized glob's segments as the walk reads them. A run of `**`
+/// segments is one (`**/**` names what `**` names), so the walk nests as
+/// deep as the directories go, not as long as the pattern is.
+fn glob_segments(normalized: &str) -> Vec<&str> {
+    let mut segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+    segments.dedup_by(|next, kept| *next == "**" && *kept == "**");
+    segments
+}
+
+/// The (directory, segments left) pairs a glob walk has been through. A
+/// glob with two or more `**` reaches one directory along many routes, one
+/// per way to split the levels above it between them, and their number
+/// grows exponentially with the `**` count. The walk takes the first route
+/// and drops the rest, which name the same directories.
+struct Walked(Option<HashSet<(String, usize)>>);
+
+impl Walked {
+    fn of(segments: &[&str]) -> Self {
+        // With one `**` or none every directory has a single route to it,
+        // so there is nothing to remember.
+        let globstars = segments.iter().filter(|seg| **seg == "**").count();
+        Walked((globstars > 1).then(HashSet::new))
+    }
+
+    /// Whether this is the walk's first time at `at` with `left` segments
+    /// to go.
+    fn first_visit(&mut self, at: &str, left: usize) -> bool {
+        self.0
+            .as_mut()
+            .is_none_or(|seen| seen.insert((at.to_string(), left)))
+    }
 }
 
 /// Whether a `members` entry is a glob rather than a literal path: some
@@ -559,7 +597,9 @@ pub(crate) fn is_member_pattern(pattern: &str) -> bool {
 
 fn segment_is_pattern(seg: &str) -> bool {
     seg.contains(['*', '?'])
-        || seg.match_indices('[').any(|(at, _)| {
+        // The first `[` decides: a `]` that closes a later one closes it
+        // too. (Looking after each `[` reads a run of them once per `[`.)
+        || seg.find('[').is_some_and(|at| {
             let body = &seg[at + 1..];
             let body = body.strip_prefix('!').unwrap_or(body);
             body.char_indices().skip(1).any(|(_, c)| c == ']')
@@ -596,9 +636,10 @@ fn expand_from(
     at: String,
     rest: &[&str],
     skip: &[&str],
+    walked: &mut Walked,
     out: &mut Vec<String>,
 ) {
-    if out.len() >= MAX_MANIFESTS {
+    if out.len() >= MAX_MANIFESTS || !walked.first_visit(&at, rest.len()) {
         return;
     }
     let Some((seg, tail)) = rest.split_first() else {
@@ -608,7 +649,7 @@ fn expand_from(
     if !segment_is_pattern(seg) {
         let next = join_rel(&at, seg);
         if tree.is_real_dir(&next) {
-            expand_from(tree, next, tail, skip, out);
+            expand_from(tree, next, tail, skip, walked, out);
         }
         return;
     }
@@ -617,9 +658,9 @@ fn expand_from(
     };
     let children = glob_children(entries, seg, skip);
     if *seg == "**" {
-        expand_from(tree, at.clone(), tail, skip, out);
+        expand_from(tree, at.clone(), tail, skip, walked, out);
         for child in children {
-            expand_from(tree, join_rel(&at, &child), rest, skip, out);
+            expand_from(tree, join_rel(&at, &child), rest, skip, walked, out);
         }
         return;
     }
@@ -627,7 +668,7 @@ fn expand_from(
     for child in children {
         let name: Vec<char> = child.chars().collect();
         if segment_glob_matches(&pattern, &name) {
-            expand_from(tree, join_rel(&at, &child), tail, skip, out);
+            expand_from(tree, join_rel(&at, &child), tail, skip, walked, out);
         }
     }
 }
@@ -846,6 +887,121 @@ mod tests {
         );
     }
 
+    /// A chain of nested directories `a/a/…/a`, `depth` deep, that counts
+    /// the listings a walk asks of it.
+    struct Chain {
+        depth: usize,
+        listings: std::cell::Cell<usize>,
+    }
+
+    impl Chain {
+        fn new(depth: usize) -> Self {
+            Chain {
+                depth,
+                listings: std::cell::Cell::new(0),
+            }
+        }
+
+        /// How deep `rel` is, when it is a directory of the chain.
+        fn depth_of(&self, rel: &str) -> Option<usize> {
+            let depth = rel.split('/').filter(|seg| !seg.is_empty()).count();
+            (depth <= self.depth && rel.split('/').all(|seg| seg.is_empty() || seg == "a"))
+                .then_some(depth)
+        }
+    }
+
+    impl DirTree for Chain {
+        fn is_real_dir(&self, rel: &str) -> bool {
+            self.depth_of(rel).is_some()
+        }
+
+        fn child_dirs(&self, rel: &str) -> Option<Vec<String>> {
+            self.listings.set(self.listings.get() + 1);
+            let depth = self.depth_of(rel)?;
+            Some(if depth < self.depth {
+                vec!["a".to_string()]
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    /// A glob with several `**` reaches one directory along many routes
+    /// (each split of the levels between them). The walk lists a directory
+    /// once per pattern segment, not once per route: six `**` over a
+    /// sixteen-deep chain is at most 17 × 7 listings, where walking every
+    /// route asked 74,613 (and 10^11 for twelve `**` over forty levels, a
+    /// `members` line and a directory chain that hung the scan).
+    #[test]
+    fn repeated_globstars_list_a_directory_once_per_segment() {
+        for (pattern, segments) in [
+            ("**/**/**/**/**/**/zz", 7),
+            ("**/a/**/a/**/a/**/a/**/a/**/a/zz", 13),
+        ] {
+            let chain = Chain::new(16);
+            let (dirs, truncated) = expand_glob_bounded(&chain, pattern, &[]);
+            assert!(dirs.is_empty() && !truncated, "{pattern}: {dirs:?}");
+            assert!(
+                chain.listings.get() <= 17 * segments,
+                "{pattern}: {} listings",
+                chain.listings.get()
+            );
+        }
+        // The answer is the set a single `**` names, and reaching each of
+        // its directories along thousands of routes is not "more than
+        // MAX_MANIFESTS directories".
+        let all: Vec<String> = (0..=40).map(|depth| vec!["a"; depth].join("/")).collect();
+        for pattern in ["**", "**/**/**", "**/**/**/**/**/**/**/**"] {
+            let (dirs, truncated) = expand_glob_bounded(&Chain::new(40), pattern, &[]);
+            assert_eq!(dirs, all, "{pattern}");
+            assert!(!truncated, "{pattern}");
+        }
+        let below: Vec<String> = all[2..].to_vec();
+        for pattern in ["**/a/**/a", "**/a/a/**", "a/**/**/a/**"] {
+            let (dirs, truncated) = expand_glob_bounded(&Chain::new(40), pattern, &[]);
+            assert_eq!(dirs, below, "{pattern}");
+            assert!(!truncated, "{pattern}");
+        }
+    }
+
+    /// The same walk through a [`ProjectView`] (the hosted engine's): a
+    /// `members` glob of twelve `**` over a forty-deep directory chain
+    /// names nothing, and says so at once.
+    #[test]
+    fn view_walk_of_repeated_globstars_finishes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(
+            &root,
+            "Cargo.toml",
+            &format!(
+                "[workspace]\nmembers = [\"{}zz\", \"**/**/m\"]\n",
+                "**/".repeat(12)
+            ),
+        );
+        write(
+            &root,
+            &format!("{}m/Cargo.toml", "a/".repeat(40)),
+            &pkg("m"),
+        );
+        let (answer, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let walked = runtime.block_on(member_manifests_in(&ProjectView::Disk(&root)));
+            let _ = answer.send((walked, member_manifests(&root)));
+        });
+        let (view, disk) = wait
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the member walk did not finish within a minute");
+        let member = format!("{}m/Cargo.toml", "a/".repeat(40));
+        assert_eq!(view, vec![member.clone()]);
+        assert_eq!(disk, vec![member]);
+        drop(tmp);
+    }
+
     /// Members and path dependencies behind a symbolic link — whether the
     /// link is a literal member, matched by a glob, a path dependency, an
     /// intermediate directory or the manifest itself — are never returned:
@@ -991,6 +1147,45 @@ mod tests {
         for pattern in ["crates/a", "odd[dir", "x[]", "x[!]", "a]b["] {
             assert!(!is_member_pattern(pattern), "{pattern}");
         }
+    }
+
+    /// Whether a segment is a pattern is read off its first `[`, with the
+    /// answer looking after every `[` gave (20,000 seeded segments), and a
+    /// megabyte of unclosed `[` is one read, not one per `[`.
+    #[test]
+    fn member_pattern_check_reads_the_first_bracket_only() {
+        let every_bracket = |seg: &str| {
+            seg.contains(['*', '?'])
+                || seg.match_indices('[').any(|(at, _)| {
+                    let body = &seg[at + 1..];
+                    let body = body.strip_prefix('!').unwrap_or(body);
+                    body.char_indices().skip(1).any(|(_, c)| c == ']')
+                })
+        };
+        let mut rng = crate::test_rng::Rng::new(0x54);
+        let mut patterns = 0;
+        for case in 0..20_000 {
+            let seg: String = (0..rng.below(8))
+                .map(|_| rng.pick(&["[", "[", "]", "]", "!", "^", "a", "é", "-", "*"]))
+                .collect();
+            let want = every_bracket(&seg);
+            assert_eq!(segment_is_pattern(&seg), want, "case {case}: {seg:?}");
+            patterns += usize::from(want);
+        }
+        assert!((4_000..16_000).contains(&patterns), "{patterns}");
+
+        let (answer, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let run = "[".repeat(1_000_000);
+            let _ = answer.send((
+                is_member_pattern(&run),
+                is_member_pattern(&format!("{run}]")),
+            ));
+        });
+        let answers = wait
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the pattern check did not finish within a minute");
+        assert_eq!(answers, (false, true));
     }
 
     /// V-7: the memoized member walk returns exactly what the per-call
