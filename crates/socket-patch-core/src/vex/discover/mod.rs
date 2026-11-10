@@ -2067,19 +2067,29 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
 /// the workspace root's lock, see
 /// [`crate::hosted::governing_root::member_stray_lock`]) is read as absent,
 /// as it is by the install: nothing in it is wiring, so its pins attest
-/// nothing. Its Socket identities are still recognized (rule 11), so a
+/// nothing. So is a pnpm workspace member's own lock while the workspace
+/// shares one, and a yarn 1 workspace member's classic `yarn.lock`
+/// ([`crate::hosted::governing_root::member_unread_lock`]). Its Socket
+/// identities are still recognized (rule 11), so a
 /// ledger claim it alone mentions is dead, and one diagnostic says why.
 /// Disk runs only: an in-memory project has no ancestors.
 async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
+    use crate::hosted::governing_root::{
+        member_stray_lock, member_stray_lock_own_files, member_unread_lock,
+    };
     // Declares the project files the check reads; the rest are above the
     // project, which no overlay of the project's files changes.
-    let Some(root) =
-        ctx.disk_root_reading(crate::hosted::governing_root::member_stray_lock_own_files())
-    else {
+    let own_files =
+        member_stray_lock_own_files().chain([crate::utils::pnpm_workspace::PNPM_WORKSPACE]);
+    let Some(root) = ctx.disk_root_reading(own_files) else {
         return;
     };
-    let Some(stray) = crate::hosted::governing_root::member_stray_lock(root).await else {
-        return;
+    let stray = match member_stray_lock(root).await {
+        Some(stray) => stray,
+        None => match member_unread_lock(root).await {
+            Some(stray) => stray,
+            None => return,
+        },
     };
     for rel in &stray.ignored {
         let mentions = match ctx.view.read_bytes(rel).await {
@@ -6246,5 +6256,100 @@ mod member_stray_lock_tests {
                 diag.detail
             );
         }
+    }
+
+    /// A pnpm workspace member's own lock (while the workspace shares one)
+    /// and a yarn 1 workspace member's classic `yarn.lock` are never read
+    /// either: real pnpm 10.34.1 / 11.27.0 and yarn 1.22.19 install the
+    /// member from the workspace root and leave its own lock untouched. A
+    /// hosted pin there attests nothing. Each manager's own exception keeps
+    /// the lock: a pnpm workspace with the shared lock off, a pnpm
+    /// workspace or yarn `workspaces` that does not list the directory, and
+    /// a berry lock (a nested berry project).
+    #[tokio::test]
+    async fn a_pnpm_or_yarn_classic_member_lock_attests_nothing() {
+        const UUID: &str = "22222222-2222-2222-2222-222222222222";
+        let wired = |member: &Path| {
+            let member = member.to_path_buf();
+            async move {
+                let out = discover_patched_refs(&member).await;
+                let wired = out.refs.iter().any(|r| r.uuid == UUID);
+                if !wired {
+                    assert!(out.refs.is_empty(), "{:#?}", out.refs);
+                    assert!(out.recognized.iter().any(|r| r.uuid == UUID), "{out:#?}");
+                    let stray = out.diagnostics.iter().any(|d| {
+                        d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("ignores its own")
+                            && d.detail.contains("not attested")
+                    });
+                    assert!(stray, "{:#?}", out.diagnostics);
+                }
+                wired
+            }
+        };
+        let member_of = |fixture: &str| {
+            let ws = tempfile::tempdir().unwrap();
+            // The checkout: nothing above it is read.
+            std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+            let member = ws.path().join("packages/a");
+            copy_dir(&fixture_path(fixture), &member);
+            if !member.join("package.json").exists() {
+                std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+            }
+            (ws, member)
+        };
+
+        // pnpm.
+        let (ws, member) = member_of("redirect/npm/pnpm/basic/expected");
+        assert!(wired(&member).await, "control: no workspace");
+        let workspace = ws.path().join("pnpm-workspace.yaml");
+        std::fs::write(&workspace, "packages:\n  - 'packages/*'\n").unwrap();
+        assert!(!wired(&member).await, "a member of a shared-lock workspace");
+        std::fs::write(&workspace, "packages:\n  - 'apps/*'\n").unwrap();
+        assert!(wired(&member).await, "the workspace does not list it");
+        std::fs::write(
+            &workspace,
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        )
+        .unwrap();
+        assert!(
+            wired(&member).await,
+            "each member installs from its own lock"
+        );
+        // A root lock that lists member importers is the shared one.
+        std::fs::write(
+            ws.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        )
+        .unwrap();
+        assert!(
+            !wired(&member).await,
+            "a shared root lock, whatever the setting"
+        );
+
+        // yarn classic.
+        let (ws, member) = member_of("redirect/npm/yarn-classic/basic/expected");
+        assert!(wired(&member).await, "control: no workspace");
+        let manifest = ws.path().join("package.json");
+        std::fs::write(&manifest, r#"{"private":true,"workspaces":["packages/*"]}"#).unwrap();
+        assert!(!wired(&member).await, "a yarn 1 workspace member");
+        std::fs::write(
+            &manifest,
+            r#"{"private":true,"workspaces":{"packages":["packages/*"]}}"#,
+        )
+        .unwrap();
+        assert!(!wired(&member).await, "the object spelling of workspaces");
+        std::fs::write(&manifest, r#"{"private":true,"workspaces":["apps/*"]}"#).unwrap();
+        assert!(wired(&member).await, "the workspace does not list it");
+
+        // yarn berry treats a nested lock as a project of its own.
+        let (ws, member) = member_of("redirect/npm/yarn-berry/basic/expected");
+        std::fs::write(
+            ws.path().join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let out = discover_patched_refs(&member).await;
+        assert!(!out.refs.is_empty(), "{out:#?}");
     }
 }
