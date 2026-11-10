@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -747,6 +748,42 @@ fn locate_section(lines: &[&str], name: &str) -> Option<SectionSpan> {
             .map(|(close, _)| SectionSpan::Block { open, close }),
         "}" | "}," => Some(SectionSpan::Inline { line: open }),
         _ => None,
+    }
+}
+
+/// Where each top-level member's value sits in `text` as JSON reads it
+/// (the last one, for a repeated key): the byte range of the value, braces
+/// included. `None` when `text` is not a JSON object.
+pub(crate) fn top_level_value_spans(text: &str) -> Option<HashMap<String, Range<usize>>> {
+    let members: HashMap<String, &RawValue> = serde_json::from_str(text).ok()?;
+    members
+        .into_iter()
+        .map(|(key, raw)| {
+            let start = (raw.get().as_ptr() as usize).checked_sub(text.as_ptr() as usize)?;
+            let span = start..start.checked_add(raw.get().len())?;
+            (text.get(span.clone()) == Some(raw.get())).then_some((key, span))
+        })
+        .collect()
+}
+
+/// The byte range of a located section's `{…}` in the text `lines` were
+/// split from. [`nodes_block`] and [`edges_block`] find a section by the
+/// shape of its lines, which a member of the same name nested elsewhere (an
+/// `options.nodes` written at the top level's indent) can have too; a
+/// caller that edits the section's lines first checks that this range is
+/// the one [`top_level_value_spans`] gives the member, so the lines it
+/// edits are the ones every JSON reader takes for that section.
+pub(crate) fn section_value_span(lines: &[&str], span: SectionSpan) -> Range<usize> {
+    let offset = |line: usize| lines[..line].iter().map(|l| l.len() + 1).sum::<usize>();
+    match span {
+        SectionSpan::Inline { line } => {
+            let open = offset(line) + lines[line].find('{').unwrap_or_default();
+            open..open + 2
+        }
+        SectionSpan::Block { open, close } => {
+            let header = strip_cr(lines[open]).0;
+            offset(open) + header.len().saturating_sub(1)..offset(close) + "  }".len()
+        }
     }
 }
 
@@ -2538,6 +2575,42 @@ mod tests {
             }
         }
         assert!(unknown > 1000, "{unknown} pairs outside the table");
+    }
+
+    /// VBV-D4: the span of a section's lines is the span JSON gives the
+    /// top-level member, for the block and the inline layout, with LF and
+    /// CRLF line ends, and is another one for a same-named member nested
+    /// in `options` at the top level's indent.
+    #[test]
+    fn section_lines_are_tied_to_the_top_level_member() {
+        let lock = "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \"~npm~a@1.0.0\": [0,\"a\"]\n  },\n  \"edges\": {}\n}\n";
+        for text in [lock.to_string(), lock.replace('\n', "\r\n")] {
+            let lines = split_lines(&text);
+            let spans = top_level_value_spans(&text).unwrap();
+            for (name, span) in [
+                ("nodes", nodes_block(&lines)),
+                ("edges", edges_block(&lines)),
+            ] {
+                let span = section_value_span(&lines, span.unwrap());
+                assert_eq!(span, spans[name], "{name}");
+                assert!(text[span.clone()].starts_with('{') && text[span].ends_with('}'));
+            }
+        }
+        let decoy = lock.replace(
+            "  \"options\": {},\n",
+            "  \"options\": {\n  \"nodes\": {\n    \"~npm~b@1.0.0\": [0,\"b\"]\n  }\n  },\n",
+        );
+        assert!(serde_json::from_str::<Value>(&decoy).is_ok());
+        let lines = split_lines(&decoy);
+        let spans = top_level_value_spans(&decoy).unwrap();
+        let found = section_value_span(&lines, nodes_block(&lines).unwrap());
+        assert!(
+            decoy[found.clone()].contains("~npm~b@1.0.0"),
+            "the decoy is found first"
+        );
+        assert_ne!(found, spans["nodes"]);
+        assert!(decoy[spans["nodes"].clone()].contains("~npm~a@1.0.0"));
+        assert_eq!(top_level_value_spans("[]"), None);
     }
 
     #[test]

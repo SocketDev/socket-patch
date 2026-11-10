@@ -37,12 +37,12 @@ use super::npm_dir::{dependency_token, replace_dependency_token, stage_patch_dir
 use super::source::PackageSource;
 use super::state::{load_state, VendorArtifact, VendorEntry, WiringAction, WiringRecord};
 use super::vlt_lock_text::{
-    brotli_for_slot3, edges_block, entry_text, file_dep_id, has_brotli_flag,
+    brotli_for_slot3, edges_block, encode_segment, entry_text, file_dep_id, has_brotli_flag,
     installs_outside_registry, is_default_registry, is_importer_dep_id, is_registry_url_segment,
     nodes_block, parse_edge_entry_text, parse_edge_line, parse_node_entry_text, parse_node_line,
-    parse_vendored_dir_path, render_entry_line, render_tuple_with_slots, sniff_lock, split_dep_id,
-    split_lines, vendored_dir_rel, vlt_collate, vlt_edge_cmp, DepIdEra, DepIdKind, EdgeSortKey,
-    LockSniff, ParsedLock, SectionSpan,
+    parse_vendored_dir_path, render_entry_line, render_tuple_with_slots, section_value_span,
+    sniff_lock, split_dep_id, split_lines, top_level_value_spans, vendored_dir_rel, vlt_collate,
+    vlt_edge_cmp, DepIdEra, DepIdKind, EdgeSortKey, LockSniff, ParsedLock, SectionSpan,
 };
 use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 
@@ -195,6 +195,21 @@ fn parse_doc(text: &str) -> Result<LockDoc, Refusal> {
         parse_block(&lines, nodes_block(&lines), node_count, true).ok_or_else(not_canonical)?;
     let edges =
         parse_block(&lines, edges_block(&lines), edge_count, false).ok_or_else(not_canonical)?;
+    // The sections were found by the shape of their lines. Every edit is to
+    // those lines, so they must be where JSON puts the top-level `nodes`
+    // and `edges`: a member of that name nested elsewhere and written at
+    // the same indent has the same shape (and can have as many entries).
+    let members = top_level_value_spans(text).ok_or_else(not_canonical)?;
+    for (name, block) in [("nodes", &nodes), ("edges", &edges)] {
+        let top_level = match (block.span, members.get(name)) {
+            (Some(span), Some(member)) => section_value_span(&lines, span) == *member,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !top_level {
+            return Err(not_canonical());
+        }
+    }
     Ok(LockDoc {
         era: parsed.new_id_era(),
         lines: lines.into_iter().map(str::to_string).collect(),
@@ -456,6 +471,28 @@ fn importer_dir(from: &str) -> Option<String> {
     let dep_id = split_dep_id(from)?;
     (dep_id.kind == DepIdKind::Workspace && is_safe_multi_segment(&dep_id.first))
         .then_some(dep_id.first)
+}
+
+/// Why the importer manifest `pkg_rel` must not be written, when its
+/// directory is reached through a symbolic link (or cannot be told from
+/// one): a workspace directory linked out of the project leads to a
+/// `package.json` that is not this project's to edit. The root's own
+/// manifest has no level to check.
+fn linked_importer(project_root: &Path, pkg_rel: &str) -> Option<String> {
+    let dir = Path::new(pkg_rel)
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())?;
+    match crate::utils::containment::try_linked_level(project_root, &project_root.join(dir)) {
+        Ok(None) => None,
+        Ok(Some(link)) => Some(format!(
+            "{pkg_rel} is reached through the symbolic link {}, and its target is not \
+             socket-patch's to change; make the workspace a real directory of the project first",
+            link.strip_prefix(project_root).unwrap_or(&link).display()
+        )),
+        Err(e) => Some(format!(
+            "cannot tell whether {pkg_rel} is reached through a symbolic link: {e}"
+        )),
+    }
 }
 
 /// The one default-registry instance of `name@version` (plain or with only
@@ -747,6 +784,11 @@ async fn analyze(
         })?;
     let doc = parse_doc(&text)?;
     let target = find_target(&doc, name, version)?;
+    for edge in &target.importers {
+        if let Some(detail) = linked_importer(project_root, &edge.pkg_rel()) {
+            return Err((UNSUPPORTED, detail));
+        }
+    }
     let pkgs = read_importer_pkgs(project_root, &target).await;
     let rel = vendored_dir_rel(uuid, name, version);
     check_declarations(&target, &pkgs, &rel)?;
@@ -1892,8 +1934,99 @@ async fn revert_reinstall_advisory(
     ))
 }
 
+/// The first lock entry (an edge before a node) whose key or value names
+/// one of `needles`, which are lowercase. A uuid, and a vendored path in
+/// either DepID spelling, read the same wherever the lock writes them: in
+/// a node key, an edge's source, its `file:` spec and its target.
+fn lock_entry_naming<'e>(
+    nodes: &[&'e Entry],
+    edges: &[&'e Entry],
+    needles: &[String],
+) -> Option<&'e Entry> {
+    let names = |entry: &&&Entry| {
+        let (key, value) = (
+            entry.key.to_ascii_lowercase(),
+            entry.value.to_ascii_lowercase(),
+        );
+        needles
+            .iter()
+            .any(|needle| key.contains(needle) || value.contains(needle))
+    };
+    edges
+        .iter()
+        .find(names)
+        .or(nodes.iter().find(names))
+        .copied()
+}
+
+/// How an unrecorded lock entry reads in a warning: an edge with the
+/// `package.json` that declares it, or a node.
+fn unrecorded_entry(entry: &Entry) -> String {
+    match entry.key.split_once(' ') {
+        Some((from, _)) => match importer_dir(from) {
+            Some(dir) => format!("edge `{}` (declared in {})", entry.key, pkg_json_rel(&dir)),
+            None => format!("edge `{}`", entry.key),
+        },
+        None => format!("node `{}`", entry.key),
+    }
+}
+
+/// What names the entry's own vendored node in a lock: the directory's
+/// path below the vendor root, its DepID in both grammars, and the node
+/// key the ledger recorded. All lowercase.
+fn own_node_needles(entry: &VendorEntry) -> Vec<String> {
+    let path = entry.artifact.path.as_str();
+    let mut needles = vec![
+        path.strip_prefix(".socket/vendor/npm/")
+            .unwrap_or(path)
+            .to_string(),
+        encode_segment(path, DepIdEra::Tilde),
+        encode_segment(path, DepIdEra::Legacy),
+    ];
+    needles.extend(
+        entry
+            .wiring
+            .iter()
+            .filter(|r| r.kind == KIND_LOCK_NODE)
+            .filter_map(|r| fragment(&r.new).and_then(parse_node_entry_text))
+            .map(|node| node.key.to_string()),
+    );
+    needles.iter().map(|n| n.to_ascii_lowercase()).collect()
+}
+
+/// Whether a `package.json` still names the uuid dir, in any string it
+/// holds (a file that is not JSON is searched as text).
+fn manifest_names_uuid(text: &str, uuid: &str) -> bool {
+    fn names(value: &Value, needle: &str) -> bool {
+        match value {
+            Value::String(s) => s.to_ascii_lowercase().contains(needle),
+            Value::Array(items) => items.iter().any(|v| names(v, needle)),
+            Value::Object(map) => map
+                .iter()
+                .any(|(k, v)| k.to_ascii_lowercase().contains(needle) || names(v, needle)),
+            _ => false,
+        }
+    }
+    let needle = uuid.to_ascii_lowercase();
+    match serde_json::from_str::<Value>(crate::formats::text::strip_bom(text)) {
+        Ok(value) => names(&value, &needle),
+        Err(_) => text.to_ascii_lowercase().contains(&needle),
+    }
+}
+
 /// Undo one vlt-vendored package: every record through its inverse,
 /// all or nothing, then remove the artifact.
+///
+/// The artifact goes only when nothing the project installs from still
+/// names it. A lock entry the ledger never recorded that still reaches the
+/// vendored node (the edge of a workspace pointed at the directory after
+/// vendoring) leaves the whole revert alone, as drift: undoing the node
+/// under it would leave that edge dangling. Anything else that still names
+/// the uuid dir (an importer `package.json`, the wiring of another package
+/// vendored under the same uuid) keeps the directory and the ledger entry
+/// (`vendor_revert_residual_reference`) with the recorded wiring restored.
+/// A dry run does all of this but the writes, so it reports what the real
+/// run would.
 pub async fn revert_vlt_opts(
     entry: &VendorEntry,
     project_root: &Path,
@@ -1911,9 +2044,6 @@ pub async fn revert_vlt_opts(
         if let Some(blocked) = guard_unwired(project_root, entry, &uuid_dir_rel).await {
             return blocked;
         }
-    }
-    if dry_run {
-        return RevertOutcome::ok();
     }
     let mut outcome = RevertOutcome::ok();
 
@@ -1937,6 +2067,12 @@ pub async fn revert_vlt_opts(
                 rec.kind, rec.file
             )));
             continue;
+        }
+        if rec.kind == KIND_PKG_DEP {
+            if let Some(detail) = linked_importer(project_root, &rec.file) {
+                outcome.warnings.push(drifted(detail));
+                continue;
+            }
         }
         if rec.kind == KIND_PKG_DEP && !pkgs.contains_key(&rec.file) {
             match read_regular_to_string(&project_root.join(&rec.file)).await {
@@ -1976,8 +2112,11 @@ pub async fn revert_vlt_opts(
         });
     let already_reverted = !wired_lock && !wired_pkg;
 
+    // The lock and the manifests as the revert leaves them.
+    let mut new_pkgs = pkgs.clone();
+    let mut staged = None;
     if !already_reverted {
-        let mut staged = doc.as_ref().map(|d| Staged {
+        staged = doc.as_ref().map(|d| Staged {
             nodes: d.nodes.entries.clone(),
             edges: d.edges.entries.clone(),
             touched_nodes: Vec::new(),
@@ -1985,7 +2124,6 @@ pub async fn revert_vlt_opts(
             merged_nodes: BTreeSet::new(),
             merged_edges: BTreeSet::new(),
         });
-        let mut new_pkgs = pkgs.clone();
         let mut drift: Option<String> = None;
         for rec in entry.wiring.iter().rev() {
             let step = match (rec.kind.as_str(), staged.as_mut()) {
@@ -2014,11 +2152,63 @@ pub async fn revert_vlt_opts(
         if let Some(staged) = staged.as_mut() {
             drop_unrecorded_file_edges(staged, entry);
         }
-        let new_lock = match (doc.as_ref(), staged) {
-            (Some(doc), Some(staged)) => Some(render_restored(doc, staged)),
-            _ => None,
-        };
-        if let Some(lock) = new_lock.filter(|l| Some(l) != lock_text.as_ref()) {
+    }
+    fn left<'e>(entries: &'e [Entry], merged: &BTreeSet<usize>) -> Vec<&'e Entry> {
+        let entries = entries.iter().enumerate();
+        entries
+            .filter(|(i, _)| !merged.contains(i))
+            .map(|(_, e)| e)
+            .collect()
+    }
+    let (nodes, edges) = match (&staged, &doc) {
+        (Some(staged), _) => (
+            left(&staged.nodes, &staged.merged_nodes),
+            left(&staged.edges, &staged.merged_edges),
+        ),
+        (None, Some(doc)) => (
+            doc.nodes.entries.iter().collect(),
+            doc.edges.entries.iter().collect(),
+        ),
+        (None, None) => (Vec::new(), Vec::new()),
+    };
+    let fix = "point it back at the registry release, run `vlt install`, then re-run \
+               `socket-patch vendor --revert`";
+    if let Some(unrecorded) = lock_entry_naming(&nodes, &edges, &own_node_needles(entry)) {
+        outcome.warnings.push(drifted(format!(
+            "{VLT_LOCK} {} still installs from {uuid_dir_rel} and the vendor ledger has no \
+             record of wiring it; {fix}",
+            unrecorded_entry(unrecorded)
+        )));
+        outcome.keep_artifact(&uuid_dir_rel);
+        return outcome;
+    }
+    // What still names the uuid dir once the records are undone, and so
+    // keeps it: nothing of this entry's to restore, nothing to delete
+    // under.
+    let mut naming = Vec::new();
+    if !keep_artifact {
+        let uuid = [entry.uuid.to_ascii_lowercase()];
+        if let Some(other) = lock_entry_naming(&nodes, &edges, &uuid) {
+            naming.push(format!("{VLT_LOCK} {}", unrecorded_entry(other)));
+        }
+        for rel in &allowed {
+            let text = match new_pkgs.get(rel) {
+                Some(text) => Some(text.clone()),
+                None => read_regular_to_string(&project_root.join(rel)).await.ok(),
+            };
+            if text.is_some_and(|text| manifest_names_uuid(&text, &entry.uuid)) {
+                naming.push(rel.clone());
+            }
+        }
+    }
+    let new_lock = match (doc.as_ref(), staged) {
+        (Some(doc), Some(staged)) => Some(render_restored(doc, staged)),
+        _ => None,
+    }
+    .filter(|lock| Some(lock) != lock_text.as_ref());
+
+    if !dry_run {
+        if let Some(lock) = &new_lock {
             if let Err(e) =
                 atomic_write_bytes_preserving_mode(&project_root.join(VLT_LOCK), lock.as_bytes())
                     .await
@@ -2049,7 +2239,17 @@ pub async fn revert_vlt_opts(
         });
     let reinstall =
         revert_reinstall_advisory(project_root, entry, &uuid_dir, restored_optional).await;
-    if !keep_artifact {
+    if !naming.is_empty() {
+        outcome.warnings.push(VendorWarning::new(
+            super::RESIDUAL_REFERENCE_CODE,
+            format!(
+                "{} still {} {uuid_dir_rel}, which this entry's records do not cover; {fix}",
+                naming.join(", "),
+                if naming.len() == 1 { "names" } else { "name" },
+            ),
+        ));
+        outcome.keep_artifact_for_reference(&uuid_dir_rel);
+    } else if !dry_run && !keep_artifact {
         if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
             return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
         }
@@ -3138,10 +3338,11 @@ mod tests {
         let fx = self::fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
         let (entry, _) = entry_of(run(&fx, UUID, false).await);
         link(&committed(&fx), &fx.root.join("node_modules/left-pad"));
+        // The preview names the reinstall the real run will ask for.
         let dry = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(true)).await;
-        assert!(dry.success && dry.warnings.is_empty(), "{dry:?}");
         let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
-        assert!(out.success, "{out:?}");
+        assert!(dry.success && out.success, "{dry:?} {out:?}");
+        assert_eq!(dry.warnings, out.warnings);
         assert_eq!(
             out.warnings,
             vec![VendorWarning::new(
@@ -4116,6 +4317,376 @@ mod tests {
         assert_eq!(read(&fx, VLT_LOCK).await, lock);
         assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
         assert!(fx.root.join(&entry.artifact.path).exists());
+    }
+
+    // ── VBV-S3, VBV-D2, VBV-U1, VBV-D4 ───────────────────────────────────
+
+    const MEMBER_LOCK_EDGE: &str =
+        r#""workspace~packages+a left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#;
+    const MEMBER_PKG: &str =
+        "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+
+    /// REGRESSION (VBV-S3): a workspace directory that is a symbolic link
+    /// leads out of the project, and vendoring rewrote the `package.json`
+    /// it found there. Vendoring refuses such an importer before anything
+    /// is staged (the download plan's gate too), and a revert leaves a
+    /// record for one alone as drift, on a dry run as well.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_workspace_directory_is_never_written_through() {
+        let lock = render(1, &[REG_NODE], &[MEMBER_LOCK_EDGE]);
+        let fx = self::fx(&lock, &[]).await;
+        let outside = fx._tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join(PACKAGE_JSON), MEMBER_PKG).unwrap();
+        std::fs::create_dir_all(fx.root.join("packages")).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.root.join("packages/a")).unwrap();
+        for dry_run in [true, false] {
+            let (code, detail) = refusal(run(&fx, UUID, dry_run).await);
+            assert_eq!(code, UNSUPPORTED, "{detail}");
+            assert!(
+                detail.contains("symbolic link") && detail.contains("packages/a"),
+                "{detail}"
+            );
+        }
+        assert_eq!(
+            preflight_packages(&fx.root, &[(PURL, &record(UUID))]).await,
+            [Err(UNSUPPORTED)]
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join(PACKAGE_JSON)).unwrap(),
+            MEMBER_PKG
+        );
+        assert_eq!(read(&fx, VLT_LOCK).await, lock);
+        assert!(!fx.root.join(".socket").exists(), "nothing staged");
+
+        // Vendored as a real directory, which then becomes a link.
+        let fx = self::fx(&lock, &[("packages/a/package.json", MEMBER_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let vendored_pkg = read(&fx, "packages/a/package.json").await;
+        let vendored_lock = read(&fx, VLT_LOCK).await;
+        assert_ne!(vendored_pkg, MEMBER_PKG);
+        let outside = fx._tmp.path().join("outside");
+        std::fs::rename(fx.root.join("packages/a"), &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, fx.root.join("packages/a")).unwrap();
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(out.success && out.kept_artifact, "{out:?}");
+            assert!(
+                out.warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_lock_entry_drifted"
+                        && w.detail.contains("symbolic link")),
+                "{out:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(outside.join(PACKAGE_JSON)).unwrap(),
+                vendored_pkg
+            );
+            assert_eq!(read(&fx, VLT_LOCK).await, vendored_lock);
+            assert!(fx.root.join(&entry.artifact.path).exists());
+        }
+    }
+
+    /// The vendored `basic_lock` project after `packages/a` was pointed at
+    /// the vendored copy too (its `package.json` line copied from the
+    /// root's, then `vlt install`): an importer edge and a manifest spec
+    /// the ledger has no record of. Returns the lock and the member spec.
+    async fn late_importer(fx: &Fx, entry: &VendorEntry) -> (String, String) {
+        let spec = importer_spec("packages/a", &entry.artifact.path);
+        let vendored = read(fx, VLT_LOCK).await;
+        let root_edge = vendored
+            .lines()
+            .find(|line| line.contains("\"file~_d left-pad\""))
+            .unwrap();
+        let member_edge = format!(
+            "    \"workspace~packages+a left-pad\": \"prod {spec} {}\",",
+            file_id()
+        );
+        let lock = vendored.replacen(root_edge, &format!("{root_edge}\n{member_edge}"), 1);
+        assert_ne!(lock, vendored);
+        tokio::fs::write(fx.root.join(VLT_LOCK), &lock)
+            .await
+            .unwrap();
+        let pkg = MEMBER_PKG.replace("\"1.3.0\"", &json_string(&spec));
+        tokio::fs::create_dir_all(fx.root.join("packages/a"))
+            .await
+            .unwrap();
+        tokio::fs::write(fx.root.join("packages/a/package.json"), pkg)
+            .await
+            .unwrap();
+        (lock, spec)
+    }
+
+    /// REGRESSION (VBV-D2): a workspace that came to depend on the vendored
+    /// directory after vendoring has an edge to the vendored node and a
+    /// `file:` spec the ledger never recorded. The revert used to restore
+    /// the recorded surfaces and delete the directory, leaving that edge
+    /// dangling and the spec pointing at nothing. It now leaves everything
+    /// as it is, as drift naming the edge and the manifest.
+    #[tokio::test]
+    async fn a_revert_is_left_alone_while_an_unrecorded_importer_edge_reaches_the_node() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let root_pkg = read(&fx, PACKAGE_JSON).await;
+        let (lock, _) = late_importer(&fx, &entry).await;
+        let member_pkg = read(&fx, "packages/a/package.json").await;
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(out.success && out.kept_artifact, "{out:?}");
+            let drift = out
+                .warnings
+                .iter()
+                .find(|w| w.code == "vendor_lock_entry_drifted")
+                .unwrap_or_else(|| panic!("{out:?}"));
+            assert!(
+                drift.detail.contains("`workspace~packages+a left-pad`")
+                    && drift.detail.contains("packages/a/package.json"),
+                "{}",
+                drift.detail
+            );
+            assert_eq!(read(&fx, VLT_LOCK).await, lock);
+            assert_eq!(read(&fx, PACKAGE_JSON).await, root_pkg);
+            assert_eq!(read(&fx, "packages/a/package.json").await, member_pkg);
+            assert!(fx.root.join(&entry.artifact.path).exists());
+        }
+
+        // The workspace goes back to the registry release: the revert ends.
+        tokio::fs::write(
+            fx.root.join(VLT_LOCK),
+            lock.replace(
+                &format!(
+                    "{}\n",
+                    lock.lines()
+                        .find(|l| l.contains("workspace~packages+a"))
+                        .unwrap()
+                ),
+                "",
+            ),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(fx.root.join("packages/a/package.json"), MEMBER_PKG)
+            .await
+            .unwrap();
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && !out.kept_artifact, "{out:?}");
+        assert_eq!(read(&fx, VLT_LOCK).await, basic_lock());
+        assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+        assert!(!uuid_dir(&fx, UUID).exists());
+    }
+
+    /// VBV-D2, the manifest half: an importer's `package.json` that names
+    /// the vendored directory with no lock edge behind it yet (the line was
+    /// added, `vlt install` not run). The lock no longer needs the
+    /// directory, so the recorded wiring is restored, but the artifact and
+    /// the ledger entry stay, with `vendor_revert_residual_reference`
+    /// naming the file, until the line is gone.
+    #[tokio::test]
+    async fn a_revert_keeps_the_artifact_while_an_importer_manifest_names_it() {
+        let member_edge = r#""workspace~packages+a a": "prod 1.0.0 ~npm~a@1.0.0""#;
+        let root_edge = "    \"file~_d left-pad\": \"prod 1.3.0 ~npm~left-pad@1.3.0\",\n";
+        let lock = basic_lock().replacen(root_edge, &format!("{root_edge}    {member_edge},\n"), 1);
+        assert_ne!(lock, basic_lock());
+        let member = "{\n  \"name\": \"a\",\n  \"dependencies\": {\n    \"a\": \"1.0.0\"\n  }\n}\n";
+        let fx = fx(
+            &lock,
+            &[
+                (PACKAGE_JSON, ROOT_PKG),
+                ("packages/a/package.json", member),
+            ],
+        )
+        .await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let spec = importer_spec("packages/a", &entry.artifact.path);
+        let naming = member.replace(
+            "\"a\": \"1.0.0\"",
+            &format!(
+                "\"a\": \"1.0.0\",\n    \"left-pad\": {}",
+                json_string(&spec)
+            ),
+        );
+        tokio::fs::write(fx.root.join("packages/a/package.json"), &naming)
+            .await
+            .unwrap();
+        let vendored_lock = read(&fx, VLT_LOCK).await;
+
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(out.success && out.kept_artifact, "{out:?}");
+            assert!(out.kept_for_residual_reference(), "{out:?}");
+            let reference = out
+                .warnings
+                .iter()
+                .find(|w| w.code == crate::vendor::RESIDUAL_REFERENCE_CODE)
+                .unwrap_or_else(|| panic!("{out:?}"));
+            assert!(
+                reference.detail.contains("packages/a/package.json"),
+                "{}",
+                reference.detail
+            );
+            assert_eq!(
+                read(&fx, VLT_LOCK).await,
+                if dry_run {
+                    vendored_lock.clone()
+                } else {
+                    lock.clone()
+                }
+            );
+            assert_eq!(read(&fx, "packages/a/package.json").await, naming);
+            assert!(fx.root.join(&entry.artifact.path).exists());
+        }
+        assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+
+        tokio::fs::write(fx.root.join("packages/a/package.json"), member)
+            .await
+            .unwrap();
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && !out.kept_artifact, "{out:?}");
+        assert!(!uuid_dir(&fx, UUID).exists());
+    }
+
+    /// VBV-D2: what blocks the restore is a reference to this entry's own
+    /// node. Another package's vendored directory under the same uuid is
+    /// not one: this entry's wiring is restored, and only the directory
+    /// they share is kept, until that package is reverted too.
+    #[tokio::test]
+    async fn another_directory_under_the_uuid_keeps_it_without_blocking_the_restore() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let other = format!("file~.socket+vendor+npm+{UUID}+a-1.0.0+node__modules+a");
+        let vendored = read(&fx, VLT_LOCK).await;
+        let shared = vendored
+            .replace(
+                r#""~npm~a@1.0.0": [0,"a","sha512-A=="]"#,
+                &format!(r#""{other}": [0,"a"]"#),
+            )
+            .replace(
+                r#""file~_d a": "prod 1.0.0 ~npm~a@1.0.0""#,
+                &format!(
+                    r#""file~_d a": "prod file:./.socket/vendor/npm/{UUID}/a-1.0.0/node_modules/a {other}""#
+                ),
+            );
+        assert_eq!(shared.matches(&other).count(), 2);
+        tokio::fs::write(fx.root.join(VLT_LOCK), &shared)
+            .await
+            .unwrap();
+
+        let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(false)).await;
+        assert!(out.success && out.kept_artifact, "{out:?}");
+        assert!(out.kept_for_residual_reference(), "{out:?}");
+        assert!(
+            out.warnings
+                .iter()
+                .any(|w| w.detail.contains("`file~_d a`")),
+            "{out:?}"
+        );
+        let lock = read(&fx, VLT_LOCK).await;
+        assert!(
+            lock.contains(REG_NODE) && !lock.contains(&file_id()),
+            "{lock}"
+        );
+        assert_eq!(lock.matches(&other).count(), 2, "{lock}");
+        assert_eq!(read(&fx, PACKAGE_JSON).await, ROOT_PKG);
+        assert!(uuid_dir(&fx, UUID).exists());
+    }
+
+    /// REGRESSION (VBV-U1): `vendor --revert --dry-run` returned before it
+    /// read the lock, so it promised a revert the real run then kept as
+    /// drift. The dry run replays the same records and reports the same
+    /// keep, and the same failure for a lock it cannot edit, writing
+    /// nothing.
+    #[tokio::test]
+    async fn a_dry_run_revert_reports_what_the_real_one_would_keep() {
+        let fx = fx(&basic_lock(), &[(PACKAGE_JSON, ROOT_PKG)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let vendored = read(&fx, VLT_LOCK).await;
+        // The importer edge changed since vendoring.
+        let drifted = vendored.replacen("\"prod file:./", "\"dev file:./", 1);
+        assert_ne!(drifted, vendored);
+        tokio::fs::write(fx.root.join(VLT_LOCK), &drifted)
+            .await
+            .unwrap();
+        let pkg = read(&fx, PACKAGE_JSON).await;
+        let mut outcomes = Vec::new();
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(
+                out.success && out.kept_artifact,
+                "dry run {dry_run}: {out:?}"
+            );
+            assert!(out.drift_skipped(), "dry run {dry_run}: {out:?}");
+            assert_eq!(read(&fx, VLT_LOCK).await, drifted);
+            assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+            assert!(fx.root.join(&entry.artifact.path).exists());
+            outcomes.push(out.warnings);
+        }
+        assert_eq!(outcomes[0], outcomes[1], "the preview is the real verdict");
+
+        tokio::fs::write(fx.root.join(VLT_LOCK), "{ not a lock")
+            .await
+            .unwrap();
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(!out.success, "dry run {dry_run}: {out:?}");
+            assert!(fx.root.join(&entry.artifact.path).exists());
+        }
+    }
+
+    /// REGRESSION (VBV-D4): the section a line edit targets was found by
+    /// the shape of its lines and tied to the parsed lock by its entry
+    /// count alone. A `nodes` member nested in `options`, written at the
+    /// top level's indent ahead of the real one, was edited in its place:
+    /// "Vendored 1 package", with the node every reader installs
+    /// untouched. Such a lock is refused before any write, by the
+    /// vendoring, its gate and the revert alike.
+    #[tokio::test]
+    async fn a_nested_member_shaped_like_a_section_is_not_edited_in_its_place() {
+        let honest = render(
+            1,
+            &[REG_NODE],
+            &[r#""file~_d left-pad": "prod 1.3.0 ~npm~left-pad@1.3.0""#],
+        );
+        let decoy = |lock: &str| {
+            let with = lock.replacen(
+                "  \"options\": {},\n",
+                "  \"options\": {\n  \"nodes\": {\n    \"~npm~left-pad@1.3.0\": [0,\"left-pad\",\"sha512-DECOY==\"]\n  }\n  },\n",
+                1,
+            );
+            assert_ne!(with, lock);
+            assert!(serde_json::from_str::<Value>(&with).is_ok());
+            with
+        };
+        let pkg = "{\n  \"name\": \"root\",\n  \"dependencies\": {\n    \"left-pad\": \"1.3.0\"\n  }\n}\n";
+        let lock = decoy(&honest);
+        for dry_run in [true, false] {
+            let fx = fx(&lock, &[(PACKAGE_JSON, pkg)]).await;
+            let (code, detail) = refusal(run(&fx, UUID, dry_run).await);
+            assert_eq!(code, "vendor_lockfile_version_unsupported", "{detail}");
+            assert_eq!(detail, NOT_CANONICAL);
+            assert_eq!(
+                preflight_packages(&fx.root, &[(PURL, &record(UUID))]).await,
+                [Err("vendor_lockfile_version_unsupported")]
+            );
+            assert_eq!(read(&fx, VLT_LOCK).await, lock);
+            assert_eq!(read(&fx, PACKAGE_JSON).await, pkg);
+            assert!(!fx.root.join(".socket").exists());
+        }
+
+        // The same member appears in a lock that was vendored honestly.
+        let fx = fx(&honest, &[(PACKAGE_JSON, pkg)]).await;
+        let (entry, _) = entry_of(run(&fx, UUID, false).await);
+        let vendored = decoy(&read(&fx, VLT_LOCK).await);
+        tokio::fs::write(fx.root.join(VLT_LOCK), &vendored)
+            .await
+            .unwrap();
+        for dry_run in [true, false] {
+            let out = revert_vlt_opts(&entry, &fx.root, RevertOpts::new(dry_run)).await;
+            assert!(!out.success, "{out:?}");
+            assert_eq!(out.error.as_deref(), Some(NOT_CANONICAL));
+            assert_eq!(read(&fx, VLT_LOCK).await, vendored);
+            assert!(fx.root.join(&entry.artifact.path).exists());
+        }
     }
 
     #[tokio::test]

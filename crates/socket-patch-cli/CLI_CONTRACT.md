@@ -1171,7 +1171,11 @@ worse, lets a warm cache silently serve unpatched bytes):
   script) keeps it, `vendor_revert_residual_reference`; a Bun revert likewise restores its recorded
   entries and then keeps the artifact and entry, with that code naming the entry, while any
   `bun.lock` tuple or `bun.lockb` record the ledger never wired still resolves into the uuid dir —
-  a nested entry Bun wrote for a later dependent, a line a merge brought back — on a dry run too),
+  a nested entry Bun wrote for a later dependent, a line a merge brought back — on a dry run too;
+  a vlt revert keeps them the same way while an importer `package.json` the ledger never wired
+  still names the uuid dir, and leaves every surface alone as drift while an unrecorded
+  `vlt-lock.json` edge still reaches the vendored node, and its dry run replays the same records
+  as the real run instead of promising a revert it would keep),
   removes the artifacts, prunes the
   ledger, sweeps orphan uuid dirs, and (v5.0) prunes the now-empty `.socket/vendor/<eco>/` and
   `.socket/vendor/` levels — `.socket/` itself is removed by the lock guard when nothing else is
