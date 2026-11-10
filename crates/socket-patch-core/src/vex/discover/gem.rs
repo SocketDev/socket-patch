@@ -966,20 +966,23 @@ fn manifest_confirms(
     let Err(why) = manifest.gives(name, wiring) else {
         return true;
     };
+    // The hosted rewriter refuses a gem whose DEPENDENCIES entry is still
+    // source-pinned, so the lock has to follow the manifest first.
     let rewire = match wiring {
         Wiring::Hosted { .. } => "socket-patch scan",
         Wiring::Vendored(_) => "socket-patch vendor",
     };
+    let rel = manifest.rel;
     out.diag(
         DIAG_REF_UNATTRIBUTABLE,
         file,
         format!(
             "{at}: {name} {version} is locked from Socket patch {}, but {why}. Bundler takes a \
-             gem from the source its {} declaration names, so it installs {name} from there \
-             and rewrites this lock (a frozen install fails); not attested. Re-run `{rewire}` \
-             to wire both files again, or `bundle lock` to drop the stale lock section",
+             gem from the source its {rel} declaration names, so it installs {name} from there \
+             and rewrites this lock (a frozen install fails); not attested. To patch it again, \
+             run `bundle install` once without frozen mode so the lock follows the {rel}, then \
+             re-run `{rewire}`",
             wiring.uuid(),
-            manifest.rel
         ),
     );
     false

@@ -1901,8 +1901,10 @@ unpatched gem (Bundler 1.17.2, 2.1.4, 2.4.22, 2.5.23 and 4.0.15 all do; the same
 vendored gem whose Gemfile loses its `path:`). `vex` therefore attests a gem only when the
 Gemfile (or `gems.rb`) beside the lock gives it the source the lock resolves it from. Otherwise
 it warns `patched_ref_unattributable`, naming the gem and what the Gemfile says instead, and
-writes no statement for it. Re-run `socket-patch scan` (or `vendor`) to wire both files again,
-or `bundle lock` to drop the stale lock section; `rollback` and `remove` still restore it.
+writes no statement for it. To patch the gem again, run `bundle install` once without frozen
+mode so the lock follows the Gemfile, then re-run `socket-patch scan` (or `vendor`): a hosted
+scan skips a gem whose lock entry is still pinned to a source (`redirect_gem_source_option`).
+`rollback` and `remove` still see and unwind a hosted lock section left this way.
 
 ## Ruby gems: gems already installed
 
