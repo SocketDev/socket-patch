@@ -694,3 +694,61 @@ fn apply_fails_a_manifest_key_that_is_not_a_purl() {
         "the error prints even under --silent: {stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// An unreadable vendor ledger
+// ---------------------------------------------------------------------------
+
+/// `apply` and `apply --check` decide which purls `socket-patch vendor`
+/// owns from `.socket/vendor/state.json`. A ledger they cannot read used
+/// to degrade to "nothing vendored" without a word, where rollback and
+/// remove report `vendor_state_unreadable`. The agent patches still apply
+/// (and the check still passes: an agent-only run must not fail over it),
+/// but the run says that vendor ownership was not consulted.
+#[test]
+fn apply_warns_when_the_vendor_ledger_is_unreadable() {
+    let project = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_project_with_extra_keys(tmp.path(), &[]);
+        let vendor_dir = tmp.path().join(".socket/vendor");
+        std::fs::create_dir_all(&vendor_dir).unwrap();
+        std::fs::write(vendor_dir.join("state.json"), "{ torn ledger").unwrap();
+        tmp
+    };
+    let ledger_warning = |v: &serde_json::Value| -> String {
+        v["warnings"]
+            .as_array()
+            .and_then(|w| w.iter().find(|w| w["code"] == "vendor_state_unreadable"))
+            .and_then(|w| w["detail"].as_str())
+            .unwrap_or_else(|| panic!("no vendor_state_unreadable warning: {v}"))
+            .to_string()
+    };
+
+    let tmp = project();
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--json", "--offline"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 0, "the agent patch still applies; {v}\n{stderr}");
+    assert_eq!(v["summary"]["applied"], 1, "{v}");
+    assert!(ledger_warning(&v).contains("state.json"), "{v}");
+
+    // Now patched: the read-only check passes, with the same warning.
+    let (code, stdout, stderr) = run_apply(tmp.path(), &["--check", "--json", "--offline"], &[]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 0, "{v}\n{stderr}");
+    assert!(ledger_warning(&v).contains("state.json"), "{v}");
+
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--check", "--offline"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("state.json"),
+        "the human check names the ledger: {stderr}"
+    );
+
+    let tmp = project();
+    let (code, _stdout, stderr) = run_apply(tmp.path(), &["--offline"], &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains("Warning:") && stderr.contains("state.json"),
+        "the human apply names the ledger: {stderr}"
+    );
+}

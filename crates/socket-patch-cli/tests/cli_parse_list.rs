@@ -1701,6 +1701,25 @@ fn silent_gates_the_malformed_vendor_ledger_warning_via_binary() {
         "--silent must mute the vendor-ledger warning; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
+
+    // Under `--json` the envelope is the machine channel: a `success` list
+    // that silently leaves the vendored patches out must say so in
+    // `warnings[]`, like the redirect-ledger and contested-wiring siblings.
+    let out = run_list_binary(tmp.path(), &["--json"]);
+    assert_eq!(out.status.code(), Some(0));
+    let v: serde_json::Value = serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim())
+        .expect("stdout must be valid JSON");
+    assert_eq!(v["status"], "success", "envelope={v}");
+    let warning = v["warnings"]
+        .as_array()
+        .and_then(|w| w.iter().find(|w| w["code"] == "vendor_state_unreadable"))
+        .unwrap_or_else(|| panic!("no vendor_state_unreadable warning; envelope={v}"));
+    assert!(
+        warning["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("vendored patches are not listed")),
+        "envelope={v}"
+    );
 }
 
 #[test]

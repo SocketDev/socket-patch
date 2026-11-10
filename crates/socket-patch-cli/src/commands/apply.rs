@@ -325,6 +325,38 @@ async fn reconcile_local_go(
         .collect()
 }
 
+/// The purl keys `socket-patch vendor` owns among this run's copies
+/// ([`vendor_owned_keys`](crate::commands::vendor_owned_keys)), and the
+/// `vendor_state_unreadable` warning when the ledger cannot be read.
+///
+/// An unreadable ledger still degrades to "nothing vendored": `apply` runs
+/// unattended after every install and must keep patching an agent-only
+/// project that never had a readable ledger to lose. But a run that could
+/// not tell what `vendor` owns says so, as `rollback` and `remove` do,
+/// instead of patching (or checking) vendored packages in place unseen.
+async fn vendor_ownership(common: &GlobalArgs) -> (HashSet<PurlKey>, Option<RunWarning>) {
+    let (ledger, warning) =
+        match socket_patch_core::vendor::load_state(&common.project_root()).await {
+            Ok(state) => (state.purl_keys(), None),
+            Err(e) => (
+                HashSet::new(),
+                Some(RunWarning::new(
+                    "vendor_state_unreadable",
+                    format!(
+                        "cannot read .socket/vendor/state.json: {e}; packages managed by \
+                         `socket-patch vendor` could not be told apart, so every manifest \
+                         patch was treated as an in-place patch. Restore the ledger from \
+                         version control"
+                    ),
+                )),
+            ),
+        };
+    (
+        crate::commands::vendor_owned_keys(common, &ledger).await,
+        warning,
+    )
+}
+
 /// One failed result per manifest key that is not a purl at all
 /// ([`UnsupportedKey::NotAPurl`]). No crawler, in this CLI or a newer one,
 /// can match such a key to a package, so its patch is never applied: the
@@ -404,12 +436,11 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             .into_values()
             .flatten()
             .collect();
-    let vendored = crate::commands::vendor_owned_keys(
-        &args.common,
-        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
-    )
-    .await;
+    let (vendored, ledger_warning) = vendor_ownership(&args.common).await;
     let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
+    // Advisories that never decide the exit: stderr here, the envelope's
+    // `warnings[]` under --json.
+    let mut check_warnings: Vec<RunWarning> = ledger_warning.into_iter().collect();
 
     // Records no crawler here can look for are verified by nothing below.
     // One of an ecosystem this CLI does not support is reported unchecked
@@ -422,16 +453,17 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             drifts.push((key.clone(), kind.code().to_string(), detail));
         }
     }
-    let (unchecked_events, unchecked_warning) =
-        match unsupported_ecosystem_report(&unsupported, "checked") {
-            Some((events, warning)) => (events, Some(warning)),
-            None => (Vec::new(), None),
-        };
-    if let Some(warning) = unchecked_warning
-        .as_ref()
-        .filter(|_| !args.common.json && !args.common.silent)
-    {
-        eprintln!("Warning: {}", warning.detail);
+    let unchecked_events = match unsupported_ecosystem_report(&unsupported, "checked") {
+        Some((events, warning)) => {
+            check_warnings.push(warning);
+            events
+        }
+        None => Vec::new(),
+    };
+    if !args.common.json && !args.common.silent {
+        for warning in &check_warnings {
+            eprintln!("Warning: {}", warning.detail);
+        }
     }
 
     {
@@ -578,7 +610,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for event in unchecked_events {
                 env.record(event);
             }
-            env.warnings.extend(unchecked_warning);
+            env.warnings.extend(check_warnings);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
             println!(
@@ -600,7 +632,7 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             for event in unchecked_events {
                 env.record(event);
             }
-            env.warnings.extend(unchecked_warning);
+            env.warnings.extend(check_warnings);
             env.mark_partial_failure();
             println!("{}", env.to_pretty_json());
         } else {
@@ -2488,16 +2520,13 @@ async fn apply_patches_inner(
     // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
     // by ledger key, resolved base purl, or qualifier-stripped key so
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
-    // unreadable state degrades to "nothing vendored" (fail-open).
+    // unreadable state degrades to "nothing vendored" (fail-open), with
+    // the `vendor_state_unreadable` run warning (see `vendor_ownership`).
     // The ledger owns the PROJECT's copies only: a global apply restores
     // and patches the global copy even when the cwd project vendors the
     // same purl (see `project_state_in_scope`), unless that copy is the
     // project's own NuGet install (#489).
-    let vendored_purls = crate::commands::vendor_owned_keys(
-        &args.common,
-        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
-    )
-    .await;
+    let (vendored_purls, ledger_warning) = vendor_ownership(&args.common).await;
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
@@ -2531,7 +2560,7 @@ async fn apply_patches_inner(
         .as_ref()
         .map(|d| d.stores.as_slice())
         .unwrap_or(&[]);
-    let mut run_warnings: Vec<RunWarning> = Vec::new();
+    let mut run_warnings: Vec<RunWarning> = ledger_warning.into_iter().collect();
     if let Some(value) = gem_discovery
         .as_ref()
         .and_then(|d| d.skipped_config_path.as_deref())
