@@ -389,7 +389,10 @@ fn assert_attested(fx: &Fx, run: &Run, purl: &str, uuid: &str, marker: &str, wha
     );
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(&run.env)
+        ),
         "{what}: {st}"
     );
     let verified: Vec<&Value> = run.env["events"]

@@ -212,7 +212,10 @@ fn assert_attested(fx: &Fx, code: Option<i32>, env: &Value, uuid: &str, purl: &s
     assert_eq!(st["vulnerability"]["aliases"][0], CVE, "{doc}");
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{doc}"
     );
     let sub = st["products"][0]["subcomponents"][0]["@id"]

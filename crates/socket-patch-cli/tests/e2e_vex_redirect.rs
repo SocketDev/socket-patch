@@ -416,9 +416,10 @@ fn redirected_no_verify_attests_without_installed_tree() {
         "the redirected patch must be attested: {doc}"
     );
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-rdir-nv");
+    // The (redirected) marker, then `--no-verify`'s own disclosure.
     assert_eq!(
         stmts[0]["impact_statement"].as_str().unwrap(),
-        format!("Patched via Socket patch {UUID} (redirected)"),
+        format!("Patched via Socket patch {UUID} (redirected); not verified on disk"),
     );
 }
 
@@ -691,8 +692,8 @@ fn no_verify_attests_redirected_patches_across_ecosystems() {
         assert_eq!(st["status"], "not_affected");
         assert_eq!(
             st["impact_statement"].as_str().unwrap(),
-            format!("Patched via Socket patch {uuid} (redirected)"),
-            "{ghsa} must carry the (redirected) marker"
+            format!("Patched via Socket patch {uuid} (redirected); not verified on disk"),
+            "{ghsa} must carry the (redirected) marker and --no-verify's disclosure"
         );
         assert_eq!(
             st["products"][0]["subcomponents"][0]["@id"], *purl,
@@ -1302,7 +1303,7 @@ fn hosted_takeover_of_a_vendored_package_attests_the_hosted_patch() {
     assert_eq!(stmts[0]["vulnerability"]["name"], "GHSA-host-u2");
     assert_eq!(
         stmts[0]["impact_statement"],
-        format!("Patched via Socket patch {U2} (redirected)")
+        format!("Patched via Socket patch {U2} (redirected); not verified on disk")
     );
 
     // Hosted wiring reverted as well: nothing is wired any more.
@@ -1782,7 +1783,7 @@ fn lockless_hosted_pins_keep_their_redirect_ledger_record_alive() {
                 serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
             assert_eq!(
                 doc["statements"][0]["impact_statement"],
-                format!("Patched via Socket patch {uuid} (redirected)"),
+                format!("Patched via Socket patch {uuid} (redirected); not verified on disk"),
                 "{name}: {doc}"
             );
         } else {

@@ -486,6 +486,23 @@ impl Marker {
     }
 }
 
+/// What a `--no-verify` run appends to the impact statement of each purl
+/// it attests, or `""` for a verifying run. The document marks a statement
+/// exactly when the run's envelope carries the `vex_not_verified` warning,
+/// so an oracle that is handed both reads the one from the other.
+pub fn unverified_suffix(envelope: &Value) -> &'static str {
+    let warned = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w["code"] == "vex_not_verified");
+    if warned {
+        "; not verified on disk"
+    } else {
+        ""
+    }
+}
+
 /// `id` names `purl` (exactly, or with PURL qualifiers appended).
 pub fn purl_matches(id: &str, purl: &str) -> bool {
     id == purl || id.split_once('?').map(|(base, _)| base) == Some(purl)

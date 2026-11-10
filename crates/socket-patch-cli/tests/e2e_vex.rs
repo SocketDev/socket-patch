@@ -357,11 +357,12 @@ fn no_verify_attests_agent_patches_across_ecosystems() {
         let impact = st["impact_statement"]
             .as_str()
             .unwrap_or_else(|| panic!("impact_statement missing for {ghsa}: {doc}"));
-        // Plain agent phrasing — the exact-equality check simultaneously proves
-        // there is NO `(vendored)`/`(redirected)` provenance marker appended.
+        // Plain agent phrasing plus `--no-verify`'s disclosure — the
+        // exact-equality check simultaneously proves there is NO
+        // `(vendored)`/`(redirected)` provenance marker appended.
         assert_eq!(
             impact,
-            format!("Patched via Socket patch {uuid}"),
+            format!("Patched via Socket patch {uuid}; not verified on disk"),
             "{ghsa} must carry the PLAIN agent impact statement (no provenance marker)"
         );
         assert!(
@@ -908,6 +909,160 @@ fn doc_id_override_without_an_iri_scheme_warns() {
         let (warned, id, env) = run(ok);
         assert!(!warned, "{ok:?} is an IRI: {env}");
         assert_eq!(id, ok);
+    }
+}
+
+/// `--no-verify` (or an ambient `SOCKET_VEX_NO_VERIFY=1`) attests an
+/// agent-mode patch the default run can show is NOT applied. It stays
+/// available, but never silently: the run warns how many statements carry
+/// no on-disk verification, and each such statement says so in its
+/// `impact_statement`. The default run is unchanged.
+#[test]
+fn no_verify_discloses_statements_emitted_without_verification() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path();
+    let nm = cwd.join("node_modules");
+    let lay_down = |name: &str, content: &[u8]| {
+        let dir = nm.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!(r#"{{"name":"{name}","version":"1.0.0"}}"#),
+        )
+        .unwrap();
+        std::fs::write(dir.join("index.js"), content).unwrap();
+    };
+    let patched = b"patched index";
+    let original = b"original index";
+    lay_down("foo", patched);
+    lay_down("bar", original);
+
+    let foo_uuid = "11111111-1111-4111-8111-111111111111";
+    let bar_uuid = "22222222-2222-4222-8222-222222222222";
+    let mut manifest = PatchManifest::new();
+    manifest.patches.insert(
+        "pkg:npm/foo@1.0.0".to_string(),
+        make_record(
+            foo_uuid,
+            "package/index.js",
+            "a".repeat(64).as_str(),
+            compute_git_sha256_from_bytes(patched).as_str(),
+            "GHSA-foo",
+            &["CVE-FOO"],
+        ),
+    );
+    manifest.patches.insert(
+        "pkg:npm/bar@1.0.0".to_string(),
+        make_record(
+            bar_uuid,
+            "package/index.js",
+            compute_git_sha256_from_bytes(original).as_str(),
+            compute_git_sha256_from_bytes(b"what the patch would write").as_str(),
+            "GHSA-bar",
+            &["CVE-BAR"],
+        ),
+    );
+    write_manifest(cwd, &manifest);
+
+    let vex_path = cwd.join("out.vex.json");
+    let run = |no_verify_flag: bool, no_verify_env: bool, json: bool| {
+        let mut cmd = cli();
+        cmd.args([
+            "vex",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--product",
+            "pkg:npm/app@1.0.0",
+            "--doc-id",
+            "urn:uuid:fixed-test-id",
+            "--output",
+            vex_path.to_str().unwrap(),
+        ]);
+        if no_verify_flag {
+            cmd.arg("--no-verify");
+        }
+        if no_verify_env {
+            cmd.env("SOCKET_VEX_NO_VERIFY", "1");
+        }
+        if json {
+            cmd.arg("--json");
+        }
+        let out = cmd.output().expect("invoke vex");
+        assert!(
+            out.status.success(),
+            "stderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc: Value = serde_json::from_slice(&std::fs::read(&vex_path).unwrap()).unwrap();
+        (out, doc)
+    };
+    let impacts = |doc: &Value| -> Vec<(String, String)> {
+        doc["statements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                (
+                    s["vulnerability"]["name"].as_str().unwrap().to_string(),
+                    s["impact_statement"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // Default: only the patched package, its impact statement unmarked,
+    // and no word about verification.
+    let (out, doc) = run(false, false, false);
+    assert_eq!(
+        impacts(&doc),
+        vec![(
+            "GHSA-foo".to_string(),
+            format!("Patched via Socket patch {foo_uuid}")
+        )]
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!stderr.contains("on-disk verification"), "{stderr}");
+
+    // The flag and the ambient variable alike: both attested, both marked,
+    // one warning naming the count.
+    for (flag, env) in [(true, false), (false, true)] {
+        let (out, doc) = run(flag, env, false);
+        assert_eq!(
+            impacts(&doc),
+            vec![
+                (
+                    "GHSA-bar".to_string(),
+                    format!("Patched via Socket patch {bar_uuid}; not verified on disk")
+                ),
+                (
+                    "GHSA-foo".to_string(),
+                    format!("Patched via Socket patch {foo_uuid}; not verified on disk")
+                ),
+            ],
+            "flag={flag} env={env}"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "Warning: 2 of 2 VEX statements were emitted without on-disk verification"
+            ),
+            "flag={flag} env={env}: {stderr}"
+        );
+        assert!(stderr.contains("SOCKET_VEX_NO_VERIFY"), "{stderr}");
+
+        let (out, _) = run(flag, env, true);
+        let envelope: Value = serde_json::from_slice(&out.stdout).expect("envelope on stdout");
+        let warning = envelope["warnings"]
+            .as_array()
+            .and_then(|ws| ws.iter().find(|w| w["code"] == "vex_not_verified"))
+            .unwrap_or_else(|| panic!("expected a vex_not_verified warning: {envelope}"));
+        assert!(
+            warning["detail"]
+                .as_str()
+                .unwrap()
+                .starts_with("2 of 2 VEX statements were emitted without on-disk verification"),
+            "{warning}"
+        );
     }
 }
 

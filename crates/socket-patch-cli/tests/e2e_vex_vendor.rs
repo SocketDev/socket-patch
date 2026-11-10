@@ -471,12 +471,16 @@ fn vendored_marker_survives_no_verify() {
     );
     assert_eq!(
         impact_for(stmts, "GHSA-vend-dddd"),
-        format!("Patched via Socket patch {UUID} (vendored)"),
-        "--no-verify must not lose the (vendored) provenance marker"
+        format!("Patched via Socket patch {UUID} (vendored); not verified on disk"),
+        "--no-verify must not lose the (vendored) provenance marker, and says what it skipped"
     );
     assert!(
         !impact_for(stmts, "GHSA-npm-control").contains("(vendored)"),
         "the agent-mode npm patch is not vendored:\n{stdout}"
+    );
+    assert!(
+        impact_for(stmts, "GHSA-npm-control").ends_with("; not verified on disk"),
+        "the agent-mode npm patch was not verified either:\n{stdout}"
     );
 }
 
@@ -2750,9 +2754,14 @@ fn reconstructed_ledger_entry_without_wiring_attests_from_the_root_lock() {
         assert_eq!(code, Some(0), "{extra:?}: {env}");
         let doc: Value =
             serde_json::from_slice(&std::fs::read(cwd.join("out.vex.json")).unwrap()).unwrap();
+        let unverified = if extra.contains(&"--no-verify") {
+            "; not verified on disk"
+        } else {
+            ""
+        };
         assert_eq!(
             doc["statements"][0]["impact_statement"],
-            format!("Patched via Socket patch {uuid} (vendored)"),
+            format!("Patched via Socket patch {uuid} (vendored){unverified}"),
             "{extra:?}: {doc}"
         );
     }

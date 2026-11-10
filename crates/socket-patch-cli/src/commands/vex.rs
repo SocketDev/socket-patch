@@ -25,8 +25,8 @@ use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::telemetry::{track_vex_failed, track_vex_generated, TelemetryAuth};
 use socket_patch_core::vex::verify::{npm_manifest_after_hash, DEPENDENCY_NOT_INSTALLED};
 use socket_patch_core::vex::{
-    build_document, detect_product, BuildOptions, Document, FailedPatch, VendorContext,
-    VerifyOutcome,
+    build_document_marking_unverified, detect_product, BuildOptions, Document, FailedPatch,
+    VendorContext, VerifyOutcome, NOT_VERIFIED_SUFFIX,
 };
 
 use crate::args::{apply_env_toggles, parse_bool_flag, GlobalArgs};
@@ -75,7 +75,9 @@ pub struct VexArgs {
     /// that doesn't have the patched files laid out yet. The wiring checks
     /// still apply: a hosted or vendored ledger record the lockfile no
     /// longer wires, or a lockfile reference whose record is unavailable or
-    /// names another package, is omitted either way.
+    /// names another package, is omitted either way. A statement emitted
+    /// this way says so (its impact statement ends with "; not verified on
+    /// disk"), and the run warns how many there are.
     //
     // `value_parser = parse_bool_flag`: clap's default bool parser accepts
     // only `true`/`false` from the env binding, so `SOCKET_VEX_NO_VERIFY=1`
@@ -126,7 +128,8 @@ pub struct VexEmbedArgs {
     pub vex_product: Option<String>,
 
     /// Skip the on-disk file-hash check when building the VEX document and
-    /// trust the patch records (the lockfile wiring checks still apply). See
+    /// trust the patch records (the lockfile wiring checks still apply, and
+    /// each such statement is marked "; not verified on disk"). See
     /// `socket-patch vex --no-verify`.
     //
     // `value_parser = parse_bool_flag`: these share env vars with the
@@ -1296,11 +1299,32 @@ async fn generate_vex(
         tooling: Some(format!("socket-patch {}", env!("CARGO_PKG_VERSION"))),
     };
 
-    let doc = match build_document(
+    // `--no-verify` declared these applied with nothing checked on disk. The
+    // purls an in-run hosted redirect confirmed are attested from that run's
+    // own evidence in either mode, so they are not among them.
+    let unverified: Vec<String> = if params.no_verify {
+        use socket_patch_core::utils::purl::strip_purl_qualifiers;
+        let confirmed: HashSet<&str> = params
+            .assume_applied
+            .iter()
+            .map(|purl| strip_purl_qualifiers(purl))
+            .collect();
+        outcome
+            .applied
+            .iter()
+            .filter(|purl| !confirmed.contains(strip_purl_qualifiers(purl)))
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let doc = match build_document_marking_unverified(
         manifest,
         &outcome.applied,
         &outcome.vendored,
         redirected,
+        &unverified,
         &opts,
     ) {
         Some(doc) => doc,
@@ -1315,6 +1339,42 @@ async fn generate_vex(
             });
         }
     };
+
+    // Trusting the records is the caller's choice, but never a silent one:
+    // the document marks each such statement, and the run says how many.
+    if !unverified.is_empty() {
+        let unverified: HashSet<&str> = unverified.iter().map(String::as_str).collect();
+        let marked = doc
+            .statements
+            .iter()
+            .filter(|statement| {
+                statement
+                    .products
+                    .iter()
+                    .flat_map(|product| &product.subcomponents)
+                    .any(|component| unverified.contains(component.id.as_str()))
+            })
+            .count();
+        let total = doc.statements.len();
+        note_warning(
+            warnings,
+            common,
+            "vex_not_verified",
+            format!(
+                "{marked} of {total} VEX {} emitted without on-disk verification of the patch \
+                 ({}, or SOCKET_VEX_NO_VERIFY in the environment): nothing checked that the \
+                 patched files are in place, and each such impact statement ends with \
+                 \"{}\". Run without it to attest only what is verified.",
+                if total == 1 {
+                    "statement was"
+                } else {
+                    "statements were"
+                },
+                params.flag("no-verify"),
+                NOT_VERIFIED_SUFFIX.trim_start_matches("; "),
+            ),
+        );
+    }
 
     let serialized = match if params.compact {
         serde_json::to_string(&doc)
