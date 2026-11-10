@@ -9,8 +9,48 @@ use crate::constants::SOCKET_DIR;
 use crate::utils::socket_dir::remove_tree_and_prune;
 
 use super::common::any_live_file_references;
-use super::npm_flavor::keep_artifact_while_lock_references_it;
-use super::{RevertOpts, RevertOutcome};
+use super::npm_flavor::{lock_text_mentions_uuid, uuid_proven_unreferenced};
+use super::{RevertOpts, RevertOutcome, VendorWarning};
+
+/// Warning code: a recorded lock entry was re-resolved since vendoring (the
+/// dependency was upgraded or re-locked) and no wired file references the
+/// artifact any more, so the revert removed it with nothing to restore.
+pub(crate) const DEPENDENCY_MOVED_ON_CODE: &str = "vendor_revert_dependency_moved_on";
+
+/// Refusal code: the recorded wiring was restored, but a wired file still
+/// resolves through the artifact, so deleting it would break installs.
+pub(crate) const STILL_WIRED_CODE: &str = "vendor_lock_still_wired_revert_blocked";
+
+/// How a `vendor_lock_entry_drifted` warning reads when the recorded
+/// fragment is still in the lock but resolves somewhere else now.
+const RE_RESOLVED: &str = "was re-resolved since vendoring";
+
+/// The `vendor_lock_entry_drifted` warning for a recorded lock fragment
+/// (`what`) that is still there but no longer resolves through the entry's
+/// artifact: the user upgraded or re-locked the dependency (`now` is what
+/// it resolves to, where the fragment says). The fragment is theirs and is
+/// left alone, and it is the one kind of left-alone record with nothing to
+/// restore later, which [`KeepPolicy::NpmFamily`] reads back.
+pub(crate) fn re_resolved(what: std::fmt::Arguments<'_>, now: Option<&str>) -> VendorWarning {
+    let now = now.map(|now| format!(" ({now})")).unwrap_or_default();
+    VendorWarning::new(
+        "vendor_lock_entry_drifted",
+        format!("{what} {RE_RESOLVED}{now}; left alone"),
+    )
+}
+
+/// Whether every record `outcome` left alone was re-resolved elsewhere
+/// ([`re_resolved`]). Any other left-alone record (a kind or file this
+/// build does not know, a fragment with no recorded original, a taken-over
+/// pin the user changed) may still need the ledger entry's recorded
+/// originals, so it keeps the artifact and the entry whatever the lock says.
+fn only_re_resolved(outcome: &RevertOutcome) -> bool {
+    outcome
+        .warnings
+        .iter()
+        .filter(|w| w.code == "vendor_lock_entry_drifted")
+        .all(|w| w.detail.contains(RE_RESOLVED))
+}
 
 /// When a revert keeps the artifact instead of deleting it. `CLI_CONTRACT.md`
 /// documents the rule each backend uses.
@@ -24,11 +64,33 @@ pub(crate) enum KeepPolicy<'a> {
     /// NuGet): a converged file never does, so the keep cannot outlive the
     /// drift. See [`any_live_file_references`].
     OnDriftWhileReferenced(&'a [&'a str]),
-    /// The npm family (pnpm, bun): any left-alone record keeps the
-    /// artifact, and a vanished lock entry keeps it while one of `locks`
-    /// may still resolve through `uuid` (#665). A failed deletion fails
-    /// the whole revert with the relative dir in the message.
-    NpmFamily { locks: &'a [&'a str], uuid: &'a str },
+    /// The npm family (pnpm, yarn classic, yarn berry): the artifact goes
+    /// only once none of `locks` — the files the wiring edits — references
+    /// `uuid` any more.
+    ///
+    /// - A recorded entry that was re-resolved elsewhere ([`re_resolved`])
+    ///   or has vanished (`vendor_lock_entry_removed`, #665) keeps the
+    ///   artifact while a file still references it. Once every file that
+    ///   exists was read and none does, the dependency has moved on
+    ///   (upgraded past the patched version, or removed): there is nothing
+    ///   left to restore, and keeping the artifact would keep it on every
+    ///   later revert too.
+    /// - Any other left-alone record (`vendor_lock_entry_drifted`) keeps
+    ///   the artifact unconditionally, as [`Self::OnDrift`] does.
+    /// - A restore that left nothing alone but did not reach every
+    ///   reference in `wired` refuses. `wired` is the subset of `locks`
+    ///   where any mention of the uuid is a reference the package manager
+    ///   resolves (yarn's lock and manifest). pnpm passes none: an override
+    ///   no entry matches names the artifact without resolving through it,
+    ///   and its revert checks the lock's entries itself, before it writes.
+    ///
+    /// A failed deletion fails the whole revert with the relative dir in
+    /// the message.
+    NpmFamily {
+        locks: &'a [&'a str],
+        wired: &'a [&'a str],
+        uuid: &'a str,
+    },
 }
 
 /// Finish a revert whose wiring restore produced `outcome`: return it
@@ -46,11 +108,16 @@ pub(crate) async fn finish(
     if opts.dry_run {
         return outcome;
     }
+    let left_alone = outcome.drift_skipped();
     let drift_keeps = match policy {
-        KeepPolicy::OnDrift | KeepPolicy::NpmFamily { .. } => outcome.drift_skipped(),
+        KeepPolicy::OnDrift => left_alone,
         KeepPolicy::OnDriftWhileReferenced(files) => {
-            outcome.drift_skipped()
-                && any_live_file_references(project_root, files, uuid_dir_rel).await
+            left_alone && any_live_file_references(project_root, files, uuid_dir_rel).await
+        }
+        KeepPolicy::NpmFamily { locks, uuid, .. } => {
+            left_alone
+                && !(only_re_resolved(&outcome)
+                    && uuid_proven_unreferenced(project_root, locks, uuid).await)
         }
     };
     if drift_keeps {
@@ -62,17 +129,46 @@ pub(crate) async fn finish(
     if opts.keep_artifact {
         return outcome;
     }
-    if let KeepPolicy::NpmFamily { locks, uuid } = policy {
-        if keep_artifact_while_lock_references_it(
-            &mut outcome,
-            project_root,
-            locks,
-            uuid,
-            uuid_dir_rel,
-        )
-        .await
+    if let KeepPolicy::NpmFamily { locks, wired, uuid } = policy {
+        if outcome.lock_entry_removed()
+            && !uuid_proven_unreferenced(project_root, locks, uuid).await
         {
+            outcome.keep_artifact(uuid_dir_rel);
             return outcome;
+        }
+        // Nothing was left alone, or what was is proven unreferenced. A
+        // file that still names the artifact resolves through a reference
+        // the restore never reached: deleting the artifact would fail
+        // every later install on the missing tarball. Each file is probed
+        // on its own; one that is absent or unreadable references nothing
+        // here (the wired revert's missing-file tolerance).
+        for file in wired {
+            if lock_text_mentions_uuid(project_root, &[file], uuid).await == Some(true) {
+                let detail = format!(
+                    "refusing to remove {uuid_dir_rel}: after restoring the recorded wiring, \
+                     {file} still resolves through it (was the entry re-keyed or hand-copied \
+                     since vendoring?) — deleting the artifact would make every subsequent \
+                     install fail; restore the pre-vendor {file} (or remove the dependency and \
+                     re-lock) and re-run `vendor --revert`"
+                );
+                outcome.success = false;
+                outcome.error = Some(detail.clone());
+                outcome
+                    .warnings
+                    .push(VendorWarning::new(STILL_WIRED_CODE, detail));
+                return outcome;
+            }
+        }
+        if left_alone {
+            outcome.warnings.push(VendorWarning::new(
+                DEPENDENCY_MOVED_ON_CODE,
+                format!(
+                    "removed {uuid_dir_rel}: the lock entries vendoring wired were re-resolved \
+                     since (the dependency was upgraded or re-locked) and no project file \
+                     references the vendored artifact any more, so there was nothing left to \
+                     restore"
+                ),
+            ));
         }
     }
     let uuid_dir = project_root.join(uuid_dir_rel);
@@ -139,6 +235,7 @@ mod tests {
             KeepPolicy::OnDriftWhileReferenced(&["composer.lock"]),
             KeepPolicy::NpmFamily {
                 locks: LOCKS,
+                wired: LOCKS,
                 uuid: UUID,
             },
         ]
@@ -192,22 +289,149 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn drift_keeps_unconditionally_for_gem_and_the_npm_family() {
-        for policy in [policies()[0], policies()[2]] {
+    async fn drift_keeps_unconditionally_for_gem() {
+        for opts in [wet(), preserve()] {
+            let dir = project("gem");
+            let outcome = finish(drifted(), dir.path(), &rel("gem"), opts, policies()[0]).await;
+            assert!(outcome.success && outcome.kept_artifact);
+            assert!(outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_artifact_kept"));
+            assert!(dir.path().join(rel("gem")).is_dir());
+        }
+    }
+
+    /// A record the restore left alone because the dependency was
+    /// re-resolved elsewhere.
+    fn re_resolved_elsewhere() -> RevertOutcome {
+        let mut outcome = RevertOutcome::ok();
+        outcome.warnings.push(re_resolved(
+            format_args!("lock block `left-pad@^1.3.0`"),
+            Some("1.3.1"),
+        ));
+        outcome
+    }
+
+    const UPGRADED_LOCK: &str = "left-pad: 1.3.1\n";
+
+    /// In the npm family a re-resolved record keeps the artifact while a
+    /// wired file may still resolve through it: one that names the uuid, or
+    /// none readable to prove otherwise. Any other left-alone record keeps
+    /// it whatever the lock says.
+    #[tokio::test]
+    async fn npm_family_drift_keeps_while_a_lock_may_name_the_uuid() {
+        let wired = format!("x: file:{}/pkg.tgz\n", rel("npm"));
+        let mut mixed = re_resolved_elsewhere();
+        mixed.warnings.extend(drifted().warnings);
+        let cases = [
+            (re_resolved_elsewhere(), Some(wired.as_str())),
+            (re_resolved_elsewhere(), None),
+            (drifted(), Some(wired.as_str())),
+            (drifted(), Some(UPGRADED_LOCK)),
+            (mixed, Some(UPGRADED_LOCK)),
+        ];
+        for (outcome, lock) in cases {
             for opts in [wet(), preserve()] {
-                let dir = project("gem");
-                let outcome = finish(drifted(), dir.path(), &rel("gem"), opts, policy).await;
-                assert!(outcome.success && outcome.kept_artifact, "{policy:?}");
+                let dir = project("npm");
+                if let Some(text) = lock {
+                    std::fs::write(dir.path().join("pnpm-lock.yaml"), text).unwrap();
+                }
+                let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+                let mut again = RevertOutcome::ok();
+                again.warnings.clone_from(&outcome.warnings);
+                let outcome = finish(again, dir.path(), &rel("npm"), opts, policies()[2]).await;
                 assert!(
-                    outcome
-                        .warnings
-                        .iter()
-                        .any(|w| w.code == "vendor_artifact_kept"),
-                    "{policy:?}"
+                    outcome.success && outcome.kept_artifact,
+                    "{codes:?} {lock:?}"
                 );
-                assert!(dir.path().join(rel("gem")).is_dir(), "{policy:?}");
+                assert!(outcome
+                    .warnings
+                    .iter()
+                    .any(|w| w.code == "vendor_artifact_kept"));
+                assert!(dir.path().join(rel("npm")).is_dir(), "{codes:?} {lock:?}");
             }
         }
+    }
+
+    /// Once every wired file that exists was read and none names the uuid,
+    /// the re-resolved dependency has moved on: the revert finishes (and
+    /// says why) instead of keeping the artifact on every later run.
+    #[tokio::test]
+    async fn npm_family_drift_finishes_once_no_lock_names_the_uuid() {
+        let dir = project("npm");
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), UPGRADED_LOCK).unwrap();
+        let outcome = finish(
+            re_resolved_elsewhere(),
+            dir.path(),
+            &rel("npm"),
+            wet(),
+            policies()[2],
+        )
+        .await;
+        assert!(outcome.success && !outcome.kept_artifact);
+        let codes: Vec<&str> = outcome.warnings.iter().map(|w| w.code).collect();
+        assert_eq!(
+            codes,
+            ["vendor_lock_entry_drifted", DEPENDENCY_MOVED_ON_CODE],
+            "the left-alone record stays reported, the keep does not"
+        );
+        assert!(!dir.path().join(rel("npm")).exists());
+
+        // `--preserve-state` deletes nothing, so it claims no removal.
+        let dir = project("npm");
+        std::fs::write(dir.path().join("pnpm-lock.yaml"), UPGRADED_LOCK).unwrap();
+        let outcome = finish(
+            re_resolved_elsewhere(),
+            dir.path(),
+            &rel("npm"),
+            preserve(),
+            policies()[2],
+        )
+        .await;
+        assert!(outcome.success && !outcome.kept_artifact);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(dir.path().join(rel("npm")).is_dir());
+    }
+
+    /// A restore that left nothing alone but did not reach every reference
+    /// (one added after vendoring) must not delete the artifact the lock
+    /// still installs from, nor report success.
+    #[tokio::test]
+    async fn npm_family_refuses_a_clean_restore_that_left_a_reference() {
+        let dir = project("npm");
+        std::fs::write(
+            dir.path().join("pnpm-lock.yaml"),
+            format!("x: file:{}/pkg.tgz\n", rel("npm")),
+        )
+        .unwrap();
+        let outcome = finish(
+            RevertOutcome::ok(),
+            dir.path(),
+            &rel("npm"),
+            wet(),
+            policies()[2],
+        )
+        .await;
+        assert!(!outcome.success && !outcome.kept_artifact);
+        assert!(outcome.warnings.iter().any(|w| w.code == STILL_WIRED_CODE));
+        let error = outcome.error.unwrap_or_default();
+        assert!(
+            error.contains("pnpm-lock.yaml still resolves through it"),
+            "{error}"
+        );
+        assert!(dir.path().join(rel("npm")).is_dir());
+
+        // `--preserve-state` never deletes, so it has nothing to refuse.
+        let outcome = finish(
+            RevertOutcome::ok(),
+            dir.path(),
+            &rel("npm"),
+            preserve(),
+            policies()[2],
+        )
+        .await;
+        assert!(outcome.success && outcome.warnings.is_empty());
     }
 
     #[tokio::test]

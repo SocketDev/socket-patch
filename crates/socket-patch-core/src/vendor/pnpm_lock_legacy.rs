@@ -911,9 +911,10 @@ fn revert_value_line(
             || parse_vendor_path_or_machine_absolute(unquote_value(rest))
                 .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
         if !ours {
-            warnings.push(drifted(format!(
-                "{section} entry `{dep}` was changed since vendoring ({rest}); left alone"
-            )));
+            // Built before the push: `dep`/`rest` borrow `*line`.
+            let warning =
+                super::revert::re_resolved(format_args!("{section} entry `{dep}`"), Some(rest));
+            warnings.push(warning);
             return;
         }
         let Some(orig) = rec.original.as_ref().and_then(Value::as_str) else {
@@ -2648,13 +2649,13 @@ packages:
         );
     }
 
-    /// Wiring records left alone during a WIRED revert (here: a root dep
-    /// re-resolved by hand since vendoring) must KEEP the
-    /// artifact dir — the lock still resolves through the tarball, and
-    /// deleting it bricks every subsequent install (the lossiness guard,
-    /// present in the v9/npm/bun backends).
+    /// A root dep re-resolved since vendoring (`pnpm update` moved it to
+    /// 1.3.1) is left alone with a drift warning. Every other fragment is
+    /// restored, so nothing resolves through the tarball any more: the
+    /// revert removes it instead of keeping the artifact and the ledger
+    /// entry for a drift that cannot be undone.
     #[tokio::test]
-    async fn drifted_lock_revert_keeps_the_artifact() {
+    async fn revert_finishes_after_the_root_dep_was_re_resolved() {
         let fx = fixture_with(T_BEFORE_PKG, T7_BEFORE_LOCK).await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
@@ -2678,17 +2679,23 @@ packages:
             outcome.warnings
         );
         assert!(
-            outcome.kept_artifact,
-            "a drift-skip must keep the artifact: {:?}",
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_dependency_moved_on"),
+            "{:?}",
             outcome.warnings
         );
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        let lock = fx.read(PNPM_LOCK).await;
         assert!(
-            fx.root().join(fx.rel_tgz()).exists(),
-            "the lock still resolves through the tarball; deleting it bricks installs"
+            lock.contains("  left-pad: 1.3.1\n"),
+            "the re-resolved line is left alone"
         );
+        assert!(!lock.contains(&entry.uuid), "{lock}");
         assert!(
-            fx.read(PNPM_LOCK).await.contains("  left-pad: 1.3.1\n"),
-            "the drifted line is left alone"
+            !fx.root().join(fx.rel_tgz()).exists(),
+            "an artifact nothing references is removed"
         );
     }
 
@@ -3020,6 +3027,47 @@ packages:
         assert_eq!(
             fx.root().join(fx.rel_tgz()).exists(),
             still_referenced,
+            "{want}: the artifact goes once nothing resolves through it"
+        );
+
+        std::fs::create_dir_all(&uuid_dir).unwrap();
+        for (path, bytes) in saved {
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
+
+    /// Revert and assert the moved-on contract: one drift warning (containing
+    /// `want`) for a fragment re-resolved elsewhere, nothing left resolving
+    /// through the artifact, so it is removed and the outcome says why. The
+    /// artifact is put back for the next sub-case.
+    async fn assert_moved_on(fx: &Fixture, entry: &VendorEntry, want: &str) {
+        let uuid_dir = fx.root().join(fx.rel_tgz()).parent().unwrap().to_path_buf();
+        let mut saved = Vec::new();
+        for file in std::fs::read_dir(&uuid_dir).unwrap() {
+            let path = file.unwrap().path();
+            saved.push((path.clone(), std::fs::read(&path).unwrap()));
+        }
+
+        let outcome = revert_pnpm_legacy(entry, fx.root(), false).await;
+        assert!(outcome.success, "{want}: {:?}", outcome.error);
+        let drifted: Vec<&VendorWarning> = outcome
+            .warnings
+            .iter()
+            .filter(|w| w.code == "vendor_lock_entry_drifted")
+            .collect();
+        assert_eq!(drifted.len(), 1, "{want}: {:?}", outcome.warnings);
+        assert!(drifted[0].detail.contains(want), "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_dependency_moved_on"),
+            "{want}: {:?}",
+            outcome.warnings
+        );
+        assert!(!outcome.kept_artifact, "{want}: {:?}", outcome.warnings);
+        assert!(
+            !fx.root().join(fx.rel_tgz()).exists(),
             "{want}: the artifact goes once nothing resolves through it"
         );
 
@@ -3624,9 +3672,10 @@ packages:
     }
 
     /// v5.4 drift matrix: third-party re-resolutions are left alone with ONE
-    /// precise warning each and keep the artifact; vanished sections warn
-    /// and keep; a vanished fragment warns as removed and the artifact goes
-    /// once nothing resolves through it (#665).
+    /// precise warning each; vanished sections warn and keep; a vanished
+    /// fragment warns as removed (#665). A re-resolved or vanished fragment
+    /// has nothing left to restore, so the artifact goes once nothing
+    /// resolves through it.
     #[tokio::test]
     async fn reresolved_and_vanished_fragments_drift_keep_v54() {
         let (fx, entry) = vendored(T7_BEFORE_LOCK).await;
@@ -3642,11 +3691,10 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_moved_on(
             &fx,
             &entry,
-            "dependencies entry `left-pad` was changed since vendoring (2.0.0)",
-            1,
+            "dependencies entry `left-pad` was re-resolved since vendoring (2.0.0)",
         )
         .await;
         assert!(
@@ -3678,11 +3726,10 @@ packages:
         tokio::fs::write(fx.root().join(PNPM_LOCK), &tampered)
             .await
             .unwrap();
-        assert_drift_keep(
+        assert_moved_on(
             &fx,
             &entry,
             "dep ref `file:consumer|left-pad` was re-resolved since vendoring (2.0.0)",
-            1,
         )
         .await;
         rewire(&fx, &wired_pkg, &wired).await;

@@ -1159,7 +1159,19 @@ worse, lets a warm cache silently serve unpatched bytes):
   that no longer exists at all — the user removed the dependency — is not drift: it warns
   `vendor_lock_entry_removed` and the artifact and entry are kept unless every wired file that exists
   was read and none mentions the uuid in any spelling (an unreadable lock keeps them), so `rollback` / `remove` / `scan --prune` clean up
-  after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`; in uv projects and PEP 723
+  after `npm uninstall` / `yarn remove` / `pnpm remove` / `bun remove`; under pnpm, yarn classic and
+  yarn berry the same holds for a recorded entry that is still there but was re-resolved away from
+  the artifact — the dependency was upgraded past the patched version (`pnpm update`, `yarn upgrade`):
+  the fragment is left alone with `vendor_lock_entry_drifted`, and once no wired file that exists
+  mentions the uuid there is nothing left to restore, so the artifact and entry are removed with a
+  `vendor_revert_dependency_moved_on` warning instead of being kept on every later revert (any other
+  left-alone record — an unknown wiring kind, a fragment with no recorded original, a taken-over pin
+  the user changed — still keeps both unconditionally); a pnpm revert also points dependency
+  references added AFTER vendoring (a new package or workspace importer that depends on the vendored
+  one, which pnpm writes as the `file:` spec) back at the registry release, an importer's
+  `specifier:` from the range its own `package.json` declares, and when one cannot be restored it
+  refuses before any write (`vendor_lock_still_wired_revert_blocked`: nothing reverted, artifact
+  kept) rather than leave a lock pnpm rejects ("Broken lockfile: no entry for …"); in uv projects and PEP 723
   script locks the same holds after `uv remove` of the package, and after `uv remove` of the parent
   of a TRANSITIVE vendored package, whose `[tool.uv]` override + source and `[manifest]` records
   uv leaves in place: those are socket-patch's own records, which the revert restores, so only a
@@ -1691,6 +1703,7 @@ command's integration tests check its output.
 | `yarn_berry_node_gyp_unresolved` | rollback/remove `warnings[]`; vendor advisory event (takeover) | upstream restore (#737): yarn's npm resolver gives the restored registry entry an implicit `node-gyp: "npm:latest"` dependency (the version document runs `node-gyp` in a script without declaring it), which the hosted pin dropped because yarn never gives a tarball-locator entry one, and the lock no longer has a `node-gyp@npm:latest` entry (the pin dropped the subtree only node-gyp reached). The entry is restored without it; a plain `yarn install --immutable` accepts that, a hardened or `--refresh-lockfile` install reports the lock modified. Remedy: run `yarn install` once. Not raised while another entry keeps `node-gyp@npm:latest` in the lock: the dependency is then restored too. |
 | `legacy_redirect_ledger_kept` | rollback `warnings[]` (+ remove stderr) | v5.0: a pre-v5 `.socket/vendor/redirect-state.json` could not be deleted once no hosted pin was left; the file is inert (never read for planning). Never flips the exit. |
 | `vendor_stale_artifact_removed` | `removed`  | vendor / scan `--mode vendored`: re-vendor under a newer patch uuid removed the previous uuid's orphaned artifact dir. |
+| `vendor_revert_dependency_moved_on` | `skipped` (advisory; human: `Warning: …`) | `vendor --revert` / rollback / remove / `scan --prune` (pnpm, yarn classic, yarn berry): a lock entry vendoring wired was re-resolved since (the dependency was upgraded or re-locked) and no wired file references the vendored artifact any more, so the revert removed the artifact and the ledger entry with nothing to restore. The re-resolved fragments are named by their own `vendor_lock_entry_drifted` warnings and are left as they are. |
 | `vendor_unsupported_ecosystem` | `skipped`   | vendor: no vendor backend for this purl's ecosystem (jsr). |
 | `already_vendored`        | `skipped`        | vendor: artifact + wiring already in sync for this patch uuid. |
 | `vendor_prebuilt_pending` / `vendor_prebuilt_unavailable` | `skipped` | vendor / scan / get `--mode vendored` (every ecosystem, #954, #1235): the package is already vendored at another patch uuid, and the patch service has no prebuilt artifact for the selected (superseding) uuid — still building (`pending_build`) / not served (`build_failed`, `not_found`, `withdrawn`, no usable artifact). Nothing is touched: the older patch's artifact, wiring and ledger entry stay in force, the detail names both uuids (`kept the vendored patch <old>: prebuilt <artifact> is still building for patch <new>`, where `<artifact>` is the backend's artifact kind: `artifact` for the npm family, `.gem`, `crate`, `module zip`, `dist zip`, `wheel`, `.jar`, `.nupkg`, …), and the run does not fail (exit 0), the way hosted mode keeps its pin and lists the upgrade in `redirect.skipped[]`. A re-run picks the new patch up once the service serves it. A package with no vendored patch to keep still fails (`failed`, error `prebuilt <artifact> is still building` / `prebuilt <artifact> unavailable: <status>`; outside the npm family under `vendor_prebuilt_required`), as does a request/transport failure. |

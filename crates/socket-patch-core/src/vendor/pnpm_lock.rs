@@ -78,7 +78,7 @@ use super::{RevertOpts, RevertOutcome, VendorOutcome, VendorWarning};
 use crate::constants::npm_family::{PNPM_LOCK, PNPM_SHRINKWRAP_LEGACY};
 use crate::formats::pnpm::lines::{
     indent_of, next_block, parse_key_line, section_bounds, split_lines, split_project_document,
-    unquote_value, yaml_key, yaml_key_like, YamlBlock,
+    unquote_value, yaml_key, yaml_key_like, yaml_value, YamlBlock,
 };
 use crate::formats::pnpm::plan::{governing_pnpm_lock, match_key, KeyMatch, Target};
 use crate::formats::pnpm::sniff_lock_grammar;
@@ -1168,6 +1168,59 @@ pub(super) async fn revert_pnpm_dialect(
         }
     }
 
+    // References added since vendoring, which no record names.
+    let mut stranded: Vec<String> = Vec::new();
+    if let (Some(lines), Some((name, version))) = (
+        lock_lines.as_mut(),
+        super::npm_common::parse_npm_purl(&entry.base_purl),
+    ) {
+        lock_dirty |= restore_unrecorded_refs(
+            dialect,
+            lines,
+            (&name, &version),
+            &entry.uuid,
+            project_root,
+            &mut stranded,
+        )
+        .await;
+    }
+    // A restore that left no record alone has put the registry entry back,
+    // so a reference into the artifact that survives it names an entry the
+    // lock no longer holds: pnpm rejects such a lock whether or not the
+    // artifact is deleted. Refused before any surface is written. The
+    // `overrides:` section is not a reference: pnpm keeps a declaration no
+    // entry matches without resolving through it.
+    if !outcome.drift_skipped() && !outcome.lock_entry_removed() {
+        let uuid = entry.uuid.to_ascii_lowercase();
+        let left = lock_lines.as_ref().and_then(|lines| {
+            let declared = section_bounds(lines, "overrides").unwrap_or((0, 0));
+            lines.iter().enumerate().find_map(|(i, line)| {
+                let reference = !(declared.0..declared.1).contains(&i)
+                    && line.to_ascii_lowercase().contains(&uuid);
+                reference.then_some(line)
+            })
+        });
+        if let Some(line) = left {
+            let what = match stranded.is_empty() {
+                true => format!("`{}`", line.trim()),
+                false => stranded.join("; "),
+            };
+            let detail = format!(
+                "refusing to revert {uuid_dir_rel}: {PNPM_LOCK} would still resolve through \
+                 it once the recorded wiring is restored ({what}), and pnpm rejects a lock \
+                 whose reference has no entry; nothing was reverted — restore the pre-vendor \
+                 {PNPM_LOCK}, or remove that reference and re-lock with `pnpm install`, then \
+                 re-run `vendor --revert`"
+            );
+            outcome.success = false;
+            outcome.error = Some(detail.clone());
+            outcome
+                .warnings
+                .push(VendorWarning::new(revert::STILL_WIRED_CODE, detail));
+            return outcome;
+        }
+    }
+
     // Remove the now-empty tables iff vendor created them (third-party keys
     // added since keep the table alive).
     if let Some((doc, _)) = pkg_state.as_mut() {
@@ -1261,13 +1314,14 @@ pub(super) async fn revert_pnpm_dialect(
         }
     }
 
-    // LOSSINESS GUARD: when any wiring record was left alone ("drifted;
-    // left alone"), the uuid dir may hold the only copy of what the lock —
-    // or the redirect ledger's recorded originals — still points at. Keep
-    // it (and let the CLI keep the ledger entry) instead of deleting evidence
-    // out from under a lock we just refused to touch.
+    // The artifact goes only once none of the three surfaces resolves
+    // through it: a record left alone or vanished keeps it (and lets the
+    // CLI keep the ledger entry) while one still names it, and a reference
+    // the restore never reached refuses the deletion. See
+    // [`KeepPolicy::NpmFamily`].
     let policy = KeepPolicy::NpmFamily {
         locks: &[PNPM_LOCK, PACKAGE_JSON, PNPM_WORKSPACE],
+        wired: &[],
         uuid: &entry.uuid,
     };
     revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
@@ -3539,9 +3593,10 @@ impl DepPair<'_> {
         let ours = field(rec.new.as_ref(), "version") == Some(live_ver)
             || (self.parse)(live_ver).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
-            return warnings.push(drifted(format!(
-                "{label} `{key}` was re-resolved since vendoring ({live_ver}); left alone"
-            )));
+            return warnings.push(revert::re_resolved(
+                format_args!("{label} `{key}`"),
+                Some(live_ver),
+            ));
         }
         if original.is_none() {
             return warnings.push(drifted(format!(
@@ -3815,10 +3870,10 @@ impl DepRef<'_> {
         let ours = Some(rest) == rec.new.as_ref().and_then(Value::as_str)
             || (self.parse)(rest).is_some_and(|p| p.eco == "npm" && p.uuid == self.entry_uuid);
         if !ours {
-            warnings.push(drifted(format!(
-                "{} `{}` was re-resolved since vendoring ({rest}); left alone",
-                self.label, self.key
-            )));
+            warnings.push(revert::re_resolved(
+                format_args!("{} `{}`", self.label, self.key),
+                Some(rest),
+            ));
             return true;
         }
         let Some(original) = rec.original.as_ref().and_then(Value::as_str) else {
@@ -3897,6 +3952,188 @@ fn same_modulo_dep_refs(a: &[String], b: &[String]) -> bool {
             .zip(b)
             .enumerate()
             .all(|(i, (x, y))| x == y || refs_a.iter().any(|r| r.0 == i))
+}
+
+/// Point the dependency references that still resolve through `uuid`'s
+/// artifact back at the registry release `name@version`, whether or not
+/// vendoring recorded them; `true` when a line changed.
+///
+/// The wiring records one edit per dependent that existed at vendor time.
+/// A package or workspace importer added since has its reference to the
+/// overridden dependency written by pnpm as the `file:` spec, with no
+/// record to replay; left in place it names an entry the restore just
+/// rekeyed away, and pnpm rejects the lock ("Broken lockfile: no entry
+/// for …"). Runs only once the registry entry is back in `packages:`, so a
+/// reference is never pointed at an entry the lock does not hold.
+///
+/// An importer's `specifier:` goes back to the range its own
+/// `package.json` declares, which is what pnpm compares it with. One whose
+/// range cannot be read is left alone and named in `stranded`.
+async fn restore_unrecorded_refs(
+    dialect: PnpmDialect,
+    lines: &mut [String],
+    (name, version): (&str, &str),
+    uuid: &str,
+    project_root: &Path,
+    stranded: &mut Vec<String>,
+) -> bool {
+    type Parse = fn(&str) -> Option<super::path::VendorPathParts>;
+    let ours = |parse: Parse| {
+        move |value: &str| {
+            parse(unquote_value(value)).is_some_and(|p| p.eco == "npm" && p.uuid == uuid)
+        }
+    };
+    let has_entry = |lines: &[String], key: &str| {
+        section_bounds(lines, "packages").is_some_and(|(start, end)| {
+            std::iter::successors(next_block(lines, start + 1, end), |b| {
+                next_block(lines, b.end, end)
+            })
+            .any(|block| block.key == key)
+        })
+    };
+    match dialect {
+        PnpmDialect::V9 => {
+            if !has_entry(&*lines, &format!("{name}@{version}")) {
+                return false;
+            }
+            let ours = ours(parse_vendor_path);
+            let refs = restore_dep_map_refs(lines, "snapshots", name, version, false, &ours);
+            let importers =
+                restore_importer_refs(lines, name, version, &ours, project_root, stranded).await;
+            refs || importers
+        }
+        PnpmDialect::Legacy => {
+            let keys = [format!("/{name}/{version}"), format!("/{name}@{version}")];
+            if !keys.iter().any(|key| has_entry(&*lines, key)) {
+                return false;
+            }
+            let ours = ours(super::path::parse_vendor_path_or_machine_absolute);
+            restore_dep_map_refs(lines, "packages", name, version, true, &ours)
+        }
+    }
+}
+
+/// Rewrite every `name: <ours>` reference line of `section`'s blocks to
+/// `name: version`. With `dep_maps_only`, only inside a block's
+/// `dependencies:` / `optionalDependencies:` maps (the legacy edit's
+/// scope); otherwise any 6-space key, as the v9 edit rewrites them.
+fn restore_dep_map_refs(
+    lines: &mut [String],
+    section: &str,
+    name: &str,
+    version: &str,
+    dep_maps_only: bool,
+    ours: &impl Fn(&str) -> bool,
+) -> bool {
+    let Some((start, end)) = section_bounds(lines, section) else {
+        return false;
+    };
+    let mut changed = false;
+    let mut in_dep_map = !dep_maps_only;
+    for line in lines[start + 1..end].iter_mut() {
+        if dep_maps_only {
+            if parse_key_line(line, 2).is_some() {
+                in_dep_map = false;
+                continue;
+            }
+            if let Some((field, _repr, rest)) = parse_key_line(line, 4) {
+                in_dep_map =
+                    rest.is_empty() && matches!(field, "dependencies" | "optionalDependencies");
+                continue;
+            }
+        }
+        if !in_dep_map {
+            continue;
+        }
+        let Some((dep, repr, rest)) = parse_key_line(line, 6) else {
+            continue;
+        };
+        if dep != name || !ours(rest) {
+            continue;
+        }
+        // Built before the splice below: `dep`/`repr` borrow `*line`.
+        let restored = format!("      {}: {version}", yaml_key_like(dep, repr));
+        *line = restored;
+        changed = true;
+    }
+    changed
+}
+
+/// The importer half of [`restore_unrecorded_refs`]: every importer dep
+/// entry of `name` whose `version:` is still ours gets the registry
+/// `version` and the range the importer's `package.json` declares for it.
+async fn restore_importer_refs(
+    lines: &mut [String],
+    name: &str,
+    version: &str,
+    ours: &impl Fn(&str) -> bool,
+    project_root: &Path,
+    stranded: &mut Vec<String>,
+) -> bool {
+    let Some((start, end)) = section_bounds(lines, "importers") else {
+        return false;
+    };
+    // (importer key, dependency map, specifier line, version line).
+    let mut found: Vec<(String, String, usize, usize)> = Vec::new();
+    let mut i = start + 1;
+    while let Some(importer) = next_block(lines, i, end) {
+        for entry in dep_entries(lines, importer.header + 1, importer.end, 6) {
+            let (Some((si, _)), Some((vi, ver))) = (entry.spec, entry.ver) else {
+                continue;
+            };
+            if entry.dep != name || !ours(ver) {
+                continue;
+            }
+            // The 4-space header the entry sits under names the map.
+            let map = lines[importer.header + 1..si.min(vi)]
+                .iter()
+                .rev()
+                .find_map(|l| parse_key_line(l, 4).map(|(field, _, _)| field.to_string()))
+                .unwrap_or_default();
+            found.push((importer.key.clone(), map, si, vi));
+        }
+        i = importer.end;
+    }
+    let mut changed = false;
+    for (importer, map, si, vi) in found {
+        let declared = importer_manifest(project_root, &importer)
+            .await
+            .and_then(|manifest| Some(manifest.get(&map)?.get(name)?.as_str()?.to_string()))
+            // A range or tag, not another protocol's spec: only those lock
+            // to the registry entry being restored.
+            .filter(|spec| !spec.is_empty() && !spec.contains([':', '/']));
+        match declared {
+            Some(spec) => {
+                lines[si] = format!("        specifier: {}", yaml_value(&spec));
+                lines[vi] = format!("        version: {version}");
+                changed = true;
+            }
+            None => stranded.push(format!(
+                "importer `{importer}` depends on {name} through the vendored tarball, and \
+                 its {PACKAGE_JSON} declares no registry range for it under `{map}` to put back"
+            )),
+        }
+    }
+    changed
+}
+
+/// The `package.json` of the workspace importer `importer` (a lock key: a
+/// directory relative to the lock). Only one inside the project is read.
+async fn importer_manifest(project_root: &Path, importer: &str) -> Option<Value> {
+    let dir = match importer {
+        "." => project_root.to_path_buf(),
+        _ => {
+            let inside = importer.split('/').all(|segment| {
+                !matches!(segment, "" | "." | "..") && !segment.contains(['\\', ':'])
+            });
+            if !inside {
+                return None;
+            }
+            project_root.join(importer)
+        }
+    };
+    let bytes = read_regular_to_bytes(&dir.join(PACKAGE_JSON)).await.ok()?;
+    parse_json_manifest(&bytes).ok()
 }
 
 pub(super) fn drifted(detail: impl Into<String>) -> VendorWarning {
@@ -6438,6 +6675,180 @@ snapshots:
         }
     }
 
+    /// A package added after vendoring that depends on the vendored one
+    /// gets its reference written as the `file:` spec, with no ledger
+    /// record. The revert restores it with the recorded ones: left in
+    /// place it names an entry the revert just rekeyed away, and pnpm
+    /// fails every install ("Broken lockfile: no entry for …") while the
+    /// revert reported success and deleted the artifact.
+    #[tokio::test]
+    async fn revert_restores_a_dependents_reference_added_after_vendoring() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let rel = fx.rel_tgz();
+        let with_dependent = |lock: &str, reference: &str| {
+            let lock = lock.replace(
+                "\n\nsnapshots:\n",
+                "\n\n  newdep@1.0.0:\n    resolution: {integrity: sha512-AAAA}\n\nsnapshots:\n",
+            );
+            format!("{lock}\n  newdep@1.0.0:\n    dependencies:\n      left-pad: {reference}\n")
+        };
+        let vendored = with_dependent(&fx.read(PNPM_LOCK).await, &format!("file:{rel}"));
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &vendored)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+        assert_eq!(
+            fx.read(PNPM_LOCK).await,
+            with_dependent(P1_BEFORE_LOCK, "1.3.0"),
+            "every reference to the artifact is back on the registry release"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert!(!fx.root().join(".socket/vendor").exists());
+    }
+
+    /// The same for a workspace importer added after vendoring: its
+    /// `specifier:` goes back to the range its own package.json declares.
+    /// When that range cannot be read the revert refuses before any write,
+    /// rather than leave a lock that names the vendored tarball beside a
+    /// registry entry, or delete the tarball it still installs from.
+    #[tokio::test]
+    async fn revert_restores_an_importer_added_after_vendoring_or_refuses_whole() {
+        let lib = |spec: &str, version: &str| {
+            format!(
+                "\n\n  packages/lib:\n    dependencies:\n      left-pad:\n        \
+                 specifier: {spec}\n        version: {version}\n\npackages:\n"
+            )
+        };
+        for declared in [true, false] {
+            let fx = fixture_with(P7_BEFORE_PKG, P7_BEFORE_LOCK).await;
+            let (_, entry, _) = expect_done(fx.vendor(false).await);
+            let entry = entry.unwrap();
+            let rel = fx.rel_tgz();
+            let vendored = fx.read(PNPM_LOCK).await.replace(
+                "\n\npackages:\n",
+                &lib(&format!("file:../../{rel}"), &format!("file:{rel}")),
+            );
+            tokio::fs::write(fx.root().join(PNPM_LOCK), &vendored)
+                .await
+                .unwrap();
+            if declared {
+                let dir = fx.root().join("packages/lib");
+                tokio::fs::create_dir_all(&dir).await.unwrap();
+                let manifest = r#"{"name": "lib", "dependencies": {"left-pad": "^1.3.0"}}"#;
+                tokio::fs::write(dir.join(PACKAGE_JSON), manifest)
+                    .await
+                    .unwrap();
+            }
+            let (pkg, ws) = (fx.read(PACKAGE_JSON).await, fx.read(PNPM_WORKSPACE).await);
+
+            let outcome = revert_pnpm(&entry, fx.root(), false).await;
+            if declared {
+                assert!(outcome.success, "{:?}", outcome.error);
+                assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+                assert_eq!(
+                    fx.read(PNPM_LOCK).await,
+                    P7_BEFORE_LOCK.replace("\n\npackages:\n", &lib("^1.3.0", "1.3.0"))
+                );
+                assert_eq!(fx.read(PACKAGE_JSON).await, P7_BEFORE_PKG);
+                assert!(!fx.root().join(".socket/vendor").exists());
+                continue;
+            }
+            assert!(!outcome.success, "an unrestorable reference must refuse");
+            assert!(!outcome.kept_artifact);
+            let error = outcome.error.unwrap_or_default();
+            assert!(
+                error.contains("packages/lib") && error.contains("nothing was reverted"),
+                "{error}"
+            );
+            assert!(outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_lock_still_wired_revert_blocked"));
+            assert_eq!(fx.read(PNPM_LOCK).await, vendored, "lock untouched");
+            assert_eq!(fx.read(PACKAGE_JSON).await, pkg, "manifest untouched");
+            assert_eq!(
+                fx.read(PNPM_WORKSPACE).await,
+                ws,
+                "workspace file untouched"
+            );
+            assert!(fx.root().join(&rel).exists(), "artifact kept");
+        }
+    }
+
+    /// Upgrading past the patched version is the normal end of a vendored
+    /// patch. The lock then resolves the dependency from the registry and
+    /// nothing references the artifact: the revert removes the override
+    /// surfaces, the artifact and (through the caller) the ledger entry,
+    /// instead of keeping both on every run as "drift" nobody can undo.
+    #[tokio::test]
+    async fn revert_finishes_after_the_dependency_was_upgraded() {
+        let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let rel = fx.rel_tgz();
+        // `pnpm update left-pad`: importer, entry and dependents move to
+        // 1.3.1; pnpm keeps mirroring the (now unmatched) override.
+        let key = format!("left-pad@file:{rel}");
+        let upgraded = fx
+            .read(PNPM_LOCK)
+            .await
+            .replace(
+                &format!("        specifier: file:{rel}\n        version: file:{rel}\n"),
+                "        specifier: ^1.3.1\n        version: 1.3.1\n",
+            )
+            .replace(
+                &format!(
+                    "  {key}:\n    resolution: {{integrity: {}, tarball: file:{rel}}}\n    version: 1.3.0\n",
+                    fx.actual_integrity().await
+                ),
+                "  left-pad@1.3.1:\n    resolution: {integrity: sha512-BBBB}\n",
+            )
+            .replace(&format!("  {key}: {{}}\n"), "  left-pad@1.3.1: {}\n")
+            .replace(&format!("      left-pad: file:{rel}\n"), "      left-pad: 1.3.1\n");
+        assert_eq!(
+            upgraded.matches(UUID).count(),
+            1,
+            "only the override mirror still names the artifact:\n{upgraded}"
+        );
+        tokio::fs::write(fx.root().join(PNPM_LOCK), &upgraded)
+            .await
+            .unwrap();
+
+        let outcome = revert_pnpm(&entry.unwrap(), fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.code == "vendor_revert_dependency_moved_on"),
+            "{:?}",
+            outcome.warnings
+        );
+        assert!(!outcome
+            .warnings
+            .iter()
+            .any(|w| w.code == "vendor_artifact_kept"));
+        assert!(
+            !fx.root().join(".socket/vendor").exists(),
+            "artifact removed"
+        );
+        let lock = fx.read(PNPM_LOCK).await;
+        assert!(
+            !lock.contains("overrides:") && !lock.contains(UUID),
+            "{lock}"
+        );
+        assert!(
+            lock.contains("  left-pad@1.3.1:\n"),
+            "the upgrade stays:\n{lock}"
+        );
+        assert_eq!(fx.read(PACKAGE_JSON).await, P1_BEFORE_PKG);
+        assert!(!fx.root().join(PNPM_WORKSPACE).exists());
+    }
+
     #[tokio::test]
     async fn revert_allowlist_is_fail_closed() {
         let fx = fixture_with(P1_BEFORE_PKG, P1_BEFORE_LOCK).await;
@@ -6515,54 +6926,20 @@ snapshots:
         );
         // Non-drifted fragments still restored.
         assert!(after.contains("  left-pad@1.3.0:\n    resolution: {integrity: sha512-XI5MPzVN"));
-        // A drift-skip keeps the artifact dir (the drifted fragment's
-        // recorded original may still be needed later) and says so.
-        assert!(
-            fx.root()
-                .join(format!(".socket/vendor/npm/{UUID}"))
-                .exists(),
-            "drift-skip must keep the artifact dir"
-        );
+        // The re-resolved importer no longer installs from the artifact
+        // and every other fragment is restored, so nothing references it:
+        // the revert finishes (and says why) instead of keeping the
+        // artifact and the ledger entry on this and every later run.
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
         assert!(
             outcome
                 .warnings
                 .iter()
-                .any(|w| w.code == "vendor_artifact_kept"),
-            "the keep must be surfaced: {:?}",
+                .any(|w| w.code == "vendor_revert_dependency_moved_on"),
+            "{:?}",
             outcome.warnings
         );
-
-        // KEEP-GATE LIVENESS: undo ONLY the drift (repoint the importer dep
-        // back at the vendored spec). Everything the first revert already
-        // restored — the rekeyed packages/snapshots blocks and the removed
-        // overrides — must now read as CONVERGED, not drifted; otherwise
-        // every later revert would re-classify it as drift and keep the
-        // artifacts + ledger entry forever.
-        let healed = after.replace(
-            "      left-pad:\n        specifier: 1.3.1\n        version: 1.3.1\n",
-            &format!(
-                "      left-pad:\n        specifier: file:{rel}\n        version: file:{rel}\n",
-                rel = fx.rel_tgz()
-            ),
-        );
-        assert_ne!(healed, after, "the undo edit must hit");
-        tokio::fs::write(fx.root().join(PNPM_LOCK), &healed)
-            .await
-            .unwrap();
-
-        let outcome = revert_pnpm(&entry, fx.root(), false).await;
-        assert!(outcome.success, "{:?}", outcome.error);
-        assert!(
-            outcome.warnings.is_empty(),
-            "already-reverted fragments are converged, not drifted: {:?}",
-            outcome.warnings
-        );
-        assert!(!outcome.kept_artifact);
-        assert_eq!(
-            fx.read(PNPM_LOCK).await,
-            P1_BEFORE_LOCK,
-            "lock byte-restored"
-        );
+        assert!(!after.contains(UUID), "{after}");
         assert_eq!(
             fx.read(PACKAGE_JSON).await,
             P1_BEFORE_PKG,
@@ -6572,7 +6949,7 @@ snapshots:
             !fx.root()
                 .join(format!(".socket/vendor/npm/{UUID}"))
                 .exists(),
-            "artifact pruned once the revert converges"
+            "an artifact nothing references is removed"
         );
     }
 
@@ -8624,9 +9001,10 @@ snapshots:
         assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
     }
 
-    /// Snapshot dep refs: the re-resolved (foreign value) arm warns and
-    /// keeps; the line-vanished arm warns `vendor_lock_entry_removed` and,
-    /// with nothing left resolving through the artifact, removes it (#665).
+    /// Snapshot dep refs: the re-resolved (foreign value) arm warns as
+    /// drift and the line-vanished arm as `vendor_lock_entry_removed`
+    /// (#665); either way nothing is left resolving through the artifact,
+    /// so it is removed rather than kept for a restore that cannot come.
     #[tokio::test]
     async fn snapshot_ref_drift_and_vanished_arms_warn() {
         // Re-resolved behind our back.
@@ -8647,7 +9025,8 @@ snapshots:
             "vendor_lock_entry_drifted",
             "snapshot ref `consumer@file:consumer|left-pad` was re-resolved since vendoring (1.3.1)",
         );
-        assert!(outcome.kept_artifact);
+        assert!(!outcome.kept_artifact, "{:?}", outcome.warnings);
+        assert!(!uuid_dir(&fx).exists(), "unreferenced artifact removed");
         assert!(
             fx.read(PNPM_LOCK).await.contains("      left-pad: 1.3.1"),
             "re-resolved ref left alone"

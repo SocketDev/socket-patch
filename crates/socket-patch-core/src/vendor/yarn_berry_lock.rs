@@ -45,7 +45,6 @@ use std::path::Path;
 use serde_json::Value;
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::constants::SOCKET_DIR;
 use crate::formats::yarn::berry_entry::{render_pinned_entry, Pin};
 use crate::formats::yarn::berry_gates::{self, BerryGate, Yarnrc, SUPPORTED_CACHE_KEY};
 use crate::formats::yarn::berry_prune::{
@@ -63,7 +62,6 @@ use crate::utils::fs::{
 };
 use crate::utils::line_endings::LineEndings;
 use crate::utils::npm_range::npm_range_admits;
-use crate::utils::socket_dir::remove_tree_and_prune;
 use crate::utils::uri::encode_uri_component;
 
 #[cfg(test)]
@@ -76,6 +74,7 @@ use super::npm_common::{
 use super::npm_dir::splice_manifest;
 use super::parse_memo::ParseMemo;
 use super::path::parse_vendor_path;
+use super::revert::{self, KeepPolicy};
 use super::source::PackageSource;
 use super::state::{PnpmMeta, VendorEntry, WiringAction, WiringRecord};
 use super::yarn_classic_lock::{
@@ -1077,74 +1076,17 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
-    // LOSSINESS GUARD: when any wiring record was left
-    // alone ("drifted; left alone"), the uuid dir may hold the only copy of
-    // what the lock — or the redirect ledger's recorded originals — still
-    // points at. Keep it (and let the CLI keep the ledger entry) instead of
-    // deleting evidence out from under a lock we just refused to touch.
-    if outcome.drift_skipped() {
-        outcome.keep_artifact(&uuid_dir_rel);
-        return outcome;
-    }
-
-    // `--preserve-state` (`keep_artifact`): the wiring restore above already
-    // ran; the artifact dir stays behind (and the caller keeps the ledger
-    // entry), so the deletion — and the still-wired probes that exist only
-    // to protect it — are skipped.
-    if keep_artifact {
-        return outcome;
-    }
-
-    if super::npm_flavor::keep_artifact_while_lock_references_it(
-        &mut outcome,
-        project_root,
-        &[YARN_LOCK, PACKAGE_JSON],
-        &entry.uuid,
-        &uuid_dir_rel,
-    )
-    .await
-    {
-        return outcome;
-    }
-
-    // FAIL-CLOSED (same brick class as the unwired guard above, twin of
-    // npm_lock's post-restore probe): the restore only rewrites the
-    // fragments the wiring recorded, but yarn can still resolve through the
-    // artifact via a lock entry or resolutions value the wiring never named
-    // (hand-copied or re-keyed since vendoring). Deleting the uuid dir then
-    // fails every subsequent install on the missing tarball, silently. Both
-    // wired files are probed independently; absent or unprovable keeps the
-    // wired revert's existing missing-file tolerance.
-    for wired in [YARN_LOCK, PACKAGE_JSON] {
-        if super::npm_flavor::lock_text_mentions_uuid(project_root, &[wired], &entry.uuid).await
-            == Some(true)
-        {
-            let detail = format!(
-                "refusing to remove {uuid_dir_rel}: after restoring the recorded wiring, \
-                 {wired} still resolves through it (was the entry re-keyed or hand-copied \
-                 since vendoring?) — deleting the artifact would make every subsequent \
-                 install fail; restore the pre-vendor {wired} (or remove the dependency and \
-                 re-lock) and re-run `vendor --revert`"
-            );
-            outcome.success = false;
-            outcome.error = Some(detail.clone());
-            outcome.warnings.push(VendorWarning::new(
-                "vendor_lock_still_wired_revert_blocked",
-                detail,
-            ));
-            return outcome;
-        }
-    }
-
-    // The last npm-family entry leaves `.socket/vendor/npm/` (and
-    // `.socket/vendor/`) empty: the shared helper prunes them so a reverted
-    // project carries no vendor residue (non-recursive: siblings keep them).
-    let uuid_dir = project_root.join(&uuid_dir_rel);
-    if let Err(e) = remove_tree_and_prune(&uuid_dir, &project_root.join(SOCKET_DIR)).await {
-        return RevertOutcome::failed(format!("cannot remove {uuid_dir_rel}: {e}"));
-    }
-
-    outcome
+    // The artifact goes only once neither wired file resolves through it:
+    // a fragment left alone or vanished keeps it while one still names it,
+    // and a lock entry or resolutions value the wiring never recorded
+    // (hand-copied or re-keyed since vendoring) refuses the deletion. See
+    // [`KeepPolicy::NpmFamily`].
+    let policy = KeepPolicy::NpmFamily {
+        locks: &[YARN_LOCK, PACKAGE_JSON],
+        wired: &[YARN_LOCK, PACKAGE_JSON],
+        uuid: &entry.uuid,
+    };
+    revert::finish(outcome, project_root, &uuid_dir_rel, opts, policy).await
 }
 
 // ───────────────────────────── revert internals ─────────────────────────────
