@@ -1493,6 +1493,33 @@ version = "1.0.4+socket.<uuid>"
   untagged copy and lock entry (`cargo_version_tagged`). Every revert
   removes both spellings.
 
+## Cargo: what `vex` attests from the lock
+
+`vex` attests a hosted or vendored crate only from files cargo acts on.
+
+- **A hosted lock entry needs a declaration that routes it.** Cargo resolves a
+  dependency from the source its declaration names. A `Cargo.lock` entry sourced
+  from a Socket patch registry therefore counts only while a declaration cargo
+  honors sends that version there: a dependency in the root `Cargo.toml` or a
+  workspace member's with `registry = "socket-patch-<uuid>"` and a requirement
+  that accepts the locked version (what hosted scan writes), or a hand-written
+  `[patch.<source>]` entry with that registry in the root manifest or the project
+  cargo config. Without one, cargo takes the crate from crates.io and rewrites the
+  lock, or fails under `--locked`. So `vex` attests nothing for a crate that only
+  registry dependents declare, for a registry named only on a `[patch]` entry
+  cargo ignores (a `[patch."https://github.com/rust-lang/crates.io-index"]` table
+  replaces `[patch.crates-io]`) or on a `[workspace.dependencies]` entry nothing
+  inherits, or for a lock with no readable `Cargo.toml` beside it. The run warns
+  `patched_ref_invalid` and names the lock entry.
+- **Run it from the workspace root.** Cargo ignores `[patch]` in a workspace
+  member and reads `Cargo.lock` only at the workspace root. Run from a member (a
+  directory an ancestor `[workspace]` does not `exclude`, or a package with
+  `package.workspace`), `vex` reads no cargo wiring: a `[patch]` path entry, a
+  registry pin and a `Cargo.lock` left beside the member attest nothing. Each
+  member file that names a Socket patch gets a `patched_ref_unattributable`
+  warning that names the workspace root. Hosted scan and `vendor` refuse the
+  same directories (`cargo_manifest_not_workspace_root`).
+
 ## Go: directory replaces and go.sum
 
 Both Go modes work through a `go.mod` `replace` directive pointing at a committed
