@@ -183,6 +183,166 @@ pub(crate) fn detect_roots<'a>(
     (roots, ignored)
 }
 
+/// What [`roots_below`] found.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DiskRoots {
+    /// The root directories relative to the walked one, `/`-separated and
+    /// sorted; `""` is the walked directory itself.
+    pub roots: Vec<String>,
+    /// A workspace member below the walked directory was left out because
+    /// the walked directory's own run reads its lock, so that run has to
+    /// happen even when the directory holds no lock of its own.
+    pub governs_members: bool,
+    /// The walk stopped at [`MAX_WALKED_ENTRIES`], so `roots` may be
+    /// incomplete.
+    pub truncated: bool,
+}
+
+/// How many directory entries [`roots_below`] reads before it gives up.
+/// Installed trees and ignored output are never entered, so this is far
+/// above any repository's source tree, and a bound on a directory that is
+/// not one.
+const MAX_WALKED_ENTRIES: usize = 500_000;
+
+/// The marker files at and below `dir`, as `/`-separated relative paths,
+/// and whether the walk was cut short.
+///
+/// The in-memory engine is handed the files git tracks. On disk the walk
+/// stands in for that list: it honours the repository's ignore files (a
+/// build directory's copy of a lockfile is not a project), never enters an
+/// [`EXCLUDED_ROOT_SEGMENTS`] directory and never follows a link. A marker
+/// that is itself a symlink still counts, as it does for the root the user
+/// names.
+fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
+    let walk = ignore::WalkBuilder::new(dir)
+        .hidden(false)
+        .follow_links(false)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|t| t.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| EXCLUDED_ROOT_SEGMENTS.contains(&name)))
+        })
+        .build();
+    let mut markers: Vec<String> = Vec::new();
+    for (seen, entry) in walk.flatten().enumerate() {
+        if seen >= MAX_WALKED_ENTRIES {
+            return (markers, true);
+        }
+        if entry.file_type().is_none_or(|t| t.is_dir()) {
+            continue;
+        }
+        let is_marker = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|base| marker_ecosystem(base).is_some());
+        if !is_marker {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(dir) else {
+            continue;
+        };
+        // A path that is not UTF-8 names no root a `/`-joined list can hold.
+        let segments: Option<Vec<&str>> = rel.iter().map(|segment| segment.to_str()).collect();
+        if let Some(segments) = segments {
+            markers.push(segments.join("/"));
+        }
+    }
+    (markers, false)
+}
+
+/// The project roots at and below `dir` on disk, so a disk scan and the
+/// in-memory engine agree on what a checkout's projects are:
+/// [`detect_roots`] over the marker files a walk finds
+/// ([`marker_paths_below`]), less the workspace members whose lock another
+/// root's run reads.
+///
+/// The engine takes such a lock away from the member and keeps the member
+/// as a root when it holds another one. A disk run cannot be handed a
+/// directory without one of its files, so here a member is left out when
+/// that lock is all that made it a root, and stays (to be handled as a run
+/// from a member directory is) when it holds another. The two cases are the
+/// engine's: a Cargo workspace member's `Cargo.lock`, which cargo ignores,
+/// and a pnpm workspace member's `pnpm-lock.yaml` that the workspace root
+/// accounts for. `admitted(root)` says whether a root will be scanned at
+/// all: a lock is only left to a root that is.
+pub async fn roots_below(
+    dir: &std::path::Path,
+    ecosystems: Option<&[String]>,
+    admitted: impl Fn(&str) -> bool,
+) -> DiskRoots {
+    use crate::vendor::lock_inventory::ProjectView;
+    let walked = dir.to_path_buf();
+    let (markers, truncated) = tokio::task::spawn_blocking(move || marker_paths_below(&walked))
+        .await
+        .unwrap_or_default();
+    let (mut roots, _) = detect_roots(markers.iter().map(String::as_str), ecosystems);
+    let dir_of = |root: &str| {
+        if root.is_empty() {
+            dir.to_path_buf()
+        } else {
+            dir.join(root)
+        }
+    };
+    // Whether `base` is the only kind of marker that makes `root` a root.
+    let only_marker = |root: &str, bases: &[&str]| {
+        !markers.iter().any(|path| {
+            let (parent, base) = split_path(path);
+            parent == root
+                && !bases.contains(&base)
+                && marker_ecosystem(base).is_some_and(|eco| allowed(ecosystems, eco))
+        })
+    };
+    let mut dropped: BTreeSet<String> = BTreeSet::new();
+    let mut governs_members = false;
+
+    if allowed(ecosystems, "cargo") {
+        for workspace in roots.iter().filter(|root| admitted(root)) {
+            let has_lock = markers
+                .iter()
+                .any(|path| *path == join_root(workspace, "Cargo.lock"));
+            if !has_lock {
+                continue;
+            }
+            for manifest in crate::utils::cargo_workspace::member_manifests(&dir_of(workspace)) {
+                let Some(member) = manifest.strip_suffix("/Cargo.toml") else {
+                    continue;
+                };
+                let member = join_root(workspace, member);
+                if roots.contains(&member) && only_marker(&member, &["Cargo.lock"]) {
+                    dropped.insert(member);
+                }
+            }
+        }
+    }
+
+    let has = |rel: &str| dir.join(rel).is_file();
+    for (member, workspace) in pnpm_member_candidates(&roots, has, ecosystems) {
+        // The walked directory is scanned whenever it governs a member.
+        let scanned = workspace.is_empty() || roots.contains(&workspace);
+        if !scanned || !admitted(&workspace) || !only_marker(&member, &["pnpm-lock.yaml"]) {
+            continue;
+        }
+        let Some(rel) = strip_root(&workspace, &member) else {
+            continue;
+        };
+        let root = dir_of(&workspace);
+        let view = ProjectView::Disk(&root);
+        if crate::utils::pnpm_workspace::root_accounts_for_member_lock(&view, rel).await {
+            governs_members |= workspace.is_empty();
+            dropped.insert(member);
+        }
+    }
+
+    roots.retain(|root| !dropped.contains(root));
+    DiskRoots {
+        roots,
+        governs_members,
+        truncated,
+    }
+}
+
 /// The candidate workspace members among the pnpm `roots` (#492): a root
 /// holding a `pnpm-lock.yaml` and no `pnpm-workspace.yaml` of its own, with
 /// a `pnpm-workspace.yaml` in a strict ancestor, paired with the nearest
@@ -312,6 +472,125 @@ mod tests {
             own.iter().copied(),
             Some(&cargo)
         ));
+    }
+
+    /// The disk walk finds the roots the path-list detection finds for
+    /// the same tree: lockfile directories at any depth, never a manifest
+    /// alone, never inside an installed, vendored or git-ignored tree.
+    #[tokio::test]
+    async fn roots_below_walks_a_checkout_like_the_tracked_file_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        // A repository, so the ignore files apply.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        write(".gitignore", "dist/\n");
+        for rel in [
+            "web/package-lock.json",
+            "web/package.json",
+            "api/requirements.txt",
+            "services/billing/go.mod",
+            "services/billing/go.sum",
+            "tools/only-manifest/package.json",
+            "web/node_modules/dep/package-lock.json",
+            "vendor/thing/Cargo.lock",
+            ".socket/vendor/npm/x/package-lock.json",
+            "dist/package-lock.json",
+            ".config/tool/yarn.lock",
+        ] {
+            write(rel, "x");
+        }
+        let all = |_: &str| true;
+
+        let found = roots_below(root, None, all).await;
+        assert!(!found.truncated && !found.governs_members);
+        assert_eq!(
+            found.roots,
+            [".config/tool", "api", "services/billing", "web"]
+        );
+
+        let only_npm = vec!["npm".to_string()];
+        assert_eq!(
+            roots_below(root, Some(&only_npm), all).await.roots,
+            [".config/tool", "web"]
+        );
+        // The walked directory itself is the root `""`.
+        assert_eq!(roots_below(&root.join("web"), None, all).await.roots, [""]);
+        assert_eq!(
+            roots_below(&root.join("tools"), None, all).await.roots,
+            [""; 0]
+        );
+    }
+
+    /// A workspace member whose lock the workspace root's run reads is not
+    /// a project of its own: a Cargo member's stray `Cargo.lock`, and a
+    /// pnpm member's lock under `sharedWorkspaceLockfile: false`. A member
+    /// holding another lock stays, and so does every member when the
+    /// workspace root is not going to be scanned.
+    #[tokio::test]
+    async fn roots_below_leaves_member_locks_to_the_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("rust/Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n");
+        write("rust/Cargo.lock", "version = 3\n");
+        for member in ["a", "b"] {
+            write(
+                &format!("rust/crates/{member}/Cargo.toml"),
+                &format!("[package]\nname = \"{member}\"\nversion = \"0.1.0\"\n"),
+            );
+            write(&format!("rust/crates/{member}/Cargo.lock"), "version = 3\n");
+        }
+        write("rust/crates/b/package-lock.json", "{}");
+        write("rust/outside/Cargo.lock", "version = 3\n");
+
+        write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\n",
+        );
+        write("package.json", "{\"name\": \"ws\"}");
+        for member in ["x", "y"] {
+            write(
+                &format!("packages/{member}/package.json"),
+                &format!("{{\"name\": \"{member}\"}}"),
+            );
+            write(
+                &format!("packages/{member}/pnpm-lock.yaml"),
+                "lockfileVersion: '9.0'\n",
+            );
+        }
+        write("unlisted/pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+
+        let found = roots_below(root, None, |_| true).await;
+        assert_eq!(
+            found.roots,
+            ["rust", "rust/crates/b", "rust/outside", "unlisted"]
+        );
+        assert!(found.governs_members, "the pnpm members are the root's");
+
+        let found = roots_below(root, None, |root| !root.is_empty() && root != "rust").await;
+        assert_eq!(
+            found.roots,
+            [
+                "packages/x",
+                "packages/y",
+                "rust",
+                "rust/crates/a",
+                "rust/crates/b",
+                "rust/outside",
+                "unlisted"
+            ],
+            "a workspace root that is not scanned takes no member's lock"
+        );
+        assert!(!found.governs_members);
     }
 
     fn roots(paths: &[&str]) -> Vec<String> {

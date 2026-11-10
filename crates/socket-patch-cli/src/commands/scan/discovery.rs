@@ -572,6 +572,7 @@ pub(crate) async fn nested_project_skips(
     crawled: &[socket_patch_core::crawlers::types::CrawledPackage],
     locked: &[LockfileEntry],
     with_patches: &[BatchPackagePatches],
+    also_scanned: &[std::path::PathBuf],
 ) -> (HashSet<PurlKey>, Vec<(String, String)>) {
     use socket_patch_core::hosted::governing_root::nested_npm_project;
     use std::collections::BTreeMap;
@@ -644,6 +645,11 @@ pub(crate) async fn nested_project_skips(
     let mut skipped = HashSet::new();
     for (purl, project) in candidates {
         let project = std::fs::canonicalize(&project).unwrap_or(project);
+        skipped.insert(PurlKey::new(&purl));
+        // This invocation scans that project too: nothing to advise.
+        if also_scanned.contains(&project) {
+            continue;
+        }
         let shown = shell_dir
             .as_deref()
             .and_then(|base| project.strip_prefix(base).ok())
@@ -651,7 +657,6 @@ pub(crate) async fn nested_project_skips(
             .unwrap_or(&project)
             .to_string_lossy()
             .replace('\\', "/");
-        skipped.insert(PurlKey::new(&purl));
         let locked = socket_patch_core::hosted::governing_root::has_own_npm_family_lock(&project);
         by_project
             .entry(shown)

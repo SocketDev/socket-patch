@@ -197,6 +197,55 @@ pub(crate) fn no_packages_message(
     "No packages found. Run your package manager's install first.".to_string()
 }
 
+/// A discovered project directory as the scan names it: relative to
+/// `--cwd`, `/`-separated.
+pub(super) fn shown_project_dir(cwd: &std::path::Path, dir: &std::path::Path) -> String {
+    dir.strip_prefix(cwd)
+        .unwrap_or(dir)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+/// What a bare scan's search for project directories left out, one line
+/// each: roots under an ignored path, and a walk that gave up.
+pub(super) fn discovery_notes(ignored: usize, truncated: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if ignored > 0 {
+        lines.push(format!(
+            "Note: {} under ignored paths (socket.yml path filters and the built-in \
+             test and fixture directories) {} not scanned; name a directory to scan it.",
+            plural(ignored, "project directory", "project directories"),
+            if ignored == 1 { "was" } else { "were" },
+        ));
+    }
+    if truncated {
+        lines.push(
+            "Warning: this directory tree is too large to search for project directories; \
+             some may have been missed. Name the project directories to scan them."
+                .to_string(),
+        );
+    }
+    lines
+}
+
+/// Warning code: a `--json` or `--vex` scan found more project
+/// directories than the one it can report on.
+pub(super) const PROJECTS_NOT_SCANNED: &str = "projects_not_scanned";
+
+/// The [`PROJECTS_NOT_SCANNED`] detail: which directories, and the run
+/// that covers each.
+pub(super) fn unscanned_projects_detail(dirs: &[String], json: bool) -> String {
+    let flag = if json { "--json" } else { "--vex" };
+    format!(
+        "{} below this one {} not scanned ({}): {flag} takes one project directory. \
+         Run one scan per directory, e.g. `socket-patch scan {}`",
+        plural(dirs.len(), "project directory", "project directories"),
+        if dirs.len() == 1 { "was" } else { "were" },
+        dirs.join(", "),
+        ui::shell_word(&dirs[0]),
+    )
+}
+
 /// `the given path: a` / `the given paths: a, b`.
 fn quoted_list(items: &[String], one: &str, many: &str) -> String {
     let label = if items.len() == 1 { one } else { many };
