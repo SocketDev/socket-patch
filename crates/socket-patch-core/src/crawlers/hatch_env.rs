@@ -92,7 +92,7 @@ pub(crate) async fn hatch_environments_with(
     }
     let root = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let config = read_config(var).await;
-    let configured = configured_envs(pyproject.as_ref(), hatch_toml.as_ref());
+    let (configured, matrix_cut) = configured_envs(pyproject.as_ref(), hatch_toml.as_ref());
     let project_name = pyproject.as_ref().and_then(project_name);
 
     let mut found: Vec<HatchEnvironment> = Vec::new();
@@ -154,6 +154,11 @@ pub(crate) async fn hatch_environments_with(
                     }
                 }
             }
+            // The matrix names are the only way into this directory, so
+            // the ones not read are environments not looked at.
+            if let Some(file) = matrix_cut {
+                warn_matrix_cut(&cwd.join(file), &env_dir);
+            }
             // `hatch test` (Hatch 1.10+) installs the project into the
             // internal `hatch-test.<python>` matrix, whose default Python
             // list varies by Hatch release. A project's
@@ -161,7 +166,7 @@ pub(crate) async fn hatch_environments_with(
             // so the default matrix stays unless the project sets its own.
             let own_test_matrix = configured
                 .iter()
-                .any(|e| e.name == "hatch-test" && !e.matrix_names.is_empty());
+                .any(|e| e.name == "hatch-test" && e.has_matrix);
             if !own_test_matrix {
                 for (dir_name, prefix) in subdirs(&env_dir) {
                     if dir_name.starts_with("hatch-test.") {
@@ -179,6 +184,22 @@ pub(crate) async fn hatch_environments_with(
     found
 }
 
+/// Say once (muted only by `--silent`) that `file`'s matrices name more
+/// environments than were looked for in the shared `env_dir`, instead of
+/// reporting the ones read as all there are.
+fn warn_matrix_cut(file: &Path, env_dir: &Path) {
+    static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    crate::utils::notice::notice_once(crate::utils::notice::Notice::Warning, &SHOWN, || {
+        format!(
+            "Warning: {} declares more than {MAX_MATRIX_ENVS} Hatch matrix environments. Only \
+             the first {MAX_MATRIX_ENVS} were looked for in {}, so packages installed in the \
+             others were not scanned.",
+            file.display(),
+            env_dir.display()
+        )
+    });
+}
+
 /// `default` is stored under the project's name; every other env under its
 /// own.
 fn env_name_for(dir_name: &str, project_name: &str) -> String {
@@ -193,7 +214,11 @@ fn env_name_for(dir_name: &str, project_name: &str) -> String {
 struct ConfiguredEnv {
     name: String,
     path: Option<String>,
-    /// The names its `matrix` generates; empty without one.
+    /// Whether its `matrix` generates env names: Hatch then creates
+    /// those, not the env itself.
+    has_matrix: bool,
+    /// The names its `matrix` generates ([`matrix_names`]), as far as the
+    /// project's [`MAX_MATRIX_ENVS`] reaches.
     matrix_names: Vec<String>,
 }
 
@@ -201,34 +226,55 @@ impl ConfiguredEnv {
     /// The env names Hatch creates from this entry: the matrix variants,
     /// or the env itself without a matrix.
     fn generated_names(&self) -> Vec<String> {
-        if self.matrix_names.is_empty() {
-            vec![self.name.clone()]
-        } else {
+        if self.has_matrix {
             self.matrix_names.clone()
+        } else {
+            vec![self.name.clone()]
         }
     }
 }
 
+/// Most matrix combinations read from one project's Hatch config. A matrix
+/// is a product, so ten lines of TOML can name billions of environments;
+/// each one is a virtualenv Hatch has to build on disk (a `pip install`
+/// and tens of megabytes apiece), and the widest matrices projects keep
+/// are a few dozen (five Pythons by a handful of dependency versions).
+const MAX_MATRIX_ENVS: usize = 1024;
+
+/// Longest env name read from a matrix, in bytes. The name is a directory
+/// name, and no filesystem this runs on holds a longer one.
+const MAX_ENV_NAME_LEN: usize = 255;
+
+/// Longest `matrix-name-format`, with its `{variable}` filled in, that a
+/// name is rendered from: a format repeating its placeholders would
+/// otherwise multiply a long value into gigabytes.
+const MAX_NAME_FORMAT_LEN: usize = 4096;
+
 /// `[tool.hatch.envs.*]` from pyproject, unless hatch.toml carries `envs`
 /// (Hatch then reads hatch.toml's `[envs.*]` only). Envs whose `type` is
-/// not `virtual` are left out.
+/// not `virtual` are left out. With them, the file whose matrices name
+/// more than [`MAX_MATRIX_ENVS`] combinations, the ones past that left
+/// out of [`ConfiguredEnv::matrix_names`].
 fn configured_envs(
     pyproject: Option<&DocumentMut>,
     hatch_toml: Option<&DocumentMut>,
-) -> Vec<ConfiguredEnv> {
-    let table = hatch_toml
-        .and_then(|doc| doc.get("envs"))
-        .or_else(|| {
+) -> (Vec<ConfiguredEnv>, Option<&'static str>) {
+    let (file, envs) = match hatch_toml.and_then(|doc| doc.get("envs")) {
+        Some(envs) => ("hatch.toml", Some(envs)),
+        None => (
+            "pyproject.toml",
             pyproject
                 .and_then(|doc| doc.get("tool"))
                 .and_then(|tool| tool.get("hatch"))
-                .and_then(|hatch| hatch.get("envs"))
-        })
-        .and_then(Item::as_table_like);
-    let Some(table) = table else {
-        return Vec::new();
+                .and_then(|hatch| hatch.get("envs")),
+        ),
     };
-    table
+    let Some(table) = envs.and_then(Item::as_table_like) else {
+        return (Vec::new(), None);
+    };
+    let mut combinations = MAX_MATRIX_ENVS;
+    let mut cut = false;
+    let envs = table
         .iter()
         .filter_map(|(name, item)| {
             let env = item.as_table_like()?;
@@ -239,6 +285,8 @@ fn configured_envs(
             {
                 return None;
             }
+            let matrix = matrix_names(name, env, &mut combinations);
+            cut |= matrix.cut;
             Some(ConfiguredEnv {
                 name: name.to_string(),
                 path: env
@@ -246,10 +294,24 @@ fn configured_envs(
                     .and_then(Item::as_str)
                     .filter(|p| !p.is_empty())
                     .map(str::to_string),
-                matrix_names: matrix_names(name, env),
+                has_matrix: matrix.generates,
+                matrix_names: matrix.names,
             })
         })
-        .collect()
+        .collect();
+    (envs, cut.then_some(file))
+}
+
+/// What an env's `matrix` generates ([`matrix_names`]).
+#[derive(Default)]
+struct Matrix {
+    /// Some matrix table has variables, each with a value: the matrix
+    /// names at least one env.
+    generates: bool,
+    names: Vec<String>,
+    /// The project's combinations ran out before this matrix was read
+    /// through.
+    cut: bool,
 }
 
 /// The env names an env's `matrix` generates, as
@@ -259,7 +321,16 @@ fn configured_envs(
 /// `{value}`), joined with `-` and prefixed `<env>.` unless the env is
 /// `default`. A format set by overrides or inherited through `template`
 /// is not modelled.
-fn matrix_names(env_name: &str, env: &dyn toml_edit::TableLike) -> Vec<String> {
+///
+/// The product is walked one combination at a time, each taking one of
+/// the project's `combinations` ([`MAX_MATRIX_ENVS`]), and stops when
+/// they run out. A name longer than [`MAX_ENV_NAME_LEN`] names no
+/// directory, so it is not built.
+fn matrix_names(
+    env_name: &str,
+    env: &dyn toml_edit::TableLike,
+    combinations: &mut usize,
+) -> Matrix {
     let format = env
         .get("matrix-name-format")
         .and_then(Item::as_str)
@@ -275,9 +346,14 @@ fn matrix_names(env_name: &str, env: &dyn toml_edit::TableLike) -> Vec<String> {
             .filter_map(|v| v.as_inline_table())
             .map(|t| t as &dyn toml_edit::TableLike)
             .collect(),
-        _ => return Vec::new(),
+        _ => return Matrix::default(),
     };
-    let mut names = Vec::new();
+    let prefix = if env_name == "default" {
+        String::new()
+    } else {
+        format!("{env_name}.")
+    };
+    let mut matrix = Matrix::default();
     for table in tables {
         let mut variables: Vec<(&str, Vec<&str>)> = table
             .iter()
@@ -297,45 +373,96 @@ fn matrix_names(env_name: &str, env: &dyn toml_edit::TableLike) -> Vec<String> {
             let entry = variables.remove(index);
             variables.insert(0, entry);
         }
-        let mut parts: Vec<Vec<String>> = vec![Vec::new()];
-        for (position, (variable, values)) in variables.iter().enumerate() {
-            let rendered: Vec<String> = values
-                .iter()
-                .map(|value| {
-                    if position == 0 && python.is_some() {
-                        if value.starts_with("py") {
-                            value.to_string()
-                        } else {
-                            format!("py{value}")
-                        }
-                    } else {
-                        format
-                            .replace("{variable}", variable)
-                            .replace("{value}", value)
-                    }
-                })
-                .collect();
-            parts = parts
-                .iter()
-                .flat_map(|prefix| {
-                    rendered.iter().map(move |part| {
-                        let mut next = prefix.clone();
-                        next.push(part.clone());
-                        next
-                    })
-                })
-                .collect();
+        // No variable, or one without a value: the product is empty.
+        if variables.is_empty() || variables.iter().any(|(_, values)| values.is_empty()) {
+            continue;
         }
-        for name in parts.into_iter().filter(|p| !p.is_empty()) {
-            let name = name.join("-");
-            names.push(if env_name == "default" {
-                name
-            } else {
-                format!("{env_name}.{name}")
-            });
+        matrix.generates = true;
+        // A name holds a `-` between every two parts, so more variables
+        // than that make every name too long.
+        if variables.len() > MAX_ENV_NAME_LEN + 1 {
+            continue;
+        }
+        // Each value as the part of a name it becomes; `None` for one too
+        // long to be in any.
+        let rendered: Vec<Vec<Option<String>>> = variables
+            .iter()
+            .enumerate()
+            .map(|(position, (variable, values))| {
+                if position == 0 && python.is_some() {
+                    return values
+                        .iter()
+                        .map(|value| {
+                            (value.len() <= MAX_ENV_NAME_LEN).then(|| {
+                                if value.starts_with("py") {
+                                    value.to_string()
+                                } else {
+                                    format!("py{value}")
+                                }
+                            })
+                        })
+                        .collect();
+                }
+                let named = replace_within(format, "{variable}", variable, MAX_NAME_FORMAT_LEN);
+                values
+                    .iter()
+                    .map(|value| {
+                        replace_within(named.as_deref()?, "{value}", value, MAX_ENV_NAME_LEN)
+                    })
+                    .collect()
+            })
+            .collect();
+        // The combination being read: an index into each variable's
+        // values, the last variable's turning fastest.
+        let mut at = vec![0usize; rendered.len()];
+        'combinations: loop {
+            let Some(left) = combinations.checked_sub(1) else {
+                matrix.cut = true;
+                return matrix;
+            };
+            *combinations = left;
+            let parts: Option<Vec<&str>> = at
+                .iter()
+                .zip(&rendered)
+                .map(|(&value, values)| values[value].as_deref())
+                .collect();
+            if let Some(parts) = parts {
+                let len =
+                    prefix.len() + parts.iter().map(|p| p.len()).sum::<usize>() + parts.len() - 1;
+                if len <= MAX_ENV_NAME_LEN {
+                    matrix.names.push(format!("{prefix}{}", parts.join("-")));
+                }
+            }
+            for position in (0..at.len()).rev() {
+                at[position] += 1;
+                if at[position] < rendered[position].len() {
+                    continue 'combinations;
+                }
+                at[position] = 0;
+            }
+            break;
         }
     }
-    names
+    matrix
+}
+
+/// `text` with every `from` replaced by `to`, or `None` when the result
+/// is longer than `max` bytes (found out before it is built).
+fn replace_within(text: &str, from: &str, to: &str, max: usize) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find(from) {
+        if out.len() + at + to.len() > max {
+            return None;
+        }
+        out.push_str(&rest[..at]);
+        out.push_str(to);
+        rest = &rest[at + from.len()..];
+    }
+    (out.len() + rest.len() <= max).then(|| {
+        out.push_str(rest);
+        out
+    })
 }
 
 /// The PEP 503-normalized `[project] name` (hatchling's
@@ -833,6 +960,186 @@ mod tests {
                 "test.py3.12-a"
             ]
         );
+    }
+
+    /// `count` values `v0`, `v1`, … as a TOML array.
+    fn values(count: usize) -> String {
+        let quoted: Vec<String> = (0..count).map(|i| format!("\"v{i}\"")).collect();
+        format!("[{}]", quoted.join(", "))
+    }
+
+    /// A matrix is a product: five variables of twelve values name
+    /// 248,832 environments (and eight of sixteen, four billion). Only the
+    /// first [`MAX_MATRIX_ENVS`] combinations are looked for in the shared
+    /// `~/.virtualenvs`, in Hatch's order, so the list a project file
+    /// costs is bounded.
+    #[tokio::test]
+    async fn shared_virtualenvs_dir_reads_a_matrix_up_to_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        let twelve = values(12);
+        std::fs::write(
+            project.join("pyproject.toml"),
+            format!(
+                "{PYPROJECT}\n[tool.hatch.envs.test]\n\
+                 matrix = [{{ a = {twelve}, b = {twelve}, c = {twelve}, d = {twelve}, \
+                 e = {twelve} }}]\n\n\
+                 [tool.hatch.envs.docs]\n"
+            ),
+        )
+        .unwrap();
+        let config = tmp.path().join("hatch-config.toml");
+        std::fs::write(&config, "[dirs.env]\nvirtual = \"~/.virtualenvs\"\n").unwrap();
+        let shared = home.join(".virtualenvs");
+        // The first combination, the last one inside the cap (1,024 =
+        // 7 × 144 + 1 × 12 + 4), the one after it, and the very last.
+        for name in [
+            "test.v0-v0-v0-v0-v0",
+            "test.v0-v0-v7-v1-v3",
+            "test.v0-v0-v7-v1-v4",
+            "test.v11-v11-v11-v11-v11",
+            "docs",
+        ] {
+            make_venv(&shared.join(name));
+        }
+        let var = env_of(&[
+            ("HATCH_CONFIG", config.display().to_string()),
+            ("HOME", home.display().to_string()),
+        ]);
+        let names: Vec<String> = hatch_environments_with(&project, &var)
+            .await
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(
+            names,
+            ["test.v0-v0-v0-v0-v0", "test.v0-v0-v7-v1-v3", "docs"]
+        );
+    }
+
+    /// The names a config's matrices generate, per env, and the file named
+    /// as cut.
+    fn generated(
+        pyproject: &str,
+        hatch_toml: Option<&str>,
+    ) -> (Vec<Vec<String>>, Option<&'static str>) {
+        let pyproject: DocumentMut = pyproject.parse().unwrap();
+        let hatch_toml: Option<DocumentMut> = hatch_toml.map(|text| text.parse().unwrap());
+        let (envs, cut) = configured_envs(Some(&pyproject), hatch_toml.as_ref());
+        (
+            envs.iter().map(ConfiguredEnv::generated_names).collect(),
+            cut,
+        )
+    }
+
+    /// The cap is the project's, not each matrix's: the combinations are
+    /// counted across every env and matrix table of the file, in order,
+    /// and the file that holds them is the one named.
+    #[test]
+    fn matrix_combinations_are_counted_across_the_project() {
+        // 16^5 combinations in one table.
+        let sixteen = values(16);
+        let wide = format!(
+            "[tool.hatch.envs.default]\n\
+             matrix = [{{ a = {sixteen}, b = {sixteen}, c = {sixteen}, d = {sixteen}, \
+             e = {sixteen} }}]\n"
+        );
+        let (names, cut) = generated(&wide, None);
+        assert_eq!(names[0].len(), MAX_MATRIX_ENVS);
+        assert_eq!(names[0][0], "v0-v0-v0-v0-v0");
+        assert_eq!(names[0][MAX_MATRIX_ENVS - 1], "v0-v0-v3-v15-v15");
+        assert_eq!(cut, Some("pyproject.toml"));
+
+        // Exactly the cap is read whole.
+        let (names, cut) = generated(
+            &format!(
+                "[tool.hatch.envs.a]\nmatrix = [{{ x = {}, y = {} }}]\n",
+                values(32),
+                values(32)
+            ),
+            None,
+        );
+        assert_eq!((names[0].len(), cut), (MAX_MATRIX_ENVS, None));
+        assert_eq!(names[0][MAX_MATRIX_ENVS - 1], "a.v31-v31");
+
+        // One past it, in a later env's second table, is cut; an env
+        // after the cut generates nothing, and is still not looked for
+        // under its own name (Hatch creates its matrix names only).
+        let spread = format!(
+            "[envs.a]\nmatrix = [{{ x = {}, y = {} }}, {{ z = {} }}]\n\n\
+             [envs.b]\nmatrix = [{{ x = {} }}, {{ y = {} }}]\n\n\
+             [envs.c]\nmatrix = [{{ x = {} }}]\n\n[envs.plain]\n",
+            values(30),
+            values(30),
+            values(100),
+            values(20),
+            values(5),
+            values(3),
+        );
+        let (names, cut) = generated("[project]\nname = \"x\"\n", Some(&spread));
+        let counts: Vec<usize> = names.iter().map(Vec::len).collect();
+        assert_eq!(counts, [1000, 24, 0, 1]);
+        assert_eq!(names[1][23], "b.v3");
+        assert_eq!(names[3], ["plain"]);
+        assert_eq!(cut, Some("hatch.toml"));
+    }
+
+    /// A name longer than a directory name is not built, however it comes
+    /// about: a long value, a format that repeats its placeholders, or
+    /// more variables than a name has room for. Each combination still
+    /// counts, so a matrix of nothing but such names ends at the cap too.
+    #[test]
+    fn matrix_names_longer_than_a_directory_name_are_not_built() {
+        let long = "x".repeat(300);
+        let (names, cut) = generated(
+            &format!(
+                "[tool.hatch.envs.test]\n\
+                 matrix = [{{ python = [\"3.12\", \"{long}\"], dep = [\"a\", \"{long}\"] }}]\n"
+            ),
+            None,
+        );
+        assert_eq!(names, [["test.py3.12-a"]]);
+        assert_eq!(cut, None);
+
+        // 2,000 `{value}` of a 2,000-byte value would be a 4 MB name per
+        // value, and `{variable}` filled in the same way.
+        let value = "y".repeat(2_000);
+        let repeated = format!(
+            "[tool.hatch.envs.test]\n\
+             matrix-name-format = \"{}\"\n\
+             matrix = [{{ {} = [\"{value}\", \"ok\"] }}]\n",
+            "{variable}{value}".repeat(2_000),
+            "v".repeat(2_000),
+        );
+        let (names, cut) = generated(&repeated, None);
+        assert_eq!(names, [Vec::<String>::new()]);
+        assert_eq!(cut, None);
+
+        // 300 one-value variables: a 599-byte name, once.
+        let variables: Vec<String> = (0..300).map(|i| format!("k{i} = [\"a\"]")).collect();
+        let (names, cut) = generated(
+            &format!(
+                "[tool.hatch.envs.test]\nmatrix = [{{ {} }}]\n",
+                variables.join(", ")
+            ),
+            None,
+        );
+        assert_eq!(names, [Vec::<String>::new()]);
+        assert_eq!(cut, None);
+
+        // Too long in every combination: the walk still ends at the cap.
+        let (names, cut) = generated(
+            &format!(
+                "[tool.hatch.envs.{long}]\nmatrix = [{{ a = {}, b = {} }}]\n",
+                values(100),
+                values(100)
+            ),
+            None,
+        );
+        assert_eq!(names, [Vec::<String>::new()]);
+        assert_eq!(cut, Some("pyproject.toml"));
     }
 
     /// Hatch decides "inside the project" on the resolved directory
