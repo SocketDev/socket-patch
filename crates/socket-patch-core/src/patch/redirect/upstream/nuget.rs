@@ -151,9 +151,12 @@ fn drop_fanout_mapping(config: &str) -> String {
 /// beats the longest `prefix*`, which beats `*`)?
 fn pattern_score(pattern: &str, id: &str) -> Option<usize> {
     match pattern.strip_suffix('*') {
-        Some(prefix) => (id.len() >= prefix.len()
-            && id[..prefix.len()].eq_ignore_ascii_case(prefix))
-        .then_some(prefix.len()),
+        // `get`: an id shorter than the prefix, or one with a multi-byte
+        // character across the prefix's length, does not start with it.
+        Some(prefix) => id
+            .get(..prefix.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+            .then_some(prefix.len()),
         None => pattern.eq_ignore_ascii_case(id).then_some(usize::MAX),
     }
 }
@@ -397,6 +400,26 @@ mod tests {
             pattern_score("Newtonsoft.Json.Bson", "Newtonsoft.Json"),
             None
         );
+    }
+
+    /// NuGet ids admit Unicode letters and a `nuget.config` is a project
+    /// file: a prefix pattern whose byte length falls inside a character of
+    /// the id is a pattern that does not match, not a slice to take.
+    #[test]
+    fn pattern_scores_never_split_a_character_of_the_id() {
+        assert_eq!(pattern_score("A*", "Ünicode.Pkg"), None);
+        assert_eq!(pattern_score("Ün*", "Ünicode.Pkg"), Some(3));
+        assert_eq!(pattern_score("Ü*", "Ünicode.Pkg"), Some(2));
+        assert_eq!(pattern_score("Ünicode.Pkg.Extra*", "Ünicode.Pkg"), None);
+        assert_eq!(pattern_score("abc*", "日本"), None);
+        assert_eq!(pattern_score("*", "日本"), Some(0));
+        // The whole restore check, on the config that reaches it.
+        let mapped = cfg(
+            r#"<configuration><packageSources><add key="nuget.org" value="https://api.nuget.org/v3/index.json" /><add key="corp" value="https://corp/v3/index.json" /></packageSources><packageSourceMapping><packageSource key="nuget.org"><package pattern="*" /></packageSource><packageSource key="corp"><package pattern="A*" /></packageSource></packageSourceMapping></configuration>"#,
+        );
+        assert!(check_upstream_feed(&mapped, "Ünicode.Pkg", "nuget.config").is_ok());
+        let why = check_upstream_feed(&mapped, "Abc", "nuget.config").unwrap_err();
+        assert!(why.contains("corp"), "{why}");
     }
 
     fn cfg(text: &str) -> NugetConfig {
