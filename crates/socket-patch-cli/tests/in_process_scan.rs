@@ -774,6 +774,147 @@ async fn scan_prune_only_wet_removes_orphans() {
     );
 }
 
+/// A manifest record with one patched file, and its two blobs on disk.
+fn write_record_with_blobs(root: &Path, purls: &[&str]) {
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    let mut patches = serde_json::Map::new();
+    for (i, purl) in purls.iter().enumerate() {
+        let (before, after) = (format!("{:064x}", 0xb0 + i), format!("{:064x}", 0xa0 + i));
+        for blob in [&before, &after] {
+            std::fs::write(socket.join("blobs").join(blob), "blob").unwrap();
+        }
+        patches.insert(
+            purl.to_string(),
+            serde_json::json!({
+                "uuid": format!("5555555{i}-5555-4555-8555-555555555555"),
+                "exportedAt": "2024-01-01T00:00:00Z",
+                "files": { "index.js": { "beforeHash": before, "afterHash": after } },
+                "vulnerabilities": {},
+                "description": "record", "license": "MIT", "tier": "free"
+            }),
+        );
+    }
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({ "patches": patches }).to_string(),
+    )
+    .unwrap();
+}
+
+fn manifest_purls(root: &Path) -> Vec<String> {
+    let body = std::fs::read_to_string(root.join(".socket/manifest.json")).unwrap();
+    let manifest: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut purls: Vec<String> = manifest["patches"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .cloned()
+        .collect();
+    purls.sort();
+    purls
+}
+
+fn blob_count(root: &Path) -> usize {
+    std::fs::read_dir(root.join(".socket/blobs")).map_or(0, |dir| dir.count())
+}
+
+/// Both scopes share `<cwd>/.socket/manifest.json`, and a global run crawls
+/// only the global installs. Its prune must not read the project's records
+/// as uninstalled: dropping them deletes the blobs the project's `apply`
+/// and `rollback` need. Only the entry neither scope accounts for goes.
+#[tokio::test]
+#[serial]
+async fn scan_global_prune_keeps_the_projects_entries() {
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let project = tmp.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    write_root_package_json(&project);
+    write_npm_package(&project, "project-only", "1.0.0");
+    // Lockfile-listed, not installed: the project's own prune keeps it.
+    std::fs::write(
+        project.join("package-lock.json"),
+        r#"{ "name": "in-proc-scan-test", "version": "0.0.0", "lockfileVersion": 3,
+            "packages": {
+              "": { "name": "in-proc-scan-test", "version": "0.0.0" },
+              "node_modules/project-only": { "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/project-only/-/project-only-1.0.0.tgz" },
+              "node_modules/locked-only": { "version": "1.0.0",
+                "resolved": "https://registry.npmjs.org/locked-only/-/locked-only-1.0.0.tgz" }
+            } }"#,
+    )
+    .unwrap();
+    write_record_with_blobs(
+        &project,
+        &[
+            "pkg:npm/project-only@1.0.0",
+            "pkg:npm/locked-only@1.0.0",
+            "pkg:npm/installed-nowhere@1.0.0",
+        ],
+    );
+    let global_root = tmp.path().join("global/lib");
+    write_npm_package(&global_root, "global-pkg", "2.0.0");
+    let global = global_root.join("node_modules");
+
+    for dry_run in [true, false] {
+        let mut args = default_args(&project);
+        args.common.api_url = Some(server.uri());
+        args.common.global_prefix = Some(global.clone());
+        args.common.dry_run = dry_run;
+        args.prune = true;
+        assert_eq!(run_scrubbed(args).await, 0);
+    }
+
+    assert_eq!(
+        manifest_purls(&project),
+        ["pkg:npm/locked-only@1.0.0", "pkg:npm/project-only@1.0.0"],
+        "a global prune drops only what neither scope accounts for"
+    );
+    assert_eq!(blob_count(&project), 4, "the kept records keep their blobs");
+}
+
+/// A prune whose manifest rewrite fails has pruned nothing: the manifest on
+/// disk still names every entry, so their blobs must survive the sweep.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn scan_prune_keeps_blobs_when_the_manifest_cannot_be_rewritten() {
+    use std::os::unix::fs::PermissionsExt;
+    let server = MockServer::start().await;
+    mock_batch_empty(&server).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_root_package_json(tmp.path());
+    write_npm_package(tmp.path(), "still-installed", "1.0.0");
+    write_record_with_blobs(tmp.path(), &["pkg:npm/orphan@1.0.0"]);
+    let socket = tmp.path().join(".socket");
+    // The lock file exists already, so the read-only directory refuses only
+    // the manifest's staged rewrite. `blobs/` stays writable.
+    std::fs::write(socket.join("apply.lock"), "").unwrap();
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let read_only = std::fs::write(socket.join("probe"), "").is_err();
+
+    let mut args = default_args(tmp.path());
+    args.common.api_url = Some(server.uri());
+    args.prune = true;
+    let code = run_scrubbed(args).await;
+    std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !read_only {
+        return; // root ignores the mode bits; nothing to observe
+    }
+
+    assert_eq!(code, 0, "a GC that could not run does not fail the scan");
+    assert_eq!(manifest_purls(tmp.path()), ["pkg:npm/orphan@1.0.0"]);
+    assert_eq!(
+        blob_count(tmp.path()),
+        2,
+        "the entry is still in the manifest, so its blobs are still referenced"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // --sync (== --mode agent --prune)
 // ---------------------------------------------------------------------------

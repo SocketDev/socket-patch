@@ -47,11 +47,12 @@ pub(super) struct GcSummary {
     /// its whole mutating half (`lock_held` or `lock_io`). Never set in
     /// preview mode.
     skipped: Option<(&'static str, String)>,
-    /// Post-revert/prune rewrites that failed (`vendor_state_write_failed`
-    /// / `manifest_write_failed`) and orphan sweeps that could not finish
-    /// (`cleanup_failed`: the removed counts above are what it did
-    /// reclaim). The mutations already happened on disk, so the stale
-    /// record is reported, not the pass failed. Also the vendored reverts'
+    /// A post-revert ledger rewrite that failed (`vendor_state_write_failed`:
+    /// the reverts already happened on disk, so the stale record is
+    /// reported, not the pass failed), a manifest prune that could not be
+    /// written (`manifest_write_failed`: nothing was pruned or swept), and
+    /// orphan sweeps that could not finish (`cleanup_failed`: the removed
+    /// counts above are what it did reclaim). Also the vendored reverts'
     /// reinstall advisories, and `manifest_invalid` / `manifest_unreadable`
     /// when the manifest half could not load the manifest.
     warnings: Vec<(&'static str, String)>,
@@ -258,30 +259,62 @@ pub(super) async fn run_apply_gc(
         Err(e) => return GcSummary::manifest_unloadable(vendor_gc, manifest_path, &e),
     };
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    keep_project_entries(common, &mut prunable).await;
     let kept = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     for purl in &prunable {
         manifest.patches.remove(purl);
     }
-    let mut write_failure = None;
     if !prunable.is_empty() {
-        // The entries stay listed as pruned: they are gone from the
-        // in-memory copy the sweep below works from.
         if let Err(e) = write_manifest(manifest_path, &manifest).await {
-            write_failure = Some((
+            // The manifest on disk still names every entry, so nothing was
+            // pruned and every blob is still referenced: no sweep.
+            let mut gc = GcSummary::vendor_only(vendor_gc);
+            gc.warnings.extend(kept);
+            gc.warnings.push((
                 "manifest_write_failed",
                 format!(
-                    "pruned {} but could not update {}: {e}",
+                    "could not prune {}: updating {} failed ({e}); nothing was removed",
                     plural(prunable.len(), "manifest entry", "manifest entries"),
                     manifest_path.display()
                 ),
             ));
+            return gc;
         }
     }
     let mut gc = run_gc(&manifest, prunable, socket_dir, /*dry_run=*/ false).await;
     gc.absorb_vendor_gc(vendor_gc);
     gc.warnings.extend(kept);
-    gc.warnings.extend(write_failure);
     gc
+}
+
+/// Under global scope, drop from `prunable` every entry the `--cwd` project
+/// still accounts for.
+///
+/// Both scopes share one manifest, and a global run crawls only the global
+/// installs. Against that crawl alone every record of the project reads as
+/// uninstalled, and pruning it deletes the blobs the project's `apply` and
+/// `rollback` need. What the project accounts for is what its own `--prune`
+/// judges against: its installed packages and the ones only its lockfiles
+/// list (its vendored entries are exempt already).
+async fn keep_project_entries(common: &GlobalArgs, prunable: &mut Vec<String>) {
+    if !common.is_global() || prunable.is_empty() {
+        return;
+    }
+    let project = GlobalArgs {
+        global: false,
+        global_prefix: None,
+        ..common.clone()
+    };
+    let (installed, _, _) =
+        crate::ecosystem_dispatch::crawl_ecosystems(&project.crawler_options(), None).await;
+    let ctx = crate::commands::context::ProjectContext::new(&project);
+    let locked = &ctx.locks().await.entries;
+    let accounted: HashSet<PurlKey> = installed
+        .iter()
+        .map(|pkg| PurlKey::new(&pkg.purl))
+        .chain(locked.iter().map(|entry| PurlKey::new(&entry.purl)))
+        .collect();
+    prunable.retain(|purl| !accounted.contains(&PurlKey::new(purl)));
 }
 
 /// Whether the vendored-state ledger exists. Checked before the lock,
@@ -407,6 +440,7 @@ async fn preview_apply_gc(
         }
     }
     let mut prunable = detect_prunable(&manifest, scanned_purls, vendored);
+    keep_project_entries(common, &mut prunable).await;
     let _ = keep_patched_cargo_copies(common, &manifest, socket_dir, &mut prunable).await;
     // The sweep derives the referenced set from this in-memory manifest.
     for purl in &prunable {
