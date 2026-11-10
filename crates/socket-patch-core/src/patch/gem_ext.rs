@@ -125,6 +125,19 @@ impl GemCopy {
     /// The copy at `pkg_path`, when it sits in a RubyGems `gems/` dir.
     /// Whether its spec exists is checked by the caller.
     fn of(pkg_path: &Path) -> Option<GemCopy> {
+        // Absolute, because a build runs Ruby from the project dir and
+        // `extconf.rb` from the ext dir: a relative crawl root (`--cwd .`,
+        // `--cwd proj`) would leave the spec path and `GEM_PATH` pointing
+        // nowhere, and an `extconf.rb` that loads `mini_portile2` (nokogiri)
+        // from the copy's own home would fail to build. `..` is dropped
+        // lexically, as Ruby's `File.expand_path` drops it from the spec
+        // path, so both name the same gem dir. A rooted path is kept as is.
+        let pkg_path = if pkg_path.has_root() {
+            pkg_path.to_path_buf()
+        } else {
+            crate::utils::relpath::absolute_lexically(pkg_path)
+        };
+        let pkg_path = pkg_path.as_path();
         let full_name = pkg_path.file_name()?.to_str()?.to_string();
         let gems = pkg_path.parent()?;
         if gems.file_name()? != "gems" {
@@ -802,7 +815,7 @@ struct BackupInfo {
 /// [`BuildMarker::extension_dir`] for `ext_dir` (one of the copy's
 /// installed extension dirs, [`find_ruby`]): relative to `home`, compared
 /// canonically too (Ruby and the crawler may spell the same dir
-/// differently: a relative crawl root, `/tmp` vs `/private/tmp`), so the
+/// differently through a symlink: `/tmp` vs `/private/tmp`), so the
 /// record survives the project moving.
 fn ext_dir_label(home: &Path, ext_dir: &Path) -> String {
     let canonical_rel = || {
@@ -1629,6 +1642,22 @@ mod tests {
             Path::new("/h/specifications/json-2.10.1.gemspec")
         );
         assert!(GemCopy::of(Path::new("/h/bundler/gems2/json-abc")).is_none());
+    }
+
+    /// A relative crawl root reaches Ruby (run from the project dir) and
+    /// `extconf.rb` (run from the ext dir) as absolute paths, `..` dropped
+    /// the way Ruby's `File.expand_path` drops it.
+    #[test]
+    fn gem_copy_of_a_relative_path_is_absolute() {
+        let copy = GemCopy::of(Path::new("proj/../vendor/ruby/3.4.0/gems/json-2.10.1")).unwrap();
+        let expected = std::env::current_dir().unwrap().join("vendor/ruby/3.4.0");
+        assert_eq!(copy.home, expected);
+        assert!(copy.spec_path.is_absolute());
+        assert!(copy.gem_dir.is_absolute());
+        assert!(!copy
+            .gem_dir
+            .components()
+            .any(|c| c == std::path::Component::ParentDir));
     }
 
     #[test]

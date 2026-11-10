@@ -303,6 +303,120 @@ fn native_patch_that_does_not_build_is_put_back() {
     assert_eq!(walk_files(&ext_dir), built_before);
 }
 
+/// An `extconf.rb` that, like nokogiri's (which activates `mini_portile2`),
+/// loads a helper gem installed beside the copy in the same home.
+const EXTCONF_WITH_HELPER: &str = "gem \"sp_helper\"\nrequire \"sp_helper\"\n\
+                                   require \"mkmf\"\ncreate_makefile(\"sp_native/sp_native\")\n";
+
+/// Build the pure-Ruby `sp_helper` gem in `scratch` (outside the project)
+/// and install it into `home`.
+fn install_helper_gem(scratch: &Path, home: &Path) {
+    let src = scratch.join("sp_helper-src");
+    let user_home = scratch.join("gem-user-home");
+    std::fs::create_dir_all(src.join("lib")).unwrap();
+    std::fs::write(src.join("lib/sp_helper.rb"), "module SpHelper; end\n").unwrap();
+    std::fs::write(
+        src.join("sp_helper.gemspec"),
+        "Gem::Specification.new do |s|\n  s.name = \"sp_helper\"\n  s.version = \"1.0.0\"\n  \
+         s.summary = \"t\"\n  s.authors = [\"t\"]\n  s.files = [\"lib/sp_helper.rb\"]\nend\n",
+    )
+    .unwrap();
+    for (args, dir) in [
+        (vec!["build", "sp_helper.gemspec"], src.clone()),
+        (
+            vec![
+                "install",
+                "--local",
+                "--no-document",
+                "--install-dir",
+                home.to_str().unwrap(),
+                "sp_helper-1.0.0.gem",
+            ],
+            src.clone(),
+        ),
+    ] {
+        let out = Command::new("gem")
+            .args(&args)
+            .current_dir(&dir)
+            .env("HOME", &user_home)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "gem {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// A crawl root spelled relative (`--cwd proj`, or the default `.`) used
+/// to reach the build as a relative spec path and `GEM_PATH`, which Ruby
+/// resolves from the project dir and `extconf.rb` from the ext dir: the
+/// build could not load a gem from the copy's own home, so nokogiri
+/// (`mini_portile2`) failed with `native_extension_build_failed`.
+#[test]
+#[ignore = "host capstone: compiles a C extension with the real ruby/gem toolchain; \
+            the unpinned `test` job skips it, the pinned-Ruby e2e leg runs it via --ignored"]
+fn native_patch_builds_from_a_relative_crawl_root() {
+    let Some(abi) = toolchain() else {
+        return;
+    };
+    let patched = c_source(2);
+    let fx = Fixture::new(&abi, &patched);
+    install_helper_gem(fx._tmp.path(), &fx.home);
+    let socket = fx.proj.join(".socket");
+    let entries = [
+        ("ext/sp_native/extconf.rb", EXTCONF, EXTCONF_WITH_HELPER),
+        (C_KEY, &c_source(1) as &str, &patched as &str),
+    ];
+    let hashes: Vec<(String, String)> = entries
+        .iter()
+        .map(|(_, b, a)| (git_sha256(b.as_bytes()), git_sha256(a.as_bytes())))
+        .collect();
+    let files: Vec<PatchEntry<'_>> = entries
+        .iter()
+        .zip(&hashes)
+        .map(|((key, _, _), (b, a))| PatchEntry {
+            file_name: key,
+            before_hash: b,
+            after_hash: a,
+        })
+        .collect();
+    // `rollback` drops the record and frees its blobs, so this runs twice.
+    let record = || {
+        write_minimal_manifest(&socket, PURL, UUID, &files);
+        for ((_, b, a), (bh, ah)) in entries.iter().zip(&hashes) {
+            write_blob(&socket, bh, b.as_bytes());
+            write_blob(&socket, ah, a.as_bytes());
+        }
+    };
+    record();
+
+    // `--cwd proj` from the project's parent.
+    let parent = fx.proj.parent().unwrap();
+    let (code, stdout, stderr) = common::run(parent, &["apply", "--cwd", "proj", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(fx.value(), "2", "Ruby must load the rebuilt extension");
+
+    let (code, stdout, stderr) = common::run(parent, &["rollback", "--cwd", "proj", "--json"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1");
+
+    // The default `.` crawl root, run from inside the project.
+    record();
+    let (code, stdout, stderr) = fx.run(&["apply", "--json"]);
+    assert_eq!(code, 0, "apply failed:\n{stdout}\n{stderr}");
+    assert_eq!(event_action(&stdout), "applied", "{stdout}");
+    assert_eq!(fx.value(), "2", "Ruby must load the rebuilt extension");
+    let (code, stdout, stderr) = fx.run(&["apply", "--check"]);
+    assert_eq!(code, 0, "a rebuilt patch checks clean:\n{stdout}\n{stderr}");
+    let (code, stdout, stderr) = fx.run(&["rollback", "--json"]);
+    assert_eq!(code, 0, "rollback failed:\n{stdout}\n{stderr}");
+    assert_eq!(fx.value(), "1", "the original build is back");
+    assert!(!fx.marker().exists());
+}
+
 /// `(relative path, bytes)` of every file under `dir`.
 fn walk_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out = Vec::new();
