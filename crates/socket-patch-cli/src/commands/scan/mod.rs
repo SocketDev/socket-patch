@@ -2655,6 +2655,29 @@ async fn run_scan(
     } else {
         None
     };
+    // A restore that failed part-way and could not put its files back
+    // leaves the lockfiles half restored: stop, rather than rewrite over
+    // them. (The restore printed the failure as it happened.)
+    if let Some(why) = withdrawn_sweep
+        .as_ref()
+        .and_then(|sweep| sweep.half_restored().map(str::to_string))
+    {
+        if args.common.json {
+            let mut env = scan_envelope(&args.common);
+            env.set_extra("scannedPackages", serde_json::json!(package_count));
+            env.set_extra(
+                "lockfileOnlyPackages",
+                serde_json::json!(lockfile_only_count),
+            );
+            env.set_extra("paths", serde_json::json!(path_scope.raw()));
+            if let Some(sweep) = withdrawn_sweep {
+                sweep.record_into(&mut env);
+            }
+            env.mark_error(EnvelopeError::new("lockfile_write_failed", why));
+            emit_scan(&env);
+        }
+        return 1;
+    }
     // The sweep's reference answers, reused by the hosted redirect.
     let sweep_references = withdrawn_sweep
         .as_mut()

@@ -10,10 +10,36 @@ use crate::args::GlobalArgs;
 /// What the hosted leg did.
 #[derive(Default)]
 pub(crate) struct HostedLegOutcome {
+    /// The pins restored (on a dry run: that would be). None when writing
+    /// the restored files failed: that restore is all or nothing.
     pub(crate) reverted: Vec<String>,
+    /// `(purl, why)` per refused pin, and `(WRITE_FAILURE_KEY, why)` when
+    /// writing the restored files failed.
     pub(crate) failed: Vec<(String, String)>,
     pub(crate) warnings: Vec<(String, String)>,
+    /// The files the leg changed (on a dry run: would change). After a
+    /// write failure, only the ones it could not put back.
     pub(crate) edited_files: std::collections::BTreeSet<String>,
+}
+
+/// The [`HostedLegOutcome::failed`] key of a failure that is not one pin's:
+/// writing the restored files failed (rollback's artifact-level
+/// `hosted_write_failed` event).
+pub(crate) const WRITE_FAILURE_KEY: &str = "files";
+
+impl HostedLegOutcome {
+    /// Why the project is left half restored, if it is: writing the
+    /// restored files failed part-way and not every file already written
+    /// could be put back. The reason names each such file and its state.
+    pub(crate) fn half_applied(&self) -> Option<&str> {
+        if self.edited_files.is_empty() {
+            return None;
+        }
+        self.failed
+            .iter()
+            .find(|(key, _)| key == WRITE_FAILURE_KEY)
+            .map(|(_, why)| why.as_str())
+    }
 }
 
 /// The patch-server origins that count as hosted, besides Socket's own:
@@ -99,14 +125,26 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 }
                 out.failed.push((pin.purl.clone(), why.clone()));
             }
+            // Not restored: the one write failure below covers them all.
+            PinStatus::Unwritten => {}
         }
     }
     if let Some(e) = &outcome.flush_error {
-        let why = format!("writing the restored lockfiles failed: {e}");
+        let why = if common.dry_run {
+            format!("writing the restored lockfiles would fail: {e}")
+        } else {
+            format!("writing the restored lockfiles failed: {e}")
+        };
         if !common.json {
             eprintln!("Error: {}", crate::ui::sentence_case(&why));
         }
-        out.failed.push(("files".to_string(), why));
+        out.failed.push((WRITE_FAILURE_KEY.to_string(), why));
+        // Only what the failed flush could not put back was edited.
+        out.edited_files
+            .extend(outcome.half_applied.iter().cloned());
+    } else {
+        out.edited_files
+            .extend(outcome.reverted_files.iter().cloned());
     }
     out.warnings.extend(
         outcome
@@ -114,8 +152,6 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .iter()
             .map(|(code, detail)| (code.to_string(), detail.clone())),
     );
-    out.edited_files
-        .extend(outcome.reverted_files.iter().cloned());
     // Bun's hoisted linker keeps the patched copies of the pins it no
     // longer pins: say so, with the install that does reinstall.
     // A dry run says it too, so the preview's reinstall note names

@@ -493,6 +493,64 @@ pub fn write_single_npm_fixture(root: &Path) {
     .unwrap();
 }
 
+/// A hosted Maven pin wired through three files, in the order a rollback
+/// writes them: the trusted checksums and `.mvn/maven.config` (both
+/// deleted), then `pom.xml` (rewritten). Maven's restore needs no registry
+/// lookup, so `--offline` runs it.
+pub const MVN_FILES: [(&str, &str); 3] = [
+    (
+        ".mvn/checksums/checksums.sha256",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/.mvn/checksums/checksums.sha256"
+        ),
+    ),
+    (
+        ".mvn/maven.config",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/.mvn/maven.config"
+        ),
+    ),
+    (
+        "pom.xml",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/pom.xml"
+        ),
+    ),
+];
+pub const MVN_PURL: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
+
+pub fn write_maven_hosted_fixture(root: &Path) {
+    for (rel, content) in MVN_FILES {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+}
+
+/// Every file under `root` with its content (a link: its target), keyed by
+/// its `/`-separated relative path.
+pub fn tree(root: &Path) -> std::collections::BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(root, &path, out);
+                continue;
+            }
+            let content = match std::fs::read_link(&path) {
+                Ok(target) => format!("-> {}", target.display()),
+                Err(_) => String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned(),
+            };
+            let rel = path.strip_prefix(root).unwrap();
+            out.insert(rel.to_string_lossy().replace('\\', "/"), content);
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
 pub fn bun_original_line() -> String {
     format!(r#"    "left-pad": ["left-pad@1.2.3", "", {{}}, "{UPSTREAM_INTEGRITY}"],"#)
 }

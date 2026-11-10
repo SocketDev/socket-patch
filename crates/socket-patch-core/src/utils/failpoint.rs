@@ -1,5 +1,5 @@
-//! Crash injection for the crash-safety tests, compiled into debug builds
-//! (and test builds with the `failpoints` feature) only.
+//! Crash and failure injection for the crash-safety tests, compiled into
+//! debug builds (and test builds with the `failpoints` feature) only.
 //!
 //! `SOCKET_PATCH_FAILPOINT=<name>[@<n>][,…]` makes the process exit
 //! (status 86, no destructors, no further writes) at the `n`-th time
@@ -13,22 +13,33 @@
 //! to stderr and, when `SOCKET_PATCH_FAILPOINT_READY=<file>` is set,
 //! creates that file as the test's ready marker.
 //!
-//! Release builds compile [`hit`] to nothing, so no environment variable
-//! can make a shipped binary stop half-way; the same
-//! goes for [`switched_off`]. The `failpoints` feature compiles them into an
-//! optimized build as well; only the CLI's dev-dependencies enable it, so
-//! it reaches the optimized test binaries (`cargo test --release`) and
-//! never a `cargo build`/`cargo install` one.
+//! `<name>[@<n>]~fail` makes [`fails`] answer `true` there and the process
+//! go on: the call site returns the error a real fault at that point would
+//! (a write that fails), so a test can drive the code that handles it.
+//!
+//! Release builds compile [`hit`] and [`fails`] to nothing, so no
+//! environment variable can make a shipped binary stop or fail half-way;
+//! the same goes for [`switched_off`]. The `failpoints` feature compiles
+//! them into an optimized build as well; only the CLI's dev-dependencies
+//! enable it, so it reaches the optimized test binaries
+//! (`cargo test --release`) and never a `cargo build`/`cargo install` one.
 
 /// A named crash point (see the module docs).
 pub fn hit(name: &str) {
+    let _ = fails(name);
+}
+
+/// A named failure point: whether the caller is asked to fail here (see
+/// the module docs). It is a crash point as well, so the same name takes
+/// the exit and `~pause` forms.
+pub fn fails(name: &str) -> bool {
     #[cfg(any(debug_assertions, feature = "failpoints"))]
     {
         use std::collections::HashMap;
         use std::sync::Mutex;
         static HITS: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
         let Ok(spec) = std::env::var("SOCKET_PATCH_FAILPOINT") else {
-            return;
+            return false;
         };
         let mut hits = HITS
             .lock()
@@ -41,6 +52,10 @@ pub fn hit(name: &str) {
         };
         for point in spec.split(',') {
             let point = point.trim();
+            let (point, fail) = match point.strip_suffix("~fail") {
+                Some(point) => (point, true),
+                None => (point, false),
+            };
             let (point, pause) = match point.strip_suffix("~pause") {
                 Some(point) => (point, true),
                 None => (point, false),
@@ -51,6 +66,9 @@ pub fn hit(name: &str) {
             };
             if point != name || at != count {
                 continue;
+            }
+            if fail {
+                return true;
             }
             if pause {
                 drop(hits);
@@ -65,9 +83,13 @@ pub fn hit(name: &str) {
             eprintln!("socket-patch: failpoint `{name}` #{count} hit; exiting");
             std::process::exit(86);
         }
+        false
     }
     #[cfg(not(any(debug_assertions, feature = "failpoints")))]
-    let _ = name;
+    {
+        let _ = name;
+        false
+    }
 }
 
 /// Whether a debug build was asked to switch the named mechanism off

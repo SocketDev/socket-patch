@@ -1300,7 +1300,7 @@ async fn pypi_refusal_after(
         .iter()
         .filter_map(|(_, s)| match s {
             PinStatus::Refused(why) => Some(why.clone()),
-            PinStatus::Restored => None,
+            PinStatus::Restored | PinStatus::Unwritten => None,
         })
         .collect();
     assert!(

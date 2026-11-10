@@ -355,6 +355,12 @@ pub fn exists(path: &Path) -> Option<bool> {
     files.get(&key).map(|c| c.bytes.is_some())
 }
 
+/// Whether a write or removal of `path` made now would be captured by an
+/// open group instead of reaching the disk.
+pub(crate) fn is_capturing(path: &Path) -> bool {
+    resolve(path).is_some()
+}
+
 /// Capture a write of `path`; `false` when `path` is not captured (write
 /// the disk).
 pub(crate) fn capture_write(path: &Path, bytes: &[u8], preserve_mode: bool) -> bool {

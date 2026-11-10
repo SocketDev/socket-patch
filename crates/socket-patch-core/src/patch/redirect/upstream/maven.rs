@@ -506,7 +506,7 @@ mod tests {
     fn refusal(outcome: &RestoreOutcome) -> String {
         match &outcome.pins[0].status {
             PinStatus::Refused(why) => why.clone(),
-            PinStatus::Restored => panic!("restored"),
+            other => panic!("{other:?}"),
         }
     }
 
