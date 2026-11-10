@@ -187,8 +187,14 @@ pub(crate) fn shown_project_dir(cwd: &Path, dir: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// The heading a run prints above one project directory's output.
+/// The name of `--cwd` itself among the project directories of a run.
+pub(crate) const CWD_NAME: &str = ".";
+
+/// The heading a run prints above one project directory's output. `shown`
+/// is the directory relative to `--cwd`; `--cwd` itself, whose relative
+/// path is empty, is headed [`CWD_NAME`].
 pub(crate) fn heading(shown: &str) -> String {
+    let shown = if shown.is_empty() { CWD_NAME } else { shown };
     format!("\n== {shown} ==")
 }
 
@@ -854,6 +860,16 @@ mod tests {
             ]
         );
         assert_eq!(advice.warnings().len(), 1);
+    }
+
+    /// `--cwd` has a name among a run's headings: its path relative to
+    /// itself is empty, which reads as nothing at all.
+    #[test]
+    fn cwd_itself_is_named_among_the_directories() {
+        assert_eq!(shown_project_dir(Path::new("mono"), Path::new("mono")), "");
+        assert_eq!(heading(""), "\n== . ==");
+        assert_eq!(heading(CWD_NAME), "\n== . ==");
+        assert_eq!(heading("services/api"), "\n== services/api ==");
     }
 
     #[test]

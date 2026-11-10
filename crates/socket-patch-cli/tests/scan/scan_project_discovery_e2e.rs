@@ -154,6 +154,16 @@ async fn a_root_project_is_scanned_with_the_projects_below_it() {
             "pkg:npm/web-dep@1.0.0"
         ]
     );
+    // `--cwd` has a name among the headings, like every other directory.
+    let headings: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.starts_with("== "))
+        .collect();
+    assert_eq!(
+        headings,
+        ["== . ==", "== services/api ==", "== web =="],
+        "{stdout}"
+    );
 }
 
 /// Nothing changes for a single project, a subdirectory, or a directory
