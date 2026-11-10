@@ -143,10 +143,12 @@ Vendoring commits the service artifact without merging installed changes.
 
 ## Existing project patches
 
-**Release classification: MAJOR.** This intentionally tightens the default
-file-mismatch policy and package eligibility. Publish it with the next major
-release under the semver policy; version stamps and release notes belong to the
-release train.
+**Release classification: fix (shipped in 5.1.0).** This tightens the default
+file-mismatch policy and package eligibility. A Socket patch applied over a
+project's own patch, or over unknown local edits, leaves an install that fails
+or runs only one of the two, so the default skip/refusal is a fix rather than a
+breaking change; `--allow-patch-conflicts` is the explicit, per-invocation way
+to attempt the old behavior.
 
 Project-owned patches are protected at package level, even if they touch a
 different file, are not installed yet, or all Socket `beforeHash` checks pass.
