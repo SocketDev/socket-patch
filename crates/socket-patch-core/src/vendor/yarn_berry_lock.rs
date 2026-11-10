@@ -899,9 +899,36 @@ pub async fn revert_yarn_berry_opts(
         }
     }
 
+    // Both files are read, parsed and edited in memory before either is
+    // written: a `package.json` that cannot be parsed or edited fails the
+    // revert here, with the lock still wired to the `resolutions` entry it
+    // pairs with. A missing file is not a failure (its warning is raised
+    // where the file's records are handled).
+    let lock_path = project_root.join(YARN_LOCK);
+    let pkg_path = project_root.join(PACKAGE_JSON);
+    let mut pkg_state: Option<(Value, Vec<u8>)> = None;
+    let mut pkg_missing = false;
+    if !pkg_recs.is_empty() {
+        match read_regular_to_bytes(&pkg_path).await {
+            Ok(bytes) => match parse_json_manifest(&bytes) {
+                Ok(pkg) => pkg_state = Some((pkg, bytes)),
+                // Fail-closed: rewriting a manifest we cannot parse risks
+                // destroying it.
+                Err(e) => {
+                    return RevertOutcome::failed(format!(
+                        "{PACKAGE_JSON} is not parseable JSON ({e}); nothing was reverted — fix \
+                         it and re-run revert"
+                    ))
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => pkg_missing = true,
+            Err(e) => return RevertOutcome::failed(format!("cannot read {PACKAGE_JSON}: {e}")),
+        }
+    }
+
     // yarn.lock fragments (reverse application order).
+    let mut lock_out: Option<String> = None;
     if !lock_recs.is_empty() {
-        let lock_path = project_root.join(YARN_LOCK);
         match read_regular_to_string(&lock_path).await {
             Ok(mut text) => {
                 let mut changed = false;
@@ -987,12 +1014,7 @@ pub async fn revert_yarn_berry_opts(
                     if rebased || merged {
                         text = doc.render(&moved);
                     }
-                    forget_block_scans();
-                    if let Err(e) =
-                        atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await
-                    {
-                        return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
-                    }
+                    lock_out = Some(text);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1012,57 +1034,46 @@ pub async fn revert_yarn_berry_opts(
         .pnpm
         .as_ref()
         .is_none_or(|meta| meta.created_overrides_table);
-    if !pkg_recs.is_empty() {
-        let pkg_path = project_root.join(PACKAGE_JSON);
-        match read_regular_to_bytes(&pkg_path).await {
-            Ok(bytes) => {
-                let mut pkg: Value = match parse_json_manifest(&bytes) {
-                    Ok(v) => v,
-                    // Fail-closed: rewriting a manifest we cannot parse
-                    // risks destroying it.
-                    Err(e) => {
-                        return RevertOutcome::failed(format!(
-                            "{PACKAGE_JSON} is not parseable JSON ({e}); fix it and re-run revert"
-                        ))
-                    }
-                };
-                let mut changed = false;
-                for rec in pkg_recs {
-                    revert_resolution_record(
-                        &mut pkg,
-                        rec,
-                        &entry.uuid,
-                        created_resolutions,
-                        &mut changed,
-                        &mut outcome.warnings,
-                    );
-                }
-                if changed {
-                    // The entry comes out as a span edit, the inverse of
-                    // the one vendoring made, so the restore lands on the
-                    // pre-vendor bytes.
-                    match splice_manifest(PACKAGE_JSON, &bytes, &pkg) {
-                        Ok(out) => {
-                            PKG_JSON_MEMO.invalidate();
-                            if let Err(e) =
-                                atomic_write_bytes_preserving_mode(&pkg_path, &out).await
-                            {
-                                return RevertOutcome::failed(format!(
-                                    "cannot write {PACKAGE_JSON}: {e}"
-                                ));
-                            }
-                        }
-                        Err(why) => return RevertOutcome::failed(why),
-                    }
-                }
+    let mut pkg_out: Option<Vec<u8>> = None;
+    if let Some((mut pkg, bytes)) = pkg_state {
+        let mut changed = false;
+        for rec in &pkg_recs {
+            revert_resolution_record(
+                &mut pkg,
+                rec,
+                &entry.uuid,
+                created_resolutions,
+                &mut changed,
+                &mut outcome.warnings,
+            );
+        }
+        if changed {
+            // The entry comes out as a span edit, the inverse of the one
+            // vendoring made, so the restore lands on the pre-vendor bytes.
+            match splice_manifest(PACKAGE_JSON, &bytes, &pkg) {
+                Ok(out) => pkg_out = Some(out),
+                Err(why) => return RevertOutcome::failed(format!("{why}; nothing was reverted")),
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                outcome.warnings.push(VendorWarning::new(
-                    "vendor_lockfile_missing",
-                    format!("{PACKAGE_JSON} is missing; the resolutions entry cannot be removed"),
-                ));
-            }
-            Err(e) => return RevertOutcome::failed(format!("cannot read {PACKAGE_JSON}: {e}")),
+        }
+    }
+    if pkg_missing {
+        outcome.warnings.push(VendorWarning::new(
+            "vendor_lockfile_missing",
+            format!("{PACKAGE_JSON} is missing; the resolutions entry cannot be removed"),
+        ));
+    }
+
+    // Writes, lock first.
+    if let Some(text) = lock_out {
+        forget_block_scans();
+        if let Err(e) = atomic_write_bytes_preserving_mode(&lock_path, text.as_bytes()).await {
+            return RevertOutcome::failed(format!("cannot write {YARN_LOCK}: {e}"));
+        }
+    }
+    if let Some(bytes) = pkg_out {
+        PKG_JSON_MEMO.invalidate();
+        if let Err(e) = atomic_write_bytes_preserving_mode(&pkg_path, &bytes).await {
+            return RevertOutcome::failed(format!("cannot write {PACKAGE_JSON}: {e}"));
         }
     }
 
@@ -4430,8 +4441,8 @@ __metadata:
     }
 
     /// Revert tolerates a deleted wired file (warn + restore the rest +
-    /// prune the artifact) but fails CLOSED on a corrupt package.json —
-    /// after the lock restore already ran (the partial-restore contract).
+    /// prune the artifact) but fails CLOSED on a corrupt package.json,
+    /// before the lock is touched.
     #[tokio::test]
     async fn revert_tolerates_missing_wired_files_and_fails_closed_on_corrupt_manifest() {
         // yarn.lock deleted: warn, restore package.json, prune the artifact.
@@ -4489,31 +4500,42 @@ __metadata:
             "the missing manifest is not resurrected"
         );
 
-        // Corrupt package.json: fail closed AFTER the lock restore ran.
+        // Corrupt package.json: fail closed BEFORE either file is written.
+        // A lock restored around a `resolutions` entry still naming the
+        // vendored tarball is a pair yarn re-resolves on the next install.
         let fx = fixture().await;
         let (_, entry, _) = expect_done(fx.vendor(false).await);
         let entry = entry.unwrap();
+        let vendored_lock = tokio::fs::read(fx.lock_path()).await.unwrap();
         tokio::fs::write(fx.pkg_path(), b"{bad").await.unwrap();
         let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
         assert!(!outcome.success, "corrupt manifest must fail the revert");
+        let error = outcome.error.as_deref().unwrap_or("");
         assert!(
-            outcome
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("not parseable JSON"),
-            "{:?}",
-            outcome.error
+            error.contains("not parseable JSON") && error.contains("nothing was reverted"),
+            "{error}"
         );
         assert_eq!(
             tokio::fs::read(fx.lock_path()).await.unwrap(),
-            fx.lock_bytes,
-            "the lock restore already ran when the manifest failed (partial restore)"
+            vendored_lock,
+            "the lock stays wired while the manifest cannot be edited"
         );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), b"{bad");
         assert!(
             fx.tgz_path().exists(),
             "artifact survives the failed revert"
         );
+
+        // Once the manifest is repaired the same revert converges.
+        tokio::fs::write(fx.pkg_path(), B3_AFTER_PKG).await.unwrap();
+        let outcome = revert_yarn_berry(&entry, fx.root(), false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read(fx.lock_path()).await.unwrap(),
+            fx.lock_bytes
+        );
+        assert_eq!(tokio::fs::read(fx.pkg_path()).await.unwrap(), fx.pkg_bytes);
+        assert!(!fx.tgz_path().exists());
     }
 
     /// Write failures fail closed on unix: a read-only project root makes
