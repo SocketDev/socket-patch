@@ -1521,6 +1521,44 @@ mod rebuild_tests {
         assert_eq!(ts::request_count(&server).await, 0);
     }
 
+    /// REGRESSION (VBV-S2): a ledger whose copy of the original lock was
+    /// cut short (and its recorded total raised to match) ended `vendor
+    /// --revert` in a slice panic. The record is left alone as drift, with
+    /// the reason, and the lock, the artifact and the entry stay.
+    #[tokio::test]
+    async fn revert_refuses_a_torn_layout_snapshot_in_the_ledger() {
+        use base64::Engine as _;
+        let pristine = include_bytes!("../../tests/fixtures/bun-lockb/0.8.1-production/bun.lockb");
+        let fx = fixture_with(pristine);
+        let root = fx.root();
+        let (result, entry, _) = ts::expect_done(flip_run(&fx, None).await);
+        assert!(result.success, "{result:?}");
+        let mut entry = entry.expect("vendoring wires the binary lock");
+        let vendored = std::fs::read(root.join(LOCK)).unwrap();
+        let mut torn = pristine.to_vec();
+        torn.extend_from_slice(b"xxx");
+        let total_at = b"#!/usr/bin/env bun\nbun-lockfile-format-v0\n".len() + 4 + 32;
+        let total = (torn.len() as u64).to_le_bytes();
+        torn[total_at..total_at + 8].copy_from_slice(&total);
+        let record = entry.wiring.iter_mut().find(|r| r.kind == KIND).unwrap();
+        let original = record.original.as_mut().unwrap();
+        assert!(original["layout_original"].is_string());
+        original["layout_original"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(&torn));
+        for dry_run in [true, false] {
+            let outcome = revert(&entry, root, RevertOpts::new(dry_run)).await;
+            assert!(outcome.success && outcome.kept_artifact, "{outcome:?}");
+            let drift = outcome
+                .warnings
+                .iter()
+                .find(|w| w.code == "vendor_lock_entry_drifted")
+                .unwrap_or_else(|| panic!("{outcome:?}"));
+            assert!(drift.detail.contains("layout_original"), "{drift:?}");
+            assert_eq!(std::fs::read(root.join(LOCK)).unwrap(), vendored);
+            assert!(root.join(&entry.artifact.path).exists());
+        }
+    }
+
     /// #1132: once `bun remove minimist` (or `bun add minimist@1.2.8`)
     /// moves the vendored record off its vendored resolution, neither the
     /// rewritten nor the pre-vendor snapshot is in bun.lockb and nothing

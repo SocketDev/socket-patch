@@ -1041,15 +1041,28 @@ impl BunLockb {
         self.normalize_production_pool()?;
         self.update_hash(style)?;
         if let Some(encoded) = snapshot.get("layout_original").and_then(Value::as_str) {
+            // The snapshot comes from the committed ledger, so it is read
+            // as any lock a user hands over.
+            let unusable = |detail: String| {
+                format!(
+                    "bun.lockb: the vendor ledger's snapshot of the original lockfile \
+                     (layout_original) cannot be restored from: {detail}"
+                )
+            };
             let original = STANDARD
                 .decode(encoded)
-                .map_err(|_| "bun.lockb: invalid legacy snapshot")?;
-            let mut expected = Self::parse(&original)?;
-            let original_style = expected.hash_style()?;
-            expected.promote_legacy_format()?;
-            expected.normalize_workspace_behaviors()?;
-            expected.normalize_production_pool()?;
-            expected.update_hash(original_style)?;
+                .map_err(|_| unusable("it is not base64".into()))?;
+            let normalized = || {
+                let mut expected = Self::parse(&original)?;
+                expected.check_editable()?;
+                let original_style = expected.hash_style()?;
+                expected.promote_legacy_format()?;
+                expected.normalize_workspace_behaviors()?;
+                expected.normalize_production_pool()?;
+                expected.update_hash(original_style)?;
+                Ok(expected)
+            };
+            let expected = normalized().map_err(unusable)?;
             let mut compacted = self.clone();
             compacted.normalize_production_pool()?;
             compacted.trim_unreferenced_tail(expected.strings.data.len())?;
@@ -1193,6 +1206,8 @@ impl BunLockb {
         if !self.needs_production_pool()? {
             return Ok(());
         }
+        // The extension walk below reads only tags `parse` recognized.
+        self.check_editable()?;
         let extension_pointers = self.legacy_extension_string_pointers()?;
         // Every string field is eight bytes of the file and is listed at
         // most twice, and each package's dependencies are its own slice of
@@ -1336,7 +1351,7 @@ impl BunLockb {
     fn legacy_extension_string_pointers(&self) -> Result<Vec<usize>, String> {
         let mut pointers = Vec::new();
         let mut pos = self.strings.data.end + 8;
-        while pos < self.total {
+        while pos.checked_add(8).is_some_and(|end| end <= self.total) {
             let tag = &self.data[pos..pos + 8];
             pos += 8;
             let widths: &[(usize, &[usize])] = match tag {
@@ -2761,6 +2776,40 @@ mod tests {
         snapshot["version"] = json!("999.0.0");
         assert!(lock.restore(1, &snapshot).is_err());
         assert_eq!(lock.bytes(), before);
+    }
+
+    /// REGRESSION (VBV-S2): the ledger's copy of the original lock is a
+    /// committed file like the lock itself. One cut one to seven bytes into
+    /// an extension tag (with its total raised to match) parses, as a lock
+    /// with an unknown trailer, and then indexed past its end while its
+    /// legacy string buffer was rebuilt. It is refused by name instead, and
+    /// the lock being restored is left as it was.
+    #[test]
+    fn a_torn_layout_snapshot_is_refused_without_slicing_past_it() {
+        let original = fixture("0.8.1-production");
+        let mut lock = BunLockb::parse(&original).unwrap();
+        let mut snapshot = lock.snapshot(1).unwrap();
+        assert!(snapshot["layout_original"].is_string());
+        lock.set_package(1, ".socket/vendor/npm/x/minimist-1.2.2.tgz", &digest())
+            .unwrap();
+        let vendored = lock.bytes();
+        let total = usize_at(&original, TOTAL_AT).unwrap();
+        for extra in 1..8 {
+            let mut torn = original[..total].to_vec();
+            torn.resize(total + extra, b'x');
+            put_u64(&mut torn, TOTAL_AT, total + extra);
+            assert!(BunLockb::parse(&torn).is_ok(), "{extra}");
+            snapshot["layout_original"] = json!(STANDARD.encode(&torn));
+            let mut restored = lock.clone();
+            let error = restored.restore(1, &snapshot).unwrap_err();
+            assert!(error.contains("layout_original"), "{extra}: {error}");
+            assert_eq!(restored.bytes(), vendored, "{extra}");
+        }
+        for garbage in ["not base64!", "AAAA"] {
+            snapshot["layout_original"] = json!(garbage);
+            let error = lock.clone().restore(1, &snapshot).unwrap_err();
+            assert!(error.contains("layout_original"), "{garbage}: {error}");
+        }
     }
 
     #[test]
