@@ -30,6 +30,43 @@ pub(crate) struct LockBlock {
 /// stripped from the first line and kept OUT of that line's span, so a
 /// header-less lock still yields its first key and a splice keeps the BOM.
 pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
+    scan(text, false)
+}
+
+/// [`scan_blocks`] for a reader that must see every entry yarn installs
+/// from a berry lock (lockfile discovery, through
+/// `lock_inventory::yarn::berry_entries_with_complex_keys`): it also reads
+/// an entry yarn berry writes with a YAML complex key. Berry's serializer
+/// spells a key longer than 1024 characters (many descriptors resolving to
+/// one package) as
+///
+/// ```text
+/// ? "left-pad@npm:1.3.0, lp1@npm:left-pad@>=0.0.1, …"
+/// :
+///   version: 1.3.0
+///   resolution: "left-pad@npm:1.3.0"
+/// ```
+///
+/// (yarn 4.5.3 writes it and reads it back). Such a block's `key` is the
+/// text after `? ` (quotes kept, as for any key), and its `lines` start
+/// with the `? …` line and the lone `:`, neither of which is a body field.
+/// The writers and the inventory keep [`scan_blocks`], whose blocks are
+/// the ones a writer can splice: they address a block by its first line,
+/// which here is not a `key:` line.
+pub(crate) fn scan_berry_blocks(text: &str) -> Vec<LockBlock> {
+    scan(text, true)
+}
+
+/// The prefix of a YAML complex key line ([`scan_berry_blocks`]).
+const COMPLEX_KEY: &str = "? ";
+
+/// Whether `line`, followed by `next`, opens a berry complex-key entry
+/// ([`scan_berry_blocks`]): `? <key>` at column 0, then a lone `:`.
+pub(crate) fn is_complex_key_line(line: &str, next: Option<&str>) -> bool {
+    line.len() > COMPLEX_KEY.len() && line.starts_with(COMPLEX_KEY) && next == Some(":")
+}
+
+fn scan(text: &str, complex_keys: bool) -> Vec<LockBlock> {
     // (start, end-incl-terminator, content-without-terminator, terminated)
     let mut lines: Vec<(usize, usize, &str, bool)> = Vec::new();
     let mut pos = 0;
@@ -53,16 +90,24 @@ pub(crate) fn scan_blocks(text: &str) -> Vec<LockBlock> {
     let mut i = 0;
     while i < lines.len() {
         let (start, _, content, _) = lines[i];
-        if is_key_line(content) {
-            let mut j = i + 1;
+        let complex =
+            complex_keys && is_complex_key_line(content, lines.get(i + 1).map(|next| next.2));
+        if complex || is_key_line(content) {
+            // A complex key's body follows its lone `:` line.
+            let mut j = i + 1 + usize::from(complex);
             while j < lines.len() && is_body_line(lines[j].2) {
                 j += 1;
             }
+            let key = if complex {
+                &content[COMPLEX_KEY.len()..]
+            } else {
+                &content[..content.len() - 1]
+            };
             blocks.push(LockBlock {
                 start,
                 end: lines[j - 1].1,
                 terminated: lines[j - 1].3,
-                key: content[..content.len() - 1].to_string(),
+                key: key.to_string(),
                 lines: lines[i..j].iter().map(|l| l.2.to_string()).collect(),
             });
             i = j;
@@ -290,6 +335,55 @@ mod tests {
 
     fn lines(text: &str) -> Vec<String> {
         text.lines().map(str::to_string).collect()
+    }
+
+    /// The complex-key entry yarn berry writes for a key longer than 1024
+    /// characters (shape taken from a lock yarn 4.5.3 wrote): the readers'
+    /// scan yields one block keyed by the text after `? `, with the fields
+    /// readable; the writers' scan is unchanged, so no writer splices a
+    /// block whose first line is not a `key:` line.
+    #[test]
+    fn complex_key_entry_is_a_block_for_readers_only() {
+        let lock = "__metadata:\n  version: 8\n\n\"a@npm:^1.0.0\":\n  version: 1.0.0\n  resolution: \"a@npm:1.0.0\"\n\n? \"b@npm:^1.0.0, c@npm:b@^1.0.0\"\n:\n  version: 1.2.0\n  resolution: \"b@npm:1.2.0\"\n  linkType: hard\n\n\"z@npm:^2.0.0\":\n  version: 2.0.0\n";
+        let keys = |blocks: &[LockBlock]| -> Vec<String> {
+            blocks.iter().map(|b| b.key.clone()).collect()
+        };
+        let read = scan_berry_blocks(lock);
+        assert_eq!(
+            keys(&read),
+            [
+                "__metadata",
+                "\"a@npm:^1.0.0\"",
+                "\"b@npm:^1.0.0, c@npm:b@^1.0.0\"",
+                "\"z@npm:^2.0.0\""
+            ]
+        );
+        let complex = &read[2];
+        assert_eq!(
+            complex.lines[..2],
+            ["? \"b@npm:^1.0.0, c@npm:b@^1.0.0\"", ":"]
+        );
+        assert_eq!(
+            berry_field(&complex.lines, "resolution"),
+            Some("b@npm:1.2.0")
+        );
+        assert_eq!(berry_field(&complex.lines, "version"), Some("1.2.0"));
+        assert!(lock[complex.start..complex.end].starts_with("? \"b@npm"));
+        assert!(lock[complex.start..complex.end].ends_with("linkType: hard\n"));
+        // CRLF, and a `? key` with no `:` after it (not an entry).
+        assert_eq!(
+            keys(&scan_berry_blocks(&lock.replace('\n', "\r\n"))),
+            keys(&read)
+        );
+        assert_eq!(
+            keys(&scan_berry_blocks("? \"b@npm:^1.0.0\"\n  version: 1.2.0\n")),
+            Vec::<String>::new()
+        );
+        // The writers' view: the lone `:` opens a key-less block, as before.
+        assert_eq!(
+            keys(&scan_blocks(lock)),
+            ["__metadata", "\"a@npm:^1.0.0\"", "", "\"z@npm:^2.0.0\""]
+        );
     }
 
     #[test]

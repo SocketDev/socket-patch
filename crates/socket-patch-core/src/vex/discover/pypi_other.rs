@@ -100,6 +100,21 @@
 //! Socket direct reference there routes every PEP 517 frontend's
 //! resolution of the package.
 //!
+//! ## Requirements are not lock entries
+//!
+//! A requirements line or a `pyproject.toml` declaration decides what
+//! installs only where the installer reads it. A Socket reference is
+//! therefore withheld while another requirement of the same package can
+//! install the same release where the reference does not apply
+//! ([`RequirementSet`], [`bypasses`]): beside a reference whose environment
+//! marker limits it (the hosted rewriter carries a pin's marker over), or
+//! beside one in a table the default install does not read (an extra, a
+//! dependency group, a Hatch environment) when `[project].dependencies`
+//! names the package or another table pins the release. `Pipfile.lock` is
+//! a lock: each category installs its own entries, so a non-Socket entry
+//! of the release in one category withholds the ref of another
+//! ([`Discovery::locked_elsewhere`]).
+//!
 //! ## Integrity (rule 8)
 //!
 //! `locked_integrity` is the `#sha256=` url fragment when present (the pin
@@ -115,12 +130,14 @@ use toml_edit::DocumentMut;
 
 use super::{
     mentions_vendor_dir, pypi_purl, toml_or_diag, vendored_leaf_purl, DiscoverCtx, Discovery,
-    LocateOpts, PatchedRef, TomlDiag, VendorRef, Wired, DIAG_LOCKFILE_UNPARSEABLE,
-    DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID, SOCKET_PATCH_SERVER_HOST,
+    LocateOpts, PatchedRef, TomlDiag, TreePart, UnpatchedCopy, VendorRef, Wired,
+    DIAG_LOCKFILE_UNPARSEABLE, DIAG_LOCKFILE_UNREADABLE, DIAG_REF_INVALID,
+    SOCKET_PATCH_SERVER_HOST,
 };
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 use crate::utils::digest::sha256_hex;
 use crate::utils::hatch::dependency_specs;
+use crate::utils::purl_key::canonical_base_purl;
 use crate::utils::requirements;
 use crate::utils::requirements::{
     editable_location, egg_name, hash_options, logical_lines, parse_requirement, split_comment,
@@ -191,10 +208,10 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 // release, so it may be any version (#1549).
                 if pkg.is_vcs() {
                     if live {
-                        out.resolved_elsewhere_any_version(PIPFILE_LOCK, pypi_name_purl(name));
+                        out.locked_elsewhere_any_version(PIPFILE_LOCK, pypi_name_purl(name));
                     }
                 } else if let Some(version) = pkg.exact_pin() {
-                    out.resolved_elsewhere(PIPFILE_LOCK, pypi_purl(name, version));
+                    out.locked_elsewhere(PIPFILE_LOCK, pypi_purl(name, version));
                 }
                 continue;
             }
@@ -232,6 +249,7 @@ async fn extract_pipfile_lock(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 tag: None,
                 root_uri: false,
                 foreign_is_evidence: live,
+                locked: true,
             },
             location,
             integrity_of(location, hashes),
@@ -258,6 +276,7 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 vec![ROOT_REQUIREMENTS.to_string()]
             }
         };
+    let mut set = RequirementSet::default();
     for file in files.iter().take(MAX_REQUIREMENTS_FILES) {
         // pip installs the root and every include it reaches as ONE
         // requirement set, so they contest other locks as one (#1086).
@@ -266,7 +285,7 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             continue;
         };
         for line in logical_lines(&text) {
-            requirements_line(ctx, file, &line.text, out);
+            requirements_line(ctx, file, &line.text, &mut set, out);
         }
     }
     // #1851: pip installs the pins of an include outside the project root
@@ -282,7 +301,192 @@ async fn extract_requirements(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         };
         for line in logical_lines(&text) {
             outside_root_line(ctx, file, &line.text, out);
+            set.plain(file, None, &line.text);
         }
+    }
+    set.contest(out);
+}
+
+/// A requirement that is not a Socket reference: the package it names
+/// and, when it can only install one release (an exact pin, an artifact
+/// named for its version), that release.
+struct PlainRequirement {
+    /// PEP 503-canonical.
+    name: String,
+    /// The one release it installs, as a canonical base purl; `None` when
+    /// it may install any (a range, a bare name, a source checkout).
+    release: Option<String>,
+    file: String,
+    /// The requirement as written.
+    text: String,
+    /// The `pyproject.toml` / `hatch.toml` table declaring it; `None` for a
+    /// requirements line.
+    table: Option<DeclTable>,
+}
+
+impl PlainRequirement {
+    /// Read `code` (a requirements line's code part, or one PEP 508
+    /// dependency string); `None` when it names no package.
+    fn of(file: &str, table: Option<DeclTable>, code: &str) -> Option<Self> {
+        let code = code.trim();
+        let (name, version) = match requirement_location(code) {
+            Some((declared, location)) => foreign_release(declared, location, None)?,
+            None => {
+                let name = requirements::requirement_name(code)?;
+                // pip expands `${NAME}` where it runs: any release.
+                let version = (!requirements::has_env_reference(code))
+                    .then(|| parse_requirement(code))
+                    .flatten()
+                    .and_then(|r| {
+                        r.exact_version()
+                            .filter(|version| crate::utils::pep440::is_valid(version))
+                            .or(r.arbitrary_version())
+                    });
+                (name.to_string(), version.map(str::to_string))
+            }
+        };
+        Some(PlainRequirement {
+            release: version
+                .and_then(|version| pypi_purl(&name, &version))
+                .map(|purl| canonical_base_purl(&purl)),
+            name: canonicalize_pypi_name(&name),
+            file: file.to_string(),
+            text: code.to_string(),
+            table,
+        })
+    }
+
+    /// Whether it can install the release `purl` names.
+    fn may_install(&self, purl: &str) -> bool {
+        let named =
+            crate::utils::purl::purl_name_version(purl).is_some_and(|(name, _)| name == self.name);
+        named
+            && self.release.as_deref().is_none_or(|release| {
+                release == purl || crate::utils::purl_key::pypi_same_release(release, purl)
+            })
+    }
+}
+
+/// A Socket reference among requirements: the ref it became, where it
+/// sits and whether an environment marker limits it.
+struct WiredRequirement {
+    /// The ref's canonical base purl.
+    purl: String,
+    file: String,
+    marker: bool,
+    /// As [`PlainRequirement::table`].
+    table: Option<DeclTable>,
+}
+
+/// The requirements one installer resolves from one project: a pip
+/// requirement set (`requirements.txt` and its includes), or the
+/// dependency tables of `pyproject.toml` / `hatch.toml`. A Socket
+/// reference there is no lock entry: it decides what installs only where
+/// it is read, and another requirement of the same package may be read
+/// where it is not ([`RequirementSet::contest`]).
+#[derive(Default)]
+struct RequirementSet {
+    wired: Vec<WiredRequirement>,
+    plain: Vec<PlainRequirement>,
+}
+
+impl RequirementSet {
+    /// Record a Socket reference `emit` pushed as the ref `purl`.
+    fn wired(&mut self, file: &str, table: Option<DeclTable>, code: &str, purl: &str) {
+        self.wired.push(WiredRequirement {
+            purl: canonical_base_purl(purl),
+            file: file.to_string(),
+            marker: carries_marker(code),
+            table,
+        });
+    }
+
+    /// Record a requirement that is not a Socket reference.
+    fn plain(&mut self, file: &str, table: Option<DeclTable>, code: &str) {
+        let (code, _) = split_comment(code);
+        self.plain.extend(PlainRequirement::of(file, table, code));
+    }
+
+    /// Withhold every Socket reference beside a plain requirement that can
+    /// install its release where the reference does not apply
+    /// ([`bypasses`]): the ref is shadowed ([`Discovery::shadowed`]), with
+    /// one diagnostic naming that requirement.
+    fn contest(self, out: &mut Discovery) {
+        for wired in &self.wired {
+            let Some(plain) = self.plain.iter().find(|plain| bypasses(plain, wired)) else {
+                continue;
+            };
+            let where_read = match plain.table {
+                None => "wherever the Socket reference's environment marker does not hold",
+                Some(_) if wired.marker => {
+                    "wherever the Socket reference's environment marker does not hold, or its \
+                     table is not installed"
+                }
+                Some(_) => "in an install that does not read the Socket reference's table",
+            };
+            let declared = match plain.table {
+                Some(DeclTable::Project) => " [project].dependencies",
+                Some(DeclTable::Optional) => " [project.optional-dependencies]",
+                Some(DeclTable::Group) => " [dependency-groups]",
+                Some(DeclTable::Env) => " (a Hatch environment)",
+                None => "",
+            };
+            out.unpatched_copies.push(UnpatchedCopy {
+                purl: wired.purl.clone(),
+                file: wired.file.clone().into(),
+                key: plain.text.clone(),
+                how: format!(
+                    "in {}{declared} can install that release from the index {where_read}",
+                    plain.file
+                ),
+                remedy: None,
+                part: TreePart::File,
+            });
+        }
+    }
+}
+
+/// Whether `plain` can install `wired`'s release in an install the Socket
+/// reference does not decide.
+///
+/// Read together, pip resolves a direct reference and a compatible
+/// requirement of the same package to the reference (#1086): the lines of
+/// one requirement set, and `[project].dependencies` with the project's
+/// own extras. There only an environment marker on the reference keeps it
+/// out of an install (the hosted rewriter carries a pin's marker over), and
+/// the plain requirement then installs the release from the index.
+///
+/// Read apart (an extra, a dependency group or a Hatch environment beside
+/// `[project].dependencies`, or two of those), each table is its own
+/// install: an exact pin of the release installs it unpatched, and so does
+/// any requirement in `[project].dependencies`, which every install of the
+/// project reads. A range in another optional table is not evidence: what
+/// it selects depends on the index.
+fn bypasses(plain: &PlainRequirement, wired: &WiredRequirement) -> bool {
+    if !plain.may_install(&wired.purl) {
+        return false;
+    }
+    let together = matches!(
+        (wired.table, plain.table),
+        (None, None)
+            | (
+                Some(DeclTable::Project),
+                Some(DeclTable::Project | DeclTable::Optional)
+            )
+    );
+    if together {
+        return wired.marker;
+    }
+    plain.release.is_some() || wired.marker || plain.table == Some(DeclTable::Project)
+}
+
+/// Whether a requirement's code part carries an environment marker.
+fn carries_marker(code: &str) -> bool {
+    match parse_requirement(code) {
+        Some(requirement) => requirement.marker.is_some(),
+        // A bare url or path line: the marker follows a `;` ahead of the
+        // per-requirement options.
+        None => code.split(" --").next().unwrap_or(code).contains(';'),
     }
 }
 
@@ -316,13 +520,21 @@ fn outside_root_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
             tag: None,
             root_uri: false,
             foreign_is_evidence: true,
+            locked: false,
         };
         foreign_reference(&entry, location, out);
     }
 }
 
-/// One logical requirements line (see the module docs for the two shapes).
-fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Discovery) {
+/// One logical requirements line (see the module docs for the two shapes),
+/// recorded in its requirement `set`.
+fn requirements_line(
+    ctx: &DiscoverCtx<'_>,
+    file: &str,
+    line: &str,
+    set: &mut RequirementSet,
+    out: &mut Discovery,
+) {
     let (code, comment) = split_comment(line);
     let code = code.trim();
     if let Some(location) = editable_location(code) {
@@ -343,10 +555,11 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
     }
     let Some((name, location)) = requirement_location(code) else {
         registry_line(file, code, out);
+        set.plain(file, None, code);
         return;
     };
     let tag = comment.and_then(vendor_tag);
-    emit(
+    let wired = emit(
         ctx,
         &Entry {
             file,
@@ -355,11 +568,16 @@ fn requirements_line(ctx: &DiscoverCtx<'_>, file: &str, line: &str, out: &mut Di
             tag,
             root_uri: false,
             foreign_is_evidence: true,
+            locked: false,
         },
         location,
         integrity_of(location, hash_options(code)),
         out,
     );
+    match wired {
+        Some(purl) => set.wired(file, None, code, &purl),
+        None => set.plain(file, None, code),
+    }
 }
 
 /// A registry requirement line, in-root or in an out-of-root include. pip
@@ -451,9 +669,14 @@ async fn extract_hatch(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     let pyproject = read_toml(ctx, PYPROJECT, out).await;
     // Hatch's own table walk (`utils::hatch::dependency_specs`); PEP 735
     // groups are where Hatch leaves `{root:uri}` unexpanded.
+    let mut set = RequirementSet::default();
     for s in dependency_specs(pyproject.as_ref(), hatch_toml.as_ref()) {
-        hatch_spec(ctx, s.file, s.spec, s.table != DeclTable::Group, out);
+        match hatch_spec(ctx, s.file, s.spec, s.table != DeclTable::Group, out) {
+            Some(purl) => set.wired(s.file, Some(s.table), s.spec, &purl),
+            None => set.plain(s.file, Some(s.table), s.spec),
+        }
     }
+    set.contest(out);
 }
 
 async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Option<DocumentMut> {
@@ -463,17 +686,16 @@ async fn read_toml(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) -> Op
 }
 
 /// One PEP 508 dependency string. `root_uri_expanded`: whether Hatch
-/// expands `{root:uri}` in the table it came from.
+/// expands `{root:uri}` in the table it came from. Answers the purl of the
+/// ref it pushed, if any.
 fn hatch_spec(
     ctx: &DiscoverCtx<'_>,
     file: &str,
     spec: &str,
     root_uri_expanded: bool,
     out: &mut Discovery,
-) {
-    let Some((name, location)) = pep508_direct_reference(spec) else {
-        return;
-    };
+) -> Option<String> {
+    let (name, location) = pep508_direct_reference(spec)?;
     let expanded = location.starts_with(HATCH_ROOT_URI);
     let location = match location.strip_prefix(HATCH_ROOT_URI) {
         Some(rest) if root_uri_expanded => rest,
@@ -488,7 +710,7 @@ fn hatch_spec(
                     ),
                 );
             }
-            return;
+            return None;
         }
         None => location,
     };
@@ -501,11 +723,12 @@ fn hatch_spec(
             tag: None,
             root_uri: expanded,
             foreign_is_evidence: false,
+            locked: false,
         },
         location,
         integrity_of(location, Vec::new()),
         out,
-    );
+    )
 }
 
 // ── shared reference classification ──────────────────────────────────────
@@ -531,6 +754,10 @@ struct Entry<'a> {
     /// they reference. Hatch's dependency tables are declarations a
     /// resolver reads, not an install source of their own.
     foreign_is_evidence: bool,
+    /// The file is a lock of resolved entries (`Pipfile.lock`), each
+    /// installed where its category is: a non-Socket entry is a same-lock
+    /// copy too ([`Discovery::locked_elsewhere`]).
+    locked: bool,
 }
 
 impl Entry<'_> {
@@ -581,32 +808,40 @@ fn classify(ctx: &DiscoverCtx<'_>, location: &str, uri: bool) -> Result<Option<W
 }
 
 /// Validate and push the ref `location` wires for `entry`, or diagnose it.
+/// Answers the pushed ref's purl.
 fn emit(
     ctx: &DiscoverCtx<'_>,
     entry: &Entry<'_>,
     location: &str,
     integrity: Option<LockIntegrity>,
     out: &mut Discovery,
-) {
+) -> Option<String> {
     let uri = entry.root_uri || url_form(location);
     let result = match classify(ctx, location, uri) {
         Ok(None) => {
             if entry.foreign_is_evidence {
                 foreign_reference(entry, location, out);
             }
-            return;
+            return None;
         }
         Ok(Some(Wired::Hosted(uuid))) => hosted_ref(entry, location, uuid, integrity),
         Ok(Some(Wired::Vendored(vref))) => vendored_ref(entry, &vref, integrity),
         Err(detail) => Err(detail),
     };
     match result {
-        Ok(r) => out.push(r),
-        Err(detail) => out.diag(
-            DIAG_REF_INVALID,
-            entry.file,
-            format!("{}: {}: {detail}", entry.file, entry.subject(location)),
-        ),
+        Ok(r) => {
+            let purl = r.purl.clone();
+            out.push(r);
+            Some(purl)
+        }
+        Err(detail) => {
+            out.diag(
+                DIAG_REF_INVALID,
+                entry.file,
+                format!("{}: {}: {detail}", entry.file, entry.subject(location)),
+            );
+            None
+        }
     }
 }
 
@@ -622,9 +857,11 @@ fn foreign_reference(entry: &Entry<'_>, location: &str, out: &mut Discovery) {
     let Some((name, version)) = foreign_release(entry.name, location, entry.pinned_version) else {
         return;
     };
-    match version {
-        Some(version) => out.resolved_elsewhere(entry.file, pypi_purl(&name, &version)),
-        None => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(&name)),
+    match (version, entry.locked) {
+        (Some(version), true) => out.locked_elsewhere(entry.file, pypi_purl(&name, &version)),
+        (Some(version), false) => out.resolved_elsewhere(entry.file, pypi_purl(&name, &version)),
+        (None, true) => out.locked_elsewhere_any_version(entry.file, pypi_name_purl(&name)),
+        (None, false) => out.resolved_elsewhere_any_version(entry.file, pypi_name_purl(&name)),
     }
 }
 
@@ -855,6 +1092,236 @@ mod tests {
             doc[category] = members.clone();
         }
         serde_json::to_string_pretty(&doc).unwrap()
+    }
+
+    /// Whether discovery attests the urllib3 patch: `Ok` with the ref, or
+    /// `Err` with the [`DIAG_REF_UNATTRIBUTABLE`] details that withhold it.
+    fn urllib3_attested(out: &Discovery) -> Result<&PatchedRef, Vec<&str>> {
+        match out.refs.as_slice() {
+            [r] if r.purl == "pkg:pypi/urllib3@1.26.18" => Ok(r),
+            [] => Err(out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                .map(|d| d.detail.as_str())
+                .collect()),
+            refs => panic!("{refs:#?}"),
+        }
+    }
+
+    /// `Pipfile.lock` categories are one file but separate installs:
+    /// `pipenv install` takes `default` alone, `--dev` adds `develop`. A
+    /// category that pins the release from the index beside one wired to
+    /// the patch installs it unpatched, so the lock's ref is withheld.
+    /// Another release in the other category contests nothing.
+    #[tokio::test]
+    async fn pipfile_lock_category_pinning_the_release_from_the_index_withholds_the_ref() {
+        let hosted = serde_json::json!({
+            "file": format!("{}#sha256={SHA}", wheel_url(UUID_A)),
+            "hashes": [format!("sha256:{SHA}")],
+        });
+        let registry = |version: &str| serde_json::json!({ "hashes": [format!("sha256:{SHA_B}")], "version": version });
+        for (other, attested) in [
+            (registry("==1.26.18"), false),
+            (registry("==1.26.18.0"), false),
+            (
+                serde_json::json!({ "git": "https://github.com/urllib3/urllib3", "ref": "main" }),
+                false,
+            ),
+            (registry("==2.2.0"), true),
+        ] {
+            for (wired, plain) in [("develop", "default"), ("default", "develop")] {
+                let p = Project::new();
+                p.write("Pipfile", "[packages]\nurllib3 = \"*\"\n");
+                p.write(
+                    "Pipfile.lock",
+                    pipfile_lock(serde_json::json!({
+                        wired: { "urllib3": hosted.clone() },
+                        plain: { "urllib3": other.clone() },
+                    })),
+                );
+                let out = run(&p).await;
+                let verdict = urllib3_attested(&out);
+                assert_eq!(verdict.is_ok(), attested, "{other} in {plain}: {verdict:?}");
+                if let Err(details) = verdict {
+                    assert!(
+                        matches!(details.as_slice(), [d] if d.contains("another entry of the same lock")),
+                        "{details:#?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The hosted rewriter keeps a pin's environment marker on the Socket
+    /// reference it writes, so that line installs the patch only where the
+    /// marker holds. Another line that can install the same release
+    /// elsewhere (the complementary marker, a range, an unpinned name) is
+    /// then a second, unpatched install, in the root or an include. A line
+    /// pinning another release, and any line beside an unmarked reference
+    /// (pip resolves the two to the reference, #1086), contest nothing.
+    #[tokio::test]
+    async fn requirements_marker_split_release_is_not_attested() {
+        let socket = format!("urllib3 @ {} --hash=sha256:{SHA}", wheel_url(UUID_A));
+        let marked = format!(
+            "urllib3 @ {} ; sys_platform == \"win32\" --hash=sha256:{SHA}",
+            wheel_url(UUID_A)
+        );
+        let vendored_marked = format!(
+            "./{} ; sys_platform == \"win32\" --hash=sha256:{SHA}",
+            vendored_wheel(UUID_A, WHEEL)
+        );
+        let elsewhere = "urllib3==1.26.18 ; sys_platform != \"win32\"";
+        for (root, include, attested) in [
+            // The auditor's reproduction, and its control without a marker.
+            (format!("{marked}\n{elsewhere}\n"), None, false),
+            (format!("{socket}\n{elsewhere}\n"), None, true),
+            (format!("{vendored_marked}\n{elsewhere}\n"), None, false),
+            // Anything that may select the release.
+            (
+                format!("{marked}\nurllib3>=1.26 ; sys_platform != \"win32\"\n"),
+                None,
+                false,
+            ),
+            (format!("{marked}\nurllib3\n"), None, false),
+            (
+                format!("{marked}\nurllib3==1.26.18.0 ; os_name == \"posix\"\n"),
+                None,
+                false,
+            ),
+            (
+                format!("{marked}\n-r base.txt\n"),
+                Some(format!("{elsewhere}\n")),
+                false,
+            ),
+            // Another release, another package, or the reference alone.
+            (
+                format!("{marked}\nurllib3==2.2.0 ; sys_platform != \"win32\"\n"),
+                None,
+                true,
+            ),
+            (format!("{marked}\nrequests==2.31.0\n"), None, true),
+            (format!("{marked}\n"), None, true),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", &root);
+            if let Some(include) = &include {
+                p.write("base.txt", include);
+            }
+            let out = run(&p).await;
+            let verdict = urllib3_attested(&out);
+            assert_eq!(verdict.is_ok(), attested, "{root:?}: {verdict:?}");
+            if let Err(details) = verdict {
+                assert!(
+                    matches!(details.as_slice(), [d] if d.contains("marker")),
+                    "{root:?}: {details:#?}"
+                );
+                assert_eq!(out.shadowed.len(), 1, "{root:?}: rollback still finds it");
+            }
+        }
+    }
+
+    /// A Socket direct reference in a `pyproject.toml` table that is not
+    /// installed by default (an extra, a dependency group, a Hatch
+    /// environment) says nothing about `pip install .`, which reads
+    /// `[project].dependencies`. While that table (or any other) can
+    /// install the same release from the index, the reference is withheld.
+    #[tokio::test]
+    async fn pyproject_reference_beside_an_index_declaration_of_the_release_is_not_attested() {
+        let reference = format!("urllib3 @ {}#sha256={SHA}", wheel_url(UUID_A));
+        let project = |dependencies: &str, rest: &str| {
+            format!(
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [{dependencies}]\n{rest}"
+            )
+        };
+        let extra = format!("\n[project.optional-dependencies]\nsec = [\"{reference}\"]\n");
+        let group = format!("\n[dependency-groups]\nsec = [\"{reference}\"]\n");
+        let env = format!("\n[tool.hatch.envs.docs]\ndependencies = [\"{reference}\"]\n");
+        for (pyproject, attested) in [
+            // The auditor's reproductions: the default install pins the
+            // release from the index.
+            (project("\"urllib3==1.26.18\"", &extra), false),
+            (project("\"urllib3==1.26.18\"", &group), false),
+            (project("\"urllib3==1.26.18\"", &env), false),
+            // A range or a bare name in the default table may select it.
+            (project("\"urllib3>=1.26\"", &extra), false),
+            (project("\"urllib3\"", &env), false),
+            // An exact pin of the release in any other table.
+            (
+                project(
+                    "",
+                    &format!("{extra}\n[dependency-groups]\ndev = [\"urllib3==1.26.18\"]\n"),
+                ),
+                false,
+            ),
+            // The default table carries the reference itself.
+            (project(&format!("\"{reference}\""), ""), true),
+            (project(&format!("\"{reference}\""), &extra), true),
+            // The default table does not name the package, or pins another
+            // release; another table's range is not evidence.
+            (project("", &extra), true),
+            (project("\"requests==2.31.0\"", &group), true),
+            (project("\"urllib3==2.2.0\"", &extra), true),
+            (
+                project(
+                    "",
+                    &format!("{extra}\n[dependency-groups]\ndev = [\"urllib3>=1.26\"]\n"),
+                ),
+                true,
+            ),
+        ] {
+            let p = Project::new();
+            p.write("pyproject.toml", &pyproject);
+            let out = run(&p).await;
+            let verdict = urllib3_attested(&out);
+            assert_eq!(verdict.is_ok(), attested, "{pyproject}: {verdict:?}");
+            if let Err(details) = verdict {
+                assert!(
+                    matches!(details.as_slice(), [d] if d.contains("pyproject.toml")),
+                    "{pyproject}: {details:#?}"
+                );
+            }
+        }
+    }
+
+    /// pip percent-decodes a `file:` reference (pip 26.2.1 installs
+    /// `six-….whl` for `six @ file:…/%73ix-….whl` and cannot find the
+    /// literal file), so a vendored reference whose wheel name carries a
+    /// `%` does not name the committed artifact `vex` would hash. It is
+    /// diagnosed, in the url form and as a bare path, and the plain
+    /// spelling beside it is the control.
+    #[tokio::test]
+    async fn percent_encoded_vendored_wheel_is_not_a_reference() {
+        let plain = vendored_wheel(UUID_A, WHEEL);
+        let encoded = vendored_wheel(UUID_A, &WHEEL.replacen('u', "%75", 1));
+        for (line, attested) in [
+            (format!("urllib3 @ file:{plain} --hash=sha256:{SHA}"), true),
+            (
+                format!("urllib3 @ file:{encoded} --hash=sha256:{SHA}"),
+                false,
+            ),
+            (format!("./{encoded} --hash=sha256:{SHA}"), false),
+        ] {
+            let p = Project::new();
+            p.write("requirements.txt", format!("{line}\n"));
+            let out = run(&p).await;
+            assert_eq!(out.refs.len(), usize::from(attested), "{line}: {out:#?}");
+            if !attested {
+                assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID], "{line}");
+            }
+        }
+        let p = Project::new();
+        p.write(
+            "pyproject.toml",
+            format!(
+                "[project]\nname = \"app\"\nversion = \"0.1.0\"\n\
+                 dependencies = [\"urllib3 @ {{root:uri}}/{encoded}#sha256={SHA}\"]\n"
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_INVALID]);
     }
 
     // ── Pipfile.lock ──────────────────────────────────────────────────────

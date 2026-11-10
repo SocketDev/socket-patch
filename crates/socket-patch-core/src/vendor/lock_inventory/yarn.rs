@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::formats::yarn::blocks::{
-    berry_field, classic_field, live_blocks, scan_blocks, LockBlock,
+    berry_field, classic_field, live_blocks, scan_berry_blocks, scan_blocks, LockBlock,
 };
 use crate::formats::yarn::patterns::{
     classic_pattern_real_name, parse_berry_locator, split_berry_key_patterns, split_key_patterns,
@@ -126,7 +126,21 @@ impl SelectorIndex {
 /// grammar — as the ONE entry walk the lock inventory and lockfile
 /// discovery share (see [`classic_entries`]).
 pub(crate) fn berry_entries(text: &str) -> BerryLock {
-    let blocks = scan_blocks(text);
+    berry_lock(scan_blocks(text))
+}
+
+/// [`berry_entries`] with yarn's complex-key entries read as entries too
+/// ([`scan_berry_blocks`]: the `? <key>` form berry writes for a key
+/// longer than 1024 characters). Lockfile discovery reads through this:
+/// what such an entry resolves is installed like any other, so it must
+/// count as evidence, and the rest of the lock must stay readable. The
+/// inventory and the writers' helpers keep [`berry_entries`], whose
+/// entries are exactly the blocks the writers can splice.
+pub(crate) fn berry_entries_with_complex_keys(text: &str) -> BerryLock {
+    berry_lock(scan_berry_blocks(text))
+}
+
+fn berry_lock(blocks: Vec<LockBlock>) -> BerryLock {
     let cache_key = crate::formats::yarn::berry_gates::cache_key(&blocks).map(str::to_string);
     let mut entries = yarn_entries(blocks, split_berry_key_patterns);
     entries.retain(|e| e.block.key != "__metadata");

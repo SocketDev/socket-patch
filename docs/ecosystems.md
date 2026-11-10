@@ -110,7 +110,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
   omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
   `remove` still manage them; rename the lock to package-lock.json (or commit
-  a copy under that name) and re-run. A Deno project's `deno install` reads
+  a copy under that name) and re-run. A project whose own rc file tells the
+  package manager not to read the lock (npm `package-lock=false`, yarn 1
+  `--install.no-lockfile`, a yarn berry `lockfileFilename` naming another
+  file) installs from the registry whatever the lock pins: `vex` then attests
+  a hosted pin only from an installed tree that verifies, and omits a
+  vendored pin (`vex_lock_not_read`). A Deno project's `deno install` reads
   only `deno.lock`, never an npm-family lock, so a hosted or vendored npm pin
   of a `name@version` that `deno.lock` also locks warns
   (`redirect_npm_deno_lock` / `vendor_npm_deno_lock`) and `vex` omits it
@@ -190,7 +195,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   and the scan names the copy (`redirect_copy_unpatched` in hosted mode,
   `vendor_copy_unpatched` in vendored mode); `vex` attests nothing for the
   package while the copy is in the lock. A directory's version is read from
-  its `package.json` (#935).
+  its `package.json` (#935); one that cannot be read (outside the project,
+  missing) may be any version, so `vex` withholds every pin of the package
+  the lock keys it by. The same holds for a copy pnpm fetches from a git
+  remote or a url tarball (`left-pad@git+https://…` with its `version:`
+  line), and, in pnpm 8 and older locks, for a second registry key of the
+  same `name@version` (one per peer set) left on the registry.
   A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
   in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
   run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
@@ -214,7 +224,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   pnpm never reads `pnpm-lock.yaml` and installs from the registry, so hosted
   mode refuses the pnpm pins with `redirect_pnpm_lockfile_disabled` and
   lock-only `vex` attests no hosted pin from that lock. Use `--mode vendored`,
-  which pnpm applies through `overrides` without a lock.
+  which pnpm applies through `overrides` without a lock; `vex` attests such a
+  vendored pin only while the override map that pnpm reads still routes the
+  package to its artifact, and omits it otherwise (`vex_lock_not_read`).
   For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project or, for pnpm >=11, by a

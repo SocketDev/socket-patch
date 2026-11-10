@@ -102,7 +102,38 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         }
     }
     push_uncontested(locks, twin_present, &user_patches, out);
+    if let Some(why) = npm_lock_turned_off(ctx).await {
+        for lock in NPM_LOCKS {
+            out.unpin_lock_not_read(lock, &why);
+            out.unattest_vendored_not_read(lock, &why, |_| false);
+        }
+    }
     extract_pnpm(ctx, out).await;
+}
+
+/// What the project `.npmrc` does when it turns npm's lock off: a top-level
+/// `package-lock` (or its deprecated alias `shrinkwrap`) that npm reads as
+/// false. `npm install` then ignores `package-lock.json` and
+/// `npm-shrinkwrap.json` alike and resolves every dependency from the
+/// registry, while `npm ci` still installs from the lock (measured on npm
+/// 11.19.1: `false` and `null` turn it off, quoted or not; `0`, `False`,
+/// `no` and an empty value do not). Which command a build runs is not in
+/// the files, so the lock's pins prove nothing on their own. A value npm
+/// expands from the environment (`${VAR}`) may be either, and counts as
+/// off. Only the project's own `.npmrc` is read, as for pnpm
+/// ([`crate::utils::pnpm_workspace::lockfile_disabled`]).
+async fn npm_lock_turned_off(ctx: &DiscoverCtx<'_>) -> Option<String> {
+    let npmrc = ctx.read_advisory_text(".npmrc").await?;
+    let setting = ["package-lock", "shrinkwrap"].into_iter().find_map(|key| {
+        let value = crate::patch::redirect::npmrc::npmrc_top_level_value(&npmrc, key)?;
+        let value = value.trim();
+        (matches!(value, "false" | "null" | "undefined") || value.contains("${"))
+            .then(|| format!("`{key}={value}` in .npmrc"))
+    })?;
+    Some(format!(
+        "{setting} makes `npm install` ignore the lock and resolve every dependency from the \
+         registry (only `npm ci` still installs from it)"
+    ))
 }
 
 /// What one parsed npm lock wires, plus the packages it resolves ELSEWHERE
@@ -748,7 +779,9 @@ fn entry_ref(
 ///   locks in scope, exactly the set `scan --mode hosted` collects and
 ///   rewrites (`commands/scan/hosted.rs`). Read whether or not a root lock
 ///   exists, like the rewriter (no precedence between files — rule 10).
-///   Vendoring refuses Rush (`npm_flavor`), so these only carry hosted refs.
+///   Vendoring refuses Rush (`npm_flavor`), so these only carry hosted
+///   refs: a vendored path in a Rush or per-member lock names a file under
+///   that lock's own directory and is diagnosed ([`pnpm_vendored_ref`]).
 ///
 /// Every document of a lock is read. pnpm 11+'s env lockfile document
 /// (config dependencies, the pinned package manager; identified by its
@@ -802,6 +835,12 @@ fn entry_ref(
 ///   tarball is also a ref (pnpm fetches `file:` tarballs locally), under
 ///   the same leaf check.
 ///
+/// Every other entry of the wired `name@version` is a copy pnpm installs
+/// beside it, and withholds the ref: a `file:` directory or tarball
+/// ([`record_pnpm_file_copies`]), a git remote or url tarball
+/// ([`record_pnpm_other_copy`]), and a second registry key of the release
+/// left on the registry ([`record_pnpm_registry_twins`]).
+///
 /// A resolution the grammar refuses (duplicate keys, nested values,
 /// aliases) is a [`DIAG_REF_INVALID`] when it carries a Socket reference;
 /// a file with neither `lockfileVersion:` nor `shrinkwrapVersion:` is not a
@@ -816,7 +855,11 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     } else {
         crate::utils::pnpm_workspace::lockfile_disabled(&ctx.view, false).await
     };
-    let disabled = disabled.as_deref();
+    let off = match disabled {
+        Some(source) => Some(PnpmLockOff::read(ctx, source).await),
+        None => None,
+    };
+    let off = off.as_ref();
     // The root and member locks read (Rush's are not: its pnpm runs with a
     // workspace of its own).
     let mut read: Vec<String> = Vec::new();
@@ -833,7 +876,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         _ => None,
     };
     if let Some(governing) = governing_pnpm_lock(both.0, both.1, pinned) {
-        extract_pnpm_lock(ctx, governing, disabled, out).await;
+        extract_pnpm_lock(ctx, governing, off, out).await;
         read.push(governing.to_string());
         if both == (true, true) {
             let shadowed = if governing == lock { shrinkwrap } else { lock };
@@ -857,7 +900,7 @@ async fn extract_pnpm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         // member importers) is a stale leftover pnpm never reads, and is
         // not among `rels`.
         for rel in rels {
-            extract_pnpm_lock(ctx, &rel, disabled, out).await;
+            extract_pnpm_lock(ctx, &rel, off, out).await;
             read.push(rel);
         }
     }
@@ -948,16 +991,19 @@ fn unattest_git_branch_lock(file: &str, branch_locks: &[String], out: &mut Disco
 }
 
 /// One pnpm lock at root-relative `file` (see [`extract_pnpm`]).
-/// `disabled` names where pnpm's `lockfile` setting is turned off: its
-/// hosted refs then keep no lock pin, and one [`DIAG_REF_UNATTRIBUTABLE`]
-/// names them. Vendored refs are untouched: pnpm applies the `overrides`
-/// that wire them without a lock.
+/// `off` says where pnpm's `lockfile` setting is turned off: its hosted
+/// refs then keep no lock pin, and one [`DIAG_REF_UNATTRIBUTABLE`] names
+/// them. A vendored ref stands only while the override map pnpm reads
+/// without a lock routes its package to the same artifact
+/// ([`PnpmLockOff::routes`]); otherwise it is marked
+/// [`UnattestedKind::LockNotRead`].
 async fn extract_pnpm_lock(
     ctx: &DiscoverCtx<'_>,
     file: &str,
-    disabled: Option<&str>,
+    off: Option<&PnpmLockOff>,
     out: &mut Discovery,
 ) {
+    let disabled = off.map(|off| off.source.as_str());
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
@@ -977,6 +1023,106 @@ async fn extract_pnpm_lock(
     for document in lock.documents() {
         let tree = PnpmTree::of(file, document);
         extract_pnpm_document(ctx, &tree, &lock, document, disabled, out).await;
+    }
+    if let Some(off) = off {
+        out.unattest_vendored_not_read(file, &off.unrouted(), |r| off.routes(r));
+    }
+}
+
+/// A pnpm project whose `lockfile` setting is off: where
+/// ([`crate::utils::pnpm_workspace::lockfile_disabled`]'s source), and the
+/// vendored artifacts its override maps route packages to. pnpm applies
+/// `overrides` while it resolves, with or without a lock, so a vendored
+/// package still installs from its committed artifact exactly when the map
+/// the governing pnpm major reads names it (measured: pnpm 10.34.1 reads
+/// package.json `pnpm.overrides` and, with `lockfile=false` in `.npmrc`,
+/// the workspace file's `overrides:` too; pnpm 11.27.0 reads the workspace
+/// file alone and ignores both `.npmrc`'s `lockfile=false` and
+/// `pnpm.overrides`).
+struct PnpmLockOff {
+    source: String,
+    /// `(override key, artifact)` of package.json `pnpm.overrides`.
+    manifest: Vec<(String, VendorRef)>,
+    /// `(override key, artifact)` of pnpm-workspace.yaml `overrides:`.
+    workspace: Vec<(String, VendorRef)>,
+    /// The lock is off for pnpm 11+, which reads the workspace map alone.
+    needs_workspace: bool,
+    /// The lock is off for pnpm 10 and older, which read `pnpm.overrides`.
+    needs_manifest: bool,
+    /// The project pins pnpm 10, which reads the workspace map as well.
+    pnpm10: bool,
+}
+
+impl PnpmLockOff {
+    async fn read(ctx: &DiscoverCtx<'_>, source: String) -> Self {
+        let vendored = |entries: Vec<(String, String)>| -> Vec<(String, VendorRef)> {
+            entries
+                .into_iter()
+                .filter_map(|(key, value)| Some((key, vendor_ref(&value)?)))
+                .collect()
+        };
+        let manifest = ctx
+            .read_advisory_text("package.json")
+            .await
+            .and_then(|text| serde_json::from_str::<Value>(strip_bom(&text)).ok())
+            .and_then(|doc| doc.pointer("/pnpm/overrides")?.as_object().cloned())
+            .map(|map| {
+                map.into_iter()
+                    .filter_map(|(key, value)| Some((key, value.as_str()?.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let workspace = ctx
+            .read_advisory_text(crate::utils::pnpm_workspace::PNPM_WORKSPACE)
+            .await
+            .map(|text| crate::vendor::pnpm_lock::workspace_override_entries(&text))
+            .unwrap_or_default();
+        let (needs_workspace, needs_manifest, major) =
+            crate::utils::pnpm_workspace::lockfile_off_sources(&ctx.view).await;
+        PnpmLockOff {
+            source,
+            manifest: vendored(manifest),
+            workspace: vendored(workspace),
+            needs_workspace,
+            needs_manifest,
+            pnpm10: major == Some(10),
+        }
+    }
+
+    /// Whether pnpm installs `r`'s package from `r`'s artifact with the
+    /// lock off: every override map a pnpm that ignores the lock reads
+    /// routes it there, by the whole-graph selectors vendoring writes or
+    /// takes over (`name@version`, bare `name`). A `parent>name` selector
+    /// reaches one dependent only, and a range may not select the version.
+    fn routes(&self, r: &PatchedRef) -> bool {
+        let Some((name, version)) = crate::utils::purl::purl_name_version(&r.purl) else {
+            return false;
+        };
+        let exact = format!("{name}@{version}");
+        let routed = |map: &[(String, VendorRef)]| {
+            map.iter().any(|(key, artifact)| {
+                (*key == exact || key == name)
+                    && Some(artifact.artifact_rel.as_str()) == r.artifact_rel.as_deref()
+            })
+        };
+        let (manifest, workspace) = (routed(&self.manifest), routed(&self.workspace));
+        (!self.needs_workspace || workspace)
+            && (!self.needs_manifest || manifest || (self.pnpm10 && workspace))
+    }
+
+    /// Completes "its pin is in `<lock>`, and …" for a ref no override
+    /// routes.
+    fn unrouted(&self) -> String {
+        let map = match (self.needs_workspace, self.needs_manifest) {
+            (true, false) => "pnpm-workspace.yaml `overrides`",
+            (false, true) => "package.json `pnpm.overrides`",
+            _ => "package.json `pnpm.overrides` and pnpm-workspace.yaml `overrides`",
+        };
+        format!(
+            "{}; without the lock pnpm installs a vendored artifact only through an override, \
+             and {map} does not route this package to it",
+            crate::utils::pnpm_workspace::describe_lockfile_disabled(&self.source)
+        )
     }
 }
 
@@ -1013,11 +1159,13 @@ async fn extract_pnpm_document(
     let mut copies: Vec<PnpmFileCopy> = Vec::new();
     let mut bundles: Vec<(&str, Bundled<'_>)> = Vec::new();
     let mut withheld: BTreeSet<String> = BTreeSet::new();
+    let entries_from = out.elsewhere.len();
     for package in lock.packages_of(document) {
         let withhold = disabled.map(|_| &mut withheld);
         pnpm_entry_ref(ctx, tree, package, &mut copies, withhold, out);
         bundles.extend(entry_bundled(&package.entry).map(|b| (package.key, b)));
     }
+    record_pnpm_registry_twins(tree, entries_from, out);
     record_pnpm_file_copies(ctx, tree, copies, out).await;
     record_pnpm_bundled_copies(tree, bundles, out);
     let label = &tree.label;
@@ -1033,6 +1181,73 @@ async fn extract_pnpm_document(
                 withheld.into_iter().collect::<Vec<_>>().join(", ")
             ),
         );
+    }
+}
+
+/// Record each registry-keyed entry of this document that resolves a wired
+/// `name@version` from somewhere else as an unpatched copy of it. One
+/// `name@version` has several `packages:` keys where pnpm keys an entry
+/// per peer set (lockfileVersion 5 / 6, `/name@version(peer@…)`), and pnpm
+/// installs each one. `entries_from` is where this document's entries
+/// start in [`Discovery::elsewhere`], so nothing is recorded per entry of
+/// a lock that wires nothing.
+fn record_pnpm_registry_twins(tree: &PnpmTree<'_>, entries_from: usize, out: &mut Discovery) {
+    let wired: BTreeSet<&str> = out
+        .refs
+        .iter()
+        .filter(|r| r.source_file == Path::new(tree.file) && r.part == tree.part)
+        .map(|r| r.purl.as_str())
+        .collect();
+    if wired.is_empty() {
+        return;
+    }
+    let twins: BTreeSet<String> = out.elsewhere[entries_from..]
+        .iter()
+        .filter(|e| wired.contains(e.purl.as_str()))
+        .map(|e| e.purl.clone())
+        .collect();
+    for purl in twins {
+        let key = purl.strip_prefix("pkg:npm/").unwrap_or(&purl).to_string();
+        out.unpatched_copy_in(
+            tree.file,
+            tree.part,
+            Some(purl),
+            &key,
+            "(another `packages:` key of the same release) resolves it from elsewhere, not a \
+             Socket patch, and pnpm installs every entry",
+        );
+    }
+}
+
+/// Record a `packages:` entry keyed by something other than a registry
+/// version or a `file:` path (a git remote, a url tarball) as a copy of the
+/// package it installs: pnpm fetches it from that source, where no Socket
+/// wiring reaches. pnpm writes the package's own name into the key
+/// (`name@git+https://…`) or a `name:` line, and its version on a
+/// `version:` line; a copy that states no version may be any version of
+/// its package, and one that names no package any package at its version.
+/// An entry that says neither is left alone.
+fn record_pnpm_other_copy(tree: &PnpmTree<'_>, package: &PnpmPackage<'_>, out: &mut Discovery) {
+    let key = package.key;
+    if classify_pnpm_key(key) != PnpmKey::Other {
+        return;
+    }
+    // `[@scope/]name@<spec>`: the `@` after a scope's leading one.
+    let bare = key.trim_start_matches('/');
+    let key_name = bare
+        .get(1..)
+        .and_then(|rest| rest.find('@'))
+        .map(|at| &bare[..at + 1]);
+    let name = entry_field(&package.entry, "name").or(key_name);
+    let version = entry_field(&package.entry, "version");
+    let how = "installs it from a git remote or url, which no Socket wiring reaches (pnpm \
+               installs every packages entry)";
+    match (name, version) {
+        (Some(name), Some(version)) => {
+            out.unpatched_copy_in(tree.file, tree.part, npm_purl(name, version), key, how)
+        }
+        (None, None) => {}
+        (name, version) => out.unidentified_copy(tree.file, name, version, key, how),
     }
 }
 
@@ -1154,18 +1369,33 @@ async fn record_pnpm_file_copies(
             name = name.or_else(|| field("name"));
             version = version.or_else(|| field("version"));
         }
-        let (Some(name), Some(version)) = (name, version) else {
-            continue;
-        };
         let what = if copy.directory {
             "directory"
         } else {
             "tarball"
         };
+        let (Some(name), Some(version)) = (&name, &version) else {
+            // Outside the project, missing, or no package: nobody read
+            // which release it holds, so it may be any the lock leaves
+            // open (#1516's rule for yarn).
+            out.unidentified_copy(
+                tree.file,
+                name.as_deref(),
+                version.as_deref(),
+                &copy.key,
+                &format!(
+                    "installs the user's file: {what} {:?}, whose package.json can't be read \
+                     (outside the project, missing or not a package), so it may be any release \
+                     of the package the lock keys it by",
+                    copy.path
+                ),
+            );
+            continue;
+        };
         out.unpatched_copy_in(
             tree.file,
             tree.part,
-            npm_purl(&name, &version),
+            npm_purl(name, version),
             &copy.key,
             &format!(
                 "installs it from the user's file: {what} {:?}, which no Socket wiring \
@@ -1279,6 +1509,7 @@ fn pnpm_entry_ref(
         // A plain registry entry (integrity only) or a directory/git dep.
         out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, true));
+        record_pnpm_other_copy(tree, package, out);
         return;
     };
     let integrity = resolution
@@ -1322,10 +1553,11 @@ fn pnpm_entry_ref(
             PatchedRef::hosted(purl, uuid, file, Some(tarball), integrity, true).in_part(tree.part),
         );
     } else {
-        // A registry-keyed entry fetching some other tarball, or a user's
-        // `file:` tarball.
+        // A registry-keyed entry fetching some other tarball, a user's
+        // `file:` tarball, or a url-keyed one.
         out.resolved_elsewhere_in(file, tree.part, pnpm_registry_key_purl(key));
         copies.extend(pnpm_file_copy(package, false));
+        record_pnpm_other_copy(tree, package, out);
     }
 }
 
@@ -1349,6 +1581,21 @@ fn pnpm_vendored_ref(
             ),
         );
     };
+    // pnpm resolves a lock's `file:` tarball against the lock's own
+    // directory, so only the root lock's root-relative path is the
+    // committed artifact. A member or Rush lock's names a file under its
+    // own directory, which nothing here hashes (no vendor backend writes
+    // one there).
+    if Path::new(tree.file)
+        .parent()
+        .is_some_and(|dir| dir != Path::new(""))
+    {
+        return invalid(
+            out,
+            "is a root-relative vendored path in a lock outside the project root, which pnpm \
+             resolves against the lock's own directory, not the committed artifact",
+        );
+    }
     // (name, the key's own `file:` path if the key was rekeyed).
     let (name, key_path) = match classify_pnpm_key(key) {
         // Legacy (v5.4 / v6.0): bare `file:<rel-tgz>` key + `name:` line.
@@ -1524,6 +1771,56 @@ mod tests {
             v.locked_integrity,
             Some(LockIntegrity::Sri(SRI.to_string()))
         );
+    }
+
+    /// A vendored `resolved` whose tarball name carries a `%` is not a
+    /// reference: the leaf-name check would decode it (`%6ceft-pad` reads
+    /// as `left-pad`), and whether the file a package manager opens is the
+    /// literal or the decoded one differs by package manager, so one rule
+    /// refuses it for all (`vendor_ref`). The uuid stays recognized, so a
+    /// ledger entry for it is dead.
+    #[tokio::test]
+    async fn percent_encoded_vendored_tarball_is_not_a_reference() {
+        for (leaf, attested) in [
+            ("left-pad-1.3.0.tgz", true),
+            ("%6ceft-pad-1.3.0.tgz", false),
+            ("left-pad-1.3.0%2etgz", false),
+        ] {
+            let resolved = format!("file:.socket/vendor/npm/{UUID_B}/{leaf}");
+            let p = Project::new();
+            p.write(
+                "package-lock.json",
+                lock_with_packages(serde_json::json!({
+                    "": { "name": "app", "version": "1.0.0" },
+                    "node_modules/left-pad": { "version": "1.3.0", "resolved": resolved, "integrity": SRI },
+                })),
+            );
+            p.write(
+                "pnpm-lock.yaml",
+                format!(
+                    "lockfileVersion: '9.0'\n\npackages:\n\n  left-pad@{resolved}:\n    resolution: \
+                     {{integrity: {SRI}, tarball: {resolved}}}\n    version: 1.3.0\n"
+                ),
+            );
+            let out = run(&p).await;
+            let files: Vec<&Path> = out.refs.iter().map(|r| r.source_file.as_path()).collect();
+            if attested {
+                assert_eq!(
+                    files,
+                    [Path::new("package-lock.json"), Path::new("pnpm-lock.yaml")],
+                    "{leaf}"
+                );
+            } else {
+                assert!(files.is_empty(), "{leaf}: {:#?}", out.refs);
+                assert!(
+                    out.recognized
+                        .iter()
+                        .any(|r| r.uuid == UUID_B && r.mode == WiringMode::Vendored),
+                    "{leaf}: {:#?}",
+                    out.recognized
+                );
+            }
+        }
     }
 
     /// Nested instances and the alias `name` field: the package is the
@@ -3277,8 +3574,8 @@ mod tests {
 
     /// A `file:` directory's `package.json` is read past one leading BOM
     /// (`formats::text`): with one it still contests the ref; with two the
-    /// manifest does not parse, so the copy is left alone like any
-    /// unreadable one.
+    /// manifest does not parse, so like any unreadable copy it may be any
+    /// release of the package its key names, and withholds the ref too.
     #[tokio::test]
     async fn pnpm_file_directory_manifest_reads_past_one_bom_only() {
         let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
@@ -3302,10 +3599,10 @@ mod tests {
             "forks/left-pad/package.json",
             format!("\u{feff}\u{feff}{manifest}"),
         );
-        assert_refs(
-            &run(&p).await,
-            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
-        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        let detail = &out.diagnostics[0].detail;
+        assert!(detail.contains("package.json can't be read"), "{detail}");
     }
 
     /// pnpm unpacks a package's `bundledDependencies` from its own tarball
@@ -3964,6 +4261,355 @@ mod tests {
         p.write("packages/a/package.json", "{}");
         p.write("packages/a/pnpm-lock.yaml", &wired);
         withheld(&run(&p).await, "`lockfile: false` in pnpm-workspace.yaml");
+    }
+
+    /// The marks discovery put on `purl`, by kind.
+    fn marks(out: &Discovery, purl: &str) -> Vec<UnattestedKind> {
+        out.unattested
+            .iter()
+            .filter(|u| u.purl == purl)
+            .map(|u| u.kind)
+            .collect()
+    }
+
+    /// pnpm installs every `packages:` entry a snapshot reaches, so a second
+    /// entry of the wired `name@version` from a git remote, a url tarball
+    /// or a directory is an unpatched copy beside the patched one (real
+    /// pnpm 10.34.1 locks `github:stevemao/left-pad#v1.3.0` and
+    /// `file:../lp-fork` under the package's own name, exactly as below,
+    /// and installs both next to the registry entry). A copy whose
+    /// directory cannot be read may be any version of the package it is
+    /// keyed by. Another version, or another package, contests nothing.
+    #[tokio::test]
+    async fn pnpm_second_copy_from_git_url_or_directory_withholds_the_wiring() {
+        const PURL: &str = "pkg:npm/left-pad@1.3.0";
+        const SHA: &str = "ff8e7ba8b4122829cf66125ca8445cac7f073bce";
+        let url = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = |second: &str| {
+            format!(
+                "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+                 specifier: 1.3.0\n        version: 1.3.0\n\npackages:\n\n  left-pad@1.3.0:\n    \
+                 resolution: {{integrity: {SRI}, tarball: {url}}}\n\n{second}"
+            )
+        };
+        let git = |name: &str, version: &str| {
+            format!(
+                "  {name}@git+https://git@github.com:stevemao/left-pad.git#{SHA}:\n    \
+                 resolution: {{commit: {SHA}, repo: git@github.com:stevemao/left-pad.git, type: git}}\n    \
+                 version: {version}\n"
+            )
+        };
+        let codeload = format!(
+            "  left-pad@https://codeload.github.com/stevemao/left-pad/tar.gz/{SHA}:\n    \
+             resolution: {{tarball: https://codeload.github.com/stevemao/left-pad/tar.gz/{SHA}}}\n    \
+             version: 1.3.0\n"
+        );
+        let directory = |path: &str| {
+            format!(
+                "  left-pad@file:{path}:\n    resolution: {{directory: {path}, type: directory}}\n"
+            )
+        };
+        let withheld = |second: &str, what: &str| {
+            let text = lock(second);
+            let what = what.to_string();
+            async move {
+                let p = Project::nested("app");
+                p.write("pnpm-lock.yaml", text);
+                p.write(
+                    "lp-other/package.json",
+                    r#"{"name":"left-pad","version":"2.0.0"}"#,
+                );
+                let out = run(&p).await;
+                let unattributable: Vec<&str> = out
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                    .map(|d| d.detail.as_str())
+                    .collect();
+                match out.refs.as_slice() {
+                    [] => {
+                        assert_eq!(out.shadowed.len(), 1, "{what}: {out:#?}");
+                        assert!(
+                            matches!(unattributable.as_slice(), [d] if d.contains(PURL)),
+                            "{what}: {unattributable:#?}"
+                        );
+                        true
+                    }
+                    [r] => {
+                        assert_eq!(r.purl, PURL, "{what}");
+                        assert!(unattributable.is_empty(), "{what}: {unattributable:#?}");
+                        false
+                    }
+                    refs => panic!("{what}: {refs:#?}"),
+                }
+            }
+        };
+        assert!(withheld(&git("left-pad", "1.3.0"), "a git copy").await);
+        assert!(withheld(&codeload, "a url tarball copy").await);
+        assert!(withheld(&directory("../lp-fork"), "a directory outside the project").await);
+        assert!(withheld(&directory("lp-missing"), "a directory that is not there").await);
+        // Controls.
+        assert!(!withheld("", "the wiring alone").await);
+        assert!(!withheld(&git("left-pad", "2.0.0"), "a git copy of another version").await);
+        assert!(!withheld(&git("right-pad", "1.3.0"), "a git copy of another package").await);
+        assert!(
+            !withheld(
+                &directory("lp-other"),
+                "a directory holding another version"
+            )
+            .await
+        );
+
+        // pnpm <= 8 keys a registry entry per peer set: one left on the
+        // registry beside the wired one installs unpatched.
+        let p = Project::new();
+        p.write(
+            "pnpm-lock.yaml",
+            format!(
+                "lockfileVersion: '6.0'\n\npackages:\n\n  /left-pad@1.3.0(react@18.2.0):\n    \
+                 resolution: {{integrity: {SRI}, tarball: {url}}}\n    dev: false\n\n  \
+                 /left-pad@1.3.0(react@17.0.2):\n    resolution: {{integrity: sha512-UP==}}\n    \
+                 dev: false\n"
+            ),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.shadowed.len(), 1, "{out:#?}");
+    }
+
+    /// pnpm resolves a lock's `file:` tarball against the lock's own
+    /// directory (real pnpm 10.34.1 and 11.27.0, `sharedWorkspaceLockfile:
+    /// false`: `packages/a/pnpm-lock.yaml`'s `file:vendor/x.tgz` installs
+    /// `packages/a/vendor/x.tgz`). A root-relative `.socket/vendor/…` path
+    /// in a member or Rush lock therefore names a file under that lock's
+    /// directory, never the committed artifact `vex` hashes, and no vendor
+    /// backend writes one there: it is diagnosed, not a ref.
+    #[tokio::test]
+    async fn pnpm_vendored_path_in_a_member_or_rush_lock_is_not_the_root_artifact() {
+        let rel = format!(".socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: file:{rel}\n        version: file:{rel}\n\npackages:\n\n  \
+             left-pad@file:{rel}:\n    resolution: {{integrity: {SRI}, tarball: file:{rel}}}\n    \
+             version: 1.3.0\n"
+        );
+        let refused = |out: &Discovery, file: &str| {
+            assert_refs(out, &[]);
+            let invalid: Vec<&Diag> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == DIAG_REF_INVALID)
+                .collect();
+            assert!(
+                matches!(invalid.as_slice(), [d] if d.file == Path::new(file)
+                    && d.detail.contains("the lock's own directory")),
+                "{file}: {:#?}",
+                out.diagnostics
+            );
+        };
+
+        // Control: the root lock's path is the committed artifact.
+        let p = Project::new();
+        p.write("pnpm-lock.yaml", &lock);
+        assert_refs(
+            &run(&p).await,
+            &[("pkg:npm/left-pad@1.3.0", UUID_B, WiringMode::Vendored)],
+        );
+
+        let p = Project::new();
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        );
+        p.write("packages/a/package.json", "{}");
+        p.write("packages/a/pnpm-lock.yaml", &lock);
+        refused(&run(&p).await, "packages/a/pnpm-lock.yaml");
+
+        let p = Project::new();
+        p.write("rush.json", "{}");
+        p.write("common/config/rush/pnpm-lock.yaml", &lock);
+        refused(&run(&p).await, "common/config/rush/pnpm-lock.yaml");
+    }
+
+    /// With pnpm's lock off, a vendored entry of the unread lock installs
+    /// only through the override map the governing pnpm major reads
+    /// (measured: pnpm 10.34.1 applies `pnpm.overrides` or the workspace
+    /// file's `overrides:` with `lockfile=false`; pnpm 11.27.0 reads the
+    /// workspace file alone, and ignores `.npmrc`'s `lockfile=false`). An
+    /// entry no such override routes to its artifact is what pnpm replaces
+    /// with the registry release, so it is never attested.
+    #[tokio::test]
+    async fn pnpm_disabled_lockfile_attests_a_vendored_ref_only_through_an_override() {
+        let rel = format!(".socket/vendor/npm/{UUID_B}/left-pad-1.3.0.tgz");
+        let lock = format!(
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    dependencies:\n      left-pad:\n        \
+             specifier: file:{rel}\n        version: file:{rel}\n\npackages:\n\n  \
+             left-pad@file:{rel}:\n    resolution: {{integrity: {SRI}, tarball: file:{rel}}}\n    \
+             version: 1.3.0\n"
+        );
+        const PURL: &str = "pkg:npm/left-pad@1.3.0";
+        let manifest = |overrides: &str| {
+            format!(r#"{{"name":"app","dependencies":{{"left-pad":"1.3.0"}}{overrides}}}"#)
+        };
+        let routed = format!(r#","pnpm":{{"overrides":{{"left-pad@1.3.0":"file:{rel}"}}}}"#);
+        let workspace = |off: &str, key: &str| {
+            format!("packages:\n  - '.'\n{off}overrides:\n  {key}: file:{rel}\n")
+        };
+        let project = || {
+            let p = Project::new();
+            p.write("pnpm-lock.yaml", &lock);
+            p
+        };
+        let attested = |out: &Discovery| {
+            assert_refs(out, &[(PURL, UUID_B, WiringMode::Vendored)]);
+            marks(out, PURL).is_empty()
+        };
+
+        // Control: the lock is read.
+        let p = project();
+        p.write("package.json", manifest(""));
+        assert!(attested(&run(&p).await), "control");
+
+        // `.npmrc` turns it off (pnpm <= 10) and nothing routes the package.
+        p.write(".npmrc", "lockfile=false\n");
+        let out = run(&p).await;
+        assert!(!attested(&out), "no override: {:#?}", out.unattested);
+        assert_eq!(marks(&out, PURL), [UnattestedKind::LockNotRead]);
+        let detail = &out.unattested[0].detail;
+        assert!(
+            detail.contains("`lockfile=false` in .npmrc") && detail.contains("pnpm.overrides"),
+            "{detail}"
+        );
+        // The override pnpm <= 10 reads routes it.
+        p.write("package.json", manifest(&routed));
+        assert!(attested(&run(&p).await), "package.json override");
+        // One for another artifact, a dependent-scoped one or a range do not.
+        for other in [
+            format!(
+                r#","pnpm":{{"overrides":{{"left-pad@1.3.0":"file:.socket/vendor/npm/{UUID_A}/left-pad-1.3.0.tgz"}}}}"#
+            ),
+            format!(r#","pnpm":{{"overrides":{{"app>left-pad@1.3.0":"file:{rel}"}}}}"#),
+            format!(r#","pnpm":{{"overrides":{{"left-pad@^1.0.0":"file:{rel}"}}}}"#),
+            format!(r#","pnpm":{{"overrides":{{"left-pad@1.2.0":"file:{rel}"}}}}"#),
+        ] {
+            p.write("package.json", manifest(&other));
+            assert!(!attested(&run(&p).await), "{other}");
+        }
+
+        // pnpm 11 reads the workspace file alone: its `lockfile: false`
+        // needs the override there, whatever package.json carries.
+        let p = project();
+        p.write("package.json", manifest(&routed));
+        p.write(
+            "pnpm-workspace.yaml",
+            "packages:\n  - '.'\nlockfile: false\n",
+        );
+        assert!(!attested(&run(&p).await), "package.json alone on pnpm 11");
+        for key in ["left-pad@1.3.0", "left-pad", "'left-pad@1.3.0'"] {
+            p.write("pnpm-workspace.yaml", workspace("lockfile: false\n", key));
+            assert!(attested(&run(&p).await), "workspace override `{key}`");
+        }
+        p.write(
+            "pnpm-workspace.yaml",
+            workspace("lockfile: false\n", "app>left-pad"),
+        );
+        assert!(!attested(&run(&p).await), "a dependent-scoped override");
+
+        // A pinned pnpm 10 reads either map with `.npmrc`'s setting.
+        let p = project();
+        p.write(
+            "package.json",
+            r#"{"name":"app","packageManager":"pnpm@10.34.1","dependencies":{"left-pad":"1.3.0"}}"#,
+        );
+        p.write(".npmrc", "lockfile=false\n");
+        assert!(!attested(&run(&p).await), "pnpm 10, no override");
+        p.write("pnpm-workspace.yaml", workspace("", "left-pad@1.3.0"));
+        assert!(attested(&run(&p).await), "pnpm 10, workspace override");
+    }
+
+    /// npm's `package-lock=false` (or its `shrinkwrap=false` alias) in the
+    /// project `.npmrc` makes `npm install` ignore both npm locks and
+    /// resolve from the registry, while `npm ci` still installs from them
+    /// (measured on npm 11.19.1, with the values npm reads as false). Which
+    /// one a build runs is not in the files: a hosted pin keeps no lockfile
+    /// basis, and a vendored pin, whose only wiring is that lock entry, is
+    /// not attested.
+    #[tokio::test]
+    async fn npm_lock_turned_off_in_npmrc_attests_nothing_from_the_lock_alone() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:.socket/vendor/npm/{UUID_B}/@scope/pkg-2.0.0.tgz");
+        let lock = lock_with_packages(serde_json::json!({
+            "": { "name": "app", "version": "1.0.0" },
+            "node_modules/left-pad": { "version": "1.3.0", "resolved": hosted, "integrity": SRI },
+            "node_modules/@scope/pkg": { "version": "2.0.0", "resolved": vendored, "integrity": SRI },
+        }));
+        const HOSTED: &str = "pkg:npm/left-pad@1.3.0";
+        const VENDORED: &str = "pkg:npm/@scope/pkg@2.0.0";
+        for (npmrc, off) in [
+            ("package-lock=false\n", true),
+            ("package-lock = \"false\"\n", true),
+            ("package-lock=null\n", true),
+            ("shrinkwrap=false\n", true),
+            ("package-lock=true\nshrinkwrap=false\n", true),
+            ("package-lock=${NO_LOCK}\n", true),
+            ("package-lock=true\n", false),
+            ("package-lock=0\n", false),
+            ("package-lock=False\n", false),
+            ("package-lock=\n", false),
+            ("package-lock=false\npackage-lock=true\n", false),
+            ("[section]\npackage-lock=false\n", false),
+            ("lockfile=false\n", false),
+        ] {
+            let p = Project::new();
+            p.write("package-lock.json", &lock);
+            p.write(".npmrc", npmrc);
+            let out = run(&p).await;
+            // The wiring stays visible to rollback, remove and list.
+            assert_refs(
+                &out,
+                &[
+                    (HOSTED, UUID_A, WiringMode::Hosted),
+                    (VENDORED, UUID_B, WiringMode::Vendored),
+                ],
+            );
+            let pinned = out
+                .refs
+                .iter()
+                .find(|r| r.mode == WiringMode::Hosted)
+                .unwrap()
+                .lockfile_basis_ok();
+            assert_eq!(pinned, !off, "{npmrc:?}");
+            let expected: &[UnattestedKind] = if off {
+                &[UnattestedKind::LockNotRead]
+            } else {
+                &[]
+            };
+            assert_eq!(marks(&out, VENDORED), expected, "{npmrc:?}");
+            assert!(marks(&out, HOSTED).is_empty(), "{npmrc:?}");
+            let diags: Vec<&str> = out
+                .diagnostics
+                .iter()
+                .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                .map(|d| d.detail.as_str())
+                .collect();
+            if off {
+                assert!(
+                    matches!(diags.as_slice(), [d] if d.contains(HOSTED) && d.contains(".npmrc")),
+                    "{npmrc:?}: {diags:#?}"
+                );
+            } else {
+                assert!(diags.is_empty(), "{npmrc:?}: {diags:#?}");
+            }
+        }
+        // The shrinkwrap is ignored the same way.
+        let p = Project::new();
+        p.write("npm-shrinkwrap.json", &lock);
+        p.write("package-lock.json", &lock);
+        p.write(".npmrc", "package-lock=false\n");
+        let out = run(&p).await;
+        assert!(out.refs.iter().all(|r| !r.lockfile_basis_ok()), "{out:#?}");
+        // One mark per lock that carries the pin.
+        assert_eq!(marks(&out, VENDORED), [UnattestedKind::LockNotRead; 2]);
     }
 
     /// REGRESSION (#556, N1): with pnpm's `gitBranchLockfile` on and a

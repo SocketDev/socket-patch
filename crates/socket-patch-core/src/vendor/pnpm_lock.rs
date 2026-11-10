@@ -2264,6 +2264,23 @@ fn ws_overrides_section(lines: &[String]) -> Option<(usize, usize, usize)> {
     Some((start, end, indent))
 }
 
+/// The `(key, value)` entries of a pnpm-workspace.yaml's block-style
+/// `overrides:` section, values as YAML reads them ([`ws_override_value`]).
+/// Empty for a missing or flow-style section: VEX discovery asks which
+/// packages the map routes, and a shape the surgery cannot read routes none
+/// it can vouch for.
+pub(crate) fn workspace_override_entries(ws_text: &str) -> Vec<(String, String)> {
+    let lines = split_lines(ws_text);
+    let Some((start, end, indent)) = ws_overrides_section(&lines) else {
+        return Vec::new();
+    };
+    lines[start + 1..end]
+        .iter()
+        .filter_map(|l| parse_key_line(l, indent))
+        .map(|(key, _repr, rest)| (key.to_string(), ws_override_value(rest).to_string()))
+        .collect()
+}
+
 /// Pre-flight mirror check for pnpm-workspace.yaml (analogous to
 /// [`check_lock_override`]): a block-style `overrides:` section may only
 /// carry a same-name key equal to `effective_key` with an ownable value.

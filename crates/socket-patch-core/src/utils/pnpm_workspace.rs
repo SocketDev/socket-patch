@@ -950,6 +950,25 @@ async fn lockfile_disabled_in(
     })
 }
 
+/// Which settings files turn pnpm's lock off for the project at `view`,
+/// as `(pnpm-workspace.yaml, .npmrc)`, with the pnpm major that decides
+/// which one counts ([`lockfile_disabled`]): the YAML file for pnpm 11 and
+/// newer, `.npmrc` for pnpm 10 and older, either when no major is known.
+/// The same majors read their override map from different places (pnpm 11
+/// from the YAML file alone), which is what VEX discovery asks this for.
+pub(crate) async fn lockfile_off_sources(view: &ProjectView<'_>) -> (bool, bool, Option<u32>) {
+    let workspace = view.read_text(PNPM_WORKSPACE).await.ok();
+    let npmrc = view.read_text(".npmrc").await.ok();
+    let yaml = lockfile_off(|key, _| pnpm_setting(workspace.as_deref(), None, key, key));
+    let rc = lockfile_off(|_, key| pnpm_setting(None, npmrc.as_deref(), key, key));
+    let major = pnpm_major(view).await;
+    (
+        yaml.is_some() && major.is_none_or(|major| major >= 11),
+        rc.is_some() && major.is_none_or(|major| major <= 10),
+        major,
+    )
+}
+
 /// Where one settings source turns pnpm's lock off: its `lockfile` when
 /// that reads as a boolean, else npm's `package-lock`, which every pnpm
 /// (7 through 11) falls back to for `useLockfile`. `setting` looks a key

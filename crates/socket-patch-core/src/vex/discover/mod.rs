@@ -564,6 +564,16 @@ pub struct ResolvedElsewhere {
     pub as_spelled: bool,
     /// The install tree of `file` the entry is in ([`TreePart`]).
     pub part: TreePart,
+    /// The entry is one resolved package of a Python lock (uv, a PEP 723
+    /// script lock, pylock, Poetry, PDM, `Pipfile.lock`), which the
+    /// installer installs wherever its markers, extras or category select
+    /// it, beside every other entry of the lock. It is then a same-lock
+    /// copy too ([`Discovery::locked_elsewhere`]). `false` for a pip
+    /// requirement, which pip resolves together with a direct reference to
+    /// the same release (#1086), and for npm-family entries, whose
+    /// extractors record same-lock copies themselves
+    /// ([`Discovery::unpatched_copy`]).
+    pub locked: bool,
 }
 
 impl ResolvedElsewhere {
@@ -784,6 +794,16 @@ pub enum UnattestedKind {
     /// replaces the same module elsewhere — exactly where the hosted and
     /// vendored writers refuse to write one.
     GoWorkspaceOverride,
+    /// A vendored npm-family pin in a lock the project's own configuration
+    /// tells the package manager not to read
+    /// ([`Discovery::unattest_vendored_not_read`]): npm's `package-lock=false`
+    /// (`npm install` resolves from the registry; only `npm ci` reads the
+    /// lock), yarn 1's `--install.no-lockfile`, a yarn berry
+    /// `lockfileFilename` naming another file, or pnpm's `lockfile: false`
+    /// with no override routing the package to the artifact. The committed
+    /// artifact is the vendored basis, and nothing installs it through a
+    /// lock nothing reads.
+    LockNotRead,
 }
 
 impl UnattestedKind {
@@ -1192,7 +1212,36 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: false,
             part,
+            locked: false,
         });
+    }
+
+    /// [`Discovery::resolved_elsewhere`] for one resolved package of a
+    /// Python lock ([`ResolvedElsewhere::locked`]): evidence against
+    /// another lock's wiring of the release, and a same-lock copy that
+    /// withholds this lock's own ref of it
+    /// ([`Discovery::contest_within_locks`]). The Python lock extractors
+    /// record every non-Socket entry through here, so the same-lock rule is
+    /// decided in one place for all of them.
+    pub(crate) fn locked_elsewhere(&mut self, file: &str, purl: Option<String>) {
+        let before = self.elsewhere.len();
+        self.resolved_elsewhere(file, purl);
+        self.mark_locked(before);
+    }
+
+    /// [`Discovery::resolved_elsewhere_any_version`] for a Python lock
+    /// entry ([`Discovery::locked_elsewhere`]).
+    pub(crate) fn locked_elsewhere_any_version(&mut self, file: &str, name_purl: Option<String>) {
+        let before = self.elsewhere.len();
+        self.resolved_elsewhere_any_version(file, name_purl);
+        self.mark_locked(before);
+    }
+
+    /// Mark the evidence recorded since `from` as lock entries.
+    fn mark_locked(&mut self, from: usize) {
+        for entry in &mut self.elsewhere[from..] {
+            entry.locked = true;
+        }
     }
 
     /// [`Discovery::resolved_elsewhere`] for a version that matches only as
@@ -1205,6 +1254,7 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: true,
             part: TreePart::File,
+            locked: false,
         });
     }
 
@@ -1225,6 +1275,7 @@ impl Discovery {
             file: PathBuf::from(file),
             as_spelled: false,
             part: TreePart::File,
+            locked: false,
         });
     }
 
@@ -1361,14 +1412,72 @@ impl Discovery {
     /// moves it to [`Discovery::rewirable`] (a re-run rewires that entry,
     /// and the project ref then stands in its place, see
     /// [`Discovery::drop_env_twins`]).
+    ///
+    /// A Python lock's ref is withheld by another entry of the SAME lock
+    /// that resolves its release from elsewhere
+    /// ([`Discovery::locked_elsewhere`]; any PEP 440 spelling of the
+    /// version, or an entry naming no version): uv's marker forks, Poetry's
+    /// multiple-constraint dependencies, a PEP 751 marker split, a PDM
+    /// extras variant and a `Pipfile.lock` category each install their own
+    /// entry where it is selected. A re-run rewires that entry, so the ref
+    /// moves to [`Discovery::rewirable`].
     fn contest_within_locks(&mut self) {
         self.drop_env_twins();
         self.expand_unidentified_copies();
-        if self.unpatched_copies.is_empty() && self.refs.iter().all(|r| r.part == TreePart::File) {
+        // The Python lock entries, by the keys a ref looks its own up under
+        // ([`ResolvedElsewhere::index_keys`]).
+        let mut locked: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, e) in self.elsewhere.iter().enumerate().filter(|(_, e)| e.locked) {
+            for key in e.index_keys() {
+                locked.entry(key).or_default().push(i);
+            }
+        }
+        if self.unpatched_copies.is_empty()
+            && locked.is_empty()
+            && self.refs.iter().all(|r| r.part == TreePart::File)
+        {
             return;
         }
+        // Each ref's own-lock entry of its release, decided before the refs
+        // move: (ref index, whether the entry names no version).
+        let own_entry: HashMap<usize, bool> = self
+            .refs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| {
+                let entry = ResolvedElsewhere::lookup_keys(&r.purl)
+                    .filter_map(|key| locked.get(key))
+                    .flatten()
+                    .map(|&e| &self.elsewhere[e])
+                    .find(|e| e.file == r.source_file && e.part == r.part && e.covers(&r.purl))?;
+                Some((i, entry.any_version()))
+            })
+            .collect();
+        drop(locked);
         let refs = std::mem::take(&mut self.refs);
-        for r in refs {
+        for (i, r) in refs.into_iter().enumerate() {
+            if let Some(&any_version) = own_entry.get(&i) {
+                let file = r.source_file.to_string_lossy().into_owned();
+                let resolves = if any_version {
+                    "resolves the package, at a version it doesn't name, from elsewhere"
+                } else {
+                    "resolves the same release from elsewhere"
+                };
+                self.diag(
+                    DIAG_REF_UNATTRIBUTABLE,
+                    &file,
+                    format!(
+                        "{file}: {} is wired to Socket patch {}, but another entry of the same \
+                         lock {resolves} (not a Socket patch); the installer takes that entry \
+                         wherever its markers, extras or category select it, so the patch is \
+                         not attested — re-run `socket-patch scan` / `vendor` to rewire every \
+                         entry",
+                        r.purl, r.uuid
+                    ),
+                );
+                self.withhold_rewirable(r);
+                continue;
+            }
             let copy = self
                 .unpatched_copies
                 .iter()
@@ -1433,10 +1542,14 @@ impl Discovery {
     /// ([`DIAG_REF_UNATTRIBUTABLE`], naming both files) and not emitted.
     /// Its uuid stays recognized, so a ledger claim for it is dead too (rule
     /// 11). This generalizes the npm extractor's shrinkwrap/package-lock
-    /// rule to every pair of locks. PEP 723 script locks (`*.py.lock`)
-    /// neither contest nor are contested: each is scoped to its own script's
-    /// install. Neither is a pnpm env lockfile document
-    /// ([`TreePart::PnpmEnv`]): pnpm installs its config dependencies into
+    /// rule to every pair of locks. A PEP 723 script lock (`*.py.lock`) is
+    /// one of them: `uv run` installs the release its script imports from
+    /// it, so a script lock wired to a patch does not vouch for a project
+    /// lock that resolves the same release from the index, nor the reverse
+    /// (a VEX statement covers the release, not one install tree; both
+    /// writers rewire script locks, so a re-run clears it). A pnpm env
+    /// lockfile document ([`TreePart::PnpmEnv`]) neither contests nor is
+    /// contested: pnpm installs its config dependencies into
     /// its config store whatever else runs, and its wiring exempts no
     /// other tree. Files of one install tree ([`Discovery::install_trees`])
     /// are one lock here: pip resolves a direct reference and a compatible
@@ -1463,7 +1576,7 @@ impl Discovery {
         let mut contested = Vec::new();
         let refs = std::mem::take(&mut self.refs);
         for r in refs {
-            let other = (!is_script_lock(&r.source_file) && r.part == TreePart::File)
+            let other = (r.part == TreePart::File)
                 .then(|| {
                     let tree = self.tree_of(&r.source_file);
                     // Only a PyPI ref can match another spelling of its
@@ -1715,6 +1828,72 @@ impl Discovery {
         });
     }
 
+    /// Take the lock pin from every hosted ref of root-relative lock `file`,
+    /// because the project's own configuration tells the package manager
+    /// not to read that lock (`why` names the setting and what it does):
+    /// what installs is then resolved afresh, so the pin fixes no bytes
+    /// and the ref has no lockfile basis ([`PatchedRef::lockfile_basis_ok`]).
+    /// Only an installed tree whose every copy verifies attests it. One
+    /// [`DIAG_REF_UNATTRIBUTABLE`] names the pins. Called once the
+    /// extractor has pushed `file`'s refs; the vendored half is
+    /// [`Discovery::unattest_vendored_not_read`].
+    pub(crate) fn unpin_lock_not_read(&mut self, file: &str, why: &str) {
+        let mut unpinned: BTreeSet<String> = BTreeSet::new();
+        for r in self.refs.iter_mut().filter(|r| {
+            r.mode == WiringMode::Hosted && r.source_file == Path::new(file) && r.integrity_required
+        }) {
+            r.locked_integrity = None;
+            unpinned.insert(r.purl.clone());
+        }
+        if unpinned.is_empty() {
+            return;
+        }
+        self.diag(
+            DIAG_REF_UNATTRIBUTABLE,
+            file,
+            format!(
+                "{file}: {why}, so its hosted pins of {} are not attested from the lock alone, \
+                 only from an installed tree whose every copy verifies",
+                unpinned.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        );
+    }
+
+    /// Mark every vendored ref of root-relative lock `file`
+    /// [`UnattestedKind::LockNotRead`], because the project's own
+    /// configuration tells the package manager not to read that lock
+    /// (`why`, as in [`Discovery::unpin_lock_not_read`]): the vendored basis
+    /// is the committed artifact, which nothing installs through a lock
+    /// nothing reads. `wired` exempts a ref that a file the package manager
+    /// does read routes to the same artifact (a pnpm override). The refs
+    /// stay refs: the wiring is intact, and no `scan` / `vendor` re-run
+    /// clears a setting.
+    pub(crate) fn unattest_vendored_not_read(
+        &mut self,
+        file: &str,
+        why: &str,
+        wired: impl Fn(&PatchedRef) -> bool,
+    ) {
+        let marks: Vec<UnwiredCopy> = self
+            .refs
+            .iter()
+            .filter(|r| r.mode == WiringMode::Vendored && r.source_file == Path::new(file))
+            .filter(|r| !wired(r))
+            .map(|r| UnwiredCopy {
+                scope: Some((r.source_file.clone(), r.part)),
+                // Only while the ref survives every contest.
+                target: CopyTarget::Ref {
+                    purl: r.purl.clone(),
+                    uuid: r.uuid.clone(),
+                },
+                file: r.source_file.clone(),
+                detail: format!("its pin is in {file}, and {why}"),
+                kind: UnattestedKind::LockNotRead,
+            })
+            .collect();
+        self.unwired_copies.extend(marks);
+    }
+
     /// Record a copy some build installs where no Socket wiring reaches,
     /// when the files cannot tie it to a ref's exact `name@version` or
     /// cannot say the build runs it ([`UnwiredCopy`]). Every ref it may
@@ -1888,19 +2067,29 @@ async fn discover_with_ctx(mut ctx: DiscoverCtx<'_>) -> Discovery {
 /// the workspace root's lock, see
 /// [`crate::hosted::governing_root::member_stray_lock`]) is read as absent,
 /// as it is by the install: nothing in it is wiring, so its pins attest
-/// nothing. Its Socket identities are still recognized (rule 11), so a
+/// nothing. So is a pnpm workspace member's own lock while the workspace
+/// shares one, and a yarn 1 workspace member's classic `yarn.lock`
+/// ([`crate::hosted::governing_root::member_unread_lock`]). Its Socket
+/// identities are still recognized (rule 11), so a
 /// ledger claim it alone mentions is dead, and one diagnostic says why.
 /// Disk runs only: an in-memory project has no ancestors.
 async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discovery) {
+    use crate::hosted::governing_root::{
+        member_stray_lock, member_stray_lock_own_files, member_unread_lock,
+    };
     // Declares the project files the check reads; the rest are above the
     // project, which no overlay of the project's files changes.
-    let Some(root) =
-        ctx.disk_root_reading(crate::hosted::governing_root::member_stray_lock_own_files())
-    else {
+    let own_files =
+        member_stray_lock_own_files().chain([crate::utils::pnpm_workspace::PNPM_WORKSPACE]);
+    let Some(root) = ctx.disk_root_reading(own_files) else {
         return;
     };
-    let Some(stray) = crate::hosted::governing_root::member_stray_lock(root).await else {
-        return;
+    let stray = match member_stray_lock(root).await {
+        Some(stray) => stray,
+        None => match member_unread_lock(root).await {
+            Some(stray) => stray,
+            None => return,
+        },
     };
     for rel in &stray.ignored {
         let mentions = match ctx.view.read_bytes(rel).await {
@@ -1925,11 +2114,6 @@ async fn ignore_member_stray_locks(ctx: &mut DiscoverCtx<'_>, out: &mut Discover
         }
     }
     ctx.ignored = stray.ignored;
-}
-
-/// A PEP 723 script lock (`<script>.py.lock`).
-fn is_script_lock(file: &Path) -> bool {
-    crate::utils::python_lock::is_script_lock_name(&file.to_string_lossy())
 }
 
 /// What every extractor receives: the project view plus the hosted-origin
@@ -5830,8 +6014,9 @@ mod tests {
     }
 
     /// What does NOT contest: a lock that never mentions the package, a lock
-    /// that wires the same patch too, another version of the package, and a
-    /// PEP 723 script lock (scoped to its script's own install).
+    /// that wires the same patch too, and another version of the package.
+    /// A PEP 723 script lock is a lock like any other: one that resolves
+    /// the release from the index does contest.
     #[tokio::test]
     async fn only_a_registry_resolution_of_the_same_version_contests() {
         const SRI: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
@@ -5904,6 +6089,16 @@ mod tests {
         p.write(
             "tool.py.lock",
             "version = 1\n\n[[package]]\nname = \"vexdemo\"\nversion = \"1.2.3\"\n\
+             source = { registry = \"https://pypi.org/simple\" }\n",
+        );
+        let out = p.discover().await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.contested.len(), 1, "{out:#?}");
+        assert_eq!(out.contested[0].other, Path::new("tool.py.lock"));
+        // Another release in the script lock contests nothing.
+        p.write(
+            "tool.py.lock",
+            "version = 1\n\n[[package]]\nname = \"vexdemo\"\nversion = \"2.0.0\"\n\
              source = { registry = \"https://pypi.org/simple\" }\n",
         );
         let out = p.discover().await;
@@ -6061,5 +6256,100 @@ mod member_stray_lock_tests {
                 diag.detail
             );
         }
+    }
+
+    /// A pnpm workspace member's own lock (while the workspace shares one)
+    /// and a yarn 1 workspace member's classic `yarn.lock` are never read
+    /// either: real pnpm 10.34.1 / 11.27.0 and yarn 1.22.19 install the
+    /// member from the workspace root and leave its own lock untouched. A
+    /// hosted pin there attests nothing. Each manager's own exception keeps
+    /// the lock: a pnpm workspace with the shared lock off, a pnpm
+    /// workspace or yarn `workspaces` that does not list the directory, and
+    /// a berry lock (a nested berry project).
+    #[tokio::test]
+    async fn a_pnpm_or_yarn_classic_member_lock_attests_nothing() {
+        const UUID: &str = "22222222-2222-2222-2222-222222222222";
+        let wired = |member: &Path| {
+            let member = member.to_path_buf();
+            async move {
+                let out = discover_patched_refs(&member).await;
+                let wired = out.refs.iter().any(|r| r.uuid == UUID);
+                if !wired {
+                    assert!(out.refs.is_empty(), "{:#?}", out.refs);
+                    assert!(out.recognized.iter().any(|r| r.uuid == UUID), "{out:#?}");
+                    let stray = out.diagnostics.iter().any(|d| {
+                        d.code == DIAG_REF_UNATTRIBUTABLE
+                            && d.detail.contains("ignores its own")
+                            && d.detail.contains("not attested")
+                    });
+                    assert!(stray, "{:#?}", out.diagnostics);
+                }
+                wired
+            }
+        };
+        let member_of = |fixture: &str| {
+            let ws = tempfile::tempdir().unwrap();
+            // The checkout: nothing above it is read.
+            std::fs::create_dir_all(ws.path().join(".git")).unwrap();
+            let member = ws.path().join("packages/a");
+            copy_dir(&fixture_path(fixture), &member);
+            if !member.join("package.json").exists() {
+                std::fs::write(member.join("package.json"), r#"{"name":"a"}"#).unwrap();
+            }
+            (ws, member)
+        };
+
+        // pnpm.
+        let (ws, member) = member_of("redirect/npm/pnpm/basic/expected");
+        assert!(wired(&member).await, "control: no workspace");
+        let workspace = ws.path().join("pnpm-workspace.yaml");
+        std::fs::write(&workspace, "packages:\n  - 'packages/*'\n").unwrap();
+        assert!(!wired(&member).await, "a member of a shared-lock workspace");
+        std::fs::write(&workspace, "packages:\n  - 'apps/*'\n").unwrap();
+        assert!(wired(&member).await, "the workspace does not list it");
+        std::fs::write(
+            &workspace,
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        )
+        .unwrap();
+        assert!(
+            wired(&member).await,
+            "each member installs from its own lock"
+        );
+        // A root lock that lists member importers is the shared one.
+        std::fs::write(
+            ws.path().join("pnpm-lock.yaml"),
+            "lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n\n  packages/a: {}\n",
+        )
+        .unwrap();
+        assert!(
+            !wired(&member).await,
+            "a shared root lock, whatever the setting"
+        );
+
+        // yarn classic.
+        let (ws, member) = member_of("redirect/npm/yarn-classic/basic/expected");
+        assert!(wired(&member).await, "control: no workspace");
+        let manifest = ws.path().join("package.json");
+        std::fs::write(&manifest, r#"{"private":true,"workspaces":["packages/*"]}"#).unwrap();
+        assert!(!wired(&member).await, "a yarn 1 workspace member");
+        std::fs::write(
+            &manifest,
+            r#"{"private":true,"workspaces":{"packages":["packages/*"]}}"#,
+        )
+        .unwrap();
+        assert!(!wired(&member).await, "the object spelling of workspaces");
+        std::fs::write(&manifest, r#"{"private":true,"workspaces":["apps/*"]}"#).unwrap();
+        assert!(wired(&member).await, "the workspace does not list it");
+
+        // yarn berry treats a nested lock as a project of its own.
+        let (ws, member) = member_of("redirect/npm/yarn-berry/basic/expected");
+        std::fs::write(
+            ws.path().join("package.json"),
+            r#"{"private":true,"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let out = discover_patched_refs(&member).await;
+        assert!(!out.refs.is_empty(), "{out:#?}");
     }
 }
