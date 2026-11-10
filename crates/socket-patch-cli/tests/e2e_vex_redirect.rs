@@ -460,6 +460,15 @@ fn write_hosted_wiring(cwd: &Path, eco: &str, uuid: &str) -> Vec<&'static str> {
             vec!["requirements.txt"]
         }
         "cargo" => {
+            // All three files: the manifest pin is what makes cargo resolve
+            // the crate from the lock's Socket source.
+            write(
+                "Cargo.toml",
+                format!(
+                    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                     serde = {{ version = \"1.0.0\", registry = \"socket-patch-{uuid}\" }}\n"
+                ),
+            );
             write(
                 "Cargo.lock",
                 format!(
@@ -469,9 +478,25 @@ fn write_hosted_wiring(cwd: &Path, eco: &str, uuid: &str) -> Vec<&'static str> {
                     "e".repeat(64)
                 ),
             );
-            vec!["Cargo.lock"]
+            write(
+                ".cargo/config.toml",
+                format!(
+                    "[registries.socket-patch-{uuid}]\nindex = \"sparse+{}/index/\"\n",
+                    registry("cargo")
+                ),
+            );
+            vec!["Cargo.toml", "Cargo.lock", ".cargo/config.toml"]
         }
         "gem" => {
+            // The pair: bundler takes the gem from the source the Gemfile
+            // declaration names, so the lock section alone wires nothing.
+            write(
+                "Gemfile",
+                format!(
+                    "source \"https://rubygems.org\"\n\ngem \"rack\", \"2.2.3\", source: \"{}/\"\n",
+                    registry("gem")
+                ),
+            );
             write(
                 "Gemfile.lock",
                 format!(
@@ -480,7 +505,7 @@ fn write_hosted_wiring(cwd: &Path, eco: &str, uuid: &str) -> Vec<&'static str> {
                     registry("gem")
                 ),
             );
-            vec!["Gemfile.lock"]
+            vec!["Gemfile", "Gemfile.lock"]
         }
         "golang" => {
             write(

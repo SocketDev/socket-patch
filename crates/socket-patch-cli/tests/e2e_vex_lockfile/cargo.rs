@@ -888,6 +888,120 @@ fn cargo_hosted_d_reverted_wiring_never_keeps_the_ledger_alive() {
     }
 }
 
+/// d: a Socket-sourced lock entry that no declaration cargo honors routes to
+/// the patch is stale, so nothing attests (#2045). Cargo resolves a
+/// dependency from the source its declaration names: in each shape real
+/// cargo 1.93 takes the crate from crates.io, rewriting the lock or failing
+/// under `--locked`. The lock's pin is no evidence, with or without a
+/// ledger record, a patched copy in the cargo home, or `--no-verify`.
+#[test]
+fn cargo_hosted_d_a_lock_entry_nothing_routes_is_not_attested() {
+    let pin =
+        format!("{CRATE} = {{ version = \"{CRATE_VERSION}\", registry = \"socket-patch-{U}\" }}");
+    let other = "[dependencies]\nother = \"1\"\n";
+    let transitive = cargo_toml(other);
+    let dead_patch = cargo_toml(&format!(
+        "{other}\n[patch.crates-io]\n{pin}\n\n\
+         [patch.\"https://github.com/rust-lang/crates.io-index\"]\n\
+         unrelated = {{ path = \"unrelated\" }}\n"
+    ));
+    let dead_template = cargo_toml(&format!(
+        "{other}\n[workspace]\n\n[workspace.dependencies]\n{pin}\n"
+    ));
+    let shapes: [(&str, Option<&str>); 4] = [
+        ("only a registry dependent declares it", Some(&transitive)),
+        ("a [patch] entry cargo ignores", Some(&dead_patch)),
+        ("a template nothing inherits", Some(&dead_template)),
+        ("no Cargo.toml", None),
+    ];
+    let api = Api::start(vec![(U, cargo_view(U))]);
+    for (name, manifest) in shapes {
+        let fx = Fx::new();
+        write_cargo_hosted(&fx, U, "https://patch.socket.dev", CARGO_HOSTED);
+        match manifest {
+            Some(text) => fx.put("Cargo.toml", text),
+            None => fx.rm("Cargo.toml"),
+        }
+        let run = fx.vex(&["--proxy-url", &api.uri()]);
+        assert_nothing_discovered(&run, name);
+
+        write_redirect_ledger(&fx, CARGO_PURL, cargo_record(U), CARGO_HOSTED_EDITS);
+        fx.install_crate(SOCKET_CARGO_SRC, PATCHED_RS);
+        for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+            let run = fx.vex(extra);
+            assert_omitted(
+                &run,
+                CARGO_PURL,
+                "redirect_unwired",
+                &format!("{name} {extra:?}"),
+            );
+        }
+    }
+}
+
+/// d: a package that is a member of a cargo workspace is not the root cargo
+/// builds from. Cargo ignores a member's `[patch]` and never reads a
+/// `Cargo.lock` beside it (real cargo 1.93 builds the workspace lock's
+/// crates.io crate from inside the member), so neither wiring attests there;
+/// the same files attest while no workspace claims the package.
+#[test]
+fn cargo_workspace_member_wiring_is_not_attested() {
+    let api = Api::start(vec![(U, cargo_view(U))]);
+    let hosted = |fx: &Fx| write_cargo_hosted(fx, U, "https://patch.socket.dev", CARGO_HOSTED);
+    let vendored = |fx: &Fx| write_cargo_vendored(fx, U, CargoVendored::Inline, PATCHED_RS);
+    let shapes: [(&str, &str, &str, &Shape); 2] = [
+        ("hosted", "redirected", "redirect_unwired", &hosted),
+        ("vendored", "vendored", "vendor_unwired", &vendored),
+    ];
+    for (name, marker, unwired, shape) in shapes {
+        let fx = Fx::new();
+        shape(&fx);
+        let run = fx.vex(&["--proxy-url", &api.uri()]);
+        assert_attested(&fx, &run, CARGO_PURL, U, marker, &format!("{name} root"));
+
+        put(
+            fx.cwd.parent().unwrap(),
+            "Cargo.toml",
+            b"[workspace]\nmembers = [\"app\"]\n",
+        );
+        let run = fx.vex(&["--proxy-url", &api.uri()]);
+        assert_nothing_discovered(&run, &format!("{name} member"));
+
+        if name == "hosted" {
+            write_redirect_ledger(&fx, CARGO_PURL, cargo_record(U), CARGO_HOSTED_EDITS);
+        } else {
+            write_vendor_ledger(
+                &fx,
+                "cargo",
+                CARGO_PURL,
+                U,
+                &cargo_artifact(U),
+                Some(cargo_record(U)),
+                &[
+                    ("Cargo.toml", "cargo_patch_entry"),
+                    ("Cargo.lock", "cargo_lock_entry"),
+                ],
+            );
+        }
+        for extra in [&["--offline"][..], &["--offline", "--no-verify"][..]] {
+            let run = fx.vex(extra);
+            assert_omitted(
+                &run,
+                CARGO_PURL,
+                unwired,
+                &format!("{name} member, ledger {extra:?}"),
+            );
+            assert!(
+                run.env
+                    .to_string()
+                    .contains("member of the cargo workspace"),
+                "{name} {extra:?}: the run says where to run instead: {}",
+                run.env
+            );
+        }
+    }
+}
+
 /// e: the Socket registry's extracted copy tampered → `hash_mismatch`, even
 /// though the pinned wiring alone would attest a not-installed checkout.
 #[test]

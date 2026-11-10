@@ -10,12 +10,44 @@
 //! attest them — and each ref it WOULD yield is
 //! [`DIAG_REF_UNATTRIBUTABLE`] instead: a leftover redirected
 //! `Gemfile.lock` beside `gems.rb` + `gems.locked` is never installed
-//! (#736). The Gemfile / `gems.rb` is NOT read: it is
-//! Ruby source whose `source:` / `path:` options and `source … do` blocks
-//! only become what bundler installs once they are locked, and every wiring
-//! our tools write lands in the lock as well (see below). A Gemfile-only
-//! wiring (the "mixed" pair socket-patch 5.0 / 5.1 left on a bundler < 2.6
-//! lock) is left to the ledger fallback [`super::hosted_wiring_in_files`].
+//! (#736).
+//!
+//! ## The manifest decides, the lock names the version
+//!
+//! A ref is read from the lock (the exact version, the pin), but the lock
+//! alone is no wiring: bundler takes a gem from the source its Gemfile
+//! declaration names and treats a lock that says otherwise as out of date.
+//! Verified on bundler 4.0.15 and 2.5.23 with a local index: with the
+//! Gemfile's `source:` option (or `path:`) taken off and the lock's Socket
+//! `GEM` (or `PATH`) section left in place, a frozen install exits 16
+//! ("the list of sources changed") and an unfrozen one rewrites the lock to
+//! the upstream one and installs the upstream gem, for a gem the Gemfile
+//! declares and for one only another gem depends on alike. So a spec under
+//! a Socket-wired section is a ref only when the manifest bundler loads
+//! beside that lock (`Gemfile` for `Gemfile.lock`, `gems.rb` for
+//! `gems.locked`) gives the gem that very source ([`ManifestSources`]):
+//! every `gem` declaration of it carries `source: "<the section's remote>"`
+//! or sits in a `source "<remote>" do` block (hosted), or carries
+//! `path: "<the section's vendored dir>"` (vendored), and there is one.
+//! That is what both writers leave: hosted scan appends the option to the
+//! user's declaration, or adds a line for a gem the manifest did not
+//! declare (5.0 / 5.1 wrote the block), and `vendor` writes the `path:`
+//! (in a managed block for such a gem). Anything else is
+//! [`DIAG_REF_UNATTRIBUTABLE`] and no ref: no manifest beside the lock, a
+//! declaration with no source or another one, a second source-selecting
+//! option beside ours (`git:` / `path:` win over `source:`). A hosted spec
+//! withheld this way is still one gem version's pin in the lock, so it
+//! stays among the pins `rollback` / `remove` unwind
+//! ([`Discovery::shadowed`]); a vendored one is kept by its ledger entry,
+//! which the diagnostic keeps from the prune GC.
+//!
+//! The manifest is read ONLY to confirm lock wiring, and only when the lock
+//! has a Socket-wired section. It never makes a ref: a Gemfile-only wiring
+//! (the "mixed" pair socket-patch 5.0 / 5.1 left on a bundler < 2.6 lock)
+//! is not installed until the lock follows, and is left to the ledger
+//! fallback [`super::hosted_wiring_in_files`]. Nor are its identities
+//! recognized (rule 11) by that confirming read, so that fallback answers
+//! as it did before.
 //!
 //! ## Lock grammar
 //!
@@ -153,14 +185,14 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
     // Legacy spelling first (order only affects diagnostics).
     for file in BUNDLER_LOCKS {
         if loaded == Some(file) {
-            extract_file(ctx, file, out).await;
+            extract_file(ctx, file, true, out).await;
             continue;
         }
         // The twin bundler ignores: read into a scratch discovery (the
         // guarded read still recognizes its identities) and explain every
         // ref it would have yielded.
         let mut ignored = Discovery::default();
-        extract_file(ctx, file, &mut ignored).await;
+        extract_file(ctx, file, false, &mut ignored).await;
         let why = match loaded {
             Some(lock) => format!("bundler loads {lock}, not {file}"),
             None => "socket-patch cannot tell which lock bundler loads here (BUNDLE_GEMFILE or \
@@ -184,36 +216,185 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 }
 
 /// Every ref and diagnostic the bundler lock `file` yields on its own.
-async fn extract_file(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discovery) {
+/// `confirm`: the manifest beside it must give each gem its lock source
+/// (module docs, "The manifest decides"). Off for the twin bundler ignores,
+/// which is only explained: its manifest may be long gone.
+async fn extract_file(ctx: &DiscoverCtx<'_>, file: &str, confirm: bool, out: &mut Discovery) {
     let Some(text) = ctx.read_text(file, out).await else {
         return;
     };
     let lock = GemfileLock::parse(&text);
+    let readable = lock.problems.is_empty();
     // A readable lock with a `GEM` section listing several remotes.
-    let merged = lock.problems.is_empty() && lock.gem_sections().any(|s| s.remotes.len() > 1);
-    let blocks = if merged {
-        source_block_gems(ctx, bundler_manifest_for(file), out).await
-    } else {
-        Vec::new()
+    let merged = readable && lock.gem_sections().any(|s| s.remotes.len() > 1);
+    // One with a section that reads as Socket wiring.
+    let wired = readable
+        && lock.sections.iter().any(|sec| match sec.header {
+            "GEM" => sec.remotes.iter().any(|r| ctx.hosted_uuid(r).is_some()),
+            "PATH" => sec.remotes.iter().any(|r| names_vendor_dir(r)),
+            _ => false,
+        });
+    let manifest = ManifestSources::load(
+        ctx,
+        bundler_manifest_for(file),
+        merged,
+        wired && confirm,
+        out,
+    )
+    .await;
+    let manifest = ManifestSources {
+        confirm,
+        ..manifest
     };
-    extract_lock(ctx, file, &lock, &blocks, out);
+    // `(source URL, gem name)` for every `gem` the manifest gives a source
+    // of its own ([`parse_source_blocks`]; see "Merged sections").
+    let blocks = match manifest.text.as_deref() {
+        Some(text) if merged => parse_source_blocks(text),
+        _ => Vec::new(),
+    };
+    extract_lock(ctx, file, &lock, &blocks, &manifest, out);
 }
 
-/// `(source URL, gem name)` for every `gem` the root manifest `rel` gives a
-/// source of its own ([`parse_source_blocks`]; see "Merged sections").
-/// Missing => empty; unreadable => empty + the usual unreadable diagnostic.
-async fn source_block_gems(
-    ctx: &DiscoverCtx<'_>,
-    rel: &str,
-    out: &mut Discovery,
-) -> Vec<(String, String)> {
-    ctx.read_text(rel, out)
-        .await
-        .map(|text| parse_source_blocks(&text))
-        .unwrap_or_default()
+/// Where the manifest bundler loads beside a lock takes its gems from, as
+/// far as its text says (module docs, "The manifest decides").
+struct ManifestSources {
+    /// The manifest's root-relative name.
+    rel: &'static str,
+    /// `None`: not read (the lock wires nothing), missing, or unreadable.
+    text: Option<String>,
+    decls: declarations::Declarations,
+    /// Whether [`Self::gives`] is asked at all.
+    confirm: bool,
 }
 
-/// The Gemfile grammar [`source_block_gems`] reads, `(source URL, gem
+/// Where one `gem` declaration takes its gem from.
+enum Given {
+    /// No source of its own: the manifest's default one.
+    Default,
+    /// A `source: "<url>"` option, or the `source "<url>" do` block the
+    /// declaration sits in.
+    Source(String),
+    /// A `path: "<dir>"` option.
+    Path(String),
+    /// Any other source (`git:`, a `path … do` block, …), or one the text
+    /// does not settle: several source-selecting options, a value that is
+    /// no plain string, a block opener that is not a one-line
+    /// `source "<url>" do`.
+    Other,
+}
+
+impl ManifestSources {
+    /// Read `rel` when the lock needs it. A merged section's cross-check is
+    /// a guarded read, as it always was (missing: nothing; unreadable: the
+    /// usual diagnostic). The confirming read of a `wired` lock is quiet
+    /// and recognizes nothing, so it changes no ledger verdict.
+    async fn load(
+        ctx: &DiscoverCtx<'_>,
+        rel: &'static str,
+        merged: bool,
+        wired: bool,
+        out: &mut Discovery,
+    ) -> Self {
+        let text = if merged {
+            ctx.read_text(rel, out).await
+        } else if wired {
+            ctx.view.read_text(rel).await.ok()
+        } else {
+            None
+        };
+        let decls = text
+            .as_deref()
+            .map(declarations::declarations)
+            .unwrap_or_default();
+        Self {
+            rel,
+            text,
+            decls,
+            confirm: true,
+        }
+    }
+
+    /// Where `decl` takes its gem from. An argument whose keys cannot be
+    /// read (`**opts`) is not counted: `vendor` keeps one the user wrote
+    /// after the `path:` it adds.
+    fn given(text: &str, decl: &declarations::Declaration) -> Given {
+        use crate::formats::gem::gemfile::NON_SOURCE_KEYS;
+        use crate::formats::gem::ruby::{block_stack, BlockSource};
+        use declarations::ArgKind;
+
+        let mut selecting = decl.args.iter().filter_map(|arg| match &arg.kind {
+            ArgKind::Option { key, value, .. } if !NON_SOURCE_KEYS.contains(&key.as_str()) => {
+                Some((key.as_str(), value.as_deref()))
+            }
+            _ => None,
+        });
+        let own = selecting.next();
+        if selecting.next().is_some() {
+            return Given::Other;
+        }
+        let line_start = text[..decl.start].rfind('\n').map_or(0, |i| i + 1);
+        let block = block_stack(text, line_start)
+            .into_iter()
+            .rev()
+            .find(|frame| frame.source.is_some());
+        match (own, block) {
+            (None, None) => Given::Default,
+            (Some(("source", Some(url))), None) => Given::Source(url.to_string()),
+            (Some(("path", Some(dir))), None) => Given::Path(dir.to_string()),
+            (None, Some(frame)) if frame.source == Some(BlockSource::Source) => {
+                let opener = text[frame.opener..].lines().next().unwrap_or_default();
+                source_block_opener(opener.trim())
+                    .map_or(Given::Other, |url| Given::Source(url.to_string()))
+            }
+            _ => Given::Other,
+        }
+    }
+
+    /// `Err(why)` unless every declaration of `name` gives it the source
+    /// `wiring` resolves it from, and there is one.
+    fn gives(&self, name: &str, wiring: &Wiring<'_>) -> Result<(), String> {
+        if !self.confirm {
+            return Ok(());
+        }
+        let rel = self.rel;
+        let Some(text) = self.text.as_deref() else {
+            return Err(format!("there is no readable {rel} beside it"));
+        };
+        let want = match wiring {
+            Wiring::Hosted { remote, .. } => format!("`source: \"{remote}\"`"),
+            Wiring::Vendored(vref) => format!("`path: \"{}\"`", vref.artifact_rel),
+        };
+        let mut declared = false;
+        for decl in self.decls.of(name) {
+            declared = true;
+            let given = Self::given(text, decl);
+            let ours = match (&given, wiring) {
+                (Given::Source(url), Wiring::Hosted { remote, .. }) => same_remote(url, remote),
+                (Given::Path(dir), Wiring::Vendored(vref)) => {
+                    vendor_ref(dir).is_some_and(|v| v.artifact_rel == vref.artifact_rel)
+                }
+                _ => false,
+            };
+            if ours {
+                continue;
+            }
+            let from = match given {
+                Given::Default => "with no source of its own".to_string(),
+                Given::Source(url) => format!("with the source {url:?}"),
+                Given::Path(dir) => format!("with the path {dir:?}"),
+                Given::Other => "with another source, or one its text does not settle".to_string(),
+            };
+            return Err(format!("{rel} declares {name} {from}, not with {want}"));
+        }
+        if declared {
+            Ok(())
+        } else {
+            Err(format!("{rel} does not declare {name} with {want}"))
+        }
+    }
+}
+
+/// The Gemfile grammar a merged section is cross-checked with, `(source URL, gem
 /// name)` for every gem the manifest gives a source of its own:
 ///
 /// * a `gem "<name>", …, source: "<url>"` declaration, read with the ONE
@@ -446,6 +627,7 @@ fn extract_lock(
     file: &str,
     lock: &GemfileLock<'_>,
     blocks: &[(String, String)],
+    manifest: &ManifestSources,
     out: &mut Discovery,
 ) {
     if let Some(why) = lock.problems.first() {
@@ -471,7 +653,7 @@ fn extract_lock(
             _ => Vec::new(),
         };
         for wiring in &wirings {
-            section_refs(file, lock, &owners, sec, wiring, out);
+            section_refs(file, lock, &owners, sec, wiring, manifest, out);
         }
     }
 }
@@ -483,6 +665,7 @@ fn section_refs(
     owners: &HashMap<&str, BTreeSet<usize>>,
     sec: &Section<'_>,
     wiring: &Wiring<'_>,
+    manifest: &ManifestSources,
     out: &mut Discovery,
 ) {
     if sec.specs.is_empty() {
@@ -512,7 +695,7 @@ fn section_refs(
             continue;
         }
         matched = true;
-        spec_ref(file, lock, owners, line, wiring, out);
+        spec_ref(file, lock, owners, line, wiring, manifest, out);
     }
     if let Some(only) = only.filter(|_| !matched) {
         out.diag(
@@ -675,6 +858,7 @@ fn spec_ref(
     owners: &HashMap<&str, BTreeSet<usize>>,
     line: &SpecLine<'_>,
     wiring: &Wiring<'_>,
+    manifest: &ManifestSources,
     out: &mut Discovery,
 ) {
     let uuid = wiring.uuid();
@@ -725,16 +909,25 @@ fn spec_ref(
         );
         return;
     };
+    // The lock names the version; the manifest decides the source.
+    let coords = (spec.name, spec.version);
     match wiring {
         Wiring::Hosted { remote, uuid, .. } => {
-            out.push(PatchedRef::hosted(
+            let pin = PatchedRef::hosted(
                 purl,
                 uuid.clone(),
                 file,
                 Some(*remote),
                 lock.integrity(spec.name, spec.version),
                 lock.has_checksums(),
-            ));
+            );
+            if manifest_confirms(file, &at, coords, wiring, manifest, out) {
+                out.push(pin);
+            } else {
+                // Not what bundler installs, but still one gem version's
+                // pin in the lock: the management commands unwind it.
+                out.shadow(pin);
+            }
         }
         Wiring::Vendored(vref) => {
             let leaf = format!("{}-{}", spec.name, spec.version);
@@ -751,9 +944,48 @@ fn spec_ref(
                 );
                 return;
             }
+            if !manifest_confirms(file, &at, coords, wiring, manifest, out) {
+                return;
+            }
             out.push(PatchedRef::vendored(purl, vref, file, None));
         }
     }
+}
+
+/// Why the spec `name (version)` at `at`, locked under `wiring`, is no ref:
+/// the manifest does not give the gem that source
+/// ([`ManifestSources::gives`]). Diagnosed; `true` when it is one.
+fn manifest_confirms(
+    file: &str,
+    at: &str,
+    (name, version): (&str, &str),
+    wiring: &Wiring<'_>,
+    manifest: &ManifestSources,
+    out: &mut Discovery,
+) -> bool {
+    let Err(why) = manifest.gives(name, wiring) else {
+        return true;
+    };
+    // The hosted rewriter refuses a gem whose DEPENDENCIES entry is still
+    // source-pinned, so the lock has to follow the manifest first.
+    let rewire = match wiring {
+        Wiring::Hosted { .. } => "socket-patch scan",
+        Wiring::Vendored(_) => "socket-patch vendor",
+    };
+    let rel = manifest.rel;
+    out.diag(
+        DIAG_REF_UNATTRIBUTABLE,
+        file,
+        format!(
+            "{at}: {name} {version} is locked from Socket patch {}, but {why}. Bundler takes a \
+             gem from the source its {rel} declaration names, so it installs {name} from there \
+             and rewrites this lock (a frozen install fails); not attested. To patch it again, \
+             run `bundle install` once without frozen mode so the lock follows the {rel}, then \
+             re-run `{rewire}`",
+            wiring.uuid(),
+        ),
+    );
+    false
 }
 
 #[cfg(test)]
@@ -775,6 +1007,23 @@ mod tests {
 
     fn vendored_rel(uuid: &str, leaf: &str) -> String {
         format!(".socket/vendor/gem/{uuid}/{leaf}")
+    }
+
+    /// A manifest holding `decls`, one `gem` declaration per line, under a
+    /// rubygems.org default source.
+    fn manifest(decls: &[String]) -> String {
+        format!("source \"https://rubygems.org\"\n\n{}\n", decls.join("\n"))
+    }
+
+    /// The declaration hosted scan leaves for `name`: the user's own, with
+    /// the patch registry of `uuid` as its `source:`.
+    fn hosted_decl(name: &str, uuid: &str) -> String {
+        format!("gem \"{name}\", source: \"{}\"", index(uuid))
+    }
+
+    /// The declaration `vendor` leaves for the copy at `rel`.
+    fn vendored_decl(name: &str, version: &str, rel: &str) -> String {
+        format!("gem \"{name}\", \"{version}\", path: \"{rel}\"")
     }
 
     /// `is_patch_registry_index` reads URL path segments while the
@@ -934,8 +1183,8 @@ mod tests {
 
     /// The option form converged by the rewriter (or by `bundle lock`): the
     /// spec sits in a `GEM` section of its own and attests from the lock
-    /// under the same rule as the 5.0 / 5.1 block form — the manifest is
-    /// not consulted for a single-remote section either way.
+    /// under the same rule as the 5.0 / 5.1 block form: the manifest gives
+    /// the gem the section's remote either way.
     #[tokio::test]
     async fn source_option_pair_attests_like_the_block_pair() {
         let lock = format!(
@@ -1030,6 +1279,13 @@ mod tests {
              DEPENDENCIES\n  puma\n  rack (= 3.2.6)!\n\nBUNDLED WITH\n   2.5.22\n"
         );
         let p = Project::new();
+        p.write(
+            "Gemfile",
+            manifest(&[
+                "gem \"puma\"".to_string(),
+                vendored_decl("rack", "3.2.6", &rel),
+            ]),
+        );
         p.write("Gemfile.lock", lock);
         let out = run(&p).await;
         assert_refs(
@@ -1055,6 +1311,17 @@ mod tests {
              DEPENDENCIES\n  rack (= 3.1.8)!\n\nCHECKSUMS\n  rack (3.1.8)\n\nBUNDLED WITH\n   2.7.2\n"
         );
         let p = Project::new();
+        // The managed block `vendor` appends for a gem the Gemfile did not
+        // declare.
+        p.write(
+            "Gemfile",
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"sinatra\"\n\
+                 # >>> socket-patch vendor (managed) >>>\n{}\n\
+                 # <<< socket-patch vendor (managed) <<<\n",
+                vendored_decl("rack", "3.1.8", &rel)
+            ),
+        );
         p.write("Gemfile.lock", lock);
         let out = run(&p).await;
         assert_refs(
@@ -1086,6 +1353,20 @@ mod tests {
         )
         .replace('\n', "\r\n");
         let p = Project::new();
+        p.write(
+            "Gemfile",
+            manifest(&[
+                vendored_decl("puma", "6.4.2", &vendored_rel(UUID_A, "puma-6.4.2")),
+                vendored_decl(
+                    "rack-test",
+                    "2.1.0",
+                    &vendored_rel(UUID_B, "rack-test-2.1.0"),
+                ),
+                "gem \"rack\"".to_string(),
+                hosted_decl("rails", UUID_B),
+            ])
+            .replace('\n', "\r\n"),
+        );
         p.write("Gemfile.lock", lock);
         let out = run(&p).await;
         assert_refs(
@@ -1122,7 +1403,12 @@ mod tests {
              BUNDLED WITH\n   2.4.22\n",
             index(UUID_A)
         );
+        let gemfile = manifest(&[
+            "gem \"puma\", \"6.0.0\"".to_string(),
+            hosted_decl("rails", UUID_A),
+        ]);
         let p = Project::new();
+        p.write("Gemfile", &gemfile);
         p.write("Gemfile.lock", &pre);
         let out = run(&p).await;
         let r = only(&out);
@@ -1135,6 +1421,7 @@ mod tests {
             &format!("CHECKSUMS\n  puma (6.0.0) sha256={SHA_UP}\n  rails (7.0.0)\n\nBUNDLED WITH"),
         );
         let p = Project::new();
+        p.write("Gemfile", &gemfile);
         p.write("Gemfile.lock", era);
         let out = run(&p).await;
         let r = only(&out);
@@ -1161,8 +1448,12 @@ mod tests {
             (false, ("Gemfile.lock", UUID_B), ("gems.locked", UUID_A)),
         ] {
             let p = Project::new();
+            // The manifest of the pair bundler loads gives the gem its
+            // source; the twin's own manifest is gone.
             if gems_rb {
-                p.write("gems.rb", "gem \"rails\"\n");
+                p.write("gems.rb", manifest(&[hosted_decl("rails", UUID_A)]));
+            } else {
+                p.write("Gemfile", manifest(&[hosted_decl("rails", UUID_B)]));
             }
             p.write("gems.locked", lock(UUID_A));
             p.write("Gemfile.lock", lock(UUID_B));
@@ -1234,11 +1525,17 @@ mod tests {
             "GEM\n  remote: http://127.0.0.1:4545/patch-registry/gem/tok/{UUID_A}/\n  specs:\n    \
              rails (7.0.0)\n\nDEPENDENCIES\n  rails (= 7.0.0)!\n"
         );
+        let gemfile = format!(
+            "source \"https://rubygems.org\"\n\ngem \"rails\", \"7.0.0\", source: \
+             \"http://127.0.0.1:4545/patch-registry/gem/tok/{UUID_A}/\"\n"
+        );
         let without = Project::new();
+        without.write("Gemfile", &gemfile);
         without.write("Gemfile.lock", &lock);
         let out = run(&without).await;
         assert!(out.refs.is_empty() && out.diagnostics.is_empty());
         let with = Project::new().with_origin("http://127.0.0.1:4545");
+        with.write("Gemfile", &gemfile);
         with.write("Gemfile.lock", &lock);
         assert_refs(
             &run(&with).await,
@@ -1879,6 +2176,315 @@ mod tests {
             .expect("discovery must not block on a FIFO");
         assert!(out.refs.is_empty());
         assert_eq!(diag_codes(&out), vec![DIAG_LOCKFILE_UNREADABLE]);
+    }
+
+    // ── the manifest decides the source ──────────────────────────────
+
+    /// A bundler >= 2.2 lock resolving `rack` 2.2.3 from Socket patch A's
+    /// registry, `sinatra` (which depends on it) from rubygems.org.
+    fn hosted_rack_lock(dependencies: &str) -> String {
+        format!(
+            "GEM\n  remote: {}\n  specs:\n    rack (2.2.3)\n\nGEM\n  remote: \
+             https://rubygems.org/\n  specs:\n    sinatra (2.1.0)\n      rack (~> 2.2)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n{dependencies}\nBUNDLED WITH\n   2.5.23\n",
+            index(UUID_A)
+        )
+    }
+
+    /// The lock `vendor` leaves for the copy of `rack` 2.2.3 of patch A.
+    fn vendored_rack_lock(dependencies: &str) -> String {
+        format!(
+            "PATH\n  remote: {}\n  specs:\n    rack (2.2.3)\n\nGEM\n  remote: \
+             https://rubygems.org/\n  specs:\n    sinatra (2.1.0)\n      rack (~> 2.2)\n\n\
+             PLATFORMS\n  ruby\n\nDEPENDENCIES\n{dependencies}\nBUNDLED WITH\n   2.5.23\n",
+            vendored_rel(UUID_A, "rack-2.2.3")
+        )
+    }
+
+    /// Asserts `out` wires nothing, says the manifest is why, and leaves a
+    /// ledger claim for the patch dead.
+    fn assert_manifest_withholds(out: &Discovery, what: &str) {
+        assert!(out.refs.is_empty(), "{what}: {:#?}", out.refs);
+        assert!(
+            out.diagnostics
+                .iter()
+                .any(|d| d.code == DIAG_REF_UNATTRIBUTABLE
+                    && d.file == std::path::Path::new("Gemfile.lock")
+                    && d.detail.contains("rack 2.2.3")
+                    && d.detail.contains("Gemfile")
+                    && d.detail.contains("not attested")),
+            "{what}: {:#?}",
+            out.diagnostics
+        );
+    }
+
+    /// The lock's Socket section alone is no wiring: bundler takes a gem
+    /// from the source its Gemfile declaration names. On bundler 4.0.15 and
+    /// 2.5.23, each of these pairs fails a frozen install (exit 16) and an
+    /// unfrozen one rewrites the lock to the upstream one and installs the
+    /// upstream gem.
+    #[tokio::test]
+    async fn a_hosted_section_the_manifest_does_not_name_is_not_a_ref() {
+        let socket = index(UUID_A);
+        let direct = "  rack (= 2.2.3)!\n  sinatra\n";
+        let cases: Vec<(&str, Option<String>, &str)> = vec![
+            (
+                "the Gemfile was reverted, the lock was not",
+                Some(manifest(&[
+                    "gem \"rack\", \"2.2.3\"".into(),
+                    "gem \"sinatra\"".into(),
+                ])),
+                direct,
+            ),
+            (
+                "reverted, and the lock entry lost its `!` too",
+                Some(manifest(&[
+                    "gem \"rack\", \"2.2.3\"".into(),
+                    "gem \"sinatra\"".into(),
+                ])),
+                "  rack (= 2.2.3)\n  sinatra\n",
+            ),
+            (
+                "only another gem depends on it, and nothing declares it",
+                Some(manifest(&["gem \"sinatra\"".into()])),
+                "  sinatra\n",
+            ),
+            ("no Gemfile beside the lock", None, direct),
+            (
+                "the Gemfile gives it another source",
+                Some(manifest(&[
+                    "gem \"rack\", \"2.2.3\", source: \"https://gems.corp.example/\"".into(),
+                ])),
+                direct,
+            ),
+            (
+                "another patch's registry",
+                Some(manifest(&[hosted_decl("rack", UUID_B)])),
+                direct,
+            ),
+            (
+                "a `path:` beside the option, which bundler prefers",
+                Some(manifest(&[format!(
+                    "gem \"rack\", source: \"{socket}\", path: \"../rack\""
+                )])),
+                direct,
+            ),
+            (
+                "a second declaration without the source",
+                Some(manifest(&[
+                    hosted_decl("rack", UUID_A),
+                    "gem \"rack\", \"2.2.3\", group: :test".into(),
+                ])),
+                direct,
+            ),
+            (
+                "the option is commented out",
+                Some(manifest(&[format!(
+                    "gem \"rack\", \"2.2.3\" # , source: \"{socket}\""
+                )])),
+                direct,
+            ),
+            (
+                "the source is not a plain string",
+                Some(manifest(&["gem \"rack\", source: SOCKET_INDEX".into()])),
+                direct,
+            ),
+            (
+                "the declaration sits in another source's block",
+                Some(format!(
+                    "source \"https://rubygems.org\"\n\nsource \"https://gems.corp.example/\" do\n  \
+                     gem \"rack\", \"2.2.3\"\nend\n"
+                )),
+                direct,
+            ),
+        ];
+        for (what, gemfile, dependencies) in cases {
+            let p = Project::new();
+            if let Some(gemfile) = gemfile {
+                p.write("Gemfile", gemfile);
+            }
+            p.write("Gemfile.lock", hosted_rack_lock(dependencies));
+            let out = run(&p).await;
+            assert_manifest_withholds(&out, what);
+            assert_eq!(
+                out.hosted_claim("pkg:gem/rack@2.2.3", UUID_A),
+                Some(false),
+                "{what}"
+            );
+            // Still the lock's pin: `rollback` / `remove` unwind it.
+            assert_eq!(
+                out.shadowed
+                    .iter()
+                    .map(|r| (r.purl.as_str(), r.uuid.as_str(), r.mode))
+                    .collect::<Vec<_>>(),
+                [("pkg:gem/rack@2.2.3", UUID_A, WiringMode::Hosted)],
+                "{what}"
+            );
+        }
+    }
+
+    /// Every way the writers (and a user's own formatting of their line)
+    /// give the gem the Socket source keeps the ref.
+    #[tokio::test]
+    async fn a_hosted_section_the_manifest_names_is_a_ref() {
+        let socket = index(UUID_A);
+        let direct = "  rack (~> 2.2)!\n  sinatra\n";
+        let head = "source \"https://rubygems.org\"\n\ngem \"sinatra\"\n";
+        let forms = [
+            format!("gem \"rack\", \"~> 2.2\", source: \"{socket}\""),
+            format!("gem 'rack', '~> 2.2', source: '{socket}'"),
+            format!("gem(\"rack\", \"~> 2.2\", source: \"{socket}\")"),
+            format!("gem \"rack\", \"~> 2.2\", :source => \"{socket}\""),
+            format!(
+                "gem \"rack\",\n    \"~> 2.2\",\n    require: false,\n    source: \"{socket}\""
+            ),
+            format!("gem \"rack\", \"~> 2.2\", source: \"{socket}\" if RUBY_VERSION >= \"3\""),
+            format!("gem \"rack\", \"~> 2.2\", source: \"{socket}\"  # web server interface"),
+            format!("group :web do\n  gem \"rack\", \"~> 2.2\", source: \"{socket}\"\nend"),
+            // The same remote without its trailing slash.
+            format!(
+                "gem \"rack\", \"~> 2.2\", source: \"{}\"",
+                socket.trim_end_matches('/')
+            ),
+            // The line hosted scan adds for a gem the manifest did not declare.
+            crate::formats::gem::declarations::added_line("rack", "2.2.3", &socket),
+            // The block socket-patch 5.0 / 5.1 wrote, also inside the
+            // user's own source block (#1997).
+            format!("source \"{socket}\" do\n  gem \"rack\", \"2.2.3\"\nend"),
+            format!(
+                "source \"https://gems.corp.example/\" do\n  source \"{socket}\" do\n    \
+                 gem \"rack\", \"2.2.3\"\n  end\nend"
+            ),
+        ];
+        for form in forms {
+            for crlf in [false, true] {
+                let gemfile = format!("{head}{form}\n");
+                let gemfile = if crlf {
+                    gemfile.replace('\n', "\r\n")
+                } else {
+                    gemfile
+                };
+                let p = Project::new();
+                p.write("Gemfile", &gemfile);
+                p.write("Gemfile.lock", hosted_rack_lock(direct));
+                let out = run(&p).await;
+                assert_refs(&out, &[("pkg:gem/rack@2.2.3", UUID_A, WiringMode::Hosted)]);
+                assert!(out.diagnostics.is_empty(), "{form}: {:#?}", out.diagnostics);
+            }
+        }
+
+        // The `gems.rb` / `gems.locked` pair reads its own manifest.
+        let p = Project::new();
+        p.write(
+            "gems.rb",
+            format!("{head}{}\n", hosted_decl("rack", UUID_A)),
+        );
+        p.write("gems.locked", hosted_rack_lock(direct));
+        let out = run(&p).await;
+        assert_refs(&out, &[("pkg:gem/rack@2.2.3", UUID_A, WiringMode::Hosted)]);
+    }
+
+    /// The vendored twin: a `PATH` section the Gemfile's `path:` does not
+    /// name is not what bundler installs (same real-bundler result as the
+    /// hosted pairs). Unattributable, so the prune GC keeps the artifact.
+    #[tokio::test]
+    async fn a_vendored_section_the_manifest_does_not_name_is_not_a_ref() {
+        let rel = vendored_rel(UUID_A, "rack-2.2.3");
+        let direct = "  rack (= 2.2.3)!\n  sinatra\n";
+        let cases: Vec<(&str, Option<String>, &str)> = vec![
+            (
+                "the Gemfile lost its `path:`",
+                Some(manifest(&[
+                    "gem \"rack\", \"2.2.3\"".into(),
+                    "gem \"sinatra\"".into(),
+                ])),
+                direct,
+            ),
+            (
+                "nothing declares the gem",
+                Some(manifest(&["gem \"sinatra\"".into()])),
+                "  sinatra\n",
+            ),
+            ("no Gemfile beside the lock", None, direct),
+            (
+                "the `path:` names another patch's copy",
+                Some(manifest(&[vendored_decl(
+                    "rack",
+                    "2.2.3",
+                    &vendored_rel(UUID_B, "rack-2.2.3"),
+                )])),
+                direct,
+            ),
+            (
+                "the `path:` is the user's own fork",
+                Some(manifest(&[vendored_decl("rack", "2.2.3", "../rack")])),
+                direct,
+            ),
+            (
+                "a `git:` beside the `path:`",
+                Some(manifest(&[format!(
+                    "gem \"rack\", \"2.2.3\", path: \"{rel}\", git: \"https://example.com/rack.git\""
+                )])),
+                direct,
+            ),
+        ];
+        for (what, gemfile, dependencies) in cases {
+            let p = Project::new();
+            if let Some(gemfile) = gemfile {
+                p.write("Gemfile", gemfile);
+            }
+            p.write("Gemfile.lock", vendored_rack_lock(dependencies));
+            let out = run(&p).await;
+            assert_manifest_withholds(&out, what);
+            assert_eq!(
+                out.vendored_claim("pkg:gem/rack@2.2.3", UUID_A, &rel),
+                Some(false),
+                "{what}"
+            );
+            assert!(out.shadowed.is_empty(), "{what}: {:#?}", out.shadowed);
+        }
+    }
+
+    /// Every `path:` spelling `vendor` writes or keeps is the wiring.
+    #[tokio::test]
+    async fn a_vendored_section_the_manifest_names_is_a_ref() {
+        let rel = vendored_rel(UUID_A, "rack-2.2.3");
+        let direct = "  rack (= 2.2.3)!\n  sinatra\n";
+        let head = "source \"https://rubygems.org\"\n\ngem \"sinatra\"\n";
+        let forms = [
+            vendored_decl("rack", "2.2.3", &rel),
+            format!("gem 'rack', '2.2.3', path: '{rel}'"),
+            format!("gem \"rack\", \"2.2.3\", path: \"./{rel}/\""),
+            format!("gem \"rack\", \"2.2.3\", path: \"{rel}\", require: false # web"),
+            format!("gem \"rack\", \"2.2.3\", path: \"{rel}\", \"require\": false, **OPTS"),
+            format!("gem \"rack\", \"2.2.3\", path: \"{rel}\", :require => false"),
+            format!("group :web do\n  gem \"rack\", \"2.2.3\", path: \"{rel}\"\nend"),
+            // The managed block of a gem the Gemfile did not declare.
+            format!(
+                "# >>> socket-patch vendor (managed) >>>\n{}\n\
+                 # <<< socket-patch vendor (managed) <<<",
+                vendored_decl("rack", "2.2.3", &rel)
+            ),
+        ];
+        for form in forms {
+            for crlf in [false, true] {
+                let gemfile = format!("{head}{form}\n");
+                let gemfile = if crlf {
+                    gemfile.replace('\n', "\r\n")
+                } else {
+                    gemfile
+                };
+                let p = Project::new();
+                p.write("Gemfile", &gemfile);
+                p.write("Gemfile.lock", vendored_rack_lock(direct));
+                let out = run(&p).await;
+                assert_refs(
+                    &out,
+                    &[("pkg:gem/rack@2.2.3", UUID_A, WiringMode::Vendored)],
+                );
+                assert!(out.diagnostics.is_empty(), "{form}: {:#?}", out.diagnostics);
+            }
+        }
     }
 
     /// Through the full orchestrator: the gem ref comes out of discovery.

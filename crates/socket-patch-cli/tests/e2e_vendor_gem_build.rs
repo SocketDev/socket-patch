@@ -240,6 +240,11 @@ struct Vendored<'a> {
 ///      from the registry again — the REAL bundler re-resolves the gem from
 ///      the path on the next unfrozen install (a frozen one refuses the
 ///      pair), after which the ledger-less lock attests again;
+///   4b. manifest-only revert (the lock keeps the `PATH` section, the
+///      Gemfile lost its `path:`): `vendor_unwired` too, because bundler
+///      takes the gem from the source the Gemfile names — the REAL bundler
+///      refuses the pair frozen and, unfrozen, drops the section and
+///      resolves the gem from the registry;
 ///   5. the manifest pair reverted to its registry version (ledgers +
 ///      artifact kept): `vendor_unwired`, online / offline, with and without
 ///      `--no-verify`.
@@ -374,6 +379,61 @@ fn vendored_manifestless_vex_matrix(v: &Vendored<'_>) {
         "re-wired, ledger-less: {out}\n{relocked}"
     );
     assert_attested(out.doc(), v.purl, UUID, Marker::Vendored, VULNS);
+
+    // 4b. manifest-only revert on a copy of the checkout: the Gemfile is
+    //     back at its registry declaration, the lock keeps the PATH section.
+    //     Bundler takes the gem from the source the Gemfile names, so the
+    //     section wires nothing: no statement, with the ledger or without.
+    let copy = v.scratch.join("manifest-only-revert");
+    std::fs::create_dir_all(&copy).unwrap();
+    std::fs::write(copy.join("Gemfile"), v.pristine_gemfile).unwrap();
+    std::fs::write(copy.join(lock_name), &lock).unwrap();
+    common::fs_tree::copy_tree(&fresh.join(".socket"), &copy.join(".socket"));
+    common::fs_tree::copy_tree(v.committed_bundle, &copy.join(".bundle"));
+    for f in std::fs::read_dir(&saved).unwrap() {
+        let f = f.unwrap();
+        std::fs::copy(f.path(), copy.join(".socket/vendor").join(f.file_name())).unwrap();
+    }
+    for no_verify in [false, true] {
+        let mut r = run(VexRun::offline());
+        r.no_verify = no_verify;
+        let out = run_vex(&bin, &copy, &r);
+        assert_eq!(
+            out.code,
+            Some(1),
+            "Gemfile reverted, lock PATH section kept, ledger kept (no_verify={no_verify}): \
+             {out}\n{ctx}"
+        );
+        assert_absent(out.doc.as_ref(), v.purl);
+        assert_not_attested(&out.envelope, v.purl, "vendor_unwired");
+    }
+    let frozen = bundle(&copy, &["install"], true);
+    assert!(
+        !frozen.status.success(),
+        "a frozen install must refuse a lock whose path the Gemfile does not name (bundler {})",
+        v.bundler.version
+    );
+    common::fs_tree::copy_tree(v.committed_bundle, &copy.join(".bundle"));
+    let install = bundle(&copy, &["install"], false);
+    assert!(
+        install.status.success(),
+        "unfrozen install over the lock-only pair (bundler {}):\n{}",
+        v.bundler.version,
+        String::from_utf8_lossy(&install.stderr)
+    );
+    let relocked = std::fs::read_to_string(copy.join(lock_name)).unwrap();
+    assert!(
+        !relocked.contains(".socket/vendor/gem/"),
+        "bundler must drop the PATH section the Gemfile does not name:\n{relocked}"
+    );
+    strip_ledgers(&copy);
+    let out = run_vex(&bin, &copy, &run(VexRun::online(&api)));
+    assert_eq!(
+        out.code,
+        Some(2),
+        "re-resolved from the registry, ledger-less: {out}\n{relocked}"
+    );
+    assert_absent(out.doc.as_ref(), v.purl);
 
     // 5. full revert to the registry pair; ledgers + artifact kept.
     restore_ledgers();

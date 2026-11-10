@@ -4825,13 +4825,24 @@ mod tests {
     }
 
     /// The mixed state a vendored→hosted cargo takeover can leave behind:
-    /// the lock rewired to the hosted sparse index (declared as a
-    /// socket-patch registry in the config), while the vendored
-    /// `[patch.crates-io]` entry ALSO survives in the config.
+    /// the manifest pinned and the lock rewired to the hosted sparse index
+    /// (declared as a socket-patch registry in the config), while the
+    /// vendored `[patch.crates-io]` entry ALSO survives in the config.
     async fn write_cargo_hosted_takeover_files(root: &Path) {
         tokio::fs::create_dir_all(root.join(".cargo"))
             .await
             .unwrap();
+        // The pin is what makes cargo resolve the crate from the lock's
+        // hosted source: a lock entry no declaration routes is stale.
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 cfg-if = {{ version = \"1.0.4\", registry = \"socket-patch-{TAKEOVER_UUID}\" }}\n"
+            ),
+        )
+        .await
+        .unwrap();
         tokio::fs::write(
             root.join(".cargo/config.toml"),
             format!(

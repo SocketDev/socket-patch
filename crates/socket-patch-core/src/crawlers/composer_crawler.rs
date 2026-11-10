@@ -806,6 +806,40 @@ pub fn resolve_local_vendor_dir_sync(cwd: &Path) -> Option<PathBuf> {
     resolve_vendor_dir(cwd, manifest.as_deref(), false, user_config, &var)
 }
 
+/// Whether the project at `cwd` holds a Composer install the crawler does
+/// not read. [`resolve_local_vendor_dir_sync`] refuses a composer.json
+/// `config.vendor-dir` outside the project, because apply writes into the
+/// tree it crawls; a crawl of such a project finds no package whatever is
+/// installed. A reader that would take "no copy found" for "nothing is
+/// installed" (`vex`'s lockfile basis, #686) asks here first.
+///
+/// The refused value is resolved as Composer resolves it
+/// ([`resolve_vendor_dir`], every layer honoured) only to stat its
+/// `composer/installed.json`; nothing in the tree is read. `true` when that
+/// file exists, or when the directory cannot be resolved at all (a
+/// placeholder naming nothing).
+pub fn local_install_unread(cwd: &Path) -> bool {
+    local_install_unread_with(cwd, &|name| std::env::var_os(name))
+}
+
+fn local_install_unread_with(cwd: &Path, var: &impl Fn(&str) -> Option<OsString>) -> bool {
+    let read = |path: &Path| crate::utils::fs::read_regular_to_string_sync(path).ok();
+    let manifest = read(&cwd.join("composer.json"));
+    let user_config =
+        || local_composer_home(cwd, var).and_then(|home| read(&home.join("config.json")));
+    if resolve_vendor_dir(cwd, manifest.as_deref(), false, user_config, var).is_some() {
+        return false;
+    }
+    match resolve_vendor_dir(cwd, manifest.as_deref(), true, user_config, var) {
+        Some(vendor_dir) => vendor_dir
+            .join("composer")
+            .join("installed.json")
+            .symlink_metadata()
+            .is_ok(),
+        None => true,
+    }
+}
+
 /// Reduce a `config.vendor-dir` value to plain `a/b` segments before the
 /// safety gate. Composer accepts `./`-prefixed and `.`-interleaved values
 /// (`./vendor`, `lib/./deps`) and either separator, so those shapes must
@@ -2047,6 +2081,71 @@ mod tests {
             resolve_vendor_dir(base, lib, false, || panic!("manifest decided"), &no_env),
             Some(base.join("lib"))
         );
+    }
+
+    /// #686: an install in a `config.vendor-dir` the crawler refuses is
+    /// unread, not absent. Only an `installed.json` where Composer would
+    /// install counts; a vendor-dir the crawler reads is never unread.
+    #[test]
+    fn test_local_install_unread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("app");
+        let home = tmp.path().join("home");
+        let composer_home = tmp.path().join("composer-home");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let env = |name: &str| match name {
+            "HOME" => Some(home.clone().into_os_string()),
+            "COMPOSER_HOME" => Some(composer_home.clone().into_os_string()),
+            _ => None,
+        };
+        let configure = |value: &str| {
+            std::fs::write(
+                cwd.join("composer.json"),
+                serde_json::json!({ "config": { "vendor-dir": value } }).to_string(),
+            )
+            .unwrap();
+        };
+        let install = |vendor_dir: &Path| {
+            std::fs::create_dir_all(vendor_dir.join("composer")).unwrap();
+            std::fs::write(vendor_dir.join("composer/installed.json"), "[]").unwrap();
+        };
+        let unread = || local_install_unread_with(&cwd, &env);
+
+        // No composer.json, and the default `vendor/` installed: read.
+        assert!(!unread());
+        install(&cwd.join("vendor"));
+        assert!(!unread());
+
+        let outside = tmp.path().join("deps");
+        for (value, vendor_dir) in [
+            (outside.to_str().unwrap().to_string(), outside.clone()),
+            ("../deps2".to_string(), tmp.path().join("deps2")),
+            ("~/deps3".to_string(), home.join("deps3")),
+            ("$HOME/deps4".to_string(), home.join("deps4")),
+        ] {
+            configure(&value);
+            assert!(!unread(), "{value}: nothing installed there yet");
+            install(&vendor_dir);
+            assert!(unread(), "{value}: an install the crawler does not read");
+        }
+
+        // A placeholder naming nothing: where Composer installs is unknown.
+        configure("$SOCKET_PATCH_TEST_UNSET/deps");
+        assert!(unread());
+
+        // A subdirectory of the project is read, installed or not.
+        configure("lib/deps");
+        assert!(!unread());
+        install(&cwd.join("lib/deps"));
+        assert!(!unread());
+
+        // The user's environment decides before the manifest, and is read.
+        configure(outside.to_str().unwrap());
+        let with_env = |name: &str| match name {
+            "COMPOSER_VENDOR_DIR" => Some(outside.clone().into_os_string()),
+            other => env(other),
+        };
+        assert!(!local_install_unread_with(&cwd, &with_env));
     }
 
     /// A set `COMPOSER_HOME` is used exactly as Composer uses it, even when

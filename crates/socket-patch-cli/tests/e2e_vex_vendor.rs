@@ -930,6 +930,18 @@ fn write_matrix_wiring(cwd: &Path, eco: &str, uuid: &str, rel: &str) -> WiringRe
         ),
         other => panic!("no wiring shape for {other}"),
     };
+    if eco == "gem" {
+        // The gem backend edits a pair: bundler takes the gem from the path
+        // the Gemfile declaration names, so the lock section alone wires
+        // nothing.
+        std::fs::write(
+            cwd.join("Gemfile"),
+            format!(
+                "source \"https://rubygems.org\"\n\ngem \"rack\", \"3.2.6\", path: \"{rel}\"\n"
+            ),
+        )
+        .unwrap();
+    }
     let path = cwd.join(file);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     std::fs::write(&path, text).unwrap();

@@ -248,6 +248,9 @@ const NOTE_MAVEN_PROFILE_UNPATCHED: &str = "vex_maven_profile_unpatched";
 /// Omission tag and note for [`UnattestedKind::MavenConfigOverride`]
 /// (`vex::Unattested`).
 const NOTE_MAVEN_CONFIG_OVERRIDE: &str = "vex_maven_config_override";
+/// Omission tag and note for [`UnattestedKind::MavenParentDeclares`]
+/// (`vex::Unattested`).
+const NOTE_MAVEN_PARENT_DECLARES: &str = "vex_maven_parent_declares";
 /// Omission tag and note: a hosted Cargo pin beside another declaration of
 /// the crate that names no Socket registry, which cargo resolves as a
 /// separate, unpatched package (`vex::Unattested`).
@@ -346,6 +349,13 @@ fn unattested_note(kind: UnattestedKind) -> (&'static str, &'static str) {
             "not attested while .mvn/maven.config redefines the property it is spelled \
              through; the wiring itself is intact, so re-running `scan` does not change this \
              (drop that -D from .mvn/maven.config, or write the pinned version literally)",
+        ),
+        UnattestedKind::MavenParentDeclares => (
+            NOTE_MAVEN_PARENT_DECLARES,
+            "not attested while a parent pom declares it with a version of its own; the \
+             wiring itself is intact, so re-running `scan` does not change this (declare the \
+             dependency in this pom with no <version>, or drop the <version> from the parent \
+             pom's declaration)",
         ),
         UnattestedKind::CargoUnpinnedDeclaration => (
             NOTE_CARGO_UNPINNED_DECLARATION,

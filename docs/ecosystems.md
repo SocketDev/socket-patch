@@ -893,6 +893,21 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
   `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
   declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
+* **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
+  literal `<version>` in the root pom (a transitive one, or one whose version a parent
+  manages), hosted mode pins it in the root pom's `<dependencyManagement>`
+  (`redirect_maven_dep_management_added`). Maven applies a managed version only to a
+  dependency that declares none, and a pom inherits its parents' `<dependencies>`: when a
+  parent pom declares the package with a version, the build resolves that version and
+  the pin does nothing. `vex` follows the parent chain through the checkout and writes no
+  statement in that case (`vex_maven_parent_declares`, naming the parent pom). Declare
+  the package in the root pom's `<dependencies>` with no `<version>`: its own
+  declaration replaces the inherited one, and the pin then governs it. When the parent is
+  not in the checkout (`<relativePath/>`, as Spring Initializr writes it, or a parent
+  resolved from a repository), `vex` cannot read what it declares, so a managed-only pin
+  is attested only after a build has resolved the patched version: until then it is
+  omitted as `package_not_found`. A pin on the root pom's own declaration is not
+  affected.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
@@ -1493,6 +1508,35 @@ version = "1.0.4+socket.<uuid>"
   untagged copy and lock entry (`cargo_version_tagged`). Every revert
   removes both spellings.
 
+## Cargo: what `vex` attests from the lock
+
+`vex` attests a hosted or vendored crate only from files cargo acts on.
+
+- **A hosted lock entry needs a declaration that routes it.** Cargo resolves a
+  dependency from the source its declaration names. A `Cargo.lock` entry sourced
+  from a Socket patch registry therefore counts only while a declaration cargo
+  honors sends that version there: a dependency in the root `Cargo.toml` or a
+  workspace member's with `registry = "socket-patch-<uuid>"` and a requirement
+  that accepts the locked version (what hosted scan writes), or a hand-written
+  `[patch.<source>]` entry with that registry in the root manifest or the project
+  cargo config. Without one, cargo takes the crate from crates.io and rewrites the
+  lock, or fails under `--locked`. So `vex` attests nothing for a crate that only
+  registry dependents declare, for a registry named only on a `[patch]` entry
+  cargo ignores (a `[patch."https://github.com/rust-lang/crates.io-index"]` table
+  replaces `[patch.crates-io]`) or on a `[workspace.dependencies]` entry nothing
+  inherits, or for a lock with no readable `Cargo.toml` beside it. The run warns
+  `patched_ref_unattributable` and names the lock entry; `rollback` and `remove`
+  still restore it.
+- **Run it from the workspace root.** Cargo ignores `[patch]` in a workspace
+  member and reads `Cargo.lock` only at the workspace root. Run from a member (a
+  directory an ancestor `[workspace]` does not `exclude`, or a package with
+  `package.workspace`), `vex` reads no cargo wiring: a `[patch]` path entry, a
+  registry pin and a `Cargo.lock` left beside the member attest nothing. Each
+  member file that names a Socket patch gets a `patched_ref_unattributable`
+  warning that names the workspace root; `rollback` and `remove` still unwind a
+  hosted pin left there. Hosted scan and `vendor` refuse the same directories
+  (`cargo_manifest_not_workspace_root`).
+
 ## Go: directory replaces and go.sum
 
 Both Go modes work through a `go.mod` `replace` directive pointing at a committed
@@ -1847,6 +1891,20 @@ re-scan leaves the block as it is (and brings a lock that never followed it in l
 `remove` bring the gem back as the exact pin `gem "<name>", "<version>"` and say so
 (`upstream_gem_declaration_pinned`): if the requirement was a range such as `~> 2.2`, put it
 back by hand and run `bundle lock`.
+
+**Keep the Gemfile and the lock together.** Bundler takes a gem from the source its Gemfile
+declaration names; a lock that names another source is out of date to it. If the Gemfile loses
+the `source:` option while the lock keeps the patch's `GEM` section (a `git checkout` of one
+file, or a merge that took the other side of the Gemfile), a frozen install fails with "the list
+of sources changed" and an ordinary `bundle install` rewrites the lock and installs the
+unpatched gem (Bundler 1.17.2, 2.1.4, 2.4.22, 2.5.23 and 4.0.15 all do; the same holds for a
+vendored gem whose Gemfile loses its `path:`). `vex` therefore attests a gem only when the
+Gemfile (or `gems.rb`) beside the lock gives it the source the lock resolves it from. Otherwise
+it warns `patched_ref_unattributable`, naming the gem and what the Gemfile says instead, and
+writes no statement for it. To patch the gem again, run `bundle install` once without frozen
+mode so the lock follows the Gemfile, then re-run `socket-patch scan` (or `vendor`): a hosted
+scan skips a gem whose lock entry is still pinned to a source (`redirect_gem_source_option`).
+`rollback` and `remove` still see and unwind a hosted lock section left this way.
 
 ## Ruby gems: gems already installed
 

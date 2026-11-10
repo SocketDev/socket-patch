@@ -41,7 +41,9 @@
 //!   exists);
 //! * g) hosted: not installed → attests from the lock's sha1 pin only;
 //!   installed + patched → attests after hash verification (composer 1 and
-//!   composer 2 `installed.json`); installed pristine → omitted;
+//!   composer 2 `installed.json`); installed pristine → omitted; installed
+//!   in a `config.vendor-dir` outside the project, which the crawler does
+//!   not read → `composer_install_unread`, never "not installed";
 //! * h) a lock wiring one package to two patches → `wiring_conflict`;
 //!   a `--patch-server-url` deployment's origin counts only when configured.
 
@@ -787,11 +789,14 @@ fn f_uuid_on_a_foreign_host_is_not_a_patch_reference() {
     for flavor in ALL_FLAVORS {
         // The exact Socket path shape (uuid-shaped token + uuid segments) on
         // someone else's host, a Socket-lookalike suffix host, a userinfo
-        // trick, and plain http to the real host.
+        // trick, the same trick behind a backslash (Socket's host to a
+        // WHATWG parser, `evil.example` to the libcurl Composer downloads
+        // with), and plain http to the real host.
         for origin in [
             "https://patch.evil.example",
             "https://patch.socket.dev.evil.example",
             "https://patch.socket.dev@evil.example",
+            "https://patch.socket.dev\\@evil.example",
             "http://patch.socket.dev",
         ] {
             let cell = format!("{flavor:?} {origin}");
@@ -1043,6 +1048,118 @@ fn g_hosted_installed_tree_is_hash_verified() {
                 &format!("{cell} pristine --no-verify"),
             );
         }
+    }
+}
+
+/// The project's `composer.json` with `config.vendor-dir` set to `value`.
+fn set_vendor_dir(cwd: &Path, value: &str) {
+    std::fs::write(
+        cwd.join("composer.json"),
+        serde_json::json!({
+            "name": "acme/app",
+            "require": { "acme/vexprobe": "^1.2" },
+            "config": { "vendor-dir": value },
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// An install of the patched package in the vendor tree at `vendor_dir`
+/// (wherever `config.vendor-dir` put it), holding `content`.
+fn install_at(vendor_dir: &Path, content: &[u8]) {
+    let file = vendor_dir.join("acme/vexprobe").join(FILE_KEY);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, content).unwrap();
+    std::fs::create_dir_all(vendor_dir.join("composer")).unwrap();
+    let pkg = serde_json::json!({
+        "name": "acme/vexprobe",
+        "version": "1.2.3",
+        "install-path": "../acme/vexprobe",
+    });
+    std::fs::write(
+        vendor_dir.join("composer/installed.json"),
+        serde_json::json!({ "packages": [pkg], "dev": true }).to_string(),
+    )
+    .unwrap();
+}
+
+/// #686: `config.vendor-dir` may put the install outside the project (an
+/// absolute path, or one climbing out), where the crawler reads nothing,
+/// since `apply` writes into the tree it crawls. "No copy found" then says
+/// nothing about what is installed: a tree installed before the lock was
+/// redirected is still the upstream package, and the pinned lock must not
+/// attest over it. With no install there the lock still attests; with one,
+/// the patch is omitted until the user names the directory in their own
+/// environment (`COMPOSER_VENDOR_DIR`), which the crawler does read.
+#[test]
+fn g_hosted_install_outside_the_project_is_not_read_as_not_installed() {
+    for absolute in [true, false] {
+        let cell = if absolute { "absolute" } else { "../" };
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("app");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let deps = tmp.path().join("deps");
+        write_wiring(&cwd, Flavor::Lock, &Wire::socket(Mode::Hosted));
+        if absolute {
+            set_vendor_dir(&cwd, deps.to_str().unwrap());
+        } else {
+            set_vendor_dir(&cwd, "../deps");
+        }
+        let api = honest_api();
+
+        // Nothing is installed where composer would install: lockfile basis.
+        let out = vex(&cwd, Some(&api), &[]);
+        assert_attests(
+            &out,
+            PURL,
+            UUID,
+            Mode::Hosted,
+            &format!("{cell} not installed"),
+        );
+
+        // An install the crawler does not read, still the upstream bytes.
+        install_at(&deps, BEFORE);
+        let out = vex(&cwd, Some(&api), &[]);
+        assert_omits(
+            &out,
+            PURL,
+            "composer_install_unread",
+            &format!("{cell} installed, unpatched"),
+        );
+        // Patched or not, it was not checked.
+        install_at(&deps, AFTER);
+        let out = vex(&cwd, Some(&api), &[]);
+        assert_omits(
+            &out,
+            PURL,
+            "composer_install_unread",
+            &format!("{cell} installed, patched"),
+        );
+
+        // The user's own environment names the tree: it is read and judged.
+        let judged = |content: &[u8]| {
+            install_at(&deps, content);
+            let mut run = VexRun::online(&api);
+            run.product = Some(PRODUCT.to_string());
+            run.envs
+                .push(("COMPOSER_VENDOR_DIR".into(), deps.clone().into_os_string()));
+            let _ = std::fs::remove_file(cwd.join(DEFAULT_OUTPUT));
+            run_vex(&binary(), &cwd, &run)
+        };
+        assert_omits(
+            &judged(BEFORE),
+            PURL,
+            "not_applied",
+            &format!("{cell} COMPOSER_VENDOR_DIR, unpatched"),
+        );
+        assert_attests(
+            &judged(AFTER),
+            PURL,
+            UUID,
+            Mode::Hosted,
+            &format!("{cell} COMPOSER_VENDOR_DIR, patched"),
+        );
     }
 }
 

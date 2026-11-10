@@ -68,6 +68,28 @@
 //!   anything);
 //! - a `-D` user property that moves the pin's `${property}` version.
 //!
+//! A pin only `<dependencyManagement>` carries, for a GA the root pom does
+//! not declare itself, governs whatever declaration the build inherits, so
+//! it is weighed against the parent poms ([`Ancestors`]). Maven merges a
+//! parent's `<dependencies>` into the child and management fills in only a
+//! dependency that declares no version (Maven 3.9.16: with the parent
+//! declaring the GA at a literal version the build lists the upstream jar
+//! and never asks for the patched one; with the parent's declaration
+//! unversioned, or the root declaring the GA itself, it asks for the
+//! patched one). The chain is followed through the checkout
+//! (`<relativePath>`, default `../pom.xml`, a pom that is the named
+//! parent):
+//! - a parent pom (or one above it, or a profile of either) declaring the
+//!   GA with a version keeps the ref but marks it unattested
+//!   ([`UnattestedKind::MavenParentDeclares`]);
+//! - the nearest parent declaring it with no version, or a chain read to
+//!   its end that never does, leaves the pin as it is;
+//! - a parent that cannot be read (resolved from a repository:
+//!   `<relativePath/>`, no pom at the relative path or another project's;
+//!   outside the repository; unparseable) may or may not: the ref then
+//!   never takes the lockfile basis (`integrity_required`, no pin), so it
+//!   attests only from the copy of the patched version a build resolved.
+//!
 //! Integrity: when the pom sha256 was known the rewriter also writes Maven
 //! Trusted Checksums — `.mvn/checksums/checksums.sha256` lines
 //! `<sha256>  <g-path>/<a>/<v>/<a>-<v>.jar` under the SUFFIXED version, made
@@ -77,10 +99,10 @@
 //! ([`crate::formats::maven::trusted_checksums::enforced`]: every setting
 //! hosted writes, read as Maven 3.9+ reads `maven.config`, and no wrapper
 //! pinning a Maven older than 3.9.4).
-//! `integrity_required` is FALSE: the rewriter writes checksums only when
-//! both hashes are known, and the suffixed version itself is the
-//! fail-closed pin (no other repository serves it; the Socket repository is
-//! `checksumPolicy=fail`).
+//! `integrity_required` is FALSE (but for a managed pin under an unread
+//! parent, above): the rewriter writes checksums only when both hashes are
+//! known, and the suffixed version itself is the fail-closed pin (no other
+//! repository serves it; the Socket repository is `checksumPolicy=fail`).
 //!
 //! ## Vendored, pre-v5 (the retired single-pom backend)
 //!
@@ -112,8 +134,10 @@
 //! (plugin classpaths) are not project resolution and are skipped silently;
 //! `<profiles>` are only read when activated, so a Socket repository or pin
 //! there is diagnosed, never a ref (a profile that bypasses a live pin
-//! withholds its attestation, [`bypasses`]). Submodule poms and parent
-//! poms are not read (root-only). Gradle builds are discovered by
+//! withholds its attestation, [`bypasses`]). Submodule poms are not read,
+//! and parent poms only for what they declare of a managed pin's GA
+//! ([`Ancestors`]): a Socket repository or pin in one is not wiring here.
+//! Gradle builds are discovered by
 //! `gradle.rs` (the hosted index) and the vendored JVM backend's own
 //! probes.
 
@@ -131,6 +155,7 @@ use crate::formats::maven::{
 };
 use crate::patch::redirect::{MVN_CHECKSUMS, MVN_CONFIG, MVN_WRAPPER_PROPERTIES};
 use crate::vendor::jvm::layout;
+use crate::vendor::jvm::maven_reactor::{pom_model, PomDecl, PomParent};
 use crate::vendor::lock_inventory::LockIntegrity;
 use crate::vendor::maven_repo::{sha1_sidecar_matches, VENDOR_REPO_URL_PREFIX};
 use crate::vendor::path::{sweep_vendor_dirs, VENDOR_DIR};
@@ -188,7 +213,16 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
             && !crate::vendor::jvm::maven_reactor::implicit_subprojects_in(&ctx.view)
                 .await
                 .is_empty());
-    extract_hosted(ctx, &pom, &gas, &hosted, reactor, config.as_deref(), out).await;
+    extract_hosted(
+        ctx,
+        (&raw, &pom),
+        &gas,
+        &hosted,
+        reactor,
+        config.as_deref(),
+        out,
+    )
+    .await;
     if !vendored.is_empty() {
         extract_vendored(ctx, &pom.deps, &vendored, out).await;
     }
@@ -198,7 +232,7 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
 
 async fn extract_hosted(
     ctx: &DiscoverCtx<'_>,
-    pom: &Pom,
+    (raw, pom): (&str, &Pom),
     gas: &BTreeSet<(String, String)>,
     hosted: &BTreeMap<String, String>,
     reactor: bool,
@@ -207,6 +241,10 @@ async fn extract_hosted(
 ) {
     // uuid -> the (purl, g, a, suffixed version) pins that tie to it.
     let mut ties: BTreeMap<&str, BTreeSet<(String, String, String, String)>> = BTreeMap::new();
+    // The parent poms, read once, and only for a pin they could override.
+    let mut ancestors: Option<Ancestors> = None;
+    // The uuids whose pin an unread parent pom may override.
+    let mut unread_parent: BTreeSet<&str> = BTreeSet::new();
 
     for dep in &pom.deps {
         if dep.in_profile
@@ -357,6 +395,39 @@ async fn extract_hosted(
                 {
                     out.unattested(&purl, uuid, POM, detail, kind);
                 }
+                // A pin this pom does not carry on a declaration of its own
+                // governs whatever declaration the build inherits: a parent
+                // pom's, when one declares the GA.
+                if !declared_here(&pom.deps, group, artifact) {
+                    if ancestors.is_none() {
+                        ancestors = Some(Ancestors::load(ctx, raw).await);
+                    }
+                    let inherited = ancestors
+                        .as_ref()
+                        .map_or(Inherited::Clear, |a| a.inherited(group, artifact));
+                    match inherited {
+                        Inherited::Clear => {}
+                        Inherited::Declared { file, version } => out.unattested(
+                            &purl,
+                            uuid,
+                            POM,
+                            format!(
+                                "{POM}: {ga} is pinned to {pinned} only through \
+                                 <dependencyManagement>, but {file}, which this pom inherits \
+                                 from, declares it with <version>{version}</version>: Maven \
+                                 builds an inherited dependency at the version its declaration \
+                                 carries, so the build resolves that version, not the patch. \
+                                 Declare {ga} in this pom's <dependencies> with no <version> \
+                                 (the pin then governs it), or drop the <version> from that \
+                                 declaration"
+                            ),
+                            UnattestedKind::MavenParentDeclares,
+                        ),
+                        Inherited::Unread => {
+                            unread_parent.insert(uuid);
+                        }
+                    }
+                }
                 ties.entry(*uuid).or_default().insert((
                     purl,
                     group.clone(),
@@ -421,14 +492,181 @@ async fn extract_hosted(
             .as_ref()
             .and_then(|c| c.get(&jar))
             .map(|hex| LockIntegrity::Sha256Hex(hex.clone()));
+        // A parent pom that is not in the checkout may declare the GA with
+        // a version of its own, which the pin would not replace. The pom
+        // alone then proves nothing: the ref never takes the lockfile basis
+        // (no pin, a pin required), so it attests only from the copy of the
+        // patched version a build resolved.
+        let unread = unread_parent.contains(uuid.as_str());
         out.push(PatchedRef::hosted(
             purl.clone(),
             uuid.clone(),
             POM,
             Some(url),
-            integrity,
-            false,
+            integrity.filter(|_| !unread),
+            unread,
         ));
+    }
+}
+
+/// Whether the root pom itself declares `group:artifact`'s main jar among
+/// the `<dependencies>` Maven always reads, with a version or without. Its
+/// own declaration replaces any it would inherit, so a managed pin that
+/// governs it is not a parent pom's to override.
+fn declared_here(deps: &[PomDep], group: &str, artifact: &str) -> bool {
+    deps.iter().any(|d| {
+        !d.in_profile
+            && !d.managed
+            && !is_variant(d.type_text.as_deref(), d.classifier.as_deref())
+            && d.group == group
+            && d.artifact == artifact
+    })
+}
+
+/// How many parent poms [`Ancestors::load`] follows.
+const MAX_ANCESTORS: usize = 16;
+
+/// What the poms the root inherits from say about one GA
+/// ([`Ancestors::inherited`]).
+enum Inherited {
+    /// Nothing that overrides a managed pin: every parent pom was read and
+    /// none declares the GA with a version, or the nearest one declaring it
+    /// leaves the version to management (and replaces any above it).
+    Clear,
+    /// The parent pom `file` declares it with `version`.
+    Declared { file: String, version: String },
+    /// A parent pom could not be read, so neither can be ruled out.
+    Unread,
+}
+
+/// The poms the root pom inherits from, nearest first, as far as the
+/// checkout holds them. Maven merges a parent's `<dependencies>` into the
+/// child and `<dependencyManagement>` fills in only a dependency that
+/// declares no version, so a parent's own versioned declaration of a GA
+/// defeats a pin the root carries in `<dependencyManagement>` alone
+/// (verified on Maven 3.9.16: it lists the upstream jar and never asks for
+/// the patched version; with the parent's declaration unversioned, or the
+/// root declaring the GA itself, it asks for the patched one).
+struct Ancestors {
+    /// Each parent pom: its root-relative file, its `<dependencies>` with
+    /// every profile's (any may be active), and its own alone.
+    poms: Vec<(String, Vec<PomDecl>, Vec<PomDecl>)>,
+    /// Whether the chain stops short of a pom with no `<parent>`: a parent
+    /// Maven resolves from a repository (`<relativePath/>`, no pom at the
+    /// relative path, or one that is another project), one outside the
+    /// repository, one that does not parse, or too long a chain.
+    unread: bool,
+}
+
+impl Ancestors {
+    /// Follow `<parent>` from the root pom `raw` through the checkout. A
+    /// quiet read: a parent pom is not a file hosted mode writes, and
+    /// nothing in it is wiring.
+    async fn load(ctx: &DiscoverCtx<'_>, raw: &str) -> Self {
+        use crate::utils::relpath::{is_anchored, normalize_rel_keeping_escapes};
+        let mut chain = Ancestors {
+            poms: Vec::new(),
+            unread: true,
+        };
+        let Ok(mut model) = pom_model(raw, false) else {
+            return chain;
+        };
+        let mut file = POM.to_string();
+        let mut seen = BTreeSet::from([file.clone()]);
+        loop {
+            let Some((group, artifact, version, relative)) = model.parent.clone() else {
+                chain.unread = false;
+                return chain;
+            };
+            let relative = relative.as_deref().map_or("../pom.xml", str::trim);
+            if relative.is_empty() || is_anchored(relative) || chain.poms.len() >= MAX_ANCESTORS {
+                return chain;
+            }
+            let path = match file.rsplit_once('/') {
+                Some((dir, _)) => normalize_rel_keeping_escapes(&format!("{dir}/{relative}")),
+                None => normalize_rel_keeping_escapes(relative),
+            };
+            // A `<relativePath>` may name the pom or its directory.
+            let candidates = if path.is_empty() {
+                vec![POM.to_string()]
+            } else {
+                vec![path.clone(), format!("{path}/{POM}")]
+            };
+            let mut found = None;
+            for candidate in candidates {
+                if let Ok(text) = ctx.view.read_text(&candidate).await {
+                    found = Some((candidate, text));
+                    break;
+                }
+            }
+            let Some((parent_file, text)) = found else {
+                return chain;
+            };
+            let (Ok(own), Ok(all)) = (pom_model(&text, false), pom_model(&text, true)) else {
+                return chain;
+            };
+            // Maven takes the pom at the relative path only when it is the
+            // parent the reference names; else it resolves the parent from
+            // a repository.
+            let inherits = |part: fn(&PomParent) -> &Option<String>| {
+                own.parent.as_ref().and_then(|p| part(p).clone())
+            };
+            let is_named = [
+                (&group, own.group.clone().or_else(|| inherits(|p| &p.0))),
+                (&artifact, own.artifact.clone()),
+                (&version, own.version.clone().or_else(|| inherits(|p| &p.2))),
+            ]
+            .into_iter()
+            .all(|(wanted, has)| wanted.is_none() || *wanted == has);
+            if !is_named || !seen.insert(parent_file.clone()) {
+                return chain;
+            }
+            chain
+                .poms
+                .push((parent_file.clone(), all.deps, own.deps.clone()));
+            file = parent_file;
+            model = own;
+        }
+    }
+
+    /// What the chain means for a pin of `group:artifact` the root carries
+    /// in `<dependencyManagement>` alone.
+    fn inherited(&self, group: &str, artifact: &str) -> Inherited {
+        // A coordinate spelled through a property is interpolated in the
+        // child's model, which this reading does not build: it may name
+        // the GA.
+        let may_be = |text: &str, name: &str| text == name || text.contains("${");
+        // Another `<type>` is another artifact, managed apart.
+        let main_jar = |d: &PomDecl| {
+            d.kind
+                .as_deref()
+                .is_none_or(|k| k == "jar" || k.contains("${"))
+        };
+        for (file, all, own) in &self.poms {
+            let versioned = all.iter().find(|d| {
+                d.version.is_some()
+                    && main_jar(d)
+                    && may_be(&d.group, group)
+                    && may_be(&d.artifact, artifact)
+            });
+            if let Some(decl) = versioned {
+                return Inherited::Declared {
+                    file: file.clone(),
+                    version: decl.version.clone().unwrap_or_default(),
+                };
+            }
+            if own
+                .iter()
+                .any(|d| main_jar(d) && d.group == group && d.artifact == artifact)
+            {
+                return Inherited::Clear;
+            }
+        }
+        if self.unread {
+            Inherited::Unread
+        } else {
+            Inherited::Clear
+        }
     }
 }
 
@@ -1295,6 +1533,287 @@ mod tests {
         // The repository names the patch on the Socket host, so it is
         // recognized: a ledger claim for it is dead (rule 11).
         assert_eq!(out.hosted_claim(FX_PURL, FX_UUID), Some(false));
+    }
+
+    // ── a managed pin under a parent pom ────────────────────────────────
+
+    /// A `<parent>` reference to `com.corp:corp-parent:3` with `relative`
+    /// as its `<relativePath>` element (`""`: none, Maven's `../pom.xml`).
+    fn parent_ref(relative: &str) -> String {
+        format!(
+            "<parent><groupId>com.corp</groupId><artifactId>corp-parent</artifactId>\
+             <version>3</version>{relative}</parent>\n"
+        )
+    }
+
+    /// The project at `app/` of a checkout: a root pom under `parent`
+    /// whose only slf4j-api pin is patch A's `<dependencyManagement>` entry
+    /// (what hosted scan writes for a GA the pom has no literal version
+    /// of), with `direct` as its own `<dependencies>`.
+    fn managed_pin_under(parent: &str, direct: &str) -> Project {
+        let p = Project::nested("app");
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "{parent}<dependencyManagement><dependencies>\n{}</dependencies>\
+                 </dependencyManagement>\n<dependencies>\n{direct}</dependencies>\n\
+                 <repositories>\n{}</repositories>\n",
+                dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                hosted_repo_a(),
+            )),
+        );
+        p
+    }
+
+    /// The pom of `com.corp:<artifact>:3` holding `body`.
+    fn corp_pom(artifact: &str, body: &str) -> String {
+        format!(
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.corp</groupId>\n  \
+             <artifactId>{artifact}</artifactId>\n  <version>3</version>\n  \
+             <packaging>pom</packaging>\n{body}</project>\n"
+        )
+    }
+
+    fn dependencies(decls: &str) -> String {
+        format!("<dependencies>\n{decls}</dependencies>\n")
+    }
+
+    const SLF4J: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
+
+    /// A managed pin governs a dependency only where the declaration Maven
+    /// builds carries no version of its own. A pom inherits its parents'
+    /// `<dependencies>`, so one that declares the GA with a version (in the
+    /// parent, its parent, or a profile of either) is what the build
+    /// resolves: real Maven 3.9.16 lists the upstream jar and never asks
+    /// for the patched version. The ref stays, unattested.
+    #[tokio::test]
+    async fn a_managed_pin_a_parent_pom_overrides_is_not_attested() {
+        let literal = dependencies(&dep("org.slf4j", "slf4j-api", Some("1.7.36")));
+        type Files = Vec<(&'static str, String)>;
+        let cases: Vec<(&str, String, Files)> = vec![
+            (
+                "the parent declares it",
+                parent_ref("<relativePath>../corp-parent/pom.xml</relativePath>"),
+                vec![("../corp-parent/pom.xml", corp_pom("corp-parent", &literal))],
+            ),
+            (
+                "the default ../pom.xml declares it",
+                parent_ref(""),
+                vec![("../pom.xml", corp_pom("corp-parent", &literal))],
+            ),
+            (
+                "a relativePath naming the parent's directory",
+                parent_ref("<relativePath>../corp-parent</relativePath>"),
+                vec![("../corp-parent/pom.xml", corp_pom("corp-parent", &literal))],
+            ),
+            (
+                "the parent's parent declares it",
+                parent_ref("<relativePath>../corp-parent/pom.xml</relativePath>"),
+                vec![
+                    (
+                        "../corp-parent/pom.xml",
+                        corp_pom(
+                            "corp-parent",
+                            "<parent><groupId>com.corp</groupId><artifactId>corp-root</artifactId>\
+                             <version>3</version><relativePath>../corp-root/pom.xml</relativePath>\
+                             </parent>\n",
+                        ),
+                    ),
+                    ("../corp-root/pom.xml", corp_pom("corp-root", &literal)),
+                ],
+            ),
+            (
+                "a profile of the parent declares it",
+                parent_ref("<relativePath>../corp-parent/pom.xml</relativePath>"),
+                vec![(
+                    "../corp-parent/pom.xml",
+                    corp_pom(
+                        "corp-parent",
+                        &format!("<profiles><profile><id>p</id>\n{literal}</profile></profiles>\n"),
+                    ),
+                )],
+            ),
+            (
+                "the parent declares it through a property",
+                parent_ref("<relativePath>../corp-parent/pom.xml</relativePath>"),
+                vec![(
+                    "../corp-parent/pom.xml",
+                    corp_pom(
+                        "corp-parent",
+                        &format!(
+                            "<properties><slf4j.version>1.7.36</slf4j.version></properties>\n{}",
+                            dependencies(&dep("org.slf4j", "slf4j-api", Some("${slf4j.version}")))
+                        ),
+                    ),
+                )],
+            ),
+        ];
+        for (what, parent, files) in cases {
+            let p = managed_pin_under(&parent, "");
+            for (rel, text) in files {
+                p.write(rel, text);
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(SLF4J, UUID_A, WiringMode::Hosted)]);
+            assert_eq!(out.unattested.len(), 1, "{what}: {:#?}", out.unattested);
+            let mark = &out.unattested[0];
+            assert_eq!(mark.kind, UnattestedKind::MavenParentDeclares, "{what}");
+            assert_eq!((mark.purl.as_str(), mark.uuid.as_str()), (SLF4J, UUID_A));
+            assert!(
+                mark.detail.contains("org.slf4j:slf4j-api") && mark.detail.contains("pom.xml"),
+                "{what}: {}",
+                mark.detail
+            );
+        }
+    }
+
+    /// The managed pin stands where Maven applies it (real Maven 3.9.16 asks
+    /// for the patched version in each): no parent declares the GA, the
+    /// nearest pom declaring it leaves the version to management, or the
+    /// root declares it itself with no version (its declaration replaces an
+    /// inherited one).
+    #[tokio::test]
+    async fn a_managed_pin_no_parent_pom_overrides_is_attested() {
+        let literal = dependencies(&dep("org.slf4j", "slf4j-api", Some("1.7.36")));
+        let unversioned = dependencies(&dep("org.slf4j", "slf4j-api", None));
+        let local = parent_ref("<relativePath>../corp-parent/pom.xml</relativePath>");
+        let grandparent = "<parent><groupId>com.corp</groupId><artifactId>corp-root</artifactId>\
+                           <version>3</version><relativePath>../corp-root/pom.xml</relativePath>\
+                           </parent>\n";
+        type Files = Vec<(&'static str, String)>;
+        let cases: Vec<(&str, &str, Files)> = vec![
+            (
+                "the parent chain declares nothing of it",
+                "",
+                vec![
+                    (
+                        "../corp-parent/pom.xml",
+                        corp_pom("corp-parent", grandparent),
+                    ),
+                    (
+                        "../corp-root/pom.xml",
+                        corp_pom(
+                            "corp-root",
+                            &dependencies(&dep("junit", "junit", Some("4.13.2"))),
+                        ),
+                    ),
+                ],
+            ),
+            (
+                "the parent declares it with no version",
+                "",
+                vec![(
+                    "../corp-parent/pom.xml",
+                    corp_pom("corp-parent", &unversioned),
+                )],
+            ),
+            (
+                "the parent re-declares it with no version over a literal above",
+                "",
+                vec![
+                    (
+                        "../corp-parent/pom.xml",
+                        corp_pom("corp-parent", &format!("{grandparent}{unversioned}")),
+                    ),
+                    ("../corp-root/pom.xml", corp_pom("corp-root", &literal)),
+                ],
+            ),
+            (
+                "the root declares it with no version over the parent's literal",
+                "<dependency><groupId>org.slf4j</groupId><artifactId>slf4j-api</artifactId>\
+                 </dependency>\n",
+                vec![("../corp-parent/pom.xml", corp_pom("corp-parent", &literal))],
+            ),
+        ];
+        for (what, direct, files) in cases {
+            let p = managed_pin_under(&local, direct);
+            for (rel, text) in files {
+                p.write(rel, text);
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(SLF4J, UUID_A, WiringMode::Hosted)]);
+            assert!(out.unattested.is_empty(), "{what}: {:#?}", out.unattested);
+            assert!(out.diagnostics.is_empty(), "{what}: {:#?}", out.diagnostics);
+            assert!(out.refs[0].lockfile_basis_ok(), "{what}");
+        }
+    }
+
+    /// A parent pom that is not in the checkout cannot be read: whether it
+    /// declares the GA with a version of its own is unknown, so the pin
+    /// attests only from a copy a build resolved, never from the pom alone.
+    #[tokio::test]
+    async fn a_managed_pin_under_an_unread_parent_needs_the_installed_copy() {
+        type Files = Vec<(&'static str, String)>;
+        let cases: Vec<(&str, String, Files)> = vec![
+            (
+                "resolved from a repository (<relativePath/>)",
+                parent_ref("<relativePath/>"),
+                vec![],
+            ),
+            ("no ../pom.xml in the checkout", parent_ref(""), vec![]),
+            (
+                "the pom at the relative path is another project",
+                parent_ref(""),
+                vec![("../pom.xml", corp_pom("something-else", ""))],
+            ),
+            (
+                "the parent pom does not parse",
+                parent_ref(""),
+                vec![("../pom.xml", "<project><dependencies>".to_string())],
+            ),
+            (
+                "the parent's own parent is not in the checkout",
+                parent_ref(""),
+                vec![(
+                    "../pom.xml",
+                    corp_pom(
+                        "corp-parent",
+                        "<parent><groupId>org.springframework.boot</groupId>\
+                         <artifactId>spring-boot-starter-parent</artifactId>\
+                         <version>3.3.0</version><relativePath/></parent>\n",
+                    ),
+                )],
+            ),
+        ];
+        for (what, parent, files) in cases {
+            let p = managed_pin_under(&parent, "");
+            for (rel, text) in files {
+                p.write(rel, text);
+            }
+            let out = run(&p).await;
+            assert_refs(&out, &[(SLF4J, UUID_A, WiringMode::Hosted)]);
+            assert!(out.unattested.is_empty(), "{what}: {:#?}", out.unattested);
+            let r = &out.refs[0];
+            assert!(
+                r.integrity_required && !r.lockfile_basis_ok(),
+                "{what}: {r:#?}"
+            );
+        }
+
+        // A pin the root pom carries on its own declaration is not
+        // inherited from anything: the parent is not consulted.
+        let p = Project::nested("app");
+        p.write(
+            "pom.xml",
+            pom(&format!(
+                "{}<dependencies>\n{}</dependencies>\n<repositories>\n{}</repositories>\n",
+                parent_ref("<relativePath/>"),
+                dep("org.slf4j", "slf4j-api", Some(&suffixed(UUID_A))),
+                hosted_repo_a(),
+            )),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(SLF4J, UUID_A, WiringMode::Hosted)]);
+        assert!(out.refs[0].lockfile_basis_ok());
+        // Nor is one the root governs through its own versionless
+        // declaration.
+        let p = managed_pin_under(
+            &parent_ref("<relativePath/>"),
+            &dep("org.slf4j", "slf4j-api", None),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[(SLF4J, UUID_A, WiringMode::Hosted)]);
+        assert!(out.refs[0].lockfile_basis_ok());
     }
 
     #[tokio::test]
