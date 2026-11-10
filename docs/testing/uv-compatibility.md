@@ -93,9 +93,36 @@ frozen, locked, and ordinary installation outcomes separately where supported.
   `--locked`, and ordinary installs). A lock that has metadata but no entry
   for the package is stale and is still refused with
   `pypi_uv_lock_package_missing`.
+- Vendored native wiring replaces the release the lock resolves, never
+  another one. Every manifest patch is a vendor candidate, including one for
+  a release the project has since moved off (a dependency bump, a manifest
+  shared across branches). When `uv.lock` resolves the package at another
+  version than the patch is for (compared as PEP 440 versions), the patch is
+  refused with `pypi_uv_lock_package_missing`, naming both versions, and
+  neither file is written; with patches for two releases in the manifest, the
+  one for the locked release is wired. The lock entry keeps its own
+  `version` line. Earlier releases wired such a patch by rewriting the
+  entry's version, which made `uv sync` install the patch's release.
 - Native lock versions other than `version = 1`, and PEP 751 versions other than
   `lock-version = "1.0"`, are refused. Lock `revision` values 1 (0.6.0–0.6.14),
   2 (0.6.15–0.8.3) and 3 (0.8.4 onward) are covered by the release-family runner.
+- The hosted unwind copies a restored entry's registry and artifact fields
+  from another registry package of the lock. A `[[package]]` lock whose
+  registry packages are all hosted (a project or script with one dependency)
+  has none, so the entry is rebuilt on PyPI's default index with the fields uv
+  records at the lock's `revision`: `url`, `hash` and `size` with no
+  `revision` (0.2.35–0.5) and at revision 1, those and `upload-time` at
+  revisions 2 and 3. Measured with real binaries (macOS arm64): the restored
+  `uv.lock` is byte-identical to the one `uv lock` wrote on 0.2.37, 0.3.5,
+  0.4.30, 0.5.31, 0.6.14, 0.7.0, 0.8.0, 0.8.4, 0.9.30, 0.10.0, 0.11.19 and
+  0.12.17. uv 0.6.15–0.6.17 spell the revision 2 timestamp `upload_time`; their
+  entry comes back as `upload-time`, which 0.6.17 accepts (`uv lock --check`,
+  `uv sync --frozen`), as 0.7.0 and later accept `upload_time`. The run warns
+  `upstream_uv_entry_rebuilt`. The rebuild is refused for a `revision` above
+  3, and when a uv setting or environment variable names a package index
+  (the registry is then not known to be PyPI). The `project`, `constraints`
+  and `script` lanes of `e2e_redirect_uv_build` pin it. A PEP 751 lock or a
+  `[[distribution]]` lock with no other registry package is still refused.
 - Command availability boundaries observed with real binaries: `uv lock`
   writes a lock from 0.1.45 (see above); `uv export` from 0.4.1, its
   `--output-file` flag from 0.4.7 (the harness reads the export from stdout
@@ -168,7 +195,25 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - Both uv backends preserve CRLF line endings: the hosted rewriter and the
   vendored `uv.lock` / `pyproject.toml` writer (including the appended
   `[manifest]` and `[package.metadata]` fragments and their revert) keep the
-  file's convention.
+  file's convention. A `pyproject.toml` that mixes CRLF and LF lines keeps
+  each line's own ending through vendored uv wiring: only the lines the
+  wiring adds or changes are new (they take the ending most of the file's
+  lines have), and `vendor --revert` restores the file's original bytes.
+  The other writers that render a whole document (hosted mode, Hatch, PEP
+  723 script blocks, PEP 751 locks) still write a mixed-ending file all-LF.
+- The `[package.metadata]` block of a vendored or hosted wheel is rebuilt
+  from the wheel's `Requires-Dist` / `Provides-Extra` headers. Each value is
+  written as one TOML string, and a header a lock entry cannot hold is
+  refused before any file is written (`pypi_uv_metadata_unsupported`
+  vendored, `pypi_lock_parse_failed` for a vendored script lock,
+  `python_metadata_unavailable` hosted): a requirement with no
+  distribution name, an extra that is not a PEP 508 identifier, a version
+  specifier that is not a PEP 440 specifier set, a control character in a
+  marker, or a direct reference (`name @ url`). The refusal names the header.
+  uv reads these strings back strictly: measured on 0.11.19, a `specifier`
+  such as `>=1.26.*`, `>=1.26,`, `~=1`, `>=1.0+local` or `===1.0x`, an
+  `extras` entry that is not a name, or a malformed `marker` makes every uv
+  command fail with `Failed to parse uv.lock`.
 - uv workspaces are refused from the root (`pypi_uv_workspace_unsupported` /
   `redirect_uv_project_unsupported`) and from a member directory: a member
   listed by the nearest ancestor `[tool.uv.workspace] members` (no

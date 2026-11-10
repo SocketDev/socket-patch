@@ -528,7 +528,10 @@ pub(super) async fn wire_python_locks(
                     SCRIPT_KIND,
                 ));
             }
-            if let Some(metadata) = super::pypi_uv::wheel_metadata_block(&root.join(wheel)).await {
+            let metadata = super::pypi_uv::wheel_metadata_block(&root.join(wheel))
+                .await
+                .map_err(|why| ("pypi_lock_parse_failed", format!("wheel metadata: {why}")))?;
+            if let Some(metadata) = metadata {
                 let metadata = metadata
                     .strip_prefix("[package.metadata]\n")
                     .unwrap_or(&metadata);
