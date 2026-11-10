@@ -570,8 +570,10 @@ async fn vlt_pinned_matrix_migration_agent_apply_after_hosted() {
     fx.leg.ran();
 }
 
-/// 8: a hosted scan over an agent-patched warm tree keeps the tree (heal
-/// rule (c) sees the afterHash pass): nothing is invalidated.
+/// 8: a hosted scan over an agent-patched warm tree with no hidden lock
+/// keeps the tree. Hosted scans fetch no patch record, so nothing proves
+/// which bytes the store copy holds: heal rule (c) reports it as
+/// unchecked and asks for `vlt ci`, and nothing is invalidated.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "real vlt: SOCKET_PATCH_VLT_E2E_JS"]
 async fn vlt_pinned_matrix_migration_hosted_scan_keeps_agent_patched_tree() {
@@ -586,7 +588,7 @@ async fn vlt_pinned_matrix_migration_hosted_scan_keeps_agent_patched_tree() {
     let _ = std::fs::remove_file(fx.proj.join(HIDDEN_LOCK));
     let ids = fx.store_ids(fx.t());
     let doc = fx.scan(&[]);
-    fx.assert_advisory(&doc, &advisory_nothing_stale());
+    fx.assert_advisory(&doc, &advisory_undeterminable(ids.len()));
     for id in &ids {
         assert!(store_entry(&fx.proj, id).exists(), "{id} kept");
     }
