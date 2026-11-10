@@ -607,6 +607,24 @@ pub fn checkout_remedy(files: &[String]) -> String {
     )
 }
 
+/// The files a refused pin's remedy names: the ones wiring it and, for a
+/// uv lock, the paired `pyproject.toml` / script the hosted rewrite pointed
+/// at the same patch (`[tool.uv.sources]`). Discovery lists only the lock,
+/// and a checkout of the lock alone would leave that source live, so the
+/// next `uv lock` would wire the patch straight back in.
+async fn remedy_files(view: &mut View<'_>, pin: &HostedPin) -> Vec<String> {
+    let mut files: BTreeSet<String> = pin.files.iter().cloned().collect();
+    for lock in &pin.files {
+        let Some(paired) = crate::utils::python_lock::paired_metadata_path(lock) else {
+            continue;
+        };
+        if matches!(view.read(&paired).await, Ok(Some(text)) if text.contains(&pin.uuid)) {
+            files.insert(paired);
+        }
+    }
+    files.into_iter().collect()
+}
+
 /// The staged project view the restorers work over: reads fall through to
 /// disk, writes stay in memory until [`restore_upstream`] flushes them.
 pub(crate) struct View<'a> {
@@ -884,7 +902,7 @@ pub async fn restore_upstream(
     // yet refused over a FRESH view; a pass that refuses a new pin is rerun
     // without it, so the final view restores exactly the surviving set.
     let mut refused: BTreeMap<String, String> = BTreeMap::new();
-    let (view, result) = loop {
+    let (mut view, result) = loop {
         let active: Vec<&HostedPin> = pins
             .iter()
             .filter(|p| !refused.contains_key(&p.uuid))
@@ -935,22 +953,23 @@ pub async fn restore_upstream(
         flush_staged(root, &changed, &changed_bytes).await.err()
     };
 
-    let pins_out = pins
-        .iter()
-        .map(|pin| PinResult {
+    let mut pins_out = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let status = match refused.get(&pin.uuid) {
+            Some(why) => PinStatus::Refused(format!(
+                "cannot restore {} to its upstream registry entry: {why}; {}",
+                pin.purl,
+                checkout_remedy(&remedy_files(&mut view, pin).await)
+            )),
+            None => PinStatus::Restored,
+        };
+        pins_out.push(PinResult {
             purl: pin.purl.clone(),
             uuid: pin.uuid.clone(),
-            status: match refused.get(&pin.uuid) {
-                Some(why) => PinStatus::Refused(format!(
-                    "cannot restore {} to its upstream registry entry: {why}; {}",
-                    pin.purl,
-                    checkout_remedy(&pin.files)
-                )),
-                None => PinStatus::Restored,
-            },
+            status,
             files: pin.files.clone(),
-        })
-        .collect();
+        });
+    }
 
     RestoreOutcome {
         pins: pins_out,

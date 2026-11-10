@@ -96,6 +96,23 @@ frozen, locked, and ordinary installation outcomes separately where supported.
 - Native lock versions other than `version = 1`, and PEP 751 versions other than
   `lock-version = "1.0"`, are refused. Lock `revision` values 1 (0.6.0–0.6.14),
   2 (0.6.15–0.8.3) and 3 (0.8.4 onward) are covered by the release-family runner.
+- The hosted unwind copies a restored entry's registry and artifact fields
+  from another registry package of the lock. A `[[package]]` lock whose
+  registry packages are all hosted (a project or script with one dependency)
+  has none, so the entry is rebuilt on PyPI's default index with the fields uv
+  records at the lock's `revision`: `url`, `hash` and `size` with no
+  `revision` (0.2.35–0.5) and at revision 1, those and `upload-time` at
+  revisions 2 and 3. Measured with real binaries (macOS arm64): the restored
+  `uv.lock` is byte-identical to the one `uv lock` wrote on 0.2.37, 0.3.5,
+  0.4.30, 0.5.31, 0.6.14, 0.7.0, 0.8.0, 0.8.4, 0.9.30, 0.10.0, 0.11.19 and
+  0.12.17. uv 0.6.15–0.6.17 spell the revision 2 timestamp `upload_time`; their
+  entry comes back as `upload-time`, which 0.6.17 accepts (`uv lock --check`,
+  `uv sync --frozen`), as 0.7.0 and later accept `upload_time`. The run warns
+  `upstream_uv_entry_rebuilt`. The rebuild is refused for a `revision` above
+  3, and when a uv setting or environment variable names a package index
+  (the registry is then not known to be PyPI). The `project`, `constraints`
+  and `script` lanes of `e2e_redirect_uv_build` pin it. A PEP 751 lock or a
+  `[[distribution]]` lock with no other registry package is still refused.
 - Command availability boundaries observed with real binaries: `uv lock`
   writes a lock from 0.1.45 (see above); `uv export` from 0.4.1, its
   `--output-file` flag from 0.4.7 (the harness reads the export from stdout

@@ -1730,14 +1730,24 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
         // their unwind runs and must re-derive every `requires-dist` /
         // `requires-dev` specifier from the declaration uv lowered it from
         // (#606, #473).
-        let byte_exact = matches!(
-            lane,
-            Lane::ExportPylock
-                | Lane::CompilePylock
-                | Lane::PipLock
-                | Lane::Extras
-                | Lane::IncludeGroup
-        );
+        // The project / constraints / script lanes lock `six` alone, so no
+        // sibling shows the registry or the artifact fields: the unwind
+        // rebuilds the entry in the shape uv records at the lock's
+        // `revision`. That is what uv wrote on every release with a
+        // `[[package]]` lock (0.2.35 and later), except 0.6.15–0.6.17, whose
+        // `upload_time` comes back as the `upload-time` they also read.
+        let rebuilt = matches!(lane, Lane::Project | Lane::Constraints | Lane::Script)
+            && uv.at_least((0, 2, 35));
+        let underscore_time = uv.at_least((0, 6, 15)) && !uv.at_least((0, 7, 0));
+        let byte_exact = (rebuilt && !underscore_time)
+            || matches!(
+                lane,
+                Lane::ExportPylock
+                    | Lane::CompilePylock
+                    | Lane::PipLock
+                    | Lane::Extras
+                    | Lane::IncludeGroup
+            );
         let env: Value = serde_json::from_slice(&out.stdout)
             .unwrap_or_else(|e| panic!("{}: ({e})\n{}", report.what("revert"), dump(&out)));
         let still_wired =
@@ -1777,8 +1787,8 @@ pub fn run_lane(suite: &str, uv: &Uv, mode: Mode, lane: Lane) {
                 }
                 report.row("revert", "restored to the upstream registry entry");
             }
-            _ if byte_exact => panic!(
-                "{}: a pylock must restore:\n{}",
+            _ if byte_exact || rebuilt => panic!(
+                "{}: the lock must restore:\n{}",
                 report.what("revert"),
                 dump(&out)
             ),
