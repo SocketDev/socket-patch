@@ -3,6 +3,7 @@ pub mod apply;
 pub(crate) mod composer_hints;
 pub(crate) mod context;
 pub(crate) mod fetch_stage;
+pub(crate) mod gem_refresh;
 pub mod get;
 pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;

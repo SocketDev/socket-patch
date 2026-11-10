@@ -20,6 +20,10 @@ pub(crate) struct HostedLegOutcome {
     /// The files the leg changed (on a dry run: would change). After a
     /// write failure, only the ones it could not put back.
     pub(crate) edited_files: std::collections::BTreeSet<String>,
+    /// The restored gems whose installed copies the leg brought back to the
+    /// upstream gem (on a dry run: would), with none left on the patched
+    /// build: they need no reinstall.
+    pub(crate) refreshed_installs: std::collections::BTreeSet<String>,
 }
 
 /// The [`HostedLegOutcome::failed`] key of a failure that is not one pin's:
@@ -56,6 +60,62 @@ pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<Str
         .filter(|url| !url.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// The gem leg of the unwind's installed-tree care (the "Gem stale-install
+/// guard" section of CLI_CONTRACT.md, in the upstream direction): refresh
+/// what [`crate::commands::gem_refresh::after_restore`] may, then report.
+/// A human run prints what was refreshed as progress lines and gets ONE
+/// warning for the gems still on their patched build; `--json` carries a
+/// note per refreshed materialization and a warning per stale one. An
+/// archive in Bundler's cache dir the refresh replaced no longer needs the
+/// restore's own `upstream_gem_stale_cache` advisory.
+async fn refresh_restored_gems(
+    common: &GlobalArgs,
+    outcome: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
+    out: &mut HostedLegOutcome,
+) {
+    use crate::commands::gem_refresh::{after_restore, Direction};
+    use socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE;
+
+    let restored: Vec<String> = outcome
+        .restored()
+        .filter(|pin| pin.purl.starts_with("pkg:gem/"))
+        .map(|pin| pin.purl.clone())
+        .collect();
+    if restored.is_empty() {
+        return;
+    }
+    let refresh = after_restore(common, &restored, &outcome.staged_text).await;
+    out.warnings.retain(|(code, detail)| {
+        code != GEM_STALE_CACHE
+            || !refresh
+                .replaced_archives
+                .iter()
+                .any(|path| detail.contains(&path.display().to_string()))
+    });
+    out.refreshed_installs = refresh.refreshed_installs;
+    let report = refresh.report;
+    if common.json {
+        out.warnings.extend(
+            report
+                .warnings
+                .into_iter()
+                .map(|(code, detail)| (code.to_string(), detail)),
+        );
+        return;
+    }
+    if !common.silent {
+        for line in &report.progress {
+            println!("{line}");
+        }
+    }
+    if let Some(summary) = &report.summary {
+        out.warnings.push((
+            Direction::Upstream.stale_code().to_string(),
+            summary.paragraph(),
+        ));
+    }
 }
 
 /// Restore the in-scope hosted pins to their default upstream registry
@@ -196,6 +256,11 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         if let Some(detail) = advisory(&common.cwd, &unwound).await {
             out.warnings.push((HOSTED_CODE.to_string(), detail));
         }
+        // Bundler keeps a gem it already holds whatever source the lock
+        // names: bring the project's installed copies and cached archives
+        // of the restored gems back to the upstream gem, and say what is
+        // still the patched build.
+        refresh_restored_gems(common, &outcome, &mut out).await;
     }
     let unwound: Vec<_> = vlt_targets
         .into_iter()

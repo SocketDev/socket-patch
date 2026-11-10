@@ -369,6 +369,38 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_gem_native_rebuild: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): do NOT refresh the gems Bundler already holds for
+    /// the project (an installed gem under the project and its cached
+    /// `.gem`, an archive in `vendor/cache`) after `Gemfile.lock` is
+    /// repointed or restored. Bundler keeps an installed gem whatever
+    /// source the lock names, so opting out means reinstalling those gems
+    /// by hand (the run's `redirect_gem_stale_install` warning names the
+    /// files). Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-gem-install-refresh",
+        env = "SOCKET_NO_GEM_INSTALL_REFRESH",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_gem_install_refresh: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): also refresh gems in a gem home OUTSIDE the project
+    /// (the system gems, `~/.gem`, an rbenv or asdf home). Off by default:
+    /// another project on the machine may pin the other build of the same
+    /// gem version, and its `bundle pristine` would then fail on the
+    /// replaced archive's checksum. Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "gem-refresh-shared",
+        env = "SOCKET_GEM_REFRESH_SHARED",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub gem_refresh_shared: bool,
 }
 
 impl GlobalArgs {
@@ -701,6 +733,8 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
     "SOCKET_NO_GEM_NATIVE_REBUILD",
+    "SOCKET_NO_GEM_INSTALL_REFRESH",
+    "SOCKET_GEM_REFRESH_SHARED",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -770,6 +804,8 @@ impl Default for GlobalArgs {
             no_npm_allow_remote_config: false,
             no_vlt_install_cleanup: false,
             no_gem_native_rebuild: false,
+            no_gem_install_refresh: false,
+            gem_refresh_shared: false,
         }
     }
 }

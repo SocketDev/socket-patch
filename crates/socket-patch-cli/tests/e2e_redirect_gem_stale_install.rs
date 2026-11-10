@@ -8,9 +8,17 @@
 //! Coverage (real binary + wiremock; the "installed" gems are laid down by
 //! hand in bundler's deployment layout, so no ruby/gem/bundler is needed):
 //!
+//!   0. REFRESH (the `refresh` tests at the end): a stale project-local
+//!      install and a committed cache-dir archive are replaced with the
+//!      sha256-verified patched gem, and by the upstream gem after a
+//!      rollback; a shared gem home is left alone under one human warning;
+//!      a dry run only says what it would do; an unverified or unreachable
+//!      archive changes nothing. Arms 1-7 run where the patched archive
+//!      cannot be fetched, so they pin the warning the refresh falls back
+//!      to.
 //!   1. STALE materialization → loud warning in the JSON envelope naming
 //!      the installed dir, cache `.gem`, and specifications entry, plus the
-//!      code-tagged stderr mirror in human mode.
+//!      one-warning summary on stderr in human mode.
 //!   2. ALREADY-PATCHED materialization → quiet (never false-positive).
 //!   3. FRESH checkout (no materialization) → quiet.
 //!   4. TWO gem homes both stale → one warning per home, each naming its
@@ -70,6 +78,12 @@ fn patched_archive_sha256() -> String {
 /// view answers 200 exactly n times and 500 afterwards (the transient-fetch
 /// re-fire arm).
 async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
+    mount_api_for(server, view_budget, &patched_archive_sha256()).await;
+}
+
+/// [`mount_api`] with the grant naming `patched_sha` as the patched
+/// archive's sha256.
+async fn mount_api_for(server: &MockServer, view_budget: Option<u64>, patched_sha: &str) {
     let hosted_url = format!(
         "{}/patch/gem/{DEP}/{DEP_VERSION}/{TOKEN}/{UUID}/{DEP}-{DEP_VERSION}.gem",
         server.uri()
@@ -116,7 +130,7 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
                     "artifacts": [{
                         "kind": "tarball",
                         "url": hosted_url,
-                        "integrity": { "sha256": patched_archive_sha256() }
+                        "integrity": { "sha256": patched_sha }
                     }],
                     "registryOverride": {
                         "kind": "rubygems-compact-index",
@@ -124,7 +138,7 @@ async fn mount_api(server: &MockServer, view_budget: Option<u64>) {
                         "identifiers": {
                             "name": DEP,
                             "version": DEP_VERSION,
-                            "gemChecksumSha256": patched_archive_sha256(),
+                            "gemChecksumSha256": patched_sha,
                         }
                     }
                 }
@@ -279,9 +293,11 @@ fn stale_warnings(env: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
-/// STALE materialization: the redirect succeeds AND the envelope carries the
-/// loud machine-readable warning naming every stale path plus the verified
-/// remedy. The human path mirrors the same code-tagged detail to stderr.
+/// STALE materialization the refresh cannot fix (the patch registry does
+/// not serve the archive): the redirect succeeds, nothing of the install is
+/// changed, AND the envelope carries the machine-readable warning naming
+/// the stale install, why it was not refreshed, and the verified remedy.
+/// The human path prints one summary warning with the same facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     let server = MockServer::start().await;
@@ -325,15 +341,13 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
         detail.contains("`bundle install`"),
         "detail must prescribe the re-install: {detail}"
     );
-    // The empirically DISPROVEN remedies are steered away from, never
-    // prescribed (they reinstall from the stale cache).
     assert!(
-        detail.contains("--redownload") && detail.contains("--force"),
-        "detail must steer away from --force/--redownload: {detail}"
+        detail.contains("was not refreshed (the patched gem could not be downloaded"),
+        "detail must say why the refresh did not happen: {detail}"
     );
 
-    // The installed tree was NOT touched — detection is read-only (no
-    // destructive deletion by default).
+    // The installed tree was NOT touched: without the verified patched
+    // archive in hand nothing is changed, and nothing is ever deleted.
     assert_eq!(
         std::fs::read_to_string(gem_dir.join("lib").join("stale_probe_gem.rb")).unwrap(),
         UPSTREAM_LIB,
@@ -366,13 +380,21 @@ async fn gem_hosted_redirect_over_stale_install_warns_loudly() {
     );
     assert_eq!(code, 0, "human re-scan must succeed:\n{stderr}");
     assert!(
-        stderr.contains("Warning: ")
-            && stderr.contains("was switched to its hosted patch, but a stale"),
-        "human mode must print the stale-install warning on stderr:\n{stderr}"
+        stderr.contains(
+            "Warning: 1 gem is still unpatched on disk after the switch to hosted patches."
+        ),
+        "human mode must print the stale-install summary on stderr:\n{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("still unpatched on disk").count(),
+        1,
+        "one stale-install warning for the run:\n{stderr}"
     );
     assert!(
-        stderr.contains(&gem_dir.display().to_string()),
-        "human mode must name the stale gem dir on stderr:\n{stderr}"
+        stderr.contains(&format!("stale-probe-gem {DEP_VERSION}"))
+            && stderr.contains(&spec.display().to_string())
+            && stderr.contains(&cache.display().to_string()),
+        "human mode must name the gem and the files to remove:\n{stderr}"
     );
 }
 
@@ -1478,7 +1500,7 @@ async fn gem_hosted_stale_install_under_out_of_tree_config_path_is_not_attested(
         warnings[0]
     );
     assert!(
-        warnings[0].contains("Remove the stale"),
+        warnings[0].contains("or remove ") && !warnings[0].contains("shared gem home"),
         "the project's own bundle path takes the project-local remedy: {}",
         warnings[0]
     );
@@ -1713,7 +1735,7 @@ async fn gem_hosted_default_cwd_keeps_project_local_remedy() {
         );
         let detail = &warnings[0];
         assert!(
-            detail.contains("Remove the stale") && !detail.contains("shared gem home"),
+            detail.contains("or remove ") && !detail.contains("shared gem home"),
             "args={args:?}: the project's own vendor/bundle is project-local: {detail}"
         );
         let cache_archive = Path::new("vendor")
@@ -2002,4 +2024,533 @@ async fn gem_hosted_standalone_vex_ignores_unused_system_home_copy() {
             assert_not_attested(&out.envelope, PURL, "not_applied");
         }
     }
+}
+
+// ── refresh ───────────────────────────────────────────────────────────
+
+/// A real `.gem` of the fixture gem whose `lib/stale_probe_gem.rb` is
+/// `lib`: the outer tar RubyGems reads, with the gemspec YAML
+/// (`metadata.gz`, the same bytes for every build, as the patch service
+/// keeps it) and the package tree (`data.tar.gz`).
+fn real_gem(lib: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    fn gz(bytes: &[u8]) -> Vec<u8> {
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        enc.write_all(bytes).unwrap();
+        enc.finish().unwrap()
+    }
+    fn tar_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (name, bytes) in members {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, name, *bytes).unwrap();
+        }
+        tar.into_inner().unwrap()
+    }
+    let metadata = format!(
+        "--- !ruby/object:Gem::Specification\nname: {DEP}\nversion: \
+         !ruby/object:Gem::Version\n  version: {DEP_VERSION}\nplatform: ruby\nauthors:\n- \
+         e2e\nbindir: bin\ndependencies: []\nexecutables: []\nextensions: []\nfiles:\n- \
+         lib/stale_probe_gem.rb\nrequire_paths:\n- lib\nrubygems_version: 3.6.9\n"
+    );
+    tar_of(&[
+        ("metadata.gz", &gz(metadata.as_bytes())),
+        (
+            "data.tar.gz",
+            &gz(&tar_of(&[("lib/stale_probe_gem.rb", lib.as_bytes())])),
+        ),
+    ])
+}
+
+fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// The patch registry's download route for the fixture gem, serving `body`.
+async fn serve_patched_gem(server: &MockServer, body: Vec<u8>) {
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/patch-registry/gem/{TOKEN}/{UUID}/gems/{DEP}-{DEP_VERSION}.gem"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/octet-stream"))
+        .mount(server)
+        .await;
+}
+
+/// A real install of the fixture gem under `home`: the gem dir, the
+/// archive RubyGems installed it from, and a gemspec that builds nothing.
+fn install_real_gem(home: &Path, lib: &str) -> PathBuf {
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let gem_dir = home.join("gems").join(&leaf);
+    std::fs::create_dir_all(gem_dir.join("lib")).unwrap();
+    std::fs::write(gem_dir.join("lib").join("stale_probe_gem.rb"), lib).unwrap();
+    std::fs::create_dir_all(home.join("cache")).unwrap();
+    std::fs::write(
+        home.join("cache").join(format!("{leaf}.gem")),
+        real_gem(lib),
+    )
+    .unwrap();
+    std::fs::create_dir_all(home.join("specifications")).unwrap();
+    std::fs::write(
+        home.join("specifications").join(format!("{leaf}.gemspec")),
+        format!(
+            "Gem::Specification.new do |s|\n  s.name = \"{DEP}\".freeze\n  s.version = \
+             \"{DEP_VERSION}\".freeze\n  s.require_paths = [\"lib\".freeze]\nend\n"
+        ),
+    )
+    .unwrap();
+    gem_dir
+}
+
+fn project_home(proj: &Path) -> PathBuf {
+    proj.join("vendor")
+        .join("bundle")
+        .join("ruby")
+        .join("3.3.0")
+}
+
+fn warnings_with_code(env: &serde_json::Value, code: &str) -> Vec<String> {
+    env["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| w["code"] == code)
+        .map(|w| w["detail"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+fn installed_lib(gem_dir: &Path) -> String {
+    std::fs::read_to_string(gem_dir.join("lib").join("stale_probe_gem.rb")).unwrap()
+}
+
+fn scan_args<'a>(proj: &'a Path, api: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "scan",
+        "--mode",
+        "hosted",
+        "--yes",
+        "--cwd",
+        proj.to_str().expect("utf8 tmp path"),
+        "--api-url",
+        api,
+        "--org",
+        ORG,
+        "--api-token",
+        "fake",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// The whole point: after `scan`, with no further command, the project's
+/// installed gem and both archives ARE the patched gem (so `bundle exec`
+/// loads it, and every reinstall flavor reinstalls it), the same run's
+/// `--vex` attests it once the probe re-verified it, and a re-scan has
+/// nothing left to say.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_replaces_a_stale_project_install_and_its_archives() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let spec = home.join("specifications").join(format!("{leaf}.gemspec"));
+    let spec_before = std::fs::read(&spec).unwrap();
+    // A committed `bundle cache` of the upstream gem.
+    let committed = proj
+        .join("vendor")
+        .join("cache")
+        .join(format!("{leaf}.gem"));
+    std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+    std::fs::write(&committed, real_gem(UPSTREAM_LIB)).unwrap();
+
+    let vex_path = proj.join("out.vex.json");
+    let uri = server.uri();
+    let args = scan_args(
+        &proj,
+        &uri,
+        &[
+            "--json",
+            "--vex",
+            vex_path.to_str().unwrap(),
+            "--vex-product",
+            "pkg:gem/app@1.0.0",
+        ],
+    );
+    let (code, stdout, stderr) = common::run_with_env(&proj, &args, &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    assert_eq!(hosted_pinned(&env), 1, "{env}");
+    assert!(
+        stale_warnings(&env).is_empty(),
+        "nothing is left stale: {env}"
+    );
+    let notes = warnings_with_code(&env, "redirect_gem_install_refreshed");
+    assert_eq!(
+        notes.len(),
+        2,
+        "the install and the committed archive: {env}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains(&gem_dir.display().to_string()))
+            && notes
+                .iter()
+                .any(|n| n.contains(&committed.display().to_string())),
+        "{notes:?}"
+    );
+
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{leaf}.gem"))).unwrap(),
+        patched,
+        "the archive RubyGems reinstalls from is the patched one"
+    );
+    assert_eq!(std::fs::read(&committed).unwrap(), patched);
+    assert_eq!(std::fs::read(&spec).unwrap(), spec_before);
+    assert!(
+        !home.join(".socket-patch-refresh").exists(),
+        "no stage left"
+    );
+    let doc = std::fs::read_to_string(&vex_path).expect("VEX written");
+    assert!(doc.contains(PURL), "the refreshed copy is attested:\n{doc}");
+
+    // Human re-scan: nothing to refresh, nothing to warn about.
+    let args = scan_args(&proj, &uri, &[]);
+    let (code, _, stderr) = common::run_with_env(&proj, &args, &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        !stderr.contains("still unpatched") && !stderr.contains("Replaced"),
+        "a re-scan has nothing to refresh or to warn about:\n{stderr}"
+    );
+}
+
+/// Human output of the run that refreshes: one progress line per kind,
+/// no warning, and the committed archive in the files to commit.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_reports_progress_lines_and_the_archive_to_commit() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    install_real_gem(&project_home(&proj), UPSTREAM_LIB);
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let committed = proj
+        .join("vendor")
+        .join("cache")
+        .join(format!("{leaf}.gem"));
+    std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+    std::fs::write(&committed, real_gem(UPSTREAM_LIB)).unwrap();
+
+    let uri = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &[]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Replaced the installed copy of 1 gem with the patched build: {DEP} {DEP_VERSION}."
+        )) && stderr.contains(&format!(
+            "Replaced 1 archive in Bundler's cache dir with the patched gem: {DEP} {DEP_VERSION}."
+        )),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("still unpatched"), "{stderr}");
+    assert!(
+        stdout.contains(&format!("vendor/cache/{leaf}.gem")),
+        "the replaced archive is a file to commit:\n{stdout}"
+    );
+}
+
+/// `--dry-run` writes nothing and says what a wet run would refresh.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_dry_run_only_says_what_it_would_replace() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let upstream = real_gem(UPSTREAM_LIB);
+    let gemfile = std::fs::read(proj.join("Gemfile")).unwrap();
+
+    let uri = server.uri();
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &scan_args(&proj, &uri, &["--json", "--dry-run"]),
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\nstderr:\n{stderr}");
+    let would = warnings_with_code(&env, "redirect_gem_install_would_refresh");
+    assert_eq!(would.len(), 1, "{env}");
+    assert!(
+        would[0].contains(&gem_dir.display().to_string()),
+        "{would:?}"
+    );
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+
+    let (code, _, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--dry-run"]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(
+        stderr.contains(&format!(
+            "Would replace the installed copy of 1 gem with the patched build: {DEP} {DEP_VERSION}."
+        )),
+        "{stderr}"
+    );
+
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
+    assert_eq!(
+        std::fs::read(home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"))).unwrap(),
+        upstream
+    );
+    assert_eq!(std::fs::read(proj.join("Gemfile")).unwrap(), gemfile);
+    assert!(
+        !server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .any(|r| r.url.path().ends_with(".gem")),
+        "a dry run downloads no archive"
+    );
+}
+
+/// The archive the server sends is not the one the grant pins: nothing of
+/// it is used, the install stays as it was, the warning says why, and the
+/// run still exits 0. `--no-gem-install-refresh` does not even ask.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_uses_no_byte_of_an_unverified_archive() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    // Same gem, other bytes.
+    serve_patched_gem(
+        &server,
+        real_gem("module StaleProbeGem\n  EVIL = true\nend\n"),
+    )
+    .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let cache = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
+
+    let uri = server.uri();
+    let (code, stdout, stderr) =
+        common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(
+        code, 0,
+        "a failed refresh never fails the scan: {env}\n{stderr}"
+    );
+    let details = stale_warnings(&env);
+    assert_eq!(details.len(), 1, "{env}");
+    assert!(
+        details[0].contains("does not have the pinned sha256"),
+        "{}",
+        details[0]
+    );
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
+    assert_eq!(std::fs::read(&cache).unwrap(), real_gem(UPSTREAM_LIB));
+    assert!(!home.join(".socket-patch-refresh").exists());
+
+    let before = server.received_requests().await.unwrap_or_default().len();
+    let (code, stdout, _) = common::run_with_env(
+        &proj,
+        &scan_args(&proj, &uri, &["--json", "--no-gem-install-refresh"]),
+        &[],
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}");
+    let details = stale_warnings(&env);
+    assert!(
+        details.len() == 1 && details[0].contains("`--no-gem-install-refresh` is set"),
+        "{env}"
+    );
+    let asked_for_gem = server.received_requests().await.unwrap_or_default()[before..]
+        .iter()
+        .any(|r| r.url.path().ends_with(".gem"));
+    assert!(!asked_for_gem, "an opted-out run downloads no archive");
+}
+
+/// A gem home outside the project is left exactly as it was, under ONE
+/// human warning that names the gem, the home, and the remedy as a
+/// command; `--gem-refresh-shared` refreshes it like a project-local one.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_leaves_a_shared_gem_home_alone_unless_asked() {
+    let server = MockServer::start().await;
+    let patched = real_gem(PATCHED_LIB);
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = tmp.path().join("system-home");
+    let bin_dir = tmp.path().join("fake-bin");
+    stage_system_home_copy(&home, &bin_dir);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let cache = home.join("cache").join(format!("{DEP}-{DEP_VERSION}.gem"));
+    let path_env = [("PATH", bin_dir.to_str().unwrap())];
+
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &[]), &path_env);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        installed_lib(&gem_dir),
+        UPSTREAM_LIB,
+        "the shared home is not touched"
+    );
+    assert_eq!(std::fs::read(&cache).unwrap(), real_gem(UPSTREAM_LIB));
+    assert_eq!(
+        stderr.matches("still unpatched on disk").count(),
+        1,
+        "one stale-install warning:\n{stderr}"
+    );
+    for needle in [
+        "Warning: 1 gem is still unpatched on disk after the switch to hosted patches.",
+        &format!(
+            "  - Shared gem home {} (left alone, other projects may load it): {DEP} {DEP_VERSION}.",
+            home.display()
+        ),
+        "run `bundle config set --local path vendor/bundle && bundle install`",
+        "`--gem-refresh-shared`",
+    ] {
+        assert!(stderr.contains(needle), "missing {needle:?}:\n{stderr}");
+    }
+
+    let (code, stdout, stderr) = common::run_with_env(
+        &proj,
+        &scan_args(&proj, &uri, &["--json", "--gem-refresh-shared"]),
+        &path_env,
+    );
+    let env = common::parse_json_envelope(&stdout);
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    assert!(stale_warnings(&env).is_empty(), "{env}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
+    assert_eq!(std::fs::read(&cache).unwrap(), patched);
+}
+
+/// The unwind direction: `rollback` puts the lock back on rubygems.org and
+/// the project's installed gem and archives back on the upstream gem,
+/// verified against the sha256 the compact index names.
+#[tokio::test(flavor = "multi_thread")]
+async fn refresh_after_rollback_restores_the_upstream_gem() {
+    let server = MockServer::start().await;
+    let (patched, upstream) = (real_gem(PATCHED_LIB), real_gem(UPSTREAM_LIB));
+    mount_api_for(&server, None, &sha256_of(&patched)).await;
+    serve_patched_gem(&server, patched.clone()).await;
+    // rubygems.org's stand-in: the compact index entry and the download.
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/info/{DEP}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+            "---\n{DEP_VERSION} |checksum:{}\n",
+            sha256_of(&upstream)
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path(format!("/upstream/gems/{DEP}-{DEP_VERSION}.gem")))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_raw(upstream.clone(), "application/octet-stream"),
+        )
+        .mount(&server)
+        .await;
+    let tmp = tempfile::tempdir().unwrap();
+    let proj = tmp.path().join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    write_manifest_pair(&proj);
+    let home = project_home(&proj);
+    let gem_dir = install_real_gem(&home, UPSTREAM_LIB);
+    let leaf = format!("{DEP}-{DEP_VERSION}");
+    let cache = home.join("cache").join(format!("{leaf}.gem"));
+    let committed = proj
+        .join("vendor")
+        .join("cache")
+        .join(format!("{leaf}.gem"));
+    std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+    std::fs::write(&committed, &upstream).unwrap();
+
+    let uri = server.uri();
+    let (code, _, stderr) = common::run_with_env(&proj, &scan_args(&proj, &uri, &["--json"]), &[]);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB, "scan refreshed it");
+    // The lock as `bundle install` leaves it once the pin is installed.
+    std::fs::write(proj.join("Gemfile.lock"), converged_lock(&uri)).unwrap();
+
+    let rubygems = format!("{uri}/upstream");
+    let rollback = |extra: &[&'static str]| {
+        let mut args = vec![
+            "rollback",
+            PURL,
+            "--cwd",
+            proj.to_str().unwrap(),
+            "--api-url",
+            uri.as_str(),
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--patch-server-url",
+            uri.as_str(),
+        ];
+        args.extend_from_slice(extra);
+        common::run_with_env(&proj, &args, &[("SOCKET_RUBYGEMS_URL", rubygems.as_str())])
+    };
+
+    // A dry run says what it would do and changes nothing.
+    let (code, stdout, stderr) = rollback(&["--dry-run"]);
+    assert_eq!(code, 0, "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(&format!(
+            "Would replace the installed copy of 1 gem with the upstream build: {DEP} {DEP_VERSION}."
+        )),
+        "{stdout}"
+    );
+    assert_eq!(installed_lib(&gem_dir), PATCHED_LIB);
+
+    let (code, stdout, stderr) = rollback(&["--json"]);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("not JSON: {e}\n{stdout}\n{stderr}"));
+    assert_eq!(code, 0, "{env}\n{stderr}");
+    let lock = std::fs::read_to_string(proj.join("Gemfile.lock")).unwrap();
+    assert!(
+        !lock.contains("/patch-registry/"),
+        "the lock is back on upstream:\n{lock}"
+    );
+    assert_eq!(installed_lib(&gem_dir), UPSTREAM_LIB);
+    assert_eq!(std::fs::read(&cache).unwrap(), upstream);
+    assert_eq!(std::fs::read(&committed).unwrap(), upstream);
+    assert_eq!(
+        warnings_with_code(&env, "upstream_gem_install_refreshed").len(),
+        2,
+        "the install and the committed archive: {env}"
+    );
+    assert!(
+        warnings_with_code(&env, "upstream_gem_stale_cache").is_empty()
+            && warnings_with_code(&env, "upstream_gem_stale_install").is_empty(),
+        "nothing is left on the patched build: {env}"
+    );
 }

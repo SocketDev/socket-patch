@@ -129,6 +129,12 @@ fn global_flag_cases() -> Vec<(&'static str, Option<&'static str>, fn(&GlobalArg
         ("--no-gem-native-rebuild", None, |c| {
             assert!(c.no_gem_native_rebuild)
         }),
+        ("--no-gem-install-refresh", None, |c| {
+            assert!(c.no_gem_install_refresh)
+        }),
+        ("--gem-refresh-shared", None, |c| {
+            assert!(c.gem_refresh_shared)
+        }),
         ("--lock-timeout", Some("30"), |c| {
             assert_eq!(c.lock_timeout, Some(30))
         }),
@@ -237,6 +243,8 @@ fn global_flag_cases_cover_every_global_field() {
         no_npm_allow_remote_config: _,
         no_vlt_install_cleanup: _,
         no_gem_native_rebuild: _,
+        no_gem_install_refresh: _,
+        gem_refresh_shared: _,
         strict: _,
         allow_patch_conflicts: _,
         vendor_source: _,
@@ -245,11 +253,11 @@ fn global_flag_cases_cover_every_global_field() {
         maven_config: _,
     } = common;
 
-    // 28 fields ↔ 28 long-flag cases. Bump both this count and add a case when
+    // 30 fields ↔ 30 long-flag cases. Bump both this count and add a case when
     // the destructure above forces you to add a field.
     assert_eq!(
         global_flag_cases().len(),
-        28,
+        30,
         "every GlobalArgs field needs a long-flag case in global_flag_cases()",
     );
 }
@@ -596,7 +604,7 @@ fn bool_env_vars_reject_zero_and_falsey() {
 #[serial_test::serial]
 fn empty_bool_env_var_resolves_to_false_not_crash() {
     // (env var, accessor) for every boolean global.
-    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 14] = [
+    let bool_vars: [(&str, fn(&GlobalArgs) -> bool); 16] = [
         ("SOCKET_OFFLINE", |c| c.offline),
         ("SOCKET_STRICT", |c| c.strict),
         ("SOCKET_GLOBAL", |c| c.global),
@@ -617,6 +625,10 @@ fn empty_bool_env_var_resolves_to_false_not_crash() {
             c.no_vlt_install_cleanup
         }),
         ("SOCKET_NO_GEM_NATIVE_REBUILD", |c| c.no_gem_native_rebuild),
+        ("SOCKET_NO_GEM_INSTALL_REFRESH", |c| {
+            c.no_gem_install_refresh
+        }),
+        ("SOCKET_GEM_REFRESH_SHARED", |c| c.gem_refresh_shared),
     ];
 
     for (var, accessor) in bool_vars {

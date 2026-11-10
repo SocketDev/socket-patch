@@ -923,6 +923,27 @@ pub async fn gem_stale_cache_after_unwind(
     gem::unwound_stale_cache(root, purl, offline).await
 }
 
+/// The upstream `.gem` of a gem `purl` that is back on its registry entry
+/// in the project at `root`: `(sha256, download url)`. The sha256 is what
+/// the restored lock pins (its `CHECKSUMS` entry, else the rubygems.org
+/// compact index, unless `offline`); the url is set when the lock resolves
+/// the gem from rubygems.org. `staged` is a restore's
+/// [`RestoreOutcome::staged_text`]: the restored lock is read from it when
+/// it is there (a dry run's lock is not on disk), else from disk. `None`
+/// when nothing proves the sha256, so there is nothing to judge an
+/// installed copy or a cached archive by.
+pub async fn gem_upstream_archive(
+    root: &Path,
+    staged: &BTreeMap<String, Option<String>>,
+    purl: &str,
+    offline: bool,
+) -> Option<(String, Option<String>)> {
+    let restored = crate::formats::gem::BUNDLER_LOCKS
+        .iter()
+        .find_map(|lock| staged.get(*lock)?.as_deref());
+    gem::upstream_archive(root, restored, purl, offline).await
+}
+
 /// Restore every pin in `pins` to its default upstream registry entry.
 /// See the module docs for the contract.
 pub async fn restore_upstream(
