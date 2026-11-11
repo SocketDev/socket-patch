@@ -674,13 +674,21 @@ impl YarnPnpLoader {
     }
 }
 
-/// [`detect_npm_pkg_manager`] for a unit test: reads only the project
-/// tree, never `YARN_NODE_LINKER`, `YARN_RC_FILENAME` or the home rc
-/// file, so a developer's yarn setup can't flip the answer (#1919).
+/// [`detect_npm_pkg_manager`] for a unit test: the `nodeLinker` comes from
+/// the project's own `.yarnrc.yml` alone, never `YARN_NODE_LINKER`,
+/// `YARN_RC_FILENAME`, the home rc file or an rc file in a folder above
+/// the project, so a developer's yarn setup can't flip the answer (#1919).
+/// The upward walk is skipped on purpose: a temp dir outside a git
+/// checkout has no read boundary, so it would reach every ancestor of
+/// `TMPDIR` up to `/`.
 #[cfg(test)]
 pub(crate) fn detect_npm_pkg_manager_hermetic(project_root: &Path) -> NpmPkgManager {
     detect_npm_pkg_manager_with(project_root, || {
-        yarn_node_linker_in(project_root, &YarnEnv::repository_only())
+        let env = YarnEnv::repository_only();
+        let rc =
+            crate::utils::fs::read_regular_to_string_sync(&project_root.join(&env.rc_filename))
+                .ok()?;
+        rc_node_linker(&rc, &env)
     })
 }
 
@@ -713,6 +721,34 @@ mod tests {
             NpmPkgManager::YarnClassic
         );
         assert!(YarnPnpLoader::detect(d.path()).is_none());
+        // Without a loader the injected lookup is never asked, so the host
+        // env the public wrapper reads can't matter here.
+        assert_eq!(
+            detect_npm_pkg_manager_with(d.path(), || panic!("linker asked without a loader")),
+            NpmPkgManager::YarnClassic
+        );
+    }
+
+    /// The hermetic detector ignores an rc file above the project: outside
+    /// a git checkout the production walk is unbounded, and a developer's
+    /// `$HOME/tmp/../.yarnrc.yml` would otherwise mark the loader stale.
+    #[test]
+    fn hermetic_detector_ignores_an_rc_file_above_the_project() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        let project = d.path().join("app");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".pnp.cjs"), "").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager_hermetic(&project),
+            NpmPkgManager::YarnBerryPnP
+        );
+        std::fs::write(project.join(".yarnrc.yml"), "nodeLinker: node-modules\n").unwrap();
+        assert_eq!(
+            detect_npm_pkg_manager_hermetic(&project),
+            NpmPkgManager::Unknown,
+            "the project's own rc file is still read"
+        );
     }
 
     /// A yarn PnP loader vouches for a patch only when it names it: berry
