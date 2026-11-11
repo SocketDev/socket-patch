@@ -527,6 +527,9 @@ mod tests {
     #[tokio::test]
     async fn an_unremovable_hidden_lock_keeps_every_store_entry() {
         use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
         let tmp = tempfile::tempdir().unwrap();
         store(tmp.path(), ID, PRISTINE);
         hidden(tmp.path(), Some("sha512-UPSTREAM"));

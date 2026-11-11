@@ -1503,6 +1503,9 @@ content-hash = "4b42a89b7ff7b26511b06acdc458dbd85312e5083db8f212b017482bc68cdd01
     #[tokio::test]
     async fn wire_write_failure_maps_error_and_leaves_lock_untouched() {
         use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
         let tmp = write_project(LOCK21_DIRECT_REGISTRY, PYPROJECT_DIRECT).await;
         let p = load_poetry_project(tmp.path()).await.unwrap();
 
