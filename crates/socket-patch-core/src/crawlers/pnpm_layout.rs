@@ -160,7 +160,8 @@ fn npmrc_modules_dir(npmrc: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::crawlers::pkg_managers::{
-        detect_npm_pkg_manager, pnpm_pnp_layout, pnpm_pnp_layout_in, NpmPkgManager, YarnPnpLoader,
+        detect_npm_pkg_manager_hermetic, pnpm_pnp_layout, pnpm_pnp_layout_in, NpmPkgManager,
+        YarnPnpLoader,
     };
     use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
@@ -237,11 +238,11 @@ mod tests {
                 "snapshot: {layout:?}"
             );
             assert_eq!(
-                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+                detect_npm_pkg_manager_hermetic(root),
                 NpmPkgManager::Pnpm,
                 "{layout:?}"
             );
-            assert!(YarnPnpLoader::detect(root).is_none(), "{layout:?}");
+            assert!(YarnPnpLoader::detect_hermetic(root).is_none(), "{layout:?}");
             let (code, _) = crate::vendor::npm_flavor::detect_npm_lock_flavor(root)
                 .await
                 .unwrap_err();
@@ -250,7 +251,7 @@ mod tests {
             // Without the loader it is a plain pnpm install in deps/.
             std::fs::remove_file(root.join(".pnp.cjs")).unwrap();
             assert_eq!(
-                detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+                detect_npm_pkg_manager_hermetic(root),
                 NpmPkgManager::Pnpm,
                 "{layout:?}"
             );
@@ -270,18 +271,15 @@ mod tests {
         );
         assert!(!installed_store(root));
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+            detect_npm_pkg_manager_hermetic(root),
             NpmPkgManager::YarnBerryPnP
         );
 
         std::fs::create_dir_all(root.join("deps/.pnpm")).unwrap();
-        assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
-            NpmPkgManager::Pnpm
-        );
+        assert_eq!(detect_npm_pkg_manager_hermetic(root), NpmPkgManager::Pnpm);
         std::fs::write(root.join("yarn.lock"), "").unwrap();
         assert_eq!(
-            detect_npm_pkg_manager(crate::utils::repo_root::ReadScope::Workspace, root),
+            detect_npm_pkg_manager_hermetic(root),
             NpmPkgManager::YarnBerryPnP
         );
     }
