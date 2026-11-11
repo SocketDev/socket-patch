@@ -162,10 +162,7 @@ impl RubyCrawler {
         &self,
         options: &CrawlerOptions,
     ) -> (Vec<CrawledPackage>, Option<BundleStoreDiscovery>) {
-        let mut packages = Vec::new();
-        let mut seen = HashSet::new();
-
-        let (gem_paths, discovery) = Self::gem_paths_and_discovery(
+        self.crawl_all_with_env(
             options,
             std::env::var_os("BUNDLE_GEMFILE").as_deref(),
             std::env::var_os("BUNDLE_PATH").as_deref(),
@@ -174,6 +171,38 @@ impl RubyCrawler {
             ambient_home().as_deref(),
             ambient_global_config_unless_ignored(&options.cwd).as_deref(),
             bundler_ignores_config(),
+        )
+        .await
+    }
+
+    /// [`Self::crawl_all_with_discovery`] against an explicit Bundler
+    /// environment instead of the process env and home folder, so unit
+    /// tests can crawl without a developer's `BUNDLE_*` exports or
+    /// `~/.bundle/config` changing the result (#1919).
+    #[allow(clippy::too_many_arguments)]
+    async fn crawl_all_with_env(
+        &self,
+        options: &CrawlerOptions,
+        gemfile_env: Option<&OsStr>,
+        bundle_path_env: Option<&OsStr>,
+        env_flags: &BundlerEnvPathFlags,
+        app_config_env: Option<&OsStr>,
+        home_env: Option<&OsStr>,
+        global_config: Option<&Path>,
+        ignore_config: bool,
+    ) -> (Vec<CrawledPackage>, Option<BundleStoreDiscovery>) {
+        let mut packages = Vec::new();
+        let mut seen = HashSet::new();
+
+        let (gem_paths, discovery) = Self::gem_paths_and_discovery(
+            options,
+            gemfile_env,
+            bundle_path_env,
+            env_flags,
+            app_config_env,
+            home_env,
+            global_config,
+            ignore_config,
         )
         .await;
 
@@ -3353,8 +3382,10 @@ mod tests {
     /// The full local-mode pipeline heals on a project shaped exactly
     /// like the live repro: Gemfile + flat `vendor/bundle` store. The
     /// installed gem must crawl out with its PURL and real on-disk path.
-    /// Asserts `contains` rather than equality so an ambient
-    /// `BUNDLE_PATH` on the dev machine cannot perturb the result set.
+    /// Crawls against an empty Bundler environment: an ambient
+    /// `BUNDLE_PATH__SYSTEM`, `BUNDLE_GEMFILE`, `BUNDLE_APP_CONFIG` or a
+    /// `~/.bundle/config` on the dev machine used to move the install
+    /// root away from `vendor/bundle` and fail this test (#1919).
     #[tokio::test]
     async fn crawl_all_finds_flat_bundler1_project() {
         let dir = tempfile::tempdir().unwrap();
@@ -3379,7 +3410,18 @@ mod tests {
             global: false,
             global_prefix: None,
         };
-        let packages = crawler.crawl_all(&options).await;
+        let (packages, _) = crawler
+            .crawl_all_with_env(
+                &options,
+                None,
+                None,
+                &BundlerEnvPathFlags::default(),
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
         let found = packages
             .iter()
             .find(|p| p.purl == "pkg:gem/activestorage@6.0.3");
