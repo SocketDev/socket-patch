@@ -335,6 +335,17 @@ a version without a non-empty section in this file.
     still restores the exact pin, with a new
     `upstream_gem_declaration_pinned` warning. The scan prints one line
     naming the declarations it changed (#2052).
+  - `vex` attests a gem under a Socket section of `Gemfile.lock` only when
+    the manifest beside the lock gives the gem that source: the `source:`
+    option, the 5.0 / 5.1 `source … do` block, or `path:` to the vendored
+    directory. With a lock that names the Socket source and a Gemfile that
+    does not, Bundler fails a frozen install and an unfrozen one rewrites
+    the lock and installs the upstream gem (checked on Bundler 1.17, 2.1,
+    2.4, 2.5 and 4.0), so that state is no longer attested: a hosted pin
+    reads `patched_ref_unattributable` and a vendored one `vendor_unwired`.
+    Both stay among the pins `rollback` and `remove` unwind. A declaration
+    whose `source:` / `path:` is not a plain string literal, and a lock
+    checked out without its manifest, are withheld too (#2052).
 - **npm family.**
   - A package the project patches itself (pnpm `patchedDependencies`, a
     yarn `patch:` descriptor or lock locator, patch-package files),
@@ -399,12 +410,43 @@ a version without a non-empty section in this file.
     environment is also withheld (`patched_ref_unattributable`) while a
     plain requirement can install the same release where the reference
     doesn't apply (#2052).
+- **Cargo.**
+  - `vex` attests a Socket-sourced `Cargo.lock` entry only while a
+    declaration cargo honors routes the crate to it: a live dependency
+    pinned to the patch registry whose requirement can select that version,
+    or a live `[patch]` registry pin in the root manifest or
+    `.cargo/config.toml`. A lock entry nothing routes (a transitive-only
+    crate, a shadowed `[patch.crates-io]` entry) makes `cargo fetch
+    --locked` fail and an unlocked build link the upstream crate; `vex`
+    attested it and now withholds it with `patched_ref_unattributable`. The
+    entry stays among the pins `rollback` and `remove` unwind. Run from a
+    workspace member, `vex` attests nothing from the member's own `[patch]`
+    or lock, which cargo ignores for the workspace root's, and names the
+    workspace root (#2052).
 - **JVM.**
   - `vex` withholds a Gradle statement when the derived-cache check of its
     patched copy doesn't finish: the purl is omitted as
     `gradle_unpatched_copy` with the new
     `vex_gradle_derived_cache_check_failed` warning. A check that crashed
     used to count as nothing to check (#2052).
+  - Maven: a patch pinned only through `<dependencyManagement>`, for a
+    package the root pom does not declare, is weighed against the parent
+    poms. When a parent in the checkout, a grandparent or an active parent
+    profile declares the package with a literal version, Maven builds the
+    upstream jar, so `vex` omits the patch (`vex_maven_parent_declares`).
+    When a parent cannot be read (`<relativePath/>`, a parent outside the
+    checkout, a missing one), the pin is no longer attested from the pom
+    alone: it reads `package_not_found` until a build has resolved the
+    patched version. That withholds the pre-build statement in projects
+    that inherit from a published parent such as
+    `spring-boot-starter-parent`; the statement returns after a build
+    (#2052).
+- **Composer.**
+  - `vex` no longer attests a hosted Composer pin from the lock alone when
+    `composer.json` puts the install outside the project
+    (`config.vendor-dir`) and an install exists there that the crawler does
+    not read: the patch is omitted with `composer_install_unread`. Set
+    `COMPOSER_VENDOR_DIR` to have that tree read and verified (#2052).
 
 ### Fixed
 
