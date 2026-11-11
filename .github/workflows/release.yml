@@ -94,12 +94,16 @@ jobs:
     strategy:
       matrix:
         include:
+          # macOS uses the -latest label like the other runners and like
+          # ci.yml: a pinned image is retired after about two years
+          # (macos-14 on 2026-11-02), and a job on a retired label fails
+          # before its first step.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-latest
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-latest
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-unknown-linux-gnu
