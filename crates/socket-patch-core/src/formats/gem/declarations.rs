@@ -279,6 +279,12 @@ fn read_call(text: &str, masked: &str, start: usize, end: usize) -> Option<Call>
                     }
                     break;
                 }
+                // A `\` carries the call on to the next line only: a blank
+                // or comment-only line after it ends the statement, as in
+                // Ruby. A `,` keeps carrying it over such lines.
+                if last == b'\\' {
+                    last = b'\n';
+                }
                 i += 1;
                 continue;
             }
@@ -756,6 +762,14 @@ mod tests {
                 "gem \"puma\", \\\n  \"4.3.5\", source: \"URL\"\n",
             ),
             (
+                "gem \"rack\", \"~> 2.2\" \\\n\ngem \"puma\"\n",
+                "gem \"rack\", \"~> 2.2\", source: \"URL\" \\\n\ngem \"puma\"\n",
+            ),
+            (
+                "gem \"rack\", \"~> 2.2\" \\\r\n# note\r\ngem \"puma\"\r\n",
+                "gem \"rack\", \"~> 2.2\", source: \"URL\" \\\r\n# note\r\ngem \"puma\"\r\n",
+            ),
+            (
                 "gem 'rexml', '>= 3.2.4', '< 3.2.5', group: :test\r\n",
                 "gem 'rexml', '>= 3.2.4', '< 3.2.5', group: :test, source: \"URL\"\r\n",
             ),
@@ -810,6 +824,25 @@ mod tests {
             assert_eq!(url, Some(URL), "{edited}");
             assert_eq!(without_arg(&edited, arg), before, "{edited}");
         }
+    }
+
+    /// A `\` continues a call onto the next physical line only, so a blank
+    /// or comment-only line after it ends the call and the next `gem` is
+    /// its own declaration (Ruby reads these as two calls).
+    #[test]
+    fn a_backslash_continues_one_line_only() {
+        for text in [
+            "gem 'rack', '~> 2.2' \\\n\ngem 'puma'\n",
+            "gem 'rack', '~> 2.2' \\\n# note\ngem 'puma'\n",
+            "gem 'rack', '~> 2.2' \\\r\n\r\ngem 'puma'\r\n",
+        ] {
+            let decls = declarations(text).literal;
+            assert_eq!(decls.len(), 2, "{text:?}: {decls:?}");
+            assert_eq!(decls[0].positionals().count(), 1, "{text:?}");
+            assert_eq!(decls[1].positionals().count(), 0, "{text:?}");
+        }
+        // A `\` straight onto the next argument still carries the call.
+        assert_eq!(one("gem 'rack', \\\n  '~> 2.2'\n").positionals().count(), 1);
     }
 
     /// What is not code declares nothing, and neither does a local variable

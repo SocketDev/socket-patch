@@ -443,6 +443,28 @@ fn rollback_from_an_agent_mode_project_leaves_the_projects_below() {
     assert!(said.contains("socket-patch rollback --cwd web"), "{said}");
 }
 
+/// Where a bare scan cannot tell the project's mode (agent-mode patches
+/// beside a vendor ledger) it stops with `mode_ambiguous` and touches
+/// nothing below, so a bare rollback leaves the projects below too.
+#[test]
+fn rollback_where_the_mode_is_ambiguous_leaves_the_projects_below() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join(".git")).unwrap();
+    write_agent_project(root);
+    std::fs::create_dir_all(root.join(".socket/vendor")).unwrap();
+    std::fs::write(root.join(".socket/vendor/state.json"), "not a ledger").unwrap();
+    write_hosted_project(&root.join("web"), &yarn_redirected_block());
+    let registry = registry();
+    let (_code, stdout, stderr) = run_hosted(root, &["rollback", "--yes"], Some(&registry));
+    assert_eq!(
+        read(root, "web/yarn.lock"),
+        yarn_lock_content(&yarn_redirected_block()),
+        "the project below is left as it was\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(headings(&stdout).is_empty(), "{stdout}");
+}
+
 /// An identifier names one project's patch, so the run does not fan out:
 /// it fails as before, and now says where that patch is.
 #[test]

@@ -87,13 +87,16 @@ pub(crate) async fn vendor_owned_keys(
     nuget
 }
 
-/// Whether a bare `scan` at `--cwd` runs in agent mode, the mode the
-/// project's own state keeps ([`mode_from_project_state`]). Such a scan
-/// covers `--cwd` alone, so the commands that undo it do too.
-pub(crate) async fn bare_scan_is_agent_mode(common: &crate::args::GlobalArgs) -> bool {
+/// Whether a bare `scan` at `--cwd` looks at the projects below it: only
+/// in the hosted or vendored mode the project's own state keeps
+/// ([`mode_from_project_state`]). From an agent-mode project it covers
+/// `--cwd` alone, and where it cannot tell the mode it stops with
+/// `mode_ambiguous` and touches nothing, so the commands that undo it
+/// stay at `--cwd` too.
+pub(crate) async fn bare_scan_looks_below(common: &crate::args::GlobalArgs) -> bool {
     matches!(
         mode_from_project_state(common).await,
-        Ok(scan::ScanMode::Agent)
+        Ok(scan::ScanMode::Hosted | scan::ScanMode::Vendored)
     )
 }
 
