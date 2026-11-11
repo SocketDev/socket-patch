@@ -94,12 +94,14 @@ jobs:
     strategy:
       matrix:
         include:
+          # macos-latest, like the other legs and ci.yml: GitHub retires
+          # pinned macOS images, and a job on a retired label never starts.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-latest
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-apple-darwin
-            runner: macos-14
+            runner: macos-latest
             archive: tar.gz
             build-tool: cargo
           - target: x86_64-unknown-linux-gnu
