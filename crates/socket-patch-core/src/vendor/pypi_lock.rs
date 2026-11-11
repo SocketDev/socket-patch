@@ -1209,19 +1209,27 @@ fn toml_json(item: &Item) -> serde_json::Value {
 /// of the key `parent`: array elements that name the package (a
 /// requirement string, a `{ name = … }` entry, a lock unit), its key in a
 /// `sources` table or in a lock's `files` / `hashes` table (Poetry's and
-/// PDM's older formats, the latter keyed `<name> <version>`), the Hatch
+/// PDM's older formats, the latter keyed `<name> <version>`, or
+/// `<name>[<extras>] <version>` for a unit with extras), the Hatch
 /// direct-reference permission, and then every table and array left
 /// empty.
 fn drop_package(value: &mut serde_json::Value, parent: &str, canon: &str) {
     use serde_json::Value as Json;
     let names = |name: &str| canonicalize_pypi_name(name) == canon;
+    // The package a `files` / `hashes` key is for: its first word, less the
+    // `[<extras>]` PDM's older formats append for an extras unit.
+    let keys = |key: &str| {
+        let unit = key.split_whitespace().next().unwrap_or_default();
+        let name = unit
+            .strip_suffix(']')
+            .and_then(|open| open.split_once('['))
+            .map_or(unit, |(name, _)| name);
+        names(name)
+    };
     match value {
         Json::Object(map) => {
             let keyed = matches!(parent, "sources" | "files" | "hashes");
-            map.retain(|key, _| {
-                key != "allow-direct-references"
-                    && !(keyed && names(key.split_whitespace().next().unwrap_or_default()))
-            });
+            map.retain(|key, _| key != "allow-direct-references" && !(keyed && keys(key)));
             for (key, child) in map.iter_mut() {
                 drop_package(child, key, canon);
             }
@@ -3674,6 +3682,58 @@ mod tests {
                 "{table}"
             );
         }
+    }
+
+    /// A revert of what the PDM writer wrote is the package's own in every
+    /// native lock format. PDM 0.x keys an extras unit's files
+    /// `<name>[<extras>] <version>`: read as another package's key, it made
+    /// `rollback` refuse to undo its own vendoring of a dependency declared
+    /// with extras.
+    #[test]
+    fn confinement_allows_a_pdm_revert_in_every_native_format() {
+        const WHEEL: &str = "urllib3-1.26.18-py2.py3-none-any.whl";
+        for fixture in [
+            "0.12.3",
+            "0.12.3-extras",
+            "2.8.2",
+            "2.9.3",
+            "2.10.4",
+            "2.11.2",
+            "2.17.3",
+            "2.29.2",
+            "2.29.2-extras",
+        ] {
+            let original = std::fs::read_to_string(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/pdm-native")
+                    .join(format!("{fixture}.lock")),
+            )
+            .unwrap();
+            let vendored = crate::utils::pdm_lock::rewrite_pdm_lock(
+                &original,
+                "urllib3",
+                "1.26.18",
+                ("path", &format!("./.socket/vendor/pypi/u/{WHEEL}")),
+                WHEEL,
+                &"a".repeat(64),
+            )
+            .unwrap();
+            assert_ne!(vendored, original, "{fixture}");
+            assert_eq!(
+                confinement_refusal(&vendored, &original, "urllib3"),
+                None,
+                "{fixture}"
+            );
+        }
+
+        // Another package's extras key is still not the package's own.
+        let wired = "[metadata]\ncontent_hash = \"h\"\n\n[metadata.files]\n\"six[socks] 1.16.0\" = [{ file = \"six.whl\", hash = \"sha256:cc\" }]\n\"idna[socks] 3.7\" = [{ file = \"idna.whl\", hash = \"sha256:dd\" }]\n";
+        let restored = wired.replace("sha256:cc", "sha256:bb");
+        assert_eq!(confinement_refusal(wired, &restored, "six"), None);
+        assert!(
+            confinement_refusal(wired, &restored.replace("sha256:dd", "sha256:ee"), "six")
+                .is_some()
+        );
     }
 
     /// ...and what it may not: another package, a setting, or anything in a
