@@ -116,6 +116,15 @@ fn human_wet_reports_already_original_and_not_installed() {
             && stderr.contains(&format!("  - {ghost_purl}")),
         "the not-installed warning block must print on stderr; stderr=\n{stderr}"
     );
+    // Its record is dropped with nothing restored: the warning says what
+    // that leaves if the crawl merely missed a copy, and the remedy.
+    assert!(
+        stderr.contains(
+            "Nothing was restored for it and its record was removed: a copy this run did \
+             not find stays patched until the package is reinstalled."
+        ),
+        "stderr=\n{stderr}"
+    );
 }
 
 /// `--verbose` per-file details on a hash-mismatch failure: the humanized
@@ -369,9 +378,9 @@ fn empty_manifest_announces_no_patches() {
         code, 0,
         "an empty manifest is a clean no-op; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
-    assert!(
-        stdout.contains("No patches found in manifest"),
-        "the empty-manifest announce must print; stdout=\n{stdout}\nstderr=\n{stderr}"
+    assert_eq!(
+        stdout, "No patches in this project; nothing to roll back.\n",
+        "the empty-manifest announce must print; stderr=\n{stderr}"
     );
 }
 
@@ -410,17 +419,40 @@ fn blobs_path_as_file_prints_human_error() {
     );
 }
 
-/// No manifest: the human `Error:` line names it, exit 1. The `--json`
-/// twin pins `manifest_not_found` in `rollback_invariants.rs`.
+/// A project with no patch of any mode (what a hosted project is after a
+/// rollback: hosted mode never has a manifest): the human `Error:` line
+/// says there is nothing to roll back, exit 1, instead of naming a manifest
+/// the user never had. A `--manifest-path` of their own is named, so a
+/// mistyped one shows. The `--json` twin keeps `manifest_not_found` and its
+/// message (`rollback_invariants.rs`).
 #[test]
-fn no_manifest_prints_human_error() {
+fn no_patches_prints_nothing_to_roll_back() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--offline"]);
     assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
     assert!(
-        stderr.contains("Error: Manifest not found"),
+        stderr.ends_with("Error: No patches in this project; nothing to roll back.\n"),
         "stderr=\n{stderr}"
     );
+    assert!(!stderr.contains("anifest"), "stderr=\n{stderr}");
+
+    let (code, _, stderr) = run(
+        tmp.path(),
+        &["rollback", "--offline", "--manifest-path", "elsewhere.json"],
+    );
+    assert_eq!(code, 1, "stderr=\n{stderr}");
+    assert!(
+        stderr.contains("Error: No patches in this project; nothing to roll back (no manifest at ")
+            && stderr.trim_end().ends_with("elsewhere.json)."),
+        "stderr=\n{stderr}"
+    );
+
+    let (code, stdout, _) = run(tmp.path(), &["rollback", "--offline", "--json"]);
+    assert_eq!(code, 1, "{stdout}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert_eq!(doc["error"]["code"], "manifest_not_found", "{doc}");
+    assert_eq!(doc["error"]["message"], "Manifest not found", "{doc}");
 }
 
 /// An identifier that matches no manifest entry: the human `Error:` line
@@ -687,7 +719,7 @@ fn drift_keep_prints_human_notice() {
     );
     std::fs::write(socket.join("manifest.json"), &original_manifest).unwrap();
 
-    // Ledger wired with a fragment the lock does not contain (the
+    // Ledger wired with a record the npm revert backend leaves alone (the
     // in_process_rollback_vendored.rs drift shape).
     let artifact_dir = socket.join("vendor/npm").join(DRIFT_UUID);
     std::fs::create_dir_all(&artifact_dir).unwrap();
@@ -701,7 +733,7 @@ fn drift_keep_prints_human_notice() {
       "basePurl": "{DRIFT_PURL}",
       "uuid": "{DRIFT_UUID}",
       "artifact": {{ "path": ".socket/vendor/npm/{DRIFT_UUID}/package.tgz" }},
-      "wiring": [{{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }}]
+      "wiring": [{{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }}]
     }}
   }}
 }}"#
@@ -942,6 +974,45 @@ fn hosted_restore_write_failure_prints_human_error_line() {
         stderr.contains("Error: Writing the restored lockfiles failed"),
         "the human write-failure line must print on stderr; stderr=\n{stderr}"
     );
+    assert!(
+        !stdout.contains("Restored ") && !stdout.contains("unwired"),
+        "a pin whose lockfile was not written is not reported restored; stdout=\n{stdout}"
+    );
+}
+
+/// Human twin of `hosted_restore_over_a_symlinked_file_writes_nothing`:
+/// the wet run and its `--dry-run` preview both print the refusal and no
+/// restore line.
+#[cfg(unix)]
+#[test]
+fn hosted_restore_over_a_symlinked_file_prints_only_the_refusal() {
+    for (dry_run, line, restore) in [
+        (
+            false,
+            "Error: Writing the restored lockfiles failed: pom.xml is a symbolic link",
+            "Restored ",
+        ),
+        (
+            true,
+            "Error: Writing the restored lockfiles would fail: pom.xml is a symbolic link",
+            "Would restore ",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_maven_hosted_fixture(tmp.path());
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::fs::rename(tmp.path().join("pom.xml"), tmp.path().join("real/pom.xml")).unwrap();
+        std::os::unix::fs::symlink("real/pom.xml", tmp.path().join("pom.xml")).unwrap();
+
+        let mut args = vec!["rollback", "--yes", "--offline"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run(tmp.path(), &args);
+        assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+        assert!(stderr.contains(line), "stderr=\n{stderr}");
+        assert!(!stdout.contains(restore), "stdout=\n{stdout}");
+    }
 }
 
 /// A hosted bun.lock pin restores to the registry 4-tuple

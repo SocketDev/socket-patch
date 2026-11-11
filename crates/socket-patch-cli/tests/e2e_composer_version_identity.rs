@@ -38,7 +38,7 @@ const PATCHED: &[u8] =
 
 fn hosted_url() -> String {
     format!(
-        "http://patch.test/patch/composer/psr/log/3.0.2.0/\
+        "https://patch.test/patch/composer/psr/log/3.0.2.0/\
          77777777-7777-4777-8777-777777777777/{UUID}/log-3.0.2.0.zip"
     )
 }

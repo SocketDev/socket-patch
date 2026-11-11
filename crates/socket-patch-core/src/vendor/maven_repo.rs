@@ -435,6 +435,10 @@ fn shown_ancestor(project_root: &Path, ancestor: &Path, canonical_root: &Path) -
 pub(super) struct LocalSources {
     installed_dir: Option<PathBuf>,
     roots: Vec<crate::crawlers::jvm_cache::JvmCacheRoot>,
+    /// Set once an online run took a local metadata file the registry
+    /// publishes no checksum for ([`acquire_jvm_artifact`]): the entry is
+    /// then recorded `local_unverified`, as an offline one is.
+    unverified: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LocalSources {
@@ -443,7 +447,24 @@ impl LocalSources {
         Self {
             installed_dir: None,
             roots: Vec::new(),
+            unverified: Default::default(),
         }
+    }
+
+    /// The caches alone (never the patched GAV's own directory), for a
+    /// parent's or BOM's files. Shares the [`Self::unverified`] mark.
+    fn caches(&self) -> Self {
+        Self {
+            installed_dir: None,
+            roots: self.roots.clone(),
+            unverified: std::sync::Arc::clone(&self.unverified),
+        }
+    }
+
+    /// Whether a file was taken from a local cache without a registry
+    /// checksum to hold it to.
+    fn took_unverified(&self) -> bool {
+        self.unverified.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The crawler's `installed_dir` for `group_id`, its cache root and
@@ -477,6 +498,7 @@ impl LocalSources {
         Self {
             installed_dir: Some(installed_dir.to_path_buf()),
             roots,
+            unverified: Default::default(),
         }
     }
 
@@ -783,6 +805,7 @@ async fn vendor_maven_jvm(
             uuid: &record.uuid,
             jar: &[],
             upstream_pom: probe_pom.as_bytes(),
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -947,6 +970,40 @@ async fn vendor_maven_jvm(
     }
     let extras = extras.unwrap_or_default();
     let patched: Vec<String> = record.files.keys().cloned().collect();
+    // A suffixed pom is written against its upstream parents: Maven reads
+    // a `${project.version}` of theirs as the suffixed version.
+    let parents = if matches!(shape, Shape::MavenReactor | Shape::Mixed | Shape::Sbt) {
+        match upstream_parent_chain(&pom_bytes, &local, service).await {
+            Ok(chain) => Some(chain),
+            // A committed tree re-planned offline keeps the pom it has: its
+            // parents may be in no cache of this machine.
+            Err(_) if was_committed && !online => None,
+            Err(e) => {
+                let suffixed = super::jvm::Coords {
+                    group_id: &group_id,
+                    artifact_id: &artifact_id,
+                    version: &version,
+                    uuid: &record.uuid,
+                }
+                .suffixed_version();
+                return refused(
+                    "vendor_jvm_upstream_unavailable",
+                    format!(
+                        "reason: parent_unavailable: {e}, so whether \
+                         {group_id}:{artifact_id}:{suffixed} would resolve the versions \
+                         {group_id}:{artifact_id}:{version} does cannot be checked{}",
+                        if online {
+                            ""
+                        } else {
+                            " (vendoring is offline: resolve the project once, or vendor online)"
+                        }
+                    ),
+                );
+            }
+        }
+    } else {
+        None
+    };
     let patch = super::jvm::JvmPatch {
         group_id: &group_id,
         artifact_id: &artifact_id,
@@ -954,6 +1011,7 @@ async fn vendor_maven_jvm(
         uuid: &record.uuid,
         jar: &jar_bytes,
         upstream_pom: &pom_bytes,
+        upstream_parents: parents.as_deref(),
         upstream_module: module_bytes.as_deref(),
         extra_artifacts: &extras,
         patched_members: &patched,
@@ -1103,7 +1161,8 @@ async fn vendor_maven_jvm(
         })
     });
     let prior_verified = previous.is_some_and(|e| !super::jvm::apply::upstream_unverified(e));
-    let registry_verified = online || (was_committed && prior_verified);
+    let registry_verified =
+        (online && !local.took_unverified()) || (was_committed && prior_verified);
     plan.records.push(WiringRecord {file: plan.jar_rel.clone(), kind: super::jvm::UPSTREAM_KIND.into(), action: WiringAction::Added, key: Some("upstream".into()), original: None, new: Some(serde_json::json!({"op": if registry_verified {"registry_verified"} else {"local_unverified"}}))});
     warnings.extend(
         plan.warnings
@@ -1241,6 +1300,14 @@ fn verify_unpatched_jar_members(
     Ok(())
 }
 
+/// What the registry's sidecars say of an upstream file.
+enum UpstreamCheck {
+    /// They match its bytes (or vendoring is offline and none is asked).
+    Verified,
+    /// The registry gave no checksum for it: why.
+    Unpublished(String),
+}
+
 /// Check registry sidecars independently of any checksum in the local
 /// cache. `ext` is the leaf's tail after `<a>-<v>` (`jar`, `pom`, a
 /// classifier's `tests.jar` is spelled `-tests.jar` there).
@@ -1252,8 +1319,25 @@ async fn verify_jvm_upstream(
     ext: &str,
     service: Option<&VendorServiceConfig>,
 ) -> Result<(), String> {
+    match check_jvm_upstream(bytes, g, a, v, ext, service).await? {
+        UpstreamCheck::Verified => Ok(()),
+        UpstreamCheck::Unpublished(why) => Err(why),
+    }
+}
+
+/// [`verify_jvm_upstream`] telling a file the registry has no checksum for
+/// (it does not serve the file, or cannot be reached) from one whose bytes
+/// differ from the checksum it publishes, which is the `Err`.
+async fn check_jvm_upstream(
+    bytes: &[u8],
+    g: &str,
+    a: &str,
+    v: &str,
+    ext: &str,
+    service: Option<&VendorServiceConfig>,
+) -> Result<UpstreamCheck, String> {
     if service.is_none_or(|s| s.offline) {
-        return Ok(());
+        return Ok(UpstreamCheck::Verified);
     }
     use sha2::Digest;
     // `tests.jar` is the `tests` classifier's jar.
@@ -1268,10 +1352,10 @@ async fn verify_jvm_upstream(
     );
     let (checksum, actual) = match fetch_pom_bytes(&format!("{url}.sha512")).await {
         Ok(sum) => (sum, hex::encode(sha2::Sha512::digest(bytes))),
-        Err(_) => (
-            fetch_pom_bytes(&format!("{url}.sha1")).await?,
-            sha1_hex(bytes),
-        ),
+        Err(_) => match fetch_pom_bytes(&format!("{url}.sha1")).await {
+            Ok(sum) => (sum, sha1_hex(bytes)),
+            Err(why) => return Ok(UpstreamCheck::Unpublished(why)),
+        },
     };
     let expected = std::str::from_utf8(&checksum)
         .map_err(|_| "upstream checksum is not UTF-8")?
@@ -1281,13 +1365,17 @@ async fn verify_jvm_upstream(
     if !expected.eq_ignore_ascii_case(&actual) {
         return Err(format!("upstream checksum mismatch for {g}:{a}:{v}{tail}"));
     }
-    Ok(())
+    Ok(UpstreamCheck::Verified)
 }
 
 /// One upstream file of `gav` (`classifier`, `ext`): a local copy (see
 /// [`LocalSources::find`]), else a registry download when the service is
 /// online; online, the bytes are checked against the registry's checksum
-/// either way.
+/// either way. A local pom or module the registry has no checksum for is
+/// still the file the build resolved (a parent or BOM from a corporate
+/// repository is on no public registry): it is used, and the run is marked
+/// [`LocalSources::took_unverified`]. Bytes that differ from a published
+/// checksum are refused.
 pub(super) async fn acquire_jvm_artifact(
     local: &LocalSources,
     gav: &crate::crawlers::jvm_cache::Gav,
@@ -1297,10 +1385,10 @@ pub(super) async fn acquire_jvm_artifact(
 ) -> Result<Vec<u8>, String> {
     let (g, a, v) = gav;
     let leaf = layout::file_name(a, v, classifier, ext);
-    let bytes = match local.find(gav, classifier, ext, false).await? {
-        Some(bytes) => bytes,
+    let (bytes, cached) = match local.find(gav, classifier, ext, false).await? {
+        Some(bytes) => (bytes, true),
         None if service.is_some_and(|s| !s.offline) => {
-            fetch_registry_bytes(
+            let bytes = fetch_registry_bytes(
                 &layout::registry_url(g, a, v, classifier, ext),
                 if ext == "jar" {
                     super::registry_fetch::MAX_DOWNLOAD_BYTES
@@ -1308,7 +1396,8 @@ pub(super) async fn acquire_jvm_artifact(
                     MAX_POM_BYTES as u64
                 },
             )
-            .await?
+            .await?;
+            (bytes, false)
         }
         None => {
             return Err(format!(
@@ -1321,7 +1410,13 @@ pub(super) async fn acquire_jvm_artifact(
         Some(c) => format!("{c}.{ext}"),
         None => ext.to_string(),
     };
-    verify_jvm_upstream(&bytes, g, a, v, &tail, service).await?;
+    match check_jvm_upstream(&bytes, g, a, v, &tail, service).await? {
+        UpstreamCheck::Verified => {}
+        UpstreamCheck::Unpublished(_) if cached && matches!(ext, "pom" | "module") => local
+            .unverified
+            .store(true, std::sync::atomic::Ordering::Relaxed),
+        UpstreamCheck::Unpublished(why) => return Err(why),
+    }
     Ok(bytes)
 }
 
@@ -1337,7 +1432,7 @@ pub(super) async fn acquire_jvm_metadata(
 ) -> Result<Vec<u8>, String> {
     let local = LocalSources {
         installed_dir: Some(dir.to_path_buf()),
-        roots: Vec::new(),
+        ..LocalSources::none()
     };
     acquire_jvm_artifact(
         &local,
@@ -1417,9 +1512,11 @@ async fn collect_gradle_metadata(
 }
 
 /// The poms outside the checkout (external parents, imported BOMs) the
-/// reactor planner weighs a pin against (#488), from the local caches or
-/// the registry like any upstream metadata; one that neither has is
-/// recorded unavailable, and the planner then leaves that root unpinned.
+/// reactor planner weighs a pin against (#488): the copy a local cache
+/// holds, which is the one the build reads whatever a registry says of it
+/// (a corporate parent is on no public registry), else the registry's;
+/// one that neither has is recorded unavailable, and the planner then
+/// leaves that root unpinned.
 async fn external_maven_poms(
     read: super::jvm::ReadFn<'_>,
     list: super::jvm::ListFn<'_>,
@@ -1427,18 +1524,57 @@ async fn external_maven_poms(
     local: &LocalSources,
     service: Option<&VendorServiceConfig>,
 ) -> super::jvm::maven_reactor::ExternalPoms {
+    // These poms only decide a pin: nothing of them is vendored, so they
+    // do not make the entry's upstream files unverified.
+    let caches = LocalSources {
+        roots: local.roots.clone(),
+        ..LocalSources::none()
+    };
     let mut known = super::jvm::maven_reactor::ExternalPoms::new();
     loop {
         let need = super::jvm::maven_reactor::external_poms_needed(read, list, patch, &known);
         if need.is_empty() {
             return known;
         }
-        for (g, a, v) in need {
-            let bytes = acquire_upstream_metadata(local, &g, &a, &v, "pom", service)
-                .await
-                .ok();
-            known.insert((g, a, v), bytes);
+        for gav in need {
+            let bytes = match caches.find(&gav, None, "pom", false).await {
+                Ok(Some(bytes)) => Some(bytes),
+                _ => acquire_jvm_artifact(&caches, &gav, None, "pom", service)
+                    .await
+                    .ok(),
+            };
+            known.insert(gav, bytes);
         }
+    }
+}
+
+/// The upstream poms of `pom`'s parent chain, nearest first and complete
+/// ([`super::jvm::JvmPatch::upstream_parents`]), read like any upstream
+/// metadata. The error names the parent that could not be read.
+pub(super) async fn upstream_parent_chain(
+    pom: &[u8],
+    local: &LocalSources,
+    service: Option<&VendorServiceConfig>,
+) -> Result<Vec<Vec<u8>>, String> {
+    /// A parent chain is a handful of poms; this bounds a cyclic one.
+    const MAX_PARENTS: usize = 16;
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let child = chain.last().map_or(pom, Vec::as_slice);
+        let Some((g, a, v)) = super::jvm::maven_reactor::parent_gav(child)
+            .map_err(|e| format!("a pom of its parent chain cannot be followed ({e})"))?
+        else {
+            return Ok(chain);
+        };
+        if chain.len() >= MAX_PARENTS {
+            return Err(format!(
+                "its parent poms nest deeper than {MAX_PARENTS} (at {g}:{a}:{v})"
+            ));
+        }
+        let parent = acquire_upstream_metadata(local, &g, &a, &v, "pom", service)
+            .await
+            .map_err(|e| format!("its parent pom {g}:{a}:{v} cannot be read ({e})"))?;
+        chain.push(parent);
     }
 }
 
@@ -1452,12 +1588,8 @@ async fn acquire_upstream_metadata(
     ext: &str,
     service: Option<&VendorServiceConfig>,
 ) -> Result<Vec<u8>, String> {
-    let roots = LocalSources {
-        installed_dir: None,
-        roots: local.roots.clone(),
-    };
     acquire_jvm_artifact(
-        &roots,
+        &local.caches(),
         &(g.to_string(), a.to_string(), v.to_string()),
         None,
         ext,
@@ -1641,8 +1773,10 @@ async fn revert_repo_record(
 
     // (a) Byte-identical to what we wrote → the whole-file restore is provably
     //     safe (nothing changed since vendoring). This also cheaply covers the
-    //     lone-patch common case.
-    if new.is_some_and(|n| &live == n) {
+    //     lone-patch common case. The ledger is committed, so its snapshots
+    //     are not trusted to say what the pom was: the restore is only taken
+    //     when they differ by nothing but our `<repository>` element.
+    if new.is_some_and(|n| &live == n && only_adds_our_repository(original, n, uuid_dir_rel)) {
         if dry_run {
             return Ok(true);
         }
@@ -1674,6 +1808,51 @@ async fn revert_repo_record(
             )
         })?;
     Ok(true)
+}
+
+/// Whether the pom snapshot `new` is `original` with nothing but lines of a
+/// `<repository>` element for this patch's vendored repo added (and the
+/// `<repositories>` section around it): what the pre-v5 backend wrote. The
+/// whole-file restore puts `original` back, so this is what makes it the
+/// undo of that edit and nothing more — a ledger whose snapshots differ in
+/// any other way (a dependency, a plugin, another repository) is not
+/// followed, and the element is excised instead.
+fn only_adds_our_repository(original: &str, new: &str, uuid_dir_rel: &str) -> bool {
+    let between = |line: &str, tag: &str| {
+        line.strip_prefix(&format!("<{tag}>"))
+            .and_then(|rest| rest.strip_suffix(&format!("</{tag}>")))
+            .map(str::to_string)
+    };
+    let kept: Vec<&str> = original.lines().collect();
+    let mut next = 0;
+    let mut ours = false;
+    for line in new.lines() {
+        if kept.get(next) == Some(&line) {
+            next += 1;
+            continue;
+        }
+        let line = line.trim();
+        let element = matches!(
+            line,
+            "<repositories>"
+                | "</repositories>"
+                | "<repository>"
+                | "</repository>"
+                | "<releases>"
+                | "</releases>"
+                | "<snapshots>"
+                | "</snapshots>"
+        ) || between(line, "id").is_some_and(|id| !id.contains(['<', '>']))
+            || between(line, "enabled").is_some_and(|v| matches!(v.as_str(), "true" | "false"))
+            || between(line, "checksumPolicy").is_some_and(|v| !v.contains(['<', '>']));
+        let url = between(line, "url")
+            .is_some_and(|url| url == format!("{VENDOR_REPO_URL_PREFIX}{uuid_dir_rel}"));
+        ours |= url;
+        if !element && !url {
+            return false;
+        }
+    }
+    next == kept.len() && ours
 }
 
 /// After excising our `<repository>`, drop a `<repositories>` section left with
@@ -2279,6 +2458,83 @@ mod tests {
             !root.join(format!(".socket/vendor/maven/{UUID}")).exists(),
             "uuid dir removed"
         );
+    }
+
+    /// The ledger is committed, so the pom snapshot it records is not
+    /// trusted to say what the pom was: one that differs from the vendored
+    /// pom by more than our `<repository>` is never written. The element is
+    /// excised from the live pom instead.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn revert_never_writes_a_pom_snapshot_that_is_not_the_pom_minus_our_repository() {
+        let (dir, _, _, record) = fixture(Some(project_pom()), true, true).await;
+        let root = dir.path();
+        let pom_before = tokio::fs::read_to_string(root.join(PROJECT_POM))
+            .await
+            .unwrap();
+        let mut entry = legacy_vendor(root, &record).await;
+        let evil = pom_before.replace(
+            "</project>",
+            "  <build><plugins><plugin><artifactId>exec-maven-plugin</artifactId></plugin></plugins></build>\n</project>",
+        );
+        assert_ne!(evil, pom_before);
+        entry.wiring[0].original = Some(Value::String(evil));
+
+        let outcome = revert_maven(&entry, root, false).await;
+        assert!(outcome.success, "{:?}", outcome.error);
+        assert_eq!(
+            tokio::fs::read_to_string(root.join(PROJECT_POM))
+                .await
+                .unwrap(),
+            pom_before,
+            "our repository is excised; the ledger's text is not written"
+        );
+    }
+
+    #[test]
+    fn a_pom_snapshot_pair_differs_only_by_our_repository() {
+        let rel = format!(".socket/vendor/maven/{UUID}");
+        let original = "<project>\n  <modelVersion>4.0.0</modelVersion>\n</project>\n";
+        let block = repository_block("socket-patch-vendor-x", &rel);
+        let new = original.replace(
+            "</project>",
+            &format!("  <repositories>\n{block}  </repositories>\n</project>"),
+        );
+        assert!(only_adds_our_repository(original, &new, &rel));
+        // In a section the pom already had.
+        let sectioned = "<project>\n  <repositories>\n  </repositories>\n</project>\n";
+        let wired = sectioned.replace("  </repositories>", &format!("{block}  </repositories>"));
+        assert!(only_adds_our_repository(sectioned, &wired, &rel));
+
+        for (what, original, new) in [
+            (
+                "nothing of ours added",
+                original.to_string(),
+                original.to_string(),
+            ),
+            (
+                "a line dropped",
+                original.to_string(),
+                new.replace("  <modelVersion>4.0.0</modelVersion>\n", ""),
+            ),
+            (
+                "a line the original has and the pom does not",
+                original.replace("</project>", "  <build />\n</project>"),
+                new.clone(),
+            ),
+            (
+                "another repository",
+                original.to_string(),
+                new.replace(&rel, ".socket/vendor/maven/other"),
+            ),
+            (
+                "a plugin among the added lines",
+                original.to_string(),
+                new.replace("</project>", "  <build />\n</project>"),
+            ),
+        ] {
+            assert!(!only_adds_our_repository(&original, &new, &rel), "{what}");
+        }
     }
 
     #[tokio::test]
@@ -3567,6 +3823,155 @@ mod tests {
         assert!(detail.contains("patch service request failed"), "{detail}");
     }
 
+    /// commons-text as log4j-core is published: a sibling's version comes
+    /// from the parent's management, written `${project.version}`.
+    const CHILD_OF_PARENT_POM: &str = "<project><modelVersion>4.0.0</modelVersion>\
+        <parent><groupId>org.apache.commons</groupId><artifactId>commons-parent</artifactId>\
+        <version>54</version></parent><artifactId>commons-text</artifactId>\
+        <version>1.10.0</version><dependencies><dependency><groupId>org.apache.commons</groupId>\
+        <artifactId>commons-lang3</artifactId></dependency></dependencies></project>";
+    const PARENT_POM: &str = "<project><modelVersion>4.0.0</modelVersion>\
+        <groupId>org.apache.commons</groupId><artifactId>commons-parent</artifactId>\
+        <version>54</version><packaging>pom</packaging><dependencyManagement><dependencies>\
+        <dependency><groupId>org.apache.commons</groupId><artifactId>commons-lang3</artifactId>\
+        <version>${project.version}</version></dependency></dependencies></dependencyManagement>\
+        </project>";
+
+    /// The reactor fixture with [`CHILD_OF_PARENT_POM`] as the cached
+    /// upstream pom; `parent` puts [`PARENT_POM`] in the same repository.
+    async fn inheriting_fixture(
+        parent: bool,
+    ) -> (tempfile::TempDir, PathBuf, PathBuf, PatchRecord) {
+        let fx = reactor_fixture(true).await;
+        std::fs::write(fx.2.join("commons-text-1.10.0.pom"), CHILD_OF_PARENT_POM).unwrap();
+        if parent {
+            let dir = fx.0.path().join("m2/org/apache/commons/commons-parent/54");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("commons-parent-54.pom"), PARENT_POM).unwrap();
+        }
+        fx
+    }
+
+    fn upstream_status(entry: &VendorEntry) -> &str {
+        entry
+            .wiring
+            .iter()
+            .find(|w| w.kind == super::super::jvm::UPSTREAM_KIND)
+            .map(super::super::jvm::op_of)
+            .unwrap_or_default()
+    }
+
+    /// VJ-D1 end to end: the parent's `${project.version}` would read the
+    /// suffixed version in the vendored pom, so the sibling it manages is
+    /// declared there at the base version. VJ-D2: the parent is in the
+    /// local repository and on no registry (the fixture's serves the
+    /// artifact alone), which is every corporate parent; it is used, and
+    /// the entry says its upstream files were not all registry-verified.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_parent_naming_the_poms_version_is_vendored_at_the_base_version() {
+        let (dir, blobs, installed, record) = inheriting_fixture(true).await;
+        let root = dir.path();
+        let (result, entry, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(result.success, "{result:?}");
+        let entry = entry.expect("ledger entry");
+        let jar = root.join(&entry.artifact.path);
+        let pom = std::fs::read_to_string(jar.with_extension("pom")).unwrap();
+        assert!(pom.contains("socket-patch:inherited:begin"), "{pom}");
+        assert!(
+            pom.contains("<artifactId>commons-lang3</artifactId><version>1.10.0</version>"),
+            "{pom}"
+        );
+        assert!(!pom.contains("${project.version}"), "{pom}");
+        assert_eq!(upstream_status(&entry), "local_unverified");
+        crate::vendor::test_support::persist(root, PURL, entry.clone()).await;
+        // In sync on a re-run, online or offline with the parent gone from
+        // every cache (a fresh checkout), and under `--check` either way.
+        let (_, again, _) = unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(again.is_none(), "an in-sync re-run records nothing");
+        let m2 = root.join("m2");
+        super::super::jvm::apply::check_entry(root, &entry, Some(&m2)).expect("with the parent");
+        std::fs::remove_dir_all(m2.join("org/apache/commons/commons-parent")).unwrap();
+        super::super::jvm::apply::check_entry(root, &entry, Some(&m2)).expect("without it");
+        let offline = crate::vendor::test_support::service_cfg(
+            "http://127.0.0.1:9",
+            crate::vendor::VendorSource::Service,
+            true,
+        );
+        let (result, again, _) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, Some(&offline)).await);
+        assert!(result.success && again.is_none(), "{result:?}");
+        assert_eq!(
+            std::fs::read_to_string(jar.with_extension("pom")).unwrap(),
+            pom
+        );
+    }
+
+    /// Without the parent the suffixed pom cannot be checked, and a pom
+    /// that may resolve `commons-lang3:1.10.0-socket.<hex8>` is not written.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn an_unreadable_parent_refuses_a_first_vendoring() {
+        let (dir, blobs, installed, record) = inheriting_fixture(false).await;
+        let root = dir.path();
+        let (code, detail) = unwrap_refused(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert_eq!(code, "vendor_jvm_upstream_unavailable");
+        assert!(
+            detail.starts_with("reason: parent_unavailable: ")
+                && detail.contains("org.apache.commons:commons-parent:54"),
+            "{detail}"
+        );
+        assert!(!root.join(".socket").exists(), "nothing written");
+    }
+
+    /// VJ-D2: a root's parent from a corporate repository is in the local
+    /// repository and on no public registry. The pin is weighed against
+    /// the local copy, as Maven reads it: before, the registry's 404 for
+    /// its checksum made the pom "in no local Maven repository", the root
+    /// stayed unpinned and a transitive-only patch was refused.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_parent_on_no_registry_is_read_from_the_local_repository() {
+        let (dir, blobs, installed, record) = fixture(None, true, true).await;
+        let root = dir.path();
+        std::fs::write(
+            root.join("pom.xml"),
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <parent>\n    \
+             <groupId>com.corp</groupId>\n    <artifactId>corp-parent</artifactId>\n    \
+             <version>1</version>\n    <relativePath/>\n  </parent>\n  <artifactId>app</artifactId>\n  \
+             <dependencies>\n    <dependency>\n      <groupId>com.corp</groupId>\n      \
+             <artifactId>uses-commons-text</artifactId>\n      <version>1</version>\n    \
+             </dependency>\n  </dependencies>\n</project>\n",
+        )
+        .unwrap();
+        let corp = root.join("m2/com/corp/corp-parent/1");
+        std::fs::create_dir_all(&corp).unwrap();
+        std::fs::write(
+            corp.join("corp-parent-1.pom"),
+            "<project><modelVersion>4.0.0</modelVersion><groupId>com.corp</groupId>\
+             <artifactId>corp-parent</artifactId><version>1</version><packaging>pom</packaging>\
+             </project>",
+        )
+        .unwrap();
+        let (result, entry, warnings) =
+            unwrap_done(run_jvm(root, &blobs, &installed, &record, None).await);
+        assert!(result.success, "{result:?}");
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.detail.contains("management_unresolved")),
+            "{warnings:?}"
+        );
+        let pom = std::fs::read_to_string(root.join("pom.xml")).unwrap();
+        assert!(
+            pom.contains("<version>1.10.0-socket.9f6b2c4e</version>"),
+            "{pom}"
+        );
+        // The corporate pom only decided the pin; nothing of it is vendored.
+        assert_eq!(upstream_status(&entry.unwrap()), "registry_verified");
+    }
+
     /// A file the index does not list in the vendored tree (a Finder
     /// `.DS_Store`, a stray directory) fails the Gradle build and
     /// `vendor --check` (#656), so a re-run is not in sync: a dry run
@@ -4211,8 +4616,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let gav: crate::crawlers::jvm_cache::Gav = ("com.x".into(), "lib".into(), "1.0".into());
         let only = |path: PathBuf, layout| LocalSources {
-            installed_dir: None,
             roots: vec![JvmCacheRoot::new(path, layout)],
+            ..LocalSources::none()
         };
 
         let files21 = dir.path().join("gradle/caches/modules-2/files-2.1");

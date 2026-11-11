@@ -1092,16 +1092,19 @@ mod architecture_tests {
     const WRITERS: &[(&str, usize, &str)] = &[
         (
             "vendor/pnpm_lock.rs",
-            3,
+            4,
             "vendored planner (both dialects): the shared lookup and rekey \
              over line blocks (`lock_has_target_package`, `edit_packages`, \
-             `LockIndex`), keys read with `plan::match_key`",
+             `LockIndex`), keys read with `plan::match_key`; and the revert's \
+             check, on the lines it is editing, that the registry entry is \
+             back before references are pointed at it \
+             (`restore_unrecorded_refs`)",
         ),
         (
             "vendor/pnpm_lock_legacy.rs",
-            4,
-            "5.4 / 6.0 dialect: its ref gate, sorted rekey, dep-ref edit and \
-             revert over line blocks",
+            3,
+            "5.4 / 6.0 dialect: its ref gate, sorted rekey and dep-ref edit \
+             over line blocks",
         ),
     ];
 

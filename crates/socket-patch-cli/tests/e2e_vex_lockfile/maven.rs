@@ -190,7 +190,10 @@ fn assert_attested(fx: &Fx, code: Option<i32>, env: &Value, uuid: &str, purl: &s
     assert_eq!(st["vulnerability"]["aliases"][0], CVE, "{doc}");
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(env)
+        ),
         "{doc}"
     );
     let sub = st["products"][0]["subcomponents"][0]["@id"]
@@ -730,6 +733,125 @@ fn maven_hosted_pin_without_trusted_checksums_still_attests() {
     );
     let (code, env) = fx.vex(&["--proxy-url", &api.uri()]);
     assert_omitted(code, &env, MVN_PURL, "hash_mismatch", "no .mvn, tampered");
+}
+
+/// A pin that only `<dependencyManagement>` carries (what hosted scan adds
+/// for a GA the pom has no literal version of) governs a dependency only
+/// while the declaration Maven builds has no version of its own, and a pom
+/// inherits its parents' `<dependencies>`. Real Maven 3.9.16 resolves the
+/// upstream jar, and never asks for the patched version, when the parent
+/// declares the GA with a version; it asks for the patched one when no
+/// parent does. So:
+///
+/// * a parent pom in the checkout that declares it with a version: no
+///   statement (`vex_maven_parent_declares`), installed copy or not;
+/// * a parent chain in the checkout that does not: attested from the pom;
+/// * a parent that is not in the checkout (`<relativePath/>`: resolved from
+///   a repository) cannot be read: the pom alone attests nothing, the copy
+///   of the patched version a build resolved does.
+#[test]
+fn maven_hosted_managed_pin_is_weighed_against_the_parent_pom() {
+    let api = Api::serve(vec![(MVN_HOSTED_UUID, mvn_hosted_view())]);
+    let args = ["--proxy-url", &api.uri()];
+    let parent = |relative: &str| {
+        format!(
+            "  <parent>\n    <groupId>com.corp</groupId>\n    <artifactId>corp-parent</artifactId>\n    \
+             <version>3</version>\n    {relative}\n  </parent>\n"
+        )
+    };
+    let corp_parent = |dependencies: &str| {
+        format!(
+            "<project>\n  <modelVersion>4.0.0</modelVersion>\n  <groupId>com.corp</groupId>\n  \
+             <artifactId>corp-parent</artifactId>\n  <version>3</version>\n  \
+             <packaging>pom</packaging>\n{dependencies}</project>\n"
+        )
+    };
+    let declares = |version: &str| {
+        format!(
+            "  <dependencies>\n    <dependency>\n      <groupId>org.slf4j</groupId>\n      \
+             <artifactId>slf4j-api</artifactId>\n{version}    </dependency>\n  </dependencies>\n"
+        )
+    };
+    // The golden's managed pin, under `parent_ref`, beside `parent_pom`, in
+    // one git checkout (nothing outside the checkout is ever read).
+    let project = |parent_ref: &str, parent_pom: Option<String>| {
+        let fx = Fx::new();
+        std::fs::create_dir_all(fx.tmp.path().join(".git")).unwrap();
+        copy_golden(&fx, "maven/pom/transitive-depmgmt/expected");
+        let pom = std::fs::read_to_string(fx.cwd.join("pom.xml")).unwrap();
+        let anchor = "  <modelVersion>4.0.0</modelVersion>\n";
+        assert!(pom.contains(anchor), "fixture sanity");
+        fx.put(
+            "pom.xml",
+            pom.replace(anchor, &format!("{anchor}{parent_ref}")),
+        );
+        if let Some(text) = parent_pom {
+            put(fx.tmp.path(), "corp-parent/pom.xml", text.as_bytes());
+        }
+        fx
+    };
+    let install_patched = |fx: &Fx| {
+        let dir = fx.m2().join(format!("org/slf4j/slf4j-api/{MVN_SUFFIXED}"));
+        put(
+            &dir,
+            &format!("slf4j-api-{MVN_SUFFIXED}.pom"),
+            b"<project/>",
+        );
+        put(&dir, &format!("slf4j-api-{MVN_SUFFIXED}.jar"), MVN_PATCHED);
+    };
+    let local = parent("<relativePath>../corp-parent/pom.xml</relativePath>");
+
+    // The parent declares it with a version: the build resolves that one.
+    let fx = project(
+        &local,
+        Some(corp_parent(&declares("      <version>1.7.36</version>\n"))),
+    );
+    let (code, env) = fx.vex(&args);
+    assert_omitted(
+        code,
+        &env,
+        MVN_PURL,
+        "vex_maven_parent_declares",
+        "parent declares a version",
+    );
+    assert!(
+        env.to_string().contains("corp-parent/pom.xml"),
+        "the run names the parent pom: {env}"
+    );
+    install_patched(&fx);
+    let (code, env) = fx.vex(&args);
+    assert_omitted(
+        code,
+        &env,
+        MVN_PURL,
+        "vex_maven_parent_declares",
+        "parent declares a version, a patched copy in the local repository",
+    );
+
+    // The parent leaves the version to management, or says nothing of it.
+    for (what, body) in [
+        ("parent declares it unversioned", declares("")),
+        ("parent declares nothing of it", String::new()),
+    ] {
+        let fx = project(&local, Some(corp_parent(&body)));
+        let (code, env) = fx.vex(&args);
+        assert_eq!(code, Some(0), "{what}: {env}");
+        assert_attested(&fx, code, &env, MVN_HOSTED_UUID, MVN_PURL, "redirected");
+    }
+
+    // A parent Maven resolves from a repository is not there to read.
+    let fx = project(&parent("<relativePath/>"), None);
+    let (code, env) = fx.vex(&args);
+    assert_omitted(
+        code,
+        &env,
+        MVN_PURL,
+        "package_not_found",
+        "unread parent, nothing installed",
+    );
+    install_patched(&fx);
+    let (code, env) = fx.vex(&args);
+    assert_attested(&fx, code, &env, MVN_HOSTED_UUID, MVN_PURL, "redirected");
 }
 
 /// Cell f: a `socket-patch-<uuid>` repository on a NON-Socket host (and a

@@ -34,10 +34,10 @@ pub const PATCHED_INDEX: &[u8] = b"module.exports = () => 'patched';\n";
 // retired once no hosted pin remains.
 
 pub const LP_PURL: &str = "pkg:npm/left-pad@1.2.3";
-pub const LP_HOSTED_URL: &str = "http://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
+pub const LP_HOSTED_URL: &str = "https://patch.test/patch/npm/left-pad/1.2.3/66666666-6666-4666-8666-666666666666/55555555-5555-4555-8555-555555555555/left-pad-1.2.3.tgz";
 pub const IO_PURL: &str = "pkg:npm/is-odd@3.0.1";
-pub const IO_HOSTED_URL: &str = "http://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
-pub const PATCH_SERVER: &str = "http://patch.test";
+pub const IO_HOSTED_URL: &str = "https://patch.test/patch/npm/is-odd/3.0.1/66666666-6666-4666-8666-666666666666/99999999-9999-4999-8999-999999999999/is-odd-3.0.1.tgz";
+pub const PATCH_SERVER: &str = "https://patch.test";
 pub const UPSTREAM_INTEGRITY: &str = "sha512-UPSTREAMupstream==";
 
 pub const VLT_UUID: &str = "88888888-8888-4888-8888-888888888888";
@@ -491,6 +491,64 @@ pub fn write_single_npm_fixture(root: &Path) {
         yarn_lock_content(&yarn_redirected_block()),
     )
     .unwrap();
+}
+
+/// A hosted Maven pin wired through three files, in the order a rollback
+/// writes them: the trusted checksums and `.mvn/maven.config` (both
+/// deleted), then `pom.xml` (rewritten). Maven's restore needs no registry
+/// lookup, so `--offline` runs it.
+pub const MVN_FILES: [(&str, &str); 3] = [
+    (
+        ".mvn/checksums/checksums.sha256",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/.mvn/checksums/checksums.sha256"
+        ),
+    ),
+    (
+        ".mvn/maven.config",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/.mvn/maven.config"
+        ),
+    ),
+    (
+        "pom.xml",
+        include_str!(
+            "../../../socket-patch-core/tests/fixtures/redirect/maven/pom/basic/expected/pom.xml"
+        ),
+    ),
+];
+pub const MVN_PURL: &str = "pkg:maven/org.slf4j/slf4j-api@1.7.36";
+
+pub fn write_maven_hosted_fixture(root: &Path) {
+    for (rel, content) in MVN_FILES {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+}
+
+/// Every file under `root` with its content (a link: its target), keyed by
+/// its `/`-separated relative path.
+pub fn tree(root: &Path) -> std::collections::BTreeMap<String, String> {
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(root, &path, out);
+                continue;
+            }
+            let content = match std::fs::read_link(&path) {
+                Ok(target) => format!("-> {}", target.display()),
+                Err(_) => String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned(),
+            };
+            let rel = path.strip_prefix(root).unwrap();
+            out.insert(rel.to_string_lossy().replace('\\', "/"), content);
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(root, root, &mut out);
+    out
 }
 
 pub fn bun_original_line() -> String {

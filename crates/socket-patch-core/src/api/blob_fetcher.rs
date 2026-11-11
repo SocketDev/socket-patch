@@ -3,8 +3,9 @@ use std::path::Path;
 
 use crate::api::client::{ApiClient, ApiError, BinaryBody};
 use crate::hash::git_sha256::{compute_git_sha256_from_bytes, compute_git_sha256_from_reader};
-use crate::manifest::operations::get_after_hash_blobs;
+use crate::manifest::operations::{get_after_hash_blobs, get_before_hash_blobs};
 use crate::manifest::schema::PatchManifest;
+use crate::patch::apply::is_valid_blob_hash;
 
 /// Result of fetching a single blob.
 #[derive(Debug, Clone)]
@@ -49,6 +50,50 @@ pub async fn get_missing_blobs(manifest: &PatchManifest, blobs_path: &Path) -> H
     missing
 }
 
+/// The cached blobs `manifest` references (`afterHash` and `beforeHash`)
+/// that are on disk but no longer hash to their git-sha256 name: truncated,
+/// rewritten by a line-ending-converting checkout (`core.autocrlf`), or
+/// unreadable. [`get_missing_blobs`] only tests for presence, so such an
+/// entry is trusted until `apply` or `rollback` refuses its bytes, on every
+/// run.
+///
+/// Hashes every present blob, so this is `repair`'s check: the apply path
+/// verifies a blob only when it is about to write its bytes.
+pub async fn get_corrupt_blobs(manifest: &PatchManifest, blobs_path: &Path) -> HashSet<String> {
+    let mut referenced = get_after_hash_blobs(manifest);
+    referenced.extend(get_before_hash_blobs(manifest));
+    let mut corrupt = HashSet::new();
+
+    for hash in referenced {
+        // Never join an unvalidated manifest string onto the directory;
+        // apply and rollback refuse such a hash by name.
+        if !is_valid_blob_hash(&hash) {
+            continue;
+        }
+        let blob_path = blobs_path.join(&hash);
+        // A missing entry is `get_missing_blobs`' to report. One that is
+        // not a regular file (a planted link, a directory) is refused by
+        // name where it is read, and a download never writes through it.
+        let Ok(meta) = tokio::fs::symlink_metadata(&blob_path).await else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let intact = match tokio::fs::File::open(&blob_path).await {
+            Ok(file) => compute_git_sha256_from_reader(meta.len(), file)
+                .await
+                .is_ok_and(|actual| blob_hash_matches(&hash, &actual)),
+            Err(_) => false,
+        };
+        if !intact {
+            corrupt.insert(hash);
+        }
+    }
+
+    corrupt
+}
+
 /// Download all missing `afterHash` blobs referenced in the manifest.
 /// `on_progress` is called before each download with
 /// `(hash, 1-based index, total)`.
@@ -69,6 +114,22 @@ pub async fn fetch_missing_blobs(
     // nothing leaves no `.socket/blobs/` husk behind.
     let hashes: Vec<String> = missing.into_iter().collect();
     download_entries(&hashes, blobs_path, client, on_progress).await
+}
+
+/// Download the blobs `hashes` whether or not an entry is already on disk:
+/// each download is staged, verified against its name and renamed over the
+/// entry, so a corrupt one ([`get_corrupt_blobs`]) is replaced whole and a
+/// failed download leaves it as it was.
+pub async fn fetch_blobs_replacing(
+    hashes: &[String],
+    blobs_path: &Path,
+    client: &ApiClient,
+    on_progress: Option<&OnProgress>,
+) -> FetchMissingBlobsResult {
+    if hashes.is_empty() {
+        return FetchMissingBlobsResult::default();
+    }
+    download_entries(hashes, blobs_path, client, on_progress).await
 }
 
 /// Download the blobs `hashes` (rollback's `beforeHash` set). Blobs that
@@ -334,8 +395,9 @@ fn guard_cache_entry(dest: &Path) -> std::io::Result<()> {
 /// never held in memory whole.
 ///
 /// [`get_missing_blobs`] only tests for presence, so a torn entry left by
-/// an in-place write would be trusted forever; stage+rename makes the final
-/// path either the complete bytes or absent.
+/// an in-place write would be trusted until a `repair` re-hashed it
+/// ([`get_corrupt_blobs`]); stage+rename makes the final path either the
+/// complete bytes or what was there before.
 ///
 /// Deliberately LIGHTER than [`crate::utils::fs::atomic_write_bytes`] (no
 /// file fsync, no dir fsync, `.socket-dl-` prefix): these are re-downloadable
@@ -577,6 +639,59 @@ mod tests {
         let manifest = PatchManifest::new();
         let missing = get_missing_blobs(&manifest, &blobs_path).await;
         assert!(missing.is_empty());
+    }
+
+    /// A present blob is corrupt exactly when its bytes do not hash to its
+    /// name: the CRLF checkout and the truncation are caught for both the
+    /// after and the before blob, while an intact, a missing and an
+    /// unreferenced entry are not.
+    #[tokio::test]
+    async fn corrupt_blobs_are_the_present_ones_that_do_not_hash_to_their_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let blobs_path = dir.path().join("blobs");
+        tokio::fs::create_dir_all(&blobs_path).await.unwrap();
+
+        let intact = b"line one\nline two\n";
+        let crlf = b"patched\nbytes\n";
+        let truncated = b"the original file\n";
+        let h_intact = compute_git_sha256_from_bytes(intact);
+        let h_crlf = compute_git_sha256_from_bytes(crlf);
+        let h_truncated = compute_git_sha256_from_bytes(truncated);
+        let h_missing = "c".repeat(64);
+
+        let mut manifest = make_manifest_with_hashes(&[&h_intact, &h_crlf, &h_missing]);
+        manifest
+            .patches
+            .get_mut("pkg:npm/test@1.0.0")
+            .unwrap()
+            .files
+            .get_mut("package/file0.js")
+            .unwrap()
+            .before_hash = h_truncated.clone();
+
+        tokio::fs::write(blobs_path.join(&h_intact), intact)
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_path.join(&h_crlf), b"patched\r\nbytes\r\n")
+            .await
+            .unwrap();
+        tokio::fs::write(blobs_path.join(&h_truncated), &truncated[..4])
+            .await
+            .unwrap();
+        // Unreferenced junk is the sweep's business, not this check's.
+        tokio::fs::write(blobs_path.join("d".repeat(64)), b"junk")
+            .await
+            .unwrap();
+
+        let corrupt = get_corrupt_blobs(&manifest, &blobs_path).await;
+        assert_eq!(
+            corrupt,
+            HashSet::from([h_crlf, h_truncated]),
+            "only the present, referenced, mismatching blobs"
+        );
+        assert!(get_missing_blobs(&manifest, &blobs_path)
+            .await
+            .contains(&h_missing));
     }
 
     fn ok(id: &str) -> BlobFetchResult {

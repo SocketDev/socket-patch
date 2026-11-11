@@ -7,17 +7,19 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use socket_patch_core::api::client::{
-    resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
+    get_api_client_with_overrides, resolve_ambient_credentials, ApiClient, ApiClientEnvOverrides,
 };
 use socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH;
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::telemetry::TelemetryAuth;
 use socket_patch_core::vendor::{VendorServiceConfig, VendorSource};
 
-/// Reject unknown ecosystems before they can produce a misleading empty scan.
+/// Reject unknown ecosystems before they can produce a misleading empty
+/// scan, and spell a recognized one (`Ecosystem::from_name`: `go`,
+/// `python`, `NPM`) the one way every later comparison expects.
 fn parse_supported_ecosystem(s: &str) -> Result<String, String> {
-    if Ecosystem::all().iter().any(|e| e.cli_name() == s) {
-        return Ok(s.to_string());
+    if let Some(ecosystem) = Ecosystem::from_name(s) {
+        return Ok(ecosystem.cli_name().to_string());
     }
     let supported = Ecosystem::all()
         .iter()
@@ -115,7 +117,8 @@ pub struct GlobalArgs {
     #[arg(help_heading = GLOBAL_OPTIONS, long = "proxy-url", env = "SOCKET_PROXY_URL")]
     pub proxy_url: Option<String>,
 
-    /// Restrict to these ecosystems (comma-separated).
+    /// Restrict to these ecosystems (comma-separated): npm, pypi, cargo,
+    /// gem, golang, maven, composer, nuget, deno.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "ecosystems",
@@ -156,9 +159,10 @@ pub struct GlobalArgs {
     /// scheme + host (+ port) of the returned URL to this base, preserving the
     /// path. `vex` and `scan` also accept lockfile URLs on this origin as
     /// hosted patch references (attested, and counted as live hosted wiring)
-    /// next to patch.socket.dev. Mainly for local-dev / testing, where the
-    /// host the server bakes into the URL is not the one to actually fetch
-    /// from.
+    /// next to patch.socket.dev, and hosted mode writes a plain http patch
+    /// URL into a lockfile only for this origin or a loopback address.
+    /// Mainly for local-dev / testing, where the host the server bakes into
+    /// the URL is not the one to actually fetch from.
     // A dev/testing knob: listed in `--help`, left out of the `-h` summary.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
@@ -290,7 +294,7 @@ pub struct GlobalArgs {
     )]
     pub debug: bool,
 
-    /// Disable anonymous usage telemetry.
+    /// Disable usage telemetry.
     #[arg(
         help_heading = GLOBAL_OPTIONS,
         long = "no-telemetry",
@@ -365,6 +369,38 @@ pub struct GlobalArgs {
         value_parser = parse_bool_flag,
     )]
     pub no_gem_native_rebuild: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): do NOT refresh the gems Bundler already holds for
+    /// the project (an installed gem under the project and its cached
+    /// `.gem`, an archive in `vendor/cache`) after `Gemfile.lock` is
+    /// repointed or restored. Bundler keeps an installed gem whatever
+    /// source the lock names, so opting out means reinstalling those gems
+    /// by hand (the run's `redirect_gem_stale_install` warning names the
+    /// files). Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "no-gem-install-refresh",
+        env = "SOCKET_NO_GEM_INSTALL_REFRESH",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub no_gem_install_refresh: bool,
+
+    /// Hosted mode (`scan`/`get --mode hosted`, and `rollback`/`remove` of
+    /// hosted patches): also refresh gems in a gem home OUTSIDE the project
+    /// (the system gems, `~/.gem`, an rbenv or asdf home). Off by default:
+    /// another project on the machine may pin the other build of the same
+    /// gem version, and its `bundle pristine` would then fail on the
+    /// replaced archive's checksum. Other subcommands accept it silently.
+    #[arg(
+        help_heading = GLOBAL_OPTIONS,
+        long = "gem-refresh-shared",
+        env = "SOCKET_GEM_REFRESH_SHARED",
+        default_value_t = false,
+        value_parser = parse_bool_flag,
+    )]
+    pub gem_refresh_shared: bool,
 }
 
 impl GlobalArgs {
@@ -547,6 +583,17 @@ impl GlobalArgs {
         }
     }
 
+    /// The run's API client, built from these flags the first time a
+    /// request needs it (see [`RunApiClient`]) and the same one ever after.
+    pub(crate) async fn api_client<'a>(&self, run: &'a RunApiClient) -> &'a ApiClient {
+        run.get_or_init(|| async {
+            get_api_client_with_overrides(self.api_client_overrides())
+                .await
+                .0
+        })
+        .await
+    }
+
     /// Telemetry's route for a run that built no API client, resolved
     /// through the client's own credential chain (flag, the
     /// `SOCKET_NO_API_TOKEN` veto, env, `socket login` config) without a
@@ -558,6 +605,14 @@ impl GlobalArgs {
         let (api_token, org_slug) =
             resolve_ambient_credentials(overrides.api_token, overrides.org_slug);
         TelemetryAuth::from_credentials(api_token.as_deref(), org_slug.as_deref())
+    }
+
+    /// Telemetry's route for the run as it stands: the client's when the
+    /// run has built one, else [`Self::telemetry_auth`]. A client is never
+    /// built, and the org never looked up, only to address an event.
+    pub(crate) fn telemetry_auth_for(&self, run: &RunApiClient) -> TelemetryAuth {
+        run.get()
+            .map_or_else(|| self.telemetry_auth(), TelemetryAuth::for_client)
     }
 
     /// The vendoring-service config every vendor entry point (`vendor`,
@@ -580,6 +635,16 @@ impl GlobalArgs {
         }
     }
 }
+
+/// The run's API client, built at most once and only when a request needs
+/// it ([`GlobalArgs::api_client`]). Building one reads the socket-cli
+/// config, prints the public-proxy and token-shape advisories and, with a
+/// token but no org, asks the API for the org — none of which a run that
+/// fetches nothing should pay for or print. A command hands this cell to
+/// the steps that may fetch instead of a client built up front; a host
+/// that already holds a client seeds it (`RunApiClient::new_with`), so a
+/// nested step reuses the run's one org resolution.
+pub(crate) type RunApiClient = tokio::sync::OnceCell<ApiClient>;
 
 /// [`GlobalArgs::project_root`] for a caller holding a resolved manifest
 /// path: the manifest's `.socket` parent's parent in the standard layout,
@@ -610,13 +675,16 @@ pub(crate) fn socket_dir_of(manifest_path: &Path, cwd: &Path) -> PathBuf {
 
 /// Mirror the flags that core reads from the env (`SOCKET_OFFLINE`,
 /// `SOCKET_DEBUG`, `SOCKET_TELEMETRY_DISABLED`, `SOCKET_API_URL`,
-/// `SOCKET_PROXY_URL`) into it. Core's own parse matches only `"1" | "true"`,
+/// `SOCKET_PROXY_URL`) into it. Core's own parse of `SOCKET_OFFLINE` and
+/// `SOCKET_DEBUG` matches only `"1" | "true"`,
 /// and the telemetry kill-switch and endpoint resolvers never see the parsed
 /// flags: without the mirror `--offline` still sent telemetry, and an
 /// on-prem `--api-url` run sent it, token included, to `api.socket.dev`.
 /// Empty URLs mean "unset" and are not mirrored. `--api-token` / `--org` are
-/// deliberately not mirrored: exporting a secret into the process env would
-/// leak it to every spawned package-manager child.
+/// deliberately not mirrored: the client takes them as explicit overrides,
+/// and a secret given as a flag stays out of the process environment. (No
+/// spawned child inherits these variables either way: core's
+/// `utils::process::CHILD_ENV_SCRUB`.)
 pub(crate) fn apply_env_toggles(common: &GlobalArgs) {
     if common.offline {
         std::env::set_var("SOCKET_OFFLINE", "1");
@@ -665,6 +733,8 @@ pub const GLOBAL_ARG_ENV_VARS: &[&str] = &[
     "SOCKET_NO_NPM_ALLOW_REMOTE_CONFIG",
     "SOCKET_NO_VLT_INSTALL_CLEANUP",
     "SOCKET_NO_GEM_NATIVE_REBUILD",
+    "SOCKET_NO_GEM_INSTALL_REFRESH",
+    "SOCKET_GEM_REFRESH_SHARED",
 ];
 
 /// Every env var a subcommand-local flag binds (one per `env = "..."`
@@ -734,6 +804,8 @@ impl Default for GlobalArgs {
             no_npm_allow_remote_config: false,
             no_vlt_install_cleanup: false,
             no_gem_native_rebuild: false,
+            no_gem_install_refresh: false,
+            gem_refresh_shared: false,
         }
     }
 }
@@ -753,7 +825,7 @@ mod tests {
     #[test]
     fn ecosystem_rejection_messages() {
         let supported = "npm, pypi, cargo, gem, golang, maven, composer, nuget, deno";
-        for bad in ["bogus", "NPM", "py-pi"] {
+        for bad in ["bogus", "npm pypi", "py-pi"] {
             assert_eq!(
                 parse_supported_ecosystem(bad),
                 Err(format!(
@@ -804,6 +876,63 @@ mod tests {
         with_env_cleared(GLOBAL_ARG_ENV_VARS, || {
             with_env_cleared(LOCAL_ARG_ENV_VARS, f);
         });
+    }
+
+    /// Every env var a flag of the real `Cli` binds, on any subcommand,
+    /// with whether clap hides its value (`hide_env_values`: a secret).
+    fn clap_env_bindings() -> Vec<(String, bool)> {
+        fn walk(command: &clap::Command, out: &mut Vec<(String, bool)>) {
+            for arg in command.get_arguments() {
+                if let Some(env) = arg.get_env() {
+                    out.push((
+                        env.to_string_lossy().into_owned(),
+                        arg.is_hide_env_values_set(),
+                    ));
+                }
+            }
+            for sub in command.get_subcommands() {
+                walk(sub, out);
+            }
+        }
+        let mut out = Vec::new();
+        walk(&<crate::Cli as clap::CommandFactory>::command(), &mut out);
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// No child process inherits a variable the CLI reads for itself: every
+    /// env binding a flag declares, here or in a command file, is on core's
+    /// scrub list. A new token-bearing binding (`SOCKET_API_TOKEN` is the
+    /// one today) that the list lacked would reach every package manager,
+    /// interpreter and gem build script the CLI runs.
+    #[test]
+    fn every_flag_env_binding_is_scrubbed_from_child_processes() {
+        use socket_patch_core::utils::process::CHILD_ENV_SCRUB;
+
+        let bindings = clap_env_bindings();
+        assert!(
+            bindings.contains(&("SOCKET_API_TOKEN".to_string(), true)),
+            "the walk must see the token binding, hidden: {bindings:?}"
+        );
+        assert!(
+            bindings.contains(&("SOCKET_VEX_OUTPUT".to_string(), false)),
+            "the walk must reach the subcommands' own bindings: {bindings:?}"
+        );
+        let declared = bindings.iter().map(|(name, _)| name.as_str());
+        let listed = GLOBAL_ARG_ENV_VARS
+            .iter()
+            .chain(LOCAL_ARG_ENV_VARS)
+            .copied();
+        let missing: std::collections::BTreeSet<&str> = declared
+            .chain(listed)
+            .filter(|name| !CHILD_ENV_SCRUB.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "add these flag env bindings to socket_patch_core::utils::process::CHILD_ENV_SCRUB, \
+             or every spawned child inherits them: {missing:?}"
+        );
     }
 
     /// Clear the extra env the core telemetry gate reads beyond the
@@ -1125,6 +1254,46 @@ mod tests {
         });
     }
 
+    /// A run's telemetry route is its API client's once it has built one
+    /// and, until then, what the credentials alone select: a token with no
+    /// org reports anonymously instead of building a client (and asking
+    /// the API for the org) just to address an event.
+    #[test]
+    #[serial_test::serial]
+    fn telemetry_auth_for_follows_the_client_only_once_built() {
+        use socket_patch_core::api::client::{ApiClientOptions, ApiRoute};
+
+        // Keep a developer's `socket login` config out of the chain.
+        with_env_cleared(&["SOCKET_NO_CONFIG"], || {
+            std::env::set_var("SOCKET_NO_CONFIG", "1");
+            with_clean_socket_env(|| {
+                let args = GlobalArgs {
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    ..GlobalArgs::default()
+                };
+
+                let run = RunApiClient::new();
+                let auth = args.telemetry_auth_for(&run);
+                assert_eq!(auth, args.telemetry_auth());
+                assert!(!auth.is_authenticated(), "no org is known yet");
+                assert!(!run.initialized(), "reading the route builds nothing");
+
+                // The client a fetch built, its org resolved by the API.
+                let run = RunApiClient::new_with(Some(ApiClient::new(ApiClientOptions {
+                    api_url: "https://api.example.test".to_string(),
+                    api_token: Some("sktsec_flag_api".to_string()),
+                    route: ApiRoute::org("resolved-org"),
+                })));
+                let auth = args.telemetry_auth_for(&run);
+                assert_eq!(
+                    auth.url(),
+                    "https://api.example.test/v0/orgs/resolved-org/telemetry"
+                );
+                assert!(auth.is_authenticated());
+            });
+        });
+    }
+
     /// Empty strings for url/token/org are dropped, not forwarded as
     /// `Some("")`: an empty value would mask the env-var fallback.
     #[test]
@@ -1252,7 +1421,8 @@ mod tests {
     }
 
     /// `parse_supported_ecosystem` accepts every supported ecosystem name
-    /// and returns it verbatim.
+    /// and returns it verbatim; the names a run prints (`go`, `python`) and
+    /// other spellings come back as the flag's own name.
     #[test]
     fn parse_supported_ecosystem_accepts_supported_names() {
         for e in Ecosystem::all() {
@@ -1262,7 +1432,13 @@ mod tests {
                 Ok(name.to_string()),
                 "{name:?} is a supported ecosystem and must be accepted",
             );
+            assert_eq!(
+                parse_supported_ecosystem(e.display_name()),
+                Ok(name.to_string())
+            );
         }
+        assert_eq!(parse_supported_ecosystem("NPM"), Ok("npm".to_string()));
+        assert_eq!(parse_supported_ecosystem("pip"), Ok("pypi".to_string()));
     }
 
     /// End-to-end through clap: `--ecosystems` splits on commas, validates each

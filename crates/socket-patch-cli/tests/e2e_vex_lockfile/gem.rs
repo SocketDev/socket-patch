@@ -442,6 +442,101 @@ fn vendored_spoofed_paths_are_not_references() {
     }
 }
 
+// ── the manifest decides ──────────────────────────────────────────────
+
+/// The pre-patch manifest: `vexgem` declared with no source of its own.
+fn write_unwired_manifest(dir: &Path, era: Era) {
+    std::fs::write(
+        dir.join(era.manifest()),
+        "source \"https://rubygems.org\"\n\ngem \"rake\"\ngem \"vexgem\", \"2.3.4\"\n",
+    )
+    .unwrap();
+}
+
+/// Nothing may attest, and the run must not even ask for the record.
+fn nothing_attests(dir: &Path, api: &PatchApi, cell: &str) {
+    let out = run_vex(&binary(), dir, &online(api));
+    assert_eq!(out.code, Some(2), "{cell}: {out}");
+    assert_eq!(
+        out.envelope["error"]["code"], "manifest_not_found",
+        "{cell}: {out}"
+    );
+    assert_absent(out.doc.as_ref(), PURL);
+    api.assert_no_requests();
+}
+
+/// The lock's Socket section alone is no wiring: bundler takes a gem from
+/// the source its manifest declaration names. With the manifest back at its
+/// pre-patch declaration (a revert, or a merge that took the other side of
+/// the Gemfile) and the lock untouched, real bundler 4.0.15 and 2.5.23 fail
+/// a frozen install (exit 16) and, unfrozen, rewrite the lock and install
+/// the upstream gem. So neither mode attests from that lock, whatever is
+/// installed, and neither does a lock with no manifest beside it.
+#[test]
+fn a_lock_section_the_manifest_does_not_name_attests_nothing() {
+    for era in ERAS {
+        for hosted in [true, false] {
+            let cell = format!("{era:?} {}", if hosted { "hosted" } else { "vendored" });
+            let api = api();
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            if hosted {
+                write_hosted(dir, era, &index(&api.uri(), UUID), true);
+                attested(dir, &online(&api), Marker::Redirected, &cell);
+            } else {
+                write_vendored(dir, era, &artifact_rel(UUID), AFTER);
+                attested(dir, &online(&api), Marker::Vendored, &cell);
+            }
+
+            let api = self::api();
+            write_unwired_manifest(dir, era);
+            nothing_attests(dir, &api, &format!("{cell}, manifest reverted"));
+            // A patched copy left installed from before the revert changes
+            // nothing: the next install replaces it.
+            install(dir, AFTER);
+            nothing_attests(dir, &api, &format!("{cell}, reverted, patched copy"));
+
+            std::fs::remove_file(dir.join(era.manifest())).unwrap();
+            nothing_attests(dir, &api, &format!("{cell}, no manifest"));
+        }
+    }
+}
+
+/// What hosted scan writes today: the user's own declaration with the patch
+/// registry as its `source:` option, and the added line for a gem the
+/// manifest did not declare. Both attest in every era, like the 5.0 / 5.1
+/// block the other cells use.
+#[test]
+fn hosted_source_option_pair_attests_in_every_era() {
+    for era in ERAS {
+        let api = api();
+        let remote = index(&api.uri(), UUID);
+        let forms = [
+            format!("gem \"vexgem\", \"~> 2.3\", source: \"{remote}\""),
+            format!(
+                "gem \"vexgem\", \"2.3.4\", source: \"{remote}\", require: false \
+                 # added by socket-patch (transitive dependency)"
+            ),
+        ];
+        for form in forms {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = tmp.path();
+            write_hosted(dir, era, &remote, true);
+            std::fs::write(
+                dir.join(era.manifest()),
+                format!("source \"https://rubygems.org\"\n\ngem \"rake\"\n{form}\n"),
+            )
+            .unwrap();
+            attested(
+                dir,
+                &online(&api),
+                Marker::Redirected,
+                &format!("{era:?} {form}"),
+            );
+        }
+    }
+}
+
 // ── embedded ──────────────────────────────────────────────────────────
 
 /// The embedded `apply --vex` / `vendor --vex` of a manifest-less checkout

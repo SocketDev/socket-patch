@@ -20,9 +20,7 @@ use socket_patch_core::crawlers::ruby_crawler::{
 use socket_patch_core::crawlers::Ecosystem;
 use socket_patch_core::ledgers::merge_ledger_records_for_updates;
 use socket_patch_core::manifest::schema::PatchManifest;
-use socket_patch_core::telemetry::{
-    spawn_patch_scan_failed, spawn_patch_scanned, PendingTelemetry, TelemetryAuth,
-};
+use socket_patch_core::telemetry::{track_patch_scan_failed, track_patch_scanned, TelemetryAuth};
 use socket_patch_core::utils::concurrent::{api_concurrency_for, ordered_concurrent};
 use socket_patch_core::utils::purl::{canonical_purl, normalize_purl};
 use socket_patch_core::utils::purl_key::{canonical_base_purl, PurlKey};
@@ -64,8 +62,9 @@ pub(crate) mod vendor_flow;
 mod withdrawn;
 
 use self::discovery::{
-    collect_vuln_ids, detect_updates, lockfile_only_contains, lockfile_supplement,
-    preverify_vendor_baselines, vendored_ledger_supplement, LockfileSupplement,
+    advisory_coverage, collect_vuln_ids, detect_updates, lockfile_only_contains,
+    lockfile_supplement, preverify_vendor_baselines, vendored_ledger_supplement, AdvisoryCoverage,
+    LockfileSupplement,
 };
 // Shared with `get --mode hosted|vendored` (commands::get): the lockfile
 // and vendored-ledger crawl supplements. `pub(crate)` re-exports because
@@ -557,15 +556,10 @@ async fn discover_selected(
     show_progress: bool,
     warn: bool,
     detail_error_line: bool,
-    telemetry: &mut PendingTelemetry,
     json_warnings: Option<&mut Envelope>,
 ) -> Result<Discovered, (i32, String)> {
     let (all_search_results, failures) =
         fetch_patch_details(api_client, packages, show_progress, warn).await;
-    // The scan event's send overlapped the detail fetches; every caller's
-    // next output (the error line below, a `--json` envelope) must find it
-    // delivered.
-    telemetry.flush().await;
     let error_count = failures.len();
     if error_count > 0 && error_count == packages.len() {
         let err = failures.last().map_or_else(
@@ -642,8 +636,34 @@ fn classified_rows(
     if let Some(env) = result {
         let updates = offer_updates(&rows, discovered, recorded, packages);
         env.set_extra("updates", serde_json::Value::Array(updates_json(&updates)));
+        coverage_into_packages_json(env, &advisory_coverage(packages, &writers_of(&rows)));
     }
     rows
+}
+
+/// Say on each `packages[]` entry which patch the run selected for the
+/// package and what that leaves unfixed: `selectedUuids`, `fixedIds` and
+/// `unfixedIds`, absent on a package the run selected no patch for. Whether
+/// a selected patch landed is its event.
+fn coverage_into_packages_json(env: &mut Envelope, coverage: &[AdvisoryCoverage]) {
+    let Some(packages) = env
+        .extra
+        .get_mut("packages")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for pkg in packages {
+        let Some(c) = coverage
+            .iter()
+            .find(|c| pkg["purl"].as_str() == Some(c.purl.as_str()))
+        else {
+            continue;
+        };
+        pkg["selectedUuids"] = serde_json::json!(c.uuids);
+        pkg["fixedIds"] = serde_json::json!(c.fixed_ids);
+        pkg["unfixedIds"] = serde_json::json!(c.unfixed_ids);
+    }
 }
 
 /// `common` for `select_patches`: scan never prompts, so it always takes
@@ -709,9 +729,11 @@ pub(super) fn finish_rollout_json(stage: &rollout::Stage, env: &mut Envelope) {
     }
 }
 
-/// The human `Rollout:` line and the Next-steps lines about deferred
-/// patches, for the agent and vendored summaries.
-fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool) {
+/// The human `Rollout:` line and the "Next steps:" block, for the agent
+/// and vendored summaries: the mode's `own_steps` (a whole block with its
+/// header; empty when the mode printed its own or has none), then the
+/// lines about deferred patches.
+fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool, own_steps: &[String]) {
     if silent {
         return;
     }
@@ -722,8 +744,13 @@ fn print_rollout_human(stage: &rollout::Stage, dry_run: bool, silent: bool) {
     if let Some(line) = line {
         println!("\n{line}");
     }
+    for step in own_steps {
+        println!("{step}");
+    }
     if !next.is_empty() {
-        println!("Next steps:");
+        if own_steps.is_empty() {
+            println!("Next steps:");
+        }
         for step in next {
             println!("  {step}");
         }
@@ -743,6 +770,49 @@ fn select_accessible(
         .filter(|p| can_access_paid_patches || p.tier == "free")
         .collect();
     policy.select(accessible)
+}
+
+/// The advisory lines ([`render::coverage_lines`]) of the packages whose
+/// selected patch is one of `landed`: only a patch the run applied (or, on
+/// a dry run, would apply) is said to fix anything.
+pub(super) fn coverage_lines_for(
+    coverage: &[AdvisoryCoverage],
+    landed: &HashSet<&str>,
+    dry_run: bool,
+    verbose: bool,
+) -> Vec<String> {
+    let patched: Vec<&AdvisoryCoverage> = coverage
+        .iter()
+        .filter(|c| c.uuids.iter().any(|uuid| landed.contains(uuid.as_str())))
+        .collect();
+    render::coverage_lines(&patched, dry_run, verbose, ui::stdout_color())
+}
+
+/// Print [`coverage_lines_for`] on stdout, under the mode's result line.
+fn print_coverage(
+    coverage: &[AdvisoryCoverage],
+    landed: &HashSet<&str>,
+    dry_run: bool,
+    verbose: bool,
+) {
+    for line in coverage_lines_for(coverage, landed, dry_run, verbose) {
+        println!("{line}");
+    }
+}
+
+/// The uuids of the patches an agent run left applied: the ones its nested
+/// apply wrote, and the ones it found already in place.
+fn patched_uuids(outcome: &Envelope) -> HashSet<&str> {
+    outcome
+        .events
+        .iter()
+        .filter(|event| match event.action {
+            PatchAction::Applied => true,
+            PatchAction::Skipped => event.error_code.as_deref() == Some("already_patched"),
+            _ => false,
+        })
+        .filter_map(|event| event.uuid.as_deref())
+        .collect()
 }
 
 /// Print the blank stdout line that opens a paragraph, once: `opened`
@@ -1190,6 +1260,14 @@ pub(super) const VENDORED_OWNERSHIP_RETAINED: &str = "vendored_ownership_retaine
 /// envelope instead.)
 pub(super) const API_BATCH_FAILED: &str = "api_batch_failed";
 
+/// A package the patch API gave no answer for while it answered for
+/// others (the public proxy's per-package path), so it was not checked for
+/// patches: the `errorCode` of its `failed` event, and the code of the one
+/// run-level warning naming every such package. The run is a partial
+/// failure (exit 1). (No package answered is the all-batches-failed error
+/// envelope instead.)
+pub(super) const PATCH_LOOKUP_FAILED: &str = "patch_lookup_failed";
+
 /// Run-level `--json` warning: one package's patch-detail query failed
 /// (after the client's bounded 429 / 503 retry) while others succeeded, so
 /// its patch was left out of the selection. The detail is the human
@@ -1552,15 +1630,7 @@ fn scanned_ecosystems(purls: &[String]) -> Vec<String> {
 }
 
 pub async fn run(args: ScanArgs) -> i32 {
-    // Scan's telemetry sends run off the critical path: each is spawned
-    // where its event fires and flushed before the first stdout write that
-    // follows it (so a closed pipe's SIGPIPE or a Ctrl-C still finds it
-    // delivered, as with an inline send). The flush here is the
-    // backstop that keeps every event ahead of the process exit.
-    let mut telemetry = PendingTelemetry::new();
-    let code = Box::pin(run_scan(args, &mut telemetry, None, true)).await;
-    telemetry.flush().await;
-    code
+    Box::pin(run_scan(args, None, true)).await
 }
 
 /// The project directories a hosted or vendored scan's PATHs name: each
@@ -1609,18 +1679,35 @@ fn project_dirs(
     Ok(dirs)
 }
 
-/// Run a hosted or vendored scan once per project directory its PATHs
-/// name, as if each were `--cwd`. The exit code is the worst of the runs.
-/// `--json` takes one directory, so stdout stays one document. Every
-/// directory must be inside the repository root the policy was read from.
+/// Whether this run finds its project directories itself
+/// ([`projects_below::discovered`]): a hosted or vendored scan with no
+/// PATH, of a project rather than the global installs, that is the
+/// invocation's own run (not one of its directories), inside a git
+/// checkout. The checkout bounds the walk: a scan from a home directory
+/// never goes looking for every project below.
+///
+/// [`projects_below::discovered`]: crate::commands::projects_below::discovered
+fn discovers_projects(args: &ScanArgs, invocation: &InvocationPolicy) -> bool {
+    args.paths.is_empty()
+        && !args.common.is_global()
+        && args.rollout.carry.is_none()
+        && invocation.in_git_repo
+        && matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
+}
+
+/// Run a hosted or vendored scan once per project directory, as if each
+/// were `--cwd`: the directories its PATHs name, or the ones a bare scan
+/// found. The exit code is the worst of the runs. `--json` takes one
+/// directory, so stdout stays one document. Every directory must be
+/// inside the repository root the policy was read from.
 ///
 /// `mode_inferred`: the mode came from `--cwd`'s state rather than
 /// `--mode`, so each directory takes its mode from its own state.
 async fn run_project_dirs(
     args: ScanArgs,
-    telemetry: &mut PendingTelemetry,
     invocation: &InvocationPolicy,
     mode_inferred: bool,
+    dirs: Vec<(PathBuf, bool)>,
 ) -> i32 {
     let usage = |code: &str, message: &str| {
         usage_error(
@@ -1630,10 +1717,6 @@ async fn run_project_dirs(
             code,
             message,
         )
-    };
-    let dirs = match project_dirs(&args.common.cwd, &args.paths) {
-        Ok(dirs) => dirs,
-        Err((code, message)) => return usage(code, &message),
     };
     if !args.common.is_global() {
         for (dir, _) in &dirs {
@@ -1684,11 +1767,18 @@ async fn run_project_dirs(
     };
     let root = std::fs::canonicalize(&args.common.cwd).unwrap_or_else(|_| args.common.cwd.clone());
     let carry = rollout::RolloutCarry::new(configured, root);
+    if dirs.len() > 1 {
+        let _ = invocation.scanned_dirs.set(
+            dirs.iter()
+                .map(|(dir, _)| std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone()))
+                .collect(),
+        );
+    }
     let mut code = 0;
     for (dir, explicit) in &dirs {
         if dirs.len() > 1 && !args.common.silent {
-            let shown = dir.strip_prefix(&args.common.cwd).unwrap_or(dir);
-            println!("\n== {} ==", shown.display());
+            let shown = crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir);
+            println!("{}", crate::commands::projects_below::heading(&shown));
         }
         let mut child = args.clone();
         child.paths.clear();
@@ -1697,7 +1787,7 @@ async fn run_project_dirs(
         if mode_inferred {
             child.mode = None;
         }
-        code = code.max(Box::pin(run_scan(child, telemetry, Some(invocation), *explicit)).await);
+        code = code.max(Box::pin(run_scan(child, Some(invocation), *explicit)).await);
     }
     code
 }
@@ -1729,11 +1819,27 @@ fn report_policy_error(err: &socket_patch_core::policy::PolicyError, args: &Scan
 
 /// `invocation` is the policy a PATH-list parent already loaded (`None`
 /// loads it here); `explicit` says whether the user named this root.
-async fn run_scan(
+///
+/// The one place a scan's exit code is settled: a run that left packages
+/// unchecked (the patch API gave no answer for them) is a partial failure
+/// whatever the mode it went on to run reported, so it never exits 0.
+async fn run_scan(args: ScanArgs, invocation: Option<&InvocationPolicy>, explicit: bool) -> i32 {
+    let mut unchecked = 0usize;
+    let code = Box::pin(scan_project(args, invocation, explicit, &mut unchecked)).await;
+    if unchecked > 0 && code == 0 {
+        1
+    } else {
+        code
+    }
+}
+
+/// [`run_scan`]'s body. `unchecked` is set to the number of packages the
+/// patch API gave no answer for (already reported; see `run_scan`).
+async fn scan_project(
     mut args: ScanArgs,
-    telemetry: &mut PendingTelemetry,
     invocation: Option<&InvocationPolicy>,
     explicit: bool,
+    unchecked: &mut usize,
 ) -> i32 {
     apply_env_toggles(&args.common);
 
@@ -1809,7 +1915,49 @@ async fn run_scan(
     if matches!(args.mode, Some(ScanMode::Hosted) | Some(ScanMode::Vendored))
         && !args.paths.is_empty()
     {
-        return Box::pin(run_project_dirs(args, telemetry, invocation, mode_inferred)).await;
+        let dirs = match project_dirs(&args.common.cwd, &args.paths) {
+            Ok(dirs) => dirs,
+            Err((code, message)) => return scan_usage_error(&args, code, &message),
+        };
+        return Box::pin(run_project_dirs(args, invocation, mode_inferred, dirs)).await;
+    }
+    // A bare one names none and finds them: every project in the checkout
+    // at or below `--cwd`. `--json` and `--vex` take one directory, so they
+    // scan `--cwd` alone and say which projects were left.
+    let mut unscanned_projects = None;
+    if discovers_projects(&args, invocation) {
+        let found = crate::commands::projects_below::discovered(
+            &args.common,
+            &invocation.policy,
+            &invocation.repo_root,
+        )
+        .await;
+        let others: Vec<String> = found
+            .dirs
+            .iter()
+            .filter(|(_, explicit)| !explicit)
+            .map(|(dir, _)| {
+                crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir)
+            })
+            .collect();
+        if !args.common.json && !args.common.silent {
+            for line in render::discovery_notes(found.ignored, found.truncated) {
+                eprintln!("{line}");
+            }
+        }
+        if !others.is_empty() {
+            if args.common.json || args.vex.vex.is_some() {
+                unscanned_projects = Some(others);
+            } else {
+                return Box::pin(run_project_dirs(
+                    args,
+                    invocation,
+                    mode_inferred,
+                    found.dirs,
+                ))
+                .await;
+            }
+        }
     }
 
     let mut policy = Box::new(ScanPolicy::for_root(
@@ -1943,6 +2091,13 @@ async fn run_scan(
     // Unsupported layouts and malformed binary Bun locks, kept on empty
     // scans too: an unreadable graph is not evidence of no dependencies.
     let mut layout_refusals = unsupported_layout_warnings(&lockfile_only.unsupported);
+    if let Some(others) = &unscanned_projects {
+        let detail = render::unscanned_projects_detail(others, args.common.json);
+        if !args.common.json && !args.common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+    }
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`
     // consumers get it on the same run-level `warnings[]` channel.
@@ -2247,16 +2402,25 @@ async fn run_scan(
     // Protect before querying/selecting, in every mode and in dry-run previews.
     let user_patches = super::user_patches::inspect(&args.common).await;
     let mut user_patch_withheld = 0usize;
+    // Of those, the ones held back only because a project file could not
+    // be read: a broken file, not a patch the project declares.
+    let mut user_patch_unreadable = 0usize;
     let mut user_patch_skips = Vec::new();
     filtered_crawled.retain(|package| {
         let sources = user_patches.conflicts(&package.purl);
         if sources.is_empty() {
             return true;
         }
-        let detail =
-            super::user_patches::detail(&package.purl, &sources, args.common.allow_patch_conflicts);
+        let unreadable = user_patches.unreadable_only(&package.purl);
+        let detail = super::user_patches::detail(
+            &package.purl,
+            &sources,
+            args.common.allow_patch_conflicts,
+            unreadable,
+        );
         if !args.common.allow_patch_conflicts {
             user_patch_withheld += 1;
+            user_patch_unreadable += usize::from(unreadable);
             if !user_patch_skips
                 .iter()
                 .any(|event: &PatchEvent| event.purl.as_deref() == Some(package.purl.as_str()))
@@ -2318,8 +2482,7 @@ async fn run_scan(
             }
         }
         // Telemetry: empty-scan still counts as a successful scan.
-        spawn_patch_scanned(
-            telemetry,
+        track_patch_scanned(
             0,
             0,
             0,
@@ -2329,9 +2492,8 @@ async fn run_scan(
             requested_mode,
             &project_modes,
             &telemetry_auth,
-        );
-        // The result prints right away: nothing to overlap the send with.
-        telemetry.flush().await;
+        )
+        .await;
         if args.common.json {
             // GC is intentionally skipped when the crawl finds nothing:
             // pruning every manifest entry is too destructive (`repair`
@@ -2391,8 +2553,19 @@ async fn run_scan(
             // A project the policy skipped as a whole is not an empty one,
             // and neither is one whose every package the consent gate held.
             if user_patch_withheld > 0 {
+                for line in render::user_patch_withheld_lines(
+                    user_patch_withheld - user_patch_unreadable,
+                    user_patch_unreadable,
+                ) {
+                    println!("{line}");
+                }
+            } else if !lockfile_only.unsupported.is_empty() {
+                // A lockfile or layout that could not be read is why
+                // nothing was found (its warning is on stderr): an install
+                // is not the fix.
                 println!(
-                    "{user_patch_withheld} installed package(s) are protected by project patches (see the warnings above) and were not scanned. Pass --allow-patch-conflicts to scan them anyway."
+                    "{}",
+                    render::no_packages_unreadable(lockfile_only.unsupported.len())
                 );
             } else if !policy.root_excluded() {
                 println!(
@@ -2467,6 +2640,11 @@ async fn run_scan(
     // chunk order, surfaced as run-level `warnings[]` when some batch
     // succeeded (all failing is the error envelope below).
     let mut failed_batches: Vec<(usize, String)> = Vec::new();
+    // Packages of an answered batch the patch API gave no answer for (the
+    // public proxy's per-package path), as `(purl, error)` in chunk order.
+    // They were not checked, so the run reports them and is a partial
+    // failure; treating them as patch-free would be a false clean.
+    let mut unanswered: Vec<(String, String)> = Vec::new();
 
     // Fold one batch outcome; callers consume outcomes strictly in chunk
     // order.
@@ -2482,6 +2660,7 @@ async fn run_scan(
                     all_packages_with_patches.push(pkg);
                 }
             }
+            unanswered.extend(response.unanswered.into_iter().map(|u| (u.purl, u.error)));
         }
         Err(e) => {
             batch_error_count += 1;
@@ -2591,6 +2770,7 @@ async fn run_scan(
             &filtered_crawled,
             &lockfile_only.entries,
             &all_packages_with_patches,
+            invocation.scanned_dirs.get().map_or(&[], Vec::as_slice),
         ))
         .await;
         if !skipped.is_empty() {
@@ -2609,9 +2789,7 @@ async fn run_scan(
     if total_batches > 0 && batch_error_count == total_batches {
         status.finish();
         let err = last_batch_error.unwrap_or_else(|| "all batches failed".to_string());
-        spawn_patch_scan_failed(telemetry, &err, fallback_to_proxy, &telemetry_auth);
-        // The failure prints right away: nothing to overlap the send with.
-        telemetry.flush().await;
+        track_patch_scan_failed(&err, fallback_to_proxy, &telemetry_auth).await;
         if args.common.json {
             let mut env = scan_envelope(&args.common);
             env.set_extra("scannedPackages", serde_json::json!(package_count));
@@ -2627,6 +2805,22 @@ async fn run_scan(
         }
         return 1;
     }
+
+    // Some packages got no answer: the run goes on with the answered ones,
+    // says which were left unchecked (even under `--silent`: this is why
+    // the run exits 1), and no later step may read their absence as "no
+    // patches".
+    *unchecked = unanswered.len();
+    let unanswered_detail = (!unanswered.is_empty())
+        .then(|| render::unanswered_lookups(&unanswered, query_purls.len()));
+    if let Some(detail) = &unanswered_detail {
+        if !args.common.json {
+            status.println(format!("Warning: {detail}"));
+        }
+    }
+    // A package the lookup missed could have been NEW, like one in a
+    // failed batch.
+    let lookup_incomplete = batch_error_count > 0 || !unanswered.is_empty();
 
     let total_patches_found: usize = all_packages_with_patches
         .iter()
@@ -2655,6 +2849,29 @@ async fn run_scan(
     } else {
         None
     };
+    // A restore that failed part-way and could not put its files back
+    // leaves the lockfiles half restored: stop, rather than rewrite over
+    // them. (The restore printed the failure as it happened.)
+    if let Some(why) = withdrawn_sweep
+        .as_ref()
+        .and_then(|sweep| sweep.half_restored().map(str::to_string))
+    {
+        if args.common.json {
+            let mut env = scan_envelope(&args.common);
+            env.set_extra("scannedPackages", serde_json::json!(package_count));
+            env.set_extra(
+                "lockfileOnlyPackages",
+                serde_json::json!(lockfile_only_count),
+            );
+            env.set_extra("paths", serde_json::json!(path_scope.raw()));
+            if let Some(sweep) = withdrawn_sweep {
+                sweep.record_into(&mut env);
+            }
+            env.mark_error(EnvelopeError::new("lockfile_write_failed", why));
+            emit_scan(&env);
+        }
+        return 1;
+    }
     // The sweep's reference answers, reused by the hosted redirect.
     let sweep_references = withdrawn_sweep
         .as_mut()
@@ -2677,8 +2894,7 @@ async fn run_scan(
     // Telemetry: record the scan outcome with the per-tier counts and the
     // ecosystems the crawl actually found (not the `--ecosystems` filter,
     // which is empty on a default run).
-    spawn_patch_scanned(
-        telemetry,
+    track_patch_scanned(
         package_count,
         free_patches,
         paid_patches,
@@ -2688,7 +2904,8 @@ async fn run_scan(
         requested_mode,
         &project_modes,
         &telemetry_auth,
-    );
+    )
+    .await;
 
     let mut updates = detect_updates(update_manifest.as_deref(), &all_packages_with_patches);
     policy.set_update_purls(updates.iter().map(|u| u.purl.as_str()));
@@ -2770,6 +2987,18 @@ async fn run_scan(
             let detail = line.strip_prefix("Warning: ").unwrap_or(&line);
             env.warn(API_BATCH_FAILED, detail);
         }
+        // A package the patch API gave no answer for: one warning naming
+        // them, and a `failed` event each, which makes the run a partial
+        // failure whatever the mode below reports.
+        if let Some(detail) = &unanswered_detail {
+            env.warn(PATCH_LOOKUP_FAILED, detail.as_str());
+            for (purl, error) in &unanswered {
+                env.record(
+                    PatchEvent::new(PatchAction::Failed, purl.as_str())
+                        .with_error(PATCH_LOOKUP_FAILED, error.as_str()),
+                );
+            }
+        }
         policy.fold_into_envelope(&mut env);
 
         // Hosted mode: the redirect engine records its events into this
@@ -2785,10 +3014,9 @@ async fn run_scan(
                 can_access_paid_patches,
                 &policy,
                 env,
-                telemetry,
                 npm_crawl.as_ref(),
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &mut stage,
                 prior_discovery,
                 sweep_references,
@@ -2830,7 +3058,6 @@ async fn run_scan(
                 false,
                 false,
                 false,
-                telemetry,
                 Some(&mut env),
             )
             .await
@@ -2840,7 +3067,7 @@ async fn run_scan(
                         &mut stage,
                         &discovered,
                         &recorded,
-                        batch_error_count > 0,
+                        lookup_incomplete,
                         &all_packages_with_patches,
                         Some(&mut env),
                     );
@@ -2862,7 +3089,6 @@ async fn run_scan(
                 false,
                 false,
                 false,
-                telemetry,
                 Some(&mut env),
             )
             .await
@@ -2877,7 +3103,7 @@ async fn run_scan(
                 &mut stage,
                 &discovered,
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &all_packages_with_patches,
                 Some(&mut env),
             );
@@ -2970,7 +3196,7 @@ async fn run_scan(
                 &all_packages_with_patches,
                 can_access_paid_patches,
                 &recorded,
-                batch_error_count > 0,
+                lookup_incomplete,
                 &mut stage,
                 &policy,
                 &mut env,
@@ -2980,15 +3206,10 @@ async fn run_scan(
                 &vendored_purls,
                 prune,
                 &telemetry_auth,
-                telemetry,
                 npm_crawl.as_ref(),
             )
             .await;
         }
-
-        // The GC and the VEX build below can write to stderr; the report-
-        // only arm may not have flushed the scan event yet.
-        telemetry.flush().await;
 
         // --- GC (post-apply, or standalone --prune GC-sweep) -------------
         if prune {
@@ -3018,9 +3239,6 @@ async fn run_scan(
         emit_scan(&env);
         return final_code;
     }
-
-    // Every human exit below prints first; the scan event goes out before.
-    telemetry.flush().await;
 
     let use_color = ui::stdout_color();
     let verbose = args.common.verbose;
@@ -3063,7 +3281,13 @@ async fn run_scan(
     // a wiped `.socket/vendor/` is `repair`'s job).
     if all_packages_with_patches.is_empty() {
         if !silent {
-            println!("\nNo patches available for installed packages.");
+            // Only a lookup the service answered in full may say it of
+            // every installed package.
+            if lookup_incomplete {
+                println!("\n{}", render::NO_PATCHES_AMONG_CHECKED);
+            } else {
+                println!("\nNo patches available for installed packages.");
+            }
         }
         return finish_human(0).await;
     }
@@ -3091,7 +3315,6 @@ async fn run_scan(
             human,
             !silent,
             !hosted,
-            telemetry,
             None,
         )
         .await
@@ -3101,7 +3324,7 @@ async fn run_scan(
                     &mut stage,
                     &discovered,
                     &recorded,
-                    batch_error_count > 0,
+                    lookup_incomplete,
                     &all_packages_with_patches,
                     None,
                 );
@@ -3115,6 +3338,9 @@ async fn run_scan(
             }
         }
     };
+    // What each package's selected patch fixes and leaves unpatched: every
+    // mode prints it under its result line, for the packages it patched.
+    let coverage = advisory_coverage(&all_packages_with_patches, &writers_of(&rows));
 
     // Presentational only, so `--silent` skips it wholesale.
     if !silent {
@@ -3270,6 +3496,7 @@ async fn run_scan(
                 rows,
                 prior: prior_discovery,
                 references: sweep_references,
+                coverage,
             }),
             "scan",
         )
@@ -3370,7 +3597,7 @@ async fn run_scan(
                 println!("{}", render::ALL_ALREADY_RECORDED);
             }
         }
-        print_rollout_human(&stage, args.common.dry_run, silent);
+        print_rollout_human(&stage, args.common.dry_run, silent, &[]);
         return finish_human(0).await;
     }
 
@@ -3378,6 +3605,9 @@ async fn run_scan(
     if !silent && !selected.is_empty() {
         if vendor {
             println!("\nPatches to vendor:\n");
+        } else if report_only {
+            // This run applies none of them.
+            println!("\nPatches available:\n");
         } else {
             println!("\nPatches to apply:\n");
         }
@@ -3418,39 +3648,12 @@ async fn run_scan(
         }
     }
 
-    // `--dry-run` is a non-mutating preview: stop here, having printed the
-    // table and the per-patch plan above, before the download/apply and the
-    // prune GC (which runs as a read-only preview instead).
-    if args.common.dry_run {
-        if !silent {
-            // Vendored preview: the JSON arm's ledger classification,
-            // rendered as `[skip]` and `[would-refuse]` lines so a preview
-            // never advertises vendoring the wet run would skip or refuse.
-            let preview = if vendor {
-                // `vendor` is never report-only, so the planning pass
-                // above always computed it.
-                let mut preview = vendor_preview
-                    .take()
-                    .expect("the vendored planning pass computed the preview");
-                preview.retain_selected(&selected);
-                Some(preview)
-            } else {
-                None
-            };
-            match &preview {
-                Some(preview) => preview.print_human(),
-                None => println!(
-                    "{}",
-                    render::dry_run_line(render::Plan::Apply(selected.len()))
-                ),
-            }
-        }
-        print_rollout_human(&stage, true, silent);
-        return finish_human(0).await;
-    }
-
+    // A report-only run applies nothing, with or without `--dry-run`: both
+    // end with how to apply what was found, and the `--prune` GC (a
+    // read-only preview on a dry run). The preview never says it would
+    // download and apply.
     if report_only {
-        // The "Patches to apply:" listing already ends with a blank line.
+        // The "Patches available:" listing already ends with a blank line.
         if !silent {
             for line in render::report_only_hint(&args.common) {
                 println!("{line}");
@@ -3475,6 +3678,49 @@ async fn run_scan(
             hosted,
         )
         .await;
+    }
+
+    // `--dry-run` is a non-mutating preview: stop here, having printed the
+    // table and the per-patch plan above, before the download/apply and the
+    // prune GC (which runs as a read-only preview instead).
+    if args.common.dry_run {
+        if !silent {
+            // Vendored preview: the JSON arm's ledger classification,
+            // rendered as `[skip]` and `[would-refuse]` lines so a preview
+            // never advertises vendoring the wet run would skip or refuse.
+            let preview = if vendor {
+                // The planning pass above always computed it for a
+                // vendored run.
+                let mut preview = vendor_preview
+                    .take()
+                    .expect("the vendored planning pass computed the preview");
+                preview.retain_selected(&selected);
+                Some(preview)
+            } else {
+                None
+            };
+            match &preview {
+                Some(preview) => preview.print_human(),
+                None => println!(
+                    "{}",
+                    render::dry_run_line(render::Plan::Apply(selected.len()))
+                ),
+            }
+            // What the wet run would patch: the vendored preview's rows
+            // less its refusals, or the agent selection with the recorded
+            // patches it re-applies.
+            let landing: HashSet<&str> = match &preview {
+                Some(preview) => preview.landing_uuids(),
+                None => selected
+                    .iter()
+                    .chain(&already_recorded)
+                    .map(|p| p.uuid.as_str())
+                    .collect(),
+            };
+            print_coverage(&coverage, &landing, true, verbose);
+        }
+        print_rollout_human(&stage, true, silent, &[]);
+        return finish_human(0).await;
     }
 
     // Vendor mode: pre-verify baselines so a content mismatch is reported
@@ -3513,6 +3759,7 @@ async fn run_scan(
         &args, /*save_only=*/ vendor, /*json=*/ false, silent,
     );
 
+    let mut agent_steps: Vec<String> = Vec::new();
     let code = if vendor {
         // Boxed for the same Windows 1 MiB frame reason as the JSON path.
         boxed_vendor_interactive_path(
@@ -3529,6 +3776,7 @@ async fn run_scan(
             prune,
             &telemetry_auth,
             npm_crawl.as_ref(),
+            &coverage,
         )
         .await
     } else {
@@ -3536,12 +3784,25 @@ async fn run_scan(
         // record and the nested apply re-applies them (a no-op on disk
         // when the installed copy is still patched).
         let to_download: Vec<_> = selected.iter().chain(&already_recorded).cloned().collect();
-        let (code, _) = download_and_apply_patches_with(
+        let (code, outcome) = download_and_apply_patches_with(
             &to_download,
             &params,
             &download_run(&args, &api_client),
         )
         .await;
+        if !silent {
+            print_coverage(&coverage, &patched_uuids(&outcome), false, verbose);
+        }
+        // A project run that recorded a patch has something to commit, and
+        // a re-apply to wire up after every install.
+        if code == 0 && !args.common.is_global() {
+            agent_steps = crate::commands::agent_download::next_steps(
+                &crate::commands::agent_download::recorded_purls(&outcome),
+                &socket_dir,
+                &args.common.project_root(),
+                false,
+            );
+        }
         code
     };
 
@@ -3559,8 +3820,8 @@ async fn run_scan(
         }
     }
 
-    // The deferred next steps assume a run that landed.
-    print_rollout_human(&stage, false, silent || code != 0);
+    // The next steps assume a run that landed.
+    print_rollout_human(&stage, false, silent || code != 0, &agent_steps);
 
     // Post-apply GC: only with `--prune` or `--sync`; otherwise an agent
     // apply leaves every other manifest entry alone (`socket-patch repair`
@@ -4564,13 +4825,24 @@ mod tests {
     }
 
     /// The mixed state a vendored→hosted cargo takeover can leave behind:
-    /// the lock rewired to the hosted sparse index (declared as a
-    /// socket-patch registry in the config), while the vendored
-    /// `[patch.crates-io]` entry ALSO survives in the config.
+    /// the manifest pinned and the lock rewired to the hosted sparse index
+    /// (declared as a socket-patch registry in the config), while the
+    /// vendored `[patch.crates-io]` entry ALSO survives in the config.
     async fn write_cargo_hosted_takeover_files(root: &Path) {
         tokio::fs::create_dir_all(root.join(".cargo"))
             .await
             .unwrap();
+        // The pin is what makes cargo resolve the crate from the lock's
+        // hosted source: a lock entry no declaration routes is stale.
+        tokio::fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n\
+                 cfg-if = {{ version = \"1.0.4\", registry = \"socket-patch-{TAKEOVER_UUID}\" }}\n"
+            ),
+        )
+        .await
+        .unwrap();
         tokio::fs::write(
             root.join(".cargo/config.toml"),
             format!(
@@ -5250,8 +5522,10 @@ mod tests {
     // ---- hostile-ledger tamper guards (path traversal) ----------------------
     // The ledgers are committed files an attacker can edit: a recorded
     // lockfile name must never make the wiring probes READ outside the
-    // project root. With nothing discovered the probes fall back to the
-    // ledger's recorded files, which is the path under test.
+    // project root. With nothing discovered the hosted probe and the
+    // vendored prune GC's keep check fall back to the ledger's recorded
+    // files, which is the path under test; vendored LIVENESS reads no file
+    // the ledger names at all.
 
     #[tokio::test]
     async fn hosted_wiring_text_proof_never_reads_outside_the_project() {
@@ -5341,8 +5615,17 @@ mod tests {
             !nothing_discovered.vendor_entry_live(&root, &escaping).await,
             "a '../'-escaping wiring file must never be read"
         );
+        assert_eq!(
+            nothing_discovered
+                .vendor_entry_in_use(&root, &escaping)
+                .await,
+            None,
+            "nor may it keep the entry in use: undecided, as with no wiring recorded"
+        );
 
-        // Positive control: same content, in-project name ⇒ proven live.
+        // Same content under an in-project name the ledger supplies: the
+        // prune GC keeps the entry (the positive control for the guard
+        // above), but a ledger-named file is no liveness proof.
         tokio::fs::write(
             root.join("inside.lock"),
             format!("resolved file:{marker}/minimist-1.2.2.tgz\n"),
@@ -5351,11 +5634,18 @@ mod tests {
         .unwrap();
         let in_project: socket_patch_core::vendor::VendorEntry =
             serde_json::from_value(entry_json("inside.lock")).unwrap();
-        assert!(
+        assert_eq!(
             nothing_discovered
+                .vendor_entry_in_use(&root, &in_project)
+                .await,
+            Some(true),
+            "the identical in-project wiring file keeps the entry from the prune GC"
+        );
+        assert!(
+            !nothing_discovered
                 .vendor_entry_live(&root, &in_project)
                 .await,
-            "the identical in-project wiring file must prove vendored wiring"
+            "raw text never proves vendored wiring: only a discovered reference does"
         );
     }
 

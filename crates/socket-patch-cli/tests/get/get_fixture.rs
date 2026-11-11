@@ -701,7 +701,7 @@ pub fn run_get_via_proxy(cwd: &Path, uri: &str, extra: &[&str]) -> (i32, String,
 }
 
 /// The patched tarball URL [`hosted_project_with_held_lock`] grants.
-pub const HOSTED_URL: &str = "http://patch.test/patch/npm/covgap-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-pkg-1.0.0.tgz";
+pub const HOSTED_URL: &str = "https://patch.test/patch/npm/covgap-pkg/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/covgap-pkg-1.0.0.tgz";
 
 /// The project fixture with [`UUID`] granted for hosted mode at
 /// [`HOSTED_URL`], while another holder keeps `.socket/apply.lock` (until

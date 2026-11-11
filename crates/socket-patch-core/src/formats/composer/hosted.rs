@@ -265,17 +265,18 @@ pub(crate) fn rewrite_composer_lock(
             });
             continue;
         }
+        // The value between the two captured delimiters, written as it is:
+        // a closure, since a template would read a `$` in it as a capture.
+        let between = |value: &str| {
+            let value = value.to_string();
+            move |m: &regex::Captures<'_>| format!("{}{value}{}", &m[1], &m[2])
+        };
         let mut rewritten = type_re.replace(&block, "${1}zip${2}").to_string();
         rewritten = url_re
-            .replace(
-                &rewritten,
-                format!("${{1}}{}${{2}}", dep.artifact_url).as_str(),
-            )
+            .replace(&rewritten, between(&dep.artifact_url))
             .to_string();
         rewritten = if rewritten.contains("\"shasum\": \"") {
-            shasum_re
-                .replace(&rewritten, format!("${{1}}{sha1}${{2}}").as_str())
-                .to_string()
+            shasum_re.replace(&rewritten, between(&sha1)).to_string()
         } else {
             append_composer_shasum(&rewritten, &sha1)
         };

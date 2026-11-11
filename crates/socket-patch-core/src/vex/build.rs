@@ -37,8 +37,9 @@ pub struct BuildOptions {
 
 /// Build a VEX document from a manifest and a set of applied PURLs.
 ///
-/// `applied` is a list of PURLs that have been verified (or were
-/// declared verified via `--no-verify`). Manifest entries not in
+/// `applied` is a list of PURLs that have been verified (a caller that
+/// only declares them applied, as `--no-verify` does, says which with
+/// [`build_document_marking_unverified`]). Manifest entries not in
 /// `applied` are silently dropped — see the design note in
 /// `vex::verify` for why we never emit `affected`.
 ///
@@ -63,10 +64,34 @@ pub fn build_document(
     redirected: &[String],
     opts: &BuildOptions,
 ) -> Option<Document> {
+    build_document_marking_unverified(manifest, applied, vendored, redirected, &[], opts)
+}
+
+/// What [`build_document_marking_unverified`] appends to the impact
+/// statement part of a PURL nothing on disk was checked for. Appended
+/// after the provenance marker, so the three marker strings stay intact.
+pub const NOT_VERIFIED_SUFFIX: &str = "; not verified on disk";
+
+/// [`build_document`], where the PURLs in `unverified` (a subset of
+/// `applied`) were declared applied without any on-disk check
+/// (`--no-verify`): their impact-statement part ends with
+/// [`NOT_VERIFIED_SUFFIX`], so a reader of the document can tell a
+/// statement that rests on hashed bytes from one that rests on the patch
+/// records alone. With no such PURL the document is [`build_document`]'s,
+/// byte for byte.
+pub fn build_document_marking_unverified(
+    manifest: &PatchManifest,
+    applied: &[String],
+    vendored: &[String],
+    redirected: &[String],
+    unverified: &[String],
+    opts: &BuildOptions,
+) -> Option<Document> {
     let timestamp = now_rfc3339();
     let applied_set: HashSet<&str> = applied.iter().map(String::as_str).collect();
     let vendored_set: HashSet<&str> = vendored.iter().map(String::as_str).collect();
     let redirected_set: HashSet<&str> = redirected.iter().map(String::as_str).collect();
+    let unverified_set: HashSet<&str> = unverified.iter().map(String::as_str).collect();
 
     // vuln-id -> (aliases, impact-statement parts, subcomponent PURLs)
     // BTreeMap/BTreeSet keep every output field sorted, which keeps
@@ -82,15 +107,17 @@ pub fn build_document(
             let entry = grouped.entry(vuln_id.clone()).or_default();
             entry.aliases.extend(info.cves.iter().cloned());
             entry.subcomponents.insert(purl.clone());
-            entry
-                .impact_parts
-                .insert(if vendored_set.contains(purl.as_str()) {
-                    format!("Patched via Socket patch {} (vendored)", record.uuid)
-                } else if redirected_set.contains(purl.as_str()) {
-                    format!("Patched via Socket patch {} (redirected)", record.uuid)
-                } else {
-                    format!("Patched via Socket patch {}", record.uuid)
-                });
+            let mut part = if vendored_set.contains(purl.as_str()) {
+                format!("Patched via Socket patch {} (vendored)", record.uuid)
+            } else if redirected_set.contains(purl.as_str()) {
+                format!("Patched via Socket patch {} (redirected)", record.uuid)
+            } else {
+                format!("Patched via Socket patch {}", record.uuid)
+            };
+            if unverified_set.contains(purl.as_str()) {
+                part.push_str(NOT_VERIFIED_SUFFIX);
+            }
+            entry.impact_parts.insert(part);
         }
     }
 
@@ -851,5 +878,80 @@ mod tests {
             "duplicate vendored UUID must collapse: {imp}"
         );
         assert!(imp.contains("(vendored)"));
+    }
+
+    /// A PURL declared applied with nothing checked on disk says so after
+    /// its provenance marker, per part: a statement mixing a hashed patch
+    /// and an unverified one marks only the latter, and the three marker
+    /// strings stay intact.
+    #[test]
+    fn unverified_purls_are_marked_after_their_provenance_marker() {
+        let mut manifest = PatchManifest::new();
+        for (purl, uuid) in [
+            ("pkg:npm/agent@1.0.0", "u-agent"),
+            ("pkg:npm/vend@1.0.0", "u-vend"),
+            ("pkg:npm/host@1.0.0", "u-host"),
+            ("pkg:npm/hashed@1.0.0", "u-hashed"),
+        ] {
+            manifest.patches.insert(
+                purl.to_string(),
+                record(uuid, vec![("GHSA-shared", vec!["CVE-1"])]),
+            );
+        }
+        let applied: Vec<String> = manifest.patches.keys().cloned().collect();
+        let vendored = vec!["pkg:npm/vend@1.0.0".to_string()];
+        let redirected = vec!["pkg:npm/host@1.0.0".to_string()];
+        let unverified: Vec<String> = applied
+            .iter()
+            .filter(|purl| *purl != "pkg:npm/hashed@1.0.0")
+            .cloned()
+            .collect();
+        let doc = build_document_marking_unverified(
+            &manifest,
+            &applied,
+            &vendored,
+            &redirected,
+            &unverified,
+            &opts(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.statements[0].impact_statement.as_deref(),
+            Some(
+                "Patched via Socket patch u-agent; not verified on disk; \
+                 Patched via Socket patch u-hashed; \
+                 Patched via Socket patch u-host (redirected); not verified on disk; \
+                 Patched via Socket patch u-vend (vendored); not verified on disk"
+            )
+        );
+    }
+
+    /// With nothing unverified the marking builder is [`build_document`]:
+    /// the default path's document does not change by a byte.
+    #[test]
+    fn marking_nothing_unverified_changes_nothing() {
+        let mut manifest = PatchManifest::new();
+        manifest.patches.insert(
+            "pkg:npm/x@1.0.0".to_string(),
+            record("u1", vec![("GHSA-x", vec!["CVE-1"])]),
+        );
+        let applied = vec!["pkg:npm/x@1.0.0".to_string()];
+        let untimed = |doc: Option<Document>| {
+            let mut v = serde_json::to_value(doc.unwrap()).unwrap();
+            v["timestamp"] = serde_json::Value::Null;
+            v["statements"][0]["timestamp"] = serde_json::Value::Null;
+            serde_json::to_string(&v).unwrap()
+        };
+        assert_eq!(
+            untimed(build_document(&manifest, &applied, &applied, &[], &opts())),
+            untimed(build_document_marking_unverified(
+                &manifest,
+                &applied,
+                &applied,
+                &[],
+                &[],
+                &opts()
+            ))
+        );
     }
 }

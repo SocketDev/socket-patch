@@ -157,6 +157,38 @@ describe("npm wrapper libc selection (#974)", () => {
     assert.match(logs[0], /ENOENT/);
   });
 
+  // `npm install --omit=optional` leaves the launcher with no platform
+  // package; it must say so, not report ENOENT on an internal path.
+  it("explains a missing platform package and how to get the binary", () => {
+    const root = mkdtempSync(join(tmpdir(), "sp-wrapper-missing-"));
+    try {
+      const binDir = join(root, "node_modules", "@socketsecurity", "socket-patch", "bin");
+      mkdirSync(binDir, { recursive: true });
+      writeFileSync(join(binDir, "socket-patch"), readFileSync(wrapperPath));
+      const run = spawnSync(process.execPath, [join(binDir, "socket-patch"), "--version"], {
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 1);
+      const key = `${process.platform} ${process.arch}`;
+      if (PLATFORMS[key]) {
+        assert.match(run.stderr, /platform package .* is not installed/);
+        assert.ok(run.stderr.includes(PLATFORMS[key][0]), run.stderr);
+        assert.match(run.stderr, /--omit=optional/);
+      } else {
+        assert.match(run.stderr, /no prebuilt binary for this platform/);
+      }
+      assert.doesNotMatch(run.stderr, /ENOENT/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("names the supported platforms on an unsupported one", () => {
+    const message = wrapper.unsupportedPlatformMessage("freebsd x64");
+    assert.match(message, /freebsd x64/);
+    for (const key of EXPECTED_KEYS) assert.ok(message.includes(key), key);
+  });
+
   it("propagates the exit status of a binary that ran", () => {
     const status = wrapper.runFirstUsable(["/gnu", "/musl"], [], {
       spawn: () => ({ status: 3 }),

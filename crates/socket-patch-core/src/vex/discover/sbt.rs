@@ -831,6 +831,7 @@ mod tests {
             jar: b"PK-gson",
             upstream_pom: b"<project>\n  <groupId>com.google.code.gson</groupId>\n  \
                 <artifactId>gson</artifactId>\n  <version>2.8.9</version>\n</project>\n",
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],

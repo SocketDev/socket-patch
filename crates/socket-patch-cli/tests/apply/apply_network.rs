@@ -4,7 +4,8 @@
 //!
 //! Verifies:
 //!   - `apply` (default, online) fetches missing blobs from the API
-//!     and writes them to an OS tempdir (NOT `.socket/`).
+//!     into a transient stage under `.socket/` that it removes again
+//!     (never into the persistent `.socket/blobs/` cache).
 //!   - a cold-cache apply fetches only per-file blobs, never a diff
 //!     archive (v5 removed the diff download path).
 //!   - `apply` against installed packages writes patched content to
@@ -156,6 +157,82 @@ async fn apply_online_fetches_missing_blob_and_patches_file() {
             "apply must not write blobs to .socket/blobs/; found: {entries:?}"
         );
     }
+}
+
+/// The download overlay is staged beside the blob cache, under `.socket/`,
+/// not in the system temp dir: there the next lock holder's sweep finds it
+/// if the run is killed before it can remove it, and the cached blobs are
+/// hardlinked rather than copied across filesystems. So `apply` no longer
+/// needs a usable `$TMPDIR` to fetch a blob, and a finished run leaves
+/// neither a stage nor a cache entry behind.
+#[tokio::test]
+async fn apply_stages_downloads_beside_the_blob_cache() {
+    let before = b"before\n";
+    let after = b"after\n";
+    let after_hash = git_sha256(after);
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!(
+            "/v0/orgs/{ORG_SLUG}/patches/blob/{after_hash}"
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(after.to_vec()))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_root_package_json(tmp.path());
+    install_npm_pkg(tmp.path(), "apply-stage-test", "1.0.0", Some(before));
+    write_manifest(
+        tmp.path(),
+        json!({ "pkg:npm/apply-stage-test@1.0.0": patch_record(
+            "12121212-1212-4121-8121-121212121212",
+            one_file("package/index.js", before, after),
+        )}),
+    );
+
+    // A temp dir that does not exist: a stage created there would fail.
+    let no_tmp = tmp.path().join("no-such-tmp");
+    let out = hermetic::command(&binary())
+        .args(["apply", "--json"])
+        .current_dir(tmp.path())
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", "fake-token-for-test")
+        .env("SOCKET_ORG_SLUG", ORG_SLUG)
+        .env("TMPDIR", &no_tmp)
+        .env("TMP", &no_tmp)
+        .env("TEMP", &no_tmp)
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/apply-stage-test/index.js")).unwrap(),
+        after
+    );
+
+    let mut left: Vec<String> = std::fs::read_dir(tmp.path().join(".socket"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    left.sort();
+    assert_eq!(
+        left,
+        ["blobs", "manifest.json"],
+        "no stage (and no lock) is left under .socket/"
+    );
+    assert_eq!(
+        std::fs::read_dir(tmp.path().join(".socket/blobs"))
+            .unwrap()
+            .count(),
+        0,
+        "the fetched blob never enters the persistent cache"
+    );
+    assert!(!no_tmp.exists(), "nothing recreated the temp dir");
 }
 
 // ---------------------------------------------------------------------------
@@ -931,4 +1008,144 @@ async fn mismatch_overwrites_every_copy_of_a_duplicated_package() {
             "apply must not write to .socket/blobs/; found {entries:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The API client is built on first need: an apply that fetches nothing asks
+// the API nothing and prints no API advisory.
+// ---------------------------------------------------------------------------
+
+/// A token of the real shape, so the client's token-shape warning (printed
+/// when a client is built) never explains a stderr difference.
+const WELL_SHAPED_TOKEN: &str = "sktsec_00000000000000000000000000000000000000000000_api";
+
+/// A project whose one patch is already applied and whose patched blob is
+/// cached: `apply` has nothing to fetch and nothing to write.
+fn write_already_patched_project(root: &Path) {
+    let before = b"lazy client before\n";
+    let after = b"lazy client after\n";
+    write_root_package_json(root);
+    install_npm_pkg(root, "lazy-client", "1.0.0", Some(after));
+    write_manifest(
+        root,
+        json!({ "pkg:npm/lazy-client@1.0.0": patch_record(
+            "55555555-5555-4555-8555-555555555555",
+            one_file("package/index.js", before, after),
+        )}),
+    );
+    stage_blob(root, &git_sha256(after), after);
+}
+
+/// `METHOD /path` for every request `mock` saw.
+async fn request_log(mock: &MockServer) -> Vec<String> {
+    mock.received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect()
+}
+
+/// CA-P01: with a token and no org, building the client asks the API for
+/// the org (`GET /v0/organizations`). A no-op apply — the run CI makes
+/// after every install — needs no client, so it must not ask: its only
+/// request is its own telemetry event, sent on the route the credentials
+/// alone select (no org is known, so the anonymous proxy).
+#[tokio::test]
+async fn noop_apply_with_a_token_and_no_org_never_asks_for_the_org() {
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Lazy", "image": null, "plan": "free", "slug": "lazy-org"
+            }}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_already_patched_project(tmp.path());
+
+    let mut cmd = hermetic::command(&binary());
+    cmd.args(["apply", "--json"]).current_dir(tmp.path());
+    // Telemetry on (the builder forces it off), token set, org absent, and
+    // both hosts pinned to the mock so every request is seen.
+    cmd.env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env("SOCKET_API_TOKEN", WELL_SHAPED_TOKEN);
+    let out = cmd.output().expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("json envelope");
+    assert_eq!(v["events"][0]["errorCode"], "already_patched", "{v}");
+
+    assert_eq!(
+        request_log(&mock).await,
+        ["POST /patch/telemetry"],
+        "a no-op apply's only request is its telemetry event"
+    );
+    assert!(
+        mock.received_requests().await.unwrap()[0]
+            .headers
+            .get("authorization")
+            .is_none(),
+        "the anonymous route never carries the bearer"
+    );
+}
+
+/// CA-U07: the "No SOCKET_API_TOKEN set — using the public patch API
+/// proxy" advisory describes where a fetch goes. A tokenless apply that
+/// fetches nothing must not print it; one that has a blob to download
+/// still does (the anti-vacuous half; its proxy is a closed loopback port).
+#[test]
+fn tokenless_apply_prints_the_proxy_advisory_only_when_it_fetches() {
+    let run = |root: &Path| {
+        let out = hermetic::command(&binary())
+            .args(["apply", "--proxy-url", "http://127.0.0.1:1/"])
+            .current_dir(root)
+            .output()
+            .expect("run socket-patch");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_already_patched_project(tmp.path());
+    let (code, stderr) = run(tmp.path());
+    assert_eq!(code, Some(0), "stderr={stderr}");
+    assert!(
+        !stderr.contains("public patch API proxy"),
+        "nothing was fetched, so no proxy is in use; stderr={stderr}"
+    );
+
+    // Same project with the cached blob gone and the package unpatched:
+    // now the run must download, and says where from.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_already_patched_project(tmp.path());
+    std::fs::remove_dir_all(tmp.path().join(".socket/blobs")).unwrap();
+    std::fs::write(
+        tmp.path().join("node_modules/lazy-client/index.js"),
+        b"lazy client before\n",
+    )
+    .unwrap();
+    let (code, stderr) = run(tmp.path());
+    assert_eq!(code, Some(1), "the download fails; stderr={stderr}");
+    assert_eq!(
+        stderr.matches("public patch API proxy").count(),
+        1,
+        "a run that fetches says which API it uses, once; stderr={stderr}"
+    );
 }

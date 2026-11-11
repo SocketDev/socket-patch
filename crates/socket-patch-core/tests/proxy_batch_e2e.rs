@@ -323,3 +323,307 @@ async fn proxy_batch_fallback_preserves_requested_purl_order() {
         "assembled packages must follow the requested PURL order, not response-completion order"
     );
 }
+
+// ── A fallback that was not answered must not read as "no patches" ──────
+
+/// What a host that is not the patch service answers: a web server's own
+/// error page.
+fn html_page(status: u16) -> ResponseTemplate {
+    ResponseTemplate::new(status).set_body_raw(
+        "<!doctype html><html><head><title>Error</title></head><body>nginx</body></html>",
+        "text/html",
+    )
+}
+
+/// The proxy's catch-all for a route it does not serve.
+fn unsupported_endpoint() -> ResponseTemplate {
+    ResponseTemplate::new(400).set_body_json(json!({
+        "error": "Unsupported endpoint",
+        "message": "Endpoint POST /patch/batch is not supported."
+    }))
+}
+
+fn by_package_path(purl: &str) -> String {
+    format!(
+        "/patch/by-package/{}",
+        purl.replace(':', "%3A")
+            .replace('/', "%2F")
+            .replace('@', "%40")
+    )
+}
+
+async fn mount_package(server: &MockServer, purl: &str, answer: ResponseTemplate) {
+    Mock::given(method("GET"))
+        .and(path(by_package_path(purl)))
+        .respond_with(answer)
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn fallback_no_patch_answers_are_a_success_with_nothing_unanswered() {
+    // Every way the service says "nothing for this package" on the legacy
+    // path: an empty list, its refusal of a PURL it does not serve, and
+    // its own 404 body. All three are answers.
+    let empty = "pkg:npm/empty@1.0.0";
+    let refused = "pkg:jsr/@std/path@0.220.0";
+    let missing = "pkg:npm/missing@1.0.0";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(unsupported_endpoint())
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_package(
+        &server,
+        empty,
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "patches": [], "canAccessPaidPatches": false })),
+    )
+    .await;
+    mount_package(
+        &server,
+        refused,
+        ResponseTemplate::new(400).set_body_json(json!({
+            "error": "Invalid PURL format",
+            "message": "Expected a valid PURL starting with \"pkg:\""
+        })),
+    )
+    .await;
+    mount_package(
+        &server,
+        missing,
+        ResponseTemplate::new(404).set_body_json(json!({
+            "error": { "message": "Not found", "details": null }
+        })),
+    )
+    .await;
+
+    let resp = proxy_client(&server.uri())
+        .search_patches_batch(&[empty.to_string(), refused.to_string(), missing.to_string()])
+        .await
+        .expect("the service answered for every package");
+    assert!(resp.packages.is_empty(), "{:?}", resp.packages);
+    assert!(resp.unanswered.is_empty(), "{:?}", resp.unanswered);
+}
+
+#[tokio::test]
+async fn fallback_returns_the_answered_packages_and_names_the_rest() {
+    // Some lookups answered, others did not: the answered packages are
+    // used, and each one that got no answer is listed with its error, in
+    // the order asked — never dropped as if it had no patches.
+    let patched = PURL;
+    let clean = "pkg:npm/clean@1.0.0";
+    let broken = "pkg:npm/broken@1.0.0";
+    let foreign = "pkg:npm/foreign@1.0.0";
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(unsupported_endpoint())
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_package(
+        &server,
+        patched,
+        ResponseTemplate::new(200).set_body_json(by_package_response_body()),
+    )
+    .await;
+    mount_package(
+        &server,
+        clean,
+        ResponseTemplate::new(200)
+            .set_body_json(json!({ "patches": [], "canAccessPaidPatches": false })),
+    )
+    .await;
+    mount_package(
+        &server,
+        broken,
+        ResponseTemplate::new(500).set_body_string("upstream exploded"),
+    )
+    .await;
+    mount_package(&server, foreign, html_page(404)).await;
+
+    let resp = proxy_client(&server.uri())
+        .search_patches_batch(&[
+            broken.to_string(),
+            patched.to_string(),
+            foreign.to_string(),
+            clean.to_string(),
+        ])
+        .await
+        .expect("two packages were answered");
+    assert_eq!(resp.packages.len(), 1, "{:?}", resp.packages);
+    assert_eq!(resp.packages[0].purl, patched);
+    let unanswered: Vec<(&str, &str)> = resp
+        .unanswered
+        .iter()
+        .map(|u| (u.purl.as_str(), u.error.as_str()))
+        .collect();
+    assert_eq!(unanswered.len(), 2, "{unanswered:?}");
+    assert_eq!(
+        unanswered[0],
+        (
+            broken,
+            "API request failed with status 500: upstream exploded"
+        )
+    );
+    assert_eq!(unanswered[1].0, foreign);
+    assert!(
+        unanswered[1]
+            .1
+            .contains("did not answer like the Socket patch API"),
+        "{unanswered:?}"
+    );
+}
+
+#[tokio::test]
+async fn fallback_with_every_lookup_failing_is_an_error_not_an_empty_result() {
+    // The batch POST is refused, and every per-package GET then fails
+    // with a 500: the service said nothing about any package, so the call
+    // must fail instead of reporting an empty (patch-free) result.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(unsupported_endpoint())
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("upstream exploded"))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let err = proxy_client(&server.uri())
+        .search_patches_batch(&[
+            "pkg:npm/alpha@1.0.0".to_string(),
+            "pkg:npm/omega@1.0.0".to_string(),
+        ])
+        .await
+        .expect_err("no package was answered: the call must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("500") && msg.contains("upstream exploded"),
+        "the error must carry the cause: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_is_not_the_patch_service_is_an_error_naming_it() {
+    // A mistyped proxy URL: the host 404s the batch POST and every
+    // per-package GET with its own HTML page. A 404 that is not the patch
+    // service's answer says nothing about patches.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(html_page(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(html_page(404))
+        .mount(&server)
+        .await;
+
+    let err = proxy_client(&server.uri())
+        .search_patches_batch(&[PURL.to_string()])
+        .await
+        .expect_err("a foreign 404 page must not read as \"no patches\"");
+    let msg = err.to_string();
+    assert!(
+        msg.contains(&server.address().to_string()),
+        "the error must name the host that answered: {msg}"
+    );
+    assert!(
+        msg.contains("--proxy-url") && msg.contains("SOCKET_PROXY_URL"),
+        "the error must say which setting to check: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_400_that_is_not_the_services_is_an_error_without_fallback() {
+    // What a forward proxy or WAF answers for anything: a 400 with its own
+    // page. That is not the batch endpoint rejecting a chunk, so it must
+    // not fan out into one GET per package against the same wrong host.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(html_page(400))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(html_page(400))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let err = proxy_client(&server.uri())
+        .search_patches_batch(&[PURL.to_string()])
+        .await
+        .expect_err("a foreign 400 page must not read as \"no patches\"");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("400") && msg.contains(&server.address().to_string()),
+        "{msg}"
+    );
+    assert!(msg.contains("--proxy-url"), "{msg}");
+}
+
+#[tokio::test]
+async fn a_200_that_is_not_json_fails_the_lookup() {
+    // A captive portal answers every GET with a 200 login page.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(ResponseTemplate::new(405))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(html_page(200))
+        .mount(&server)
+        .await;
+
+    let err = proxy_client(&server.uri())
+        .search_patches_batch(&[PURL.to_string()])
+        .await
+        .expect_err("a login page is not an answer");
+    assert!(matches!(err, ApiError::Parse(_)), "{err:?}");
+    assert!(
+        err.to_string().contains("--proxy-url"),
+        "the error must say which setting to check: {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_proxy_without_the_per_package_route_fails_the_lookup() {
+    // Both routes answer the proxy's "Unsupported endpoint" catch-all: a
+    // Socket proxy that does not serve patches at this URL.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(unsupported_endpoint())
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"^/patch/by-package/.*$"))
+        .respond_with(unsupported_endpoint())
+        .mount(&server)
+        .await;
+
+    let err = proxy_client(&server.uri())
+        .search_patches_batch(&[PURL.to_string()])
+        .await
+        .expect_err("a missing route is not \"no patches\"");
+    assert!(
+        err.to_string().contains("Unsupported endpoint"),
+        "the error must carry the cause: {err}"
+    );
+}

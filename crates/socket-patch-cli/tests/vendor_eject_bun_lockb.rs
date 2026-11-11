@@ -121,9 +121,13 @@ impl Project {
 }
 
 fn record() -> Value {
+    record_of(UUID, PURL)
+}
+
+fn record_of(uuid: &str, purl: &str) -> Value {
     json!({
-        "uuid": UUID,
-        "purl": PURL,
+        "uuid": uuid,
+        "purl": purl,
         "exportedAt": "2026-01-01T00:00:00Z",
         "publishedAt": "2026-01-01T00:00:00Z",
         "files": {
@@ -202,11 +206,15 @@ async fn hosted_project(writer: &str) -> Project {
 /// Legacy agent state alongside the hosted pins. Vendor still selects
 /// the lockfile patches and runs the same eject as a manifest-free repo.
 fn stage_record(root: &Path) {
+    stage_record_of(root, PURL, record());
+}
+
+fn stage_record_of(root: &Path, purl: &str, record: Value) {
     let socket = root.join(".socket");
     std::fs::create_dir_all(socket.join("blobs")).unwrap();
     std::fs::write(
         socket.join("manifest.json"),
-        serde_json::to_vec_pretty(&json!({ "patches": { PURL: record() } })).unwrap(),
+        serde_json::to_vec_pretty(&json!({ "patches": { purl: record } })).unwrap(),
     )
     .unwrap();
     std::fs::write(
@@ -546,20 +554,36 @@ fn vendored_original(root: &Path) -> Value {
 /// A Bun workspace's member-relative mirror of the vendored tarball goes
 /// missing while the canonical tarball still matches its ledger SHA-256:
 /// an offline re-vendor rewrites the mirror from the committed tarball
-/// rather than refusing to redownload an artifact it already holds.
+/// rather than refusing to redownload an artifact it already holds. The
+/// patched package is left-pad, the one the fixture's `packages/helper`
+/// member depends on: a member gets a copy only of what it depends on.
 #[tokio::test]
 async fn offline_vendor_rewrites_a_missing_workspace_mirror() {
+    const MEMBER_UUID: &str = "0a1b2c3d-4e5f-4a7b-8c9d-0e1f2a3b4c5d";
+    const MEMBER_PURL: &str = "pkg:npm/left-pad@1.3.0";
     let p = hosted_project("1.1.45-extensions").await;
     // The pre-hosted lock (`git checkout -- bun.lockb`): a plain vendor.
     std::fs::write(p.root().join("bun.lockb"), &p.pristine).unwrap();
-    stage_record(p.root());
+    let installed = p.root().join("node_modules/left-pad");
+    std::fs::create_dir_all(&installed).unwrap();
+    std::fs::write(
+        installed.join("package.json"),
+        r#"{"name":"left-pad","version":"1.3.0"}"#,
+    )
+    .unwrap();
+    std::fs::write(installed.join("index.js"), ORIG_INDEX).unwrap();
+    let mut view = record_of(MEMBER_UUID, MEMBER_PURL);
+    view["files"]["package/index.js"]["blobContent"] =
+        json!(base64::engine::general_purpose::STANDARD.encode(PATCHED_INDEX));
+    prebuilt_common::mount_view(&p.server, &view, None).await;
+    stage_record_of(p.root(), MEMBER_PURL, record_of(MEMBER_UUID, MEMBER_PURL));
     let (code, env) = p.run_json(&["vendor"]);
     assert_eq!(code, 0, "{env:#}");
-    let canonical = p
-        .root()
-        .join(format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz"));
+    let canonical = p.root().join(format!(
+        ".socket/vendor/npm/{MEMBER_UUID}/left-pad-1.3.0.tgz"
+    ));
     let mirror = p.root().join(format!(
-        "packages/helper/.socket/vendor/npm/{UUID}/minimist-1.2.2.tgz"
+        "packages/helper/.socket/vendor/npm/{MEMBER_UUID}/left-pad-1.3.0.tgz"
     ));
     let tarball = std::fs::read(&canonical).unwrap();
     assert_eq!(std::fs::read(&mirror).unwrap(), tarball, "{env:#}");

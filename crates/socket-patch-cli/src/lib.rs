@@ -5,6 +5,63 @@
 //! is a thin wrapper that delegates to [`parse_argv_with_shortcuts`] and the
 //! `run` function on each command's `Args`.
 
+// The four print macros, crate-wide: every call site in the modules below
+// goes through `socket_patch_core::utils::stdio::print`, so once `main` has
+// opted in (`interrupt::install`) a closed stdout or stderr pipe stops the
+// printing instead of ending a command between two of its writes. Declared
+// before the modules: a `macro_rules!` shadows std's macro only in what
+// follows it.
+macro_rules! println {
+    () => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            true,
+            ::std::format_args!(""),
+        )
+    };
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            true,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! eprintln {
+    () => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            true,
+            ::std::format_args!(""),
+        )
+    };
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            true,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! print {
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stdout,
+            false,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+macro_rules! eprint {
+    ($($arg:tt)*) => {
+        ::socket_patch_core::utils::stdio::print(
+            ::socket_patch_core::utils::stdio::Stream::Stderr,
+            false,
+            ::std::format_args!($($arg)*),
+        )
+    };
+}
+
 pub mod args;
 pub mod commands;
 pub(crate) mod ecosystem_dispatch;
@@ -31,10 +88,20 @@ use socket_patch_core::utils::target::is_uuid_shaped;
     about = "Apply security fixes to the dependency versions you already use",
     version,
     propagate_version = true,
+    // Help wraps to the terminal, and to 100 columns when it is wider or
+    // not a terminal.
+    max_term_width = 100,
     after_help = "Quick start:\n  \
         socket-patch scan --dry-run   Preview patches and dependency-file changes\n  \
         socket-patch scan             Apply patches, then run your package manager's install\n  \
         socket-patch vex -O vex.json  Generate OpenVEX after installing\n\n\
+        Patch modes (scan --mode, get --mode):\n  \
+        hosted    Default. Lockfiles point at Socket-built patched packages, which your\n            \
+        package manager installs; nothing extra runs after an install\n  \
+        vendored  Patched packages are committed under .socket/vendor/; installs need no\n            \
+        Socket service\n  \
+        agent     Patches are recorded in .socket/ and written into installed packages;\n            \
+        run `socket-patch apply` after every install\n\n\
         Use 'socket-patch <command> -h' for common options, or '--help' for all options."
 )]
 pub struct Cli {

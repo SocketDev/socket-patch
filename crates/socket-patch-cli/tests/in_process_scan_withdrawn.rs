@@ -31,11 +31,11 @@ const NAME: &str = "in-proc-redirect";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 /// The replacement patch a superseding offer pins.
 const UUID2: &str = "33333333-3333-4333-8333-333333333333";
-const HOSTED_URL2: &str = "http://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/in-proc-redirect-1.0.0.tgz";
+const HOSTED_URL2: &str = "https://patch.test/patch/npm/in-proc-redirect/1.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/in-proc-redirect-1.0.0.tgz";
 const PATCHED_SHA512_2: &str = "sha512-REPLACEMENTreplacementREPLACEMENT0123456==";
 
 fn scan_args(cwd: &Path, api_url: String, dry_run: bool) -> ScanArgs {
@@ -49,7 +49,7 @@ fn scan_args(cwd: &Path, api_url: String, dry_run: bool) -> ScanArgs {
             api_token: Some("fake".to_string()),
             api_url: Some(api_url),
             // The mock patch host's pins count as hosted.
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             json: true,
             yes: true,
             dry_run,
@@ -505,7 +505,7 @@ async fn the_envelope_reports_the_restored_pin() {
             "--api-url",
             &server.uri(),
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             tmp.path().to_str().unwrap(),
         ])
@@ -532,6 +532,221 @@ async fn the_envelope_reports_the_restored_pin() {
     assert_eq!(restored[0]["errorCode"], "patch_withdrawn", "{envelope:#}");
     assert_eq!(restored[0]["details"]["mode"], "hosted");
     assert_eq!(lock(tmp.path()), pristine);
+}
+
+/// `scan --json --mode hosted` through the binary, with `env` added to the
+/// child: the exit code and the envelope.
+fn scan_binary(root: &Path, server: &MockServer, env: &[(&str, &str)]) -> (Option<i32>, Value) {
+    let mut cmd = hermetic::binary_command();
+    for key in ["NPM_CONFIG_REGISTRY", "npm_config_registry"] {
+        cmd.env_remove(key);
+    }
+    let out = cmd
+        .env(
+            "SOCKET_NPM_REGISTRY",
+            format!("{}/npm-registry", server.uri()),
+        )
+        .envs(env.iter().copied())
+        .args([
+            "scan",
+            "--json",
+            "--yes",
+            "--mode",
+            "hosted",
+            "--org",
+            ORG,
+            "--api-token",
+            "fake",
+            "--api-url",
+            &server.uri(),
+            "--patch-server-url",
+            "https://patch.test",
+            "--cwd",
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run socket-patch");
+    let envelope: Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "scan --json stdout must be a JSON envelope: {e}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+    (out.status.code(), envelope)
+}
+
+fn events_with<'a>(envelope: &'a Value, action: &str) -> Vec<&'a Value> {
+    envelope["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["action"] == action)
+        .collect()
+}
+
+/// The `redirect_withdrawn_restore_failed` warning details.
+fn restore_failed_warnings(envelope: &Value) -> Vec<&str> {
+    envelope["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "redirect_withdrawn_restore_failed")
+        .map(|w| w["detail"].as_str().unwrap())
+        .collect()
+}
+
+/// A withdrawn pin whose restored lockfile cannot be written (here: the
+/// lock is a symbolic link) is kept and reported as not restored: a
+/// `redirect_withdrawn_restore_failed` warning naming the pin, no
+/// `rolledBack` event, status and exit unchanged.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_withdrawn_pin_that_cannot_be_written_is_not_reported_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired) = wired_project(tmp.path()).await;
+    let link = tmp.path().join("package-lock.json");
+    std::fs::rename(&link, tmp.path().join("shared-lock.json")).unwrap();
+    std::os::unix::fs::symlink("shared-lock.json", &link).unwrap();
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[]).await;
+    mock_references(
+        &server,
+        serde_json::json!({ UUID: { "status": "withdrawn" } }),
+    )
+    .await;
+    mock_npm_registry(&server).await;
+    let (code, envelope) = scan_binary(tmp.path(), &server, &[]);
+
+    assert_eq!(code, Some(0), "{envelope:#}");
+    assert_eq!(envelope["status"], "success", "{envelope:#}");
+    assert!(
+        events_with(&envelope, "rolledBack").is_empty(),
+        "{envelope:#}"
+    );
+    let warnings = restore_failed_warnings(&envelope);
+    assert_eq!(warnings.len(), 1, "{envelope:#}");
+    assert!(
+        warnings[0].starts_with(&format!(
+            "{PURL}: writing the restored lockfiles failed: package-lock.json is a symbolic link"
+        )),
+        "{envelope:#}"
+    );
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(lock(tmp.path()), wired, "the pin is kept");
+}
+
+/// A restore that fails part-way and cannot put its first file back leaves
+/// the project half restored: the scan stops there with
+/// `lockfile_write_failed` instead of pinning the replacement over it.
+#[tokio::test]
+#[serial]
+async fn a_half_restored_withdrawn_pin_stops_the_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (_, wired) = wired_project(tmp.path()).await;
+    let npmrc = tmp.path().join(".npmrc");
+    assert_eq!(
+        std::fs::read_to_string(&npmrc).unwrap(),
+        "allow-remote=all\n",
+        "the restore spans two files: the .npmrc the wiring scan created, then the lock"
+    );
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[UUID2]).await;
+    mock_references(
+        &server,
+        serde_json::json!({
+            UUID: { "status": "withdrawn" },
+            UUID2: granted(HOSTED_URL2, PATCHED_SHA512_2),
+        }),
+    )
+    .await;
+    mock_view(&server, UUID2).await;
+    mock_npm_registry(&server).await;
+    let (code, envelope) = scan_binary(
+        tmp.path(),
+        &server,
+        &[(
+            "SOCKET_PATCH_FAILPOINT",
+            "hosted_restore_write@2~fail,hosted_restore_put_back~fail",
+        )],
+    );
+
+    assert_eq!(code, Some(1), "{envelope:#}");
+    assert_eq!(envelope["status"], "error", "{envelope:#}");
+    assert_eq!(
+        envelope["error"]["code"], "lockfile_write_failed",
+        "{envelope:#}"
+    );
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(".npmrc is left deleted")
+            && message.contains("every other file is unchanged"),
+        "{message}"
+    );
+    assert!(
+        events_with(&envelope, "rolledBack").is_empty(),
+        "{envelope:#}"
+    );
+    assert_eq!(restore_failed_warnings(&envelope).len(), 1, "{envelope:#}");
+    assert!(
+        !npmrc.exists(),
+        "the one file the restore could not put back"
+    );
+    assert_eq!(
+        lock(tmp.path()),
+        wired,
+        "the rewrite must not run over the half-restored project"
+    );
+}
+
+/// The same fault with the first file put back: nothing was changed, so
+/// the pin is kept with a warning and the scan goes on to pin the
+/// replacement, as after any refused restore.
+#[tokio::test]
+#[serial]
+async fn a_failed_restore_that_was_put_back_does_not_stop_the_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    wired_project(tmp.path()).await;
+
+    let server = MockServer::start().await;
+    mock_search(&server, &[UUID2]).await;
+    mock_references(
+        &server,
+        serde_json::json!({
+            UUID: { "status": "withdrawn" },
+            UUID2: granted(HOSTED_URL2, PATCHED_SHA512_2),
+        }),
+    )
+    .await;
+    mock_view(&server, UUID2).await;
+    mock_npm_registry(&server).await;
+    let (code, envelope) = scan_binary(
+        tmp.path(),
+        &server,
+        &[("SOCKET_PATCH_FAILPOINT", "hosted_restore_write@2~fail")],
+    );
+
+    assert_eq!(code, Some(0), "{envelope:#}");
+    assert!(
+        events_with(&envelope, "rolledBack").is_empty(),
+        "{envelope:#}"
+    );
+    let warnings = restore_failed_warnings(&envelope);
+    assert_eq!(warnings.len(), 1, "{envelope:#}");
+    assert!(
+        warnings[0].starts_with(&format!("{PURL}: writing the restored lockfiles failed: "))
+            && warnings[0].ends_with("put back, so nothing was changed"),
+        "{envelope:#}"
+    );
+    let after = lock(tmp.path());
+    assert!(
+        after.contains(HOSTED_URL2) && !after.contains(UUID),
+        "the replacement is pinned over the kept pin:\n{after}"
+    );
+    assert!(tmp.path().join(".npmrc").exists());
 }
 
 /// The uuids each reference request asked about, in request order.

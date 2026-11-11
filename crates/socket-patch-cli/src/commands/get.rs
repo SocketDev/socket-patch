@@ -30,11 +30,12 @@ use crate::args::{apply_env_toggles, GlobalArgs};
 // the engine itself lives in the shared `agent_download` helper.
 use crate::commands::agent_download::{
     decide_patch_action, download_patch_records_preflighted, download_patch_records_reusing,
-    filter_to_installed_releases, max_vuln_severity, nested_apply_args, patch_event_metadata,
-    record_apply_outcome, report_lock_failure, run_nested_apply, run_outcome, tag_mode,
-    unwind_new_blobs, vendored_download_refusals, warn_if_manifest_gitignored,
-    warn_on_vendored_uuid_drift, write_all_patch_blobs, DetachedDownload, PatchAction,
-    ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED, RELEASE_NARROWING,
+    filter_to_installed_releases, max_vuln_severity, nested_apply_args,
+    next_steps as agent_next_steps, patch_event_metadata, record_apply_outcome, recorded_purls,
+    report_lock_failure, run_nested_apply, run_outcome, tag_mode, unwind_new_blobs,
+    vendored_download_refusals, warn_if_manifest_gitignored, warn_on_vendored_uuid_drift,
+    write_all_patch_blobs, DetachedDownload, PatchAction, ALREADY_IN_MANIFEST, BLOB_WRITE_FAILED,
+    RELEASE_NARROWING,
 };
 pub use crate::commands::agent_download::{
     download_and_apply_patches_into, download_and_apply_patches_with, DownloadParams, DownloadRun,
@@ -1809,6 +1810,15 @@ pub async fn run(args: GetArgs) -> i32 {
     let code = download_and_apply_patches_into(&selected, &params, &run, &mut env).await;
     if args.common.json {
         emit(&env);
+    } else if !quiet && code == 0 && !args.common.is_global() {
+        for line in agent_next_steps(
+            &recorded_purls(&env),
+            &args.common.socket_dir(),
+            &args.common.project_root(),
+            args.save_only,
+        ) {
+            println!("{line}");
+        }
     }
     code
 }
@@ -2041,7 +2051,11 @@ async fn save_and_apply_patch(
     // See `download_and_apply_patches_with`: the RMW runs under the lock,
     // which also creates `.socket/` and prunes it again when nothing lands;
     // an error return below drops the guard.
-    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, lock_timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(
+        &socket_dir,
+        lock_timeout,
+        args.common.dry_run,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             let err = report_lock_failure(args.common.json, &socket_dir, &e, lock_timeout);
@@ -2053,6 +2067,7 @@ async fn save_and_apply_patch(
             return 1;
         }
     };
+    let commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&guard);
 
     let action = match save_patch_record(args, &manifest_path, &socket_dir, patch).await {
         Ok(action) => action,
@@ -2074,7 +2089,7 @@ async fn save_and_apply_patch(
     // explicitly fetched this uuid; if the vendor ledger still wires a
     // different one, VEX verification fails closed (`vendor_uuid_mismatch`)
     // until a `vendor` run refreshes the committed artifact.
-    let mut warnings: Vec<RunWarning> = Vec::new();
+    let mut warnings: Vec<RunWarning> = commit_recovery.into_iter().collect();
     let recorded = [(patch.purl.clone(), patch.uuid.clone())];
     if changed {
         warn_on_vendored_uuid_drift(&args.common.project_root(), quiet, &recorded, &mut warnings)
@@ -2130,6 +2145,17 @@ async fn save_and_apply_patch(
     // status `error` above — so only the apply step can degrade us.
     let apply_failed = !apply_succeeded && !args.save_only;
     let exit_code = run_outcome(false, apply_failed);
+
+    if !quiet && changed && exit_code == 0 && !args.common.is_global() {
+        for line in agent_next_steps(
+            &[patch.purl.as_str()],
+            &socket_dir,
+            &args.common.project_root(),
+            args.save_only,
+        ) {
+            println!("{line}");
+        }
+    }
 
     if args.common.json {
         let mut env = new_envelope(&args.common);
@@ -2386,6 +2412,7 @@ async fn run_get_vendored(
         prior: None,
         download_errors: dl_code != 0,
         telemetry_auth: telemetry,
+        closing_lines: None,
     })
     .await
     {

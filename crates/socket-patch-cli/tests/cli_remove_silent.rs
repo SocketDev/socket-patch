@@ -188,11 +188,14 @@ fn write_vendor_state_wired(root: &Path, purl: &str, uuid: &str, detached: bool,
     std::fs::write(vendor.join("state.json"), state).expect("write vendor state");
 }
 
-/// A wiring record naming a file the npm revert backend does not edit:
-/// the backend emits a `vendor_lock_entry_drifted` warning and DRIFT-KEEPS
+/// A wiring record the npm revert backend leaves alone — a kind this build
+/// does not know (a newer build's), in a file it does not edit: the
+/// backend emits a `vendor_lock_entry_drifted` warning and DRIFT-KEEPS
 /// (`kept_artifact`) — since v5.0 the caller then keeps the ledger entry
 /// AND the manifest entry, and an all-kept remove exits 1 — fully offline.
-const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_lock_entry", "action": "added", "key": "node_modules/x" }]"#;
+/// (A kind this build DOES write, naming a file its backend never edits,
+/// is not drift: the revert refuses it, `vendor_revert_tamper_e2e`.)
+const DRIFTED_WIRING: &str = r#"[{ "file": "weird.txt", "kind": "npm_kind_of_a_newer_build", "action": "added", "key": "node_modules/x" }]"#;
 
 /// `--silent` must also gate the vendor-revert chatter on the manifest
 /// path: removing a vendored patch printed "Reverted vendoring for ..."

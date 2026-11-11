@@ -17,7 +17,7 @@ The backticked slug in each row is the value `-e`/`--ecosystems` accepts (e.g.
 | npm (`npm`) — pnpm / yarn / berry / bun / vlt | ✅ any install layout, vlt's `node_modules/.vlt` store included (every store copy, copy-on-write) | ✅ seven lockfile flavors: package-lock, yarn classic, yarn berry (node-modules linker; PnP refused), pnpm v9, pnpm legacy v5.4/v6.0 (`pnpm 7/8` — frozen installs are path-bound because those majors absolutize `file:` override specifiers; moved checkouts run one `pnpm install --offline --no-frozen-lockfile`, surfaced as `vendor_pnpm_legacy_absolute_specifier`), bun text `bun.lock` lockfileVersion 0/1/2 and native binary `bun.lockb` revisions 1/2/3 (binary locks stay binary; text workspace vendoring requires lockfileVersion 2 — see [Bun compatibility](testing/bun-compatibility.md)), vlt `vlt-lock.json` lockfileVersion 0/1 (patched package directories for direct dependencies of the root or a workspace member; transitive targets refused — see [vlt notes](#npm-vlt-notes)). Rush monorepos refused (`vendor_rush_unsupported`) — see [Rush notes](#npm-rush-monorepos) | ✅ package-lock / npm-shrinkwrap, pnpm-lock.yaml and legacy shrinkwrap.yaml (pnpm majors 1–12; block and flow resolutions), yarn classic, yarn berry, bun, vlt (`vlt-lock.json` without `lockfileVersion`, 0 or 1) — pnpm, berry, bun and vlt carry constraints, see [npm hosted-mode notes](#npm-hosted-mode-notes) and [vlt notes](#npm-vlt-notes) |
 | PyPI (`pypi`) — uv / poetry / pdm / pipenv / pip | ✅ in place | ✅ uv project/script locks, PEP 751 `pylock.toml` / `pylock.<name>.toml`, poetry, pdm, pipenv (Pipenv 2018 or later — every `Pipfile.lock` category is rewired, lock-only checkouts included; Pipenv 2023+ does not hash-check local wheels — `vendor_integrity_unverified`; Pipenv 2023.7.9+ exports the vendored wheel without a hash, so `pipenv requirements --hash` output fails pip's hash-checking mode — `pypi_pipenv_hash_export_unsupported`; a venv still holding the upstream release is reported as `pypi_pipenv_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)), and requirements.txt. Native uv vendoring requires uv ≥ 0.2.35 (the `[[package]]` lock grammar); hosted mode covers native `uv.lock` from uv 0.1.45 (the first release whose `uv lock` writes one) and requirements from uv 0.0.5; see [uv compatibility](testing/uv-compatibility.md). | ✅ requirements.txt including hash continuations, uv project/script locks, and PEP 751 locks. Version/source ambiguity is refused; see [uv compatibility](testing/uv-compatibility.md). Poetry 1.x and 2.x locks are supported; Poetry 0.x ignores URL sources and is refused. See [Poetry compatibility](testing/poetry-compatibility.md). Pipenv `Pipfile.lock` (pipfile-spec 6 — Pipenv 7 and later; `path` references for 7–11, `file` from 2018; lock-only checkouts and Pipenv's out-of-tree venv are discovered; a warm venv that Pipenv will not reinstall over warns `redirect_pypi_stale_install`; see [Pipenv compatibility](testing/pipenv-compatibility.md)). `pdm.lock` is supported for the lock formats PDM 0.12–1.4 and 2.8.1+ write (`lock_version` 2 / 4.3–4.5.1); the identity-losing 3.1 / 4.0–4.2 formats (PDM 1.8–2.7) are refused. PDM 2.8.0 writes an indistinguishable `4.3` lock but shares that identity-loss bug, so a rewritten 2.8.0 lock crashes `pdm sync` — upgrade to ≥ 2.8.1. See [PDM compatibility](testing/pdm-compatibility.md). |
 | Cargo (`cargo`) | ✅ in-place + `.cargo-checksum.json` rewrite (shared registry-cache caveat — see [Cargo: shared registry cache](#cargo-shared-registry-cache)) | ✅ `[patch.crates-io]` path entry in the root `Cargo.toml` (v5; per-version Socket keys; pre-v5 `.cargo/config*` wiring migrates on re-run) | ✅ per-patch sparse registry (`[registries.socket-patch-<uuid>]` + Cargo.lock source/checksum); needs cargo 1.68+ (sparse registries) — a project whose `rust-version` or `rust-toolchain[.toml]` declares an older cargo is refused (`redirect_cargo_old_cargo`), use `--mode vendored`; direct dependencies only — a crate another dependency also pulls in is refused, use `--mode vendored`; a crate the user overrides with `[patch]` (path, git or another registry) is refused too, the override is left alone; a `cargo vendor` or `cargo local-registry` project (crates.io replaced by an on-disk source in the project's, a parent directory's or `$CARGO_HOME`'s `.cargo/config*`) is refused, use agent mode; with no `Cargo.lock` the graph is unknown, so only a project whose sole dependency is the patched crate is redirected |
-| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ per-dep `source` block — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (older locks get a `redirect_gem_no_checksums_section` warning); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is flagged `redirect_gem_stale_install` with a prescriptive remedy (see CLI_CONTRACT.md's "Gem stale-install guard") |
+| RubyGems (`gem`) | ✅ in place | ✅ Gemfile + Gemfile.lock path pair (a CRLF `Gemfile.lock`, as a `core.autocrlf` checkout leaves it, is edited and reverted in its own line ending, and a lock mixing CRLF and LF fails closed; `Gemfile` spelling only — a `gems.rb` twin, which bundler ≥ 2 loads instead, or a `BUNDLE_GEMFILE`-configured manifest makes vendoring refuse with `gemfile_not_loaded` before any write) | ✅ a `source:` option on the gem's own declaration, the lock converged to match (see [Ruby gems: hosted mode](#ruby-gems-hosted-mode)) — edits `gems.rb` + `gems.locked` or `Gemfile` + `Gemfile.lock`, whichever the project holds (a `Gemfile` + `gems.rb` twin is refused with `redirect_gem_twin_manifest_ambiguous`: bundler 1.x loads the `Gemfile`, bundler ≥ 2 loads `gems.rb`, and nothing in the project says which bundler installs it; bundler 4's `BUNDLE_LOCKFILE` (environment, app config or global config) naming any other lock is refused with `redirect_gem_bundle_lockfile_unsupported`, as is vendoring with `gemfile_not_loaded`; spellings that diverge beyond Socket's own edits fail closed with `redirect_gem_gemfile_spellings_diverge`; `BUNDLE_GEMFILE` from `.bundle/config` (which outranks the environment, as in bundler), the environment, or the global `~/.bundle/config` / `$BUNDLE_USER_CONFIG` (lowest, as in bundler) is followed when it names the project's `Gemfile` / `gems.rb`, and any other configured manifest is refused with `redirect_gem_bundle_gemfile_unsupported`); a Bundler all-source, exact-source or hostname mirror in app config or the scan environment can capture the patch registry, so the redirect is refused with `redirect_gem_mirror_overrides_source` without printing mirror URLs (scope mirrors to `mirror.https://rubygems.org`; user-global config and mirrors set only in a later install environment are not inspected); the `CHECKSUMS` pin needs bundler ≥ 2.6 (an older lock is still pinned by source and installs frozen; the run says once, with `redirect_gem_no_checksums_section`, that it cannot record the checksums); a stale pre-redirect materialization that `bundle install` would reuse instead of refetching is replaced with the verified patched gem when it is the project's own, else flagged `redirect_gem_stale_install` with the remedy (see "Ruby gems: gems already installed" below and CLI_CONTRACT.md's "Gem stale-install guard") |
 | Go (`golang`) | ✅ `go.mod` `replace` → `.socket/go-patches/` — see [Go: directory replaces and go.sum](#go-directory-replaces-and-gosum) | ✅ `replace` → the committed vendor tree | ✅ (free tier) fork-style `replace` → `patch.socket.dev/gopatch/<uuid>` + committed `go.sum` pin; see [Go notes](#go-directory-replaces-and-gosum). Paid hosted patches are unsupported; `redirect_golang_unsupported` names the vendored remedy |
 | Maven (`maven`) — Maven and Gradle | ✅ in place in every copy the build consumes: each `~/.m2` copy it reads and each Gradle `files-2.1` copy; `~/.m2` `.sha1`/`.md5` sidecars are rewritten, Gradle copies get advisories; jar-member records swap in the patch service's whole jar — prefer vendored / hosted, see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) | ✅ suffixed Maven repository (`<version>-socket.<hex8>` pin + `.mvn/maven.config` + fallback file repository) for every pom root, single-module or reactor, or Gradle 6.8+ same-GAV repository with settings wiring and SHA-256 checks (a root with both `pom.xml` and a Gradle build wires both); see [JVM vendoring](design/maven-vendoring.md) and [Gradle](#gradle) | ✅ fail-closed by a Socket-only `<version>-socket.<hex8>` suffix: pom projects get a pinned `<version>` (`${property}` versions are refused); Gradle 6.8+ builds get an owned settings script, lock-entry rewrites and a resolution tripwire — see [Maven & NuGet caveats](#maven--nuget-caveats) and [Gradle](#gradle) |
 | sbt / Mill / scala-cli (`maven`) | ✅ Coursier caches (sbt 1.3+, sbt 2, Mill, scala-cli) and Ivy caches (sbt 0.13–1.2, `useCoursier := false`) patched in place, Coursier checksum sidecars resynced — see [Scala build tools](#scala-build-tools-sbt-mill-scala-cli) | ✅ sbt 0.13.18+: generated `socket-patch-vendor.sbt` over the committed suffixed `.socket/vendor/maven2` tree; scala-cli directory builds: owned `socket-patch.scala` + same-GAV `.socket/vendor/coursier` tree (Linux / macOS); Mill: not wired (agent or hosted guidance) | ✅ sbt 0.13.18+: one generated `socket-patch.sbt`, gated on sbt's own `sbt update` records; Mill / scala-cli: paste-able snippets only (`redirect_mill_manual_snippet`, `redirect_scala_cli_manual_snippet`) |
@@ -110,7 +110,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   (`redirect_npm_shrinkwrap_only` / `vendor_npm_shrinkwrap_only`), and `vex`
   omits those patches (`vex_npm_shrinkwrap_only`) while `list`, `rollback` and
   `remove` still manage them; rename the lock to package-lock.json (or commit
-  a copy under that name) and re-run. A Deno project's `deno install` reads
+  a copy under that name) and re-run. A project whose own rc file tells the
+  package manager not to read the lock (npm `package-lock=false`, yarn 1
+  `--install.no-lockfile`, a yarn berry `lockfileFilename` naming another
+  file) installs from the registry whatever the lock pins: `vex` then attests
+  a hosted pin only from an installed tree that verifies, and omits a
+  vendored pin (`vex_lock_not_read`). A Deno project's `deno install` reads
   only `deno.lock`, never an npm-family lock, so a hosted or vendored npm pin
   of a `name@version` that `deno.lock` also locks warns
   (`redirect_npm_deno_lock` / `vendor_npm_deno_lock`) and `vex` omits it
@@ -190,7 +195,12 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   and the scan names the copy (`redirect_copy_unpatched` in hosted mode,
   `vendor_copy_unpatched` in vendored mode); `vex` attests nothing for the
   package while the copy is in the lock. A directory's version is read from
-  its `package.json` (#935).
+  its `package.json` (#935); one that cannot be read (outside the project,
+  missing) may be any version, so `vex` withholds every pin of the package
+  the lock keys it by. The same holds for a copy pnpm fetches from a git
+  remote or a url tarball (`left-pad@git+https://…` with its `version:`
+  line), and, in pnpm 8 and older locks, for a second registry key of the
+  same `name@version` (one per peer set) left on the registry.
   A workspace with `sharedWorkspaceLockfile: false` (`shared-workspace-lockfile=false`
   in `.npmrc` on pnpm 10 and older) installs each member from its own lock:
   run from the workspace root, every `packages:` member's `pnpm-lock.yaml` is
@@ -214,7 +224,9 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   pnpm never reads `pnpm-lock.yaml` and installs from the registry, so hosted
   mode refuses the pnpm pins with `redirect_pnpm_lockfile_disabled` and
   lock-only `vex` attests no hosted pin from that lock. Use `--mode vendored`,
-  which pnpm applies through `overrides` without a lock.
+  which pnpm applies through `overrides` without a lock; `vex` attests such a
+  vendored pin only while the override map that pnpm reads still routes the
+  package to its artifact, and omits it otherwise (`vex_lock_not_read`).
   For 9.0 root or member locks, the CLI configures `trustLockfile: true` in
   the root `pnpm-workspace.yaml` unless opted out with `--no-trust-lockfile-config` or
   explicitly disabled by the project or, for pnpm >=11, by a
@@ -386,8 +398,11 @@ Each Legacy format has an upgrade path and an undo path. Both work in v5:
   `yarn install`, `yarn add` or `yarn workspace <name> …` run from a member directory
   fails ("Tarball is not in network and can not be located in cache"), whether or not the
   member depends on the patched package (yarn 1.7.0, 1.10.1 and 1.22.22; no relative
-  spelling installs from both). Installs from the workspace root work, and warm the cache
-  for later member-directory commands. A vendored run in such a project warns
+  spelling installs from both). Installs from the workspace root work, as does
+  `yarn install --cwd <workspace root>` run from a member directory, and either warms the
+  cache for later member-directory commands. Vendoring adds nothing to the members to
+  change this: yarn fetches the whole workspace from any member, so a tarball copy would
+  be needed in every one of them. A vendored run in such a project warns
   `yarn_classic_workspace_member_install_risk`; hosted mode, which pins an absolute URL,
   is not affected.
 - **yarn classic git dependencies** — yarn 1 fetches a git pattern (`git+https:`,
@@ -781,6 +796,26 @@ when every dependency is optional (0.0.0-30 … 1.0.4 install none from the lock
 optional dependency (a plain `vlt install` keeps the link to the removed vendored
 directory) or a link still into the vendored directory.
 
+`vendor --revert` undoes every recorded surface or none, and removes the directory only
+when nothing the project installs from still names it. A lock edge the ledger never
+recorded that still reaches the vendored node, such as the edge of a workspace that was
+pointed at the vendored copy after vendoring, leaves the whole revert alone as drift
+(`vendor_lock_entry_drifted` names the edge and its `package.json`): undoing the node
+under it would leave that edge dangling. Anything else that still names the uuid
+directory (an importer `package.json` with no lock edge behind it yet) keeps the directory
+and the ledger entry (`vendor_revert_residual_reference` names it) with the recorded
+wiring restored.
+`vendor --revert --dry-run` replays the same records without writing, so it reports the
+same keeps, failures and reinstall advice as the real run.
+
+A workspace directory that is a symbolic link is never written through: vendoring refuses
+the package (`vendor_lock_entry_unsupported`) before anything is staged, and a revert
+leaves a record for its `package.json` alone as drift. The `nodes` and `edges` sections are
+edited line by line, so a lock is taken as canonical only when the lines found for them
+are the top-level members themselves; one with a same-named member nested elsewhere at
+that indent is refused (`vendor_lockfile_version_unsupported`) by vendoring and revert
+alike.
+
 **Workspace members.** vlt installs a workspace member from the root's `vlt-lock.json`
 and ignores any lock in the member, so a hosted or vendored run from a member is refused
 (`redirect_workspace_lockfile_elsewhere`, `vendor_lockfile_missing`) and names the root
@@ -858,6 +893,21 @@ Honest limits of the Maven and NuGet flows — documented behavior, not bugs:
   profile) is therefore refused with `redirect_maven_multimodule_unsupported` (`pom.xml` and
   `.mvn/` are left untouched and the dep is not counted as redirected); use `scan --mode vendored`, whose reactor planner rewrites each module's
   declaration. `vex` likewise does not attest a hosted pin found in a reactor root.
+* **A parent pom can override a managed pin (hosted Maven).** For a dependency with no
+  literal `<version>` in the root pom (a transitive one, or one whose version a parent
+  manages), hosted mode pins it in the root pom's `<dependencyManagement>`
+  (`redirect_maven_dep_management_added`). Maven applies a managed version only to a
+  dependency that declares none, and a pom inherits its parents' `<dependencies>`: when a
+  parent pom declares the package with a version, the build resolves that version and
+  the pin does nothing. `vex` follows the parent chain through the checkout and writes no
+  statement in that case (`vex_maven_parent_declares`, naming the parent pom). Declare
+  the package in the root pom's `<dependencies>` with no `<version>`: its own
+  declaration replaces the inherited one, and the pin then governs it. When the parent is
+  not in the checkout (`<relativePath/>`, as Spring Initializr writes it, or a parent
+  resolved from a repository), `vex` cannot read what it declares, so a managed-only pin
+  is attested only after a build has resolved the patched version: until then it is
+  omitted as `package_not_found`. A pin on the root pom's own declaration is not
+  affected.
 * **Trusted Checksums reinforcement (hosted Maven, 3.9.4+).** When the patch server
   supplies both the jar and pom sha256, the rewriter also emits Maven
   [Trusted Checksums](https://maven.apache.org/resolver/expected-checksums.html) files —
@@ -1118,7 +1168,8 @@ Gradle hash directory, and the suffixed copies of a hosted pin. A derived copy p
 to come from the unpatched jar, or an older one that does not match the patched jar,
 withholds the statement (`vex_gradle_unpatched_copy`). A derived-cache walk cut short
 on a very large cache warns `vex_gradle_derived_cache_unchecked` and does not
-withhold.
+withhold; a derived-cache check that does not finish at all withholds the statement
+(`vex_gradle_derived_cache_check_failed`).
 
 ## Scala build tools: sbt, Mill, scala-cli
 
@@ -1457,6 +1508,35 @@ version = "1.0.4+socket.<uuid>"
   untagged copy and lock entry (`cargo_version_tagged`). Every revert
   removes both spellings.
 
+## Cargo: what `vex` attests from the lock
+
+`vex` attests a hosted or vendored crate only from files cargo acts on.
+
+- **A hosted lock entry needs a declaration that routes it.** Cargo resolves a
+  dependency from the source its declaration names. A `Cargo.lock` entry sourced
+  from a Socket patch registry therefore counts only while a declaration cargo
+  honors sends that version there: a dependency in the root `Cargo.toml` or a
+  workspace member's with `registry = "socket-patch-<uuid>"` and a requirement
+  that accepts the locked version (what hosted scan writes), or a hand-written
+  `[patch.<source>]` entry with that registry in the root manifest or the project
+  cargo config. Without one, cargo takes the crate from crates.io and rewrites the
+  lock, or fails under `--locked`. So `vex` attests nothing for a crate that only
+  registry dependents declare, for a registry named only on a `[patch]` entry
+  cargo ignores (a `[patch."https://github.com/rust-lang/crates.io-index"]` table
+  replaces `[patch.crates-io]`) or on a `[workspace.dependencies]` entry nothing
+  inherits, or for a lock with no readable `Cargo.toml` beside it. The run warns
+  `patched_ref_unattributable` and names the lock entry; `rollback` and `remove`
+  still restore it.
+- **Run it from the workspace root.** Cargo ignores `[patch]` in a workspace
+  member and reads `Cargo.lock` only at the workspace root. Run from a member (a
+  directory an ancestor `[workspace]` does not `exclude`, or a package with
+  `package.workspace`), `vex` reads no cargo wiring: a `[patch]` path entry, a
+  registry pin and a `Cargo.lock` left beside the member attest nothing. Each
+  member file that names a Socket patch gets a `patched_ref_unattributable`
+  warning that names the workspace root; `rollback` and `remove` still unwind a
+  hosted pin left there. Hosted scan and `vendor` refuse the same directories
+  (`cargo_manifest_not_workspace_root`).
+
 ## Go: directory replaces and go.sum
 
 Both Go modes work through a `go.mod` `replace` directive pointing at a committed
@@ -1728,6 +1808,148 @@ Important limits:
 The implemented hosted shape and fresh-checkout behavior are exercised by
 [`e2e_golang_hosted_build.rs`](../crates/socket-patch-cli/tests/e2e_golang_hosted_build.rs).
 
+## Ruby gems: hosted mode
+
+`scan --mode hosted` makes Bundler install a patched gem from that patch's own gem source on
+the patch registry. It edits the `Gemfile` (or `gems.rb`) and its lock, and nothing else.
+
+**The Gemfile.** The gem's declaration gains one option, `source:`, after its last argument.
+The rest of the declaration stays byte for byte: the version requirement, the other options,
+the quoting, the comment, the indentation and the `group` block around it.
+
+```ruby
+# before
+gem "rack", "~> 2.2.3"       # web server interface
+# after
+gem "rack", "~> 2.2.3", source: "https://patch.socket.dev/patch-registry/gem/<token>/<patch-uuid>/"       # web server interface
+```
+
+The same goes for a declaration in parentheses (`gem("rack", "2.2.3")`), one that continues
+over several lines (the option goes after the last argument, on that argument's line), one with
+a trailing `if` / `unless` modifier (the option goes before the modifier), and one followed by
+another statement after a `;`.
+
+A patched gem the Gemfile does not declare (a dependency of another gem) gets one line at the
+end of the file, after one blank line:
+
+```ruby
+gem "nokogiri", "1.13.6", source: "https://patch.socket.dev/patch-registry/gem/<token>/<patch-uuid>/", require: false # added by socket-patch (transitive dependency)
+```
+
+`require: false` keeps `Bundler.require` from loading the gem at boot, which it did not do
+before the line was there; the gems that depend on it load it as they always did. The line is in
+the default group, so `bundle install` installs the gem in every environment, including one that
+leaves out the group of the only gem that depends on it.
+
+**The lock.** The lock is edited to what Bundler itself writes for that Gemfile, so the pair
+installs under frozen and deployment mode (`BUNDLE_FROZEN=true`, `bundle install --deployment`,
+`bundle config set frozen true`) as it is committed:
+
+- the gem's spec moves to a `GEM` section whose `remote:` is the patch's source (a lock written
+  by Bundler 2.2 or later), or that source joins the `remote:` lines of the lock's one `GEM`
+  section (a lock written by Bundler 1.17 to 2.1);
+- its `DEPENDENCIES` entry keeps the requirement the Gemfile declares and gains `!`
+  (`rack (~> 2.2.3)!`); a transitive gem gets the entry `nokogiri (= 1.13.6)!`;
+- where the lock has a `CHECKSUMS` section (Bundler 2.6 and later), the gem's entry holds the
+  sha256 of the patched gem. A lock without the section cannot record it: the gem is pinned by
+  its source alone, and the scan says so once (`redirect_gem_no_checksums_section`).
+
+A lock records the Bundler that wrote it (`BUNDLED WITH`), not the one that installs it, so the
+lock is converged for the one that wrote it. For a lock written by Bundler 1.17 to 2.1 the scan
+says which Bundler the pair is for (`redirect_gem_merged_lock_layout`): later Bundlers deprecate a
+`GEM` section with several remotes and from 2.5 on refuse it under frozen mode. If a newer
+Bundler installs the project, run `bundle lock` with it and re-run the scan.
+
+The scan output names what it changed:
+
+```text
+Added `source:` to 2 gem declarations in Gemfile (puma and rack); added 1 line for the transitive dependency nokogiri.
+```
+
+**When a gem is left alone.** The scan never writes a pair Bundler would refuse. A gem it cannot
+wire is skipped, neither file changes for it, and the warning says why and what to do:
+
+| Warning | The gem is skipped when |
+|---|---|
+| `redirect_gem_unrecognized_declaration` | its declaration cannot be edited in place: a heredoc or a `do` block among its arguments, other code before it on its line, a last argument that may be an options hash (`gem "rack", OPTS`). Write it as one `gem "<name>", …` call with literal arguments on a line of its own. |
+| `redirect_gem_source_option` | the declaration already selects a source (`source:`, `git:`, `github:`, `path:`, a `**opts` splat that may hold one), sits inside a `source` / `git` / `github` / `path` block, or the lock resolves the gem from a `GIT` / `PATH` section. Bundler allows one source per gem. |
+| `redirect_gem_declared_more_than_once` | the Gemfile declares it more than once. Merge the declarations into one. |
+| `redirect_gem_declaration_not_visible` | the lock lists it as a direct dependency, but it is declared where the scan cannot edit: an `eval_gemfile`d file, a loop, a gemspec. |
+| `redirect_gem_dependency_not_locked` | the Gemfile declares it and the lock's `DEPENDENCIES` does not list it. Run `bundle lock` and re-run. |
+| `redirect_gem_lock_unconvergeable` | the lock cannot be brought in line with the Gemfile: it has no `BUNDLED WITH` section to say which layout its Bundler accepts, or a Bundler < 2.2 lock lists its sources in an order the Gemfile's `source` lines do not explain. Run `bundle lock` with your current Bundler and re-run. |
+| `redirect_gem_platform_unsupported` | the lock holds a platform-specific build of the gem (`nokogiri (1.16.0-x86_64-linux)`); the patch registry serves the `ruby` platform gem only. |
+
+`--mode vendored` or `--mode agent` can still patch a gem hosted mode skips.
+
+**Undoing it.** `rollback` and `remove` take the option (or the added line) off again and
+restore the lock: the pair is the pre-scan pair byte for byte, with LF or CRLF line endings.
+
+**Projects pinned by socket-patch 5.0 or 5.1.** Those releases replaced the declaration with a
+`source "<url>" do … end` block that declares the exact version. Such a pin keeps working: a
+re-scan leaves the block as it is (and brings a lock that never followed it in line), and
+`list` and `vex` read it. The block does not hold the declaration it replaced, so `rollback` /
+`remove` bring the gem back as the exact pin `gem "<name>", "<version>"` and say so
+(`upstream_gem_declaration_pinned`): if the requirement was a range such as `~> 2.2`, put it
+back by hand and run `bundle lock`.
+
+**Keep the Gemfile and the lock together.** Bundler takes a gem from the source its Gemfile
+declaration names; a lock that names another source is out of date to it. If the Gemfile loses
+the `source:` option while the lock keeps the patch's `GEM` section (a `git checkout` of one
+file, or a merge that took the other side of the Gemfile), a frozen install fails with "the list
+of sources changed" and an ordinary `bundle install` rewrites the lock and installs the
+unpatched gem (Bundler 1.17.2, 2.1.4, 2.4.22, 2.5.23 and 4.0.15 all do; the same holds for a
+vendored gem whose Gemfile loses its `path:`). `vex` therefore attests a gem only when the
+Gemfile (or `gems.rb`) beside the lock gives it the source the lock resolves it from. Otherwise
+it warns `patched_ref_unattributable`, naming the gem and what the Gemfile says instead, and
+writes no statement for it. To patch the gem again, run `bundle install` once without frozen
+mode so the lock follows the Gemfile, then re-run `socket-patch scan` (or `vendor`): a hosted
+scan skips a gem whose lock entry is still pinned to a source (`redirect_gem_source_option`).
+`rollback` and `remove` still see and unwind a hosted lock section left this way.
+
+## Ruby gems: gems already installed
+
+Bundler keeps a gem it has already installed, whatever source `Gemfile.lock` names for it. After
+a hosted scan repoints the lock at the patched gem, `bundle install` still prints `Using rack
+2.2.3` and "Bundle complete!" over the unpatched copy, and `bundle install --redownload` and
+`bundle pristine` reinstall from the unpatched archive RubyGems kept beside it (Bundler 2.6 and
+later refuse it instead, on the lock's checksum). A `vendor/cache` filled by `bundle cache` has the
+same problem on every fresh checkout.
+
+So hosted mode (`scan` / `get --mode hosted`) replaces those copies itself, right after it
+rewrites the lock:
+
+- an installed gem whose gem home is inside the project (`vendor/bundle`, a `BUNDLE_PATH` or
+  `GEM_HOME` under the project), together with the `.gem` archive RubyGems reinstalls it from;
+- an archive in Bundler's cache dir (`vendor/cache`, or the configured `cache_path`). It is a
+  committed file: the run lists it with the files to commit.
+
+They are replaced with the patched `.gem` the lock pins, checked against that sha256 first. A gem
+with a native extension is installed into a staging directory by RubyGems, with the Ruby that
+owns the installed copy, and swapped in once it has compiled; with no such Ruby, or with
+`--no-gem-native-rebuild`, it is left alone. After the scan `bundle exec` runs the patched code,
+and every kind of reinstall keeps it. `rollback` and `remove` do the same with the upstream gem.
+Vendoring a gem that was hosted (`vendor`, `scan --mode vendored`) leaves the installed copies as
+they are: Bundler loads the vendored copy from then on.
+
+Nothing is changed when the patched gem cannot be downloaded or verified: the run still exits 0
+and warns (`redirect_gem_stale_install`), naming the files to remove by hand. `--dry-run` only
+says what it would replace. `--no-gem-install-refresh` (or `SOCKET_NO_GEM_INSTALL_REFRESH=1`)
+turns the refresh off.
+
+Gems in a gem home **outside** the project (the system gems, `~/.gem`, an rbenv or asdf home) are
+not touched: another project on the machine may use the same copy. The run prints one warning
+naming them. Either install the project's gems into the project, where Bundler fetches the patched
+ones:
+
+```
+bundle config set --local path vendor/bundle && bundle install
+```
+
+or re-run with `--gem-refresh-shared` (or `SOCKET_GEM_REFRESH_SHARED=1`) to replace the copies in
+the shared gem home. Another project that pins the upstream build of the same gem version then
+loads the patched code too, and its `bundle pristine` fails on the checksum until it is patched
+as well.
+
 ## Ruby gems: native extensions
 
 Some gem fixes change only a C extension's sources (`ext/**/*.c`, `*.h`, `extconf.rb`). Ruby
@@ -1748,6 +1970,11 @@ tail of the build output. When it can't rebuild at all (a precompiled platform g
 checkout, or no matching Ruby), nothing is written and the package fails with
 `native_extensions_unsupported`. Use hosted mode for those.
 
+The rebuild runs the gem's own build scripts (`extconf.rb`, `make`), as `gem install` did, and
+only after the patch's files verified against the installed gem. Nothing of the gem is run
+before that: `apply --dry-run` starts no Ruby and reports that a rebuild is pending. Ruby and the
+build run without the Socket token in their environment.
+
 A tool that compiles the extension itself after `apply` (as the patches evaluation harness does)
 passes `--no-gem-native-rebuild` (or `SOCKET_NO_GEM_NATIVE_REBUILD=1`): the sources are written
 without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does not attest them.
@@ -1756,6 +1983,11 @@ without a rebuild, with a `native_extension_not_rebuilt` warning, and `vex` does
 `rollback` restores it without recompiling, and records what it built in
 `.socket-patch-native-build.json`. `vex` attests the patch only while that record matches the
 installed extension: after `gem pristine` or a reinstall, run `apply` again.
+
+Interrupting `apply` during a rebuild (Ctrl-C, a cancelled CI job) stops the build with it. The
+gem is then left with its patched sources and no finished extension until Socket Patch runs
+again: `apply` puts the previous build back and completes the rebuild, and `rollback` restores the
+original sources and build.
 
 ## Supported platforms
 

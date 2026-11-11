@@ -446,6 +446,12 @@ pub(crate) async fn dispatch_revert_one_opts(
     {
         return RevertOutcome::failed(vendor::path::vendor_dir_symlink_detail(&link));
     }
+    // Before any read or write: the ledger is committed, so every record is
+    // held to the files its ecosystem's backend edits (a pull request's
+    // ledger must not aim a revert at `.git/config` or a workflow).
+    if let Some(refusal) = vendor::state::wiring_refusal(entry, project_root).await {
+        return RevertOutcome::failed(refusal);
+    }
     match vendor::jvm::layout::ledger_ecosystem(&entry.ecosystem) {
         "npm" => vendor::npm_flavor::revert_npm_any_opts(entry, project_root, opts).await,
         "pypi" => vendor::pypi::revert_pypi_opts(entry, project_root, opts).await,
@@ -998,6 +1004,11 @@ pub async fn run(args: VendorArgs) -> i32 {
         }
     };
 
+    // What a lock acquire of this run did about an interrupted run's commit
+    // journal, for whichever envelope the run goes on to print (stderr has
+    // it already).
+    let mut commit_recovery: Option<RunWarning> = None;
+
     // Hosted pins are the input, even when an agent manifest also exists.
     // The raw lockfile inventory does not require VEX eligibility or an
     // installed copy of a patch. Revert needs only the vendor ledger.
@@ -1005,7 +1016,9 @@ pub async fn run(args: VendorArgs) -> i32 {
         // A commit journal a killed eject left is replayed (by taking the
         // apply lock) before the lockfiles are read: the pins must come
         // off the committed state, or a re-run would eject again from the
-        // hosted lock the replay is about to replace (#1782).
+        // hosted lock the replay is about to replace (#1782). A dry run
+        // replays nothing, so it stops here rather than preview an eject
+        // off the half-committed lock.
         if tokio::fs::symlink_metadata(
             args.common
                 .cwd
@@ -1015,9 +1028,18 @@ pub async fn run(args: VendorArgs) -> i32 {
         .is_ok()
         {
             let timeout = Duration::from_secs(args.common.lock_timeout.unwrap_or(0));
-            if let Err(e) = crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
-                let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
-                return emit_eject_refusal(&args.common, code, &message);
+            match crate::commands::lock_cli::acquire_with_status(
+                &socket_dir,
+                timeout,
+                args.common.dry_run,
+            ) {
+                Ok(guard) => {
+                    commit_recovery = crate::commands::lock_cli::commit_recovery_warning(&guard);
+                }
+                Err(e) => {
+                    let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
+                    return emit_eject_refusal(&args.common, code, &message);
+                }
             }
         }
         let inventory = crate::commands::hosted_inventory(&args.common, &args.common.cwd).await;
@@ -1047,7 +1069,7 @@ pub async fn run(args: VendorArgs) -> i32 {
                     ),
                 );
             }
-            return run_eject(&args, pins).await;
+            return run_eject(&args, pins, commit_recovery).await;
         }
     }
 
@@ -1083,6 +1105,7 @@ pub async fn run(args: VendorArgs) -> i32 {
             let mut env = Envelope::new(Command::Vendor);
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
+            env.warnings.extend(commit_recovery);
             match vex_result.as_ref() {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
@@ -1185,6 +1208,12 @@ pub async fn run(args: VendorArgs) -> i32 {
 
     let mut env = Envelope::new(Command::Vendor);
     env.dry_run = args.common.dry_run;
+    // `--revert` skips the journal replay above, so its lock is the one
+    // that finishes an interrupted commit.
+    env.warnings.extend(commit_recovery.or_else(|| {
+        lock.as_ref()
+            .and_then(crate::commands::lock_cli::commit_recovery_warning)
+    }));
     // A token whose org could not be resolved put the run on the proxy
     // (stderr already said so); the embedded `--vex` reuses this client and
     // leaves reporting it to the host's `warnings[]`.
@@ -1328,6 +1357,9 @@ async fn run_check(args: &VendorArgs) -> i32 {
     };
     let go_sync_issues =
         socket_patch_core::vendor::go_consumer_sync::audit(root, &HashMap::new()).await;
+    // Read only: the parents of a suffixed Maven pom, when a cache of this
+    // machine holds them, say whether the pom resolves what its upstream does.
+    let jvm_caches = socket_patch_core::crawlers::jvm_cache::all_local_roots(root);
     for (key, entry) in entries {
         let record = entry.record.as_ref().or_else(|| manifest.patches.get(key));
         let mut failure = match record {
@@ -1338,7 +1370,12 @@ async fn run_check(args: &VendorArgs) -> i32 {
             None => Some("patch record missing; restore the manifest or vendor ledger".to_string()),
         };
         if failure.is_none() && vendor::jvm::apply::is_jvm_entry(entry) {
-            match vendor::jvm::apply::check_entry(root, entry, local_repo.as_deref()) {
+            match vendor::jvm::apply::check_entry_in(
+                root,
+                entry,
+                local_repo.as_deref(),
+                &jvm_caches,
+            ) {
                 Ok(None) => {}
                 // Intact and wired, but `vex` will not attest it: a
                 // declaration may still build the base. Re-vendoring cannot
@@ -1892,7 +1929,11 @@ impl EjectSnapshot {
 /// pin's upstream registry entry is restored first (not per purl by the
 /// engine's takeover), so `vendor --revert` later returns the project to
 /// upstream, not to hosted.
-async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
+async fn run_eject(
+    args: &VendorArgs,
+    pins: Vec<HostedPin>,
+    commit_recovery: Option<RunWarning>,
+) -> i32 {
     let common = &args.common;
     // A ledger git would not commit refuses before anything is fetched or
     // restored, so the project stays hosted (#1638).
@@ -1903,7 +1944,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     {
         return emit_eject_refusal(common, code, &detail);
     }
-    let user_patch_warnings =
+    let mut run_warnings =
         match super::user_patches::check(common, pins.iter().map(|p| &p.purl)).await {
             Ok(warnings) => {
                 super::user_patches::warn(common, &warnings);
@@ -1911,6 +1952,9 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
             }
             Err(error) => return super::user_patches::refuse(common, Command::Vendor, error),
         };
+    // The envelope's copy of what stderr already said: the user-patch
+    // warnings above, and what the journal replay before the eject did.
+    run_warnings.extend(commit_recovery.map(|w| (w.code, w.detail)));
     let (client, use_public_proxy) =
         get_api_client_with_overrides(common.api_client_overrides()).await;
     let telemetry = TelemetryAuth::for_client(&client);
@@ -1968,7 +2012,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !fetch_failures.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.warnings.extend(
-            user_patch_warnings
+            run_warnings
                 .into_iter()
                 .map(|(code, detail)| crate::json_envelope::RunWarning { code, detail }),
         );
@@ -2068,7 +2112,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if !refused.is_empty() {
         let mut env = Envelope::new(Command::Vendor);
         env.warnings.extend(
-            user_patch_warnings
+            run_warnings
                 .into_iter()
                 .map(|(code, detail)| RunWarning { code, detail }),
         );
@@ -2102,7 +2146,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     if common.dry_run {
         let mut env = Envelope::new(Command::Vendor);
         env.warnings.extend(
-            user_patch_warnings
+            run_warnings
                 .into_iter()
                 .map(|(code, detail)| RunWarning { code, detail }),
         );
@@ -2151,7 +2195,11 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     // exactly as it was, and every file it never wrote untouched.
     let socket_dir = common.socket_dir();
     let timeout = Duration::from_secs(common.lock_timeout.unwrap_or(0));
-    let guard = match crate::commands::lock_cli::acquire_with_status(&socket_dir, timeout) {
+    let guard = match crate::commands::lock_cli::acquire_with_status(
+        &socket_dir,
+        timeout,
+        common.dry_run,
+    ) {
         Ok(guard) => guard,
         Err(e) => {
             let (code, message) = crate::commands::lock_cli::lock_failure(&e, timeout);
@@ -2181,7 +2229,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
     };
     let mut env = Envelope::new(Command::Vendor);
     env.warnings.extend(
-        user_patch_warnings
+        run_warnings
             .into_iter()
             .map(|(code, detail)| RunWarning { code, detail }),
     );
@@ -2392,7 +2440,7 @@ async fn run_eject(args: &VendorArgs, pins: Vec<HostedPin>) -> i32 {
         // The vendored summary and its "Next steps:", deferred until the
         // eject is known to stand: a failed one is rolled back (or needs
         // the manual restore its error names), so neither applies.
-        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true);
+        print_vendor_closing(common, &env, 0, &capture.wired_flavors, true, None);
     }
     note_classic_migration_risk(&mut env, &common.cwd, common);
     drop(guard);
@@ -3131,7 +3179,7 @@ pub(crate) async fn vendor_records(
     ledger: std::io::Result<VendorState>,
 ) -> bool {
     vendor_records_reusing(
-        common, records, sources, detached, force, env, service, ledger, None, None,
+        common, records, sources, detached, force, env, service, ledger, None, None, None,
     )
     .await
 }
@@ -3154,6 +3202,9 @@ pub(crate) async fn vendor_records_reusing(
     ledger: std::io::Result<VendorState>,
     prior: Option<&NpmCrawlSnapshot>,
     mut eject: Option<&mut EjectCapture>,
+    // Lines for the human close to print under its summary line (see
+    // `VendoredBackend::with_closing_lines`).
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) -> bool {
     let mut has_errors = false;
     // This run's events start here (`scan --mode vendored` hands over an
@@ -4316,28 +4367,51 @@ pub(crate) async fn vendor_records_reusing(
     // undone: the eject prints it itself once it knows the outcome (#1005).
     match eject {
         Some(capture) => capture.wired_flavors = wired_flavors,
-        None => print_vendor_closing(common, env, dry_in_sync, &wired_flavors, !commit_failed),
+        None => print_vendor_closing(
+            common,
+            env,
+            dry_in_sync,
+            &wired_flavors,
+            !commit_failed,
+            closing_lines,
+        ),
     }
 
     has_errors
 }
 
-/// The human close of a vendor run: the summary line, then — when
-/// something was vendored and `next_steps` (the run's commit landed) — the
-/// commit and reinstall "Next steps:" for the lockfile flavors the run
-/// wired.
+/// The human close of a vendor run: the summary line, the caller's
+/// `closing_lines` for the packages the run vendored or found already
+/// vendored, then — when something was vendored and `next_steps` (the run's
+/// commit landed) — the commit and reinstall "Next steps:" for the lockfile
+/// flavors the run wired.
 fn print_vendor_closing(
     common: &GlobalArgs,
     env: &Envelope,
     dry_in_sync: u32,
     wired_flavors: &HashSet<String>,
     next_steps: bool,
+    closing_lines: Option<&super::vendored_backend::ClosingLines<'_>>,
 ) {
     if common.json || common.silent {
         return;
     }
     let tally = VendorTally::from_envelope(env, common.dry_run, dry_in_sync);
     println!("{}", format_vendor_summary(common.dry_run, &tally));
+    if let Some(lines) = closing_lines {
+        let vendored: Vec<&str> = env
+            .events
+            .iter()
+            .filter(|e| {
+                e.action == PatchAction::Applied
+                    || e.error_code.as_deref() == Some("already_vendored")
+            })
+            .filter_map(|e| e.purl.as_deref())
+            .collect();
+        for line in lines(&vendored) {
+            println!("{line}");
+        }
+    }
     if env.summary.applied > 0 && !common.dry_run && next_steps {
         // pnpm >=11 reads `overrides` ONLY from pnpm-workspace.yaml (the
         // package.json `pnpm.overrides` mirror is ignored), so pnpm-wired

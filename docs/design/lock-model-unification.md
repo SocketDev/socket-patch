@@ -312,7 +312,9 @@ A format whose planner merge is large splits into two PRs, readers first.
   contentHash)`, are verified anywhere against raw bytes. Socket-served
   packages may be unsigned, in which case the two hashes agree. PR 10 checks
   this before it adds `NugetContentHash`.
-* Whether the raw-text fallbacks (`hosted_wiring_in_files`,
-  `vendored_wiring_live`) can go entirely. They exist for formats that no
-  reader reads and for patch servers outside the allowlist. PR 13 decides
-  from what is left by then.
+* Whether the remaining raw-text fallbacks can go entirely:
+  `hosted_wiring_in_files` (hosted ledger liveness, for formats that no
+  reader reads and for patch servers outside the allowlist) and
+  `vendored_wiring_recorded` (only the prune GC's reason to keep a vendor
+  entry; vendor ledger liveness reads discovered references alone). PR 13
+  decides from what is left by then.

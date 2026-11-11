@@ -215,7 +215,8 @@ struct Api {
 
 impl Api {
     /// Serve each `(uuid, view)` on the public-proxy route (the one an
-    /// unauthenticated `vex` fetches from). Any other request 404s.
+    /// unauthenticated `vex` fetches from), and an empty answer to a scan's
+    /// patch lookup. Any other request 404s.
     fn start(views: Vec<(&str, Value)>) -> Self {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -226,6 +227,7 @@ impl Api {
             .unwrap();
         let server = rt.block_on(async {
             let server = MockServer::start().await;
+            crate::vex_e2e_common::mount_empty_patch_search(&server).await;
             for (uuid, body) in views {
                 Mock::given(method("GET"))
                     .and(path(format!("/patch/view/{uuid}")))
@@ -389,7 +391,10 @@ fn assert_attested(fx: &Fx, run: &Run, purl: &str, uuid: &str, marker: &str, wha
     );
     assert_eq!(
         st["impact_statement"],
-        format!("Patched via Socket patch {uuid} ({marker})"),
+        format!(
+            "Patched via Socket patch {uuid} ({marker}){}",
+            crate::vex_e2e_common::unverified_suffix(&run.env)
+        ),
         "{what}: {st}"
     );
     let verified: Vec<&Value> = run.env["events"]

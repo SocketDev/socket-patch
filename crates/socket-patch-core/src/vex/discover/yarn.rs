@@ -5,9 +5,13 @@
 //! rewriters' own sniff ([`is_berry_lock`]: `(?m)^__metadata:` ⇒ berry).
 //! Both grammars are
 //! read through the entry models the lock inventory shares
-//! ([`classic_entries`] / [`berry_entries`], over the vendor backends' own
-//! block scanner: key line at column 0 ending `:`, indented body,
-//! CRLF-aware), so discovery sees exactly the blocks the writers edit.
+//! ([`classic_entries`] / [`berry_entries_with_complex_keys`], over the
+//! vendor backends' own block scanner: key line at column 0 ending `:`,
+//! indented body, CRLF-aware), so discovery sees exactly the blocks the
+//! writers edit, plus the one berry shape they do not: an entry under a
+//! YAML complex key (`? "<descriptors>"`, a lone `:`, the body), which
+//! berry writes for a key longer than 1024 characters. It installs like
+//! any other entry, so it is read as one.
 //!
 //! **Last block wins.** yarn parses a lock into an object, so a descriptor
 //! (key pattern) repeated on a later block — a mangled merge — shadows the
@@ -92,7 +96,7 @@ use super::{
     ClassicPinnedBlock, DiscoverCtx, Discovery, LocateOpts, PatchedRef, VendorRef, Wired,
     DIAG_LOCKFILE_UNPARSEABLE, DIAG_REF_INVALID, DIAG_REF_UNATTRIBUTABLE,
 };
-use crate::formats::yarn::blocks::{berry_field, classic_field};
+use crate::formats::yarn::blocks::{berry_field, classic_field, is_complex_key_line};
 use crate::formats::yarn::copy::{berry_copy_ref, classic_copy_ref, CopyRef};
 use crate::formats::yarn::is_berry_lock;
 use crate::formats::yarn::patterns::{
@@ -102,7 +106,7 @@ use crate::formats::yarn::patterns::{
 use crate::formats::yarn::source::{classic_copy_source, CopySource};
 use crate::utils::digest::is_sri_pin;
 use crate::vendor::lock_inventory::yarn::{
-    berry_checksum_pin, berry_entries, classic_entries, BerryLock, YarnEntry,
+    berry_checksum_pin, berry_entries_with_complex_keys, classic_entries, BerryLock, YarnEntry,
 };
 use crate::vendor::lock_inventory::LockIntegrity;
 
@@ -114,7 +118,8 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         return;
     };
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
-    if let Some(line) = stray_top_level_line(text) {
+    let berry = is_berry_lock(text);
+    if let Some(line) = stray_top_level_line(text, berry) {
         out.diag(
             DIAG_LOCKFILE_UNPARSEABLE,
             YARN_LOCK,
@@ -125,20 +130,78 @@ pub(crate) async fn extract(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         );
         return;
     }
-    if is_berry_lock(text) {
-        extract_berry(ctx, berry_entries(text), out).await;
+    if berry {
+        extract_berry(ctx, berry_entries_with_complex_keys(text), out).await;
     } else {
         extract_classic(ctx, classic_entries(text), out).await;
     }
+    if let Some(why) = yarn_lock_turned_off(ctx, berry).await {
+        out.unpin_lock_not_read(YARN_LOCK, &why);
+        out.unattest_vendored_not_read(YARN_LOCK, &why, |_| false);
+    }
+}
+
+/// What the project's own yarn rc does when it keeps yarn from reading
+/// `yarn.lock`, for the yarn that reads this lock's grammar (yarn 1 never
+/// reads `.yarnrc.yml`, berry never `.yarnrc`):
+///
+/// * classic: a `no-lockfile` flag in `.yarnrc`, for `install`, for every
+///   command (`--*.`) or bare. `yarn install` then neither reads nor writes
+///   the lock, `--frozen-lockfile` included, and resolves every dependency
+///   from the registry (measured on yarn 1.22.19). yarn turns the flag on
+///   for any value but a literal `false`;
+/// * berry: `lockfileFilename` in `.yarnrc.yml` naming another file. yarn
+///   2 and 3 read and write that file and never `yarn.lock`; yarn 4 rejects
+///   the setting and installs nothing (measured on 2.4.3, 3.8.7, 4.5.3).
+///
+/// Either way the lock's pins prove nothing about what installs.
+async fn yarn_lock_turned_off(ctx: &DiscoverCtx<'_>, berry: bool) -> Option<String> {
+    use crate::formats::yarn::classic_rc::{settings, RcScalar};
+    if berry {
+        let rc = ctx.read_advisory_text(".yarnrc.yml").await?;
+        let name = crate::formats::yarn::rc::raw_setting(&rc, "lockfileFilename")?;
+        return (name != YARN_LOCK).then(|| {
+            format!(
+                "`lockfileFilename: {name}` in .yarnrc.yml makes yarn 2 and 3 read and write \
+                 that file instead of {YARN_LOCK} (yarn 4 rejects the setting and installs \
+                 nothing)"
+            )
+        });
+    }
+    let rc = ctx.read_advisory_text(".yarnrc").await?;
+    let settings = settings(&rc)?;
+    let flag = ["--install.no-lockfile", "--*.no-lockfile", "--no-lockfile"]
+        .into_iter()
+        .find(|flag| {
+            settings
+                .get(*flag)
+                .is_some_and(|value| *value != RcScalar::Bool(false))
+        })?;
+    Some(format!(
+        "`{flag}` in .yarnrc makes yarn 1 neither read nor write {YARN_LOCK}, so `yarn install` \
+         resolves every dependency from the registry"
+    ))
 }
 
 /// The first column-0 line that is neither blank, a `#` comment, nor an
-/// entry key (`…:`) — both yarn grammars reject such a file, so nothing
-/// read from it would be what yarn installs.
-fn stray_top_level_line(text: &str) -> Option<&str> {
-    text.lines()
+/// entry key — both yarn grammars reject such a file, so nothing read
+/// from it would be what yarn installs. A key is a line ending in `:`,
+/// or, in a `berry` lock, the `? <key>` line of a complex-key entry (the
+/// one grammar decision of [`is_complex_key_line`], which the entry model
+/// reads the entry by).
+fn stray_top_level_line(text: &str, berry: bool) -> Option<&str> {
+    let mut lines = text
+        .lines()
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
-        .find(|l| !l.is_empty() && !l.starts_with([' ', '\t', '#']) && !l.ends_with(':'))
+        .peekable();
+    while let Some(line) = lines.next() {
+        let entry_key =
+            line.ends_with(':') || (berry && is_complex_key_line(line, lines.peek().copied()));
+        if !line.is_empty() && !line.starts_with([' ', '\t', '#']) && !entry_key {
+            return Some(line);
+        }
+    }
+    None
 }
 
 // ── classic ──────────────────────────────────────────────────────────────
@@ -1064,6 +1127,191 @@ mod tests {
             "resolutions": res,
         })
         .to_string()
+    }
+
+    /// What a lock yarn is configured not to read still proves: a hosted
+    /// ref keeps no lockfile basis, a vendored one is marked
+    /// [`UnattestedKind::LockNotRead`], and the refs stay refs.
+    fn assert_lock_not_read(out: &Discovery, off: bool, what: &str) {
+        assert_refs(
+            out,
+            &[
+                ("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted),
+                ("pkg:npm/@scope/pkg@2.0.0", UUID_B, WiringMode::Vendored),
+            ],
+        );
+        let hosted = out.refs.iter().find(|r| r.uuid == UUID_A).unwrap();
+        assert_eq!(hosted.lockfile_basis_ok(), !off, "{what}");
+        let marks: Vec<(&str, UnattestedKind)> = out
+            .unattested
+            .iter()
+            .map(|u| (u.purl.as_str(), u.kind))
+            .collect();
+        let expected: &[(&str, UnattestedKind)] = if off {
+            &[("pkg:npm/@scope/pkg@2.0.0", UnattestedKind::LockNotRead)]
+        } else {
+            &[]
+        };
+        assert_eq!(marks, expected, "{what}");
+        let unread = out.diagnostics.iter().any(|d| {
+            d.code == DIAG_REF_UNATTRIBUTABLE && d.detail.contains("pkg:npm/left-pad@1.3.0")
+        });
+        assert_eq!(unread, off, "{what}: {:#?}", out.diagnostics);
+    }
+
+    /// yarn 1's `no-lockfile` flag set in the project `.yarnrc` (for
+    /// `install`, for every command, or bare) makes `yarn install` neither
+    /// read nor write yarn.lock, `--frozen-lockfile` included (measured on
+    /// yarn 1.22.19): every dependency resolves from the registry, so the
+    /// lock's pins prove nothing about what installs.
+    #[tokio::test]
+    async fn classic_lock_turned_off_in_yarnrc_attests_nothing_from_the_lock_alone() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let vendored = format!("file:./.socket/vendor/npm/{UUID_B}/@scope/pkg-2.0.0.tgz#{SHA1}");
+        let lock = classic(&[
+            classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI)),
+            classic_block("\"@scope/pkg@2.0.0\"", "2.0.0", &vendored, Some(SRI)),
+        ]);
+        for (yarnrc, off) in [
+            ("--install.no-lockfile true\n", true),
+            ("--*.no-lockfile true\n", true),
+            ("--no-lockfile true\n", true),
+            ("\"--install.no-lockfile\" true\n", true),
+            ("--install.no-lockfile false\n", false),
+            ("--install.pure-lockfile true\n", false),
+            ("--add.no-lockfile true\n", false),
+            ("no-lockfile true\n", false),
+            ("# --install.no-lockfile true\n", false),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", &lock);
+            p.write(".yarnrc", yarnrc);
+            assert_lock_not_read(&run(&p).await, off, yarnrc);
+        }
+        // Berry never reads `.yarnrc`.
+        let p = Project::new();
+        p.write("yarn.lock", &lock);
+        assert_lock_not_read(&run(&p).await, false, "no .yarnrc");
+    }
+
+    /// A berry `lockfileFilename` naming another file makes yarn 2 and 3
+    /// read and write that file and never yarn.lock, and yarn 4 rejects the
+    /// setting and installs nothing (measured on 2.4.3, 3.8.7 and 4.5.3).
+    /// Either way yarn.lock is not what installs.
+    #[tokio::test]
+    async fn berry_lock_renamed_in_yarnrc_yml_attests_nothing_from_yarn_lock_alone() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let lock = berry(&[
+            berry_block(
+                "left-pad@npm:1.3.0",
+                "1.3.0",
+                &format!("left-pad@{hosted}"),
+                Some(CHECKSUM),
+            ),
+            berry_vendored_block("@scope/pkg", "2.0.0", UUID_B),
+        ]);
+        let manifest = package_json_with_resolutions(serde_json::json!({
+            "@scope/pkg": format!("file:./.socket/vendor/npm/{UUID_B}/@scope/pkg-2.0.0.tgz"),
+        }));
+        for (rc, off) in [
+            ("lockfileFilename: real.lock\n", true),
+            ("lockfileFilename: \"locks/yarn.lock\"\n", true),
+            (
+                "nodeLinker: node-modules\nlockfileFilename: ${LOCK}\n",
+                true,
+            ),
+            ("lockfileFilename: yarn.lock\n", false),
+            ("nodeLinker: node-modules\n", false),
+        ] {
+            let p = Project::new();
+            p.write("yarn.lock", &lock);
+            p.write("package.json", &manifest);
+            p.write(".yarnrc.yml", rc);
+            assert_lock_not_read(&run(&p).await, off, rc);
+        }
+        // Yarn classic never reads `.yarnrc.yml`, and berry no `.yarnrc`.
+        let p = Project::new();
+        p.write("yarn.lock", &lock);
+        p.write("package.json", &manifest);
+        p.write(".yarnrc", "--install.no-lockfile true\n");
+        assert_lock_not_read(&run(&p).await, false, "a classic rc beside a berry lock");
+    }
+
+    /// Yarn berry writes an entry whose key is longer than 1024 characters
+    /// as a YAML complex key: `? "<descriptors>"`, then a lone `:`, then
+    /// the body (real yarn 4.5.3, sixty aliases of one package; it reads
+    /// the lock back with `--immutable`). Such an entry is one more entry:
+    /// the lock is still a yarn lock, its other entries still wire, and a
+    /// registry resolution under the long key contests a wiring of the
+    /// same `name@version` like any other. Yarn 1 has no such grammar.
+    #[tokio::test]
+    async fn berry_complex_key_entry_is_read_like_any_other() {
+        let hosted = hosted_url("npm", "left-pad", "1.3.0", UUID_A, "left-pad-1.3.0.tgz");
+        let wired = berry_block(
+            "left-pad@npm:1.3.0",
+            "1.3.0",
+            &format!("left-pad@{hosted}"),
+            Some(CHECKSUM),
+        );
+        let long_key = |name: &str, resolution: &str| {
+            let descriptors: Vec<String> = (1..=60)
+                .map(|i| format!("lp{i}@npm:{name}@>=0.0.{i}"))
+                .collect();
+            let key = descriptors.join(", ");
+            assert!(key.len() > 1024);
+            format!(
+                "? \"{key}\"\n:\n  version: 1.3.0\n  resolution: \"{resolution}\"\n  \
+                 checksum: {CHECKSUM}\n  languageName: node\n  linkType: hard\n\n"
+            )
+        };
+
+        // Another package under the long key: the wiring stands.
+        let p = Project::new();
+        p.write(
+            "yarn.lock",
+            berry(&[wired.clone(), long_key("right-pad", "right-pad@npm:1.3.0")]),
+        );
+        let out = run(&p).await;
+        assert_refs(
+            &out,
+            &[("pkg:npm/left-pad@1.3.0", UUID_A, WiringMode::Hosted)],
+        );
+        assert!(out.diagnostics.is_empty(), "{:#?}", out.diagnostics);
+        // The entry under the long key is evidence like any other.
+        assert!(
+            out.elsewhere
+                .iter()
+                .any(|e| e.purl == "pkg:npm/right-pad@1.3.0"),
+            "{:#?}",
+            out.elsewhere
+        );
+
+        // The wired release itself, from the registry, under the long key.
+        let p = Project::new();
+        p.write(
+            "yarn.lock",
+            berry(&[wired.clone(), long_key("left-pad", "left-pad@npm:1.3.0")]),
+        );
+        let out = run(&p).await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.shadowed.len(), 1, "{out:#?}");
+        assert_eq!(diag_codes(&out), vec![DIAG_REF_UNATTRIBUTABLE]);
+
+        // A `? key` with no `:` line after it is not YAML yarn wrote, and
+        // yarn 1 reads no complex keys at all.
+        let p = Project::new();
+        let broken = long_key("right-pad", "right-pad@npm:1.3.0").replace("\"\n:\n", "\"\n");
+        p.write("yarn.lock", berry(&[wired, broken]));
+        assert_eq!(diag_codes(&run(&p).await), vec![DIAG_LOCKFILE_UNPARSEABLE]);
+        let p = Project::new();
+        p.write(
+            "yarn.lock",
+            format!(
+                "{}? \"right-pad@^1.0.0\"\n:\n  version \"1.3.0\"\n",
+                classic(&[classic_block("left-pad@1.3.0", "1.3.0", &hosted, Some(SRI))])
+            ),
+        );
+        assert_eq!(diag_codes(&run(&p).await), vec![DIAG_LOCKFILE_UNPARSEABLE]);
     }
 
     // ── classic ──────────────────────────────────────────────────────────

@@ -361,6 +361,107 @@ async fn scan_human_preview_renders_vulnerability_details() {
     }
 }
 
+/// A `package.json` that is not valid JSON may declare project patches
+/// nobody can read, so its packages are left alone. The run says that the
+/// file is broken and to fix it. It does not call the packages "protected
+/// by project patches", and it does not advise switching the check off.
+#[tokio::test]
+async fn scan_human_invalid_package_json_says_to_fix_the_file() {
+    let mock = MockServer::start().await;
+    let tmp = minimist_project(b"x\n");
+    std::fs::write(tmp.path().join("package.json"), "{ \"name\": ").unwrap();
+
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "1 package was not scanned: this project's own patches could not be checked (see the \
+         warnings). Fix the file they name and run again.\n"
+    );
+    let warning = stderr
+        .lines()
+        .find(|l| l.starts_with("Warning: pkg:npm/minimist@1.2.2: "))
+        .unwrap_or_else(|| panic!("the package's warning must print; stderr={stderr}"));
+    assert!(
+        warning.starts_with(
+            "Warning: pkg:npm/minimist@1.2.2: not patched, because this project's own patches \
+             for it could not be checked: "
+        ) && warning.ends_with(
+            "package.json (not valid JSON: EOF while parsing a value at line 1 column 10). Fix \
+             that file and run again."
+        ),
+        "{warning}"
+    );
+    for output in [&stdout, &stderr] {
+        assert!(!output.contains("--allow-patch-conflicts"), "{output}");
+        assert!(!output.contains("protected by"), "{output}");
+    }
+    assert!(recorded(&mock).await.is_empty(), "nothing was queried");
+
+    // A patch the project does declare keeps the consent wording.
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"pnpm":{"patchedDependencies":{"minimist":"missing.patch"}}}"#,
+    )
+    .unwrap();
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        stdout,
+        "1 package is protected by this project's own patches and was not scanned (see the \
+         warnings). Pass --allow-patch-conflicts to scan it anyway.\n"
+    );
+    assert!(
+        stderr.contains("protected by project patch/replacement metadata in "),
+        "{stderr}"
+    );
+}
+
+/// A `package-lock.json` that is not JSON, with nothing installed: the
+/// scan finds no package, and says why. Before, it printed only "Run your
+/// package manager's install first", which is not the problem.
+#[tokio::test]
+async fn scan_human_unparseable_package_lock_warns_and_names_the_file() {
+    let mock = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{"name":"x","version":"1.0.0","dependencies":{"minimist":"1.2.2"}}"#,
+    )
+    .unwrap();
+    std::fs::write(tmp.path().join("package-lock.json"), "this is not json").unwrap();
+
+    for extra in [&[][..], &["--dry-run"][..]] {
+        let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), extra);
+        assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+        assert!(
+            stderr.contains(
+                "Warning: package-lock.json is not valid JSON (expected ident at line 1 column \
+                 2), so the packages it lists were NOT scanned. Fix or regenerate it (`npm \
+                 install --package-lock-only`) and run again."
+            ),
+            "stderr={stderr}"
+        );
+        assert_eq!(
+            stdout, "No packages found (see the warning).\n",
+            "stderr={stderr}"
+        );
+    }
+
+    let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["--json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    assert!(
+        doc["warnings"]
+            .as_array()
+            .is_some_and(|w| w.iter().any(|w| w["code"] == "npm_lock_invalid"
+                && w["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.starts_with("package-lock.json is not valid JSON ")))),
+        "{doc:#}"
+    );
+}
+
 /// When every detail fetch fails, the human path prints ONE Error line that
 /// names the package and the cause (no per-package Warning repeating it).
 #[tokio::test]
@@ -783,8 +884,12 @@ async fn scan_prune_without_a_mode_is_report_only() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches to apply:") && stdout.contains(MINIMIST),
+        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
         "the per-patch preview still prints; got {stdout:?}"
+    );
+    assert!(
+        !stdout.contains("Patches to apply:"),
+        "a run that applies nothing must not head its listing `to apply`; got {stdout:?}"
     );
     assert!(
         stdout.contains("To apply these patches in place, run:")
@@ -799,6 +904,21 @@ async fn scan_prune_without_a_mode_is_report_only() {
         !tmp.path().join(".socket").exists(),
         "a report-only scan must not create .socket/"
     );
+
+    // The preview of a report-only run is the report: the real run applies
+    // nothing, so `--dry-run` must not say it would download and apply.
+    let (code, dry_stdout, stderr) =
+        run_scan_api(tmp.path(), &mock.uri(), &["--prune", "--dry-run"]);
+    assert_eq!(code, 0, "stdout={dry_stdout}; stderr={stderr}");
+    assert!(
+        !dry_stdout.contains("Would download and apply"),
+        "the preview promises an apply the real run does not make; got {dry_stdout:?}"
+    );
+    assert_eq!(
+        dry_stdout, stdout,
+        "a report-only run and its preview say the same thing"
+    );
+    assert!(!tmp.path().join(".socket").exists());
     assert_eq!(
         std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
         b"x\n",
@@ -840,9 +960,17 @@ async fn scan_global_report_only_hint_keeps_the_global_scope() {
         "report-only is a success; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("Patches to apply:") && stdout.contains(MINIMIST),
+        stdout.contains("Patches available:") && stdout.contains(MINIMIST),
         "the global scan must find the patch; got {stdout:?}"
     );
+    // Its preview is the same report, never "Would download and apply".
+    let (code, dry_stdout, stderr) = run_scan_api(
+        &cwd,
+        &mock.uri(),
+        &["--global-prefix", prefix_arg, "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={dry_stdout}; stderr={stderr}");
+    assert_eq!(dry_stdout, stdout);
     let quoted = if cfg!(windows) {
         format!("\"{prefix_arg}\"")
     } else {
@@ -892,6 +1020,177 @@ async fn scan_human_agent_mode_applies_without_prompting() {
             "flags={flags:?}"
         );
     }
+}
+
+/// Mount a package with two patches: `UUID` (critical, CVE-2021-0001) and
+/// `UUID_B` (high, CVE-2021-0002). Only `UUID` has a patch view: it is the
+/// one the ranking selects.
+async fn mount_two_patches(mock: &MockServer, purl: &str, before: &[u8]) {
+    let patches = [
+        (UUID, "critical", "CVE-2021-0001", "GHSA-aaaa-aaaa-aaaa"),
+        (UUID_B, "high", "CVE-2021-0002", "GHSA-bbbb-bbbb-bbbb"),
+    ];
+    let batch: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [cve],
+                "ghsaIds": [ghsa], "severity": severity, "title": "covgap test patch"
+            })
+        })
+        .collect();
+    let details: Vec<serde_json::Value> = patches
+        .iter()
+        .map(|(uuid, severity, cve, ghsa)| {
+            serde_json::json!({
+                "uuid": uuid, "purl": purl, "publishedAt": "2024-01-01T00:00:00Z",
+                "description": "Covgap test patch", "license": "MIT", "tier": "free",
+                "vulnerabilities": { *ghsa: {
+                    "cves": [cve], "summary": "s", "severity": severity, "description": "d"
+                } }
+            })
+        })
+        .collect();
+    mount_batch(
+        mock,
+        serde_json::json!([{ "purl": purl, "patches": batch }]),
+        false,
+    )
+    .await;
+    mount_by_package_body(
+        mock,
+        purl,
+        serde_json::json!({ "patches": details, "canAccessPaidPatches": false }),
+    )
+    .await;
+    mount_view(mock, purl, UUID, before).await;
+}
+
+const UNPATCHED_NOTE: &str = "Only one patch is applied per package version. Upgrade the \
+    package to fix the advisories still unpatched.";
+
+/// Agent mode applies one of a package's two patches. Under the apply
+/// summary the run names the advisory it fixed and the one it left
+/// unpatched; a re-run that finds the package already patched says the same.
+#[tokio::test]
+async fn scan_human_agent_names_unpatched_advisories() {
+    let mock = MockServer::start().await;
+    let before = b"before\n";
+    mount_two_patches(&mock, MINIMIST, before).await;
+    let tmp = minimist_project(before);
+    let expected = format!(
+        "Summary: 1 of 1 targeted patch applied, 0 already patched, 0 not found on disk\n  \
+         {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
+         {UNPATCHED_NOTE}\n"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert_eq!(
+        std::fs::read(tmp.path().join("node_modules/minimist/index.js")).unwrap(),
+        b"after\n"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "  {MINIMIST}: fixes CVE-2021-0001; still unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+}
+
+/// Agent mode ends a run that recorded a patch with the two steps the mode
+/// needs: commit `.socket/`, and re-apply after every install (named for
+/// the project's package manager). A re-run that records nothing new
+/// prints no steps.
+#[tokio::test]
+async fn scan_human_agent_ends_with_commit_and_reapply_next_steps() {
+    let mock = MockServer::start().await;
+    let before = b"before\n";
+    mount_two_patches(&mock, MINIMIST, before).await;
+    let tmp = minimist_project(before);
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "{UNPATCHED_NOTE}\n\
+             Next steps:\n  \
+             1. Commit .socket/ to keep the patches.\n  \
+             2. Run `socket-patch apply` after every `npm install`, locally and in CI. A \
+             fresh install removes the patches.\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &[]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(!stdout.contains("Next steps:"), "{stdout}");
+}
+
+/// The agent dry run says what the patch would fix and leave unpatched,
+/// and prints no next steps: nothing was recorded.
+#[tokio::test]
+async fn scan_human_agent_dry_run_names_unpatched_advisories_in_the_future_tense() {
+    let mock = MockServer::start().await;
+    mount_two_patches(&mock, MINIMIST, b"before\n").await;
+    let tmp = minimist_project(b"before\n");
+
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "[dry-run] Would download and apply 1 patch. No changes made.\n  \
+             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+    assert!(!tmp.path().join(".socket").exists());
+
+    // The vendored preview ends the same way.
+    let (code, stdout, stderr) = run_scan_api(
+        tmp.path(),
+        &mock.uri(),
+        &["--mode", "vendored", "--dry-run"],
+    );
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    assert!(
+        stdout.ends_with(&format!(
+            "[dry-run] Would download and vendor 1 patch. No changes made.\n  \
+             {MINIMIST}: would fix CVE-2021-0001; would stay unpatched: CVE-2021-0002\n\
+             {UNPATCHED_NOTE}\n"
+        )),
+        "stdout={stdout}; stderr={stderr}"
+    );
+
+    // `--json` carries the same facts on the package's discovery entry.
+    let (code, stdout, stderr) = run_scan_agent(tmp.path(), &mock.uri(), &["--dry-run", "--json"]);
+    assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("one JSON document");
+    let package = &doc["packages"][0];
+    assert_eq!(
+        package["selectedUuids"],
+        serde_json::json!([UUID]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["fixedIds"],
+        serde_json::json!(["CVE-2021-0001", "GHSA-aaaa-aaaa-aaaa"]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["unfixedIds"],
+        serde_json::json!(["CVE-2021-0002", "GHSA-bbbb-bbbb-bbbb"]),
+        "{doc:#}"
+    );
 }
 
 /// The post-apply GC line, both pluralization arms, for each spelling of

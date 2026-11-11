@@ -792,6 +792,7 @@ async fn revert_lock_fragment_splice_inner(
         Ok(t) => t,
         Err(e) => return RevertOutcome::failed(format!("cannot read {lock_file}: {e}")),
     };
+    let live_text = lock_text.clone();
     let mut warnings: Vec<VendorWarning> = Vec::new();
     // Set once a fragment was actually spliced: a fully converged revert (a
     // second `vendor --revert`, a rollback after a relock) must not rewrite a
@@ -863,6 +864,19 @@ async fn revert_lock_fragment_splice_inner(
         }
     }
 
+    if changed && (!atomic || !drifted) {
+        // The fragments come from the committed ledger and are spliced in
+        // by text: before anything is written (and on a dry run, so the
+        // preview says what the wet run would), the restore may only have
+        // touched the vendored package's own entries.
+        let refusal = match super::pypi_lock::entry_package(entry) {
+            None => Some("the ledger entry names no PyPI release".to_string()),
+            Some(name) => super::pypi_lock::confinement_refusal(&live_text, &lock_text, &name),
+        };
+        if let Some(why) = refusal {
+            return super::pypi_lock::unconfined(entry, lock_file, &why);
+        }
+    }
     if changed && !dry_run && (!atomic || !drifted) {
         // Mode-preserving: the lock is a user-owned file we merely edit, so
         // the swapped-in inode must keep its permission bits rather than
@@ -1458,6 +1472,16 @@ mod tests {
         }
     }
 
+    /// A lock whose `six` unit is wired, the fragment that wiring wrote,
+    /// the one it replaced, and the lock with that back in place: the
+    /// splice the write-reaching tests below revert. (The restore is only
+    /// written when it changes nothing but the vendored package's entries.)
+    const SPLICE_WIRED: &str = "[[package]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\nsource = \"wired\"\n";
+    const SPLICE_NEW: &str = "name = \"six\"\nversion = \"1.16.0\"\nsource = \"wired\"\n";
+    const SPLICE_ORIGINAL: &str = "name = \"six\"\nversion = \"1.16.0\"\n";
+    const SPLICE_RESTORED: &str =
+        "[[package]]\nname = \"idna\"\nversion = \"3.7\"\n\n[[package]]\nname = \"six\"\nversion = \"1.16.0\"\n";
+
     /// The lock file is user-owned: reverting the splice must not reset its
     /// permission bits (see `atomic_write_bytes_preserving_mode`).
     #[cfg(unix)]
@@ -1466,9 +1490,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("poetry.lock");
-        tokio::fs::write(&lock, "alpha\nNEW-FRAGMENT\nomega\n")
-            .await
-            .unwrap();
+        tokio::fs::write(&lock, SPLICE_WIRED).await.unwrap();
         let mut perms = std::fs::metadata(&lock).unwrap().permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&lock, perms).unwrap();
@@ -1486,8 +1508,8 @@ mod tests {
             "poetry_lock_package",
             WiringAction::Rewritten,
             "six",
-            Some("OLD-FRAGMENT".into()),
-            "NEW-FRAGMENT".into(),
+            Some(SPLICE_ORIGINAL.into()),
+            SPLICE_NEW.into(),
         )];
 
         let outcome = revert_lock_fragment_splice(
@@ -1503,7 +1525,7 @@ mod tests {
         assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
         assert_eq!(
             tokio::fs::read_to_string(&lock).await.unwrap(),
-            "alpha\nOLD-FRAGMENT\nomega\n",
+            SPLICE_RESTORED,
             "fragment restored"
         );
         let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
@@ -1587,9 +1609,7 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join("poetry.lock");
-        tokio::fs::write(&lock, "alpha\nNEW-FRAGMENT\nomega\n")
-            .await
-            .unwrap();
+        tokio::fs::write(&lock, SPLICE_WIRED).await.unwrap();
 
         let mut entry: VendorEntry = serde_json::from_value(serde_json::json!({
             "ecosystem": "pypi",
@@ -1615,8 +1635,8 @@ mod tests {
                 "poetry_lock_package",
                 WiringAction::Rewritten,
                 "six",
-                Some("OLD-FRAGMENT".into()),
-                "NEW-FRAGMENT".into(),
+                Some(SPLICE_ORIGINAL.into()),
+                SPLICE_NEW.into(),
             ),
         ];
 
@@ -1666,7 +1686,7 @@ mod tests {
         );
         assert_eq!(
             tokio::fs::read_to_string(&lock).await.unwrap(),
-            "alpha\nNEW-FRAGMENT\nomega\n",
+            SPLICE_WIRED,
             "a failed revert must leave the lock content untouched"
         );
     }

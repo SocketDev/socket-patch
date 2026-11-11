@@ -46,6 +46,17 @@ pub struct SidecarRecord {
     pub advisory: Option<SidecarAdvisory>,
 }
 
+impl SidecarRecord {
+    /// The message of a `sidecar_fixup_failed` record: the fixup (or the
+    /// rollback's resync) itself failed, which fails its package.
+    pub fn fixup_failure(&self) -> Option<&str> {
+        self.advisory
+            .as_ref()
+            .filter(|advisory| advisory.code == SidecarAdvisoryCode::SidecarFixupFailed)
+            .map(|advisory| advisory.message.as_str())
+    }
+}
+
 /// One file the fixup rewrote or deleted. Paths are relative to the
 /// package directory the patch landed in. (There is deliberately no
 /// "created" action — see [`SidecarFileAction`], which reserves no
@@ -100,7 +111,8 @@ pub struct SidecarAdvisory {
 ///   signature sidecar we cannot honestly recompute; `dotnet
 ///   restore` may flag.
 /// * `SidecarFixupFailed` — the fixup itself raised an error
-///   (I/O, parse). The patch is on disk; the sidecar is not.
+///   (I/O, parse). The package fails: the files this run wrote are put
+///   back, and the message says so (or that they were already in place).
 /// * `GradleRefreshReverts` — a jar patched in Gradle's `files-2.1`
 ///   cache: `--refresh-dependencies` (or a changed upstream) makes
 ///   Gradle download it again, and a new download reverts the patch.

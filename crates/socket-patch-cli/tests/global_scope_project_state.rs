@@ -37,7 +37,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use common::git_sha256;
 
-const PATCH_HOST: &str = "http://patch.test";
+const PATCH_HOST: &str = "https://patch.test";
 
 fn run(root: &Path, args: &[&str]) -> (i32, String, String) {
     common::run_with_env(root, args, &[("SOCKET_PATCH_SERVER_URL", PATCH_HOST)])
@@ -132,7 +132,7 @@ fn scan_refuses_vendored_mode_under_global_scope() {
 // ═══════════════════ 2. hosted project under rollback/remove -g ═══════════════════
 
 const HOSTED_PURL: &str = "pkg:pypi/requests@2.31.0";
-const WIRED_LINE: &str = "requests @ http://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1/requests-2.31.0-py3-none-any.whl --hash=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const WIRED_LINE: &str = "requests @ https://patch.test/patch/pypi/requests/2.31.0/22222222-2222-4222-8222-222222222222/a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1/requests-2.31.0-py3-none-any.whl --hash=sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 fn hosted_requirements() -> String {
     format!("flask==2.0.1\n{WIRED_LINE}\n")

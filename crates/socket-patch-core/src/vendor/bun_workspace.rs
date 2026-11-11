@@ -39,14 +39,22 @@ fn required_mirrors(
     {
         return Err("unsafe canonical artifact path".into());
     }
-    if !lock.packages()?.iter().any(|p| {
-        parse_vendor_path(&p.resolution).is_some_and(|path| {
-            path.eco == "npm" && path.uuid == entry.uuid && path.leaf == canonical.leaf
+    // The records wired to this artifact, and the members that depend on
+    // them: the ones the vendoring gave a copy.
+    let wired: Vec<usize> = lock
+        .packages()?
+        .iter()
+        .filter(|p| {
+            parse_vendor_path(&p.resolution).is_some_and(|path| {
+                path.eco == "npm" && path.uuid == entry.uuid && path.leaf == canonical.leaf
+            })
         })
-    }) {
+        .map(|p| p.id)
+        .collect();
+    if wired.is_empty() {
         return Ok(Vec::new());
     }
-    lock.workspace_paths()?
+    lock.workspace_paths_reaching(&wired)?
         .into_iter()
         .map(|workspace| {
             let rel = format!(
@@ -216,9 +224,12 @@ mod tests {
 
     const UUID: &str = "11111111-1111-4111-8111-111111111111";
 
+    /// The workspace fixture with left-pad vendored: the package its
+    /// `packages/helper` member depends on, so the one a member copy of the
+    /// tarball is required for.
     fn fixture() -> (tempfile::TempDir, VendorEntry, Vec<u8>) {
         let root = tempfile::tempdir().unwrap();
-        let artifact = format!(".socket/vendor/npm/{UUID}/minimist-1.2.2.tgz");
+        let artifact = format!(".socket/vendor/npm/{UUID}/left-pad-1.3.0.tgz");
         let bytes = b"the fingerprint-verified committed tarball".to_vec();
         std::fs::create_dir_all(root.path().join(&artifact).parent().unwrap()).unwrap();
         std::fs::write(root.path().join(&artifact), &bytes).unwrap();
@@ -230,7 +241,7 @@ mod tests {
             .packages()
             .unwrap()
             .into_iter()
-            .find(|p| p.name == "minimist")
+            .find(|p| p.name == "left-pad")
             .unwrap();
         let sri = format!(
             "sha512-{}",
@@ -240,7 +251,7 @@ mod tests {
         assert!(!lock.workspace_paths().unwrap().is_empty());
         std::fs::write(root.path().join("bun.lockb"), lock.bytes()).unwrap();
         let entry = serde_json::from_value(serde_json::json!({
-            "ecosystem": "npm", "basePurl": "pkg:npm/minimist@1.2.2", "uuid": UUID,
+            "ecosystem": "npm", "basePurl": "pkg:npm/left-pad@1.3.0", "uuid": UUID,
             "artifact": { "path": artifact, "sha256": hex::encode(Sha256::digest(&bytes)) },
             "flavor": "bun", "wiring": [],
         }))

@@ -486,6 +486,23 @@ impl Marker {
     }
 }
 
+/// What a `--no-verify` run appends to the impact statement of each purl
+/// it attests, or `""` for a verifying run. The document marks a statement
+/// exactly when the run's envelope carries the `vex_not_verified` warning,
+/// so an oracle that is handed both reads the one from the other.
+pub fn unverified_suffix(envelope: &Value) -> &'static str {
+    let warned = envelope["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|w| w["code"] == "vex_not_verified");
+    if warned {
+        "; not verified on disk"
+    } else {
+        ""
+    }
+}
+
 /// `id` names `purl` (exactly, or with PURL qualifiers appended).
 pub fn purl_matches(id: &str, purl: &str) -> bool {
     id == purl || id.split_once('?').map(|(base, _)| base) == Some(purl)
@@ -769,6 +786,24 @@ pub fn patch_view(
         "license": "MIT",
         "tier": "free",
     })
+}
+
+/// Answer the scan's patch lookup (`POST /patch/batch`) on `server` the way
+/// the public proxy answers for packages with no patch on offer: `200` and
+/// an empty result. A stand-in that 404s the route does not look like the
+/// patch API, and a scan stops on it rather than report "no patches".
+pub async fn mount_empty_patch_search(server: &wiremock::MockServer) {
+    use wiremock::matchers::{method, path};
+    wiremock::Mock::given(method("POST"))
+        .and(path("/patch/batch"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "packages": [],
+                "canAccessPaidPatches": false,
+            })),
+        )
+        .mount(server)
+        .await;
 }
 
 /// A wiremock patch API serving patch views on both the public-proxy and

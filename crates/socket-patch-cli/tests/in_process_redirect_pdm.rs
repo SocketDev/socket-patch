@@ -52,7 +52,7 @@ const PURL: &str = "pkg:pypi/urllib3@1.26.18";
 /// pre-v5 redirect ledger was keyed by).
 const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
-const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+const HOSTED_URL: &str = "https://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
 const GHSA: &str = "GHSA-gm62-xv2j-4w53";
 const UPSTREAM: &[u8] = b"upstream response implementation\n";
 const PATCHED: &[u8] = b"patched response implementation\n";
@@ -275,7 +275,7 @@ fn read(path: &Path) -> String {
 
 /// Origin of [`HOSTED_URL`]: not on the Socket host allowlist, so discovery
 /// only counts it as a hosted reference when named by `--patch-server-url`.
-const PATCH_SERVER: &str = "http://patch.test";
+const PATCH_SERVER: &str = "https://patch.test";
 
 /// The manifest-less VEX step every flow ends with. `root` holds the
 /// committed state the flow produced (pyproject + lock + `.socket/`);

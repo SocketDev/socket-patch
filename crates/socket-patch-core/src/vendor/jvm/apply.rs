@@ -1134,6 +1134,43 @@ fn local_external_poms(
     }
 }
 
+/// The upstream poms of the parent chain of `pom` (a suffixed tree's pom,
+/// un-suffixed), nearest first, from the Maven local repository
+/// `local_repo` and `caches` alone; `None` when one is in neither (or the
+/// chain cannot be followed), which leaves the pom unjudged.
+fn local_parent_chain(
+    pom: &[u8],
+    local_repo: Option<&Path>,
+    caches: &[crate::crawlers::jvm_cache::JvmCacheRoot],
+) -> Option<Vec<Vec<u8>>> {
+    const MAX_PARENTS: usize = 16;
+    let mut chain: Vec<Vec<u8>> = Vec::new();
+    loop {
+        let child = chain.last().map_or(pom, Vec::as_slice);
+        let Some(gav) = maven_reactor::parent_gav(child).ok()? else {
+            return Some(chain);
+        };
+        if chain.len() >= MAX_PARENTS {
+            return None;
+        }
+        let (g, a, v) = &gav;
+        let in_repo = local_repo.map(|repo| {
+            repo.join(g.replace('.', "/"))
+                .join(a)
+                .join(v)
+                .join(format!("{a}-{v}.pom"))
+        });
+        let cached = caches
+            .iter()
+            .flat_map(|root| crate::crawlers::jvm_cache::locate_artifact(root, &gav, None, "pom"));
+        let bytes = in_repo
+            .into_iter()
+            .chain(cached)
+            .find_map(|path| read_regular_to_bytes_sync(&path).ok())?;
+        chain.push(bytes);
+    }
+}
+
 /// Verify every recorded file plus the effective wiring, without writes or network I/O.
 ///
 /// `Ok(Some(why))`: the entry is intact and wired, but a Maven declaration
@@ -1145,6 +1182,20 @@ pub fn check_entry(
     root: &Path,
     entry: &VendorEntry,
     local_repo: Option<&Path>,
+) -> Result<Option<String>, String> {
+    check_entry_in(root, entry, local_repo, &[])
+}
+
+/// [`check_entry`] that also reads the machine's JVM `caches`
+/// ([`crate::crawlers::jvm_cache::all_local_roots`]) for the upstream
+/// parents of a suffixed pom: with them at hand, a pom that resolves a
+/// suffixed version nothing serves (a tree vendored before the parents
+/// were read, [`maven_reactor::committed_pom_leak`]) fails the check.
+pub fn check_entry_in(
+    root: &Path,
+    entry: &VendorEntry,
+    local_repo: Option<&Path>,
+    caches: &[crate::crawlers::jvm_cache::JvmCacheRoot],
 ) -> Result<Option<String>, String> {
     let (g, a, v) = entry_gav(entry)?;
     let c = Coords {
@@ -1207,6 +1258,18 @@ pub fn check_entry(
     } else {
         Vec::new()
     };
+    // A suffixed pom is judged against its upstream parents when a local
+    // cache holds them (no network): one that resolves a suffixed version
+    // nothing serves breaks the build whatever else is in sync.
+    let parents = (maven || sbt_entry)
+        .then(|| local_parent_chain(&pom, local_repo, caches))
+        .flatten();
+    if let Some(leak) = parents
+        .as_deref()
+        .and_then(|parents| maven_reactor::committed_pom_leak(&read, &c, parents))
+    {
+        return Err(leak);
+    }
     let patch = super::JvmPatch {
         group_id: &g,
         artifact_id: &a,
@@ -1214,6 +1277,7 @@ pub fn check_entry(
         uuid: &entry.uuid,
         jar: &jar,
         upstream_pom: &pom,
+        upstream_parents: parents.as_deref(),
         upstream_module: module.as_deref(),
         extra_artifacts: &extras,
         patched_members: &patched,
@@ -1229,19 +1293,47 @@ pub fn check_entry(
     } else {
         None
     };
-    let plan = super::plan_with_external(shape, &read, &list, &patch, config, external.as_ref())
-        .map_err(|e| e.detail)?;
     let incomplete = external
         .as_ref()
         .is_some_and(|known| known.values().any(Option::is_none));
-    let plan = if incomplete && !plan.writes.is_empty() {
-        super::plan_with_config(shape, &read, &list, &patch, config).map_err(|e| e.detail)?
-    } else {
-        plan
-    };
-    if let Some(w) = plan.writes.first() {
-        return Err(format!("vendored wiring or metadata drifted: {}", w.rel));
+    // Likewise the pom `vendor` wrote where it could not read the parents
+    // (or before it read them at all) is in sync: what it would add to
+    // that pom changes nothing a Maven before 4 resolves, or the leak
+    // above would have named it.
+    let mut attempts = vec![(patch.clone(), external.as_ref())];
+    if incomplete {
+        attempts.push((patch.clone(), None));
     }
+    if parents.is_some() {
+        let as_committed = super::JvmPatch {
+            upstream_parents: None,
+            ..patch.clone()
+        };
+        attempts.push((as_committed.clone(), external.as_ref()));
+        if incomplete {
+            attempts.push((as_committed, None));
+        }
+    }
+    let mut drift: Option<String> = None;
+    let mut in_sync: Option<super::JvmPlan> = None;
+    for (patch, external) in &attempts {
+        let outcome = super::plan_with_external(shape, &read, &list, patch, config, *external)
+            .map_err(|e| e.detail)
+            .and_then(|plan| match plan.writes.first() {
+                Some(w) => Err(format!("vendored wiring or metadata drifted: {}", w.rel)),
+                None => Ok(plan),
+            });
+        match outcome {
+            Ok(plan) => {
+                in_sync = Some(plan);
+                break;
+            }
+            Err(e) => drift = drift.or(Some(e)),
+        }
+    }
+    let Some(plan) = in_sync else {
+        return Err(drift.unwrap_or_default());
+    };
     let referenced = if sbt_entry || scala_cli_entry {
         entry_wiring_checked(root, entry, false)?
     } else {

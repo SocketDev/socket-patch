@@ -211,7 +211,8 @@ impl LockfileEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnsupportedNpmLayout {
     /// Stable diagnosis code, including `bun_lockb_invalid` for malformed
-    /// binary Bun locks, the flavor probe's Plug'n'Play refusal codes, and
+    /// binary Bun locks, `npm_lock_invalid` for a `package-lock.json` that
+    /// is not JSON, the flavor probe's Plug'n'Play refusal codes, and
     /// `gem_lock_unsupported` for a Bundler lock bundler loads but
     /// socket-patch cannot read (despite the name, not only npm).
     pub code: &'static str,

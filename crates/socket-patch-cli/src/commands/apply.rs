@@ -1,5 +1,4 @@
 use clap::Args;
-use socket_patch_core::api::client::{get_api_client_with_overrides, ApiClient};
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
@@ -26,7 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::args::{apply_env_toggles, is_local_go, GlobalArgs};
+use crate::args::{apply_env_toggles, is_local_go, GlobalArgs, RunApiClient};
 use crate::commands::fetch_stage::{stage_patch_sources, StageOutcome};
 use crate::commands::lock_cli::acquire_or_emit;
 use crate::commands::vex::{
@@ -34,7 +33,7 @@ use crate::commands::vex::{
 };
 use crate::ecosystem_dispatch::{
     distinct_install_dirs, distinct_npm_copies, find_all_packages_for_purls, partition_purls,
-    JvmScope,
+    unsupported_ecosystem_report, unsupported_keys, JvmScope, UnsupportedKey,
 };
 use crate::json_envelope::{
     AppliedVia, Command, Envelope, EnvelopeError, PatchAction, PatchEvent, PatchEventFile,
@@ -325,6 +324,66 @@ async fn reconcile_local_go(
         .collect()
 }
 
+/// The purl keys `socket-patch vendor` owns among this run's copies
+/// ([`vendor_owned_keys`](crate::commands::vendor_owned_keys)), and the
+/// `vendor_state_unreadable` warning when the ledger cannot be read.
+///
+/// An unreadable ledger still degrades to "nothing vendored": `apply` runs
+/// unattended after every install and must keep patching an agent-only
+/// project that never had a readable ledger to lose. But a run that could
+/// not tell what `vendor` owns says so, as `rollback` and `remove` do,
+/// instead of patching (or checking) vendored packages in place unseen.
+async fn vendor_ownership(common: &GlobalArgs) -> (HashSet<PurlKey>, Option<RunWarning>) {
+    let (ledger, warning) =
+        match socket_patch_core::vendor::load_state(&common.project_root()).await {
+            Ok(state) => (state.purl_keys(), None),
+            Err(e) => (
+                HashSet::new(),
+                Some(RunWarning::new(
+                    "vendor_state_unreadable",
+                    format!(
+                        "cannot read .socket/vendor/state.json: {e}; packages managed by \
+                         `socket-patch vendor` could not be told apart, so every manifest \
+                         patch was treated as an in-place patch. Restore the ledger from \
+                         version control"
+                    ),
+                )),
+            ),
+        };
+    (
+        crate::commands::vendor_owned_keys(common, &ledger).await,
+        warning,
+    )
+}
+
+/// One failed result per manifest key that is not a purl at all
+/// ([`UnsupportedKey::NotAPurl`]). No crawler, in this CLI or a newer one,
+/// can match such a key to a package, so its patch is never applied: the
+/// run fails naming it instead of dropping it from the partition unseen.
+fn invalid_key_failures(args: &ApplyArgs, manifest_purls: &[String]) -> Vec<ApplyResult> {
+    unsupported_keys(&args.common, manifest_purls)
+        .into_iter()
+        .filter(|(_, kind)| *kind == UnsupportedKey::NotAPurl)
+        .map(|(key, kind)| {
+            let error = kind.detail(&key);
+            // Errors print even under --silent.
+            if args.prints_errors() {
+                eprintln!("{}", format_patch_failure(&key, &error));
+            }
+            ApplyResult {
+                package_key: key,
+                package_path: String::new(),
+                success: false,
+                files_verified: Vec::new(),
+                files_patched: Vec::new(),
+                applied_via: HashMap::new(),
+                error: Some(error),
+                sidecar: None,
+            }
+        })
+        .collect()
+}
+
 /// Read-only verification that the manifest's patches are in place, for CI
 /// / GitHub-App auditing. Lock-free, fetch-free, offline-safe, and it never
 /// writes. Exits 0 when in sync, 1 on drift.
@@ -376,12 +435,35 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
             .into_values()
             .flatten()
             .collect();
-    let vendored = crate::commands::vendor_owned_keys(
-        &args.common,
-        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
-    )
-    .await;
+    let (vendored, ledger_warning) = vendor_ownership(&args.common).await;
     let owned_by_apply = |purl: &str| in_scope.contains(purl) && !purl_keys_cover(&vendored, purl);
+    // Advisories that never decide the exit: stderr here, the envelope's
+    // `warnings[]` under --json.
+    let mut check_warnings: Vec<RunWarning> = ledger_warning.into_iter().collect();
+
+    // Records no crawler here can look for are verified by nothing below.
+    // One of an ecosystem this CLI does not support is reported unchecked
+    // (the result line must not read "in sync" over it); a key that is not
+    // a purl can never be verified, which is drift.
+    let unsupported = unsupported_keys(&args.common, &manifest_purls);
+    for (key, kind) in &unsupported {
+        if *kind == UnsupportedKey::NotAPurl {
+            let detail = format!("{key}: {}", kind.detail(key));
+            drifts.push((key.clone(), kind.code().to_string(), detail));
+        }
+    }
+    let unchecked_events = match unsupported_ecosystem_report(&unsupported, "checked") {
+        Some((events, warning)) => {
+            check_warnings.push(warning);
+            events
+        }
+        None => Vec::new(),
+    };
+    if !args.common.json && !args.common.silent {
+        for warning in &check_warnings {
+            eprintln!("Warning: {}", warning.detail);
+        }
+    }
 
     {
         use socket_patch_core::patch::redirect::golang_local::Drift as GoDrift;
@@ -524,9 +606,16 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
         if args.common.json {
             let mut env = Envelope::new(Command::Apply);
             record_check_skips(&mut env, &in_sync, &not_installed);
+            for event in unchecked_events {
+                env.record(event);
+            }
+            env.warnings.extend(check_warnings);
             println!("{}", env.to_pretty_json());
         } else if !args.common.silent {
-            println!("{}", format_check_in_sync(checked, not_installed.len()));
+            println!(
+                "{}",
+                format_check_in_sync(checked, not_installed.len(), unchecked_events.len())
+            );
         }
         0
     } else {
@@ -539,6 +628,10 @@ async fn run_check(args: &ApplyArgs, manifest_path: &Path) -> i32 {
                 );
             }
             record_check_skips(&mut env, &in_sync, &not_installed);
+            for event in unchecked_events {
+                env.record(event);
+            }
+            env.warnings.extend(check_warnings);
             env.mark_partial_failure();
             println!("{}", env.to_pretty_json());
         } else {
@@ -783,8 +876,10 @@ fn check_remedy(common: &GlobalArgs, user_patched: bool) -> String {
 
 /// The `apply --check` success line: how many patches were checked, and how
 /// many were skipped for having no installed copy, so a check over an
-/// uninstalled tree never reads as a vacuous "in sync".
-fn format_check_in_sync(checked: usize, not_installed: usize) -> String {
+/// uninstalled tree never reads as a vacuous "in sync". With `unchecked`
+/// records of an ecosystem this CLI does not support, the line claims "in
+/// sync" only for the patches it did check.
+fn format_check_in_sync(checked: usize, not_installed: usize, unchecked: usize) -> String {
     let skipped = if not_installed == 0 {
         String::new()
     } else {
@@ -793,12 +888,27 @@ fn format_check_in_sync(checked: usize, not_installed: usize) -> String {
             plural(not_installed, "patch", "patches")
         )
     };
-    if checked == 0 && not_installed == 0 {
-        "No patches to check.".to_string()
+    let nothing_checked = checked == 0 && not_installed == 0;
+    if unchecked == 0 {
+        return if nothing_checked {
+            "No patches to check.".to_string()
+        } else {
+            format!(
+                "Patches are in sync ({} checked{skipped}).",
+                plural(checked, "patch", "patches")
+            )
+        };
+    }
+    let unchecked = format!(
+        "{} not checked (unsupported ecosystem)",
+        plural(unchecked, "patch", "patches")
+    );
+    if nothing_checked {
+        format!("No patches checked: {unchecked}.")
     } else {
         format!(
-            "Patches are in sync ({} checked{skipped}).",
-            plural(checked, "patch", "patches")
+            "{} in sync{skipped}; {unchecked}.",
+            plural(checked, "checked patch is", "checked patches are")
         )
     }
 }
@@ -1142,6 +1252,26 @@ pub async fn run(args: ApplyArgs) -> i32 {
             // `.socket/vendor/`) and still nothing for `apply` to do.
             println!("No patch manifest found; nothing to apply.");
         }
+        // Nothing to apply here, but a bare scan patches every project
+        // directory of the checkout: the ones below that hold a manifest
+        // are where this command has work. Only their manifests are looked
+        // for (no lockfile is parsed), and a `--silent` run (an install
+        // hook) prints nothing, so it does not look at all.
+        let below = if args.common.json || !args.common.silent {
+            use crate::commands::projects_below::{patched, Depth, Work};
+            let command = if args.check { "apply --check" } else { "apply" };
+            patched(&args.common, Depth::Local).await.advice(
+                &args.common,
+                command,
+                Work::Manifest,
+                &[],
+            )
+        } else {
+            Default::default()
+        };
+        if !args.common.json {
+            below.print();
+        }
         let vex_result = if !args.common.dry_run && !args.check && args.vex.vex.is_some() {
             let params = args.vex.to_build_params(None);
             Some(generate_vex_without_manifest(&args.common, &params, &manifest_path).await)
@@ -1158,6 +1288,7 @@ pub async fn run(args: ApplyArgs) -> i32 {
             let mut env = Envelope::new(Command::Apply);
             env.status = Status::NoManifest;
             env.dry_run = args.common.dry_run;
+            env.warnings.extend(below.warnings());
             match &vex_result {
                 Some(ManifestlessVex::Written(summary)) => {
                     env.vex = Some(VexSummary {
@@ -1212,12 +1343,12 @@ pub async fn run(args: ApplyArgs) -> i32 {
         return run_check(&args, &manifest_path).await;
     }
 
-    // The run's ONE API client — built past both read-only exits above (a
-    // hook on a manifest-less project or a CI `--check` never pays its
-    // config read, stderr advisory or org-slug round-trip) and BEFORE the
-    // lock, so none of that lengthens the lock hold. It serves the staging
-    // fetch, the mismatch blob top-up and telemetry.
-    let (client, _) = get_api_client_with_overrides(args.common.api_client_overrides()).await;
+    // The run's ONE API client, built by the first step that fetches (see
+    // `RunApiClient`): the staging download, the Maven jar service or an
+    // embedded `--vex`. An apply that finds every blob cached — the run a
+    // CI job or install hook makes after every install — never pays its
+    // config read, stderr advisory or org-slug round-trip.
+    let client = RunApiClient::new();
 
     // Serialize against concurrent socket-patch runs targeting the same
     // `.socket/` directory; see `socket_patch_core::patch::apply_lock`.
@@ -1377,17 +1508,26 @@ fn collect_apply_outcomes(
 /// `scan --mode agent` call this straight after their manifest write, so
 /// download → manifest write → apply is ONE lock window (a same-process
 /// re-acquire would contend) and the nested apply never builds a second
-/// client. `lock` is released explicitly once every mutation is done
-/// (output and a possibly slow telemetry POST must not keep a sibling
+/// client (they seed `client` with theirs; [`run`] passes an empty one,
+/// built only if this apply has something to fetch). `lock` is released
+/// explicitly once every mutation is done (output must not keep a sibling
 /// waiting), otherwise on return. The returned [`ApplyRunReport`] carries
 /// the exit code plus what failed, for a nested caller's envelope.
 pub(crate) async fn run_locked(
     args: ApplyArgs,
     manifest_path: PathBuf,
-    client: &ApiClient,
+    client: &RunApiClient,
     lock: LockGuard,
 ) -> ApplyRunReport {
-    let telemetry = TelemetryAuth::for_client(client);
+    // Read where each event fires: the client may be built in between.
+    let telemetry = || args.common.telemetry_auth_for(client);
+    // What taking the lock did about an interrupted run's commit, for this
+    // run's envelope (stderr has it from the acquire). A nested apply's
+    // caller took the lock and carries it in its own envelope.
+    let commit_recovery = match &args.nested {
+        None => crate::commands::lock_cli::commit_recovery_warning(&lock),
+        Some(_) => None,
+    };
 
     // ONE parse of the manifest for the whole run — the PnP gate and the
     // apply loop (embedded VEX re-reads it by design, after the writes).
@@ -1402,7 +1542,7 @@ pub(crate) async fn run_locked(
                 "manifest_not_found",
                 format!("Manifest not found at {}", manifest_path.display()),
             );
-            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry).await;
+            let code = report_apply_failure(&args, &err, &err.message, &[], &telemetry()).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
         Err(e) => {
@@ -1410,7 +1550,7 @@ pub(crate) async fn run_locked(
             // One manifest-load mapping for every command (#931):
             // `manifest_invalid` / `manifest_unreadable`, never `apply_failed`.
             let err = crate::json_envelope::manifest_load_error(&manifest_path, &e);
-            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e.to_string(), &[], &telemetry()).await;
             return ApplyRunReport::run_failure(code, &err.code, err.message);
         }
     };
@@ -1427,6 +1567,21 @@ pub(crate) async fn run_locked(
         .iter()
         .filter_map(|e| e.purl.clone())
         .collect();
+    // Records of an ecosystem this CLI has no crawler for sit the run out
+    // too, each named: `partition_purls` drops them, and "No patches to
+    // apply." over them would read as patched. They ride the same skip
+    // channel as the project-patched ones, so every envelope this run can
+    // print carries them. (A key that is not a purl at all fails instead:
+    // see `invalid_key_failures`.)
+    let mut user_patch_skips = user_patch_skips;
+    let unsupported_warning = unsupported_ecosystem_report(
+        &unsupported_keys(&args.common, manifest.patches.keys()),
+        "applied",
+    )
+    .map(|(events, warning)| {
+        user_patch_skips.extend(events);
+        warning
+    });
 
     // Package-manager layout detection. yarn-berry PnP keeps packages
     // inside `.yarn/cache/*.zip` and resolves them via `.pnp.cjs` —
@@ -1547,6 +1702,7 @@ pub(crate) async fn run_locked(
                 .map(|(code, detail)| RunWarning { code, detail })
                 .collect();
             run_warnings.extend(user_patch_warnings.iter().cloned());
+            run_warnings.extend(unsupported_warning);
             run_warnings.extend(results.iter().flat_map(|r| {
                 let note = r.error.as_deref().filter(|_| r.success).unwrap_or_default();
                 socket_patch_core::patch::apply::advisory_warning_codes(note)
@@ -1615,6 +1771,44 @@ pub(crate) async fn run_locked(
                 for skip in &fallback_skips {
                     eprintln!("Warning: {}", skip.detail());
                 }
+                // A package's sidecar advisory (the PyPI `RECORD`, a gem
+                // `--redownload`, `go mod verify`, a signed NuGet package,
+                // a Gradle cache copy) is `sidecars[]` under `--json`; a
+                // person reads it here, each distinct one once. An
+                // error-severity record is its package's failure and is
+                // printed with it.
+                let mut advised = HashSet::new();
+                for result in &results {
+                    use socket_patch_core::patch::sidecars::SidecarSeverity;
+                    let Some(record) = &result.sidecar else {
+                        continue;
+                    };
+                    let gradle = record
+                        .advisory
+                        .as_ref()
+                        .is_some_and(|a| a.code == SidecarAdvisoryCode::GradleRefreshReverts);
+                    let extra = if gradle {
+                        maven_sidecars::gradle_extra_records(
+                            &result.package_key,
+                            Path::new(&result.package_path),
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    for advisory in std::iter::once(record)
+                        .chain(&extra)
+                        .filter_map(|r| r.advisory.as_ref())
+                    {
+                        let label = match advisory.severity {
+                            SidecarSeverity::Info => "Note",
+                            SidecarSeverity::Warning => "Warning",
+                            SidecarSeverity::Error => continue,
+                        };
+                        if advised.insert(advisory.message.clone()) {
+                            eprintln!("{label}: {}", advisory.message);
+                        }
+                    }
+                }
             }
 
             // Human per-package report BEFORE the embedded VEX runs, so
@@ -1665,7 +1859,7 @@ pub(crate) async fn run_locked(
             // `no_applicable_patches`, and would write an attestation
             // file during --dry-run. Skip instead.
             let vex_result = if success && !args.common.dry_run && args.vex.vex.is_some() {
-                let params = args.vex.to_build_params(Some(client));
+                let params = args.vex.to_build_params(client.get());
                 Some(generate_vex_from_manifest_path(&args.common, &params, &manifest_path).await)
             } else {
                 None
@@ -1744,14 +1938,17 @@ pub(crate) async fn run_locked(
                 // skip, the sources-unavailable reason): the envelope's
                 // `warnings[]` is their machine channel — stderr is
                 // suppressed under --json.
+                env.warnings.extend(commit_recovery);
                 env.warnings.extend(run_warnings.iter().cloned());
                 // A token whose org could not be resolved put the run on the
                 // proxy (stderr already said so); the embedded `--vex` reuses
-                // this client and leaves reporting it to the host.
-                env.warnings
-                    .extend(crate::commands::vex_sources::api_auth_fallback_warning(
-                        client,
-                    ));
+                // this client and leaves reporting it to the host. A run
+                // that built no client fell back to nothing.
+                env.warnings.extend(
+                    client
+                        .get()
+                        .and_then(crate::commands::vex_sources::api_auth_fallback_warning),
+                );
                 if !success {
                     env.mark_partial_failure();
                 }
@@ -1821,12 +2018,12 @@ pub(crate) async fn run_locked(
 
             // Track telemetry
             if success {
-                track_patch_applied(patched_count, args.common.dry_run, &telemetry).await;
+                track_patch_applied(patched_count, args.common.dry_run, &telemetry()).await;
             } else {
                 track_patch_apply_failed(
                     "One or more patches failed to apply",
                     args.common.dry_run,
-                    &telemetry,
+                    &telemetry(),
                 )
                 .await;
             }
@@ -1895,7 +2092,7 @@ pub(crate) async fn run_locked(
         Err(e) => {
             lock.release();
             let err = EnvelopeError::new("apply_failed", e.clone());
-            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry).await;
+            let code = report_apply_failure(&args, &err, &e, &user_patch_skips, &telemetry()).await;
             ApplyRunReport {
                 skipped: user_patch_skips,
                 ..ApplyRunReport::run_failure(code, "apply_failed", e)
@@ -2303,7 +2500,7 @@ async fn apply_patches_inner(
     args: &ApplyArgs,
     mut manifest: PatchManifest,
     user_patched: &HashSet<String>,
-    client: &ApiClient,
+    client: &RunApiClient,
 ) -> Result<ApplyOutcome, String> {
     // Resolve patch sources (read `.socket/` directly, or stage an overlay
     // tempdir + download the gap). Shared with `vendor` via fetch_stage.
@@ -2358,7 +2555,10 @@ async fn apply_patches_inner(
         .chain(user_patched)
         .cloned()
         .collect();
-    let reconcile_failures = reconcile_local_go(args, &recorded).await;
+    let mut reconcile_failures = reconcile_local_go(args, &recorded).await;
+    // Beside them, the keys that are not purls: each fails by name below,
+    // on the empty-scope exit too.
+    reconcile_failures.extend(invalid_key_failures(args, &manifest_purls));
 
     if partitioned.is_empty() {
         // Nothing in scope: the manifest lists no patches (or every patch was
@@ -2390,16 +2590,13 @@ async fn apply_patches_inner(
     // vendor-owned go `replace` back at `.socket/go-patches/`). Matchable
     // by ledger key, resolved base purl, or qualifier-stripped key so
     // release-variant manifest keys (pypi `?artifact_id=`…) hit too;
-    // unreadable state degrades to "nothing vendored" (fail-open).
+    // unreadable state degrades to "nothing vendored" (fail-open), with
+    // the `vendor_state_unreadable` run warning (see `vendor_ownership`).
     // The ledger owns the PROJECT's copies only: a global apply restores
     // and patches the global copy even when the cwd project vendors the
     // same purl (see `project_state_in_scope`), unless that copy is the
     // project's own NuGet install (#489).
-    let vendored_purls = crate::commands::vendor_owned_keys(
-        &args.common,
-        &socket_patch_core::vendor::vendored_purl_keys(&args.common.project_root()).await,
-    )
-    .await;
+    let (vendored_purls, ledger_warning) = vendor_ownership(&args.common).await;
     let is_vendored = |p: &str| purl_keys_cover(&vendored_purls, p);
     let (mut results, mut matched_manifest_purls, vendored_bases) =
         synthesize_vendor_owned_results(&target_manifest_purls, &vendored_purls);
@@ -2433,7 +2630,7 @@ async fn apply_patches_inner(
         .as_ref()
         .map(|d| d.stores.as_slice())
         .unwrap_or(&[]);
-    let mut run_warnings: Vec<RunWarning> = Vec::new();
+    let mut run_warnings: Vec<RunWarning> = ledger_warning.into_iter().collect();
     if let Some(value) = gem_discovery
         .as_ref()
         .and_then(|d| d.skipped_config_path.as_deref())
@@ -2578,10 +2775,16 @@ async fn apply_patches_inner(
     } else {
         None
     };
-    let jvm_service = jvm_scope.as_ref().map(|_| {
-        args.common
-            .vendor_service_config(Some(client.clone()), client.uses_public_proxy())
-    });
+    let jvm_service = match &jvm_scope {
+        Some(_) => {
+            let client = args.common.api_client(client).await;
+            Some(
+                args.common
+                    .vendor_service_config(Some(client.clone()), client.uses_public_proxy()),
+            )
+        }
+        None => None,
+    };
 
     let jvm_derived = socket_patch_core::patch::jvm_jar::DerivedCache::default();
 
@@ -4408,20 +4611,35 @@ mod tests {
 
     #[test]
     fn check_in_sync_line() {
-        assert_eq!(format_check_in_sync(0, 0), "No patches to check.");
+        assert_eq!(format_check_in_sync(0, 0, 0), "No patches to check.");
         assert_eq!(
-            format_check_in_sync(1, 0),
+            format_check_in_sync(1, 0, 0),
             "Patches are in sync (1 patch checked)."
         );
         assert_eq!(
-            format_check_in_sync(3, 0),
+            format_check_in_sync(3, 0, 0),
             "Patches are in sync (3 patches checked)."
         );
         // A check that skipped uninstalled packages says so, never a bare
         // vacuous "in sync".
         assert_eq!(
-            format_check_in_sync(0, 2),
+            format_check_in_sync(0, 2, 0),
             "Patches are in sync (0 patches checked; 2 patches not installed, skipped)."
+        );
+        // Records of an unsupported ecosystem were not checked: "in sync"
+        // is claimed only for the ones that were.
+        assert_eq!(
+            format_check_in_sync(0, 0, 3),
+            "No patches checked: 3 patches not checked (unsupported ecosystem)."
+        );
+        assert_eq!(
+            format_check_in_sync(1, 0, 1),
+            "1 checked patch is in sync; 1 patch not checked (unsupported ecosystem)."
+        );
+        assert_eq!(
+            format_check_in_sync(2, 1, 2),
+            "2 checked patches are in sync; 1 patch not installed, skipped; 2 patches not \
+             checked (unsupported ecosystem)."
         );
     }
 

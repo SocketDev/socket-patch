@@ -711,6 +711,7 @@ mod tests {
             uuid,
             jar: b"PK-text",
             upstream_pom: POM_TEXT.as_bytes(),
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -725,6 +726,7 @@ mod tests {
             uuid: UUID_B,
             jar: b"PK-gson",
             upstream_pom: POM_GSON.as_bytes(),
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -1161,6 +1163,7 @@ mod tests {
                 .into_boxed_str(),
             )
             .as_bytes(),
+            upstream_parents: None,
             upstream_module: None,
             extra_artifacts: &[],
             patched_members: &[],
@@ -1581,6 +1584,7 @@ mod tests {
         let again = JvmPatch {
             jar: &jar,
             upstream_pom: &pom,
+            upstream_parents: None,
             upstream_module: module.as_deref(),
             ..p
         };

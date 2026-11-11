@@ -196,19 +196,49 @@ fn build_list_envelope(entries: &[ListEntry<'_>]) -> Envelope {
     env
 }
 
-/// Emit the top-level envelope for `list` in error states. Used for the
-/// "manifest not found" and "manifest unreadable" paths so they share
-/// the same JSON shape as a successful list. `warnings` gathered before
-/// the error (a corrupt redirect ledger) ride the error envelope too, so a
-/// JSON consumer sees them on every exit path.
-fn emit_error(args: &ListArgs, code: &str, message: String, warnings: Vec<RunWarning>) {
-    if args.common.json {
+/// One project's listing, gathered and not yet on stdout: [`run`] prints
+/// it, alone or under its heading among the project directories below
+/// `--cwd`. The warnings and errors of a human run are already on stderr.
+struct Listed {
+    /// The exit code of a run over this project alone.
+    code: i32,
+    /// The `--json` document (a `--json` run only): the listing, or the
+    /// error.
+    envelope: Option<Envelope>,
+    /// The human listing (a human run that did not fail).
+    text: Option<String>,
+    /// How many patches it lists.
+    patches: usize,
+    /// How many of them are manifest records (what telemetry counts).
+    manifest_patches: usize,
+}
+
+/// The listing of a project in an error state. Used for the "manifest not
+/// found" and "manifest unreadable" paths so they share the same JSON
+/// shape as a successful list. `warnings` gathered before the error (a
+/// corrupt redirect ledger) ride the error envelope too, so a JSON
+/// consumer sees them on every exit path.
+fn failed_listing(
+    args: &ListArgs,
+    code: &str,
+    message: String,
+    warnings: Vec<RunWarning>,
+) -> Listed {
+    let envelope = if args.common.json {
         let mut env = Envelope::new(Command::List);
         env.mark_error(EnvelopeError::new(code, message));
         env.warnings = warnings;
-        println!("{}", env.to_pretty_json());
+        Some(env)
     } else {
         eprintln!("Error: {message}");
+        None
+    };
+    Listed {
+        code: 1,
+        envelope,
+        text: None,
+        patches: 0,
+        manifest_patches: 0,
     }
 }
 
@@ -316,7 +346,139 @@ fn format_listing(entries: &[ListEntry<'_>], color: bool) -> String {
 }
 
 pub async fn run(args: ListArgs) -> i32 {
+    use crate::commands::projects_below::{self, CWD_NAME};
     apply_env_toggles(&args.common);
+    // What `scan` patched from this directory is listed from it: the
+    // project at `--cwd`, then the patched project directories below it.
+    let below = projects_below::patched(&args.common, projects_below::Depth::All).await;
+    let loud = !args.common.json && !args.common.silent;
+    if loud {
+        below.print_notes();
+    }
+    // With nothing patched below, the project at `--cwd` is the plain
+    // listing it always was. Above patched directories it is one of them
+    // when it holds patches itself: listed first, under the heading scan
+    // gives `--cwd`. A project's warnings and errors go to stderr as it is
+    // read, so its heading goes out before it is.
+    let mut here = !below.projects.is_empty() && projects_below::cwd_is_patched(&args.common).await;
+    if here && loud {
+        println!("{}", projects_below::heading(CWD_NAME));
+    }
+    let mut own = list_project(&args).await;
+    // The listing has the last word on what `--cwd` holds.
+    if !here && !below.projects.is_empty() && (own.patches > 0 || own.code != 0) {
+        here = true;
+        if loud {
+            println!("{}", projects_below::heading(CWD_NAME));
+        }
+    }
+    if here {
+        if let Some(text) = &own.text {
+            println!("{text}");
+        }
+    }
+    let mut listed: Vec<(&str, Listed)> = Vec::new();
+    for project in &below.projects {
+        let child = ListArgs {
+            common: project.common(&args.common),
+        };
+        if loud {
+            println!("{}", projects_below::heading(&project.shown));
+        }
+        let listing = list_project(&child).await;
+        if let Some(text) = &listing.text {
+            println!("{text}");
+        }
+        listed.push((&project.shown, listing));
+    }
+
+    // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
+    // to its consumers, so it counts the manifest records ONLY (0 on a
+    // ledger-only project) rather than the listed entries.
+    if own.code == 0 {
+        let manifest_patches = own.manifest_patches
+            + listed
+                .iter()
+                .map(|(_, listing)| listing.manifest_patches)
+                .sum::<usize>();
+        track_patch_listed(manifest_patches, &args.common.telemetry_auth()).await;
+    }
+
+    let below_failed = listed.iter().any(|(_, listing)| listing.code != 0);
+    if let Some(env) = own.envelope.as_mut() {
+        // One document: the envelope for `--cwd`, and beside it the one
+        // each project's own `list --json` prints, with its directory.
+        if !listed.is_empty() {
+            let projects: Vec<serde_json::Value> = listed
+                .iter()
+                .filter_map(|(shown, listing)| {
+                    let mut value = listing.envelope.as_ref()?.to_value();
+                    value.as_object_mut()?.shift_insert(
+                        0,
+                        "path".to_string(),
+                        serde_json::json!(shown),
+                    );
+                    Some(value)
+                })
+                .collect();
+            env.set_extra("projects", serde_json::Value::Array(projects));
+        }
+        // The run's status goes with its exit code: a directory that could
+        // not be listed carries its own error in `projects[]`.
+        if below_failed {
+            env.mark_partial_failure();
+        }
+        env.warnings.extend(
+            below
+                .notes
+                .iter()
+                .map(|note| RunWarning::new(projects_below::PROJECTS_BELOW_NOT_SEARCHED, note)),
+        );
+        println!("{}", env.to_pretty_json());
+    } else if listed.is_empty() {
+        if let Some(text) = &own.text {
+            println!("{text}");
+        }
+    } else {
+        if loud {
+            let patches: usize = listed.iter().map(|(_, listing)| listing.patches).sum();
+            println!(
+                "\n{} in {}.",
+                crate::ui::plural(
+                    patches + if here { own.patches } else { 0 },
+                    "patch",
+                    "patches"
+                ),
+                below.covered(here)
+            );
+        }
+        // Errors print even under --silent.
+        let failed: Vec<&str> = (own.code != 0)
+            .then_some(CWD_NAME)
+            .into_iter()
+            .chain(
+                listed
+                    .iter()
+                    .filter(|(_, listing)| listing.code != 0)
+                    .map(|(shown, _)| *shown),
+            )
+            .collect();
+        if !failed.is_empty() {
+            eprintln!(
+                "Error: {} could not be listed: {}",
+                crate::ui::plural(failed.len(), "project directory", "project directories"),
+                failed.join(", ")
+            );
+        }
+    }
+    listed
+        .iter()
+        .fold(own.code, |code, (_, listing)| code.max(listing.code))
+}
+
+/// Read the patches of the project at `args.common.cwd`: the manifest's,
+/// the vendor ledger's and the hosted pins its lockfiles wire.
+async fn list_project(args: &ListArgs) -> Listed {
     let manifest_path = args.common.resolved_manifest_path();
 
     // One load of the three stores, all from the SAME project as the
@@ -329,8 +491,7 @@ pub async fn run(args: ListArgs) -> i32 {
             // Ledger records never mask a present-but-broken manifest: it
             // is an error state.
             let err = crate::json_envelope::manifest_load_error(&manifest_path, e);
-            emit_error(&args, &err.code, err.message, Vec::new());
-            return 1;
+            return failed_listing(args, &err.code, err.message, Vec::new());
         }
     };
 
@@ -409,14 +570,18 @@ pub async fn run(args: ListArgs) -> i32 {
         }
     }
     // A broken vendor ledger degrades to nothing-to-list here (every path
-    // that writes or attests from it fails closed instead), but says so.
+    // that writes or attests from it fails closed instead), but says so:
+    // on stderr, or in `warnings[]` under --json, where a `success`
+    // envelope would otherwise read as "no vendored patches".
     let vendor_state = match &loaded.vendor {
         Ok(state) => Some(state),
         Err(e) => {
-            if !args.common.silent {
-                eprintln!(
-                    "Warning: unreadable vendor ledger ({e}); its vendored patches are not listed"
-                );
+            let detail =
+                format!("unreadable vendor ledger ({e}); its vendored patches are not listed");
+            if args.common.json {
+                warnings.push(RunWarning::new("vendor_state_unreadable", detail));
+            } else if !args.common.silent {
+                eprintln!("Warning: {detail}");
             }
             None
         }
@@ -428,8 +593,7 @@ pub async fn run(args: ListArgs) -> i32 {
     let entries = combined_entries(manifest, &hosted, vendor_state);
     if manifest.is_none() && entries.is_empty() {
         if let Some(detail) = contested {
-            emit_error(&args, "hosted_wiring_contested", detail, warnings);
-            return 1;
+            return failed_listing(args, "hosted_wiring_contested", detail, warnings);
         }
     }
 
@@ -437,24 +601,23 @@ pub async fn run(args: ListArgs) -> i32 {
     // and no ledger record is just an empty project (normal for hosted
     // mode, which writes no manifest); only an unreadable or invalid
     // manifest or contested hosted wiring fails.
-    //
-    // Telemetry: `patch_listed`'s `patches_count` means "manifest patches"
-    // to its consumers, so it counts the manifest ONLY (0 on a ledger-only
-    // project) rather than the listed entries.
-    let manifest_patch_count = manifest.map_or(0, |m| m.patches.len());
-    track_patch_listed(manifest_patch_count, &args.common.telemetry_auth()).await;
-
+    let mut listed = Listed {
+        code: 0,
+        envelope: None,
+        text: None,
+        patches: entries.len(),
+        manifest_patches: manifest.map_or(0, |m| m.patches.len()),
+    };
     if args.common.json {
         let mut env = build_list_envelope(&entries);
         env.warnings = warnings;
-        println!("{}", env.to_pretty_json());
+        listed.envelope = Some(env);
     } else if args.common.silent {
         // `--silent` is "errors only" (CLI_CONTRACT.md).
     } else {
-        println!("{}", format_listing(&entries, crate::ui::stdout_color()));
+        listed.text = Some(format_listing(&entries, crate::ui::stdout_color()));
     }
-
-    0
+    listed
 }
 
 #[cfg(test)]

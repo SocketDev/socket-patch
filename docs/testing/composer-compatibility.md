@@ -103,6 +103,25 @@ the hints name is the one Composer installed into: `COMPOSER_VENDOR_DIR`, else
 `config.vendor-dir`, else `vendor` (a project with `"vendor-dir": "lib"` is told
 to remove `lib/<vendor>/<name>`).
 
+## A `vendor-dir` outside the project
+
+socket-patch reads and patches an installed tree only inside the project, or
+where your own environment points (`COMPOSER_VENDOR_DIR`, the user-level
+`config.json`). A `config.vendor-dir` in the project's `composer.json` that is
+absolute, starts with `~/` or `$VAR`, or climbs out with `../` is not followed:
+`apply` finds nothing to patch there.
+
+`vex` treats such an install as unread, not as absent. A hosted pin attests
+from `composer.lock` alone while nothing is installed at that directory. Once
+an install is there (its `composer/installed.json` exists), the package is
+omitted as `composer_install_unread`: the copy was not checked, and one
+installed before the lock was redirected is still the upstream package. Run
+`COMPOSER_VENDOR_DIR=<that directory> socket-patch vex` to have the installed
+files hash-verified. The real-Composer matrix does not cover this rule: it
+rests on Composer's documented `vendor-dir` resolution, which the crawler
+already follows for the layers it trusts, and is tested with fabricated
+install trees (`e2e_vex_lockfile` `composer::g_hosted_install_outside_…`).
+
 ## Vendored copies and Composer's mirror filters
 
 `transport-options.symlink: false` makes Composer MIRROR the vendored copy into

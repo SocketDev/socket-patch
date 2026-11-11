@@ -1336,10 +1336,10 @@ fn path_glob_selects_hosted_record() {
 }
 
 /// The restored lockfile cannot be written (a read-only project root; the
-/// write is an atomic temp-file + rename beside it): the failure lands in
-/// `hosted.failed` under the `files` key and the run exits 1, the lock
-/// untouched. (Skipped where the sandbox ignores directory modes, e.g. as
-/// root.)
+/// write is an atomic temp-file + rename beside it): the failure is the
+/// artifact-level `hosted_write_failed` event and the run exits 1, the lock
+/// untouched and the pin not reported as restored. (Skipped where the
+/// sandbox ignores directory modes, e.g. as root.)
 #[cfg(unix)]
 #[test]
 fn hosted_restore_write_failure_lands_in_hosted_failed() {
@@ -1364,7 +1364,9 @@ fn hosted_restore_write_failure_lands_in_hosted_failed() {
         "a lockfile write failure must exit 1; stdout=\n{stdout}\nstderr=\n{stderr}"
     );
     let v = parse_json_envelope(&stdout);
-    assert_eq!(v["status"], "partialFailure", "stdout=\n{stdout}");
+    // Nothing was rolled back, so the run is an error, not a partial one.
+    assert_eq!(v["status"], "error", "stdout=\n{stdout}");
+    assert_eq!(envelope_error_code(&v), Some("rollback_failed"));
     let failed_view = rollback_json::hosted_failed(&v);
     let failed = failed_view.as_array().expect("failed array");
     assert!(
@@ -1374,10 +1376,148 @@ fn hosted_restore_write_failure_lands_in_hosted_failed() {
         "the write failure must be an artifact-level hosted_write_failed event; stdout=\n{stdout}"
     );
     assert_eq!(
+        rollback_json::hosted_reverted(&v),
+        json!([]),
+        "a pin whose lockfile was not written is not restored; stdout=\n{stdout}"
+    );
+    assert_eq!(rollback_json::summary(&v, "rolledBack"), 0);
+    assert_eq!(
         std::fs::read_to_string(project.join("yarn.lock")).unwrap(),
         yarn_lock_content(&yarn_redirected_block()),
         "the lock was never written"
     );
+}
+
+/// What a failed three-file hosted restore must report: exit 1, the one
+/// artifact-level `hosted_write_failed` event, and no pin restored (or, on
+/// a dry run, previewed as restorable). Returns the failure's message.
+fn assert_hosted_write_failed(code: i32, stdout: &str, stderr: &str) -> String {
+    assert_eq!(code, 1, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_json_envelope(stdout);
+    assert_eq!(
+        rollback_json::hosted_reverted(&v),
+        json!([]),
+        "stdout=\n{stdout}"
+    );
+    assert_eq!(rollback_json::summary(&v, "rolledBack"), 0);
+    assert_eq!(rollback_json::summary(&v, "verified"), 0);
+    let failed = rollback_json::hosted_failed(&v);
+    assert_eq!(
+        failed.as_array().map(Vec::len),
+        Some(1),
+        "stdout=\n{stdout}"
+    );
+    assert_eq!(failed[0]["purl"], Value::Null, "stdout=\n{stdout}");
+    assert_eq!(
+        failed[0]["errorCode"], "hosted_write_failed",
+        "stdout=\n{stdout}"
+    );
+    assert!(
+        !warning_codes(&v).contains(&"reinstall_required".to_string()),
+        "nothing was unwired; stdout=\n{stdout}"
+    );
+    failed[0]["error"].as_str().expect("error text").to_string()
+}
+
+/// A hosted pin wired through three files, the last a symbolic link: the
+/// rollback refuses before writing any of them, reports the failure and no
+/// restored pin, and `--dry-run` previews the same refusal.
+#[cfg(unix)]
+#[test]
+fn hosted_restore_over_a_symlinked_file_writes_nothing() {
+    for dry_run in [false, true] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        write_maven_hosted_fixture(tmp.path());
+        std::fs::create_dir(tmp.path().join("real")).unwrap();
+        std::fs::rename(tmp.path().join("pom.xml"), tmp.path().join("real/pom.xml")).unwrap();
+        std::os::unix::fs::symlink("real/pom.xml", tmp.path().join("pom.xml")).unwrap();
+        let before = tree(tmp.path());
+
+        let mut args = vec!["rollback", "--json", "--yes", "--offline"];
+        if dry_run {
+            args.push("--dry-run");
+        }
+        let (code, stdout, stderr) = run(tmp.path(), &args);
+        let error = assert_hosted_write_failed(code, &stdout, &stderr);
+        assert!(
+            error.contains("pom.xml is a symbolic link") && error.ends_with("nothing was written"),
+            "dry_run={dry_run}: {error}"
+        );
+        assert_eq!(
+            error.starts_with("writing the restored lockfiles would fail: "),
+            dry_run,
+            "{error}"
+        );
+        let v = parse_json_envelope(&stdout);
+        assert_eq!(v["hosted"]["editedFiles"], 0, "stdout=\n{stdout}");
+        assert_eq!(tree(tmp.path()), before, "dry_run={dry_run}");
+    }
+}
+
+/// The second of the three writes fails: the first is put back, so every
+/// file ends byte-identical to the start, and the run reports the failure.
+#[test]
+fn hosted_restore_write_failure_midway_puts_the_files_back() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_maven_hosted_fixture(tmp.path());
+    let before = tree(tmp.path());
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["rollback", "--json", "--yes", "--offline"],
+        &[("SOCKET_PATCH_FAILPOINT", "hosted_restore_write@2~fail")],
+    );
+    let error = assert_hosted_write_failed(code, &stdout, &stderr);
+    assert_eq!(
+        error,
+        "writing the restored lockfiles failed: write .mvn/maven.config: injected write \
+         failure; the file already written was put back, so nothing was changed"
+    );
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(v["hosted"]["editedFiles"], 0, "stdout=\n{stdout}");
+    assert_eq!(tree(tmp.path()), before);
+
+    // The same project rolls back once the fault is gone.
+    let (code, stdout, stderr) = run(tmp.path(), &["rollback", "--json", "--yes", "--offline"]);
+    assert_eq!(code, 0, "stdout=\n{stdout}\nstderr=\n{stderr}");
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(rollback_json::hosted_reverted(&v), json!([MVN_PURL]));
+    assert_eq!(
+        tree(tmp.path()).keys().collect::<Vec<_>>(),
+        ["pom.xml"],
+        "the restore deletes the two .mvn files"
+    );
+}
+
+/// The second write fails and the first cannot be put back either: the
+/// failure names that file and the state it is left in, and counts it as
+/// the one edited file. The other two are untouched.
+#[test]
+fn hosted_restore_that_cannot_put_a_file_back_names_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_maven_hosted_fixture(tmp.path());
+    let mut expected = tree(tmp.path());
+
+    let (code, stdout, stderr) = common::run_with_env(
+        tmp.path(),
+        &["rollback", "--json", "--yes", "--offline"],
+        &[(
+            "SOCKET_PATCH_FAILPOINT",
+            "hosted_restore_write@2~fail,hosted_restore_put_back~fail",
+        )],
+    );
+    let error = assert_hosted_write_failed(code, &stdout, &stderr);
+    let (sums, _) = MVN_FILES[0];
+    assert!(
+        error.contains(&format!("{sums} is left deleted"))
+            && error.contains("every other file is unchanged")
+            && error.contains(&format!("`git checkout -- {sums}`")),
+        "{error}"
+    );
+    let v = parse_json_envelope(&stdout);
+    assert_eq!(v["hosted"]["editedFiles"], 1, "stdout=\n{stdout}");
+    expected.remove(sums);
+    assert_eq!(tree(tmp.path()), expected);
 }
 
 /// #764: Bun's hoisted linker keeps an installed copy whose lock entry

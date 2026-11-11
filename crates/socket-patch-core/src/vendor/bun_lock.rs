@@ -783,6 +783,25 @@ pub(super) fn preflight_package(
             ),
         )));
     }
+    // Bun writes a key once. On two lines (a merge that kept both sides) it
+    // is two entries to this line grammar and one to whatever reads the
+    // lock as JSON, and a revert, which finds its line by key, could not
+    // tell them apart.
+    let twice = project
+        .entries
+        .iter()
+        .filter(|e| classify_rewritable(e, &target_spec, name, &target_leaf).is_some())
+        .find(|e| project.entries.iter().filter(|o| o.key == e.key).count() > 1);
+    if let Some(entry) = twice {
+        return Err(Box::new(refused(
+            "vendor_lockfile_version_unsupported",
+            format!(
+                "{BUN_LOCK} lists the packages entry `{}` more than once; remove the duplicate \
+                 line (or run `bun install`, which rewrites the lock) before vendoring",
+                entry.key
+            ),
+        )));
+    }
     // Workspace gate, evaluated on the CLASSIFIED target instances rather
     // than the raw lock: it refuses only a run that would WRITE a new
     // local-tarball tuple (a `Registry` instance) into a pre-v2 workspace
@@ -1126,6 +1145,29 @@ async fn revert_bun_wiring(
         outcome.keep_artifact(&uuid_dir_rel);
         return outcome;
     }
+    // The artifact goes only when no entry still installs from it. The
+    // records are restored, but a tuple the ledger has no record of (a
+    // nested entry Bun wrote for a later dependent, a line a merge brought
+    // back) may still resolve into the uuid dir: deleting it would break
+    // every install. Checked on a dry run too, so a preview says the same.
+    if !keep_artifact {
+        let unrecorded = lines
+            .as_deref()
+            .and_then(|lines| entry_resolving_into(lines, &entry.uuid));
+        if let Some(key) = unrecorded {
+            outcome.warnings.push(VendorWarning::new(
+                super::RESIDUAL_REFERENCE_CODE,
+                format!(
+                    "{BUN_LOCK} entry `{key}` still installs from {uuid_dir_rel} and the vendor \
+                     ledger has no record of wiring it; point it back at the registry release \
+                     (`bun install` after restoring the dependency's version) and re-run the \
+                     revert"
+                ),
+            ));
+            outcome.keep_artifact_for_reference(&uuid_dir_rel);
+            return outcome;
+        }
+    }
     if dry_run {
         return outcome;
     }
@@ -1185,13 +1227,35 @@ pub(super) fn revert_one_record(
         )));
         return;
     };
-    let located = lines[start + 1..end]
+    let mut candidates: Vec<(usize, BunEntry)> = lines[start + 1..end]
         .iter()
         .enumerate()
-        .find_map(|(off, line)| {
+        .filter_map(|(off, line)| {
             let parsed = parse_entry_line(line).ok()?;
             (parsed.key == key).then_some((start + 1 + off, parsed))
-        });
+        })
+        .collect();
+    // Bun writes a key once. Where a merge left it on several lines, the
+    // record undoes the line it wrote, else one still resolving into the
+    // uuid dir, and only then settles for a line that is already restored:
+    // two records of one key each undo their own line.
+    fn recorded(fragment: &Option<Value>) -> Option<&str> {
+        fragment.as_ref().and_then(Value::as_str)
+    }
+    let is = |wanted: Option<&str>| {
+        candidates
+            .iter()
+            .position(|(idx, _)| Some(lines[*idx].as_str()) == wanted && wanted.is_some())
+    };
+    let pick = is(recorded(&rec.new))
+        .or_else(|| {
+            candidates
+                .iter()
+                .position(|(_, parsed)| resolves_into(parsed, entry_uuid))
+        })
+        .or_else(|| is(recorded(&rec.original)))
+        .unwrap_or(0);
+    let located = (!candidates.is_empty()).then(|| candidates.swap_remove(pick));
     if let Some((idx, parsed)) = located {
         // ALREADY CONVERGED: the live line equals the recorded pre-vendor
         // original — an earlier partial revert (or the user, by hand)
@@ -1207,11 +1271,7 @@ pub(super) fn revert_one_record(
         // 3-tuple as on any later lock re-save; the path is the claim, the
         // dropped sha512 proves nothing either way).
         let exact = Some(lines[idx].as_str()) == rec.new.as_ref().and_then(Value::as_str);
-        let ours_uuid = matches!(parsed.elems.len(), 2 | 3)
-            && decode_json_string(&parsed.elems[0])
-                .and_then(|spec| split_name_spec(&spec).map(|(_, p)| p.to_string()))
-                .and_then(|path| parse_vendor_path(&path))
-                .is_some_and(|p| p.eco == "npm" && p.uuid == entry_uuid);
+        let ours_uuid = resolves_into(&parsed, entry_uuid);
         if !exact && !ours_uuid {
             // MOVED OFF THE VENDORED VERSION, not drifted (#1155): `bun
             // update` / `bun add pkg@other` re-locked the entry at another
@@ -1258,6 +1318,28 @@ pub(super) fn revert_one_record(
         super::LOCK_ENTRY_REMOVED_CODE,
         format!("lock entry `{key}` no longer exists; nothing to restore"),
     ));
+}
+
+/// Whether `entry`'s tuple is a local tarball under `uuid`'s artifact dir:
+/// the 3-tuple vendoring writes, or the digest-less 2-tuple Bun 1.1.39–1.3.9
+/// re-save it as.
+fn resolves_into(entry: &BunEntry, uuid: &str) -> bool {
+    matches!(entry.elems.len(), 2 | 3)
+        && decode_json_string(&entry.elems[0])
+            .and_then(|spec| split_name_spec(&spec).map(|(_, p)| p.to_string()))
+            .and_then(|path| parse_vendor_path(&path))
+            .is_some_and(|p| p.eco == "npm" && p.uuid == uuid)
+}
+
+/// The key of the first `packages` entry still resolving into `uuid`'s
+/// artifact dir.
+fn entry_resolving_into(lines: &[String], uuid: &str) -> Option<String> {
+    let (start, end) = packages_bounds(lines)?;
+    lines[start + 1..end]
+        .iter()
+        .filter_map(|line| parse_entry_line(line).ok())
+        .find(|entry| resolves_into(entry, uuid))
+        .map(|entry| entry.key)
 }
 
 /// The package name and registry version an entry tuple locks
@@ -4470,6 +4552,154 @@ mod tests {
             !fx.root().join(fx.rel_tgz()).exists(),
             "unreferenced artifact removed"
         );
+    }
+
+    // ── one key on two lines, and tuples the ledger never saw (VBV-D3) ───
+
+    /// `BN3_BEFORE_LOCK` with its one entry line twice: what a merge that
+    /// kept both sides leaves.
+    fn duplicated_lock() -> String {
+        let line = BN3_BEFORE_LOCK
+            .lines()
+            .find(|l| l.contains("\"left-pad\": ["))
+            .unwrap();
+        let lock = BN3_BEFORE_LOCK.replacen(&format!("{line}\n"), &format!("{line}\n{line}\n"), 1);
+        assert_eq!(lock.matches("\"left-pad\": [").count(), 2);
+        lock
+    }
+
+    /// REGRESSION (VBV-D3): a lock holding the entry to rewrite on two
+    /// lines was vendored on both and reverted on one. It is refused
+    /// before any write, in the vendoring and in the download plan's gate.
+    #[tokio::test]
+    async fn an_entry_listed_twice_is_refused_before_any_write() {
+        let lock = duplicated_lock();
+        for dry_run in [true, false] {
+            let fx = fixture_with(&lock, "node_modules/left-pad").await;
+            match fx.vendor(dry_run).await {
+                VendorOutcome::Refused { code, detail } => {
+                    assert_eq!(code, "vendor_lockfile_version_unsupported", "{detail}");
+                    assert!(
+                        detail.contains("`left-pad`") && detail.contains("more than once"),
+                        "{detail}"
+                    );
+                }
+                other => panic!("dry run {dry_run}: expected a refusal, got {other:?}"),
+            }
+            assert_eq!(fx.read_lock().await, lock);
+            assert!(!fx.root().join(".socket/vendor").exists());
+            assert_eq!(
+                preflight_packages(fx.root(), &[("pkg:npm/left-pad@1.3.0", &fx.record)]).await,
+                [Err("vendor_lockfile_version_unsupported")]
+            );
+        }
+        // Another key twice is not this package's entry: it vendors.
+        let other = BN4C_BEFORE_LOCK.replacen(
+            "    \"left-pad\": [\"left-pad@1.2.0\"",
+            "    \"left-pad\": [\"left-pad@1.2.0\", \"\", {}, \"sha512-AA==\"],\n    \"left-pad\": [\"left-pad@1.2.0\"",
+            1,
+        );
+        assert_ne!(other, BN4C_BEFORE_LOCK);
+        let fx = fixture_with(&other, "node_modules/haspad/node_modules/left-pad").await;
+        let (result, entry, _) = expect_done(fx.vendor(false).await);
+        assert!(result.success && entry.is_some(), "{result:?}");
+    }
+
+    /// VBV-D3 for a ledger an earlier release wrote from such a lock: two
+    /// records of one key, both lines vendored. Each record restores its
+    /// own line, so the lock comes back whole and the artifact goes.
+    #[tokio::test]
+    async fn two_records_of_one_key_each_restore_their_own_line() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let mut entry = entry.unwrap();
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let vendored = fx.read_lock().await;
+        let both = vendored.replacen(
+            &format!("{new_line}\n"),
+            &format!("{new_line}\n{new_line}\n"),
+            1,
+        );
+        assert_ne!(both, vendored);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &both)
+            .await
+            .unwrap();
+        let record = entry.wiring[0].clone();
+        entry.wiring.push(record);
+
+        let dry = revert_bun(&entry, fx.root(), true).await;
+        assert!(dry.success && !dry.kept_artifact, "{dry:?}");
+        assert_eq!(fx.read_lock().await, both, "a dry run writes nothing");
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success && !outcome.kept_artifact, "{outcome:?}");
+        assert_eq!(fx.read_lock().await, duplicated_lock());
+        assert!(!fx.root().join(fx.rel_tgz()).exists());
+    }
+
+    /// VBV-D3's invariant: the artifact goes only when no `packages` entry
+    /// still resolves through it. A tuple the ledger has no record of (a
+    /// nested entry Bun wrote for a later dependent, a line a merge
+    /// brought back) keeps the artifact and the ledger entry, named in a
+    /// `vendor_revert_residual_reference` warning, while the recorded
+    /// entry is restored; once that tuple is gone the revert finishes.
+    #[tokio::test]
+    async fn a_tuple_the_ledger_never_recorded_keeps_the_artifact() {
+        let fx = fixture_with(BN3_BEFORE_LOCK, "node_modules/left-pad").await;
+        let (_, entry, _) = expect_done(fx.vendor(false).await);
+        let entry = entry.unwrap();
+        let new_line = entry.wiring[0]
+            .new
+            .as_ref()
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string();
+        let stray = new_line.replacen("\"left-pad\"", "\"other/left-pad\"", 1);
+        let vendored = fx.read_lock().await;
+        let with_stray = vendored.replacen(
+            &format!("{new_line}\n"),
+            &format!("{new_line}\n{stray}\n"),
+            1,
+        );
+        assert_ne!(with_stray, vendored);
+        tokio::fs::write(fx.root().join(BUN_LOCK), &with_stray)
+            .await
+            .unwrap();
+        let restored = BN3_BEFORE_LOCK.replacen("  }\n}\n", &format!("{stray}\n  }}\n}}\n"), 1);
+        assert_ne!(restored, BN3_BEFORE_LOCK);
+
+        for dry_run in [true, false] {
+            let outcome = revert_bun(&entry, fx.root(), dry_run).await;
+            assert!(outcome.success && outcome.kept_artifact, "{outcome:?}");
+            assert!(outcome.kept_for_residual_reference(), "{outcome:?}");
+            let reference = outcome
+                .warnings
+                .iter()
+                .find(|w| w.code == crate::vendor::RESIDUAL_REFERENCE_CODE)
+                .unwrap_or_else(|| panic!("{outcome:?}"));
+            assert!(
+                reference.detail.contains("`other/left-pad`"),
+                "{reference:?}"
+            );
+            assert_eq!(
+                &fx.read_lock().await,
+                if dry_run { &with_stray } else { &restored },
+                "dry run {dry_run}"
+            );
+            assert!(fx.root().join(fx.rel_tgz()).exists(), "artifact kept");
+        }
+
+        tokio::fs::write(fx.root().join(BUN_LOCK), BN3_BEFORE_LOCK)
+            .await
+            .unwrap();
+        let outcome = revert_bun(&entry, fx.root(), false).await;
+        assert!(outcome.success && !outcome.kept_artifact, "{outcome:?}");
+        assert_eq!(fx.read_lock().await, BN3_BEFORE_LOCK);
+        assert!(!fx.root().join(fx.rel_tgz()).exists());
     }
 
     /// #665 guard: the recorded entry vanished but another entry line still

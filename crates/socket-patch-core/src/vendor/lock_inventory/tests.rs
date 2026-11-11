@@ -395,6 +395,50 @@ async fn stale_pnpm_lock_behind_yarn_berry_pnp_marker_is_not_inventoried() {
     );
 }
 
+/// A `package-lock.json` (or shrinkwrap) that is there but is not JSON
+/// lists packages nobody can read: the inventory says so, naming the file
+/// and the parse error, instead of reading as a project with no
+/// dependencies. A lock that parses, and a project with no lock, yield no
+/// diagnosis.
+#[tokio::test]
+async fn unparseable_package_lock_yields_a_diagnosis_naming_the_file() {
+    for lock in ["package-lock.json", "npm-shrinkwrap.json"] {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "package.json",
+            r#"{"name":"x","version":"1.0.0"}"#,
+        )
+        .await;
+        write(tmp.path(), lock, "this is not json").await;
+        let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+        assert!(entries.is_empty(), "{lock}: {entries:?}");
+        assert_eq!(unsupported.len(), 1, "{lock}: {unsupported:?}");
+        assert_eq!(unsupported[0].code, "npm_lock_invalid", "{lock}");
+        assert_eq!(
+            unsupported[0].detail,
+            format!(
+                "{lock} is not valid JSON (expected ident at line 1 column 2), so the packages \
+                 it lists were NOT scanned. Fix or regenerate it (`npm install \
+                 --package-lock-only`) and run again."
+            )
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write(
+        tmp.path(),
+        "package.json",
+        r#"{"name":"x","version":"1.0.0"}"#,
+    )
+    .await;
+    assert!(inventory_project_diagnosed(tmp.path()).await.1.is_empty());
+    write(tmp.path(), "package-lock.json", PACKAGE_LOCK).await;
+    let (entries, unsupported) = inventory_project_diagnosed(tmp.path()).await;
+    assert!(!entries.is_empty());
+    assert!(unsupported.is_empty(), "{unsupported:?}");
+}
+
 /// A malformed binary lock fails closed with format context, including
 /// beside a different package manager's lock. A text Bun lock wins.
 #[tokio::test]
@@ -4154,9 +4198,15 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// * the only registry downloads are the hosted → vendored takeover's
 ///   upstream restore (`patch::redirect::upstream::client`), which
 ///   re-resolves the entry from the registry's own metadata and never
-///   reads the hosted pin's URL or hash, and the JVM backend's Maven
+///   reads the hosted pin's URL or hash, the JVM backend's Maven
 ///   Central fetches (`maven_repo`, `jvm_jar`), whose URLs are built from
-///   coordinates and checked against the upstream checksum files.
+///   coordinates and checked against the upstream checksum files, and the
+///   gem refresh after a hosted unwind (`patch::gem_refresh`), which
+///   fetches `<rubygems base>/gems/<name>-<version>.gem`, a URL built from
+///   the gem's name and version, and uses the bytes only when their sha256
+///   is the one the restore re-pinned from the registry's compact index
+///   (`upstream::gem::upstream_archive`); a lock still on its hosted entry
+///   yields no URL at all.
 ///
 /// [`PINNED_REFERENCES`] lists every production reference to those three
 /// functions in this crate, by file and line text. What the check catches:
@@ -4170,6 +4220,11 @@ fn unsupported_layout_warnings_rewrites_known_codes_and_forwards_unknown_ones() 
 /// Those stay a review matter: read the pristine source from the
 /// registry, never from a lock entry that might be Socket-hosted.
 const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
+    (
+        "patch/gem_refresh.rs",
+        "download",
+        "crate::vendor::registry_fetch::download(&client, url).await",
+    ),
     (
         "patch/redirect/upstream/client.rs",
         "download",
@@ -4239,7 +4294,7 @@ const PINNED_REFERENCES: &[(&str, &str, &str)] = &[
     (
         "vendor/maven_repo.rs",
         "fetch_registry_bytes",
-        "fetch_registry_bytes(",
+        "let bytes = fetch_registry_bytes(",
     ),
     (
         "vendor/maven_repo.rs",

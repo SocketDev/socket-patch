@@ -135,6 +135,102 @@ fn rollback_unknown_identifier_emits_error() {
     // The human `Error:` line is rendered in `rollback_render.rs`.
 }
 
+/// A record whose purl type has no crawler in this CLI (a newer CLI's
+/// ecosystem, a type in another case) cannot be rolled back here. The run
+/// used to count it in the confirmation prompt, then do nothing and report
+/// a bare success. It is named instead (a `skipped` /
+/// `unsupported_ecosystem` event, a `warnings[]` entry, a stderr warning),
+/// kept out of the prompt, and its record stays in the manifest.
+#[test]
+fn rollback_names_records_of_an_unsupported_ecosystem_and_keeps_them() {
+    const SWIFT: &str = "pkg:swift/github.com/apple/swift-nio@2.60.0";
+    const CASE: &str = "pkg:NPM/left-pad@1.3.0";
+    let before = git_sha256(crate::rollback_fixture::ORIG_INDEX);
+    let after = git_sha256(crate::rollback_fixture::PATCHED_INDEX);
+    let project = || {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        crate::rollback_fixture::write_socket_manifest(
+            tmp.path(),
+            &[
+                crate::rollback_fixture::manifest_entry(
+                    SWIFT,
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    &before,
+                    &after,
+                ),
+                crate::rollback_fixture::manifest_entry(
+                    CASE,
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    &before,
+                    &after,
+                ),
+            ],
+        );
+        tmp
+    };
+    let recorded = |root: &Path| -> Vec<String> {
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(root.join(".socket/manifest.json")).expect("manifest"),
+        )
+        .expect("manifest JSON");
+        let mut keys: Vec<String> = manifest["patches"]
+            .as_object()
+            .expect("patches")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    let tmp = project();
+    let (code, stdout) = run(tmp.path(), &["--json", "--offline"]);
+    let v: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["status"], "success", "{v:#}");
+    for purl in [SWIFT, CASE] {
+        assert_eq!(
+            event_for(&v, "skipped", purl)["errorCode"],
+            "unsupported_ecosystem",
+            "{v:#}"
+        );
+    }
+    assert!(
+        codes_in(&v["warnings"]).contains(&"unsupported_ecosystem".to_string()),
+        "{v:#}"
+    );
+    assert_eq!(
+        recorded(tmp.path()),
+        vec![CASE, SWIFT],
+        "nothing was rolled back, so the records stay"
+    );
+
+    // Human mode: no prompt over patches the run cannot touch (stdin is not
+    // a terminal here, so a prompt would print its auto-accept note), and
+    // the records are named.
+    let tmp = project();
+    let out = rollback_cmd(tmp.path())
+        .args(["--offline"])
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("Non-interactive mode detected"),
+        "no confirmation over records it cannot roll back: stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(
+        stderr.contains("Warning:") && stderr.contains(SWIFT) && stderr.contains(CASE),
+        "{stderr}"
+    );
+    assert_eq!(recorded(tmp.path()), vec![CASE, SWIFT]);
+}
+
 /// The beforeHash pinned in `MANIFEST_JSON` (deliberately not staged on
 /// disk by the missing-blob tests).
 const MISSING_BEFORE_HASH: &str =
@@ -977,6 +1073,133 @@ fn rollback_honors_manifest_path_override() {
         event_for(&v, "skipped", "pkg:npm/__rollback_test__@1.0.0")["errorCode"],
         "package_not_installed",
         "the override manifest's entry must be the one reported; stdout={stdout}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The API client is built only for a before-blob download
+// ---------------------------------------------------------------------------
+
+/// A project whose one package is installed at its patched bytes, with
+/// the before-blob cached: `rollback` restores it from disk.
+fn write_offline_satisfiable_project(root: &Path) -> PathBuf {
+    let before = b"lazy rollback before\n";
+    let after = b"lazy rollback after\n";
+    std::fs::write(
+        root.join("package.json"),
+        r#"{ "name": "rollback-lazy-root", "version": "0.0.0" }"#,
+    )
+    .unwrap();
+    let pkg_dir = root.join("node_modules/rollback-lazy");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        r#"{ "name": "rollback-lazy", "version": "1.0.0" }"#,
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), after).unwrap();
+    let socket = root.join(".socket");
+    std::fs::create_dir_all(socket.join("blobs")).unwrap();
+    std::fs::write(
+        socket.join("manifest.json"),
+        serde_json::json!({ "patches": { "pkg:npm/rollback-lazy@1.0.0": {
+            "uuid": "66666666-6666-4666-8666-666666666666",
+            "exportedAt": "2024-01-01T00:00:00Z",
+            "files": { "package/index.js": {
+                "beforeHash": git_sha256(before), "afterHash": git_sha256(after)
+            }},
+            "vulnerabilities": {}, "description": "x", "license": "MIT", "tier": "free"
+        }}})
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::write(socket.join("blobs").join(git_sha256(before)), before).unwrap();
+    pkg_dir.join("index.js")
+}
+
+/// CA-P01: with a token and no org, building the API client asks the API
+/// for the org (`GET /v0/organizations`). A rollback that restores from
+/// cached blobs needs no client, so it must not ask: its only request is
+/// its telemetry event, on the route the credentials alone select (no org
+/// is known, so the anonymous proxy).
+#[tokio::test]
+async fn rollback_from_cached_blobs_never_asks_for_the_org() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v0/organizations"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "organizations": { "org-1": {
+                "id": "org-1", "name": "Lazy", "image": null, "plan": "free", "slug": "lazy-org"
+            }}
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(201))
+        .mount(&mock)
+        .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let index_js = write_offline_satisfiable_project(tmp.path());
+
+    // Telemetry on (the builder forces it off), token set, org absent, and
+    // both hosts pinned to the mock so every request is seen.
+    let out = rollback_cmd(tmp.path())
+        .arg("--json")
+        .env("SOCKET_TELEMETRY_DISABLED", "0")
+        .env("SOCKET_API_URL", mock.uri())
+        .env("SOCKET_PROXY_URL", mock.uri())
+        .env(
+            "SOCKET_API_TOKEN",
+            "sktsec_00000000000000000000000000000000000000000000_api",
+        )
+        .output()
+        .expect("run socket-patch");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout={stdout}\nstderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(index_js).unwrap(),
+        b"lazy rollback before\n",
+        "the cached blob restored the file"
+    );
+
+    let reqs = mock.received_requests().await.expect("recording enabled");
+    let log: Vec<String> = reqs
+        .iter()
+        .map(|r| format!("{} {}", r.method, r.url.path()))
+        .collect();
+    assert_eq!(
+        log,
+        ["POST /patch/telemetry"],
+        "a rollback that fetches nothing sends only its telemetry event"
+    );
+}
+
+/// CA-U07: the "No SOCKET_API_TOKEN set — using the public patch API
+/// proxy" advisory describes where a fetch goes; a tokenless rollback that
+/// fetches nothing must not print it. (The run that does download prints
+/// it once: `rollback_undownloadable_blob_envelope_names_blob`.)
+#[test]
+fn tokenless_rollback_from_cached_blobs_prints_no_proxy_advisory() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    write_offline_satisfiable_project(tmp.path());
+    let out = rollback_cmd(tmp.path())
+        .args(["--proxy-url", "http://127.0.0.1:1/"])
+        .output()
+        .expect("run socket-patch");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "stderr={stderr}");
+    assert!(
+        !stderr.contains("public patch API proxy"),
+        "nothing was fetched, so no proxy is in use; stderr={stderr}"
     );
 }
 

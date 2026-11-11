@@ -19,7 +19,7 @@
 /// `gitlab:`) and any `git_source(:name) { … }` the Gemfile declares —
 /// bundler rejects every other unknown key, so an unknown key here can only
 /// be a git source.
-const NON_SOURCE_KEYS: [&str; 14] = [
+pub(crate) const NON_SOURCE_KEYS: [&str; 14] = [
     "group",
     "groups",
     "require",
@@ -234,10 +234,10 @@ pub(crate) struct SourceOption {
 }
 
 /// The first option on a `gem` line's argument tail that picks the gem's
-/// source, if any. Bundler allows ONE source per gem, so such an option
-/// moved into the Socket source block overrides the block (hosted: the
-/// redirect becomes a silent no-op that still gets attested), and kept next
-/// to a vendored `path:` makes bundler refuse the Gemfile. Fails closed:
+/// source, if any. Bundler allows ONE source per gem, so a declaration
+/// that carries such an option cannot take a Socket `source:` as well
+/// (hosted), and kept next to a vendored `path:` it makes bundler refuse
+/// the Gemfile. Fails closed:
 /// an unreadable tail counts as source-selecting, and so (flagged
 /// [`SourceOption::dynamic`]) does a `**opts` splat or hash literal, since
 /// it may carry one. Positional arguments (`*V`, constants, method calls)
@@ -270,9 +270,9 @@ pub(crate) fn source_option(tail: &str) -> Option<SourceOption> {
 /// The argument tail of a `gem "name", …` line minus any leading quoted
 /// version-constraint args (`"7.0.0"`, `'~> 7.0'`, `">= 1", "< 2"`) — i.e. the
 /// options (`require: false`, `group: :test`, `"require" => false`, …) that
-/// must survive the move into the source block or next to a vendored
-/// `path:`. Empty when the line carries none; bails to empty on an
-/// unparseable tail (unbalanced quote or bracket).
+/// must survive next to a vendored `path:` (and that a socket-patch 5.0 /
+/// 5.1 source block carried along). Empty when the line carries none; bails
+/// to empty on an unparseable tail (unbalanced quote or bracket).
 pub(crate) fn trailing_options(tail: &str) -> String {
     let tail = &without_statement_end(tail);
     let Some(args) = args(tail) else {
@@ -321,6 +321,218 @@ pub(crate) fn exact_version(tail: &str) -> Option<String> {
         && v.chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'));
     exact.then(|| v.to_string())
+}
+
+/// Whether the positional arguments of a tail evaluate nothing when
+/// bundler loads the Gemfile: each is a literal (a string, a symbol, a
+/// number, or an array, `%w` / `%i` list or hash of those, whose keys
+/// select no source), a name that is only read (a constant like `VERSION`
+/// or `Rack::VERSION`, a local variable, either one splatted) or one
+/// lookup in such a name (`ENV["V"]`, `ENV.fetch("V", "~> 1")`,
+/// `VERSIONS[:rack]`); a string may interpolate those. Any other method
+/// call, a lambda or a backtick runs code of its own on every `bundle`
+/// command. The `key => value` options are not looked at.
+///
+/// The vendored rewrite drops the positional arguments and keeps the
+/// options, and `vendor --revert` puts the declaration back from the
+/// committed ledger — which anyone who can open a pull request can write.
+/// The revert restores only positional arguments in this grammar (the
+/// options it restores are the ones the vendored line still shows), so the
+/// rewrite never drops any other.
+pub(crate) fn inert_positionals(tail: &str) -> bool {
+    let tail = without_statement_end(tail);
+    let Some(code) = code_of(&tail).map(str::trim) else {
+        return false;
+    };
+    if code.is_empty() {
+        return true;
+    }
+    code.strip_prefix(',')
+        .and_then(split_args)
+        .is_some_and(|args| {
+            args.iter()
+                .map(|(_, arg)| arg.trim())
+                .all(|arg| matches!(classify(arg), Arg::Option { .. }) || inert_arg(arg))
+        })
+}
+
+/// One positional argument: a value, or a splatted name.
+fn inert_arg(arg: &str) -> bool {
+    match arg.strip_prefix("**").or_else(|| arg.strip_prefix('*')) {
+        Some(splat) => read_name(splat.trim_start()),
+        None => inert_value(arg),
+    }
+    .is_some_and(|rest| rest.trim().is_empty())
+}
+
+/// A leading inert value of `s`; the text after it.
+fn inert_value(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    match s.chars().next()? {
+        '"' | '\'' => inert_string(s),
+        ':' if s[1..].starts_with(['"', '\'']) => inert_string(&s[1..]),
+        ':' => {
+            let n = ident_len(&s[1..]);
+            let rest = &s[1 + n..];
+            (n > 0).then(|| rest.strip_prefix(['?', '!']).unwrap_or(rest))
+        }
+        '[' => inert_list(&s[1..], ']', false),
+        '{' => inert_list(&s[1..], '}', true),
+        '%' => word_list(s),
+        c if c.is_ascii_digit()
+            || (c == '-' && s[1..].starts_with(|d: char| d.is_ascii_digit())) =>
+        {
+            let end = s[1..]
+                .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '_'))
+                .map_or(s.len(), |i| i + 1);
+            Some(&s[end..])
+        }
+        _ => lookup(read_name(s)?),
+    }
+}
+
+/// Bare words that are calls, not reads: a local variable or constant may
+/// be named in an argument, these may not.
+const CALLS: [&str; 22] = [
+    "abort",
+    "at_exit",
+    "binding",
+    "eval",
+    "exec",
+    "exit",
+    "fail",
+    "fork",
+    "gemspec",
+    "gets",
+    "lambda",
+    "load",
+    "loop",
+    "proc",
+    "raise",
+    "readline",
+    "readlines",
+    "require",
+    "sleep",
+    "spawn",
+    "system",
+    "throw",
+];
+
+/// A leading name that is only read — a constant path (`VERSION`,
+/// `Rack::VERSION`), a local variable, `true` / `false` / `nil`; the text
+/// after it. A name that is called (`f(…)`, `f.g`, `f!`) leaves that text
+/// behind for the caller to reject.
+fn read_name(s: &str) -> Option<&str> {
+    let mut rest = s;
+    let mut scoped = false;
+    loop {
+        let n = ident_len(rest);
+        let constant = rest.starts_with(|c: char| c.is_ascii_uppercase());
+        // `Const::name` is a call.
+        if n == 0 || CALLS.contains(&&rest[..n]) || (scoped && !constant) {
+            return None;
+        }
+        rest = &rest[n..];
+        match rest.strip_prefix("::") {
+            Some(next) if constant => (rest, scoped) = (next, true),
+            _ => return Some(rest),
+        }
+    }
+}
+
+/// A leading string literal that interpolates nothing but inert values;
+/// the text after it.
+fn inert_string(s: &str) -> Option<&str> {
+    let quote = s.chars().next().filter(|c| matches!(c, '"' | '\''))?;
+    let mut rest = &s[1..];
+    loop {
+        let c = rest.chars().next()?;
+        rest = &rest[c.len_utf8()..];
+        match c {
+            '\\' => rest = &rest[rest.chars().next()?.len_utf8()..],
+            c if c == quote => return Some(rest),
+            '#' if quote == '"' && rest.starts_with('{') => {
+                rest = inert_value(&rest[1..])?.trim_start().strip_prefix('}')?;
+            }
+            '#' if quote == '"' && rest.starts_with(['$', '@']) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// One lookup in the value a name holds (`ENV["V"]`, `VERSIONS[:rack]`,
+/// `ENV.fetch("V", "~> 1")`), or none; the text after it.
+fn lookup(rest: &str) -> Option<&str> {
+    if let Some(key) = rest.strip_prefix('[') {
+        return inert_value(key)?.trim_start().strip_prefix(']');
+    }
+    let Some(key) = rest.strip_prefix(".fetch(") else {
+        return Some(rest);
+    };
+    let rest = inert_value(key)?.trim_start();
+    match rest.strip_prefix(',') {
+        Some(default) => inert_value(default)?.trim_start().strip_prefix(')'),
+        None => rest.strip_prefix(')'),
+    }
+}
+
+/// The elements of an array (or the pairs of a `hash`) up to `close`; the
+/// text after it.
+fn inert_list(s: &str, close: char, hash: bool) -> Option<&str> {
+    let mut rest = s.trim_start();
+    loop {
+        if let Some(done) = rest.strip_prefix(close) {
+            return Some(done);
+        }
+        rest = if hash {
+            inert_pair(rest)?
+        } else {
+            inert_value(rest)?
+        }
+        .trim_start();
+        match rest.strip_prefix(',') {
+            Some(next) => rest = next.trim_start(),
+            None => return rest.strip_prefix(close),
+        }
+    }
+}
+
+/// One `key => value` of a hash literal, whose key selects no source.
+fn inert_pair(s: &str) -> Option<&str> {
+    let n = ident_len(s);
+    let (key, rest) = if n > 0 && s[n..].starts_with(':') && !s[n..].starts_with("::") {
+        (&s[..n], &s[n + 1..])
+    } else {
+        let (key, rest) = match s.strip_prefix(':') {
+            Some(sym) if ident_len(sym) > 0 => sym.split_at(ident_len(sym)),
+            _ => leading_quoted(s)?,
+        };
+        let rest = rest.trim_start();
+        (
+            key,
+            rest.strip_prefix("=>").or_else(|| rest.strip_prefix(':'))?,
+        )
+    };
+    NON_SOURCE_KEYS
+        .contains(&key)
+        .then(|| inert_value(rest))
+        .flatten()
+}
+
+/// A `%w[…]` / `%i[…]` list of plain words; the text after it.
+fn word_list(s: &str) -> Option<&str> {
+    let rest = s.strip_prefix("%w").or_else(|| s.strip_prefix("%i"))?;
+    let close = match rest.chars().next()? {
+        '[' => ']',
+        '(' => ')',
+        '{' => '}',
+        '<' => '>',
+        _ => return None,
+    };
+    let (body, rest) = rest[1..].split_once(close)?;
+    body.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ' | '\t'))
+        .then_some(rest)
 }
 
 /// `opts` minus a top-level `;` statement terminator (and any extra `;`s),
@@ -538,6 +750,76 @@ mod tests {
             ", \"\"",
         ] {
             assert_eq!(exact_version(tail), None, "{tail}");
+        }
+    }
+
+    /// The positional arguments the vendored rewrite drops (and its revert
+    /// puts back from the ledger) are literals and reads: constants, local
+    /// variables, `ENV`. The options are not judged here, whatever they
+    /// hold.
+    #[test]
+    fn inert_positionals_are_literals_and_reads() {
+        for tail in [
+            "",
+            "  # a comment",
+            ";",
+            ", \"~> 3.1\"",
+            ", '>= 1', '< 2'",
+            ", \"~> 3.1\" # system(\"x\")",
+            ", \"3.1\", require: false",
+            ", VERSION",
+            ", Rack::VERSION, group: :web",
+            ", *V",
+            ", *versions",
+            ", rails_version",
+            ", **OPTS",
+            ", ENV[\"RACK\"]",
+            ", ENV.fetch(\"RV\", \"~> 3.1\")",
+            ", ENV.fetch(\"a, b\", \"#x\")",
+            ", VERSIONS[:rack]",
+            ", versions.fetch(\"rack\", \"~> 3\")",
+            ", \"~> #{RAILS}\"",
+            ", \"~> #{ENV['RAILS']}\"",
+            ", \"~> #{ENV.fetch(\"RAILS\", \"7.0\")}.0\"",
+            ", { require: false, groups: [:test, \"ci\"] }",
+            ", :require => false",
+            ", %w[a b]",
+            // Options are the vendored line's to show, not this grammar's.
+            ", \"1.0\", install_if: -> { RUBY_PLATFORM =~ /darwin/ }",
+            ", require: helper(\"x\")",
+        ] {
+            assert!(inert_positionals(tail), "{tail}");
+        }
+        for tail in [
+            ", system(\"touch x\")",
+            ", system(\"touch x\").to_s",
+            ", `touch x`",
+            ", %x(touch x)",
+            ", \"#{`touch x`}\"",
+            ", \"#{system('x')}\"",
+            ", \"#$stdout\"",
+            ", File.read(\"VERSION\").strip",
+            ", version_for(:rack)",
+            ", Kernel::exit",
+            ", Rack::version",
+            ", exit",
+            ", gemspec",
+            ", binding.irb",
+            ", -> { 1 }",
+            ", VERSION.tap { system(\"x\") }",
+            ", ENV.fetch(\"X\") { system(\"x\") }",
+            ", ENV.fetch(system(\"x\"))",
+            ", VERSIONS[helper()]",
+            ", versions.map(&:to_s)",
+            ", { git: \"https://evil.example/a.git\" }",
+            ", { \"git\" => \"https://evil.example/a.git\" }",
+            ", *helper()",
+            ", \"1.0\"; system(\"x\")",
+            ", \"unterminated",
+            ",",
+            " \"1.0\"",
+        ] {
+            assert!(!inert_positionals(tail), "{tail}");
         }
     }
 }

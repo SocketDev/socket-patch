@@ -29,7 +29,7 @@ const NAME: &str = "in-proc-redirect-pnpm";
 const VERSION: &str = "1.0.0";
 const PURL: &str = "pkg:npm/in-proc-redirect-pnpm@1.0.0";
 const UUID: &str = "11111111-1111-4111-8111-111111111111";
-const HOSTED_URL: &str = "http://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
+const HOSTED_URL: &str = "https://patch.test/patch/npm/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
 const PATCHED_SHA512: &str = "sha512-PATCHEDpatchedPATCHEDpatched0123456789==";
 const UPSTREAM_SHA512: &str = "sha512-UPSTREAMupstream==";
 const GHSA: &str = "GHSA-rdir-pnpm-bbbb";
@@ -58,7 +58,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
             json: true,
             yes: true,
             silent: true,
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..socket_patch_cli::args::GlobalArgs::default()
         },
         preserve_state: false,
@@ -518,6 +518,66 @@ async fn hosted_trust_edit_scaffolds_packages_in_a_keyless_workspace_yaml() {
     );
 }
 
+/// A CRLF pnpm-workspace.yaml stays CRLF through the trust edit: the key
+/// it appends, and the scaffold a file with no keys gains, end in CRLF
+/// like the lines around them. `rollback` takes the scaffold back out byte
+/// for byte, and removes the file hosted mode created in either line
+/// ending (a `core.autocrlf` checkout).
+#[tokio::test]
+#[serial]
+async fn hosted_trust_edit_keeps_a_crlf_workspace_yaml_crlf() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+
+    // (the user's file, the file after the scan, the file after rollback)
+    let appended = "packages:\r\n  - '.'\r\n  - 'tools/*'\r\ntrustLockfile: true\r\n";
+    for (user_ws, wired, rolled_back) in [
+        (
+            "packages:\r\n  - '.'\r\n  - 'tools/*'\r\n",
+            appended,
+            // A key appended to a file with keys is never taken back out.
+            appended,
+        ),
+        (
+            "# pnpm settings go here\r\n",
+            "# pnpm settings go here\r\npackages:\r\n  - '.'\r\ntrustLockfile: true\r\n",
+            "# pnpm settings go here\r\n",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pnpm_project(tmp.path());
+        let ws_path = tmp.path().join("pnpm-workspace.yaml");
+        std::fs::write(&ws_path, user_ws).unwrap();
+
+        assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            wired,
+            "the added lines end in CRLF ({user_ws:?})"
+        );
+        assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+        assert_eq!(
+            std::fs::read_to_string(&ws_path).unwrap(),
+            rolled_back,
+            "{user_ws:?}"
+        );
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_pnpm_project(tmp.path());
+    let ws_path = tmp.path().join("pnpm-workspace.yaml");
+    assert_eq!(run(hosted_args(tmp.path(), server.uri())).await, 0);
+    let created = std::fs::read_to_string(&ws_path).unwrap();
+    assert_eq!(created, "packages:\n  - '.'\ntrustLockfile: true\n");
+    std::fs::write(&ws_path, created.replace('\n', "\r\n")).unwrap();
+    assert_eq!(rollback_hosted(tmp.path(), &server).await, 0);
+    assert!(
+        !ws_path.exists(),
+        "the created file goes with the pin, checked out as CRLF or not"
+    );
+}
+
 /// #903 / #904: a `pnpm-lock.yaml` and `pnpm-workspace.yaml` saved with a
 /// UTF-8 BOM read like their plain twins. The BOM lock gets the
 /// `trustLockfile: true` auto-config (it used to read as unversioned and
@@ -718,7 +778,7 @@ packages:
 async fn hosted_rewrites_pnpm_quoted_scoped_key() {
     const SCOPED_NAME: &str = "@socktest/in-proc-redirect-pnpm";
     const SCOPED_PURL: &str = "pkg:npm/%40socktest/in-proc-redirect-pnpm@1.0.0";
-    const SCOPED_HOSTED_URL: &str = "http://patch.test/patch/npm/%40socktest/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
+    const SCOPED_HOSTED_URL: &str = "https://patch.test/patch/npm/%40socktest/in-proc-redirect-pnpm/1.0.0/22222222-2222-4222-8222-222222222222/11111111-1111-4111-8111-111111111111/in-proc-redirect-pnpm-1.0.0.tgz";
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -882,7 +942,7 @@ async fn hosted_pnpm_vex_emits_redirected_attestation() {
 /// Manifest-less VEX after the in-process hosted rewrite of a v9 root lock
 /// AND a legacy shrinkwrap-3 lock (pnpm 1/2): the project carries no
 /// manifest (hosted mode never writes one), the hosted URL sits on the
-/// operator's patch server (`--patch-server-url http://patch.test`).
+/// operator's patch server (`--patch-server-url https://patch.test`).
 ///
 /// * not installed, no ledger (v5): the lockfile reference + the patch API
 ///   record attest `(redirected)` from the integrity pin, then
@@ -940,7 +1000,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                 );
                 let api = PatchApi::start(vec![(UUID.to_string(), view.clone())]);
                 let online = |no_verify| VexRun {
-                    patch_server_url: Some("http://patch.test".to_string()),
+                    patch_server_url: Some("https://patch.test".to_string()),
                     no_verify,
                     ..VexRun::online(&api)
                 };
@@ -968,7 +1028,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                     &bin,
                     root,
                     &VexRun {
-                        patch_server_url: Some("http://patch.test".to_string()),
+                        patch_server_url: Some("https://patch.test".to_string()),
                         ..VexRun::offline()
                     },
                 );
@@ -996,7 +1056,7 @@ async fn hosted_pnpm_manifestless_vex_from_lockfile_legacy_ledger_and_api() {
                     &bin,
                     root,
                     &VexRun {
-                        patch_server_url: Some("http://patch.test".to_string()),
+                        patch_server_url: Some("https://patch.test".to_string()),
                         ..VexRun::offline()
                     },
                 );
@@ -1619,9 +1679,46 @@ async fn hosted_scan_from_pnpm_project_outside_workspace_globs_pins_and_nests_tr
     assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws_before);
 }
 
+/// A listed member's own `pnpm-lock.yaml` under the default shared
+/// workspace lock is one pnpm never reads: `pnpm install` in the member
+/// installs from the workspace root's lock and leaves the member's alone
+/// (pnpm 10.34 and 11.27). A pin written there would never be installed, so
+/// the scan refuses and names the workspace root instead of reporting a
+/// patch nothing delivers.
+#[tokio::test]
+#[serial]
+async fn hosted_scan_from_pnpm_member_with_an_unread_lock_refuses() {
+    let server = MockServer::start().await;
+    mock_discovery(&server).await;
+    mock_reference(&server).await;
+    mock_view(&server).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = member_root(&tmp);
+    let root_ws = root.join("pnpm-workspace.yaml");
+    let ws = "packages:\n  - 'packages/*'\n";
+    std::fs::write(&root_ws, ws).unwrap();
+    let member = root.join("packages/a");
+    std::fs::create_dir_all(&member).unwrap();
+    write_pnpm_project(&member);
+    let lock = member.join("pnpm-lock.yaml");
+    let before = std::fs::read_to_string(&lock).unwrap();
+
+    let (code, doc) = run_hosted_json(&member, &server.uri());
+    assert_refused_workspace_lock_elsewhere("pnpm member", code, &doc, &lock, &before, &member);
+    let message = doc["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains(&root.display().to_string()),
+        "the refusal names the workspace root to run from: {message}"
+    );
+    assert_eq!(std::fs::read_to_string(&root_ws).unwrap(), ws);
+    assert!(!member.join("pnpm-workspace.yaml").exists());
+}
+
 /// #880: an explicit `trustLockfile: false` in the root file is the user's
 /// call, respected as in a single project: the member pins, nothing is
-/// nested, and the warning names the root file.
+/// nested, and the warning names the root file. The workspace turns the
+/// shared lock off, so the member's own lock is the one pnpm installs it
+/// from.
 #[tokio::test]
 #[serial]
 async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
@@ -1632,7 +1729,7 @@ async fn hosted_scan_from_pnpm_member_respects_root_trust_opt_out() {
     let tmp = tempfile::tempdir().unwrap();
     let root = member_root(&tmp);
     let root_ws = root.join("pnpm-workspace.yaml");
-    let ws = "packages:\n  - 'packages/*'\ntrustLockfile: false\n";
+    let ws = "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\ntrustLockfile: false\n";
     std::fs::write(&root_ws, ws).unwrap();
     let member = root.join("packages/a");
     std::fs::create_dir_all(&member).unwrap();
@@ -3222,7 +3319,7 @@ fn rollback_subprocess(
             "--json",
             "--yes",
             "--patch-server-url",
-            "http://patch.test",
+            "https://patch.test",
             "--cwd",
             cwd.to_str().unwrap(),
         ])
@@ -3376,7 +3473,7 @@ async fn issue_1268_rollback_of_a_member_lock_warns_trust_lockfile_left() {
 async fn issue_1268_member_lock_still_hosted_keeps_trust_without_warning() {
     const OTHER: &str = "other-pkg";
     const OTHER_VERSION: &str = "2.0.0";
-    const OTHER_HOSTED_URL: &str = "http://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
+    const OTHER_HOSTED_URL: &str = "https://patch.test/patch/npm/other-pkg/2.0.0/22222222-2222-4222-8222-222222222222/33333333-3333-4333-8333-333333333333/other-pkg-2.0.0.tgz";
     let server = MockServer::start().await;
     mock_registry_version(&server, NAME, VERSION).await;
 
@@ -3481,7 +3578,7 @@ async fn hosted_pins_a_pnpm_patched_dependency_only_with_explicit_consent() {
     let out = discover_patched_refs_with(
         tmp.path(),
         &DiscoverOptions {
-            patch_server_origins: vec!["http://patch.test".to_string()],
+            patch_server_origins: vec!["https://patch.test".to_string()],
         },
     )
     .await;

@@ -10,10 +10,40 @@ use crate::args::GlobalArgs;
 /// What the hosted leg did.
 #[derive(Default)]
 pub(crate) struct HostedLegOutcome {
+    /// The pins restored (on a dry run: that would be). None when writing
+    /// the restored files failed: that restore is all or nothing.
     pub(crate) reverted: Vec<String>,
+    /// `(purl, why)` per refused pin, and `(WRITE_FAILURE_KEY, why)` when
+    /// writing the restored files failed.
     pub(crate) failed: Vec<(String, String)>,
     pub(crate) warnings: Vec<(String, String)>,
+    /// The files the leg changed (on a dry run: would change). After a
+    /// write failure, only the ones it could not put back.
     pub(crate) edited_files: std::collections::BTreeSet<String>,
+    /// The restored gems whose installed copies the leg brought back to the
+    /// upstream gem (on a dry run: would), with none left on the patched
+    /// build: they need no reinstall.
+    pub(crate) refreshed_installs: std::collections::BTreeSet<String>,
+}
+
+/// The [`HostedLegOutcome::failed`] key of a failure that is not one pin's:
+/// writing the restored files failed (rollback's artifact-level
+/// `hosted_write_failed` event).
+pub(crate) const WRITE_FAILURE_KEY: &str = "files";
+
+impl HostedLegOutcome {
+    /// Why the project is left half restored, if it is: writing the
+    /// restored files failed part-way and not every file already written
+    /// could be put back. The reason names each such file and its state.
+    pub(crate) fn half_applied(&self) -> Option<&str> {
+        if self.edited_files.is_empty() {
+            return None;
+        }
+        self.failed
+            .iter()
+            .find(|(key, _)| key == WRITE_FAILURE_KEY)
+            .map(|(_, why)| why.as_str())
+    }
 }
 
 /// The patch-server origins that count as hosted, besides Socket's own:
@@ -30,6 +60,69 @@ pub(crate) fn patch_server_origins_of(patch_server_url: Option<&str>) -> Vec<Str
         .filter(|url| !url.trim().is_empty())
         .map(str::to_string)
         .collect()
+}
+
+/// The gem leg of the unwind's installed-tree care (the "Gem stale-install
+/// guard" section of CLI_CONTRACT.md, in the upstream direction): refresh
+/// what [`crate::commands::gem_refresh::after_restore`] may, then report.
+/// A human run prints what was refreshed as progress lines and gets ONE
+/// warning for the gems still on their patched build; `--json` carries a
+/// note per refreshed materialization and a warning per stale one. An
+/// archive in Bundler's cache dir the refresh replaced no longer needs the
+/// restore's own `upstream_gem_stale_cache` advisory.
+///
+/// Only this leg refreshes, because only its callers leave the gem on its
+/// upstream entry. A hosted → vendored takeover restores the pins itself
+/// (`restore_upstream`, on its way to the `path:` source) and must stay
+/// off this path: Bundler loads the vendored copy from then on, so the
+/// installed one is an unused leftover that a refresh would only make
+/// unpatched, at the cost of a registry download vendored mode never needs.
+async fn refresh_restored_gems(
+    common: &GlobalArgs,
+    outcome: &socket_patch_core::patch::redirect::upstream::RestoreOutcome,
+    out: &mut HostedLegOutcome,
+) {
+    use crate::commands::gem_refresh::{after_restore, Direction};
+    use socket_patch_core::patch::redirect::upstream::GEM_STALE_CACHE;
+
+    let restored: Vec<String> = outcome
+        .restored()
+        .filter(|pin| pin.purl.starts_with("pkg:gem/"))
+        .map(|pin| pin.purl.clone())
+        .collect();
+    if restored.is_empty() {
+        return;
+    }
+    let refresh = after_restore(common, &restored, &outcome.staged_text).await;
+    out.warnings.retain(|(code, detail)| {
+        code != GEM_STALE_CACHE
+            || !refresh
+                .replaced_archives
+                .iter()
+                .any(|path| detail.contains(&path.display().to_string()))
+    });
+    out.refreshed_installs = refresh.refreshed_installs;
+    let report = refresh.report;
+    if common.json {
+        out.warnings.extend(
+            report
+                .warnings
+                .into_iter()
+                .map(|(code, detail)| (code.to_string(), detail)),
+        );
+        return;
+    }
+    if !common.silent {
+        for line in &report.progress {
+            println!("{line}");
+        }
+    }
+    if let Some(summary) = &report.summary {
+        out.warnings.push((
+            Direction::Upstream.stale_code().to_string(),
+            summary.paragraph(),
+        ));
+    }
 }
 
 /// Restore the in-scope hosted pins to their default upstream registry
@@ -99,14 +192,26 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
                 }
                 out.failed.push((pin.purl.clone(), why.clone()));
             }
+            // Not restored: the one write failure below covers them all.
+            PinStatus::Unwritten => {}
         }
     }
     if let Some(e) = &outcome.flush_error {
-        let why = format!("writing the restored lockfiles failed: {e}");
+        let why = if common.dry_run {
+            format!("writing the restored lockfiles would fail: {e}")
+        } else {
+            format!("writing the restored lockfiles failed: {e}")
+        };
         if !common.json {
             eprintln!("Error: {}", crate::ui::sentence_case(&why));
         }
-        out.failed.push(("files".to_string(), why));
+        out.failed.push((WRITE_FAILURE_KEY.to_string(), why));
+        // Only what the failed flush could not put back was edited.
+        out.edited_files
+            .extend(outcome.half_applied.iter().cloned());
+    } else {
+        out.edited_files
+            .extend(outcome.reverted_files.iter().cloned());
     }
     out.warnings.extend(
         outcome
@@ -114,8 +219,6 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
             .iter()
             .map(|(code, detail)| (code.to_string(), detail.clone())),
     );
-    out.edited_files
-        .extend(outcome.reverted_files.iter().cloned());
     // Bun's hoisted linker keeps the patched copies of the pins it no
     // longer pins: say so, with the install that does reinstall.
     // A dry run says it too, so the preview's reinstall note names
@@ -160,6 +263,11 @@ pub(crate) async fn run_hosted_leg(common: &GlobalArgs, pins: &[HostedPin]) -> H
         if let Some(detail) = advisory(&common.cwd, &unwound).await {
             out.warnings.push((HOSTED_CODE.to_string(), detail));
         }
+        // Bundler keeps a gem it already holds whatever source the lock
+        // names: bring the project's installed copies and cached archives
+        // of the restored gems back to the upstream gem, and say what is
+        // still the patched build.
+        refresh_restored_gems(common, &outcome, &mut out).await;
     }
     let unwound: Vec<_> = vlt_targets
         .into_iter()

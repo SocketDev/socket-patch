@@ -34,7 +34,7 @@ const PURL: &str = "pkg:pypi/urllib3@1.26.18";
 /// pre-v5 redirect ledger was keyed by).
 const RECORD_PURL: &str = "pkg:pypi/urllib3@1.26.18?artifact_id=py2-py3-none-any-whl";
 const UUID: &str = "e828efa5-5c6d-43f3-9909-03f5ac232b98";
-const HOSTED_URL: &str = "http://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
+const HOSTED_URL: &str = "https://patch.test/patch/pypi/urllib3/1.26.18/22222222-2222-4222-8222-222222222222/e828efa5-5c6d-43f3-9909-03f5ac232b98/urllib3-1.26.18-py2.py3-none-any.whl";
 const GHSA: &str = "GHSA-gm62-xv2j-4w53";
 const UPSTREAM: &[u8] = b"upstream response implementation\n";
 const PATCHED: &[u8] = b"patched response implementation\n";
@@ -105,7 +105,7 @@ async fn rollback_hosted(cwd: &Path, server: &MockServer) -> i32 {
     let code = rollback::run(RollbackArgs {
         targets: Vec::new(),
         common: GlobalArgs {
-            patch_server_url: Some("http://patch.test".to_string()),
+            patch_server_url: Some("https://patch.test".to_string()),
             ..global(cwd, server.uri())
         },
         preserve_state: false,
@@ -658,7 +658,7 @@ async fn python_probe_does_not_guess_staleness_or_run_on_dry_run() {
 // ── manifest-less VEX over the hosted wiring ──────────────────────────────
 
 /// Standalone `vex` on the redirected checkout `root` (hosted urls live on
-/// the mock's `http://patch.test` origin, which `vex` must be told is the
+/// the mock's `https://patch.test` origin, which `vex` must be told is the
 /// patch server).
 fn manifestless_vex(
     root: &Path,
@@ -670,7 +670,7 @@ fn manifestless_vex(
     let mut run = vex_e2e_common::VexRun {
         offline,
         proxy_url: Some(api.uri()),
-        patch_server_url: Some("http://patch.test".to_string()),
+        patch_server_url: Some("https://patch.test".to_string()),
         product: Some("pkg:pypi/app@0.1.0".to_string()),
         ..vex_e2e_common::VexRun::default()
     };
@@ -729,7 +729,7 @@ fn manifestless_vex_after_hosted_redirect() {
     let _ = std::fs::remove_file(root.join(vex_e2e_common::DEFAULT_OUTPUT));
     let apply = vex_e2e_common::VexRun {
         proxy_url: Some(api.uri()),
-        patch_server_url: Some("http://patch.test".to_string()),
+        patch_server_url: Some("https://patch.test".to_string()),
         product: Some("pkg:pypi/app@0.1.0".to_string()),
         ..vex_e2e_common::VexRun::default()
     }
@@ -738,7 +738,7 @@ fn manifestless_vex_after_hosted_redirect() {
     assert_eq!(out.code, Some(0), "{out}");
     assert_eq!(out.envelope["status"], "noManifest", "{out}");
     assert_attested(out.doc(), PURL, UUID, Marker::Redirected, vulns);
-    // Without the origin configured, `http://patch.test` is nobody's patch
+    // Without the origin configured, `https://patch.test` is nobody's patch
     // server: nothing is referenced at all.
     let mut run = vex_e2e_common::VexRun::online(&api);
     run.product = Some("pkg:pypi/app@0.1.0".to_string());

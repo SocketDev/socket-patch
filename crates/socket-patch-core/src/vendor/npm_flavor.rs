@@ -857,7 +857,11 @@ pub(super) async fn keep_artifact_while_lock_references_it(
 ///   which decodes `\u` escapes. A file that might hide the uuid behind an
 ///   escape the raw scan cannot see (a `\u`/`\x`/`\U` sequence in YAML,
 ///   yarn.lock or JSON that does not parse) fails closed.
-async fn uuid_proven_unreferenced(project_root: &Path, names: &[&str], uuid: &str) -> bool {
+pub(super) async fn uuid_proven_unreferenced(
+    project_root: &Path,
+    names: &[&str],
+    uuid: &str,
+) -> bool {
     let mut any_present = false;
     for name in names {
         match read_regular_to_string(&project_root.join(name)).await {

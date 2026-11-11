@@ -10,6 +10,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -750,6 +751,42 @@ fn locate_section(lines: &[&str], name: &str) -> Option<SectionSpan> {
     }
 }
 
+/// Where each top-level member's value sits in `text` as JSON reads it
+/// (the last one, for a repeated key): the byte range of the value, braces
+/// included. `None` when `text` is not a JSON object.
+pub(crate) fn top_level_value_spans(text: &str) -> Option<HashMap<String, Range<usize>>> {
+    let members: HashMap<String, &RawValue> = serde_json::from_str(text).ok()?;
+    members
+        .into_iter()
+        .map(|(key, raw)| {
+            let start = (raw.get().as_ptr() as usize).checked_sub(text.as_ptr() as usize)?;
+            let span = start..start.checked_add(raw.get().len())?;
+            (text.get(span.clone()) == Some(raw.get())).then_some((key, span))
+        })
+        .collect()
+}
+
+/// The byte range of a located section's `{…}` in the text `lines` were
+/// split from. [`nodes_block`] and [`edges_block`] find a section by the
+/// shape of its lines, which a member of the same name nested elsewhere (an
+/// `options.nodes` written at the top level's indent) can have too; a
+/// caller that edits the section's lines first checks that this range is
+/// the one [`top_level_value_spans`] gives the member, so the lines it
+/// edits are the ones every JSON reader takes for that section.
+pub(crate) fn section_value_span(lines: &[&str], span: SectionSpan) -> Range<usize> {
+    let offset = |line: usize| lines[..line].iter().map(|l| l.len() + 1).sum::<usize>();
+    match span {
+        SectionSpan::Inline { line } => {
+            let open = offset(line) + lines[line].find('{').unwrap_or_default();
+            open..open + 2
+        }
+        SectionSpan::Block { open, close } => {
+            let header = strip_cr(lines[open]).0;
+            offset(open) + header.len().saturating_sub(1)..offset(close) + "  }".len()
+        }
+    }
+}
+
 /// The nodes section in vlt's canonical layout. `None` when absent or laid
 /// out any other way; a caller whose parsed lock has nodes refuses then.
 pub(crate) fn nodes_block(lines: &[&str]) -> Option<SectionSpan> {
@@ -1080,13 +1117,24 @@ pub(crate) fn is_importer_dep_id(id: &str) -> bool {
 const COLLATION_PRIMARY: &str =
     " _-,;:!?.·'\"()[]{}§@*/\\&#%`^+<=>|~$0123456789abcdefghijklmnopqrstuvwxyz";
 
+/// [`COLLATION_PRIMARY`] by code point (every character in it is below
+/// U+0100): the character's position in the table plus one, 0 for a
+/// character outside it.
+static COLLATION_WEIGHTS: LazyLock<[u8; 256]> = LazyLock::new(|| {
+    let mut weights = [0; 256];
+    for (primary, c) in COLLATION_PRIMARY.chars().enumerate() {
+        weights[c as usize] = primary as u8 + 1;
+    }
+    weights
+});
+
 fn collation_weight(c: char) -> Option<(usize, bool)> {
     let upper = c.is_ascii_uppercase();
     let folded = c.to_ascii_lowercase();
-    COLLATION_PRIMARY
-        .chars()
-        .position(|p| p == folded)
-        .map(|primary| (primary, upper))
+    match COLLATION_WEIGHTS.get(folded as usize) {
+        None | Some(0) => None,
+        Some(weight) => Some((usize::from(*weight) - 1, upper)),
+    }
 }
 
 /// vlt's `a.localeCompare(b, 'en')`, restricted to the collation table:
@@ -1094,11 +1142,29 @@ fn collation_weight(c: char) -> Option<(usize, bool)> {
 /// position by position, lowercase first. `None` is "Unknown": a character
 /// outside the table (a tilde-era `file:` path with non-ASCII, say), for
 /// which callers fall back to in-place placement.
+///
+/// One pass over both strings, to their ends: the order is settled at the
+/// first difference, but a character outside the table anywhere in either
+/// string still makes the comparison Unknown.
 pub(crate) fn vlt_collate(a: &str, b: &str) -> Option<Ordering> {
-    let weigh = |s: &str| s.chars().map(collation_weight).collect::<Option<Vec<_>>>();
-    let (wa, wb) = (weigh(a)?, weigh(b)?);
-    let primary = wa.iter().map(|w| w.0).cmp(wb.iter().map(|w| w.0));
-    Some(primary.then_with(|| wa.iter().map(|w| w.1).cmp(wb.iter().map(|w| w.1))))
+    // `Some(None)` past the end of a string, `None` outside the table.
+    let weigh = |c: Option<char>| match c {
+        Some(c) => collation_weight(c).map(Some),
+        None => Some(None),
+    };
+    let (mut a, mut b) = (a.chars(), b.chars());
+    let (mut primary, mut case) = (Ordering::Equal, Ordering::Equal);
+    loop {
+        match (weigh(a.next())?, weigh(b.next())?) {
+            (None, None) => return Some(primary.then(case)),
+            (None, Some(_)) => primary = primary.then(Ordering::Less),
+            (Some(_), None) => primary = primary.then(Ordering::Greater),
+            (Some(l), Some(r)) => {
+                primary = primary.then(l.0.cmp(&r.0));
+                case = case.then(l.1.cmp(&r.1));
+            }
+        }
+    }
 }
 
 /// The fields vlt's `formatEdges` sorts by.
@@ -2438,6 +2504,113 @@ mod tests {
             assert_eq!(vlt_collate(&pair[0], &pair[1]), Some(Ordering::Less));
             assert_eq!(vlt_collate(&pair[1], &pair[0]), Some(Ordering::Greater));
         }
+    }
+
+    /// The collation as first written: a scan of the table per character
+    /// and a weight vector per string, per comparison.
+    fn vlt_collate_reference(a: &str, b: &str) -> Option<Ordering> {
+        let weight = |c: char| {
+            let folded = c.to_ascii_lowercase();
+            COLLATION_PRIMARY
+                .chars()
+                .position(|p| p == folded)
+                .map(|primary| (primary, c.is_ascii_uppercase()))
+        };
+        let weigh = |s: &str| s.chars().map(weight).collect::<Option<Vec<_>>>();
+        let (wa, wb) = (weigh(a)?, weigh(b)?);
+        let primary = wa.iter().map(|w| w.0).cmp(wb.iter().map(|w| w.0));
+        Some(primary.then_with(|| wa.iter().map(|w| w.1).cmp(wb.iter().map(|w| w.1))))
+    }
+
+    /// VBV-P1: the table-driven, single-pass collation gives the answer of
+    /// the one it replaces for every pair of the golden's DepIDs and edge
+    /// keys, its alphabet, and strings that differ only in case, in length
+    /// or by a character outside the table (at the start, the end, and
+    /// past the first difference).
+    #[test]
+    fn collation_agrees_with_the_scan_it_replaces_on_every_pair() {
+        let golden = collation_golden();
+        let mut strings: Vec<String> = golden.nodes.iter().step_by(3).cloned().collect();
+        strings.extend(golden.edges.iter().step_by(2).map(|(key, _)| key.clone()));
+        strings.extend(golden.alphabet.chars().map(String::from));
+        strings.extend(
+            [
+                "",
+                "a",
+                "A",
+                "ab",
+                "aB",
+                "Ab",
+                "AB",
+                "abc",
+                "a b",
+                "a\tb",
+                "é",
+                "éa",
+                "aé",
+                "aéb",
+                "bé",
+                "naïve",
+                "NAÏVE",
+                "~npm~a@1.0.0",
+                "~npm~A@1.0.0",
+                "~npm~a@1.0.0é",
+                "file~packages+naïve",
+                "\u{a7}",
+                "\u{b7}",
+                "\u{ff}",
+                "\u{100}",
+                "\u{7f}",
+                "\0",
+            ]
+            .map(String::from),
+        );
+        assert!(strings.len() > 300, "{}", strings.len());
+        let mut unknown = 0;
+        for a in &strings {
+            for b in &strings {
+                let expected = vlt_collate_reference(a, b);
+                assert_eq!(vlt_collate(a, b), expected, "{a:?} vs {b:?}");
+                unknown += usize::from(expected.is_none());
+            }
+        }
+        assert!(unknown > 1000, "{unknown} pairs outside the table");
+    }
+
+    /// VBV-D4: the span of a section's lines is the span JSON gives the
+    /// top-level member, for the block and the inline layout, with LF and
+    /// CRLF line ends, and is another one for a same-named member nested
+    /// in `options` at the top level's indent.
+    #[test]
+    fn section_lines_are_tied_to_the_top_level_member() {
+        let lock = "{\n  \"lockfileVersion\": 1,\n  \"options\": {},\n  \"nodes\": {\n    \"~npm~a@1.0.0\": [0,\"a\"]\n  },\n  \"edges\": {}\n}\n";
+        for text in [lock.to_string(), lock.replace('\n', "\r\n")] {
+            let lines = split_lines(&text);
+            let spans = top_level_value_spans(&text).unwrap();
+            for (name, span) in [
+                ("nodes", nodes_block(&lines)),
+                ("edges", edges_block(&lines)),
+            ] {
+                let span = section_value_span(&lines, span.unwrap());
+                assert_eq!(span, spans[name], "{name}");
+                assert!(text[span.clone()].starts_with('{') && text[span].ends_with('}'));
+            }
+        }
+        let decoy = lock.replace(
+            "  \"options\": {},\n",
+            "  \"options\": {\n  \"nodes\": {\n    \"~npm~b@1.0.0\": [0,\"b\"]\n  }\n  },\n",
+        );
+        assert!(serde_json::from_str::<Value>(&decoy).is_ok());
+        let lines = split_lines(&decoy);
+        let spans = top_level_value_spans(&decoy).unwrap();
+        let found = section_value_span(&lines, nodes_block(&lines).unwrap());
+        assert!(
+            decoy[found.clone()].contains("~npm~b@1.0.0"),
+            "the decoy is found first"
+        );
+        assert_ne!(found, spans["nodes"]);
+        assert!(decoy[spans["nodes"].clone()].contains("~npm~a@1.0.0"));
+        assert_eq!(top_level_value_spans("[]"), None);
     }
 
     #[test]

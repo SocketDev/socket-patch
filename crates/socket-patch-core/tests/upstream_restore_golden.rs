@@ -625,14 +625,57 @@ async fn gem_pre_checksums_states() {
         .replace(&format!("\nCHECKSUMS\n{checksums}\n"), "")
         .replace("2.6.2", "2.5.22");
     assert!(!lock.contains("CHECKSUMS"));
-    // Mixed: the rewriter edits only the Gemfile, so discovery finds no pin;
-    // hand the restore one. The untouched lock keeps the original constraint.
-    let mut mixed = synthetic(
-        "mixed",
+
+    // The rewriter converges a bundler 2.2–2.5 lock itself (a Socket GEM
+    // section, the `!` on the user's own requirement, no CHECKSUMS), and
+    // the pair unwinds offline, byte for byte: `~> 7.0` is still `~> 7.0`.
+    let converged_by_rewriter = synthetic(
+        "pre-checksums",
         &[("Gemfile", gemfile), ("Gemfile.lock", &lock)],
         gem_override("rails", "7.0.0"),
     );
-    assert_eq!(mixed.expected["Gemfile.lock"], lock);
+    assert!(converged_by_rewriter.expected["Gemfile.lock"].contains("  rails (~> 7.0)!\n"));
+    let (after, statuses) = run_case_with(&converged_by_rewriter, None, &offline()).await;
+    assert_round_trip(&converged_by_rewriter, &after, &statuses);
+
+    // So does a bundler ≤ 2.1 lock, whose one GEM section lists the patch
+    // registry as a second remote.
+    let merged_by_rewriter = synthetic(
+        "merged",
+        &[
+            ("Gemfile", gemfile),
+            ("Gemfile.lock", &lock.replace("2.5.22", "2.1.4")),
+        ],
+        gem_override("rails", "7.0.0"),
+    );
+    assert!(
+        merged_by_rewriter.expected["Gemfile.lock"].contains(&format!(
+            "GEM\n  remote: https://rubygems.org/\n  remote: {GEM_INDEX}\n  specs:\n"
+        ))
+    );
+    let (after, statuses) = run_case_with(&merged_by_rewriter, None, &offline()).await;
+    assert_round_trip(&merged_by_rewriter, &after, &statuses);
+
+    // The pairs socket-patch 5.0 / 5.1 left: a `source … do` block in the
+    // declaration's place, which holds the exact version only.
+    let block_gemfile = format!(
+        "source \"https://rubygems.org\"\nsource \"{GEM_INDEX}\" do\n  gem \"rails\", \"7.0.0\"\nend\ngem \"puma\"\n"
+    );
+    let mut mixed = Case {
+        dir: PathBuf::from("synthetic/mixed-block"),
+        input: BTreeMap::from([
+            ("Gemfile".to_string(), gemfile.to_string()),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]),
+        expected: BTreeMap::from([
+            ("Gemfile".to_string(), block_gemfile),
+            ("Gemfile.lock".to_string(), lock.clone()),
+        ]),
+        overrides: gem_override("rails", "7.0.0").as_array().unwrap().clone(),
+    };
+    // Mixed: those releases edited only the Gemfile on such a lock, so
+    // discovery finds no pin; hand the restore one. The untouched lock keeps
+    // the original constraint, which comes back with the declaration.
     let pin = HostedPin {
         purl: "pkg:gem/rails@7.0.0".into(),
         uuid: GEM_UUID.into(),
@@ -641,7 +684,7 @@ async fn gem_pre_checksums_states() {
     let (after, statuses) = run_case_with(&mixed, Some(vec![pin]), &offline()).await;
     assert_round_trip(&mixed, &after, &statuses);
 
-    // Bundler 2.2–2.5 then converges the pair itself (a Socket GEM section,
+    // Bundler 2.2–2.5 then converged the pair itself (a Socket GEM section,
     // a `!` pin, no CHECKSUMS): restorable offline. Not derivable: `~> 7.0`
     // comes back as the exact pin the lock records.
     let restored_lock = lock.replace("  rails (~> 7.0)\n", "  rails (= 7.0.0)\n");
@@ -686,7 +729,7 @@ async fn gem_pre_checksums_states() {
 #[serial]
 async fn gem_transitive_append_round_trips_unless_unprovable() {
     // #457: on a Gemfile ending in a declaration line, the rewriter's own
-    // append for a transitive gem is undone byte for byte: no new `gem`
+    // line for a transitive gem is undone byte for byte: no new `gem`
     // line, no `(= version)` DEPENDENCIES pin freezing the version.
     let gemfile = "source \"https://rubygems.org\"\n\ngem \"puma\"\n";
     let lock = transitive_lock().replace("  rails (= 7.0.0)\n", "");
@@ -698,12 +741,12 @@ async fn gem_transitive_append_round_trips_unless_unprovable() {
     let (after, statuses) = gem_run(&case).await;
     assert_round_trip(&case, &after, &statuses);
 
-    // An append with no blank line before it (what releases before #457
-    // wrote) is indistinguishable from a direct last-line declaration, so
-    // it is kept as a direct exact pin.
+    // A block socket-patch 5.0 appended with no blank line before it (what
+    // releases before #457 wrote) is indistinguishable from a direct
+    // last-line declaration, so it is kept as a direct exact pin.
     let mut case = case.clone_with("transitive-ambiguous");
-    let legacy = case.expected["Gemfile"].replace("\n\nsource", "\nsource");
-    assert_ne!(legacy, case.expected["Gemfile"]);
+    let legacy =
+        format!("{gemfile}source \"{GEM_INDEX}\" do\n  gem \"zeitwerk\", \"2.6.0\"\nend\n");
     case.expected.insert("Gemfile".into(), legacy);
     let (after, statuses) = gem_run(&case).await;
     assert_eq!(statuses[0].1, PinStatus::Restored);
@@ -728,13 +771,13 @@ async fn gem_refusals_leave_everything_hosted() {
     );
     // Offline: the CHECKSUMS sha256 needs the registry.
     let (after, statuses) = run_case_with(&case, None, &offline()).await;
-    assert_refused(&case, &after, &statuses, "Gemfile.lock", "offline");
+    assert_refused(&case, &after, &statuses, "Gemfile Gemfile.lock", "offline");
     // The registry does not know the gem.
     {
         let server = MockServer::start().await;
         let _env = EnvGuard::set("SOCKET_RUBYGEMS_URL", server.uri());
         let (after, statuses) = run_case(&case).await;
-        assert_refused(&case, &after, &statuses, "Gemfile.lock", "404");
+        assert_refused(&case, &after, &statuses, "Gemfile Gemfile.lock", "404");
     }
     // The upstream section is another registry's.
     let mut foreign = case.clone_with("foreign-upstream");
@@ -749,7 +792,7 @@ async fn gem_refusals_leave_everything_hosted() {
         &foreign,
         &after,
         &statuses,
-        "Gemfile.lock",
+        "Gemfile Gemfile.lock",
         "not rubygems.org",
     );
     // Two upstream sections, neither singled out.
@@ -774,23 +817,44 @@ async fn gem_refusals_leave_everything_hosted() {
         &ambiguous,
         &after,
         &statuses,
-        "Gemfile.lock",
+        "Gemfile Gemfile.lock",
         "upstream GEM sections",
     );
-    // The Gemfile block was hand-edited.
-    let mut edited = case.clone_with("edited-block");
+    // The Gemfile wiring was hand-edited into a shape nothing reads: the
+    // source moved into a constant.
+    let mut edited = case.clone_with("edited-option");
+    let option = format!("source: \"{GEM_INDEX}\"");
+    assert!(edited.expected["Gemfile"].contains(&option));
     edited.expected.insert(
         "Gemfile".into(),
-        edited.expected["Gemfile"]
-            .replace("  gem \"rails\", \"7.0.0\"", "  gem \"rails\", \"~> 7.0\""),
+        format!(
+            "SOCKET = \"{GEM_INDEX}\"\n{}",
+            edited.expected["Gemfile"].replace(&option, "source: SOCKET")
+        ),
     );
     let (after, statuses) = gem_run(&edited).await;
     assert_refused(
         &edited,
         &after,
         &statuses,
-        "Gemfile.lock",
-        "shape other than the source block",
+        "Gemfile Gemfile.lock",
+        "shape other than the `source:` option or the source block",
+    );
+    // A block of socket-patch 5.0 / 5.1 whose declaration was hand-edited.
+    let mut edited = case.clone_with("edited-block");
+    edited.expected.insert(
+        "Gemfile".into(),
+        format!(
+            "source \"https://rubygems.org\"\n\nsource \"{GEM_INDEX}\" do\n  gem \"rails\", \"~> 7.0\"\nend\ngem \"puma\"\n"
+        ),
+    );
+    let (after, statuses) = gem_run(&edited).await;
+    assert_refused(
+        &edited,
+        &after,
+        &statuses,
+        "Gemfile Gemfile.lock",
+        "shape other than the `source:` option or the source block",
     );
 }
 
@@ -1187,16 +1251,31 @@ async fn pypi_mock(releases: &[Release<'_>]) -> (MockServer, EnvGuard) {
             .mount(&server)
             .await;
     }
-    // The host's user- and system-level uv settings stay out of the tests.
-    let env = EnvGuard::many([
-        (
-            "SOCKET_PYPI_JSON_API",
-            Some(format!("{}/pypi", server.uri())),
-        ),
-        ("UV_NO_CONFIG", Some("1".to_string())),
-    ]);
+    // The host's user- and system-level uv settings stay out of the tests,
+    // and so does an index its environment names.
+    let env = EnvGuard::many(
+        [
+            (
+                "SOCKET_PYPI_JSON_API",
+                Some(format!("{}/pypi", server.uri())),
+            ),
+            ("UV_NO_CONFIG", Some("1".to_string())),
+        ]
+        .into_iter()
+        .chain(UV_INDEX_ENV.map(|name| (name, None))),
+    );
     (server, env)
 }
+
+/// The environment variables that give uv a package index.
+const UV_INDEX_ENV: [&str; 6] = [
+    "UV_INDEX",
+    "UV_DEFAULT_INDEX",
+    "UV_INDEX_URL",
+    "UV_EXTRA_INDEX_URL",
+    "UV_FIND_LINKS",
+    "UV_NO_INDEX",
+];
 
 fn tree(files: &[(&str, String)]) -> BTreeMap<String, String> {
     files
@@ -1223,6 +1302,19 @@ async fn restore_tree(
     files: &BTreeMap<String, String>,
     opts: &RestoreOptions,
 ) -> (BTreeMap<String, String>, Vec<(String, PinStatus)>) {
+    let (after, statuses, _) = restore_tree_warnings(files, opts).await;
+    (after, statuses)
+}
+
+/// [`restore_tree`], with the restore's `(code, detail)` warnings.
+async fn restore_tree_warnings(
+    files: &BTreeMap<String, String>,
+    opts: &RestoreOptions,
+) -> (
+    BTreeMap<String, String>,
+    Vec<(String, PinStatus)>,
+    Vec<(&'static str, String)>,
+) {
     let tmp = tempfile::tempdir().unwrap();
     for (rel, text) in files {
         let p = tmp.path().join(rel);
@@ -1238,7 +1330,7 @@ async fn restore_tree(
         .iter()
         .map(|p| (p.purl.clone(), p.status.clone()))
         .collect();
-    (walk(tmp.path()), statuses)
+    (walk(tmp.path()), statuses, outcome.warnings)
 }
 
 /// Hosted-rewrite `input`, restore it, and require the input bytes back.
@@ -1300,7 +1392,7 @@ async fn pypi_refusal_after(
         .iter()
         .filter_map(|(_, s)| match s {
             PinStatus::Refused(why) => Some(why.clone()),
-            PinStatus::Restored => None,
+            PinStatus::Restored | PinStatus::Unwritten => None,
         })
         .collect();
     assert!(
@@ -1347,17 +1439,20 @@ async fn requirements_golden_restores_modulo_name_casing() {
 
 #[tokio::test]
 #[serial]
-async fn uv_golden_without_a_registry_sibling_is_refused() {
-    // NOT invertible: the lock holds no other registry package, so which
-    // artifact fields this uv release records (`size`, `upload-time`) and
-    // how it lays out `wheels` is not derivable.
+async fn uv_golden_without_a_registry_sibling_is_rebuilt_by_revision() {
+    // The lock holds no other registry package to show which artifact
+    // fields uv records, but its header does: a `[[package]]` lock with no
+    // `revision` records `url`, `hash` and `size`. The golden's input omits
+    // `size` (no uv writes that), so the entry comes back with it and is
+    // otherwise the input's.
+    let hash = "0".repeat(64);
     let (_server, _env) = pypi_mock(&[(
         "click",
         "8.1.7",
         vec![(
-            "click-8.1.7-py3-none-any.whl",
-            URLLIB3_WHEEL_SHA,
-            1,
+            "https://files.pythonhosted.org/packages/00/2e/click-8.1.7-py3-none-any.whl",
+            hash.as_str(),
+            97941,
             "2023-08-17T17:29:10Z",
         )],
     )])
@@ -1367,16 +1462,19 @@ async fn uv_golden_without_a_registry_sibling_is_refused() {
         let (after, statuses) = run_case(&case).await;
         assert!(!statuses.is_empty());
         for (purl, status) in &statuses {
-            assert!(
-                matches!(status, PinStatus::Refused(why)
-                    if why.contains("sibling") && why.contains("git checkout -- uv.lock")),
-                "{}: {purl} {status:?}",
+            assert_eq!(
+                *status,
+                PinStatus::Restored,
+                "{}: {purl}",
                 case.dir.display()
             );
         }
+        let entry = format!("hash = \"sha256:{hash}\"");
         assert_eq!(
-            after, case.expected,
-            "a refused pin must leave the files untouched"
+            after["uv.lock"],
+            case.input["uv.lock"].replace(&entry, &format!("{entry}, size = 97941")),
+            "{}",
+            case.dir.display()
         );
         ran += 1;
     }
@@ -2069,6 +2167,273 @@ async fn uv_project_locks_round_trip() {
     );
     let input = tree(&[("uv.lock", lock)]);
     assert_pypi_round_trip("uv lock-only", &input, &[urllib3_dep()], None).await;
+}
+
+/// The uv.lock of a project whose one dependency is `urllib3`, as `uv lock`
+/// writes it: `revision` is the lock's `revision` line (empty before uv
+/// 0.6.0) and `time_key` the artifact timestamp key that revision records.
+/// No other registry package shows the registry or the artifact fields.
+fn uv_single_lock(revision: &str, time_key: Option<&str>) -> String {
+    let time = |stamp: &str| match time_key {
+        Some(key) => format!(", {key} = \"{stamp}\""),
+        None => String::new(),
+    };
+    format!(
+        "version = 1\n{revision}requires-python = \">=3.8\"\n\n\
+[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = {{ virtual = \".\" }}\ndependencies = [\n    {{ name = \"urllib3\" }},\n]\n\n\
+[package.metadata]\nrequires-dist = [{{ name = \"urllib3\", specifier = \"==1.26.18\" }}]\n\n\
+[[package]]\nname = \"urllib3\"\nversion = \"1.26.18\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+sdist = {{ url = \"{sdist_url}\", hash = \"sha256:{URLLIB3_SDIST_SHA}\", size = 305687{sdist_time} }}\n\
+wheels = [\n    {{ url = \"{wheel_url}\", hash = \"sha256:{URLLIB3_WHEEL_SHA}\", size = 143835{wheel_time} }},\n]\n",
+        sdist_url = pypi_file_url(URLLIB3_SDIST),
+        wheel_url = pypi_file_url(URLLIB3_WHEEL),
+        sdist_time = time("2023-10-17T17:46:24Z"),
+        wheel_time = time("2023-10-17T17:46:21.184Z"),
+    )
+}
+
+const SINGLE_PYPROJECT: &str =
+    "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"urllib3==1.26.18\"]\n";
+
+/// The artifact fields `uv lock` records at each lock revision, as `(the
+/// `revision` line, the timestamp key)`: checked against uv 0.2.35–0.5.31
+/// (no revision), 0.6.0–0.6.14 (1), 0.7.0–0.8.0 (2) and 0.8.24–0.11.19 (3).
+const UV_REVISIONS: [(&str, Option<&str>); 4] = [
+    ("", None),
+    ("revision = 1\n", None),
+    ("revision = 2\n", Some("upload-time")),
+    ("revision = 3\n", Some("upload-time")),
+];
+
+/// A project with one dependency: the hosted package is the lock's only
+/// registry package, so nothing shows the registry or the artifact fields
+/// uv records. The entry comes back in the shape uv writes at the lock's
+/// `revision`, on PyPI's default index, byte for byte.
+#[tokio::test]
+#[serial]
+async fn uv_lock_with_no_registry_sibling_round_trips_by_its_revision() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    for (revision, time_key) in UV_REVISIONS {
+        for eol in ["\n", "\r\n"] {
+            let input = tree(&[
+                (
+                    "uv.lock",
+                    uv_single_lock(revision, time_key).replace('\n', eol),
+                ),
+                ("pyproject.toml", SINGLE_PYPROJECT.replace('\n', eol)),
+            ]);
+            assert_pypi_round_trip(
+                &format!("uv single {revision:?} {eol:?}"),
+                &input,
+                &[urllib3_dep()],
+                None,
+            )
+            .await;
+        }
+    }
+    // A lock-only checkout, and a script whose one dependency it is.
+    let input = tree(&[(
+        "uv.lock",
+        uv_single_lock("revision = 3\n", Some("upload-time")),
+    )]);
+    assert_pypi_round_trip("uv single lock-only", &input, &[urllib3_dep()], None).await;
+    let script = "# /// script\n# dependencies = [\"urllib3==1.26.18\"]\n# ///\nprint('hi')\n";
+    let lock = uv_single_lock("revision = 3\n", Some("upload-time")).replace(
+        "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [\n    { name = \"urllib3\" },\n]\n\n[package.metadata]\nrequires-dist = [{ name = \"urllib3\", specifier = \"==1.26.18\" }]\n\n",
+        "[manifest]\nrequirements = [{ name = \"urllib3\", specifier = \"==1.26.18\" }]\n\n",
+    );
+    assert!(!lock.contains("proj"), "{lock}");
+    let input = tree(&[("tool.py", script.into()), ("tool.py.lock", lock)]);
+    assert_pypi_round_trip("uv single script", &input, &[urllib3_dep()], None).await;
+}
+
+/// Every registry package of the lock is hosted (two dependencies, both
+/// patched): each is the other's only would-be sibling, and both come back.
+#[tokio::test]
+#[serial]
+async fn uv_lock_whose_registry_packages_are_all_hosted_round_trips() {
+    let idna = (
+        "idna",
+        "3.4",
+        vec![
+            (
+                "https://files.pythonhosted.org/packages/aa/idna-3.4.tar.gz",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                183077,
+                "2022-09-14T19:41:00.123000Z",
+            ),
+            (
+                "https://files.pythonhosted.org/packages/bb/idna-3.4-py3-none-any.whl",
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                61538,
+                "2022-09-14T19:40:59.100000Z",
+            ),
+        ],
+    );
+    let (_server, _env) = pypi_mock(&[urllib3_release(), idna]).await;
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \"==3.4\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna==3.4\", \"urllib3==1.26.18\"]\n";
+    let input = tree(&[("uv.lock", lock), ("pyproject.toml", pyproject.into())]);
+    let deps = [
+        urllib3_dep(),
+        pypi_dep(
+            "idna",
+            "3.4",
+            "idna-3.4-py3-none-any.whl",
+            "55555555-5555-5555-5555-555555555555",
+        ),
+    ];
+    let rewritten = hosted(&input, &deps, None);
+    assert!(
+        !rewritten["uv.lock"].contains("files.pythonhosted.org"),
+        "{}",
+        rewritten["uv.lock"]
+    );
+    assert_pypi_round_trip("uv all hosted", &input, &deps, None).await;
+}
+
+/// What the no-sibling restore reports, and where it still refuses: a
+/// revision whose artifact fields are unknown here, and a package index
+/// configured for uv (the registry is then not known to be PyPI's).
+#[tokio::test]
+#[serial]
+async fn uv_lock_with_no_registry_sibling_says_it_was_rebuilt_or_refuses() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let project = |lock: String| {
+        tree(&[
+            ("uv.lock", lock),
+            ("pyproject.toml", SINGLE_PYPROJECT.into()),
+        ])
+    };
+    let default = RestoreOptions::default();
+
+    // The run names the entry, the shape it was rebuilt in and the check.
+    let input = project(uv_single_lock("revision = 3\n", Some("upload-time")));
+    let rewritten = hosted(&input, &[urllib3_dep()], None);
+    let (after, _, warnings) = restore_tree_warnings(&rewritten, &default).await;
+    assert_eq!(after, input);
+    assert!(
+        matches!(warnings.as_slice(), [(code, detail)]
+            if *code == "upstream_uv_entry_rebuilt"
+                && detail.starts_with("uv.lock: ")
+                && detail.contains("urllib3==1.26.18 was rebuilt from PyPI")
+                && detail.contains("https://pypi.org/simple")
+                && detail.contains("lock revision 3 (`url`, `hash`, `size`, `upload-time`)")
+                && detail.contains("`uv lock --check`")),
+        "{warnings:?}"
+    );
+    // A lock with a sibling copies its shape and has nothing to report.
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n";
+    let with_sibling = tree(&[("uv.lock", lock), ("pyproject.toml", pyproject.into())]);
+    let rewritten = hosted(&with_sibling, &[urllib3_dep()], None);
+    let (after, _, warnings) = restore_tree_warnings(&rewritten, &default).await;
+    assert_eq!(after, with_sibling);
+    assert!(warnings.is_empty(), "{warnings:?}");
+
+    // uv 0.6.15–0.6.17 spell the revision 2 timestamp `upload_time`. With
+    // no sibling to show that, the entry takes the spelling every later uv
+    // writes (each of them reads both), and the run says so.
+    let old = project(uv_single_lock("revision = 2\n", Some("upload_time")));
+    let rewritten = hosted(&old, &[urllib3_dep()], None);
+    let (after, statuses, warnings) = restore_tree_warnings(&rewritten, &default).await;
+    assert!(
+        matches!(statuses.as_slice(), [(_, PinStatus::Restored)]),
+        "{statuses:?}"
+    );
+    assert_eq!(
+        after,
+        project(uv_single_lock("revision = 2\n", Some("upload-time")))
+    );
+    assert!(
+        matches!(warnings.as_slice(), [(_, detail)] if detail.contains("`upload_time`")),
+        "{warnings:?}"
+    );
+
+    // A newer revision may record fields unknown here.
+    let newer = project(uv_single_lock("revision = 4\n", Some("upload-time")));
+    let (why, rewritten, after) = pypi_refusal(&newer, &[urllib3_dep()], &default).await;
+    assert!(
+        why.contains("`revision` (4)")
+            && why.contains("(`git checkout -- pyproject.toml uv.lock`)"),
+        "{why}"
+    );
+    assert_eq!(after, rewritten, "a refused pin must change nothing");
+
+    // A configured index: the project's own, a settings file's, the
+    // environment's.
+    let mirror = "https://mirror.example/simple";
+    let (why, _, _) = pypi_refusal_after(&input, &[urllib3_dep()], &default, |files| {
+        let pyproject = format!(
+            "{}\n[[tool.uv.index]]\nurl = \"{mirror}\"\ndefault = true\n",
+            files["pyproject.toml"]
+        );
+        files.insert("pyproject.toml".into(), pyproject);
+    })
+    .await;
+    assert!(
+        why.contains("pyproject.toml sets uv `index`") && why.contains("not derivable"),
+        "{why}"
+    );
+    let (why, _, _) = pypi_refusal_after(&input, &[urllib3_dep()], &default, |files| {
+        files.insert("uv.toml".into(), format!("index-url = \"{mirror}\"\n"));
+    })
+    .await;
+    assert!(why.contains("uv.toml sets uv `index-url`"), "{why}");
+    let _index = EnvGuard::set("UV_DEFAULT_INDEX", mirror);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &default).await;
+    assert!(why.contains("`UV_DEFAULT_INDEX` is set"), "{why}");
+}
+
+/// A refused uv pin's remedy names every file the hosted rewrite edited:
+/// the paired `pyproject.toml` (or script) carries the pin's
+/// `[tool.uv.sources]` URL, and checking out the lock alone would leave it.
+#[tokio::test]
+#[serial]
+async fn uv_refusal_remedy_names_the_paired_metadata() {
+    let (_server, _env) = pypi_mock(&[urllib3_release()]).await;
+    let lock = uv_lock(
+        "    { name = \"idna\" },\n    { name = \"urllib3\" },\n",
+        "    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n",
+        "",
+    );
+    let pyproject = "[project]\nname = \"proj\"\nversion = \"0.1.0\"\ndependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n";
+    let input = tree(&[
+        ("uv.lock", lock.clone()),
+        ("pyproject.toml", pyproject.into()),
+    ]);
+    let (why, rewritten, after) = pypi_refusal(&input, &[urllib3_dep()], &offline()).await;
+    assert!(
+        why.contains("(`git checkout -- pyproject.toml uv.lock`)"),
+        "{why}"
+    );
+    assert_eq!(after, rewritten, "a refused pin must change nothing");
+    // A lock-only checkout has no paired file to restore.
+    let input = tree(&[("uv.lock", lock)]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &offline()).await;
+    assert!(why.contains("(`git checkout -- uv.lock`)"), "{why}");
+    // A script lock pairs with its script.
+    let script =
+        "# /// script\n# dependencies = [\"idna>=3\", \"urllib3==1.26.18\"]\n# ///\nprint('hi')\n";
+    let lock = uv_lock("", "", "\n[manifest]\nrequirements = [\n    { name = \"idna\", specifier = \">=3\" },\n    { name = \"urllib3\", specifier = \"==1.26.18\" },\n]\n")
+        .replace(
+            "[[package]]\nname = \"proj\"\nversion = \"0.1.0\"\nsource = { virtual = \".\" }\ndependencies = [\n]\n\n[package.metadata]\nrequires-dist = [\n]\n\n",
+            "",
+        );
+    let input = tree(&[("tool.py", script.into()), ("tool.py.lock", lock)]);
+    let (why, _, _) = pypi_refusal(&input, &[urllib3_dep()], &offline()).await;
+    assert!(
+        why.contains("(`git checkout -- tool.py tool.py.lock`)"),
+        "{why}"
+    );
 }
 
 #[tokio::test]
@@ -2886,7 +3251,10 @@ async fn uv_explicit_extra_collision_refuses_without_writing() {
                 )
                 .await;
                 assert!(why.contains("different specifiers"), "{why}");
-                assert!(why.contains("git checkout -- uv.lock"), "{why}");
+                assert!(
+                    why.contains("git checkout -- pyproject.toml uv.lock"),
+                    "{why}"
+                );
                 assert!(rewritten["uv.lock"].contains("patch.socket.dev"));
                 assert!(rewritten["pyproject.toml"].contains("patch.socket.dev"));
                 assert_eq!(
@@ -2917,7 +3285,10 @@ async fn uv_refusals() {
         let (why, rewritten, after) =
             pypi_refusal(&input, &[urllib3_dep()], &RestoreOptions::default()).await;
         assert!(why.contains("multi-clause"), "{why}");
-        assert!(why.contains("git checkout -- uv.lock"), "{why}");
+        assert!(
+            why.contains("git checkout -- pyproject.toml uv.lock"),
+            "{why}"
+        );
         assert_eq!(after, rewritten, "a refused pin leaves every file hosted");
         // Another registry than PyPI.
         let mirror = direct.replace("https://pypi.org/simple", "https://mirror.example/simple");

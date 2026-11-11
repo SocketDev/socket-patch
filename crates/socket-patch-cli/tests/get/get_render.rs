@@ -782,6 +782,77 @@ async fn nested_apply_block_starts_stdout_without_a_blank_line() {
     assert!(!stdout.contains("\n\n\n"), "stdout={stdout:?}");
 }
 
+/// The two steps agent mode needs, as `get` prints them after a run that
+/// recorded a patch in the npm project fixture.
+const AGENT_NEXT_STEPS: &str = "Next steps:\n  \
+    1. Commit .socket/ to keep the patches.\n  \
+    2. Run `socket-patch apply` after every `npm install`, locally and in CI. A fresh install \
+    removes the patches.\n";
+
+fn one_file_view() -> serde_json::Value {
+    serde_json::json!({
+        "package/index.js": {
+            "beforeHash": git_hash(BEFORE_BYTES),
+            "afterHash": git_hash(AFTER_BYTES),
+            "blobContent": b64(AFTER_BYTES),
+        }
+    })
+}
+
+/// Agent-mode `get` ends with the two steps the mode needs: commit
+/// `.socket/`, and re-apply after every install. Both the uuid path and the
+/// search path print them once a patch was recorded; a re-run that records
+/// nothing new does not, and neither does a dry run.
+#[tokio::test]
+async fn agent_get_ends_with_commit_and_reapply_next_steps() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, one_file_view()).await;
+    mount_ghsa_single(&server).await;
+
+    for identifier in [UUID, GHSA] {
+        let tmp = tempfile::tempdir().unwrap();
+        write_project(tmp.path());
+
+        let (code, stdout, stderr) =
+            run_get_bin(tmp.path(), &server.uri(), &[identifier, "--dry-run"]);
+        assert_eq!(code, 0, "{identifier}: stdout={stdout}\nstderr={stderr}");
+        assert!(!stdout.contains("Next steps:"), "{identifier}: {stdout}");
+
+        let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[identifier]);
+        assert_eq!(code, 0, "{identifier}: stdout={stdout}\nstderr={stderr}");
+        assert!(
+            stdout.ends_with(AGENT_NEXT_STEPS),
+            "{identifier}: stdout={stdout}\nstderr={stderr}"
+        );
+
+        let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[identifier]);
+        assert_eq!(code, 0, "{identifier}: stdout={stdout}\nstderr={stderr}");
+        assert!(!stdout.contains("Next steps:"), "{identifier}: {stdout}");
+    }
+}
+
+/// `--save-only` records the patch without applying it, so the second step
+/// starts with the apply the user still has to run.
+#[tokio::test]
+async fn agent_get_save_only_next_steps_start_with_the_apply() {
+    let server = MockServer::start().await;
+    mount_view_files(&server, UUID, PURL, one_file_view()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    write_project(tmp.path());
+
+    let (code, stdout, stderr) = run_get_bin(tmp.path(), &server.uri(), &[UUID, "--save-only"]);
+    assert_eq!(code, 0, "stdout={stdout}\nstderr={stderr}");
+    assert!(
+        stdout.ends_with(
+            "Next steps:\n  \
+             1. Commit .socket/ to keep the patches.\n  \
+             2. Run `socket-patch apply` now, and after every `npm install`, locally and in \
+             CI. A fresh install removes the patches.\n"
+        ),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+}
+
 /// A free user's CVE search: a free patch for one installed package and a
 /// paid patch for ANOTHER installed package. The narrowed listing must
 /// still show the paid fix as `[PAID] (no access)` (an installed package's

@@ -99,6 +99,70 @@ pub async fn remove_tree_and_prune(dir: &Path, stop_dir: &Path) -> std::io::Resu
     Ok(())
 }
 
+/// Name prefix of the transient entries commands stage directly under
+/// `.socket/`: `rollback --dry-run`'s blob stage, `apply`'s download
+/// overlay, an atomic write's stage file.
+pub const STAGE_PREFIX: &str = ".socket-stage-";
+
+/// How old a leftover stage entry must be before [`sweep_stale_stage_entries`]
+/// removes it. Every command that stages under `.socket/` holds the apply
+/// lock for the stage's whole life, so an entry a later lock holder finds
+/// has no live owner. The floor is for a filesystem whose advisory locks do
+/// not exclude, where a young entry could be a concurrent run's.
+pub const STALE_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// Remove the stage entries an interrupted run left directly under
+/// `socket_dir`, once they are at least `min_age` old.
+///
+/// A stage removes itself when its guard drops, but a signal or a kill
+/// ends the process without running destructors, and without this nothing
+/// looks for what that leaves: a hardlinked copy of the blob cache, or a
+/// half-written stage file, would stay under `.socket/` for good. Called by
+/// [`apply_lock::acquire`](crate::patch::apply_lock::acquire) with the lock
+/// just taken, so every lock-taking command clears the leftovers of the
+/// ones before it.
+///
+/// Only the entries themselves go: a link is unlinked, never followed, and
+/// a `socket_dir` that is itself a link is left alone (socket-patch never
+/// creates one; see [`containment`]). Best effort: an entry that cannot be
+/// read or removed is tried again by the next run.
+pub fn sweep_stale_stage_entries(socket_dir: &Path, min_age: std::time::Duration) {
+    if !std::fs::symlink_metadata(socket_dir).is_ok_and(|meta| meta.is_dir()) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(socket_dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGE_PREFIX)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // A modification time in the future (clock skew) is not "old".
+        let stale = meta
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= min_age);
+        if !stale {
+            continue;
+        }
+        let _ = if meta.is_dir() {
+            std::fs::remove_dir_all(&path)
+        } else {
+            std::fs::remove_file(&path)
+        };
+    }
+}
+
 /// The root the link guard starts below: the project that owns `stop_dir`
 /// (`<project>/.socket`), so `.socket` itself is a guarded level.
 fn guard_root(stop_dir: &Path) -> &Path {
@@ -225,6 +289,90 @@ mod tests {
         prune_empty_dirs(&elsewhere, &tmp.path().join(".socket")).await;
 
         assert!(elsewhere.exists(), "an out-of-subtree dir is left alone");
+    }
+
+    /// Stale `.socket-stage-*` directories, files and links go; a recent
+    /// one, an entry with another name and anything a link points at stay.
+    #[test]
+    fn sweep_removes_only_stale_stage_entries() {
+        use std::time::{Duration, SystemTime};
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(socket.join("blobs")).unwrap();
+        std::fs::write(socket.join("blobs/aa"), b"cached").unwrap();
+        std::fs::write(socket.join("manifest.json"), b"{}").unwrap();
+
+        let stage_dir = socket.join(".socket-stage-dryrun-blobs-abc");
+        std::fs::create_dir_all(&stage_dir).unwrap();
+        std::fs::hard_link(socket.join("blobs/aa"), stage_dir.join("aa")).unwrap();
+        let stage_file = socket.join(".socket-stage-manifest.json-123");
+        std::fs::write(&stage_file, b"{").unwrap();
+
+        // Nothing here is an hour old yet.
+        sweep_stale_stage_entries(&socket, STALE_STAGE_AGE);
+        assert!(stage_dir.exists() && stage_file.exists());
+
+        // Entries dated in the future are never "old" either.
+        let future = SystemTime::now() + Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&stage_file)
+            .and_then(|f| f.set_modified(future))
+            .unwrap();
+        sweep_stale_stage_entries(&socket, Duration::ZERO);
+        assert!(stage_file.exists(), "a future mtime is not stale");
+        assert!(!stage_dir.exists(), "the stage dir is swept with its links");
+        assert_eq!(
+            std::fs::read(socket.join("blobs/aa")).unwrap(),
+            b"cached",
+            "the cache entry the stage hardlinked is untouched"
+        );
+
+        let past = SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&stage_file)
+            .and_then(|f| f.set_modified(past))
+            .unwrap();
+        sweep_stale_stage_entries(&socket, STALE_STAGE_AGE);
+        assert!(!stage_file.exists(), "a two-hour-old stage file is swept");
+        assert!(socket.join("manifest.json").exists());
+        assert!(socket.join("blobs/aa").exists());
+
+        // A missing directory is a no-op.
+        sweep_stale_stage_entries(&tmp.path().join("absent"), Duration::ZERO);
+    }
+
+    /// A stage-named link is unlinked, not followed, and a linked
+    /// `.socket` is not swept at all.
+    #[cfg(unix)]
+    #[test]
+    fn sweep_never_follows_links() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("keep"), b"keep").unwrap();
+        let socket = tmp.path().join(".socket");
+        std::fs::create_dir_all(&socket).unwrap();
+        std::os::unix::fs::symlink(&outside, socket.join(".socket-stage-link")).unwrap();
+
+        sweep_stale_stage_entries(&socket, Duration::ZERO);
+        assert!(socket
+            .join(".socket-stage-link")
+            .symlink_metadata()
+            .is_err());
+        assert!(
+            outside.join("keep").exists(),
+            "the link target is untouched"
+        );
+
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir_all(elsewhere.join(".socket-stage-x")).unwrap();
+        let linked = tmp.path().join("linked-socket");
+        std::os::unix::fs::symlink(&elsewhere, &linked).unwrap();
+        sweep_stale_stage_entries(&linked, Duration::ZERO);
+        assert!(elsewhere.join(".socket-stage-x").exists());
     }
 
     #[tokio::test]

@@ -1,8 +1,9 @@
 //! Patch-source staging for `apply`: where the patch pipeline reads
 //! per-file blobs from, downloading what's missing into a transient overlay
-//! tempdir. The persistent `.socket/blobs` cache is only ever read;
-//! downloads are discarded when the tempdir drops (filling the cache is
-//! `repair`'s job, keeping `apply` read-only against `.socket/`).
+//! (a `.socket-stage-apply-blobs-*` directory under `.socket/`). The
+//! persistent `.socket/blobs` cache is only ever read; downloads are
+//! discarded when the overlay drops (filling the cache is `repair`'s job,
+//! so `apply` leaves `.socket/` as it found it).
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -10,12 +11,11 @@ use std::path::{Path, PathBuf};
 use socket_patch_core::api::blob_fetcher::{
     fetch_missing_blobs, get_missing_blobs, FetchMissingBlobsResult,
 };
-use socket_patch_core::api::client::ApiClient;
 use socket_patch_core::manifest::schema::PatchManifest;
 use socket_patch_core::patch::apply::PatchSources;
 use tempfile::TempDir;
 
-use crate::args::GlobalArgs;
+use crate::args::{GlobalArgs, RunApiClient};
 use crate::ui::{plural, StatusLine};
 
 /// Resolved artifact locations for the patch pipeline. Holds the overlay
@@ -146,14 +146,15 @@ async fn overlay_dir(src: &Path, dst: &Path) {
 
 /// Resolve patch sources for `manifest`: read straight from `.socket/` when
 /// every blob needed is cached (or `--offline`), else stage an overlay
-/// tempdir and fetch the missing blobs through `client`. `Err` is a hard
-/// setup failure (tempdir creation); `Ok(Unavailable)` is the soft "cannot
+/// tempdir and fetch the missing blobs through the run's `client`, which
+/// is built here if nothing has needed it yet. `Err` is a hard setup
+/// failure (tempdir creation); `Ok(Unavailable)` is the soft "cannot
 /// proceed" path with diagnostics already printed.
 pub(crate) async fn stage_patch_sources(
     common: &GlobalArgs,
     manifest: &PatchManifest,
     socket_dir: &Path,
-    client: &ApiClient,
+    client: &RunApiClient,
 ) -> Result<StageOutcome, String> {
     let quiet = common.silent || common.json;
     let socket_blobs_path = socket_dir.join("blobs");
@@ -190,8 +191,20 @@ pub(crate) async fn stage_patch_sources(
     }
 
     // The pipeline reads only from the overlay; dropping `StagedSources`
-    // removes it and any downloaded bytes.
-    let stage = tempfile::tempdir().map_err(|e| e.to_string())?;
+    // removes it and any downloaded bytes. It sits under `.socket/`, beside
+    // the cache it mirrors: the same filesystem, so the mirror hardlinks
+    // instead of copying, and the place the next lock holder sweeps
+    // (`sweep_stale_stage_entries`) if this run is killed before that drop
+    // (nothing looks for a stage in the system temp dir). The system temp
+    // dir is only the fallback for a `.socket/` that cannot hold it.
+    let stage = tempfile::Builder::new()
+        .prefix(&format!(
+            "{}apply-blobs-",
+            socket_patch_core::utils::socket_dir::STAGE_PREFIX
+        ))
+        .tempdir_in(socket_dir)
+        .or_else(|_| tempfile::tempdir())
+        .map_err(|e| e.to_string())?;
     let staged = StagedSources {
         blobs: stage.path().join("blobs"),
         _stage: Some(stage),
@@ -201,6 +214,10 @@ pub(crate) async fn stage_patch_sources(
         .map_err(|e| e.to_string())?;
     overlay_dir(&socket_blobs_path, &staged.blobs).await;
 
+    // The first point this run needs the network: the client's advisories
+    // print here, ahead of the status line, and not at all on a run that
+    // found every blob cached.
+    let client = common.api_client(client).await;
     let mut status = StatusLine::stderr(common.json, common.silent);
     status.set("Downloading missing patch artifacts...");
     let fetch_result = fetch_missing_blobs(manifest, &staged.blobs, client, None).await;
@@ -239,7 +256,6 @@ pub(crate) async fn stage_patch_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use socket_patch_core::api::client::get_api_client_with_overrides;
 
     use socket_patch_core::manifest::schema::{PatchFileInfo, PatchRecord};
     use std::collections::HashMap;
@@ -281,25 +297,10 @@ mod tests {
         }
     }
 
-    /// A client for the arms that return before any fetch, built directly
-    /// so no ambient token or socket-cli config can leak into a unit test.
-    fn offline_client() -> ApiClient {
-        ApiClient::new(socket_patch_core::api::client::ApiClientOptions {
-            api_url: "http://127.0.0.1:1".to_string(),
-            api_token: None,
-            route: socket_patch_core::api::client::ApiRoute::Proxy,
-        })
-    }
-
-    /// The client `dead_endpoint_args` describes (see there).
-    async fn dead_endpoint_client(args: &GlobalArgs) -> ApiClient {
-        get_api_client_with_overrides(args.api_client_overrides())
-            .await
-            .0
-    }
-
     /// Everything cached, online or offline → read `.socket/` in place: no
-    /// overlay tempdir, and the blobs path is the persistent cache itself.
+    /// overlay tempdir, the blobs path is the persistent cache itself, and
+    /// the run's API client is never built (CA-P01: no config read, no
+    /// advisory, no org lookup for a stage that fetches nothing).
     #[tokio::test]
     async fn stage_reads_socket_dir_in_place_when_fully_cached() {
         let tmp = tempfile::tempdir().unwrap();
@@ -312,19 +313,20 @@ mod tests {
                 offline,
                 ..offline_args()
             };
-            let outcome = stage_patch_sources(
-                &args,
-                &manifest_with_one_patch(),
-                &socket_dir,
-                &offline_client(),
-            )
-            .await
-            .expect("no hard failure");
+            let client = RunApiClient::new();
+            let outcome =
+                stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir, &client)
+                    .await
+                    .expect("no hard failure");
             let StageOutcome::Ready(staged) = outcome else {
                 panic!("fully-cached staging must be Ready (offline: {offline})");
             };
             assert!(staged._stage.is_none(), "no overlay when nothing to fetch");
             assert_eq!(staged.blobs, socket_dir.join("blobs"));
+            assert!(
+                !client.initialized(),
+                "nothing to fetch must build no API client (offline: {offline})"
+            );
         }
     }
 
@@ -335,11 +337,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_dir = tmp.path().join(".socket");
 
+        let client = RunApiClient::new();
         let outcome = stage_patch_sources(
             &offline_args(),
             &manifest_with_one_patch(),
             &socket_dir,
-            &offline_client(),
+            &client,
         )
         .await
         .expect("no hard failure");
@@ -347,6 +350,7 @@ mod tests {
             matches!(outcome, StageOutcome::Unavailable),
             "offline + no local source must be Unavailable"
         );
+        assert!(!client.initialized(), "offline builds no API client");
         assert!(
             !socket_dir.exists(),
             "the stager is read-only against .socket/ — it must not create it"
@@ -380,17 +384,17 @@ mod tests {
         let socket_dir = tmp.path().join(".socket");
 
         let args = dead_endpoint_args();
-        let outcome = stage_patch_sources(
-            &args,
-            &manifest_with_one_patch(),
-            &socket_dir,
-            &dead_endpoint_client(&args).await,
-        )
-        .await
-        .expect("no hard failure");
+        let client = RunApiClient::new();
+        let outcome = stage_patch_sources(&args, &manifest_with_one_patch(), &socket_dir, &client)
+            .await
+            .expect("no hard failure");
         assert!(
             matches!(outcome, StageOutcome::Unavailable),
             "no source anywhere + failed downloads must be Unavailable"
+        );
+        assert!(
+            client.initialized(),
+            "the download is what builds the run's API client"
         );
     }
 

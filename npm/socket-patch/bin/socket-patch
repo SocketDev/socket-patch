@@ -72,11 +72,33 @@ function runFirstUsable(binPaths, args, {
   return 1;
 }
 
+const STANDALONE_INSTALL = "curl -fsSL https://install.socket.dev/patch | sh";
+
+function unsupportedPlatformMessage(key) {
+  return [
+    `socket-patch: no prebuilt binary for this platform (${key}).`,
+    `Supported: ${Object.keys(PLATFORMS).join(", ")}.`,
+    "To build from source: cargo install socket-patch-cli",
+  ].join("\n");
+}
+
+// No platform package is installed and there is no bundled binary: npm
+// skipped the optional dependency, which a bare ENOENT on an internal
+// path does not say.
+function missingPlatformPackageMessage(candidates) {
+  return [
+    `socket-patch: the platform package ${candidates.join(" or ")} is not installed.`,
+    "npm skips it under --omit=optional (or --no-optional), and when the lockfile was",
+    "written on another platform without it. Reinstall with optional dependencies, or",
+    `use the standalone installer on macOS or Linux: ${STANDALONE_INSTALL}`,
+  ].join("\n");
+}
+
 function main() {
   const key = `${process.platform} ${process.arch}`;
   const candidates = PLATFORMS[key];
   if (!candidates) {
-    console.error(`Unsupported platform: ${key}`);
+    console.error(unsupportedPlatformMessage(key));
     process.exit(1);
   }
 
@@ -93,7 +115,12 @@ function main() {
     const localBin = process.platform === "win32"
       ? `socket-patch-${key.replace(" ", "-")}.exe`
       : `socket-patch-${key.replace(" ", "-")}`;
-    binPaths.push(path.join(__dirname, localBin));
+    const bundled = path.join(__dirname, localBin);
+    if (!fs.existsSync(bundled)) {
+      console.error(missingPlatformPackageMessage(candidates));
+      process.exit(1);
+    }
+    binPaths.push(bundled);
   }
 
   process.exit(runFirstUsable(binPaths, process.argv.slice(2)));
@@ -102,5 +129,12 @@ function main() {
 if (require.main === module) {
   main();
 } else {
-  module.exports = { PLATFORMS, detectLibc, orderCandidates, runFirstUsable };
+  module.exports = {
+    PLATFORMS,
+    detectLibc,
+    orderCandidates,
+    runFirstUsable,
+    unsupportedPlatformMessage,
+    missingPlatformPackageMessage,
+  };
 }

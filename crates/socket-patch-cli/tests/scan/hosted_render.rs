@@ -255,7 +255,7 @@ async fn human_supersedes_warning_names_the_superseded_package() {
     let root = tmp.path();
     write_superseded_vendored_project(root);
 
-    let psu = ["--patch-server-url", "http://patch.test"];
+    let psu = ["--patch-server-url", "https://patch.test"];
     let (code, _stdout, stderr) = scan_hosted(root, &server.uri(), &psu, &[]);
     assert_eq!(code, 0, "human overlap run exits 0; stderr=\n{stderr}");
     assert!(
@@ -528,6 +528,248 @@ async fn human_rerun_says_already_redirected_and_first_run_prints_next_steps() {
     assert_eq!(
         engine_stdout(&stdout),
         "1 package is already on hosted patches; nothing to rewrite.\n"
+    );
+}
+
+/// A package with three patches gets one of them. The run names the
+/// advisory that patch fixes and the two it leaves unpatched (a CVE, and an
+/// advisory that has only a GHSA id), in the future tense on a dry run and
+/// again on a re-run that rewrites nothing. `--json` carries the same facts
+/// on the package's `packages[]` entry.
+#[tokio::test]
+async fn human_names_the_fixed_advisory_and_the_ones_left_unpatched() {
+    const UUID_B: &str = "33333333-3333-4333-8333-333333333333";
+    const UUID_C: &str = "44444444-4444-4444-8444-444444444444";
+    const LINE: &str = "  pkg:npm/covgap-hosted@1.0.0: fixes CVE-2026-0001; still unpatched: \
+        CVE-2026-0002, GHSA-cccc-cccc-cccc\n";
+    const NOTE: &str = "Only one patch is applied per package version. Upgrade the package to \
+        fix the advisories still unpatched.\n";
+
+    let server = MockServer::start().await;
+    mock_discovery_patches(
+        &server,
+        PURL,
+        &[
+            (UUID, "critical", "CVE-2026-0001", "GHSA-aaaa-aaaa-aaaa"),
+            (UUID_B, "high", "CVE-2026-0002", "GHSA-bbbb-bbbb-bbbb"),
+            (UUID_C, "high", "", "GHSA-cccc-cccc-cccc"),
+        ],
+    )
+    .await;
+    mock_granted_reference(&server, UUID, PURL, HOSTED_URL).await;
+    mock_view(&server, UUID, PURL).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_npm_project(tmp.path(), NAME);
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        format!(
+            "Would switch 1 package to hosted patches and rewrite 2 files (--dry-run: nothing \
+             was changed).\n  pkg:npm/covgap-hosted@1.0.0: would fix CVE-2026-0001; would stay \
+             unpatched: CVE-2026-0002, GHSA-cccc-cccc-cccc\n{NOTE}"
+        ),
+        "stderr=\n{stderr}"
+    );
+
+    let (code, doc) = scan_hosted_json(tmp.path(), &server.uri(), &["--dry-run"], &[]);
+    assert_eq!(code, 0, "{doc:#}");
+    let package = &doc["packages"][0];
+    assert_eq!(package["selectedUuids"], json!([UUID]), "{doc:#}");
+    assert_eq!(
+        package["fixedIds"],
+        json!(["CVE-2026-0001", "GHSA-aaaa-aaaa-aaaa"]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["unfixedIds"],
+        json!([
+            "CVE-2026-0002",
+            "GHSA-bbbb-bbbb-bbbb",
+            "GHSA-cccc-cccc-cccc"
+        ]),
+        "{doc:#}"
+    );
+    assert_eq!(
+        package["patches"].as_array().map(Vec::len),
+        Some(3),
+        "the existing discovery payload is unchanged: {doc:#}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    let engine = engine_stdout(&stdout);
+    assert!(
+        engine.starts_with(&format!(
+            "Switched 1 package to hosted patches; rewrote 2 files.\n{LINE}{NOTE}Next steps:\n"
+        )),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(tmp.path(), &server.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        format!("1 package is already on hosted patches; nothing to rewrite.\n{LINE}{NOTE}"),
+        "stderr=\n{stderr}"
+    );
+}
+
+/// A run that puts a second package on a hosted patch, beside one an
+/// earlier run already switched, counts one package as switched and says
+/// the other was already there. Before, it said "Switched 2 packages".
+#[tokio::test]
+async fn human_summary_counts_only_the_packages_this_run_switched() {
+    const SECOND: &str = "covgap-second";
+    const SECOND_PURL: &str = "pkg:npm/covgap-second@1.0.0";
+    const SECOND_UUID: &str = "55555555-5555-4555-8555-555555555555";
+    const SECOND_URL: &str = "https://patch.test/patch/npm/covgap-second/1.0.0/22222222-2222-4222-8222-222222222222/55555555-5555-4555-8555-555555555555/covgap-second-1.0.0.tgz";
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("package.json"),
+        format!(
+            r#"{{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{SECOND}": "{VERSION}" }} }}"#
+        ),
+    )
+    .unwrap();
+    let mut packages = String::new();
+    for name in [NAME, SECOND] {
+        let pkg = root.join("node_modules").join(name);
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::write(
+            pkg.join("package.json"),
+            format!(r#"{{ "name": "{name}", "version": "{VERSION}" }}"#),
+        )
+        .unwrap();
+        packages.push_str(&format!(
+            r#",
+    "node_modules/{name}": {{
+      "version": "{VERSION}",
+      "resolved": "https://registry.npmjs.org/{name}/-/{name}-{VERSION}.tgz",
+      "integrity": "{UPSTREAM_SHA512}"
+    }}"#
+        ));
+    }
+    std::fs::write(
+        root.join("package-lock.json"),
+        format!(
+            r#"{{
+  "name": "consumer",
+  "version": "0.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {{
+    "": {{ "name": "consumer", "version": "0.0.0", "dependencies": {{ "{NAME}": "{VERSION}", "{SECOND}": "{VERSION}" }} }}{packages}
+  }}
+}}
+"#
+        ),
+    )
+    .unwrap();
+
+    // First run: only one of the two packages has a patch.
+    let first = MockServer::start().await;
+    mock_discovery(&first, PURL, UUID).await;
+    mock_granted_reference(&first, UUID, PURL, HOSTED_URL).await;
+    mock_view(&first, UUID, PURL).await;
+    let (code, stdout, stderr) = scan_hosted(root, &first.uri(), &[], &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        engine_stdout(&stdout)
+            .starts_with("Switched 1 package to hosted patches; rewrote 2 files.\n"),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    // Second run: both have one.
+    let second = MockServer::start().await;
+    let patch = |uuid: &str, purl: &str| {
+        json!({
+            "uuid": uuid, "purl": purl, "tier": "free", "cveIds": [], "ghsaIds": [],
+            "severity": "high", "title": "covgap hosted fixture"
+        })
+    };
+    Mock::given(method("POST"))
+        .and(path(format!("/v0/orgs/{ORG}/patches/batch")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [
+                { "purl": PURL, "patches": [patch(UUID, PURL)] },
+                { "purl": SECOND_PURL, "patches": [patch(SECOND_UUID, SECOND_PURL)] },
+            ],
+            "canAccessPaidPatches": false,
+        })))
+        .mount(&second)
+        .await;
+    for (uuid, purl, name) in [(UUID, PURL, NAME), (SECOND_UUID, SECOND_PURL, SECOND)] {
+        Mock::given(method("GET"))
+            .and(path_regex(format!(
+                "^/v0/orgs/{ORG}/patches/by-package/.*{name}.*$"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "patches": [{
+                    "uuid": uuid, "purl": purl,
+                    "publishedAt": "2024-01-01T00:00:00Z",
+                    "description": "x", "license": "MIT", "tier": "free",
+                    "vulnerabilities": {}
+                }],
+                "canAccessPaidPatches": false,
+            })))
+            .mount(&second)
+            .await;
+        mock_view(&second, uuid, purl).await;
+    }
+    let grant = |url: &str, purl: &str| {
+        json!({
+            "status": "granted", "url": url, "purl": purl,
+            "artifacts": [{
+                "kind": "tarball", "url": url,
+                "integrity": { "sha512": PATCHED_SHA512, "sha1": PATCHED_SHA1 }
+            }],
+            "registryOverride": null
+        })
+    };
+    mock_reference_results(
+        &second,
+        json!({ UUID: grant(HOSTED_URL, PURL), SECOND_UUID: grant(SECOND_URL, SECOND_PURL) }),
+    )
+    .await;
+
+    // The fixture's patch server is not Socket's: name it, so its pins are
+    // recognised as hosted, as Socket's own are by default.
+    const SERVER: [&str; 2] = ["--patch-server-url", "https://patch.test"];
+    let (code, stdout, stderr) = scan_hosted(
+        root,
+        &second.uri(),
+        &[SERVER[0], SERVER[1], "--dry-run"],
+        &[],
+    );
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        "Would switch 1 package to hosted patches and rewrite 1 file (--dry-run: nothing was \
+         changed). 1 package is already on hosted patches.\n",
+        "stderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(root, &second.uri(), &SERVER, &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert!(
+        engine_stdout(&stdout).starts_with(
+            "Switched 1 package to hosted patches; rewrote 1 file. 1 package was already on \
+             hosted patches.\nNext steps:\n"
+        ),
+        "stdout=\n{stdout}\nstderr=\n{stderr}"
+    );
+
+    let (code, stdout, stderr) = scan_hosted(root, &second.uri(), &SERVER, &[]);
+    assert_eq!(code, 0, "stderr=\n{stderr}");
+    assert_eq!(
+        engine_stdout(&stdout),
+        "2 packages are already on hosted patches; nothing to rewrite.\n",
+        "stderr=\n{stderr}"
     );
 }
 

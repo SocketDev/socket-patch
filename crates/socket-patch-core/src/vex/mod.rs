@@ -24,7 +24,9 @@ pub mod schema;
 pub mod time;
 pub mod verify;
 
-pub use build::{build_document, BuildOptions};
+pub use build::{
+    build_document, build_document_marking_unverified, BuildOptions, NOT_VERIFIED_SUFFIX,
+};
 pub use discover::{
     discover_patched_refs, discover_patched_refs_in, discover_patched_refs_with, Diag,
     DiscoverOptions, Discovery, PatchedRef, Recognized, Unattested, UnattestedKind, UnlockedPin,

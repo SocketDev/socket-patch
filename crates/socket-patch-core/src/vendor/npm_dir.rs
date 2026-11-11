@@ -282,6 +282,476 @@ pub(crate) fn replace_dependency_token(
     Ok(format!("{}{raw}{}", &text[..start], &text[end..]))
 }
 
+// ── in-place document edits ──────────────────────────────────────────────
+
+/// One item of a JSON container: an object member (from its key) or an
+/// array element.
+struct JsonItem {
+    /// The member's decoded key; `None` for an array element.
+    key: Option<String>,
+    /// Where the item starts: its key, or its value in an array.
+    start: usize,
+    value_start: usize,
+    value_end: usize,
+    /// The comma right after the value, when one follows.
+    comma: Option<usize>,
+}
+
+/// An object or array and its items, by byte offset.
+struct JsonContainer {
+    open: usize,
+    close: usize,
+    items: Vec<JsonItem>,
+}
+
+impl JsonContainer {
+    /// The container whose `{` or `[` is at `open`.
+    fn scan(text: &str, open: usize) -> Option<Self> {
+        let b = text.as_bytes();
+        let items: Vec<JsonItem> = match b.get(open)? {
+            b'{' => object_members(text, open)?
+                .into_iter()
+                .map(|m| JsonItem {
+                    key: Some(m.key),
+                    start: m.key_start,
+                    value_start: m.value_start,
+                    value_end: m.value_end,
+                    comma: m.comma,
+                })
+                .collect(),
+            b'[' => array_elements(b, open)?,
+            _ => return None,
+        };
+        let close = skip_ws(b, items.last().map_or(open + 1, |last| last.value_end));
+        matches!(b.get(close)?, b'}' | b']').then_some(Self { open, close, items })
+    }
+
+    /// Where the whitespace ahead of item `i` starts: after the previous
+    /// item's comma, or after the opening bracket.
+    fn lead_start(&self, i: usize) -> usize {
+        match i.checked_sub(1).and_then(|prev| self.items[prev].comma) {
+            Some(comma) => comma + 1,
+            None => self.open + 1,
+        }
+    }
+
+    /// How item `i` is placed: on a line of its own, or beside its
+    /// neighbours.
+    fn place_of(&self, text: &str, i: usize) -> JsonPlace {
+        let lead = &text[self.lead_start(i)..self.items[i].start];
+        match lead.rfind('\n') {
+            Some(at) => JsonPlace::Line {
+                eol: if lead.contains("\r\n") { "\r\n" } else { "\n" },
+                indent: lead[at + 1..].to_string(),
+            },
+            None => JsonPlace::Inline {
+                pad: self.pad(text).to_string(),
+            },
+        }
+    }
+
+    /// The whitespace between the opening bracket and the first item of a
+    /// one-line container (`{ "a": 1 }` pads with a space).
+    fn pad<'t>(&self, text: &'t str) -> &'t str {
+        let first = self.items.first().map_or(self.close, |item| item.start);
+        let pad = &text[self.open + 1..first];
+        if pad.contains('\n') {
+            ""
+        } else {
+            pad
+        }
+    }
+}
+
+/// The elements of the array whose `[` is at `open`.
+fn array_elements(b: &[u8], open: usize) -> Option<Vec<JsonItem>> {
+    let mut items = Vec::new();
+    let mut i = skip_ws(b, open + 1);
+    if b.get(i) == Some(&b']') {
+        return Some(items);
+    }
+    loop {
+        let value_end = scan_value(b, i)?;
+        let next = skip_ws(b, value_end);
+        items.push(JsonItem {
+            key: None,
+            start: i,
+            value_start: i,
+            value_end,
+            comma: (b.get(next) == Some(&b',')).then_some(next),
+        });
+        match b.get(next)? {
+            b',' => i = skip_ws(b, next + 1),
+            b']' => return Some(items),
+            _ => return None,
+        }
+    }
+}
+
+/// Where a value sits, which decides how a container written there lays
+/// out its own items.
+#[derive(Clone)]
+enum JsonPlace {
+    /// On a line indented by `indent`, in a file whose lines end `eol`: its
+    /// items go one indent unit deeper, one per line.
+    Line { eol: &'static str, indent: String },
+    /// Inside a one-line container that pads its brackets with `pad`: its
+    /// items stay on that line.
+    Inline { pad: String },
+}
+
+/// The spellings a document uses where an edit has to write new ones.
+struct JsonStyle {
+    /// One level of indentation.
+    unit: String,
+    /// What separates a key from its value (`": "`, or `":"` when compact).
+    colon: String,
+    /// What follows the comma between two items of a one-line container.
+    inline_sep: &'static str,
+    eol: &'static str,
+}
+
+impl JsonStyle {
+    /// The style of `body`, a document whose root `{` is at `open`.
+    fn of(body: &str, open: usize) -> Self {
+        let b = body.as_bytes();
+        let colon = object_members(body, open)
+            .and_then(|members| {
+                let first = members.first()?;
+                Some(body[scan_string(b, first.key_start)?..first.value_start].to_string())
+            })
+            .unwrap_or_else(|| ": ".to_string());
+        Self {
+            unit: super::common::detect_indent(body),
+            inline_sep: if colon.ends_with(':') { "" } else { " " },
+            colon,
+            eol: if body.contains("\r\n") { "\r\n" } else { "\n" },
+        }
+    }
+
+    /// `key: value` (or the bare value of an array element) as written at
+    /// `place`.
+    fn item(&self, key: Option<&str>, value: &Value, place: &JsonPlace) -> String {
+        let value = self.value(value, place);
+        match key {
+            Some(key) => format!("{}{}{value}", Value::from(key), self.colon),
+            None => value,
+        }
+    }
+
+    /// `value` as written at `place`: a scalar or an empty container in
+    /// serde_json's spelling, a container with its items laid out the way
+    /// the place asks.
+    fn value(&self, value: &Value, place: &JsonPlace) -> String {
+        let (open, close, items): (char, char, Vec<(Option<&str>, &Value)>) = match value {
+            Value::Object(map) if !map.is_empty() => (
+                '{',
+                '}',
+                map.iter().map(|(k, v)| (Some(k.as_str()), v)).collect(),
+            ),
+            Value::Array(list) if !list.is_empty() => {
+                ('[', ']', list.iter().map(|v| (None, v)).collect())
+            }
+            scalar => return scalar.to_string(),
+        };
+        let mut out = String::from(open);
+        match place {
+            JsonPlace::Line { eol, indent } => {
+                let inner = JsonPlace::Line {
+                    eol,
+                    indent: format!("{indent}{}", self.unit),
+                };
+                for (i, (key, item)) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    out.push_str(eol);
+                    out.push_str(indent);
+                    out.push_str(&self.unit);
+                    out.push_str(&self.item(*key, item, &inner));
+                }
+                out.push_str(eol);
+                out.push_str(indent);
+            }
+            JsonPlace::Inline { pad } => {
+                out.push_str(pad);
+                for (i, (key, item)) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                        out.push_str(self.inline_sep);
+                    }
+                    out.push_str(&self.item(*key, item, place));
+                }
+                out.push_str(pad);
+            }
+        }
+        out.push(close);
+        out
+    }
+}
+
+/// One span edit: `[start, end)` of the text becomes `with`.
+struct Splice {
+    start: usize,
+    end: usize,
+    with: String,
+}
+
+/// Take item `i` out of `container`, with the comma and the whitespace
+/// that belong to it — the exact inverse of [`insert_item`], so an item
+/// this module put in comes out leaving the bytes it found.
+fn remove_item(container: &JsonContainer, i: usize) -> Option<Splice> {
+    let item = &container.items[i];
+    let (start, end) = match (item.comma, i.checked_sub(1)) {
+        // Followed by another item: everything up to that item goes.
+        (Some(_), _) => (item.start, container.items.get(i + 1)?.start),
+        // The last of several: the comma that introduced it goes with it.
+        (None, Some(prev)) => (container.items[prev].comma?, item.value_end),
+        // The only item. One written flush against the opening bracket
+        // ahead of whitespace was put into `{<whitespace>}`, which comes
+        // back; any other leaves the container empty.
+        (None, None) => {
+            let flush = item.start == container.open + 1;
+            let kept_tail = flush && item.value_end < container.close;
+            let end = if kept_tail {
+                item.value_end
+            } else {
+                container.close
+            };
+            (container.open + 1, end)
+        }
+    };
+    Some(Splice {
+        start,
+        end,
+        with: String::new(),
+    })
+}
+
+/// Put `key: value` (an element when `key` is `None`) into `container` as
+/// its item number `at`, written the way the item beside it is: on its own
+/// line at that item's indentation, or on the same line. Nothing already
+/// in the text is moved or respelled. `place` is how the container itself
+/// sits, which lays out the first item of an empty one.
+fn insert_item(
+    text: &str,
+    container: &JsonContainer,
+    at: usize,
+    key: Option<&str>,
+    value: &Value,
+    place: &JsonPlace,
+    style: &JsonStyle,
+) -> Splice {
+    let count = container.items.len();
+    let insert = |start: usize, with: String| Splice {
+        start,
+        end: start,
+        with,
+    };
+    if count == 0 {
+        let (lead, inner, tail) = match place {
+            JsonPlace::Line { eol, indent } => {
+                let deeper = format!("{indent}{}", style.unit);
+                let inner = JsonPlace::Line {
+                    eol,
+                    indent: deeper.clone(),
+                };
+                (format!("{eol}{deeper}"), inner, format!("{eol}{indent}"))
+            }
+            JsonPlace::Inline { pad } => (pad.clone(), place.clone(), pad.clone()),
+        };
+        let item = style.item(key, value, &inner);
+        // Whitespace already inside the empty container stays where it is,
+        // behind the item, so [`remove_item`] gives it back.
+        let with = match container.close == container.open + 1 {
+            true => format!("{lead}{item}{tail}"),
+            false => item,
+        };
+        return insert(container.open + 1, with);
+    }
+    // The neighbour whose placement the new item copies: the one it goes
+    // in front of, or the last when it is appended.
+    let neighbour = at.min(count - 1);
+    let inner = container.place_of(text, neighbour);
+    // What goes between the comma and the item after it.
+    let gap = match &inner {
+        JsonPlace::Line { eol, indent } => format!("{eol}{indent}"),
+        // On one line: what follows a comma there already, copied from an
+        // item that has one in front of it.
+        JsonPlace::Inline { .. } => {
+            let after_comma = neighbour.max(1);
+            match container.items.get(after_comma) {
+                Some(item) => text[container.lead_start(after_comma)..item.start].to_string(),
+                None => style.inline_sep.to_string(),
+            }
+        }
+    };
+    let item = style.item(key, value, &inner);
+    match container.items.get(at) {
+        Some(next) => insert(next.start, format!("{item},{gap}")),
+        None => insert(
+            container.items[count - 1].value_end,
+            format!(",{gap}{item}"),
+        ),
+    }
+}
+
+/// The next span edit that moves the value at `at` — which parses as
+/// `before` — toward `after`: one member or element removed, inserted or
+/// replaced. `None` when the text cannot be followed.
+fn next_splice(
+    text: &str,
+    at: usize,
+    before: &Value,
+    after: &Value,
+    place: &JsonPlace,
+    style: &JsonStyle,
+) -> Option<Splice> {
+    match (before, after) {
+        (Value::Object(was), Value::Object(now)) => {
+            let container = JsonContainer::scan(text, at)?;
+            // A repeated key reads as its last member, as `JSON.parse` and
+            // serde_json both read it.
+            let find = |key: &str| {
+                container
+                    .items
+                    .iter()
+                    .rposition(|item| item.key.as_deref() == Some(key))
+            };
+            if let Some(gone) = was.keys().find(|key| !now.contains_key(*key)) {
+                return remove_item(&container, find(gone)?);
+            }
+            let mut prev: Option<&String> = None;
+            for (key, value) in now {
+                if !was.contains_key(key) {
+                    let at = match prev {
+                        Some(prev) => find(prev)? + 1,
+                        None => 0,
+                    };
+                    return Some(insert_item(
+                        text,
+                        &container,
+                        at,
+                        Some(key),
+                        value,
+                        place,
+                        style,
+                    ));
+                }
+                prev = Some(key);
+            }
+            let (key, value) = now
+                .iter()
+                .find(|(key, value)| was.get(key.as_str()) != Some(*value))?;
+            let i = find(key)?;
+            next_splice(
+                text,
+                container.items[i].value_start,
+                was.get(key)?,
+                value,
+                &container.place_of(text, i),
+                style,
+            )
+        }
+        (Value::Array(was), Value::Array(now)) => {
+            let container = JsonContainer::scan(text, at)?;
+            if container.items.len() != was.len() {
+                return None;
+            }
+            let i = (0..was.len().max(now.len())).find(|&i| was.get(i) != now.get(i))?;
+            let insert =
+                |value: &Value| Some(insert_item(text, &container, i, None, value, place, style));
+            match (was.get(i), now.get(i)) {
+                (Some(_), None) => remove_item(&container, i),
+                (None, Some(value)) => insert(value),
+                // An element that is wanted further on stays, so the new
+                // one goes in front of it; one the new list has no place
+                // for goes; otherwise the element itself changed.
+                (Some(old), Some(value)) if now[i + 1..].contains(old) => insert(value),
+                (Some(_), Some(value)) if was[i + 1..].contains(value) => {
+                    remove_item(&container, i)
+                }
+                (Some(_), Some(value)) if was.len() < now.len() => insert(value),
+                (Some(_), Some(_)) if was.len() > now.len() => remove_item(&container, i),
+                (Some(old), Some(value)) => next_splice(
+                    text,
+                    container.items[i].value_start,
+                    old,
+                    value,
+                    &container.place_of(text, i),
+                    style,
+                ),
+                (None, None) => None,
+            }
+        }
+        _ => Some(Splice {
+            start: at,
+            end: scan_value(text.as_bytes(), at)?,
+            with: style.value(after, place),
+        }),
+    }
+}
+
+/// The most span edits one [`splice_json`] call makes. A manifest edit
+/// takes a handful; the bound only stops a scanner fault from looping.
+const MAX_SPLICES: usize = 4096;
+
+/// `text` — a JSON object document — edited in place until it parses as
+/// `after`: each member or element `after` adds, drops or changes becomes
+/// one span edit, and every other byte stays as it is (formatting,
+/// escapes, number spellings, repeated keys, line endings, a BOM, the
+/// trailing newline). An added item copies the indentation and line ending
+/// of the item beside it, and taking it out again restores the bytes it
+/// was put into, so a caller that undoes its own additions round-trips the
+/// document exactly.
+///
+/// This is how socket-patch edits a file the user owns. Printing the
+/// parsed document instead reflows it and changes values serde_json does
+/// not read exactly (a long float, an integer past `u64`).
+///
+/// `Err` says why the document was left alone; the result is only ever
+/// returned once it parses as `after`.
+pub(crate) fn splice_json(text: &str, after: &Value) -> Result<String, String> {
+    let bom = text.len() - crate::formats::text::strip_bom(text).len();
+    let parse = |text: &str| {
+        serde_json::from_str::<Value>(&text[bom..])
+            .ok()
+            .filter(Value::is_object)
+            .ok_or("is not a JSON object")
+    };
+    let mut before = parse(text)?;
+    if !after.is_object() {
+        return Err("is not a JSON object".to_string());
+    }
+    let open = skip_ws(text.as_bytes(), bom);
+    let style = JsonStyle::of(&text[bom..], open - bom);
+    let root = JsonPlace::Line {
+        eol: style.eol,
+        indent: String::new(),
+    };
+    let mut out = text.to_string();
+    for _ in 0..MAX_SPLICES {
+        if before == *after {
+            return Ok(out);
+        }
+        let splice = next_splice(&out, open, &before, after, &root, &style)
+            .filter(|s| out.is_char_boundary(s.start) && out.is_char_boundary(s.end))
+            .ok_or("has a layout the in-place editor cannot follow")?;
+        out.replace_range(splice.start..splice.end, &splice.with);
+        before = parse(&out).map_err(|_| "could not be edited in place")?;
+    }
+    Err("needs more edits than the in-place editor makes".to_string())
+}
+
+/// [`splice_json`] over the bytes of the manifest `file`, with the reason
+/// it was left alone spelled as the failure a vendor or revert reports.
+pub(crate) fn splice_manifest(file: &str, bytes: &[u8], after: &Value) -> Result<Vec<u8>, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| format!("{file} is not UTF-8"))?;
+    splice_json(text, after)
+        .map(String::into_bytes)
+        .map_err(|why| format!("{file} {why}, so it cannot be edited without rewriting it"))
+}
+
 /// The `devDependencies` strip on a staged tree's `package.json`. A
 /// refusal is the ready outcome.
 pub(super) async fn apply_transforms(
@@ -410,7 +880,7 @@ async fn git_output(
     stdin: Option<String>,
 ) -> Option<(i32, String)> {
     use tokio::io::AsyncWriteExt as _;
-    let mut child = tokio::process::Command::new(git)
+    let mut child = tokio::process::Command::from(crate::utils::process::command_for(git))
         .arg("-C")
         .arg(root)
         .args(args)
@@ -964,6 +1434,7 @@ pub(super) async fn try_service_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn dev_dependencies_are_cut_out_as_one_span() {
@@ -1032,6 +1503,227 @@ mod tests {
                 "a"
             ),
             Err(SpanError::Duplicate("dependencies.a".into()))
+        );
+    }
+
+    /// `text` parsed, changed by `edit`, and spliced back.
+    fn spliced(text: &str, edit: impl FnOnce(&mut Value)) -> Result<String, String> {
+        let mut doc: Value = serde_json::from_str(crate::formats::text::strip_bom(text))
+            .map_err(|e| e.to_string())?;
+        edit(&mut doc);
+        splice_json(text, &doc)
+    }
+
+    fn set(doc: &mut Value, path: &[&str], value: Value) {
+        let (last, parents) = path.split_last().unwrap();
+        let mut at = doc;
+        for key in parents {
+            at = at
+                .as_object_mut()
+                .unwrap()
+                .entry(*key)
+                .or_insert_with(|| json!({}));
+        }
+        at.as_object_mut().unwrap().insert(last.to_string(), value);
+    }
+
+    fn unset(doc: &mut Value, path: &[&str]) {
+        let (last, parents) = path.split_last().unwrap();
+        let mut at = doc;
+        for key in parents {
+            at = at.get_mut(*key).unwrap();
+        }
+        at.as_object_mut().unwrap().shift_remove(*last).unwrap();
+    }
+
+    #[test]
+    fn an_added_member_copies_the_layout_of_the_one_beside_it() {
+        let add = |doc: &mut Value| set(doc, &["pnpm", "overrides", "a@1"], json!("file:x"));
+        for (text, want) in [
+            // Two spaces, four spaces, tabs, CRLF, no trailing newline.
+            (
+                "{\n  \"name\": \"x\"\n}\n",
+                "{\n  \"name\": \"x\",\n  \"pnpm\": {\n    \"overrides\": {\n      \"a@1\": \"file:x\"\n    }\n  }\n}\n",
+            ),
+            (
+                "{\n    \"name\": \"x\"\n}\n",
+                "{\n    \"name\": \"x\",\n    \"pnpm\": {\n        \"overrides\": {\n            \"a@1\": \"file:x\"\n        }\n    }\n}\n",
+            ),
+            (
+                "{\n\t\"name\": \"x\"\n}",
+                "{\n\t\"name\": \"x\",\n\t\"pnpm\": {\n\t\t\"overrides\": {\n\t\t\t\"a@1\": \"file:x\"\n\t\t}\n\t}\n}",
+            ),
+            (
+                "\u{feff}{\r\n  \"name\": \"x\"\r\n}\r\n",
+                "\u{feff}{\r\n  \"name\": \"x\",\r\n  \"pnpm\": {\r\n    \"overrides\": {\r\n      \"a@1\": \"file:x\"\r\n    }\r\n  }\r\n}\r\n",
+            ),
+            // One line: compact, and spaced.
+            (
+                "{\"name\":\"x\"}\n",
+                "{\"name\":\"x\",\"pnpm\":{\"overrides\":{\"a@1\":\"file:x\"}}}\n",
+            ),
+            (
+                "{ \"name\": \"x\", \"v\": 1 }",
+                "{ \"name\": \"x\", \"v\": 1, \"pnpm\": { \"overrides\": { \"a@1\": \"file:x\" } } }",
+            ),
+            // A table that is already there takes the member in its own
+            // layout, whatever the rest of the file looks like.
+            (
+                "{\n  \"pnpm\": { \"overrides\": { \"z\": \"1\" } },\n  \"name\": \"x\"\n}\n",
+                "{\n  \"pnpm\": { \"overrides\": { \"z\": \"1\", \"a@1\": \"file:x\" } },\n  \"name\": \"x\"\n}\n",
+            ),
+            (
+                "{\n  \"pnpm\": {\n      \"overrides\": {\n          \"z\": \"1\"\n      }\n  }\n}\n",
+                "{\n  \"pnpm\": {\n      \"overrides\": {\n          \"z\": \"1\",\n          \"a@1\": \"file:x\"\n      }\n  }\n}\n",
+            ),
+            // Empty tables, with and without whitespace inside.
+            (
+                "{\n  \"pnpm\": {},\n  \"name\": \"x\"\n}\n",
+                "{\n  \"pnpm\": {\n    \"overrides\": {\n      \"a@1\": \"file:x\"\n    }\n  },\n  \"name\": \"x\"\n}\n",
+            ),
+            (
+                "{\n  \"pnpm\": { \"overrides\": { } }\n}\n",
+                "{\n  \"pnpm\": { \"overrides\": {\"a@1\": \"file:x\" } }\n}\n",
+            ),
+            ("{}", "{\n  \"pnpm\": {\n    \"overrides\": {\n      \"a@1\": \"file:x\"\n    }\n  }\n}"),
+        ] {
+            let added = spliced(text, add).unwrap();
+            assert_eq!(added, want, "{text:?}");
+            // Taking the member out again gives the bytes back: with the
+            // tables it was put into left in place...
+            let had_pnpm = text.contains("\"pnpm\"");
+            let had_overrides = text.contains("\"overrides\"");
+            let removed = spliced(&added, |doc| {
+                unset(doc, &["pnpm", "overrides", "a@1"]);
+                if !had_overrides {
+                    unset(doc, &["pnpm", "overrides"]);
+                }
+                if !had_pnpm {
+                    unset(doc, &["pnpm"]);
+                }
+            })
+            .unwrap();
+            assert_eq!(removed, text, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_changed_member_is_respelled() {
+        // Everything a parse-and-print round trip would rewrite.
+        let text = concat!(
+            "{\n",
+            "  \"author\": \"Jos\\u00e9\", \"url\": \"https:\\/\\/x\",\n",
+            "  \"files\": [\"dist\", \"src\"],\n",
+            "  \"n\": [1e3, 4.670e-22, 5.173e28, 18446744073709551616, -0],\n",
+            "  \"license\": \"MIT\",\n",
+            "  \"license\": \"ISC\",\n",
+            "  \"scripts\": { },\n",
+            "  \"resolutions\": { \"a\": \"1.0.0\" , \"b\" : \"2.0.0\" }\n",
+            "}",
+        );
+        // A value replaced in place keeps its key and surroundings.
+        assert_eq!(
+            spliced(text, |doc| set(
+                doc,
+                &["resolutions", "a"],
+                json!("file:./v")
+            ))
+            .unwrap(),
+            text.replace("\"1.0.0\"", "\"file:./v\"")
+        );
+        // A member dropped from the middle, the end and the front.
+        assert_eq!(
+            spliced(text, |doc| unset(doc, &["resolutions", "a"])).unwrap(),
+            text.replace("\"a\": \"1.0.0\" , ", "")
+        );
+        assert_eq!(
+            spliced(text, |doc| unset(doc, &["resolutions", "b"])).unwrap(),
+            text.replace(", \"b\" : \"2.0.0\"", "")
+        );
+        assert_eq!(
+            spliced(text, |doc| unset(doc, &["resolutions"])).unwrap(),
+            text.replace(
+                ",\n  \"resolutions\": { \"a\": \"1.0.0\" , \"b\" : \"2.0.0\" }",
+                ""
+            )
+        );
+        assert_eq!(
+            spliced(text, |doc| unset(doc, &["author"])).unwrap(),
+            text.replace("\"author\": \"Jos\\u00e9\", ", "")
+        );
+        // A repeated key reads as its last member; that one is edited.
+        assert_eq!(
+            spliced(text, |doc| set(doc, &["license"], json!("0BSD"))).unwrap(),
+            text.replace("\"ISC\"", "\"0BSD\"")
+        );
+        // No change, no edit.
+        assert_eq!(spliced(text, |_| {}).unwrap(), text);
+    }
+
+    #[test]
+    fn array_elements_are_added_and_dropped_in_place() {
+        let text = "{\n  \"pnpm\": {\n    \"onlyBuiltDependencies\": [\n      \"esbuild\",\n      \"sharp\"\n    ],\n    \"inline\": [\"a\", \"b\"]\n  }\n}\n";
+        let list = |doc: &mut Value, field: &str, items: Value| {
+            set(doc, &["pnpm", field], items);
+        };
+        // After an element in the middle, at the end, and at the front.
+        let middle = spliced(text, |doc| {
+            list(
+                doc,
+                "onlyBuiltDependencies",
+                json!(["esbuild", "new", "sharp"]),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            middle,
+            text.replace("\"esbuild\",\n", "\"esbuild\",\n      \"new\",\n")
+        );
+        assert_eq!(
+            spliced(&middle, |doc| {
+                list(doc, "onlyBuiltDependencies", json!(["esbuild", "sharp"]))
+            })
+            .unwrap(),
+            text
+        );
+        let end = spliced(text, |doc| list(doc, "inline", json!(["a", "b", "c"]))).unwrap();
+        assert_eq!(end, text.replace("[\"a\", \"b\"]", "[\"a\", \"b\", \"c\"]"));
+        assert_eq!(
+            spliced(&end, |doc| list(doc, "inline", json!(["a", "b"]))).unwrap(),
+            text
+        );
+        assert_eq!(
+            spliced(text, |doc| list(doc, "inline", json!(["z", "a", "b"]))).unwrap(),
+            text.replace("[\"a\", \"b\"]", "[\"z\", \"a\", \"b\"]")
+        );
+        // One element swapped for another, and the list emptied.
+        assert_eq!(
+            spliced(text, |doc| list(doc, "inline", json!(["a", "c"]))).unwrap(),
+            text.replace("[\"a\", \"b\"]", "[\"a\", \"c\"]")
+        );
+        assert_eq!(
+            spliced(text, |doc| list(doc, "inline", json!([]))).unwrap(),
+            text.replace("[\"a\", \"b\"]", "[]")
+        );
+    }
+
+    #[test]
+    fn a_document_the_editor_cannot_follow_is_left_alone() {
+        assert_eq!(
+            splice_json("[1]", &json!({})),
+            Err("is not a JSON object".to_string())
+        );
+        assert_eq!(
+            splice_json("{\"a\": 1", &json!({})),
+            Err("is not a JSON object".to_string())
+        );
+        assert_eq!(
+            splice_json("{}", &json!([])),
+            Err("is not a JSON object".to_string())
+        );
+        assert_eq!(
+            splice_manifest("package.json", b"\xff{}", &json!({})),
+            Err("package.json is not UTF-8".to_string())
         );
     }
 

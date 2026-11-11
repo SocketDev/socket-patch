@@ -575,6 +575,120 @@ pub(crate) async fn member_stray_lock(root: &Path) -> Option<MemberStrayLock> {
     })
 }
 
+/// Two more member locks the package manager never reads, which
+/// [`member_stray_lock`] (shared with the vendored backends) does not
+/// name. Hosted mode refuses them and VEX discovery reads them as absent:
+///
+/// - pnpm installs every project a `pnpm-workspace.yaml` lists from the
+///   workspace root's lock, so a listed member's own `pnpm-lock.yaml` (or
+///   `shrinkwrap.yaml`) is never read: `pnpm install --frozen-lockfile`
+///   inside the member installs what the root lock resolves and leaves the
+///   member's lock untouched (pnpm 10.34.1, 11.27.0). The exception is a
+///   workspace that turns the shared lock off (`sharedWorkspaceLockfile:
+///   false`) and whose root lock lists no member importer, where each
+///   member installs from its own lock (#492). A workspace file above the
+///   repository root is never read, so it may list the member
+///   ([`governing_workspace_file`] fails closed).
+/// - yarn 1 installs a `package.json` workspace member from the workspace
+///   root and never reads a classic `yarn.lock` inside the member, whether
+///   or not the root holds a lock yet (yarn 1.22.19, `--frozen-lockfile`
+///   included). The root is the nearest ancestor whose `package.json` has
+///   `workspaces`; when those do not list the directory, yarn takes it for
+///   a project of its own. A berry lock in a member is a separate project.
+pub(crate) async fn member_unread_lock(root: &Path) -> Option<MemberStrayLock> {
+    let canonical = canonical_or_absolute(root);
+    let pnpm_own: Vec<&'static str> = [PNPM_LOCK, EXTRA_OWN_LOCKS[0]]
+        .into_iter()
+        .filter(|name| root.join(name).exists())
+        .collect();
+    if !pnpm_own.is_empty() {
+        if let Some(file) = governing_workspace_file(root) {
+            let dir = file.parent()?.to_path_buf();
+            if pnpm_member_shares_root_lock(&canonical, &file, &dir).await {
+                return Some(MemberStrayLock {
+                    detail: format!(
+                        "{} is a member of the pnpm workspace rooted at {}: pnpm installs it \
+                         from the workspace's shared {} and ignores its own {}",
+                        root.display(),
+                        dir.display(),
+                        dir.join(PNPM_LOCK).display(),
+                        join_paths(root, &pnpm_own)
+                    ),
+                    root: dir,
+                    root_kind: "workspace root",
+                    ignored: pnpm_own,
+                });
+            }
+        }
+    }
+    let classic = read_regular_to_string(&root.join(YARN_LOCK))
+        .await
+        .is_ok_and(|text| !is_berry_lock(strip_bom(&text)));
+    if !classic {
+        return None;
+    }
+    let own = [YARN_LOCK];
+    let bound = upward_bound(crate::utils::repo_root::ReadScope::Workspace, &canonical);
+    for ancestor in canonical.ancestors().skip(1) {
+        if bound.as_ref().is_some_and(|b| !b.contains(ancestor)) {
+            // Nothing inside the repository names workspaces; a manifest
+            // above it is never read, so it may list the member.
+            return stray_lock_marker_above(root, &own, &["package.json"]);
+        }
+        let Ok(text) = read_regular_to_string(&ancestor.join("package.json")).await else {
+            continue;
+        };
+        let Some(patterns) = Workspaces::listed_patterns(&text) else {
+            continue;
+        };
+        let rel: Vec<String> = canonical
+            .strip_prefix(ancestor)
+            .ok()?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        // The nearest manifest with `workspaces` decides, listed or not.
+        return workspaces_include_as(&patterns, &rel, WorkspacesDialect::YARN_CLASSIC).then(
+            || MemberStrayLock {
+                detail: format!(
+                    "{} is a member of the yarn workspace rooted at {}: yarn 1 installs it \
+                     from the workspace root's {YARN_LOCK} and ignores its own {}",
+                    root.display(),
+                    ancestor.display(),
+                    join_paths(root, &own)
+                ),
+                root: ancestor.to_path_buf(),
+                root_kind: "workspace root",
+                ignored: own.to_vec(),
+            },
+        );
+    }
+    None
+}
+
+/// Whether the pnpm workspace whose file `file` (in `dir`) lists the
+/// project at `canonical` installs it from the workspace's shared lock
+/// (see [`member_unread_lock`]). A workspace file that cannot be read, one
+/// above the repository root included, counts as shared.
+async fn pnpm_member_shares_root_lock(canonical: &Path, file: &Path, dir: &Path) -> bool {
+    use crate::utils::repo_root::{upward_readable, ReadScope};
+    if !upward_readable(ReadScope::Workspace, canonical, file) {
+        return true;
+    }
+    let Ok(workspace) = read_regular_to_string(file).await else {
+        return true;
+    };
+    let npmrc = read_regular_to_string(&dir.join(".npmrc")).await.ok();
+    if !crate::utils::pnpm_workspace::shared_lockfile_disabled(&workspace, npmrc.as_deref()) {
+        return true;
+    }
+    // A root lock that lists member importers is the shared one, whatever
+    // the setting says now.
+    read_regular_to_string(&dir.join(PNPM_LOCK))
+        .await
+        .is_ok_and(|lock| crate::formats::pnpm::workspace::lock_text_has_member_importers(&lock))
+}
+
 /// The workspace files an npm-family member's governing root may hold.
 const WORKSPACE_MARKERS: [&str; 3] = [PNPM_WORKSPACE, VLT_JSON, "package.json"];
 
@@ -826,9 +940,14 @@ async fn listing_workspace(base: &Path, dir: &Path) -> Option<PathBuf> {
     None
 }
 
-/// The hosted refusal for [`member_stray_lock`].
+/// The hosted refusal for [`member_stray_lock`] and [`member_unread_lock`]:
+/// a pin written into a lock the package manager never reads is never
+/// installed, so the run would report a patch nothing delivers.
 async fn member_stray_lock_refusal(root: &Path) -> Option<(PathBuf, Refusal)> {
-    let stray = member_stray_lock(root).await?;
+    let stray = match member_stray_lock(root).await {
+        Some(stray) => stray,
+        None => member_unread_lock(root).await?,
+    };
     let refusal = Refusal {
         code: WORKSPACE_LOCKFILE_ELSEWHERE.to_string(),
         message: format!(
@@ -1675,15 +1794,22 @@ mod tests {
         assert_eq!(code(&member, "pypi").await, None);
     }
 
-    /// A member with its own lock (`sharedWorkspaceLockfile: false`) is its
-    /// own lock root; a workspace whose root has no lock refuses nothing.
+    /// A yarn berry lock's opening: berry treats a nested `yarn.lock` as a
+    /// project of its own, where yarn 1 never reads a member's.
+    const BERRY_LOCK: &str = "__metadata:\n  version: 8\n";
+
+    /// A member with its own lock in a workspace that turns the shared lock
+    /// off (`sharedWorkspaceLockfile: false`) is its own lock root, and a
+    /// workspace whose root has no lock refuses nothing for a lockless
+    /// member. Under the default shared lock pnpm never reads a listed
+    /// member's own lock, so a pin there would never be installed.
     #[tokio::test]
     async fn pnpm_member_with_own_lock_or_lockless_root_is_left_alone() {
         let tmp = tempfile::tempdir().unwrap();
         write(
             tmp.path(),
             "pnpm-workspace.yaml",
-            "packages:\n  - packages/*\ntrustLockfile: true\n",
+            "packages:\n  - packages/*\nsharedWorkspaceLockfile: false\ntrustLockfile: true\n",
         );
         write(tmp.path(), "packages/a/package.json", "{}");
         let member = tmp.path().join("packages/a");
@@ -1695,6 +1821,15 @@ mod tests {
             "lockfileVersion: '9.0'\n",
         );
         assert_eq!(code(&member, "npm").await, None);
+        write(
+            tmp.path(),
+            "pnpm-workspace.yaml",
+            "packages:\n  - packages/*\ntrustLockfile: true\n",
+        );
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
     }
 
     /// #1006: a project the nearest `pnpm-workspace.yaml` does not list
@@ -1739,10 +1874,11 @@ mod tests {
         let action = tmp.path().join(".github/actions/demo");
         let refused = refusal(&ProjectView::Disk(&action), &[candidate("npm")], true).await;
         assert!(refused.is_none(), "{refused:?}");
-        // ...while `examples/demo`, which `**` lists, is refused.
+        // ...while `examples/demo`, which `**` lists, is refused: pnpm
+        // installs it from the workspace's shared lock, not its own.
         assert_eq!(
             code(&demo, "npm").await.as_deref(),
-            Some(PNPM_SETTINGS_ELSEWHERE)
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
         );
     }
 
@@ -2490,10 +2626,17 @@ mod tests {
             Some(WORKSPACE_LOCKFILE_ELSEWHERE)
         );
         for own in ["yarn.lock", "bun.lock", "vlt-lock.json"] {
-            write(tmp.path(), &format!("packages/a/{own}"), "");
+            write(tmp.path(), &format!("packages/a/{own}"), BERRY_LOCK);
             assert_eq!(code(&member, "npm").await, None, "{own}");
             std::fs::remove_file(member.join(own)).unwrap();
         }
+        // A yarn 1 lock is not one of those: yarn 1 installs the member
+        // from the workspace root and never reads it.
+        write(tmp.path(), "packages/a/yarn.lock", "");
+        assert_eq!(
+            code(&member, "npm").await.as_deref(),
+            Some(WORKSPACE_LOCKFILE_ELSEWHERE)
+        );
     }
 
     /// The nearest ancestor that lists the member is its root, past an
@@ -3125,7 +3268,7 @@ mod tests {
         // own-lock shortcut, and so does one with an npm lock the root
         // does not back with its own npm lock.
         for own in ["yarn.lock", "pnpm-lock.yaml", "package-lock.json"] {
-            write(tmp.path(), &format!("packages/a/{own}"), "");
+            write(tmp.path(), &format!("packages/a/{own}"), BERRY_LOCK);
             assert_eq!(code(&member, "npm").await, None, "{own}");
             std::fs::remove_file(member.join(own)).unwrap();
         }

@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::manifest::schema::PatchFileInfo;
-use crate::patch::apply::{files_in_order, normalize_file_path};
+use crate::patch::apply::{
+    commit_package, files_in_order, finish_package, normalize_file_path, stage_change, FileChange,
+    PackageWrite, PackageWriteError,
+};
 use crate::patch::file_hash::compute_file_git_sha256;
 
 /// Status of a file rollback verification.
@@ -678,217 +681,214 @@ async fn rollback_package_patch_at(
             return result;
         }
     }
+    // An earlier run that was interrupted may have left stages behind.
+    if !dry_run {
+        crate::patch::apply::sweep_stale_stages(
+            pkg_path,
+            files,
+            crate::patch::apply::STALE_STAGE_AGE,
+        )
+        .await;
+    }
     if all_original || dry_run {
-        // Maven: retry a Coursier sidecar resync an earlier rollback could
-        // not finish (see `sidecars::coursier::retry_record`).
+        // This run restores nothing, so it never reaches the sidecar
+        // resync below; an earlier rollback that died after its last
+        // rename left the sidecars describing the patched bytes (apply's
+        // twin, see `sidecars::recheck`). A sidecar that cannot be resynced
+        // fails the package, which keeps its record for the next run.
         if !dry_run {
             let keys: Vec<String> = result
                 .files_verified
                 .iter()
                 .map(|v| v.file.clone())
                 .collect();
-            let failed = "sidecar resync failed (files still rolled back)";
-            result.sidecar = crate::patch::sidecars::coursier::retry_record(
+            result.sidecar = crate::patch::sidecars::recheck(
                 package_key,
                 pkg_path,
                 &keys,
-                failed,
-            );
+                true,
+                "sidecar resync failed (the files are already restored)",
+            )
+            .await;
+            if let Some(why) = result.sidecar.as_ref().and_then(|s| s.fixup_failure()) {
+                result.error = Some(why.to_string());
+                return result;
+            }
         }
         result.success = true;
         return result;
     }
 
-    // Advisory notes from restores that committed but could not put the
-    // ownership back (see `apply_file_patch_at`); reported on `error`
-    // alongside `success`.
+    // Advisory notes from restores that committed but could not keep an
+    // owner or clean up after themselves (see `apply_file_patch_at`);
+    // reported on `error` alongside `success`.
     let mut warnings: Vec<String> = Vec::new();
 
-    // Rollback files that need it
+    // A failed restore or delete fails the package with every file as it
+    // was, and names the file (apply's twin, the Windows daemon advisory
+    // included).
+    let write_failed = |result: &mut RollbackResult, e: PackageWriteError| {
+        let file = e.file.unwrap_or_default();
+        let target = pkg_path.join(normalize_file_path(&file));
+        if package_key.starts_with("pkg:maven/")
+            && crate::patch::sidecars::maven::is_locked_by_daemon(&e.source, &target)
+        {
+            result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
+                purl: package_key.to_string(),
+                ecosystem: "maven".to_string(),
+                files: Vec::new(),
+                advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
+                    &target,
+                )),
+            });
+        }
+        let note = crate::patch::apply::not_restored_note(&e.not_restored);
+        result.error = Some(if e.delete {
+            format!("Failed to delete {file}: {}{note}", e.source)
+        } else {
+            format!(
+                "{}{note}",
+                cannot_rollback_error(&file, &e.source.to_string())
+            )
+        });
+    };
+
+    // Stage every restore, and plan every delete, before the first file is
+    // changed: rolling a file back is the same operation as patching it
+    // forward ("safely overwrite this file with these hash-verified
+    // bytes"), so it goes through the same `PackageWrite` and gets the same
+    // guarantees. A before blob that cannot be read or does not hold its
+    // hash's bytes stops the package with nothing changed. pnpm store
+    // copies are rolled back by the package-level wrapper, one full verify
+    // each.
+    let pending: std::collections::HashSet<&str> = result
+        .files_verified
+        .iter()
+        .filter(|v| v.status != VerifyRollbackStatus::AlreadyOriginal)
+        .map(|v| v.file.as_str())
+        .collect();
+    let mut write = PackageWrite::new();
+    // Each changed file, and whether it was deleted.
+    let mut changed: Vec<(&String, bool)> = Vec::new();
     for (file_name, file_info) in files_in_order(files) {
-        let already_original = result
-            .files_verified
-            .iter()
-            .any(|v| v.file == *file_name && v.status == VerifyRollbackStatus::AlreadyOriginal);
-        if already_original {
+        if !pending.contains(file_name.as_str()) {
             continue;
         }
 
         // New files (empty beforeHash): delete instead of restoring.
-        if file_info.before_hash.is_empty() {
-            let normalized = normalize_file_path(file_name);
-            // SECURITY: this delete path constructs the target itself and
-            // does NOT go through `apply_file_patch_at`, so it must enforce the
-            // same path-escape guard. Without it a poisoned manifest entry
-            // (empty beforeHash + a `../../`/absolute key) would unlink an
-            // arbitrary file outside the package directory. Verify already
-            // blocks such keys, but defense-in-depth: never trust an
-            // unvalidated key at the syscall.
-            if !crate::patch::apply::is_safe_relative_subpath(normalized) {
-                result.error = Some(format!(
-                    "Unsafe patch path (escapes package directory): {}",
-                    file_name
-                ));
-                return result;
-            }
-            let filepath = pkg_path.join(normalized);
-            // Unlinking a directory entry requires write permission on the
-            // *parent directory*, not the file. Go's module cache marks
-            // package directories read-only (0o555), so — exactly as the
-            // apply write path does — temporarily grant owner-write on the
-            // parent and restore its exact mode afterward, whether the
-            // delete succeeds or fails.
-            let dir_guard = crate::patch::apply::DirWriteGuard::acquire(filepath.parent()).await;
-            let remove_result = tokio::fs::remove_file(&filepath).await;
-            dir_guard.restore().await;
-            if let Err(e) = remove_result {
-                result.error = Some(format!("Failed to delete {}: {}", file_name, e));
-                return result;
-            }
-            // The bytecode goes whatever the pruning decides: a stale `.pyc`
-            // of a deleted module must not outlive it, and a failed delete is
-            // reported like a restore's (`stale_bytecode_not_removed`).
-            warnings.extend(
-                crate::patch::apply::remove_stale_bytecode(
-                    &filepath,
-                    crate::patch::apply::StaleBytecode::All,
-                )
-                .await,
-            );
-            prune_emptied_parents(pkg_path, &filepath).await;
-            result.files_rolled_back.push(file_name.clone());
-            continue;
-        }
-
-        // SECURITY: defense-in-depth twin of the verify-time guard — never
-        // join an unvalidated manifest hash onto the blobs directory at the
-        // read syscall either (mirrors the delete branch above). Verify
-        // already blocks unsafe hashes, but this read must not depend on it.
-        if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
-            result.error = Some(format!(
-                "Unsafe before-blob hash (escapes blobs directory): {}",
-                file_info.before_hash
-            ));
-            return result;
-        }
-        // Twin of the verify-time 64-hex gate (see `verify_file_rollback`):
-        // shared with the apply engine's `read_blob`.
-        if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
-            result.error = Some(format!(
-                "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
-                file_info.before_hash
-            ));
-            return result;
-        }
-
-        // Read the original content from the blob. SECURITY: defense-in-depth
-        // twin of the verify-time entry-type guard (exactly like the string
-        // guard above) — `read_blob_entry` lstat's the ENTRY (a planted
-        // symlink is refused, never followed) and opens FIFO-safe, so this
-        // read does not depend on verify having blocked a bad entry.
-        let blob_path = blobs_path.join(&file_info.before_hash);
-        let original_content = match crate::patch::apply::read_blob_entry(&blob_path).await {
-            Ok(content) => content,
-            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
-                result.error = Some(format!(
-                    "Before blob is not a regular file: {}",
+        let change = if file_info.before_hash.is_empty() {
+            FileChange::Delete
+        } else {
+            // SECURITY: defense-in-depth twin of the verify-time guards —
+            // never join an unvalidated manifest hash onto the blobs
+            // directory at the read syscall either. Verify already blocks
+            // unsafe hashes, but this read must not depend on it.
+            let blob = if !crate::patch::apply::is_safe_relative_subpath(&file_info.before_hash) {
+                Err(format!(
+                    "Unsafe before-blob hash (escapes blobs directory): {}",
                     file_info.before_hash
-                ));
-                return result;
-            }
-            Err(e) => {
-                result.error = Some(format!(
-                    "Failed to read blob {}: {}",
-                    file_info.before_hash, e
-                ));
-                return result;
-            }
-        };
-
-        // Restore via `apply_file_patch_at`, the hardened single-copy write
-        // path shared with apply — rolling a file back is the same operation
-        // as patching it forward ("safely overwrite this file with these
-        // hash-verified bytes") and gets the same guarantees: blob
-        // hash-checked in memory before any disk write, atomic stage+rename
-        // (which also isolates shared pnpm / Go-cache inodes), and the
-        // file's original mode + uid/gid restored afterward. pnpm store
-        // copies are rolled back by the package-level wrapper, one full
-        // verify each.
-        //
-        // A bin npm installed with an LF shebang gets the original in that
-        // form, the bytes `npm install` leaves (see `npm_bin`).
-        let (original_content, restored_hash) = match crate::patch::npm_bin::form_for_write(
-            package_key,
-            pkg_path,
-            normalize_file_path(file_name),
-            &file_info.after_hash,
-            std::borrow::Cow::Owned(original_content),
-            &file_info.before_hash,
-        )
-        .await
-        {
-            Ok(write) => write,
-            Err(e) => {
-                result.error = Some(e.to_string());
-                return result;
-            }
-        };
-        match crate::patch::apply::apply_file_patch_at(
-            pkg_path,
-            file_name,
-            &original_content,
-            &restored_hash,
-        )
-        .await
-        {
-            Ok(warning) => warnings.extend(warning),
-            Err(e) => {
-                // A Windows daemon holding a cached jar open: say which
-                // process to stop (apply's twin).
-                let target = pkg_path.join(normalize_file_path(file_name));
-                if package_key.starts_with("pkg:maven/")
-                    && crate::patch::sidecars::maven::is_locked_by_daemon(&e, &target)
-                {
-                    result.sidecar = Some(crate::patch::sidecars::SidecarRecord {
-                        purl: package_key.to_string(),
-                        ecosystem: "maven".to_string(),
-                        files: Vec::new(),
-                        advisory: Some(crate::patch::sidecars::maven::locked_by_daemon_advisory(
-                            &target,
-                        )),
-                    });
+                ))
+            } else if !crate::patch::apply::is_valid_blob_hash(&file_info.before_hash) {
+                Err(format!(
+                    "Refusing to read blob with invalid hash {:?} (expected 64 hex chars)",
+                    file_info.before_hash
+                ))
+            } else {
+                // `read_blob_entry` lstat's the ENTRY (a planted symlink is
+                // refused, never followed) and opens FIFO-safe.
+                let blob_path = blobs_path.join(&file_info.before_hash);
+                match crate::patch::apply::read_blob_entry(&blob_path).await {
+                    Ok(content) => {
+                        let hash = crate::hash::git_sha256::compute_git_sha256_from_bytes(&content);
+                        if hash == file_info.before_hash {
+                            Ok(content)
+                        } else {
+                            Err(crate::patch::apply::corrupt_blob_error(&blob_path, &hash))
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => Err(format!(
+                        "Before blob is not a regular file: {}",
+                        file_info.before_hash
+                    )),
+                    Err(e) => Err(format!(
+                        "Failed to read blob {}: {}",
+                        file_info.before_hash, e
+                    )),
                 }
-                result.error = Some(e.to_string());
+            };
+            // A bin npm installed with an LF shebang gets the original in
+            // that form, the bytes `npm install` leaves (see `npm_bin`).
+            let formed = match blob {
+                Ok(content) => crate::patch::npm_bin::form_for_write(
+                    package_key,
+                    pkg_path,
+                    normalize_file_path(file_name),
+                    &file_info.after_hash,
+                    std::borrow::Cow::Owned(content),
+                    &file_info.before_hash,
+                )
+                .await
+                .map_err(|e| e.to_string()),
+                Err(msg) => Err(msg),
+            };
+            match formed {
+                Ok((content, hash)) => FileChange::Write {
+                    content: content.into_owned(),
+                    hash,
+                },
+                Err(msg) => {
+                    crate::patch::apply::abort_package(write).await;
+                    result.error = Some(cannot_rollback_error(file_name, &msg));
+                    return result;
+                }
+            }
+        };
+
+        let deleted = matches!(change, FileChange::Delete);
+        write = match stage_change(write, pkg_path, file_name, change).await {
+            Ok((write, warning)) => {
+                warnings.extend(warning);
+                write
+            }
+            Err(e) => {
+                write_failed(&mut result, e);
                 return result;
             }
-        }
-
-        result.files_rolled_back.push(file_name.clone());
+        };
+        changed.push((file_name, deleted));
     }
 
+    let write = match commit_package(write).await {
+        Ok(write) => write,
+        Err(e) => {
+            write_failed(&mut result, e);
+            return result;
+        }
+    };
     // Ecosystem sidecar resync — the rollback-side twin of apply's
-    // `dispatch_fixup` boundary. Apply rewrote integrity sidecars to the
-    // patched hashes; with the original bytes now restored those hashes
-    // are stale in the other direction (cargo refuses to build a vendored
-    // crate whose `.cargo-checksum.json` disagrees with its sources).
-    // Best-effort, exactly like apply: a failing resync does NOT undo the
-    // rollback — the restored bytes are already committed — it surfaces
-    // as an `Error`-severity `sidecar_fixup_failed` advisory instead.
-    if !result.files_rolled_back.is_empty() {
-        use crate::patch::sidecars::{dispatch_rollback_fixup, fixup_failed_record};
+    // `dispatch_fixup` boundary, and like it made before the write is
+    // closed. Apply rewrote integrity sidecars to the patched hashes; with
+    // the original bytes now restored those hashes are stale in the other
+    // direction (cargo refuses to build a vendored crate whose
+    // `.cargo-checksum.json` disagrees with its sources). A resync that
+    // fails fails the package and the restored files are put back, so the
+    // package stays what its record says: patched. It also rides an
+    // `Error`-severity `sidecar_fixup_failed` record.
+    {
+        use crate::patch::sidecars::{
+            dispatch_fixup_with, dispatch_rollback_fixup, fixup_failed_record,
+        };
         // Include files verified `AlreadyOriginal` alongside the ones
-        // restored this run: a previous rollback that failed partway
-        // restored them but returned before this boundary, so their
-        // sidecar entries still carry the PATCHED hashes apply's fixup
-        // wrote — and this retry is the only chance to resync them.
-        // They exist at their before-hash (or, for patch-added files,
-        // are already deleted, which the resync handles by dropping the
-        // entry), so the rehash is a no-op rewrite in the common
+        // restored this run: a previous rollback that stopped partway
+        // restored them but never reached this boundary, so their sidecar
+        // entries still carry the PATCHED hashes apply's fixup wrote. They
+        // exist at their before-hash (or, for patch-added files, are
+        // already deleted, which the resync handles by dropping the
+        // entry), so the rehash changes nothing in the common
         // already-synced case.
-        let resync_files: Vec<String> = result
-            .files_rolled_back
+        let resync_files: Vec<String> = changed
             .iter()
-            .cloned()
+            .map(|(file, _)| (*file).clone())
             .chain(
                 result
                     .files_verified
@@ -898,15 +898,44 @@ async fn rollback_package_patch_at(
             )
             .collect();
         match dispatch_rollback_fixup(package_key, pkg_path, &resync_files).await {
-            Ok(Some(record)) => result.sidecar = Some(record),
-            Ok(None) => {}
+            Ok(record) => result.sidecar = record,
             Err(e) => {
-                result.sidecar = Some(fixup_failed_record(
-                    package_key,
-                    format!("sidecar resync failed (files still rolled back): {}", e),
-                ));
+                let not_restored = crate::patch::apply::undo_package(write).await;
+                // Whatever the failed resync had already rewritten is put
+                // back in line with the patched files. Best-effort.
+                let _ = dispatch_fixup_with(package_key, pkg_path, &resync_files, None).await;
+                let message = if not_restored.is_empty() {
+                    format!("sidecar resync failed (the restored files were put back): {e}")
+                } else {
+                    format!(
+                        "sidecar resync failed: {e}{}",
+                        crate::patch::apply::not_restored_note(&not_restored)
+                    )
+                };
+                result.error = Some(message.clone());
+                result.sidecar = Some(fixup_failed_record(package_key, message));
+                return result;
             }
         }
+    }
+
+    warnings.extend(finish_package(write).await);
+    for (file_name, deleted) in changed {
+        let filepath = pkg_path.join(normalize_file_path(file_name));
+        // The bytecode goes whatever the pruning decides: a stale `.pyc` of
+        // a rewritten or deleted module must not outlive it, and a failed
+        // delete is reported (`stale_bytecode_not_removed`).
+        warnings.extend(
+            crate::patch::apply::remove_stale_bytecode(
+                &filepath,
+                crate::patch::apply::StaleBytecode::All,
+            )
+            .await,
+        );
+        if deleted {
+            prune_emptied_parents(pkg_path, &filepath).await;
+        }
+        result.files_rolled_back.push(file_name.clone());
     }
 
     if !warnings.is_empty() {
@@ -2287,12 +2316,82 @@ mod tests {
         assert!(sidecar.advisory.is_none());
     }
 
-    /// Best-effort boundary: a malformed `.cargo-checksum.json` must not
-    /// fail the rollback (the bytes are already restored) — it surfaces
-    /// as an `Error`-severity `sidecar_fixup_failed` advisory, mirroring
-    /// apply's boundary in `apply_package_patch`.
+    /// A rollback that died after its last rename left every file original
+    /// under a `.cargo-checksum.json` that still lists the patched hashes
+    /// (and an entry for the patch-added file it deleted). The next
+    /// rollback restores nothing and must still resync the checksum file;
+    /// once it agrees, nothing is rewritten or reported.
     #[tokio::test]
-    async fn test_rollback_package_patch_cargo_sidecar_failure_is_best_effort() {
+    async fn test_rollback_rechecks_the_sidecar_of_an_already_original_package() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let pkg = pkg_dir.path();
+        let (original, patched, added) = (b"original content", b"patched content", b"added");
+        let sha256_hex = |bytes: &[u8]| crate::utils::digest::sha256_hex_of(bytes);
+        tokio::fs::write(pkg.join("lib.rs"), original)
+            .await
+            .unwrap();
+        let checksum_path = pkg.join(".cargo-checksum.json");
+        let stale = serde_json::json!({
+            "files": { "lib.rs": sha256_hex(patched), "new.rs": sha256_hex(added) },
+            "package": "x",
+        });
+        tokio::fs::write(&checksum_path, stale.to_string())
+            .await
+            .unwrap();
+        let files = HashMap::from([
+            (
+                "lib.rs".to_string(),
+                PatchFileInfo {
+                    before_hash: compute_git_sha256_from_bytes(original),
+                    after_hash: compute_git_sha256_from_bytes(patched),
+                },
+            ),
+            (
+                "new.rs".to_string(),
+                PatchFileInfo {
+                    before_hash: String::new(),
+                    after_hash: compute_git_sha256_from_bytes(added),
+                },
+            ),
+        ]);
+        let rollback = || {
+            rollback_package_patch(
+                crate::utils::repo_root::ReadScope::Workspace,
+                "pkg:cargo/demo@1.0.0",
+                pkg,
+                &files,
+                blobs_dir.path(),
+                false,
+            )
+        };
+
+        let result = rollback().await;
+        assert!(result.success, "{:?}", result.error);
+        assert!(result.files_rolled_back.is_empty());
+        let post: serde_json::Value =
+            serde_json::from_str(&tokio::fs::read_to_string(&checksum_path).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            post["files"],
+            serde_json::json!({ "lib.rs": sha256_hex(original) })
+        );
+        let record = result.sidecar.expect("the repair is reported");
+        assert_eq!(record.files[0].path, ".cargo-checksum.json");
+
+        let again = rollback().await;
+        assert!(again.success);
+        assert!(again.sidecar.is_none(), "nothing left to repair");
+    }
+
+    /// A malformed `.cargo-checksum.json` cannot be resynced, so the
+    /// rollback fails and the restored file is put back: the package stays
+    /// patched, as its record says, instead of original sources under a
+    /// checksum of the patched ones. The failure also rides an
+    /// `Error`-severity `sidecar_fixup_failed` record, mirroring apply's
+    /// boundary in `apply_package_patch`.
+    #[tokio::test]
+    async fn test_rollback_package_patch_cargo_sidecar_failure_keeps_the_package_patched() {
         use crate::patch::sidecars::{SidecarAdvisoryCode, SidecarSeverity};
 
         let pkg_dir = tempfile::tempdir().unwrap();
@@ -2330,15 +2429,24 @@ mod tests {
         )
         .await;
 
+        assert!(!result.success, "a failed resync fails the rollback");
+        assert!(result.files_rolled_back.is_empty());
+        let error = result.error.expect("a failure names its cause");
         assert!(
-            result.success,
-            "sidecar resync failure must not fail the rollback"
+            error.contains("sidecar resync failed") && error.contains(".cargo-checksum.json"),
+            "{error}"
         );
         assert_eq!(
             tokio::fs::read(pkg.join("lib.rs")).await.unwrap(),
-            original,
-            "the file restore itself must have happened"
+            patched,
+            "the restored file must have been put back"
         );
+        let names: Vec<String> = std::fs::read_dir(pkg)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".socket-"))
+            .collect();
+        assert!(names.is_empty(), "no stage may be left: {names:?}");
         let sidecar = result
             .sidecar
             .expect("failure must surface as a sidecar record");
@@ -2347,6 +2455,25 @@ mod tests {
             .expect("failure record carries an advisory");
         assert_eq!(advisory.code, SidecarAdvisoryCode::SidecarFixupFailed);
         assert_eq!(advisory.severity, SidecarSeverity::Error);
+
+        // Every file already original and the checksum file still broken:
+        // nothing to restore, and the resync still cannot be made.
+        tokio::fs::write(pkg.join("lib.rs"), original)
+            .await
+            .unwrap();
+        let again = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:cargo/demo@1.0.0",
+            pkg,
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+        assert!(!again.success);
+        assert!(again
+            .error
+            .is_some_and(|e| e.contains("sidecar resync failed")));
     }
 
     /// Retried partial rollback must not wedge cargo: a previous
@@ -2905,7 +3032,7 @@ mod tests {
         files.insert(
             "index.js".to_string(),
             PatchFileInfo {
-                before_hash,
+                before_hash: before_hash.clone(),
                 after_hash,
             },
         );
@@ -2927,6 +3054,12 @@ mod tests {
             err.contains("Hash verification failed"),
             "unexpected error: {err}"
         );
+        // It names the cache entry and the command that replaces it.
+        assert!(
+            err.contains(&blobs_dir.path().join(&before_hash).display().to_string())
+                && err.contains("`socket-patch repair`"),
+            "unexpected error: {err}"
+        );
         // The patched file must NOT have been overwritten with the bad bytes.
         assert_eq!(
             tokio::fs::read(pkg_dir.path().join("index.js"))
@@ -2943,6 +3076,82 @@ mod tests {
                 "stage/cow litter leaked: {name}"
             );
         }
+    }
+
+    /// A package rollback changes nothing when a LATER file cannot be
+    /// restored: with the before blob of the last file corrupt, the
+    /// patch-added file sorted first is not deleted and the file before it
+    /// is not restored, and the error names the file and its blob.
+    #[tokio::test]
+    async fn test_rollback_package_patch_later_file_failure_changes_nothing() {
+        let pkg_dir = tempfile::tempdir().unwrap();
+        let blobs_dir = tempfile::tempdir().unwrap();
+        let hash = compute_git_sha256_from_bytes;
+
+        let mut files = HashMap::new();
+        tokio::fs::write(pkg_dir.path().join("a-added.js"), b"added")
+            .await
+            .unwrap();
+        files.insert(
+            "a-added.js".to_string(),
+            PatchFileInfo {
+                before_hash: String::new(),
+                after_hash: hash(b"added"),
+            },
+        );
+        for name in ["b.js", "c.js"] {
+            let (original, patched) = (format!("original {name}"), format!("patched {name}"));
+            tokio::fs::write(pkg_dir.path().join(name), &patched)
+                .await
+                .unwrap();
+            let blob = if name == "c.js" {
+                b"corrupted blob bytes".to_vec()
+            } else {
+                original.clone().into_bytes()
+            };
+            tokio::fs::write(blobs_dir.path().join(hash(original.as_bytes())), blob)
+                .await
+                .unwrap();
+            files.insert(
+                name.to_string(),
+                PatchFileInfo {
+                    before_hash: hash(original.as_bytes()),
+                    after_hash: hash(patched.as_bytes()),
+                },
+            );
+        }
+
+        let result = rollback_package_patch(
+            crate::utils::repo_root::ReadScope::Workspace,
+            "pkg:npm/test@1.0.0",
+            pkg_dir.path(),
+            &files,
+            blobs_dir.path(),
+            false,
+        )
+        .await;
+
+        assert!(!result.success);
+        assert!(result.files_rolled_back.is_empty());
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("c.js") && err.contains(&hash(b"original c.js")),
+            "the error must name the file and its blob: {err}"
+        );
+        let read = |name: &str| std::fs::read(pkg_dir.path().join(name)).unwrap();
+        assert_eq!(read("a-added.js"), b"added");
+        assert_eq!(read("b.js"), b"patched b.js");
+        assert_eq!(read("c.js"), b"patched c.js");
+        let mut names: Vec<String> = std::fs::read_dir(pkg_dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["a-added.js", "b.js", "c.js"],
+            "no stage may be left"
+        );
     }
 
     /// New-file delete failure surfaces: when the unlink itself fails the

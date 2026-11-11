@@ -577,6 +577,13 @@ fn apply_failure_does_not_cow_or_modify() {
         err.contains("Hash verification failed before patch"),
         "failure must be the pre-write hash-verification gate, got error: {err:?}"
     );
+    // Re-running `apply` can never fix a blob with the wrong bytes: the
+    // error names the cache entry and the command that replaces it.
+    assert!(
+        err.contains(&format!(".socket/blobs/{claimed_after_hash} is corrupt"))
+            && err.contains("`socket-patch repair`"),
+        "failure must name the corrupt blob and its remedy, got error: {err:?}"
+    );
 
     // Content unchanged on both sides of the hardlink.
     assert_eq!(git_sha256_file(&fx.index_js()), git_sha256(ORIGINAL_BYTES));

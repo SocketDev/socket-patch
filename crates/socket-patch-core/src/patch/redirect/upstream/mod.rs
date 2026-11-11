@@ -18,8 +18,11 @@
 //! so no pin is ever left half hosted.
 //!
 //! Nothing reaches disk until every pin resolved (the staged view below),
-//! and a dry run resolves everything exactly like a wet run — network
-//! lookups included — and skips only the flush.
+//! and the flush that follows is all or nothing: every file is checked
+//! before the first is written, and a write that fails part-way puts the
+//! earlier ones back ([`RestoreOutcome::flush_error`]). A dry run resolves
+//! everything exactly like a wet run — network lookups and the flush's
+//! checks included — and skips only the writes.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -49,7 +52,7 @@ pub(crate) use uv::{
     root_uv_settings, LockRequirementArray,
 };
 
-use super::staged::{flush_staged, read_rel, Staged, StagedBytes};
+use super::staged::{flush, preflight, read_rel, Pending, Staged, StagedBytes};
 
 /// One hosted pin to restore: a `(purl, patch uuid)` pair and the
 /// root-relative files lockfile discovery found it wired in.
@@ -537,6 +540,10 @@ pub enum PinStatus {
     Restored,
     /// Nothing was changed for this pin. The message names the remedy.
     Refused(String),
+    /// The pin resolved, but the restored files were not written (on a dry
+    /// run: could not be): [`RestoreOutcome::flush_error`] says why, for
+    /// every such pin at once.
+    Unwritten,
 }
 
 /// One pin's outcome.
@@ -555,7 +562,7 @@ pub struct RestoreOutcome {
     /// One entry per input pin, in input order.
     pub pins: Vec<PinResult>,
     /// Root-relative files rewritten or removed (or that would be, on a
-    /// dry run), sorted.
+    /// dry run or had the flush not failed), sorted.
     pub reverted_files: Vec<String>,
     /// Advisory `(code, detail)` pairs.
     pub warnings: Vec<(&'static str, String)>,
@@ -563,9 +570,18 @@ pub struct RestoreOutcome {
     /// would, on a dry run); `None` for a file it removed. Lets a caller
     /// evaluate the restored project before anything is written.
     pub staged_text: BTreeMap<String, Option<String>>,
-    /// A write failure after every pin resolved: some files may have
-    /// landed. `None` on a clean flush (and always on a dry run).
+    /// Why the restored files were not written, after every pin resolved:
+    /// a file the flush must not or cannot write (a symbolic link, an
+    /// unwritable directory, an edit since it was read), which a dry run
+    /// reports as well, or a write that failed part-way. The flush is all
+    /// or nothing, so the files are as they were ([`Self::half_applied`]
+    /// aside) and the resolved pins are [`PinStatus::Unwritten`]. `None` on
+    /// a clean flush.
     pub flush_error: Option<String>,
+    /// Root-relative files a failed flush had written and could not put
+    /// back: they hold their restored state, every other file is as it
+    /// was. [`Self::flush_error`] names each with the state it is in.
+    pub half_applied: Vec<String>,
 }
 
 impl RestoreOutcome {
@@ -576,7 +592,7 @@ impl RestoreOutcome {
     pub fn refused(&self) -> impl Iterator<Item = (&PinResult, &str)> {
         self.pins.iter().filter_map(|p| match &p.status {
             PinStatus::Refused(why) => Some((p, why.as_str())),
-            PinStatus::Restored => None,
+            PinStatus::Restored | PinStatus::Unwritten => None,
         })
     }
 }
@@ -585,12 +601,30 @@ impl RestoreOutcome {
 /// For a Bun lock it also names `bun install --force`: Bun's hoisted linker
 /// keeps the installed patched copy when the restored entry is the registry
 /// copy of the same `name@version`, so a plain `bun install` after the
-/// checkout reports no changes (#764).
+/// checkout reports no changes (#764). A Bundler lock is named with its
+/// manifest: a hosted gem is wired in both, and a `Gemfile` left on the
+/// Socket source beside a restored lock fails every frozen install.
 pub fn checkout_remedy(files: &[String]) -> String {
     if files.is_empty() {
         return "restore the lockfile from version control (`git checkout -- <lockfile>`)"
             .to_string();
     }
+    let mut with_manifests: Vec<String> = Vec::new();
+    for file in files {
+        let (dir, leaf) = match file.rfind(['/', '\\']) {
+            Some(at) => file.split_at(at + 1),
+            None => ("", file.as_str()),
+        };
+        let manifest = crate::formats::gem::BUNDLER_LOCKS
+            .contains(&leaf)
+            .then(|| format!("{dir}{}", crate::formats::gem::bundler_manifest_for(leaf)));
+        for name in manifest.into_iter().chain([file.clone()]) {
+            if !with_manifests.contains(&name) {
+                with_manifests.push(name);
+            }
+        }
+    }
+    let files = &with_manifests;
     use crate::constants::npm_family::{BUN_LOCK, BUN_LOCKB};
     let bun = files.iter().any(|f| {
         let name = f.rsplit(['/', '\\']).next().unwrap_or(f);
@@ -605,6 +639,24 @@ pub fn checkout_remedy(files: &[String]) -> String {
             ""
         }
     )
+}
+
+/// The files a refused pin's remedy names: the ones wiring it and, for a
+/// uv lock, the paired `pyproject.toml` / script the hosted rewrite pointed
+/// at the same patch (`[tool.uv.sources]`). Discovery lists only the lock,
+/// and a checkout of the lock alone would leave that source live, so the
+/// next `uv lock` would wire the patch straight back in.
+async fn remedy_files(view: &mut View<'_>, pin: &HostedPin) -> Vec<String> {
+    let mut files: BTreeSet<String> = pin.files.iter().cloned().collect();
+    for lock in &pin.files {
+        let Some(paired) = crate::utils::python_lock::paired_metadata_path(lock) else {
+            continue;
+        };
+        if matches!(view.read(&paired).await, Ok(Some(text)) if text.contains(&pin.uuid)) {
+            files.insert(paired);
+        }
+    }
+    files.into_iter().collect()
 }
 
 /// The staged project view the restorers work over: reads fall through to
@@ -696,6 +748,29 @@ impl<'a> View<'a> {
             .filter(|(rel, pending)| self.originals.get(*rel) != Some(*pending))
             .map(|(rel, pending)| (rel.clone(), pending.clone()))
             .collect()
+    }
+
+    /// The changed files as the flush takes them, text before binary, each
+    /// with what this view read at its path.
+    fn pending<'s>(
+        &'s self,
+        changed: &'s Staged,
+        changed_bytes: &'s StagedBytes,
+    ) -> Vec<Pending<'s>> {
+        let text = changed.iter().map(|(rel, content)| Pending {
+            rel,
+            content: content.as_deref().map(str::as_bytes),
+            read: self
+                .originals
+                .get(rel)
+                .map(|read| read.as_deref().map(str::as_bytes)),
+        });
+        let binary = changed_bytes.iter().map(|(rel, content)| Pending {
+            rel,
+            content: Some(content),
+            read: self.original_bytes.get(rel).map(Option::as_deref),
+        });
+        text.chain(binary).collect()
     }
 }
 
@@ -866,6 +941,27 @@ pub async fn gem_stale_cache_after_unwind(
     gem::unwound_stale_cache(root, purl, offline).await
 }
 
+/// The upstream `.gem` of a gem `purl` that is back on its registry entry
+/// in the project at `root`: `(sha256, download url)`. The sha256 is what
+/// the restored lock pins (its `CHECKSUMS` entry, else the rubygems.org
+/// compact index, unless `offline`); the url is set when the lock resolves
+/// the gem from rubygems.org. `staged` is a restore's
+/// [`RestoreOutcome::staged_text`]: the restored lock is read from it when
+/// it is there (a dry run's lock is not on disk), else from disk. `None`
+/// when nothing proves the sha256, so there is nothing to judge an
+/// installed copy or a cached archive by.
+pub async fn gem_upstream_archive(
+    root: &Path,
+    staged: &BTreeMap<String, Option<String>>,
+    purl: &str,
+    offline: bool,
+) -> Option<(String, Option<String>)> {
+    let restored = crate::formats::gem::BUNDLER_LOCKS
+        .iter()
+        .find_map(|lock| staged.get(*lock)?.as_deref());
+    gem::upstream_archive(root, restored, purl, offline).await
+}
+
 /// Restore every pin in `pins` to its default upstream registry entry.
 /// See the module docs for the contract.
 pub async fn restore_upstream(
@@ -884,7 +980,7 @@ pub async fn restore_upstream(
     // yet refused over a FRESH view; a pass that refuses a new pin is rerun
     // without it, so the final view restores exactly the surviving set.
     let mut refused: BTreeMap<String, String> = BTreeMap::new();
-    let (view, result) = loop {
+    let (mut view, result) = loop {
         let active: Vec<&HostedPin> = pins
             .iter()
             .filter(|p| !refused.contains_key(&p.uuid))
@@ -929,28 +1025,36 @@ pub async fn restore_upstream(
         .chain(changed_bytes.keys())
         .cloned()
         .collect();
-    let flush_error = if opts.dry_run || (changed.is_empty() && changed_bytes.is_empty()) {
-        None
-    } else {
-        flush_staged(root, &changed, &changed_bytes).await.err()
-    };
+    // A dry run checks the files like a wet run and stops short of writing
+    // them, so its preview predicts a flush the wet run would refuse.
+    let (flush_error, half_applied) =
+        match preflight(root, view.pending(&changed, &changed_bytes)).await {
+            Err(refused) => (Some(refused), Vec::new()),
+            Ok(_) if opts.dry_run => (None, Vec::new()),
+            Ok(checked) => match flush(&checked).await {
+                Ok(()) => (None, Vec::new()),
+                Err(failed) => (Some(failed.message), failed.left),
+            },
+        };
 
-    let pins_out = pins
-        .iter()
-        .map(|pin| PinResult {
+    let mut pins_out = Vec::with_capacity(pins.len());
+    for pin in pins {
+        let status = match refused.get(&pin.uuid) {
+            Some(why) => PinStatus::Refused(format!(
+                "cannot restore {} to its upstream registry entry: {why}; {}",
+                pin.purl,
+                checkout_remedy(&remedy_files(&mut view, pin).await)
+            )),
+            None if flush_error.is_some() => PinStatus::Unwritten,
+            None => PinStatus::Restored,
+        };
+        pins_out.push(PinResult {
             purl: pin.purl.clone(),
             uuid: pin.uuid.clone(),
-            status: match refused.get(&pin.uuid) {
-                Some(why) => PinStatus::Refused(format!(
-                    "cannot restore {} to its upstream registry entry: {why}; {}",
-                    pin.purl,
-                    checkout_remedy(&pin.files)
-                )),
-                None => PinStatus::Restored,
-            },
+            status,
             files: pin.files.clone(),
-        })
-        .collect();
+        });
+    }
 
     RestoreOutcome {
         pins: pins_out,
@@ -958,6 +1062,7 @@ pub async fn restore_upstream(
         warnings: result.warnings,
         staged_text: changed,
         flush_error,
+        half_applied,
     }
 }
 
@@ -1052,6 +1157,30 @@ mod tests {
             assert_eq!(
                 checkout_remedy(&[file.to_string()]),
                 format!("restore it from version control instead (`git checkout -- {file}`)")
+            );
+        }
+    }
+
+    /// HE-U3: a hosted gem is wired in the manifest and the lock, and
+    /// discovery names only the lock. Checking out the lock alone leaves the
+    /// Gemfile on the Socket source beside an upstream lock, which bundler
+    /// refuses under frozen mode, so the remedy names the pair.
+    #[test]
+    fn gem_lock_remedies_name_the_manifest_too() {
+        for (files, want) in [
+            (vec!["Gemfile.lock"], "Gemfile Gemfile.lock"),
+            (vec!["gems.locked"], "gems.rb gems.locked"),
+            (vec!["api/Gemfile.lock"], "api/Gemfile api/Gemfile.lock"),
+            (vec!["Gemfile", "Gemfile.lock"], "Gemfile Gemfile.lock"),
+            (
+                vec!["Gemfile.lock", "package-lock.json"],
+                "Gemfile Gemfile.lock package-lock.json",
+            ),
+        ] {
+            let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+            assert_eq!(
+                checkout_remedy(&files),
+                format!("restore it from version control instead (`git checkout -- {want}`)")
             );
         }
     }

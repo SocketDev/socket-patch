@@ -24,9 +24,17 @@ pub(crate) use prompt::confirm;
 pub use prompt::{select_one, SelectError};
 pub(crate) use status::StatusLine;
 pub(crate) use text::{
-    manifest_error_message, next_steps, plural, sentence_case, shell_word, short_uuid,
-    sweep_failure, truncate,
+    agent_next_steps, manifest_error_message, next_steps, next_steps_installed, plural,
+    sentence_case, shell_word, short_uuid, sweep_failure, truncate,
 };
+
+/// [`text::no_patches_message`] for this run: the manifest path is named
+/// only when `--manifest-path` moved it.
+pub(crate) fn no_patches_message(nothing_to: &str, common: &GlobalArgs) -> String {
+    let moved = (common.manifest_path != socket_patch_core::constants::DEFAULT_PATCH_MANIFEST_PATH)
+        .then(|| common.resolved_manifest_path());
+    text::no_patches_message(nothing_to, moved.as_deref())
+}
 
 /// A global run's scope as one pasteable argument: `--global-prefix <dir>`
 /// (shell-quoted when needed) or `-g`; `None` for a project run.

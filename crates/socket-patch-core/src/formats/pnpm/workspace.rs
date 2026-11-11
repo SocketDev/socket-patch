@@ -215,15 +215,49 @@ pub(crate) fn lock_text_has_member_importers(text: &str) -> bool {
         })
 }
 
+/// Insert `block` at line `at` of `lines` (a file split at `\n`), ending
+/// its lines as the file ends its own (`eol`, the file's
+/// [`terminator`](crate::utils::line_endings::terminator)): in a CRLF file
+/// each inserted line that another line follows carries the `\r`, and so
+/// does a last line that had no ending until the block followed it. No
+/// other line changes, so a CRLF file is not left with mixed endings and
+/// [`strip_keyless_splice`] takes the block back out.
+pub(crate) fn splice_lines(lines: &mut Vec<String>, at: usize, block: &[&str], eol: &str) {
+    let appended = at == lines.len();
+    lines.splice(at..at, block.iter().map(|line| line.to_string()));
+    if eol != "\r\n" {
+        return;
+    }
+    let last = lines.len() - 1;
+    let unterminated = at.checked_sub(1).filter(|_| appended);
+    for i in unterminated.into_iter().chain(at..at + block.len()) {
+        if i < last && !lines[i].ends_with('\r') {
+            lines[i].push('\r');
+        }
+    }
+}
+
 /// `text` with the contiguous run of lines `block` removed, when that
 /// leaves a [`is_keyless`] document: the inverse of a splice that gave a
-/// keyless file its first keys. `None` when the run is absent or the rest
-/// of the file holds keys (the lines are then not provably the splice).
+/// keyless file its first keys ([`splice_lines`], in either line ending).
+/// `None` when the run is absent or the rest of the file holds keys (the
+/// lines are then not provably the splice).
 pub(crate) fn strip_keyless_splice(text: &str, block: &[&str]) -> Option<String> {
+    fn bare(line: &str) -> &str {
+        line.strip_suffix('\r').unwrap_or(line)
+    }
     let lines: Vec<&str> = text.split('\n').collect();
-    let at = lines.windows(block.len()).position(|w| w == block)?;
+    let at = lines
+        .windows(block.len())
+        .position(|w| w.iter().map(|line| bare(line)).eq(block.iter().copied()))?;
     let mut rest = lines;
+    let crlf = rest[at].ends_with('\r');
     rest.drain(at..at + block.len());
+    // A CRLF block at the end of the file gave the line before it its
+    // `\r\n`: that line had no ending.
+    if crlf && at == rest.len() && at > 0 {
+        rest[at - 1] = bare(rest[at - 1]);
+    }
     let rest = rest.join("\n");
     is_keyless(&rest).then_some(rest)
 }
@@ -710,6 +744,54 @@ mod tests {
             "other keys: not provably the splice"
         );
         assert_eq!(strip_keyless_splice("# c\n", &block), None);
+        // The splice in a CRLF file, and at the end of one whose last line
+        // had no ending.
+        for (spliced, original) in [
+            (
+                "# c\r\npackages:\r\n  - '.'\r\ntrustLockfile: true\r\n",
+                "# c\r\n",
+            ),
+            (
+                "# a\r\n# b\r\npackages:\r\n  - '.'\r\ntrustLockfile: true",
+                "# a\r\n# b",
+            ),
+            (
+                "# a\n# b\npackages:\n  - '.'\ntrustLockfile: true",
+                "# a\n# b",
+            ),
+        ] {
+            assert_eq!(
+                strip_keyless_splice(spliced, &block).as_deref(),
+                Some(original),
+                "{spliced:?}"
+            );
+        }
+    }
+
+    /// `splice_lines` ends what it inserts as the file ends its lines and
+    /// touches no other line.
+    #[test]
+    fn splice_lines_follows_the_files_line_endings() {
+        let spliced = |text: &str, at: usize, eol: &str| {
+            let mut lines = lines(text);
+            splice_lines(&mut lines, at, &["x: 1", "y: 2"], eol);
+            lines.join("\n")
+        };
+        assert_eq!(spliced("a: 1\nb: 2\n", 1, "\n"), "a: 1\nx: 1\ny: 2\nb: 2\n");
+        assert_eq!(
+            spliced("a: 1\r\nb: 2\r\n", 2, "\r\n"),
+            "a: 1\r\nb: 2\r\nx: 1\r\ny: 2\r\n"
+        );
+        assert_eq!(
+            spliced("a: 1\r\nb: 2", 2, "\r\n"),
+            "a: 1\r\nb: 2\r\nx: 1\r\ny: 2",
+            "the last line gains the ending the block follows it with"
+        );
+        assert_eq!(
+            spliced("a: 1\nb: 2\r\nc: 3\r\n", 1, "\r\n"),
+            "a: 1\nx: 1\r\ny: 2\r\nb: 2\r\nc: 3\r\n",
+            "a line the block merely follows keeps its own ending"
+        );
     }
 
     #[test]

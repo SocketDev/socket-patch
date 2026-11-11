@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::api::blob_fetcher::ArtifactNoun;
 use crate::manifest::schema::{PatchManifest, PatchRecord};
+use crate::utils::containment::ensure_unlinked;
 
 /// Result of a blob cleanup operation.
 #[derive(Debug, Default)]
@@ -77,17 +78,33 @@ impl ArtifactReferences {
 
     /// Sweep each artifact directory independently so a failed pass does not
     /// stop another. Callers report partial counts and cleanup warnings.
+    ///
+    /// A directory reached through a link (`.socket` itself or the artifact
+    /// directory under it) is refused, on a dry run too: socket-patch never
+    /// creates a link there, so its target is someone else's tree, and
+    /// every file in it would read as an orphan.
     pub async fn sweep(&self, socket_dir: &Path, dry_run: bool) -> ArtifactSweep {
+        let root = socket_dir.parent().unwrap_or(socket_dir);
+        let pass = |name: &str| {
+            let dir = socket_dir.join(name);
+            ensure_unlinked(root, &dir, "sweep").map(|()| dir)
+        };
         ArtifactSweep {
-            blobs: cleanup_dir(&socket_dir.join("blobs"), dry_run, |name| {
-                self.blobs.contains(name)
-            })
-            .await,
+            blobs: match pass("blobs") {
+                Ok(dir) => cleanup_dir(&dir, dry_run, |name| self.blobs.contains(name)).await,
+                Err(refusal) => Err(refusal),
+            },
             // Nothing writes or reads legacy diff or package archives any
             // more (v5 fetches patch content as per-file blobs only), so
             // every file in either directory is an orphan.
-            diffs: cleanup_dir(&socket_dir.join("diffs"), dry_run, |_| false).await,
-            packages: cleanup_dir(&socket_dir.join("packages"), dry_run, |_| false).await,
+            diffs: match pass("diffs") {
+                Ok(dir) => cleanup_dir(&dir, dry_run, |_| false).await,
+                Err(refusal) => Err(refusal),
+            },
+            packages: match pass("packages") {
+                Ok(dir) => cleanup_dir(&dir, dry_run, |_| false).await,
+                Err(refusal) => Err(refusal),
+            },
         }
     }
 }
@@ -445,6 +462,61 @@ mod tests {
         assert!(tokio::fs::metadata(blobs_dir.join(ORPHAN_HASH))
             .await
             .is_err());
+    }
+
+    /// A `.socket/` level that is a link is not socket-patch's own state
+    /// (a checkout can commit `.socket/packages -> ../../elsewhere`): the
+    /// sweep must refuse it, wet and dry, instead of deleting the target's
+    /// files as orphans. The passes over real directories still run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sweep_refuses_a_linked_artifact_dir_and_spares_its_target() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let victim = tmp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("notes.txt"), "keep me").unwrap();
+        let socket_dir = tmp.path().join("project/.socket");
+        std::fs::create_dir_all(socket_dir.join("blobs")).unwrap();
+        std::fs::write(socket_dir.join("blobs").join(ORPHAN_HASH), "orphan").unwrap();
+
+        for linked in ["packages", "diffs"] {
+            symlink(&victim, socket_dir.join(linked)).unwrap();
+            for dry_run in [true, false] {
+                let sweep = ArtifactReferences::active(&PatchManifest::new())
+                    .sweep(&socket_dir, dry_run)
+                    .await;
+                let refused = match linked {
+                    "packages" => sweep.packages,
+                    _ => sweep.diffs,
+                };
+                let err = refused.expect_err("a linked artifact dir is refused");
+                assert!(
+                    err.to_string()
+                        .contains(crate::utils::containment::LINKED_LEVEL_MARKER),
+                    "{err}"
+                );
+                assert!(
+                    victim.join("notes.txt").exists(),
+                    "{linked} dry_run={dry_run}"
+                );
+                assert!(sweep.blobs.is_ok(), "the real blobs dir is still swept");
+            }
+            std::fs::remove_file(socket_dir.join(linked)).unwrap();
+        }
+
+        // `.socket` itself linked: every pass is refused.
+        let shared = tmp.path().join("shared-socket");
+        std::fs::create_dir_all(shared.join("blobs")).unwrap();
+        std::fs::write(shared.join("blobs").join(ORPHAN_HASH), "theirs").unwrap();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        symlink(&shared, other.join(".socket")).unwrap();
+        let sweep = ArtifactReferences::active(&PatchManifest::new())
+            .sweep(&other.join(".socket"), false)
+            .await;
+        assert!(sweep.blobs.is_err() && sweep.diffs.is_err() && sweep.packages.is_err());
+        assert!(shared.join("blobs").join(ORPHAN_HASH).exists());
     }
 
     /// #893: the beforeHash blobs of a patch still in the manifest are its

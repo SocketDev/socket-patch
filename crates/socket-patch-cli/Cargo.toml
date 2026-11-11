@@ -33,8 +33,8 @@ glob = { workspace = true }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# main.rs restores the default SIGPIPE disposition so piped invocations
-# (`socket-patch scan | head -1`) die quietly instead of panicking.
+# interrupt.rs installs the signal handlers that remove a held lock, and
+# keeps SIGPIPE ignored so a closed output pipe cannot end a run mid-write.
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]

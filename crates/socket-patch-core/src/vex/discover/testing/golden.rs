@@ -3,7 +3,9 @@
 //! shares with the rewriters and `vendor::lock_inventory`.
 //!
 //! The corpus is every project under `tests/fixtures/`: each redirect case's
-//! `input/` and `expected/` tree, every real-package-manager capture
+//! `input/` and `expected/` tree (a cargo one copied outside this
+//! repository, whose own `[workspace]` it would otherwise sit under), every
+//! real-package-manager capture
 //! (`pnpm-hosted/<v>`, `poetry/<v>`, `pipenv/<v>`, `bun-lockb/<v>`, …), and
 //! each `pdm-native/<v>.lock` staged as a project's `pdm.lock`, run through
 //! the full orchestrator. [`render`] captures every field [`Discovery`]
@@ -452,8 +454,20 @@ fn corpus() -> Vec<CorpusEntry> {
                     let base = dir.file_name().unwrap().to_string_lossy().into_owned();
                     let is_case_side = (base == "input" || base == "expected")
                         && dir.parent().is_some_and(|c| c.join("input").is_dir());
-                    if is_case_side {
-                        out.push((rel(&root, &dir), dir, None));
+                    if !is_case_side {
+                        continue;
+                    }
+                    // A cargo project is read from a copy outside this
+                    // repository: in place it sits under the repository's
+                    // own `[workspace]`, so cargo would not build it as a
+                    // root and discovery reads none of its wiring.
+                    let name = rel(&root, &dir);
+                    if dir.join("Cargo.toml").is_file() {
+                        let staged = tempfile::tempdir().expect("stage cargo project");
+                        copy_tree(&dir, staged.path());
+                        out.push((name, staged.path().to_path_buf(), Some(staged)));
+                    } else {
+                        out.push((name, dir, None));
                     }
                 }
             }
@@ -531,6 +545,20 @@ fn collect_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
     for sub in subdirs {
         out.push(sub.clone());
         collect_dirs(&sub, out);
+    }
+}
+
+/// Copy every file under `src` to the same relative path under `dest`.
+fn copy_tree(src: &Path, dest: &Path) {
+    for entry in std::fs::read_dir(src).expect("read fixture dir") {
+        let path = entry.expect("fixture entry").path();
+        let to = dest.join(path.file_name().expect("entry name"));
+        if path.is_dir() {
+            std::fs::create_dir_all(&to).expect("create staged dir");
+            copy_tree(&path, &to);
+        } else {
+            std::fs::copy(&path, &to).expect("stage fixture file");
+        }
     }
 }
 

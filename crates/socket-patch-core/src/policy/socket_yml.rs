@@ -612,12 +612,13 @@ fn patches_block(node: &Node) -> Result<PatchesBlock, (String, String)> {
                             .to_string(),
                     ));
                 }
-                let known: Vec<&str> = Ecosystem::all().iter().map(|e| e.cli_name()).collect();
                 let mut out = Vec::with_capacity(list.len());
                 for (i, entry) in list.iter().enumerate() {
-                    let lower = entry.trim().to_lowercase();
-                    if !known.contains(&lower.as_str()) {
-                        let hint = did_you_mean(&lower, known.iter().copied())
+                    // The same names `--ecosystems` takes.
+                    let Some(ecosystem) = Ecosystem::from_name(entry) else {
+                        let known: Vec<&str> =
+                            Ecosystem::all().iter().map(|e| e.cli_name()).collect();
+                        let hint = did_you_mean(entry.trim(), known.iter().copied())
                             .map(|k| format!(" (did you mean `{k}`?)"))
                             .unwrap_or_default();
                         return Err((
@@ -628,8 +629,8 @@ fn patches_block(node: &Node) -> Result<PatchesBlock, (String, String)> {
                                 known.join(", ")
                             ),
                         ));
-                    }
-                    out.push(lower);
+                    };
+                    out.push(ecosystem.cli_name().to_string());
                 }
                 block.ecosystems = Some(out);
             }
@@ -869,6 +870,20 @@ mod tests {
         assert_eq!(b.ignore_packages.len(), 2);
         assert_eq!(b.min_severity, Some(1));
         assert_eq!(b.max_new_patches, Some(5));
+    }
+
+    /// `ecosystems` takes the names `--ecosystems` takes, stored as slugs.
+    #[test]
+    fn ecosystems_accept_the_names_the_flag_accepts() {
+        let b = block("version: 2\npatches:\n  ecosystems: [go, Python, rubygems]\n");
+        assert_eq!(
+            b.ecosystems,
+            Some(vec![
+                "golang".to_string(),
+                "pypi".to_string(),
+                "gem".to_string()
+            ])
+        );
     }
 
     #[test]

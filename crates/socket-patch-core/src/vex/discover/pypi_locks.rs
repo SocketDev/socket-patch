@@ -18,6 +18,14 @@
 //! traversal in the leaf) is diagnosed too — the installer would consume a
 //! file outside this project's vendored artifact.
 //!
+//! Every other entry that installs from somewhere (an index, a user's url)
+//! is recorded through [`Discovery::locked_elsewhere`]: evidence against
+//! another lock's wiring of the release, and against this lock's own. A
+//! lock may hold a release twice (a uv marker fork, a Poetry
+//! multiple-constraint dependency, a PEP 751 marker split, a PDM extras
+//! variant), and the installer takes the non-Socket entry wherever it is
+//! selected. A PEP 723 script lock is evidence like any other lock.
+//!
 //! Every hosted rewriter below refuses a dep without a sha256 and always
 //! writes the patched wheel's digest next to the url, so
 //! `integrity_required` is set for EVERY format here: a pin-less Socket url
@@ -344,8 +352,8 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
         return;
     };
     let mut candidates = Vec::new();
-    // A PEP 723 script lock is scoped to its script's own install: it is not
-    // evidence against the project's locks (see `contest_across_locks`).
+    // A PEP 723 script lock pairs with its script, not `pyproject.toml`;
+    // its entries are evidence like any other lock's.
     let script_lock = is_script_lock_name(file);
     // The packages a uv / script lock holds (a pylock has no paired
     // metadata to leave an override behind in).
@@ -363,8 +371,8 @@ async fn extract_python_lock(ctx: &DiscoverCtx<'_>, file: &str, out: &mut Discov
             pylock_candidates(ctx, file, package, out, &mut candidates);
         } else if let Some(c) = uv_candidate(ctx, file, package, out) {
             candidates.push(c);
-        } else if !script_lock && uv_resolves_elsewhere(ctx, package) {
-            out.resolved_elsewhere(file, package_purl(package));
+        } else if uv_resolves_elsewhere(ctx, package) {
+            out.locked_elsewhere(file, package_purl(package));
         }
     }
     if candidates.is_empty() {
@@ -636,7 +644,7 @@ fn pylock_candidates<'t>(
         .map(|(_, location, wired)| (location.to_string(), wired.clone()))
     else {
         if foreign {
-            out.resolved_elsewhere(file, name.zip(version).and_then(|(n, v)| pypi_purl(n, v)));
+            out.locked_elsewhere(file, name.zip(version).and_then(|(n, v)| pypi_purl(n, v)));
         }
         return;
     };
@@ -812,7 +820,7 @@ async fn extract_poetry(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         let name = package.get("name").and_then(Item::as_str);
         let Some(source) = package.get("source").and_then(Item::as_table_like) else {
             // No `[package.source]`: resolved from PyPI.
-            out.resolved_elsewhere(file, package_purl(package));
+            out.locked_elsewhere(file, package_purl(package));
             continue;
         };
         let Some(url) = str_of(source, "url") else {
@@ -821,7 +829,7 @@ async fn extract_poetry(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
         let wired = match classify(ctx, url) {
             Ok(Some(wired)) => wired,
             Ok(None) => {
-                out.resolved_elsewhere(file, package_purl(package));
+                out.locked_elsewhere(file, package_purl(package));
                 continue;
             }
             Err(()) => {
@@ -958,7 +966,7 @@ async fn extract_pdm(ctx: &DiscoverCtx<'_>, out: &mut Discovery) {
                 .and_then(Item::as_str)
                 .is_none_or(|location| matches!(classify(ctx, location), Ok(None)))
         }) {
-            out.resolved_elsewhere(file, package_purl(package));
+            out.locked_elsewhere(file, package_purl(package));
         }
         for key in ["url", "path"] {
             let Some(location) = package.get(key).and_then(Item::as_str) else {
@@ -1809,6 +1817,199 @@ mod tests {
     }
 
     // ── cross-format and negative cases ──────────────────────────────────
+
+    /// A lock that wires one entry of a release to a Socket patch and
+    /// resolves a second entry of the same release from the index (uv's
+    /// marker forks, Poetry's multiple-constraint dependencies, PEP 751
+    /// marker-split packages, a PDM extras variant) installs the index
+    /// copy wherever that entry is selected. The lock's own ref is then
+    /// withheld, in every format; an entry of another release, or of
+    /// another package, contests nothing.
+    #[tokio::test]
+    async fn a_locks_own_registry_entry_of_the_release_withholds_its_ref() {
+        const FOO: &str = "pkg:pypi/foo@1.0";
+        let wheel = "foo-1.0-py3-none-any.whl";
+        let url = hosted_url("pypi", "foo", "1.0", UUID_A, wheel);
+        let pypi = |version: &str| {
+            format!("https://files.pythonhosted.org/packages/foo-{version}-py3-none-any.whl")
+        };
+        // (file, the lock with its wired entry, a registry entry of `version`)
+        type Entry = Box<dyn Fn(&str) -> String>;
+        let uv: Entry = Box::new(move |version| {
+            format!(
+                "\n[[package]]\nname = \"foo\"\nversion = \"{version}\"\n\
+                 source = {{ registry = \"https://pypi.org/simple\" }}\n\
+                 wheels = [{{ url = \"{}\", hash = \"sha256:{SHA}\" }}]\n",
+                pypi(version)
+            )
+        });
+        let poetry: Entry = Box::new(|version| {
+            format!(
+                "\n[[package]]\nname = \"foo\"\nversion = \"{version}\"\noptional = false\n\
+                 python-versions = \"*\"\nfiles = [{{file = \"foo-{version}-py3-none-any.whl\", \
+                 hash = \"sha256:{SHA}\"}}]\n"
+            )
+        });
+        let pylock: Entry = Box::new(move |version| {
+            format!(
+                "\n[[packages]]\nname = \"foo\"\nversion = \"{version}\"\n\
+                 marker = \"sys_platform != 'win32'\"\n\
+                 wheels = [{{ url = \"{}\", hashes = {{ sha256 = \"{SHA}\" }} }}]\n",
+                pypi(version)
+            )
+        });
+        let pdm: Entry = Box::new(|version| {
+            format!(
+                "\n[[package]]\nname = \"foo\"\nversion = \"{version}\"\nextras = [\"x\"]\n\
+                 files = [{{file = \"foo-{version}-py3-none-any.whl\", hash = \"sha256:{SHA}\"}}]\n"
+            )
+        });
+        let cases: [(&str, String, Entry); 4] = [
+            (
+                "uv.lock",
+                format!(
+                    "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"foo\"\n\
+                     version = \"1.0\"\nsource = {{ url = \"{url}\" }}\n\
+                     wheels = [{{ url = \"{url}\", hash = \"sha256:{SHA}\" }}]\n"
+                ),
+                uv,
+            ),
+            (
+                "poetry.lock",
+                format!(
+                    "[metadata]\nlock-version = \"2.1\"\npython-versions = \"*\"\n\
+                     content-hash = \"x\"\n\n[[package]]\nname = \"foo\"\nversion = \"1.0\"\n\
+                     optional = false\npython-versions = \"*\"\n\
+                     files = [{{file = \"{wheel}\", hash = \"sha256:{SHA}\"}}]\n\n\
+                     [package.source]\ntype = \"url\"\nurl = \"{url}\"\n"
+                ),
+                poetry,
+            ),
+            (
+                "pylock.toml",
+                format!(
+                    "lock-version = \"1.0\"\ncreated-by = \"test\"\n\n[[packages]]\n\
+                     name = \"foo\"\nversion = \"1.0\"\nmarker = \"sys_platform == 'win32'\"\n\
+                     archive = {{ url = \"{url}\", hashes = {{ sha256 = \"{SHA}\" }} }}\n"
+                ),
+                pylock,
+            ),
+            (
+                "pdm.lock",
+                format!(
+                    "[metadata]\nlock_version = \"4.5.0\"\n\n[[package]]\nname = \"foo\"\n\
+                     version = \"1.0\"\nurl = \"{url}\"\n\
+                     files = [{{file = \"{wheel}\", hash = \"sha256:{SHA}\"}}]\n"
+                ),
+                pdm,
+            ),
+        ];
+        for (file, wired, entry) in cases {
+            // Another release beside it contests nothing.
+            let p = Project::new();
+            p.write(file, format!("{wired}{}", entry("2.0")));
+            let out = run(&p).await;
+            assert_refs(&out, &[(FOO, UUID_A, WiringMode::Hosted)]);
+            assert!(out.diagnostics.is_empty(), "{file}: {:#?}", out.diagnostics);
+
+            // The same release from the index: in either order, and in
+            // another PEP 440 spelling of the version.
+            for lock in [
+                format!("{wired}{}", entry("1.0")),
+                format!("{wired}{}", entry("1.0.0")),
+            ] {
+                let p = Project::new();
+                p.write(file, &lock);
+                let out = run(&p).await;
+                assert_refs(&out, &[]);
+                assert_eq!(out.rewirable.len(), 1, "{file}: {out:#?}");
+                assert_eq!(out.rewirable[0].purl, FOO, "{file}");
+                let diags: Vec<&Diag> = out
+                    .diagnostics
+                    .iter()
+                    .filter(|d| d.code == DIAG_REF_UNATTRIBUTABLE)
+                    .collect();
+                assert!(
+                    matches!(diags.as_slice(), [d] if d.detail.contains(FOO)
+                        && d.detail.contains("another entry of the same lock")),
+                    "{file}: {:#?}",
+                    out.diagnostics
+                );
+            }
+        }
+    }
+
+    /// A PEP 723 script lock is one more lock of the project: the release
+    /// its script runs is installed from it whenever the script runs. A
+    /// script lock wired to a patch does not vouch for a project lock that
+    /// resolves the same release from the index, nor the reverse; a script
+    /// lock that wires the release too contests nothing.
+    #[tokio::test]
+    async fn a_script_lock_and_the_project_lock_contest_each_other() {
+        const FOO: &str = "pkg:pypi/foo@1.0";
+        let wheel = "foo-1.0-py3-none-any.whl";
+        let url = hosted_url("pypi", "foo", "1.0", UUID_A, wheel);
+        let wired = format!(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"foo\"\n\
+             version = \"1.0\"\nsource = {{ url = \"{url}\" }}\n\
+             wheels = [{{ url = \"{url}\", hash = \"sha256:{SHA}\" }}]\n"
+        );
+        let registry = format!(
+            "version = 1\nrequires-python = \">=3.9\"\n\n[[package]]\nname = \"foo\"\n\
+             version = \"1.0\"\nsource = {{ registry = \"https://pypi.org/simple\" }}\n\
+             wheels = [{{ url = \"https://files.pythonhosted.org/packages/{wheel}\", \
+             hash = \"sha256:{SHA}\" }}]\n"
+        );
+        let script = |sources: bool| {
+            let sources = if sources {
+                format!("#\n# [tool.uv.sources]\n# foo = {{ url = \"{url}\" }}\n")
+            } else {
+                String::new()
+            };
+            format!("# /// script\n# dependencies = [\"foo==1.0\"]\n{sources}# ///\nimport foo\n")
+        };
+
+        // The script's lock is wired; the project's resolves from PyPI.
+        let p = Project::new();
+        p.write("tool.py", script(true));
+        p.write("tool.py.lock", &wired);
+        p.write("uv.lock", &registry);
+        let out = p.discover().await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.contested.len(), 1, "{out:#?}");
+        assert_eq!(
+            (
+                out.contested[0].file.as_path(),
+                out.contested[0].other.as_path()
+            ),
+            (Path::new("tool.py.lock"), Path::new("uv.lock"))
+        );
+
+        // The project's lock is wired; the script's resolves from PyPI.
+        let p = Project::new();
+        p.write("tool.py", script(false));
+        p.write("tool.py.lock", &registry);
+        p.write("uv.lock", &wired);
+        let out = p.discover().await;
+        assert_refs(&out, &[]);
+        assert_eq!(out.contested.len(), 1, "{out:#?}");
+        assert_eq!(
+            (
+                out.contested[0].file.as_path(),
+                out.contested[0].other.as_path()
+            ),
+            (Path::new("uv.lock"), Path::new("tool.py.lock"))
+        );
+
+        // Both wired: one statement, nothing contested.
+        let p = Project::new();
+        p.write("tool.py", script(true));
+        p.write("tool.py.lock", &wired);
+        p.write("uv.lock", &wired);
+        let out = p.discover().await;
+        assert_refs(&out, &[(FOO, UUID_A, WiringMode::Hosted)]);
+        assert!(out.contested.is_empty(), "{out:#?}");
+    }
 
     /// Every lock present is read — no poetry → pdm → uv precedence.
     #[tokio::test]

@@ -29,7 +29,7 @@ use fx::{masked_tree, Fixture};
 const OFF: (&str, &str) = ("SOCKET_PATCH_SWITCH_OFF", "group_commit");
 
 /// The paths whose bytes differ between two trees (or exist in one only).
-fn differing(a: &[(String, String)], b: &[(String, String)]) -> Vec<String> {
+fn differing<T: PartialEq>(a: &[(String, T)], b: &[(String, T)]) -> Vec<String> {
     let mut out: Vec<String> = a
         .iter()
         .filter(|entry| !b.contains(entry))
@@ -270,7 +270,8 @@ fn the_roll_forward_runs_before_any_locked_command_reads_the_files() {
 /// A file the journal covers was edited by hand after the crash: the
 /// journal matches neither side of it, so it is set aside whole (with a
 /// warning), nothing of it is applied, and the run proceeds over the
-/// project as it stands.
+/// project as it stands. Setting it aside is a write too (a rename), so a
+/// dry run leaves it where it is.
 #[test]
 fn a_journal_the_files_no_longer_match_is_set_aside_not_half_applied() {
     let f = Fixture::new("pnpm");
@@ -283,10 +284,19 @@ fn a_journal_the_files_no_longer_match_is_set_aside_not_half_applied() {
     std::fs::write(&pkg, &edited).unwrap();
 
     let (code, stdout, stderr) = f.run(&["vendor", "--json", "--offline", "--dry-run"], &[]);
+    assert_eq!(code, 1, "{stdout}\n{stderr}");
+    assert!(f.root.join(JOURNAL).is_file(), "{stdout}\n{stderr}");
+
+    let (code, stdout, stderr) = f.run(&["vendor", "--revert", "--json"], &[]);
     assert_eq!(code, 0, "{stdout}\n{stderr}");
     assert!(
         stderr.contains("set aside"),
         "the set-aside is reported: {stderr}"
+    );
+    assert_eq!(
+        common::envelope::codes_in(&parse_json_envelope(&stdout)["warnings"]),
+        ["vendor_commit_set_aside"],
+        "{stdout}"
     );
     assert!(!f.root.join(".socket/vendor/.commit-journal.json").exists());
     let aside: Vec<_> = std::fs::read_dir(f.root.join(".socket/vendor"))
@@ -305,4 +315,191 @@ fn a_journal_the_files_no_longer_match_is_set_aside_not_half_applied() {
         "no file of the set-aside journal is applied"
     );
     assert_eq!(std::fs::read_to_string(&pkg).unwrap(), edited);
+}
+
+const JOURNAL: &str = ".socket/vendor/.commit-journal.json";
+
+/// A project whose vendored commit was interrupted right after its journal
+/// became durable: the journal is the genuine one a crash leaves.
+fn interrupted_after_the_journal(eco: &str) -> Fixture {
+    let f = Fixture::new(eco);
+    let (code, stdout, stderr) =
+        f.vendor(&[], &[("SOCKET_PATCH_FAILPOINT", "group_commit_journal")]);
+    assert_eq!(code, 86, "{eco}: the crash fires: {stdout}\n{stderr}");
+    assert!(f.root.join(JOURNAL).is_file(), "{eco}: the journal is left");
+    f
+}
+
+/// The paths a journal names.
+fn journaled_paths(root: &std::path::Path) -> Vec<String> {
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join(JOURNAL)).unwrap()).unwrap();
+    journal["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// `--dry-run` writes nothing, so it never finishes an interrupted commit:
+/// every lock-taking command refuses with `vendor_commit_pending`, naming
+/// what the journal covers, and the project (journal included) stays byte
+/// for byte what the interruption left.
+#[test]
+fn a_dry_run_reports_a_pending_journal_and_writes_nothing() {
+    let f = interrupted_after_the_journal("pnpm");
+    let purl = f.patches[0].purl.clone();
+    let pending = f.tree();
+    for args in [
+        &["vendor", "--json", "--dry-run"][..],
+        &["vendor", "--revert", "--json", "--dry-run"],
+        &["apply", "--json", "--offline", "--dry-run"],
+        &["rollback", "--json", "--offline", "--dry-run"],
+        &["repair", "--json", "--offline", "--dry-run"],
+        &["remove", &purl, "--json", "--offline", "--dry-run"],
+    ] {
+        let (code, stdout, stderr) = f.run(args, &[]);
+        assert_eq!(code, 1, "{args:?}: {stdout}\n{stderr}");
+        let env = parse_json_envelope(&stdout);
+        assert_eq!(
+            common::envelope::envelope_error_code(&env),
+            Some("vendor_commit_pending"),
+            "{args:?}: {stdout}"
+        );
+        let message = common::envelope::envelope_error_message(&env).unwrap();
+        assert!(
+            message.contains("--dry-run") && message.contains("pnpm-lock.yaml"),
+            "{args:?}: the refusal says what is pending and how to finish it: {message}"
+        );
+        assert_eq!(env["dryRun"], true, "{args:?}");
+        assert!(
+            f.tree() == pending,
+            "{args:?}: a dry run writes nothing; differing: {:?}",
+            differing(&f.tree(), &pending)
+        );
+    }
+    // Human mode says the same on stderr.
+    let (code, _, stderr) = f.run(&["apply", "--offline", "--dry-run"], &[]);
+    assert_eq!(code, 1, "{stderr}");
+    assert!(
+        stderr.contains("--dry-run") && stderr.contains("pnpm-lock.yaml"),
+        "{stderr}"
+    );
+    assert!(f.tree() == pending, "the human dry run writes nothing");
+}
+
+/// A genuine journal still rolls forward under the next locked command,
+/// and that command now says so: a `Warning:` line on stderr and a
+/// `vendor_commit_recovered` run warning in the envelope, both naming the
+/// files it rewrote.
+#[test]
+fn a_roll_forward_is_reported_by_the_command_that_performed_it() {
+    for command in ["vendor", "revert", "apply", "rollback", "repair", "remove"] {
+        let f = interrupted_after_the_journal("pnpm");
+        let purl = f.patches[0].purl.clone();
+        let args: &[&str] = match command {
+            "vendor" => &["vendor", "--json"],
+            "revert" => &["vendor", "--revert", "--json"],
+            "apply" => &["apply", "--json", "--offline"],
+            "rollback" => &["rollback", "--json", "--offline", "--yes"],
+            "repair" => &["repair", "--json", "--offline"],
+            _ => &["remove", &purl, "--json", "--offline", "--yes"],
+        };
+        let journaled = journaled_paths(&f.root);
+        assert!(journaled.len() > 1, "{journaled:?}");
+        let (_, stdout, stderr) = f.run(args, &[]);
+        assert!(
+            !f.root.join(JOURNAL).exists(),
+            "{args:?}: the journal is consumed: {stdout}\n{stderr}"
+        );
+        let line = stderr
+            .lines()
+            .find(|l| l.starts_with("Warning:") && l.contains("rolled forward"))
+            .unwrap_or_else(|| panic!("{args:?}: no roll-forward warning on stderr: {stderr}"));
+        let env = parse_json_envelope(&stdout);
+        let warning = env["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["code"] == "vendor_commit_recovered")
+            .unwrap_or_else(|| panic!("{args:?}: no vendor_commit_recovered warning: {stdout}"));
+        let detail = warning["detail"].as_str().unwrap();
+        for rel in &journaled {
+            assert!(line.contains(rel.as_str()), "{args:?}: {rel} in {line}");
+            assert!(detail.contains(rel.as_str()), "{args:?}: {rel} in {detail}");
+        }
+    }
+}
+
+/// A journal is a file the checkout can supply (a pull request can commit
+/// one), so a replay never reaches a git directory or leaves the project:
+/// the forged journal is set aside whole, the command says so, and neither
+/// the path it must not write nor the plausible one beside it is touched.
+#[test]
+fn a_forged_journal_is_set_aside_with_nothing_written() {
+    use base64::Engine as _;
+    use sha2::Digest as _;
+    let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    let sha256 = |bytes: &[u8]| hex::encode(sha2::Sha256::digest(bytes));
+    for bad in [".git/hooks/post-checkout", ".GIT/config", "../escaped.txt"] {
+        let f = Fixture::new("npm");
+        std::fs::create_dir_all(f.root.join(".git/hooks")).unwrap();
+        std::fs::write(f.root.join(".git/config"), b"[core]\n").unwrap();
+        std::fs::create_dir_all(f.root.join(".socket/vendor")).unwrap();
+        let package_json = std::fs::read(f.root.join("package.json")).unwrap();
+        // The entry replaces the file it names when that file exists, and
+        // creates it otherwise.
+        let before = std::fs::read(f.root.join(bad)).ok();
+        let journal = serde_json::json!({
+            "version": 1,
+            "files": [
+                {
+                    "path": "package.json",
+                    "before": sha256(&package_json),
+                    "after": b64(b"{\"scripts\":{\"postinstall\":\"forged\"}}\n"),
+                },
+                {
+                    "path": bad,
+                    "before": before.as_deref().map(sha256),
+                    "after": b64(b"#!/bin/sh\nforged\n"),
+                },
+            ]
+        });
+        std::fs::write(f.root.join(JOURNAL), serde_json::to_vec(&journal).unwrap()).unwrap();
+
+        let (code, stdout, stderr) = f.run(&["vendor", "--revert", "--json"], &[]);
+        assert_eq!(code, 0, "{bad}: {stdout}\n{stderr}");
+        assert!(
+            stderr.contains("set aside") && stderr.contains("nothing of it was applied"),
+            "{bad}: the refusal is reported: {stderr}"
+        );
+        assert_eq!(
+            common::envelope::codes_in(&parse_json_envelope(&stdout)["warnings"]),
+            ["vendor_commit_set_aside"],
+            "{bad}: {stdout}"
+        );
+        assert!(!f.root.join(JOURNAL).exists(), "{bad}");
+        assert_eq!(
+            std::fs::read(f.root.join("package.json")).unwrap(),
+            package_json,
+            "{bad}: the plausible entry is not applied either"
+        );
+        assert_eq!(
+            std::fs::read(f.root.join(".git/config")).unwrap(),
+            b"[core]\n",
+            "{bad}"
+        );
+        assert_eq!(
+            std::fs::read_dir(f.root.join(".git/hooks"))
+                .unwrap()
+                .count(),
+            0,
+            "{bad}: no hook is planted"
+        );
+        assert!(
+            !f.root.parent().unwrap().join("escaped.txt").exists(),
+            "{bad}"
+        );
+    }
 }

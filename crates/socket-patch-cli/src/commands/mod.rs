@@ -3,11 +3,13 @@ pub mod apply;
 pub(crate) mod composer_hints;
 pub(crate) mod context;
 pub(crate) mod fetch_stage;
+pub(crate) mod gem_refresh;
 pub mod get;
 pub mod hosted_bundle;
 pub(crate) mod hosted_unwind;
 pub mod list;
 pub(crate) mod lock_cli;
+pub(crate) mod projects_below;
 pub(crate) mod pypi_reinstall;
 pub mod remove;
 pub mod repair;
@@ -83,6 +85,19 @@ pub(crate) async fn vendor_owned_keys(
         return Default::default();
     }
     nuget
+}
+
+/// Whether a bare `scan` at `--cwd` looks at the projects below it: only
+/// in the hosted or vendored mode the project's own state keeps
+/// ([`mode_from_project_state`]). From an agent-mode project it covers
+/// `--cwd` alone, and where it cannot tell the mode it stops with
+/// `mode_ambiguous` and touches nothing, so the commands that undo it
+/// stay at `--cwd` too.
+pub(crate) async fn bare_scan_looks_below(common: &crate::args::GlobalArgs) -> bool {
+    matches!(
+        mode_from_project_state(common).await,
+        Ok(scan::ScanMode::Hosted | scan::ScanMode::Vendored)
+    )
 }
 
 /// The mode a `scan`/`get` run with no `--mode` uses for the project

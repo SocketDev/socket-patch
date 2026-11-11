@@ -583,6 +583,61 @@ async fn vendored_takeover_is_refused() {
     assert!(output.changed_files.is_empty());
 }
 
+/// The in-memory engine builds its candidates through the disk scan's gate:
+/// a grant with a field no lockfile takes verbatim, or with a plain-http
+/// artifact URL, is skipped and warned, and no file changes.
+#[tokio::test]
+async fn malformed_and_plain_http_grants_are_refused() {
+    type Edit = fn(&mut Value);
+    let cases: [(&str, &str, Edit); 2] = [
+        ("redirect_grant_malformed", "its sha512 is not", |grant| {
+            let sri = grant["artifacts"][0]["integrity"]["sha512"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            grant["artifacts"][0]["integrity"]["sha512"] =
+                format!("{sri}\n  injected-by-integrity \"x\"").into();
+        }),
+        (
+            "redirect_grant_insecure_url",
+            "is plain http on patch.example,",
+            |grant| {
+                let url = grant["url"].as_str().unwrap().to_string();
+                grant["url"] = url
+                    .replace("https://patch.socket.dev", "http://patch.example")
+                    .into();
+            },
+        ),
+    ];
+    for (code, reason, edit) in cases {
+        let server = MockServer::start().await;
+        let mut patches = patches_from_overrides(
+            &fixtures_root().join(NPM_FIXTURE).join("overrides.json"),
+            None,
+        );
+        edit(&mut patches[0].reference);
+        mount_api(&server, &patches).await;
+        let output = run_engine(&server, build_input(&npm_files(), &[], options(false))).await;
+        let project = &output.projects[0];
+        let skip = project
+            .skipped
+            .iter()
+            .find(|s| s.reason == code)
+            .unwrap_or_else(|| panic!("{code}: {:?}", project.skipped));
+        let detail = skip.detail.as_deref().unwrap_or_default();
+        assert!(detail.contains(reason), "{detail}");
+        assert!(project.redirected.is_empty(), "{code}");
+        let warnings = project.redirect["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w["code"] == code && w["detail"] == detail),
+            "{warnings:?}"
+        );
+        assert!(output.changed_files.is_empty(), "{code}");
+    }
+}
+
 /// The in-memory engine refuses exactly the takeovers the disk flow
 /// performs (one shared predicate): a vendored PyPI package is one, so it
 /// is refused as a takeover rather than handed to the Python rewriters,

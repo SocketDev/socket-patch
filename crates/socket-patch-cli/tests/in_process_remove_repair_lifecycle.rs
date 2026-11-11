@@ -723,9 +723,13 @@ async fn repair_telemetry_attributed_to_env_credentials() {
     // below would fail for the wrong reason (`is_telemetry_disabled`
     // reads these at runtime — `VITEST=true` included).
     std::env::remove_var("SOCKET_TELEMETRY_DISABLED");
+    std::env::remove_var("SOCKET_PATCH_TELEMETRY_DISABLED");
+    std::env::remove_var("DO_NOT_TRACK");
     std::env::remove_var("SOCKET_OFFLINE");
     std::env::remove_var("VITEST");
     let code = repair_run(make_repair_args(tmp.path())).await;
+    // The event is sent beside the command; `main` is what waits for it.
+    socket_patch_core::telemetry::flush(std::time::Duration::from_secs(30)).await;
     std::env::remove_var("SOCKET_API_URL");
     std::env::remove_var("SOCKET_API_TOKEN");
     std::env::remove_var("SOCKET_ORG_SLUG");

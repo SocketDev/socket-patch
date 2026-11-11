@@ -38,6 +38,7 @@ pub(crate) mod requirements;
 pub(crate) mod serde;
 pub mod socket_cli_config;
 pub mod socket_dir;
+pub mod stdio;
 pub mod target;
 pub(crate) mod toml_edit_ext;
 pub mod uri;
