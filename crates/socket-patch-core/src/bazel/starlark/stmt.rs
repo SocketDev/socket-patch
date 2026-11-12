@@ -482,6 +482,89 @@ fn reasons(why: Why, stmts: &[&Stmt]) -> Vec<Reason> {
     stmts.iter().map(reason).collect()
 }
 
+/// Where one name is written. [`read`] finds it once for every name, so a
+/// query costs what that name's own uses cost and not the size of the
+/// file: a caller asks about each proxy and each constant of a file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Places {
+    /// Its bindings, in the order of [`File::bindings`].
+    bindings: Vec<Binding>,
+    /// The identifier tokens that use it, in source order: each one that
+    /// spells it and is not a binding, an attribute after a `.` or the
+    /// keyword of an argument.
+    uses: Vec<Span>,
+}
+
+/// Every name of a file and its [`Places`].
+fn places<'a>(src: &'a [u8], tokens: &[Token], bindings: &[Binding]) -> BTreeMap<&'a [u8], Places> {
+    let mut names: BTreeMap<&[u8], Places> = BTreeMap::new();
+    for binding in bindings {
+        let name = &src[binding.span.0..binding.span.1];
+        names.entry(name).or_default().bindings.push(*binding);
+    }
+    // Sorted for the search below: nothing keeps `bindings` in source
+    // order in a file Bazel would reject and this reader still reads.
+    let mut bound: Vec<usize> = bindings.iter().map(|b| b.span.0).collect();
+    bound.sort_unstable();
+    let is_op = |at: Option<usize>, op: &[u8]| {
+        let token = at.and_then(|at| tokens.get(at));
+        token.is_some_and(|t| t.tok == Tok::Op && &src[t.start..t.end] == op)
+    };
+    for (i, t) in tokens.iter().enumerate() {
+        if t.tok != Tok::Ident {
+            continue;
+        }
+        let attribute = is_op(i.checked_sub(1), b".");
+        let keyword = t.depth > 0 && is_op(Some(i + 1), b"=");
+        if attribute || keyword || bound.binary_search(&t.start).is_ok() {
+            continue;
+        }
+        let name = &src[t.start..t.end];
+        names.entry(name).or_default().uses.push((t.start, t.end));
+    }
+    names
+}
+
+/// The statement of `stmts` that holds byte offset `at`. The statements
+/// of one block are in source order and do not overlap.
+fn stmt_at(stmts: &[Stmt], at: usize) -> Option<&Stmt> {
+    let next = stmts.partition_point(|stmt| stmt.span.1 <= at);
+    stmts.get(next).filter(|stmt| stmt.span.0 <= at)
+}
+
+/// What a statement that was read does with a name.
+enum Role {
+    Callee,
+    Proxy,
+    Passed,
+}
+
+/// The role `stmt` gives the name written at byte offset `at`, when it
+/// accounts for that name at all.
+fn role(stmt: &Stmt, at: usize) -> Option<Role> {
+    let (call, proxy) = match &stmt.kind {
+        StmtKind::Call(call) | StmtKind::Bind { call, .. } => (call, None),
+        StmtKind::Include(include) => (&include.call, None),
+        StmtKind::TagCall {
+            proxy_span, call, ..
+        } => (call, Some(proxy_span.0)),
+        _ => return None,
+    };
+    match proxy {
+        Some(proxy) if proxy == at => return Some(Role::Proxy),
+        None if call.callee_span.0 == at => return Some(Role::Callee),
+        _ => {}
+    }
+    // The arguments are in source order, so one call of any length is
+    // searched and not walked once per name it is handed.
+    let next = call.args.partition_point(|arg| arg.value.span.0 < at);
+    let passed = call.args.get(next).is_some_and(|arg| {
+        let whole = matches!(arg.kind, ArgKind::Positional | ArgKind::Named(_));
+        whole && arg.value.span.0 == at && matches!(arg.value.kind, ValueKind::Ident(_))
+    });
+    passed.then_some(Role::Passed)
+}
+
 /// A Starlark file as read. The spans of everything in it index `src`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct File<'a> {
@@ -495,6 +578,8 @@ pub struct File<'a> {
     /// Every binding of a name, function bodies included.
     pub bindings: Vec<Binding>,
     pub(super) tokens: Vec<Token>,
+    /// Where each name is bound and used.
+    names: BTreeMap<&'a [u8], Places>,
 }
 
 /// Read a Starlark file. `Err` is a file Bazel rejects or this reader
@@ -526,6 +611,7 @@ pub fn read(src: &[u8], dialect: Dialect) -> Result<File<'_>, Unreadable> {
         eol: lexed.eol,
         stmts,
         comments: lexed.comments,
+        names: places(src, &lexed.tokens, &bindings),
         bindings,
         tokens: lexed.tokens,
     })
@@ -559,57 +645,25 @@ impl<'a> File<'a> {
     }
 
     fn uses_within<'f>(&'f self, scope: &'f [Stmt], region: Span, name: &str) -> Uses<'f> {
-        enum Role {
-            Callee,
-            Proxy,
-            Passed,
-        }
-        // What each statement of the scope accounts for, by the offset of
-        // the identifier.
-        let mut roles = BTreeMap::new();
-        for stmt in scope {
-            let (call, proxy) = match &stmt.kind {
-                StmtKind::Call(call) | StmtKind::Bind { call, .. } => (call, None),
-                StmtKind::Include(include) => (&include.call, None),
-                StmtKind::TagCall {
-                    proxy_span, call, ..
-                } => (call, Some(proxy_span.0)),
-                _ => continue,
-            };
-            match proxy {
-                Some(at) => roles.insert(at, (Role::Proxy, stmt)),
-                None => roles.insert(call.callee_span.0, (Role::Callee, stmt)),
-            };
-            for arg in &call.args {
-                let whole = matches!(arg.kind, ArgKind::Positional | ArgKind::Named(_));
-                if whole && matches!(arg.value.kind, ValueKind::Ident(_)) {
-                    roles.insert(arg.value.span.0, (Role::Passed, stmt));
-                }
-            }
-        }
-        let inside = |span: Span| region.0 <= span.0 && span.1 <= region.1;
-        let named = |span: Span| self.bytes(span) == name.as_bytes();
-        let is_op = |at: Option<usize>, op: &[u8]| {
-            let token = at.and_then(|at| self.tokens.get(at));
-            token.is_some_and(|t| t.tok == Tok::Op && self.bytes((t.start, t.end)) == op)
-        };
         let mut uses = Uses::default();
-        let bound = |b: &&Binding| named(b.span) && (b.top_level || inside(b.span));
-        uses.bindings = self.bindings.iter().filter(bound).copied().collect();
-        for (i, t) in self.tokens.iter().enumerate() {
-            let span = (t.start, t.end);
-            if t.tok != Tok::Ident || !named(span) || !inside(span) {
-                continue;
-            }
-            let attribute = is_op(i.checked_sub(1), b".");
-            let keyword = t.depth > 0 && is_op(Some(i + 1), b"=");
-            if attribute || keyword || self.bindings.iter().any(|b| b.span == span) {
-                continue;
-            }
-            match roles.get(&t.start) {
-                Some((Role::Callee, stmt)) => uses.calls.push(*stmt),
-                Some((Role::Proxy, stmt)) => uses.tags.push(*stmt),
-                Some((Role::Passed, stmt)) => uses.passed.push(*stmt),
+        let Some(places) = self.names.get(name.as_bytes()) else {
+            return uses;
+        };
+        let inside = |span: Span| region.0 <= span.0 && span.1 <= region.1;
+        let bound = |b: &&Binding| b.top_level || inside(b.span);
+        uses.bindings = places.bindings.iter().filter(bound).copied().collect();
+        let first = places.uses.partition_point(|span| span.0 < region.0);
+        let within = places.uses[first..]
+            .iter()
+            .take_while(|span| span.1 <= region.1);
+        for &span in within {
+            // The statement of the scope the name is written in, and what
+            // that statement accounts for.
+            let stmt = stmt_at(scope, span.0);
+            match stmt.and_then(|stmt| Some((role(stmt, span.0)?, stmt))) {
+                Some((Role::Callee, stmt)) => uses.calls.push(stmt),
+                Some((Role::Proxy, stmt)) => uses.tags.push(stmt),
+                Some((Role::Passed, stmt)) => uses.passed.push(stmt),
                 None => uses.other.push(span),
             }
         }
@@ -634,8 +688,8 @@ impl<'a> File<'a> {
 
     /// Every top-level `proxy.tag(...)` statement. Exact when every other
     /// use of the proxy is its one binding or a whole argument of a
-    /// predeclared function (`use_repo(proxy, ...)`), which cannot call a
-    /// tag.
+    /// predeclared function (`use_repo(proxy, ...)`) or of a tag of an
+    /// extension proxy, neither of which can call a tag.
     pub fn tags(&self, proxy: &str) -> Answer<Vec<&Stmt>> {
         let uses = self.uses(proxy);
         let mut why = uses.rebound();
@@ -648,20 +702,42 @@ impl<'a> File<'a> {
         Answer::new(uses.tags, why)
     }
 
-    /// The statements that hand a name to something that could use it: a
-    /// function that is not predeclared. A tag and `include` only record
-    /// their arguments.
+    /// The statements that hand a name to something that could use it.
+    /// A predeclared function, `include` and a tag of a module extension
+    /// cannot: they record their arguments. A method of any other value
+    /// can keep what it is given and change it: after `L.append(proxy)`
+    /// and `L.append(ARTIFACTS)`, Bazel 7.7.2 and 9.3.2 run
+    /// `L[0].tag(...)` as a tag of the proxy and `L[1].append(...)` on
+    /// the list, and `D.update(k = proxy)` does the same through a dict.
+    /// So `x.y(...)` is inert only when `x` is proven to be an extension
+    /// proxy.
     fn handed_on<'f>(&self, uses: &Uses<'f>) -> Vec<&'f Stmt> {
-        let builtin = |stmt: &&&Stmt| match &stmt.kind {
+        let inert = |stmt: &&&Stmt| match &stmt.kind {
             StmtKind::Call(call) => self.dialect.predeclared().contains(&call.callee.as_str()),
-            StmtKind::TagCall { .. } | StmtKind::Include(_) => true,
+            StmtKind::Include(_) => true,
+            StmtKind::TagCall { proxy, .. } => self.extension_proxy(proxy, stmt.span.0),
             _ => false,
         };
-        uses.passed
-            .iter()
-            .filter(|s| !builtin(s))
-            .copied()
-            .collect()
+        uses.passed.iter().filter(|s| !inert(s)).copied().collect()
+    }
+
+    /// Whether `name` is an extension proxy at byte offset `before`: in a
+    /// `MODULE.bazel`, where nothing can rebind `use_extension` ([`read`]),
+    /// the one binding of the name anywhere in the file is a top-level
+    /// `name = use_extension(...)` statement that ends above `before`.
+    fn extension_proxy(&self, name: &str, before: usize) -> bool {
+        let places = self.names.get(name.as_bytes());
+        let Some([only]) = places.map(|places| &places.bindings[..]) else {
+            return false;
+        };
+        let binds = |stmt: &&Stmt| match &stmt.kind {
+            StmtKind::Bind {
+                name_span, call, ..
+            } => *name_span == only.span && call.callee == "use_extension",
+            _ => false,
+        };
+        let bind = stmt_at(&self.stmts, only.span.0).filter(binds);
+        self.dialect == Dialect::Module && bind.is_some_and(|stmt| stmt.span.1 <= before)
     }
 
     /// The literal a name is bound to, for a use at byte offset `before`:
@@ -670,8 +746,8 @@ impl<'a> File<'a> {
     ///
     /// A list or dict is exact only if nothing could have changed it by
     /// then: Starlark values are mutable until their file is loaded, so
-    /// `NAME.append(x)`, and a loaded function that is handed the list,
-    /// can both change it.
+    /// `NAME.append(x)`, `NAME[0] = x`, and a loaded function or a method
+    /// of another value that is handed the list, can all change it.
     pub fn constant(&self, name: &str, before: usize) -> Answer<Option<&Value>> {
         let uses = self.uses(name);
         let reason = |why: Why, span: Span| Reason { why, span };
@@ -682,7 +758,7 @@ impl<'a> File<'a> {
             why.extend(uses.bindings.is_empty().then_some(unbound));
             return Answer::new(None, why);
         };
-        let bound = self.stmts.iter().find_map(|stmt| match &stmt.kind {
+        let bound = stmt_at(&self.stmts, binding.span.0).and_then(|stmt| match &stmt.kind {
             StmtKind::ConstBind {
                 name_span, value, ..
             } if *name_span == binding.span => Some((stmt, value)),
@@ -821,11 +897,60 @@ impl<'a> Reader<'a> {
         (runs, clean)
     }
 
+    /// The names the target of an assignment or a `for`, tokens `[a, b)`,
+    /// binds: an identifier that stands on its own or in a tuple or list
+    /// pattern. Nothing else in a target is bound. An attribute, and what
+    /// stands in the brackets of a call, a subscript or a dict, is an
+    /// expression; and a name or a bracket with `.`, `[` or `(` after it
+    /// is the value the statement changes. Bazel 7.7.2 and 9.3.2 run
+    /// `d[None] = 1`, `(d)[0] = 2` and `[a, b][0] = 3`, and load a `.bzl`
+    /// whose uncalled function holds `None.x = 1`. [`File::uses`] accounts
+    /// for every name left out here as a use.
+    ///
+    /// Outside those shapes it errs towards too many names: a missed
+    /// binding would let a rebound `True` or `bazel_dep` be read as the
+    /// builtin.
+    fn targets(&self, a: usize, b: usize) -> Vec<usize> {
+        let any = |i: usize, ops: &[&str]| i < b && ops.iter().any(|op| self.is_op(i, op));
+        let suffix = |i: usize| any(i, &[".", "[", "("]);
+        // The end of something a `(` or `[` right after it calls or indexes.
+        let operand = |i: usize| match self.toks[i].tok {
+            Tok::Op => any(i, &[")", "]", "}"]),
+            Tok::Ident => self.ident(i).is_some(),
+            _ => true,
+        };
+        let mut out = Vec::new();
+        // For each open pattern, how many names were found before it.
+        let mut patterns = Vec::new();
+        let mut i = a;
+        while i < b {
+            let applied = i > a && operand(i - 1) && any(i, &["(", "["]);
+            if applied || self.is_op(i, "{") {
+                i = self.close_of(i).map_or(b, |close| close + 1);
+                continue;
+            }
+            if any(i, &["(", "["]) {
+                patterns.push(out.len());
+            } else if any(i, &[")", "]"]) {
+                // `[a, b][0] = 1`: a list that is indexed, and no pattern.
+                let names = patterns.pop().filter(|_| suffix(i + 1));
+                out.truncate(names.unwrap_or(out.len()));
+            } else if self.ident(i).is_some() && !suffix(i + 1) {
+                let attribute = i > a && self.is_op(i - 1, ".");
+                out.extend((!attribute).then_some(i));
+            }
+            i += 1;
+        }
+        out
+    }
+
     /// Every binding in the file, by the binding forms Starlark has:
     /// assignment, `for`, `def` with its parameters, `load`. It looks at
     /// every line, the bodies of blocks this reader does not read
-    /// included, and errs towards reporting too many: a missed binding
-    /// would let a rebound `True` or `bazel_dep` be read as the builtin.
+    /// included: [`read`] refuses a file that binds a name Bazel
+    /// predeclares, so a missed binding would be a wrong reading, and a
+    /// name that is only mentioned ([`Reader::targets`]) must not be taken
+    /// for one, or the reader loses a file Bazel builds.
     /// Comprehension and `lambda` variables are left out: their scope is
     /// an expression that is never given a value.
     fn bindings(&self, lines: &[Line]) -> Result<Vec<Binding>, Unreadable> {
@@ -851,10 +976,10 @@ impl<'a> Reader<'a> {
                     from = (a..b).find(colon).map_or(a, |colon| colon + 1);
                 }
                 if self.is_kw(a, "for") {
-                    let targets = (a + 1..b).take_while(|&i| !self.is_kw(i, "in"));
-                    targets
-                        .filter(|&i| self.ident(i).is_some())
-                        .for_each(|i| push(i, BindingKind::For));
+                    let is_in = |i: &usize| self.toks[*i].depth == 0 && self.is_kw(*i, "in");
+                    let end = (a + 1..b).find(is_in).unwrap_or(b);
+                    let targets = self.targets(a + 1, end).into_iter();
+                    targets.for_each(|i| push(i, BindingKind::For));
                 }
                 if self.is_kw(a, "def") {
                     if self.ident(a + 1).is_some() {
@@ -871,9 +996,8 @@ impl<'a> Reader<'a> {
                     }
                 }
                 let assign = (from..b).find(|&i| self.toks[i].depth == 0 && self.is_assign(i));
-                (from..assign.unwrap_or(from))
-                    .filter(|&i| self.ident(i).is_some())
-                    .for_each(|i| push(i, BindingKind::Assign));
+                let targets = self.targets(from, assign.unwrap_or(from)).into_iter();
+                targets.for_each(|i| push(i, BindingKind::Assign));
             }
         }
         Ok(out)
@@ -1284,6 +1408,13 @@ def _one(): return go_repository(name = "inline")
             .exact()
             .unwrap();
         assert_eq!(calls.len(), 1);
+        // Uses of the name outside the function are not the function's.
+        let around =
+            exact.replacen("\ndef ", "\nx = [go_repository]\n\ndef ", 1) + "y = go_repository\n";
+        let file = read(around.as_bytes(), Dialect::Bzl).unwrap();
+        let calls = file.calls_in(&file.stmts[2], "go_repository");
+        assert_eq!(calls.exact().map(|calls| calls.len()), Some(1));
+        assert_eq!(whys(&file.calls("go_repository")), [Why::UnmodelledUse; 4]);
         // A parameter of that name is not the loaded function.
         let shadowed = exact.replace("extra = None", "go_repository");
         let file = read(shadowed.as_bytes(), Dialect::Bzl).unwrap();
@@ -1323,6 +1454,17 @@ def _one(): return go_repository(name = "inline")
             (r#""a" "b""#, r#"<"a" "b">"#),
             (r#""a" + NAME"#, r#"<"a" + NAME>"#),
             (r#""a" % 1"#, r#"<"a" % 1>"#),
+            // Only `+` between plain strings folds, and only `-` before
+            // digits is a number.
+            (r#""a" % "b""#, r#"<"a" % "b">"#),
+            (r#""a" * "b""#, r#"<"a" * "b">"#),
+            (r#""a" == "b""#, r#"<"a" == "b">"#),
+            (r#""a" + "b" % "c""#, r#"<"a" + "b" % "c">"#),
+            (r#""a" + "b" +"#, r#"<"a" + "b" +>"#),
+            ("+7", "<+7>"),
+            ("~7", "<~7>"),
+            ("--7", "<--7>"),
+            ("- 7", "-7"),
             (r#""{}".format(1)"#, r#"<"{}".format(1)>"#),
             (r#""a" if X else "b""#, r#"<"a" if X else "b">"#),
             (r#"("a", "b")"#, r#"<("a", "b")>"#),
@@ -1580,6 +1722,12 @@ def _one(): return go_repository(name = "inline")
             ("def f(None):\n    pass\n", Build, 6),
             ("load(\"//:x.bzl\", \"False\")\n", Workspace, 18),
             ("x = 1\nNone += 1\n", Module, 6),
+            // A name in a pattern is bound, however deep, and next to a
+            // target that binds nothing.
+            ("[a, (b, [True])] = x\n", Bzl, 9),
+            ("d[0], x.y, include = 1, 2, 3\n", Module, 11),
+            ("for d[0], (a, None) in []:\n    pass\n", Build, 14),
+            ("(module) = 1\n", Module, 1),
         ] {
             assert_eq!(
                 refusal(src, dialect),
@@ -1589,7 +1737,24 @@ def _one(): return go_repository(name = "inline")
         }
         // The same names are free where Bazel does not predeclare them,
         // and as keywords, attributes and defaults they bind nothing.
+        // Neither does a target that only mentions one: Bazel 7.7.2 and
+        // 9.3.2 run `D[None] = 1` in a `MODULE.bazel`, and load a `.bzl`
+        // whose uncalled function holds `None.x = 1`.
         for (src, dialect) in [
+            ("D = {}\nD[None] = 1\nD[True] = 2\n", Module),
+            ("def f(d):\n    d[True] += 1\n", Bzl),
+            ("x = {}\nx[False] = \"a\"\n", Build),
+            ("cfg = {}\ncfg[str(None)] = 1\n", Workspace),
+            ("d.module = 1\n", Module),
+            ("x[bazel_dep] = 1\n", Module),
+            ("x.y[None].include[use_repo] = 1\n", Module),
+            ("d[f(include = 1)] = 1\n", Module),
+            ("[a, b][None] = 1\n", Bzl),
+            ("(d)[True], x = 1, 2\n", Bzl),
+            ("{None: 1}[None] = 2\n", Bzl),
+            ("for d[None], x.module in []:\n    pass\n", Module),
+            ("def f():\n    None.x = 1\n    True[0] = 2\n", Bzl),
+            ("def f():\n    bazel_dep.x = 1\n", Module),
             ("bind = 1\ninclude = 2\n", Bzl),
             // Bazel 8: the Starlark `local_repository`, loaded.
             (
@@ -1608,6 +1773,72 @@ def _one(): return go_repository(name = "inline")
             ("x = module\n", Module),
         ] {
             assert_eq!(refusal(src, dialect), None, "{src}");
+        }
+    }
+
+    /// What each binding form binds. A target binds its names, alone or
+    /// in a pattern; what it indexes, calls or reads an attribute of is
+    /// changed or mentioned, which makes it a use for the queries to
+    /// account for.
+    #[test]
+    fn a_target_binds_its_names_and_nothing_it_only_mentions() {
+        for (src, bound, used) in [
+            ("a = 1\n", "a", ""),
+            ("a, b = 1, 2\n", "a b", ""),
+            ("(a, [b, c]), d = x\n", "a b c d", "x"),
+            ("a += b\n", "a", "b"),
+            ("a = b == c\n", "a", "b c"),
+            ("a = [b for b in c]\n", "a", "b c"),
+            ("a.b = c\n", "", "a c"),
+            ("a[b] = c\n", "", "a b c"),
+            ("a[b] += c\n", "", "a b c"),
+            ("a[b].c[d](e).f = g\n", "", "a b d e g"),
+            ("a, b[c], d.e, f = g\n", "a f", "b c d g"),
+            ("[a, b][c] = d\n", "", "a b c d"),
+            ("a, [b, c][d] = e\n", "a", "b c d e"),
+            ("(a, b).c, d = e\n", "d", "a b e"),
+            ("((a), b)[c], d = e\n", "d", "a b c e"),
+            ("{a: b}[c] = d\n", "", "a b c d"),
+            ("f(a)[b] = c\n", "", "a b c f"),
+            ("\"s\"[a] = b\n", "", "a b"),
+            ("for a, (b, c) in d:\n    pass\n", "a/For b/For c/For", "d"),
+            ("for a[b], c.d, e in f:\n    pass\n", "e/For", "a b c f"),
+            ("for a in b: c = d\n", "a/For c", "b d"),
+            ("for a in b[c in d]: e[f] = g\n", "a/For", "b c d e f g"),
+            ("for a[b in c], d in e:\n    pass\n", "d/For", "a b c e"),
+            ("if a: b = c; d[e] = f\n", "b", "a c d e f"),
+            (
+                "def f(a, b = c, *d, **e): g = h; i.j = k\n",
+                "f/Def a/Param b/Param d/Param e/Param g",
+                "c h i k",
+            ),
+            (
+                "load(\"//:x.bzl\", \"a\", b = \"c\")\n",
+                "a/Load b/Load",
+                "",
+            ),
+            // Not Starlark: a bracket after a keyword is taken for a
+            // pattern, which errs towards a binding.
+            ("return (a, b) = c\n", "a b", "c"),
+        ] {
+            let file = read(src.as_bytes(), Dialect::Bzl).unwrap_or_else(|e| panic!("{e:?}"));
+            let binding = |b: &Binding| {
+                let name = String::from_utf8_lossy(file.bytes(b.span)).into_owned();
+                match b.kind {
+                    BindingKind::Assign => name,
+                    kind => format!("{name}/{kind:?}"),
+                }
+            };
+            let bindings: Vec<String> = file.bindings.iter().map(binding).collect();
+            assert_eq!(bindings.join(" "), bound, "{src}");
+            let is_used = |name: &&str| {
+                let uses = file.uses(name);
+                let read = uses.calls.len() + uses.tags.len() + uses.passed.len();
+                read + uses.other.len() > 0
+            };
+            let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "x"];
+            let uses: Vec<&str> = names.into_iter().filter(is_used).collect();
+            assert_eq!(uses.join(" "), used, "{src}");
         }
     }
 
@@ -1845,6 +2076,15 @@ use_repo(maven, "maven")
             ("maven.install().more()\n", Why::UnmodelledUse),
             ("other = maven\n", Why::UnmodelledUse),
             ("maven(name = \"x\")\n", Why::UnmodelledUse),
+            ("maven.tags = []\n", Why::UnmodelledUse),
+            ("use_repo(*maven)\n", Why::UnmodelledUse),
+            // Whatever is handed the proxy can call its tags later: a
+            // function, and a method of a list or dict that keeps it.
+            ("x = wrap(maven)\n", Why::PassedAsValue),
+            ("inst = getattr(maven, \"install\")\n", Why::PassedAsValue),
+            ("L = []\nL.append(maven)\n", Why::PassedAsValue),
+            ("D = {}\nD.update(m = maven)\n", Why::PassedAsValue),
+            ("native.keep(maven)\n", Why::PassedAsValue),
         ] {
             let src = format!("{src}{extra}");
             let file = module(&src);
@@ -1855,6 +2095,11 @@ use_repo(maven, "maven")
                 "{extra}"
             );
         }
+        // A tag of an extension proxy records what it is given, and so
+        // does a predeclared function.
+        let inert = "other = use_extension(\"//:o.bzl\", \"o\")\nother.tag(of = maven)\nuse_repo(other, maven)\n";
+        let src = format!("{src}{inert}");
+        assert_eq!(module(&src).tags("maven").exact().unwrap().len(), 2);
         // A predeclared object needs no binding.
         let file = read(
             b"def f():\n    pass\nnative.bind(name = \"x\")\n",
@@ -1866,7 +2111,7 @@ use_repo(maven, "maven")
 
     #[test]
     fn a_constant_resolves_one_level_when_nothing_else_can_bind_or_change_it() {
-        let src = "LOCK = \"//:maven_install.json\"\nARTIFACTS = [\"g:a:1\"]\nmaven.install(artifacts = ARTIFACTS, lock_file = LOCK)\n";
+        let src = "maven = use_extension(\"@rules_jvm_external//:extensions.bzl\", \"maven\")\nLOCK = \"//:maven_install.json\"\nARTIFACTS = [\"g:a:1\"]\nmaven.install(artifacts = ARTIFACTS, lock_file = LOCK)\n";
         let file = module(src);
         let end = src.len();
         assert_eq!(
@@ -1898,14 +2143,127 @@ use_repo(maven, "maven")
                 vec![Why::UnmodelledUse],
             ),
             ("helper(ARTIFACTS)\n", "ARTIFACTS", vec![Why::PassedAsValue]),
+            // Spread into a call it is not handed on whole: what reads its
+            // items is not modelled, whatever the function.
+            (
+                "helper(*ARTIFACTS)\n",
+                "ARTIFACTS",
+                vec![Why::UnmodelledUse],
+            ),
+            (
+                "x = wrap(ARTIFACTS)\n",
+                "ARTIFACTS",
+                vec![Why::PassedAsValue],
+            ),
+            // A list or dict that keeps the list can change it later:
+            // `ALL[0].append(...)`.
+            (
+                "ALL = []\nALL.append(ARTIFACTS)\n",
+                "ARTIFACTS",
+                vec![Why::PassedAsValue],
+            ),
+            (
+                "D = {}\nD.update(k = ARTIFACTS)\n",
+                "ARTIFACTS",
+                vec![Why::PassedAsValue],
+            ),
+            // An item assignment changes the list and binds nothing.
+            (
+                "ARTIFACTS[0] = \"g:b:2\"\n",
+                "ARTIFACTS",
+                vec![Why::UnmodelledUse],
+            ),
+            (
+                "(ARTIFACTS)[0] = \"g:b:2\"\n",
+                "ARTIFACTS",
+                vec![Why::UnmodelledUse],
+            ),
         ] {
             let src = format!("{src}{extra}");
             let file = module(&src);
             assert_eq!(whys(&file.constant(name, src.len())), why, "{extra}");
         }
         // A string cannot be changed, whatever else reads it.
-        let src = format!("{src}helper(LOCK)\nx = LOCK + \"x\"\n");
+        let src = format!("{src}helper(LOCK)\nx = LOCK + \"x\"\nL = []\nL.append(LOCK)\n");
         assert!(module(&src).constant("LOCK", src.len()).exact().is_some());
+    }
+
+    /// `x.y(...)` hands its arguments to a method, and only the tag of a
+    /// module extension is known to do nothing with them. Bazel 7.7.2 and
+    /// 9.3.2 run these statements in a `MODULE.bazel` and register three
+    /// tags: `visible` with `["g:a:1", "evil:b:2"]`, `hidden` and
+    /// `dict-hidden`.
+    #[test]
+    fn a_method_call_is_inert_only_on_a_proven_extension_proxy() {
+        let src = r#"module(name = "probe", version = "0.0.0")
+
+ext = use_extension("//:ext.bzl", "ext")
+ARTIFACTS = ["g:a:1"]
+L = []
+L.append(ext)
+L.append(ARTIFACTS)
+L[1].append("evil:b:2")
+ext.tag(name = "visible", artifacts = ARTIFACTS)
+L[0].tag(name = "hidden", artifacts = [])
+D = {}
+D.update(k = ext)
+D["k"].tag(name = "dict-hidden", artifacts = [])
+use_repo(ext, "r")
+"#;
+        let file = module(src);
+        let line = |r: &Reason| (r.why, file.line_of(r.span.0));
+        let tags = file.tags("ext");
+        assert_eq!(tags.seen().len(), 1);
+        let reasons: Vec<_> = tags.reasons().iter().map(line).collect();
+        assert_eq!(reasons, [(Why::PassedAsValue, 6), (Why::PassedAsValue, 12)]);
+        let artifacts = file.constant("ARTIFACTS", src.len());
+        let reasons: Vec<_> = artifacts.reasons().iter().map(line).collect();
+        assert_eq!(reasons, [(Why::PassedAsValue, 7)]);
+
+        // What proves a proxy: in a `MODULE.bazel`, its one binding in the
+        // file is a top-level `use_extension` above the call.
+        use Dialect::{Bzl, Module, Workspace};
+        const EXT: &str = "maven = use_extension(\"//:m.bzl\", \"maven\")\n";
+        const TAG: &str = "ARTIFACTS = [\"g:a:1\"]\nmaven.install(artifacts = ARTIFACTS)\n";
+        let handed = |src: &str, dialect: Dialect| {
+            let file = read(src.as_bytes(), dialect).unwrap_or_else(|e| panic!("{e:?}: {src}"));
+            whys(&file.constant("ARTIFACTS", src.len()))
+        };
+        assert_eq!(handed(&format!("{EXT}{TAG}"), Module), []);
+        for (src, dialect) in [
+            // Nothing binds the receiver, or something else does.
+            (TAG.to_string(), Module),
+            (format!("maven = []\n{TAG}"), Module),
+            (format!("maven = wrap()\n{TAG}"), Module),
+            (
+                format!("maven = use_repo_rule(\"//:m.bzl\", \"m\")\n{TAG}"),
+                Module,
+            ),
+            (format!("load(\"//:m.bzl\", \"maven\")\n{TAG}"), Module),
+            (
+                format!("maven, x = use_extension(\"//:m.bzl\", \"m\"), 1\n{TAG}"),
+                Module,
+            ),
+            // The binding comes after the call, or is not the only one.
+            (format!("{TAG}{EXT}"), Module),
+            (format!("{EXT}{EXT}{TAG}"), Module),
+            (format!("{EXT}{TAG}maven = []\n"), Module),
+            (format!("{EXT}def f(maven):\n    pass\n{TAG}"), Module),
+            (format!("{EXT}if x:\n    maven = []\n{TAG}"), Module),
+            (
+                format!("if x:\n    maven = use_extension(\"//:m.bzl\", \"m\")\n{TAG}"),
+                Module,
+            ),
+            // `use_extension` is the Bzlmod function in a `MODULE.bazel` only.
+            (format!("{EXT}{TAG}"), Workspace),
+            (format!("{EXT}{TAG}"), Bzl),
+            (
+                "ARTIFACTS = []\nnative.java_library(srcs = ARTIFACTS)\n".to_string(),
+                Bzl,
+            ),
+        ] {
+            assert_eq!(handed(&src, dialect), [Why::PassedAsValue], "{src}");
+        }
     }
 
     #[test]
