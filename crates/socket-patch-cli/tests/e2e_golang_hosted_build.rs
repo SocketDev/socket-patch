@@ -97,6 +97,9 @@ impl Machine {
 fn go(dir: &Path, machine: &Machine, args: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = Command::new("go");
     cmd.args(args).current_dir(dir);
+    // No ambient `GOWORK`/`GOFLAGS`: an exported `GOWORK=<file>` fails
+    // every staging `go` command.
+    common::hermetic::scrub_extra(&mut cmd, &[common::hermetic::Extra::Go]);
     cache_env::isolate(&mut cmd);
     cmd.env("GOMODCACHE", &machine.modcache);
     cmd.env("GOCACHE", &machine.gocache);
