@@ -475,7 +475,9 @@ pub enum Located {
         route: Route,
     },
     /// No link leads to a base and no listed base names the workspace:
-    /// never built here, or built under a root socket-patch does not know.
+    /// never built here, built under a root socket-patch does not know, or
+    /// built by a Bazel whose marker cannot be compared ([`marker_names`]).
+    /// It says that no base was named, not that there is none.
     NotFound,
     CannotTell(Unsure),
 }
@@ -569,6 +571,8 @@ impl TreeFs for Listing {
 mod tests {
     use std::cell::Cell;
 
+    use serde_json::Value;
+
     use super::PathClass::{
         Link, OutputBase, Plain, RepoContentsCache, RepositoryCache, VendorDir,
     };
@@ -584,6 +588,13 @@ mod tests {
         let drive = spelled.as_bytes().get(1) == Some(&b':');
         let root = if drive { "/" } else { "" };
         PathBuf::from(format!("{root}{}", spelled.replace('\\', "/")))
+    }
+
+    /// One entry of a fabricated disk.
+    enum Put {
+        File,
+        Dir,
+        Link(PathBuf),
     }
 
     /// A fabricated disk whose `stat` follows links the way a kernel does.
@@ -616,17 +627,48 @@ mod tests {
                     Some((at, target)) => (at, Some(self.path(target))),
                     None => (line, None),
                 };
-                let (path, is_dir) = (self.path(at), at.ends_with(['/', '\\']));
-                for dir in path.ancestors().skip(usize::from(!is_dir)) {
-                    self.dirs.insert(dir.to_path_buf());
-                }
-                match target {
-                    Some(target) => drop(self.links.insert(path, target)),
-                    None if is_dir => {}
-                    None => drop(self.files.insert(path)),
-                }
+                let entry = match target {
+                    Some(target) => Put::Link(target),
+                    None if at.ends_with(['/', '\\']) => Put::Dir,
+                    None => Put::File,
+                };
+                self.put(self.path(at), entry);
             }
             self
+        }
+
+        /// One entry, with every directory above it.
+        fn put(&mut self, path: PathBuf, entry: Put) {
+            let is_dir = matches!(entry, Put::Dir);
+            for dir in path.ancestors().skip(usize::from(!is_dir)) {
+                self.dirs.insert(dir.to_path_buf());
+            }
+            match entry {
+                Put::Dir => {}
+                Put::File => drop(self.files.insert(path)),
+                Put::Link(target) => drop(self.links.insert(path, target)),
+            }
+        }
+
+        /// A layout real Bazel left: the `tree` of a recorded `detect`
+        /// vector, its tokens placed as `disk` says, without the entries
+        /// `left_out` names. A vector may list an entry twice.
+        fn recorded(disk: &Tokens, tree: &[Value], left_out: &[String]) -> Self {
+            let mut fs = Self::default();
+            for row in tree {
+                let path = text(row, "path");
+                if left_out.iter().any(|out| out == path) {
+                    continue;
+                }
+                let entry = match text(row, "type") {
+                    "dir" => Put::Dir,
+                    "file" => Put::File,
+                    "symlink" => Put::Link(at(disk, text(row, "target"))),
+                    other => panic!("{path}: {other}"),
+                };
+                fs.put(at(disk, path), entry);
+            }
+            fs
         }
 
         fn path(&self, template: &str) -> PathBuf {
@@ -1342,5 +1384,344 @@ mod tests {
         assert_eq!(listing.stat(Path::new("services/api/go.mod")), Entry::File);
         assert_eq!(listing.stat(Path::new("services/web")), Entry::Neither);
         assert_eq!(listing.read_link(Path::new("vendor_src")), None);
+    }
+
+    // ── What real Bazel left on disk (probes C1, C3, C7, C8, C11, H1, H3) ──
+    //
+    // The layouts above are fabricated. These are recorded: the vectors of
+    // three probe groups, as `tests/fixtures/bazel/probe_vectors/` holds
+    // them (its README, "Output-tree layouts", says what each file is and
+    // what it does not record).
+
+    macro_rules! probe_vector {
+        ($path:literal) => {
+            include_str!(concat!("../../tests/fixtures/bazel/probe_vectors/", $path))
+        };
+    }
+
+    /// Ten layouts a build left, each with the answers of the probe's
+    /// reference detector for four or five paths.
+    const LAYOUTS: [&str; 10] = [
+        probe_vector!("core-external-edits/vectors/detect/5.4.1-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/6.6.0-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/7.7.2-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/7.7.2-vendor.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.3.1-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.8.2-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/8.8.2-default.json"),
+        probe_vector!("core-external-edits/vectors/detect/9.3.2-cc.json"),
+        probe_vector!("core-external-edits/vectors/detect/9.3.2-vendor.json"),
+        probe_vector!("core-external-edits/vectors/detect/10.0.0rc3-cc.json"),
+    ];
+    /// The convenience links of five built workspaces.
+    const LINK_ROUTE: &str = probe_vector!("core-output-base/proto/vectors/link_route.json");
+    /// Repository-cache entries of fetches that passed a canonical id.
+    const CAS_VECTORS: &str = probe_vector!("platform-server/vectors/repo_cache_vectors.json");
+
+    /// Where the tokens of a recorded path stand on a fabricated disk.
+    type Tokens = [(&'static str, &'static str)];
+
+    const UNIX_DISK: &Tokens = &[
+        ("<WS>", WS),
+        ("<OB>", BASE),
+        (
+            "<CACHE>",
+            "/home/u/.cache/bazel/_bazel_u/cache/repos/v1/contents",
+        ),
+        ("<INSTALL>", "/home/u/.cache/bazel/_bazel_u/install"),
+        ("<CAMPAIGN>", "/srv/campaign"),
+    ];
+    const WINDOWS_DISK: &Tokens = &[
+        ("<WS>", WIN_WS),
+        ("<OB>", WIN_BASE),
+        ("<CACHE>", r"c:\users\me\_bazel_me\cache\repos\v1\contents"),
+        ("<INSTALL>", r"c:\users\me\_bazel_me\install"),
+        ("<CAMPAIGN>", r"D:\campaign"),
+    ];
+    /// The same tokens as directories of a path list.
+    const LISTED: &Tokens = &[
+        ("<WS>", "ws"),
+        ("<OB>", "out/ob"),
+        ("<CACHE>", "cache/contents"),
+        ("<INSTALL>", "install"),
+    ];
+
+    /// A recorded path on `disk`. A link target with no token is relative
+    /// and stays so.
+    fn at(disk: &Tokens, recorded: &str) -> PathBuf {
+        let placed = disk
+            .iter()
+            .fold(recorded.to_string(), |path, (token, dir)| {
+                path.replace(token, dir)
+            });
+        p(&placed)
+    }
+
+    fn vector(text: &str) -> Value {
+        serde_json::from_str(text).expect("probe vector")
+    }
+
+    fn list<'a>(row: &'a Value, key: &str) -> &'a [Value] {
+        row[key]
+            .as_array()
+            .unwrap_or_else(|| panic!("{key}: {row}"))
+    }
+
+    fn text<'a>(row: &'a Value, key: &str) -> &'a str {
+        row[key].as_str().unwrap_or_else(|| panic!("{key}: {row}"))
+    }
+
+    /// The verdict a row of `expect` stands for: the trees the probe's
+    /// detector named on the live disk, the output base first, and the
+    /// class of the first. A path it found in no tree is `Plain`.
+    fn recorded_answer(disk: &Tokens, row: &Value) -> (PathClass, Vec<Tree>) {
+        let kinds = list(row, "kinds");
+        let mut trees = Vec::new();
+        for (class, key, kind) in [
+            (OutputBase, "output_base", "bazel_output_base"),
+            (
+                RepoContentsCache,
+                "cache_entry",
+                "bazel_repo_contents_cache",
+            ),
+            (VendorDir, "vendor_dir", "bazel_vendor_dir"),
+        ] {
+            let root = row[key].as_str().map(|root| at(disk, root));
+            assert_eq!(root.is_some(), kinds.iter().any(|k| k == kind), "{row}");
+            trees.extend(root.map(|root| Tree { class, root }));
+        }
+        (trees.first().map_or(Plain, |tree| tree.class), trees)
+    }
+
+    #[test]
+    fn the_recorded_layouts_classify_as_the_probe_recorded() {
+        let layouts = LAYOUTS.map(vector);
+        let queries: usize = layouts.iter().map(|l| list(l, "expect").len()).sum();
+        assert_eq!(queries, 42);
+        for layout in &layouts {
+            let id = format!("{}-{}", text(layout, "bazel"), text(layout, "cfg"));
+            // Every vector is the state right after a build. Three states
+            // of each layout give the same answers: that one; the one
+            // `clean` and a build leave, without the second marker (probe
+            // C7); and, under `--vendor_dir`, the one before `bazel vendor`
+            // wrote a marker, the directory being known by the tracked
+            // flag alone.
+            let mut states = vec![
+                (vec![], vec![]),
+                (vec!["<OB>/execroot/DO_NOT_BUILD_HERE".to_string()], vec![]),
+            ];
+            let flags = list(layout, "flags").iter().filter_map(Value::as_str);
+            for dir in flags.filter_map(|flag| flag.strip_prefix("--vendor_dir=")) {
+                let markers = VENDOR_MARKERS.map(|marker| format!("<WS>/{dir}/{marker}"));
+                states.push((markers.to_vec(), vec![format!("<WS>/{dir}")]));
+            }
+            assert_eq!(states.len(), if id.ends_with("-vendor") { 3 } else { 2 });
+            for (left_out, tracked) in &states {
+                for disk in [UNIX_DISK, WINDOWS_DISK] {
+                    let fs = Fake::recorded(disk, list(layout, "tree"), left_out);
+                    let tracked: Vec<PathBuf> = tracked.iter().map(|dir| at(disk, dir)).collect();
+                    let verdict = |found: &Path, canonical: &Path| {
+                        let mut memo = Memo::new(tracked.clone());
+                        classify(&fs, found, Some(canonical), &mut memo)
+                    };
+                    for row in list(layout, "expect") {
+                        let found = at(disk, text(row, "query"));
+                        let canonical = at(disk, text(row, "canonical"));
+                        // The fabricated disk resolves the path the way
+                        // the real one did.
+                        assert_eq!(fs.real(&found), canonical, "{id}: {found:?}");
+                        let crosses_a_link = list(row, "kinds").iter().any(|k| k == "via_link");
+                        assert_eq!(found != canonical, crosses_a_link, "{id}: {found:?}");
+                        let (class, trees) = recorded_answer(disk, row);
+                        let verdict = verdict(&found, &canonical);
+                        assert_eq!(
+                            (verdict.class, verdict.cannot_tell),
+                            (class, false),
+                            "{id}: {found:?}"
+                        );
+                        assert_eq!(
+                            (verdict.tree, verdict.resolves_into),
+                            (trees.first().cloned(), trees.get(1).cloned()),
+                            "{id}: {found:?}"
+                        );
+                    }
+                    // What each layout says beyond its queries: the four
+                    // links of the workspace root lead into the base, whose
+                    // root holds the markers.
+                    let (ws, ob) = (at(disk, "<WS>"), at(disk, "<OB>"));
+                    let base = Some(Tree {
+                        class: OutputBase,
+                        root: ob.clone(),
+                    });
+                    let in_root = |link: &&PathBuf| link.parent() == Some(ws.as_path());
+                    let links: Vec<&PathBuf> = fs.links.keys().filter(in_root).collect();
+                    assert_eq!(links.len(), 4, "{id}");
+                    for link in links {
+                        let verdict = verdict(link, &fs.real(link));
+                        assert_eq!(
+                            (verdict.class, verdict.tree, verdict.cannot_tell),
+                            (Link, base.clone(), false),
+                            "{id}: {link:?}"
+                        );
+                    }
+                    assert_eq!(tree_at(&fs, &ob, &tracked).tree, base, "{id}");
+                    assert_eq!(tree_at(&fs, &ws, &tracked), Found::default(), "{id}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_recorded_layouts_classify_as_a_path_list() {
+        for layout in LAYOUTS.map(vector) {
+            let id = format!("{}-{}", text(&layout, "bazel"), text(&layout, "cfg"));
+            let files = list(&layout, "tree").iter();
+            let files: Vec<PathBuf> = files
+                .filter(|row| text(row, "type") == "file")
+                .map(|row| at(LISTED, text(row, "path")))
+                .collect();
+            let listing = Listing::new(files.iter().map(|file| file.to_str().expect("utf-8")));
+            for row in list(&layout, "expect") {
+                // A listing has no links, so a path is in the tree it is
+                // spelled in and no other.
+                let query = at(LISTED, text(row, "query"));
+                let (_, trees) = recorded_answer(LISTED, row);
+                let spelled_in = trees.into_iter().find(|tree| query.starts_with(&tree.root));
+                let found = enclosing(&listing, &query, &mut Memo::default());
+                assert_eq!(
+                    (found.tree, found.cannot_tell),
+                    (spelled_in, false),
+                    "{id}: {query:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_recorded_links_name_their_output_base() {
+        let links = vector(LINK_ROUTE);
+        let links = links.as_array().expect("links");
+        assert_eq!(links.len(), 24);
+        for disk in [UNIX_DISK, WINDOWS_DISK] {
+            let mut linked: HashMap<PathBuf, Vec<Candidate>> = HashMap::new();
+            for row in links {
+                let (link, prefix) = (text(row, "link"), text(row, "prefix"));
+                assert!(link.starts_with(prefix), "{link}");
+                let ws = at(disk, text(row, "workspace"));
+                let link = at(disk, &format!("{}/{link}", text(row, "workspace")));
+                let target = at(disk, text(row, "target"));
+                let base = at(disk, text(row, "expected_output_base"));
+                let tree = Some(Tree {
+                    class: OutputBase,
+                    root: base.clone(),
+                });
+                // While the build's output is there, and after `clean`
+                // removed it: the route needs the marker and nothing else.
+                for live in [true, false] {
+                    let mut fs = Fake::default();
+                    fs.put(base.join(OUTPUT_BASE_MARKER), Put::File);
+                    fs.put(link.clone(), Put::Link(target.clone()));
+                    if live {
+                        fs.put(target.clone(), Put::Dir);
+                    }
+                    let route = base_of_link_target(&fs, &target);
+                    assert_eq!(route, LinkRoute::Base(base.clone()), "{link:?}");
+                    let verdict = classify(&fs, &link, Some(&target), &mut Memo::default());
+                    assert_eq!(
+                        (verdict.class, verdict.tree, verdict.cannot_tell),
+                        (Link, tree.clone(), false),
+                        "{link:?}, live: {live}"
+                    );
+                }
+                // With no marker beside `execroot` the same link leads
+                // nowhere Bazel owns.
+                let mut fs = Fake::default();
+                fs.put(link.clone(), Put::Link(target.clone()));
+                fs.put(target.clone(), Put::Dir);
+                assert_eq!(base_of_link_target(&fs, &target), LinkRoute::NoBase);
+                let verdict = classify(&fs, &link, Some(&target), &mut Memo::default());
+                assert_eq!((verdict.class, verdict.cannot_tell), (Plain, false));
+
+                // The marker holds the workspace path and nothing more.
+                let marker = at(disk, text(row, "marker"));
+                let names_workspace = marker_names(marker.as_os_str().as_encoded_bytes(), &ws);
+                let recorded = row["marker_names_this_workspace"].as_bool();
+                assert_eq!(Some(names_workspace), recorded, "{link:?}");
+                let candidate = Candidate {
+                    base,
+                    names_workspace,
+                };
+                linked.entry(ws).or_default().push(candidate);
+            }
+            // Five workspaces, each with one live base: under the default
+            // prefix, with `dist/` links beside stale `bazel-*` ones, after
+            // an upgrade moved the root, on a shared base, and in the tree.
+            assert_eq!(linked.len(), 5);
+            for (ws, linked) in linked {
+                let located = locate(&linked, &[], true);
+                let base = linked[0].base.clone();
+                let route = Route::Link;
+                assert_eq!(located, Located::Base { base, route }, "{ws:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_recorded_cache_entries_are_known_with_and_without_their_id_file() {
+        let entries = vector(CAS_VECTORS);
+        let entries = entries.as_array().expect("entries");
+        assert_eq!(entries.len(), 35);
+        let answer = |fs: &Fake, path: &str| {
+            let found = p(path);
+            let verdict = classify(fs, &found, Some(&found), &mut Memo::default());
+            assert!(!verdict.cannot_tell && verdict.resolves_into.is_none());
+            (verdict.class, verdict.tree)
+        };
+        let mut kinds = HashSet::new();
+        for cache in [
+            "/home/u/.cache/bazel/_bazel_u/cache/repos/v1",
+            r"c:\users\me\_bazel_me\cache\repos\v1",
+        ] {
+            for row in entries {
+                let entry = format!("{cache}/{}", text(row, "entry_dir"));
+                let id_file = format!("{entry}/{}", text(row, "observed_id_marker"));
+                let tree = Some(Tree {
+                    class: RepositoryCache,
+                    root: p(&entry),
+                });
+                // As recorded, and with no `id-*` file. Every recorded
+                // fetch passed a canonical id; Bazel 5 and 6, and a
+                // download that passes none on any version, leave the same
+                // entry without the file (probes H1, H3, T3), and an
+                // `id-*` file as a condition would call those plain.
+                for with_id in [true, false] {
+                    let mut fs = Fake::default();
+                    fs.put(p(&format!("{entry}/file")), Put::File);
+                    if with_id {
+                        fs.put(p(&id_file), Put::File);
+                    }
+                    for path in [&entry, &format!("{entry}/file"), &id_file] {
+                        let want = (RepositoryCache, tree.clone());
+                        assert_eq!(answer(&fs, path), want, "{path}, id: {with_id}");
+                    }
+                    // The cache's own directories are not an entry.
+                    let kind = entry.rsplit_once('/').expect("kind").0;
+                    kinds.insert(kind.rsplit_once('/').expect("name").1.to_string());
+                    let cas = format!("{cache}/{CAS_DIR}");
+                    for above in [kind, cas.as_str(), cache] {
+                        assert_eq!(answer(&fs, above), (Plain, None), "{above}");
+                    }
+                }
+                // An `id-*` file with no payload beside it marks nothing.
+                let mut fs = Fake::default();
+                fs.put(p(&id_file), Put::File);
+                assert_eq!(answer(&fs, &entry), (Plain, None), "{entry}");
+            }
+        }
+        // No recorded entry sits under `sha1`, `sha384` or `blake3`: those
+        // kinds are fabricated above.
+        let mut kinds: Vec<String> = kinds.into_iter().collect();
+        kinds.sort();
+        assert_eq!(kinds, ["sha256", "sha512"]);
     }
 }
