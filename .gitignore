@@ -161,3 +161,9 @@ simplify-output/
 # Python bytecode caches (scripts/backtest-*.py)
 __pycache__/
 *.pyc
+
+# Bazel fixture workspaces carry registry tarballs and `dist` directories.
+!crates/socket-patch-cli/tests/fixtures/bazel/**/*.tgz
+!crates/socket-patch-cli/tests/fixtures/bazel/**/dist
+!crates/socket-patch-core/tests/fixtures/bazel/**/*.tgz
+!crates/socket-patch-core/tests/fixtures/bazel/**/dist

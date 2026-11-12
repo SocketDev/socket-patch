@@ -1,0 +1,146 @@
+//! Per-cell JSON reports: the evidence a claim rests on.
+//!
+//! A lane claims a (Bazel line, dependency system, OS) only with a report
+//! of status `ran` for it. A test that skips, for any reason, writes a
+//! report of status `skipped`, so a cell whose test printed SKIP can never
+//! be mistaken for one that passed. A test that fails writes nothing.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Instant;
+
+use serde_json::{json, Value};
+
+use super::env::{self, Group, System};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Ran,
+    Skipped,
+}
+
+/// One test's report in one cell.
+#[derive(Clone, Debug)]
+pub struct Report {
+    pub test: String,
+    /// The Bazel version driven; `None` when the test skipped before it
+    /// found one.
+    pub bazel: Option<String>,
+    pub group: Option<Group>,
+    pub system: Option<System>,
+    /// Every host the fixture server was asked for, from its request log.
+    pub hosts: Vec<String>,
+    /// The test reached hosts directly, with no downloader rewrite, so
+    /// `hosts` is not the whole list. Canaries only: such a cell proves
+    /// nothing about hermeticity.
+    pub direct_network: bool,
+    /// Ruleset name to the version `bazel mod graph` resolved.
+    pub resolved: BTreeMap<String, String>,
+    /// Free-form measurements of the cell.
+    pub details: serde_json::Map<String, Value>,
+    pub started: Instant,
+}
+
+impl Report {
+    pub fn new(test: &str) -> Report {
+        Report {
+            test: test.to_string(),
+            bazel: None,
+            group: None,
+            system: None,
+            hosts: Vec::new(),
+            direct_network: false,
+            resolved: BTreeMap::new(),
+            details: serde_json::Map::new(),
+            started: Instant::now(),
+        }
+    }
+
+    pub fn detail(&mut self, key: &str, value: impl Into<Value>) -> &mut Report {
+        self.details.insert(key.to_string(), value.into());
+        self
+    }
+
+    pub fn to_json(&self, status: Status, reason: Option<&str>) -> Value {
+        json!({
+            "test": self.test,
+            "status": match status { Status::Ran => "ran", Status::Skipped => "skipped" },
+            "reason": reason,
+            "bazel": self.bazel,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "group": self.group.map(Group::name),
+            "system": self.system.map(System::name),
+            "hosts": self.hosts,
+            "direct_network": self.direct_network,
+            "wall_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "resolved": self.resolved,
+            "details": self.details,
+        })
+    }
+
+    /// The file this report is written to: one per (test, Bazel version,
+    /// system, OS, architecture), so the cells of a matrix never collide.
+    pub fn path(&self) -> PathBuf {
+        let cell = format!(
+            "{}.{}.{}.{}-{}",
+            self.test,
+            self.bazel.as_deref().unwrap_or("none"),
+            self.system.map_or("any", System::name),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        let name: String = cell
+            .chars()
+            .map(|c| match c {
+                c if c.is_ascii_alphanumeric() => c,
+                '.' | '_' | '-' => c,
+                _ => '_',
+            })
+            .collect();
+        probe_dir().join(format!("{name}.json"))
+    }
+
+    /// The test ran to its end: write status `ran`. Call it last, after
+    /// every assertion.
+    pub fn ran(&self) -> PathBuf {
+        self.write(Status::Ran, None)
+    }
+
+    fn write(&self, status: Status, reason: Option<&str>) -> PathBuf {
+        let path = self.path();
+        std::fs::create_dir_all(probe_dir()).expect("create the probe directory");
+        let text = serde_json::to_vec_pretty(&self.to_json(status, reason)).unwrap();
+        std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+        println!("probe report ({status:?}): {}", path.display());
+        path
+    }
+}
+
+/// Where reports go: [`env::PROBE_DIR`], else `<target tmp>/bazel-probe`.
+pub fn probe_dir() -> PathBuf {
+    env::var(env::PROBE_DIR)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("bazel-probe"))
+}
+
+/// The test cannot run here (no Bazel, an unreachable origin): a failure
+/// on a required cell, else `SKIP` and a `skipped` report.
+pub fn skip(report: &Report, why: &str) -> PathBuf {
+    assert!(
+        !env::required(),
+        "{}: {} is set but the test cannot run: {why}",
+        report.test,
+        env::REQUIRED
+    );
+    println!("SKIP {}: {why}", report.test);
+    report.write(Status::Skipped, Some(why))
+}
+
+/// The test does not apply to this cell (another fixture group, a
+/// dependency system the Bazel line does not have, an OS the test has no
+/// tool for): `SKIP (n/a)` and a `skipped` report, also on a required cell.
+pub fn skip_na(report: &Report, why: &str) -> PathBuf {
+    println!("SKIP (n/a) {}: {why}", report.test);
+    report.write(Status::Skipped, Some(why))
+}

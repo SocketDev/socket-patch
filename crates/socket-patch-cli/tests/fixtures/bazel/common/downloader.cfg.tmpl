@@ -1,0 +1,13 @@
+# Downloader config of the real-Bazel suite. The harness replaces the port
+# placeholder with the fixture server's and passes the result on every
+# command (tests/bazel_build_common/workspace.rs).
+#
+# Every URL that is not already loopback goes to the fixture server as
+# /<host>/<path>, so committed locks keep their production URLs; whatever
+# is left is blocked. A rewrite matches the URL without its scheme, and the
+# negative lookahead keeps a loopback URL from being rewritten onto itself.
+# A miss is a fast 404 from a live server. `block *` alone is not an
+# offline recipe before Bazel 9.3.0.
+rewrite ((?!127\.0\.0\.1[:/]).*) http://127.0.0.1:<port>/$1
+block *
+allow 127.0.0.1
