@@ -1,0 +1,18 @@
+module(name = "rp_probe", version = "0.0.0")
+
+bazel_dep(name = "rules_python", version = "2.0.3")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.11",
+)
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pypi",
+    python_version = "3.11",
+    requirements_lock = "//:requirements_lock.txt",
+    experimental_index_url = "https://127.0.0.1:47292/simple",
+)
+use_repo(pip, "pypi")
