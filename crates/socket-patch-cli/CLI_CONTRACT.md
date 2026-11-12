@@ -3111,14 +3111,16 @@ Support lands in stages, so each code has a **status**:
 
 A code becomes `active` in the release that ships its behaviour. Every code is additive
 (MINOR). The strings are defined in one place (`socket_patch_core::bazel::codes`), and
-`test_bazel_contract_codes` (`tests/contract_gradle_codes.rs`) fails when a code or a
-token has no row here, when this document names a Bazel code that does not exist, or
-when a code string is spelled anywhere else in the source.
+`test_bazel_contract_codes` (`tests/contract_gradle_codes.rs`) fails when a code, or a
+token that a module lists in its `TOKENS`, has no row here, when this document names a
+Bazel code that does not exist, or when a code string or the bare prefix of one is
+spelled anywhere else in the source.
 
-Run-level codes and advisories are `warnings[]` entries with the additive `level`
-field (`info` or `warn`), as the Gradle discovery notes are: human mode prints `info`
-as `Note:` lines, which `--silent` suppresses. The level in a table is the lowest the
-code is reported at; a run raises an `info` to `warn` only where the row says so. A
+Run-level codes and advisories are `warnings[]` entries, and a `warnings[]` entry is
+`{code, detail}` like every other: it has no `level` field. The **Level** column of a
+table is the prefix of the code's line in human mode: `info` prints `Note:`, which
+`--silent` suppresses, and `warn` prints `Warning:`. The level in a table is the lowest
+the code is reported at; a run raises an `info` to `warn` only where the row says so. A
 refusal writes nothing for the package: its detail ends with the remedy and "nothing
 was written", and never contains a grant token.
 
@@ -3138,7 +3140,7 @@ was written", and never contains a grant token.
 | `bazel_workspace_ignore_line_added` | planned | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
 | `bazel_workspace_ignore_line_needed` | planned | `warn` | A `.socket` tree is visible to `//...` and `.bazelignore` cannot be written. | Add the printed lines to the printed file. |
 | `bazel_workspace_prune_skipped` | planned | `warn` | `scan --prune` could not tell what a lock that Bazel reads resolves, so the records of that ecosystem were kept. | - |
-| `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which has no `level`: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
+| `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which prints no line for a human and so has no level: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
 
 ### Agent mode
 
@@ -3175,7 +3177,7 @@ case. A `-` means the mode has no such refusal.
 
 | Code | Status | Level | When |
 |---|---|---|---|
-| `redirect_bazel_run_required` | planned | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. With `gatesVex: false` it only notes lockfile facts that may be stale, and `vex` is not held back. Also reported after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale: at `warn` when builds fail until the command has run. `details` carries `kind` (`lockfile`, `update_repos` or `repin`), `command`, `platforms` and `gatesVex`. |
+| `redirect_bazel_run_required` | planned | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. The detail names the command and the platforms to run it on. Reported at `warn` when, until the command has run, builds fail or the Bazel build does not yet consume the patch (a WORKSPACE `go_repository` hub keeps building the upstream module until its `gazelle update-repos` command has run). It stays `info` where an ordinary build refreshes the stale `MODULE.bazel.lock` by itself, and where it only notes lockfile facts that may be stale, in which case `vex` is not held back. Also reported, by the same rule, after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale. The entry is `{code, detail}`: a structured form (`kind`: `lockfile`, `update_repos` or `repin`; `command`; `platforms`; `gatesVex`) is left to an event's `details`, and is specified in the release that makes this code `active`. |
 | `vendor_bazel_run_required` | planned | `info` | The same, in vendored mode. |
 | `redirect_bazel_withdrawn_pin_kept` | planned | `warn` | The pin of a withdrawn patch was kept, because restoring it under `--lockfile_mode=error` would fail every build. Names both steps to take. |
 | `redirect_bazel_fetch_dependency` | planned | `info` | Once per run: a pin makes cold repository fetches depend on the patch host beyond the package itself (the NuGet service index for a rules_dotnet pin, the registry `config.json` for a rules_rs pin). |
