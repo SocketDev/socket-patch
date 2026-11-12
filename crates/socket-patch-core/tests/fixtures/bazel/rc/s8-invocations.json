@@ -1,0 +1,513 @@
+{
+ "source": "probe S8 (rc-ignore-substitution/s8/vectors/*.compact.json), exit-0 invocations only",
+ "note": "order: every rc line carries --distdir=/sp/<tag>; observed_order is the tag order of one real invocation, from the canonical command line of the build event protocol (bep) or from --announce_rc (sections in applied order, a --config token printed unexpanded). tops: the rc files the client read, in its order (workspace, home, $BAZELRC from 9.0.0, --bazelrc=); the run was started in the workspace root on macOS. startup: the -Dsp.t values among the server's startup options. effective: the value Bazel reported for the flag with cli on the command line.",
+ "order": [
+  {
+   "id": "C_build",
+   "bazel": "6.2.1",
+   "command": "build",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "build1",
+    "build_b",
+    "build_a",
+    "build2",
+    "imp_build",
+    "build3",
+    "user_root",
+    "home_build",
+    "extra_build"
+   ]
+  },
+  {
+   "id": "G_version_import",
+   "bazel": "6.2.1",
+   "command": "build",
+   "tops": [
+    ".bazelrc"
+   ],
+   "files": {
+    ".bazelrc": "try-import-if-bazel-version >=9.0.0 %workspace%/ge9.rc\ntry-import-if-bazel-version <9.0.0 %workspace%/lt9.rc\ntry-import-if-bazel-version ~8 %workspace%/t8.rc\ntry-import-if-bazel-version ~10 %workspace%/t10.rc\ntry-import-if-bazel-version >=10.0.0-0 %workspace%/ge10pre.rc\nbuild --distdir=/sp/base\n",
+    "ge9.rc": "build --distdir=/sp/ge9\n",
+    "lt9.rc": "build --distdir=/sp/lt9\n",
+    "t8.rc": "build --distdir=/sp/t8\n",
+    "t10.rc": "build --distdir=/sp/t10\n",
+    "ge10pre.rc": "build --distdir=/sp/ge10pre\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "base"
+   ]
+  },
+  {
+   "id": "C_version",
+   "bazel": "6.2.1",
+   "command": "version",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "announce_rc",
+   "observed_order": [
+    "common1",
+    "imp_common",
+    "--config=cc",
+    "home_common",
+    "extra_common",
+    "version1"
+   ]
+  },
+  {
+   "id": "C_query",
+   "bazel": "6.2.1",
+   "command": "query",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "query1"
+   ]
+  },
+  {
+   "id": "C_build",
+   "bazel": "6.6.0",
+   "command": "build",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "build1",
+    "build_b",
+    "build_a",
+    "build2",
+    "imp_build",
+    "build3",
+    "user_root",
+    "home_build",
+    "extra_build"
+   ]
+  },
+  {
+   "id": "G_version_import",
+   "bazel": "6.6.0",
+   "command": "build",
+   "tops": [
+    ".bazelrc"
+   ],
+   "files": {
+    ".bazelrc": "try-import-if-bazel-version >=9.0.0 %workspace%/ge9.rc\ntry-import-if-bazel-version <9.0.0 %workspace%/lt9.rc\ntry-import-if-bazel-version ~8 %workspace%/t8.rc\ntry-import-if-bazel-version ~10 %workspace%/t10.rc\ntry-import-if-bazel-version >=10.0.0-0 %workspace%/ge10pre.rc\nbuild --distdir=/sp/base\n",
+    "ge9.rc": "build --distdir=/sp/ge9\n",
+    "lt9.rc": "build --distdir=/sp/lt9\n",
+    "t8.rc": "build --distdir=/sp/t8\n",
+    "t10.rc": "build --distdir=/sp/t10\n",
+    "ge10pre.rc": "build --distdir=/sp/ge10pre\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "base"
+   ]
+  },
+  {
+   "id": "C_build",
+   "bazel": "7.7.2",
+   "command": "build",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "build1",
+    "build_b",
+    "build_a",
+    "build2",
+    "imp_build",
+    "build3",
+    "user_root",
+    "home_build",
+    "extra_build"
+   ]
+  },
+  {
+   "id": "G_version_import",
+   "bazel": "7.7.2",
+   "command": "build",
+   "tops": [
+    ".bazelrc"
+   ],
+   "files": {
+    ".bazelrc": "try-import-if-bazel-version >=9.0.0 %workspace%/ge9.rc\ntry-import-if-bazel-version <9.0.0 %workspace%/lt9.rc\ntry-import-if-bazel-version ~8 %workspace%/t8.rc\ntry-import-if-bazel-version ~10 %workspace%/t10.rc\ntry-import-if-bazel-version >=10.0.0-0 %workspace%/ge10pre.rc\nbuild --distdir=/sp/base\n",
+    "ge9.rc": "build --distdir=/sp/ge9\n",
+    "lt9.rc": "build --distdir=/sp/lt9\n",
+    "t8.rc": "build --distdir=/sp/t8\n",
+    "t10.rc": "build --distdir=/sp/t10\n",
+    "ge10pre.rc": "build --distdir=/sp/ge10pre\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "base"
+   ]
+  },
+  {
+   "id": "C_build",
+   "bazel": "9.0.2",
+   "command": "build",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "env.rc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "build1",
+    "build_b",
+    "build_a",
+    "build2",
+    "imp_build",
+    "build3",
+    "user_root",
+    "home_build",
+    "env_build",
+    "extra_build"
+   ]
+  },
+  {
+   "id": "G_version_import",
+   "bazel": "9.0.2",
+   "command": "build",
+   "tops": [
+    ".bazelrc"
+   ],
+   "files": {
+    ".bazelrc": "try-import-if-bazel-version >=9.0.0 %workspace%/ge9.rc\ntry-import-if-bazel-version <9.0.0 %workspace%/lt9.rc\ntry-import-if-bazel-version ~8 %workspace%/t8.rc\ntry-import-if-bazel-version ~10 %workspace%/t10.rc\ntry-import-if-bazel-version >=10.0.0-0 %workspace%/ge10pre.rc\nbuild --distdir=/sp/base\n",
+    "ge9.rc": "build --distdir=/sp/ge9\n",
+    "lt9.rc": "build --distdir=/sp/lt9\n",
+    "t8.rc": "build --distdir=/sp/t8\n",
+    "t10.rc": "build --distdir=/sp/t10\n",
+    "ge10pre.rc": "build --distdir=/sp/ge10pre\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "ge9",
+    "base"
+   ]
+  },
+  {
+   "id": "C_version",
+   "bazel": "9.0.2",
+   "command": "version",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "env.rc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "announce_rc",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "--config=cc",
+    "home_common",
+    "extra_common",
+    "version1"
+   ]
+  },
+  {
+   "id": "C_query",
+   "bazel": "9.0.2",
+   "command": "query",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "env.rc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "query1"
+   ]
+  },
+  {
+   "id": "C_mod",
+   "bazel": "9.0.2",
+   "command": "mod",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "env.rc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "announce_rc",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "--config=cc",
+    "home_common",
+    "extra_common",
+    "mod1"
+   ]
+  },
+  {
+   "id": "C_build",
+   "bazel": "10.0.0rc3",
+   "command": "build",
+   "tops": [
+    ".bazelrc",
+    "HOME/.bazelrc",
+    "env.rc",
+    "extra.rc"
+   ],
+   "files": {
+    ".bazelrc": "test --distdir=/sp/test1\nbuild --distdir=/sp/build1\ncommon --distdir=/sp/common1\nalways --distdir=/sp/always1\nfrobnicate --distdir=/sp/frob1\nbuild --config=a\nbuild --distdir=/sp/build2\nimport %workspace%/imp.rc\nbuild --distdir=/sp/build3\ncommon --config=cc\ncommon:cc --distdir=/sp/common_cc\nbuild:a --config=b\nbuild:a --distdir=/sp/build_a\nbuild:b --distdir=/sp/build_b\nbuild:ci --distdir=/sp/build_ci\ncommon:ci --distdir=/sp/common_ci\ntest:ci --distdir=/sp/test_ci\nquery --distdir=/sp/query1\ncquery --distdir=/sp/cquery1\nmod --distdir=/sp/mod1\nfetch --distdir=/sp/fetch1\ninfo --distdir=/sp/info1\nversion --distdir=/sp/version1\nsync --distdir=/sp/sync1\ntry-import %workspace%/missing.rc\ntry-import user.bazelrc\n",
+    "imp.rc": "common --distdir=/sp/imp_common\nbuild --distdir=/sp/imp_build\n",
+    "user.bazelrc": "build --distdir=/sp/user_root\n",
+    "sub/user.bazelrc": "build --distdir=/sp/user_sub\n",
+    "extra.rc": "build --distdir=/sp/extra_build\ncommon --distdir=/sp/extra_common\n",
+    "env.rc": "build --distdir=/sp/env_build\n",
+    "HOME/.bazelrc": "build --distdir=/sp/home_build\ncommon --distdir=/sp/home_common\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "always1",
+    "common1",
+    "imp_common",
+    "common_cc",
+    "home_common",
+    "extra_common",
+    "build1",
+    "build_b",
+    "build_a",
+    "build2",
+    "imp_build",
+    "build3",
+    "user_root",
+    "home_build",
+    "env_build",
+    "extra_build"
+   ]
+  },
+  {
+   "id": "G_version_import",
+   "bazel": "10.0.0rc3",
+   "command": "build",
+   "tops": [
+    ".bazelrc"
+   ],
+   "files": {
+    ".bazelrc": "try-import-if-bazel-version >=9.0.0 %workspace%/ge9.rc\ntry-import-if-bazel-version <9.0.0 %workspace%/lt9.rc\ntry-import-if-bazel-version ~8 %workspace%/t8.rc\ntry-import-if-bazel-version ~10 %workspace%/t10.rc\ntry-import-if-bazel-version >=10.0.0-0 %workspace%/ge10pre.rc\nbuild --distdir=/sp/base\n",
+    "ge9.rc": "build --distdir=/sp/ge9\n",
+    "lt9.rc": "build --distdir=/sp/lt9\n",
+    "t8.rc": "build --distdir=/sp/t8\n",
+    "t10.rc": "build --distdir=/sp/t10\n",
+    "ge10pre.rc": "build --distdir=/sp/ge10pre\n"
+   },
+   "order_source": "bep",
+   "observed_order": [
+    "base"
+   ]
+  }
+ ],
+ "startup": [
+  {
+   "id": "G_startup_os2",
+   "bazel": "6.2.1",
+   "files": {
+    ".bazelrc": "startup --host_jvm_args=-Dsp.t=plain\nstartup:macos --host_jvm_args=-Dsp.t=macos\nstartup:linux --host_jvm_args=-Dsp.t=linux\nstartup:ci --host_jvm_args=-Dsp.t=ci\n"
+   },
+   "observed_host_jvm_args": [
+    "-Dsp.t=plain"
+   ]
+  },
+  {
+   "id": "G_startup_os2",
+   "bazel": "7.7.2",
+   "files": {
+    ".bazelrc": "startup --host_jvm_args=-Dsp.t=plain\nstartup:macos --host_jvm_args=-Dsp.t=macos\nstartup:linux --host_jvm_args=-Dsp.t=linux\nstartup:ci --host_jvm_args=-Dsp.t=ci\n"
+   },
+   "observed_host_jvm_args": [
+    "-Dsp.t=plain"
+   ]
+  },
+  {
+   "id": "G_startup_os2",
+   "bazel": "8.8.2",
+   "files": {
+    ".bazelrc": "startup --host_jvm_args=-Dsp.t=plain\nstartup:macos --host_jvm_args=-Dsp.t=macos\nstartup:linux --host_jvm_args=-Dsp.t=linux\nstartup:ci --host_jvm_args=-Dsp.t=ci\n"
+   },
+   "observed_host_jvm_args": [
+    "-Dsp.t=plain"
+   ]
+  },
+  {
+   "id": "G_startup_os2",
+   "bazel": "9.0.2",
+   "files": {
+    ".bazelrc": "startup --host_jvm_args=-Dsp.t=plain\nstartup:macos --host_jvm_args=-Dsp.t=macos\nstartup:linux --host_jvm_args=-Dsp.t=linux\nstartup:ci --host_jvm_args=-Dsp.t=ci\n"
+   },
+   "observed_host_jvm_args": [
+    "-Dsp.t=plain",
+    "-Dsp.t=macos"
+   ]
+  }
+ ],
+ "effective": [
+  {
+   "id": "R_rulesjs_shape_ci",
+   "bazel": "7.7.2",
+   "command": "build",
+   "cli": [
+    "--config=ci"
+   ],
+   "files": {
+    ".bazelrc": "common:ci --lockfile_mode=\"error\"\ncommon:ci --lockfile_mode=off\n"
+   },
+   "flag": "--lockfile_mode",
+   "observed": "off"
+  },
+  {
+   "id": "R_repin_config_then_flag",
+   "bazel": "7.7.2",
+   "command": "build",
+   "cli": [
+    "--config=ci",
+    "--lockfile_mode=update"
+   ],
+   "files": {
+    ".bazelrc": "common:ci --lockfile_mode=error\n"
+   },
+   "flag": "--lockfile_mode",
+   "observed": "update"
+  }
+ ]
+}

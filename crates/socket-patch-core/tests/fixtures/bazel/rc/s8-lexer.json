@@ -1,0 +1,395 @@
+{
+ "source": "probe S8 (rc-ignore-substitution/s8/vectors/*.compact.json, LEX.lexer_cases)",
+ "note": "rc_hex is the rc file's bytes. tokens: section keyword -> words, as the Bazel client reported them in the build event protocol (--default_override) on every release of bep_releases; each character of a string is one byte (Latin-1). announce_rc_10.0.0rc3: the words of each section Bazel 10.0.0rc3 printed under --announce_rc, joined by one space and decoded as UTF-8; a section whose keyword is not a command is not printed.",
+ "bep_releases": [
+  "6.2.1",
+  "6.6.0",
+  "7.7.2",
+  "8.6.0",
+  "9.0.2",
+  "9.3.2"
+ ],
+ "cases": [
+  {
+   "id": "L01_quote_midword",
+   "rc_hex": "6275696c64202d2d646566696e653d613d2262206322640a",
+   "tokens": {
+    "build": [
+     "--define=a=b cd"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=a=b cd"
+   }
+  },
+  {
+   "id": "L02_hash_midword",
+   "rc_hex": "6275696c64202d2d646566696e653d783d79237a202d2d646566696e653d6e657665723d310a",
+   "tokens": {
+    "build": [
+     "--define=x=y"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=x=y"
+   }
+  },
+  {
+   "id": "L03_single_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d713d2773696e676c65202264712220696e270a",
+   "tokens": {
+    "build": [
+     "--define=q=single \"dq\" in"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=q=single \"dq\" in"
+   }
+  },
+  {
+   "id": "L04_escapes",
+   "rc_hex": "6275696c64202d2d646566696e653d6573633d615c20625c23635c22645c5c650a",
+   "tokens": {
+    "build": [
+     "--define=esc=a b#c\"d\\e"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=esc=a b#c\"d\\e"
+   }
+  },
+  {
+   "id": "L05_comment_backslash_swallows",
+   "rc_hex": "2320636f6d6d656e74205c0a6275696c64202d2d646566696e653d7377616c6c6f7765643d310a6275696c64202d2d646566696e653d61667465723d310a",
+   "tokens": {
+    "build": [
+     "--define=after=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=after=1"
+   }
+  },
+  {
+   "id": "L06_continuation_midtoken",
+   "rc_hex": "6275696c64202d2d646566696e653d636f5c0a6e743d310a",
+   "tokens": {
+    "build": [
+     "--define=cont=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=cont=1"
+   }
+  },
+  {
+   "id": "L07_continuation_crlf",
+   "rc_hex": "6275696c64202d2d646566696e653d63725c0d0a6c663d310d0a",
+   "tokens": {
+    "build": [
+     "--define=crlf=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=crlf=1"
+   }
+  },
+  {
+   "id": "L08_crlf_file",
+   "rc_hex": "6275696c64202d2d646566696e653d613d310d0a6275696c64202d2d646566696e653d623d320d0a",
+   "tokens": {
+    "build": [
+     "--define=a=1",
+     "--define=b=2"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=a=1 --define=b=2"
+   }
+  },
+  {
+   "id": "L09_bom",
+   "rc_hex": "efbbbf6275696c64202d2d646566696e653d626f6d3d310a6275696c64202d2d646566696e653d7365636f6e643d310a",
+   "tokens": {
+    "\u00ef\u00bb\u00bfbuild": [
+     "--define=bom=1"
+    ],
+    "build": [
+     "--define=second=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=second=1"
+   }
+  },
+  {
+   "id": "L10_empty_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d653d2222202222202727202d2d646566696e653d663d310a",
+   "tokens": {
+    "build": [
+     "--define=e=",
+     "--define=f=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=e= --define=f=1"
+   }
+  },
+  {
+   "id": "L11_unterminated_quote",
+   "rc_hex": "6275696c64202d2d646566696e653d753d22616263206465660a6275696c64202d2d646566696e653d6e6578743d310a",
+   "tokens": {
+    "build": [
+     "--define=u=abc def",
+     "--define=next=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=u=abc def --define=next=1"
+   }
+  },
+  {
+   "id": "L12_hash_in_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d683d2261236222202d2d646566696e653d693d27632364270a",
+   "tokens": {
+    "build": [
+     "--define=h=a#b",
+     "--define=i=c#d"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=h=a#b --define=i=c#d"
+   }
+  },
+  {
+   "id": "L13_tabs_ws",
+   "rc_hex": "09206275696c64092d2d646566696e653d743d312009200a",
+   "tokens": {
+    "build": [
+     "--define=t=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=t=1"
+   }
+  },
+  {
+   "id": "L14_two_token_option",
+   "rc_hex": "6275696c64202d2d646566696e652074776f3d746f6b0a",
+   "tokens": {
+    "build": [
+     "--define",
+     "two=tok"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define two=tok"
+   }
+  },
+  {
+   "id": "L15_quoted_keyword",
+   "rc_hex": "226275696c6422202d2d646566696e653d6b713d310a",
+   "tokens": {
+    "build": [
+     "--define=kq=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=kq=1"
+   }
+  },
+  {
+   "id": "L16_backslash_eof",
+   "rc_hex": "6275696c64202d2d646566696e653d656f663d315c",
+   "tokens": {
+    "build": [
+     "--define=eof=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=eof=1"
+   }
+  },
+  {
+   "id": "L17_keyword_hash",
+   "rc_hex": "6275696c642378202d2d646566696e653d7a3d310a6275696c64202d2d646566696e653d6f6b3d310a",
+   "tokens": {
+    "build": [
+     "--define=ok=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=ok=1"
+   }
+  },
+  {
+   "id": "L18_backslash_n",
+   "rc_hex": "6275696c64202d2d646566696e653d626e3d615c6e620a",
+   "tokens": {
+    "build": [
+     "--define=bn=anb"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=bn=anb"
+   }
+  },
+  {
+   "id": "L19_utf8",
+   "rc_hex": "6275696c64202d2d646566696e653d75383d636166c3a90a",
+   "tokens": {
+    "build": [
+     "--define=u8=caf\u00c3\u00a9"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=u8=caf\u00e9"
+   }
+  },
+  {
+   "id": "L20_lone_cr_separator",
+   "rc_hex": "6275696c64202d2d646566696e653d613d310d2d2d646566696e653d623d320a",
+   "tokens": {
+    "build": [
+     "--define=a=1",
+     "--define=b=2"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=a=1 --define=b=2"
+   }
+  },
+  {
+   "id": "L21_windows_path",
+   "rc_hex": "6275696c64202d2d646566696e653d703d433a5c55736572735c780a",
+   "tokens": {
+    "build": [
+     "--define=p=C:Usersx"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=p=C:Usersx"
+   }
+  },
+  {
+   "id": "L22_escaped_quote_in_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d69713d22615c2262220a",
+   "tokens": {
+    "build": [
+     "--define=iq=a\"b"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=iq=a\"b"
+   }
+  },
+  {
+   "id": "L23_adjacent_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d61713d226122276227630a",
+   "tokens": {
+    "build": [
+     "--define=aq=abc"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=aq=abc"
+   }
+  },
+  {
+   "id": "L24_trailing_backslash_space",
+   "rc_hex": "6275696c64202d2d646566696e653d74733d315c200a6275696c64202d2d646566696e653d6e3d320a",
+   "tokens": {
+    "build": [
+     "--define=ts=1",
+     "--define=n=2"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=ts=1 --define=n=2"
+   }
+  },
+  {
+   "id": "L25_no_final_newline",
+   "rc_hex": "6275696c64202d2d646566696e653d6e663d31",
+   "tokens": {
+    "build": [
+     "--define=nf=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=nf=1"
+   }
+  },
+  {
+   "id": "L26_hash_after_space",
+   "rc_hex": "6275696c64202d2d646566696e653d633d312023207461696c202d2d646566696e653d6e657665723d310a",
+   "tokens": {
+    "build": [
+     "--define=c=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=c=1"
+   }
+  },
+  {
+   "id": "L27_continuation_in_quotes",
+   "rc_hex": "6275696c64202d2d646566696e653d63713d22615c0a62220a",
+   "tokens": {
+    "build": [
+     "--define=cq=ab"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=cq=ab"
+   }
+  },
+  {
+   "id": "L28_double_backslash_newline",
+   "rc_hex": "6275696c64202d2d646566696e653d64623d315c5c0a6275696c64202d2d646566696e653d6462323d320a",
+   "tokens": {
+    "build": [
+     "--define=db=1build",
+     "--define=db2=2"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=db=1build --define=db2=2"
+   }
+  },
+  {
+   "id": "L29_vt_ff",
+   "rc_hex": "0b6275696c64202d2d646566696e653d76743d310c0a",
+   "tokens": {
+    "build": [
+     "--define=vt=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=vt=1"
+   }
+  },
+  {
+   "id": "L30_quote_keeps_hash_then_comment",
+   "rc_hex": "6275696c6420222d2d646566696e653d6b3d7623772223676f6e650a",
+   "tokens": {
+    "build": [
+     "--define=k=v#w"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {
+    "build": "--define=k=v#w"
+   }
+  },
+  {
+   "id": "L32_config_section",
+   "rc_hex": "6275696c643a6369202d2d646566696e653d633d310a6275696c643a63690a636f6d6d6f6e3a656d7074790a",
+   "tokens": {
+    "build:ci": [
+     "--define=c=1"
+    ]
+   },
+   "announce_rc_10.0.0rc3": {}
+  }
+ ]
+}
