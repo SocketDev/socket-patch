@@ -1,0 +1,50 @@
+{
+  "schema": 1,
+  "group": "core",
+  "filter": "bazel_core_",
+  "notes": [
+    "Layout: core/<system>/e<major> is one workspace per dependency system and Bazel major, all on the toy ruleset of toy.bzl (no external ruleset). core/payloads/{upstream,patched} holds the package files the fixture server serves; core/bzlmod/<era>/locks holds the lock `bazel mod deps` made against https://bcr.bazel.build/.",
+    "A cell is one run of every bazel_core_ test under one Bazel on one OS, with SOCKET_PATCH_BAZEL_E2E_GROUP=core and no SOCKET_PATCH_BAZEL_E2E_SYSTEM: each test opens the fixture of its own dependency system and reports SKIP (n/a) where the line has none.",
+    "network none: the registry files and the one module archive a build fetches are committed (fixtures/bazel/registry), so the cell contacts no host. network archives: Bazel 8.8.2 fetches 12.4 MB of module archives from github.com into the repository cache, and its reports say direct_network; restore that cache (SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT) to keep the fetch to one.",
+    "tests lists the Bazel versions each test reports status `ran` on; elsewhere it reports `skipped`. bazel_core_zero_network is claimed where the archives are committed, bazel_core_toy_facts_go_stale from Bazel 8.6.",
+    "Every cell ran on macOS arm64 only (2026-11-12). The Linux and Windows cells are unverified: on Windows the registry is served by the fixture server instead of read through --registry=file://, and proof tier 2 is not run.",
+    "The committed locks were recorded on macOS arm64; bazel_core_zero_network builds on them in error mode. The same Bazel command (the committed lock in error mode, --registry=file://, --distdir, no network interface) also passed in a Linux arm64 container on 7.7.2 and 9.3.2, outside the test harness. Linux x86_64 has not run."
+  ],
+  "cells": [
+    {
+      "bazel": "9.3.2",
+      "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+      "tier": {"ubuntu-latest": "pr", "macos-latest": "nightly", "windows-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e9"}
+    },
+    {
+      "bazel": "8.8.2",
+      "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+      "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly", "windows-latest": "nightly"},
+      "network": "archives",
+      "fixtures": {"bzlmod": "core/bzlmod/e8", "workspace": "core/workspace/e8", "hybrid": "core/hybrid/e8"}
+    },
+    {
+      "bazel": "7.7.2",
+      "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+      "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly", "windows-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e7", "workspace": "core/workspace/e7", "hybrid": "core/hybrid/e7"}
+    }
+  ],
+  "tests": {
+    "bazel_core_launch_isolated": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_lock_writes_stop_the_server": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_shutdown_after_the_server_was_killed": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_toy_pin_consumed_bzlmod": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_toy_pin_consumed_workspace": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
+    "bazel_core_toy_pin_tamper_twin_bzlmod": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_toy_pin_tamper_twin_workspace": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
+    "bazel_core_bazelignore_hides_tree": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_zero_network": {"system": "bzlmod", "bazel": ["7.7.2", "9.3.2"]},
+    "bazel_core_hybrid_hub_names_resolve_per_system": {"system": "hybrid", "bazel": ["7.7.2", "8.8.2"]},
+    "bazel_core_workspace_only_gets_a_placeholder_module_file": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
+    "bazel_core_toy_facts_go_stale": {"system": "bzlmod", "bazel": ["8.8.2", "9.3.2"]}
+  }
+}

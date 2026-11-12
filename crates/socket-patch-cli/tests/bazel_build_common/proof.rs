@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use base64::Engine as _;
 use sha2::{Digest, Sha256, Sha512};
 
-use super::invoke::Run;
+use super::invoke::{Options, Run};
 use super::server::Cell;
 
 /// The tier-0 and tier-1 target every fixture defines.
@@ -146,9 +146,21 @@ impl Cell {
     /// output `socket_probe.out/<name>` (a directory for a tree-artifact
     /// input). An action input is then the file tier 0 listed.
     pub fn tier1_output(&self, name: &str) -> PathBuf {
-        self.bazel_ok("build", &[PROBE]);
-        let files = self.bazel_ok("cquery", &["--output=files", PROBE]).stdout();
-        let suffix = format!("socket_probe.out/{name}");
+        self.probe_output(&self.options, PROBE, name)
+    }
+
+    /// [`Cell::tier1_output`] for any `socket_probe` target, built under
+    /// `options`: a fixture with a second hub probes it in a package of
+    /// its own, and a workspace that two dependency systems can read is
+    /// built once under each.
+    pub fn probe_output(&self, options: &Options, target: &str, name: &str) -> PathBuf {
+        let built = self.bazel_with(options, "build", &[target]);
+        assert!(built.ok(), "{}: tier 1: {}", self.test, built.dump());
+        let listed = self.bazel_with(options, "cquery", &["--output=files", target]);
+        assert!(listed.ok(), "{}: tier 1: {}", self.test, listed.dump());
+        let files = listed.stdout();
+        let rule = target.rsplit(':').next().unwrap_or(target);
+        let suffix = format!("{rule}.out/{name}");
         let hits: Vec<&str> = files
             .lines()
             .map(str::trim)
@@ -160,7 +172,11 @@ impl Cell {
                 self.test
             );
         };
-        PathBuf::from(self.info("execution_root")).join(hit)
+        // Asked under the same options: the execution root is named after
+        // the WORKSPACE where Bzlmod is off and `_main` where it is on.
+        let root = self.bazel_with(options, "info", &["execution_root"]);
+        assert!(root.ok(), "{}: tier 1: {}", self.test, root.dump());
+        PathBuf::from(root.stdout().trim()).join(hit)
     }
 
     /// Tier 1 for a file input: the bytes of the probe output `name`. Run

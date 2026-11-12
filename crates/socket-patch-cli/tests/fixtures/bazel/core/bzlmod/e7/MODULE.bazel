@@ -1,0 +1,7 @@
+# The toy core fixture, Bzlmod: no external ruleset, one hub read from a JSON lock.
+
+module(name = "toy_core")
+
+toy = use_extension("//:toy.bzl", "toy")
+toy.lock(file = "//:toy.lock.json")
+use_repo(toy, "toy")

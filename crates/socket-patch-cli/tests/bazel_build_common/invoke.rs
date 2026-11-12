@@ -255,6 +255,15 @@ pub struct Options {
     /// The proxies of every child point at a closed port (the offline
     /// phase): only a loopback fixture server stays reachable.
     pub closed_proxies: bool,
+    /// `--registry=`: where Bzlmod resolves modules, in place of the Bazel
+    /// Central Registry. The `file://` URL of the committed subset
+    /// (`fixtures/bazel/registry`) makes resolution read no network.
+    pub registry: Option<String>,
+    /// `--distdir=`: a directory Bazel takes an archive from, by file name
+    /// and checksum, before it downloads one. Bazel consults it only for a
+    /// download the downloader config leaves a URL for, which the rewrite
+    /// does and `block *` does not.
+    pub distdir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -267,6 +276,8 @@ impl Default for Options {
             contents_cache: false,
             no_retries: false,
             closed_proxies: false,
+            registry: None,
+            distdir: None,
         }
     }
 }
@@ -292,6 +303,12 @@ impl Options {
         if let Some(config) = &self.downloader_config {
             let flag = format!("{}=", version.downloader_config_flag());
             joined(&flag, config.as_os_str());
+        }
+        if let Some(registry) = &self.registry {
+            joined("--registry=", registry.as_ref());
+        }
+        if let Some(distdir) = &self.distdir {
+            joined("--distdir=", distdir.as_os_str());
         }
         if let Some(system) = self.system {
             let flags = version.system_flags(system).ok_or_else(|| {
