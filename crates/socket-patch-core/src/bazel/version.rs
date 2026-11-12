@@ -707,7 +707,7 @@ pub fn tier(line: &BazelLine, decl: DeclSystem) -> Tier {
 /// The releases that write each `lockFileVersion`. A range that ends at
 /// the newest audited release of its major is left open to that major's
 /// ceiling: a later release may write the same token.
-const LOCK_TOKENS: &[(u64, BazelVersion, BazelVersion)] = &[
+const LOCK_FILE_VERSIONS: &[(u64, BazelVersion, BazelVersion)] = &[
     (1, v(6, 2, 0), v(6, 3, u32::MAX)),
     (3, v(6, 4, 0), ceiling(6)),
     (3, v(7, 0, 0), v(7, 0, u32::MAX)),
@@ -731,7 +731,7 @@ const LOCK_TOKENS: &[(u64, BazelVersion, BazelVersion)] = &[
 /// empty for a token no audited release writes. The token is an exact
 /// match, never an ordering: 28 is written by 8.8 and 26 by 9.0.
 pub fn lock_token_releases(token: u64) -> Vec<(BazelVersion, BazelVersion)> {
-    let rows = LOCK_TOKENS.iter().filter(|row| row.0 == token);
+    let rows = LOCK_FILE_VERSIONS.iter().filter(|row| row.0 == token);
     rows.map(|row| (row.1, row.2)).collect()
 }
 
@@ -1570,7 +1570,7 @@ mod tests {
             );
             // No other token claims the release, bar the two that
             // `--incompatible_use_plus_in_repo_names` selects on 7.3+.
-            for (other, lo, hi) in LOCK_TOKENS {
+            for (other, lo, hi) in LOCK_FILE_VERSIONS {
                 let variant = matches!(other, 12 | 14);
                 assert!(
                     *other == token || variant || bazel < *lo || *hi < bazel,
