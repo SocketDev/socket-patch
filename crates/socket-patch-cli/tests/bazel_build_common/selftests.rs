@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256, Sha512};
 
 use super::env::{self, Group, System, Version};
 use super::fixture_server::FixtureServer;
-use super::invoke::{absolute_program, Bazel, Options};
+use super::invoke::{absolute_program, named_bazelisk, Bazel, Options};
 use super::isolation::{self, OutsideState, Scratch};
 use super::probe_report::{self, Report, Status};
 use super::proof::{parse_locations, Anchor, SourceFile};
@@ -238,10 +238,14 @@ fn the_child_environment_is_scrubbed_and_points_into_the_scratch_root() {
     );
     // hermetic::command removes DO_NOT_TRACK; the harness sets it again.
     assert_eq!(set(&direct, "DO_NOT_TRACK"), Some("1".into()));
-    assert_eq!(
-        set(&direct, "NO_CRASH_ON_LOGGING_IN_TEST"),
-        Some("1".into())
-    );
+    // A launcher may export TEST_TMPDIR itself: both variables, or a
+    // failing extension on 7.x is a crash (exit 37) in that server.
+    for test_mode in [
+        "ENABLE_BUG_REPORT_LOGGING_IN_TEST",
+        "NO_CRASH_ON_LOGGING_IN_TEST",
+    ] {
+        assert_eq!(set(&direct, test_mode), Some("1".into()), "{test_mode}");
+    }
     assert_eq!(set(&direct, "SOCKET_TELEMETRY_DISABLED"), Some("1".into()));
 
     let launcher = env_of(&bazel("7.7.2", true));
@@ -1350,6 +1354,108 @@ fn a_plain_write_never_reaches_the_module_lock_or_leaves_the_workspace() {
 }
 
 #[test]
+fn a_mod_command_keeps_lock_rule_three() {
+    let check = workspace::check_mod_command;
+    // The two subcommands that write choose their mode, but for the one
+    // mode that is no oracle.
+    assert_eq!(check(&["deps"], "update"), Ok(()));
+    assert_eq!(check(&["deps"], "refresh"), Ok(()));
+    assert_eq!(check(&["tidy"], "update"), Ok(()));
+    for args in [&["deps"][..], &["--enable_bzlmod", "deps"]] {
+        let refused = check(args, "error").unwrap_err();
+        assert!(refused.contains("error_mode_build"), "{refused}");
+    }
+    // An explicit mode among the arguments follows the cell's own on the
+    // command line and wins there: it decides here too.
+    let stated = check(&["deps", "--lockfile_mode=error"], "update").unwrap_err();
+    assert!(stated.contains("error_mode_build"), "{stated}");
+    assert_eq!(check(&["deps", "--lockfile_mode=update"], "error"), Ok(()));
+
+    // Every subcommand that only asks runs with the lock off.
+    for oracle in [
+        "graph",
+        "show_repo",
+        "show_extension",
+        "all_paths",
+        "path",
+        "explain",
+        "dump_repo_mapping",
+    ] {
+        assert_eq!(check(&[oracle, "--output=json"], "off"), Ok(()), "{oracle}");
+        for mode in ["update", "refresh", "error"] {
+            let refused = check(&[oracle], mode).unwrap_err();
+            assert!(
+                refused.contains("mod_oracle") && refused.contains(oracle),
+                "{oracle} {mode}: {refused}"
+            );
+        }
+        assert_eq!(check(&["--lockfile_mode=off", oracle], "update"), Ok(()));
+        assert!(check(&[oracle, "--lockfile_mode=update"], "off").is_err());
+    }
+    // No subcommand at all is Bazel's error to report, with the lock off.
+    assert_eq!(check(&[], "off"), Ok(()));
+    assert!(check(&[], "update").is_err());
+}
+
+/// A stand-in Bazel of a version no release has, on a line that knows
+/// `--lockfile_mode`: for what a cell does per line without a server.
+fn lockfile_line(_: &Scratch) -> Result<Bazel, String> {
+    Ok(Bazel {
+        version: version("99.0.0"),
+        ..stand_in("socket-patch-selftest-no-such-bazel")?
+    })
+}
+
+#[test]
+fn a_cell_refuses_a_mod_command_that_breaks_lock_rule_three() {
+    let cell = selftest_cell("harness_selftest_mod_commands", lockfile_line);
+    let with = |mode: &'static str| Options {
+        lockfile_mode: mode,
+        ..cell.options.clone()
+    };
+    let argv = |options: &Options, args: &[&str]| -> Vec<String> {
+        let cmd = cell.command_with(options, "mod", args);
+        cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect()
+    };
+    // What mod_oracle and baseline build.
+    let oracle = argv(&with("off"), &["graph", "--output=json"]);
+    assert!(
+        oracle.contains(&"--lockfile_mode=off".to_string()),
+        "{oracle:?}"
+    );
+    let deps = argv(&with("update"), &["deps"]);
+    assert!(
+        deps.contains(&"--lockfile_mode=update".to_string()),
+        "{deps:?}"
+    );
+
+    // The cell's default mode is `update`: an oracle asked through the
+    // plain helpers would rewrite the lock under test.
+    assert!(panics(&|| drop(argv(&cell.options, &["graph"]))));
+    assert!(panics(&|| drop(argv(
+        &with("update"),
+        &["show_repo", "@toy"]
+    ))));
+    assert!(panics(&|| drop(argv(&with("error"), &["deps"]))));
+    assert!(panics(&|| drop(argv(
+        &with("update"),
+        &["deps", "--lockfile_mode=error"]
+    ))));
+    // Only `mod` is looked at: an `error`-mode build is the oracle itself.
+    let build = cell.command_with(&with("error"), "build", &["//:socket_probe"]);
+    assert!(build.get_args().any(|arg| arg == "--lockfile_mode=error"));
+    cell.close();
+
+    // A line without `--lockfile_mode` has no rule to keep (and no `mod`).
+    let old = selftest_cell("harness_selftest_mod_commands_old_line", no_bazel);
+    assert!(!old.bazel.version.has_lockfile_mode());
+    drop(old.command_with(&old.options, "mod", &["graph"]));
+    old.close();
+}
+
+#[test]
 fn the_probe_rule_is_installed_once_and_never_over_a_fixtures_own() {
     let ws = tempfile::tempdir().unwrap();
     assert_eq!(workspace::install_probe_rule(ws.path()), Ok(()));
@@ -1426,6 +1532,37 @@ fn a_program_named_by_a_relative_path_is_made_absolute() {
     }
     let absolute = cwd.join("bazel").into_os_string();
     assert_eq!(absolute_program(absolute.clone()), absolute);
+}
+
+#[test]
+fn a_program_is_bazelisk_by_its_file_name_links_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = |name: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, "").unwrap();
+        path
+    };
+    // What the installer writes, and what a release is called.
+    let pinned = file("bazelisk-v1.30.0-darwin-arm64");
+    assert!(named_bazelisk(&pinned));
+    assert!(named_bazelisk(&file("Bazelisk.exe")));
+    // A Bazel release binary, and a wrapper script that contains its own
+    // bazelisk home: neither gets a scratch BAZELISK_HOME forced on it.
+    assert!(!named_bazelisk(&file("bazel-9.3.2-darwin-arm64")));
+    let wrapper = dir.path().join("tools");
+    std::fs::create_dir(&wrapper).unwrap();
+    std::fs::write(wrapper.join("bazel"), "#!/bin/sh\n").unwrap();
+    assert!(!named_bazelisk(&wrapper.join("bazel")));
+    // A name that is not on disk is judged as written.
+    assert!(named_bazelisk(Path::new("bazelisk")));
+    assert!(!named_bazelisk(Path::new("bazel")));
+    // Homebrew installs `bazel` as a link to bazelisk.
+    #[cfg(unix)]
+    {
+        let link = dir.path().join("bazel");
+        std::os::unix::fs::symlink(&pinned, &link).unwrap();
+        assert!(named_bazelisk(&link));
+    }
 }
 
 #[test]

@@ -17,6 +17,8 @@
 //!    through [`Cell::mod_oracle`] (`--lockfile_mode=off`), and the
 //!    stale-lock oracle is [`Cell::error_mode_build`], never `bazel mod
 //!    deps --lockfile_mode=error` (exit 2 on a healthy lock made by builds).
+//!    [`check_mod_command`] refuses both mistakes on every `mod` command a
+//!    cell builds.
 //! 4. The repository cache lies outside the workspace copy (asserted when
 //!    the scratch root is made).
 //! 5. A cell that expects a fetch to fail runs one command through
@@ -26,7 +28,12 @@
 //! [`Cell::baseline`] runs every command class a scenario later runs
 //! before the test takes its snapshot, so the lock Bazel leaves is the one
 //! later steps reproduce. Lock equality after a rollback is asserted only
-//! after [`Cell::shutdown`] and a second [`Cell::baseline`].
+//! after [`Cell::shutdown`] and a second [`Cell::baseline`]:
+//! [`Cell::lock_after_rebaseline`] does both and returns the lock to compare.
+//!
+//! Rule 2 is the one rule no helper can enforce: a restored snapshot and a
+//! hand edit are the same bytes to [`Cell::write_module_lock`]. There is no
+//! restore helper on purpose; a saved tree goes into a new cell.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -83,6 +90,43 @@ pub fn check_plain_write(rel: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Lock rule 3 for `bazel mod <args>` on a cell whose `--lockfile_mode` is
+/// `lockfile_mode`. `Cell::command_with` asks before it builds any `mod`
+/// command, so the rule holds whichever helper a test goes through.
+///
+/// - `mod deps --lockfile_mode=error` is refused: it exits 2 on a healthy
+///   lock that builds made, so it is no stale-lock oracle
+///   ([`Cell::error_mode_build`] is).
+/// - `deps` and `tidy` are the two subcommands whose job is to write; any
+///   other mode is theirs to choose.
+/// - Every other subcommand (`graph`, `show_repo`, `show_extension`,
+///   `all_paths`, `path`, `explain`, `dump_repo_mapping`) only asks, and
+///   must run with the lock off ([`Cell::mod_oracle`]): in any other mode
+///   it rewrites the lock under test into the `mod` flavour.
+///
+/// An explicit `--lockfile_mode=` among `args` counts, the last one first:
+/// it follows the cell's own on the command line and wins there too.
+pub fn check_mod_command(args: &[&str], lockfile_mode: &str) -> Result<(), String> {
+    let mode = args
+        .iter()
+        .rev()
+        .find_map(|arg| arg.strip_prefix("--lockfile_mode="))
+        .unwrap_or(lockfile_mode);
+    let subcommand = args.iter().find(|arg| !arg.starts_with('-'));
+    match (subcommand.copied().unwrap_or_default(), mode) {
+        ("deps", "error") => Err(
+            "lock rule 3: `bazel mod deps --lockfile_mode=error` exits 2 on a healthy lock made \
+             by builds; the stale-lock oracle is Cell::error_mode_build"
+                .to_string(),
+        ),
+        ("deps" | "tidy", _) | (_, "off") => Ok(()),
+        (other, mode) => Err(format!(
+            "lock rule 3: `bazel mod {other}` under --lockfile_mode={mode} rewrites the lock \
+             under test; ask through Cell::mod_oracle (--lockfile_mode=off)"
+        )),
+    }
 }
 
 /// Write `fixtures/bazel/common/probe.bzl` to the root of `workspace`.
@@ -223,5 +267,18 @@ impl Cell {
             let run = self.bazel_with(&options, "mod", &["deps"]);
             assert!(run.ok(), "{}: {}", self.test, run.dump());
         }
+    }
+
+    /// The lock a lock-equality assertion compares: what the step-1
+    /// commands leave on a restarted server. Runs `bazel shutdown`, then
+    /// [`Cell::baseline`] with the same arguments as step 1, then reads
+    /// the lock. A test asserts lock equality after a rollback on this
+    /// value and on nothing else: the file as the scenario's last command
+    /// left it shows which command class ran last (rule 3), and on 7.2.0
+    /// to 8.7.0 and 9.0.2 a live server may still revert it (rule 1).
+    pub fn lock_after_rebaseline(&self, targets: &[&str], lock_fixture: bool) -> Option<Vec<u8>> {
+        self.shutdown();
+        self.baseline(targets, lock_fixture);
+        self.module_lock()
     }
 }

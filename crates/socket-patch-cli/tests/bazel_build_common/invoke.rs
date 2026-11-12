@@ -219,7 +219,7 @@ fn environment(
 
 /// Whether `program` is a file named like bazelisk, links followed
 /// (Homebrew installs `bazel` as a link to `bazelisk`).
-fn named_bazelisk(program: &Path) -> bool {
+pub fn named_bazelisk(program: &Path) -> bool {
     let resolved = program
         .canonicalize()
         .unwrap_or_else(|_| program.to_path_buf());

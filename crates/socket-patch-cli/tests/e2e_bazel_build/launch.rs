@@ -1,20 +1,23 @@
 //! Real-Bazel tests of the harness itself: a launched Bazel stays inside
 //! its scratch root, a lock write stops the live server, a cell survives a
-//! server that was killed, and the shared probe rule builds. The standing
-//! versions of probes T1 (isolation flags) and T4 (proof ladder), and the
-//! checks of the harness's own lock and shutdown rules; every other test
-//! in this suite relies on what these assert.
+//! server that was killed, and the shared probe rule builds over a file and
+//! a tree artifact (with no network on the toy cell, and as a record-only
+//! canary on any line). The standing versions of probes T1 (isolation
+//! flags) and T4 (proof ladder), and the checks of the harness's own lock
+//! and shutdown rules; every other test in this suite relies on what these
+//! assert.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::bazel_build_common::env::Group;
+use crate::bazel_build_common::env::{self, Group, System};
 use crate::bazel_build_common::isolation::{self, OutsideState};
 use crate::bazel_build_common::probe_report::{self, Report};
 use crate::bazel_build_common::proof::{Anchor, PROBE};
 use crate::bazel_build_common::server::{self, Cell};
+use crate::bazel_build_common::toy;
 use crate::bazel_build_common::workspace::{MODULE_LOCK, PROBE_BZL};
 
 /// `path` with links resolved, so a path Bazel printed compares equal to
@@ -297,6 +300,87 @@ socket_probe(
 )
 "#;
 
+/// The package the toy cell probes the rule in: beside the fixture's own
+/// `//:socket_probe`, so nothing of the fixture changes.
+const PROBE_PACKAGE: &str = "probe_rule";
+
+/// What a `socket_probe` over [`BUILD`] must yield: the file input's bytes
+/// and a directory that holds exactly the tree artifact's one file.
+fn assert_probe_outputs(cell: &Cell, target: &str, server: &str) {
+    let output = |name: &str| cell.probe_output(&cell.options, target, name);
+    let file = std::fs::read(output("data.txt")).expect("read the probe's file output");
+    assert_eq!(file, DATA, "{server} server: file input");
+    let tree = output("tree.dir");
+    assert!(
+        tree.is_dir(),
+        "{server} server: {} is not a directory",
+        tree.display()
+    );
+    assert_eq!(
+        entries(&tree),
+        ["data.txt"],
+        "{server} server: tree contents"
+    );
+    let copied = std::fs::read(tree.join("data.txt")).expect("read the tree's file");
+    assert_eq!(copied, DATA, "{server} server: tree-artifact input");
+}
+
+/// `common/probe.bzl` takes a tree-artifact input (the shape rules_js
+/// hands it) on the toy cell, where nothing leaves the machine on a line
+/// that commits its module archives: Bazel's own modules come from the
+/// committed registry and archives, and the fixture's one package from the
+/// loopback fixture server. Tier 1 holds for the file and for the tree on
+/// a warm and on a restarted server, and the lock the baseline wrote is
+/// the lock a restarted server writes again (`lock_after_rebaseline`: what
+/// a lane compares after a rollback). The standing check of the rule in
+/// the `bazel_core_` row; `bazel_canary_probe_rule_tree_artifact` is the
+/// same probe on any line, through the real registry.
+#[test]
+#[ignore = "real Bazel; run with --ignored"]
+fn bazel_core_probe_rule_takes_a_tree_artifact() {
+    const TEST: &str = "bazel_core_probe_rule_takes_a_tree_artifact";
+    if cfg!(windows) {
+        probe_report::skip_na(&Report::new(TEST), "the tree-artifact maker runs /bin/cp");
+        return;
+    }
+    let Some(toy) = toy::open(TEST, System::Bzlmod, false) else {
+        return;
+    };
+    let cell = &toy.cell;
+    let target = format!("//{PROBE_PACKAGE}:socket_probe");
+    cell.write("tree.bzl", TREE_BZL);
+    cell.write(&format!("{PROBE_PACKAGE}/data.txt"), DATA);
+    cell.write(&format!("{PROBE_PACKAGE}/BUILD.bazel"), BUILD);
+
+    // `//...` and not the probe alone: the fixture's own targets evaluate
+    // the toy extension, so the lock has something to record on every line
+    // (under the committed `file://` registry a 9.3.2 build that evaluates
+    // no extension writes no lock at all).
+    cell.baseline(&["//..."], false);
+    let lock = cell.module_lock();
+    assert!(lock.is_some(), "{TEST}: the baseline wrote no lock");
+    assert_probe_outputs(cell, &target, "warm");
+
+    let again = cell.lock_after_rebaseline(&["//..."], false);
+    assert_probe_outputs(cell, &target, "restarted");
+    assert!(
+        again == lock,
+        "{TEST}: a restarted server wrote another lock for the same commands"
+    );
+
+    // Whatever the fixture server was asked for (the fixture's own toy
+    // package, and the registry where it plays one), it answered.
+    let unanswered: Vec<String> = toy
+        .server
+        .requests()
+        .into_iter()
+        .filter(|request| request.status != 200)
+        .map(|request| request.url)
+        .collect();
+    assert_eq!(unanswered, Vec::<String>::new(), "{TEST}: unanswered");
+    toy.finish();
+}
+
 /// The canary's workspace on a line where `socket_probe` cannot take a
 /// directory input: the file input alone.
 const BUILD_FILE_ONLY: &str = r#"load("//:probe.bzl", "socket_probe")
@@ -328,6 +412,14 @@ fn bazel_canary_probe_rule_tree_artifact() {
     let Some(mut cell) = Cell::open(TEST, Group::Core, None) else {
         return;
     };
+    if env::offline() {
+        // No fixture server and no downloader rewrite here: the build
+        // would reach the real registry in the phase that forbids it.
+        let why = "the canary resolves Bazel's own modules from the real registry; the offline \
+                   phase has bazel_core_probe_rule_takes_a_tree_artifact";
+        probe_report::skip_na(&cell.report, why);
+        return;
+    }
     cell.write("MODULE.bazel", "module(name = \"socket_probe_canary\")\n");
     cell.write("WORKSPACE", "workspace(name = \"socket_probe_canary\")\n");
     cell.write("data.txt", DATA);
