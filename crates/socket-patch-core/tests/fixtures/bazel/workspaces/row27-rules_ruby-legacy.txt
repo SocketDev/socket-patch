@@ -1,0 +1,52 @@
+# Design 4.2 row 27: rules_ruby `rb_bundle` and bazelruby `ruby_bundle`,
+# which run Bundler themselves beside the `Gemfile`.
+
+=== .bazelversion
+7.7.2
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_ruby",
+    strip_prefix = "rules_ruby-0.4.1",
+    url = "https://github.com/bazel-contrib/rules_ruby/releases/download/v0.4.1/rules_ruby-v0.4.1.tar.gz",
+)
+
+load("@rules_ruby//ruby:deps.bzl", "rb_bundle", "rb_register_toolchains")
+
+rb_register_toolchains(version = "system")
+
+rb_bundle(
+    name = "bundle",
+    gemfile = "//app:Gemfile",
+)
+
+load("@bazelruby_rules_ruby//ruby:deps.bzl", "rules_ruby_dependencies", "rules_ruby_select_sdk")
+
+rules_ruby_dependencies()
+
+rules_ruby_select_sdk(version = "3.0.2")
+
+load("@bazelruby_rules_ruby//ruby:defs.bzl", "ruby_bundle")
+
+ruby_bundle(
+    name = "legacy_bundle",
+    gemfile = "//:Gemfile",
+    gemfile_lock = "//:Gemfile.lock",
+)
+=== Gemfile
+source "https://rubygems.org"
+=== Gemfile.lock
+GEM
+  remote: https://rubygems.org/
+  specs:
+=== app/Gemfile
+source "https://rubygems.org"
+=== app/Gemfile.lock
+GEM
+  remote: https://rubygems.org/
+  specs:
+=== app/BUILD.bazel
+

@@ -1,0 +1,24 @@
+# Design 4.2 row 8: legacy `pip_install`, which fails by default from
+# rules_python 0.27.0. Its lock is the `requirements` attribute.
+
+=== .bazelversion
+6.6.0
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_python",
+    strip_prefix = "rules_python-0.26.0",
+    url = "https://github.com/bazelbuild/rules_python/releases/download/0.26.0/rules_python-0.26.0.tar.gz",
+)
+
+load("@rules_python//python:pip.bzl", "pip_install")
+
+pip_install(
+    name = "old",
+    requirements = "//:requirements.txt",
+)
+=== requirements.txt
+six==1.16.0

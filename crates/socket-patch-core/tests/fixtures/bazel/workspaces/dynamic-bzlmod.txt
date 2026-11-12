@@ -1,0 +1,34 @@
+# Dynamic declarations under Bzlmod (design 2.7: a lock label must be one
+# plain string naming a file of the main repository). A computed lock label,
+# a hub name from a function and a `use_extension` whose label is computed:
+# none can be followed, so the model is incomplete and each ecosystem that
+# could be meant is undetermined.
+
+=== .bazelversion
+9.3.2
+=== MODULE.bazel
+module(name = "app")
+
+bazel_dep(name = "aspect_rules_js", version = "3.6.0")
+bazel_dep(name = "rules_jvm_external", version = "7.2")
+
+LOCKS = {"web": "//web:pnpm-lock.yaml"}
+
+npm = use_extension("@aspect_rules_js//npm:extensions.bzl", "npm")
+npm.npm_translate_lock(
+    name = "npm",
+    pnpm_lock = LOCKS["web"],
+)
+use_repo(npm, "npm")
+
+maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+maven.install(
+    name = hub_name("main"),
+    artifacts = ["junit:junit:4.13.2"],
+    lock_file = "//:maven_install.json",
+)
+use_repo(maven, "maven_main")
+=== web/pnpm-lock.yaml
+lockfileVersion: '9.0'
+=== maven_install.json
+{"version": "2", "artifacts": {}}

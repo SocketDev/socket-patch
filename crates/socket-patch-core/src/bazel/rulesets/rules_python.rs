@@ -621,7 +621,7 @@ pub(super) fn unread_module(
 /// hold one, and may turn the lock off. `--registry`, when any line sets
 /// it, is taken for unknown: a family-A lock is then not proven to be
 /// reused, and the declared version stands as a lower bound.
-pub(super) fn module_version(
+pub(in crate::bazel) fn module_version(
     input: &RecognizeInput<'_>,
     module: Option<&str>,
     api_floor: Option<&str>,

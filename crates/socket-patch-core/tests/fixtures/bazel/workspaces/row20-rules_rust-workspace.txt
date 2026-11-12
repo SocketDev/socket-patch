@@ -1,0 +1,43 @@
+# The WORKSPACE signature of rules_rust (design 2.7): `crates_repository`
+# without a `lockfile` (4.2 row 20) and with one (row 19).
+
+=== .bazelversion
+6.6.0
+=== WORKSPACE
+workspace(name = "app")
+
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+
+http_archive(
+    name = "rules_rust",
+    urls = ["https://github.com/bazelbuild/rules_rust/releases/download/0.49.3/rules_rust-v0.49.3.tar.gz"],
+)
+
+load("@rules_rust//crate_universe:defs.bzl", "crates_repository")
+
+crates_repository(
+    name = "crate_index",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+
+crates_repository(
+    name = "pinned",
+    cargo_lockfile = "//tools:Cargo.lock",
+    lockfile = "//tools:cargo-bazel-lock.json",
+    manifests = ["//tools:Cargo.toml"],
+)
+=== Cargo.toml
+[package]
+name = "app"
+version = "0.0.0"
+=== Cargo.lock
+version = 3
+=== tools/Cargo.toml
+[package]
+name = "tools"
+version = "0.0.0"
+=== tools/Cargo.lock
+version = 3
+=== tools/cargo-bazel-lock.json
+{}

@@ -1,0 +1,30 @@
+# The WORKSPACE signature of rules_dotnet (design 2.7): the per-group data
+# file is loaded and its function called.
+
+=== .bazelversion
+7.7.2
+=== WORKSPACE
+workspace(name = "app")
+
+load("@rules_dotnet//dotnet:repositories.bzl", "rules_dotnet_dependencies")
+
+rules_dotnet_dependencies()
+
+load("//deps:paket.main.bzl", "main")
+
+main()
+=== deps/paket.main.bzl
+"GENERATED"
+
+load("@rules_dotnet//dotnet:defs.bzl", "nuget_repo")
+
+def main():
+    "main"
+    nuget_repo(
+        name = "paket.main",
+        packages = [
+            {"name": "SP.Victim", "id": "SP.Victim", "version": "1.0.0", "sha512": "sha512-fIYTuz3T8aSwai2/N4teNgwbFh7YYi50ptRulds1qeLLcwYgoIxuE+QgjpW8w9BHAD6/mKkGH1qAXgEzOV25KA==", "sources": ["https://api.nuget.org/v3/index.json"], "dependencies": {"net8.0": []}, "targeting_pack_overrides": [], "framework_list": []},
+        ],
+    )
+=== deps/BUILD.bazel
+

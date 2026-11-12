@@ -1,0 +1,37 @@
+# Design 4.2 row 13: rules_pycross over `pdm.lock` (2.0 tags) and
+# `lock_file.instantiate` over a generated `.bzl`.
+
+=== .bazelversion
+9.3.2
+=== MODULE.bazel
+bazel_dep(name = "rules_pycross", version = "2.0.1")
+single_version_override(module_name = "rules_pycross", version = "2.0.1")
+
+pdm = use_extension("@rules_pycross//pycross/extensions:pdm.bzl", "pdm")
+pdm.workspace(
+    name = "pdm_deps",
+    lock_file = "//:pdm.lock",
+)
+pdm.repo(
+    dependency_groups = ["default"],
+    workspace = "pdm_deps",
+)
+use_repo(pdm, "pdm_deps")
+
+lock_file = use_extension("@rules_pycross//pycross/extensions:lock_file.bzl", "lock_file")
+lock_file.instantiate(
+    name = "generated",
+    lock_file = "//third_party:lock.bzl",
+)
+use_repo(lock_file, "generated")
+=== pdm.lock
+[metadata]
+lock_version = "4.5.0"
+=== pyproject.toml
+[project]
+name = "app"
+version = "0"
+=== third_party/lock.bzl
+PINS = {}
+=== third_party/BUILD.bazel
+

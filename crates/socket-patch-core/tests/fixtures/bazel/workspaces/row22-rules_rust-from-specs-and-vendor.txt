@@ -1,0 +1,35 @@
+# Design 4.2 rows 22 and 23: a `crate.from_specs` hub, which has no
+# `Cargo.lock`, and a `crates_vendor` target, which is a BUILD rule and so
+# exists under both dependency systems (probe R6).
+
+=== .bazelversion
+9.3.2
+=== MODULE.bazel
+module(name = "app")
+
+bazel_dep(name = "rules_rust", version = "0.75.0")
+
+crate = use_extension("@rules_rust//crate_universe:extensions.bzl", "crate")
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+)
+crate.from_specs(name = "specs")
+use_repo(crate, "crates", "specs")
+=== third_party/BUILD.bazel
+load("@rules_rust//crate_universe:defs.bzl", "crates_vendor")
+
+crates_vendor(
+    name = "crates_vendor",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = ["//:Cargo.toml"],
+    mode = "local",
+    vendor_path = "crates",
+)
+=== Cargo.toml
+[package]
+name = "app"
+version = "0.0.0"
+=== Cargo.lock
+version = 3

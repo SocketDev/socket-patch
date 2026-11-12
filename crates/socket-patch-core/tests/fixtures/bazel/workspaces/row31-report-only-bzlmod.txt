@@ -1,0 +1,37 @@
+# Design 4.2 row 31 under Bzlmod: rules_req_compile, a hand-written
+# `http_jar` pin, and a hub of a module that is not the root (the root
+# imports a repository from an extension it gives no tag).
+
+=== .bazelversion
+9.3.2
+=== MODULE.bazel
+module(name = "app")
+
+bazel_dep(name = "rules_req_compile", version = "1.7.1")
+bazel_dep(name = "rules_python", version = "1.4.1")
+
+requirements = use_extension("@rules_req_compile//extensions:python.bzl", "requirements")
+requirements.parse(
+    name = "req_compile_deps",
+    requirements_locks = {
+        "//3rdparty:requirements.linux_x86_64.txt": "linux_x86_64",
+        "//3rdparty:requirements.macos_aarch64.txt": "macos_aarch64",
+    },
+)
+use_repo(requirements, "req_compile_deps")
+
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+use_repo(pip, "their_pip")
+
+http_jar = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_jar")
+
+http_jar(
+    name = "guava",
+    url = "https://repo1.maven.org/maven2/com/google/guava/guava/33.0.0-jre/guava-33.0.0-jre.jar",
+)
+=== 3rdparty/requirements.linux_x86_64.txt
+six==1.16.0
+=== 3rdparty/requirements.macos_aarch64.txt
+six==1.16.0
+=== 3rdparty/BUILD.bazel
+
