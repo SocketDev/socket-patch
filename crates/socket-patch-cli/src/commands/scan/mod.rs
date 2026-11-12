@@ -1312,20 +1312,83 @@ struct GradleScan {
 /// directories Bazel owns (design 3, HZ-02 and HZ-03).
 const BAZEL_TREE_SKIPPED: &str = BazelCode::WorkspaceOutputTreeSkipped.as_str();
 
-/// The [`BAZEL_TREE_SKIPPED`] detail: which directories below `--cwd`.
-fn bazel_trees_skipped_detail(trees: &[String]) -> String {
+/// A [`BAZEL_TREE_SKIPPED`] detail: how many directories were left out,
+/// `which` ones and what was `not_done` there, then their names relative to
+/// `--cwd`. A repository cache kept in the checkout is one tree per
+/// download, so the first names stand for the rest
+/// ([`spelled_out`](crate::commands::projects_below::spelled_out)): the
+/// note stays one short line however many there are.
+fn bazel_trees_left_out(trees: &[String], which: &str, not_done: &str) -> String {
     let named: Vec<&str> = trees
         .iter()
         .map(|tree| if tree.is_empty() { "." } else { tree })
         .collect();
     format!(
-        "{} below this one {} not searched for projects ({}): Bazel owns {} (an output \
-         base, a cache or a vendor directory), and nothing in one is a project to patch",
+        "{} {which} {} not {not_done} ({}): Bazel owns {} (an output base, a cache or a \
+         vendor directory), and nothing in one is a project to patch",
         plural(trees.len(), "directory", "directories"),
         if trees.len() == 1 { "was" } else { "were" },
-        named.join(", "),
+        crate::commands::projects_below::spelled_out(&named),
         if trees.len() == 1 { "it" } else { "them" },
     )
+}
+
+/// The directories below `--cwd` a search for projects did not enter.
+fn bazel_trees_skipped_detail(trees: &[String]) -> String {
+    bazel_trees_left_out(trees, "below this one", "searched for projects")
+}
+
+/// The directories a PATH glob matched that are not scanned
+/// ([`leave_out_matched_bazel_trees`]).
+fn bazel_trees_matched_detail(trees: &[String]) -> String {
+    bazel_trees_left_out(trees, "a PATH pattern matched", "scanned")
+}
+
+/// The project directories of a PATH list, less the ones a glob matched in
+/// a tree Bazel owns, which are named once in a note.
+///
+/// A glob takes every directory it matches: `*` at a workspace root
+/// matches an output base kept in the checkout, a vendor directory and a
+/// cache beside the projects. A match is a discovered root, and a
+/// discovered root in a tree is left out with a note, as a bare scan
+/// leaves it out. Refusing it (each directory's own run does,
+/// [`refuse_bazel_tree_scope`]) would fail a command that scanned its
+/// projects and exited 0 before.
+///
+/// A directory the user named is theirs to hear about, so it stays and its
+/// run refuses it. So do the matches when they are all the PATHs gave: a
+/// run that scanned nothing must not exit 0.
+async fn leave_out_matched_bazel_trees(
+    common: &GlobalArgs,
+    dirs: Vec<(PathBuf, bool)>,
+) -> Vec<(PathBuf, bool)> {
+    let matched = dirs.iter().filter(|(_, named)| !named);
+    let matched: Vec<PathBuf> = matched.map(|(dir, _)| dir.clone()).collect();
+    if matched.is_empty() {
+        return dirs;
+    }
+    let in_tree = socket_patch_core::patch::shared_store::in_bazel_tree(matched.clone()).await;
+    let trees: HashSet<PathBuf> = matched
+        .into_iter()
+        .zip(in_tree)
+        .filter_map(|(dir, in_tree)| in_tree.then_some(dir))
+        .collect();
+    if trees.is_empty() || trees.len() == dirs.len() {
+        return dirs;
+    }
+    let (left_out, kept): (Vec<_>, Vec<_>) = dirs
+        .into_iter()
+        .partition(|(dir, named)| !named && trees.contains(dir));
+    // Several directories remain or were given, so this is no `--json`
+    // run: its one document takes one directory.
+    if !common.silent && !common.json {
+        let shown = |(dir, _): &(PathBuf, bool)| {
+            crate::commands::projects_below::shown_project_dir(&common.cwd, dir)
+        };
+        let named: Vec<String> = left_out.iter().map(shown).collect();
+        eprintln!("Note: {}", bazel_trees_matched_detail(&named));
+    }
+    kept
 }
 
 /// Refuse a scan whose scope root (`--cwd`, or `--global-prefix`) is in a
@@ -1811,6 +1874,16 @@ async fn run_project_dirs(
             ),
         );
     }
+    // A run over several directories heads each one's output, also when
+    // one is all that is left of them below.
+    let headed = dirs.len() > 1 && !args.common.silent;
+    // Only a PATH glob can match a tree: the search of a bare scan enters
+    // none, so the directories it found need no second look.
+    let dirs = if args.paths.is_empty() {
+        dirs
+    } else {
+        leave_out_matched_bazel_trees(&args.common, dirs).await
+    };
     // One budget per invocation (§5.2): the directories spend it in sorted
     // order, and a package admitted in one is admitted free in the next.
     let configured = match args
@@ -1831,7 +1904,7 @@ async fn run_project_dirs(
     }
     let mut code = 0;
     for (dir, explicit) in &dirs {
-        if dirs.len() > 1 && !args.common.silent {
+        if headed {
             let shown = crate::commands::projects_below::shown_project_dir(&args.common.cwd, dir);
             println!("{}", crate::commands::projects_below::heading(&shown));
         }
@@ -3921,6 +3994,40 @@ async fn scan_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repository cache kept in the checkout is one tree per download:
+    /// the note names the first few and counts the rest, on stderr and in
+    /// `warnings[].detail` alike.
+    #[test]
+    fn a_bazel_tree_note_stays_short_however_many_trees_it_counts() {
+        let cache = ".cache/repo/content_addressable/sha256";
+        let trees: Vec<String> = (0..8_000).map(|n| format!("{cache}/{n:064x}")).collect();
+        let detail = bazel_trees_skipped_detail(&trees);
+        assert!(
+            detail.starts_with("8000 directories below this one were not searched for projects ("),
+            "{detail}"
+        );
+        assert!(detail.contains(&format!("{cache}/{:064x}, and 7990 more): ", 9)));
+        assert!(!detail.contains(&format!("{:064x}", 10)), "{detail}");
+        assert!(detail.len() < 1_500, "{} bytes", detail.len());
+        assert!(!detail.contains('\n'));
+
+        let one = bazel_trees_skipped_detail(&[String::new()]);
+        assert!(
+            one.starts_with(
+                "1 directory below this one was not searched for projects (.): Bazel owns it "
+            ),
+            "{one}"
+        );
+        let matched = bazel_trees_matched_detail(&["out".into(), "vendor_src".into()]);
+        assert!(
+            matched.starts_with(
+                "2 directories a PATH pattern matched were not scanned (out, vendor_src): \
+                 Bazel owns them "
+            ),
+            "{matched}"
+        );
+    }
 
     #[test]
     fn pypi_equivalents_add_spellings_only_for_lockfile_only_pypi_pins() {

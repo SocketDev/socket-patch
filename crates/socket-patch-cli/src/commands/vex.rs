@@ -1948,7 +1948,7 @@ async fn generate_vex_with_cleanup(
 /// at an unrelated file from being destroyed by an unrelated failure.
 /// Removal errors are swallowed: the non-zero exit is the contract, the
 /// deletion is hygiene. Returns whether a document was actually removed.
-async fn remove_stale_vex_doc(path: &Path) -> bool {
+pub(crate) async fn remove_stale_vex_doc(path: &Path) -> bool {
     // FIFO-safe read: `--vex` can name any path, and a plain read of a FIFO
     // there would block this failure path forever.
     let Ok(bytes) = socket_patch_core::utils::fs::read_regular_to_bytes(path).await else {

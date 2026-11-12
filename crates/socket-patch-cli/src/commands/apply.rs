@@ -1202,6 +1202,9 @@ fn refuse_yarn_pnp_with_skips(args: &ApplyArgs, skipped: &[PatchEvent]) -> i32 {
 /// variables) is refused, exit 1. So is `--check` wherever it runs: it is
 /// an audit no hook calls, and passing would say the patches are in place
 /// in a tree nothing was checked in.
+///
+/// The warning leaves no earlier run's `--vex` document behind (the
+/// refusal does, like every `apply` that fails before it attests).
 async fn bazel_tree_preflight(args: &ApplyArgs) -> Option<i32> {
     use socket_patch_core::bazel::codes::Code;
     use socket_patch_core::patch::shared_store::bazel_tree_of;
@@ -1227,11 +1230,30 @@ async fn bazel_tree_preflight(args: &ApplyArgs) -> Option<i32> {
     env.dry_run = common.dry_run;
     if implicit && !args.check {
         let detail = tree.scope_warning();
+        // This run attested nothing, so a document an earlier run left at
+        // `--vex` must not stay there to be read as its own: every other
+        // `apply --vex` that exits 0 wrote the document or removed it. A
+        // dry run changes nothing, a stale document included.
+        let stale = args.vex.vex.as_deref().filter(|_| !common.dry_run);
+        let removed = match stale {
+            Some(path) if crate::commands::vex::remove_stale_vex_doc(path).await => Some(format!(
+                "Removed the previous VEX document at {} (this run patched nothing, so \
+                     it attests nothing).",
+                path.display()
+            )),
+            _ => None,
+        };
         if common.json {
             env.warn(Code::WorkspaceInsideOutputTree.as_str(), detail);
+            if let Some(removed) = removed {
+                env.warn("vex_stale_doc_removed", removed);
+            }
             println!("{}", env.to_pretty_json());
         } else if !common.silent {
             eprintln!("Warning: {detail}");
+            if let Some(removed) = removed {
+                eprintln!("Warning: {removed}");
+            }
         }
         return Some(0);
     }
@@ -4898,6 +4920,31 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A nested apply (`get`, `scan --mode agent`) reports the refusal to
+    /// write into a tree Bazel owns under its own code, as the standalone
+    /// event does, and a patch that did not fit beside it stays generic.
+    #[test]
+    fn collect_apply_failures_codes_a_bazel_tree_refusal() {
+        use socket_patch_core::bazel::codes::Code;
+        use socket_patch_core::bazel::output_tree::PathClass;
+        use socket_patch_core::patch::shared_store::{SharedStore, SharedStoreKind};
+        let store = SharedStore {
+            kind: SharedStoreKind::BazelTree(PathClass::OutputBase),
+            real_path: PathBuf::from("/b/external/npm/node_modules/a"),
+        };
+        let refusal = store.refusal("patch");
+        let results = vec![
+            failed_result("pkg:npm/a@1.0.0", Some(&refusal)),
+            failed_result("pkg:npm/b@1.0.0", Some("hash mismatch")),
+        ];
+        let failures = collect_apply_failures(&results, &[], &HashSet::new());
+        let codes: Vec<&str> = failures.iter().map(|f| f.code.as_str()).collect();
+        assert_eq!(codes, [Code::AgentOutputTree.as_str(), "apply_failed"]);
+        assert_eq!(failures[0].error, refusal);
+        let event = result_to_event(&results[0], false);
+        assert_eq!(event.error_code.as_deref(), Some(failures[0].code.as_str()));
     }
 
     #[test]
