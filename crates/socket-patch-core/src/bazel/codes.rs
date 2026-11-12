@@ -11,8 +11,11 @@
 //!   does not have;
 //! - a string literal of one of the five families (`bazel_workspace_`,
 //!   `bazel_agent_`, `redirect_bazel_`, `vendor_bazel_`, `vex_bazel_`) is
-//!   in production source outside this file. There is no bare `bazel_`
-//!   family, so `"bazel_dep"` in a reader is not a code.
+//!   in production source outside this file: a whole code, or the bare
+//!   prefix that `format!` or `starts_with` would build or match one
+//!   from. Production source is a whole file but its inline test modules.
+//!   There is no bare `bazel_` family, so `"bazel_dep"` in a reader is
+//!   not a code.
 //!
 //! Hosted and vendored refusals share one [`Reason`]: the code is the
 //! mode's prefix plus the reason ([`Code::refusal`]), and the refusal's
@@ -30,24 +33,55 @@
 //!
 //! with every token it emits as a string literal (`model::TOKENS` is the
 //! first such list). The contract test finds the lists by source scan, so
-//! the declaration is spelled exactly like this, and requires each token
-//! in the token table of the contract section; a `token: "..."` literal
-//! that is not in its file's list fails there too. The table starts with
-//! the whole list of design 6, so a lane's tokens are documented before
-//! the lane lands. A token that is not in the table is a contract change
-//! and goes through the wave's steward, like a new code.
+//! the declaration is spelled exactly like this, every item is a string
+//! literal and nothing else in a Bazel file is named `*TOKENS*`. The test
+//! requires each token in the token table of the contract section. An
+//! emission site names a token in one of two ways, and both are checked:
+//! a `token: "..."` literal must be in its file's list, and a constant in
+//! `token: NAME` must be declared as an item of a list,
+//!
+//! ```text
+//! pub const LANE_NOT_ENABLED: &str = TOKENS[0];
+//! ```
+//!
+//! in any Bazel module. The table starts with the whole list of design 6,
+//! so a lane's tokens are documented before the lane lands. A token that
+//! is not in the table is a contract change and goes through the wave's
+//! steward, like a new code.
+//!
+//! The scan reads spellings, so it does not see a token that reaches a
+//! `token` field through a variable, a parameter or the field shorthand.
+//! Only a type closes that: the fields are `&'static str` (design 2.3),
+//! and a `Token` type declared here beside [`Code`] is a change to the
+//! model for a wave's steward to decide.
+//!
+//! # Levels
+//!
+//! A [`Level`] is the prefix of a code's line for a human: `Note:` or
+//! `Warning:`. It is not a JSON field. Design 6 heads the run-level table
+//! "`warnings[]`, with `level`", but the v5.0 envelope has no such field:
+//! a run-level warning is `{code, detail}` (the CLI crate's `RunWarning`),
+//! and v5.0 removed the `level` the Gradle discovery notes once carried.
+//! The contract section therefore documents the Level column as the
+//! human prefix, and gives the run-required advisory no `details` object:
+//! its detail text names the command and the platforms. Nothing is
+//! emitted yet, so the choice is open until the first code becomes
+//! `active`: either this stands, or the envelope gains optional `level`
+//! and `details` fields on `RunWarning` and the contract's envelope text
+//! changes with it.
 
 use std::fmt;
 
-use super::model::{Mode, Reason, WithholdKind};
+use super::model::{Mode, Reason, RunKind, WithholdKind};
 
-/// How loud a code is: the `level` field of a run-level or advisory
-/// `warnings[]` entry, and the prefix of a code's line for a human.
+/// How loud a code is: the prefix of its line for a human, and the Level
+/// column of the contract. A `warnings[]` entry does not carry it (module
+/// docs, "Levels").
 ///
 /// The level in the table below is a floor. A caller may raise `Info` to
-/// `Warn` (the run-required advisory after a rollback under
-/// `--lockfile_mode=error`, where builds fail until the command has run)
-/// and never lowers a `Warn`: evidence only escalates.
+/// `Warn` and never lowers a `Warn`: evidence only escalates. The one
+/// raise the contract names is the run-required advisory's
+/// ([`Level::of_required_run`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
     /// Nothing to do. Printed as `Note:`, which `--silent` hides.
@@ -58,11 +92,30 @@ pub enum Level {
 }
 
 impl Level {
-    /// The value of the `level` field.
+    /// The word in the contract's Level column.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Info => "info",
             Self::Warn => "warn",
+        }
+    }
+
+    /// The level of a `*_bazel_run_required` advisory whose command is of
+    /// `kind`. `builds_fail` says that builds fail until the command has
+    /// run, as after a restoring edit under `--lockfile_mode=error`.
+    ///
+    /// It is a note only while Bazel heals the state by itself: an
+    /// ordinary build refreshes `MODULE.bazel.lock`, and the command only
+    /// makes the committed lock current. The advisory that does not gate
+    /// `vex` (lockfile facts that may be stale) is of that kind. It is a
+    /// warning when builds fail, and for the two kinds that no build
+    /// refreshes: until the user runs `update-repos` Bazel keeps building
+    /// from the old `go_repository` rule, so the build does not get the
+    /// patch, and until a repin the crate lock digest fails the build.
+    pub const fn of_required_run(kind: RunKind, builds_fail: bool) -> Level {
+        match kind {
+            RunKind::Lockfile if !builds_fail => Self::Info,
+            RunKind::Lockfile | RunKind::UpdateRepos | RunKind::Repin => Self::Warn,
         }
     }
 }
@@ -73,8 +126,8 @@ impl Level {
 pub enum Kind {
     /// One `warnings[]` entry about the workspace as a whole.
     RunLevel,
-    /// A warning of the in-memory hosted engine, whose warnings carry no
-    /// `level`.
+    /// A warning of the in-memory hosted engine, which prints no line for
+    /// a human: the contract gives it no level.
     EngineWarning,
     /// Rides a run that went on: what the run does not cover, or the one
     /// command to run next.
@@ -109,9 +162,10 @@ macro_rules! codes {
                 match self { $(Code::$variant => Kind::$kind),+ }
             }
 
-            /// The lowest level the code is reported at. Only a run-level
-            /// entry or an advisory carries it as a `level` field; for the
-            /// other kinds it is `Warn`, so none is ever printed as a note.
+            /// The lowest level the code is reported at. The contract
+            /// has a level cell only for a run-level code or an advisory;
+            /// for the other kinds it is `Warn`, so none is ever printed
+            /// as a note.
             pub const fn level(self) -> Level {
                 match self { $(Code::$variant => Level::$level),+ }
             }
@@ -242,7 +296,9 @@ codes! {
     // ── Advisories ───────────────────────────────────────────────────
     /// Wired, and one named command refreshes committed Bazel state; also
     /// after a restoring edit that stales state socket-patch cannot
-    /// repair. Raised to `Warn` when builds fail until the command ran.
+    /// repair. `Info` is the floor: [`Level::of_required_run`] raises it
+    /// to `Warn` when, until the command has run, builds fail or the
+    /// Bazel build does not get the patch.
     RedirectRunRequired = "redirect_bazel_run_required", Advisory, Info;
     /// Vendored twin of [`Code::RedirectRunRequired`].
     VendorRunRequired = "vendor_bazel_run_required", Advisory, Info;
@@ -470,10 +526,30 @@ mod tests {
             let stops = !matches!(code.kind(), Kind::RunLevel | Kind::Advisory);
             assert!(!stops || code.level() == Level::Warn, "{code} is a note");
         }
-        // A caller escalates with `max`; the field values are the contract's.
+        // A caller escalates with `max`; the words are the contract's.
         assert_eq!(Level::Info.max(Level::Warn), Level::Warn);
         let levels = [Level::Info, Level::Warn].map(Level::as_str);
         assert_eq!(levels, ["info", "warn"]);
+    }
+
+    /// The run-required advisory is the one advisory whose level depends
+    /// on the run, so the loop above cannot hold it to the rule. It is a
+    /// note only while an ordinary build heals the state by itself. Where
+    /// builds fail, or Bazel keeps building upstream until the user runs
+    /// the command (a WORKSPACE `go_repository` hub), `--silent` must not
+    /// hide it.
+    #[test]
+    fn a_required_run_the_build_waits_for_is_never_a_note() {
+        let floor = Code::RedirectRunRequired.level();
+        assert_eq!(floor, Level::Info);
+        assert_eq!(Code::VendorRunRequired.level(), floor);
+        for kind in RunKind::ALL {
+            let heals = *kind == RunKind::Lockfile;
+            let passing = Level::of_required_run(*kind, false);
+            assert_eq!(passing == Level::Info, heals, "{kind:?}");
+            assert_eq!(Level::of_required_run(*kind, true), Level::Warn);
+            assert!(passing >= floor, "{kind:?} is below the code's floor");
+        }
     }
 
     /// A code's kind is where a script finds it, so the split is pinned to
