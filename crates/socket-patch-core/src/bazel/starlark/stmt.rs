@@ -348,7 +348,8 @@ pub struct Binding {
     /// Where the name is written.
     pub span: Span,
     pub kind: BindingKind,
-    /// On an unindented line, so not inside a function or block body.
+    /// Not inside a function or block body: on an unindented line, and
+    /// not what a `def` or block assigns on its own line (`def f(): x = 1`).
     pub top_level: bool,
 }
 
@@ -956,10 +957,14 @@ impl<'a> Reader<'a> {
     fn bindings(&self, lines: &[Line]) -> Result<Vec<Binding>, Unreadable> {
         let mut out = Vec::new();
         for line in lines {
+            // What a `def` or block line assigns after its colon
+            // (`def f(): x = 1`) is bound in its body, like an indented line.
+            let block = BLOCKS.iter().any(|kw| self.is_kw(line.first, kw));
+            let body = block || self.is_kw(line.first, "def");
             let binding = |span: Span, kind: BindingKind| Binding {
                 span,
                 kind,
-                top_level: line.indent == 0,
+                top_level: line.indent == 0 && !(body && kind == BindingKind::Assign),
             };
             for (a, b) in self.split(line.first, line.end, 0, ";").0 {
                 if self.is_kw(a, "load") {
@@ -1531,102 +1536,83 @@ def _one(): return go_repository(name = "inline")
         assert_eq!(call.positional().count(), 2);
     }
 
-    /// Probe S1c (`starlark-include/s1/syntax-<version>.json`): the root
-    /// `MODULE.bazel` of each row, and what Bazel does with it.
+    /// What makes an `include` exact. Bazel checks the shape on the syntax
+    /// tree before it runs anything (`CompiledModuleFile`, read at 7.7.2
+    /// and 9.3.2): one positional string literal, then at most
+    /// `dev_dependency = True | False`. The rows probe S1c ran through
+    /// Bazel are the fixture `s1c/`
+    /// (`s1c_include_rows_agree_with_what_bazel_accepts`); these are the
+    /// shapes around them. A statement that is not exact is still an
+    /// include statement the query returns: reported, never skipped.
     #[test]
-    fn include_rows_of_probe_s1c() {
+    fn an_include_is_exact_only_in_the_shape_bazel_checks_for() {
         const PKG: &str = "//.socket/bazel:socket-patch.MODULE.bazel";
-        let rows = [
-            // Accepted from 7.2.0.
+        let quoted = format!("\"{PKG}\"");
+        for (args, want) in [
+            (quoted.clone(), Some((PKG, false))),
             (
-                "ok-baseline",
-                format!("include(\"{PKG}\")\n"),
-                Some((PKG, false)),
-            ),
-            (
-                "single-quotes",
-                format!("include('{PKG}')\n"),
-                Some((PKG, false)),
-            ),
-            (
-                "trailing-comma-multiline",
-                format!("include(\n    \"{PKG}\",\n)\n"),
-                Some((PKG, false)),
-            ),
-            (
-                "trailing-comment",
-                format!("include(\"{PKG}\")  # socket-patch\n"),
-                Some((PKG, false)),
-            ),
-            // Bazel's parser folds the `+`, so this is a legal include a
-            // reader of single tokens would miss.
-            (
-                "nonliteral-concat",
-                "include(\"//.socket/bazel:\" + \"socket-patch.MODULE.bazel\")\n".to_string(),
-                Some((PKG, false)),
-            ),
-            // Accepted on 9.3.2 and 10.0.0rc3 only; under
-            // `--ignore_dev_dependency` the segment is skipped.
-            (
-                "dev_dependency-True",
-                format!("include(\"{PKG}\", dev_dependency = True)\n"),
+                format!("{quoted}, dev_dependency = True"),
                 Some((PKG, true)),
             ),
             (
-                "dev_dependency-False",
-                format!("include(\"{PKG}\", dev_dependency = False)\n"),
+                format!("{quoted}, dev_dependency = False,"),
                 Some((PKG, false)),
             ),
             (
-                "dev_dependency-True+ignore_dev",
-                format!("include(\"{PKG}\", dev_dependency = True)\n"),
-                Some((PKG, true)),
+                "\"//.socket/bazel:\" + 'socket-patch' + \".MODULE.bazel\"".to_string(),
+                Some((PKG, false)),
             ),
-            // Rejected by every Bazel that has `include`: never exact.
+            // `dev_dependency` must be a boolean literal, given once.
+            (format!("{quoted}, dev_dependency = DEV"), None),
+            (format!("{quoted}, dev_dependency = 1"), None),
+            (format!("{quoted}, dev_dependency = not False"), None),
             (
-                "nonliteral-variable",
-                format!("SEG = \"{PKG}\"\n\ninclude(SEG)\n"),
+                format!("{quoted}, dev_dependency = True, dev_dependency = True"),
                 None,
             ),
-            (
-                "keyword-label",
-                format!("include(label = \"{PKG}\")\n"),
-                None,
-            ),
-            (
-                "dev-not-literal",
-                format!("include(\"{PKG}\", dev_dependency = DEV)\n"),
-                None,
-            ),
-            (
-                "unknown-keyword",
-                format!("include(\"{PKG}\", isolate = True)\n"),
-                None,
-            ),
-        ];
-        for (row, body, want) in rows {
-            let src = format!("module(name = \"s1\", version = \"0.0.0\")\n\n{body}");
+            // Nothing else is an argument of `include`.
+            (format!("{quoted}, isolate = True"), None),
+            (format!("{quoted}, \"//:other.MODULE.bazel\""), None),
+            (format!("{quoted}, True"), None),
+            (format!("{quoted}, *REST"), None),
+            (format!("{quoted}, **{{\"dev_dependency\": True}}"), None),
+            // The label is the first argument, positional.
+            (String::new(), None),
+            ("dev_dependency = True".to_string(), None),
+            (format!("label = {quoted}"), None),
+            (format!("*[{quoted}]"), None),
+            // A label Bazel may take and this reader has no value for.
+            (format!("\"\"{quoted}\"\""), None),
+            (format!("r{quoted}"), None),
+            (format!("({quoted})"), None),
+            ("\"//.socket/bazel:\" + NAME".to_string(), None),
+            ("\"//.socket/bazel:%s\" % NAME".to_string(), None),
+            ("\"//.socket/bazel:\" \"x.MODULE.bazel\"".to_string(), None),
+        ] {
+            let src = format!("module(name = \"s1\", version = \"0.0.0\")\n\ninclude({args})\n");
             let file = module(&src);
-            let includes = file.calls("include").exact().expect(row);
+            let includes = file.calls("include").exact().expect(&args);
             let [Stmt {
                 kind: StmtKind::Include(include),
                 ..
             }] = includes[..]
             else {
-                panic!("{row}: not one include")
+                panic!("{args}: not one include")
             };
-            assert_eq!(include.exact(), want, "{row}");
+            assert_eq!(include.exact(), want, "{args}");
         }
+        // The comment after an include stays with it.
         let src = format!("include(\"{PKG}\")  # socket-patch\n");
         let trailing = module(&src);
         let comment = trailing.stmts[0].trailing.expect("comment kept");
         assert_eq!(trailing.bytes(comment), b"# socket-patch");
-        // `assigned-result` and `indented-include`: Bazel rejects both.
-        // The first is no include statement, and the query says so.
+        // An include whose result is assigned is no include statement
+        // (Bazel rejects it), and the query says so.
         let src = format!("x = include(\"{PKG}\")\n");
         let assigned = module(&src);
         let calls = assigned.calls("include").exact().unwrap();
         assert!(matches!(calls[0].kind, StmtKind::Bind { .. }));
+        // An indented include is the indentation error Bazel reports.
         let indented = format!("module(name = \"s1\")\n\n  include(\"{PKG}\")\n");
         assert_eq!(
             refusal(&indented, Dialect::Module),
@@ -1839,6 +1825,43 @@ def _one(): return go_repository(name = "inline")
             let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "x"];
             let uses: Vec<&str> = names.into_iter().filter(is_used).collect();
             assert_eq!(uses.join(" "), used, "{src}");
+        }
+    }
+
+    /// What a `def` or block assigns on its own line is bound in its body,
+    /// exactly as on an indented line: it is no top-level binding, so a
+    /// name with only such a binding does not mean one thing at the top
+    /// of the file, and another function does not see it.
+    #[test]
+    fn a_one_line_body_binds_in_the_body_and_not_at_the_top() {
+        for src in [
+            "def f(): native = 1; g = 2\nnative.bind(name = \"x\")\n",
+            "def f():\n    native = 1; g = 2\nnative.bind(name = \"x\")\n",
+        ] {
+            let file = read(src.as_bytes(), Dialect::Bzl).unwrap();
+            let top: Vec<bool> = file.bindings.iter().map(|b| b.top_level).collect();
+            assert_eq!(top, [true, false, false], "{src}");
+            let tags = file.tags("native");
+            assert_eq!((tags.seen().len(), whys(&tags)), (1, vec![Why::Rebound]));
+        }
+        for src in ["if x: y = 1\n", "for a in b: y = a\n", "while x: y = 1\n"] {
+            let file = read(src.as_bytes(), Dialect::Bzl).unwrap();
+            let y = file.uses("y").bindings;
+            assert_eq!(y.len(), 1, "{src}");
+            assert!(!y[0].top_level, "{src}");
+        }
+        // The `def` itself, and a plain assignment, are bound at the top.
+        let file = read(b"def f(): pass\nx = 1; y = 2\n", Dialect::Bzl).unwrap();
+        assert!(file.bindings.iter().all(|b| b.top_level));
+        // A local of one function is not a binding inside another.
+        for local in [
+            "def f(): go_repository = None\n",
+            "def f():\n    go_repository = None\n",
+        ] {
+            let src = format!("{local}def deps():\n    go_repository(name = \"a\")\n");
+            let file = read(src.as_bytes(), Dialect::Bzl).unwrap();
+            let uses = file.uses_in(&file.stmts[1], "go_repository");
+            assert_eq!((uses.bindings.len(), uses.calls.len()), (0, 1), "{src}");
         }
     }
 
