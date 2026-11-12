@@ -729,6 +729,12 @@ struct RestoreWalk {
 /// [`SCOPE_SKIPPED_DIRS`] are not entered, nor `skip` or a package folder
 /// a restore already named (package stores, not project trees); more than
 /// [`SCOPE_DIR_BUDGET`] directories also means `None`.
+///
+/// Nor is a tree Bazel owns below `cwd` (design 2.11: an output base kept
+/// in the checkout, a Bazel vendor directory, a cache entry). The project
+/// files and restores in one belong to repositories Bazel fetched or to a
+/// copy it built, and the folders they name are not this project's. Only
+/// a directory whose listing names a marker costs a `stat`.
 fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
     let mut walk = RestoreWalk {
         package_folders: Vec::new(),
@@ -738,7 +744,8 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
     // Absolute, so `skip` and the restores' (absolute) package folders
     // compare against the walked paths.
     let root = std::path::absolute(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    let mut pending = vec![root];
+    let bazel = super::bazel_output::Classifier::new();
+    let mut pending = vec![root.clone()];
     let mut listed = 0usize;
     while let Some(dir) = pending.pop() {
         // A store a restore named after `dir` was queued.
@@ -751,6 +758,16 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
             break;
         }
         let (entries, complete) = super::listing::list_dir_sync_complete(&dir);
+        let files = entries
+            .iter()
+            .filter(|entry| !entry.file_type.is_some_and(|kind| kind.is_dir()));
+        let bazel_trees = bazel.trees_marked_by(&dir, files.map(|entry| entry.name.as_os_str()));
+        let is_bazel_tree = |at: &Path| bazel_trees.iter().any(|tree| tree.root == at);
+        // `cwd` itself is the caller's to judge, like the scan root of
+        // every other walk.
+        if dir != root && is_bazel_tree(&dir) {
+            continue;
+        }
         if !complete {
             walk.libraries = None;
         }
@@ -772,6 +789,7 @@ fn restore_walk(cwd: &Path, skip: &[PathBuf]) -> RestoreWalk {
                 if !name.starts_with('.')
                     && !SCOPE_SKIPPED_DIRS.contains(&name)
                     && !skip.contains(&sub)
+                    && !is_bazel_tree(&sub)
                 {
                     subdirs.push(sub);
                 }
@@ -2801,5 +2819,69 @@ mod tests {
             walk.libraries,
             Some(vec![("Newtonsoft.Json".to_string(), "13.0.3".to_string())])
         );
+    }
+
+    /// A tree Bazel owns below the project is not walked (design 3,
+    /// HZ-02): the restores in an output base kept in the checkout, in a
+    /// Bazel vendor directory and in a cache entry belong to fetched
+    /// repositories. Entered, each would add its package folders to the
+    /// crawl and its unrestored project files would drop the scope.
+    #[test]
+    fn restore_walk_does_not_enter_a_bazel_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        let restore = |project: &str, folder: &str, library: &str| {
+            write(&format!("{project}/App.csproj"), "<Project/>");
+            let assets = serde_json::json!({
+                "libraries": { library: { "type": "package" } },
+                "packageFolders": { root.join(folder).to_string_lossy(): {} }
+            });
+            write(
+                &format!("{project}/obj/project.assets.json"),
+                &assets.to_string(),
+            );
+        };
+        restore("src/app", "own", "Newtonsoft.Json/13.0.3");
+        // A base after `clean` and a build: one marker, no `execroot` marker.
+        write("out/DO_NOT_BUILD_HERE", "/ws");
+        restore("out/external/rules_dotnet~/tools", "base", "Paket/8.0.0");
+        write(
+            "out/external/rules_dotnet~/unrestored/Lib.csproj",
+            "<Project/>",
+        );
+        write("vendor_src/VENDOR.bazel", "");
+        restore("vendor_src/+nuget+dep", "vendored", "Serilog/3.0.0");
+        write("third_party/.vendorignore", "");
+        write("third_party/rules_x~/Old.csproj", "<Project/>");
+        write("cache/contents/cd12/26ed.recorded_inputs", "cd12\n");
+        restore("cache/contents/cd12/26ed", "cached", "NUnit/4.0.0");
+        // Named like a marker, with nothing of a base beside it.
+        write("notes/DO_NOT_BUILD_HERE", "");
+        restore("notes", "noted", "Moq/4.20.0");
+
+        let walk = restore_walk(root, &[]);
+        let mut folders = walk.package_folders.clone();
+        folders.sort();
+        assert_eq!(folders, [root.join("noted"), root.join("own")]);
+        let mut libraries = walk.libraries.expect("every project left is restored");
+        libraries.sort();
+        let named = |id: &str, version: &str| (id.to_string(), version.to_string());
+        assert_eq!(
+            libraries,
+            [named("Moq", "4.20.0"), named("Newtonsoft.Json", "13.0.3")]
+        );
+
+        // The directory the caller names is walked whatever it is: the
+        // run's scope root is the caller's to judge.
+        let vendored = restore_walk(&root.join("vendor_src"), &[]);
+        assert_eq!(vendored.package_folders, [root.join("vendored")]);
+        // Without its marker a directory is walked like any other.
+        std::fs::remove_file(root.join("third_party/.vendorignore")).unwrap();
+        assert_eq!(restore_walk(root, &[]).libraries, None);
     }
 }

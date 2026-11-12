@@ -53,9 +53,20 @@
 //! containment rule, not a list of stores: a layout nobody has seen yet
 //! is refused rather than written through.
 //!
+//! One more place is never ours to write, whatever is linked into it: a
+//! tree Bazel owns ([`SharedStoreKind::BazelTree`]). An output base, the
+//! repo contents cache, the repository cache and a Bazel vendor directory
+//! hold copies of packages in every ecosystem's layout, and Bazel replaces
+//! them or shares them between workspaces without a message. They are
+//! known by the markers Bazel writes (`crawlers::bazel_output`), never by
+//! a name.
+//!
 //! [`containment::resolves_within`]: crate::utils::containment::resolves_within
 
 use std::path::{Path, PathBuf};
+
+use crate::bazel::output_tree::PathClass;
+use crate::crawlers::bazel_output::Classifier;
 
 /// The substring every shared-store refusal carries, so callers and tests
 /// can recognize it without matching the full sentence.
@@ -68,6 +79,16 @@ pub const LINKED_SOURCE_REFUSAL_MARKER: &str = "outside every node_modules tree"
 /// The substring every out-of-install-tree refusal carries (see
 /// [`SharedStoreKind::OutsideInstallTree`]).
 pub const OUTSIDE_INSTALL_TREE_REFUSAL_MARKER: &str = "outside the install tree";
+
+/// The substring every Bazel-tree refusal and warning carries (see
+/// [`SharedStoreKind::BazelTree`]).
+pub const BAZEL_TREE_REFUSAL_MARKER: &str = "owned by Bazel";
+
+/// Why nothing is written into a Bazel tree, and what to do instead.
+const BAZEL_TREE_WHY: &str = "That tree is owned by Bazel, which creates and replaces what is \
+     in it: a change written there is lost on a later build, or reaches every workspace that \
+     shares it. Run socket-patch from the Bazel workspace root, or use `socket-patch scan \
+     --mode hosted` there";
 
 /// The `action` [`SharedStore::refusal`] is given by rollback.
 pub const ROLL_BACK_ACTION: &str = "roll back";
@@ -89,6 +110,25 @@ pub enum SharedStoreKind {
     /// found in: a Composer path repository's link into first-party
     /// source, or a directory linked out of the package.
     OutsideInstallTree,
+    /// A tree Bazel owns (design 2.11): an output base, an entry of the
+    /// repo contents cache or of the repository cache, a vendor directory,
+    /// or a link into one of them. The class says which. A write there is
+    /// undone by the next build, or reaches every workspace that shares
+    /// the cache, and either way a manifest would record a patch the
+    /// build does not contain.
+    BazelTree(PathClass),
+}
+
+/// Where a path in a Bazel tree of `class` is, as the words after "it is".
+fn bazel_tree_place(class: PathClass) -> &'static str {
+    match class {
+        PathClass::OutputBase => "in a Bazel output base",
+        PathClass::RepoContentsCache => "in Bazel's repository contents cache",
+        PathClass::RepositoryCache => "in Bazel's repository cache",
+        PathClass::VendorDir => "in a Bazel vendor directory",
+        // `Plain` is never stored in a `BazelTree`.
+        PathClass::Link | PathClass::Plain => "a link into a Bazel output tree",
+    }
 }
 
 /// Where a package directory really lives, when that is a shared store.
@@ -139,6 +179,14 @@ impl SharedStore {
                     path = self.real_path.display(),
                 );
             }
+            SharedStoreKind::BazelTree(class) => {
+                return format!(
+                    "Refusing to {action} {path}: it is {place}. {BAZEL_TREE_WHY}; nothing \
+                     was written",
+                    path = self.real_path.display(),
+                    place = bazel_tree_place(class),
+                );
+            }
             SharedStoreKind::LinkedSource => {
                 return format!(
                     "Refusing to {action} {path}: node_modules links to it, but it is \
@@ -159,6 +207,58 @@ impl SharedStore {
             path = self.real_path.display(),
         )
     }
+
+    /// The refusal for a run whose scope root is in a Bazel tree: the
+    /// directory it would `action` ("scan", "apply") in, `named_by` the
+    /// flag that chose it. Nothing is read or crawled there either: what a
+    /// run found in such a tree it would report as installed.
+    pub fn scope_refusal(&self, action: &str, named_by: &str) -> String {
+        format!(
+            "Refusing to {action} in {path} ({named_by}): it is {place}. {BAZEL_TREE_WHY}; \
+             nothing was written",
+            path = self.real_path.display(),
+            place = self.bazel_place(),
+        )
+    }
+
+    /// The warning of an `apply` that found its working directory in a
+    /// Bazel tree and did nothing. It is not a refusal: a legacy ruleset
+    /// runs `apply` there from a lifecycle hook, and a failure would fail
+    /// the repository rule and every target behind it.
+    pub fn scope_warning(&self) -> String {
+        format!(
+            "`socket-patch apply` patched nothing: its working directory {path} is {place}. \
+             {BAZEL_TREE_WHY}",
+            path = self.real_path.display(),
+            place = self.bazel_place(),
+        )
+    }
+
+    fn bazel_place(&self) -> &'static str {
+        match self.kind {
+            SharedStoreKind::BazelTree(class) => bazel_tree_place(class),
+            _ => bazel_tree_place(PathClass::Plain),
+        }
+    }
+}
+
+/// The Bazel tree a run's scope root is in or links into: its `--cwd` or
+/// its `--global-prefix` (design 3, HZ-02). `None` for a directory outside
+/// every such tree, which is every directory of a project that does not
+/// build with Bazel. A run that gets `Some` neither crawls nor writes
+/// there ([`SharedStore::scope_refusal`], [`SharedStore::scope_warning`]).
+pub async fn bazel_tree_of(scope_root: &Path) -> Option<SharedStore> {
+    let scope_root = scope_root.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let class = Classifier::new().classify(&scope_root).class;
+        (class != PathClass::Plain).then(|| SharedStore {
+            kind: SharedStoreKind::BazelTree(class),
+            real_path: std::fs::canonicalize(&scope_root).unwrap_or(scope_root),
+        })
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Classify `pkg_path`: `Some` when its real location is inside a shared
@@ -169,10 +269,12 @@ pub async fn shared_store_of(
     pkg_path: &Path,
 ) -> Option<SharedStore> {
     let pkg_path = pkg_path.to_path_buf();
-    tokio::task::spawn_blocking(move || shared_store_of_blocking(scope, &pkg_path))
-        .await
-        .ok()
-        .flatten()
+    tokio::task::spawn_blocking(move || {
+        shared_store_of_blocking(scope, &Classifier::new(), &pkg_path)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Classify every directory a patch writes into: `pkg_path` itself and
@@ -196,6 +298,9 @@ pub async fn shared_store_of_patch_dirs<'a>(
         .map(str::to_string)
         .collect();
     tokio::task::spawn_blocking(move || {
+        // One classifier for the package: its directories share ancestors,
+        // which are then judged once.
+        let bazel = Classifier::new();
         let mut seen = std::collections::HashSet::new();
         let dirs = std::iter::once(pkg_path.clone()).chain(keys.iter().filter_map(|key| {
             let mut dir = pkg_path.join(key).parent()?.to_path_buf();
@@ -205,7 +310,8 @@ pub async fn shared_store_of_patch_dirs<'a>(
             Some(dir)
         }));
         dirs.filter(|dir| seen.insert(dir.clone())).find_map(|dir| {
-            shared_store_of_blocking(scope, &dir).or_else(|| outside_install_tree(&pkg_path, &dir))
+            shared_store_of_blocking(scope, &bazel, &dir)
+                .or_else(|| outside_install_tree(&pkg_path, &dir))
         })
     })
     .await
@@ -215,9 +321,20 @@ pub async fn shared_store_of_patch_dirs<'a>(
 
 fn shared_store_of_blocking(
     scope: crate::utils::repo_root::ReadScope,
+    bazel: &Classifier,
     pkg_path: &Path,
 ) -> Option<SharedStore> {
     let real = std::fs::canonicalize(pkg_path).ok()?;
+    // Bazel's trees first, in every read scope and for every ecosystem's
+    // layout: whichever store a package manager linked into one of them,
+    // nothing there is an installed copy a reinstall gives back.
+    let class = bazel.classify(pkg_path).class;
+    if class != PathClass::Plain {
+        return Some(SharedStore {
+            kind: SharedStoreKind::BazelTree(class),
+            real_path: real,
+        });
+    }
     for dir in real.ancestors() {
         let Some(name) = dir.file_name().and_then(|n| n.to_str()) else {
             continue;
@@ -1325,5 +1442,245 @@ mod tests {
         assert!(msg.contains(LINKED_SOURCE_REFUSAL_MARKER), "{msg}");
         assert!(msg.contains("/ws/packages/left-pad"), "{msg}");
         assert!(!msg.contains(SHARED_STORE_REFUSAL_MARKER), "{msg}");
+    }
+
+    // ── Bazel trees (design 3, HZ-02) ────────────────────────────────────
+
+    use crate::utils::repo_root::ReadScope;
+
+    /// Creates `files` (empty) under `root`, with their directories; a
+    /// path that ends in `/` is a directory.
+    fn lay(root: &Path, files: &[&str]) {
+        for file in files {
+            let path = root.join(file);
+            if file.ends_with('/') {
+                std::fs::create_dir_all(&path).unwrap();
+            } else {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, b"").unwrap();
+            }
+        }
+    }
+
+    /// The kind of the store `shared_store_of_patch_dirs` finds for a
+    /// patch of `keys` in `pkg`, in each read scope: the two must agree.
+    async fn kind_of(pkg: &Path, keys: &[&str]) -> Option<SharedStoreKind> {
+        let mut kinds = Vec::new();
+        for scope in [ReadScope::Workspace, ReadScope::Global] {
+            let store = shared_store_of_patch_dirs(scope, pkg, keys.iter().copied()).await;
+            kinds.push(store.map(|store| store.kind));
+        }
+        assert_eq!(kinds[0], kinds[1], "{}", pkg.display());
+        kinds[0]
+    }
+
+    /// Bazel fetches packages of every ecosystem into its output base, in
+    /// that ecosystem's own layout. None of them is an installed copy: the
+    /// next fetch or build replaces what is there. `after_clean` is the
+    /// base `bazel clean` and a build leave (probe C7): no second marker,
+    /// and nothing in `execroot` to tell it by.
+    #[tokio::test]
+    async fn a_package_in_a_bazel_output_base_is_refused_in_every_ecosystem_layout() {
+        const PACKAGES: [(&str, &str); 8] = [
+            ("external/npm/node_modules/left-pad/", "index.js"),
+            ("external/pip_deps/site-packages/", "urllib3/response.py"),
+            (
+                "external/bundle/vendor/bundle/ruby/3.3.0/gems/rack-3.0.0/",
+                "lib/rack.rb",
+            ),
+            ("external/crates/vendor/serde-1.0.0/", "src/lib.rs"),
+            ("external/com_github_pkg_errors/", "errors.go"),
+            (
+                "external/composer/vendor/monolog/monolog/",
+                "src/Logger.php",
+            ),
+            ("external/nuget/newtonsoft.json/13.0.3/", "lib/net6.0/x.dll"),
+            (
+                "external/maven/v1/https/repo1.maven.org/maven2/org/x/y/1.0/",
+                "y-1.0.jar",
+            ),
+        ];
+        for after_clean in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let base = dir.path().join("_bazel_u/6d82");
+            lay(&base, &["DO_NOT_BUILD_HERE", "execroot/_main/"]);
+            if !after_clean {
+                lay(&base, &["execroot/DO_NOT_BUILD_HERE"]);
+            }
+            for (pkg, key) in PACKAGES {
+                lay(&base, &[pkg, &format!("{pkg}{key}")]);
+                let kind = kind_of(&base.join(pkg), &[key]).await;
+                let want = SharedStoreKind::BazelTree(PathClass::OutputBase);
+                assert_eq!(kind, Some(want), "{pkg}, after clean: {after_clean}");
+            }
+            // The same layouts beside the base are ordinary installs.
+            let project = dir.path().join("project");
+            for (pkg, key) in PACKAGES {
+                lay(&project, &[pkg, &format!("{pkg}{key}")]);
+                assert_eq!(kind_of(&project.join(pkg), &[key]).await, None, "{pkg}");
+            }
+        }
+    }
+
+    /// The other three trees, each known by its own marker, and a patch
+    /// that would add a file in a directory that does not exist yet.
+    #[tokio::test]
+    async fn a_package_in_a_bazel_cache_or_vendor_directory_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let sha256 = "ab".repeat(32);
+        lay(
+            root,
+            &[
+                // A contents-cache entry: 9.x by default, 8.3+ on request.
+                "cache/contents/cd12/26ed.recorded_inputs",
+                "cache/contents/cd12/26ed/node_modules/left-pad/index.js",
+                &format!("cache/content_addressable/sha256/{sha256}/file"),
+                // `bazel vendor` on 7.3 and later, and on 7.1.2 - 7.2.1.
+                "ws/vendor_src/VENDOR.bazel",
+                "ws/vendor_src/+http+dep/node_modules/left-pad/index.js",
+                "ws/third_party/.vendorignore",
+                "ws/third_party/rules_x~/vendor/monolog/monolog/src/Logger.php",
+                "ws/node_modules/left-pad/index.js",
+            ],
+        );
+        let tree = |class| Some(SharedStoreKind::BazelTree(class));
+        for (pkg, key, want) in [
+            (
+                "cache/contents/cd12/26ed/node_modules/left-pad",
+                "index.js",
+                tree(PathClass::RepoContentsCache),
+            ),
+            (
+                &*format!("cache/content_addressable/sha256/{sha256}"),
+                "file",
+                tree(PathClass::RepositoryCache),
+            ),
+            (
+                "ws/vendor_src/+http+dep/node_modules/left-pad",
+                "index.js",
+                tree(PathClass::VendorDir),
+            ),
+            (
+                "ws/third_party/rules_x~/vendor/monolog/monolog",
+                "src/Logger.php",
+                tree(PathClass::VendorDir),
+            ),
+            // A file the patch adds, in a directory it would create.
+            (
+                "ws/vendor_src/+http+dep/node_modules/left-pad",
+                "lib/new/added.js",
+                tree(PathClass::VendorDir),
+            ),
+            ("ws/node_modules/left-pad", "index.js", None),
+            ("ws/node_modules/left-pad", "lib/new/added.js", None),
+        ] {
+            assert_eq!(kind_of(&root.join(pkg), &[key]).await, want, "{pkg} {key}");
+        }
+    }
+
+    /// A build leaves links into its output base in the workspace
+    /// (`bazel-bin`, or any name under `--symlink_prefix`), and a package
+    /// manager may be pointed into one. The path below a link is in the
+    /// tree; the link itself is a link into it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_package_reached_through_a_link_into_a_bazel_tree_is_refused() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        lay(
+            root,
+            &[
+                "base/DO_NOT_BUILD_HERE",
+                "base/execroot/_main/bazel-out/k8/bin/node_modules/left-pad/index.js",
+                "ws/dist/",
+                "ws/node_modules/is-odd/index.js",
+            ],
+        );
+        let bin = root.join("base/execroot/_main/bazel-out/k8/bin");
+        symlink(&bin, root.join("ws/bazel-bin")).unwrap();
+        symlink(&bin, root.join("ws/dist/bin")).unwrap();
+        symlink(
+            bin.join("node_modules/left-pad"),
+            root.join("ws/node_modules/left-pad"),
+        )
+        .unwrap();
+        let tree = |class| Some(SharedStoreKind::BazelTree(class));
+        for (pkg, want) in [
+            (
+                "ws/bazel-bin/node_modules/left-pad",
+                tree(PathClass::OutputBase),
+            ),
+            (
+                "ws/dist/bin/node_modules/left-pad",
+                tree(PathClass::OutputBase),
+            ),
+            ("ws/node_modules/left-pad", tree(PathClass::Link)),
+            ("ws/node_modules/is-odd", None),
+        ] {
+            assert_eq!(kind_of(&root.join(pkg), &["index.js"]).await, want, "{pkg}");
+        }
+        // The store names the real directory, which says where the link led.
+        let store = shared_store_of(ReadScope::Workspace, &root.join("ws/node_modules/left-pad"))
+            .await
+            .expect("a link into the base");
+        let real = std::fs::canonicalize(bin.join("node_modules/left-pad")).unwrap();
+        assert_eq!(store.real_path, real);
+
+        // A scope root is judged the same way.
+        for (scope_root, want) in [
+            ("ws/bazel-bin", tree(PathClass::Link)),
+            ("ws/dist/bin/node_modules", tree(PathClass::OutputBase)),
+            ("base/execroot/_main", tree(PathClass::OutputBase)),
+            ("ws", None),
+            ("ws/node_modules", None),
+            ("ws/not-there", None),
+        ] {
+            let found = bazel_tree_of(&root.join(scope_root)).await;
+            assert_eq!(found.map(|store| store.kind), want, "{scope_root}");
+        }
+    }
+
+    #[test]
+    fn a_bazel_tree_refusal_names_the_tree_the_remedy_and_that_nothing_was_written() {
+        assert!(BAZEL_TREE_WHY.contains(BAZEL_TREE_REFUSAL_MARKER));
+        for (class, place) in [
+            (PathClass::OutputBase, "in a Bazel output base"),
+            (
+                PathClass::RepoContentsCache,
+                "in Bazel's repository contents cache",
+            ),
+            (PathClass::RepositoryCache, "in Bazel's repository cache"),
+            (PathClass::VendorDir, "in a Bazel vendor directory"),
+            (PathClass::Link, "a link into a Bazel output tree"),
+        ] {
+            let store = SharedStore {
+                kind: SharedStoreKind::BazelTree(class),
+                real_path: PathBuf::from("/b/external/npm/node_modules/x"),
+            };
+            let refusals = [
+                store.refusal("patch"),
+                store.refusal(ROLL_BACK_ACTION),
+                store.scope_refusal("scan", "--cwd"),
+            ];
+            for msg in &refusals {
+                assert!(msg.contains(BAZEL_TREE_REFUSAL_MARKER), "{msg}");
+                assert!(msg.contains(place), "{msg}");
+                assert!(msg.contains("/b/external/npm/node_modules/x"), "{msg}");
+                assert!(msg.contains("scan --mode hosted"), "{msg}");
+                assert!(msg.ends_with("nothing was written"), "{msg}");
+                assert!(!msg.contains(SHARED_STORE_REFUSAL_MARKER), "{msg}");
+            }
+            assert!(refusals[1].starts_with("Refusing to roll back "));
+            assert!(refusals[2].starts_with("Refusing to scan in "));
+            assert!(refusals[2].contains("(--cwd)"), "{}", refusals[2]);
+            // The warning is not a refusal and does not read like one.
+            let warning = store.scope_warning();
+            assert!(warning.contains(BAZEL_TREE_REFUSAL_MARKER), "{warning}");
+            assert!(warning.contains(place), "{warning}");
+            assert!(warning.contains("patched nothing"), "{warning}");
+            assert!(!warning.contains("Refusing"), "{warning}");
+        }
     }
 }

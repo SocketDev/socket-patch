@@ -126,6 +126,9 @@ pub(crate) struct DiscoveredDirs {
     pub ignored: usize,
     /// The walk gave up before it had seen the whole tree.
     pub truncated: bool,
+    /// Directories below `--cwd` the walk did not enter because Bazel owns
+    /// them (`DiskRoots::bazel_trees`), relative to `--cwd`.
+    pub bazel_trees: Vec<String>,
 }
 
 /// The projects at and below `--cwd`: the roots the in-memory engine
@@ -176,6 +179,7 @@ pub(crate) async fn discovered(
         dirs,
         ignored,
         truncated: found.truncated,
+        bazel_trees: found.bazel_trees,
     }
 }
 

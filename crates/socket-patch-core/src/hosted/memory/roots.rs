@@ -6,9 +6,22 @@
 //! member, so the engine demotes members once manifests are readable. A
 //! pnpm workspace member's lock is demoted into the workspace root the
 //! same way, by the `packages:` globs ([`pnpm_member_candidates`]).
+//!
+//! Nothing inside a tree Bazel owns is a root either (design 3, HZ-02 and
+//! HZ-03): an output base kept in the checkout mirrors the root's own
+//! lockfiles and holds those of every fetched ruleset, and a committed
+//! Bazel vendor directory holds the lockfiles of the repositories it
+//! vendors. Such a tree is known by the marker Bazel wrote into it
+//! (`bazel::output_tree`), on disk and in a path list alike.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use crate::bazel::codes::Code;
+use crate::bazel::output_tree;
+use crate::crawlers::bazel_output::Classifier;
 use crate::formats::registry;
 use crate::utils::python_lock::is_python_lock_name;
 
@@ -32,9 +45,18 @@ pub const UNSUPPORTED_MARKERS: [(&str, &[&str]); 2] = [
 /// Directory names whose subtrees never hold a project root: installed
 /// trees, VCS and tool state, and vendored dependencies. Structural, so no
 /// policy can negate them. (Test and fixture trees are the socket.yml
-/// policy's overridable built-in ignores.)
-pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 5] =
-    ["node_modules", ".git", ".socket", ".yarn", "vendor"];
+/// policy's overridable built-in ignores.) `.socket-auto-manifest` is
+/// where socket-cli writes the manifests it generates for a build it
+/// cannot read (design 3, HZ-24): they describe the project above them and
+/// are regenerated, so a pin written there would patch nothing.
+pub(crate) const EXCLUDED_ROOT_SEGMENTS: [&str; 6] = [
+    "node_modules",
+    ".git",
+    ".socket",
+    ".yarn",
+    "vendor",
+    ".socket-auto-manifest",
+];
 
 /// The marker basenames of `root` among `paths` (the files the policy's
 /// path filters test for that root).
@@ -113,13 +135,65 @@ fn allowed(ecosystems: Option<&[String]>, eco: &str) -> bool {
     ecosystems.is_none_or(|list| list.iter().any(|e| e == eco))
 }
 
+/// Whether `dir` is `tree` or lies below it; `""` is the listing's root.
+fn at_or_below(dir: &str, tree: &str) -> bool {
+    tree.is_empty() || strip_root(tree, dir).is_some() || dir == tree
+}
+
+/// The directories of a path list that are trees Bazel owns (design
+/// 2.11), `/`-separated and sorted: an output base, an entry of either
+/// cache, a vendor directory. A list knows a directory only by the files
+/// in it, so a tree is found as far as its marker is listed.
+///
+/// The first pass asks each path whether its name can be a marker at all.
+/// Almost no list has one, and then nothing more is done; the directories
+/// the names point at are judged by the classifier, over the files listed
+/// in and beside them.
+fn bazel_trees_listed<'a>(paths: impl Iterator<Item = &'a str> + Clone) -> Vec<String> {
+    let mut pointed: BTreeSet<String> = BTreeSet::new();
+    for path in paths.clone() {
+        let (dir, base) = split_path(path);
+        if let Some(marked) = output_tree::marked_dir(Path::new(dir), OsStr::new(base)) {
+            let segments: Option<Vec<&str>> = marked.iter().map(OsStr::to_str).collect();
+            pointed.extend(segments.map(|segments| segments.join("/")));
+        }
+    }
+    if pointed.is_empty() {
+        return Vec::new();
+    }
+    // The marker of a contents-cache entry lies beside it; every other
+    // file a rule asks for lies inside the directory.
+    let near = |path: &str| {
+        pointed.iter().any(|dir| {
+            let (parent, _) = split_path(path);
+            at_or_below(parent, dir)
+                || path
+                    .strip_prefix(dir.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'))
+        })
+    };
+    let listing = output_tree::Listing::new(paths.filter(|path| near(path)));
+    let is_tree = |dir: &String| {
+        output_tree::tree_at(&listing, Path::new(dir), &[])
+            .tree
+            .is_some()
+    };
+    pointed.into_iter().filter(is_tree).collect()
+}
+
 /// The detected roots (sorted) and the marker paths that did not make one.
 /// The socket.yml path policy (built-in default ignores included) is the
 /// caller's to apply.
-pub(crate) fn detect_roots<'a>(
-    paths: impl IntoIterator<Item = &'a str>,
+pub(crate) fn detect_roots<'a, I>(
+    paths: I,
     ecosystems: Option<&[String]>,
-) -> (Vec<String>, Vec<IgnoredPath>) {
+) -> (Vec<String>, Vec<IgnoredPath>)
+where
+    I: IntoIterator<Item = &'a str>,
+    I::IntoIter: Clone,
+{
+    let paths = paths.into_iter();
+    let bazel_trees = bazel_trees_listed(paths.clone());
     let mut ignored: Vec<IgnoredPath> = Vec::new();
     let mut markers: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
     let mut marker_paths: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -139,6 +213,10 @@ pub(crate) fn detect_roots<'a>(
             .any(|seg| EXCLUDED_ROOT_SEGMENTS.contains(&seg))
         {
             ignore("excluded_dir", &mut ignored);
+            continue;
+        }
+        if bazel_trees.iter().any(|tree| at_or_below(dir, tree)) {
+            ignore(Code::WorkspaceOutputTreeSkipped.as_str(), &mut ignored);
             continue;
         }
         if !allowed(ecosystems, eco) {
@@ -196,6 +274,98 @@ pub struct DiskRoots {
     /// The walk stopped at [`MAX_WALKED_ENTRIES`], so `roots` may be
     /// incomplete.
     pub truncated: bool,
+    /// The directories the walk did not enter because Bazel owns them (an
+    /// output base, a cache entry, a vendor directory), relative to the
+    /// walked one, `/`-separated and sorted. A run reports them
+    /// (`bazel_workspace_output_tree_skipped`): what it left out of its
+    /// search must not look searched.
+    pub bazel_trees: Vec<String>,
+}
+
+/// What [`marker_paths_below`] found.
+#[derive(Debug, Default)]
+struct WalkedMarkers {
+    /// The marker files, as `/`-separated paths relative to the walked
+    /// directory.
+    markers: Vec<String>,
+    /// The walk was cut short.
+    truncated: bool,
+    /// [`DiskRoots::bazel_trees`].
+    bazel_trees: Vec<String>,
+    /// How many entries the walk read: a tree that was not entered adds
+    /// its root and its markers, whatever it holds.
+    walked: usize,
+}
+
+/// Whether `dir` is the root of a tree Bazel owns, by its own markers.
+fn is_tree_root(classifier: &Classifier, dir: &Path) -> bool {
+    let own = classifier.tree_at(dir).tree;
+    own.is_some_and(|tree| tree.root == dir)
+}
+
+/// The trees Bazel owns that a walk has met, and how it stays out of them
+/// for the price of a few `stat`s per directory that has subdirectories.
+///
+/// A root is found in two ways. Before the walk enters a subdirectory, the
+/// directory that holds it is judged by the classifier, once: so nothing
+/// below a root is ever read, in whatever order a directory lists its
+/// entries, and an output base larger than the whole walk's budget costs
+/// one listing. A root with no subdirectory is never asked about that way;
+/// it is known by the marker among its files, whose name points at it
+/// ([`output_tree::marked_dir`]) at no cost, and the classifier decides.
+#[derive(Debug, Default)]
+struct BazelTreesMet {
+    /// The roots, as the walk spells them.
+    roots: Vec<PathBuf>,
+    /// The directories the walk is inside of, outermost first, each with
+    /// whether it is a root.
+    inside: Vec<(PathBuf, bool)>,
+}
+
+impl BazelTreesMet {
+    fn note(&mut self, root: PathBuf) {
+        if !self.roots.contains(&root) {
+            self.roots.push(root);
+        }
+    }
+
+    /// Whether the walk must not enter `subdir`, an entry of a directory
+    /// it is listing: that directory is a root, or `subdir` is one a
+    /// marker beside it already named.
+    fn keeps_out_of(&mut self, classifier: &Classifier, subdir: &Path) -> bool {
+        if self.roots.iter().any(|root| subdir.starts_with(root)) {
+            return true;
+        }
+        let Some(dir) = subdir.parent() else {
+            return false;
+        };
+        // The walk is depth-first: what is not above `dir` has been left.
+        while self
+            .inside
+            .last()
+            .is_some_and(|(above, _)| !dir.starts_with(above))
+        {
+            self.inside.pop();
+        }
+        if let Some((_, root)) = self.inside.last().filter(|(above, _)| above == dir) {
+            return *root;
+        }
+        let root = is_tree_root(classifier, dir);
+        if root {
+            self.note(dir.to_path_buf());
+        }
+        self.inside.push((dir.to_path_buf(), root));
+        root
+    }
+}
+
+/// `path` relative to `dir`, `/`-separated. `None` for a path outside
+/// `dir` and for one that is not UTF-8, which names no root a `/`-joined
+/// list can hold.
+fn relative_slashed(dir: &Path, path: &Path) -> Option<String> {
+    let rel = path.strip_prefix(dir).ok()?;
+    let segments: Option<Vec<&str>> = rel.iter().map(OsStr::to_str).collect();
+    Some(segments?.join("/"))
 }
 
 /// How many directory entries [`roots_below`] reads before it gives up.
@@ -204,8 +374,7 @@ pub struct DiskRoots {
 /// not one.
 const MAX_WALKED_ENTRIES: usize = 500_000;
 
-/// The marker files at and below `dir`, as `/`-separated relative paths,
-/// and whether the walk was cut short.
+/// The marker files at and below `dir`.
 ///
 /// The in-memory engine is handed the files git tracks. On disk the walk
 /// stands in for that list: it honours git's ignore rules (a build
@@ -217,12 +386,18 @@ const MAX_WALKED_ENTRIES: usize = 500_000;
 /// repository does not track and whose own policy a run from here has not
 /// read. A marker that is itself a symlink still counts, as it does for
 /// the root the user names.
-fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
+///
+/// Nor does it enter a tree Bazel owns ([`BazelTreesMet`]): nothing below
+/// the root of one is read, and what the root itself holds is dropped.
+fn marker_paths_below(dir: &Path) -> WalkedMarkers {
+    let classifier = Arc::new(Classifier::new());
+    let met: Arc<Mutex<BazelTreesMet>> = Arc::default();
+    let (judge, entered) = (Arc::clone(&classifier), Arc::clone(&met));
     let walk = ignore::WalkBuilder::new(dir)
         .hidden(false)
         .ignore(false)
         .follow_links(false)
-        .filter_entry(|entry| {
+        .filter_entry(move |entry| {
             if !entry.file_type().is_some_and(|t| t.is_dir()) {
                 return true;
             }
@@ -232,34 +407,56 @@ fn marker_paths_below(dir: &std::path::Path) -> (Vec<String>, bool) {
                 .is_some_and(|name| EXCLUDED_ROOT_SEGMENTS.contains(&name));
             let other_repository =
                 entry.depth() > 0 && entry.path().join(".git").symlink_metadata().is_ok();
-            !excluded && !other_repository
+            if excluded || other_repository {
+                return false;
+            }
+            // The walked directory itself is the caller's to judge.
+            let mut entered = entered.lock().unwrap_or_else(PoisonError::into_inner);
+            entry.depth() == 0 || !entered.keeps_out_of(&judge, entry.path())
         })
         .build();
-    let mut markers: Vec<String> = Vec::new();
+    let mut found = WalkedMarkers::default();
     for (seen, entry) in walk.flatten().enumerate() {
         if seen >= MAX_WALKED_ENTRIES {
-            return (markers, true);
+            found.truncated = true;
+            break;
         }
+        found.walked = seen + 1;
         if entry.file_type().is_none_or(|t| t.is_dir()) {
             continue;
+        }
+        let marked = entry
+            .path()
+            .parent()
+            .and_then(|parent| output_tree::marked_dir(parent, entry.file_name()));
+        if let Some(marked) = marked.filter(|marked| is_tree_root(&classifier, marked)) {
+            met.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .note(marked);
         }
         let is_marker = entry
             .file_name()
             .to_str()
             .is_some_and(|base| marker_ecosystem(base).is_some());
-        if !is_marker {
-            continue;
-        }
-        let Ok(rel) = entry.path().strip_prefix(dir) else {
-            continue;
-        };
-        // A path that is not UTF-8 names no root a `/`-joined list can hold.
-        let segments: Option<Vec<&str>> = rel.iter().map(|segment| segment.to_str()).collect();
-        if let Some(segments) = segments {
-            markers.push(segments.join("/"));
+        if is_marker {
+            found.markers.extend(relative_slashed(dir, entry.path()));
         }
     }
-    (markers, false)
+    let met = met.lock().unwrap_or_else(PoisonError::into_inner);
+    let trees = met
+        .roots
+        .iter()
+        .filter_map(|tree| relative_slashed(dir, tree));
+    found.bazel_trees = trees.collect::<BTreeSet<String>>().into_iter().collect();
+    let in_tree = |marker: &String| {
+        let (parent, _) = split_path(marker);
+        found
+            .bazel_trees
+            .iter()
+            .any(|tree| at_or_below(parent, tree))
+    };
+    found.markers.retain(|marker| !in_tree(marker));
+    found
 }
 
 /// The project roots at and below `dir` on disk, so a disk scan and the
@@ -284,7 +481,12 @@ pub async fn roots_below(
 ) -> DiskRoots {
     use crate::vendor::lock_inventory::ProjectView;
     let walked = dir.to_path_buf();
-    let (markers, truncated) = tokio::task::spawn_blocking(move || marker_paths_below(&walked))
+    let WalkedMarkers {
+        markers,
+        truncated,
+        bazel_trees,
+        walked: _,
+    } = tokio::task::spawn_blocking(move || marker_paths_below(&walked))
         .await
         .unwrap_or_default();
     let (mut roots, _) = detect_roots(markers.iter().map(String::as_str), ecosystems);
@@ -350,6 +552,7 @@ pub async fn roots_below(
         roots,
         governs_members,
         truncated,
+        bazel_trees,
     }
 }
 
@@ -665,6 +868,213 @@ mod tests {
         assert_eq!(found, vec!["docs", "test/fixtures"]);
         assert_eq!(ignored.len(), 3);
         assert!(ignored.iter().all(|i| i.reason == "excluded_dir"));
+    }
+
+    /// HZ-24: the manifests socket-cli generates describe the project
+    /// above them, at any depth.
+    #[test]
+    fn socket_cli_generated_manifests_never_make_a_root() {
+        let (found, ignored) = detect_roots(
+            [
+                "build.gradle",
+                ".socket-auto-manifest/pom.xml",
+                ".socket-auto-manifest/requirements.txt",
+                "svc/.socket-auto-manifest/app/requirements.txt",
+                "svc/go.mod",
+            ],
+            None,
+        );
+        assert_eq!(found, vec!["svc"]);
+        let ignored: Vec<(&str, &str)> = ignored
+            .iter()
+            .map(|i| (i.path.as_str(), i.reason.as_str()))
+            .collect();
+        let generated = [
+            ".socket-auto-manifest/requirements.txt",
+            "svc/.socket-auto-manifest/app/requirements.txt",
+        ];
+        assert_eq!(ignored, generated.map(|path| (path, "excluded_dir")));
+    }
+
+    /// The trees of [`BAZEL_LAYOUT`]: an output base kept in the checkout
+    /// (probe C8), a vendor directory as Bazel 7.3 and later mark it and
+    /// one as 7.1.2 to 7.2.1 do (probe C11), an entry of a contents cache
+    /// under an in-tree output root (probe C6), and a base two levels down.
+    const BAZEL_TREES: [&str; 5] = [
+        "_bazel_u/cache/repos/v1/contents/cd12/26ed",
+        "apps/web/out",
+        "out",
+        "third_party",
+        "vendor_src",
+    ];
+
+    /// A Bazel workspace with those trees, each holding lockfiles, beside
+    /// two projects of its own and two directories that only look like a
+    /// tree: a marker name with nothing of a base beside it, and a
+    /// directory named like a convenience link.
+    const BAZEL_LAYOUT: [&str; 22] = [
+        "MODULE.bazel",
+        "pnpm-lock.yaml",
+        "apps/web/package-lock.json",
+        "out/DO_NOT_BUILD_HERE",
+        "out/execroot/_main/pnpm-lock.yaml",
+        "out/external/rules_nodejs~/yarn.lock",
+        "out/external/rules_python~/gazelle/go.mod",
+        "apps/web/out/DO_NOT_BUILD_HERE",
+        "apps/web/out/external/aspect_rules_js~/e2e/pnpm-lock.yaml",
+        "vendor_src/VENDOR.bazel",
+        "vendor_src/+http_archive+dep/package-lock.json",
+        "vendor_src/+http_archive+dep/sub/Cargo.lock",
+        "third_party/.vendorignore",
+        "third_party/rules_x~/go.mod",
+        "_bazel_u/cache/repos/v1/contents/cd12/26ed.recorded_inputs",
+        "_bazel_u/cache/repos/v1/contents/cd12/26ed/yarn.lock",
+        "_bazel_u/cache/repos/v1/contents/cd12/7220/yarn.lock",
+        "notes/DO_NOT_BUILD_HERE",
+        "notes/requirements.txt",
+        "bazel-notes/go.mod",
+        "bazel-notes/go.sum",
+        "docs/file",
+    ];
+
+    /// What is left: the workspace's own projects, the two look-alikes
+    /// and the cache entry no marker names.
+    const BAZEL_ROOTS: [&str; 5] = [
+        "",
+        "_bazel_u/cache/repos/v1/contents/cd12/7220",
+        "apps/web",
+        "bazel-notes",
+        "notes",
+    ];
+
+    /// HZ-02 and HZ-03 in a path list: a lockfile inside a tree Bazel owns
+    /// makes no root, and each one is reported with the code a disk run
+    /// reports the directory under.
+    #[test]
+    fn nothing_in_a_listed_bazel_tree_is_a_root() {
+        let (found, ignored) = detect_roots(BAZEL_LAYOUT, None);
+        assert_eq!(found, BAZEL_ROOTS);
+        let skipped: Vec<&str> = ignored.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            skipped,
+            [
+                "_bazel_u/cache/repos/v1/contents/cd12/26ed/yarn.lock",
+                "apps/web/out/external/aspect_rules_js~/e2e/pnpm-lock.yaml",
+                "out/execroot/_main/pnpm-lock.yaml",
+                "out/external/rules_nodejs~/yarn.lock",
+                "out/external/rules_python~/gazelle/go.mod",
+                "third_party/rules_x~/go.mod",
+                "vendor_src/+http_archive+dep/package-lock.json",
+                "vendor_src/+http_archive+dep/sub/Cargo.lock",
+            ]
+        );
+        let code = Code::WorkspaceOutputTreeSkipped.as_str();
+        assert!(ignored.iter().all(|i| i.reason == code), "{ignored:?}");
+        assert_eq!(bazel_trees_listed(BAZEL_LAYOUT.into_iter()), BAZEL_TREES);
+
+        // A list of lockfiles alone names no marker, so it prunes nothing
+        // (and costs one pass over the names): this is what the disk walk
+        // hands over after it has pruned.
+        let locks = BAZEL_LAYOUT
+            .into_iter()
+            .filter(|path| marker_ecosystem(split_path(path).1).is_some());
+        assert_eq!(bazel_trees_listed(locks.clone()), [""; 0]);
+        assert_eq!(detect_roots(locks, None).1.len(), 0);
+
+        // A vendor directory at the listing's root: the list is one tree.
+        let (found, ignored) = detect_roots(["VENDOR.bazel", "+x+y/go.mod", "go.mod"], None);
+        assert_eq!((found.len(), ignored.len()), (0, 2));
+    }
+
+    /// The same workspace on disk: the walk does not enter the trees, and
+    /// says which directories it left out.
+    #[tokio::test]
+    async fn roots_below_does_not_enter_a_bazel_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for rel in BAZEL_LAYOUT {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        let found = roots_below(root, None, |_| true).await;
+        assert_eq!(found.roots, BAZEL_ROOTS);
+        assert_eq!(found.bazel_trees, BAZEL_TREES);
+        assert!(!found.truncated);
+
+        // Walked from inside the workspace, the trees are named from there.
+        let web = roots_below(&root.join("apps/web"), None, |_| true).await;
+        assert_eq!(
+            (web.roots, web.bazel_trees),
+            (vec![String::new()], vec!["out".to_string()])
+        );
+
+        // A walk that starts at a tree finds nothing in it.
+        let base = roots_below(&root.join("out"), None, |_| true).await;
+        assert_eq!(
+            (base.roots, base.bazel_trees),
+            (vec![], vec![String::new()])
+        );
+
+        // The marker gone, the directory is searched like any other.
+        std::fs::remove_file(root.join("vendor_src/VENDOR.bazel")).unwrap();
+        let found = roots_below(root, None, |_| true).await;
+        assert!(found
+            .roots
+            .contains(&"vendor_src/+http_archive+dep".to_string()));
+        assert!(!found.bazel_trees.contains(&"vendor_src".to_string()));
+    }
+
+    /// A tree is not entered, which is more than dropping what was found
+    /// in it: an output base can hold more entries than the whole walk may
+    /// read ([`MAX_WALKED_ENTRIES`]), and the projects after it would then
+    /// be missed.
+    #[test]
+    fn the_walk_reads_nothing_below_a_bazel_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mut files = vec!["out/DO_NOT_BUILD_HERE".to_string(), "web/yarn.lock".into()];
+        files.extend((0..30).map(|i| format!("out/external/rules_{i}/e2e/yarn.lock")));
+        for rel in &files {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x").unwrap();
+        }
+        // The walked directory, `out`, its marker, `web` and its lock.
+        let pruned = marker_paths_below(root);
+        assert_eq!(
+            (pruned.walked, pruned.markers),
+            (5, vec!["web/yarn.lock".to_string()])
+        );
+        std::fs::remove_file(root.join("out/DO_NOT_BUILD_HERE")).unwrap();
+        let entered = marker_paths_below(root);
+        assert_eq!((entered.walked, entered.markers.len()), (5 + 3 * 30, 31));
+    }
+
+    /// A build leaves links into its output base in the workspace. The
+    /// walk follows no link, so they need no marker to stay out.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn roots_below_follows_no_link_into_an_output_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, base) = (tmp.path().join("ws"), tmp.path().join("base"));
+        let bin = base.join("execroot/_main/bazel-out/k8/bin");
+        for file in [
+            ws.join("pnpm-lock.yaml"),
+            base.join("DO_NOT_BUILD_HERE"),
+            bin.join("app/package-lock.json"),
+        ] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "x").unwrap();
+        }
+        std::fs::create_dir(ws.join("dist")).unwrap();
+        std::os::unix::fs::symlink(&bin, ws.join("bazel-bin")).unwrap();
+        std::os::unix::fs::symlink(&bin, ws.join("dist/bin")).unwrap();
+        let found = roots_below(&ws, None, |_| true).await;
+        assert_eq!(
+            (found.roots, found.bazel_trees),
+            (vec![String::new()], vec![])
+        );
     }
 
     #[test]

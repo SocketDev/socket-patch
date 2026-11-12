@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use super::bazel_output::Classifier as BazelTrees;
 use super::pnpm_layout::MODULES_YAML as PNPM_MODULES_YAML;
 use super::types::{CrawledPackage, CrawlerOptions};
 use super::walk_pool::{par_map, run_walk};
@@ -131,6 +132,7 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
     let walkable = |entry: &ListedEntry| {
         entry.file_type.is_some_and(|ft| ft.is_dir()) && entry.name_str != "node_modules"
     };
+    let bazel = BazelTrees::new();
     let mut roots = Vec::new();
     // A leading `!` is a negation in some readings and part of an extglob
     // or a literal name in others; the dirs it can reach are walked either
@@ -172,7 +174,9 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
                 };
                 dir.push(&entry.name);
                 rel.push(entry.name_str.clone());
-                if is_tagged_cache_dir(&dir, &list_dir_sync(&dir)) {
+                if is_tagged_cache_dir(&dir, &list_dir_sync(&dir))
+                    || bazel.tree_at(&dir).tree.is_some()
+                {
                     reachable = false;
                     break;
                 }
@@ -192,10 +196,13 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
             let mut stack = vec![(dir, rel, 0usize)];
             while let Some((dir, rel, depth)) = stack.pop() {
                 let listing = list_dir_sync(&dir);
+                let bazel_trees = bazel_trees_listed(&bazel, &dir, &listing);
                 // The workspace root itself is exempt, as the walk always
                 // crawls the scan root (and never reaches a nested project
-                // inside a tagged dir).
-                if !rel.is_empty() && is_tagged_cache_dir(&dir, &listing) {
+                // inside a tagged dir or a Bazel tree).
+                if !rel.is_empty()
+                    && (is_tagged_cache_dir(&dir, &listing) || bazel_trees.contains(&dir))
+                {
                     continue;
                 }
                 let hidden = rel.iter().any(|seg| seg.starts_with('.'));
@@ -224,9 +231,13 @@ fn skipped_members_of(root: &Path) -> Vec<PathBuf> {
                         break;
                     };
                     budget = left;
+                    let child = dir.join(&entry.name);
+                    if bazel_trees.contains(&child) {
+                        continue;
+                    }
                     let mut child_rel = rel.clone();
                     child_rel.push(entry.name_str.clone());
-                    stack.push((dir.join(&entry.name), child_rel, depth + 1));
+                    stack.push((child, child_rel, depth + 1));
                 }
             }
         }
@@ -1915,6 +1926,22 @@ fn is_tagged_cache_dir(dir: &Path, listing: &Listing) -> bool {
         .is_ok_and(|()| head == CACHEDIR_TAG_SIGNATURE)
 }
 
+/// The trees Bazel owns (design 2.11) that the `listing` of `dir` gives
+/// away: `dir` itself and its child directories. An output base kept in
+/// the checkout mirrors the project's `package.json` and holds the
+/// `node_modules` of every JS target, a Bazel vendor directory and a cache
+/// entry hold those of fetched repositories, and none is an installed tree
+/// (Bazel replaces what is there), so the workspace walks enter none. Only
+/// a listing that names a marker costs a `stat`.
+fn bazel_trees_listed(bazel: &BazelTrees, dir: &Path, listing: &Listing) -> Vec<PathBuf> {
+    let files = listing
+        .entries
+        .iter()
+        .filter(|entry| !entry.file_type.is_some_and(|ft| ft.is_dir()));
+    let trees = bazel.trees_marked_by(dir, files.map(|entry| entry.name.as_os_str()));
+    trees.into_iter().map(|tree| tree.root).collect()
+}
+
 /// List `path` (empty when it cannot be read — the walks' long-standing
 /// tolerate-and-skip contract).
 fn list_dir_sync(path: &Path) -> Listing {
@@ -3557,21 +3584,29 @@ impl NpmCrawler {
         // Dirs are numbered in visit order, level by level, so each dir's
         // children occupy a contiguous range of the next level.
         let mut nodes: Vec<WalkedDir> = Vec::new();
+        let bazel = BazelTrees::new();
+        // The scan root itself is exempt, as for a tagged cache directory.
+        let bazel_trees = bazel_trees_listed(&bazel, dir, &listing);
         let mut level = Self::workspace_children(dir, listing);
+        level.retain(|child| !bazel_trees.contains(child));
         let roots = 0..level.len();
         while !level.is_empty() {
             let visits: Vec<(Option<PathBuf>, Vec<PathBuf>)> = par_map(level, |full_path| {
                 let listing = list_dir_sync(&full_path);
                 // A tagged cache directory (a cargo `target/`, a tool's
                 // cache) is pruned whole: neither its `node_modules` nor
-                // anything below it is a workspace.
-                if is_tagged_cache_dir(&full_path, &listing) {
+                // anything below it is a workspace. So is a tree Bazel
+                // owns.
+                let bazel_trees = bazel_trees_listed(&bazel, &full_path, &listing);
+                if is_tagged_cache_dir(&full_path, &listing) || bazel_trees.contains(&full_path) {
                     return (None, Vec::new());
                 }
                 // Check if this subdirectory has its own node_modules
                 let node_modules = has_node_modules_dir(&full_path, &listing)
                     .then(|| full_path.join("node_modules"));
-                (node_modules, Self::workspace_children(&full_path, listing))
+                let mut children = Self::workspace_children(&full_path, listing);
+                children.retain(|child| !bazel_trees.contains(child));
+                (node_modules, children)
             });
             let next_base = nodes.len() + visits.len();
             let mut next_level = Vec::new();
@@ -6127,6 +6162,93 @@ mod tests {
             found.contains(&root.join("target/debug/deps/pkg/node_modules")),
             "{found:?}"
         );
+    }
+
+    /// A tree Bazel owns is pruned from the workspace roots walk whole
+    /// (design 3, HZ-02): an output base kept in the checkout (also after
+    /// `bazel clean` and a build, when one marker is left), a Bazel vendor
+    /// directory of either marker, a contents-cache entry. A marker name
+    /// with nothing of a tree beside it, a directory named like a
+    /// convenience link and the scan root itself prune nothing.
+    #[tokio::test]
+    async fn test_workspace_walk_prunes_bazel_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let nm = |rel: &str| {
+            let path = root.join(rel).join("node_modules");
+            std::fs::create_dir_all(&path).unwrap();
+            path
+        };
+        let touch = |rel: &str| std::fs::write(root.join(rel), b"").unwrap();
+        let mut want = vec![nm(""), nm("apps/web")];
+        // Pruned: the tree's own node_modules and everything below.
+        nm("out");
+        nm("out/execroot/_main/bazel-out/k8/bin");
+        nm("out/external/npm");
+        touch("out/DO_NOT_BUILD_HERE");
+        nm("vendor_src/+http_archive+dep");
+        touch("vendor_src/VENDOR.bazel");
+        nm("third_party/rules_x~/e2e");
+        touch("third_party/.vendorignore");
+        nm("cache/contents/cd12/26ed");
+        touch("cache/contents/cd12/26ed.recorded_inputs");
+        // Not trees: kept.
+        want.push(nm("cache/contents/cd12/7220"));
+        want.push(nm("notes"));
+        touch("notes/DO_NOT_BUILD_HERE");
+        want.push(nm("bazel-notes"));
+        // Declared members under names the walk prunes are added back,
+        // but never from inside a tree: one whose literal prefix is a base,
+        // one the glob reaches below a base.
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"workspaces": ["tmp/*", "build/external/*", "packages/**"]}"#,
+        )
+        .unwrap();
+        let member = |rel: &str| {
+            touch(&format!("{rel}/package.json"));
+            root.join(rel).join("node_modules")
+        };
+        want.push(nm("tmp/tool"));
+        member("tmp/tool");
+        nm("build/external/npm");
+        member("build/external/npm");
+        touch("build/DO_NOT_BUILD_HERE");
+        nm("packages/app/dist/external/npm");
+        member("packages/app/dist/external/npm");
+        touch("packages/app/dist/DO_NOT_BUILD_HERE");
+        want.push(nm("packages/lib/dist/pkg"));
+        member("packages/lib/dist/pkg");
+
+        let paths = |cwd: PathBuf| async move {
+            let options = CrawlerOptions {
+                cwd,
+                global: false,
+                global_prefix: None,
+            };
+            let mut found = NpmCrawler::new()
+                .get_node_modules_paths(&options)
+                .await
+                .unwrap();
+            found.sort();
+            found
+        };
+        want.sort();
+        assert_eq!(paths(root.clone()).await, want);
+
+        // The scan root is crawled whatever it is: a run's scope root is
+        // the caller's to judge.
+        assert_eq!(
+            paths(root.join("vendor_src")).await,
+            [root.join("vendor_src/+http_archive+dep/node_modules")]
+        );
+        // Removing the marker un-prunes the directory.
+        std::fs::remove_file(root.join("out/DO_NOT_BUILD_HERE")).unwrap();
+        let found = paths(root.clone()).await;
+        for rel in ["out", "out/external/npm"] {
+            let entered = root.join(rel).join("node_modules");
+            assert!(found.contains(&entered), "{rel}: {found:?}");
+        }
     }
     /// and undecodable ids are `None` (still probed by package.json).
     #[test]
