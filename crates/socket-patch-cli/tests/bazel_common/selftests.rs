@@ -375,7 +375,15 @@ fn files_bazel_or_the_user_own_are_never_written() {
 
 #[test]
 fn outside_dot_socket_only_the_two_side_files_are_created_and_nothing_else_goes() {
-    for path in [".npmrc", "go.sum", "maven_install.json", "MODULE.bazel"] {
+    for path in [
+        ".npmrc",
+        "web/.npmrc",
+        "go.sum",
+        "maven_install.json",
+        "MODULE.bazel",
+        "MODULE.bazel.lock",
+        "legacy/MODULE.bazel.lock",
+    ] {
         assert!(
             verdict(path, None, Some("new")).is_err(),
             "{path} was created"
@@ -387,7 +395,8 @@ fn outside_dot_socket_only_the_two_side_files_are_created_and_nothing_else_goes(
     }
     // Native hosted mode creates the pnpm side file beside the lock, and
     // so does a rules_js lane (owner decision O14). A forward run never
-    // deletes it.
+    // deletes it. Where the lock is takes the tree: see
+    // `the_pnpm_side_file_comes_and_goes_only_beside_a_pnpm_lock`.
     for path in ["pnpm-workspace.yaml", "web/pnpm-workspace.yaml"] {
         let created = verdict(path, None, Some("packages:\n  - '.'\n"));
         assert_eq!(created, Ok(WriteClass::NativeLock), "{path}");
@@ -398,6 +407,138 @@ fn outside_dot_socket_only_the_two_side_files_are_created_and_nothing_else_goes(
     assert!(kinds("third_party", None, Some(&Entry::Dir)).is_err());
     assert!(kinds(".bazelignore", None, Some(&link("x"))).is_err());
     assert!(kinds("pnpm-workspace.yaml", None, Some(&Entry::Dir)).is_err());
+}
+
+/// What a policy assertion says when it fails, `None` when it passes.
+fn refusal<F>(check: F) -> Option<String>
+where
+    F: FnOnce() -> Vec<(String, WriteClass)> + std::panic::UnwindSafe,
+{
+    let panic = std::panic::catch_unwind(check).err()?;
+    Some(*panic.downcast::<String>().expect("a formatted panic"))
+}
+
+/// Owner decision O14: the pnpm side file is created beside the governed
+/// lock, as native hosted mode creates it, and nowhere else. pnpm takes
+/// the nearest `pnpm-workspace.yaml` above a directory as its workspace
+/// root, so one written into a member or into `docs/` cuts that directory
+/// out of the user's workspace. `.npmrc` is never the side file: a created
+/// one fails rules_js 3.x.
+#[test]
+fn the_pnpm_side_file_comes_and_goes_only_beside_a_pnpm_lock() {
+    let scaffold = "packages:\n  - '.'\ntrustLockfile: true\n";
+    let side = "web/pnpm-workspace.yaml";
+    let before = tree(&[("web/pnpm-lock.yaml", "upstream"), ("docs/a.md", "x")]);
+    let with = |files: &[(&str, &str)]| {
+        let mut after = before.clone();
+        after.extend(tree(files));
+        after
+    };
+
+    // Wired: the lock is rewritten and the side file appears beside it.
+    let wired = with(&[("web/pnpm-lock.yaml", "pinned"), (side, scaffold)]);
+    let both = [
+        ("web/pnpm-lock.yaml".to_string(), WriteClass::NativeLock),
+        (side.to_string(), WriteClass::NativeLock),
+    ];
+    assert_eq!(assert_write_policy(&before, &wired), both);
+    // The rollback deletes it there, and a repair puts back a side file
+    // the user deleted without touching the lock.
+    assert_eq!(assert_restore_policy(&wired, &before), both);
+    let repaired = assert_write_policy(&before, &with(&[(side, scaffold)]));
+    assert_eq!(repaired, [(side.to_string(), WriteClass::NativeLock)]);
+
+    // No pnpm lock in the directory: a member of the workspace, a
+    // directory that has nothing to do with pnpm, the root above the lock.
+    for stray in [
+        "web/app/pnpm-workspace.yaml",
+        "docs/pnpm-workspace.yaml",
+        "pnpm-workspace.yaml",
+    ] {
+        let after = with(&[("web/pnpm-lock.yaml", "pinned"), (stray, scaffold)]);
+        let why = refusal(|| assert_write_policy(&before, &after)).expect(stray);
+        assert!(
+            why.contains(&format!(
+                "{stray}: `pnpm-workspace.yaml` is created or deleted only"
+            )),
+            "{why}"
+        );
+        let why = refusal(|| assert_restore_policy(&after, &before)).expect(stray);
+        assert!(why.contains(&format!("{stray}: ")), "{why}");
+    }
+    // A lock of another package manager, or a link named like the lock, is
+    // not the governed pnpm lock.
+    let mut npm = tree(&[("web/package-lock.json", "{}"), ("web/yarn.lock", "")]);
+    let mut created = npm.clone();
+    created.insert(side.to_string(), file(scaffold));
+    assert!(refusal(|| assert_write_policy(&npm, &created)).is_some());
+    npm.insert("web/pnpm-lock.yaml".to_string(), link("../pnpm-lock.yaml"));
+    created.insert("web/pnpm-lock.yaml".to_string(), link("../pnpm-lock.yaml"));
+    assert!(refusal(|| assert_write_policy(&npm, &created)).is_some());
+    // `.npmrc` beside the governed lock is still never created.
+    let why = refusal(|| assert_write_policy(&before, &with(&[("web/.npmrc", "x")])));
+    assert!(why.is_some_and(|why| why.contains("web/.npmrc: ")));
+
+    // An existing file that the run extends may govern from above the
+    // lock, and a package vendored under `.socket` may ship its own.
+    let above = tree(&[
+        ("pnpm-workspace.yaml", "packages:\n  - web\n"),
+        ("web/pnpm-lock.yaml", "upstream"),
+    ]);
+    let mut trusted = above.clone();
+    trusted.extend(tree(&[
+        (
+            "pnpm-workspace.yaml",
+            "packages:\n  - web\ntrustLockfile: true\n",
+        ),
+        ("web/pnpm-lock.yaml", "pinned"),
+    ]));
+    assert_eq!(assert_write_policy(&above, &trusted).len(), 2);
+    let shipped = format!(".socket/vendor/npm/{UUID}/pkg/pnpm-workspace.yaml");
+    let vendored = with(&[(shipped.as_str(), "packages: []\n")]);
+    let writes = assert_write_policy(&before, &vendored);
+    assert_eq!(writes, [(shipped, WriteClass::SocketState)]);
+}
+
+/// Probe T7: Bazel rewrites its own files on every command, so the write
+/// policy is judged on the diff taken right after socket-patch exits. On a
+/// tree Bazel has built since it fails on every file of Bazel's instead of
+/// excusing one, which is how "socket-patch never writes
+/// `MODULE.bazel.lock`" stays an assertion. The comparison made after
+/// Bazel ran is the other helper, and it leaves exactly those paths out.
+#[test]
+fn the_write_policy_refuses_what_bazel_writes_and_the_later_comparison_leaves_it_out() {
+    let user: Snapshot = [
+        ("MODULE.bazel".to_string(), file("module(name = \"m\")\n")),
+        ("legacy".to_string(), Entry::Dir),
+        ("legacy/WORKSPACE".to_string(), file("")),
+    ]
+    .into();
+    let mut built = user.clone();
+    built.extend(bazel_owned());
+    assert_same_tree_but_bazel_owned(&user, &built);
+
+    let why = refusal(|| assert_write_policy(&user, &built)).expect("Bazel's files were allowed");
+    for path in bazel_owned().keys() {
+        assert!(why.contains(&format!("\n  {path}: ")), "{path}: {why}");
+    }
+    // The same for a lock that was there before the run and that a later
+    // build rewrote, in either kind of run.
+    let mut rewritten = built.clone();
+    for (path, entry) in &mut rewritten {
+        if path.ends_with("MODULE.bazel.lock") {
+            *entry = file("{\"lockFileVersion\": 28}\n");
+        }
+    }
+    let why = refusal(|| assert_write_policy(&built, &rewritten)).expect("a rewritten lock");
+    assert_eq!(
+        why,
+        "socket-patch wrote outside the allowed classes:\n  \
+         MODULE.bazel.lock: `MODULE.bazel.lock` is never written\n  \
+         legacy/MODULE.bazel.lock: `MODULE.bazel.lock` is never written"
+    );
+    assert_same_tree_but_bazel_owned(&built, &rewritten);
+    assert!(refusal(|| assert_restore_policy(&built, &rewritten)).is_some());
 }
 
 #[test]

@@ -609,9 +609,10 @@ impl RunKind {
     }
 }
 
-/// The one command the user runs after a works-after write. The build and
-/// tests pass before it runs; `vex` withholds until committed evidence
-/// shows it ran.
+/// The one command the user runs after a works-after write, or after a
+/// restoring edit that stales Bazel state socket-patch cannot repair
+/// (design 7). After a works-after write the build and tests pass before
+/// it runs; after a restore they can fail until it has (`Repin` always).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequired {
     pub kind: RunKind,
@@ -619,6 +620,10 @@ pub struct RunRequired {
     /// The platforms the lock records an entry for; the command is run on
     /// each.
     pub platforms: Vec<String>,
+    /// Whether `vex` withholds the statement until committed evidence
+    /// shows the command ran. `false` when all that may be stale is a
+    /// lockfile fact (design 2.10): the pin's digest is enforced at fetch,
+    /// so a fact is no part of the consumer proof.
     pub gates_vex: bool,
 }
 

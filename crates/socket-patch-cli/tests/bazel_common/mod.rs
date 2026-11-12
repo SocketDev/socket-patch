@@ -39,5 +39,5 @@ pub use snapshot::{
 #[allow(unused_imports)]
 pub use write_policy::{
     assert_restore_policy, assert_restore_policy_with, assert_write_policy,
-    assert_write_policy_with, classify, classify_restore, Layout, WriteClass,
+    assert_write_policy_with, beside_its_lock, classify, classify_restore, Layout, WriteClass,
 };
