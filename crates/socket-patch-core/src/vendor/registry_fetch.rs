@@ -1546,24 +1546,17 @@ mod tests {
         // GOPROXY is a comma- OR pipe-separated list (go help goproxy); a
         // pipe-separated value must yield the first usable proxy, not a
         // `https://a|b`-shaped base that builds an unparseable URL.
-        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
-        let saved = std::env::var("GOPROXY").ok();
-        std::env::remove_var("SOCKET_GOPROXY");
-        std::env::set_var(
-            "GOPROXY",
-            "https://athens.example|https://proxy.golang.org|direct",
-        );
+        let _env = crate::test_env::EnvGuard::many([
+            ("SOCKET_GOPROXY", None),
+            (
+                "GOPROXY",
+                Some("https://athens.example|https://proxy.golang.org|direct"),
+            ),
+        ]);
         let piped = goproxy_base(MODULE);
-        std::env::set_var("GOPROXY", "https://mirror.example/,direct");
+        let _mixed_env =
+            crate::test_env::EnvGuard::set("GOPROXY", "https://mirror.example/,direct");
         let mixed = goproxy_base(MODULE);
-        match saved {
-            Some(v) => std::env::set_var("GOPROXY", v),
-            None => std::env::remove_var("GOPROXY"),
-        }
-        match saved_socket {
-            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
-            None => std::env::remove_var("SOCKET_GOPROXY"),
-        }
         assert_eq!(piped.as_deref(), Ok("https://athens.example"));
         assert_eq!(mixed.as_deref(), Ok("https://mirror.example"));
     }
@@ -1671,7 +1664,7 @@ mod tests {
             "GONOPROXY",
             "SOCKET_GOPROXY",
         ];
-        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var(k).ok())).collect();
+        let _env = crate::test_env::EnvGuard::many(keys.map(|k| (k, None::<&str>)));
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("env");
         std::fs::write(
@@ -1679,9 +1672,6 @@ mod tests {
             "GOPROXY=http://127.0.0.1:18702\nGOPRIVATE=example.com\n",
         )
         .unwrap();
-        for k in &keys[1..] {
-            std::env::remove_var(k);
-        }
         std::env::set_var("GOENV", &file);
         let private = goproxy_base("example.com/upstream");
         let public = goproxy_base("golang.org/x/text");
@@ -1690,12 +1680,6 @@ mod tests {
         std::env::set_var("GOENV", "off");
         std::env::remove_var("GOPROXY");
         let off = goproxy_base("example.com/upstream");
-        for (k, v) in saved {
-            match v {
-                Some(v) => std::env::set_var(k, v),
-                None => std::env::remove_var(k),
-            }
-        }
         let err = private.unwrap_err();
         assert!(err.contains("matches GOPRIVATE"), "{err}");
         assert_eq!(public.as_deref(), Ok("http://127.0.0.1:18702"));
@@ -1707,11 +1691,12 @@ mod tests {
     #[serial_test::serial]
     fn goproxy_base_env_precedence() {
         const MODULE: &str = "example.com/m";
-        let saved_socket = std::env::var("SOCKET_GOPROXY").ok();
-        let saved = std::env::var("GOPROXY").ok();
         // No `go env -w` file: the developer's own must not leak in.
-        let saved_goenv = std::env::var("GOENV").ok();
-        std::env::set_var("GOENV", "off");
+        let _env = crate::test_env::EnvGuard::many([
+            ("SOCKET_GOPROXY", None),
+            ("GOPROXY", None),
+            ("GOENV", Some("off")),
+        ]);
 
         // SOCKET_GOPROXY wins over GOPROXY (trailing slash trimmed).
         std::env::set_var("SOCKET_GOPROXY", "https://socket.example/");
@@ -1729,19 +1714,6 @@ mod tests {
         // default proxy.
         std::env::set_var("GOPROXY", "direct,off");
         let no_proxy = goproxy_base(MODULE);
-
-        match saved_socket {
-            Some(v) => std::env::set_var("SOCKET_GOPROXY", v),
-            None => std::env::remove_var("SOCKET_GOPROXY"),
-        }
-        match saved {
-            Some(v) => std::env::set_var("GOPROXY", v),
-            None => std::env::remove_var("GOPROXY"),
-        }
-        match saved_goenv {
-            Some(v) => std::env::set_var("GOENV", v),
-            None => std::env::remove_var("GOENV"),
-        }
         assert_eq!(socket_wins.as_deref(), Ok("https://socket.example"));
         assert_eq!(
             empty_falls_through.as_deref(),

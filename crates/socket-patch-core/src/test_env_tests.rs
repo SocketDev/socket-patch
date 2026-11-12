@@ -47,3 +47,22 @@ fn keeps_a_non_utf8_previous_value() {
     assert_eq!(std::env::var_os(KEY).as_deref(), Some(raw));
     std::env::remove_var(KEY);
 }
+
+#[test]
+#[serial_test::serial]
+fn guarded_var_sees_only_vars_a_live_guard_holds() {
+    std::env::set_var(KEY, "host");
+    assert_eq!(crate::test_env::guarded_var(KEY), None, "host value hidden");
+    {
+        let _outer = EnvGuard::set(KEY, "a");
+        assert_eq!(crate::test_env::guarded_var(KEY).as_deref(), Some("a"));
+        {
+            let _inner = EnvGuard::unset(KEY);
+            assert_eq!(crate::test_env::guarded_var(KEY), None);
+        }
+        // The outer guard still holds it once the inner one drops.
+        assert_eq!(crate::test_env::guarded_var(KEY).as_deref(), Some("a"));
+    }
+    assert_eq!(crate::test_env::guarded_var(KEY), None, "released on drop");
+    std::env::remove_var(KEY);
+}
