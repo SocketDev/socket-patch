@@ -23,6 +23,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 
 use super::env::{self, Group, System};
+use super::fixture_server::FixtureServer;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
@@ -39,8 +40,18 @@ pub struct Report {
     pub bazel: Option<String>,
     pub group: Option<Group>,
     pub system: Option<System>,
+    /// The lanes this test proves on its cell (`H-JS1`): what the claims
+    /// audit matches a claim of `lanes::claims_json()` against. Empty for
+    /// a test that proves no lane (the toy, a guard, a canary).
+    pub lanes: Vec<String>,
     /// Every host the fixture server was asked for, from its request log.
-    pub hosts: Vec<String>,
+    /// Private, with [`Report::hosts_logged`]: only
+    /// [`Report::hosts_from_log`] and [`Report::hosts_from_renamed_log`],
+    /// which read a server, can set it, so a report cannot name a host no
+    /// server logged. The audit refuses a list with any other source.
+    hosts: Vec<String>,
+    /// [`Report::hosts`] was taken from a fixture server's log.
+    hosts_logged: bool,
     /// A command of the test reached hosts directly, with no downloader
     /// rewrite, so `hosts` is not the whole list and the report proves
     /// nothing about hermeticity. Set only when such a command ran: by the
@@ -63,7 +74,9 @@ impl Report {
             bazel: None,
             group: None,
             system: None,
+            lanes: Vec::new(),
             hosts: Vec::new(),
+            hosts_logged: false,
             direct_network: false,
             resolved: BTreeMap::new(),
             details: serde_json::Map::new(),
@@ -76,6 +89,45 @@ impl Report {
         self
     }
 
+    /// This test is evidence for `lane` on its cell. A lane is claimed on
+    /// a Bazel line, dependency system or OS only with a `ran` report that
+    /// names it there (`scripts/bazel-matrix-audit.py --claims`).
+    pub fn proves(&mut self, lane: &str) -> &mut Report {
+        if !self.lanes.iter().any(|known| known == lane) {
+            self.lanes.push(lane.to_string());
+        }
+        self
+    }
+
+    /// The hosts the report names: empty until one of the two functions
+    /// below read a fixture server's log.
+    pub fn hosts(&self) -> &[String] {
+        &self.hosts
+    }
+
+    /// Take `hosts` from the request log of the test's fixture server.
+    pub fn hosts_from_log(&mut self, server: &FixtureServer) {
+        self.hosts_from_renamed_log(server, server.hosts());
+    }
+
+    /// [`Report::hosts_from_log`] for a test that renames what the log
+    /// cannot name: a request a tool sent straight to the loopback origin
+    /// has no host segment, and is reported as `127.0.0.1`. `hosts` is the
+    /// server's own list after that renaming, which can merge two entries
+    /// and never adds one.
+    pub fn hosts_from_renamed_log(&mut self, server: &FixtureServer, mut hosts: Vec<String>) {
+        hosts.sort();
+        hosts.dedup();
+        let logged = server.hosts().len();
+        assert!(
+            hosts.len() <= logged,
+            "{}: {hosts:?} names more hosts than the fixture server logged ({logged})",
+            self.test
+        );
+        self.hosts = hosts;
+        self.hosts_logged = true;
+    }
+
     pub fn to_json(&self, status: Status, reason: Option<&str>) -> Value {
         json!({
             "test": self.test,
@@ -86,7 +138,11 @@ impl Report {
             "arch": std::env::consts::ARCH,
             "group": self.group.map(Group::name),
             "system": self.system.map(System::name),
+            "lanes": self.lanes,
             "hosts": self.hosts,
+            // `none`: no fixture server's log was read. The audit accepts
+            // that only beside an empty list (a test that served nothing).
+            "hosts_source": if self.hosts_logged { "fixture_server_log" } else { "none" },
             "direct_network": self.direct_network,
             "wall_ms": u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "resolved": self.resolved,

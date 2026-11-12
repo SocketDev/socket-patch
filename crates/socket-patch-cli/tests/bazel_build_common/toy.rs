@@ -689,7 +689,7 @@ impl Toy {
     /// is closed, nothing outside the scratch root was written, and the
     /// report is written with status `ran`.
     pub fn finish(mut self) {
-        self.cell.report.hosts = self.server.hosts();
+        self.cell.report.hosts_from_log(&self.server);
         let report = self.cell.close();
         self.outside.assert_untouched("after the cell closed");
         report.ran();

@@ -10,9 +10,10 @@ The hermetic Bazel suites (`e2e_bazel`, and the unit tests under
 `crates/socket-patch-core/src/bazel/`) need no Bazel and run in the normal
 `cargo test` job. Everything below needs a Bazel binary.
 
-State of this document: it describes the harness. The fixture workspaces, the
-lane tests and the CI workflow land in later changes; where a statement about
-Windows or Linux x86_64 has not been confirmed by a CI cell it says so.
+State of this document: it describes the harness, the CI matrix and the
+report audit. The lane tests land in later changes. Everything has run on
+macOS arm64 only; where a statement about Windows or Linux x86_64 has not been
+confirmed by a CI cell it says so.
 
 ## Getting a pinned Bazel
 
@@ -68,9 +69,12 @@ only the harness's own self-tests, which need no Bazel. With `--ignored` and no
 `SOCKET_PATCH_BAZEL_E2E_*` variable, a test looks for `bazel` on `PATH`; when
 there is none it prints `SKIP`, writes a report of status `skipped` and passes.
 
-A test name starts with one of six prefixes, which the CI cells filter on:
-`bazel_core_` (the toy fixture; no network), `bazel_guard_`, `bazel_agent_`,
-`bazel_hosted_`, `bazel_vendor_` and `bazel_canary_` (record-only).
+A test name starts with one of six prefixes, which the CI cells group by:
+`bazel_core_` (the toy fixture; no network where the line's module archives
+are committed, which is every pinned line but 8.8.2), `bazel_guard_`,
+`bazel_agent_`, `bazel_hosted_`, `bazel_vendor_` and `bazel_canary_`
+(record-only). `scripts/ci-e2e-bundle.py --check` refuses any other name, and
+`scripts/bazel-matrix.py --check` does the same for a test a macro declares.
 
 | Variable | Meaning |
 |---|---|
@@ -215,8 +219,13 @@ log is the `hosts` field of the cell report.
 - Fetches that do not go through Bazel's downloader (pip, cargo under
   crate_universe, Go modules, unpinned Coursier) need their own lever. One
   module per upstream registry lives under
-  `tests/bazel_build_common/registry/`; each is a stub that refuses until the
-  package that needs it lands the emulation.
+  `tests/bazel_build_common/registry/`. A fixture whose packages such a tool
+  fetches says `"fetch": "tool"` in its `MATRIX.json`, and a test that plays
+  the Socket API takes the origin it advertises from
+  `FixtureServer::hosted_origin(fetcher)`: `https://patch.socket.dev` for
+  Bazel's downloader, so everything socket-patch writes is production-shaped
+  and arrives through the rewrite, and the loopback origin for a tool the
+  rewrite cannot reach.
 
 ## `MODULE.bazel.lock`
 
@@ -310,7 +319,9 @@ Each test writes `<probe dir>/<test>.<bazel>.<system>.<os>-<arch>.json`:
   "arch": "aarch64",
   "group": "core",
   "system": null,
+  "lanes": [],
   "hosts": [],
+  "hosts_source": "none",
   "direct_network": false,
   "wall_ms": 11022,
   "resolved": {},
@@ -322,8 +333,18 @@ Each test writes `<probe dir>/<test>.<bazel>.<system>.<os>-<arch>.json`:
 printed `SKIP` or `SKIP (n/a)` writes `skipped` with the reason. A lane may
 claim a Bazel line, dependency system or OS only with a `ran` report for it.
 `hosts` is the fixture server's log, `resolved` the ruleset versions `bazel
-mod graph` reported, and `direct_network` marks a canary that reached hosts
+mod graph` reported, and `direct_network` marks a test that reached hosts
 without the downloader rewrite.
+
+- `hosts_source` says where `hosts` came from: `fixture_server_log` when the
+  test set it with `Report::hosts_from_log` (or `hosts_from_renamed_log`, for
+  a request a tool sent straight to the loopback origin, which the log cannot
+  name), else `none` beside an empty list. The field is private, so a test
+  cannot write a list by hand, and the audit refuses any report whose list
+  names a host without that source.
+- `lanes` names the lanes the test proves on its cell (`Report::proves("H-JS1")`).
+  The claims audit matches a lane's claim against it, so a lane test that does
+  not call `proves` is evidence for nothing.
 
 A test that fails leaves no report. It writes none, and because the file name
 is fixed per cell and the default directory persists, `Cell::open` removes the
@@ -335,6 +356,73 @@ run that skips before it finds a Bazel (no Bazel, or another `_GROUP` or
 `_SYSTEM`; that report is `<test>.none...json`). **A run whose reports are
 audited therefore sets `SOCKET_PATCH_BAZEL_E2E_PROBE_DIR` to a new, empty
 directory.**
+
+## CI matrix and audit
+
+| Where | Runs | Blocking |
+|---|---|---|
+| `ci.yml`, job `e2e`, one row | `--ignored bazel_core_` on Bazel 9.3.2 on ubuntu: the toy fixture, no network | yes |
+| [`bazel-compatibility.yml`](../../.github/workflows/bazel-compatibility.yml) on a pull request that touches a Bazel path | the cells of tier `pr` | no |
+| the same workflow nightly, on dispatch, and on a pull request labelled `bazel-matrix` | every cell | no (a red audit blocks promoting a lane) |
+
+The workflow's matrix is generated. Each fixture group or ruleset has a
+`MATRIX.json` under `crates/socket-patch-cli/tests/fixtures/bazel/` that lists
+its tests, the Bazel releases each runs on and a tier (`pr` or `nightly`).
+`scripts/bazel-matrix.py` reads all of them and prints the cells of an event:
+one cell per (fixture group, Bazel, runner, test-name prefix), run with
+`--exact` and the full path of each test, so a cell runs the tests its
+matrices list and no other. The toy group is all in one: its `core` cell
+also runs the guard tests that use the toy fixture
+(`core/guard/MATRIX.json`), which the `bazel_core_` row of `ci.yml` does not
+select. To add a cell, edit the `MATRIX.json` of your fixtures; nobody edits
+the workflow. A new `#[ignore]` test that no matrix lists fails `--check`: a
+`bazel_core_` test goes into `core/MATRIX.json`, any other test on the toy
+fixture into `core/guard/MATRIX.json` (or a file of the same shape with its
+own `filter`), and a ruleset's test under its fixture in the ruleset's file.
+
+```sh
+python3 scripts/bazel-matrix.py --check                  # the rules below
+python3 scripts/bazel-matrix.py --event pull_request     # the plan, as JSON
+```
+
+`--check` (also run by `scripts/tests/test_bazel_matrix.py`) fails when a
+listed test is not an `#[ignore]` test of the suite or such a test is in no
+matrix, when a (Bazel, runner) has no pin, when a (fixture, Bazel) pair is not
+in the era table the script carries, when a rules_jvm_external entry of tier
+`pr` climbs above proof tier 0, when a Go or Rust entry is `pr` without a
+restored repository cache, or when a fixture whose packages a tool fetches
+(pip mode, crate_universe, an unpinned Coursier hub) does not say
+`"fetch": "tool"`. The light and heavy matrices name no runner: a nightly
+entry runs on ubuntu, and a lane test on 7.7.2, 8.8.2 or 9.3.2 also on macOS
+and Windows; `pr` moves the ubuntu cell into the pull-request tier.
+
+A test that printed `SKIP` still passes for libtest, so a green cell proves
+nothing by itself. Each cell therefore ends with the audit, and the `audit`
+job repeats it over the whole run:
+
+```sh
+python3 scripts/bazel-matrix-audit.py --reports <dir> --require hosts,wall_ms,resolved \
+    [--tiers pr|full [--cell <id>]] [--claims target/bazel-claims.json]
+```
+
+It fails when a `ran` report lacks its hosts, their source or its wall time,
+when a resolved ruleset version differs from the pin in its `MATRIX.json`,
+when a test planned for the run (or the cell) has no `ran` report on its
+Bazel release and runner, and when a claim of `lanes::claims_json()` has no
+evidence. A claim is a lane on Bazel `lo` to `hi` under one dependency system.
+It is held to the pinned releases: `hi` must be one, every major the range
+spans must have one inside it, and the newest of each needs a `ran` report
+that names the lane, under that system, on each OS the claim lists (on any OS
+while it lists none). Over a whole run a record-only cell that did not run is
+listed and is not an error.
+
+To check a local run against the plan of its cell (the cell ids are in the
+plan; a macOS cell is `nightly`, so `--tiers full`):
+
+```sh
+python3 scripts/bazel-matrix-audit.py --reports "$SOCKET_PATCH_BAZEL_E2E_PROBE_DIR" \
+    --tiers full --cell core-9.3.2-macos-core
+```
 
 ## Local runs on a shared machine
 

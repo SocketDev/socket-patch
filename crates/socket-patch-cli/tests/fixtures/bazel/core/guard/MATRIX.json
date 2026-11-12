@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "group": "core",
+  "filter": "bazel_guard_",
+  "notes": [
+    "The real-Bazel guard tests that run on the toy fixture (fixtures/bazel/core, opened through toy::open) and so belong to the core group, without being `bazel_core_` tests: core/MATRIX.json lists only names with that prefix. Same shape as that file. scripts/bazel-matrix.py plans these tests into the core cell of their Bazel and runner (a core cell is every gating test of the toy fixture), so they run in bazel-compatibility.yml; ci.yml's required row filters on `bazel_core_` and does not run them.",
+    "tests lists the Bazel versions each test reported status `ran` on. Both ran on 9.3.2 and 7.7.2 on macOS arm64 (2026-11-12), with no host but the toy registry, which the fixture server plays. The ubuntu cells are where the plan runs them, not where they have run. No Windows cell: nothing has run these tests there."
+  ],
+  "cells": [
+    {
+      "bazel": "9.3.2",
+      "os": ["ubuntu-latest", "macos-latest"],
+      "tier": {"ubuntu-latest": "pr", "macos-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e9"}
+    },
+    {
+      "bazel": "7.7.2",
+      "os": ["ubuntu-latest", "macos-latest"],
+      "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e7"}
+    }
+  ],
+  "tests": {
+    "bazel_guard_ignore_agent_go_tree_at_the_root": {"system": "bzlmod", "bazel": ["7.7.2", "9.3.2"]},
+    "bazel_guard_ignore_agent_go_tree_below_the_root": {"system": "bzlmod", "bazel": ["7.7.2", "9.3.2"]}
+  }
+}

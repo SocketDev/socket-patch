@@ -75,9 +75,11 @@ class PrefixGuard(unittest.TestCase):
         ])
 
     def test_every_gradle_suite_is_guarded_by_its_own_prefixes(self):
-        self.assertEqual(set(bundle.PREFIX_GUARDS), set(bundle.GRADLE_SUITES))
+        # The real-Bazel suite is guarded too, by prefixes of its own
+        # (test_ci_bazel_prefixes.py); no Gradle name may pass its guard.
+        self.assertEqual(set(bundle.PREFIX_GUARDS), set(bundle.GRADLE_SUITES) | set(bundle.BAZEL_SUITE_PREFIXES))
         admits = {suite: [n for n in ("gradle_agent_x", "gradle_hosted_x", "gradle_vendor_x", "gradle_multi_project_x")
-                          if guard.match(n)] for suite, guard in bundle.PREFIX_GUARDS.items()}
+                          if bundle.PREFIX_GUARDS[suite].match(n)] for suite in bundle.GRADLE_SUITES}
         self.assertEqual(admits, {
             "e2e_gradle_discovery_build": ["gradle_agent_x"],
             "e2e_gradle_agent_build": ["gradle_agent_x"],
