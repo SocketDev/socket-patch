@@ -94,9 +94,10 @@ pub struct RootRef {
     /// The project relative to `root`: forward slashes, `""` at the root.
     pub project_rel: String,
     /// How many directory levels the read boundary (the git checkout
-    /// root) lies above `root`; 0 when the root is the boundary. `probe`
-    /// sets it. It is what lets a pure reader walk the ancestors of the
-    /// root without asking for a file past the boundary.
+    /// root, or the top of the disk for a project outside any checkout)
+    /// lies above `root`; 0 when the root is the boundary. `probe` sets
+    /// it. It is what lets a pure reader walk the ancestors of the root
+    /// without asking for a file past the boundary.
     pub boundary_levels: usize,
 }
 
