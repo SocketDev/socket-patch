@@ -1,0 +1,190 @@
+{
+ "source": "probe L7 gv11 (versions-hybrid/vectors/version-order.json)",
+ "note": "selected is the higher of a and b under Bazel's module version ordering: the version `bazel mod graph` selected on every run of bazel_runs.",
+ "bazel_runs": [
+  "10.0.0rc3-abs",
+  "6.6.0-abs",
+  "7.0.2-abs",
+  "7.1.2-abs",
+  "7.6.2-abs",
+  "7.7.0-abs",
+  "7.7.0-workspace",
+  "7.7.2-abs",
+  "7.7.2-workspace",
+  "8.3.1-abs",
+  "8.4.2-abs",
+  "8.8.2-abs",
+  "9.3.2-abs",
+  "9.3.2-workspace"
+ ],
+ "pairs": [
+  {
+   "id": "pair01",
+   "a": "1.5.0-rc0",
+   "b": "1.5.0",
+   "selected": "1.5.0"
+  },
+  {
+   "id": "pair02",
+   "a": "1.5.0-rc4",
+   "b": "1.5.0-rc0",
+   "selected": "1.5.0-rc4"
+  },
+  {
+   "id": "pair03",
+   "a": "1.5.0-rc10",
+   "b": "1.5.0-rc9",
+   "selected": "1.5.0-rc9"
+  },
+  {
+   "id": "pair04",
+   "a": "1.5.0-rc.10",
+   "b": "1.5.0-rc.9",
+   "selected": "1.5.0-rc.10"
+  },
+  {
+   "id": "pair05",
+   "a": "6.9",
+   "b": "6.10",
+   "selected": "6.10"
+  },
+  {
+   "id": "pair06",
+   "a": "1.0.0-beta.1",
+   "b": "0.54.0",
+   "selected": "1.0.0-beta.1"
+  },
+  {
+   "id": "pair07",
+   "a": "2.0.0-beta.2",
+   "b": "2.0.0-beta.1",
+   "selected": "2.0.0-beta.2"
+  },
+  {
+   "id": "pair08",
+   "a": "2.0.0-beta.2",
+   "b": "1.0.0-beta.1",
+   "selected": "2.0.0-beta.2"
+  },
+  {
+   "id": "pair09",
+   "a": "1.0.0-beta.2",
+   "b": "1.0.0-beta.10",
+   "selected": "1.0.0-beta.10"
+  },
+  {
+   "id": "pair10",
+   "a": "1.0",
+   "b": "1.0.0",
+   "selected": "1.0.0"
+  },
+  {
+   "id": "pair11",
+   "a": "1.2.3-alpha",
+   "b": "1.2.3-alpha.1",
+   "selected": "1.2.3-alpha.1"
+  },
+  {
+   "id": "pair12",
+   "a": "1.2.3-1",
+   "b": "1.2.3-alpha",
+   "selected": "1.2.3-alpha"
+  },
+  {
+   "id": "pair13",
+   "a": "20210324.2",
+   "b": "20230125.1",
+   "selected": "20230125.1"
+  },
+  {
+   "id": "pair14",
+   "a": "1.a",
+   "b": "1.1",
+   "selected": "1.a"
+  },
+  {
+   "id": "pair15",
+   "a": "29.0-rc2",
+   "b": "29.0-rc2.bcr.1",
+   "selected": "29.0-rc2.bcr.1"
+  },
+  {
+   "id": "pair16",
+   "a": "1.7.1",
+   "b": "1.7.1.bcr.1",
+   "selected": "1.7.1.bcr.1"
+  },
+  {
+   "id": "pair17",
+   "a": "4.0.0-alpha.1",
+   "b": "3.6.0",
+   "selected": "4.0.0-alpha.1"
+  },
+  {
+   "id": "pair18",
+   "a": "1.2.3.socket.ab12cd34",
+   "b": "1.2.3",
+   "selected": "1.2.3.socket.ab12cd34"
+  },
+  {
+   "id": "pair19",
+   "a": "1.2.3.socket.ab12cd34",
+   "b": "1.2.4",
+   "selected": "1.2.4"
+  },
+  {
+   "id": "pair20",
+   "a": "1.2.3-socket.ab12cd34",
+   "b": "1.2.3",
+   "selected": "1.2.3"
+  },
+  {
+   "id": "pair21",
+   "a": "0.0.0",
+   "b": "0.0.1-rc1",
+   "selected": "0.0.1-rc1"
+  },
+  {
+   "id": "pair22",
+   "a": "1.9.2",
+   "b": "1.10.0",
+   "selected": "1.10.0"
+  },
+  {
+   "id": "pair23",
+   "a": "1.0.0-rc1",
+   "b": "1.0.0-Rc2",
+   "selected": "1.0.0-rc1"
+  },
+  {
+   "id": "pair24",
+   "a": "1.0.0-0",
+   "b": "1.0.0-a",
+   "selected": "1.0.0-a"
+  },
+  {
+   "id": "pair25",
+   "a": "1.0.0",
+   "b": "1.0.0+build.5",
+   "skip": "build metadata is release-dependent: 6.6.0 and 7.0.2 crash (LabelSyntaxException: invalid repository name 'pair25~1.0.0+build.5'); 7.1.2 keeps '+build.5' in the module key; 7.6.2 and later normalize to 1.0.0. Not a golden."
+  },
+  {
+   "id": "pair26",
+   "a": "0.31.0",
+   "b": "0.4.0",
+   "selected": "0.31.0"
+  },
+  {
+   "id": "pair27",
+   "a": "7.2",
+   "b": "7.2.1",
+   "selected": "7.2.1"
+  },
+  {
+   "id": "pair28",
+   "a": "2025.01.01",
+   "b": "2025.1.2",
+   "selected": "2025.1.2"
+  }
+ ]
+}
