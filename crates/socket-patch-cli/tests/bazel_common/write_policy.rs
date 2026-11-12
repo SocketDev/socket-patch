@@ -11,7 +11,8 @@ pub enum WriteClass {
     /// A native lock a hub reads, the manifest the native rewriter edits
     /// with it, or a side file: today's rewriter output. A side file
     /// exists already, except `pnpm-workspace.yaml`, which native hosted
-    /// mode also creates (owner decision O14).
+    /// mode also creates beside the pnpm lock (owner decision O14; see
+    /// [`beside_its_lock`]).
     NativeLock,
     /// A value in a file a tool generates: `maven_install*.json`,
     /// `paket.<group>.bzl`, an rules_js hash-file line, one existing
@@ -90,6 +91,9 @@ const NEVER_LEAVES: &[&str] = &[
 
 /// The class of one changed path after a run that wires, repairs or takes
 /// over (`None` = absent on that side), or why the change is not allowed.
+///
+/// This judges the path by itself. The one rule that needs the tree
+/// around it, [`beside_its_lock`], is applied by the `assert_*` functions.
 pub fn classify(
     rel: &str,
     before: Option<&Entry>,
@@ -215,6 +219,42 @@ fn regular_file(entry: Option<&Entry>) -> Result<Option<(&[u8], u32)>, String> {
         Some(Entry::File { bytes, mode }) => Ok(Some((bytes, *mode))),
         Some(_) => Err("outside `.socket` only a regular file may change".into()),
     }
+}
+
+/// The pnpm side file comes and goes only beside the pnpm lock it serves
+/// (owner decision O14): a run creates `pnpm-workspace.yaml` where native
+/// hosted mode creates it, in the directory of the governed
+/// `pnpm-lock.yaml`, and a restore deletes it there. pnpm takes the
+/// nearest `pnpm-workspace.yaml` above a directory as its workspace root,
+/// so one created anywhere else cuts that directory out of the user's
+/// workspace. An existing file that a run extends is not judged here: the
+/// file that governs a lock may lie above it.
+///
+/// `class` is the verdict of [`classify`] on `rel`: a `pnpm-workspace.yaml`
+/// that a vendored package ships under `.socket` is no side file.
+pub fn beside_its_lock(
+    rel: &str,
+    class: WriteClass,
+    before: &Snapshot,
+    after: &Snapshot,
+) -> Result<(), String> {
+    let dir = match rel.rsplit_once('/') {
+        Some((dir, "pnpm-workspace.yaml")) => format!("{dir}/"),
+        None if rel == "pnpm-workspace.yaml" => String::new(),
+        _ => return Ok(()),
+    };
+    if class != WriteClass::NativeLock || before.contains_key(rel) == after.contains_key(rel) {
+        return Ok(());
+    }
+    let lock = format!("{dir}pnpm-lock.yaml");
+    let regular = |tree: &Snapshot| matches!(tree.get(&lock), Some(Entry::File { .. }));
+    if regular(before) && regular(after) {
+        return Ok(());
+    }
+    Err(format!(
+        "`pnpm-workspace.yaml` is created or deleted only beside a pnpm lock, and `{lock}` is \
+         not a regular file before and after the run"
+    ))
 }
 
 /// Files a tool generates and socket-patch splices one value into.
@@ -479,7 +519,9 @@ fn assert_all(
     let mut allowed = Vec::new();
     let mut refused = Vec::new();
     for (path, _) in changes(before, after) {
-        match classify(&path, before.get(&path), after.get(&path), layout) {
+        let class = classify(&path, before.get(&path), after.get(&path), layout)
+            .and_then(|class| beside_its_lock(&path, class, before, after).map(|()| class));
+        match class {
             Ok(class) => allowed.push((path, class)),
             Err(why) => refused.push(format!("{path}: {why}")),
         }
