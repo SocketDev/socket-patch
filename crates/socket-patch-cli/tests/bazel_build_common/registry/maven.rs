@@ -70,6 +70,25 @@ pub fn mount(server: &FixtureServer, mirror: &Path) -> Result<Vec<String>, Strin
     Ok(scopes)
 }
 
+/// Serve the mirrored file `path` (under the repository root:
+/// `org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar`) at its Maven Central URL with
+/// one byte in the middle flipped, for a tamper twin: the same length, another
+/// digest, never an appended byte. A pinned lock still records the mirrored sha256,
+/// so Bazel's downloader must refuse what it gets; run the twin on an empty
+/// repository cache, or no request is made. The `.sha1` sidecar keeps the digest of
+/// the mirrored file. Call it after [`mount`]: it replaces the file's route.
+pub fn tamper(server: &FixtureServer, mirror: &Path, path: &str) -> Result<(), String> {
+    let file = mirror.join(HOST).join(ROOT).join(path);
+    let mut bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("{}: nothing to tamper with", file.display()));
+    }
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    server.serve(&format!("https://{HOST}/{ROOT}/{path}"), bytes);
+    Ok(())
+}
+
 /// Serve the mirror on `server` as a repository of its own, for a client that reads
 /// it directly, and return the URL to write as the hub's `repositories` value in the
 /// workspace copy. Plain `http` on loopback is all Coursier needs; nothing Bazel's

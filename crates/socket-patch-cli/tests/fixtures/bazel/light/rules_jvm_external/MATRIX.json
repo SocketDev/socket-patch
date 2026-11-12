@@ -39,7 +39,12 @@
       ],
       "tier0_roots": [
         "@maven//:org_slf4j_slf4j_api"
-      ]
+      ],
+      "lock_flavors": {
+        "maven_install.json": [
+          "v3-sorted"
+        ]
+      }
     },
     {
       "path": "bzlmod/e9-two-hubs",
@@ -67,7 +72,17 @@
       ],
       "load": [
         "@other//:all"
-      ]
+      ],
+      "lock_flavors": {
+        "maven_install.json": [
+          "v3-sorted",
+          "v3-insertion"
+        ],
+        "other_install.json": [
+          "v3-sorted",
+          "v3-insertion"
+        ]
+      }
     },
     {
       "path": "bzlmod/e9-spoke",
@@ -96,7 +111,12 @@
       ],
       "versioned_names": [
         "org_slf4j_slf4j_api_1_7_36"
-      ]
+      ],
+      "lock_flavors": {
+        "maven_install.json": [
+          "v3-sorted"
+        ]
+      }
     },
     {
       "path": "bzlmod/e8-insertion",
@@ -115,7 +135,12 @@
       ],
       "tier0_roots": [
         "@maven//:org_slf4j_slf4j_api"
-      ]
+      ],
+      "lock_flavors": {
+        "maven_install.json": [
+          "v3-insertion"
+        ]
+      }
     },
     {
       "path": "bzlmod/e7-v2",
@@ -134,7 +159,12 @@
       ],
       "tier0_roots": [
         "@maven//:org_slf4j_slf4j_api"
-      ]
+      ],
+      "lock_flavors": {
+        "maven_install.json": [
+          "v2"
+        ]
+      }
     },
     {
       "path": "bzlmod/e9-unpinned",

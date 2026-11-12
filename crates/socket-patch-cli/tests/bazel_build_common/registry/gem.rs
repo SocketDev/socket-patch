@@ -40,6 +40,25 @@ fn gem_name(file: &str) -> Option<&str> {
     (cut > 0).then(|| &stem[..cut])
 }
 
+/// Serve the mirrored gem `file` (`sp-victim-1.0.0.gem`) at its production URL with
+/// one byte in the middle flipped, for a tamper twin: the same length (so never
+/// [`SKIPPED_GEM_SIZE`], which [`mount`] refuses), another digest, never an appended
+/// byte. Bazel refuses it only when the fixture lists the gem in `gem_checksums`:
+/// without the dict rules_ruby accepts a tampered gem at fetch, so a twin is claimed
+/// on a `gem_checksums` fixture alone, and on an empty repository cache. Call it
+/// after [`mount`]: it replaces the gem's route.
+pub fn tamper(server: &FixtureServer, mirror: &Path, file: &str) -> Result<(), String> {
+    let path = mirror.join(HOST).join("gems").join(file);
+    let mut bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("{}: nothing to tamper with", path.display()));
+    }
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    server.serve(&format!("https://{HOST}/gems/{file}"), bytes);
+    Ok(())
+}
+
 /// Serve the mirror on `server` at its production URLs. `Err` for a gem whose name
 /// cannot be read, and for one of [`SKIPPED_GEM_SIZE`] bytes.
 ///

@@ -137,6 +137,30 @@ pub fn mount(server: &FixtureServer, mirror: &Path) -> Result<Vec<String>, Strin
     Ok(scopes)
 }
 
+/// Serve the mirrored package file of `id` at `version` at its production URL with
+/// one byte in the middle flipped, for a tamper twin: the same length, another
+/// digest, never an appended byte. The fixture still pins the mirrored sha512, so
+/// Bazel's downloader must refuse what it gets; run the twin on an empty repository
+/// cache, or no request is made. Call it after [`mount`]: it replaces the package's
+/// route.
+pub fn tamper(
+    server: &FixtureServer,
+    mirror: &Path,
+    id: &str,
+    version: &str,
+) -> Result<(), String> {
+    let url = nupkg_url(id, version);
+    let file = mirror.join(url.trim_start_matches("https://"));
+    let mut bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
+    if bytes.is_empty() {
+        return Err(format!("{}: nothing to tamper with", file.display()));
+    }
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0x01;
+    server.serve(&url, bytes);
+    Ok(())
+}
+
 /// Have the flat container at `base` answer a bare `status` (403, 503, or 410 for a
 /// withdrawal) for the package file of `id` at `version`, at every spelling of
 /// [`nupkg_spellings`]: what a feed does for a package it does not hold or no longer
