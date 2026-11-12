@@ -74,13 +74,13 @@ A test name starts with one of six prefixes, which the CI cells filter on:
 
 | Variable | Meaning |
 |---|---|
-| `SOCKET_PATCH_BAZEL_E2E_BAZEL` | The Bazel binary to drive, or a launcher. Unset: `bazel` on `PATH`. |
+| `SOCKET_PATCH_BAZEL_E2E_BAZEL` | The Bazel binary to drive, or a launcher. Unset: `bazel` on `PATH`. A relative path is resolved against the directory the tests run from (`crates/socket-patch-cli`), not against the workspace copy Bazel runs in. |
 | `SOCKET_PATCH_BAZEL_E2E_VERSION` | `bazel --version` must print exactly this. Exported to the child as `USE_BAZEL_VERSION`, so a launcher selects it. |
 | `SOCKET_PATCH_BAZEL_E2E_REQUIRED` | Non-empty: a missing Bazel or an unreachable origin fails instead of printing `SKIP`. CI sets it. |
 | `SOCKET_PATCH_BAZEL_E2E_GROUP` | `core`, `light` or `heavy`. A test of another group prints `SKIP (n/a)`. |
 | `SOCKET_PATCH_BAZEL_E2E_SYSTEM` | `bzlmod`, `workspace` or `hybrid`. A test of another system, or of a system the Bazel line does not have, prints `SKIP (n/a)`. |
 | `SOCKET_PATCH_BAZEL_E2E_BAZELISK`, `_BINARY` | The launcher cell: the pinned bazelisk runs the release binary. |
-| `SOCKET_PATCH_BAZEL_E2E_PROBE_DIR` | Where the per-cell JSON reports go. Default: `target/tmp/bazel-probe`. |
+| `SOCKET_PATCH_BAZEL_E2E_PROBE_DIR` | Where the per-cell JSON reports go. Default: `target/tmp/bazel-probe`, which persists between runs. A run whose reports are audited sets this to an empty directory (see [Reports](#reports)). |
 | `SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT` | A persistent repository cache (`<root>/repos`) shared by every test. Default: an empty cache per test. |
 | `SOCKET_PATCH_BAZEL_E2E_OUTPUT_ROOT` | A short directory for output user roots (Windows path limits). |
 | `SOCKET_PATCH_BAZEL_E2E_ARGS` | Extra whitespace-separated options for every Bazel command. |
@@ -105,8 +105,10 @@ bazel --nohome_rc --nosystem_rc --output_user_root=<T>/root --max_idle_secs=15 \
 plus, per Bazel line: the dependency-system flags, `--lockfile_mode` with a
 stated value (6.2 and later), `--repo_contents_cache=` (8.3 and later, so
 fetched repositories are not shared between workspaces), and the downloader
-config when the test has a fixture server. The workspace `.bazelrc` stays
-active, because socket-patch's model reads it.
+config when the test has a fixture server (`--downloader_config` from 8.2.0,
+`--experimental_downloader_config` before: 8.0.x and 8.1.x do not know the
+new name). The workspace `.bazelrc` stays active, because socket-patch's
+model reads it.
 
 - `--output_user_root` alone keeps the output base and install base inside
   `<T>`. `--output_base` does not: Bazel still creates the default user root.
@@ -137,6 +139,16 @@ active, because socket-patch's model reads it.
   removes `<T>`, also when the test panics. At most two servers run at once,
   and a test holds one cell at a time: it closes its cell before it opens a
   twin (opening a second one panics).
+- A server that was killed or that crashed (exit 37, the OOM killer) leaves
+  its `server/server.pid.txt` behind: only a JVM shutdown hook removes it,
+  and `bazel shutdown` returns at once when no server answers. After a
+  successful `bazel shutdown` the harness therefore checks whether the
+  process a remaining pid file names still exists (`kill(pid, 0)`; on
+  Windows `tasklist`, untested) and removes the file of a dead one. Only a
+  server that is still running is an error.
+  `bazel_core_shutdown_after_the_server_was_killed` kills a server with
+  `SIGKILL` and checks that the cell shuts down, starts a new server and
+  closes (Unix only; `SKIP (n/a)` on Windows).
 
 `bazel_core_launch_isolated` is the test of these rules: the version matches,
 the output base and install base are under `<T>/root`, the server JVM has the
@@ -145,6 +157,16 @@ scratch temp directory and wrote no perf-data file, and none of
 the default bazelisk home was created or changed. It runs only `info` and
 `shutdown`, so it needs no network. It has run on macOS arm64 for Bazel 7.0.2,
 7.7.2 and 9.3.2; Linux and Windows are unconfirmed until a CI cell runs it.
+
+The check must not depend on the test process having `USER` set (a Docker
+container often sets `HOME` alone). The perf-data check looks into every
+`hsperfdata_*` directory for the server's pid. The user's name in the default
+output root (`/private/var/tmp/_bazel_<user>` on macOS,
+`%USERPROFILE%\_bazel_<user>` on Windows) comes from `USER` or `USERNAME`, else
+from `LOGNAME` and `id -un`. When no name can be found on those two systems
+the test fails instead of watching nothing; on Linux the root is under
+`~/.cache/bazel`, which is watched through `HOME`. A test process with
+neither `HOME` nor `USERPROFILE` fails the same way.
 
 On Windows the harness sets `BAZEL_SH` to Git's or MSYS2's `bash.exe` when it
 is unset (Bazel otherwise takes the first `bash.exe` on `PATH`, which on a
@@ -170,13 +192,26 @@ log is the `hosts` field of the cell report.
 - **Offline phase** (`SOCKET_PATCH_BAZEL_E2E_OFFLINE`): the same config
   against a server whose store is empty, with `HTTP_PROXY`, `HTTPS_PROXY` and
   `ALL_PROXY` at `127.0.0.1:9` and `NO_PROXY=127.0.0.1,localhost`. The
-  assertion is "the server log holds no request for the package's own URL",
-  not "no request". A warm repository cache plus `block *` is not an offline
-  recipe before Bazel 9.3.0: it fails at the first archive without a `type`.
+  assertion is "the server log holds no request for the package's own URL"
+  (`FixtureServer::assert_not_requested`), not "no request", and it has no
+  minimum either: the phase runs on the warm cache, where a fully checksummed
+  fixture sends nothing at all. A warm repository cache plus `block *` is not
+  an offline recipe before Bazel 9.3.0: it fails at the first archive without
+  a `type`.
 - **Twins.** A tamper or withdrawal twin runs on a new output base with an
   empty repository cache (`Cell::open_cold`): with a warm cache the same URL
-  and checksum pass with zero requests. Every assertion about what the server
-  received first asserts that at least one request arrived.
+  and checksum pass with zero requests. Every assertion about what a cold run
+  sent first asserts that the artifact itself was requested
+  (`FixtureServer::assert_requested(url, ..)`, which returns its requests so
+  a withdrawal twin can read the status). "Some request arrived" is not
+  enough: under the rewrite a cold cell always asks the server for registry
+  files (`bcr.bazel.build/...`), also when the artifact was never fetched.
+  `assert_no_header(name, artifact_url, ..)` makes that check and then scans
+  every request, because a credential on any of them is a leak.
+- `FixtureServer::serve` answers with `Content-Type: application/octet-stream`,
+  which Bazel's downloader ignores. A client that reads the type gets it from
+  `serve_as(url, content_type, bytes)`: pip accepts an index page only as
+  `text/html` or `application/vnd.pypi.simple.v1+html` / `+json`.
 - Fetches that do not go through Bazel's downloader (pip, cargo under
   crate_universe, Go modules, unpinned Coursier) need their own lever. One
   module per upstream registry lives under
@@ -203,6 +238,12 @@ Bazel owns this file, and a live server keeps its own view of it.
 5. A cell that expects a fetch to fail runs one command with
    `--experimental_repository_downloader_retries=0` (`Cell::failing_fetch`).
 
+`Cell::write` refuses `MODULE.bazel.lock` (and a path that leaves the
+workspace copy), so rule 1 cannot be skipped by accident.
+`bazel_core_lock_writes_stop_the_server` checks against a live server that
+`write_module_lock` and a tree copy that carries a lock stop it first; it runs
+only `info` and `shutdown`.
+
 `Cell::baseline` runs every command class a scenario later runs, before the
 test takes its snapshot. Tree comparisons after Bazel ran leave out what Bazel
 owns (`bazel_common::assert_same_tree_but_bazel_owned`), and lock equality
@@ -216,9 +257,13 @@ socket-patch wrote, and the harness never names `external/<repo>` itself: it
 asks Bazel. Every fixture defines `//:socket_probe` with the shared rule in
 [`fixtures/bazel/common/probe.bzl`](../../crates/socket-patch-cli/tests/fixtures/bazel/common/probe.bzl),
 which the harness copies to the workspace root (`load("//:probe.bzl",
-"socket_probe")`). The rule symlinks each source to an output and uses no
-shell, so it builds without Bash; a tree-artifact input gets a directory
-output.
+"socket_probe")`); a fixture that ships its own `probe.bzl` is refused. The
+rule symlinks each source to an output and uses no shell, so it builds
+without Bash. A file input builds on every line from 5.4.1 on. A
+tree-artifact input gets a directory output, which needs Bazel 6: it builds
+on 6.2.1 and 6.6.0 (6.0 and 6.1 were not run) and fails on 5.4.1 with
+`Creating symlink ... failed: ... (File exists)`. No fixture gives the probe
+a directory input on a 5.x line.
 
 | Tier | Command | Proves |
 |---|---|---|
@@ -227,8 +272,10 @@ output.
 | 2 | `bazel run //:consumer` printing a marker from patched code | The language rule consumes it. |
 
 `bazel_canary_probe_rule_tree_artifact` builds the rule over a file and a
-tree artifact on the selected Bazel. It is record-only and uses the network on
-a Bzlmod line (Bazel resolves its builtin modules from the registry).
+tree artifact on the selected Bazel. Before Bazel 6 it builds the file input
+alone and records `"tree_artifact": "unsupported before Bazel 6"` in the
+report's details. It is record-only and uses the network on a Bzlmod line
+(Bazel resolves its builtin modules from the registry).
 
 ## Reports
 
@@ -253,12 +300,22 @@ Each test writes `<probe dir>/<test>.<bazel>.<system>.<os>-<arch>.json`:
 ```
 
 `status` is `ran` only when the test reached its last line; a test that
-printed `SKIP` or `SKIP (n/a)` writes `skipped` with the reason, and a test
-that failed writes nothing. A lane may claim a Bazel line, dependency system or
-OS only with a `ran` report for it. `hosts` is the fixture server's log,
-`resolved` the ruleset versions `bazel mod graph` reported, and
-`direct_network` marks a canary that reached hosts without the downloader
-rewrite.
+printed `SKIP` or `SKIP (n/a)` writes `skipped` with the reason. A lane may
+claim a Bazel line, dependency system or OS only with a `ran` report for it.
+`hosts` is the fixture server's log, `resolved` the ruleset versions `bazel
+mod graph` reported, and `direct_network` marks a canary that reached hosts
+without the downloader rewrite.
+
+A test that fails leaves no report. It writes none, and because the file name
+is fixed per cell and the default directory persists, `Cell::open` removes the
+report an earlier run of the same cell left as soon as it knows the Bazel
+version: a passing run followed by a failing one does not keep a `ran` report
+on disk. Two cases are out of that reach, because the later run never learns
+the earlier file's name: a test the later run does not run at all, and a later
+run that skips before it finds a Bazel (no Bazel, or another `_GROUP` or
+`_SYSTEM`; that report is `<test>.none...json`). **A run whose reports are
+audited therefore sets `SOCKET_PATCH_BAZEL_E2E_PROBE_DIR` to a new, empty
+directory.**
 
 ## Local runs on a shared machine
 

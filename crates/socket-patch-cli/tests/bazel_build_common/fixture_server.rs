@@ -7,7 +7,13 @@
 //! production URLs. A URL with nothing registered is answered 404 at once:
 //! a rewrite to a closed port instead costs Bazel 12 to 79 seconds of
 //! retries per miss. The request log is the `hosts` field of a cell report
-//! and what the offline and withdrawal assertions read.
+//! and what the offline and withdrawal assertions read:
+//!
+//! - [`FixtureServer::assert_not_requested`] is the offline assertion and
+//!   has no minimum (a warm cache sends nothing).
+//! - [`FixtureServer::assert_requested`] and
+//!   [`FixtureServer::assert_no_header`] are for a cold cell
+//!   (`Cell::open_cold`) and fail unless the artifact itself was fetched.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -25,10 +31,17 @@ use std::time::Duration;
 /// port recorded in `MODULE.bazel.lock` facts fails the next run.
 pub const HOSTED_ORIGIN: &str = "https://patch.socket.dev";
 
+/// The `Content-Type` of [`FixtureServer::serve`]: Bazel's downloader and
+/// the package managers that fetch an artifact ignore it.
+pub const OCTET_STREAM: &str = "application/octet-stream";
+
 /// What the server answers for one URL.
 #[derive(Clone, Debug)]
 enum Route {
-    Body(Vec<u8>),
+    Body {
+        content_type: String,
+        bytes: Vec<u8>,
+    },
     /// A bare status: 403, 404 or 410 for a withdrawal twin.
     Status(u16),
 }
@@ -103,7 +116,23 @@ impl FixtureServer {
     /// Serve `bytes` for `url`, written as the lock writes it
     /// (`https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz`).
     pub fn serve(&self, url: &str, bytes: impl Into<Vec<u8>>) {
-        self.route(url, Route::Body(bytes.into()));
+        self.serve_as(url, OCTET_STREAM, bytes);
+    }
+
+    /// [`FixtureServer::serve`] with a stated `Content-Type`, for a client
+    /// that reads it: pip accepts an index page only as `text/html` or
+    /// `application/vnd.pypi.simple.v1+html` / `+json`, and skips any
+    /// other page ("no matching distribution").
+    pub fn serve_as(&self, url: &str, content_type: &str, bytes: impl Into<Vec<u8>>) {
+        assert!(
+            !content_type.is_empty() && !content_type.contains(['\r', '\n']),
+            "not a Content-Type value: {content_type:?}"
+        );
+        let route = Route::Body {
+            content_type: content_type.to_string(),
+            bytes: bytes.into(),
+        };
+        self.route(url, route);
     }
 
     /// Answer `url` with a bare `status`.
@@ -139,30 +168,40 @@ impl FixtureServer {
         all.into_iter().filter(|r| r.url == key).collect()
     }
 
-    /// At least one request arrived. Every assertion about what the host
-    /// did *not* receive starts here: with a warm repository cache Bazel
-    /// sends nothing at all, and "no request with a credential" would
-    /// pass without having tested anything.
-    pub fn assert_reached(&self, what: &str) {
+    /// The artifact `url` was asked for at least once; returns its
+    /// requests (a withdrawal twin then reads their status). Every
+    /// assertion about what a cold run sent, or did not send, starts
+    /// here. "Some request arrived" is not enough: under the
+    /// rewrite-everything config a cold cell always asks the server for
+    /// registry files (`bcr.bazel.build/...`), also in a run that never
+    /// fetched the artifact itself.
+    pub fn assert_requested(&self, url: &str, what: &str) -> Vec<Request> {
+        let hits = self.requests_for(url);
         assert!(
-            !self.requests().is_empty(),
-            "{what}: the fixture server received no request, so this run proves nothing \
-             about what Bazel sends (is the repository cache warm?)"
+            !hits.is_empty(),
+            "{what}: the fixture server received no request for {url}, so this run proves \
+             nothing about how Bazel fetches it (is the repository cache warm?). \
+             Requested: {:?}",
+            self.requested_urls()
         );
+        hits
     }
 
-    /// `url` was not asked for, by a run that did reach the server. The
-    /// offline assertion: "no request for the package's own URL".
+    /// `url` was not asked for. The offline assertion: "the server log
+    /// holds no request for the package's own URL". It has no minimum: on
+    /// the warm cache the offline phase runs on, a fully checksummed
+    /// fixture sends no request at all.
     pub fn assert_not_requested(&self, url: &str, what: &str) {
-        self.assert_reached(what);
         let hits = self.requests_for(url);
         assert!(hits.is_empty(), "{what}: {url} was requested: {hits:?}");
     }
 
     /// No request carried the header `name` (any case), on a run that did
-    /// reach the server: no `Authorization` leaves the machine.
-    pub fn assert_no_header(&self, name: &str, what: &str) {
-        self.assert_reached(what);
+    /// fetch the artifact `artifact_url`: no `Authorization` leaves the
+    /// machine. Every request is scanned, not only the artifact's: a
+    /// credential on any of them is a leak.
+    pub fn assert_no_header(&self, name: &str, artifact_url: &str, what: &str) {
+        self.assert_requested(artifact_url, what);
         let name = name.to_ascii_lowercase();
         let with: Vec<String> = self
             .requests()
@@ -174,6 +213,11 @@ impl FixtureServer {
             with.is_empty(),
             "{what}: requests carried `{name}`: {with:?}"
         );
+    }
+
+    /// The URLs asked for, in arrival order, for a failure message.
+    fn requested_urls(&self) -> Vec<String> {
+        self.requests().into_iter().map(|r| r.url).collect()
     }
 }
 
@@ -222,11 +266,18 @@ fn serve_connection(mut stream: TcpStream, state: &State) {
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect();
     let route = state.routes.lock().unwrap().get(&url).cloned();
-    let (status, body) = match (method.as_str(), route) {
-        ("GET" | "HEAD", Some(Route::Body(body))) => (200, body),
-        ("GET" | "HEAD", Some(Route::Status(status))) => (status, Vec::new()),
-        ("GET" | "HEAD", None) => (404, Vec::new()),
-        _ => (405, Vec::new()),
+    let plain = |status: u16| (status, OCTET_STREAM.to_string(), Vec::new());
+    let (status, content_type, body) = match (method.as_str(), route) {
+        (
+            "GET" | "HEAD",
+            Some(Route::Body {
+                content_type,
+                bytes,
+            }),
+        ) => (200, content_type, bytes),
+        ("GET" | "HEAD", Some(Route::Status(status))) => plain(status),
+        ("GET" | "HEAD", None) => plain(404),
+        _ => plain(405),
     };
     state.log.lock().unwrap().push(Request {
         method: method.clone(),
@@ -243,7 +294,7 @@ fn serve_connection(mut stream: TcpStream, state: &State) {
         _ => "Status",
     };
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/octet-stream\r\n\
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );

@@ -2,13 +2,19 @@
 
 Each source is symlinked to an output under `<name>.out/` with
 `ctx.actions.symlink`: no shell and no toolchain, so one rule builds on
-every Bazel line from 5.4.1 on and on Windows without Bash. `bazel query`
-over the target's dependencies lists the files Bazel materialised (tier 0);
-building it makes each of them an action input whose output has the same
-bytes (tier 1).
+Windows without Bash. `bazel query` over the target's dependencies lists
+the files Bazel materialised (tier 0); building it makes each of them an
+action input whose output has the same bytes (tier 1).
 
-A tree-artifact input (rules_js `:node_modules/<pkg>/dir`) gets a directory
-output: `ctx.actions.symlink` rejects a file output for a directory target.
+Which Bazel builds what:
+
+- A file input builds on every line from 5.4.1 on.
+- A tree-artifact input (rules_js `:node_modules/<pkg>/dir`) gets a
+  directory output, because `ctx.actions.symlink` rejects a file output for
+  a directory target. That needs Bazel 6: it builds on 6.2.1 and 6.6.0
+  (6.0 and 6.1 were not run) and fails on 5.4.1, where the action ends with
+  `Creating symlink .../<name>.out/<dir> failed: ... (File exists)`. Do not
+  give the probe a directory input in a fixture that runs on a 5.x line.
 
 The test harness copies this file to the workspace root, so a fixture loads
 it as `load("//:probe.bzl", "socket_probe")` and must not ship its own.

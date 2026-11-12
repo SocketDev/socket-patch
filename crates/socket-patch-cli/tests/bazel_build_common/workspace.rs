@@ -28,7 +28,7 @@
 //! later steps reproduce. Lock equality after a rollback is asserted only
 //! after [`Cell::shutdown`] and a second [`Cell::baseline`].
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::env;
 use super::fixture_server::FixtureServer;
@@ -63,6 +63,44 @@ pub fn render_downloader_config(port: u16) -> String {
     text.replace("<port>", &port.to_string())
 }
 
+/// Whether [`Cell::write`] may write the workspace file `rel`: a relative
+/// path that stays inside the workspace copy and is not a
+/// `MODULE.bazel.lock` (any case: the macOS and Windows file systems fold
+/// it onto the one Bazel owns). `Err` says why not.
+pub fn check_plain_write(rel: &str) -> Result<(), String> {
+    let path = Path::new(rel);
+    let inside = path
+        .components()
+        .all(|part| matches!(part, Component::Normal(_) | Component::CurDir));
+    let Some(name) = path.file_name().filter(|_| inside) else {
+        return Err(format!(
+            "{rel:?} is not a file path inside the workspace copy"
+        ));
+    };
+    if name.to_string_lossy().eq_ignore_ascii_case(MODULE_LOCK) {
+        return Err(format!(
+            "{rel:?}: write {MODULE_LOCK} with write_module_lock, which stops the server first"
+        ));
+    }
+    Ok(())
+}
+
+/// Write `fixtures/bazel/common/probe.bzl` to the root of `workspace`.
+/// `Err` when a file of that name is already there: a fixture that ships
+/// its own would have the proof ladder test a rule nobody reviewed.
+pub fn install_probe_rule(workspace: &Path) -> Result<(), String> {
+    let dest = workspace.join(PROBE_BZL);
+    if std::fs::symlink_metadata(&dest).is_ok() {
+        return Err(format!(
+            "the workspace already has a {PROBE_BZL}: a fixture must not carry its own"
+        ));
+    }
+    let shared = fixtures_root().join("common").join(PROBE_BZL);
+    std::fs::copy(&shared, &dest)
+        .map(drop)
+        .map_err(|e| format!("install {}: {e}", dest.display()))
+}
+
 impl Cell {
     /// Copy the fixture workspace `rel` (`core/bzlmod/e9`) into the cell,
     /// byte for byte, then install the shared probe rule.
@@ -84,29 +122,21 @@ impl Cell {
     }
 
     /// Write `fixtures/bazel/common/probe.bzl` to the workspace root. A
-    /// fixture that ships its own file of that name is a mistake: the
-    /// proof ladder would then test a rule nobody reviewed.
+    /// fixture that ships its own file of that name is a mistake and
+    /// panics (see [`install_probe_rule`]).
     pub fn install_probe_rule(&self) {
-        let dest = self.scratch.workspace.join(PROBE_BZL);
-        assert!(
-            !dest.exists(),
-            "{}: the fixture carries its own {PROBE_BZL}",
-            self.test
-        );
-        std::fs::copy(fixtures_root().join("common").join(PROBE_BZL), &dest)
-            .unwrap_or_else(|e| panic!("install {}: {e}", dest.display()));
+        if let Err(why) = install_probe_rule(&self.scratch.workspace) {
+            panic!("{}: {why}", self.test);
+        }
     }
 
     /// Write a workspace file. `MODULE.bazel.lock` goes through
-    /// [`Cell::write_module_lock`].
+    /// [`Cell::write_module_lock`]; this panics on it, and on a path that
+    /// leaves the workspace copy (see [`check_plain_write`]).
     pub fn write(&self, rel: &str, bytes: impl AsRef<[u8]>) {
-        assert!(
-            Path::new(rel)
-                .file_name()
-                .is_some_and(|name| name != MODULE_LOCK),
-            "{}: write {MODULE_LOCK} with write_module_lock",
-            self.test
-        );
+        if let Err(why) = check_plain_write(rel) {
+            panic!("{}: {why}", self.test);
+        }
         let path = self.scratch.workspace.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));

@@ -42,6 +42,16 @@ body="$FAKE_CURL_DIR/$(printf %s "$url" | tr ':/' '__')"
 cp "$body" "$dest"
 """
 
+# `uname` as another machine reports it: the installer then looks for that
+# platform's pins, whatever host the test runs on.
+FAKE_UNAME = r"""#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo "$FAKE_UNAME_S" ;;
+  -m) echo "$FAKE_UNAME_M" ;;
+  *) echo "unexpected uname $*" >&2; exit 64 ;;
+esac
+"""
+
 
 def read_pins(path=PINS):
     pins = []
@@ -134,9 +144,19 @@ class InstallerTest(unittest.TestCase):
     def serve(self, url, body):
         (self.bodies / url.replace(":", "_").replace("/", "_")).write_bytes(body)
 
-    def run_installer(self, version="9.3.2", script=None):
+    def run_installer(self, version="9.3.2", script=None, uname=None):
+        env = self.env
+        if uname:
+            # A `uname` stub first on PATH: (`uname -s`, `uname -m`).
+            bin_dir = self.tmp / "uname-bin"
+            bin_dir.mkdir(exist_ok=True)
+            stub = bin_dir / "uname"
+            stub.write_text(FAKE_UNAME)
+            stub.chmod(stub.stat().st_mode | stat.S_IXUSR)
+            env = dict(env, PATH=f"{bin_dir}{os.pathsep}{env['PATH']}",
+                       FAKE_UNAME_S=uname[0], FAKE_UNAME_M=uname[1])
         return subprocess.run(["bash", str(script or self.script), version, str(self.dest)],
-                              env=self.env, capture_output=True, text=True, check=False)
+                              env=env, capture_output=True, text=True, check=False)
 
     def requests(self):
         return self.log.read_text().split()
@@ -223,12 +243,24 @@ class InstallerTest(unittest.TestCase):
         self.assertEqual(self.requests()[-1], mirror)
 
     def test_an_unpinned_version_fails_closed_before_any_download(self):
-        # The committed script and pins file, as CI runs them.
-        for version in ("0.0.0", "7.7.0"):
-            done = self.run_installer(version, script=INSTALLER)
-            self.assertNotEqual(done.returncode, 0, version)
-            self.assertEqual(done.stdout, "")
-            self.assertIn(f"no pinned sha256 for bazel {version}", done.stderr)
+        # The committed script and pins file, as CI runs them. On every
+        # platform the message names the Bazel version that was asked for:
+        # on one with all its pins (as a CI runner reports itself), and on
+        # one with no pin at all, not even for bazelisk (a developer's
+        # linux-arm64 or darwin-x86_64 machine).
+        machines = {"linux-x86_64": ("Linux", "x86_64"), "darwin-arm64": ("Darwin", "arm64"),
+                    "windows-x86_64": ("MINGW64_NT-10.0-20348", "x86_64"),
+                    "linux-arm64": ("Linux", "aarch64"), "darwin-x86_64": ("Darwin", "x86_64")}
+        self.assertLessEqual(PLATFORMS, set(machines))
+        pinned = {plat for tool, _, plat, _ in read_pins() if tool == "bazelisk"}
+        self.assertFalse({"linux-arm64", "darwin-x86_64"} & pinned, "pick platforms with no pin")
+        for plat, uname in [(self.plat, None), *sorted(machines.items())]:
+            for version in ("0.0.0", "7.7.0"):
+                with self.subTest(platform=plat, version=version):
+                    done = self.run_installer(version, script=INSTALLER, uname=uname)
+                    self.assertNotEqual(done.returncode, 0)
+                    self.assertEqual(done.stdout, "")
+                    self.assertIn(f"no pinned sha256 for bazel {version} on {plat}", done.stderr)
         self.assertEqual(self.requests(), [])
         self.assertFalse(self.dest.exists(), "the target directory must not be created")
 
