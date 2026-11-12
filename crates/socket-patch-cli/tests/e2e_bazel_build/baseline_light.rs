@@ -44,9 +44,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use socket_patch_core::bazel::{java_hash, rje_lock};
 
 use crate::bazel_build_common::env::{self, Group, System, Version};
 use crate::bazel_build_common::fixture_server::FixtureServer;
@@ -89,6 +91,12 @@ const BASELINE_PROOF: u8 = 1;
 
 /// The top of the proof ladder: 0 fetch, 1 build the probe, 2 run the consumer.
 const TOP_PROOF: u8 = 2;
+
+/// The one Bazel release no cell may name.
+const NEVER_PINNED: &str = "7.7.0";
+
+/// The key of a `moduleExtensions` entry that holds for every host system.
+const GENERAL: &str = "general";
 
 /// `fixtures/bazel/light`.
 pub(crate) fn light() -> PathBuf {
@@ -207,6 +215,13 @@ pub(crate) struct Fixture {
     /// that lists one is the input of a refusal.
     #[serde(default)]
     pub(crate) versioned_names: Vec<String>,
+    /// Each `maven_install.json`-format lock of the workspace, by its path, to
+    /// the hash flavors that reproduce its stored `__RESOLVED_ARTIFACTS_HASH`
+    /// (`v2`, `v3-sorted`, `v3-insertion`: the names of
+    /// `socket_patch_core::bazel::rje_lock::Flavor`). The two v3 flavors differ
+    /// only for a lock with two repositories; with one, both reproduce.
+    #[serde(default)]
+    pub(crate) lock_flavors: BTreeMap<String, Vec<String>>,
     /// The cells of the lane tests that run on this fixture. Checked for
     /// shape here; run by the lane's own module, never by the canary.
     #[serde(default)]
@@ -931,6 +946,13 @@ fn cell_problems(
         if !pinned.contains(bazel) {
             problems.push(format!("Bazel {bazel} is not in scripts/bazel-pins.txt"));
         }
+        // Whatever the pins file says: 7.7.0 alone writes absolute `file:///`
+        // registry keys into `MODULE.bazel.lock`, so no fixture is claimed on it.
+        if bazel == NEVER_PINNED {
+            problems.push(format!(
+                "Bazel {bazel} is never pinned: its locks record absolute file:/// registry keys"
+            ));
+        }
         if let (Some(version), Some(system)) = (Version::parse(bazel), system) {
             if version.system_flags(system).is_none() {
                 problems.push(format!("Bazel {bazel} has no {} system", system.name()));
@@ -1113,8 +1135,10 @@ fn matrix_problems(matrix: &Matrix, pinned: &BTreeSet<String>) -> Vec<String> {
 /// shape rests on.
 fn lock_problems(fixture: &Fixture, rel: &str, bytes: &[u8]) -> Vec<String> {
     let mut problems = Vec::new();
-    let place = regex::Regex::new(r"^locks/v(\d+)/(?:[^/]+/)?MODULE\.bazel\.lock$").unwrap();
-    let stated: Option<u64> = place.captures(rel).and_then(|hit| hit[1].parse().ok());
+    let place = regex::Regex::new(r"^locks/v(\d+)/(?:([^/]+)/)?MODULE\.bazel\.lock$").unwrap();
+    let placed = place.captures(rel);
+    let stated: Option<u64> = placed.as_ref().and_then(|hit| hit[1].parse().ok());
+    let per_os = placed.as_ref().is_some_and(|hit| hit.get(2).is_some());
     if stated.is_none() {
         problems.push(format!("{rel} is not locks/v<N>[/<os>]/{MODULE_LOCK}"));
     }
@@ -1154,6 +1178,20 @@ fn lock_problems(fixture: &Fixture, rel: &str, bytes: &[u8]) -> Vec<String> {
             return problems;
         }
     };
+    // One lock serves every host only when no entry is keyed by a host system:
+    // a lock made on macOS whose entry is keyed `os:osx,arch:aarch64` holds
+    // nothing for a Linux host. Such a fixture carries one lock per OS the
+    // matrix runs.
+    let extensions = lock["moduleExtensions"].as_object();
+    for (extension, entries) in extensions.into_iter().flatten() {
+        let keys = entries.as_object().into_iter().flat_map(|map| map.keys());
+        for key in keys.filter(|key| !per_os && key.as_str() != GENERAL) {
+            problems.push(format!(
+                "{rel} records {extension} under {key:?}: a lock with a host-keyed entry goes \
+                 under locks/v<N>/<os>/, one per OS the matrix runs"
+            ));
+        }
+    }
     if let Some(extension) = &fixture.recorded_extension {
         if !records(&recorded, extension) {
             problems.push(format!("{rel} does not record {extension}"));
@@ -1301,6 +1339,432 @@ fn versioned_names_used(texts: &BTreeMap<String, String>) -> BTreeSet<String> {
     names.into_iter().filter(used).collect()
 }
 
+/// Starlark source without its comments, for a check that reads what a file
+/// declares. No fixture holds a `#` inside a string.
+fn uncommented(source: &str) -> String {
+    let code = source
+        .lines()
+        .map(|line| line.split('#').next().unwrap_or(""));
+    code.collect::<Vec<_>>().join("\n")
+}
+
+/// The leading numbers of a ruleset release: `(3, 6, 0)` of `3.6.0`, `(7, 2, 0)`
+/// of `7.2`, `(1, 0, 0)` of `1.0.0-rc2`.
+fn release(version: &str) -> (u32, u32, u32) {
+    let mut parts = version.split('.').map(|part| {
+        let digits: String = part.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().unwrap_or(0)
+    });
+    let mut next = || parts.next().unwrap_or(0);
+    (next(), next(), next())
+}
+
+/// What is wrong with the `single_version_override` pins of a `MODULE.bazel`:
+/// each comes with a `bazel_dep` of that module at the same version. Bazel 9.3.2
+/// rejects an override below the declared version (`module 'bazel_skylib' is
+/// overridden to use version '1.6.1', which is lower than the version '1.7.1'
+/// requested by the root module`), and above it the `bazel_dep` line states a
+/// version no build uses.
+fn override_problems(module: &str) -> Vec<String> {
+    let code = uncommented(module);
+    let pairs = |call: &str, name: &str| -> Vec<(String, String)> {
+        let pattern = format!(r#"\b{call}\(\s*{name} = "([^"]+)",\s*version = "([^"]*)""#);
+        let found = regex::Regex::new(&pattern).unwrap();
+        let hits = found.captures_iter(&code);
+        hits.map(|hit| (hit[1].to_string(), hit[2].to_string()))
+            .collect()
+    };
+    let declared: BTreeMap<String, String> = pairs("bazel_dep", "name").into_iter().collect();
+    let mut problems = Vec::new();
+    for (module, version) in pairs("single_version_override", "module_name") {
+        match declared.get(&module) {
+            Some(dep) if *dep == version => {}
+            Some(dep) => problems.push(format!(
+                "{module} is overridden to {version} and declared at {dep}"
+            )),
+            None => problems.push(format!(
+                "{module} is overridden to {version} and no bazel_dep declares a version of it"
+            )),
+        }
+    }
+    problems
+}
+
+/// What a rules_js workspace declares about its hub.
+struct NpmHub {
+    /// The hub's name: `npm`.
+    name: String,
+    /// The pnpm lock as a label without its repository: `//app:pnpm-lock.yaml`.
+    lock_label: String,
+    update_pnpm_lock: bool,
+    /// The managed pnpm the workspace names, where it names one.
+    pnpm_version: Option<String>,
+}
+
+impl NpmHub {
+    /// Read from `MODULE.bazel` or `WORKSPACE`: its one `npm_translate_lock` call.
+    fn read(declaration: &str) -> Result<NpmHub, String> {
+        let code = uncommented(declaration);
+        let mut calls = code.split("npm_translate_lock(").skip(1);
+        let (Some(call), None) = (calls.next(), calls.next()) else {
+            return Err("not exactly one npm_translate_lock call".to_string());
+        };
+        let body = call.split(')').next().unwrap_or("");
+        let text = |attribute: &str, within: &str| {
+            let pattern = format!(r#"\b{attribute} = "([^"]*)""#);
+            let found = regex::Regex::new(&pattern).unwrap().captures(within)?;
+            Some(found[1].to_string())
+        };
+        let name = text("name", body).ok_or("the hub has no name")?;
+        let lock_label = text("pnpm_lock", body).ok_or("the hub has no pnpm_lock")?;
+        if !lock_label.starts_with("//") || !lock_label.contains(':') {
+            return Err(format!(
+                "pnpm_lock {lock_label:?} is not //<package>:<file>"
+            ));
+        }
+        Ok(NpmHub {
+            name,
+            lock_label,
+            update_pnpm_lock: body.contains("update_pnpm_lock = True"),
+            pnpm_version: text("pnpm_version", &code),
+        })
+    }
+
+    /// The workspace path of `file` in the lock's package.
+    fn beside_lock(&self, file: &str) -> String {
+        match self.lock_label[2..].split(':').next().unwrap_or("") {
+            "" => file.to_string(),
+            package => format!("{package}/{file}"),
+        }
+    }
+
+    /// The lock's path in the workspace: `app/pnpm-lock.yaml`.
+    fn lock_path(&self) -> String {
+        let name = self.lock_label.rsplit(':').next().unwrap_or("");
+        self.beside_lock(name)
+    }
+
+    /// Where rules_js keeps the hub's `update_pnpm_lock` hash file: the name ends
+    /// in the base64 of the decimal Starlark `hash` of the hub name followed by
+    /// the lock label (`npm_translate_lock_state.bzl`, `_init_update_labels`).
+    fn hash_file(&self) -> String {
+        let key = format!("{}{}", self.name, self.lock_label);
+        let hash = java_hash::hash_bytes(key.as_bytes()).to_string();
+        let suffix = base64::engine::general_purpose::STANDARD.encode(hash);
+        format!(".aspect/rules/external_repository_action_cache/npm_translate_lock_{suffix}")
+    }
+}
+
+/// `9.0` of `lockfileVersion: '9.0'`, the line that opens a pnpm lock.
+fn lockfile_version(lock: &str) -> String {
+    let line = lock
+        .lines()
+        .find_map(|line| line.strip_prefix("lockfileVersion:"));
+    line.unwrap_or("").trim().trim_matches('\'').to_string()
+}
+
+/// Whether the workspace carries pnpm's lifecycle-hook allow list where rules_js
+/// looks for it: `pnpm.onlyBuiltDependencies` in the `package.json` beside the
+/// lock, or `onlyBuiltDependencies` / `allowBuilds` in a `pnpm-workspace.yaml`
+/// there.
+fn allows_builds(hub: &NpmHub, texts: &BTreeMap<String, String>) -> bool {
+    let manifest = texts.get(&hub.beside_lock("package.json"));
+    let manifest = manifest.and_then(|text| serde_json::from_str::<Value>(text).ok());
+    let in_manifest = manifest.is_some_and(|m| m["pnpm"]["onlyBuiltDependencies"].is_array());
+    let key =
+        |line: &str| line.starts_with("onlyBuiltDependencies:") || line.starts_with("allowBuilds:");
+    let workspace = texts.get(&hub.beside_lock("pnpm-workspace.yaml"));
+    in_manifest || workspace.is_some_and(|text| text.lines().any(key))
+}
+
+/// What is wrong with the committed `update_pnpm_lock` hash file of `hub`. rules_js
+/// compares each `<path>=<value>` line with the Starlark `hash` of that file; on a
+/// difference it runs pnpm and rewrites the lock and this file. A fixture commits
+/// the lines rules_js would write, so its baseline build runs no pnpm.
+fn hash_file_problems(hub: &NpmHub, texts: &BTreeMap<String, String>) -> Vec<String> {
+    let path = hub.hash_file();
+    let Some(file) = texts.get(&path) else {
+        return vec![format!("update_pnpm_lock without the hash file {path}")];
+    };
+    let mut problems = Vec::new();
+    let mut recorded = BTreeSet::new();
+    let lines = file.lines().filter(|line| !line.is_empty());
+    for line in lines.filter(|line| !line.starts_with('#')) {
+        let Some((input, value)) = line.split_once('=') else {
+            problems.push(format!("{path}: {line:?} is not <path>=<hash>"));
+            continue;
+        };
+        recorded.insert(input.to_string());
+        let hash = texts
+            .get(input)
+            .map(|text| java_hash::hash_bytes(text.as_bytes()).to_string());
+        match hash {
+            Some(hash) if hash == value => {}
+            Some(hash) => problems.push(format!(
+                "{path} records {input} as {value}, the file hashes to {hash}: the first build \
+                 would run pnpm"
+            )),
+            None => problems.push(format!("{path} records {input}, which the fixture lacks")),
+        }
+    }
+    for input in [hub.lock_path(), hub.beside_lock("package.json")] {
+        if !recorded.contains(&input) {
+            problems.push(format!("{path} has no line for {input}"));
+        }
+    }
+    problems
+}
+
+/// What is wrong with a rules_js fixture, read from the files of its workspace:
+/// the facts the probes fixed that the matrix alone cannot show. `pin` is the
+/// rules_js release the fixture is written for, `bazel` the versions of its cells.
+fn rules_js_problems(pin: &str, bazel: &[&str], texts: &BTreeMap<String, String>) -> Vec<String> {
+    let declaration = texts.get("MODULE.bazel").or_else(|| texts.get("WORKSPACE"));
+    let Some(declaration) = declaration else {
+        return vec!["neither MODULE.bazel nor WORKSPACE".to_string()];
+    };
+    let hub = match NpmHub::read(declaration) {
+        Ok(hub) => hub,
+        Err(why) => return vec![why],
+    };
+    let Some(lock) = texts.get(&hub.lock_path()) else {
+        return vec![format!("no {}", hub.lock_path())];
+    };
+    let lock_version = lockfile_version(lock);
+    let (major, ..) = release(pin);
+    let mut problems = Vec::new();
+    if major >= 2 && lock_version == "9.0" && !allows_builds(&hub, texts) {
+        problems.push(
+            "a 9.0 lock on rules_js 2.x or 3.x without the lifecycle-hook allow list: the build \
+             fails with `pnpm 'allowBuilds' ... configuration required`"
+                .to_string(),
+        );
+    }
+    // Lock 6.0 belongs to rules_js 1.x on the 6.6.0, 7.0.2 and 7.1.2 lines.
+    let late = |version: &str| Version::parse(version).is_some_and(|v| v.at_least(7, 7, 0));
+    for version in bazel.iter().filter(|v| lock_version == "6.0" && late(v)) {
+        problems.push(format!("a pnpm lock 6.0 has no cell on Bazel {version}"));
+    }
+    if hub.update_pnpm_lock {
+        problems.extend(hash_file_problems(&hub, texts));
+        // rules_js 2.x manages pnpm 8 unless told otherwise, and its version
+        // table ends at 10.22.0; the hash-miss cells are proven on pnpm 9 and 10.
+        let managed = hub.pnpm_version.as_deref().map(release);
+        let in_table = |pnpm: (u32, u32, u32)| ((9, 0, 0)..=(10, 22, 0)).contains(&pnpm);
+        match managed {
+            _ if major != 2 => {}
+            Some(pnpm) if in_table(pnpm) => {}
+            Some(_) => problems.push(format!(
+                "rules_js {pin} cannot manage pnpm {}: name a 9.x release, or 10.x up to 10.22.0",
+                hub.pnpm_version.as_deref().unwrap_or_default()
+            )),
+            None => problems.push(format!(
+                "rules_js {pin} manages pnpm 8 by default: name pnpm_version 9.x or 10.x"
+            )),
+        }
+    }
+    // A lock of another package manager beside the pnpm lock is one no hub reads,
+    // and the input of the `.npmrc` creation hazard: the workspace has none yet.
+    if texts.contains_key(&hub.beside_lock("package-lock.json")) {
+        if uncommented(declaration).contains("package-lock.json") {
+            problems.push("the hub names the sibling package-lock.json".to_string());
+        }
+        if texts.contains_key(&hub.beside_lock(".npmrc")) {
+            problems.push("a sibling package-lock.json beside an .npmrc".to_string());
+        }
+    }
+    problems
+}
+
+/// The files `paket2bazel` generated for a rules_dotnet fixture, as far as the
+/// lock gate reads them.
+#[derive(Debug, PartialEq)]
+struct PaketFiles {
+    /// The `moduleExtensions` key of the generated extension:
+    /// `//deps:paket.main_extension.bzl%main_extension`.
+    extension: String,
+    /// Whether the extension file holds the literal `reproducible = True`. With
+    /// it Bazel records nothing; without it the lock holds the extension's
+    /// result, and an edit of the data file stales the lock.
+    reproducible: bool,
+    /// Every `sha512` value of the data file.
+    sha512: Vec<String>,
+}
+
+/// The first line of both files `paket2bazel` of rules_dotnet 0.13.0 - 0.14.x
+/// writes.
+const LEGACY_PAKET_HEADER: &str = "\"Generated by paket2bazel\"";
+
+/// Read the generated pair of a rules_dotnet fixture and hold it to one
+/// generation. On 0.13.0 - 0.14.x the data file and the extension file both start
+/// `"Generated by paket2bazel"` and an entry has no `"name"` key; from 0.15.0 the
+/// data file starts `"GENERATED"`, the extension file `"Generated"`, and an entry
+/// starts with `"name"`. A fixture pinned below 0.15.0 holds the first
+/// generation: that release generates no other. (Files of the first generation
+/// under a later pin are a shape a project can have, and are not refused here.)
+fn paket_files(pin: &str, texts: &BTreeMap<String, String>) -> Result<PaketFiles, String> {
+    let module = texts.get("MODULE.bazel").ok_or("no MODULE.bazel")?;
+    let used = regex::Regex::new(
+        r#"use_extension\(\s*"//([^:"]*):(paket\.[^"]+_extension\.bzl)",\s*"([^"]+)""#,
+    )
+    .unwrap();
+    let code = uncommented(module);
+    let used = used
+        .captures(&code)
+        .ok_or("MODULE.bazel uses no generated paket extension")?;
+    let (package, file, name) = (&used[1], &used[2], &used[3]);
+    let beside = |file: &str| match package {
+        "" => file.to_string(),
+        package => format!("{package}/{file}"),
+    };
+    let extension = texts
+        .get(&beside(file))
+        .ok_or_else(|| format!("no {}", beside(file)))?;
+    let loaded = regex::Regex::new(r#"load\(":([^"]+)""#).unwrap();
+    let data_file = loaded
+        .captures(extension)
+        .map(|hit| beside(&hit[1]))
+        .ok_or("the extension file loads no data file")?;
+    let data = texts
+        .get(&data_file)
+        .ok_or_else(|| format!("no {data_file}"))?;
+
+    let first = |text: &str| text.lines().next().unwrap_or("").to_string();
+    let legacy = match (first(data).as_str(), first(extension).as_str()) {
+        (LEGACY_PAKET_HEADER, LEGACY_PAKET_HEADER) => true,
+        ("\"GENERATED\"", "\"Generated\"") => false,
+        (data, extension) => {
+            return Err(format!(
+                "{data_file} starts {data} and its extension file {extension}: the headers of \
+                 no one generation"
+            ))
+        }
+    };
+    if data.contains("{\"name\": ") == legacy {
+        let expected = if legacy { "no" } else { "a" };
+        return Err(format!(
+            "{data_file}: files with this header have entries with {expected} \"name\" key"
+        ));
+    }
+    if release(pin) < (0, 15, 0) && !legacy {
+        return Err(format!(
+            "rules_dotnet {pin} generates files that start {LEGACY_PAKET_HEADER}, the fixture \
+             holds the later generation"
+        ));
+    }
+    let reproducible = uncommented(extension).contains("reproducible = True");
+    let sha512 = regex::Regex::new(r#""sha512": "(sha512-[^"]+)""#).unwrap();
+    let sha512: Vec<String> = sha512
+        .captures_iter(data)
+        .map(|hit| hit[1].to_string())
+        .collect();
+    if sha512.is_empty() {
+        return Err(format!("{data_file} pins no package"));
+    }
+    Ok(PaketFiles {
+        extension: format!("//{package}:{file}%{name}"),
+        reproducible,
+        sha512,
+    })
+}
+
+/// What is wrong with the `.bazelrc` of a rules_ruby fixture whose cells are on
+/// `bazel`. rules_ruby's rules resolve a Java runtime: without a remote one named
+/// the build stops at `Cannot find Java binary` on a host that has no JDK. Bazel
+/// 6 ships `remotejdk_11`, the later lines `remotejdk_21`.
+fn ruby_runtime_problem(rc: Option<&str>, bazel: &[&str]) -> Option<String> {
+    let on_six = |version: &&str| Version::parse(version).is_some_and(|v| v.major <= 6);
+    let runtime = match bazel.iter().all(on_six) {
+        true => "remotejdk_11",
+        false => "remotejdk_21",
+    };
+    let flag = format!("build --java_runtime_version={runtime}");
+    let named = rc.is_some_and(|rc| rc.lines().any(|line| line.trim() == flag));
+    (!named).then(|| format!(".bazelrc has no `{flag}`"))
+}
+
+/// The hash flavors that reproduce the stored hash of a rules_jvm_external lock,
+/// by the names `MATRIX.json` writes.
+fn reproduced_flavors(lock: &str) -> Result<Vec<String>, String> {
+    let lock = rje_lock::read(lock).map_err(|why| format!("{why:?}"))?;
+    let flavors = lock.reproduced().map_err(|why| format!("{why:?}"))?;
+    let names = flavors
+        .into_iter()
+        .map(|flavor| flavor.as_str().to_string());
+    Ok(names.collect())
+}
+
+/// What is wrong with the locks and the probe of a rules_jvm_external fixture.
+///
+/// Locks: every lock of the workspace is listed under `lock_flavors` with the
+/// flavors that reproduce its stored hash, and a v3 lock reproduces under the
+/// flavor its pinned release checks (6.10 in file order, 7.0 and later sorted).
+///
+/// Probe: the registry jar is under the artifact repository's `file/` directory,
+/// and a pinned fixture reaches it one of two ways. Through the versionless hub
+/// label (`tier0_roots`): a query lists the jar with no build, and every baseline
+/// cell stops at proof 0, because building that label analyses a `jvm_import` and
+/// pulls a JDK. Or through the versioned artifact repository (`versioned_names`),
+/// whose `file` target builds with no Java toolchain, in a fixture that a rewrite
+/// of the lock breaks.
+fn rje_problems(fixture: &Fixture, texts: &BTreeMap<String, String>) -> Vec<String> {
+    let mut problems = Vec::new();
+    let is_lock =
+        |(name, text): &(&String, &String)| name.ends_with(".json") && rje_lock::read(text).is_ok();
+    let found: BTreeSet<&String> = texts.iter().filter(is_lock).map(|(name, _)| name).collect();
+    let listed: BTreeSet<&String> = fixture.lock_flavors.keys().collect();
+    if found != listed {
+        problems.push(format!(
+            "lock_flavors lists {listed:?}, the workspace holds the locks {found:?}"
+        ));
+    }
+    let pin = fixture
+        .pins
+        .get("rules_jvm_external")
+        .map(|pin| release(pin));
+    let checked = match pin {
+        Some((6, 10, _)) => Some("v3-insertion"),
+        Some((7.., _, _)) => Some("v3-sorted"),
+        _ => None,
+    };
+    for (rel, stated) in &fixture.lock_flavors {
+        match texts.get(rel).map(|text| reproduced_flavors(text)) {
+            Some(Ok(reproduced)) if reproduced == *stated => {}
+            Some(Ok(reproduced)) => problems.push(format!(
+                "{rel} reproduces under {reproduced:?}, lock_flavors says {stated:?}"
+            )),
+            Some(Err(why)) => problems.push(format!("{rel}: {why}")),
+            None => problems.push(format!("lock_flavors names {rel}, which is no file")),
+        }
+        let v3 = stated.iter().any(|flavor| flavor.starts_with("v3-"));
+        let stated_as = |flavor: &str| stated.iter().any(|name| name == flavor);
+        if let Some(checked) = checked.filter(|checked| v3 && !stated_as(checked)) {
+            problems.push(format!(
+                "{rel}: the pinned release checks the {checked} hash, which is not in {stated:?}"
+            ));
+        }
+    }
+    if fixture.lock_flavors.is_empty() {
+        return problems;
+    }
+    if fixture.tier0_roots.is_empty() {
+        if fixture.versioned_names.is_empty() {
+            problems.push(
+                "a pinned fixture whose probe is neither rooted at a hub label (tier0_roots) nor \
+                 reads a versioned artifact repository (versioned_names)"
+                    .to_string(),
+            );
+        }
+    } else if fixture.cells.iter().any(|spec| spec.proof > 0) {
+        problems.push(
+            "a pinned fixture probed through its hub stops at proof 0: building the hub label \
+             pulls a JDK"
+                .to_string(),
+        );
+    }
+    problems
+}
+
 /// The matrices, the fixture directories and the declared tests name the same
 /// fixtures, every entry has the shape the canary and the CI plan read, and a
 /// committed lock is the lock its fixture claims.
@@ -1408,6 +1872,11 @@ fn every_light_fixture_pins_its_ruleset_and_keeps_production_hosts() {
                 );
                 assert!(module_file.contains(&dep), "{what}: no {dep}");
                 assert!(module_file.contains(&pin), "{what}: no {pin}");
+            }
+            // Every override, of the ruleset or of anything else the fixture pins.
+            if let Some(module_file) = texts.get("MODULE.bazel") {
+                let found = override_problems(module_file);
+                assert!(found.is_empty(), "{what}: {}", found.join("; "));
             }
         }
     }
@@ -1642,6 +2111,28 @@ fn matrix_checks_refuse_what_a_canary_would_not_notice() {
     );
     assert!(found[0].contains("stops at proof 0"), "{found:?}");
     assert!(cell_problems(&pr, Some(System::Bzlmod), &pinned, TOP_PROOF, "rules_js").is_empty());
+
+    // Bazel 7.7.0 is refused even where a pins file lists it.
+    let mut with_770 = pinned.clone();
+    with_770.insert(NEVER_PINNED.to_string());
+    let on_770 = [CellSpec {
+        bazel: NEVER_PINNED.to_string(),
+        proof: 1,
+        tier: "nightly".to_string(),
+        outcome: None,
+    }];
+    let found = cell_problems(
+        &on_770,
+        Some(System::Bzlmod),
+        &with_770,
+        TOP_PROOF,
+        "rules_js",
+    );
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(
+        found[0].contains("Bazel 7.7.0 is never pinned"),
+        "{found:?}"
+    );
 }
 
 #[test]
@@ -1811,6 +2302,18 @@ fn a_committed_lock_is_held_to_its_fixture() {
     }
     let why = found(&recorded, rel, "not a lock");
     assert!(why.contains("is not JSON"), "{why}");
+    // An entry keyed by a host system makes the lock that system's: it goes
+    // under a directory that says so, beside the locks of the other systems.
+    let keyed = text.replace("\"general\"", "\"os:osx,arch:aarch64\"");
+    let why = found(&recorded, rel, &keyed);
+    assert!(
+        why.contains("records //deps:e.bzl%e under \"os:osx,arch:aarch64\""),
+        "{why}"
+    );
+    assert_eq!(
+        found(&recorded, "locks/v13/macos/MODULE.bazel.lock", &keyed),
+        ""
+    );
 }
 
 #[test]
@@ -1988,6 +2491,519 @@ fn the_undeclared_npmrc_holds_an_unscoped_credential() {
     // rules_js 2.x does not look for the file on Windows.
     assert!(!expected.applies_on("windows") && expected.applies_on("linux"));
     assert!(expected.applies_on("macos"));
+}
+
+/// The rules_js facts the probes fixed: the lifecycle-hook allow list, the lines
+/// a lock version belongs to, hash files that match, and the variants the later
+/// rules_js packages start from.
+#[test]
+fn rules_js_fixtures_hold_what_the_probes_fixed() {
+    let matrix = Matrix::load("rules_js");
+    let mut shapes = BTreeSet::new();
+    for fixture in &matrix.fixtures {
+        let what = format!("light/rules_js/{}", fixture.path);
+        let texts = fixture_texts("rules_js", &fixture.path);
+        let pin = &fixture.pins["aspect_rules_js"];
+        let bazel: Vec<&str> = fixture.cells.iter().map(|c| c.bazel.as_str()).collect();
+        let found = rules_js_problems(pin, &bazel, &texts);
+        assert!(found.is_empty(), "{what}: {}", found.join("; "));
+
+        let declaration = texts.get("MODULE.bazel").or_else(|| texts.get("WORKSPACE"));
+        let hub = NpmHub::read(declaration.expect("read above")).expect("read above");
+        let line = format!("rules_js {}.x", release(pin).0);
+        let lock = lockfile_version(&texts[&hub.lock_path()]);
+        if hub.lock_label != "//:pnpm-lock.yaml" {
+            shapes.insert(format!("{line}: lock {lock} in a sub-package"));
+        }
+        if let (true, Some(pnpm)) = (hub.update_pnpm_lock, &hub.pnpm_version) {
+            shapes.insert(format!("{line}: update_pnpm_lock, managed pnpm {pnpm}"));
+            // The managed pnpm is a dependency of neither proof target: the
+            // canary loads it, so a version rules_js cannot fetch fails there.
+            let loaded = fixture
+                .load
+                .iter()
+                .any(|label| label.starts_with("@pnpm//"));
+            assert!(loaded, "{what}: `load` names no @pnpm// label");
+        }
+        if texts.contains_key(&hub.beside_lock("package-lock.json")) {
+            shapes.insert(format!("{line}: a package-lock.json beside lock {lock}"));
+        }
+    }
+    for shape in [
+        // The gate of the vendored lane: rules_js >= 2.1.1 joins a `file:` path
+        // with the lock's package, older releases do not.
+        "rules_js 3.x: lock 9.0 in a sub-package",
+        // The managed pnpm majors as the probe ran them. On a hash miss 9 and 10
+        // keep a hosted lock's pins; 11 and 12 fail the build.
+        "rules_js 3.x: update_pnpm_lock, managed pnpm 9.15.9",
+        "rules_js 3.x: update_pnpm_lock, managed pnpm 10.34.9",
+        "rules_js 3.x: update_pnpm_lock, managed pnpm 11.28.10",
+        "rules_js 3.x: update_pnpm_lock, managed pnpm 12.17.0",
+        // rules_js 2.x only with a managed pnpm it is told to use.
+        "rules_js 2.x: update_pnpm_lock, managed pnpm 9.15.9",
+        // Where today's hosted run creates an `.npmrc`, which rules_js 3.x refuses.
+        "rules_js 3.x: a package-lock.json beside lock 9.0",
+    ] {
+        assert!(
+            shapes.contains(shape),
+            "no fixture is {shape:?}: {shapes:?}"
+        );
+    }
+}
+
+#[test]
+fn rules_js_checks_refuse_what_a_probe_refuted() {
+    const NEW: &[&str] = &["9.3.2", "8.8.2"];
+    let of = |path: &str| fixture_texts("rules_js", path);
+    let found = |pin: &str, bazel: &[&str], texts: &BTreeMap<String, String>| {
+        rules_js_problems(pin, bazel, texts).join("\n")
+    };
+    let edit = |texts: &mut BTreeMap<String, String>, file: &str, from: &str, to: &str| {
+        let text = texts.get_mut(file).unwrap_or_else(|| panic!("no {file}"));
+        assert!(text.contains(from), "{file} holds no {from:?}");
+        *text = text.replace(from, to);
+    };
+
+    // The allow list, in the manifest or the workspace file of the lock's package.
+    let mut bare = of("bzlmod/e9");
+    assert_eq!(found("3.6.0", NEW, &bare), "");
+    edit(
+        &mut bare,
+        "package.json",
+        "onlyBuiltDependencies",
+        "neverBuiltDependencies",
+    );
+    let why = found("3.6.0", NEW, &bare);
+    assert!(why.contains("lifecycle-hook allow list"), "{why}");
+    bare.insert(
+        "pnpm-workspace.yaml".to_string(),
+        "onlyBuiltDependencies: []\n".to_string(),
+    );
+    assert_eq!(found("3.6.0", NEW, &bare), "");
+    let mut misplaced = of("bzlmod/e9-sub");
+    let manifest = misplaced.remove("app/package.json").unwrap();
+    misplaced.insert("package.json".to_string(), manifest);
+    let why = found("3.6.0", NEW, &misplaced);
+    assert!(why.contains("lifecycle-hook allow list"), "{why}");
+
+    // Lock 6.0 stays on the lines before 7.7.
+    let old = of("bzlmod/e6");
+    assert_eq!(found("1.42.3", &["7.1.2", "7.0.2", "6.6.0"], &old), "");
+    for late in ["7.7.2", "8.8.2", "9.3.2"] {
+        let why = found("1.42.3", &["6.6.0", late], &old);
+        assert_eq!(why, format!("a pnpm lock 6.0 has no cell on Bazel {late}"));
+    }
+
+    // The hash file is the one rules_js would write for these files.
+    let upl = of("bzlmod/e9-upl-pnpm10");
+    let hub = NpmHub::read(&upl["MODULE.bazel"]).unwrap();
+    assert_eq!(
+        hub.hash_file(),
+        ".aspect/rules/external_repository_action_cache/npm_translate_lock_LTE4Nzc1MDcwNjU="
+    );
+    assert_eq!(found("3.6.0", NEW, &upl), "");
+    let mut stale = upl.clone();
+    stale.get_mut("pnpm-lock.yaml").unwrap().push('\n');
+    let why = found("3.6.0", NEW, &stale);
+    assert!(why.contains("records pnpm-lock.yaml as 734347507"), "{why}");
+    assert!(why.contains("the first build would run pnpm"), "{why}");
+    let mut renamed = upl.clone();
+    edit(
+        &mut renamed,
+        "MODULE.bazel",
+        "name = \"npm\",",
+        "name = \"npm_other\",",
+    );
+    let why = found("3.6.0", NEW, &renamed);
+    assert!(
+        why.contains("update_pnpm_lock without the hash file"),
+        "{why}"
+    );
+    let mut partial = upl.clone();
+    edit(
+        &mut partial,
+        &hub.hash_file(),
+        "package.json=",
+        "other.json=",
+    );
+    let why = found("3.6.0", NEW, &partial);
+    assert!(
+        why.contains("records other.json, which the fixture lacks"),
+        "{why}"
+    );
+    assert!(why.contains("has no line for package.json"), "{why}");
+    // The lock label is part of the name, and its package of every path.
+    let declared =
+        "npm_translate_lock(\n    name = \"npm\",\n    pnpm_lock = \"//app:pnpm-lock.yaml\",\n)";
+    let sub = NpmHub::read(declared).unwrap();
+    assert_eq!(sub.lock_path(), "app/pnpm-lock.yaml");
+    assert_eq!(sub.beside_lock("package.json"), "app/package.json");
+    assert_ne!(sub.hash_file(), hub.hash_file());
+    assert!(!sub.update_pnpm_lock && sub.pnpm_version.is_none());
+    assert!(NpmHub::read("npm_translate_lock(name = \"npm\")").is_err());
+    assert!(NpmHub::read(&format!("{declared}\n{declared}")).is_err());
+    assert!(NpmHub::read("# npm_translate_lock(name = \"npm\")").is_err());
+
+    // rules_js 2.x manages only a pnpm 9 or 10 it is told to use.
+    let managed = of("bzlmod/e7-upl");
+    assert_eq!(found("2.9.3", &["7.7.2"], &managed), "");
+    for other in ["8.15.9", "10.34.9", "11.28.10"] {
+        let mut texts = managed.clone();
+        edit(&mut texts, "MODULE.bazel", "9.15.9", other);
+        let why = found("2.9.3", &["7.7.2"], &texts);
+        assert!(
+            why.contains(&format!("cannot manage pnpm {other}")),
+            "{why}"
+        );
+    }
+    let mut default = managed.clone();
+    edit(
+        &mut default,
+        "MODULE.bazel",
+        "    pnpm_version = \"9.15.9\",\n",
+        "",
+    );
+    let why = found("2.9.3", &["7.7.2"], &default);
+    assert!(why.contains("manages pnpm 8 by default"), "{why}");
+    // rules_js 3.x manages pnpm 10 by default, and its table holds 11 and 12.
+    assert_eq!(found("3.6.0", NEW, &default), "");
+
+    // A sibling lock is one no hub reads, in a workspace without an `.npmrc`.
+    let mut sibling = of("bzlmod/e9-npm-lock");
+    assert_eq!(found("3.6.0", NEW, &sibling), "");
+    sibling.insert(
+        ".npmrc".to_string(),
+        "registry=https://registry.npmjs.org/\n".to_string(),
+    );
+    let why = found("3.6.0", NEW, &sibling);
+    assert!(why.contains("beside an .npmrc"), "{why}");
+    edit(
+        &mut sibling,
+        "MODULE.bazel",
+        "    pnpm_lock = ",
+        "    npm_package_lock = \"//:package-lock.json\",\n    pnpm_lock = ",
+    );
+    let why = found("3.6.0", NEW, &sibling);
+    assert!(
+        why.contains("the hub names the sibling package-lock.json"),
+        "{why}"
+    );
+}
+
+#[test]
+fn an_override_is_held_to_the_declared_version() {
+    let module = |dep: &str, pin: &str| {
+        format!(
+            "bazel_dep(name = \"bazel_skylib\", version = \"{dep}\")\n\
+             # single_version_override(module_name = \"commented\", version = \"9\")\n\
+             single_version_override(\n    module_name = \"bazel_skylib\",\n    version = \"{pin}\",\n)\n"
+        )
+    };
+    assert_eq!(
+        override_problems(&module("1.7.1", "1.7.1")),
+        Vec::<String>::new()
+    );
+    // What Bazel 9.3.2 rejects, and its mirror image.
+    for (dep, pin) in [("1.7.1", "1.6.1"), ("1.6.1", "1.7.1")] {
+        let found = override_problems(&module(dep, pin)).join("\n");
+        let why = format!("bazel_skylib is overridden to {pin} and declared at {dep}");
+        assert_eq!(found, why);
+    }
+    let undeclared = "single_version_override(module_name = \"rules_x\", version = \"1.0\")";
+    let found = override_problems(undeclared).join("\n");
+    assert!(found.contains("no bazel_dep declares a version"), "{found}");
+    // An override that pins no version is not one of these.
+    let unversioned =
+        "single_version_override(module_name = \"rules_x\", registry = \"https://bcr.bazel.build/\")";
+    assert!(override_problems(unversioned).is_empty());
+
+    assert_eq!(release("3.6.0"), (3, 6, 0));
+    assert_eq!(release("7.2"), (7, 2, 0));
+    assert_eq!(release("6.10"), (6, 10, 0));
+    assert_eq!(release("1.0.0-rc2"), (1, 0, 0));
+    assert_eq!(release("latest"), (0, 0, 0));
+    assert!(release("0.14.0") < (0, 15, 0) && release("0.22.2") >= (0, 15, 0));
+}
+
+/// rules_dotnet: each fixture holds the files of one `paket2bazel` generation,
+/// the 0.14.0 one the generation that release writes, and its matrix entry says
+/// what follows for `MODULE.bazel.lock`. Without `reproducible = True` in the
+/// generated extension Bazel records the extension's result: the fixture commits
+/// that lock and its hosted outcome is WORKS-AFTER, because an edit of the data
+/// file stales the entry. With it nothing is recorded and the outcome is WORKS.
+#[test]
+fn rules_dotnet_fixtures_are_of_one_generation_and_say_what_the_lock_records() {
+    let matrix = Matrix::load("rules_dotnet");
+    let mut kinds = BTreeSet::new();
+    for fixture in &matrix.fixtures {
+        let what = format!("light/rules_dotnet/{}", fixture.path);
+        let texts = fixture_texts("rules_dotnet", &fixture.path);
+        let pin = &fixture.pins["rules_dotnet"];
+        let files = paket_files(pin, &texts).unwrap_or_else(|why| panic!("{what}: {why}"));
+        let (recorded, unrecorded, outcome) = match files.reproducible {
+            true => (None, Some(&files.extension), "WORKS"),
+            false => (Some(&files.extension), None, "WORKS-AFTER"),
+        };
+        assert_eq!(fixture.recorded_extension.as_ref(), recorded, "{what}");
+        assert_eq!(
+            fixture.not_recorded_extension.as_ref(),
+            unrecorded,
+            "{what}"
+        );
+        for spec in &fixture.cells {
+            let on = format!("{what} on Bazel {}", spec.bazel);
+            assert_eq!(spec.outcome.as_deref(), Some(outcome), "{on}");
+            let committed = fixture.module_lock.get(&spec.bazel);
+            assert_eq!(committed.is_some(), !files.reproducible, "{on}: a lock");
+            let Some(rel) = committed else { continue };
+            // The recorded entry holds what the data file pins, so an edit of
+            // the data file is an edit the lock disagrees with.
+            let path = light().join("rules_dotnet").join(&fixture.path).join(rel);
+            let lock = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            let lock: Value = serde_json::from_slice(&lock).expect("a lock");
+            let entries = lock["moduleExtensions"].as_object().expect("extensions");
+            let entry = entries
+                .iter()
+                .find(|(key, _)| records(&[(*key).clone()], &files.extension))
+                .map(|(_, entry)| entry.to_string())
+                .unwrap_or_else(|| panic!("{on}: {rel} has no entry of {}", files.extension));
+            for sha512 in &files.sha512 {
+                assert!(
+                    entry.contains(sha512.as_str()),
+                    "{on}: {rel} lacks {sha512}"
+                );
+            }
+        }
+        kinds.insert((release(pin) < (0, 15, 0), files.reproducible));
+    }
+    // The 0.13 - 0.14 generation, recorded; and a reproducible extension.
+    assert!(kinds.contains(&(true, false)), "{kinds:?}");
+    assert!(
+        kinds.iter().any(|(_, reproducible)| *reproducible),
+        "{kinds:?}"
+    );
+}
+
+#[test]
+fn paket_files_of_two_generations_are_refused() {
+    const EXTENSION: &str = "//deps:paket.main_extension.bzl%main_extension";
+    const DATA: &str = "deps/paket.main.bzl";
+    let legacy = fixture_texts("rules_dotnet", "bzlmod/e7");
+    let current = fixture_texts("rules_dotnet", "bzlmod/e9");
+    let old = paket_files("0.14.0", &legacy).unwrap();
+    assert_eq!(
+        (old.extension.as_str(), old.reproducible, old.sha512.len()),
+        (EXTENSION, false, 2)
+    );
+    let new = paket_files("0.22.2", &current).unwrap();
+    assert_eq!(
+        (new.extension.as_str(), new.reproducible, new.sha512.len()),
+        (EXTENSION, true, 2)
+    );
+    assert_eq!(old.sha512, new.sha512, "both pin the mirrored packages");
+
+    // 0.14.0 generates the first generation alone. The reverse is a project that
+    // kept its old files under a newer release: its extension is still recorded.
+    let why = paket_files("0.14.0", &current).unwrap_err();
+    assert!(
+        why.contains("the fixture holds the later generation"),
+        "{why}"
+    );
+    assert_eq!(paket_files("0.22.2", &legacy), Ok(old));
+
+    // A data file under the extension file of the other generation.
+    let mut mixed = legacy.clone();
+    mixed.insert(DATA.to_string(), current[DATA].clone());
+    let why = paket_files("0.14.0", &mixed).unwrap_err();
+    assert!(why.contains("the headers of no one generation"), "{why}");
+    // Entries of the other generation under a header.
+    let mut named = legacy.clone();
+    let data = named.get_mut(DATA).unwrap();
+    *data = data.replace("{\"id\": ", "{\"name\": \"SP\", \"id\": ");
+    let why = paket_files("0.14.0", &named).unwrap_err();
+    assert!(why.contains("entries with no \"name\" key"), "{why}");
+    let mut unnamed = current.clone();
+    let data = unnamed.get_mut(DATA).unwrap();
+    assert!(data.contains("{\"name\": \"SP.Victim\", "));
+    *data = data
+        .replace("{\"name\": \"SP.Victim\", ", "{")
+        .replace("{\"name\": \"SP.Other\", ", "{");
+    let why = paket_files("0.22.2", &unnamed).unwrap_err();
+    assert!(why.contains("entries with a \"name\" key"), "{why}");
+
+    let mut alone = legacy.clone();
+    alone.remove("deps/paket.main_extension.bzl");
+    let why = paket_files("0.14.0", &alone).unwrap_err();
+    assert_eq!(why, "no deps/paket.main_extension.bzl");
+    let mut unused = legacy.clone();
+    unused.insert(
+        "MODULE.bazel".to_string(),
+        "module(name = \"x\")\n".to_string(),
+    );
+    let why = paket_files("0.14.0", &unused).unwrap_err();
+    assert!(why.contains("uses no generated paket extension"), "{why}");
+}
+
+#[test]
+fn rules_ruby_fixtures_name_the_remote_java_runtime_of_their_line() {
+    let matrix = Matrix::load("rules_ruby");
+    for fixture in &matrix.fixtures {
+        let texts = fixture_texts("rules_ruby", &fixture.path);
+        let bazel: Vec<&str> = fixture.cells.iter().map(|c| c.bazel.as_str()).collect();
+        let found = ruby_runtime_problem(texts.get(".bazelrc").map(String::as_str), &bazel);
+        assert_eq!(found, None, "light/rules_ruby/{}", fixture.path);
+    }
+
+    let rc = "# rules_ruby resolves a Java runtime.\nbuild --java_runtime_version=remotejdk_21\n";
+    assert_eq!(ruby_runtime_problem(Some(rc), &["9.3.2", "8.8.2"]), None);
+    assert_eq!(ruby_runtime_problem(Some(rc), &["7.7.2"]), None);
+    // Bazel 6 has remotejdk_11.
+    let why = ruby_runtime_problem(Some(rc), &["6.6.0"]).expect("refused");
+    assert!(why.contains("--java_runtime_version=remotejdk_11"), "{why}");
+    let eleven = rc.replace("remotejdk_21", "remotejdk_11");
+    assert_eq!(ruby_runtime_problem(Some(&eleven), &["6.6.0"]), None);
+    assert!(ruby_runtime_problem(Some(&eleven), &["7.7.2"]).is_some());
+    assert!(ruby_runtime_problem(None, &["9.3.2"]).is_some());
+    let commented = "# build --java_runtime_version=remotejdk_21\n";
+    assert!(ruby_runtime_problem(Some(commented), &["9.3.2"]).is_some());
+}
+
+/// rules_jvm_external: every lock is of the flavor its fixture states, and the
+/// registry jar is probed in one of the two ways [`rje_problems`] describes.
+#[test]
+fn rules_jvm_external_fixtures_state_their_lock_flavors_and_their_probe() {
+    let matrix = Matrix::load("rules_jvm_external");
+    let mut sole = BTreeSet::new();
+    let mut hubs = 0;
+    for fixture in &matrix.fixtures {
+        let texts = fixture_texts("rules_jvm_external", &fixture.path);
+        let found = rje_problems(fixture, &texts);
+        let what = format!("light/rules_jvm_external/{}", fixture.path);
+        assert!(found.is_empty(), "{what}: {}", found.join("; "));
+        for stated in fixture.lock_flavors.values() {
+            if let [flavor] = &stated[..] {
+                sole.insert(flavor.as_str());
+            }
+        }
+        hubs = hubs.max(fixture.lock_flavors.len());
+    }
+    // v2 and both v3 flavors each have a lock that no other flavor reproduces
+    // (the v3 ones differ only for a lock with two repositories), and one
+    // fixture pins two hubs.
+    assert_eq!(sole, BTreeSet::from(["v2", "v3-insertion", "v3-sorted"]));
+    assert_eq!(hubs, 2);
+
+    // No other ruleset writes these locks, so nothing else may state a flavor.
+    let others = rulesets();
+    for ruleset in others
+        .iter()
+        .filter(|name| name.as_str() != "rules_jvm_external")
+    {
+        for fixture in &Matrix::load(ruleset).fixtures {
+            let what = format!("light/{ruleset}/{}", fixture.path);
+            assert!(fixture.lock_flavors.is_empty(), "{what}: lock_flavors");
+        }
+    }
+}
+
+#[test]
+fn rje_checks_refuse_a_misstated_lock_and_a_probe_that_pulls_a_jdk() {
+    const FETCHED: &str = r#"[{"bazel": "9.3.2", "proof": 0, "tier": "nightly"}]"#;
+    const BUILT: &str = r#"[{"bazel": "9.3.2", "proof": 1, "tier": "nightly"}]"#;
+    const HUB: &str = r#""tier0_roots": ["@maven//:org_slf4j_slf4j_api"],"#;
+    let fixture = |cells: &str, extra: &str, pin: &str| {
+        let pinned = format!(r#""rules_jvm_external": "{pin}""#);
+        let entry = entry(cells, extra).replace(r#""rules_x": "1.0.0""#, &pinned);
+        matrix_of(r#"["maven"]"#, SOUND_PROBE, &entry)
+            .fixtures
+            .remove(0)
+    };
+    let stated = |flavors: &str| format!(r#""lock_flavors": {{"maven_install.json": {flavors}}},"#);
+    let found = |fixture: &Fixture, texts: &BTreeMap<String, String>| {
+        rje_problems(fixture, texts).join("\n")
+    };
+    let sorted = fixture_texts("rules_jvm_external", "bzlmod/e9");
+    let insertion = fixture_texts("rules_jvm_external", "bzlmod/e8-insertion");
+    let hub_probed = |flavors: &str| format!("{} {HUB}", stated(flavors));
+    let sound = fixture(FETCHED, &hub_probed(r#"["v3-sorted"]"#), "7.2");
+    assert_eq!(found(&sound, &sorted), "");
+
+    // The flavor is what reproduces the stored hash, not what the entry says.
+    for wrong in [
+        r#"["v3-insertion"]"#,
+        r#"["v3-sorted", "v3-insertion"]"#,
+        r#"["v2"]"#,
+    ] {
+        let why = found(&fixture(FETCHED, &hub_probed(wrong), "7.2"), &sorted);
+        assert!(
+            why.contains("maven_install.json reproduces under [\"v3-sorted\"]"),
+            "{wrong}: {why}"
+        );
+    }
+    // A lock in the flavor the pinned release does not check fails its build.
+    let why = found(&sound, &insertion);
+    assert!(why.contains("reproduces under [\"v3-insertion\"]"), "{why}");
+    let on_610 = fixture(FETCHED, &hub_probed(r#"["v3-sorted"]"#), "6.10");
+    let why = found(&on_610, &sorted);
+    assert!(why.contains("checks the v3-insertion hash"), "{why}");
+    let on_72 = fixture(FETCHED, &hub_probed(r#"["v3-insertion"]"#), "7.2");
+    let why = found(&on_72, &insertion);
+    assert!(why.contains("checks the v3-sorted hash"), "{why}");
+    // A lock nothing states, a stated lock that is no file, an edited lock.
+    let why = found(&fixture(FETCHED, HUB, "7.2"), &sorted);
+    assert!(why.contains("the workspace holds the locks"), "{why}");
+    let elsewhere = hub_probed(r#"["v3-sorted"]"#).replace("maven_install", "other_install");
+    let why = found(&fixture(FETCHED, &elsewhere, "7.2"), &sorted);
+    assert!(
+        why.contains("names other_install.json, which is no file"),
+        "{why}"
+    );
+    let mut edited = sorted.clone();
+    let lock = edited.get_mut("maven_install.json").unwrap();
+    assert!(lock.contains("\"1.7.36\""));
+    *lock = lock.replace("\"1.7.36\"", "\"1.7.37\"");
+    let why = found(&sound, &edited);
+    assert!(why.contains("maven_install.json: Mismatch"), "{why}");
+
+    // The probe: through the hub the baseline stops at the query.
+    let built = fixture(BUILT, &hub_probed(r#"["v3-sorted"]"#), "7.2");
+    let why = found(&built, &sorted);
+    assert!(why.contains("stops at proof 0"), "{why}");
+    let rootless = fixture(BUILT, &stated(r#"["v3-sorted"]"#), "7.2");
+    let why = found(&rootless, &sorted);
+    assert!(why.contains("neither rooted at a hub label"), "{why}");
+    let spoke = format!(
+        r#"{} "versioned_names": ["org_slf4j_slf4j_api_1_7_36"],"#,
+        stated(r#"["v3-sorted"]"#)
+    );
+    assert_eq!(found(&fixture(BUILT, &spoke, "7.2"), &sorted), "");
+    // An unpinned hub has no lock, and nothing here to answer for.
+    assert_eq!(found(&fixture(BUILT, "", "7.2"), &BTreeMap::new()), "");
+}
+
+/// `registry/SHA256SUMS` lists every file of the mirror, so the files no lock
+/// pins (the POMs and `.md5` files Coursier asks for, the NuGet service index)
+/// are held to their bytes as well.
+#[test]
+fn the_registry_mirror_is_the_tree_its_checksums_list() {
+    const SUMS: &str = "SHA256SUMS";
+    let tree = snapshot(&mirror());
+    let line = |(path, entry): (&String, &Entry)| match entry {
+        Entry::File { bytes, .. } if path != SUMS => {
+            Some(format!("{}  {path}", hex::encode(Sha256::digest(bytes))))
+        }
+        _ => None,
+    };
+    let expected: Vec<String> = tree.iter().filter_map(line).collect();
+    let Some(Entry::File { bytes, .. }) = tree.get(SUMS) else {
+        panic!("no registry/{SUMS}");
+    };
+    let listed = String::from_utf8(bytes.clone()).expect("UTF-8");
+    assert_eq!(
+        listed.lines().collect::<Vec<_>>(),
+        expected,
+        "registry/{SUMS} is stale: one `<sha256>  <path>` line per mirrored file, in path order"
+    );
 }
 
 #[test]
@@ -2489,4 +3505,64 @@ fn nuget_registry_serves_the_index_the_packages_and_a_refusal() {
     .unwrap();
     let why = nuget::mount(&server, stray.path()).unwrap_err();
     assert!(why.contains("in lower case"), "{why}");
+}
+
+/// What a tamper twin is served: at the URL the lock pins, bytes of the mirrored
+/// length with one byte changed. Nothing is appended, and nothing else moves.
+#[test]
+fn a_tampered_artifact_keeps_its_url_and_length_and_changes_one_byte() {
+    const TARBALL: &str = "registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz";
+    const JAR: &str = "repo1.maven.org/maven2/org/slf4j/slf4j-api/1.7.36/slf4j-api-1.7.36.jar";
+    const GEM: &str = "rubygems.org/gems/sp-victim-1.0.0.gem";
+    const NUPKG: &str = "api.nuget.org/v3-flatcontainer/sp.victim/1.0.0/sp.victim.1.0.0.nupkg";
+    let server = FixtureServer::start();
+    let every: Vec<String> = REGISTRIES.iter().map(|name| name.to_string()).collect();
+    mount(&server, &every);
+
+    let tarballs = npm::tarballs(&mirror()).unwrap();
+    let left_pad = tarballs.iter().find(|tarball| tarball.name == "left-pad");
+    npm::tamper(&server, left_pad.expect("left-pad"));
+    let jar = JAR.trim_start_matches("repo1.maven.org/maven2/");
+    maven::tamper(&server, &mirror(), jar).unwrap();
+    gem::tamper(&server, &mirror(), "sp-victim-1.0.0.gem").unwrap();
+    nuget::tamper(&server, &mirror(), "SP.Victim", "1.0.0").unwrap();
+    for artifact in [TARBALL, JAR, GEM, NUPKG] {
+        let (status, served) = get(&server, artifact);
+        let upstream = mirrored(artifact);
+        assert_eq!((status, served.len()), (200, upstream.len()), "{artifact}");
+        let changed = served.iter().zip(&upstream).filter(|(a, b)| a != b);
+        assert_eq!(changed.count(), 1, "{artifact}");
+    }
+    assert_eq!(npm::tampered(b"ab"), b"ac");
+    // rules_ruby would skip a gem of this size and never look at its bytes.
+    assert_ne!(get(&server, GEM).1.len(), gem::SKIPPED_GEM_SIZE);
+    // The sidecar still states the mirrored jar's digest, which the served
+    // bytes no longer have.
+    let sha1 = hex::encode(<sha1::Sha1 as sha1::Digest>::digest(mirrored(JAR)));
+    assert_eq!(
+        get(&server, &format!("{JAR}.sha1")),
+        (200, sha1.into_bytes())
+    );
+    // The other packages are served as mirrored.
+    for neighbour in [
+        "registry.npmjs.org/@tootallnate/once/-/once-2.0.0.tgz",
+        "rubygems.org/gems/sp-other-1.0.0.gem",
+        "api.nuget.org/v3-flatcontainer/sp.other/1.0.0/sp.other.1.0.0.nupkg",
+    ] {
+        assert_eq!(
+            get(&server, neighbour),
+            (200, mirrored(neighbour)),
+            "{neighbour}"
+        );
+    }
+    // A package the mirror lacks cannot be tampered with.
+    assert!(maven::tamper(&server, &mirror(), "org/slf4j/none/1.0/none-1.0.jar").is_err());
+    assert!(gem::tamper(&server, &mirror(), "sp-none-1.0.0.gem").is_err());
+    assert!(nuget::tamper(&server, &mirror(), "SP.None", "1.0.0").is_err());
+
+    // The declared `.npmrc` of a hash-miss cell: the registry and no credential.
+    let npmrc = npm::loopback_npmrc(&server);
+    let registry = format!("http://127.0.0.1:{}/registry.npmjs.org/", server.port());
+    assert_eq!(npmrc, format!("registry={registry}\n"));
+    assert_eq!(npm::loopback_registry(&server), registry);
 }

@@ -57,6 +57,36 @@ pub fn loopback_registry(server: &FixtureServer) -> String {
     format!("{}/{HOST}/", server.loopback_origin())
 }
 
+/// The whole text of the declared `.npmrc` that points a Bazel-run pnpm at
+/// [`loopback_registry`]: the `registry=` line and nothing else, so no credential.
+/// A test writes it into its workspace copy and names it in the hub's `npmrc`
+/// attribute; no fixture commits it, because the port is the server's. rules_js
+/// 3.6.0 takes the default registry from a declared `.npmrc` and hashes the file
+/// into the `update_pnpm_lock` hash file (`npm_translate_lock_state.bzl`,
+/// `_load_npmrc`), so such a copy is a hash miss by construction, and its tarball
+/// URLs are loopback ones that no downloader rewrite touches.
+pub fn loopback_npmrc(server: &FixtureServer) -> String {
+    format!("registry={}\n", loopback_registry(server))
+}
+
+/// `bytes` with one byte in the middle flipped: the same length, another digest.
+/// A tamper changes content and never appends a byte, which a reader that stops at
+/// an archive's end marker would not see.
+pub fn tampered(bytes: &[u8]) -> Vec<u8> {
+    assert!(!bytes.is_empty(), "nothing to tamper with");
+    let mut out = bytes.to_vec();
+    let middle = out.len() / 2;
+    out[middle] ^= 0x01;
+    out
+}
+
+/// Serve `tarball` with [`tampered`] bytes at its production URL, for a tamper twin.
+/// The lock still pins the mirrored `integrity`, so Bazel's downloader must refuse
+/// what it gets; run the twin on an empty repository cache, or no request is made.
+pub fn tamper(server: &FixtureServer, tarball: &Tarball) {
+    server.serve(&tarball.url(), tampered(&tarball.bytes));
+}
+
 /// Every tarball under `<mirror>/registry.npmjs.org`. `Err` for a file that is not at
 /// `<name>/-/<leaf>-<version>.tgz`: a file this module cannot name would be served
 /// nowhere while the lock that pins it looked covered.
