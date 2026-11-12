@@ -1,0 +1,13 @@
+t01_trailing_slash/
+t02_double_slash//x
+t03_partial_segment_ab
+T04_CASE
+t05_trailing_tab	
+#t06_hash_comment
+t07_child_only/sub
+t08_glob_star/*
+"t09_quoted"
+t10_exact
+t11_backslash\x
+t12 space in name
+t13_dotdot/y/../x

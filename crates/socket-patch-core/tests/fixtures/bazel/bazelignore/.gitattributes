@@ -1,0 +1,3 @@
+# Byte-real `.bazelignore` inputs: CRLF, lone CR, BOM and no-final-newline
+# files are the point. No conversion on checkout.
+* -text

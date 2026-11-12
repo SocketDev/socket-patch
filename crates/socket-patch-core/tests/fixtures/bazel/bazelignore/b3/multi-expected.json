@@ -1,0 +1,82 @@
+{
+ "file": "multi.bazelignore",
+ "packages": [
+  "t01_trailing_slash",
+  "t02_double_slash/x",
+  "t03_partial_segment_abc",
+  "t04_case",
+  "t05_trailing_tab",
+  "t06_hash_comment",
+  "t07_child_only",
+  "t07_child_only/sub",
+  "t08_glob_star/x",
+  "t09_quoted",
+  "t10_exact",
+  "t11_backslash/x",
+  "t12 space in name",
+  "t13_dotdot/x"
+ ],
+ "visible_packages": {
+  "5.4.1": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ],
+  "6.6.0": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ],
+  "7.7.2": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ],
+  "8.8.2": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ],
+  "9.3.2": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ],
+  "10.0.0rc3": [
+   "t03_partial_segment_abc",
+   "t04_case",
+   "t05_trailing_tab",
+   "t06_hash_comment",
+   "t07_child_only",
+   "t08_glob_star/x",
+   "t09_quoted",
+   "t11_backslash/x"
+  ]
+ },
+ "note": "each package dir holds a BUILD file that fails to load; visible = named in an 'error loading package' line of `bazel query --keep_going //...`"
+}
