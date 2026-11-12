@@ -24,7 +24,8 @@
 //!
 //! Nothing here reads or writes a file. `utils::bazel_root_writes` is the
 //! one writer anchored at the Bazel root; it calls [`insert`] and
-//! [`remove`] and stores each [`IgnoreLineRow`] in the owned index.
+//! [`remove`] and stores each [`IgnoreLineRow`] in the owned index through
+//! `owned_index::Index::record_lines`.
 
 use super::model::FileText;
 use crate::vendor::go_mod_edit::GO_PATCHES_DIR;
@@ -98,6 +99,10 @@ impl IgnoreLine {
     /// clean the line, probe S9); white space at either end of a segment
     /// (gazelle trims the line and Bazel does not); a leading `#` (a
     /// comment); `*`, `?` and `[` (gazelle skips the line as a glob);
+    /// `{` and `}` (gazelle 0.26 to 0.38 matches the line as a doublestar
+    /// pattern, where braces are alternation: an unbalanced brace ends
+    /// the run in a panic, and a balanced pair names other directories
+    /// than the one written, so the tree is not hidden from it);
     /// `]`, quotes, `<`, `>`, `|`, `:` and a backslash (characters a
     /// Windows path cannot hold or splits at; Bazel's source rejects such
     /// a line there, and nothing ran on Windows); control characters; and
@@ -114,7 +119,7 @@ impl IgnoreLine {
                 return Err(Unspellable::NotRelative);
             }
             let spellable =
-                |c: char| (c.is_ascii_graphic() || c == ' ') && !"\\*?[]\"'<>|:".contains(c);
+                |c: char| (c.is_ascii_graphic() || c == ' ') && !"\\*?[]{}\"'<>|:".contains(c);
             if let Some(bad) = segment.chars().find(|c| !spellable(*c)) {
                 return Err(Unspellable::Char(bad));
             }
@@ -402,6 +407,9 @@ impl IgnoreModel {
     }
 
     /// Why no line can be added to or removed from the file, if none can.
+    /// A lone CR refuses an edit, not a run: [`insert`] and [`remove`]
+    /// return it only when they have a line to add or take, so a writer
+    /// reports their error and does not ask here first.
     pub fn cannot_edit(&self) -> Option<CannotEdit> {
         match self {
             Self::Absent => None,
@@ -431,6 +439,13 @@ pub struct Insertion {
     /// The lines that were added, in file order. A line whose directory
     /// was already hidden is not among them and gets no index row, so a
     /// line the user wrote is never removed.
+    ///
+    /// A row replaces the row the index already holds for the same line.
+    /// A line is added only when the file holds no live copy of it, so
+    /// such a row is stale: the user deleted the line by hand and this
+    /// insert put it back. `owned_index::Index::record_lines` records the
+    /// rows that way; appending them would record the line twice, which
+    /// the index refuses to render.
     pub rows: Vec<IgnoreLineRow>,
 }
 
@@ -440,6 +455,12 @@ pub struct Insertion {
 /// appended to an unterminated line, the new one would be glued to it and
 /// dead. `None` when every directory is hidden already: nothing is
 /// written and no file is created.
+///
+/// A file with a lone CR is refused only when a line would be appended to
+/// it. Coverage is read before the refusal, as in [`remove`]: a file that
+/// hides every tree already needs no edit, so the user has nothing to fix.
+/// An unreadable file is refused whatever is wanted, because nothing is
+/// known about what it hides.
 pub fn insert(file: &FileText, lines: &[IgnoreLine]) -> Result<Option<Insertion>, CannotEdit> {
     let (old, created_file) = match file {
         FileText::Unreadable => return Err(CannotEdit::Unreadable),
@@ -447,9 +468,6 @@ pub fn insert(file: &FileText, lines: &[IgnoreLine]) -> Result<Option<Insertion>
         FileText::Bytes(bytes) => (bytes.as_slice(), false),
     };
     let mut hidden = IgnoreFile::parse(old);
-    if hidden.lone_cr {
-        return Err(CannotEdit::LoneCr);
-    }
     let raw = raw_lines(old);
     let mut ends = raw.iter().rev().map(|line| line.eol);
     let eol = ends.find(|eol| !eol.is_empty()).unwrap_or(&b"\n"[..]);
@@ -461,6 +479,9 @@ pub fn insert(file: &FileText, lines: &[IgnoreLine]) -> Result<Option<Insertion>
     for line in wanted {
         if hides(hidden.prefixes.iter().map(String::as_str), line.as_str()) {
             continue;
+        }
+        if hidden.lone_cr {
+            return Err(CannotEdit::LoneCr);
         }
         let added_final_newline = unterminated && rows.is_empty();
         if added_final_newline {
@@ -698,9 +719,27 @@ mod tests {
         assert_eq!(model.cannot_edit(), Some(CannotEdit::LoneCr));
         let wanted = [line("", GoPatches), line("", Vendor)];
         assert_eq!(insert(&cr_only, &wanted), Err(CannotEdit::LoneCr));
+        // The refusal is for an append. A tree the file hides already
+        // needs none, so there is nothing to refuse and nothing the user
+        // must fix first.
+        let vendor_only = [line("", Vendor)];
+        assert_eq!(insert(&cr_only, &vendor_only), Ok(None));
+        assert_eq!(insert(&cr_only, &[]), Ok(None));
+        for hidden in [".socket/vendor\r\r\n", "a\rb\n.socket\n"] {
+            let file = present(hidden.as_bytes());
+            let cannot_edit = IgnoreModel::read(&file).cannot_edit();
+            assert_eq!(cannot_edit, Some(CannotEdit::LoneCr), "{hidden:?}");
+            assert_eq!(insert(&file, &vendor_only), Ok(None), "{hidden:?}");
+        }
+        assert_eq!(
+            insert(&present(b"a\rb\n.socket\n"), &wanted),
+            Ok(None),
+            "a bare `.socket` hides both trees"
+        );
         // One lone CR among LF lines is enough.
         let mixed = present(b"a\rb\n.socket/go-patches\n");
         assert_eq!(insert(&mixed, &wanted), Err(CannotEdit::LoneCr));
+        assert_eq!(insert(&mixed, &[line("", GoPatches)]), Ok(None));
         let [go, vendor] = wanted.map(|line| IgnoreLineRow {
             line,
             created_file: false,
@@ -891,18 +930,44 @@ mod tests {
             ("a*", Unspellable::Char('*')),
             ("a?", Unspellable::Char('?')),
             ("a[0]", Unspellable::Char('[')),
+            ("a]b", Unspellable::Char(']')),
+            // gazelle 0.26 to 0.38 reads a brace as doublestar alternation
+            // (bazel-gazelle@v0.26.0:walk/config.go `isExcluded`; a plain
+            // map from v0.39.0). The S9 binaries v0.26.0 and v0.36.0, run
+            // over a project of each name, panic on an unbalanced brace
+            // and do not honour a pair; v0.47.0 honours every such line.
+            ("a{b", Unspellable::Char('{')),
+            ("a}b", Unspellable::Char('}')),
+            ("x{a,b}", Unspellable::Char('{')),
+            ("{{cookiecutter.slug}}", Unspellable::Char('{')),
             ("a\\b", Unspellable::Char('\\')),
             ("\"a\"", Unspellable::Char('"')),
             ("it's", Unspellable::Char('\'')),
             ("C:/ws", Unspellable::Char(':')),
+            ("a<b", Unspellable::Char('<')),
+            ("a>b", Unspellable::Char('>')),
+            ("a|b", Unspellable::Char('|')),
+            ("svc ", Unspellable::Char(' ')),
             ("a\tb", Unspellable::Char('\t')),
             ("a\rb", Unspellable::Char('\r')),
+            // A line feed would write two lines, and the second, `src`,
+            // would hide a directory of the user's.
+            ("a\nsrc", Unspellable::Char('\n')),
+            ("a\0b", Unspellable::Char('\0')),
+            ("a\u{7f}b", Unspellable::Char('\u{7f}')),
             ("caf\u{e9}", Unspellable::Char('\u{e9}')),
             ("\u{feff}svc", Unspellable::Char('\u{feff}')),
         ];
         for (project, why) in refused {
             assert_eq!(IgnoreLine::new(project, Vendor), Err(why), "{project:?}");
+            // What cannot be written is not a line of socket-patch's when
+            // it is found in an index either.
+            let found = format!("{project}/.socket/vendor");
+            assert_eq!(IgnoreLine::parse(&found), None, "{found:?}");
         }
+        // A comma is no pattern character outside a brace pair: every
+        // gazelle run honoured `a,b`.
+        assert_eq!(line("a,b", Vendor).as_str(), "a,b/.socket/vendor");
         // A `#` is a comment only at the start of the line.
         assert_eq!(line("a/#b", Vendor).as_str(), "a/#b/.socket/vendor");
 
@@ -951,16 +1016,26 @@ mod tests {
             ".\n",
             "svc/..\n",
             "../svc\n",
+            // A line with a byte outside ASCII hides nothing, whatever it
+            // would normalise to: no probe cell ran one.
+            "caf\u{e9}/../svc\n",
         ];
         for found in dead {
             let inserted = insert(&present(found.as_bytes()), &wanted)
-                .unwrap()
-                .unwrap();
+                .unwrap_or_else(|why| panic!("{found:?}: {why:?}"))
+                .unwrap_or_else(|| panic!("{found:?} is read as hiding the tree"));
             assert_eq!(
                 inserted.bytes,
                 format!("{found}svc/.socket/vendor\n").as_bytes()
             );
         }
+        let non_ascii = IgnoreModel::read(&present("caf\u{e9}\n".as_bytes()));
+        assert!(!non_ascii.covers("caf\u{e9}") && !non_ascii.covers("caf\u{e9}/x"));
+        // A directory is named from the root. An absolute path names none
+        // below it, so no line hides it.
+        let svc = IgnoreModel::read(&present(b"svc\n"));
+        assert!(svc.covers("svc") && svc.covers("./svc/x/"));
+        assert!(!svc.covers("/svc") && !svc.covers("/svc/x") && !svc.covers("../svc"));
         // One line hides the trees of the projects below it.
         let both = [line("svc", Vendor), line("svc/.socket/vendor/x", GoPatches)];
         let inserted = insert(&FileText::Absent, &both).unwrap().unwrap();
@@ -1084,14 +1159,34 @@ mod tests {
             "load(\"//.socket/vendor/defs:x.bzl\", \"x\")",
             "//.socket/vendor",
             "//.socket/vendor x",
+            // The package itself, ended by each byte that can follow a
+            // label in a BUILD file or a directive. Missing one of these
+            // is the direction that breaks a build: the line is written
+            // and the label names a deleted package.
+            "x('//.socket/vendor')",
+            "f(//.socket/vendor)",
+            "[//.socket/vendor, x]",
+            "[//.socket/vendor]",
+            "# gazelle:resolve go m //.socket/vendor\n",
+            "# gazelle:resolve go m //.socket/vendor\r\n",
+            "//.socket/vendor\tx",
         ] {
-            assert!(hit(label), "{label}");
+            assert!(hit(label), "{label:?}");
         }
         for other in [
             "\"//.socket/vendor-cache:x\"",
             "\"//.socket/vendor_old/x\"",
             "\"//.socket/vendor.bak\"",
             "\"//.socket/vendors\"",
+            "\"//.socket/vendor2\"",
+            "\"//.socket/vendorX\"",
+            // Every other byte a directory name can go on with.
+            "//.socket/vendor@x",
+            "//.socket/vendor+x",
+            "//.socket/vendor~x",
+            "//.socket/vendor=x",
+            "//.socket/vendor$x",
+            "//.socket/vendor\u{e9}",
             "\"//.socket/go-patches/m:m\"",
             "\"//svc/.socket/vendor/x\"",
             // The ancestor form survives the line.
@@ -1114,6 +1209,8 @@ mod tests {
             "MODULE.bazel",
             "go.MODULE.bazel",
             "WORKSPACE",
+            "WORKSPACE.bazel",
+            "WORKSPACE.bzlmod",
         ] {
             assert!(is_label_scan_file(name), "{name}");
         }
@@ -1146,9 +1243,14 @@ mod tests {
             let file = FileText::Bytes(bytes.clone());
             let model = IgnoreModel::read(&file);
             let lone_cr = model.cannot_edit() == Some(CannotEdit::LoneCr);
+            let all_hidden = wanted.iter().all(|l| model.covers(l.as_str()));
             match insert(&file, &wanted) {
-                Err(why) => assert!(lone_cr && why == CannotEdit::LoneCr, "seed {seed}"),
-                Ok(None) => assert!(wanted.iter().all(|l| model.covers(l.as_str()))),
+                // Refused only where a line would have been appended.
+                Err(why) => assert!(
+                    lone_cr && !all_hidden && why == CannotEdit::LoneCr,
+                    "seed {seed}"
+                ),
+                Ok(None) => assert!(all_hidden, "seed {seed}"),
                 Ok(Some(inserted)) => {
                     assert!(
                         !lone_cr && inserted.bytes.starts_with(&bytes),
