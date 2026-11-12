@@ -1,0 +1,125 @@
+{
+  "group": "heavy",
+  "ruleset": "rules_python",
+  "fixtures": [
+    {
+      "fixture": "heavy/rules_python/bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "pip.parse with one hashed requirements file; Bazel's downloader fetches the index and the wheels",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y1 (rp2.5.0-index-b9.3.2)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y1 (rp2.5.0-index-b8.8.2)"},
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-python B1 (rp2.5.0-index-b7.7.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/bzlmod/e9-unhashed",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e9_unhashed",
+      "system": "bzlmod",
+      "shape": "pip.parse with a requirements file that states no hashes: a hosted rewrite takes form A (`#sha256=`)",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y1 form A (rp2.5.0-index-b9.3.2)"},
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/bzlmod/e9-per-platform",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e9_per_platform",
+      "system": "bzlmod",
+      "shape": "pip.parse with requirements_by_platform: three hashed files pin the same version, and a rewrite must reach all of them or none",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "unverified"},
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/bzlmod/e9-compile",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e9_compile",
+      "system": "bzlmod",
+      "shape": "pip.parse plus compile_pip_requirements over the same file: the lock check target a rewrite would turn red",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y6 (rp2.5.0-index-b9.3.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/bzlmod/e7-1.4.2",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e7_1_4_2",
+      "system": "bzlmod",
+      "shape": "pip.parse on the form-B-only release: pip installs registry requirements, Bazel downloads a hashed direct reference",
+      "pins": {"rules_python": "1.4.2"},
+      "registries": ["pypi-pip"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": ["python_3_11"],
+      "substitute": ["MODULE.bazel"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y1 (rp1.4.2-pip-b7.7.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/bzlmod/e7-1.3.0",
+      "test": "bazel_canary_baseline_rules_python_bzlmod_e7_1_3_0",
+      "system": "bzlmod",
+      "shape": "pip.parse with a hashed file on a release whose lock entry records the requirements file (the WORKS-AFTER shape of this line)",
+      "pins": {"rules_python": "1.3.0"},
+      "registries": ["pypi-pip"],
+      "fetch": "tool",
+      "hosts": ["bcr.bazel.build", "github.com", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": ["python_3_11"],
+      "substitute": ["MODULE.bazel"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-python B2 (rp1.3.0-pip-b7.7.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python/workspace/e7",
+      "test": "bazel_canary_baseline_rules_python_workspace_e7",
+      "system": "workspace",
+      "shape": "WORKSPACE pip_parse with requirements_lock and requirements_darwin: pip installs, and the per-OS file replaces the lock on that OS",
+      "pins": {"rules_python": "1.4.2"},
+      "registries": ["pypi-pip"],
+      "fetch": "tool",
+      "hosts": ["github.com", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": ["python_3_11"],
+      "substitute": ["WORKSPACE"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "rules-python Y2 (rp1.4.2-ws-b7.7.2)"}
+      ]
+    }
+  ]
+}

@@ -1,0 +1,78 @@
+{
+  "group": "heavy",
+  "ruleset": "gazelle_workspace",
+  "fixtures": [
+    {
+      "fixture": "heavy/gazelle_workspace/workspace/e7",
+      "test": "bazel_canary_baseline_gazelle_workspace_workspace_e7",
+      "system": "workspace",
+      "shape": "a literal go_repository in WORKSPACE, before go_rules_dependencies and gazelle_dependencies",
+      "pins": {"gazelle": "0.35.0", "rules_go": "0.44.0"},
+      "workspace_repos": {"gazelle": "bazel_gazelle", "rules_go": "io_bazel_rules_go"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "unverified"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle_workspace/workspace/e7-macro",
+      "test": "bazel_canary_baseline_gazelle_workspace_workspace_e7_macro",
+      "system": "workspace",
+      "shape": "the go_repository lives in a repository_macro file that `gazelle update-repos -to_macro` maintains",
+      "pins": {"gazelle": "0.35.0", "rules_go": "0.44.0"},
+      "workspace_repos": {"gazelle": "bazel_gazelle", "rules_go": "io_bazel_rules_go"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go B1 (ws-workspace/gz0.35.0-b7.7.2)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "gazelle-go B1 (ws-workspace/gz0.35.0-b8.8.2)"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle_workspace/workspace/e7-keep",
+      "test": "bazel_canary_baseline_gazelle_workspace_workspace_e7_keep",
+      "system": "workspace",
+      "shape": "a go_repository under a `# keep` comment: gazelle update-repos leaves it alone, so the hosted attributes never arrive",
+      "pins": {"gazelle": "0.35.0", "rules_go": "0.44.0"},
+      "workspace_repos": {"gazelle": "bazel_gazelle", "rules_go": "io_bazel_rules_go"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "lib.go", "sha256": "9deedc9bf5acbfc8ef4484fc11db8620bb1c1a18e9fb4f998c69d1e9d3a390c0"},
+      "consumer": "OUT: PRISTINE",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "unverified"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    },
+    {
+      "fixture": "heavy/gazelle_workspace/workspace/e7-seed",
+      "test": "bazel_canary_baseline_gazelle_workspace_workspace_e7_seed",
+      "system": "workspace",
+      "shape": "a go_repository for a module of the gazelle_dependencies seed list (a real module, fetched from the real proxy)",
+      "pins": {"gazelle": "0.35.0", "rules_go": "0.44.0"},
+      "workspace_repos": {"gazelle": "bazel_gazelle", "rules_go": "io_bazel_rules_go"},
+      "registries": ["goproxy"],
+      "fetch": "tool",
+      "hosts": ["github.com", "go.dev", "dl.google.com", "proxy.golang.org"],
+      "probe": {"label": "difflib:difflib.go", "sha256": "8a3e1b4596a360a9b6e34c1152b56a8a8887f7ab666479f6556980e43147718b"},
+      "consumer": "OUT: SEED 3",
+      "toolchains": ["go_sdk"],
+      "cells": [
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "unverified"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified"}
+      ]
+    }
+  ]
+}

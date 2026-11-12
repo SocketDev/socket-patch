@@ -1,0 +1,40 @@
+{
+  "group": "heavy",
+  "ruleset": "rules_rs",
+  "fixtures": [
+    {
+      "fixture": "heavy/rules_rs/bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_rs_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "crate.from_cargo over Cargo.lock with one version of the crate: after vendoring the lock does not go stale",
+      "pins": {"rules_rs": "0.2.2"},
+      "registries": [],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "static.rust-lang.org", "index.crates.io", "static.crates.io"],
+      "probe": {"label": "cfg-if-1.0.4//:src/lib.rs", "sha256": "c09723e0890d15810374009e96b20bf0eb2f65f383006516f34db36240835c85"},
+      "consumer": "CFG_IF=ok",
+      "toolchains": ["toolchains+cargo_"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rust-vendor-rules-rs R6 (rs022-b9-single)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified (ran on 8.7.0: rs022-b87-single)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_rs/bzlmod/e9-multi",
+      "test": "bazel_canary_baseline_rules_rs_bzlmod_e9_multi",
+      "system": "bzlmod",
+      "shape": "two registry-sourced versions of one crate name, consumed through the versioned hub aliases a vendoring retags",
+      "pins": {"rules_rs": "0.2.2"},
+      "registries": [],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "static.rust-lang.org", "index.crates.io", "static.crates.io"],
+      "probe": {"label": "itoa-1.0.15//:src/lib.rs", "sha256": "ef9f1a8665a678cf5b77bcaa628d00538d620de0c84fd2a8b92323a314a95636"},
+      "consumer": "ITOA=1015 ITOA04=48",
+      "toolchains": ["toolchains+cargo_"],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "rust-vendor-rules-rs R6 V3 (rs022-b9-multi)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "unverified (ran on 8.7.0: rs022-b87-multi)"}
+      ]
+    }
+  ]
+}

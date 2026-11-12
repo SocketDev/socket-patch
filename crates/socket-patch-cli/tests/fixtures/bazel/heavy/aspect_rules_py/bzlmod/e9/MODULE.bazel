@@ -1,0 +1,20 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+bazel_dep(name = "aspect_rules_py", version = "1.13.0")
+single_version_override(module_name = "aspect_rules_py", version = "1.13.0")
+bazel_dep(name = "rules_python", version = "1.0.0")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+
+uv = use_extension("@aspect_rules_py//uv/unstable:extension.bzl", "uv")
+uv.declare_hub(hub_name = "pypi")
+uv.project(
+    hub_name = "pypi",
+    lock = "//:uv.lock",
+    pyproject = "//:pyproject.toml",
+)
+use_repo(uv, "pypi")

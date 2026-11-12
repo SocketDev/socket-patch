@@ -1,0 +1,34 @@
+module(name = "socket_fixture", version = "0.0.0")
+
+bazel_dep(name = "rules_pycross", version = "0.8.3")
+single_version_override(module_name = "rules_pycross", version = "0.8.3")
+bazel_dep(name = "rules_python", version = "2.0.0")
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    is_default = True,
+    python_version = "3.12",
+)
+use_repo(python, "python_versions")
+
+pycross = use_extension("@rules_pycross//pycross/extensions:pycross.bzl", "pycross")
+pycross.configure_environments(
+    platforms = [
+        "aarch64-apple-darwin",
+        "x86_64-unknown-linux-gnu",
+    ],
+    python_versions = ["3.12"],
+)
+
+environments = use_extension("@rules_pycross//pycross/extensions:environments.bzl", "environments")
+use_repo(environments, "pycross_environments")
+
+lock_import = use_extension("@rules_pycross//pycross/extensions:lock_import.bzl", "lock_import")
+lock_import.import_uv(
+    lock_file = "//:uv.lock",
+    project_file = "//:pyproject.toml",
+    repo = "pypi",
+)
+
+lock_repos = use_extension("@rules_pycross//pycross/extensions:lock_repos.bzl", "lock_repos")
+use_repo(lock_repos, "pypi")

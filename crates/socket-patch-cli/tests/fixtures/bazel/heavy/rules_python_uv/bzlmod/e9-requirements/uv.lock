@@ -1,0 +1,33 @@
+version = 1
+revision = 3
+requires-python = ">=3.11"
+
+[[package]]
+name = "socket-fixture"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "spvictim" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "spvictim", specifier = "==1.0.0" }]
+
+[[package]]
+name = "spdep"
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/58/fd28227ddfb1aa681e7dd02f1e9eeafff1690bc965f515579f844f6099a1/spdep-2.0.0-py3-none-any.whl", hash = "sha256:ba58fd28227ddfb1aa681e7dd02f1e9eeafff1690bc965f515579f844f6099a1", size = 1123, upload-time = "2020-01-01T00:00:00Z" },
+]
+
+[[package]]
+name = "spvictim"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "spdep" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ce/cf/23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993/spvictim-1.0.0-py3-none-any.whl", hash = "sha256:cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", size = 1222, upload-time = "2020-01-01T00:00:00Z" },
+]

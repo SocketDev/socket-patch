@@ -1,0 +1,41 @@
+{
+  "group": "heavy",
+  "ruleset": "rules_python_uv",
+  "fixtures": [
+    {
+      "fixture": "heavy/rules_python_uv/bzlmod/e9",
+      "test": "bazel_canary_baseline_rules_python_uv_bzlmod_e9",
+      "system": "bzlmod",
+      "shape": "pip.parse(uv_lock =): the uv lock decides the bytes",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (rp250-b9)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (rp250-b8)"},
+        {"bazel": "7.7.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (rp250-b7)"}
+      ]
+    },
+    {
+      "fixture": "heavy/rules_python_uv/bzlmod/e9-requirements",
+      "test": "bazel_canary_baseline_rules_python_uv_bzlmod_e9_requirements",
+      "system": "bzlmod",
+      "shape": "pip.parse with uv_lock and requirements_lock on one tag: the uv lock decides the bytes and the requirements file is no package lock",
+      "pins": {"rules_python": "2.5.0-rc4"},
+      "registries": ["pypi"],
+      "fetch": "downloader",
+      "hosts": ["bcr.bazel.build", "github.com", "pypi.org", "files.pythonhosted.org"],
+      "probe": {"label": "spvictim-1.0.0-py3-none-any.whl", "sha256": "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993", "output": "spvictim-1.0.0-py3-none-any.whl"},
+      "consumer": "SPVICTIM=vulnerable",
+      "toolchains": [],
+      "cells": [
+        {"bazel": "9.3.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (rp220-b9, on 2.2.0)"},
+        {"bazel": "8.8.2", "proof": 2, "tier": "nightly", "evidence": "python-uv-pycross-aspect Y4.a (rp220-b8, on 2.2.0)"}
+      ]
+    }
+  ]
+}

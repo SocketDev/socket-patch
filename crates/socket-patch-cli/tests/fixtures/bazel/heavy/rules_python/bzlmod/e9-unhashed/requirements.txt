@@ -1,0 +1,2 @@
+spdep==2.0.0
+spvictim==1.0.0
