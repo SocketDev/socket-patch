@@ -1,0 +1,2 @@
+dep_a=direct:socket-patched-a-1.0
+dep_b=direct:b

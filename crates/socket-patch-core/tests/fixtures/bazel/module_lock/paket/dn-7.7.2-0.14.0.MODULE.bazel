@@ -1,0 +1,9 @@
+module(name = "sp_dotnet_probe")
+
+bazel_dep(name = "rules_dotnet", version = "0.14.0")
+
+main_extension = use_extension("//deps:paket.main_extension.bzl", "main_extension")
+use_repo(main_extension, "paket.main")
+
+probe = use_extension("//:probe_ext.bzl", "probe")
+use_repo(probe, "d00_pristine", "d10_hosted_first", "d11_hosted_last", "d12_wrong_sri", "d13_stale_sri", "d14_socket_only", "d15_foreign_pkg", "d16_v2_upstream", "d17_index_410", "d18_index_403_last")
