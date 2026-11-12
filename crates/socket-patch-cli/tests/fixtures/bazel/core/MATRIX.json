@@ -3,12 +3,12 @@
   "group": "core",
   "filter": "bazel_core_",
   "notes": [
-    "Layout: core/<system>/e<major> is one workspace per dependency system and Bazel major, all on the toy ruleset of toy.bzl (no external ruleset). core/payloads/{upstream,patched} holds the package files the fixture server serves; core/bzlmod/<era>/locks holds the lock `bazel mod deps` made against https://bcr.bazel.build/.",
+    "Layout: core/<system>/e<major> is one workspace per dependency system and Bazel major, all on the toy ruleset of toy.bzl (no external ruleset). core/payloads/{upstream,patched} holds the package files the fixture server serves; core/bzlmod/<era>/locks holds the lock `bazel mod deps` made against https://bcr.bazel.build/, for the Bazel versions whose lock pins the registry files (7.7.2, 8.8.2, 9.3.2). No fixture has a MODULE.bazel.lock at its root: every cell makes its lock in the test.",
     "A cell is one run of every bazel_core_ test under one Bazel on one OS, with SOCKET_PATCH_BAZEL_E2E_GROUP=core and no SOCKET_PATCH_BAZEL_E2E_SYSTEM: each test opens the fixture of its own dependency system and reports SKIP (n/a) where the line has none.",
-    "network none: the registry files and the one module archive a build fetches are committed (fixtures/bazel/registry), so the cell contacts no host. network archives: a Bazel 8.8.2 build needs archives that are not committed (12.4 MB under Bzlmod and 12.4 MB under WORKSPACE, 11.5 MB of that in four archives the Bzlmod build does not fetch; registry/MANIFEST.json lists both sets by sha256). With them in the repository cache of SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT a cell contacts no host: a warm cell builds on that cache, a cold cell (the tamper twins) starts from a cache that holds copies of those archives and nothing else, the offline phase runs every test but bazel_core_zero_network, and every report says direct_network false. Without them a test downloads the archives once, in a throwaway workspace, output base and cache of its own (never in the cell under test), copies them into the cache root when one is set, and its report says direct_network true; in the offline phase it fails a required cell instead. A cell whose reports are to show no direct network therefore runs on a restored cache root.",
-    "tests lists the Bazel versions each test reports status `ran` on. An entry with an `os` list holds on those runner OSes only, and one without it on every OS of the cells: bazel_core_shutdown_after_the_server_was_killed kills the server with SIGKILL and reports `skipped` on Windows. bazel_core_zero_network is claimed where the archives are committed, bazel_core_toy_facts_go_stale where the era's fixture has the facts hub: `extension_metadata(facts = ...)` exists in Bazel 8.5.0 and later (probed from 8.6.0; 8.4.2 rejects the keyword).",
-    "On a Bazel version listed here a test of another dependency system, or with no claim on that version, reports `skipped` (not applicable). On a version not listed here a toy test fails a required cell (SOCKET_PATCH_BAZEL_E2E_REQUIRED) when core/<system>/e<major> does not exist or registry/MANIFEST.json has no entry for the version, instead of passing without running: 7.0.2, 7.1.2 and 6.6.0 have no registry mirror yet (their locks carry no registryFileHashes), and 10.x has no era. The exception is a WORKSPACE test below Bazel 8, which runs with Bzlmod off and needs no mirror (the three workspace tests ran on 7.0.2 on macOS arm64).",
-    "Every cell ran on macOS arm64 only (2026-11-12). The Linux and Windows cells are unverified: on Windows the registry is served by the fixture server instead of read through --registry=file://, and proof tier 2 is not run.",
+    "network none: the registry files and the one module archive a build fetches are committed (fixtures/bazel/registry), so the cell contacts no host: every report says direct_network false and its hosts are the toy registry and the Socket host, both played by the fixture server. network archives: a Bazel 8.8.2 build needs archives that are not committed (12.4 MB under Bzlmod and 12.4 MB under WORKSPACE, 11.5 MB of that in four archives the Bzlmod build does not fetch; registry/MANIFEST.json lists both sets by sha256). With them in the repository cache of SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT a cell contacts no host: a warm cell builds on that cache, a cold cell (the tamper twins) starts from a cache that holds copies of those archives and nothing else, the offline phase runs every test but bazel_core_zero_network, and every report says direct_network false. Without them a test downloads the archives once, in a throwaway workspace, output base and cache of its own (never in the cell under test), copies them into the cache root when one is set, and its report says direct_network true; in the offline phase it fails a required cell instead. A cell whose reports are to show no direct network therefore runs on a restored cache root.",
+    "tests lists the Bazel versions each test reports status `ran` on. An entry with an `os` list holds on those runner OSes only (in each cell, on the ones the cell runs on), and one without it on every OS of the cells: bazel_core_shutdown_after_the_server_was_killed kills the server with SIGKILL and reports `skipped` on Windows. bazel_core_zero_network builds on a committed lock in error mode, so it is claimed where the archives and a lock are committed: not on 8.8.2 (no archives), and not on 6.6.0, 7.0.2 and 7.1.2, whose lock names the registry it was made against (a lock made against https://bcr.bazel.build/ fails error mode under --registry=file:// with `the value of --registry flag has been modified`, exit 48, and one made under file:// holds absolute paths). Those three lines resolve from the same committed registry files, listed for them by a recorded run (registry/README.md), and contact no host either. bazel_core_toy_facts_go_stale is claimed where the era's fixture has the facts hub: `extension_metadata(facts = ...)` exists in Bazel 8.5.0 and later (probed from 8.6.0; 8.4.2 rejects the keyword). bazel_core_workspace_only_gets_a_placeholder_module_file asserts the placeholder on Bazel 7 and later and its absence on 5.4.1 and 6.6.0; on 6.6.0 a Bzlmod command in a WORKSPACE-only workspace fails (`MODULE.bazel expected but not found`) and writes nothing.",
+    "On a Bazel version listed here a test of another dependency system, or with no claim on that version, reports `skipped` (not applicable). On a version not listed here a toy test fails a required cell (SOCKET_PATCH_BAZEL_E2E_REQUIRED) when core/<system>/e<major> does not exist or registry/MANIFEST.json has no entry for the version, instead of passing without running: 10.x has no era, and 8.4.2 has no registry files. The exception is a WORKSPACE test below Bazel 8, which runs with Bzlmod off and needs no registry file: that is the whole 5.4.1 cell (core/workspace/e5; Bzlmod on 5.x is a refused tier), which has no entry in registry/MANIFEST.json.",
+    "Every cell ran on macOS arm64 only (2026-11-12), the 5.4.1, 6.6.0, 7.0.2 and 7.1.2 cells included: their ubuntu and Windows entries are where the nightly plan runs them (DESIGN 9.5: 5.4.1 and 6.6.0 with the legacy lines on all three, 7.0.2 and 7.1.2 with the extras on ubuntu), not where they have run. The Linux and Windows cells are unverified: on Windows the registry is served by the fixture server instead of read through --registry=file://, and proof tier 2 is not run.",
     "The committed locks were recorded on macOS arm64; bazel_core_zero_network builds on them in error mode. The same Bazel command (the committed lock in error mode, --registry=file://, --distdir, no network interface) also passed in a Linux arm64 container on 7.7.2 and 9.3.2, outside the test harness. Linux x86_64 has not run."
   ],
   "cells": [
@@ -32,21 +32,49 @@
       "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly", "windows-latest": "nightly"},
       "network": "none",
       "fixtures": {"bzlmod": "core/bzlmod/e7", "workspace": "core/workspace/e7", "hybrid": "core/hybrid/e7"}
+    },
+    {
+      "bazel": "7.1.2",
+      "os": ["ubuntu-latest"],
+      "tier": {"ubuntu-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e7", "workspace": "core/workspace/e7", "hybrid": "core/hybrid/e7"}
+    },
+    {
+      "bazel": "7.0.2",
+      "os": ["ubuntu-latest"],
+      "tier": {"ubuntu-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e7", "workspace": "core/workspace/e7", "hybrid": "core/hybrid/e7"}
+    },
+    {
+      "bazel": "6.6.0",
+      "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+      "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly", "windows-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"bzlmod": "core/bzlmod/e6", "workspace": "core/workspace/e6", "hybrid": "core/hybrid/e6"}
+    },
+    {
+      "bazel": "5.4.1",
+      "os": ["ubuntu-latest", "macos-latest", "windows-latest"],
+      "tier": {"ubuntu-latest": "nightly", "macos-latest": "nightly", "windows-latest": "nightly"},
+      "network": "none",
+      "fixtures": {"workspace": "core/workspace/e5"}
     }
   ],
   "tests": {
-    "bazel_core_launch_isolated": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
-    "bazel_core_lock_writes_stop_the_server": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
-    "bazel_core_shutdown_after_the_server_was_killed": {"system": "any", "bazel": ["7.7.2", "8.8.2", "9.3.2"], "os": ["ubuntu-latest", "macos-latest"]},
-    "bazel_core_toy_pin_consumed_bzlmod": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
-    "bazel_core_toy_pin_consumed_workspace": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
-    "bazel_core_toy_pin_tamper_twin_bzlmod": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
-    "bazel_core_toy_pin_tamper_twin_workspace": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
-    "bazel_core_toy_lock_needs_its_derived_hash": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
-    "bazel_core_bazelignore_hides_tree": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_launch_isolated": {"system": "any", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_lock_writes_stop_the_server": {"system": "any", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_shutdown_after_the_server_was_killed": {"system": "any", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"], "os": ["ubuntu-latest", "macos-latest"]},
+    "bazel_core_toy_pin_consumed_bzlmod": {"system": "bzlmod", "bazel": ["6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_toy_pin_consumed_workspace": {"system": "workspace", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2"]},
+    "bazel_core_toy_pin_tamper_twin_bzlmod": {"system": "bzlmod", "bazel": ["6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_toy_pin_tamper_twin_workspace": {"system": "workspace", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2"]},
+    "bazel_core_toy_lock_needs_its_derived_hash": {"system": "bzlmod", "bazel": ["6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
+    "bazel_core_bazelignore_hides_tree": {"system": "bzlmod", "bazel": ["6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2", "9.3.2"]},
     "bazel_core_zero_network": {"system": "bzlmod", "bazel": ["7.7.2", "9.3.2"]},
-    "bazel_core_hybrid_hub_names_resolve_per_system": {"system": "hybrid", "bazel": ["7.7.2", "8.8.2"]},
-    "bazel_core_workspace_only_gets_a_placeholder_module_file": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
+    "bazel_core_hybrid_hub_names_resolve_per_system": {"system": "hybrid", "bazel": ["6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2"]},
+    "bazel_core_workspace_only_gets_a_placeholder_module_file": {"system": "workspace", "bazel": ["5.4.1", "6.6.0", "7.0.2", "7.1.2", "7.7.2", "8.8.2"]},
     "bazel_core_toy_facts_go_stale": {"system": "bzlmod", "bazel": ["8.8.2", "9.3.2"]},
     "bazel_core_probe_rule_takes_a_tree_artifact": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"], "os": ["ubuntu-latest", "macos-latest"]}
   }

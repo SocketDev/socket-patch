@@ -1,0 +1,11 @@
+{
+  "lockVersion": 1,
+  "packages": {
+    "dep": {
+      "version": "0.9.0",
+      "url": "https://registry.toy.invalid/dep/-/dep-0.9.0.sh",
+      "sha256": "123453ffbe735551ed7ff547cb145829cd3b60fd8d32845f46f4325bd09dcbff"
+    }
+  },
+  "pinsHash": -1547204096
+}

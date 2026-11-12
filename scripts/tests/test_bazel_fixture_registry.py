@@ -1,16 +1,21 @@
 """scripts/bazel-fixture-registry.py and the tree it keeps
 (crates/socket-patch-cli/tests/fixtures/bazel/registry): the committed
-registry subset is exactly what each Bazel version's committed lock pins,
-the zero-network cells have their archives, and the check notices every
-kind of drift. No test here runs Bazel or touches the network."""
+registry subset is exactly what each Bazel version's committed lock pins
+(for a Bazel whose lock pins no registry file, what its recorded list
+names), the zero-network cells have their archives, and the check notices
+every kind of drift. No test here runs Bazel or touches the network."""
 
 import base64
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import tempfile
+import threading
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 SCRIPTS = Path(__file__).parents[1]
@@ -26,6 +31,10 @@ def load(name, path):
 tool = load("bazel_fixture_registry", SCRIPTS / "bazel-fixture-registry.py")
 FIXTURES = tool.FIXTURES
 MANIFEST = json.loads((FIXTURES / "registry/MANIFEST.json").read_text(encoding="utf-8"))
+# The two kinds of entry: a version whose file list is its committed lock's,
+# and one (Bazel below 7.2.0) whose list a recorded run left.
+LOCKED = {version: entry for version, entry in MANIFEST["versions"].items() if "lock" in entry}
+RECORDED = {version: entry for version, entry in MANIFEST["versions"].items() if "recorded" in entry}
 
 
 def digest(data):
@@ -43,7 +52,8 @@ class CommittedTree(unittest.TestCase):
     def test_every_file_a_lock_pins_is_mirrored_with_that_digest(self):
         """Read straight from the locks, not through the tool's own table."""
         registry = FIXTURES / "registry"
-        for version, entry in MANIFEST["versions"].items():
+        self.assertEqual(sorted(LOCKED), ["7.7.2", "8.8.2", "9.3.2"])
+        for version, entry in LOCKED.items():
             lock = json.loads((FIXTURES / entry["lock"]).read_text(encoding="utf-8"))
             pins = lock["registryFileHashes"]
             self.assertGreater(len(pins), 50, f"Bazel {version}")
@@ -54,8 +64,9 @@ class CommittedTree(unittest.TestCase):
 
     def test_a_version_is_pinned_and_its_lock_is_the_fixtures_own(self):
         pins = (SCRIPTS / "bazel-pins.txt").read_text(encoding="utf-8")
-        for version, entry in MANIFEST["versions"].items():
+        for version in MANIFEST["versions"]:
             self.assertIn(f"bazel {version} ", pins)
+        for version, entry in LOCKED.items():
             era = f"e{version.split('.')[0]}"
             self.assertRegex(entry["lock"], rf"^core/bzlmod/{era}/locks/v\d+/MODULE\.bazel\.lock$")
             lock = json.loads((FIXTURES / entry["lock"]).read_text(encoding="utf-8"))
@@ -63,17 +74,85 @@ class CommittedTree(unittest.TestCase):
             # A lock made against a file:// registry or a loopback server
             # would pin nothing a production registry serves.
             self.assertNotRegex(json.dumps(lock), r"file://|127\.0\.0\.1|localhost")
+            # Made by `bazel mod deps`, which evaluates every extension of
+            # the module graph. A lock that builds wrote records only what a
+            # target needed (the toy hub, and on 7.x the host platform), and
+            # grows by hundreds of lines at the first `mod` command.
+            others = [
+                key for key in lock["moduleExtensions"]
+                if key.startswith("@@") and not key.startswith("@@platforms//")
+            ]
+            self.assertTrue(others, f"Bazel {version}: the lock records no extension of Bazel's own modules")
+
+    def test_a_version_whose_lock_pins_no_registry_file_has_a_recorded_list(self):
+        """Bazel 6.6.0, 7.0.2 and 7.1.2: the list names what a recorded run
+        read, every file of it is mirrored, and where a lock of another
+        version pins the same file the two agree."""
+        registry = FIXTURES / "registry"
+        self.assertEqual(sorted(RECORDED), ["6.6.0", "7.0.2", "7.1.2"])
+        self.assertEqual(sorted([*LOCKED, *RECORDED]), sorted(MANIFEST["versions"]))
+        locked = {}
+        for entry in LOCKED.values():
+            lock = json.loads((FIXTURES / entry["lock"]).read_text(encoding="utf-8"))
+            locked.update(lock["registryFileHashes"])
+        for version, entry in RECORDED.items():
+            self.assertLess(tool.release(version), tool.FIRST_WITH_REGISTRY_HASHES)
+            recorded = entry["recorded"]
+            self.assertRegex(recorded["source"], r"^bazel-central-registry@[0-9a-f]{40}$")
+            files = recorded["files"]
+            self.assertGreater(len(files), 20, f"Bazel {version}")
+            self.assertIn("bazel_registry.json", files)
+            vouched = 0
+            for rel, pinned in files.items():
+                self.assertEqual(digest((registry / rel).read_bytes()), pinned, f"Bazel {version}: {rel}")
+                if tool.BCR + rel in locked:
+                    vouched += 1
+                    self.assertEqual(locked[tool.BCR + rel], pinned, f"Bazel {version}: {rel}")
+            self.assertGreater(vouched, len(files) // 2, f"Bazel {version}: files a lock also pins")
+            # The archive a build fetches is one the list resolves.
+            for archive in entry["archives"]:
+                name, _, module_version = archive["module"].partition("@")
+                self.assertIn(f"modules/{name}/{module_version}/source.json", files)
+
+    def test_no_lock_of_such_a_version_and_no_yanked_list_is_committed(self):
+        """A lock without registryFileHashes names the registry it was made
+        against (and under file:// absolute paths), so a cell on such a
+        Bazel makes its lock in the test. `metadata.json` is the one
+        registry file upstream rewrites."""
+        locks = sorted((FIXTURES / "core").rglob("MODULE.bazel.lock"))
+        self.assertEqual(
+            [lock.relative_to(FIXTURES).as_posix() for lock in locks],
+            sorted(entry["lock"] for entry in LOCKED.values()),
+        )
+        for lock in locks:
+            text = lock.read_text(encoding="utf-8")
+            self.assertTrue(json.loads(text)["registryFileHashes"], lock)
+            self.assertNotIn("cmdRegistries", text, lock)
+        self.assertEqual(sorted((FIXTURES / "registry").rglob("metadata.json")), [])
+        for version in RECORDED:
+            era = f"e{version.split('.')[0]}"
+            for system in ("bzlmod", "hybrid"):
+                self.assertTrue((FIXTURES / "core" / system / era / "MODULE.bazel").is_file(), f"{system}/{era}")
 
     def test_a_cell_without_network_has_its_archives_committed(self):
         matrix = json.loads((FIXTURES / "core/MATRIX.json").read_text(encoding="utf-8"))
+        unmirrored = []
         for cell in matrix["cells"]:
             entry = MANIFEST["versions"].get(cell["bazel"])
-            self.assertIsNotNone(entry, f"Bazel {cell['bazel']} has a core cell and no registry files")
+            if entry is None:
+                # With Bzlmod off below Bazel 8 a build resolves no module
+                # and fetches no archive of Bazel's own: nothing to commit.
+                unmirrored.append(cell["bazel"])
+                self.assertEqual(list(cell["fixtures"]), ["workspace"], cell["bazel"])
+                self.assertLess(tool.release(cell["bazel"]), (8, 0, 0))
+                self.assertEqual(cell["network"], "none", cell["bazel"])
+                continue
             self.assertEqual(cell["network"] == "none", entry["distdir"], cell["bazel"])
             for archive in entry["archives"] if entry["distdir"] else []:
                 path = FIXTURES / "registry/distdir" / cell["bazel"] / archive["file"]
                 self.assertEqual(digest(path.read_bytes()), archive["sha256"])
                 self.assertEqual(path.stat().st_size, archive["bytes"])
+        self.assertEqual(unmirrored, ["5.4.1"])
 
 
     def test_a_cell_whose_archives_are_not_committed_lists_them_per_system(self):
@@ -85,8 +164,8 @@ class CommittedTree(unittest.TestCase):
         self.assertTrue(toys, "no toy package under core/payloads")
         listed = 0
         for cell in matrix["cells"]:
-            entry = MANIFEST["versions"][cell["bazel"]]
-            if entry["distdir"]:
+            entry = MANIFEST["versions"].get(cell["bazel"])
+            if entry is None or entry["distdir"]:
                 continue
             listed += 1
             self.assertTrue(entry["archives"], cell["bazel"])
@@ -112,7 +191,7 @@ class Drift(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         shutil.copytree(FIXTURES / "registry", self.tmp / "registry")
-        for entry in MANIFEST["versions"].values():
+        for entry in LOCKED.values():
             (self.tmp / entry["lock"]).parent.mkdir(parents=True)
             shutil.copyfile(FIXTURES / entry["lock"], self.tmp / entry["lock"])
         shutil.copytree(FIXTURES / "core/payloads", self.tmp / "core/payloads")
@@ -197,6 +276,73 @@ class Drift(unittest.TestCase):
         lock_path.write_text(json.dumps(lock))
         self.assertIn("Bazel 7.7.2", self.problems())
         self.assertIn("no registryFileHashes", self.problems())
+
+    def edit_entry(self, version, edit):
+        """Apply `edit` to one version's entry of a manifest copy."""
+        path = self.registry / "MANIFEST.json"
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        edit(manifest["versions"][version])
+        path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        sums = tool.render_sums(tool.tree(self.registry))
+        (self.registry / "SHA256SUMS").write_text(sums, encoding="utf-8")
+
+    # Only the 7.0.2 list names it: no lock pins it, and no other list.
+    RECORDED_ONLY = "modules/rules_java/7.1.0/MODULE.bazel"
+
+    def test_a_recorded_file_that_changed(self):
+        target = self.registry / self.RECORDED_ONLY
+        target.write_bytes(target.read_bytes() + b"\n")
+        self.assertRegex(self.problems(), re.escape(self.RECORDED_ONLY) + r": sha256 \w+, expected")
+
+    def test_a_recorded_list_that_drops_a_file_leaves_it_unaccounted(self):
+        self.edit_entry("7.0.2", lambda entry: entry["recorded"]["files"].pop(self.RECORDED_ONLY))
+        self.assertEqual(
+            tool.check(self.tmp),
+            [f"{self.RECORDED_ONLY}: no lock or source.json of MANIFEST.json accounts for this file"],
+        )
+
+    def test_a_recorded_list_that_disagrees_with_a_lock(self):
+        lock = json.loads((FIXTURES / LOCKED["7.7.2"]["lock"]).read_text(encoding="utf-8"))
+        both = [
+            rel for rel in sorted(RECORDED["7.0.2"]["recorded"]["files"])
+            if rel.startswith("modules/") and tool.BCR + rel in lock["registryFileHashes"]
+        ]
+        self.assertTrue(both, "no file that the 7.0.2 list and the 7.7.2 lock both name")
+        shared = both[0]
+        self.edit_entry("7.0.2", lambda entry: entry["recorded"]["files"].update({shared: "0" * 64}))
+        self.assertRegex(self.problems(), re.escape(shared) + r": the Bazel \S+ (lock|recorded list) wants")
+
+    def test_a_recorded_list_names_only_what_resolution_reads(self):
+        def yanked(entry):
+            entry["recorded"]["files"]["modules/platforms/metadata.json"] = "0" * 64
+
+        self.edit_entry("7.0.2", yanked)
+        self.assertIn(
+            "Bazel 7.0.2: modules/platforms/metadata.json is not a file module resolution reads",
+            self.problems(),
+        )
+
+    def test_a_recorded_list_says_what_it_was_recorded_from(self):
+        self.edit_entry("7.0.2", lambda entry: entry["recorded"].pop("source"))
+        self.assertIn("Bazel 7.0.2: the recorded list does not say what it was recorded from", self.problems())
+
+    def test_an_entry_names_a_lock_or_a_recorded_list_and_not_both(self):
+        lock = MANIFEST["versions"]["7.7.2"]["lock"]
+        self.edit_entry("7.0.2", lambda entry: entry.update(lock=lock))
+        self.assertIn("Bazel 7.0.2: the entry names one of `lock` and `recorded`", self.problems())
+        self.edit_entry("7.0.2", lambda entry: [entry.pop("lock"), entry.pop("recorded")])
+        self.assertIn("Bazel 7.0.2: the entry names one of `lock` and `recorded`", self.problems())
+
+    def test_a_bazel_that_pins_its_registry_files_takes_no_recorded_list(self):
+        """The weaker source is not a way around a lock."""
+        files = RECORDED["7.0.2"]["recorded"]
+
+        def swap(entry):
+            entry.pop("lock")
+            entry["recorded"] = files
+
+        self.edit_entry("7.7.2", swap)
+        self.assertIn("Bazel 7.7.2 writes registryFileHashes: its file list comes from a lock", self.problems())
 
     def test_sums_that_do_not_list_the_tree(self):
         sums = self.registry / "SHA256SUMS"
@@ -443,6 +589,130 @@ class Add(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "is not the file its cache key names"):
             self.add_workspace(cache, names={digest(self.WORKSPACE_ONLY): "suffix-1.0.tar.gz"})
         self.assertEqual(self.tree(), [])
+
+    # A Bazel whose lock pins no registry file: the list is a recorded run's.
+
+    FROM = "bazel-central-registry@" + "ab" * 20
+    READ = ("bazel_registry.json", "modules/lib/1.0/MODULE.bazel", "modules/lib/1.0/source.json")
+
+    def requests(self, lines):
+        log = self.tmp / "requests.log"
+        log.write_text("".join(f"{status}\t{rel}\n" for status, rel in lines))
+        return log
+
+    def add_recorded(self, lines=None, version="7.0.2", recorded_from=FROM):
+        if lines is None:
+            # Asked for twice, and the yanked-version list beside them.
+            lines = [(200, rel) for rel in self.READ] + [(200, "modules/lib/metadata.json"), (200, self.READ[1])]
+        tool.add(
+            self.fixtures, version, None, self.bcr, self.cache, True,
+            requests=self.requests(lines), recorded_from=recorded_from,
+        )
+
+    def test_mirrors_what_a_recorded_run_read_and_a_build_fetched(self):
+        (self.bcr / "modules/lib/metadata.json").write_text("{}\n")
+        self.add_recorded()
+        self.assertEqual(tool.check(self.fixtures), [])
+        self.assertEqual(self.tree(), [
+            "MANIFEST.json",
+            "bazel_registry.json",
+            "distdir/7.0.2/lib-1.0.tar.gz",
+            "modules/lib/1.0/MODULE.bazel",
+            "modules/lib/1.0/patches/fix.patch",
+            "modules/lib/1.0/source.json",
+        ])
+        manifest = json.loads((self.fixtures / "registry/MANIFEST.json").read_text())
+        entry = manifest["versions"]["7.0.2"]
+        self.assertNotIn("lock", entry)
+        self.assertEqual(entry["recorded"], {
+            "source": self.FROM,
+            "files": {rel: digest((self.bcr / rel).read_bytes()) for rel in self.READ},
+        })
+        self.assertEqual([archive["file"] for archive in entry["archives"]], ["lib-1.0.tar.gz"])
+
+        # Beside a version with a lock, each keeps its own files, and a
+        # refresh of either leaves the other's.
+        self.add()
+        self.add_recorded()
+        self.assertEqual(tool.check(self.fixtures), [])
+        self.assertIn("distdir/9.3.2/lib-1.0.tar.gz", self.tree())
+        self.assertIn("distdir/7.0.2/lib-1.0.tar.gz", self.tree())
+
+    def refused(self, message, **arguments):
+        before = self.snapshot()
+        with self.assertRaises(SystemExit) as refusal:
+            self.add_recorded(**arguments)
+        self.assertIn(message, str(refusal.exception))
+        self.assertEqual(self.snapshot(), before, "a refused add wrote")
+
+    def test_a_request_the_recorded_run_got_no_file_for_is_refused(self):
+        miss = [(200, rel) for rel in self.READ] + [(404, "modules/gone/1.0/MODULE.bazel")]
+        self.refused("got 404; a miss cannot be mirrored", lines=miss)
+
+    def test_a_recorded_request_for_anything_but_a_resolution_file_is_refused(self):
+        other = [(200, rel) for rel in self.READ] + [(200, "modules/lib/1.0/patches/fix.patch")]
+        self.refused("is not a file module resolution reads", lines=other)
+        self.refused("is not `<status> TAB <path>`", lines=[("", "bazel_registry.json")])
+        self.refused("no request for bazel_registry.json", lines=[(200, self.READ[1])])
+
+    def test_a_recorded_file_the_checkout_lacks_is_refused(self):
+        (self.bcr / "modules/lib/1.0/MODULE.bazel").unlink()
+        self.refused("the recorded run read this file and the checkout does not have it")
+
+    def test_a_recorded_file_that_differs_from_what_a_lock_pins_is_refused(self):
+        """The lock of another version is the stronger word for a file both read."""
+        self.add()
+        (self.bcr / "modules/lib/1.0/MODULE.bazel").write_text("# edited upstream\n")
+        self.refused("and Bazel 9.3.2 pins")
+
+    def test_a_recorded_list_needs_its_origin_and_a_bazel_without_registry_hashes(self):
+        self.refused("say what it is with --source", recorded_from=None)
+        self.refused("Bazel 7.7.2 writes registryFileHashes", version="7.7.2")
+        with self.assertRaisesRegex(SystemExit, "not both"):
+            tool.add(self.fixtures, "7.0.2", self.lock, self.bcr, self.cache, True, requests=self.requests([]))
+        with self.assertRaisesRegex(SystemExit, "not both"):
+            tool.add(self.fixtures, "7.0.2", None, self.bcr, self.cache, True)
+
+    def test_the_checkout_commit_is_read_from_git_and_from_nothing_else(self):
+        self.assertIsNone(tool.checkout_commit(self.bcr))
+        self.assertIsNone(tool.checkout_commit(self.tmp / "missing"))
+
+    def test_the_recorder_plays_the_checkout_and_logs_every_request(self):
+        log = self.tmp / "requests.log"
+        (self.bcr / ".git").mkdir()
+        (self.bcr / ".git/config").write_text("[core]\n")
+        (self.tmp / "outside.txt").write_text("not the registry\n")
+        with tool.recorder(self.bcr, log) as server:
+            serving = threading.Thread(target=server.serve_forever)
+            serving.start()
+            self.addCleanup(serving.join)
+            self.addCleanup(server.shutdown)
+            origin = f"http://127.0.0.1:{server.server_address[1]}"
+            # No proxy, whatever the machine configures for other hosts.
+            direct = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def get(path):
+                try:
+                    with direct.open(origin + path, timeout=30) as response:
+                        return response.status, response.read()
+                except urllib.error.HTTPError as error:
+                    with error:
+                        return error.code, b""
+
+            served = get("/modules/lib/1.0/MODULE.bazel")
+            self.assertEqual(served, (200, (self.bcr / "modules/lib/1.0/MODULE.bazel").read_bytes()))
+            self.assertEqual(get("/modules/lib/9.9/MODULE.bazel")[0], 404)
+            self.assertEqual(get("/.git/config")[0], 404)
+            self.assertEqual(get("/modules/../../outside.txt")[0], 404)
+            server.shutdown()
+        lines = log.read_text().splitlines()
+        self.assertEqual(lines[:3], [
+            "200\tmodules/lib/1.0/MODULE.bazel",
+            "404\tmodules/lib/9.9/MODULE.bazel",
+            "404\t.git/config",
+        ])
+        self.assertEqual(len(lines), 4)
+        self.assertTrue(lines[3].startswith("404\t"), lines[3])
 
     def test_names_are_sha256_and_file_pairs(self):
         key = digest(self.WORKSPACE_ONLY)

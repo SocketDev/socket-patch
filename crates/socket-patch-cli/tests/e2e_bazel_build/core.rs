@@ -57,7 +57,7 @@ fn read(path: &Path) -> String {
 #[test]
 fn core_fixture_copies_agree() {
     let dirs = fixture_dirs();
-    assert_eq!(dirs.len(), 7, "{dirs:?}");
+    assert_eq!(dirs.len(), 11, "{dirs:?}");
     let reference = fixtures_root().join("core/bzlmod/e9");
     for dir in &dirs {
         for shared in ["toy.bzl", "BUILD.bazel", LOCK] {
@@ -110,7 +110,7 @@ fn toy_locks_pin_the_committed_payloads() {
             }
         }
     }
-    assert_eq!(locks, 11, "toy locks found");
+    assert_eq!(locks, 16, "toy locks found");
 
     let lock = read(&fixtures_root().join("core/bzlmod/e9").join(LOCK));
     let pinned = toy::pin(&lock, DEP);
@@ -175,6 +175,15 @@ fn core_matrix_names_real_fixtures_versions_and_tests() {
         assert!(sources.contains(&format!("fn {name}()")), "no test {name}");
         // A test is claimed only on a line whose cell has a fixture of its system.
         let system = claim["system"].as_str().expect("system");
+        // A claim holds on every OS of its cells, unless it names the ones
+        // it holds on. Each of its cells then runs on at least one of
+        // them, and each of them is an OS that one of its cells runs on.
+        let scope = claim.get("os").map(|os| os.as_array().expect("os"));
+        assert!(
+            scope.is_none_or(|scope| !scope.is_empty()),
+            "{name}: an empty os list claims nothing"
+        );
+        let mut runs_on = Vec::new();
         for bazel in claim["bazel"].as_array().expect("bazel") {
             let cells = matrix["cells"].as_array().unwrap().iter();
             let has_fixture = |cell: &serde_json::Value| {
@@ -185,19 +194,21 @@ fn core_matrix_names_real_fixtures_versions_and_tests() {
                 claimed.peek().is_some(),
                 "{name}: no {system} cell on {bazel}"
             );
-            // A claim holds on every OS of its cells, unless it names the
-            // ones it holds on: those are then OSes each of its cells has.
-            let Some(scope) = claim.get("os") else {
-                continue;
-            };
-            let scope = scope.as_array().expect("os");
-            assert!(!scope.is_empty(), "{name}: an empty os list claims nothing");
             for cell in claimed {
-                let runs_on = cell["os"].as_array().expect("a cell's os");
-                let stray: Vec<_> = scope.iter().filter(|os| !runs_on.contains(os)).collect();
-                assert!(stray.is_empty(), "{name}: no {bazel} cell on {stray:?}");
+                let cell_os = cell["os"].as_array().expect("a cell's os");
+                assert!(
+                    scope.is_none_or(|scope| scope.iter().any(|os| cell_os.contains(os))),
+                    "{name}: the {bazel} cell runs on none of {scope:?}"
+                );
+                runs_on.extend(cell_os.iter());
             }
         }
+        let stray: Vec<_> = scope
+            .into_iter()
+            .flatten()
+            .filter(|os| !runs_on.contains(os))
+            .collect();
+        assert!(stray.is_empty(), "{name}: no cell on {stray:?}");
     }
     // The test that kills the server with SIGKILL reports `skipped` off
     // Unix (launch.rs), so it claims no Windows cell.
@@ -219,10 +230,11 @@ fn core_matrix_names_real_fixtures_versions_and_tests() {
 }
 
 /// Every cell of `core/MATRIX.json` can open its toy tests: its Bazel
-/// version is in the registry manifest, and where the module archives are
-/// not committed the manifest names them for each dependency system the
-/// cell has a fixture for, which is what a cold cell is given from the
-/// repository cache. No list names a toy package.
+/// version is in the registry manifest (or it has a WORKSPACE fixture
+/// alone on a line below Bazel 8, which resolves no module), and where the
+/// module archives are not committed the manifest names them for each
+/// dependency system the cell has a fixture for, which is what a cold cell
+/// is given from the repository cache. No list names a toy package.
 #[test]
 fn every_core_cell_has_its_registry_mirror_and_archives() {
     let json = |rel: &str| -> serde_json::Value {
@@ -242,7 +254,7 @@ fn every_core_cell_has_its_registry_mirror_and_archives() {
                 assert_eq!(*fixture, toy::fixture_of(&version, system), "{bazel}");
             }
             let digests = match toy::gate(&version, system, &manifest, present, false) {
-                toy::Gate::Run(toy::Mirror::Committed) => continue,
+                toy::Gate::Run(toy::Mirror::Committed | toy::Mirror::NotNeeded) => continue,
                 toy::Gate::Run(toy::Mirror::Cached(digests)) => digests,
                 // A line without the system has no fixture of it either.
                 toy::Gate::NotApplicable(_) if !present => continue,
@@ -578,7 +590,9 @@ fn bazel_core_hybrid_hub_names_resolve_per_system() {
 /// on, even one that fails, and a lock once there is something to record
 /// (under the committed `file://` registry that differs per line). Under
 /// the flags of a WORKSPACE cell they write neither, and both are in the
-/// set the tree comparisons leave out.
+/// set the tree comparisons leave out. Bazel 5 and 6 write neither: a
+/// query under the line's default flags leaves the tree alone, and 6.x
+/// with Bzlmod turned on refuses the workspace instead.
 #[test]
 #[ignore = "real Bazel; run with --ignored"]
 fn bazel_core_workspace_only_gets_a_placeholder_module_file() {
@@ -590,11 +604,37 @@ fn bazel_core_workspace_only_gets_a_placeholder_module_file() {
     let workspace = &cell.scratch.workspace;
     cell.baseline(&[PROBE], false);
     let before = snapshot(workspace);
-    for owned in ["MODULE.bazel", MODULE_LOCK] {
-        assert!(
-            !workspace.join(owned).exists(),
-            "{owned} under the WORKSPACE flags"
-        );
+    let neither_written = |when: &str| {
+        for owned in ["MODULE.bazel", MODULE_LOCK] {
+            assert!(!workspace.join(owned).exists(), "{owned} {when}");
+        }
+    };
+    neither_written("under the WORKSPACE flags");
+
+    if !cell.bazel.version.at_least(7, 0, 0) {
+        // The lower edge of the exclusion set: Bzlmod is off by default,
+        // and turned on (6.x; 5.x has no supported Bzlmod) it wants a
+        // MODULE.bazel and makes none.
+        let bzlmod_refused = cell.bazel.version.system_flags(System::Bzlmod).is_some();
+        if bzlmod_refused {
+            let bzlmod = Options {
+                system: Some(System::Bzlmod),
+                ..cell.options.clone()
+            };
+            let query = cell.bazel_with(&bzlmod, "query", &["//:all"]);
+            assert!(!query.ok(), "{}", query.dump());
+            let refusal = "MODULE.bazel expected but not found";
+            assert!(query.stderr().contains(refusal), "{}", query.dump());
+        }
+        cell.bazel_ok("query", &["//:all"]);
+        neither_written("on a line below Bazel 7");
+        assert_same_tree_but_bazel_owned(&before, &snapshot(workspace));
+        toy.cell
+            .report
+            .detail("placeholder_written", false)
+            .detail("bzlmod_command_refused", bzlmod_refused);
+        toy.finish();
+        return;
     }
 
     // The line's default flags turn Bzlmod on. The query passes on 7.7.2;
@@ -612,6 +652,7 @@ fn bazel_core_workspace_only_gets_a_placeholder_module_file() {
     let lock_written = cell.module_lock().is_some();
     toy.cell
         .report
+        .detail("placeholder_written", true)
         .detail("default_flags_query_passed", query)
         .detail("module_lock_written", lock_written);
     toy.finish();

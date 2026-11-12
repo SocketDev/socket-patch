@@ -10,8 +10,9 @@
 //! - the registry files, read through `--registry=file://` on Unix. On
 //!   Windows, where no cell has proved the `file://` path syntax, the
 //!   fixture server plays `bcr.bazel.build` from the same files.
-//! - the archives of a line whose build fetches few (7.7.2 and 9.3.2: one
-//!   file of 8 KB), committed and passed as `--distdir`.
+//! - the archives of a line whose build fetches few (one file of 6 to 8 KB
+//!   on 6.6.0, 7.0.2, 7.1.2, 7.7.2 and 9.3.2), committed and passed as
+//!   `--distdir`.
 //! - for a line whose manifest entry says `"distdir": false`, only the
 //!   sha256 of each archive (8.8.2 fetches 12.4 MB under Bzlmod and 12.4 MB
 //!   under WORKSPACE, 11.5 MB of that in four archives the Bzlmod build
@@ -21,10 +22,18 @@
 //! [`gate`] decides from those files alone whether a test runs in a cell.
 //! A WORKSPACE cell below Bazel 8 runs with Bzlmod off and needs none of
 //! them. Any other cell on a Bazel version the manifest does not list
-//! cannot run, which is a failure where the cell is required: 7.0.2, 7.1.2
-//! and 6.6.0 write locks without `registryFileHashes`, so their module
-//! list has to come from a recorded run before
-//! `bazel-fixture-registry.py` can add them.
+//! cannot run, which is a failure where the cell is required.
+//!
+//! No toy fixture has a `MODULE.bazel.lock` at its root: every cell makes
+//! its lock in the test. For 6.6.0, 7.0.2 and 7.1.2 that is the only way.
+//! Their locks name the registry they were made against
+//! (`flags.cmdRegistries`, and under a `file://` registry absolute paths
+//! in `repoSpec`), so one made against the Bazel Central Registry fails
+//! `--lockfile_mode=error` here (`the value of --registry flag has been
+//! modified`, exit 48) and one made here could not be committed. Their
+//! manifest entries therefore name no lock (the registry file list comes
+//! from a recorded run), and a test that builds on a committed lock is
+//! not applicable on them.
 //!
 //! A toy cell never runs `bazel mod deps`: that command evaluates every
 //! extension of Bazel's own modules and fetches their archives (39 MB on
@@ -228,7 +237,9 @@ impl Gate {
 /// the machine ([`open_offline`]).
 ///
 /// Not applicable: the line lacks the dependency system, or the test
-/// claims zero network on a line whose module archives are not committed.
+/// claims zero network (which it shows by building on the committed lock
+/// in `error` mode) on a line that has no committed lock or whose module
+/// archives are not committed.
 /// Cannot run: there is no fixture for the line's major, or the cell needs
 /// the registry mirror and the manifest does not list the version.
 ///
@@ -263,6 +274,14 @@ pub fn gate(
         );
         return Gate::CannotRun(why);
     };
+    if zero_network && entry.get("lock").is_none() {
+        let why = format!(
+            "a Bazel {} lock names the registry it was made against, so none is committed: the \
+             cell makes its lock in the test",
+            version.text
+        );
+        return Gate::NotApplicable(why);
+    }
     if entry["distdir"] == true {
         return Gate::Run(Mirror::Committed);
     }
@@ -389,7 +408,8 @@ pub fn open(test: &str, system: System, cold: bool) -> Option<Toy> {
 
 /// [`open`] on an empty repository cache with the proxies of every Bazel
 /// command at a closed port: for a test that claims zero network. Not
-/// applicable on a line whose module archives are not committed.
+/// applicable on a line that has no committed lock or whose module
+/// archives are not committed.
 pub fn open_offline(test: &str, system: System) -> Option<Toy> {
     open_with(test, system, true, true)
 }
