@@ -28,10 +28,12 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -47,10 +49,12 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -66,10 +70,12 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -85,12 +91,17 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
+      ],
+      "load": [
+        "@pnpm//:all"
       ]
     },
     {
@@ -104,12 +115,17 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
+      ],
+      "load": [
+        "@pnpm//:all"
       ]
     },
     {
@@ -123,12 +139,17 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
+      ],
+      "load": [
+        "@pnpm//:all"
       ]
     },
     {
@@ -142,12 +163,17 @@
       "cells": [
         {
           "bazel": "9.3.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
+      ],
+      "load": [
+        "@pnpm//:all"
       ]
     },
     {
@@ -161,6 +187,7 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -176,6 +203,7 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -187,13 +215,20 @@
       "pins": {
         "aspect_rules_js": "2.9.3"
       },
-      "shape": "pnpm lock 9.0 with an undeclared .npmrc that holds a registry token; rules_js 2.x reads it and warns, 3.x fails the build on it",
+      "shape": "pnpm lock 9.0 with an undeclared .npmrc that holds an un-scoped registry token: rules_js 2.x reads the file and warns (not on Windows, where it does not look for it) and sends the token to every registry URL that is not rewritten, so no real-registry cell may run this fixture; 3.x fails the build on the file",
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly"
         }
-      ]
+      ],
+      "build_stderr": {
+        "contains": "Implicitly using .npmrc file",
+        "not_on": [
+          "windows"
+        ]
+      }
     },
     {
       "path": "bzlmod/e7-upl",
@@ -206,8 +241,12 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly"
         }
+      ],
+      "load": [
+        "@pnpm//:all"
       ]
     },
     {
@@ -221,10 +260,12 @@
       "cells": [
         {
           "bazel": "7.7.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "8.8.2",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -240,14 +281,17 @@
       "cells": [
         {
           "bazel": "7.1.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "7.0.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "6.6.0",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
@@ -263,14 +307,17 @@
       "cells": [
         {
           "bazel": "7.1.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "7.0.2",
+          "proof": 1,
           "tier": "nightly"
         },
         {
           "bazel": "6.6.0",
+          "proof": 1,
           "tier": "nightly"
         }
       ],
@@ -300,6 +347,7 @@
       "cells": [
         {
           "bazel": "6.6.0",
+          "proof": 1,
           "tier": "nightly"
         }
       ]
