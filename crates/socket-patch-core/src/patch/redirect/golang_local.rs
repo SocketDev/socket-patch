@@ -396,6 +396,31 @@ pub async fn apply_go_redirect<'a>(
         return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal));
     }
 
+    // Under a Bazel root the copy's upstream BUILD files would join `//...`
+    // and break the build: the root's `.bazelignore` line comes first, and
+    // where it cannot be written the copy is not created. A dry run is
+    // refused where the real run is, and a copy that is in sync is written
+    // by neither. `settle` reports the line with the result, and takes it
+    // back when the copy was not made.
+    let in_sync = redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await;
+    let ignore = match crate::utils::bazel_root_writes::before_agent_go_tree(
+        project_root,
+        base_rel,
+        &copy_dir,
+        in_sync,
+        dry_run,
+    )
+    .await
+    {
+        Ok(ignore) => ignore,
+        Err(refusal) => {
+            return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal))
+        }
+    };
+    let settle = |result| {
+        crate::utils::bazel_root_writes::after_agent_go_tree(project_root, &ignore, result)
+    };
+
     if dry_run {
         // Verify (read-only) against the pristine source for an accurate
         // "would patch" report, without creating the copy or editing go.mod.
@@ -413,39 +438,29 @@ pub async fn apply_go_redirect<'a>(
         .await;
         result.package_path = copy_dir.display().to_string();
         result.sidecar = None; // a replace copy is not the cache (no go.sum advisory)
-        return result;
+        return settle(result).await;
     }
 
     // Hot path: already in sync → touch nothing, so the build's source
     // fingerprint stays stable across repeated applies (the guard re-runs apply
     // on most "deps changed" builds).
-    if redirect_in_sync(&copy_dir, files, project_root, module, version, base_rel).await {
+    if in_sync {
         let mut result = already_patched_result(purl, &copy_dir, files);
         repair_root_go_mod_mirror(&mut result, project_root, module, version, base_rel).await;
         return result;
     }
 
-    // Under a Bazel root the copy's upstream BUILD files would join `//...`
-    // and break the build: the root's `.bazelignore` line comes first, and
-    // where it cannot be written the tree is not created.
-    let ignore_note =
-        match crate::utils::bazel_root_writes::before_agent_go_tree(project_root, base_rel).await {
-            Ok(note) => note,
-            Err(refusal) => {
-                return synthesized_result(purl, &copy_dir, Vec::new(), false, Some(refusal))
-            }
-        };
-
     if let Err(e) = crate::patch::copy_tree::fresh_copy(pristine_src.path(), &copy_dir, None).await
     {
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
-        return synthesized_result(
+        let failed = synthesized_result(
             purl,
             &copy_dir,
             Vec::new(),
             false,
             Some(format!("failed to copy pristine source: {e}")),
         );
+        return settle(failed).await;
     }
 
     // A `replace` target must be a valid module: it needs a go.mod declaring the
@@ -453,13 +468,14 @@ pub async fn apply_go_redirect<'a>(
     // (validated: `gopkg.in/inf.v0`), so synthesize Go's own minimal form.
     if let Err(e) = ensure_module_go_mod(&copy_dir, module).await {
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
-        return synthesized_result(
+        let failed = synthesized_result(
             purl,
             &copy_dir,
             Vec::new(),
             false,
             Some(format!("failed to synthesize go.mod for the copy: {e}")),
         );
+        return settle(failed).await;
     }
 
     // Delegate to the hardened pipeline, pointed at the copy.
@@ -482,7 +498,7 @@ pub async fn apply_go_redirect<'a>(
     if !result.success {
         // Don't leave a half-built copy that verify/reconcile would misjudge.
         teardown_failed_redirect(project_root, &copy_dir, module, version, base_rel).await;
-        return result;
+        return settle(result).await;
     }
 
     // Wire up the `replace` directive. Load-bearing: without it the build won't
@@ -492,11 +508,9 @@ pub async fn apply_go_redirect<'a>(
     {
         result.success = false;
         result.error = Some(format!("failed to update go.mod: {e}"));
-        return result;
     }
 
-    result.error = crate::utils::bazel_root_writes::with_note(result.error.take(), ignore_note);
-    result
+    settle(result).await
 }
 
 /// Drop `owner`'s managed `replace` directive + the patched copy under

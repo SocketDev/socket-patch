@@ -20,7 +20,7 @@ use crate::bazel_common::{
     assert_restore_policy_with, assert_same_tree, assert_write_policy_with, snapshot, Layout,
     WriteClass,
 };
-use crate::common::envelope::{has_event, parse_json_envelope, warning_codes};
+use crate::common::envelope::{event_for, has_event, parse_json_envelope, warning_codes};
 use crate::common::{git_sha256, run_with_env, write_blob, write_minimal_manifest, PatchEntry};
 
 #[allow(clippy::duplicate_mod)]
@@ -36,6 +36,12 @@ const PATCHED: &[u8] = b"package m\n\nfunc V() string { return \"patched\" }\n";
 /// What an upstream module ships and no other workspace can load.
 const UPSTREAM_BUILD: &str = "load(\"@io_bazel_rules_go//go:def.bzl\", \"go_library\")\n";
 const COPY: &str = ".socket/go-patches/example.com/m@v1.0.0";
+/// A second module, for a project that is patched in two steps.
+const OTHER_PURL: &str = "pkg:golang/example.com/n@v1.0.0";
+const OTHER_UUID: &str = "7c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f";
+const OTHER_PRISTINE: &[u8] = b"package n\n\nfunc V() string { return \"upstream\" }\n";
+const OTHER_PATCHED: &[u8] = b"package n\n\nfunc V() string { return \"patched\" }\n";
+const OTHER_COPY: &str = ".socket/go-patches/example.com/n@v1.0.0";
 
 /// A checkout that is one Bazel workspace, and a module cache beside it.
 struct Workspace {
@@ -96,10 +102,52 @@ impl Workspace {
         dir
     }
 
+    /// A second module for the Go project `project`, added after the
+    /// first was patched: in the module cache with its upstream BUILD
+    /// file, required by `go.mod`, and with its patch in the manifest.
+    fn second_module(&self, project: &Path) {
+        let module = self.cache.join("example.com/n@v1.0.0");
+        std::fs::create_dir_all(&module).unwrap();
+        std::fs::write(module.join("n.go"), OTHER_PRISTINE).unwrap();
+        std::fs::write(module.join("go.mod"), "module example.com/n\n\ngo 1.21\n").unwrap();
+        std::fs::write(module.join("BUILD.bazel"), UPSTREAM_BUILD).unwrap();
+        let go_mod = project.join("go.mod");
+        let mut text = std::fs::read_to_string(&go_mod).unwrap();
+        text.push_str("\nrequire example.com/n v1.0.0\n");
+        std::fs::write(&go_mod, text).unwrap();
+        let path = project.join(".socket/manifest.json");
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        manifest["patches"][OTHER_PURL] = serde_json::json!({
+            "uuid": OTHER_UUID,
+            "exportedAt": "2026-01-01T00:00:00Z",
+            "files": {"n.go": {
+                "beforeHash": git_sha256(OTHER_PRISTINE),
+                "afterHash": git_sha256(OTHER_PATCHED),
+            }},
+            "vulnerabilities": {},
+            "description": "synthetic test patch",
+            "license": "MIT",
+            "tier": "free",
+        });
+        std::fs::write(&path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+        write_blob(
+            &project.join(".socket"),
+            &git_sha256(OTHER_PATCHED),
+            OTHER_PATCHED,
+        );
+    }
+
     fn run(&self, cwd: &Path, args: &[&str]) -> (i32, String, String) {
         let cache = self.cache.to_str().unwrap();
         let env = [("GOMODCACHE", cache), ("GOFLAGS", ""), ("GOWORK", "off")];
         run_with_env(cwd, args, &env)
+    }
+
+    /// A command that prints an envelope: the exit code and the envelope.
+    fn json(&self, cwd: &Path, args: &[&str]) -> (i32, Value) {
+        let (code, stdout, stderr) = self.run(cwd, args);
+        assert!(!stdout.is_empty(), "no envelope (exit {code}):\n{stderr}");
+        (code, parse_json_envelope(&stdout))
     }
 
     /// A `vendor` run in `project`. Vendoring downloads the artifact, so
@@ -119,9 +167,20 @@ impl Workspace {
     /// `apply --json` in `project`: the exit code and the envelope.
     fn apply(&self, project: &Path) -> (i32, Value) {
         let args = ["apply", "--offline", "--json", "--ecosystems", "golang"];
-        let (code, stdout, stderr) = self.run(project, &args);
-        assert!(!stdout.is_empty(), "no envelope (exit {code}):\n{stderr}");
-        (code, parse_json_envelope(&stdout))
+        self.json(project, &args)
+    }
+
+    /// `apply --dry-run --json` in `project`.
+    fn dry_apply(&self, project: &Path) -> (i32, Value) {
+        let args = [
+            "apply",
+            "--dry-run",
+            "--offline",
+            "--json",
+            "--ecosystems",
+            "golang",
+        ];
+        self.json(project, &args)
     }
 
     /// `apply` that must patch the module: the envelope.
@@ -201,6 +260,14 @@ fn a_project_at_the_root_and_one_below_it_each_get_their_line() {
         let before = snapshot(&ws.root);
         let line = join(rel, ".socket/go-patches");
 
+        // A dry run says which line the run would add, and writes nothing.
+        let (code, dry) = ws.dry_apply(&project);
+        assert_eq!(code, 0, "{dry:#}");
+        let would = warning(&dry, Code::WorkspaceIgnoreLineAdded);
+        let told = format!("would add the line `{line}`");
+        assert!(would.contains(&told), "{would}");
+        assert_same_tree(&before, &snapshot(&ws.root));
+
         let envelope = ws.applied(&project);
         let detail = warning(&envelope, Code::WorkspaceIgnoreLineAdded);
         let file = ws.root.join(".bazelignore");
@@ -235,11 +302,13 @@ fn a_project_at_the_root_and_one_below_it_each_get_their_line() {
         });
         assert_eq!(outside.count(), 0, "{writes:?}");
 
-        // A second run finds the line and the copy and writes nothing.
-        let (code, again) = ws.apply(&project);
-        assert_eq!(code, 0, "{again:#}");
-        assert!(warning_codes(&again).is_empty(), "{again:#}");
-        assert_same_tree(&after, &snapshot(&ws.root));
+        // A second run finds the line and the copy and writes nothing,
+        // and a dry run of it has nothing to say either.
+        for (code, again) in [ws.apply(&project), ws.dry_apply(&project)] {
+            assert_eq!(code, 0, "{again:#}");
+            assert!(warning_codes(&again).is_empty(), "{again:#}");
+            assert_same_tree(&after, &snapshot(&ws.root));
+        }
     }
 }
 
@@ -316,27 +385,29 @@ fn nested_roots_refuse_the_tree_and_print_each_line_and_file() {
     let project = ws.project("svc/api");
     let before = snapshot(&ws.root);
 
-    let (code, envelope) = ws.apply(&project);
-    assert_eq!(code, 1, "{envelope:#}");
-    let text = refusal(&envelope);
-    assert!(
-        text.starts_with(Code::AgentGoUnsupported.as_str()),
-        "{text}"
-    );
-    let outer = ws.root.join(".bazelignore");
-    let inner = ws.root.join("svc/.bazelignore");
-    for part in [
-        "`nested_bazel_roots`".to_string(),
-        format!(
-            "the line `svc/api/.socket/go-patches` to {}",
-            outer.display()
-        ),
-        format!("the line `api/.socket/go-patches` to {}", inner.display()),
-        "nothing was written".to_string(),
-    ] {
-        assert!(text.contains(&part), "{part}: {text}");
+    // A dry run is refused where the real run is, in the same words.
+    for (code, envelope) in [ws.dry_apply(&project), ws.apply(&project)] {
+        assert_eq!(code, 1, "{envelope:#}");
+        let text = refusal(&envelope);
+        assert!(
+            text.starts_with(Code::AgentGoUnsupported.as_str()),
+            "{text}"
+        );
+        let outer = ws.root.join(".bazelignore");
+        let inner = ws.root.join("svc").join(".bazelignore");
+        for part in [
+            "`nested_bazel_roots`".to_string(),
+            format!(
+                "the line `svc/api/.socket/go-patches` to {}",
+                outer.display()
+            ),
+            format!("the line `api/.socket/go-patches` to {}", inner.display()),
+            "nothing was written".to_string(),
+        ] {
+            assert!(text.contains(&part), "{part}: {text}");
+        }
+        assert_same_tree(&before, &snapshot(&ws.root));
     }
-    assert_same_tree(&before, &snapshot(&ws.root));
 
     // The user adds both lines, as the refusal says: the run goes through
     // and writes neither file.
@@ -454,6 +525,15 @@ fn a_cr_only_bazelignore_is_refused_with_the_advisory_and_left_byte_for_byte() {
     assert_eq!(code, 1, "{stderr}");
     assert!(stderr.contains(&remedy), "{stderr}");
     assert_same_tree(&before, &snapshot(&ws.root));
+
+    // A copy base with nothing in it is no tree: the copy is as new as
+    // before, and as refused.
+    std::fs::create_dir_all(project.join(".socket/go-patches")).unwrap();
+    let emptied = snapshot(&ws.root);
+    let (code, envelope) = ws.apply(&project);
+    assert_eq!(code, 1, "{envelope:#}");
+    assert!(refusal(&envelope).contains("lone carriage return"));
+    assert_same_tree(&emptied, &snapshot(&ws.root));
 }
 
 #[test]
@@ -497,4 +577,263 @@ fn a_project_outside_any_bazel_workspace_is_patched_as_before() {
     assert!(warning_codes(&envelope).is_empty(), "{envelope:#}");
     assert!(!ws.root.join(".bazelignore").exists());
     assert!(!ws.root.join(".socket").exists());
+}
+
+/// The first copy was made before the workspace was a Bazel one, so it has
+/// no line. It lets no second copy through: each copy is decided by
+/// itself, and one that is in sync is not asked about at all.
+#[test]
+fn a_new_copy_beside_an_older_one_is_refused_where_its_line_cannot_be_written() {
+    for case in ["nested roots", "a CR-only file"] {
+        let ws = Workspace::new();
+        std::fs::remove_file(ws.root.join("MODULE.bazel")).unwrap();
+        let project = ws.project("svc/api");
+        let envelope = ws.applied(&project);
+        assert!(warning_codes(&envelope).is_empty(), "{envelope:#}");
+
+        ws.put("MODULE.bazel", "module(name = \"ws\")\n");
+        let code = match case {
+            "nested roots" => {
+                ws.put("svc/WORKSPACE", "");
+                Code::AgentGoUnsupported
+            }
+            _ => {
+                ws.put(".bazelignore", "node_modules\rdist\r");
+                Code::WorkspaceIgnoreLineNeeded
+            }
+        };
+        ws.second_module(&project);
+        let before = snapshot(&ws.root);
+
+        for (exit, envelope) in [ws.dry_apply(&project), ws.apply(&project)] {
+            assert_eq!(exit, 1, "{case}: {envelope:#}");
+            let failed = event_for(&envelope, OTHER_PURL);
+            assert_eq!(failed["action"], "failed", "{case}: {envelope:#}");
+            let text = failed["error"].as_str().expect("the refusal text");
+            assert!(text.starts_with(code.as_str()), "{case}: {text}");
+            // The copy that was not made is the one named.
+            for part in ["n@v1.0.0 was not created", "nothing was written"] {
+                assert!(text.contains(part), "{case}: {part}: {text}");
+            }
+            // The copy that is there is neither refused nor touched.
+            let kept = event_for(&envelope, PURL);
+            assert_ne!(kept["action"], "failed", "{case}: {envelope:#}");
+            assert!(!project.join(OTHER_COPY).exists(), "{case}");
+            assert_same_tree(&before, &snapshot(&ws.root));
+        }
+    }
+}
+
+/// The line is written before the backend decides anything. A run that
+/// is refused or fails after that takes it back out: the root's files
+/// are the user's, and nothing told them to commit an edit.
+#[test]
+fn a_run_that_fails_after_the_line_leaves_the_root_byte_identical() {
+    let ws = Workspace::new();
+    ws.put(".bazelignore", "node_modules");
+    let project = ws.project("svc/api");
+    let before = snapshot(&ws.root);
+
+    // `vendor --offline` is refused by its backend, after the guard.
+    let args = ["vendor", "--offline", "--json", "--ecosystems", "golang"];
+    let (code, envelope) = ws.json(&project, &args);
+    assert_eq!(code, 1, "{envelope:#}");
+    let offline = "vendor_service_offline_conflict";
+    assert!(
+        has_event(&envelope, "failed", offline, PURL),
+        "{envelope:#}"
+    );
+    assert!(warning_codes(&envelope).is_empty(), "{envelope:#}");
+    assert_same_tree(&before, &snapshot(&ws.root));
+
+    // `apply` copies the module and then finds that its file is not the
+    // one the patch was made for: the copy goes, and the line with it.
+    let cached = ws.cache.join(format!("{MODULE}@{VERSION}")).join("m.go");
+    std::fs::write(
+        cached,
+        b"package m\n\nfunc V() string { return \"drifted\" }\n",
+    )
+    .unwrap();
+    let (code, envelope) = ws.apply(&project);
+    assert_eq!(code, 1, "{envelope:#}");
+    let text = refusal(&envelope);
+    assert!(
+        !text.contains(Code::WorkspaceIgnoreLineAdded.as_str()),
+        "{text}"
+    );
+    assert!(warning_codes(&envelope).is_empty(), "{envelope:#}");
+    assert_same_tree(&before, &snapshot(&ws.root));
+}
+
+/// The vendored seam refuses like the agent one, with its own code where
+/// a token names the case.
+#[test]
+fn a_vendored_tree_is_refused_where_its_line_cannot_be_written() {
+    for case in ["nested roots", "a CR-only file", "a label under the tree"] {
+        let ws = Workspace::new();
+        let rel = if case == "a label under the tree" {
+            ""
+        } else {
+            "svc/api"
+        };
+        let project = ws.project(rel);
+        let line = format!("the line `{}`", join(rel, ".socket/vendor"));
+        let outer = ws.root.join(".bazelignore").display().to_string();
+        let (code, parts) = match case {
+            "nested roots" => {
+                ws.put("svc/WORKSPACE", "");
+                let inner = ws.root.join("svc").join(".bazelignore");
+                let parts = vec![
+                    "`nested_bazel_roots`".to_string(),
+                    format!("{line} to {outer}"),
+                    format!("the line `api/.socket/vendor` to {}", inner.display()),
+                ];
+                (Code::VendorRulesetUnsupported, parts)
+            }
+            "a CR-only file" => {
+                ws.put(".bazelignore", "node_modules\rdist\r");
+                let parts = vec![
+                    "lone carriage return".to_string(),
+                    format!("Add {line} to {outer}"),
+                ];
+                (Code::WorkspaceIgnoreLineNeeded, parts)
+            }
+            _ => {
+                // A wheel vendored earlier, which the user made a package
+                // of and named in a target: the line would delete it.
+                let unit = format!(".socket/vendor/pypi/{OTHER_UUID}");
+                ws.put(&format!("{unit}/x-1.0-py3-none-any.whl"), "");
+                ws.put(
+                    &format!("{unit}/BUILD.bazel"),
+                    "exports_files(glob([\"*.whl\"]))\n",
+                );
+                let label = format!("//{unit}:x-1.0-py3-none-any.whl");
+                ws.put(
+                    "BUILD.bazel",
+                    format!("filegroup(name = \"w\", srcs = [\"{label}\"])\n"),
+                );
+                let hit = ws.root.join("BUILD.bazel").display().to_string();
+                let parts = vec![
+                    format!("{hit}:1 names a label under `//.socket/vendor`"),
+                    format!("Add {line} to {outer}, then rewrite each label under it"),
+                ];
+                (Code::WorkspaceIgnoreLineNeeded, parts)
+            }
+        };
+        let before = snapshot(&ws.root);
+
+        for args in [
+            &["vendor", "--dry-run", "--json"][..],
+            &["vendor", "--json"],
+        ] {
+            let (exit, stdout, stderr) = ws.vendor(&project, args);
+            assert_eq!(exit, 1, "{case}:\n{stdout}\n{stderr}");
+            let envelope = parse_json_envelope(&stdout);
+            assert!(
+                has_event(&envelope, "failed", code.as_str(), PURL),
+                "{case}: {envelope:#}"
+            );
+            let text = event_for(&envelope, PURL)["error"]
+                .as_str()
+                .expect("the refusal");
+            let named = format!("{UUID} was not created");
+            for part in parts.iter().map(String::as_str).chain([named.as_str()]) {
+                assert!(text.contains(part), "{case}: {part}: {text}");
+            }
+            assert!(text.ends_with("nothing was written"), "{case}: {text}");
+            assert_same_tree(&before, &snapshot(&ws.root));
+        }
+    }
+}
+
+/// A recorded line that a rollback cannot take out is a warning of that
+/// rollback: the user's file keeps an edit the run reports as undone.
+#[test]
+fn a_rollback_over_a_modified_index_says_that_the_line_stays() {
+    let ws = Workspace::new();
+    let project = ws.project("svc/api");
+    ws.applied(&project);
+    // The index as another tool re-serialised it: the same rows, and not
+    // the bytes socket-patch writes.
+    let index = String::from_utf8(ws.bytes(".socket/bazel/index.json")).unwrap();
+    ws.put(".socket/bazel/index.json", index.replace("\n  ", "\n    "));
+    let wired = snapshot(&ws.root);
+
+    let args = [
+        "rollback",
+        "--yes",
+        "--offline",
+        "--json",
+        "--preserve-state",
+    ];
+    let (code, envelope) = ws.json(&project, &args);
+    assert_eq!(code, 0, "{envelope:#}");
+    let detail = warning(&envelope, Code::WorkspaceIgnoreLineNeeded);
+    let file = ws.root.join(".bazelignore");
+    for part in [
+        format!(
+            "added the line `svc/api/.socket/go-patches` to {}",
+            file.display()
+        ),
+        "could not take all of it back".to_string(),
+        "is not the index socket-patch wrote".to_string(),
+        "restore the index from version control and remove the line by hand".to_string(),
+    ] {
+        assert!(detail.contains(&part), "{part}: {detail}");
+    }
+    assert!(!project.join(".socket/go-patches").exists());
+    let after = snapshot(&ws.root);
+    for kept in [".bazelignore", ".socket/bazel/index.json"] {
+        assert_eq!(after.get(kept), wired.get(kept), "{kept}");
+    }
+}
+
+/// A line with a leading `/` is the user's: reported, never edited.
+#[test]
+fn a_line_with_a_leading_slash_is_reported_with_the_line_that_was_added() {
+    let ws = Workspace::new();
+    ws.put(".bazelignore", "/svc/api/.socket\n");
+    let project = ws.project("svc/api");
+    let envelope = ws.applied(&project);
+    assert_eq!(
+        ws.bytes(".bazelignore"),
+        b"/svc/api/.socket\nsvc/api/.socket/go-patches\n"
+    );
+    warning(&envelope, Code::WorkspaceIgnoreLineAdded);
+    let detail = warning(&envelope, Code::WorkspaceIgnoreLineNeeded);
+    for part in [
+        "line 1 (`/svc/api/.socket`)",
+        "Bazel 8.8.2 and later reject the whole file",
+        "left it as found",
+    ] {
+        assert!(detail.contains(part), "{part}: {detail}");
+    }
+}
+
+/// The vendored revert reports the same, under the vendored code for an
+/// index that is not the one socket-patch wrote.
+#[test]
+fn a_revert_over_a_modified_index_says_that_the_line_stays() {
+    let ws = Workspace::new();
+    let project = ws.project("svc");
+    let (code, stdout, stderr) = ws.vendor(&project, &["vendor", "--json"]);
+    assert_eq!(code, 0, "vendor failed:\n{stdout}\n{stderr}");
+    let index = String::from_utf8(ws.bytes(".socket/bazel/index.json")).unwrap();
+    ws.put(".socket/bazel/index.json", index.replace("\n  ", "\n    "));
+    let wired = snapshot(&ws.root);
+
+    let (code, stdout, stderr) = ws.vendor(&project, &["vendor", "--revert", "--json"]);
+    assert_eq!(code, 0, "revert failed:\n{stdout}\n{stderr}");
+    let envelope = parse_json_envelope(&stdout);
+    // `vendor` reports a package's advisories as events of that package.
+    let modified = Code::VendorOwnedFileModified.as_str();
+    assert!(
+        has_event(&envelope, "skipped", modified, PURL),
+        "{envelope:#}"
+    );
+    assert!(!project.join(".socket/vendor").exists(), "{envelope:#}");
+    let after = snapshot(&ws.root);
+    for kept in [".bazelignore", ".socket/bazel/index.json"] {
+        assert_eq!(after.get(kept), wired.get(kept), "{kept}");
+    }
 }
