@@ -1,0 +1,5 @@
+module(name = "s5", version = "0.0.0")
+
+D = {"a": "plain"}
+V = "{a}".format(**D)
+print("S5VAL", repr(V), len(V))

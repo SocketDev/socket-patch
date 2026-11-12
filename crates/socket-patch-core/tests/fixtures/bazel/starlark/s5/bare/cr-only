@@ -1,0 +1,1 @@
+V = "plain"print("S5VAL", repr(V), len(V))

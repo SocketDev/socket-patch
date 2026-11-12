@@ -1,0 +1,2 @@
+V = "a" if True else "b"
+print("S5VAL", repr(V), len(V))

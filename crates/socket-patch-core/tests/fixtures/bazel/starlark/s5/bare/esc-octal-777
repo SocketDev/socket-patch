@@ -1,0 +1,2 @@
+V = "\777"
+print("S5VAL", repr(V), len(V))

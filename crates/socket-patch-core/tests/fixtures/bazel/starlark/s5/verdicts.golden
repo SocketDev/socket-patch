@@ -1,0 +1,301 @@
+module	adjacent-strings	opaque
+module	backslash-line-continuation	value "plain" 5
+module	bom-utf16le	refuse Bom
+module	bom-utf8	refuse Bom
+module	bytes-prefix	opaque
+module	concat-plus	value "ab" 2
+module	cr-only	refuse CrLineEnd
+module	crlf	value "plain" 5
+module	def-statement	opaque
+module	esc-N	refuse BadEscape
+module	esc-U000000e9	refuse BadEscape
+module	esc-a	opaque
+module	esc-backslash-newline	opaque
+module	esc-octal-101	opaque
+module	esc-octal-777	refuse BadEscape
+module	esc-standard-n-t-quote	opaque
+module	esc-u00e9	refuse BadEscape
+module	esc-unknown-q	refuse BadEscape
+module	esc-x41	refuse BadEscape
+module	for-statement	opaque
+module	format-method	opaque
+module	formfeed-line-start	refuse InvalidByte
+module	if-expression	opaque
+module	if-statement	opaque
+module	int-hex-octal	opaque
+module	int-legacy-octal-017	refuse BadNumber
+module	kwargs-literal-dict	opaque
+module	kwargs-variable	opaque
+module	lambda	opaque
+module	latin1-byte-in-comment	value "plain" 5
+module	latin1-byte-in-string	opaque
+module	load-statement	opaque
+module	lone-continuation-byte-in-string	opaque
+module	mixed-eol	value "plain" 5
+module	nbsp-between-tokens	refuse InvalidByte
+module	newline-in-plain-string	refuse UnclosedString
+module	no-final-newline	value "plain" 5
+module	nul-in-comment	value "plain" 5
+module	nul-in-string	opaque
+module	percent-format	opaque
+module	plain	value "plain" 5
+module	raw-string	opaque
+module	semicolon-two-statements	value "plain" 5
+module	single-quote	value "plain" 5
+module	space-indent-toplevel	refuse Indent
+module	star-args	opaque
+module	tab-between-tokens	value "plain" 5
+module	tab-in-call-args	opaque
+module	tab-indent-toplevel	refuse TabIndent
+module	top-level-comprehension	value "plain" 5
+module	trailing-comma-call	opaque
+module	trailing-ctrl-z	refuse InvalidByte
+module	trailing-whitespace	value "plain" 5
+module	triple-quote	opaque
+module	triple-quote-multiline	opaque
+module	utf8-4byte-in-string	opaque
+module	utf8-bom-in-middle	refuse InvalidByte
+module	utf8-in-comment	value "plain" 5
+module	utf8-in-string	opaque
+module	vertical-tab-between-tokens	refuse InvalidByte
+segment	adjacent-strings	opaque
+segment	backslash-line-continuation	value "plain" 5
+segment	bom-utf16le	refuse Bom
+segment	bom-utf8	refuse Bom
+segment	bytes-prefix	opaque
+segment	concat-plus	value "ab" 2
+segment	cr-only	refuse CrLineEnd
+segment	crlf	value "plain" 5
+segment	def-statement	opaque
+segment	esc-N	refuse BadEscape
+segment	esc-U000000e9	refuse BadEscape
+segment	esc-a	opaque
+segment	esc-backslash-newline	opaque
+segment	esc-octal-101	opaque
+segment	esc-octal-777	refuse BadEscape
+segment	esc-standard-n-t-quote	opaque
+segment	esc-u00e9	refuse BadEscape
+segment	esc-unknown-q	refuse BadEscape
+segment	esc-x41	refuse BadEscape
+segment	for-statement	opaque
+segment	format-method	opaque
+segment	formfeed-line-start	refuse InvalidByte
+segment	if-expression	opaque
+segment	if-statement	opaque
+segment	int-hex-octal	opaque
+segment	int-legacy-octal-017	refuse BadNumber
+segment	kwargs-literal-dict	opaque
+segment	kwargs-variable	opaque
+segment	lambda	opaque
+segment	latin1-byte-in-comment	value "plain" 5
+segment	latin1-byte-in-string	opaque
+segment	load-statement	opaque
+segment	lone-continuation-byte-in-string	opaque
+segment	mixed-eol	value "plain" 5
+segment	nbsp-between-tokens	refuse InvalidByte
+segment	newline-in-plain-string	refuse UnclosedString
+segment	no-final-newline	value "plain" 5
+segment	nul-in-comment	value "plain" 5
+segment	nul-in-string	opaque
+segment	percent-format	opaque
+segment	plain	value "plain" 5
+segment	raw-string	opaque
+segment	semicolon-two-statements	value "plain" 5
+segment	single-quote	value "plain" 5
+segment	space-indent-toplevel	refuse Indent
+segment	star-args	opaque
+segment	tab-between-tokens	value "plain" 5
+segment	tab-in-call-args	opaque
+segment	tab-indent-toplevel	refuse TabIndent
+segment	top-level-comprehension	value "plain" 5
+segment	trailing-comma-call	opaque
+segment	trailing-ctrl-z	refuse InvalidByte
+segment	trailing-whitespace	value "plain" 5
+segment	triple-quote	opaque
+segment	triple-quote-multiline	opaque
+segment	utf8-4byte-in-string	opaque
+segment	utf8-bom-in-middle	refuse Bom
+segment	utf8-in-comment	value "plain" 5
+segment	utf8-in-string	opaque
+segment	vertical-tab-between-tokens	refuse InvalidByte
+bzl	adjacent-strings	opaque
+bzl	backslash-line-continuation	value "plain" 5
+bzl	bom-utf16le	refuse Bom
+bzl	bom-utf8	refuse Bom
+bzl	bytes-prefix	opaque
+bzl	concat-plus	value "ab" 2
+bzl	cr-only	refuse CrLineEnd
+bzl	crlf	value "plain" 5
+bzl	def-statement	opaque
+bzl	esc-N	refuse BadEscape
+bzl	esc-U000000e9	refuse BadEscape
+bzl	esc-a	opaque
+bzl	esc-backslash-newline	opaque
+bzl	esc-octal-101	opaque
+bzl	esc-octal-777	refuse BadEscape
+bzl	esc-standard-n-t-quote	opaque
+bzl	esc-u00e9	refuse BadEscape
+bzl	esc-unknown-q	refuse BadEscape
+bzl	esc-x41	refuse BadEscape
+bzl	for-statement	opaque
+bzl	format-method	opaque
+bzl	formfeed-line-start	refuse InvalidByte
+bzl	if-expression	opaque
+bzl	if-statement	opaque
+bzl	int-hex-octal	opaque
+bzl	int-legacy-octal-017	refuse BadNumber
+bzl	kwargs-literal-dict	opaque
+bzl	kwargs-variable	opaque
+bzl	lambda	opaque
+bzl	latin1-byte-in-comment	value "plain" 5
+bzl	latin1-byte-in-string	opaque
+bzl	load-statement	opaque
+bzl	lone-continuation-byte-in-string	opaque
+bzl	mixed-eol	value "plain" 5
+bzl	nbsp-between-tokens	refuse InvalidByte
+bzl	newline-in-plain-string	refuse UnclosedString
+bzl	no-final-newline	value "plain" 5
+bzl	nul-in-comment	value "plain" 5
+bzl	nul-in-string	opaque
+bzl	percent-format	opaque
+bzl	plain	value "plain" 5
+bzl	raw-string	opaque
+bzl	semicolon-two-statements	value "plain" 5
+bzl	single-quote	value "plain" 5
+bzl	space-indent-toplevel	refuse Indent
+bzl	star-args	opaque
+bzl	tab-between-tokens	value "plain" 5
+bzl	tab-in-call-args	opaque
+bzl	tab-indent-def-body	refuse TabIndent
+bzl	tab-indent-toplevel	refuse TabIndent
+bzl	top-level-comprehension	value "plain" 5
+bzl	trailing-comma-call	opaque
+bzl	trailing-ctrl-z	refuse InvalidByte
+bzl	trailing-whitespace	value "plain" 5
+bzl	triple-quote	opaque
+bzl	triple-quote-multiline	opaque
+bzl	utf8-4byte-in-string	opaque
+bzl	utf8-bom-in-middle	refuse Bom
+bzl	utf8-in-comment	value "plain" 5
+bzl	utf8-in-string	opaque
+bzl	vertical-tab-between-tokens	refuse InvalidByte
+build	adjacent-strings	opaque
+build	backslash-line-continuation	value "plain" 5
+build	bom-utf16le	refuse Bom
+build	bom-utf8	refuse Bom
+build	bytes-prefix	opaque
+build	concat-plus	value "ab" 2
+build	cr-only	refuse CrLineEnd
+build	crlf	value "plain" 5
+build	def-statement	opaque
+build	esc-N	refuse BadEscape
+build	esc-U000000e9	refuse BadEscape
+build	esc-a	opaque
+build	esc-backslash-newline	opaque
+build	esc-octal-101	opaque
+build	esc-octal-777	refuse BadEscape
+build	esc-standard-n-t-quote	opaque
+build	esc-u00e9	refuse BadEscape
+build	esc-unknown-q	refuse BadEscape
+build	esc-x41	refuse BadEscape
+build	for-statement	opaque
+build	format-method	opaque
+build	formfeed-line-start	refuse InvalidByte
+build	if-expression	opaque
+build	if-statement	opaque
+build	int-hex-octal	opaque
+build	int-legacy-octal-017	refuse BadNumber
+build	kwargs-literal-dict	opaque
+build	kwargs-variable	opaque
+build	lambda	opaque
+build	latin1-byte-in-comment	value "plain" 5
+build	latin1-byte-in-string	opaque
+build	load-statement	opaque
+build	lone-continuation-byte-in-string	opaque
+build	mixed-eol	value "plain" 5
+build	nbsp-between-tokens	refuse InvalidByte
+build	newline-in-plain-string	refuse UnclosedString
+build	no-final-newline	value "plain" 5
+build	nul-in-comment	value "plain" 5
+build	nul-in-string	opaque
+build	percent-format	opaque
+build	plain	value "plain" 5
+build	raw-string	opaque
+build	semicolon-two-statements	value "plain" 5
+build	single-quote	value "plain" 5
+build	space-indent-toplevel	refuse Indent
+build	star-args	opaque
+build	tab-between-tokens	value "plain" 5
+build	tab-in-call-args	opaque
+build	tab-indent-toplevel	refuse TabIndent
+build	top-level-comprehension	value "plain" 5
+build	trailing-comma-call	opaque
+build	trailing-ctrl-z	refuse InvalidByte
+build	trailing-whitespace	value "plain" 5
+build	triple-quote	opaque
+build	triple-quote-multiline	opaque
+build	utf8-4byte-in-string	opaque
+build	utf8-bom-in-middle	refuse Bom
+build	utf8-in-comment	value "plain" 5
+build	utf8-in-string	opaque
+build	vertical-tab-between-tokens	refuse InvalidByte
+workspace	adjacent-strings	opaque
+workspace	backslash-line-continuation	value "plain" 5
+workspace	bom-utf16le	refuse Bom
+workspace	bom-utf8	refuse Bom
+workspace	bytes-prefix	opaque
+workspace	concat-plus	value "ab" 2
+workspace	cr-only	refuse CrLineEnd
+workspace	crlf	value "plain" 5
+workspace	def-statement	opaque
+workspace	esc-N	refuse BadEscape
+workspace	esc-U000000e9	refuse BadEscape
+workspace	esc-a	opaque
+workspace	esc-backslash-newline	opaque
+workspace	esc-octal-101	opaque
+workspace	esc-octal-777	refuse BadEscape
+workspace	esc-standard-n-t-quote	opaque
+workspace	esc-u00e9	refuse BadEscape
+workspace	esc-unknown-q	refuse BadEscape
+workspace	esc-x41	refuse BadEscape
+workspace	for-statement	opaque
+workspace	format-method	opaque
+workspace	formfeed-line-start	refuse InvalidByte
+workspace	if-expression	opaque
+workspace	if-statement	opaque
+workspace	int-hex-octal	opaque
+workspace	int-legacy-octal-017	refuse BadNumber
+workspace	kwargs-literal-dict	opaque
+workspace	kwargs-variable	opaque
+workspace	lambda	opaque
+workspace	latin1-byte-in-comment	value "plain" 5
+workspace	latin1-byte-in-string	opaque
+workspace	load-statement	opaque
+workspace	lone-continuation-byte-in-string	opaque
+workspace	mixed-eol	value "plain" 5
+workspace	nbsp-between-tokens	refuse InvalidByte
+workspace	newline-in-plain-string	refuse UnclosedString
+workspace	no-final-newline	value "plain" 5
+workspace	nul-in-comment	value "plain" 5
+workspace	nul-in-string	opaque
+workspace	percent-format	opaque
+workspace	plain	value "plain" 5
+workspace	raw-string	opaque
+workspace	semicolon-two-statements	value "plain" 5
+workspace	single-quote	value "plain" 5
+workspace	space-indent-toplevel	refuse Indent
+workspace	star-args	opaque
+workspace	tab-between-tokens	value "plain" 5
+workspace	tab-in-call-args	opaque
+workspace	tab-indent-toplevel	refuse TabIndent
+workspace	top-level-comprehension	value "plain" 5
+workspace	trailing-comma-call	opaque
+workspace	trailing-ctrl-z	refuse InvalidByte
+workspace	trailing-whitespace	value "plain" 5
+workspace	triple-quote	opaque
+workspace	triple-quote-multiline	opaque
+workspace	utf8-4byte-in-string	opaque
+workspace	utf8-bom-in-middle	refuse InvalidByte
+workspace	utf8-in-comment	value "plain" 5
+workspace	utf8-in-string	opaque
+workspace	vertical-tab-between-tokens	refuse InvalidByte

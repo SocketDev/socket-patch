@@ -1,0 +1,7 @@
+workspace(name = "s5")
+
+def f():
+    return "plain"
+
+V = f()
+print("S5VAL", repr(V), len(V))

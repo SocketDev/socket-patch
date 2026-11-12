@@ -1,0 +1,5 @@
+module(name = "s5", version = "0.0.0")
+
+load("//:v2.bzl", "W")
+V = W
+print("S5VAL", repr(V), len(V))

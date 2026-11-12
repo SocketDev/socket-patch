@@ -1,0 +1,4 @@
+1: call module(name="mcap", version="2.1.3", bazel_compatibility=[">=7.2.1"], compatibility_level=1)
+7: call bazel_dep(name="rules_cc", version="0.0.9")
+8: call bazel_dep(name="lz4", version="1.9.4")
+9: call bazel_dep(name="zstd", version="1.5.6")

@@ -1,0 +1,10 @@
+1: call android_sdk_repository(name="androidsdk", api_level=28)
+6: call local_repository(name="rules_jvm_external", path="../../")
+11: load "@rules_jvm_external//:repositories.bzl" rules_jvm_external_deps
+13: call rules_jvm_external_deps()
+15: load "@rules_jvm_external//:setup.bzl" rules_jvm_external_setup
+17: call rules_jvm_external_setup()
+19: load "@rules_jvm_external//:defs.bzl" maven_install
+21: call maven_install(artifacts=["junit:junit:4.12", "android.arch.lifecycle:common:1.1.1", "android.arch.lifecycle:viewmodel:1.1.1", "androidx.test.espresso:espresso-web:3.1.1", "com.android.support:design:27.0.2"], generate_compat_repositories=True, repositories=["https://maven.google.com", "https://repo1.maven.org/maven2"])
+36: load "@maven//:compat.bzl" compat_repositories
+38: call compat_repositories()

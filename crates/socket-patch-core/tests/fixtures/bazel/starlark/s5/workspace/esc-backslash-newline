@@ -1,0 +1,5 @@
+workspace(name = "s5")
+
+V = "a\
+b"
+print("S5VAL", repr(V), len(V))

@@ -1,0 +1,114 @@
+1: docstring
+6: call module(name="bazel", version="9.3.2", repo_name="io_bazel")
+16: call bazel_dep(name="abseil-cpp", version="20250814.1")
+17: call bazel_dep(name="bazel_skylib", version="1.8.2")
+18: call bazel_dep(name="blake3", version="1.8.2")
+19: call bazel_dep(name="googleapis-grpc-java", version="1.0.0")
+20: call bazel_dep(name="googleapis-java", version="1.0.0")
+21: call bazel_dep(name="googleapis", version="0.0.0-20250604-de157ca3")
+22: call bazel_dep(name="googletest", version="1.17.0.bcr.2", repo_name="com_google_googletest")
+23: call bazel_dep(name="grpc-java", version="1.71.0")
+24: call bazel_dep(name="grpc", version="1.76.0.bcr.1", repo_name="com_github_grpc_grpc")
+25: call bazel_dep(name="platforms", version="1.0.0")
+26: call bazel_dep(name="protobuf", version="33.4", repo_name="com_google_protobuf")
+27: call bazel_dep(name="re2", version="2025-11-05.bcr.1")
+28: call bazel_dep(name="rules_graalvm", version="0.11.1")
+29: call bazel_dep(name="rules_java", version="9.1.0")
+30: call bazel_dep(name="bazel_features", version="1.42.1")
+31: call bazel_dep(name="rules_jvm_external", version="6.6")
+32: call bazel_dep(name="rules_license", version="1.0.0")
+33: call bazel_dep(name="rules_pkg", version="1.1.0")
+34: call bazel_dep(name="rules_python", version="1.7.0")
+35: call bazel_dep(name="rules_shell", version="0.6.1")
+36: call bazel_dep(name="rules_testing", version="0.9.0")
+37: call bazel_dep(name="stardoc", version="0.8.0", repo_name="io_bazel_skydoc")
+38: call bazel_dep(name="with_cfg.bzl", version="0.13.0")
+39: call bazel_dep(name="zlib", version="1.3.1.bcr.7")
+40: call bazel_dep(name="zstd-jni", version="1.5.6-9")
+# Depend on apple_support first and then rules_cc so that the Xcode toolchain
+# from apple_support wins over the generic Unix toolchain from rules_cc.
+44: call bazel_dep(name="apple_support", version="2.5.2")
+45: call bazel_dep(name="rules_cc", version="0.2.17")
+# The starlark rules in @rules_cc are hidden behind macros but docgen needs to
+# load the rule class directly, so we need to expose the cc_compatibility_proxy
+# repo for access to the symbols
+50: bind cc_compatibility_proxy = use_extension("@rules_cc//cc:extensions.bzl", "compatibility_proxy")
+51: call use_repo($cc_compatibility_proxy, "cc_compatibility_proxy")
+# TODO: wyv@ - add remoteapis to the BCR
+54: call bazel_dep(name="remoteapis", version="")
+# Indirect module dependencies. Minimal versions are specified for compatibility; repo_name=None avoids accidental usages
+57: call bazel_dep(name="buildozer", version="8.5.1", repo_name=None)  # Keep in sync with MODULE.tools
+58: call bazel_dep(name="rules_swift", version="3.3.0")  # with repo_name = None, version drops to 2.4.0
+59: call bazel_dep(name="rules_apple", version="4.3.1", repo_name=None)
+60: call bazel_dep(name="google_benchmark", version="1.9.4", repo_name=None)
+61: call bazel_dep(name="onetbb", version="2022.2.0", repo_name=None)
+62: call bazel_dep(name="rules_go", version="0.59.0", repo_name=None)  # Required for loads of CcInfo
+# bazel_dep overrides
+65: call single_version_override(module_name="rules_jvm_external", patch_strip=1, patches=["//third_party:rules_jvm_external_6.5.patch"], version="6.6")
+# TODO(pcloudy): Remove once the next version of rules_graalvm is available.
+73: call single_version_override(module_name="rules_graalvm", patch_strip=1, patches=["//third_party:rules_graalvm_fix.patch", "//third_party:rules_graalvm_unicode.patch", "//third_party:rules_graalvm_load_fix.patch", "//third_party:rules_graalvm_bazel9_fixes.patch"])
+84: call single_version_override(module_name="zstd-jni", patch_strip=1, patches=["//third_party:zstd-jni.patch"])
+90: call single_version_override(module_name="googleapis", patch_strip=1, patches=["//third_party:googleapis.patch"], version="0.0.0-20250604-de157ca3")
+97: call single_version_override(module_name="protoc-gen-validate", patch_strip=1, patches=["//third_party:protoc-gen-validate.patch"], version="1.2.1.bcr.1")
+# 1. Expose @com_google_protobuf//java/core:lite_runtime_only
+# due to https://github.com/protocolbuffers/protobuf/commit/079be27925955348d1b3cb30ffbfa33dcec5778c
+# We need to package the lite runtime jar for Bazel's bootstrap build
+# 2. Partially revert of https://github.com/protocolbuffers/protobuf/commit/7ec5e19c0743b80c5097434a05cc0e972e7b4e7a
+# to support grpc
+# 3. Pull in the removal of the memoizedIsInitialized field for messages with no
+# required fields early. This reduces the memory usage of Bazel and avoids
+# spread in memory usage between Bazel and Blaze.
+# https://github.com/protocolbuffers/protobuf/blob/adf9e8b80fd10398b82e16c4ea72f2d2cffb0e9b/src/google/protobuf/compiler/java/full/message.cc#L884C1-L899C6
+113: call single_version_override(module_name="protobuf", patch_strip=1, patches=["//third_party:protobuf.patch"], version="33.4")
+# Remove once the following PRs are available in a grpc-java release.
+#   https://github.com/grpc/grpc-java/pull/12148
+#   https://github.com/grpc/grpc-java/pull/12207
+#   https://github.com/grpc/grpc-java/pull/12222
+124: call single_version_override(module_name="grpc-java", patch_strip=1, patches=["//third_party:grpc-java.patch", "//third_party:grpc-java-12207.patch", "//third_party:grpc-java-12222.patch", "//third_party:grpc-java-addloads.patch"])
+135: call local_path_override(module_name="remoteapis", path="./third_party/remoteapis")
+144: bind maven = use_extension("@rules_jvm_external//:extensions.bzl", "maven")
+145: tag maven.install(artifacts=["args4j:args4j:2.37", "com.beust:jcommander:1.82", "com.dylibso.chicory:log:1.5.2", "com.dylibso.chicory:runtime:1.5.2", "com.dylibso.chicory:wasm:1.5.2", "com.github.ben-manes.caffeine:caffeine:3.1.8", "com.github.stephenc.jcip:jcip-annotations:1.0-1", "com.google.api-client:google-api-client:1.35.2", "com.google.api-client:google-api-client-gson:1.35.2", "com.google.auth:google-auth-library-credentials:1.24.1", "com.google.auth:google-auth-library-oauth2-http:1.24.1", "com.google.auto:auto-common:1.2.2", "com.google.auto.service:auto-service:1.0", "com.google.auto.service:auto-service-annotations:1.0.1", "com.google.auto.value:auto-value:1.11.0", "com.google.auto.value:auto-value-annotations:1.11.0", "com.google.code.findbugs:jsr305:3.0.2", "com.google.code.gson:gson:2.11.0", "com.google.code.java-allocation-instrumenter:java-allocation-instrumenter:3.3.4", "com.google.errorprone:error_prone_annotation:2.41.0", "com.google.errorprone:error_prone_annotations:2.41.0", "com.google.errorprone:error_prone_check_api:2.41.0", "com.google.errorprone:error_prone_core:2.41.0", "com.google.flogger:flogger:0.5.1", "com.google.flogger:flogger-system-backend:0.5.1", "com.google.flogger:google-extensions:0.5.1", "com.google.guava:failureaccess:1.0.3", "com.google.guava:guava:33.5.0-jre", "com.google.http-client:google-http-client:1.42.2", "com.google.http-client:google-http-client-gson:1.42.2", "com.google.turbine:turbine:0.11.0", "com.guardsquare:proguard-base:jar:7.5.0", "com.ryanharter.auto.value:auto-value-gson-extension:1.3.1", "com.ryanharter.auto.value:auto-value-gson-factory:1.3.1", "com.ryanharter.auto.value:auto-value-gson-runtime:1.3.1", "com.squareup:javapoet:1.12.0", "commons-collections:commons-collections:3.2.2", "commons-lang:commons-lang:2.6", "io.github.java-diff-utils:java-diff-utils:4.12", "io.grpc:grpc-api:1.66.0", "io.grpc:grpc-auth:1.66.0", "io.grpc:grpc-context:1.66.0", "io.grpc:grpc-core:1.66.0", "io.grpc:grpc-inprocess:1.66.0", "io.grpc:grpc-netty:1.66.0", "io.grpc:grpc-protobuf:1.66.0", "io.grpc:grpc-protobuf-lite:1.66.0", "io.grpc:grpc-stub:1.66.0", "io.netty:netty-buffer:4.1.119.Final", "io.netty:netty-codec:4.1.119.Final", "io.netty:netty-codec-http:4.1.119.Final", "io.netty:netty-codec-http2:4.1.119.Final", "io.netty:netty-common:4.1.119.Final", "io.netty:netty-handler:4.1.119.Final", "io.netty:netty-handler-proxy:4.1.119.Final", "io.netty:netty-resolver:4.1.119.Final", "io.netty:netty-resolver-dns:4.1.119.Final", "io.netty:netty-tcnative-boringssl-static:jar:linux-aarch_64:2.0.70.Final", "io.netty:netty-tcnative-boringssl-static:jar:linux-x86_64:2.0.70.Final", "io.netty:netty-tcnative-boringssl-static:jar:osx-aarch_64:2.0.70.Final", "io.netty:netty-tcnative-boringssl-static:jar:osx-x86_64:2.0.70.Final", "io.netty:netty-tcnative-boringssl-static:jar:windows-x86_64:2.0.70.Final", "io.netty:netty-tcnative-classes:2.0.70.Final", "io.netty:netty-transport:4.1.119.Final", "io.netty:netty-transport-classes-epoll:4.1.119.Final", "io.netty:netty-transport-classes-kqueue:4.1.119.Final", "io.netty:netty-transport-native-epoll:jar:linux-aarch_64:4.1.119.Final", "io.netty:netty-transport-native-epoll:jar:linux-x86_64:4.1.119.Final", "io.netty:netty-transport-native-kqueue:jar:osx-aarch_64:4.1.119.Final", "io.netty:netty-transport-native-kqueue:jar:osx-x86_64:4.1.119.Final", "io.netty:netty-transport-native-unix-common:4.1.119.Final", "io.netty:netty-transport-native-unix-common:jar:linux-aarch_64:4.1.119.Final", "io.netty:netty-transport-native-unix-common:jar:linux-x86_64:4.1.119.Final", "io.netty:netty-transport-native-unix-common:jar:osx-aarch_64:4.1.119.Final", "io.netty:netty-transport-native-unix-common:jar:osx-x86_64:4.1.119.Final", "io.reactivex.rxjava3:rxjava:3.1.2", "it.unimi.dsi:fastutil:7.2.1", "javax.activation:javax.activation-api:1.2.0", "javax.annotation:javax.annotation-api:1.3.2", "javax.inject:javax.inject:1", "org.apache.commons:commons-compress:1.26.1", "org.apache.commons:commons-lang3:3.14.0", "org.apache.tomcat:tomcat-annotations-api:8.0.5", "org.apache.velocity:velocity:1.7", "org.checkerframework:checker-qual:3.42.0", "org.commonmark:commonmark:0.25.0", "org.openjdk.jmh:jmh-core:1.37", "org.openjdk.jmh:jmh-generator-annprocess:1.37", "org.openjdk.jol:jol-core:0.17", "org.ow2.asm:asm:9.9", "org.ow2.asm:asm-analysis:9.9", "org.ow2.asm:asm-commons:9.9", "org.ow2.asm:asm-tree:9.9", "org.ow2.asm:asm-util:9.9", "org.pcollections:pcollections:4.0.1", "org.threeten:threeten-extra:1.5.0", "org.tukaani:xz:1.9", "org.yaml:snakeyaml:2.0", "junit:junit:4.13.2", "org.hamcrest:hamcrest-core:1.3"], excluded_artifacts=["org.apache.httpcomponents:httpclient", "org.apache.httpcomponents:httpcore", "org.eclipse.jgit:org.eclipse.jgit"], fail_if_repin_required=True, lock_file="//:maven_install.json", repositories=["https://repo1.maven.org/maven2"], strict_visibility=True)
+# Test only maven dependencies
+268: opaque Expression
+288: call use_repo($maven, "maven")
+290: bind java_toolchains = use_extension("@rules_java//java:extensions.bzl", "toolchains")
+291: call use_repo($java_toolchains, "local_jdk", "remote_java_tools", "remote_java_tools_darwin_arm64", "remote_java_tools_darwin_x86_64", "remote_java_tools_linux", "remote_java_tools_windows", "remotejdk11_linux", "remotejdk11_linux_aarch64", "remotejdk11_linux_ppc64le", "remotejdk11_linux_s390x", "remotejdk11_macos", "remotejdk11_macos_aarch64", "remotejdk11_win", "remotejdk11_win_arm64", "remotejdk17_linux", "remotejdk17_linux_s390x", "remotejdk17_macos", "remotejdk17_macos_aarch64", "remotejdk17_win", "remotejdk17_win_arm64", "remotejdk21_linux", "remotejdk21_linux_s390x", "remotejdk21_macos", "remotejdk21_macos_aarch64", "remotejdk21_win")
+325: bind python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+326: tag python.toolchain(ignore_root_user_error=True, is_default=True, python_version="3.11")
+332: bind pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+333: tag pip.parse(hub_name="bazel_pip_dev_deps", python_version="3.11", requirements_lock="//:requirements.txt")
+338: call use_repo($pip, "bazel_pip_dev_deps")
+344: bind bazel_build_deps = use_extension("//:extensions.bzl", "bazel_build_deps")
+345: call use_repo($bazel_build_deps, "bazel_tools_repo_cache", "bootstrap_repo_cache", "debian_bin_deps", "debian_cc_deps", "debian_java_deps", "debian_proto_deps", "graalvm_ce_toolchains", "graalvm_oracle", "openjdk_linux_aarch64_vanilla", "openjdk_linux_ppc64le_vanilla", "openjdk_linux_riscv64_vanilla", "openjdk_linux_s390x_vanilla", "openjdk_linux_vanilla", "openjdk_macos_aarch64_vanilla", "openjdk_macos_x86_64_vanilla", "openjdk_win_arm64_jmods", "openjdk_win_arm64_vanilla", "openjdk_win_vanilla")
+# Required only by `--extra_toolchains=@local_config_cc//:cc-toolchain-arm64_windows` from .bazelrc
+368: bind cc_configure = use_extension("@rules_cc//cc:extensions.bzl", "cc_configure_extension")
+369: call use_repo($cc_configure, "local_config_cc")
+371: bind http_file = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "http_file")
+# DO NOT UPDATE the jq versions, they are used to verify compatibility with old and new versions.
+374: call http_file(name="jq_linux_amd64", executable=True, integrity="sha256-xrOn19PntwxvUbcGo7kL0BgzhGxU0yyjLwAn8AIm/20=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.5/jq-linux64"])
+381: call http_file(name="jq_linux_arm64", executable=True, integrity="sha256-TdLYoGYd8LIvG7mh+YMPBrbzuPfZEhGh7118TwaotKU=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-arm64"])
+388: call http_file(name="jq_linux_s390x", executable=True, integrity="sha256-hot8PKdCJKAt22EyYd38LkOxLart1etYNz29x/LF+SQ=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-linux-s390x"])
+395: call http_file(name="jq_macos_amd64", executable=True, integrity="sha256-OG6SyYKlb+SFFGjXqTHfyilWDO4wag5mxqG9QGXT2sU=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.5/jq-osx-amd64"])
+402: call http_file(name="jq_macos_arm64", executable=True, integrity="sha256-C75hnmY+DeLFUL4v4NJA0HZ5nW+KZStw+gSuqKg2Loo=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-macos-arm64"])
+409: call http_file(name="jq_windows_amd64", executable=True, integrity="sha256-6+zYQLpH779mgihoF4zHIaFRBgk396xAbj0xvQFb3pQ=", urls=["https://github.com/jqlang/jq/releases/download/jq-1.5/jq-win64.exe"])
+416: bind async_profiler_repos = use_extension("//:repositories.bzl", "async_profiler_repos")
+417: call use_repo($async_profiler_repos, "async_profiler", "async_profiler_linux_arm64", "async_profiler_linux_x64", "async_profiler_macos")
+429: call bazel_dep(name="bazel_ci_rules", version="2.1.1")
+430: call bazel_dep(name="rules_fuzzing", version="0.6.0")
+431: call bazel_dep(name="wabt", version="1.0.37")
+434: bind rbe = use_extension("@bazel_ci_rules//:rbe_config.bzl", "rbe_config_extension")
+435: tag rbe.config(name="rbe_ubuntu2404", preset="ubuntu2404")
+439: call use_repo($rbe, "rbe_ubuntu2404")
+441: bind list_source_repository = use_repo_rule("//src/test/shell/bazel:list_source_repository.bzl", "list_source_repository")
+443: call list_source_repository(name="local_bazel_source_list")
+445: bind winsdk_configure = use_repo_rule("//tools/res:winsdk_configure.bzl", "winsdk_configure")
+447: call winsdk_configure(name="local_config_winsdk")
+# /usr/local/kythe is setup on Bazel CI machines
+450: bind local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+452: call local_repository(name="kythe_release", path="/usr/local/kythe")
+457: bind remote_coverage_tools_extension = use_extension("//tools/test:extensions.bzl", "remote_coverage_tools_extension")
+458: call use_repo($remote_coverage_tools_extension, "remote_coverage_tools")
+464: call register_execution_platforms("//:default_host_platform")
+466: call register_toolchains("@local_config_winsdk//:all")
+468: call register_toolchains("//tools/res:empty_rc_toolchain")
+470: call register_toolchains("@graalvm_ce_toolchains//:gvm")

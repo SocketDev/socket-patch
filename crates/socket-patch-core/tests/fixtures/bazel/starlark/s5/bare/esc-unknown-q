@@ -1,0 +1,2 @@
+V = "\q"
+print("S5VAL", repr(V), len(V))
