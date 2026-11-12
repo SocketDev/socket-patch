@@ -623,6 +623,17 @@ impl UserPatchIndex {
         if !view.is_dir(&base_rel) && !view.is_file(&base_rel) && !view.is_symlink(&base_rel) {
             return Vec::new();
         }
+        // A pattern that names its way through one of Bazel's links or
+        // into one of its trees (`bazel-bin/packages/*`, `out/external/*`)
+        // lists no member either (hazard HZ-17): each segment it names is
+        // judged on the way down, as the walk judges what it comes down to.
+        let mut named = root.clone();
+        for name in prefix.components() {
+            named = named.file(&name.as_os_str().to_string_lossy());
+            if bazel_owned(view, &named.view_rel(), bound.repo()) {
+                return Vec::new();
+            }
+        }
         let max_depth = if pattern.contains("**") {
             32
         } else {
@@ -662,10 +673,13 @@ impl UserPatchIndex {
             }
             // A Bazel output base or vendor directory inside the checkout
             // mirrors the project's manifests and is no member (hazard
-            // HZ-17). Never the walk's own directory: only an entry the
-            // pattern named or the walk came down to.
-            let named = !components.is_empty();
-            if named && !is_link && bazel_owned(view, &rel) {
+            // HZ-17). Only an entry the walk came down to is asked about:
+            // what the pattern named was judged above, and the walk's own
+            // directory never is. A project the user points at is
+            // inspected even where it holds a marker, and one inside
+            // Bazel's tree is the scope check's to refuse.
+            let below = depth > 0;
+            if below && !is_link && bazel_owned(view, &rel, bound.repo()) {
                 continue;
             }
             if depth == 32 && !is_link {
@@ -689,7 +703,7 @@ impl UserPatchIndex {
                     // Bazel's convenience links lead to mirrors of this
                     // very tree, under any `--symlink_prefix`: nothing
                     // behind one is a member the walk failed to inspect.
-                    if named && bazel_owned(view, &rel) {
+                    if below && bazel_owned(view, &rel, bound.repo()) {
                         continue;
                     }
                     self.unknown(
@@ -1252,6 +1266,15 @@ enum Bound {
 }
 
 impl Bound {
+    /// The git repository root (canonical) that bounds a disk walk's
+    /// reads; `None` when nothing on disk bounds them.
+    fn repo(&self) -> Option<&Path> {
+        match self {
+            Bound::Disk { repo, .. } => Some(repo),
+            Bound::None | Bound::Memory => None,
+        }
+    }
+
     /// Whether `rel` (root-relative, or absolute) lies outside the bound.
     /// An absolute path is inside when it lexically lies under the
     /// repository root.
@@ -1782,9 +1805,11 @@ mod tests {
         assert!(!index.conflicts("pkg:npm/child@1.0.0").is_empty());
     }
 
-    /// A pnpm workspace with one member, `app`, that patches `child`.
+    /// A pnpm workspace with one member, `app`, that patches `child`, at
+    /// the root of a Bazel workspace.
     fn bazel_workspace(ws: &Path, pattern: &str) {
         let globs = format!("packages: ['{pattern}']\n");
+        write(ws, "MODULE.bazel", "");
         write(ws, "pnpm-workspace.yaml", &globs);
         write(ws, "package.json", "{}");
         write(ws, "app/package.json", "{}");
@@ -1811,8 +1836,10 @@ mod tests {
     /// An output base inside the checkout did the same under `**`: its
     /// execution root links back to every top-level member directory
     /// (probe C8). Links and base are skipped by the base's marker, also
-    /// where a pattern names the base, and for a run from a member. With
-    /// the marker gone they are ordinary links and directories again.
+    /// where a pattern names the base, or names its way through a link or
+    /// into the base, for a run from a member, and for a root spelled with
+    /// `..`. With the marker gone they are ordinary links and directories
+    /// again.
     #[cfg(unix)]
     #[tokio::test]
     async fn bazel_links_and_output_bases_are_not_members() {
@@ -1823,6 +1850,12 @@ mod tests {
             ("**", false),
             ("**", true),
             ("out/**", true),
+            // The literal part of a pattern leads through a link, or
+            // below the root of the base: the walk would start inside
+            // Bazel's tree.
+            ("bazel-bin/packages/*", false),
+            ("dist/bin/packages/*", false),
+            ("out/external/*", true),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let ws = tmp.path().join("ws");
@@ -1832,14 +1865,18 @@ mod tests {
             } else {
                 tmp.path().join("user_root/0a1b")
             };
-            // An output base as a build leaves it: the marker, `external`,
-            // the manifest a `js_library` copied into `bazel-out`, and an
+            // An output base as a build leaves it: the marker, `external`
+            // (one fetched repository ships a broken manifest), the
+            // manifests a `js_library` copied into `bazel-out`, and an
             // execution root that mirrors each top-level entry of the
             // workspace as a link.
             let execroot = base.join("execroot/_main");
+            let bin = "bazel-out/k8-fastbuild/bin";
             write(&base, "DO_NOT_BUILD_HERE", &ws.to_string_lossy());
             write(&base, "external/npm__left-pad/package/package.json", "{}");
-            write(&execroot, "bazel-out/k8-fastbuild/bin/package.json", "{}");
+            write(&base, "external/npm__bad/package.json", "{");
+            write(&execroot, &format!("{bin}/package.json"), "{}");
+            write(&execroot, &format!("{bin}/packages/a/package.json"), "{}");
             for entry in std::fs::read_dir(&ws).unwrap() {
                 let name = entry.unwrap().file_name();
                 symlink(ws.join(&name), execroot.join(&name)).unwrap();
@@ -1856,10 +1893,13 @@ mod tests {
                     symlink(target, ws.join(format!("{prefix}{name}"))).unwrap();
                 }
             }
-            // `.` and `out/**` list no member; the others list `app`.
+            // Only `*` and `**` list a member, `app`.
             let seen = (false, pattern.starts_with('*'));
             let what = format!("{pattern}, in-tree base: {in_tree}");
             assert_eq!(withheld(&ws).await, [seen; 2], "{what}");
+            // `--cwd ..` from the member: the same root, the same answer.
+            let dotted = withheld(&ws.join("app/..")).await;
+            assert_eq!(dotted, [seen; 2], "{what}: from app/..");
             let from_member = withheld(&ws.join("app")).await;
             assert_eq!(from_member, [(false, true); 2], "{what}: from app");
 
@@ -1868,19 +1908,61 @@ mod tests {
         }
     }
 
+    /// A walk that itself runs inside Bazel's tree stays as careful as it
+    /// was: from the execution root, reached through its convenience link,
+    /// the mirrored member is a link nobody inspected. Hiding it is not
+    /// for the member walk; refusing the run is for the scope check.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_walk_inside_the_execution_root_still_reports_its_links() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, base) = (tmp.path().join("ws"), tmp.path().join("user_root/0a1b"));
+        let execroot = base.join("execroot/_main");
+        write(&base, "DO_NOT_BUILD_HERE", &ws.to_string_lossy());
+        bazel_workspace(&ws, ".");
+        // The execution root mirrors each top-level entry of the
+        // workspace as a link.
+        std::fs::create_dir_all(&execroot).unwrap();
+        for entry in std::fs::read_dir(&ws).unwrap() {
+            let name = entry.unwrap().file_name();
+            symlink(ws.join(&name), execroot.join(&name)).unwrap();
+        }
+        symlink(&execroot, ws.join("bazel-ws")).unwrap();
+        assert_eq!(withheld(&ws).await, [(false, false); 2]);
+
+        let inside = ws.join("bazel-ws");
+        let index = UserPatchIndex::discover(&inside).await;
+        let reported = index.conflicts("pkg:npm/other@1.0.0");
+        let link = inside.join("app");
+        let expected = format!(
+            "{} (linked workspace cannot be inspected safely)",
+            link.display()
+        );
+        assert_eq!(reported, [expected]);
+    }
+
     /// HZ-17: a Bazel vendor directory holds copies of the fetched
     /// repositories, test fixtures included, and one malformed
     /// `package.json` among them used to protect every npm package. Read
-    /// from disk and from a listing, under either marker Bazel writes.
+    /// from disk and from a listing, under either marker Bazel writes, and
+    /// also where a pattern names the directory or a repository in it.
     #[tokio::test]
     async fn a_bazel_vendor_directory_is_not_walked_for_members() {
         use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
 
         const FIXTURE: &str = "third_party/bazel/npm__resolve/package/test/bad/package.json";
+        const LISTED: [&str; 4] = [
+            "MODULE.bazel",
+            "pnpm-workspace.yaml",
+            "package.json",
+            "app/package.json",
+        ];
         for (marker, pattern) in [
             ("VENDOR.bazel", "**"),
             (".vendorignore", "**"),
             ("VENDOR.bazel", "third_party/bazel/**"),
+            (".vendorignore", "third_party/bazel/npm__resolve/**"),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             let marker = format!("third_party/bazel/{marker}");
@@ -1888,7 +1970,7 @@ mod tests {
             write(tmp.path(), FIXTURE, "{");
             write(tmp.path(), &marker, "");
             let mut memory = MemoryProject::new();
-            for file in ["pnpm-workspace.yaml", "package.json", "app/package.json"] {
+            for file in LISTED {
                 let text = std::fs::read_to_string(tmp.path().join(file)).unwrap();
                 memory.insert(file, MemoryEntry::Text(text.into()));
             }
@@ -1908,6 +1990,73 @@ mod tests {
             let all = [(true, true); 2];
             assert_eq!(withheld(tmp.path()).await, all, "{marker}: no marker");
             assert!(listed(memory).await, "{marker}: no marker");
+        }
+    }
+
+    /// A marker proves a directory Bazel's only in a Bazel workspace.
+    /// `.vendorignore` and `VENDOR.bazel` are names any tool or person
+    /// may write, and where no boundary file lies above one, in the
+    /// repository, the directory is a workspace member like any other:
+    /// its patches still protect what they patch. Otherwise an empty file
+    /// would silently take a member's evidence out of the consent gate.
+    #[tokio::test]
+    async fn a_marker_outside_a_bazel_workspace_hides_no_member() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        for marker in ["app/VENDOR.bazel", "app/.vendorignore"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = tmp.path().join("ws");
+            bazel_workspace(&ws, "**");
+            // A checkout, so that the boundary file above it is out of
+            // reach whatever lies above the temporary directory.
+            write(&ws, ".git/HEAD", "ref: refs/heads/main\n");
+            write(&ws, marker, "");
+            let mut memory = MemoryProject::new();
+            for file in [
+                "MODULE.bazel",
+                "pnpm-workspace.yaml",
+                "package.json",
+                "app/package.json",
+                "app/patches/child+2.0.0.patch",
+            ] {
+                let text = std::fs::read_to_string(ws.join(file)).unwrap();
+                memory.insert(file, MemoryEntry::Text(text.into()));
+            }
+            memory.insert(marker, MemoryEntry::Present);
+            let listed = |memory: MemoryProject| async move {
+                let view = ProjectView::Memory(&memory);
+                let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+                !index.conflicts("pkg:npm/child@2.0.0").is_empty()
+            };
+            // In a Bazel workspace the marked member is Bazel's.
+            assert_eq!(withheld(&ws).await, [(false, false); 2], "{marker}");
+            assert!(!listed(memory.clone()).await, "{marker}");
+
+            std::fs::remove_file(ws.join("MODULE.bazel")).unwrap();
+            memory.remove("MODULE.bazel");
+            write(tmp.path(), "MODULE.bazel", "");
+            let member = [(false, true); 2];
+            assert_eq!(withheld(&ws).await, member, "{marker}: no boundary file");
+            assert!(listed(memory).await, "{marker}: no boundary file");
+        }
+    }
+
+    /// The walk never asks whether its own directory is Bazel's: a project
+    /// the user points at is inspected even where it holds a vendor
+    /// marker inside a Bazel workspace, and its members' patches still
+    /// protect what they patch.
+    #[tokio::test]
+    async fn the_project_root_is_inspected_whatever_marker_it_holds() {
+        for marker in ["VENDOR.bazel", ".vendorignore"] {
+            for pattern in ["*", "**"] {
+                let tmp = tempfile::tempdir().unwrap();
+                let root = tmp.path().join("third_party");
+                write(tmp.path(), "MODULE.bazel", "");
+                bazel_workspace(&root, pattern);
+                write(&root, marker, "");
+                let what = format!("{marker} {pattern}");
+                assert_eq!(withheld(&root).await, [(false, true); 2], "{what}");
+            }
         }
     }
 

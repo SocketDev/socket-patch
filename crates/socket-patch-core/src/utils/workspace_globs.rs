@@ -20,12 +20,13 @@
 //! that expands a pattern over a tree asks it for each entry, because a
 //! Bazel output tree is never a workspace member, whatever the pattern.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
 
 use crate::bazel::output_tree::{self, Entry, PathClass, TreeFs};
+use crate::crawlers::bazel_root::BOUNDARY_FILES;
 use crate::vendor::lock_inventory::view::ProjectView;
 
 /// How one package manager reads `package.json` (or `vlt.json`)
@@ -1238,32 +1239,97 @@ fn posix_class(name: &str) -> Option<&'static [(char, char)]> {
 /// - a link outside every such tree that leads into one
 ///   ([`PathClass::Link`]).
 ///
+/// And only in a Bazel workspace: a boundary file ([`BOUNDARY_FILES`]) has
+/// to be a regular file in a directory above the entry. A marker alone
+/// lifts nothing, because `.vendorignore` and `VENDOR.bazel` are names
+/// anything may write, and in a project Bazel does not build the entry is
+/// a member like any other. `repo` is the git repository root that bounds
+/// the caller's reads, when one does: a boundary file above it is out of
+/// reach and does not count. An in-memory project is asked for the
+/// directories it lists and nothing above them.
+///
 /// Anything else is left to the caller, which handles it as it did before:
 /// a marker the disk would not show, a link in an in-memory project (it
-/// has no target to judge), and an entry *inside* a tree whose root lies
-/// above the walk. In the last case the whole walk runs inside Bazel's
-/// tree, which is for the caller's scope check to refuse, not for a member
-/// walk to hide.
-pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str) -> bool {
+/// has no target to judge), and an entry *inside* a tree. A caller that
+/// asks about every entry on its way down, the segments a pattern names
+/// included, meets the last only when its own directory lies inside
+/// Bazel's tree. That whole walk is then for the caller's scope check to
+/// refuse, not for a member walk to hide.
+pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str, repo: Option<&Path>) -> bool {
     // Read through a link as well: a link to a tree's root shows the
     // markers of that root. No rc file is read here, so a `--vendor_dir`
     // is known by the marker `bazel vendor` writes into it; before that
     // run the directory holds nothing to take for a member.
-    let own = output_tree::tree_at(&ViewTree(view), Path::new(rel), &[]);
-    if own.tree.is_some() {
-        return true;
-    }
-    if !view.is_symlink(rel) {
+    let marked = output_tree::tree_at(&ViewTree(view), Path::new(rel), &[])
+        .tree
+        .is_some();
+    let Some(root) = view.disk_root_reading([rel]) else {
+        return marked && listed_below_bazel_root(view, rel);
+    };
+    if !marked && !view.is_symlink(rel) {
         return false;
+    }
+    // Where the entry is: the directory that holds it, resolved, and its
+    // own name. The directory's real ancestors are the ones Bazel looks
+    // for its workspace in, and the ones `repo` is compared with.
+    let Ok(spelled) = std::path::absolute(root.join(rel)) else {
+        return false;
+    };
+    let holder = spelled.parent().and_then(|dir| dir.canonicalize().ok());
+    let (Some(dir), Some(name)) = (holder, spelled.file_name()) else {
+        return false;
+    };
+    if !below_bazel_root(view, &dir, repo) {
+        return false;
+    }
+    if marked {
+        return true;
     }
     // Where a link leads only the disk knows. The link is fingerprinted
     // (entry and target), the markers of the tree it leads into are not:
     // Bazel writes them when a server first starts in an output base and
     // removes them only with the base, which takes the link's target along.
-    let Some(root) = view.disk_root_reading([rel]) else {
-        return false;
-    };
-    crate::crawlers::bazel_output::classify(&root.join(rel)).class == PathClass::Link
+    //
+    // The classifier judges a path spelled with `..` by its resolved form
+    // alone, which for a link is its target and never the link. So a `..`
+    // (a project root given as `--cwd ..`, a pattern re-rooted at a
+    // parent) is resolved here, and the link's own name kept. Any other
+    // path stays as it was spelled.
+    let dotted = spelled.components().any(|c| c == Component::ParentDir);
+    let entry = if dotted { dir.join(name) } else { spelled };
+    crate::crawlers::bazel_output::classify(&entry).class == PathClass::Link
+}
+
+/// Whether a Bazel boundary file is a regular file in `dir` or above it,
+/// no higher than `repo`. Each name is asked of the view at its absolute
+/// path, so a recording snapshot fingerprints it. Only a file that was
+/// seen counts: this answer lifts evidence, and a name that cannot be
+/// judged must not.
+fn below_bazel_root(view: &ProjectView<'_>, dir: &Path, repo: Option<&Path>) -> bool {
+    dir.ancestors()
+        .take_while(|dir| repo.is_none_or(|repo| dir.starts_with(repo)))
+        .any(|dir| {
+            BOUNDARY_FILES
+                .iter()
+                .any(|name| view.is_file(&dir.join(name).to_string_lossy()))
+        })
+}
+
+/// [`below_bazel_root`] for a view with no disk behind it: whether the
+/// listing holds a boundary file in a directory above the entry at `rel`.
+fn listed_below_bazel_root(view: &ProjectView<'_>, rel: &str) -> bool {
+    let mut above = rel;
+    while !above.is_empty() {
+        above = above.rsplit_once('/').map_or("", |(dir, _)| dir);
+        let at = |name: &&str| match above {
+            "" => view.is_file(name),
+            dir => view.is_file(&format!("{dir}/{name}")),
+        };
+        if BOUNDARY_FILES.iter().any(at) {
+            return true;
+        }
+    }
+    false
 }
 
 /// What is behind a [`ProjectView`], as the marker rules ask for it. Only
@@ -2459,11 +2525,15 @@ mod tests {
     /// wrote at its root, on disk, under a snapshot and in memory alike. A
     /// name proves nothing, a marker name on the wrong kind of entry
     /// proves nothing, and a directory inside a tree is not a root.
+    ///
+    /// A marker proves nothing outside a Bazel workspace either: a
+    /// boundary file has to be a file in a directory above the tree, not
+    /// in the tree, not beside it, and not above the repository.
     #[test]
     fn bazel_trees_are_known_by_their_markers_in_every_view() {
         use crate::vendor::lock_inventory::{DiskSnapshot, MemoryEntry, MemoryProject};
 
-        const FILES: [&str; 12] = [
+        const FILES: [&str; 17] = [
             // An output base (probe C8: `--output_base=<ws>/out`).
             "out/DO_NOT_BUILD_HERE",
             "out/execroot/_main/package.json",
@@ -2480,20 +2550,16 @@ mod tests {
             "notes/DO_NOT_BUILD_HERE",
             "docs/VENDOR.bazel/readme.md",
             "packages/a/package.json",
+            // Boundary files above none of those: in a tree, beside the
+            // trees, and a directory of that name.
+            "third_party/bazel/npm__left-pad/MODULE.bazel",
+            "packages/a/WORKSPACE",
+            "REPO.bazel/readme.md",
+            // A Bazel workspace of its own, below the project.
+            "tools/WORKSPACE.bazel",
+            "tools/vendor/VENDOR.bazel",
         ];
-        let tmp = tempfile::tempdir().unwrap();
-        let mut memory = MemoryProject::new();
-        for rel in FILES {
-            put(tmp.path(), rel);
-            memory.insert(rel, MemoryEntry::Present);
-        }
-        let snapshot = DiskSnapshot::new(tmp.path());
-        let views = [
-            ProjectView::Disk(tmp.path()),
-            ProjectView::Snapshot(&snapshot),
-            ProjectView::Memory(&memory),
-        ];
-        for (rel, owned) in [
+        const TREES: [(&str, bool); 11] = [
             ("out", true),
             ("third_party/bazel", true),
             ("old_vendor", true),
@@ -2505,22 +2571,54 @@ mod tests {
             ("docs", false),
             ("packages/a", false),
             ("absent", false),
-        ] {
-            for view in &views {
-                assert_eq!(bazel_owned(view, rel), owned, "{rel} in {view:?}");
-            }
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("repo");
+        let mut memory = MemoryProject::new();
+        for rel in FILES {
+            put(&root, rel);
+            memory.insert(rel, MemoryEntry::Present);
         }
+        put(tmp.path(), "WORKSPACE");
+        // The repository root as a bounded walk holds it: resolved.
+        let repo = root.canonicalize().unwrap();
+        let check = |memory: &MemoryProject, in_workspace: bool| {
+            let snapshot = DiskSnapshot::new(&root);
+            let views = [
+                ProjectView::Disk(&root),
+                ProjectView::Snapshot(&snapshot),
+                ProjectView::Memory(memory),
+            ];
+            for view in &views {
+                for (rel, tree) in TREES {
+                    let owned = bazel_owned(view, rel, Some(&repo));
+                    assert_eq!(owned, tree && in_workspace, "{rel} in {view:?}");
+                }
+                assert!(bazel_owned(view, "tools/vendor", Some(&repo)), "{view:?}");
+            }
+        };
+        // No boundary file above any tree but the one under `tools`.
+        check(&memory, false);
+        // The file above the repository counts only for a walk nothing
+        // bounds: there the root above a project is its workspace.
+        let disk = ProjectView::Disk(&root);
+        assert!(bazel_owned(&disk, "old_vendor", None));
+        put(&root, "MODULE.bazel");
+        memory.insert("MODULE.bazel", MemoryEntry::Present);
+        check(&memory, true);
         // An absolute path is read as it is, as a walk spells an ancestor.
-        let out = tmp.path().join("out");
-        assert!(bazel_owned(&views[0], &out.to_string_lossy()));
+        let out = root.join("out");
+        assert!(bazel_owned(&disk, &out.to_string_lossy(), Some(&repo)));
     }
 
     /// HZ-17: a link is Bazel's when it leads into one of Bazel's trees,
     /// whatever it is called and whether or not its target still exists
     /// (probe B4: `--symlink_prefix=dist/` moves the links, and a `clean`
-    /// leaves them stale). An ordinary link, a link whose output base is
-    /// gone, and a link met by a walk that itself runs inside a tree are
-    /// the caller's, as before.
+    /// leaves them stale), and however the path to it is spelled: from a
+    /// root given with `..`, and through a pattern re-rooted at a parent.
+    /// An ordinary link, a link whose output base is gone, a link outside
+    /// a Bazel workspace and a link met by a walk that itself runs inside
+    /// a tree are the caller's, as before.
     #[cfg(unix)]
     #[test]
     fn links_are_bazels_by_where_they_lead() {
@@ -2533,9 +2631,19 @@ mod tests {
         put(&base, "DO_NOT_BUILD_HERE");
         put(&execroot, "bazel-out/k8-fastbuild/bin/package.json");
         put(&base, "external/repo/pkg/package.json");
+        put(&ws, "MODULE.bazel");
         put(&ws, "packages/a/package.json");
         std::fs::create_dir_all(ws.join("dist")).unwrap();
         let out = execroot.join("bazel-out");
+        const LINKS: [(&str, bool); 7] = [
+            ("bazel-bin", true),
+            ("bazel-ws", true),
+            ("dist/bin", true),
+            ("bazel-testlogs", true),
+            ("base", true),
+            ("member", false),
+            ("bazel-out", false),
+        ];
         for (link, target) in [
             ("bazel-bin", out.join("k8-fastbuild/bin")),
             ("bazel-ws", execroot.clone()),
@@ -2553,17 +2661,9 @@ mod tests {
         }
         let snapshot = DiskSnapshot::tracked(&ws);
         snapshot.begin_recording();
-        for (link, owned) in [
-            ("bazel-bin", true),
-            ("bazel-ws", true),
-            ("dist/bin", true),
-            ("bazel-testlogs", true),
-            ("base", true),
-            ("member", false),
-            ("bazel-out", false),
-        ] {
+        for (link, owned) in LINKS {
             for view in [ProjectView::Disk(&ws), ProjectView::Snapshot(&snapshot)] {
-                assert_eq!(bazel_owned(&view, link), owned, "{link} in {view:?}");
+                assert_eq!(bazel_owned(&view, link, None), owned, "{link} in {view:?}");
             }
         }
         assert!(
@@ -2571,39 +2671,89 @@ mod tests {
             "judging a link must not cost the snapshot its recording"
         );
 
+        // The root spelled with `..`, as `--cwd ..` from a member spells
+        // it, and a pattern that climbs to the root from a member. The
+        // classifier reads a path that holds `..` by its resolved form,
+        // which for a link is the place it leads to.
+        let dotted = ws.join("packages/..");
+        let member = ws.join("packages/a");
+        for (link, owned) in LINKS {
+            let from_dotted = bazel_owned(&ProjectView::Disk(&dotted), link, None);
+            assert_eq!(from_dotted, owned, "{link} from packages/..");
+            let climbing = format!("../../{link}");
+            let from_member = bazel_owned(&ProjectView::Disk(&member), &climbing, None);
+            assert_eq!(from_member, owned, "{climbing} from packages/a");
+        }
+
         // A listed link has no target: not judged.
         let mut memory = MemoryProject::new();
+        memory.insert("MODULE.bazel", MemoryEntry::Present);
         memory.insert("bazel-bin", MemoryEntry::Symlink);
-        assert!(!bazel_owned(&ProjectView::Memory(&memory), "bazel-bin"));
+        let listed = ProjectView::Memory(&memory);
+        assert!(!bazel_owned(&listed, "bazel-bin", None));
 
         // A project inside the output base (a repository rule's hook runs
-        // there): its entries are in a tree, and none is a tree or a link
-        // into one.
+        // there, in a repository Bazel gave a boundary file): its entries
+        // are in a tree, and none is a tree or a link into one.
         let repo = base.join("external/repo");
+        put(&repo, "REPO.bazel");
         symlink(repo.join("pkg"), repo.join("link")).unwrap();
         for entry in ["pkg", "link"] {
-            assert!(!bazel_owned(&ProjectView::Disk(&repo), entry), "{entry}");
+            let inside = ProjectView::Disk(&repo);
+            assert!(!bazel_owned(&inside, entry, None), "{entry}");
+        }
+
+        // Outside a Bazel workspace the same links are links like any
+        // other, which the caller reports as it always has.
+        let top = ws.canonicalize().unwrap();
+        let disk = ProjectView::Disk(&ws);
+        assert!(bazel_owned(&disk, "bazel-bin", Some(&top)));
+        std::fs::remove_file(ws.join("MODULE.bazel")).unwrap();
+        for (link, _) in LINKS {
+            assert!(!bazel_owned(&disk, link, Some(&top)), "{link}");
         }
     }
 
-    /// The markers an answer rested on are in the snapshot's read set, so a
-    /// cached discovery is not reused once a directory has become a tree.
+    /// The markers and the boundary files an answer rested on are in the
+    /// snapshot's read set, so a cached discovery is not reused once a
+    /// directory has become a tree or a project a Bazel workspace.
     #[test]
     fn a_recording_snapshot_fingerprints_the_markers() {
         use crate::vendor::lock_inventory::DiskSnapshot;
 
         let tmp = tempfile::tempdir().unwrap();
+        let top = tmp.path().canonicalize().unwrap();
         put(tmp.path(), "third_party/npm__left-pad/package.json");
-        let snapshot = DiskSnapshot::tracked(tmp.path());
-        snapshot.begin_recording();
-        assert!(!bazel_owned(
-            &ProjectView::Snapshot(&snapshot),
-            "third_party"
-        ));
-        let reads = snapshot.end_recording().expect("every probe is recorded");
+        let not_owned = || {
+            let snapshot = DiskSnapshot::tracked(tmp.path());
+            snapshot.begin_recording();
+            let view = ProjectView::Snapshot(&snapshot);
+            assert!(!bazel_owned(&view, "third_party", Some(&top)));
+            snapshot.end_recording().expect("every probe is recorded")
+        };
+        let reads = not_owned();
         assert!(reads.unchanged());
         put(tmp.path(), "third_party/VENDOR.bazel");
         assert!(!reads.unchanged(), "a new marker must invalidate the reads");
-        assert!(bazel_owned(&ProjectView::Disk(tmp.path()), "third_party"));
+
+        // A marker in a project that is not a Bazel workspace: the names
+        // of the boundary files it was asked for are recorded as well.
+        // The marker is made old, because a file written this instant is
+        // compared by content and a probe has read none.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let marker = std::fs::File::options()
+            .write(true)
+            .open(tmp.path().join("third_party/VENDOR.bazel"))
+            .unwrap();
+        marker.set_modified(old).unwrap();
+        let reads = not_owned();
+        assert!(reads.unchanged());
+        put(tmp.path(), "MODULE.bazel");
+        assert!(
+            !reads.unchanged(),
+            "a new boundary file must invalidate the reads"
+        );
+        let disk = ProjectView::Disk(tmp.path());
+        assert!(bazel_owned(&disk, "third_party", Some(&top)));
     }
 }
