@@ -73,10 +73,14 @@ pub enum Probe {
     Workspace(RootRef),
     /// A nested boundary file does not cut its directory out of the outer
     /// workspace, so every root between project and boundary governs.
+    /// Nearest the project first.
     Nested(Vec<RootRef>),
     /// A boundary file above the read boundary. `confirmed` (a second Bazel
     /// signal beside it) means hubs exist that cannot be read, and
-    /// unreadable is not absent.
+    /// unreadable is not absent. A confirmed one is the answer even when
+    /// roots lie inside the boundary, because it governs them too; an
+    /// unconfirmed one only when none does. `crawlers::bazel_root::Survey`
+    /// keeps both halves, for the warning and the remedy text.
     RootOutsideBoundary {
         marker: PathBuf,
         confirmed: bool,
