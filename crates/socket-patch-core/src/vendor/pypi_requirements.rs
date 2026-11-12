@@ -3153,6 +3153,9 @@ mod tests {
     #[tokio::test]
     async fn wire_failure_rolls_back_already_written_files() {
         use std::os::unix::fs::PermissionsExt as _;
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root bypasses permission bits; nothing to test
+        }
         let original_root = "six==1.16.0\n-r deps/pinned.txt\n";
         let tmp = write_root(original_root).await;
         tokio::fs::create_dir_all(tmp.path().join("deps"))
