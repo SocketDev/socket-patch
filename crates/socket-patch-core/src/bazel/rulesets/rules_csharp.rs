@@ -74,7 +74,8 @@ pub struct RulesCsharpDetail {
     /// Every name a `use_repo` gives the hub; empty when nothing imports
     /// it.
     pub imported_as: Vec<String>,
-    /// The extension or an import of the hub is a dev dependency.
+    /// The tag or an import of the hub is a dev dependency, so
+    /// `--ignore_dev_dependency` changes or drops the hub.
     pub dev: bool,
     /// How many `from_lock` tags the root gives the extension. With more
     /// than one, through 0.5.0, they are one hub: see the module docs.
@@ -236,7 +237,8 @@ fn usage_hubs(module: &ModuleModel, usage: &[usize], out: &mut Recognized) {
             .iter()
             .filter(|import| usage.contains(&import.proxy));
         let imports = imports.filter(|import| import.exported.as_deref() == Some(name));
-        let imported_as: Vec<String> = imports.map(|import| import.local.clone()).collect();
+        let imports: Vec<_> = imports.collect();
+        let imported_as: Vec<String> = imports.iter().map(|import| import.local.clone()).collect();
         let public = match attr(module, tag, "use_public_sources") {
             Lookup::Absent => Some(true),
             Lookup::Found(Value {
@@ -248,7 +250,7 @@ fn usage_hubs(module: &ModuleModel, usage: &[usize], out: &mut Recognized) {
         let detail = RulesCsharpDetail {
             hub: name.to_string(),
             imported_as,
-            dev: tag.dev,
+            dev: tag.dev || imports.iter().any(|import| import.dev),
             root_tags: tags.len(),
             feeds: listed(module, tag, "feeds"),
             local_package_dirs: listed(module, tag, "local_package_dirs"),
@@ -462,6 +464,46 @@ nuget.from_lock(
         );
         assert_eq!(detail.use_public_sources, None);
         assert!(detail.imported_as.is_empty());
+
+        // `nuget_config = None` is the attribute's default: no config is
+        // named, and nothing is missing.
+        let none = module(
+            "nuget.from_lock(nuget_config = None, packages_lock_json = \"//:packages.lock.json\")\n",
+        );
+        assert!(none.gaps.is_empty() && none.signals.is_empty(), "{none:?}");
+        let hub = one_hub(&none);
+        let path = Some("packages.lock.json");
+        assert_eq!(
+            hub.locks,
+            [lock("//:packages.lock.json", path, LockRole::PackageLock)]
+        );
+        assert!(!names_nuget_config(hub) && hub.decl.literal);
+    }
+
+    /// A hub is a dev dependency when its tag or its `use_repo` is: with
+    /// `--ignore_dev_dependency` a hub that only a dev proxy imports is
+    /// one the root no longer sees.
+    #[test]
+    fn a_hub_that_only_a_dev_proxy_imports_is_a_dev_hub() {
+        let tag = "nuget.from_lock(packages_lock_json = \"//:packages.lock.json\")\n";
+        let dev = "nuget_dev = use_extension(\n    \"@rules_csharp//csharp:extensions.bzl\",\n    \
+                   \"nuget\",\n    dev_dependency = True,\n)\n";
+        let found = module(&format!("{tag}{dev}use_repo(nuget_dev, \"nuget\")\n"));
+        let hub = detail(one_hub(&found));
+        assert_eq!(
+            (hub.dev, &hub.imported_as[..]),
+            (true, &["nuget".to_string()][..])
+        );
+
+        // Imported through the plain proxy, the same tag is no dev hub,
+        // and a tag of the dev proxy is one however it is imported.
+        let plain = module(&format!("{tag}{dev}use_repo(nuget, \"nuget\")\n"));
+        assert!(!detail(one_hub(&plain)).dev);
+        let tagged = module(&format!(
+            "{dev}nuget_dev.from_lock(packages_lock_json = \"//:packages.lock.json\")\n\
+             use_repo(nuget, \"nuget\")\n"
+        ));
+        assert!(detail(one_hub(&tagged)).dev);
     }
 
     /// A label must be one plain string that names a file of the main
@@ -586,6 +628,17 @@ nuget.from_lock(
 
         let bare = recognized("bazel_dep(name = \"rules_csharp\", version = \"0.5.0\")\n");
         assert_eq!(signal(&bare), (Ruleset::RulesCsharp, 0));
+
+        // An extension named `nuget` in another file of the ruleset is
+        // not the one whose tags this reader knows: no hub, and the
+        // ruleset is there.
+        let elsewhere = recognized(
+            "bazel_dep(name = \"rules_csharp\", version = \"0.5.0\")\n\
+             n = use_extension(\"@rules_csharp//other:x.bzl\", \"nuget\")\n\
+             n.from_lock(packages_lock_json = \"//:packages.lock.json\")\n",
+        );
+        assert!(elsewhere.hubs.is_empty() && elsewhere.gaps.is_empty());
+        assert_eq!(signal(&elsewhere), (Ruleset::RulesCsharp, 0));
 
         // Another module's `nuget` extension is not this ruleset.
         let other = recognized(

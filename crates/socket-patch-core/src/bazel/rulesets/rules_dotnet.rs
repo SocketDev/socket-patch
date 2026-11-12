@@ -10,7 +10,11 @@
 //!   on a file of the main repository. That file is generated as well, and
 //!   its one `load` names the data file.
 //! - `WORKSPACE`: `load("//<pkg>:paket.<group>.bzl", "<group>")` and a
-//!   call of the loaded function.
+//!   call of the loaded function, in the `WORKSPACE` file or directly in
+//!   the body of a main-repository macro it calls. A macro file may name
+//!   the data file relative to itself (`load(":paket.main.bzl", "main")`,
+//!   as the generated extension file does): the label is then resolved in
+//!   the package the `WORKSPACE` file loads the macro file from.
 //!
 //! The generator's output changed four times, and each change decides
 //! something (read at the tags named, `tools/paket2bazel/Gen.fs` and
@@ -46,7 +50,17 @@
 //! group that lists the package decides its bytes (read at v0.14.0 and
 //! v0.22.2 `dotnet/private/rules/nuget/nuget_repo.bzl`). The hubs are
 //! therefore listed in the order of their calls, with the groups of other
-//! repositories that are called before them.
+//! repositories that are called before them. That order is only worth
+//! something when every declaration was read, so each of these is a
+//! `RulesetSignal`, whatever hubs were read beside it:
+//!
+//! - a direct `nuget_repo(...)` call, a group no generated file lists;
+//! - a statement that writes the name of a generated function or of
+//!   `nuget_repo` where this reader sees no call of it: a comprehension,
+//!   a block of a macro body, a function the name is handed to;
+//! - a generated file that is loaded and whose function no statement that
+//!   was read calls, and one a macro file loads by a relative label when
+//!   the package of the macro file is not known.
 //!
 //! A generated extension of another module is that module's hub, and its
 //! files are not in this tree. The ruleset with no group of the root that
@@ -54,7 +68,7 @@
 //! file this reader did not find. Liveness and the ruleset version are
 //! `govern`'s to decide; every hub leaves with the version unknown.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{RecognizeInput, Recognized};
 use crate::bazel::label::{Label, Repo};
@@ -68,9 +82,7 @@ use crate::bazel::starlark::{
     self, ArgKind, Call, Dialect, File, Load, LoadSymbol, Lookup, OpaqueKind, Span, Stmt, StmtKind,
     Value, ValueKind,
 };
-use crate::bazel::workspace_file::{
-    Callee, WorkspaceModel, WsCall, WsFile, WsLoad, WsStmt, WsStmtKind,
-};
+use crate::bazel::workspace_file::{Callee, WorkspaceModel, WsFile, WsLoad, WsStmt, WsStmtKind};
 use crate::crawlers::types::Ecosystem;
 
 /// Every `details.token` this file emits.
@@ -330,9 +342,11 @@ fn keyword<'a>(call: &'a Call, name: &str) -> Option<&'a Value> {
 /// build calls. Also the repository the file loads `nuget_repo` from.
 ///
 /// The file is taken for generated only when it is nothing but what the
-/// generator writes: its first statement, loads, and functions that hold a
-/// docstring and `nuget_repo` calls. A hand-edited file may compute its
-/// entries, and no line of it is then known to be the one Bazel builds.
+/// generator writes: its first statement, the one `load` of the rule, and
+/// functions without parameters that hold a docstring and `nuget_repo`
+/// calls. A hand-edited file may compute its entries or call something
+/// else under the rule's name (`def main(nuget_repo = print):`), and no
+/// line of it is then known to be the one Bazel builds.
 pub fn read_data_file(file: &FileText, path: &str, function: &str) -> (PaketData, Option<String>) {
     let unknown = |why: &str| PaketData::Unknown(format!("`{path}` {why}"));
     let bytes = match file {
@@ -352,7 +366,20 @@ pub fn read_data_file(file: &FileText, path: &str, function: &str) -> (PaketData
                 Some(repo) => loaded = Some(repo),
                 None => return (unknown("loads something else than `nuget_repo`"), None),
             },
-            StmtKind::Def { name, body, .. } if name == function => repos = Some(body),
+            // Every generator writes `def <group>():`. A parameter can
+            // be named as the rule is, and then it is what the body calls.
+            StmtKind::Def {
+                name,
+                name_span,
+                body,
+            } if name == function => {
+                let header = file.bytes((name_span.1, stmt.span.1));
+                if !header.starts_with(b"():") {
+                    let why = format!("defines `{function}` with parameters");
+                    return (unknown(&why), loaded);
+                }
+                repos = Some(body);
+            }
             // A function nothing in the file can call.
             StmtKind::Def { .. } => {}
             _ => {
@@ -363,10 +390,14 @@ pub fn read_data_file(file: &FileText, path: &str, function: &str) -> (PaketData
             }
         }
     }
+    // The `load` binds the name once. A second binding anywhere in the
+    // file (a `def`, a parameter) can be what a call of the name runs.
+    let rebound = file.uses("nuget_repo").bindings.len() > 1;
     let data = match (generation(&file, b"\"GENERATED\""), repos) {
         (None, _) => unknown("does not start with a header paket2bazel writes"),
         (_, None) => unknown(&format!("does not define `{function}`")),
         (_, Some(_)) if loaded.is_none() => unknown("does not load `nuget_repo`"),
+        (_, Some(_)) if rebound => unknown("binds `nuget_repo` more than once"),
         (Some(generation), Some(body)) => {
             let single = path.rsplit('/').next() == Some("paket.bzl");
             group_data(&file, body, generation, single).unwrap_or_else(unknown)
@@ -718,121 +749,315 @@ fn bzlmod(input: &RecognizeInput<'_>, module: &ModuleModel, out: &mut Recognized
     }
 }
 
+// ── WORKSPACE ────────────────────────────────────────────────────────
+
+/// Hands `visit` every statement Bazel runs of a `WORKSPACE` file, as far
+/// as this reader follows it: each top-level statement and, unless `visit`
+/// answers that it read the statement as a declaration, the statements
+/// directly in the body of the main-repository macro the statement calls.
+/// The first argument is the file the statement is written in, an index
+/// into [`WorkspaceModel::files`]. A body is handed over once, however
+/// often its macro is called: it declares the same every time.
+pub(super) fn each_statement<'a>(
+    model: &'a WorkspaceModel,
+    visit: &mut dyn FnMut(usize, &'a WsStmt) -> bool,
+) {
+    let mut bodies = BTreeSet::new();
+    for stmt in &model.stmts {
+        if visit(0, stmt) {
+            continue;
+        }
+        let WsStmtKind::Call(call) = &stmt.kind else {
+            continue;
+        };
+        let body = call.macro_def.filter(|index| bodies.insert(*index));
+        let Some(made_by) = body.and_then(|index| model.macros.get(index)) else {
+            continue;
+        };
+        for inner in &made_by.body {
+            visit(made_by.file, inner);
+        }
+    }
+}
+
+/// Which of `names` each of `stmts` writes, read off the file again: the
+/// model keeps where a statement it did not read is, and not what it
+/// says. `stmts` are statements of the model file `path`; `root` says
+/// that it is the `WORKSPACE` file itself and not a macro file.
+///
+/// A statement reaches a function its file loads only through the name
+/// the `load` binds, or through another function of the main repository,
+/// which no reader here follows (design 2.7). So a statement that writes
+/// none of `names` runs none of them, and one that writes one (in a
+/// comprehension, in a block, as an argument, as the value of an
+/// assignment) may run it where this reader does not see the call.
+///
+/// `None` when the file is no longer Starlark this reader vouches for:
+/// every statement may then.
+pub(super) fn names_written<'n>(
+    view: &dyn FileView,
+    path: &str,
+    root: bool,
+    stmts: &[&WsStmt],
+    names: &[&'n str],
+) -> Option<Vec<Vec<&'n str>>> {
+    let dialect = match root {
+        true => Dialect::Workspace,
+        false => Dialect::Bzl,
+    };
+    let text = view.read(path);
+    let file = starlark::read(text.as_bytes()?, dialect).ok()?;
+    let of = |stmt: &&WsStmt| {
+        let written = file.names_in(stmt.span);
+        let named = names.iter().filter(|name| written.contains(name));
+        named.copied().collect()
+    };
+    Some(stmts.iter().map(of).collect())
+}
+
+/// What a `load` of a `WORKSPACE` file or of a macro file binds, as far
+/// as NuGet goes.
+enum Bound {
+    /// The function of a generated data file: the file as Bazel resolves
+    /// the label, and its group (`""` for the single `paket.bzl`).
+    Data(Label, String),
+    /// A generated data file by its name, loaded by a relative label in a
+    /// macro file whose package is not known.
+    Unplaced,
+    /// `nuget_repo` itself, from `//dotnet:defs.bzl` of another
+    /// repository.
+    Rule,
+    Other,
+}
+
+/// `@<workspace name>//` is the main repository.
+fn in_main(model: &WorkspaceModel, label: &Label) -> bool {
+    match &label.repo {
+        Repo::Main => true,
+        Repo::Apparent(name) => model.name.as_deref() == Some(name.as_str()),
+        Repo::Canonical(_) => false,
+    }
+}
+
+/// The package a relative `load` of the model file `index` is resolved
+/// in: the root package for the `WORKSPACE` file, and for a macro file
+/// the package of the label the `WORKSPACE` file loads it by
+/// (`//deps:deps.bzl` is in `deps`), which is where Bazel resolves it.
+/// `None` when no `load` names the file (a `# gazelle:repository_macro`
+/// directive does) or two name it in different packages.
+fn package_of(model: &WorkspaceModel, index: usize) -> Option<&str> {
+    let (root, file) = (model.files.first()?, model.files.get(index)?);
+    if index == 0 {
+        return Some("");
+    }
+    let labels = root.loads.iter().filter_map(|load| load.label.as_ref());
+    let loaded_as = labels.filter(|label| label.path().as_deref() == Some(file.path.as_str()));
+    let mut packages = loaded_as.map(|label| label.package.as_str());
+    let first = packages.next()?;
+    packages.all(|package| package == first).then_some(first)
+}
+
+fn bound(model: &WorkspaceModel, index: usize, load: &WsLoad) -> Bound {
+    let group = |label: &Label| {
+        let name = label.name.rsplit('/').next().unwrap_or(&label.name);
+        let group = match name {
+            "paket.bzl" => Some(""),
+            // The extension file of a group is not its data file.
+            _ => group_of(name, ".bzl").filter(|group| !group.ends_with("_extension")),
+        };
+        group.map(str::to_string)
+    };
+    let label = match &load.label {
+        Some(label) => label.clone(),
+        // The model leaves a relative label of a macro file unresolved.
+        // The other labels it has no value for are those Bazel rejects.
+        None => {
+            let package = package_of(model, index);
+            match Label::parse(&load.load.module, Some(package.unwrap_or(""))) {
+                Ok(label) if package.is_some() => label,
+                Ok(label) if group(&label).is_some() => return Bound::Unplaced,
+                _ => return Bound::Other,
+            }
+        }
+    };
+    if let Some(group) = group(&label) {
+        return Bound::Data(label, group);
+    }
+    let rule = |symbol: &LoadSymbol| symbol.name == "nuget_repo";
+    let defs = label.package == "dotnet" && label.name == "defs.bzl" && !in_main(model, &label);
+    match defs && load.load.symbols.iter().any(rule) {
+        true => Bound::Rule,
+        false => Bound::Other,
+    }
+}
+
+/// The names `file` binds to something that declares NuGet archives, each
+/// with the index of its `load`: the function of a generated data file,
+/// and `nuget_repo` itself. `bound` is what each `load` of the file binds.
+fn declaring<'a>(file: &'a WsFile, bound: &[Bound]) -> Vec<(&'a str, usize)> {
+    let mut names = Vec::new();
+    for (at, (load, bound)) in file.loads.iter().zip(bound).enumerate() {
+        let rule_only = match bound {
+            Bound::Other => continue,
+            Bound::Rule => true,
+            Bound::Data(..) | Bound::Unplaced => false,
+        };
+        let symbols = load.load.symbols.iter();
+        let declares = symbols.filter(|symbol| !rule_only || symbol.name == "nuget_repo");
+        names.extend(declares.map(|symbol| (symbol.local.as_str(), at)));
+    }
+    names
+}
+
 fn workspace_hubs(files: &dyn FileView, model: &WorkspaceModel, out: &mut Recognized) {
     // A file that could not be read has no statements to look at; its
     // reader reports it.
-    let Some(root) = model.files.first() else {
+    if model.files.is_empty() {
         return;
-    };
+    }
     let found = out.hubs.len() + out.signals.len();
     let from_ruleset = |load: &WsLoad| load_repo(&load.load.module).as_deref() == Some(MODULE);
+    let site_of = |file: &WsFile, span: Span| Site {
+        file: file.path.clone(),
+        span,
+        system: DeclSystem::Workspace,
+    };
+    let bound: Vec<Vec<Bound>> = (model.files.iter().enumerate())
+        .map(|(index, file)| {
+            let loads = file.loads.iter();
+            loads.map(|load| self::bound(model, index, load)).collect()
+        })
+        .collect();
     let mut present = None;
     let mut called_before = Vec::new();
-    // A macro declares its hubs once, however often it is called.
-    let mut bodies = BTreeSet::new();
-    for stmt in &model.stmts {
-        let site = Site {
-            file: root.path.clone(),
-            span: stmt.span,
-            system: DeclSystem::Workspace,
+    // The loads, as `(file, load)`, whose function is accounted for: read
+    // where it is called, or named by a signal.
+    let mut settled = BTreeSet::new();
+    // The statements that ran and were not read as the call of a group,
+    // by file.
+    let mut unread: BTreeMap<usize, Vec<&WsStmt>> = BTreeMap::new();
+    each_statement(model, &mut |index, stmt| {
+        let Some(file) = model.files.get(index) else {
+            return false;
         };
+        let site = site_of(file, stmt.span);
         let call = match &stmt.kind {
-            WsStmtKind::Load(load) if root.loads.get(*load).is_some_and(from_ruleset) => {
-                present.get_or_insert(site);
-                continue;
+            // Only a top-level statement is a `load`.
+            WsStmtKind::Load(load) => {
+                if file.loads.get(*load).is_some_and(from_ruleset) {
+                    present.get_or_insert(site);
+                }
+                return false;
             }
             WsStmtKind::Call(call) => call,
-            _ => continue,
+            WsStmtKind::Inert | WsStmtKind::Opaque => {
+                unread.entry(index).or_default().push(stmt);
+                return false;
+            }
         };
         // The archive that defines the ruleset.
         let named = match call.call.arg("name") {
-            Lookup::Found(name) => root.resolve(name).as_str(),
+            Lookup::Found(name) => file.resolve(name).as_str(),
             Lookup::Absent | Lookup::Unknown => None,
         };
         if named == Some(MODULE) {
-            present.get_or_insert(site);
+            present.get_or_insert(site.clone());
         }
-        if workspace_hub(files, model, root, stmt, call, &mut called_before, out) {
-            continue;
-        }
-        // A macro of the main repository that calls generated functions.
-        let inner = call.macro_def.and_then(|m| Some((m, model.macros.get(m)?)));
-        let Some((_, made_by)) = inner.filter(|(index, _)| bodies.insert(*index)) else {
-            continue;
-        };
-        let Some(file) = model.files.get(made_by.file) else {
-            continue;
-        };
-        for stmt in &made_by.body {
-            if let WsStmtKind::Call(call) = &stmt.kind {
-                workspace_hub(files, model, file, stmt, call, &mut called_before, out);
+        let loaded = match &call.callee {
+            Callee::Loaded { load, symbol } => {
+                let written = file.loads.get(*load).zip(bound[index].get(*load));
+                written.map(|(written, bound)| (*load, written, bound, symbol.as_str()))
             }
+            Callee::Builtin | Callee::Unknown => None,
+        };
+        match loaded {
+            Some((load, written, Bound::Data(label, group), function)) => {
+                settled.insert((index, load));
+                let written = &written.load.module;
+                if !in_main(model, label) {
+                    // A group another repository generated, as
+                    // rules_dotnet's own.
+                    called_before.push(written.clone());
+                    return true;
+                }
+                let data_file = label.file();
+                let read = files.read(&data_file);
+                let (data, load_repo) = read_data_file(&read, &data_file, function);
+                let detail = RulesDotnetDetail {
+                    group: group.clone(),
+                    data_file,
+                    data,
+                    extension: None,
+                    imported_as: Vec::new(),
+                    other_imports: Vec::new(),
+                    dev: false,
+                    load_repo,
+                    called_before: called_before.clone(),
+                };
+                out.hubs.push(hub(site, written, true, Vec::new(), detail));
+                true
+            }
+            // A group whose data file cannot be placed.
+            Some((load, _, Bound::Unplaced, _)) => {
+                settled.insert((index, load));
+                out.signals.push(signal(site));
+                true
+            }
+            _ => {
+                unread.entry(index).or_default().push(stmt);
+                false
+            }
+        }
+    });
+    // A statement that was not read as the call of a group and writes
+    // the name of a generated function or of the rule may call it: in a
+    // comprehension, in a block of a macro body, by handing it on. A
+    // call of the rule itself is such a statement too: a group written
+    // by hand, which no generated file lists. Either declares archives
+    // this reader does not know, before every group called after it.
+    for (index, stmts) in unread {
+        let file = &model.files[index];
+        let declaring = declaring(file, &bound[index]);
+        let names: Vec<&str> = declaring.iter().map(|(name, _)| *name).collect();
+        let Some(&(_, first)) = declaring.first() else {
+            continue;
+        };
+        let loads_of = |written: &[&str]| {
+            let named = declaring.iter().filter(|(name, _)| written.contains(name));
+            named.map(|(_, load)| (index, *load)).collect::<Vec<_>>()
+        };
+        let Some(written) = names_written(files, &file.path, index == 0, &stmts, &names) else {
+            out.signals
+                .push(signal(site_of(file, file.loads[first].span)));
+            settled.extend(loads_of(&names));
+            continue;
+        };
+        for (stmt, written) in stmts.iter().zip(written) {
+            if !written.is_empty() {
+                out.signals.push(signal(site_of(file, stmt.span)));
+                settled.extend(loads_of(&written));
+            }
+        }
+    }
+    // A generated file that is loaded, and whose function no statement
+    // above accounts for: a macro this reader did not follow may call it.
+    for (index, file) in model.files.iter().enumerate() {
+        for (at, load) in file.loads.iter().enumerate() {
+            let group = matches!(bound[index][at], Bound::Data(..) | Bound::Unplaced);
+            if group && !settled.contains(&(index, at)) {
+                out.signals.push(signal(site_of(file, load.span)));
+            }
+        }
+    }
+    // A macro file that loads the ruleset shows it as well.
+    for file in model.files.iter().skip(1) {
+        if let Some(load) = file.loads.iter().find(|load| from_ruleset(load)) {
+            present.get_or_insert(site_of(file, load.span));
         }
     }
     if let Some(site) = present.filter(|_| out.hubs.len() + out.signals.len() == found) {
         out.signals.push(signal(site));
     }
-}
-
-/// The hub that `call` declares when it calls the function of a generated
-/// data file, loaded into `file`. `false` when it calls nothing of the
-/// kind.
-fn workspace_hub(
-    files: &dyn FileView,
-    model: &WorkspaceModel,
-    file: &WsFile,
-    stmt: &WsStmt,
-    call: &WsCall,
-    called_before: &mut Vec<String>,
-    out: &mut Recognized,
-) -> bool {
-    let Callee::Loaded { load, symbol } = &call.callee else {
-        return false;
-    };
-    let load = file.loads.get(*load);
-    let Some((load, label)) = load.and_then(|load| Some((load, load.label.as_ref()?))) else {
-        return false;
-    };
-    let name = label.name.rsplit('/').next().unwrap_or(&label.name);
-    let group = match name {
-        "paket.bzl" => Some(""),
-        _ => group_of(name, ".bzl").filter(|group| !group.ends_with("_extension")),
-    };
-    let Some(group) = group else {
-        return false;
-    };
-    // `@<workspace name>//` is the main repository.
-    let main = match &label.repo {
-        Repo::Main => true,
-        Repo::Apparent(name) => model.name.as_deref() == Some(name.as_str()),
-        Repo::Canonical(_) => false,
-    };
-    if !main {
-        // A group another repository generated, as rules_dotnet's own.
-        called_before.push(load.load.module.clone());
-        return true;
-    }
-    let data_file = label.file();
-    let (data, load_repo) = read_data_file(&files.read(&data_file), &data_file, symbol);
-    let site = Site {
-        file: file.path.clone(),
-        span: stmt.span,
-        system: DeclSystem::Workspace,
-    };
-    let detail = RulesDotnetDetail {
-        group: group.to_string(),
-        data_file,
-        data,
-        extension: None,
-        imported_as: Vec::new(),
-        other_imports: Vec::new(),
-        dev: false,
-        load_repo,
-        called_before: called_before.clone(),
-    };
-    let label = &load.load.module;
-    out.hubs.push(hub(site, label, true, Vec::new(), detail));
-    true
 }
 
 #[cfg(test)]
@@ -1357,6 +1582,284 @@ def nuget_deps():
         assert!(matches!(detail(hub).data, PaketData::Group { .. }));
     }
 
+    /// The one signal of `found`: its file and where it starts.
+    fn signal_at(found: &Recognized) -> (&str, usize) {
+        match &found.signals[..] {
+            [at] => (at.site.file.as_str(), at.site.span.0),
+            signals => panic!("one signal, not {signals:?}"),
+        }
+    }
+
+    /// The group, the file of the call and the lock of each hub.
+    fn groups(found: &Recognized) -> Vec<(&str, &str, &str, &str)> {
+        fn group(hub: &Hub) -> (&str, &str, &str, &str) {
+            let lock = &hub.locks[0];
+            let path = lock.path.as_deref().unwrap();
+            let file = hub.decl.site.file.as_str();
+            (detail(hub).group.as_str(), file, lock.label.as_str(), path)
+        }
+        found.hubs.iter().map(group).collect()
+    }
+
+    /// A macro file beside the generated files names them as the
+    /// generated extension file does: relative to itself. Bazel resolves
+    /// the label in the package the macro file is loaded from.
+    #[test]
+    fn a_relative_load_in_a_macro_file_is_resolved_in_its_package() {
+        let workspace = r#"workspace(name = "app")
+
+load("//deps:deps.bzl", "nuget_deps")
+
+nuget_deps()
+
+load("//other:paket.other.bzl", "other")
+
+other()
+"#;
+        let macros = "load(\":paket.main.bzl\", \"main\")\nload(\":versions.bzl\", \"V\")\n\n\
+                      def nuget_deps():\n    main()\n";
+        let other = DATA_LEGACY.replace("main", "other");
+        let files = [
+            ("WORKSPACE", workspace),
+            ("deps/deps.bzl", macros),
+            ("deps/paket.main.bzl", DATA_LEGACY),
+            ("other/paket.other.bzl", &other),
+        ];
+        let found = recognized(&view(&files), None);
+        assert!(
+            found.signals.is_empty() && found.gaps.is_empty(),
+            "{found:?}"
+        );
+        // In the order of the calls: the first group that lists a
+        // package declares its archive.
+        let expected = [
+            (
+                "main",
+                "deps/deps.bzl",
+                ":paket.main.bzl",
+                "deps/paket.main.bzl",
+            ),
+            (
+                "other",
+                "WORKSPACE",
+                "//other:paket.other.bzl",
+                "other/paket.other.bzl",
+            ),
+        ];
+        assert_eq!(groups(&found), expected);
+        let read = |hub: &Hub| matches!(detail(hub).data, PaketData::Group { .. });
+        assert!(found.hubs.iter().all(read));
+
+        // Loaded as a file of the root package, the macro file names
+        // another data file by the same words.
+        let rooted = workspace.replace("//deps:deps.bzl", "//:deps/deps.bzl");
+        let files = [
+            ("WORKSPACE", rooted.as_str()),
+            ("deps/deps.bzl", macros),
+            ("paket.main.bzl", DATA_LEGACY),
+        ];
+        let found = recognized(&view(&files), None);
+        assert_eq!(groups(&found)[0].3, "paket.main.bzl");
+        assert!(found.signals.is_empty(), "{:?}", found.signals);
+
+        // Two loads that disagree on the package, and a macro file only a
+        // gazelle directive names: where the data file is cannot be
+        // told, and a group is there.
+        let twice = workspace.replace(
+            "nuget_deps()",
+            "load(\"//:deps/deps.bzl\", again = \"nuget_deps\")\n\nnuget_deps()",
+        );
+        let found = recognized(&view(&[("WORKSPACE", &twice), files[1]]), None);
+        assert_eq!(groups(&found).len(), 1, "{:?}", found.hubs);
+        let call = macros.find("main()").unwrap();
+        assert_eq!(signal_at(&found), ("deps/deps.bzl", call));
+
+        let directive = "# gazelle:repository_macro deps/deps.bzl%nuget_deps\n";
+        let found = recognized(&view(&[("WORKSPACE", directive), files[1]]), None);
+        assert!(found.hubs.is_empty());
+        assert_eq!(signal_at(&found), ("deps/deps.bzl", 0));
+    }
+
+    /// `nuget_repo` declares the archive of a package through `maybe`, so
+    /// the first declaration decides its bytes. One this reader does not
+    /// follow, before a group it lists, leaves that group's pin inert:
+    /// the hub is listed, and NuGet is undetermined.
+    #[test]
+    fn a_declaration_that_is_not_read_beside_a_group_is_a_signal() {
+        let rule = "load(\"@rules_dotnet//dotnet:defs.bzl\", \"nuget_repo\")\n\n";
+        let other = "load(\"//other:paket.other.bzl\", \"other\")\n\n";
+        let main = "load(\"//deps:paket.main.bzl\", \"main\")\n\nmain()\n";
+        let other_data = DATA_LEGACY.replace("main", "other");
+        let by_hand =
+            "nuget_repo(\n    name = \"hand\",\n    packages = [{\"id\": \"SP.Victim\"}],\n)";
+        let cases = [
+            // A group written by hand, with the rule itself.
+            (rule, by_hand),
+            (rule, "maybe(nuget_repo, name = \"hand\", packages = [])"),
+            (
+                rule,
+                "[nuget_repo(name = n, packages = []) for n in [\"hand\"]]",
+            ),
+            // A generated function that runs where no call is read.
+            (other, "[f() for f in [other]]"),
+            (other, "wrap(other)"),
+            (other, "wrap(groups = [other])"),
+            (other, "run = other"),
+        ];
+        for (load, stmt) in cases {
+            for workspace in [
+                format!("{load}{stmt}\n\n{main}"),
+                format!("{main}\n{load}{stmt}\n"),
+            ] {
+                let files = [
+                    ("WORKSPACE", workspace.as_str()),
+                    ("deps/paket.main.bzl", DATA_LEGACY),
+                    ("other/paket.other.bzl", &other_data),
+                ];
+                let found = recognized(&view(&files), None);
+                let hub = one_hub(&found);
+                assert_eq!(detail(hub).group, "main", "{stmt}");
+                assert!(detail(hub).called_before.is_empty() && hub.decl.literal);
+                let at = workspace.find(stmt).unwrap();
+                assert_eq!(signal_at(&found), ("WORKSPACE", at), "{stmt}");
+            }
+        }
+
+        // A block of a macro body, before the group that is read.
+        let workspace = "load(\"//tools:deps.bzl\", \"nuget_deps\")\n\nnuget_deps()\n";
+        let block = "if True:\n        other()\n";
+        let macros = format!(
+            "load(\"//other:paket.other.bzl\", \"other\")\nload(\"//deps:paket.main.bzl\", \"main\")\n\n\
+             def nuget_deps():\n    {block}    main()\n"
+        );
+        let files = [
+            ("WORKSPACE", workspace),
+            ("tools/deps.bzl", macros.as_str()),
+            ("deps/paket.main.bzl", DATA_LEGACY),
+        ];
+        let found = recognized(&view(&files), None);
+        assert_eq!(groups(&found)[0].0, "main");
+        assert_eq!(found.hubs.len(), 1);
+        let at = macros.find(block).unwrap();
+        assert_eq!(signal_at(&found), ("tools/deps.bzl", at));
+    }
+
+    /// A statement runs a generated function only through the name its
+    /// file binds it to. One that is not read and writes no such name
+    /// declares no archive.
+    #[test]
+    fn a_statement_that_names_no_generated_function_hides_no_group() {
+        let workspace = r#"workspace(name = "app")
+
+load("@bazel_skylib//lib:versions.bzl", "versions")
+
+versions.check(minimum_bazel_version = "6.0.0")
+
+[print(n) for n in ["other", "nuget_repo"]]  # other
+
+load("//tools:deps.bzl", "nuget_deps")
+
+nuget_deps()
+
+load("//other:paket.other.bzl", "other")
+
+other()
+"#;
+        let macros = r#"load("//deps:paket.main.bzl", "main")
+
+def nuget_deps():
+    if not native.existing_rule("x"):
+        native.local_repository(name = "x", path = "x")
+    wrap(main = 1)
+    main()
+"#;
+        let other = DATA_LEGACY.replace("main", "other");
+        let files = [
+            ("WORKSPACE", workspace),
+            ("tools/deps.bzl", macros),
+            ("deps/paket.main.bzl", DATA_LEGACY),
+            ("other/paket.other.bzl", &other),
+        ];
+        let found = recognized(&view(&files), None);
+        let names: Vec<_> = groups(&found).iter().map(|group| group.0).collect();
+        assert_eq!(names, ["main", "other"]);
+        assert!(found.signals.is_empty(), "{:?}", found.signals);
+
+        // The names of a statement are read off its file again. When
+        // that file is gone, any statement that was not read may call a
+        // function the file loads: one signal a file, at the first `load`
+        // of a generated file or of the rule.
+        let root = view(&files);
+        let workspaces = [WorkspaceModel::read(&root, "WORKSPACE").unwrap()];
+        let gone = view(&files[2..]);
+        let found = recognize(&RecognizeInput {
+            module: None,
+            workspace_files: &workspaces,
+            module_lock: None,
+            flags: None,
+            line: None,
+            files: &gone,
+        });
+        assert_eq!(groups(&found).len(), 2);
+        let signals: Vec<_> = found.signals.iter().map(|at| &at.site).collect();
+        let sites: Vec<_> = signals
+            .iter()
+            .map(|site| (site.file.as_str(), site.span.0))
+            .collect();
+        let load = workspace.find("load(\"//other:").unwrap();
+        assert_eq!(sites, [("WORKSPACE", load), ("tools/deps.bzl", 0)]);
+    }
+
+    /// A macro file shows the ruleset as the `WORKSPACE` file does, and a
+    /// generated file it loads is a group wherever the call is: read, in
+    /// a statement that is not, or nowhere this reader looks.
+    #[test]
+    fn the_ruleset_in_a_macro_file_alone_is_a_signal() {
+        let workspace = "load(\"//tools:deps.bzl\", \"nuget_deps\")\n\nnuget_deps()\n";
+        let ruleset =
+            "load(\"@rules_dotnet//dotnet:repositories.bzl\", \"rules_dotnet_dependencies\")\n";
+        let data = "load(\"//deps:paket.main.bzl\", \"main\")\n";
+        // The hubs and the signals of a macro file with these loads and
+        // this body, and the file itself.
+        let run = |loads: &str, body: &str| {
+            let head = "def nuget_deps():\n    rules_dotnet_dependencies()\n";
+            let macros = format!("{loads}\n{head}{body}");
+            let files = [
+                ("WORKSPACE", workspace),
+                ("tools/deps.bzl", macros.as_str()),
+                ("deps/paket.main.bzl", DATA_LEGACY),
+            ];
+            let found = recognized(&view(&files), None);
+            let site = |at: &RulesetSignal| (at.site.file.clone(), at.site.span.0);
+            let signals: Vec<_> = found.signals.iter().map(site).collect();
+            (found.hubs.len(), signals, macros)
+        };
+        let both = format!("{ruleset}{data}");
+        let at = |offset: usize| vec![("tools/deps.bzl".to_string(), offset)];
+        // Read where it is called: a hub, and nothing else to say.
+        let (hubs, signals, _) = run(&both, "    main()\n");
+        assert_eq!((hubs, signals), (1, Vec::new()));
+        // In a block and handed on: the statement is where it hides.
+        for stmt in ["if True:\n        main()\n", "wrap(main)\n"] {
+            let (hubs, signals, macros) = run(&both, &format!("    {stmt}"));
+            let offset = macros.find(stmt).unwrap();
+            assert_eq!((hubs, signals), (0, at(offset)), "{stmt}");
+        }
+        // Never called by a statement that ran: the `load` is the group.
+        let (hubs, signals, macros) = run(&both, "");
+        assert_eq!((hubs, signals), (0, at(macros.find(data).unwrap())));
+        // No generated file at all: the `load` of the ruleset.
+        let (hubs, signals, _) = run(ruleset, "");
+        assert_eq!((hubs, signals), (0, at(0)));
+        // The archive of the ruleset in the body shows it as well.
+        let archive = "native.local_repository(name = \"rules_dotnet\", path = \"..\")\n";
+        let (hubs, signals, macros) = run("", &format!("    {archive}"));
+        assert_eq!((hubs, signals), (0, at(macros.find(archive).unwrap())));
+        // And without either the macro file says nothing about NuGet.
+        let (hubs, signals, _) = run("", "");
+        assert_eq!((hubs, signals), (0, Vec::new()));
+    }
+
     /// A data file is taken for generated only when it is nothing but
     /// what the generator writes. Anything else is a hub whose lock is
     /// known and whose lines are not.
@@ -1385,13 +1888,47 @@ def nuget_deps():
                 "holds a statement paket2bazel does not write",
             ),
             ("def main():", "def other():", "does not define `main`"),
-            // The rule must be the ruleset's own.
+            // The rule must be the ruleset's own: `nuget_repo` of
+            // `//dotnet:defs.bzl`, under that name, and nothing else.
             (
                 rule,
-                "load(\"//:nuget.bzl\", \"nuget_repo\")",
+                "load(\"@other//:nuget.bzl\", \"nuget_repo\")",
+                "loads something else than `nuget_repo`",
+            ),
+            (
+                rule,
+                "load(\"@rules_dotnet//dotnet:defs.bzl\", nuget_repo = \"other\")",
+                "loads something else than `nuget_repo`",
+            ),
+            (
+                rule,
+                "load(\"@rules_dotnet//dotnet:defs.bzl\", \"nuget_repo\", \"other\")",
                 "loads something else than `nuget_repo`",
             ),
             (rule, "", "does not load `nuget_repo`"),
+            // A second `load` could bind anything the body calls.
+            (
+                "def main():",
+                "load(\"//:more.bzl\", \"more\")\n\ndef main():",
+                "holds a statement paket2bazel does not write",
+            ),
+            // A parameter or a `def` named as the rule is what the body
+            // calls, whatever the `load` says.
+            (
+                "def main():",
+                "def main(nuget_repo = print):",
+                "defines `main` with parameters",
+            ),
+            (
+                "def main():",
+                "def _alt(name, packages):\n    pass\n\ndef main(nuget_repo = _alt):",
+                "defines `main` with parameters",
+            ),
+            (
+                "def main():",
+                "def nuget_repo(name, packages):\n    pass\n\ndef main():",
+                "binds `nuget_repo` more than once",
+            ),
             (
                 "    nuget_repo(",
                 "    print(\"x\")\n    nuget_repo(",
@@ -1399,6 +1936,13 @@ def nuget_deps():
             ),
             ("packages = [", "packages = EXTRA + [", not_generated),
             ("name = \"paket.main\"", "name = NAME", not_generated),
+            // The generator passes two keywords and nothing else.
+            (
+                "packages = [",
+                "extra = True,\n        packages = [",
+                not_generated,
+            ),
+            ("name = \"paket.main\"", "\"paket.main\"", not_generated),
             // The keys in another order, an escape in a value, and a mix
             // of the two generations.
             (
@@ -1490,8 +2034,17 @@ def nuget_deps():
             // data file's function, is not the one the name is bound to
             // in the end, or is not in the file.
             Some(with("    _main()\n", "    print(\"nothing\")\n")),
+            // The generated function takes no argument: this is no call
+            // the generator writes.
+            Some(with("    _main()\n", "    _main(1)\n")),
             Some(format!("{EXTENSION_CURRENT}\n_main_impl = print\n")),
             Some(with("main_extension = module_extension(", "x = f(")),
+            // A positional argument beside the keyword: which of the two
+            // the extension runs is not read.
+            Some(with(
+                "    implementation = _main_impl,",
+                "    _other,\n    implementation = _main_impl,",
+            )),
             None,
         ];
         for extension in cases {
@@ -1553,6 +2106,27 @@ load("//deps:paket.main.bzl", "main")
         )]);
         assert_eq!((workspace.hubs.len(), workspace.signals.len()), (0, 1));
         assert_eq!(workspace.signals[0].site.system, DeclSystem::Workspace);
+
+        // The archive of the ruleset, and nothing of it that was read.
+        let archive = "local_repository(name = \"rules_dotnet\", path = \"..\")\n";
+        let archive = found(&[("WORKSPACE", archive)]);
+        assert_eq!((archive.hubs.len(), archive.signals.len()), (0, 1));
+        assert_eq!(archive.signals[0].site.span.0, 0);
+
+        // The extension file of a group is not its data file, whatever a
+        // `WORKSPACE` file does with it.
+        let extension = found(&[(
+            "WORKSPACE",
+            r#"
+load("@rules_dotnet//dotnet:repositories.bzl", "rules_dotnet_dependencies")
+rules_dotnet_dependencies()
+load("//deps:paket.main_extension.bzl", "main_extension")
+main_extension()
+"#,
+        )]);
+        assert_eq!((extension.hubs.len(), extension.signals.len()), (0, 1));
+        // The `load` of the ruleset, on the second line.
+        assert_eq!(extension.signals[0].site.span.0, 1);
 
         let other = found(&[
             (
