@@ -391,13 +391,15 @@ fn a_toy_cell_reads_the_committed_registry_and_archives() {
 fn a_toy_cell_runs_or_is_not_applicable_or_cannot_run() {
     use toy::{Gate, Mirror};
     let manifest = serde_json::json!({ "versions": {
-        "7.7.2": { "distdir": true, "archives": [{ "sha256": "p7" }] },
+        "6.6.0": { "recorded": {}, "distdir": true, "archives": [{ "sha256": "p6" }] },
+        "7.7.2": { "lock": "l7", "distdir": true, "archives": [{ "sha256": "p7" }] },
         "8.8.2": {
+            "lock": "l8",
             "distdir": false,
             "archives": [{ "sha256": "both" }, { "sha256": "module" }],
             "workspace_archives": [{ "sha256": "suffix" }, { "sha256": "both" }],
         },
-        "9.3.2": { "distdir": true, "archives": [{ "sha256": "p9" }] },
+        "9.3.2": { "lock": "l9", "distdir": true, "archives": [{ "sha256": "p9" }] },
     }});
     let gate = |v: &str, system, fixture_present, zero_network| {
         toy::gate(
@@ -433,14 +435,29 @@ fn a_toy_cell_runs_or_is_not_applicable_or_cannot_run() {
         assert_eq!(gate("8.8.2", system, true, false), run, "{system:?}");
     }
 
+    // A line whose file list is a recorded one runs on its committed
+    // archives like any other; it has no committed lock, which is what a
+    // zero-network test builds on.
+    for system in [System::Bzlmod, System::Workspace, System::Hybrid] {
+        let run = Gate::Run(Mirror::Committed);
+        assert_eq!(gate("6.6.0", system, true, false), run, "{system:?}");
+    }
+    let lockless = gate("6.6.0", System::Bzlmod, true, true);
+    assert!(
+        matches!(&lockless, Gate::NotApplicable(why) if why.contains("makes its lock in the test")),
+        "{lockless:?}"
+    );
+
     // Not applicable, also where the cell is required: the line lacks the
     // dependency system (whatever else is missing), or the test claims
-    // zero network where the archives are not committed.
+    // zero network where there is no committed lock or the archives are
+    // not committed.
     let not_applicable = [
         gate("9.3.2", System::Workspace, false, false),
         gate("9.3.2", System::Hybrid, true, false),
         gate("5.4.1", System::Bzlmod, false, false),
         gate("8.8.2", System::Bzlmod, true, true),
+        lockless,
     ];
     for gate in not_applicable {
         assert!(matches!(gate, Gate::NotApplicable(_)), "{gate:?}");
@@ -480,6 +497,10 @@ fn a_toy_cell_runs_or_is_not_applicable_or_cannot_run() {
         (
             gate("6.6.0", System::Workspace, false, false),
             no_fixture("core/workspace/e6"),
+        ),
+        (
+            gate("5.4.1", System::Workspace, false, false),
+            no_fixture("core/workspace/e5"),
         ),
         // A mirror does not make up for a missing fixture.
         (
