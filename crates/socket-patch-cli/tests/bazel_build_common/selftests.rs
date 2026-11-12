@@ -636,6 +636,28 @@ fn the_offline_phase_points_every_proxy_at_a_closed_port() {
 }
 
 #[test]
+fn a_name_resolution_failure_of_a_tool_on_libcurl_is_an_unreachable_origin() {
+    // What cargo printed under the crate_universe splice when the resolver
+    // failed once (real-Bazel sweep of 2026-11-12, Bazel 8.8.2).
+    let cargo = "error: failed to query replaced source registry `crates-io`\n\
+                 Caused by:\n  [6] Couldn't resolve host name (Could not resolve host: index.crates.io)";
+    assert!(super::invoke::names_an_unreachable_origin(cargo));
+    let java = "java.net.UnknownHostException: bcr.bazel.build";
+    assert!(super::invoke::names_an_unreachable_origin(java));
+    // A host that answered with something wrong is a failure, not a skip.
+    for served in [
+        "Checksum was 0123 but wanted 4567",
+        "GET returned 404 Not Found",
+        "error: no matching package named `left-pad` found",
+    ] {
+        assert!(
+            !super::invoke::names_an_unreachable_origin(served),
+            "{served}"
+        );
+    }
+}
+
+#[test]
 fn outside_state_reports_created_changed_and_removed_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let present = tmp.path().join("present");

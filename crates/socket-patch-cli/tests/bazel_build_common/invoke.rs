@@ -400,16 +400,26 @@ impl Run {
     /// opposed to failing on what the host served. Such a failure is a
     /// SKIP on a developer's machine and a failure on a required cell.
     pub fn origin_unreachable(&self) -> bool {
-        const SIGNS: &[&str] = &[
-            "Unknown host",
-            "UnknownHostException",
-            "connect timed out",
-            "Connection timed out",
-            "Connection refused",
-            "Network is unreachable",
-            "Temporary failure in name resolution",
-        ];
-        let stderr = self.stderr();
-        !self.ok() && SIGNS.iter().any(|sign| stderr.contains(sign))
+        !self.ok() && names_an_unreachable_origin(&self.stderr())
     }
+}
+
+/// Whether a failed command's stderr says a host did not answer. Bazel's
+/// own downloader words it the Java way; a tool a repository rule runs
+/// (cargo under the crate_universe splice, anything on libcurl) words it
+/// as curl does: `[6] Couldn't resolve host name (Could not resolve
+/// host: index.crates.io)`.
+pub fn names_an_unreachable_origin(stderr: &str) -> bool {
+    const SIGNS: &[&str] = &[
+        "Unknown host",
+        "UnknownHostException",
+        "connect timed out",
+        "Connection timed out",
+        "Connection refused",
+        "Network is unreachable",
+        "Temporary failure in name resolution",
+        "Could not resolve host",
+        "Couldn't resolve host",
+    ];
+    SIGNS.iter().any(|sign| stderr.contains(sign))
 }
