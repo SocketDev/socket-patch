@@ -252,6 +252,7 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
 #[cfg(test)]
 mod tests {
     use super::super::rules_python::tests::{gap_files, locals, locks, sides, Root};
+    use super::super::rules_python::REPO_OVERRIDE;
     use super::*;
     use crate::bazel::model::{DeclSystem, DerivedState, Hub, Liveness};
     use crate::bazel::module_file::tests::fixtures;
@@ -280,8 +281,9 @@ mod tests {
         )
     }
 
-    /// `heavy/aspect_rules_py/bzlmod/e9/MODULE.bazel`: the fixture of the
-    /// 1.13.0 baseline canary.
+    /// Trimmed from `heavy/aspect_rules_py/bzlmod/e9/MODULE.bazel`, the
+    /// fixture of the 1.13.0 baseline canary: its statements without its
+    /// comments.
     const PROJECT: &str = "module(name = \"socket_fixture\", version = \"0.0.0\")\n\
         \n\
         bazel_dep(name = \"aspect_rules_py\", version = \"1.13.0\")\n\
@@ -297,8 +299,9 @@ mod tests {
         uv.project(\n    hub_name = \"pypi\",\n    lock = \"//:uv.lock\",\n    pyproject = \"//:pyproject.toml\",\n)\n\
         use_repo(uv, \"pypi\")\n";
 
-    /// `heavy/aspect_rules_py/bzlmod/e8-canary/MODULE.bazel`: 1.8.4, whose
-    /// lock is not a watched input.
+    /// Trimmed from `heavy/aspect_rules_py/bzlmod/e8-canary/MODULE.bazel`,
+    /// without its rules_python dependency and Python toolchain: 1.8.4,
+    /// whose lock is not a watched input.
     const LOCKFILE: &str = "module(name = \"socket_fixture\", version = \"0.0.0\")\n\
         \n\
         bazel_dep(name = \"aspect_rules_py\", version = \"1.8.4\")\n\
@@ -530,6 +533,24 @@ mod tests {
             .collect();
         assert_eq!(packages, ["six"]);
         assert_eq!(found.hubs[0].bypasses[0].token, USER_OVERRIDE);
+    }
+
+    #[test]
+    fn a_hub_repository_the_root_replaces_is_a_bypass() {
+        // `override_repo` on the `uv` extension: the build takes the
+        // hub from the root module's own repository, whatever the lock
+        // says.
+        let text = format!("{PROJECT}override_repo(uv, pypi = \"my_pypi\")\n");
+        let found = recognized(&[("MODULE.bazel", &text)]);
+        assert_eq!((&found.gaps, &found.signals), (&vec![], &vec![]));
+        let [bypass] = &found.hubs[0].bypasses[..] else {
+            panic!("one bypass, found {:?}", found.hubs[0].bypasses);
+        };
+        assert_eq!(
+            (bypass.token, bypass.what.as_str()),
+            (REPO_OVERRIDE, "pypi")
+        );
+        assert!(bypass.site.is_some());
     }
 
     #[test]

@@ -19,7 +19,11 @@
 //! lists none (`v2.0.1:pycross/private/lock_common.bzl:136-164, 380-397`),
 //! and Bazel records it as an input although no tag names it (probe Y4
 //! 2.5.4). So it is listed among the files the hub reads, and each
-//! `extra_project_files` label is a further one. The manifests of other
+//! `extra_project_files` label is a further one. The package is the lock
+//! label's, which is not always the lock's directory: for
+//! `//:py/uv.lock` the extension reads `//:pyproject.toml`, while the
+//! native rewriter edits the file beside the lock, and the two files
+//! then differ (`paired_manifest_mismatch`). The manifests of other
 //! workspace members are found from the lock itself, which this reader
 //! does not open. On 0.x the pair is the tag's `project_file`, and it
 //! must be the file beside the lock.
@@ -28,20 +32,22 @@
 //! locks, `lock_file.instantiate` and the `WORKSPACE` rules are recognized
 //! so that they are refused: no rewrite of theirs is one the ruleset
 //! consumes, or a generated `.bzl` stands between the lock and the build.
+//! A `WORKSPACE` rule that may be called where the file was not followed
+//! is a signal, by the rule rules_python hubs follow
+//! ([`Ran::signals`](super::rules_python::Ran::signals)).
 
 use super::pip_compile::PipCompileDetail;
 use super::rules_python::{
     called_rule, lock_checks, module_version, ruleset_load, unread_module, wheel_package,
-    ExtensionUse, HubImport, PairedManifest, Pick, Ran, Reading, Usage, USER_OVERRIDE,
+    ExtensionUse, HubImport, PairedManifest, Pick, Ran, Reading, Usage, WsSignature, MANIFEST,
+    USER_OVERRIDE,
 };
 use super::{RecognizeInput, Recognized};
-use crate::bazel::model::{
-    Bypass, HubShape, LockRef, LockRole, Ruleset, RulesetDetail, Site, UserDecl,
-};
+use crate::bazel::model::{Bypass, HubShape, LockRole, Ruleset, RulesetDetail, Site, UserDecl};
 use crate::bazel::module_file::ModuleModel;
 use crate::bazel::ruleset_version::{Unproven, VersionVerdict};
 use crate::bazel::version::Tri;
-use crate::bazel::workspace_file::WorkspaceModel;
+use crate::bazel::workspace_file::{WorkspaceModel, WsLoad};
 use crate::crawlers::python_crawler::canonicalize_pypi_name;
 
 const MODULES: [&str; 1] = ["rules_pycross"];
@@ -52,6 +58,22 @@ const EXTENSIONS: &str = "pycross/extensions";
 /// The first release that has the 2.0 extensions
 /// (`v2.0.0-alpha.1:pycross/extensions/uv.bzl`).
 const WORKSPACE_TAGS_FROM: &str = "2.0.0-alpha.1";
+
+/// The file a `WORKSPACE` loads the 0.x rules from, and the two of them
+/// that declare a hub.
+const WORKSPACE_BZL: (&str, &str) = ("pycross", "workspace.bzl");
+const LOCK_RULES: [&str; 2] = ["pycross_lock_repo", "pycross_lock_file_repo"];
+
+/// Whether `load` gives the hub rule `symbol`.
+fn lock_rule(load: &WsLoad, symbol: &str) -> bool {
+    LOCK_RULES.contains(&symbol) && ruleset_load(load, WORKSPACE_BZL.0, WORKSPACE_BZL.1).is_some()
+}
+
+const SIGNATURE: WsSignature = WsSignature {
+    ruleset: Ruleset::RulesPycross,
+    repo: MODULES[0],
+    hub_rule: lock_rule,
+};
 
 /// Which declaration makes the hub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,7 +132,8 @@ pub struct RulesPycrossDetail {
     /// extension then makes under the workspace's name.
     pub repos: Vec<String>,
     /// 0.x: the tag's `project_file` against the `pyproject.toml` beside
-    /// the lock. 2.0: that file, which no tag names.
+    /// the lock. 2.0: the `pyproject.toml` of the lock label's package,
+    /// which no tag names, against the same file.
     pub manifest: PairedManifest,
     /// The `use_repo` names that make the hub visible to the root module.
     pub imports: Vec<HubImport>,
@@ -179,6 +202,10 @@ struct Declared<'a> {
     manifest: PairedManifest,
     imports: Vec<HubImport>,
     packages: Vec<PackageOverride>,
+    /// `override_repo` and `inject_repo` on another extension than the
+    /// tag's own, where that one makes the hub's repositories (0.x
+    /// `lock_repos`).
+    overridden: Vec<Bypass>,
 }
 
 /// Completes one hub: its local wheels, lock checks, bypasses and consent
@@ -199,6 +226,7 @@ fn push(
         manifest,
         imports,
         packages,
+        overridden,
     } = declared;
     let local_wheels = match reading.texts("local_wheels", Pick::Items) {
         Some(wheels) => wheels.into_iter().map(str::to_string).collect(),
@@ -227,6 +255,7 @@ fn push(
     let mut hub = reading.hub(shape(api, lock), detail, &apparent, version.clone());
     hub.derived = rows;
     hub.bypasses = usage.map(Usage::repo_overrides).unwrap_or_default();
+    hub.bypasses.extend(overridden);
     let replaced = |package: String, site: Site| {
         let what = package.clone();
         let bypass = Bypass {
@@ -268,7 +297,12 @@ fn push(
 }
 
 /// The 0.x API: `lock_import.import_<format>` tags, whose repositories
-/// the `lock_repos` extension makes.
+/// the `lock_repos` extension makes
+/// (`v0.8.3:pycross/private/bzlmod/lock_repos.bzl`: one repository per
+/// lock of `lock_import`, and no other). So what the root does to that
+/// extension is done to the hubs: its `use_repo` names them, an
+/// `override_repo` or `inject_repo` on it replaces one, and a use of it
+/// that was not read leaves both unknown.
 fn lock_import(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recognized) {
     let repos_usages = Usage::find(
         model,
@@ -276,12 +310,16 @@ fn lock_import(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogn
         &[(EXTENSIONS, "lock_repos.bzl")],
         "lock_repos",
     );
-    for usage in Usage::find(
+    let usages = Usage::find(
         model,
         &MODULES,
         &[(EXTENSIONS, "lock_import.bzl")],
         "lock_import",
-    ) {
+    );
+    if !usages.is_empty() {
+        out.gaps.extend(repos_usages.iter().flat_map(Usage::gaps));
+    }
+    for usage in usages {
         let gaps = usage.gaps();
         let before = out.hubs.len();
         let version = module_version(input, usage.module, None);
@@ -305,6 +343,10 @@ fn lock_import(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogn
             let manifest = PairedManifest::of(path.first().map(String::as_str), named);
             let wanted = |name: &str| name == repo;
             let imports = repos_usages.iter().flat_map(|made| made.imports(wanted));
+            // A hub whose name was not read may be any repository that
+            // is replaced.
+            let overridden = repos_usages.iter().flat_map(Usage::repo_overrides);
+            let overridden = overridden.filter(|over| repo.is_empty() || over.what == repo);
             let own = overrides
                 .iter()
                 .filter(|(of, _)| of.is_none_or(|of| of == repo));
@@ -316,6 +358,7 @@ fn lock_import(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogn
                 manifest,
                 imports: imports.collect(),
                 packages: own.map(|(_, over)| over.clone()).collect(),
+                overridden: overridden.collect(),
                 reading,
             };
             push(input, declared, &version, Some(&usage), out);
@@ -353,17 +396,26 @@ fn workspaces(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogni
                     reading.computed("name");
                 }
                 let path = reading.labels("lock_file", Pick::Items, LockRole::PackageLock);
-                // The extension reads the `pyproject.toml` of the lock's
-                // package, and Bazel records it, though no tag names it.
-                let manifest = PairedManifest::of(path.first().map(String::as_str), None);
-                if let PairedManifest::Beside { path, .. } = &manifest {
-                    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
-                    reading.locks.push(LockRef {
-                        label: format!("//{dir}:{file}"),
-                        path: Some(path.clone()),
-                        role: LockRole::Config,
-                    });
-                }
+                // The extension reads the `pyproject.toml` of the lock
+                // label's package, and Bazel records it, though no tag
+                // names it. The native rewriter edits the one in the
+                // lock's directory, which is another file when the
+                // label's target has a `/` in it.
+                let named = reading.locks.iter().find(|lock| lock.path.is_some());
+                let read = named.and_then(|lock| reading.in_package_of(&lock.label, MANIFEST));
+                let beside = PairedManifest::of(path.first().map(String::as_str), None);
+                let manifest = match (&beside, &read) {
+                    (PairedManifest::Beside { path, .. }, Some(read))
+                        if read.path.as_deref() != Some(path.as_str()) =>
+                    {
+                        PairedManifest::Mismatch {
+                            label: read.label.clone(),
+                            expected: path.clone(),
+                        }
+                    }
+                    _ => beside,
+                };
+                reading.locks.extend(read);
                 reading.labels("extra_project_files", Pick::Items, LockRole::Config);
                 // With no `.repo` tag the extension makes one repository
                 // for the workspace's only project, under its name
@@ -388,6 +440,7 @@ fn workspaces(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogni
                     repos: made,
                     manifest,
                     packages: own.map(|(_, over)| over.clone()).collect(),
+                    overridden: Vec::new(),
                     reading,
                 };
                 push(input, declared, &version, Some(&usage), out);
@@ -427,6 +480,7 @@ fn instantiate(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogn
                 manifest: PairedManifest::None,
                 imports: usage.imports(|repo| repo == name),
                 packages: Vec::new(),
+                overridden: Vec::new(),
                 reading,
             };
             push(input, declared, &version, Some(&usage), out);
@@ -442,17 +496,18 @@ fn instantiate(input: &RecognizeInput<'_>, model: &ModuleModel, out: &mut Recogn
 /// `pycross_lock_repo(name, lock_model = lock_repo_model_<format>(...))`
 /// and `pycross_lock_file_repo(name, lock_file)`.
 fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recognized) {
-    for (file, stmt, call) in Ran::of(ws).calls {
+    let before = out.hubs.len();
+    let ran = Ran::of(ws);
+    for &(file, stmt, call) in &ran.calls {
         let Some((load, rule, maybe)) = called_rule(file, call) else {
             continue;
         };
-        if ruleset_load(load, "pycross", "workspace.bzl").is_none() {
+        if !lock_rule(load, rule) {
             continue;
         }
         let lock = match rule {
-            "pycross_lock_repo" => PycrossLock::Unread,
             "pycross_lock_file_repo" => PycrossLock::GeneratedBzl,
-            _ => continue,
+            _ => PycrossLock::Unread,
         };
         let mut reading = Reading::rule(ws, file, stmt, call, (rule, maybe));
         let name = reading.text("name").unwrap_or_default();
@@ -476,11 +531,16 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
             manifest: PairedManifest::Unresolved,
             imports: Vec::new(),
             packages: Vec::new(),
+            overridden: Vec::new(),
             reading,
         };
         let version = VersionVerdict::unknown(Unproven::WorkspaceDefinition);
         push(input, declared, &version, None, out);
     }
+    // A rule that is loaded and may be called where the file was not
+    // followed declares a hub this reader cannot refuse by its shape.
+    let signals = ran.signals(ws, input.files, &SIGNATURE, &out.hubs[before..], None);
+    out.signals.extend(signals);
 }
 
 /// The hubs, signals and gaps of this ruleset in `input`.
@@ -501,6 +561,7 @@ pub fn recognize(input: &RecognizeInput<'_>) -> Recognized {
 #[cfg(test)]
 mod tests {
     use super::super::rules_python::tests::{gap_files, locals, locks, sides, Root};
+    use super::super::rules_python::{PAIRED_MANIFEST_MISMATCH, REPO_OVERRIDE};
     use super::*;
     use crate::bazel::model::{DeclSystem, Hub, Liveness};
     use crate::bazel::module_file::tests::fixtures;
@@ -526,8 +587,9 @@ mod tests {
         found.hubs.into_iter().next().unwrap()
     }
 
-    /// `heavy/rules_pycross/bzlmod/e9-0.8.3/MODULE.bazel`: the 0.x API
-    /// (probe Y4, workspace `px0-uv-b8`).
+    /// Trimmed from `heavy/rules_pycross/bzlmod/e9-0.8.3/MODULE.bazel`,
+    /// without its Python toolchain: the 0.x API (probe Y4, workspace
+    /// `px0-uv-b8`).
     const LOCK_IMPORT: &str = "module(name = \"socket_fixture\", version = \"0.0.0\")\n\
         \n\
         bazel_dep(name = \"rules_pycross\", version = \"0.8.3\")\n\
@@ -549,9 +611,10 @@ mod tests {
         lock_repos = use_extension(\"@rules_pycross//pycross/extensions:lock_repos.bzl\", \"lock_repos\")\n\
         use_repo(lock_repos, \"pypi\")\n";
 
-    /// `heavy/rules_pycross/bzlmod/e9/MODULE.bazel`: the 2.0 API (probe
-    /// Y4, workspace `px2-uv-b8`). `FORMAT` and `LOCK` stand for the
-    /// extension and its lock.
+    /// Trimmed from `heavy/rules_pycross/bzlmod/e9/MODULE.bazel`, without
+    /// its Python toolchain: the 2.0 API (probe Y4, workspace
+    /// `px2-uv-b8`). `FORMAT` and `LOCK` stand for the extension and its
+    /// lock, which are `uv` and `uv.lock` in the fixture.
     const WORKSPACE_TAGS: &str = "module(name = \"socket_fixture\", version = \"0.0.0\")\n\
         \n\
         bazel_dep(name = \"rules_pycross\", version = \"2.0.1\")\n\
@@ -798,10 +861,106 @@ mod tests {
                 expected: "services/api/pyproject.toml".to_string(),
             }
         );
+        assert_eq!(mismatch.refusal(), Some(PAIRED_MANIFEST_MISMATCH));
+    }
+
+    #[test]
+    fn the_manifest_the_extension_reads_is_the_one_of_the_lock_labels_package() {
+        // `//:py/uv.lock` is a file of the root package. The extension
+        // reads `//:pyproject.toml`
+        // (`v2.0.1:pycross/private/lock_common.bzl:136-164, 395-396`),
+        // and the native rewriter edits the file beside the lock.
+        let at = |label: &str| {
+            let lock = format!("\"{label}\"");
+            one(&workspace_tags("uv", "uv.lock").replace("\"//:uv.lock\"", &lock))
+        };
+        let hub = at("//:py/uv.lock");
         assert_eq!(
-            mismatch.refusal(),
-            Some(super::super::rules_python::PAIRED_MANIFEST_MISMATCH)
+            locks(&hub),
+            [
+                ("//:py/uv.lock", Some("py/uv.lock"), LockRole::PackageLock),
+                (
+                    "//:pyproject.toml",
+                    Some("pyproject.toml"),
+                    LockRole::Config
+                ),
+            ]
         );
+        let mismatch = detail(&hub).manifest.clone();
+        assert_eq!(
+            mismatch,
+            PairedManifest::Mismatch {
+                label: "//:pyproject.toml".to_string(),
+                expected: "py/pyproject.toml".to_string(),
+            }
+        );
+        assert_eq!(mismatch.refusal(), Some(PAIRED_MANIFEST_MISMATCH));
+        // The same below a package that is not the root.
+        let hub = at("//services:api/uv.lock");
+        assert_eq!(
+            hub.locks[1].path.as_deref(),
+            Some("services/pyproject.toml")
+        );
+        assert_eq!(
+            detail(&hub).manifest,
+            PairedManifest::Mismatch {
+                label: "//services:pyproject.toml".to_string(),
+                expected: "services/api/pyproject.toml".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_repository_replaced_on_the_extension_that_makes_it_is_a_bypass() {
+        let bypasses = |hub: &Hub| -> Vec<(&'static str, String)> {
+            let bypasses = hub.bypasses.iter();
+            bypasses.map(|by| (by.token, by.what.clone())).collect()
+        };
+        let replaced = [(REPO_OVERRIDE, "pypi".to_string())];
+        // 0.x: `lock_repos` makes the hub's repository, so an override
+        // on it replaces the hub as one on the tag's own extension does.
+        for statement in [
+            "override_repo(lock_repos, pypi = \"my_pypi\")\n",
+            "inject_repo(lock_repos, pypi = \"my_pypi\")\n",
+            "override_repo(lock_import, pypi = \"my_pypi\")\n",
+        ] {
+            let hub = one(&format!("{LOCK_IMPORT}{statement}"));
+            assert_eq!(bypasses(&hub), replaced, "{statement}");
+            assert!(hub.bypasses[0].site.is_some());
+        }
+        // Another repository of `lock_repos` is not this hub's, unless
+        // the hub's own name was not read.
+        let other = "override_repo(lock_repos, other = \"mine\")\n";
+        assert!(one(&format!("{LOCK_IMPORT}{other}")).bypasses.is_empty());
+        let unnamed = LOCK_IMPORT.replace("repo = \"pypi\"", "repo = REPO");
+        let found = recognized(&[("MODULE.bazel", &format!("{unnamed}{other}"))]);
+        assert_eq!(
+            bypasses(&found.hubs[0]),
+            [(REPO_OVERRIDE, "other".to_string())]
+        );
+
+        // A `use_repo` of `lock_repos` that was not read: which name the
+        // build sees the hub by is not known.
+        let starred = LOCK_IMPORT.replace(
+            "use_repo(lock_repos, \"pypi\")",
+            "use_repo(lock_repos, *REPOS)",
+        );
+        let found = recognized(&[("MODULE.bazel", &starred)]);
+        assert_eq!(gap_files(&found), ["MODULE.bazel"]);
+        assert!(detail(&found.hubs[0]).imports.is_empty());
+        // With no `lock_import` tag the gap is of no hub.
+        let alone = "bazel_dep(name = \"rules_pycross\", version = \"0.8.3\")\n\
+                     lock_repos = use_extension(\"@rules_pycross//pycross/extensions:lock_repos.bzl\", \"lock_repos\")\n\
+                     use_repo(lock_repos, *REPOS)\n";
+        assert_eq!(
+            recognized(&[("MODULE.bazel", alone)]),
+            Recognized::default()
+        );
+
+        // 2.0: the extension of the tag makes the repository itself.
+        let text = workspace_tags("uv", "uv.lock");
+        let hub = one(&format!("{text}override_repo(uv, pypi = \"my_pypi\")\n"));
+        assert_eq!(bypasses(&hub), replaced);
     }
 
     #[test]
@@ -976,6 +1135,70 @@ mod tests {
         );
         assert_eq!(locks(pypi), [("", None, LockRole::PackageLock)]);
         assert_eq!(gap_files(&found), ["WORKSPACE"]);
+        // Both rules were read where they are called: nothing is hidden.
+        assert!(found.signals.is_empty());
+    }
+
+    #[test]
+    fn a_workspace_rule_that_may_be_called_unread_is_a_signal() {
+        let load = "load(\"@rules_pycross//pycross:workspace.bzl\", \"lock_repo_model_uv\", \"pycross_lock_repo\")\n";
+        let call = |name: &str| {
+            format!(
+                "pycross_lock_repo(name = {name}, lock_model = lock_repo_model_uv(\
+                 lock_file = \"//:uv.lock\", project_file = \"//:pyproject.toml\"))"
+            )
+        };
+        // `(hubs, the file of each signal)`.
+        let found = |files: &[(&str, &str)]| {
+            let found = recognized(files);
+            let own = |signal: &crate::bazel::model::RulesetSignal| {
+                (signal.ruleset, signal.site.system)
+                    == (Ruleset::RulesPycross, DeclSystem::Workspace)
+            };
+            assert!(found.signals.iter().all(own), "{:?}", found.signals);
+            let signals = found.signals.iter().map(|signal| signal.site.file.clone());
+            (found.hubs.len(), signals.collect::<Vec<_>>())
+        };
+        let hidden = |file: &str| (0, vec![file.to_string()]);
+        // The call in a top-level comprehension, and under a top-level
+        // `if`.
+        let looped = format!("{load}[{} for n in [\"pypi\"]]\n", call("n"));
+        assert_eq!(found(&[("WORKSPACE", &looped)]), hidden("WORKSPACE"));
+        let under_if = format!("{load}if True:\n    {}\n", call("\"pypi\""));
+        assert_eq!(found(&[("WORKSPACE", &under_if)]), hidden("WORKSPACE"));
+        // Under an `if` in the body of a macro of the main repository:
+        // the macro's file is the one to fix.
+        let ws = "load(\"//tools:deps.bzl\", \"python_deps\")\npython_deps()\n";
+        let deps = format!(
+            "{load}def python_deps():\n    if True:\n        {}\n",
+            call("\"pypi\"")
+        );
+        let files = [("WORKSPACE", ws), ("tools/deps.bzl", &*deps)];
+        assert_eq!(found(&files), hidden("tools/deps.bzl"));
+        // Loaded and never called where this reader looks.
+        assert_eq!(found(&[("WORKSPACE", load)]), hidden("WORKSPACE"));
+
+        // A call that was read is a hub and no signal: its `lock_model`
+        // is computed and names no hub rule. Beside a statement that was
+        // not read, the hub does not vouch for it.
+        let read = format!("{load}{}\n", call("\"a\""));
+        assert_eq!(found(&[("WORKSPACE", &read)]), (1, vec![]));
+        let both = format!("{read}if True:\n    {}\n", call("\"b\""));
+        assert_eq!(
+            found(&[("WORKSPACE", &both)]),
+            (1, vec!["WORKSPACE".to_string()])
+        );
+        // The ruleset with every statement followed and no hub rule in
+        // sight is silent, and another ruleset's unread statement is not
+        // this one's to signal.
+        let archive = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+                       http_archive(name = \"rules_pycross\", sha256 = \"00\", url = \"https://example.com/rules_pycross.tar.gz\")\n\
+                       load(\"@rules_pycross//pycross:repositories.bzl\", \"rules_pycross_dependencies\")\n\
+                       rules_pycross_dependencies()\n";
+        assert_eq!(recognized(&[("WORKSPACE", archive)]), Recognized::default());
+        let python = "load(\"@rules_python//python:pip.bzl\", \"pip_parse\")\n\
+                      [pip_parse(name = n, requirements_lock = \"//:r.txt\") for n in [\"a\"]]\n";
+        assert_eq!(recognized(&[("WORKSPACE", python)]), Recognized::default());
     }
 
     #[test]
