@@ -17,7 +17,7 @@ use crate::utils::fs::read_regular_to_string;
 use crate::utils::npm_range::npm_range_admits;
 use crate::utils::purl::{normalize_purl, strip_purl_qualifiers};
 use crate::utils::relpath::normalize_lexically_keeping_escapes;
-use crate::utils::workspace_globs::{workspaces_include_as, WorkspacesDialect};
+use crate::utils::workspace_globs::{bazel_owned, workspaces_include_as, WorkspacesDialect};
 use crate::vendor::lock_inventory::ProjectView;
 
 #[derive(Default, Debug)]
@@ -561,7 +561,8 @@ impl UserPatchIndex {
     // Use the existing npm/Yarn glob grammar, with a bounded, link-free walk.
     // Positive patterns are a conservative union: a patch in an excluded member
     // may still protect the same release elsewhere, never silently lose it.
-    // Returns the members' root-relative paths.
+    // Bazel's own trees, and the links into them, are no members whatever
+    // the pattern (`bazel_owned`). Returns the members' root-relative paths.
     async fn workspace_members(
         &mut self,
         view: &ProjectView<'_>,
@@ -659,6 +660,14 @@ impl UserPatchIndex {
             if !is_link && !view.is_dir(&rel) {
                 continue;
             }
+            // A Bazel output base or vendor directory inside the checkout
+            // mirrors the project's manifests and is no member (hazard
+            // HZ-17). Never the walk's own directory: only an entry the
+            // pattern named or the walk came down to.
+            let named = !components.is_empty();
+            if named && !is_link && bazel_owned(view, &rel) {
+                continue;
+            }
             if depth == 32 && !is_link {
                 self.unknown("npm", &entry.shown, "workspace inspection depth exceeded");
             }
@@ -677,6 +686,12 @@ impl UserPatchIndex {
                                 WorkspacesDialect::YARN_BERRY,
                             ) && !pattern.contains("**")))
                 {
+                    // Bazel's convenience links lead to mirrors of this
+                    // very tree, under any `--symlink_prefix`: nothing
+                    // behind one is a member the walk failed to inspect.
+                    if named && bazel_owned(view, &rel) {
+                        continue;
+                    }
                     self.unknown(
                         "npm",
                         &entry.shown,
@@ -1765,6 +1780,135 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), tmp.path().join("packages")).unwrap();
         let index = UserPatchIndex::discover(tmp.path()).await;
         assert!(!index.conflicts("pkg:npm/child@1.0.0").is_empty());
+    }
+
+    /// A pnpm workspace with one member, `app`, that patches `child`.
+    fn bazel_workspace(ws: &Path, pattern: &str) {
+        let globs = format!("packages: ['{pattern}']\n");
+        write(ws, "pnpm-workspace.yaml", &globs);
+        write(ws, "package.json", "{}");
+        write(ws, "app/package.json", "{}");
+        write(ws, "app/patches/child+2.0.0.patch", "user diff");
+    }
+
+    /// What the consent gate and the engine's index each say about
+    /// `other`, a package no project file patches (protected only when
+    /// something could not be inspected), and about `child`.
+    async fn withheld(root: &Path) -> [(bool, bool); 2] {
+        let gate = UserPatchIndex::discover(root).await;
+        let engine = UserPatchIndex::npm_family_in(&ProjectView::Disk(root), &[]).await;
+        [gate, engine].map(|index| {
+            let protects = |purl: &str| !index.conflicts(purl).is_empty();
+            let other = protects("pkg:npm/other@1.0.0");
+            (other, protects("pkg:npm/child@2.0.0"))
+        })
+    }
+
+    /// HZ-17. With Bazel's convenience links in the workspace root, or
+    /// under `--symlink_prefix=dist/`, the patterns `*`, `**` and `.` used
+    /// to withhold every npm package (probes B4, rules-js B1), `.` being
+    /// the `pnpm-workspace.yaml` hosted and vendored mode write themselves.
+    /// An output base inside the checkout did the same under `**`: its
+    /// execution root links back to every top-level member directory
+    /// (probe C8). Links and base are skipped by the base's marker, also
+    /// where a pattern names the base, and for a run from a member. With
+    /// the marker gone they are ordinary links and directories again.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bazel_links_and_output_bases_are_not_members() {
+        use std::os::unix::fs::symlink;
+        for (pattern, in_tree) in [
+            (".", false),
+            ("*", false),
+            ("**", false),
+            ("**", true),
+            ("out/**", true),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let ws = tmp.path().join("ws");
+            bazel_workspace(&ws, pattern);
+            let base = if in_tree {
+                ws.join("out")
+            } else {
+                tmp.path().join("user_root/0a1b")
+            };
+            // An output base as a build leaves it: the marker, `external`,
+            // the manifest a `js_library` copied into `bazel-out`, and an
+            // execution root that mirrors each top-level entry of the
+            // workspace as a link.
+            let execroot = base.join("execroot/_main");
+            write(&base, "DO_NOT_BUILD_HERE", &ws.to_string_lossy());
+            write(&base, "external/npm__left-pad/package/package.json", "{}");
+            write(&execroot, "bazel-out/k8-fastbuild/bin/package.json", "{}");
+            for entry in std::fs::read_dir(&ws).unwrap() {
+                let name = entry.unwrap().file_name();
+                symlink(ws.join(&name), execroot.join(&name)).unwrap();
+            }
+            std::fs::create_dir_all(ws.join("dist")).unwrap();
+            let out = execroot.join("bazel-out");
+            for prefix in ["bazel-", "dist/"] {
+                for (name, target) in [
+                    ("bin", out.join("k8-fastbuild/bin")),
+                    ("out", out.clone()),
+                    ("testlogs", out.join("k8-fastbuild/testlogs")),
+                    ("ws", execroot.clone()),
+                ] {
+                    symlink(target, ws.join(format!("{prefix}{name}"))).unwrap();
+                }
+            }
+            // `.` and `out/**` list no member; the others list `app`.
+            let seen = (false, pattern.starts_with('*'));
+            let what = format!("{pattern}, in-tree base: {in_tree}");
+            assert_eq!(withheld(&ws).await, [seen; 2], "{what}");
+            let from_member = withheld(&ws.join("app")).await;
+            assert_eq!(from_member, [(false, true); 2], "{what}: from app");
+
+            std::fs::remove_file(base.join("DO_NOT_BUILD_HERE")).unwrap();
+            assert_eq!(withheld(&ws).await, [(true, true); 2], "{what}: no marker");
+        }
+    }
+
+    /// HZ-17: a Bazel vendor directory holds copies of the fetched
+    /// repositories, test fixtures included, and one malformed
+    /// `package.json` among them used to protect every npm package. Read
+    /// from disk and from a listing, under either marker Bazel writes.
+    #[tokio::test]
+    async fn a_bazel_vendor_directory_is_not_walked_for_members() {
+        use crate::vendor::lock_inventory::{MemoryEntry, MemoryProject};
+
+        const FIXTURE: &str = "third_party/bazel/npm__resolve/package/test/bad/package.json";
+        for (marker, pattern) in [
+            ("VENDOR.bazel", "**"),
+            (".vendorignore", "**"),
+            ("VENDOR.bazel", "third_party/bazel/**"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = format!("third_party/bazel/{marker}");
+            bazel_workspace(tmp.path(), pattern);
+            write(tmp.path(), FIXTURE, "{");
+            write(tmp.path(), &marker, "");
+            let mut memory = MemoryProject::new();
+            for file in ["pnpm-workspace.yaml", "package.json", "app/package.json"] {
+                let text = std::fs::read_to_string(tmp.path().join(file)).unwrap();
+                memory.insert(file, MemoryEntry::Text(text.into()));
+            }
+            memory.insert(FIXTURE, MemoryEntry::Text("{".into()));
+            memory.insert(marker.as_str(), MemoryEntry::Present);
+            let listed = |memory: MemoryProject| async move {
+                let view = ProjectView::Memory(&memory);
+                let index = UserPatchIndex::npm_family_in(&view, &[]).await;
+                !index.conflicts("pkg:npm/other@1.0.0").is_empty()
+            };
+            let seen = (false, pattern == "**");
+            assert_eq!(withheld(tmp.path()).await, [seen; 2], "{marker} {pattern}");
+            assert!(!listed(memory.clone()).await, "{marker} {pattern}");
+
+            std::fs::remove_file(tmp.path().join(&marker)).unwrap();
+            memory.remove(&marker);
+            let all = [(true, true); 2];
+            assert_eq!(withheld(tmp.path()).await, all, "{marker}: no marker");
+            assert!(listed(memory).await, "{marker}: no marker");
+        }
     }
 
     #[tokio::test]

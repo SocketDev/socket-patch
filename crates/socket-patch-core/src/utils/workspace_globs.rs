@@ -15,10 +15,18 @@
 //! [`WorkspacesDialect`] names what each package manager reads (#1097).
 //! yarn berry's picomatch further reads regex groups (`(a|b)`), POSIX
 //! classes (`[[:alpha:]]`) and `..` segments (#1490).
+//!
+//! Matching is pure. The one disk question here is [`bazel_owned`]: a walk
+//! that expands a pattern over a tree asks it for each entry, because a
+//! Bazel output tree is never a workspace member, whatever the pattern.
 
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use regex::Regex;
+
+use crate::bazel::output_tree::{self, Entry, PathClass, TreeFs};
+use crate::vendor::lock_inventory::view::ProjectView;
 
 /// How one package manager reads `package.json` (or `vlt.json`)
 /// `workspaces`, probed on npm 10.9, yarn 1.22.22, yarn 4.10, Bun 1.2.23
@@ -1207,6 +1215,100 @@ fn posix_class(name: &str) -> Option<&'static [(char, char)]> {
     })
 }
 
+/// Whether the entry at `rel` (a path as `view` reads it) is Bazel's and
+/// not the project's, so that a glob expansion leaves it out: it is never
+/// a workspace member and is never entered (hazard HZ-17).
+///
+/// Bazel puts its trees where a wide pattern reaches them (`*`, `**`, and
+/// the `.` of the `pnpm-workspace.yaml` hosted and vendored mode write):
+/// four convenience links in the workspace root, under any
+/// `--symlink_prefix`, and sometimes an output base or a vendor directory
+/// inside the checkout. The execution root mirrors every top-level entry of
+/// the workspace, `package.json` included. A walk that does not follow
+/// links takes such a link for a member it cannot inspect, and one that
+/// enters an output base reads thousands of fetched and mirrored manifests
+/// as the project's own; either way every npm package ends up withheld.
+///
+/// `true` only on proof, by the markers Bazel writes and never by a name
+/// (`bazel::output_tree`):
+///
+/// - a directory that is the root of an output base, of a contents-cache or
+///   repository-cache entry, or of a vendor directory;
+/// - a link to such a root;
+/// - a link outside every such tree that leads into one
+///   ([`PathClass::Link`]).
+///
+/// Anything else is left to the caller, which handles it as it did before:
+/// a marker the disk would not show, a link in an in-memory project (it
+/// has no target to judge), and an entry *inside* a tree whose root lies
+/// above the walk. In the last case the whole walk runs inside Bazel's
+/// tree, which is for the caller's scope check to refuse, not for a member
+/// walk to hide.
+pub(crate) fn bazel_owned(view: &ProjectView<'_>, rel: &str) -> bool {
+    // Read through a link as well: a link to a tree's root shows the
+    // markers of that root. No rc file is read here, so a `--vendor_dir`
+    // is known by the marker `bazel vendor` writes into it; before that
+    // run the directory holds nothing to take for a member.
+    let own = output_tree::tree_at(&ViewTree(view), Path::new(rel), &[]);
+    if own.tree.is_some() {
+        return true;
+    }
+    if !view.is_symlink(rel) {
+        return false;
+    }
+    // Where a link leads only the disk knows. The link is fingerprinted
+    // (entry and target), the markers of the tree it leads into are not:
+    // Bazel writes them when a server first starts in an output base and
+    // removes them only with the base, which takes the link's target along.
+    let Some(root) = view.disk_root_reading([rel]) else {
+        return false;
+    };
+    crate::crawlers::bazel_output::classify(&root.join(rel)).class == PathClass::Link
+}
+
+/// What is behind a [`ProjectView`], as the marker rules ask for it. Only
+/// [`output_tree::tree_at`] is put to it, which asks for no link target.
+struct ViewTree<'a, 'v>(&'a ProjectView<'v>);
+
+impl TreeFs for ViewTree<'_, '_> {
+    fn stat(&self, path: &Path) -> Entry {
+        // `/`-separated, the way a view (and an in-memory key) spells it.
+        let rel = if path.is_absolute() {
+            path.to_string_lossy().into_owned()
+        } else {
+            let names = path.components().map(|c| c.as_os_str().to_string_lossy());
+            names.collect::<Vec<_>>().join("/")
+        };
+        // Named to the view first, so a recording snapshot fingerprints
+        // each marker the answer rests on.
+        let Some(root) = self.0.disk_root_reading([&rel]) else {
+            return if self.0.is_file(&rel) {
+                Entry::File
+            } else if self.0.is_dir(&rel) {
+                Entry::Dir
+            } else {
+                Entry::Neither
+            };
+        };
+        // One `stat` per marker (`is_file` then `is_dir` would be two),
+        // and an error that is not "absent" stays unknown.
+        use std::io::ErrorKind::{InvalidFilename, NotADirectory, NotFound};
+        match std::fs::metadata(root.join(&rel)) {
+            Ok(meta) if meta.is_file() => Entry::File,
+            Ok(meta) if meta.is_dir() => Entry::Dir,
+            Ok(_) => Entry::Neither,
+            Err(err) => match err.kind() {
+                NotFound | NotADirectory | InvalidFilename => Entry::Neither,
+                _ => Entry::Unknown,
+            },
+        }
+    }
+
+    fn read_link(&self, _path: &Path) -> Option<PathBuf> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2345,5 +2447,163 @@ mod tests {
             }
         }
         assert!((10_000..230_000).contains(&matched), "{matched}");
+    }
+
+    fn put(root: &Path, rel: &str) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "{}").unwrap();
+    }
+
+    /// HZ-17: a Bazel tree inside the checkout is known by the marker Bazel
+    /// wrote at its root, on disk, under a snapshot and in memory alike. A
+    /// name proves nothing, a marker name on the wrong kind of entry
+    /// proves nothing, and a directory inside a tree is not a root.
+    #[test]
+    fn bazel_trees_are_known_by_their_markers_in_every_view() {
+        use crate::vendor::lock_inventory::{DiskSnapshot, MemoryEntry, MemoryProject};
+
+        const FILES: [&str; 12] = [
+            // An output base (probe C8: `--output_base=<ws>/out`).
+            "out/DO_NOT_BUILD_HERE",
+            "out/execroot/_main/package.json",
+            "out/external/npm__left-pad/package.json",
+            // Vendor directories: 7.3 and later, and 7.1.2 to 7.2.1.
+            "third_party/bazel/VENDOR.bazel",
+            "third_party/bazel/npm__left-pad/package.json",
+            "old_vendor/.vendorignore",
+            // A contents-cache entry.
+            "cache/contents/7f/0.recorded_inputs",
+            "cache/contents/7f/0/package.json",
+            // Named like Bazel's, or holding a marker's name, and plain.
+            "bazel-bin/package.json",
+            "notes/DO_NOT_BUILD_HERE",
+            "docs/VENDOR.bazel/readme.md",
+            "packages/a/package.json",
+        ];
+        let tmp = tempfile::tempdir().unwrap();
+        let mut memory = MemoryProject::new();
+        for rel in FILES {
+            put(tmp.path(), rel);
+            memory.insert(rel, MemoryEntry::Present);
+        }
+        let snapshot = DiskSnapshot::new(tmp.path());
+        let views = [
+            ProjectView::Disk(tmp.path()),
+            ProjectView::Snapshot(&snapshot),
+            ProjectView::Memory(&memory),
+        ];
+        for (rel, owned) in [
+            ("out", true),
+            ("third_party/bazel", true),
+            ("old_vendor", true),
+            ("cache/contents/7f/0", true),
+            ("out/external/npm__left-pad", false),
+            ("third_party", false),
+            ("bazel-bin", false),
+            ("notes", false),
+            ("docs", false),
+            ("packages/a", false),
+            ("absent", false),
+        ] {
+            for view in &views {
+                assert_eq!(bazel_owned(view, rel), owned, "{rel} in {view:?}");
+            }
+        }
+        // An absolute path is read as it is, as a walk spells an ancestor.
+        let out = tmp.path().join("out");
+        assert!(bazel_owned(&views[0], &out.to_string_lossy()));
+    }
+
+    /// HZ-17: a link is Bazel's when it leads into one of Bazel's trees,
+    /// whatever it is called and whether or not its target still exists
+    /// (probe B4: `--symlink_prefix=dist/` moves the links, and a `clean`
+    /// leaves them stale). An ordinary link, a link whose output base is
+    /// gone, and a link met by a walk that itself runs inside a tree are
+    /// the caller's, as before.
+    #[cfg(unix)]
+    #[test]
+    fn links_are_bazels_by_where_they_lead() {
+        use crate::vendor::lock_inventory::{DiskSnapshot, MemoryEntry, MemoryProject};
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (ws, base) = (tmp.path().join("ws"), tmp.path().join("user_root/0a1b"));
+        let execroot = base.join("execroot/_main");
+        put(&base, "DO_NOT_BUILD_HERE");
+        put(&execroot, "bazel-out/k8-fastbuild/bin/package.json");
+        put(&base, "external/repo/pkg/package.json");
+        put(&ws, "packages/a/package.json");
+        std::fs::create_dir_all(ws.join("dist")).unwrap();
+        let out = execroot.join("bazel-out");
+        for (link, target) in [
+            ("bazel-bin", out.join("k8-fastbuild/bin")),
+            ("bazel-ws", execroot.clone()),
+            ("dist/bin", out.join("k8-fastbuild/bin")),
+            // Never built: the link is stale and its base is live.
+            ("bazel-testlogs", out.join("k8-fastbuild/testlogs")),
+            ("base", base.clone()),
+            ("member", ws.join("packages/a")),
+            (
+                "bazel-out",
+                tmp.path().join("expunged/execroot/_main/bazel-out"),
+            ),
+        ] {
+            symlink(target, ws.join(link)).unwrap();
+        }
+        let snapshot = DiskSnapshot::tracked(&ws);
+        snapshot.begin_recording();
+        for (link, owned) in [
+            ("bazel-bin", true),
+            ("bazel-ws", true),
+            ("dist/bin", true),
+            ("bazel-testlogs", true),
+            ("base", true),
+            ("member", false),
+            ("bazel-out", false),
+        ] {
+            for view in [ProjectView::Disk(&ws), ProjectView::Snapshot(&snapshot)] {
+                assert_eq!(bazel_owned(&view, link), owned, "{link} in {view:?}");
+            }
+        }
+        assert!(
+            snapshot.end_recording().is_some(),
+            "judging a link must not cost the snapshot its recording"
+        );
+
+        // A listed link has no target: not judged.
+        let mut memory = MemoryProject::new();
+        memory.insert("bazel-bin", MemoryEntry::Symlink);
+        assert!(!bazel_owned(&ProjectView::Memory(&memory), "bazel-bin"));
+
+        // A project inside the output base (a repository rule's hook runs
+        // there): its entries are in a tree, and none is a tree or a link
+        // into one.
+        let repo = base.join("external/repo");
+        symlink(repo.join("pkg"), repo.join("link")).unwrap();
+        for entry in ["pkg", "link"] {
+            assert!(!bazel_owned(&ProjectView::Disk(&repo), entry), "{entry}");
+        }
+    }
+
+    /// The markers an answer rested on are in the snapshot's read set, so a
+    /// cached discovery is not reused once a directory has become a tree.
+    #[test]
+    fn a_recording_snapshot_fingerprints_the_markers() {
+        use crate::vendor::lock_inventory::DiskSnapshot;
+
+        let tmp = tempfile::tempdir().unwrap();
+        put(tmp.path(), "third_party/npm__left-pad/package.json");
+        let snapshot = DiskSnapshot::tracked(tmp.path());
+        snapshot.begin_recording();
+        assert!(!bazel_owned(
+            &ProjectView::Snapshot(&snapshot),
+            "third_party"
+        ));
+        let reads = snapshot.end_recording().expect("every probe is recorded");
+        assert!(reads.unchanged());
+        put(tmp.path(), "third_party/VENDOR.bazel");
+        assert!(!reads.unchanged(), "a new marker must invalidate the reads");
+        assert!(bazel_owned(&ProjectView::Disk(tmp.path()), "third_party"));
     }
 }
