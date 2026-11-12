@@ -1278,7 +1278,7 @@ mod tests {
             listed.insert(dir.join(file));
         }
         assert_eq!(listed, on_disk);
-        assert!(listed.len() >= 56);
+        assert!(listed.len() >= 100);
         // No fixture is a file Bazel would take for a workspace boundary.
         let boundary = [
             "MODULE.bazel",
@@ -2104,16 +2104,33 @@ mod tests {
     }
 
     /// Probe L1.d: a lock whose recorded digest was replaced by hand
-    /// passes `error` mode and builds the unpatched package, on every
-    /// line. Digest equality alone is therefore no evidence: the entry's
-    /// repository specs must carry the new pin too.
+    /// passes `error` mode and builds the unpatched package, on each of
+    /// the eight releases the probe ran. Digest equality alone is
+    /// therefore no evidence: the entry's repository specs must carry
+    /// the new pin too. The eight locks cover both families, the three
+    /// input containers and both spellings of a spec's rule.
     #[test]
     fn a_forged_digest_is_told_from_a_refresh_by_the_repository_specs() {
-        for line in ["7.0.2", "7.7.2", "9.3.2"] {
+        let mut shapes = BTreeSet::new();
+        for (line, version, family_a) in [
+            ("6.6.0", 3, true),
+            ("7.0.2", 3, true),
+            ("7.1.2", 6, true),
+            ("7.7.2", 13, false),
+            ("8.4.2", 18, false),
+            ("8.8.2", 28, false),
+            ("9.3.2", 28, false),
+            ("10.0.0rc3", 28, false),
+        ] {
             let dir = format!("module_lock/stale-repair/bazel-{line}");
             let after = Workspace::new(&dir, &[("dep.lock", "dep.lock.after")]);
             let before = Workspace::new(&dir, &[("dep.lock", "dep.lock.before")]);
-            let read = |name: &str| lock(&format!("{dir}/{name}.MODULE.bazel.lock"));
+            let read = |name: &str| {
+                let lock = lock(&format!("{dir}/{name}.MODULE.bazel.lock"));
+                assert_eq!(lock.lock_file_version(), Some(version), "{line} {name}");
+                assert_eq!(matches!(lock, ModuleLock::FamilyA(_)), family_a, "{line}");
+                lock
+            };
             let state = |lock: &ModuleLock, files: &Workspace| {
                 let verdicts = ext(lock).input_verdicts(files);
                 let [verdict] = verdicts.as_slice() else {
@@ -2143,7 +2160,38 @@ mod tests {
                 (InputState::Stale, true),
                 "{line}"
             );
+
+            // The forged lock is the baseline with one digest replaced:
+            // the entry differs in its recorded input and in nothing
+            // else, the repository specs included.
+            let entry = |lock: &ModuleLock| ext(lock).entries_of("//:ext.bzl", "toy")[0].clone();
+            let (was, forged, updated) = (entry(&baseline), entry(&forged), entry(&updated));
+            assert_eq!(forged.platform, GENERAL, "{line}");
+            assert_eq!(forged.repo_specs, was.repo_specs, "{line}");
+            assert_ne!(updated.repo_specs, was.repo_specs, "{line}");
+            assert_ne!(forged.inputs, was.inputs, "{line}");
+            assert_eq!(forged.inputs, updated.inputs, "{line}");
+            let spec = &forged.repo_specs[0];
+            assert_eq!(spec.name, "dep_a", "{line}");
+            assert_eq!(
+                spec.rule.as_deref(),
+                Some("@@//:ext.bzl%toy_repo"),
+                "{line}"
+            );
+            assert_eq!(spec.attributes["content"], "upstream-a-1.0", "{line}");
+            shapes.insert((version, forged.inputs[0].key.clone()));
         }
+        let shapes: Vec<_> = shapes.iter().map(|(v, key)| (*v, key.as_str())).collect();
+        assert_eq!(
+            shapes,
+            [
+                (3, "@@//:dep.lock"),
+                (6, "@@//dep.lock"),
+                (13, "@@//dep.lock"),
+                (18, "@@//dep.lock"),
+                (28, "@@//dep.lock"),
+            ]
+        );
     }
 
     #[test]
@@ -2280,6 +2328,68 @@ mod tests {
         assert!(repaired.dists(PYPI, "six").is_empty());
         assert_eq!(repaired.holds_digest(PYPI, "six", SIX_1_17), not_held);
         assert_eq!(repaired.dist_hashes[0].packages.len(), 31);
+    }
+
+    /// Probe Y1 (`rules-python/RESULTS.md` 2.2): a hub that resolves
+    /// through its own index (`experimental_index_url`) has its packages
+    /// under that index's URL, beside the pypi.org packages of
+    /// rules_python's own hubs. The pin is looked up under the hub's
+    /// index and nowhere else. After the hosted rewrite of `spvictim`,
+    /// Bazel's `update` removes that one member, in both fact versions.
+    #[test]
+    fn pip_facts_are_keyed_by_the_index_the_hub_resolves_through() {
+        const INDEX: &str = "https://127.0.0.1:47292/simple";
+        // The wheels the requirements file pinned before the rewrite.
+        const VICTIM: &str = "cecf23d2e612215c6512613873a29337301ed66f92a1e81810ce20d8f3bab993";
+        const DEP: &str = "ba58fd28227ddfb1aa681e7dd02f1e9eeafff1690bc965f515579f844f6099a1";
+        let (held, not_held) = (FactDigest::Held, FactDigest::NotHeld);
+        for (dir, fact_version, of_other_hubs) in [
+            ("pip-index-v1", PipFactVersion::V1, 32),
+            ("pip-index-v2", PipFactVersion::V2, 31),
+        ] {
+            let dir = format!("module_lock/facts/{dir}");
+            // The root file names the index.
+            let root = String::from_utf8(bytes(&format!("{dir}/root.MODULE.bazel"))).unwrap();
+            assert!(root.contains(&format!("experimental_index_url = \"{INDEX}\"")));
+            let read = |name: &str| {
+                let lock = lock(&format!("{dir}/{name}.MODULE.bazel.lock"));
+                assert_eq!(lock.lock_file_version(), Some(28), "{dir}");
+                assert_eq!(lock.entries_of(PIP.0, PIP.1), Some(Vec::new()), "{dir}");
+                let facts = lock.facts_of(PIP.0, PIP.1).unwrap();
+                let [facts] = facts.as_slice() else {
+                    panic!("{dir}/{name}: {} pip facts", facts.len());
+                };
+                facts.pip().unwrap()
+            };
+            let indexes = |facts: &PipFacts| -> Vec<(String, usize)> {
+                let row = |index: &PipIndex| (index.url.clone(), index.packages.len());
+                facts.dist_hashes.iter().map(row).collect()
+            };
+            let rows =
+                |hub: usize| vec![(INDEX.to_string(), hub), (PYPI.to_string(), of_other_hubs)];
+
+            let baseline = read("baseline");
+            assert_eq!(baseline.fact_version, fact_version, "{dir}");
+            assert_eq!(indexes(&baseline), rows(2), "{dir}");
+            assert_eq!(baseline.holds_digest(INDEX, "spvictim", VICTIM), held);
+            assert_eq!(baseline.holds_digest(INDEX, "spdep", DEP), held);
+            // Another package of the index, and the package under an
+            // index the hub does not resolve through.
+            assert_eq!(baseline.holds_digest(INDEX, "spdep", VICTIM), not_held);
+            assert_eq!(baseline.holds_digest(PYPI, "spvictim", VICTIM), not_held);
+
+            let repaired = read("bazel-repaired");
+            assert_eq!(indexes(&repaired), rows(1), "{dir}");
+            assert!(repaired.dists(INDEX, "spvictim").is_empty(), "{dir}");
+            assert_eq!(repaired.holds_digest(INDEX, "spvictim", VICTIM), not_held);
+            assert_eq!(repaired.holds_digest(INDEX, "spdep", DEP), held);
+            // Nothing else moved: the other hubs' packages are as they were.
+            assert_eq!(repaired.dist_hashes[1], baseline.dist_hashes[1], "{dir}");
+            assert_eq!(
+                repaired.dists(INDEX, "spdep"),
+                baseline.dists(INDEX, "spdep")
+            );
+        }
     }
 
     #[test]
@@ -2479,5 +2589,32 @@ mod tests {
             value: serde_json::json!([]),
         };
         assert_eq!(list.keys(), None);
+    }
+
+    /// The rules_rs probe (`rust-vendor-rules-rs/RESULTS.md`, cell
+    /// `rs0026-b88-single`): rules_rs keys its facts `<name>_<version>`,
+    /// one per crate of every hub in the module graph, and its `crate`
+    /// extension is reproducible, so no entry stands beside them. This
+    /// lock is rules_rs 0.0.26 on Bazel 8.8.2, whose one fact is the one
+    /// crate the project locks; by 0.0.61 rules_rs has hubs of its own,
+    /// and a one-crate project's lock then holds 303 keys.
+    #[test]
+    fn rules_rs_facts_are_keyed_by_crate_name_and_version() {
+        const CRATE: (&str, &str) = ("//rs:extensions.bzl", "crate");
+        let lock = lock("module_lock/facts/rules-rs/baseline.MODULE.bazel.lock");
+        assert_eq!(lock.lock_file_version(), Some(28));
+        assert_eq!(lock.entries_of(CRATE.0, CRATE.1), Some(Vec::new()));
+        let facts = lock.facts_of(CRATE.0, CRATE.1).unwrap();
+        let [facts] = facts.as_slice() else {
+            panic!("{} crate facts", facts.len());
+        };
+        assert_eq!(facts.id.raw, "@@rules_rs+//rs:extensions.bzl%crate");
+        assert_eq!(facts.keys(), Some(vec!["cfg-if_1.0.4"]));
+        // The value is the crate's index metadata as one JSON string.
+        let metadata = facts.value["cfg-if_1.0.4"].as_str().unwrap();
+        assert!(serde_json::from_str::<Value>(metadata).unwrap().is_object());
+        // They are no other ruleset's facts.
+        assert!(facts.pip().is_err() && facts.go_deps().is_err());
+        assert_eq!(lock.facts().map(<[ExtensionFacts]>::len), Some(1));
     }
 }

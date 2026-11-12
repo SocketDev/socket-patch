@@ -1,0 +1,5 @@
+module(name = "toy_lock_probe", version = "0.0.0")
+
+toy = use_extension("//:ext.bzl", "toy")
+toy.from_file(lock = "//:dep.lock")
+use_repo(toy, "dep_a", "dep_b")

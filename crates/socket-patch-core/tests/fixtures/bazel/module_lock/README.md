@@ -37,8 +37,9 @@ Source: `versions-hybrid/vectors/locks/mvs-lift/<bazel>/` and `.../stale/9.3.2/{
 
 ## `facts/`: the top-level `facts` of Bazel 8.5 and later
 
-Probe L3 (`lockfile/RESULTS.md`, section L3). Every lock is version 28 and has no
-`moduleExtensions` entry for the extension whose facts it holds.
+Probe L3 (`lockfile/RESULTS.md`, section L3), and for the last three rows the rules_python
+and rules_rs probe groups. Every lock is version 28 and has no `moduleExtensions` entry for the
+extension whose facts it holds.
 
 | Directory | Cell | Files |
 |---|---|---|
@@ -46,15 +47,25 @@ Probe L3 (`lockfile/RESULTS.md`, section L3). Every lock is version 28 and has n
 | `pip-v2/` | rules_python 2.5.0-rc4 on Bazel 9.3.2, `fact_version` `v2` (`sha256:<hex>`) | `baseline`, and `bazel-repaired`, where `six` is gone |
 | `go-deps/` | gazelle 2.0.0-beta.2, rules_go 0.65.0 on Bazel 9.3.2 | `baseline`: 172 list members. `bazel-repaired`: 173, after `replace github.com/pkg/errors => github.com/pkg/errors v0.8.1` (`after-rewrite.go.mod`, `after-rewrite.go.sum`); a member was added, none replaced. Both also hold rules_go's `go_sdk` facts |
 | `toy/` | a root-module extension that returns facts (`ext.bzl`), Bazel 8.8.2 | `baseline`, and `hand-repaired` with the `dep_a@index` key deleted, which Bazel accepted (`after-rewrite.dep.lock` is the input in that state) |
+| `pip-index-v1/` | rules_python 2.0.3 on Bazel 8.8.2, `fact_version` `v1`; the hub resolves through its own index (`experimental_index_url = "https://127.0.0.1:47292/simple"` in `root.MODULE.bazel`, a fixture server of the probe) | `baseline`: `dist_hashes` has two indexes, the hub's with `spdep` and `spvictim` and pypi.org with the 32 packages of other modules' hubs. `bazel-repaired`: after the `spvictim` line became a direct reference and a build ran in the default lockfile mode (`update`); that one member is gone and nothing else changed |
+| `pip-index-v2/` | the same hub with rules_python 2.5.0-rc4 on Bazel 9.3.2, `fact_version` `v2` | `baseline` and `bazel-repaired`, as above; pypi.org has 31 packages |
+| `rules-rs/` | rules_rs 0.0.26, rules_rust 0.66.0 on Bazel 8.8.2, one crate (`root.MODULE.bazel`) | `baseline`: the facts of `@@rules_rs+//rs:extensions.bzl%crate` are one key, `cfg-if_1.0.4`, whose value is the crate's index metadata as a JSON string. On rules_rs 0.2.2 the same project's lock holds 303 keys, the crates of rules_rs's own four hubs included (rules_rs 0.0.26 has none); that lock is 377 KB and is not committed |
 
 Source: `lockfile/vectors/facts/l3-rp2.0.3-b8.8.2/`, `l3-rp2.5.0-rc4-b9.3.2/`,
-`l3-gz2.0.0-beta.2-b9.3.2/` (its `final` lock is `bazel-repaired` here) and `l3-toy-8.8.2/`.
+`l3-gz2.0.0-beta.2-b9.3.2/` (its `final` lock is `bazel-repaired` here) and `l3-toy-8.8.2/`;
+`rules-python/vectors/facts/rp2.0.3-index-b8.8.2/` and `rp2.5.0-index-b9.3.2/` (`before.lock.json`
+is `baseline` here, `after-bazel-update.lock.json` is `bazel-repaired`; `rules-python/RESULTS.md`
+2.2), with the root files of `rules-python/y1/rp2.0.3-index-b8.8.2/` and
+`rules-python/y1-rp2.5.0-index/`; `rust-vendor-rules-rs/rs0026-b88-single/`
+(`rust-vendor-rules-rs/RESULTS.md`, the table under H1).
 
 ## `stale-repair/`: a forged digest
 
-Probe L1 (`lockfile/RESULTS.md`, steps S0, S5, S6), on Bazel 7.0.2 (lock version 3), 7.7.2 (13)
-and 9.3.2 (28). The toy extension (`ext.bzl`, `root.MODULE.bazel`) reads `//:dep.lock` and makes
-one repository per line.
+Probe L1 (`lockfile/RESULTS.md`, row L1.d, steps S0, S5, S6), on each of the eight releases
+it ran: Bazel 6.6.0 and 7.0.2 (lock version 3), 7.1.2 (6), 7.7.2 (13), 8.4.2 (18), 8.8.2, 9.3.2
+and 10.0.0rc3 (28). The first three write a family-A lock. The toy extension (`ext.bzl`,
+`root.MODULE.bazel`) reads `//:dep.lock` and makes one repository per line; the four input files
+are the same bytes in every directory.
 
 | File | What |
 |---|---|

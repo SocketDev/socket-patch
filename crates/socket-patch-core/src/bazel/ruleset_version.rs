@@ -24,12 +24,15 @@
 //! This file reads no workspace file. The caller folds `MODULE.bazel`, the
 //! rc flags and the Bazel line into [`Evidence`], and for a `WORKSPACE`
 //! hub hands [`workspace_hub`] the verdict of the one function that knows
-//! which `WORKSPACE` definition Bazel builds.
+//! which `WORKSPACE` definition Bazel builds. The two inputs of the
+//! override rows are read off the model's own types here, so that no
+//! caller folds them another way: [`ignore_dev_dependency`] from the
+//! effective flags and [`LineSpan::of`] from the Bazel line.
 
 use std::cmp::Ordering;
 
 use super::module_lock::{FamilyA, FamilyB, ModuleLock};
-use super::rc::LockfileMode;
+use super::rc::{Chain, EffectiveFlags, Flag, LockfileMode};
 use super::version::{lock_token_releases, lockfile_mode_default, BazelLine, BazelVersion};
 
 /// `{lo, hi}`, each side with its own evidence. `None` is unknown.
@@ -201,6 +204,42 @@ impl LineSpan {
             prerelease: false,
         }
     }
+
+    /// The releases `line` can be, as [`Evidence::line`] takes them.
+    /// `None`, which every row reads as an unknown line, unless both ends
+    /// are known: a line with an open end can be a release no table here
+    /// holds.
+    ///
+    /// A candidate at either end (`7.4.0rc1`, or the `N.0.0rc0` bottom
+    /// of an `N.*` track) counts as its release and marks the span a
+    /// prerelease, so a line that ends at `7.4.0rc1` is not proven below
+    /// 7.4.0. The ceiling of a floating major is kept as it is: it lies
+    /// above every release a table names.
+    pub fn of(line: &BazelLine) -> Option<Self> {
+        let (lo, hi) = (line.lo?, line.hi?);
+        let release = |version: BazelVersion| Release(version.major, version.minor, version.patch);
+        Some(Self {
+            lo: release(lo),
+            hi: release(hi),
+            prerelease: !lo.is_final() || !hi.is_final(),
+        })
+    }
+}
+
+/// [`Evidence::ignore_dev_dependency`] from the tracked rc files: whether
+/// `--ignore_dev_dependency` is on, or may be, on any command chain.
+///
+/// It is when some reading of some chain gives the flag a value other
+/// than `false`, set outright or only under a named config (`common:ci
+/// --ignore_dev_dependency`). It also is when a file Bazel is sure to
+/// load could not be read, because that file may set it. An optional
+/// file that is absent does not count.
+pub fn ignore_dev_dependency(flags: &EffectiveFlags) -> bool {
+    let may_be_on = |chain: &Chain| {
+        let state = flags.state(Flag::IgnoreDevDependency, *chain);
+        state.values().into_iter().any(|value| value != "false")
+    };
+    Chain::COMMANDS.iter().any(may_be_on) || flags.gaps().iter().any(|gap| gap.hard)
 }
 
 impl Release {
@@ -299,12 +338,12 @@ pub struct Evidence<'a> {
     /// Every root override, on any module.
     pub overrides: &'a [RootOverride],
     /// `--ignore_dev_dependency` is set, or possible under a named
-    /// config, on any command chain.
+    /// config, on any command chain: [`ignore_dev_dependency`].
     pub ignore_dev_dependency: bool,
     /// `--check_direct_dependencies=error` is set unconditionally on the
     /// `build` chain.
     pub check_direct_dependencies_error: bool,
-    /// `None` = the Bazel line is unknown.
+    /// `None` = the Bazel line is unknown: [`LineSpan::of`].
     pub line: Option<LineSpan>,
     /// Whether Bazel reads the lock at all.
     pub lockfile: LockfileFlag,
@@ -769,6 +808,7 @@ fn compare(a: &str, b: &str) -> Option<Ordering> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bazel::version::module_version_cmp;
     use std::path::Path;
 
     fn bytes(rel: &str) -> Vec<u8> {
@@ -850,6 +890,12 @@ mod tests {
     /// becomes when no release of the lock's `lockFileVersion` is it.
     fn major(major: u32) -> Option<LineSpan> {
         span(Release(major, 0, 0), Release(major, u32::MAX, u32::MAX))
+    }
+
+    /// `X.Y.Z` as a release.
+    fn release_of(text: &str) -> Release {
+        let version = BazelVersion::parse(text).unwrap();
+        Release(version.major, version.minor, version.patch)
     }
 
     /// A byte-real lock of the lockfile probe: the same root file, with
@@ -1788,6 +1834,153 @@ mod tests {
         );
     }
 
+    /// The same T0 case from the files themselves: `.bazelrc` holds
+    /// `common:ci --ignore_dev_dependency`, the flag is folded from the
+    /// effective flags and the span from the model's Bazel line.
+    #[test]
+    fn the_override_rows_take_the_flag_state_and_the_bazel_line() {
+        use crate::bazel::rc::read;
+        use crate::bazel::rc::testing::Files;
+
+        let release = |text: &str| BazelLine::of(BazelVersion::parse(text).unwrap());
+        let rc = |text: &str| Files::of(&[(".bazelrc", text)]);
+        let deps = [dep("rules_python", "1.4.0")];
+        let overrides = [over("rules_python", pinned("1.5.0"))];
+        let resolve_in = |files: &Files, line: &BazelLine| {
+            let flags = read(files).effective(line);
+            resolve(&Evidence {
+                overrides: &overrides,
+                ignore_dev_dependency: ignore_dev_dependency(&flags),
+                line: LineSpan::of(line),
+                ..evidence("rules_python", &deps)
+            })
+        };
+        let pin = exact("1.5.0", Source::SingleVersionOverride);
+        let union = (Some(("1.4.0", Source::Declared)), None);
+
+        let ci = rc("common:ci --ignore_dev_dependency\n");
+        for line in [
+            release("7.7.2"),
+            release("7.4.0"),
+            release("8.8.2"),
+            // A candidate of 7.4.0 is not proven older than 7.4.0.
+            release("7.4.0rc1"),
+            BazelLine::unknown(),
+        ] {
+            let verdict = resolve_in(&ci, &line);
+            assert!(!verdict.at_least("1.5.0"), "{line}");
+            assert_eq!(sides(&verdict), union, "{line}");
+        }
+        // On 9.3.2 `bazel_tools` requires rules_python 1.7.0, so without
+        // the override Bazel selects at least that: the pin is the lower
+        // of the two states, and nothing bounds the version from above.
+        let floored = resolve_in(&ci, &release("9.3.2"));
+        assert_eq!(
+            sides(&floored),
+            (Some(("1.5.0", Source::SingleVersionOverride)), None)
+        );
+        // 7.3.2 still honours the override under the flag, and with no
+        // such rc line the pin stands on every line.
+        assert_eq!(sides(&resolve_in(&ci, &release("7.3.2"))), pin);
+        let plain = rc("build --lockfile_mode=error\n");
+        for line in [release("7.7.2"), BazelLine::unknown()] {
+            assert_eq!(sides(&resolve_in(&plain, &line)), pin, "{line}");
+        }
+    }
+
+    /// `--ignore_dev_dependency` counts when any reading of any command
+    /// chain may switch it on, and when a file Bazel is sure to load was
+    /// not read.
+    #[test]
+    fn the_flag_is_folded_over_every_chain_and_config() {
+        use crate::bazel::model::FileText;
+        use crate::bazel::rc::read;
+        use crate::bazel::rc::testing::Files;
+
+        let line = BazelLine::of(BazelVersion::new(7, 7, 2));
+        let on = |files: &Files| ignore_dev_dependency(&read(files).effective(&line));
+        let rc = |text: &str| Files::of(&[(".bazelrc", text)]);
+        for text in [
+            "common --ignore_dev_dependency\n",
+            "build --ignore_dev_dependency=1\n",
+            // `mod` inherits nothing from `build`: one chain is enough.
+            "mod --ignore_dev_dependency\n",
+            "common:ci --ignore_dev_dependency\n",
+            "build:release --ignore_dev_dependency=yes\n",
+            // Off under one config only.
+            "common --ignore_dev_dependency\ncommon:dev --noignore_dev_dependency\n",
+            // A value Bazel rejects is not a proof that the flag is off.
+            "common --ignore_dev_dependency=maybe\n",
+            // A plain import of a file that is not there stops Bazel;
+            // what it would set is not known.
+            "import %workspace%/ci.rc\n",
+        ] {
+            assert!(on(&rc(text)), "{text}");
+        }
+        assert!(on(&Files::of(&[]).with(".bazelrc", FileText::Unreadable)));
+        for text in [
+            "",
+            "build --lockfile_mode=error\n",
+            "common --noignore_dev_dependency\n",
+            "common --ignore_dev_dependency\ncommon --ignore_dev_dependency=false\n",
+            "common:ci --noignore_dev_dependency\n",
+            // The usual per-user file, absent.
+            "try-import %workspace%/user.bazelrc\n",
+        ] {
+            assert!(!on(&rc(text)), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_bazel_line_is_a_span_only_when_both_ends_are_known() {
+        let version = |text: &str| BazelVersion::parse(text).unwrap();
+        let line = |lo: Option<BazelVersion>, hi: Option<BazelVersion>| BazelLine {
+            lo,
+            hi,
+            evidence: Vec::new(),
+        };
+        let of = |lo: &str, hi: &str| LineSpan::of(&line(Some(version(lo)), Some(version(hi))));
+        assert_eq!(
+            of("7.7.2", "7.7.2"),
+            Some(LineSpan::exact(Release(7, 7, 2)))
+        );
+        assert_eq!(
+            of("7.1.0", "7.7.2"),
+            span(Release(7, 1, 0), Release(7, 7, 2))
+        );
+        // A floating major (`9.x`) keeps its ceiling, so no floor and no
+        // family-A row applies to it.
+        let floating = line(Some(version("9.0.0")), Some(BazelVersion::ceiling(9)));
+        assert_eq!(LineSpan::of(&floating), major(9));
+        assert_eq!(
+            bazel_tools_floor("rules_python", LineSpan::of(&floating)),
+            None
+        );
+        // A candidate at either end counts as its release and marks the
+        // span: `9.*` starts at the first candidate of 9.0.0.
+        let candidates = |lo: &str, hi: &str| LineSpan {
+            prerelease: true,
+            ..span(release_of(lo), release_of(hi)).unwrap()
+        };
+        assert_eq!(
+            of("8.0.0rc1", "8.0.0rc1"),
+            Some(candidates("8.0.0", "8.0.0"))
+        );
+        assert_eq!(of("7.3.2", "7.4.0rc1"), Some(candidates("7.3.2", "7.4.0")));
+        let track = line(Some(version("9.0.0rc0")), Some(BazelVersion::ceiling(9)));
+        assert_eq!(
+            LineSpan::of(&track),
+            Some(LineSpan {
+                prerelease: true,
+                ..major(9).unwrap()
+            })
+        );
+        // An open end, or no evidence at all, is an unknown line.
+        assert_eq!(LineSpan::of(&BazelLine::unknown()), None);
+        assert_eq!(LineSpan::of(&line(Some(version("8.0.0")), None)), None);
+        assert_eq!(LineSpan::of(&line(None, Some(version("7.3.2")))), None);
+    }
+
     /// Under the flag the lock was written with the overrides or
     /// without them, and an override on another module moves this one
     /// too: the lock is evidence in neither state.
@@ -2011,6 +2204,13 @@ mod tests {
                 Some(Ordering::Greater),
                 "{lower} {higher}"
             );
+            // The order `bazel/version.rs` holds (design 2.1) is the
+            // same one: a change to either port shows here.
+            assert_eq!(
+                module_version_cmp(lower, higher),
+                Some(Ordering::Less),
+                "{lower} {higher}"
+            );
         }
         // The build part does not take part.
         assert_eq!(compare("1.0.0+build.5", "1.0.0"), Some(Ordering::Equal));
@@ -2020,6 +2220,11 @@ mod tests {
         ] {
             assert_eq!(compare(not_a_version, "1.0.0"), None, "{not_a_version:?}");
             assert_eq!(compare("1.0.0", not_a_version), None, "{not_a_version:?}");
+            // The two ports differ on the empty version alone: there it
+            // is an override's placeholder and sorts above every other.
+            let other = module_version_cmp(not_a_version, "1.0.0");
+            let expected = not_a_version.is_empty().then_some(Ordering::Greater);
+            assert_eq!(other, expected, "{not_a_version:?}");
         }
         // A prerelease of a threshold is below it.
         let rc = VersionVerdict::exact("1.5.0-rc4", Source::Declared);
