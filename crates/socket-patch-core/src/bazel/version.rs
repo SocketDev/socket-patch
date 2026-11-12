@@ -2107,6 +2107,40 @@ mod tests {
                 }
             }
         }
+        // The flag-unknown rows in full (probe C16): either polarity, set
+        // outright or only under a config, on a chain every build reads
+        // or on one command's alone. Each cell names the rc line and the
+        // flag Bazel stops on.
+        for (bazel, flag, since) in [
+            ("5.4.1", "enable_workspace", "7.1.0"),
+            ("6.6.0", "enable_workspace", "7.1.0"),
+            ("7.0.2", "enable_workspace", "7.1.0"),
+            ("5.4.1", "enable_bzlmod", "6.0.0"),
+        ] {
+            for polarity in ["", "no"] {
+                for section in ["common", "common:ci", "build", "query", "query:ci"] {
+                    let rc = format!("# rc\n{section} --{polarity}{flag}\n");
+                    let found = system(&rc, &exact(bazel));
+                    let expected = format!(
+                        ".bazelrc:2: Bazel older than {since} stops on `--{flag}` (Unrecognized option)"
+                    );
+                    assert_eq!(
+                        found,
+                        DepSystem::Unknown { why: expected },
+                        "Bazel {bazel}: {rc:?}"
+                    );
+                }
+            }
+        }
+        // The controls: the first release that knows each flag reads it.
+        for (bazel, rc, expected) in [
+            ("6.6.0", "common --noenable_bzlmod\n", Workspace),
+            ("7.1.0", "common --enable_workspace\n", Hybrid),
+            ("7.1.0", "common --noenable_workspace\n", Bzlmod),
+        ] {
+            assert_eq!(system(rc, &exact(bazel)), expected, "Bazel {bazel}: {rc:?}");
+        }
+
         // The row `5.x | --experimental_enable_bzlmod Set or Possible |
         // Tier::Refused`: with the flag on, the hybrid mode of 5.x is the
         // experiment, so both file families are refused; without it a
