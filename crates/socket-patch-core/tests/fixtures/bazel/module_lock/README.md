@@ -3,12 +3,12 @@
 Locks that real Bazel wrote, for the tests of `socket_patch_core::bazel::module_lock` and
 `bazel::ruleset_version`. Nothing here was written by socket-patch.
 
-- Captured 2026-11-11 on one macOS arm64 machine (Darwin 27.0.0) with bazelisk 1.30.0,
-  `--nohome_rc --nosystem_rc`, one output base per cell. `eval-factors/` also has entries that a
-  Linux arm64 container wrote. Nothing ran on Linux x86_64 or on Windows.
+- Captured 2026-11-11 (`listing/`: 2026-11-12) on one macOS arm64 machine (Darwin 27.0.0) with
+  bazelisk 1.30.0, `--nohome_rc --nosystem_rc`, one output base per cell. `eval-factors/` also has
+  entries that a Linux arm64 container wrote. Nothing ran on Linux x86_64 or on Windows.
 - Each file is a byte-for-byte copy from the campaign's probe directories, which are outside this
-  repository. The one exception is `paket/dn-7.7.2-0.14.0.reduced.MODULE.bazel.lock` (below).
-  No file holds a machine path.
+  repository. The exceptions are `paket/dn-7.7.2-0.14.0.reduced.MODULE.bazel.lock` and the
+  `listing/` directory, whose cell is not kept there (both below). No file holds a machine path.
 - No file has the literal name of a Bazel boundary file: a `MODULE.bazel` is committed as
   `root.MODULE.bazel` or `<name>.MODULE.bazel`, a lock as `<name>.MODULE.bazel.lock`. A test maps
   the name back when it builds a workspace view.
@@ -94,3 +94,30 @@ the `paket.<group>.bzl` it loads fails `--lockfile_mode=error` with `... or one 
 The Socket URLs in these two locks are fixture values (`33333333-...`, `6c6c6c6c-...`).
 
 Source: `ruby-dotnet/dn-9.3.2-0.22.2/`, `ruby-dotnet/dn-7.7.2-0.14.0/`.
+
+## `listing/`: a listed directory, and a path that is not ASCII
+
+A cell of the package's review (2026-11-12), not one of the campaign's probe groups: the cell
+is described here in full and its sources are committed, because no probe directory keeps it.
+
+The workspace: `root.MODULE.bazel`, `ext.bzl`, an empty `BUILD.bazel`, and
+`third_party/café/dep.lock` (`café` in NFC, the bytes `63 61 66 c3 a9`) with the bytes of
+`stale-repair/bazel-9.3.2/dep.lock.before`. The toy extension lists `third_party` and reads
+`dep.lock` in each directory it finds, as a `go.work` `use` line or a glob would find it. On
+8.7.0 and 9.3.2 (`ext.bzl`) it lists the workspace root first; on 7.7.2 (`7.7.2.ext.bzl`) it
+does not. Each lock was written by
+`bazel --nohome_rc --nosystem_rc build --experimental_convenience_symlinks=ignore @dep_a//:data.txt`.
+The tests map the input to its path; no file here has a name that is not ASCII.
+
+| File | What |
+|---|---|
+| `7.7.2.MODULE.bazel.lock` | lock version 13. `recordedFileInputs` holds `@@//third_party/cafÃ©/dep.lock`, the path in Bazel's internal spelling (one character per UTF-8 byte), and `@@//MODULE.bazel`; `recordedDirentsInputs` holds `@@//third_party` |
+| `8.7.0.MODULE.bazel.lock` | version 24. The same file key; `recordedDirentsInputs` holds `@@//` and `@@//third_party`. Written by the first build, when the root held no lock yet |
+| `9.3.2.MODULE.bazel.lock` | version 28. `recordedInputs` holds `FILE:@@// DIR`, `DIRENTS:@@// <digest>`, `FILE:@@//third_party DIR`, `DIRENTS:@@//third_party <digest>` and `FILE:@@//third_party/café/dep.lock <sha256>`, the path in Unicode. Written by the second build, so the root's listing includes `MODULE.bazel.lock`: the first build's lock fails `--lockfile_mode=error` on its own arrival in the root, and this one builds (exit 0) |
+| `9.3.2.after-root-files.MODULE.bazel.lock` | the same workspace after `.bazelignore` and `.socket/bazel/index.json` were created in the root. The `error`-mode build then exits 48 with `directory entries of @@// changed`, and this is what `--lockfile_mode=update` wrote next. It differs from the lock above in the root's `DIRENTS` digest and in nothing else |
+
+Provenance: the three locks named by a Bazel version are byte-for-byte the ones the review
+wrote in a scratch workspace. Each was then written again from the sources above, in a new
+directory, through the campaign's launcher, and came out with the same SHA-256;
+`9.3.2.after-root-files` comes from that second run. Only macOS arm64 ran: how Bazel on Linux or
+Windows spells such a path is not known.
