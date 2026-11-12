@@ -22,22 +22,36 @@
 //! macro of the main repository whose body was read: a `def` in a file the
 //! `WORKSPACE` loads, whose statements are such calls themselves.
 //!
-//! One answer is stricter than Bazel's rule. A definition a macro makes
-//! is exact only when nothing before it in its chunk defined the name, or
-//! could have. Bazel builds the macro's definition there (cases c10 and
-//! r04), but the definition it silently replaces is the one a reader of
-//! the `WORKSPACE` file sees, and the one `gazelle update-repos` would
-//! edit; the answer is unknown, and the remedy is to delete one of the
-//! two.
+//! `bind(name = ...)` puts a target of that name in the table the
+//! repository rules are in, and Bazel's rule above counts it as a
+//! definition. Where a `bind` is the one that rule picks, Bazel finds no
+//! repository of the name (`'@@dep' is not a repository rule` on 7.7.2),
+//! so the answer is unknown; a repository rule after the `bind` in its
+//! chunk takes the name back.
 //!
-//! A statement that is no call, and every computed argument, is judged by
-//! its names: evaluating an expression can reach a function only through
-//! a name written in it. One whose names are all literal constants of the
-//! file or functions that only compute (`str`, `Label`; a method of a
-//! string names nothing) declares no repository. Any other is opaque.
+//! Two answers are stricter than Bazel's rule, and only for a definition
+//! a macro makes. After a definition that was read and stands in its
+//! chunk, Bazel builds the macro's (cases c10 and r04), but the
+//! definition it silently replaces is the one a reader of the `WORKSPACE`
+//! file sees, and the one `gazelle update-repos` would edit: the answer
+//! is unknown, and the remedy is to delete one of the two. And after a
+//! part of its own call that was not read (an argument that runs a
+//! function, a statement of the body) the answer is unknown, because the
+//! body may return before it reaches the rule. A statement that was not
+//! read earlier in the chunk, outside that call, changes nothing:
+//! whatever it defined, the macro's rule replaces it, as a rule of the
+//! `WORKSPACE` file itself would.
 //!
-//! An answer costs one pass over the statements of the file and of the
-//! macros it calls, for each name asked.
+//! A statement that is no call, a call of a function that only computes,
+//! and every computed argument, is judged by its names: evaluating an
+//! expression can reach a function only through a name written in it. One
+//! whose names are all literal constants of the file or functions that
+//! only compute (`str`, `Label`; a method of a string names nothing)
+//! declares no repository. Any other is opaque.
+//!
+//! An answer costs one pass over the statements of the file and a fixed
+//! number over the body of each macro it calls, however often the macro
+//! is called, for each name asked.
 //!
 //! The model also keeps what the hybrid rule needs: the repository each
 //! `load` names. When Bzlmod is on as well and the root module can see
@@ -280,32 +294,50 @@ pub enum OrderWhy {
     Unreadable,
     /// A statement that was not read may define or replace the name.
     Opaque,
-    /// A macro defines the name after something else in its chunk did,
-    /// or may have.
+    /// A macro defines the name after a definition that was read and
+    /// stands in its chunk.
     ReplacedByMacro,
+    /// `bind(name = ...)` takes the name, and nothing after it in its
+    /// chunk is proven to take it back.
+    BoundName,
 }
 
 /// Why no definition is proven to be the one Bazel builds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderGap {
+    /// The file of the statement to look at, relative to the Bazel root:
+    /// the `WORKSPACE` file, or the file of a macro it calls.
     pub file: String,
     pub line: usize,
     pub why: OrderWhy,
+    /// For a statement of a macro body: the `WORKSPACE` file and the line
+    /// of the call that runs the macro.
+    pub called_at: Option<(String, usize)>,
 }
 
 impl OrderGap {
     /// The gap as a refusal detail for repository `name`.
     pub fn to_gap(&self, name: &str) -> Gap {
+        let at = match &self.called_at {
+            Some((file, line)) => format!(
+                "{}:{}, in the macro called at {file}:{line},",
+                self.file, self.line
+            ),
+            None => format!("line {}", self.line),
+        };
         let what = match self.why {
             OrderWhy::Unreadable => "the file cannot be read".to_string(),
-            OrderWhy::Opaque => format!(
-                "the statement at line {} is not read and may define or replace `{name}`",
-                self.line
-            ),
+            OrderWhy::Opaque => {
+                format!("the statement at {at} is not read and may define or replace `{name}`")
+            }
             OrderWhy::ReplacedByMacro => format!(
                 "the macro called at line {} defines `{name}` again in the chunk of an earlier \
                  definition; delete one of the two",
                 self.line
+            ),
+            OrderWhy::BoundName => format!(
+                "`bind(name = \"{name}\")` at {at} takes the name, and no repository rule after \
+                 it in its chunk takes it back; rename or delete the `bind`"
             ),
         };
         Gap {
@@ -493,7 +525,17 @@ impl<'f> Scope<'f> {
                     WsStmtKind::Load(loads - 1)
                 }
                 StmtKind::Call(call) | StmtKind::Bind { call, .. } => {
-                    WsStmtKind::Call(self.call(def, call, &mut seen))
+                    // A function that only computes can still call what
+                    // it is handed (`sorted(xs, key = fn)`), so its call
+                    // is judged as the expression it is: by every name.
+                    let computes = PURE.contains(&call.callee.as_str())
+                        && self.callee(def, &call.callee, call.span.0, &mut seen)
+                            == Callee::Builtin;
+                    if computes && self.inert(def, call.span, &mut seen) {
+                        WsStmtKind::Inert
+                    } else {
+                        WsStmtKind::Call(self.call(def, call, &mut seen))
+                    }
                 }
                 // `native.<rule>(...)` is the predeclared rule in a `.bzl`.
                 StmtKind::TagCall { proxy, call, .. }
@@ -541,9 +583,11 @@ fn directive(comment: &str) -> Option<(&str, &str)> {
 }
 
 /// What a function Bazel predeclares in a `WORKSPACE` file declares.
+/// `bind` is not here: it declares no repository and takes a name all the
+/// same, which [`WorkspaceModel::event`] reads from its `name`.
 fn builtin_effect(name: &str) -> Option<Effect> {
     match name {
-        "workspace" | "bind" | "register_toolchains" | "register_execution_platforms" | "print" => {
+        "workspace" | "register_toolchains" | "register_execution_platforms" | "print" => {
             Some(Effect::Nothing)
         }
         "local_repository"
@@ -570,16 +614,130 @@ fn tools_effect(origin: &Origin<'_>) -> Option<Effect> {
     }
 }
 
+/// A statement that leaves the definition of one name uncertain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Doubt {
+    why: OrderWhy,
+    /// Index into [`WorkspaceModel::stmts`]: the top-level statement that
+    /// was running.
+    stmt: usize,
+    /// For a statement of a macro body: the file it is in (index into
+    /// [`WorkspaceModel::files`]) and its line.
+    inner: Option<(usize, usize)>,
+}
+
 /// What one statement does to the definition of one name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
     /// Defines it, replacing what its chunk defined before.
     Plain(Definition),
     /// Defines it when nothing has.
     Weak(Definition),
     /// May define or replace it: not read.
-    Wild,
+    Wild(Doubt),
     /// May define it when nothing has: not read.
-    WildWeak,
+    WildWeak(Doubt),
+    /// `bind` takes the name: no repository has it until a rule defines
+    /// it again.
+    Bound(Doubt),
+}
+
+/// What the events of one top-level statement leave in its chunk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Step {
+    /// The definition they make stand.
+    current: Option<Definition>,
+    /// `Some` when they change what is uncertain: to nothing, or to a
+    /// statement.
+    uncertain: Option<Option<Doubt>>,
+}
+
+impl Step {
+    /// The order rule. `events` run in a chunk that holds a definition
+    /// (`defined`) and a doubt (`doubted`); `raised` when the statement
+    /// they belong to has left the answer uncertain already. The rule
+    /// asks only whether the chunk holds each, never what it holds, so
+    /// the answer for one macro body serves every call of the macro that
+    /// finds the chunk in the same state.
+    fn of(events: &[Event], mut defined: bool, mut doubted: bool, mut raised: bool) -> Self {
+        let mut step = Self::default();
+        for event in events {
+            let untouched = !defined && !doubted;
+            match *event {
+                // Bazel builds the macro's definition, and the one it
+                // replaces is the one a reader of the file sees.
+                Event::Plain(definition) if definition.inner.is_some() && defined => {
+                    let (why, stmt) = (OrderWhy::ReplacedByMacro, definition.stmt);
+                    let inner = None;
+                    step.uncertain = Some(Some(Doubt { why, stmt, inner }));
+                    doubted = true;
+                }
+                // The body may have returned before it reached the rule.
+                Event::Plain(definition) if definition.inner.is_some() && raised => {}
+                Event::Plain(definition) => {
+                    (step.current, step.uncertain) = (Some(definition), Some(None));
+                    (defined, doubted) = (true, false);
+                }
+                Event::Weak(definition) if untouched => {
+                    step.current = Some(definition);
+                    defined = true;
+                }
+                Event::Wild(doubt) => {
+                    step.uncertain = Some(Some(doubt));
+                    (doubted, raised) = (true, true);
+                }
+                Event::WildWeak(doubt) if untouched => {
+                    step.uncertain = Some(Some(doubt));
+                    (doubted, raised) = (true, true);
+                }
+                // It was read, and a body that runs it runs on.
+                Event::Bound(doubt) => {
+                    step.uncertain = Some(Some(doubt));
+                    doubted = true;
+                }
+                Event::Weak(_) | Event::WildWeak(_) => {}
+            }
+        }
+        step
+    }
+}
+
+/// The events of one macro body for one name, and what they do to a chunk
+/// in each state [`Step::of`] tells apart.
+struct Body {
+    events: Vec<Event>,
+    steps: [Option<Step>; 8],
+}
+
+/// The state of one chunk for one name.
+#[derive(Default)]
+struct Chunk {
+    /// The definition that stands.
+    current: Option<Definition>,
+    /// The statement after which it is no longer certain.
+    uncertain: Option<Doubt>,
+}
+
+impl Chunk {
+    /// Runs the events of top-level statement `index`.
+    fn run(&mut self, events: &[Event], index: usize) {
+        let (defined, doubted) = (self.current.is_some(), self.uncertain.is_some());
+        self.take(Step::of(events, defined, doubted, false), index);
+    }
+
+    /// Takes what top-level statement `index` leaves. A macro body's
+    /// step is the same for every call of the macro: it is stamped with
+    /// the call here.
+    fn take(&mut self, step: Step, index: usize) {
+        if let Some(definition) = step.current {
+            let stmt = index;
+            self.current = Some(Definition { stmt, ..definition });
+        }
+        if let Some(uncertain) = step.uncertain {
+            let stmt = index;
+            self.uncertain = uncertain.map(|doubt| Doubt { stmt, ..doubt });
+        }
+    }
 }
 
 impl WorkspaceModel {
@@ -614,7 +772,16 @@ impl WorkspaceModel {
             stmts: scope.stmts(None, &file.stmts),
             ..Self::default()
         };
-        for comment in file.comments.iter().filter(|comment| comment.own_line) {
+        // gazelle reads the comments before and after each top-level
+        // statement (v0.47.0 `rule/directives.go`); one inside a
+        // statement, between the arguments of a call or in a body, belongs
+        // to the expression that follows it and is no directive.
+        let inside = |at: usize| {
+            let next = file.stmts.partition_point(|stmt| stmt.span.1 <= at);
+            file.stmts.get(next).is_some_and(|stmt| stmt.span.0 < at)
+        };
+        let directives = file.comments.iter().filter(|comment| comment.own_line);
+        for comment in directives.filter(|comment| !inside(comment.span.0)) {
             let text = String::from_utf8_lossy(file.bytes(comment.span));
             if let Some((key, value)) = directive(&text) {
                 let (key, value) = (key.to_string(), value.to_string());
@@ -809,53 +976,92 @@ impl WorkspaceModel {
     /// loaded functions declare: a recognizer vouches for its ruleset's
     /// repository rule and for the names its dependency macros declare.
     pub fn governing_with(&self, name: &str, knowledge: Knowledge<'_>) -> Governing {
-        let gap = |line: usize, why: OrderWhy| OrderGap {
-            file: self
-                .files
-                .first()
-                .map_or_else(String::new, |file| file.path.clone()),
-            line,
-            why,
-        };
         if let Some(unreadable) = &self.unreadable {
             return Governing::Unknown(OrderGap {
                 file: unreadable.file.clone(),
                 line: unreadable.line,
                 why: OrderWhy::Unreadable,
+                called_at: None,
             });
         }
-        // The state of one chunk: the definition that stands, and the
-        // statement after which it is no longer certain.
-        let (mut current, mut uncertain) = (None::<Definition>, None::<OrderGap>);
+        let mut state = Chunk::default();
         let mut chunk = 0;
         let mut events = Vec::new();
+        // Each macro body is walked once, whatever the number of calls.
+        let mut bodies: BTreeMap<usize, Body> = BTreeMap::new();
         for (index, stmt) in self.stmts.iter().enumerate() {
-            if stmt.chunk != chunk && (current.is_some() || uncertain.is_some()) {
+            if stmt.chunk != chunk && (state.current.is_some() || state.uncertain.is_some()) {
                 break;
             }
             chunk = stmt.chunk;
-            events.clear();
-            self.events(name, knowledge, index, &mut events);
-            for event in events.drain(..) {
-                let untouched = current.is_none() && uncertain.is_none();
-                match event {
-                    Event::Plain(definition) if definition.inner.is_some() && !untouched => {
-                        uncertain = Some(gap(stmt.line, OrderWhy::ReplacedByMacro));
-                    }
-                    Event::Plain(definition) => (current, uncertain) = (Some(definition), None),
-                    Event::Weak(definition) if untouched => current = Some(definition),
-                    Event::Wild => uncertain = Some(gap(stmt.line, OrderWhy::Opaque)),
-                    Event::WildWeak if untouched => {
-                        uncertain = Some(gap(stmt.line, OrderWhy::Opaque));
-                    }
-                    Event::Weak(_) | Event::WildWeak => {}
-                }
+            let called = match &stmt.kind {
+                WsStmtKind::Call(call) => call.macro_def.map(|m| (call, m)),
+                _ => None,
+            };
+            let Some((call, m)) = called else {
+                events.clear();
+                self.event(name, knowledge, 0, stmt, (index, None), &mut events);
+                state.run(&events, index);
+                continue;
+            };
+            let unread = Event::Wild(Doubt {
+                why: OrderWhy::Opaque,
+                stmt: index,
+                inner: None,
+            });
+            // A body this model does not hold was not read.
+            let Some(made_by) = self.macros.get(m) else {
+                state.run(&[unread], index);
+                continue;
+            };
+            // An argument that can run a function does so before the macro.
+            if call.impure {
+                state.run(&[unread], index);
             }
+            let body = bodies.entry(m).or_insert_with(|| {
+                let mut events = Vec::new();
+                for (inner, stmt) in made_by.body.iter().enumerate() {
+                    let at = (index, Some((m, inner)));
+                    self.event(name, knowledge, made_by.file, stmt, at, &mut events);
+                }
+                let steps = [None; 8];
+                Body { events, steps }
+            });
+            let (defined, doubted) = (state.current.is_some(), state.uncertain.is_some());
+            let held = usize::from(defined) | usize::from(doubted) << 1;
+            let step = body.steps[held | usize::from(call.impure) << 2]
+                .get_or_insert_with(|| Step::of(&body.events, defined, doubted, call.impure));
+            state.take(*step, index);
         }
-        match (uncertain, current) {
-            (Some(gap), _) => Governing::Unknown(gap),
+        match (state.uncertain, state.current) {
+            (Some(doubt), _) => Governing::Unknown(self.order_gap(doubt)),
             (None, Some(definition)) => Governing::Exact(definition),
             (None, None) => Governing::Undefined,
+        }
+    }
+
+    /// `doubt` as the public gap: the statement to look at, and for one
+    /// of a macro body the call that runs it.
+    fn order_gap(&self, doubt: Doubt) -> OrderGap {
+        let path = |file: usize| {
+            let file = self.files.get(file);
+            file.map_or_else(String::new, |file| file.path.clone())
+        };
+        let (why, called) = (doubt.why, self.stmts.get(doubt.stmt));
+        let called = called.map_or(0, |stmt| stmt.line);
+        match doubt.inner {
+            Some((file, line)) => OrderGap {
+                file: path(file),
+                line,
+                why,
+                called_at: Some((path(0), called)),
+            },
+            None => OrderGap {
+                file: path(0),
+                line: called,
+                why,
+                called_at: None,
+            },
         }
     }
 
@@ -882,31 +1088,9 @@ impl WorkspaceModel {
         }
     }
 
-    /// The events of top-level statement `index` for `name`, a macro
-    /// body's included.
-    fn events(&self, name: &str, knowledge: Knowledge<'_>, index: usize, out: &mut Vec<Event>) {
-        let stmt = &self.stmts[index];
-        let body = match &stmt.kind {
-            WsStmtKind::Call(call) => call.macro_def,
-            _ => None,
-        };
-        let Some(m) = body else {
-            return self.event(name, knowledge, 0, stmt, (index, None), out);
-        };
-        let WsStmtKind::Call(call) = &stmt.kind else {
-            return;
-        };
-        let Some(made_by) = self.macros.get(m) else {
-            return out.push(Event::Wild);
-        };
-        // An argument that can run a function does so before the macro.
-        out.extend(call.impure.then_some(Event::Wild));
-        for (inner, stmt) in made_by.body.iter().enumerate() {
-            let at = (index, Some((m, inner)));
-            self.event(name, knowledge, made_by.file, stmt, at, out);
-        }
-    }
-
+    /// The events of one statement for `name`: the statement `stmt` of
+    /// `file`, which is top-level statement `index`, or statement `inner`
+    /// (`(macro, statement of its body)`) of the macro it calls.
     fn event(
         &self,
         name: &str,
@@ -916,12 +1100,18 @@ impl WorkspaceModel {
         (index, inner): (usize, Option<(usize, usize)>),
         out: &mut Vec<Event>,
     ) {
+        let doubt = |why: OrderWhy| Doubt {
+            why,
+            stmt: index,
+            inner: inner.map(|_| (file, stmt.line)),
+        };
+        let unread = Event::Wild(doubt(OrderWhy::Opaque));
         let call = match &stmt.kind {
             WsStmtKind::Load(_) | WsStmtKind::Inert => return,
-            WsStmtKind::Opaque => return out.push(Event::Wild),
+            WsStmtKind::Opaque => return out.push(unread),
             WsStmtKind::Call(call) => call,
         };
-        out.extend(call.impure.then_some(Event::Wild));
+        out.extend(call.impure.then_some(unread));
         let definition = |maybe: bool| Definition {
             stmt: index,
             inner,
@@ -933,13 +1123,25 @@ impl WorkspaceModel {
             (Lookup::Found(value), Some(file)) => file.resolve(value).as_str(),
             _ => None,
         };
+        // A `bind` rule stands in the table repository rules stand in
+        // (`bazel@7.7.2:WorkspaceFactoryHelper.java`, `addBindRule`): it
+        // takes the name from a rule before it and from every later
+        // chunk, and a rule after it in its chunk takes the name back.
+        // `native.bind` in a macro is the same function.
+        if call.callee == Callee::Builtin && call.call.callee == "bind" {
+            return match declared {
+                Some(bound) if bound == name => out.push(Event::Bound(doubt(OrderWhy::BoundName))),
+                Some(_) => {}
+                None => out.push(unread),
+            };
+        }
         let rule = |effect: Option<Effect>| effect == Some(Effect::Rule);
         match self.effect(file, &call.call.callee, &call.callee, knowledge) {
             Some(Effect::Nothing) => {}
             Some(Effect::Rule) => match declared {
                 Some(declared) if declared == name => out.push(Event::Plain(definition(false))),
                 Some(_) => {}
-                None => out.push(Event::Wild),
+                None => out.push(unread),
             },
             Some(Effect::Maybe) => {
                 let passed = call
@@ -956,17 +1158,17 @@ impl WorkspaceModel {
                         out.push(Event::Weak(definition(true)));
                     }
                     (true, Some(_)) => {}
-                    (true, None) => out.push(Event::WildWeak),
+                    (true, None) => out.push(Event::WildWeak(doubt(OrderWhy::Opaque))),
                     // `maybe` of a macro runs the macro, which is not read.
-                    (false, _) => out.push(Event::Wild),
+                    (false, _) => out.push(unread),
                 }
             }
             Some(Effect::Macro { names, weak }) => match (names.contains(&name), weak) {
                 (false, _) => {}
-                (true, true) => out.push(Event::WildWeak),
-                (true, false) => out.push(Event::Wild),
+                (true, true) => out.push(Event::WildWeak(doubt(OrderWhy::Opaque))),
+                (true, false) => out.push(unread),
             },
-            None => out.push(Event::Wild),
+            None => out.push(unread),
         }
     }
 }
@@ -998,11 +1200,23 @@ mod tests {
 
     /// The verdict for `name` as text: `exact <file>:<line> <first url>`
     /// with `maybe` and `macro` where they apply, `undefined`, or
-    /// `unknown <why> at line <n>`.
+    /// `unknown <why> at line <n>`; for a statement of a macro body,
+    /// `unknown <why> at <file>:<line> called at line <n>`.
     fn verdict(model: &WorkspaceModel, name: &str, knowledge: Knowledge<'_>) -> String {
         match model.governing_with(name, knowledge) {
             Governing::Undefined => "undefined".to_string(),
-            Governing::Unknown(gap) => format!("unknown {:?} at line {}", gap.why, gap.line),
+            Governing::Unknown(gap) => match &gap.called_at {
+                Some((file, line)) => {
+                    assert_eq!(file, &model.files[0].path);
+                    let (why, at) = (gap.why, format!("{}:{}", gap.file, gap.line));
+                    format!("unknown {why:?} at {at} called at line {line}")
+                }
+                None => {
+                    let own = model.files.first().map(|file| &file.path);
+                    assert!(own.is_none_or(|own| *own == gap.file));
+                    format!("unknown {:?} at line {}", gap.why, gap.line)
+                }
+            },
             Governing::Exact(definition) => {
                 let (file, stmt, call) = model.declaration(&definition).expect("a call");
                 let tag = match call.call.arg("urls") {
@@ -1208,10 +1422,122 @@ mod tests {
             ("local_repository(name = \"dep\", path = \"p\")\n".to_string(), "exact WORKSPACE:3 -"),
             ("x = new_local_repository(name = \"dep\", path = \"p\")\n".to_string(), "exact WORKSPACE:3 -"),
             ("maybe(local_repository, name = \"dep\", path = \"p\")\n".to_string(), "exact WORKSPACE:3 maybe -"),
-            ("bind(name = \"dep\", actual = \"//x\")\nregister_toolchains(\"//x\")\nworkspace(name = \"dep\")\n".to_string(), "undefined"),
+            // What declares no repository and takes no name.
+            ("bind(name = \"other\", actual = \"//x\")\nregister_toolchains(\"//x\")\nworkspace(name = \"dep\")\n".to_string(), "undefined"),
         ] {
             assert_eq!(dep(&format!("{HTTP}{MAYBE}{body}")), want, "{body}");
         }
+    }
+
+    /// `bind` puts its rule in the table repository rules stand in, and
+    /// Bazel takes the first chunk that holds any rule of the name
+    /// (`bazel@7.7.2`: `WorkspaceFactoryHelper.addBindRule`,
+    /// `ExternalPackageHelper`). Run on 7.7.2 (`--enable_workspace
+    /// --noenable_bzlmod`, `bazel query @dep//:all`, macOS arm64): a rule
+    /// then a `bind`, a `bind` then `maybe` of a rule, a `bind` then a
+    /// `load` then a rule, and a rule then `native.bind` in one macro
+    /// fail with `'@@dep' is not a repository rule`; a `bind` then a
+    /// rule (both in the file, both in one macro, or the `bind` in the
+    /// file and the rule in a macro) resolves `@dep`, and so does a rule
+    /// or a `maybe` of one, then a `load`, then a `bind`. Only a rule
+    /// after the `bind` in its chunk takes the name back. The rule was
+    /// the Starlark `local_repository`: the native one after a `bind` of
+    /// its name is a hard error (`Cannot redefine repository after any
+    /// load statement`).
+    #[test]
+    fn a_bind_of_the_name_is_not_a_repository() {
+        const BIND: &str = "bind(name = \"dep\", actual = \"//x\")\n";
+        const WEAK: &str = "maybe(http_archive, name = \"dep\", urls = [\"m\"])\n";
+        let lit = archive("a");
+        for (body, want) in [
+            (format!("{lit}{BIND}"), "unknown BoundName at line 4"),
+            (format!("{BIND}{NOOP}{lit}"), "unknown BoundName at line 3"),
+            (format!("{BIND}{WEAK}"), "unknown BoundName at line 3"),
+            (format!("{BIND}{lit}"), "exact WORKSPACE:4 a"),
+            (BIND.to_string(), "unknown BoundName at line 3"),
+            // A later chunk cannot take the name from a rule either.
+            (format!("{lit}{NOOP}{BIND}"), "exact WORKSPACE:3 a"),
+            (format!("{WEAK}{NOOP}{BIND}"), "exact WORKSPACE:3 maybe m"),
+            // Another name is another target.
+            (
+                format!("{lit}bind(name = \"other\", actual = \"//x\")\n"),
+                "exact WORKSPACE:3 a",
+            ),
+            (
+                format!("{lit}OTHER = \"other\"\nbind(name = OTHER, actual = \"//x\")\n"),
+                "exact WORKSPACE:3 a",
+            ),
+            // The name through one level of constants, and one that is
+            // computed, which may be this one.
+            (
+                format!("{lit}NAME = \"dep\"\nbind(name = NAME, actual = \"//x\")\n"),
+                "unknown BoundName at line 5",
+            ),
+            (
+                format!("{lit}bind(name = \"d\" + \"ep\" * 1, actual = \"//x\")\n"),
+                "unknown Opaque at line 4",
+            ),
+            (format!("{lit}bind(**ARGS)\n"), "unknown Opaque at line 4"),
+            (
+                format!("{lit}bind(actual = \"//x\")\n"),
+                "unknown Opaque at line 4",
+            ),
+            // `maybe` of `bind` is a call of a function that is not a rule.
+            (
+                format!("{lit}maybe(bind, name = \"other\")\n"),
+                "unknown Opaque at line 4",
+            ),
+        ] {
+            assert_eq!(dep(&format!("{HTTP}{MAYBE}{body}")), want, "{body}");
+        }
+        // In a macro, `native.bind` is the same function, and the rule
+        // of a macro takes the name back as one of the file does.
+        let bound = |body: &str, rest: &str| {
+            let ws = format!("{HTTP}load(\"//:deps.bzl\", \"deps\")\n{rest}");
+            let bzl = format!("{HTTP}def deps():\n{body}");
+            let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+            verdict(&model, "dep", &|_| None)
+        };
+        const NATIVE: &str = "    native.bind(name = \"dep\", actual = \"//x\")\n";
+        const RULE: &str = "    http_archive(name = \"dep\", urls = [\"m\"])\n";
+        assert_eq!(
+            bound(NATIVE, "deps()\n"),
+            "unknown BoundName at deps.bzl:3 called at line 3"
+        );
+        assert_eq!(
+            bound(&format!("{RULE}{NATIVE}"), "deps()\n"),
+            "unknown BoundName at deps.bzl:4 called at line 3"
+        );
+        assert_eq!(
+            bound(&format!("{NATIVE}{RULE}"), "deps()\n"),
+            "exact deps.bzl:4 macro m"
+        );
+        assert_eq!(
+            bound(NATIVE, &format!("deps()\n{lit}")),
+            "exact WORKSPACE:4 a"
+        );
+        assert_eq!(
+            bound(RULE, &format!("{BIND}deps()\n")),
+            "exact deps.bzl:3 macro m"
+        );
+        assert_eq!(
+            bound(
+                "    native.bind(name = \"other\", actual = \"//x\")\n",
+                "deps()\n"
+            ),
+            "undefined"
+        );
+        // The refusal says which statement holds the name.
+        let model = workspace(&format!("{HTTP}{lit}{BIND}"));
+        let Governing::Unknown(gap) = model.governing("dep") else {
+            panic!("unknown")
+        };
+        assert_eq!(
+            gap.to_gap("dep").detail,
+            "which definition of `dep` Bazel builds is not proven: `bind(name = \"dep\")` at line 3 \
+             takes the name, and no repository rule after it in its chunk takes it back; rename or \
+             delete the `bind`"
+        );
     }
 
     /// A statement that was not read may define or replace any name.
@@ -1274,6 +1600,36 @@ mod tests {
             .map(|stmt| stmt.kind == WsStmtKind::Inert)
             .collect();
         assert_eq!(kinds, [false, false, true, false, false, true, true]);
+        // A call of a function that only computes is such an expression
+        // too, as a statement or as the value of an assignment. One that
+        // is handed a name it can call is not, and neither is a call of
+        // a name the file binds, which is not Bazel's function.
+        for (computed, want) in [
+            ("X = dict(a = 1)\n", "exact WORKSPACE:4 a"),
+            ("Y = str(1)\n", "exact WORKSPACE:4 a"),
+            ("L = Label(\"//:x\")\n", "exact WORKSPACE:4 a"),
+            ("len(\"x\")\n", "exact WORKSPACE:4 a"),
+            (
+                "V = \"1\"\nS = sorted([V, \"2\"], reverse = True)\n",
+                "exact WORKSPACE:4 a",
+            ),
+            (
+                "X = sorted([1], key = helper)\n",
+                "unknown Opaque at line 5",
+            ),
+            (
+                "X = max(1, 2, key = STRUCT.pick)\n",
+                "unknown Opaque at line 5",
+            ),
+            ("X = dict(a = helper())\n", "unknown Opaque at line 5"),
+            ("str = helper\nX = str(1)\n", "unknown Opaque at line 6"),
+        ] {
+            let text = format!("{HTTP}{MAYBE}{EXT}{lit}{computed}");
+            assert_eq!(dep(&text), want, "{computed}");
+            let last = workspace(&text).stmts.pop().expect("a statement");
+            let exact = want.starts_with("exact");
+            assert_eq!(last.kind == WsStmtKind::Inert, exact, "{computed}");
+        }
     }
 
     /// What a ruleset's recognizer knows and this reader does not: which
@@ -1482,8 +1838,38 @@ mod tests {
             (model.declaration(&foreign), model.site(&foreign)),
             (None, None)
         );
+        // And a call of a body this model does not hold was not read.
+        let mut unlinked = model.clone();
+        for stmt in &mut unlinked.stmts {
+            if let WsStmtKind::Call(call) = &mut stmt.kind {
+                call.macro_def = call.macro_def.map(|_| 99);
+            }
+        }
+        assert_eq!(
+            verdict(&unlinked, "com_github_pkg_errors", &gazelle),
+            "unknown Opaque at line 4"
+        );
 
-        // What makes a body unread, and so its call opaque.
+        // The same macro after `gazelle_dependencies()` in its chunk, as
+        // the rules_go setup writes it. A rule of the macro replaces what
+        // the seed list declared through `maybe`, as a rule of the
+        // `WORKSPACE` file would (H-GO2); a `maybe` of the macro does not.
+        const AFTER: &str = "load(\"@bazel_gazelle//:deps.bzl\", \"gazelle_dependencies\")\n\
+                             load(\"//third_party:go.bzl\", deps = \"go_dependencies\")\ngazelle_dependencies()\ndeps()\n";
+        let after = read(&[("WORKSPACE", AFTER), ("third_party/go.bzl", MACRO)]);
+        for (name, want) in [
+            ("org_golang_x_sys", "exact third_party/go.bzl:13 macro -"),
+            ("org_golang_x_crypto", "unknown Opaque at line 3"),
+            (
+                "com_github_pkg_errors",
+                "exact third_party/go.bzl:9 macro -",
+            ),
+        ] {
+            assert_eq!(verdict(&after, name, &gazelle), want, "{name}");
+        }
+
+        // What makes a body unread, and so its call opaque. The gap names
+        // the statement of the macro file, and the call that runs it.
         let body = |body: &str| {
             let text = format!("load(\"@bazel_gazelle//:deps.bzl\", \"go_repository\")\nload(\":more.bzl\", \"more\")\n\
                                 def helper():\n    pass\n\ndef go_dependencies(name = \"x\"):\n{body}");
@@ -1505,15 +1891,21 @@ mod tests {
         ] {
             assert_eq!(
                 body(&format!("{rule}{unread}")),
-                "unknown Opaque at line 4",
+                "unknown Opaque at third_party/go.bzl:8 called at line 4",
                 "{unread}"
             );
+            // The body may return before it reaches the rule.
             assert_eq!(
                 body(&format!("{unread}{rule}")),
-                "unknown ReplacedByMacro at line 4",
+                "unknown Opaque at third_party/go.bzl:7 called at line 4",
                 "{unread}"
             );
         }
+        // Two rules of one name in a body: the second replaces the first.
+        assert_eq!(
+            body(&format!("{rule}{rule}")),
+            "unknown ReplacedByMacro at line 4"
+        );
         // A parameter handed on as an attribute runs nothing.
         let passed =
             "    go_repository(name = \"x\", version = name)\n    \"\"\"Docs.\"\"\"\n    pass\n";
@@ -1521,6 +1913,150 @@ mod tests {
             body(&format!("{rule}{passed}")),
             "exact third_party/go.bzl:7 macro -"
         );
+
+        // A name of the body that is not what it looks like. A parameter
+        // or a local that shares its name with a constant of the file is
+        // not that constant, and a parameter called `native` is not
+        // Bazel's `native`: none of them names a repository here.
+        let shadowed = |bzl: &str, name: &str| {
+            let ws = format!("{HTTP}load(\"//:deps.bzl\", \"deps\")\ndeps()\n");
+            let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &format!("{HTTP}{bzl}"))]);
+            assert!(model.gaps.is_empty() && model.macros.len() == 1, "{bzl}");
+            verdict(&model, name, &|_| None)
+        };
+        const RULE: &str = "    http_archive(name = NAME, urls = [\"m\"])\n";
+        let constant = format!("NAME = \"dep\"\ndef deps():\n{RULE}");
+        assert_eq!(shadowed(&constant, "dep"), "exact deps.bzl:4 macro m");
+        let parameter = format!("NAME = \"dep\"\ndef deps(NAME = \"other\"):\n{RULE}");
+        let local = format!("NAME = \"dep\"\ndef deps():\n    NAME = \"other\"\n{RULE}");
+        for name in ["dep", "other"] {
+            assert_eq!(
+                shadowed(&parameter, name),
+                "unknown Opaque at deps.bzl:4 called at line 3",
+                "{name}"
+            );
+            assert_eq!(
+                shadowed(&local, name),
+                "unknown Opaque at deps.bzl:5 called at line 3",
+                "{name}"
+            );
+        }
+        const NATIVE: &str = "    native.local_repository(name = \"dep\", path = \"p\")\n";
+        assert_eq!(
+            shadowed(&format!("def deps():\n{NATIVE}"), "dep"),
+            "exact deps.bzl:3 macro -"
+        );
+        assert_eq!(
+            shadowed(&format!("def deps(native = None):\n{NATIVE}"), "dep"),
+            "unknown Opaque at deps.bzl:3 called at line 3"
+        );
+        // A body on the line of its `def` is a body.
+        assert_eq!(
+            shadowed(
+                "def deps(): http_archive(name = \"dep\", urls = [\"m\"])\n",
+                "dep"
+            ),
+            "exact deps.bzl:2 macro m"
+        );
+    }
+
+    /// A rule of a macro replaces whatever an earlier statement of its
+    /// chunk defined, as a rule of the `WORKSPACE` file does. On Bazel
+    /// 7.7.2 (`--enable_workspace --noenable_bzlmod`) macro A and then
+    /// macro B in one chunk builds B's repository whether or not A
+    /// defined the name, and with a `load` between them A's. So a
+    /// statement before the call that was not read costs the macro's
+    /// definition nothing, where one that was read and stands makes two
+    /// definitions to choose from.
+    #[test]
+    fn a_macro_definition_replaces_what_was_not_read_before_its_call() {
+        const LOADS: &str = "load(\"@rules//:deps.bzl\", \"other_deps\")\nload(\"//:deps.bzl\", \"deps\", \"weak_deps\")\n";
+        const WEAK: &str = "maybe(http_archive, name = \"dep\", urls = [\"w\"])\n";
+        let bzl = format!(
+            "{HTTP}{MAYBE}def deps(x = None):\n    http_archive(name = \"dep\", urls = [\"m\"])\n\n\
+             def weak_deps():\n    {WEAK}"
+        );
+        let lit = archive("a");
+        for (body, want) in [
+            ("deps()\n".to_string(), "exact deps.bzl:4 macro m"),
+            (
+                "other_deps()\ndeps()\n".to_string(),
+                "exact deps.bzl:4 macro m",
+            ),
+            (
+                "other_deps()\nother_deps()\ndeps()\n".to_string(),
+                "exact deps.bzl:4 macro m",
+            ),
+            (
+                "if True:\n    pass\ndeps()\n".to_string(),
+                "exact deps.bzl:4 macro m",
+            ),
+            (
+                "http_archive(name = NAME)\ndeps()\n".to_string(),
+                "exact deps.bzl:4 macro m",
+            ),
+            // After the call it may replace the macro's definition.
+            (
+                "deps()\nother_deps()\n".to_string(),
+                "unknown Opaque at line 6",
+            ),
+            // In an earlier chunk it may hold the definition that governs.
+            (
+                format!("other_deps()\n{NOOP}deps()\n"),
+                "unknown Opaque at line 5",
+            ),
+            // A definition that was read and stands: two to choose from.
+            (
+                format!("{lit}deps()\n"),
+                "unknown ReplacedByMacro at line 6",
+            ),
+            (
+                format!("{WEAK}deps()\n"),
+                "unknown ReplacedByMacro at line 6",
+            ),
+            (
+                format!("other_deps()\n{lit}deps()\n"),
+                "unknown ReplacedByMacro at line 7",
+            ),
+            (
+                "other_deps()\ndeps()\ndeps()\n".to_string(),
+                "unknown ReplacedByMacro at line 7",
+            ),
+            (
+                "weak_deps()\ndeps()\n".to_string(),
+                "unknown ReplacedByMacro at line 6",
+            ),
+            // An argument of the call itself that runs a function: the
+            // call was not read in full.
+            (
+                "deps(x = other_deps())\n".to_string(),
+                "unknown Opaque at line 5",
+            ),
+            (
+                "other_deps()\ndeps(x = other_deps())\n".to_string(),
+                "unknown Opaque at line 6",
+            ),
+            // A `maybe` defines only what nothing defined, in a macro as
+            // in the file: after an unread statement it is not proven.
+            (
+                "weak_deps()\n".to_string(),
+                "exact deps.bzl:7 maybe macro w",
+            ),
+            (
+                "other_deps()\nweak_deps()\n".to_string(),
+                "unknown Opaque at line 5",
+            ),
+            (
+                "deps()\nweak_deps()\n".to_string(),
+                "exact deps.bzl:4 macro m",
+            ),
+        ] {
+            let ws = format!("{HTTP}{MAYBE}{LOADS}{body}");
+            let noop = ("noop.bzl", "def noop():\n    pass\n");
+            let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl), noop]);
+            assert!(model.gaps.is_empty(), "{body}");
+            assert_eq!(verdict(&model, "dep", &|_| None), want, "{body}");
+        }
     }
 
     /// A macro file that cannot be read, a function that is not one `def`
@@ -1606,9 +2142,15 @@ mod tests {
                 "# gazelle:repository_macro deps.bzl%go_deps\n#gazelle:repository_macro   +a/b.bzl%more  \n\
                  # gazelle:repository_macro ../up.bzl%f\n# gazelle:repository_macro a%b%c\n# gazelle:repository_macro nopercent\n\
                  # gazelle:repo bazel_gazelle\n# gazelle:prefix\n#  gazelle :repository_macro x.bzl%f\n# not gazelle:repository_macro y.bzl%f\n\
-                 workspace(name = \"w\")  # gazelle:repository_macro trailing.bzl%f\n",
+                 workspace(name = \"w\")  # gazelle:repository_macro trailing.bzl%f\n\
+                 http_archive(\n    name = \"dep\",\n    # gazelle:repository_macro inner.bzl%deps\n    urls = [\"a\"],\n)\n\
+                 # gazelle:repo after_a_statement\n",
             ),
             ("deps.bzl", "def go_deps():\n    pass\n\ndef unused():\n    pass\n"),
+            // Named only by the comment between the arguments of a call,
+            // which gazelle gives to the argument and never reads as a
+            // directive: the file is not asked for.
+            ("inner.bzl", "def deps():\n    pass\n"),
         ]);
         let keys: Vec<(&str, &str, usize)> = model
             .directives
@@ -1625,8 +2167,11 @@ mod tests {
                 ("repository_macro", "nopercent", 5),
                 ("repo", "bazel_gazelle", 6),
                 ("prefix", "", 7),
+                ("repo", "after_a_statement", 16),
             ]
         );
+        let read: Vec<&str> = model.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(read, ["WORKSPACE", "deps.bzl"]);
         let macros: Vec<(&str, &str, bool, Option<usize>)> = model
             .repository_macros()
             .iter()
@@ -1666,7 +2211,12 @@ mod tests {
         let model = WorkspaceModel::read(&files, "WORKSPACE.bazel").unwrap();
         let unknown = |why| {
             let (file, line) = ("WORKSPACE.bazel".to_string(), 1);
-            Governing::Unknown(OrderGap { file, line, why })
+            Governing::Unknown(OrderGap {
+                file,
+                line,
+                why,
+                called_at: None,
+            })
         };
         assert_eq!(model.governing("dep"), unknown(OrderWhy::Unreadable));
         for (text, line, kind) in [
@@ -1735,6 +2285,40 @@ mod tests {
             .to_gap("dep")
             .detail
             .ends_with("the file cannot be read"));
+
+        // A statement of a macro body is named where it is written, with
+        // the call that runs it: the call itself was read.
+        let files = view(&[
+            (
+                "WORKSPACE.bazel",
+                "load(\"//third_party:go.bzl\", \"go_dependencies\")\n\n\ngo_dependencies()\n",
+            ),
+            (
+                "third_party/go.bzl",
+                "def go_dependencies():\n    native.local_repository(name = \"a\", path = \"a\")\n    helper()\n",
+            ),
+        ]);
+        let model = WorkspaceModel::read(&files, "WORKSPACE.bazel").unwrap();
+        let Governing::Unknown(gap) = model.governing("a") else {
+            panic!("unknown")
+        };
+        assert_eq!(
+            gap,
+            OrderGap {
+                file: "third_party/go.bzl".to_string(),
+                line: 3,
+                why: OrderWhy::Opaque,
+                called_at: Some(("WORKSPACE.bazel".to_string(), 4)),
+            }
+        );
+        let refusal = gap.to_gap("a");
+        assert_eq!(refusal.file, "third_party/go.bzl");
+        assert_eq!(
+            refusal.detail,
+            "which definition of `a` Bazel builds is not proven: the statement at \
+             third_party/go.bzl:3, in the macro called at WORKSPACE.bazel:4, is not read and may \
+             define or replace `a`"
+        );
     }
 
     /// Real files: the gazelle example of rules_go 0.41.0 (its
@@ -1912,6 +2496,91 @@ mod tests {
         }
         let took = started.elapsed();
         assert!(took.as_secs() < 60, "reading and 50 answers took {took:?}");
+    }
+
+    /// The cost does not depend on what the bytes are spent on. One name
+    /// bound again on every line of a file at the cap, and one macro
+    /// called from every line of a `WORKSPACE` at the cap, its body a
+    /// file of rules or of statements that are not read, are read and
+    /// answered in seconds: a look at every binding of a name for each
+    /// binding, or a walk of the body for each call, would take minutes.
+    #[test]
+    fn rebound_names_and_repeated_calls_at_the_size_cap_read_in_time() {
+        let cap = starlark::MAX_FILE_BYTES;
+        let fill = |head: String, line: &str| {
+            let lines = (cap - head.len()) / line.len();
+            (head + &line.repeat(lines), lines)
+        };
+        let started = std::time::Instant::now();
+
+        // One name, bound on every line of the file and of a macro file.
+        let rule = "def deps():\n    http_archive(name = \"inner\", urls = [\"m\"])\n";
+        let head = format!("{HTTP}load(\"//:deps.bzl\", \"deps\")\ndeps()\n");
+        let (ws, bound) = fill(head + &archive("a"), "X = 1\n");
+        let (bzl, _) = fill(format!("{HTTP}{rule}"), "X = 1\n");
+        assert!(bound > 100_000);
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert_eq!(model.stmts.len(), bound + 4);
+        assert!(model.files.iter().all(|file| file.constants.is_empty()));
+        assert_eq!(verdict(&model, "dep", &|_| None), "exact WORKSPACE:4 a");
+        assert_eq!(
+            verdict(&model, "inner", &|_| None),
+            "exact deps.bzl:3 macro m"
+        );
+
+        // One macro, called from every line. Its body is a file of rules:
+        // the first call defines each, and every later call defines it
+        // again.
+        let (ws, calls) = fill(
+            format!("{HTTP}load(\"//:deps.bzl\", \"deps\")\n"),
+            "deps()\n",
+        );
+        let mut bzl = format!("{HTTP}def deps():\n");
+        let mut rules = 0;
+        while bzl.len() + 100 < cap {
+            bzl.push_str(&format!(
+                "    http_archive(name = \"r{rules}\", urls = [\"u{rules}\"])\n"
+            ));
+            rules += 1;
+        }
+        assert!(calls > 100_000 && rules > 10_000);
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert!(model.unreadable.is_none() && model.gaps.is_empty());
+        assert_eq!(
+            (model.stmts.len(), model.macros[0].body.len()),
+            (calls + 2, rules)
+        );
+        for n in [0, rules / 2, rules - 1] {
+            assert_eq!(
+                verdict(&model, &format!("r{n}"), &|_| None),
+                format!("unknown ReplacedByMacro at line {}", calls + 2)
+            );
+        }
+        assert_eq!(verdict(&model, "other", &|_| None), "undefined");
+        let once = ws.replacen("deps()\n", "pass\n", calls - 1);
+        let model = read(&[("WORKSPACE", &once), ("deps.bzl", &bzl)]);
+        assert_eq!(
+            verdict(&model, &format!("r{}", rules - 1), &|_| None),
+            format!("exact deps.bzl:{} macro u{}", rules + 2, rules - 1)
+        );
+
+        // Its body is a file of statements that are not read: each of
+        // them, for each call, may define the name.
+        let (bzl, unread) = fill("def deps():\n".to_string(), "    f()\n");
+        assert!(unread > 100_000);
+        let model = read(&[("WORKSPACE", &ws), ("deps.bzl", &bzl)]);
+        assert_eq!(model.macros[0].body.len(), unread);
+        assert_eq!(
+            verdict(&model, "dep", &|_| None),
+            format!(
+                "unknown Opaque at deps.bzl:{} called at line {}",
+                unread + 1,
+                calls + 2
+            )
+        );
+        let took = started.elapsed();
+        assert!(took.as_secs() < 60, "reading and 8 answers took {took:?}");
     }
 
     /// No input makes the reader panic, and no answer names a statement

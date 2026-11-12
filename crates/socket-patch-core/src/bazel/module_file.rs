@@ -20,7 +20,10 @@
 //!   not all known.
 //!
 //! Evidence only escalates: a gap can refuse a write and never permits
-//! one, and what was read stays in the model beside it.
+//! one, and what was read stays in the model beside it. A question whose
+//! answer a gap can change has three answers here, not two:
+//! [`ModuleModel::visible`] says `Unknown` for a repository name that no
+//! statement that was read gives and one that was not read could.
 //!
 //! Dev-ness is tracked the way Bazel tracks it (probes S1c, S2): per
 //! `bazel_dep`, per extension proxy (its tags and imports inherit it) and
@@ -28,7 +31,7 @@
 //! `include(..., dev_dependency = True)` is a dev dependency. Which Bazel
 //! accepts that keyword (9.3.0 and later) is the caller's knowledge.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::label::{Label, Repo};
 use super::model::{DeclSystem, FileText, FileView, Site};
@@ -148,13 +151,17 @@ impl BazelDep {
 /// `var = use_extension(bzl_file, extension, ...)` in one file. Bazel
 /// merges the proxies of one extension into one usage, and keeps the
 /// dev-ness of each (probe S2): a dev proxy in the root file and a plain
-/// one in a segment give one tag of each kind.
+/// one in a segment give one tag of each kind. [`ModuleModel::usages`]
+/// says which proxies are one usage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtensionProxy {
     pub var: String,
-    /// The extension's `.bzl` label as written. Two spellings of one file
-    /// (`//x:e.bzl` beside `@@//x:e.bzl`) crash Bazel rather than make two
-    /// usages, so a recognizer compares [`ExtensionProxy::label`].
+    /// The extension's `.bzl` label as written. Proxies with different
+    /// text here can be one usage: `//x:e.bzl` and `@name//x:e.bzl` are
+    /// when `name` is the root module's own repository name (probe S2,
+    /// `spelling-@s2//`). Neither this text nor
+    /// [`ExtensionProxy::label`] tells usages apart;
+    /// [`ModuleModel::usages`] does.
     pub bzl_file: String,
     /// `None` when Bazel would reject the label.
     pub label: Option<Label>,
@@ -183,8 +190,10 @@ pub struct Import {
     pub proxy: usize,
     /// The name the root module sees it by.
     pub local: String,
-    /// The name the extension gave it.
-    pub exported: String,
+    /// The name the extension gave it. `None` for `local = <computed>`:
+    /// the alias is written and what it names is not; a gap of the proxy
+    /// says where.
+    pub exported: Option<String>,
     pub dev: bool,
     pub at: At,
 }
@@ -286,6 +295,11 @@ pub enum GapWhy {
         directive: String,
         arg: &'static str,
     },
+    /// A positional, `*` or `**` argument of `use_repo` that is not a
+    /// literal: the proxy gives the root module a repository name that
+    /// was not read. Unlike every other gap of one proxy, it leaves the
+    /// names the root module can see open ([`ModuleModel::visible`]).
+    ImportedName,
 }
 
 impl GapWhy {
@@ -307,6 +321,9 @@ impl GapWhy {
             Self::Unmodelled { name, why } => format!("`{name}`: {}", why.describe()),
             Self::Argument { directive, arg } => {
                 format!("the {arg} of `{directive}` is computed; write it as a literal")
+            }
+            Self::ImportedName => {
+                "the repository name of `use_repo` is computed; write it as a literal".to_string()
             }
         }
     }
@@ -339,8 +356,28 @@ pub enum NameSource {
 pub struct VisibleName<'a> {
     pub name: &'a str,
     pub source: NameSource,
-    /// Gone under `--ignore_dev_dependency`.
+    /// Gone under `--ignore_dev_dependency`. It is what the statement
+    /// says: where its `dev_dependency` is computed this is `false`, and
+    /// a gap covers the statement. So take it for what Bazel sees only
+    /// when no gap does: for a `use_repo` name when
+    /// [`ModuleModel::gaps_for`] its proxy is empty (the dev-ness is the
+    /// proxy's), for any other name when the model has no
+    /// [`GapScope::Everything`] gap.
     pub dev: bool,
+}
+
+/// Whether the root module can see a repository name
+/// ([`ModuleModel::visible`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Visibility<'a> {
+    /// A statement that was read gives the name.
+    Visible(VisibleName<'a>),
+    /// Every statement that can give a name was read, and none gives
+    /// this one.
+    NotVisible,
+    /// No statement that was read gives the name, and one that was not
+    /// read could.
+    Unknown,
 }
 
 /// The module whose repository a label names.
@@ -351,6 +388,19 @@ pub enum Host<'a> {
     Dep(&'a BazelDep),
     /// A canonical name, or an apparent name no `bazel_dep` gives.
     Unknown,
+}
+
+/// [`Host`] as a key: equal for two labels when, by the root module
+/// file, they name files of one module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum HostKey<'a> {
+    Root,
+    /// Index into [`ModuleModel::deps`].
+    Dep(usize),
+    /// An apparent name no `bazel_dep` gives, and a canonical name: each
+    /// names one repository, whichever that is.
+    Apparent(&'a str),
+    Canonical(&'a str),
 }
 
 /// The root `MODULE.bazel` and every file it includes. Every list is in
@@ -448,9 +498,17 @@ impl ModuleModel {
     /// read: its own name, each `bazel_dep` name or `repo_name`, each
     /// `use_repo` name or alias and each `use_repo_rule` repository. The
     /// modules Bazel adds by itself (`bazel_tools` and others, by
-    /// release) are not listed. With an [`GapScope::Everything`] gap the
-    /// list is a lower bound.
+    /// release) are not listed.
+    ///
+    /// The list is a lower bound unless
+    /// [`ModuleModel::names_are_complete`]: a name that is missing from
+    /// it is not thereby invisible. [`ModuleModel::visible`] answers for
+    /// one name, and is what the hybrid rule asks.
     pub fn visible_names(&self) -> Vec<VisibleName<'_>> {
+        self.names().collect()
+    }
+
+    fn names(&self) -> impl Iterator<Item = VisibleName<'_>> {
         fn seen(name: &str, source: NameSource, dev: bool) -> VisibleName<'_> {
             VisibleName { name, source, dev }
         }
@@ -475,11 +533,38 @@ impl ModuleModel {
                     call.dev,
                 ))
             });
-        own.into_iter()
-            .chain(deps)
-            .chain(imports)
-            .chain(rules)
-            .collect()
+        own.into_iter().chain(deps).chain(imports).chain(rules)
+    }
+
+    /// Whether [`ModuleModel::visible_names`] holds every name the
+    /// statements of the closure give the root module. It does not when
+    /// anything could be declared that was not read (a
+    /// [`GapScope::Everything`] gap), or when a `use_repo` imports a
+    /// repository under a name that was not read
+    /// ([`GapWhy::ImportedName`]: `use_repo(pip, *HUBS)` hides `pip`
+    /// behind a gap of one proxy).
+    pub fn names_are_complete(&self) -> bool {
+        let opens =
+            |gap: &ModuleGap| gap.scope == GapScope::Everything || gap.why == GapWhy::ImportedName;
+        !self.gaps.iter().any(opens)
+    }
+
+    /// Whether the root module can see the repository name `name`
+    /// through a statement of the closure: the one owner of the question
+    /// the hybrid rule asks of a `WORKSPACE` `load` (design 2.8). A name
+    /// two statements give is answered by the first. `NotVisible` is no
+    /// answer for the modules Bazel adds by itself, which no statement
+    /// gives.
+    ///
+    /// `Unknown` is not `NotVisible`: taking a name for invisible picks
+    /// the `WORKSPACE` definition of a ruleset where the Bzlmod module's
+    /// rule runs (probe S7 H9).
+    pub fn visible(&self, name: &str) -> Visibility<'_> {
+        match self.names().find(|seen| seen.name == name) {
+            Some(seen) => Visibility::Visible(seen),
+            None if self.names_are_complete() => Visibility::NotVisible,
+            None => Visibility::Unknown,
+        }
     }
 
     /// The name the root module's own repository is visible by.
@@ -488,23 +573,74 @@ impl ModuleModel {
         module.repo_name.as_deref().or(module.name.as_deref())
     }
 
+    /// The module `label` names a file of. `dep` finds the `bazel_dep`
+    /// that gives an apparent name.
+    fn host_key<'a>(&self, label: &'a Label, dep: impl Fn(&str) -> Option<usize>) -> HostKey<'a> {
+        match &label.repo {
+            Repo::Main => HostKey::Root,
+            Repo::Apparent(name) if self.own_name() == Some(name.as_str()) => HostKey::Root,
+            Repo::Apparent(name) => dep(name).map_or(HostKey::Apparent(name), HostKey::Dep),
+            Repo::Canonical(name) => HostKey::Canonical(name),
+        }
+    }
+
     /// The module that hosts the file `label` names: how a recognizer
     /// tells its ruleset from the label of a `use_extension`, whatever
     /// `repo_name` the root gave the ruleset (design 2.7).
     pub fn host(&self, label: &Label) -> Host<'_> {
-        let apparent = match &label.repo {
-            Repo::Main => return Host::Root,
-            Repo::Apparent(name) => name.as_str(),
-            Repo::Canonical(_) => return Host::Unknown,
+        let named = |name: &str| {
+            self.deps
+                .iter()
+                .position(|dep| dep.apparent() == Some(name))
         };
-        if self.own_name() == Some(apparent) {
-            return Host::Root;
+        match self.host_key(label, named) {
+            HostKey::Root => Host::Root,
+            HostKey::Dep(dep) => Host::Dep(&self.deps[dep]),
+            HostKey::Apparent(_) | HostKey::Canonical(_) => Host::Unknown,
         }
-        let dep = self
-            .deps
-            .iter()
-            .find(|dep| dep.apparent() == Some(apparent));
-        dep.map_or(Host::Unknown, Host::Dep)
+    }
+
+    /// The extension usages of the root module: the proxies Bazel merges
+    /// into one evaluation of an extension, as indexes into
+    /// [`ModuleModel::proxies`]. Every proxy is in exactly one group; a
+    /// group is in the order of its statements, and the groups are in
+    /// the order of their first proxy. This is the one owner of the
+    /// merge rule: a recognizer reads the tags, imports and gaps of
+    /// every proxy of a usage, and never tells usages apart by a label.
+    ///
+    /// Proxies are one usage when they name one extension of one file of
+    /// one module ([`ModuleModel::host`]): `//x:e.bzl` and
+    /// `@name//x:e.bzl` are, when `name` is the root module's own
+    /// repository name (probe S2, `spelling-@//` and `spelling-@s2//`:
+    /// one evaluation on Bazel 7.2.0 to 10.0.0rc3). For a module the
+    /// root does not name by a `bazel_dep`, the same repository name is
+    /// the same module. An `isolate` proxy is a usage of its own, and so
+    /// is one whose label Bazel rejects.
+    pub fn usages(&self) -> Vec<Vec<usize>> {
+        let mut named: BTreeMap<&str, usize> = BTreeMap::new();
+        for (index, dep) in self.deps.iter().enumerate() {
+            if let Some(apparent) = dep.apparent() {
+                named.entry(apparent).or_insert(index);
+            }
+        }
+        let mut usages: Vec<Vec<usize>> = Vec::new();
+        let mut merged = BTreeMap::new();
+        for (index, proxy) in self.proxies.iter().enumerate() {
+            let Some(label) = proxy.label.as_ref().filter(|_| !proxy.isolate) else {
+                usages.push(vec![index]);
+                continue;
+            };
+            let host = self.host_key(label, |name| named.get(name).copied());
+            let (package, name) = (label.package.as_str(), label.name.as_str());
+            let usage = *merged
+                .entry((host, package, name, proxy.extension.as_str()))
+                .or_insert_with(|| {
+                    usages.push(Vec::new());
+                    usages.len() - 1
+                });
+            usages[usage].push(index);
+        }
+        usages
     }
 }
 
@@ -546,13 +682,20 @@ fn text(constants: &Constants, call: &Call, name: &str) -> Result<Option<String>
 
 /// The names one top-level statement of `file` binds to a literal. Found
 /// once for the file, so that resolving an argument costs a lookup and
-/// not a walk over every use of the name.
+/// not a walk over every use of the name; and asked once for each name,
+/// because the answer walks every binding of the name: a name bound on
+/// every line would cost the square of the file.
 pub(super) fn constants(file: &File<'_>) -> Constants {
     let mut constants = Constants::new();
+    let mut asked = BTreeSet::new();
     for stmt in &file.stmts {
         let StmtKind::ConstBind { name, .. } = &stmt.kind else {
             continue;
         };
+        // A name bound twice is no constant: the first answer stands.
+        if !asked.insert(name.as_str()) {
+            continue;
+        }
         if let Some(value) = file.constant(name, usize::MAX).exact().flatten() {
             let (value, bound_by) = (value.clone(), stmt.span.1);
             constants.insert(name.clone(), Constant { value, bound_by });
@@ -861,20 +1004,34 @@ impl Reader<'_> {
                     return self.computed(Everything, at, call, "extension proxy");
                 };
                 let dev = self.model.proxies[proxy].dev;
+                let imports = call.callee == "use_repo";
                 for arg in &call.args[1..] {
                     // `"name"` keeps the extension's name; `local = "name"`
                     // renames it.
                     let exported = resolved(file, &arg.value).as_str();
-                    let pair = match (&arg.kind, exported) {
-                        (ArgKind::Positional, Some(name)) => (name.to_string(), name.to_string()),
-                        (ArgKind::Named(key), Some(name)) => (key.clone(), name.to_string()),
+                    let exported = exported.map(str::to_string);
+                    let (local, exported) = match (&arg.kind, exported) {
+                        (ArgKind::Positional, Some(name)) => (name.clone(), Some(name)),
+                        (ArgKind::Named(key), Some(name)) => (key.clone(), Some(name)),
+                        // The alias is written, and is the name the root
+                        // module sees, whatever repository it names.
+                        (ArgKind::Named(key), None) if imports => {
+                            self.computed(GapScope::Proxy(proxy), at, call, "repository name");
+                            (key.clone(), None)
+                        }
+                        // A name the root module sees was not read. The
+                        // names inside an extension that the other two
+                        // functions take are not names of the root.
+                        _ if imports => {
+                            self.gap(GapScope::Proxy(proxy), at, GapWhy::ImportedName);
+                            continue;
+                        }
                         _ => {
                             self.computed(GapScope::Proxy(proxy), at, call, "repository name");
                             continue;
                         }
                     };
-                    if call.callee == "use_repo" {
-                        let (local, exported) = pair;
+                    if imports {
                         self.model.imports.push(Import {
                             proxy,
                             local,
@@ -882,8 +1039,8 @@ impl Reader<'_> {
                             dev,
                             at,
                         });
-                    } else {
-                        let (repo, with) = pair;
+                    } else if let Some(with) = exported {
+                        let repo = local;
                         self.model.repo_overrides.push(RepoOverride {
                             proxy,
                             inject: call.callee == "inject_repo",
@@ -1087,11 +1244,8 @@ pub(super) mod tests {
         }
         for import in &model.imports {
             let (proxy, dev) = (import.proxy, dev(import.dev));
-            let _ = writeln!(
-                out,
-                "import #{proxy} {} = {}{dev}",
-                import.local, import.exported
-            );
+            let exported = import.exported.as_deref().unwrap_or("?");
+            let _ = writeln!(out, "import #{proxy} {} = {exported}{dev}", import.local);
         }
         for over in &model.repo_overrides {
             let kind = if over.inject { "inject" } else { "override" };
@@ -1123,15 +1277,12 @@ pub(super) mod tests {
         out
     }
 
-    /// The tags the probe's extension is handed, as it printed them: the
-    /// tags of every proxy that is not isolated, in order, `(dev)` after
-    /// a dev one, and none of the dev ones under `--ignore_dev_dependency`.
-    fn seen(model: &ModuleModel, isolated: Option<usize>, ignore_dev: bool) -> Vec<String> {
-        let of = |tag: &&Tag| match isolated {
-            Some(proxy) => tag.proxy == proxy,
-            None => !model.proxies[tag.proxy].isolate,
-        };
-        let tags = model.tags.iter().filter(of);
+    /// The tags the probe's extension is handed in one evaluation, as it
+    /// printed them: the tags of every proxy of one usage, in order,
+    /// `(dev)` after a dev one, and none of the dev ones under
+    /// `--ignore_dev_dependency`.
+    fn seen(model: &ModuleModel, usage: &[usize], ignore_dev: bool) -> Vec<String> {
+        let tags = model.tags.iter().filter(|tag| usage.contains(&tag.proxy));
         let kept = tags.filter(|tag| !(ignore_dev && tag.dev));
         kept.map(|tag| {
             let dev = if tag.dev { "(dev)" } else { "" };
@@ -1232,10 +1383,12 @@ pub(super) mod tests {
 
     /// Probe S2 printed the tags its extension was handed for 30 root and
     /// segment pairs on five releases. Wherever Bazel evaluated the
-    /// extension, the model gives the same tags in the same order with the
-    /// same dev-ness: proxies of one extension merge, names are per file,
-    /// an include runs in place, and a dev proxy in the root beside a
-    /// plain one in the segment gives `a(dev), b` and, under
+    /// extension, the model gives the same evaluations, each with the
+    /// same tags in the same order with the same dev-ness: proxies of one
+    /// extension are one usage however the root module spells its own
+    /// repository, an isolated proxy is a usage of its own, names are per
+    /// file, an include runs in place, and a dev proxy in the root beside
+    /// a plain one in the segment gives `a(dev), b` and, under
     /// `--ignore_dev_dependency`, `b`.
     #[test]
     fn s2_cells_read_to_their_goldens_and_agree_with_bazel() {
@@ -1247,18 +1400,26 @@ pub(super) mod tests {
             let _ = writeln!(out, "## {name}\n{}", render(&model));
             let flags = cell["flags"].as_array().unwrap();
             let ignore_dev = flags.iter().any(|flag| flag == "--ignore_dev_dependency");
+            let usages = model.usages();
+            // Each cell has two proxies: one usage, or one each.
+            match name.as_str() {
+                "spelling-@//" | "spelling-@s2//" | "merge-basic" | "rx-same-apparent-name" => {
+                    assert_eq!(usages, [[0, 1]], "{name}");
+                }
+                "isolate-root-isolated-segment-not" => assert_eq!(usages, [[0], [1]], "{name}"),
+                _ => {}
+            }
             for (version, ran) in cell["bazel"].as_object().unwrap() {
                 let evaluations = ran["seen"].as_array().unwrap();
                 if ran["ok"] != true || evaluations.is_empty() {
                     continue;
                 }
                 assert!(model.is_exact(), "{name}: {:?}", describe(&model));
-                // One evaluation for the merged usage and one for each
-                // isolated proxy, in an order that differs by release.
-                let isolated = (0..model.proxies.len()).filter(|i| model.proxies[*i].isolate);
-                let mut want: Vec<Vec<String>> = isolated
-                    .map(|proxy| seen(&model, Some(proxy), ignore_dev))
-                    .chain([seen(&model, None, ignore_dev)])
+                // One evaluation for each usage that has a tag left, in
+                // an order that differs by release.
+                let mut want: Vec<Vec<String>> = usages
+                    .iter()
+                    .map(|usage| seen(&model, usage, ignore_dev))
                     .filter(|tags| !tags.is_empty())
                     .collect();
                 let mut got: Vec<Vec<String>> =
@@ -1371,6 +1532,20 @@ multiple_version_override(module_name = "c", versions = ["1", "2"])
             ]
         );
         assert_eq!(model.visible_names()[1].source, NameSource::BazelDep(0));
+        // Everything was read, so a name is visible or it is not.
+        assert!(model.names_are_complete());
+        assert_eq!(
+            model.visible("other"),
+            Visibility::Visible(VisibleName {
+                name: "other",
+                source: NameSource::UseRepo(2),
+                dev: false
+            })
+        );
+        assert_eq!(model.imports[2].exported.as_deref(), Some("npm__lodash"));
+        for unseen in ["npm__lodash", "aspect_rules_js", "rules_cc", "app", "org_x"] {
+            assert_eq!(model.visible(unseen), Visibility::NotVisible, "{unseen}");
+        }
         // A label is hosted by the module its repository name is given to.
         let host = |label: &str| model.host(&Label::parse(label, Some("")).unwrap());
         assert_eq!(host("//tools:ext.bzl"), Host::Root);
@@ -1677,6 +1852,180 @@ multiple_version_override(module_name = "c", versions = ["1", "2"])
             panic!("lock")
         };
         assert_eq!(lock.kind, ValueKind::Dynamic);
+    }
+
+    /// A `use_repo` argument that is not a literal gives the root module
+    /// a name that was not read. What was read stays listed, a written
+    /// alias included, and a name that is missing is unknown, never
+    /// invisible: in a hybrid root, taking `pip` for invisible picks the
+    /// `WORKSPACE` version of a ruleset where the module's rule runs
+    /// (probe S7 H9). The gap stays the proxy's own, so no other hub is
+    /// refused for it.
+    #[test]
+    fn a_computed_use_repo_argument_leaves_the_visible_names_open() {
+        const HEAD: &str = "module(name = \"app\")\nbazel_dep(name = \"rules_python\", version = \"1.4.1\")\n\
+                            pip = use_extension(\"@rules_python//python/extensions:pip.bzl\", \"pip\")\n\
+                            other = use_extension(\"//:other.bzl\", \"other\")\n";
+        let names = |model: &ModuleModel| -> Vec<String> {
+            let names = model.visible_names();
+            names.iter().map(|seen| seen.name.to_string()).collect()
+        };
+        for (uses, listed) in [
+            (
+                "HUBS = [\"pip\", \"pip_dev\"]\nuse_repo(pip, *HUBS)\n",
+                &[][..],
+            ),
+            ("use_repo(pip, *NAMES)\n", &[]),
+            ("use_repo(pip, RULES)\n", &[]),
+            ("use_repo(pip, \"a\", **ALIASES)\n", &["a"]),
+            (
+                "use_repo(pip, \"a\", \"b\" + SUFFIX, c = \"d\")\n",
+                &["a", "c"],
+            ),
+        ] {
+            let model = root(&format!("{HEAD}{uses}"));
+            let gaps: Vec<(GapScope, &GapWhy)> =
+                model.gaps.iter().map(|gap| (gap.scope, &gap.why)).collect();
+            assert_eq!(
+                gaps,
+                [(GapScope::Proxy(0), &GapWhy::ImportedName)],
+                "{uses}"
+            );
+            assert_eq!(
+                (model.gaps_for(0).count(), model.gaps_for(1).count()),
+                (1, 0)
+            );
+            assert!(describe(&model)[0]
+                .ends_with("the repository name of `use_repo` is computed; write it as a literal"));
+            let mut want = vec!["app", "rules_python"];
+            want.extend(listed);
+            assert_eq!(names(&model), want, "{uses}");
+            assert!(!model.names_are_complete(), "{uses}");
+            for name in want {
+                let seen = model.visible(name);
+                assert!(matches!(seen, Visibility::Visible(_)), "{uses}: {name}");
+            }
+            for missing in ["pip", "pip_dev", "b", "d", "nothing_gives_this"] {
+                assert_eq!(model.visible(missing), Visibility::Unknown, "{uses}");
+            }
+        }
+
+        // `alias = <computed>`: the alias is written, and it is the name
+        // the root module sees, whatever repository it names. No name is
+        // hidden, so one that is missing is not visible.
+        let model = root(&format!(
+            "{HEAD}use_repo(pip, rules_py = PICK, hub = \"pip\")\n"
+        ));
+        let imports: Vec<(&str, Option<&str>)> = model
+            .imports
+            .iter()
+            .map(|import| (import.local.as_str(), import.exported.as_deref()))
+            .collect();
+        assert_eq!(imports, [("rules_py", None), ("hub", Some("pip"))]);
+        assert_eq!(
+            describe(&model),
+            ["MODULE.bazel:5: the repository name of `use_repo` is computed; write it as a literal"]
+        );
+        assert_eq!(model.gaps[0].scope, GapScope::Proxy(0));
+        assert!(model.names_are_complete());
+        assert_eq!(names(&model), ["app", "rules_python", "rules_py", "hub"]);
+        assert_eq!(
+            model.visible("rules_py"),
+            Visibility::Visible(VisibleName {
+                name: "rules_py",
+                source: NameSource::UseRepo(0),
+                dev: false
+            })
+        );
+        assert_eq!(model.visible("pip"), Visibility::NotVisible);
+        assert!(render(&model).contains("import #0 rules_py = ?\n"));
+
+        // The names `override_repo` and `inject_repo` take are names
+        // inside the extension: a computed one hides no name of the root.
+        let model = root(&format!(
+            "{HEAD}use_repo(pip, \"pip\")\noverride_repo(pip, *NAMES)\ninject_repo(pip, x = Y)\n"
+        ));
+        assert_eq!((model.gaps_for(0).count(), model.gaps.len()), (2, 2));
+        assert!(model.repo_overrides.is_empty() && model.names_are_complete());
+        assert_eq!(model.visible("x"), Visibility::NotVisible);
+        assert!(matches!(model.visible("pip"), Visibility::Visible(_)));
+
+        // A whole-model gap leaves every missing name unknown.
+        let model = root(&format!("{HEAD}use_repo(pip, \"pip\")\ninclude(SEG)\n"));
+        assert!(!model.names_are_complete());
+        assert!(matches!(model.visible("pip"), Visibility::Visible(_)));
+        assert_eq!(model.visible("pip_dev"), Visibility::Unknown);
+        // And with nothing unread, a name is visible or it is not.
+        let model = root(&format!("{HEAD}use_repo(pip, \"pip\")\n"));
+        assert!(model.is_exact() && model.names_are_complete());
+        assert_eq!(model.visible("pip_dev"), Visibility::NotVisible);
+
+        // The dev-ness of a name is what was read. Where it is computed
+        // it reads `false`, and a gap that covers the statement says so:
+        // the proxy's own for a `use_repo` name.
+        let model = root(
+            "maven = use_extension(\"@rje//:extensions.bzl\", \"maven\", dev_dependency = IS_DEV)\n\
+             use_repo(maven, \"maven\")\n",
+        );
+        let Visibility::Visible(seen) = model.visible("maven") else {
+            panic!("visible")
+        };
+        assert_eq!((seen.dev, seen.source), (false, NameSource::UseRepo(0)));
+        assert_eq!(model.gaps_for(model.imports[0].proxy).count(), 1);
+        assert!(model.names_are_complete());
+    }
+
+    /// Bazel merges the proxies of one extension into one usage, and one
+    /// extension is one name in one file of one module, however a label
+    /// spells the module: the root module's own repository is `//`, `@//`
+    /// and its own name (probe S2).
+    #[test]
+    fn proxies_of_one_extension_of_one_module_are_one_usage() {
+        let model = root(
+            r#"module(name = "app", repo_name = "me")
+bazel_dep(name = "rules_x", version = "1", repo_name = "rx")
+bazel_dep(name = "rules_y", version = "1")
+a = use_extension("//tools:ext.bzl", "ext")
+b = use_extension("@me//tools:ext.bzl", "ext")
+c = use_extension("@//tools:ext.bzl", "ext", dev_dependency = True)
+d = use_extension("//tools:ext.bzl", "other")
+e = use_extension("//tools:ext.bzl", "ext", isolate = True)
+f = use_extension("@rx//:ext.bzl", "ext")
+g = use_extension("@rx//:ext.bzl", "ext")
+h = use_extension("@rules_y//:ext.bzl", "ext")
+i = use_extension("@app//tools:ext.bzl", "ext")
+j = use_extension("@unknown//:ext.bzl", "ext")
+k = use_extension("@unknown//:ext.bzl", "ext")
+l = use_extension("@@rules_x+//:ext.bzl", "ext")
+m = use_extension("//tools:../ext.bzl", "ext")
+n = use_extension(":tools/ext.bzl", "ext")
+o = use_extension("//tools:ext.bzl", "ext")
+"#,
+        );
+        assert!(model.is_exact(), "{:?}", describe(&model));
+        let vars = |usage: &Vec<usize>| -> String {
+            let var = |proxy: &usize| model.proxies[*proxy].var.as_str();
+            usage.iter().map(var).collect()
+        };
+        let usages: Vec<String> = model.usages().iter().map(vars).collect();
+        // `@app` is not the root's name once `repo_name` is given, the
+        // canonical name of `rules_x` is not composed here, a label Bazel
+        // rejects (`m`) names nothing, and `:tools/ext.bzl` is another
+        // file of the root package.
+        assert_eq!(
+            usages,
+            ["abco", "d", "e", "fg", "h", "i", "jk", "l", "m", "n"]
+        );
+        // The labels of one usage differ, and its hosts do not.
+        let label = |proxy: usize| model.proxies[proxy].label.as_ref().unwrap();
+        assert_ne!(label(0), label(1));
+        assert_eq!(
+            (model.host(label(0)), model.host(label(1))),
+            (Host::Root, Host::Root)
+        );
+        assert_eq!(model.host(label(5)), Host::Dep(&model.deps[0]));
+        assert!(model.proxies[12].label.is_none());
+        assert_eq!(ModuleModel::default().usages(), Vec::<Vec<usize>>::new());
     }
 
     /// A file that cannot be read may hold the declaration that governs
@@ -2054,8 +2403,42 @@ multiple_version_override(module_name = "c", versions = ["1", "2"])
         );
         assert_eq!(model.deps[deps - 1].version.as_deref(), Some("1.0"));
         assert_eq!(model.visible_names().len(), proxies + deps);
+        assert_eq!(model.usages().len(), proxies);
         let took = started.elapsed();
         assert!(took.as_secs() < 60, "reading took {took:?}");
+    }
+
+    /// The cost does not depend on what the bytes are spent on: a root
+    /// and a segment at the size cap that bind one name again on every
+    /// line read in seconds, where a look at every binding of the name
+    /// for each of its bindings would take minutes.
+    #[test]
+    fn a_name_bound_on_every_line_at_the_size_cap_reads_in_time() {
+        const LINE: &str = "X = \"1\"\n";
+        let fill = |head: &str| {
+            let lines = (starlark::MAX_FILE_BYTES - head.len()) / LINE.len();
+            (format!("{head}{}", LINE.repeat(lines)), lines)
+        };
+        let (root_text, bound) =
+            fill("include(\"//:deps.MODULE.bazel\")\nbazel_dep(name = \"a\", version = X)\n");
+        let (segment, _) = fill("bazel_dep(name = \"b\", version = X)\n");
+        assert!(bound > 100_000);
+        let started = std::time::Instant::now();
+        let model = read(&[(MODULE_FILE, &root_text), ("deps.MODULE.bazel", &segment)]);
+        let took = started.elapsed();
+        assert!(model.is_exact(), "{:?}", model.gaps.first());
+        // A name bound twice is no constant, so the version is not read.
+        assert!(model.files.iter().all(|file| file.constants.is_empty()));
+        let deps: Vec<(&str, Option<&str>)> = model
+            .deps
+            .iter()
+            .map(|dep| (dep.name.as_str(), dep.version.as_deref()))
+            .collect();
+        assert_eq!(deps, [("b", None), ("a", None)]);
+        assert!(took.as_secs() < 60, "reading took {took:?}");
+        // Bound once, it is one.
+        let model = root("X = \"1\"\nbazel_dep(name = \"a\", version = X)\n");
+        assert_eq!(model.deps[0].version.as_deref(), Some("1"));
     }
 
     /// No input makes the reader panic or index outside a file: every
@@ -2094,7 +2477,22 @@ multiple_version_override(module_name = "c", versions = ["1", "2"])
                 let Some(model) = ModuleModel::read(&mutated) else {
                     continue;
                 };
-                let _ = (render(&model), model.visible_names());
+                let _ = render(&model);
+                // Every name that is listed is visible, and one that is
+                // not is invisible only when nothing could hide it.
+                for seen in model.visible_names() {
+                    let found = model.visible(seen.name);
+                    assert!(matches!(found, Visibility::Visible(_)));
+                }
+                let unseen = match model.names_are_complete() {
+                    true => Visibility::NotVisible,
+                    false => Visibility::Unknown,
+                };
+                assert_eq!(model.visible("no statement gives this name"), unseen);
+                // Every proxy is in one usage.
+                let mut proxies = model.usages().concat();
+                proxies.sort_unstable();
+                assert!(proxies.into_iter().eq(0..model.proxies.len()));
                 for gap in &model.gaps {
                     assert!(gap.at.file < model.files.len() && gap.at.line >= 1);
                 }
