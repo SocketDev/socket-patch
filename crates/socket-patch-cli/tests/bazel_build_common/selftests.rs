@@ -640,8 +640,8 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     let tmp = tempfile::tempdir().unwrap();
     let present = tmp.path().join("present");
     let absent = tmp.path().join("absent");
-    std::fs::create_dir_all(present.join("_bazel_user/old")).unwrap();
-    let keep = present.join("_bazel_user/keep");
+    std::fs::create_dir_all(present.join("_bazel_user").join("old")).unwrap();
+    let keep = present.join("_bazel_user").join("keep");
     std::fs::create_dir_all(&keep).unwrap();
     let state = OutsideState::capture_of(&[present.clone(), absent.clone()]);
     assert_eq!(state.changes(), Vec::<String>::new());
@@ -678,14 +678,14 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     );
 
     // A stray run creates `<root>/_bazel_<user>/<md5>`, two levels down.
-    std::fs::create_dir_all(present.join("_bazel_user/0123abcd")).unwrap();
+    std::fs::create_dir_all(present.join("_bazel_user").join("0123abcd")).unwrap();
     std::fs::create_dir_all(absent.join("downloads")).unwrap();
-    std::fs::remove_dir(present.join("_bazel_user/old")).unwrap();
+    std::fs::remove_dir(present.join("_bazel_user").join("old")).unwrap();
     let changes = state.changes().join("\n");
     assert!(
         changes.contains(&format!(
             "created: {}",
-            present.join("_bazel_user/0123abcd").display()
+            present.join("_bazel_user").join("0123abcd").display()
         )),
         "{changes}"
     );
@@ -696,7 +696,7 @@ fn outside_state_reports_created_changed_and_removed_entries() {
     assert!(
         changes.contains(&format!(
             "removed: {}",
-            present.join("_bazel_user/old").display()
+            present.join("_bazel_user").join("old").display()
         )),
         "{changes}"
     );
