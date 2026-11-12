@@ -296,17 +296,22 @@ codes! {
     // ── Advisories ───────────────────────────────────────────────────
     /// Wired, and one named command refreshes committed Bazel state; also
     /// after a restoring edit that stales state socket-patch cannot
-    /// repair. `Info` is the floor: [`Level::of_required_run`] raises it
+    /// repair, and, without gating `vex`, for lockfile facts that may be
+    /// stale. `Info` is the floor: [`Level::of_required_run`] raises it
     /// to `Warn` when, until the command has run, builds fail or the
     /// Bazel build does not get the patch.
     RedirectRunRequired = "redirect_bazel_run_required", Advisory, Info;
     /// Vendored twin of [`Code::RedirectRunRequired`].
     VendorRunRequired = "vendor_bazel_run_required", Advisory, Info;
-    /// The withdrawn-pin sweep kept a pin, because restoring it under
-    /// `--lockfile_mode=error` would fail every build. A warning: the
-    /// withdrawn pin itself fails every cold fetch.
+    /// The withdrawn-pin sweep kept a pin, because restoring it would fail
+    /// every build: under `--lockfile_mode=error`, or under any mode
+    /// where the restore stales a crate lock digest that only a repin
+    /// refreshes (design 7). A warning: the withdrawn pin itself fails
+    /// every cold fetch.
     RedirectWithdrawnPinKept = "redirect_bazel_withdrawn_pin_kept", Advisory, Warn;
-    /// Cold repository fetches now need the patch host's index.
+    /// Cold repository fetches now need the patch host beyond the package
+    /// itself: its NuGet service index (`H-NET1`) or its registry
+    /// `config.json` (`H-RSR1`).
     RedirectFetchDependency = "redirect_bazel_fetch_dependency", Advisory, Info;
     /// Follows a refusal that has a manual procedure.
     RedirectManualSnippet = "redirect_bazel_manual_snippet", Advisory, Info;
@@ -329,7 +334,8 @@ codes! {
     /// A bypass holds now, or a user patch hook exists that can reverse
     /// the fix.
     VexPinBypassed = "vex_bazel_pin_bypassed", Withheld, Warn;
-    /// A derived value disagrees with the pin.
+    /// A derived value disagrees with the pin, or a recorded lock entry
+    /// with a fresh digest lacks it.
     VexDerivedStale = "vex_bazel_derived_stale", Withheld, Warn;
     /// A works-after lane without committed evidence that its command ran.
     VexRunPending = "vex_bazel_run_pending", Withheld, Warn;

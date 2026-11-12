@@ -26,6 +26,7 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use socket_patch_core::bazel::codes::{Code, Kind};
+use socket_patch_core::bazel::model::RunKind;
 
 fn crates_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -653,6 +654,8 @@ fn the_scans_catch_what_they_were_written_for() {
 ///   a status (`planned` or `active`); for a run-level code or an
 ///   advisory, the level the enum gives it; and, where the table has a
 ///   Kind column (the agent table must), the enum's kind;
+/// * the run-required row lists the `kind` values of the model's
+///   `RunKind`, no more and no fewer, and names `gatesVex`;
 /// * the contract names no Bazel code the enum lacks;
 /// * no production source outside `bazel/codes.rs` spells a Bazel code or
 ///   a bare family prefix in a string literal, so the enum is the only way
@@ -664,6 +667,9 @@ fn the_scans_catch_what_they_were_written_for() {
 ///   the `TOKENS` of its file, and a `token: NAME` constant is declared as
 ///   an item of a list. What reaches a `token` field any other way is not
 ///   seen (`token_scan`);
+/// * the token table keeps the rows of the tokens reserved for lanes that
+///   have not landed: at least the 72 of design 6, the four of revision 3
+///   among them;
 /// * a `Bazel*` variant of `SidecarAdvisoryCode`, which serde spells, is a
 ///   sidecar code of the enum.
 #[test]
@@ -694,6 +700,25 @@ fn test_bazel_contract_codes() {
             continue;
         };
         problems.extend(row_problems(*code, row));
+    }
+    // The `kind` list of the run-required row is the model's `RunKind`,
+    // both ways (revision 3 added `repin`), and the row names the field
+    // that says whether `vex` waits for the command.
+    let run_required = Code::RedirectRunRequired;
+    let cell = format!("`{run_required}`");
+    let row = rows.iter().find(|row| row.contains(&&*cell));
+    let when = row.and_then(|row| row.last().copied()).unwrap_or_default();
+    let kinds = regex::Regex::new(r"`kind`: ([^;]*);").unwrap();
+    let kinds = kinds
+        .captures(when)
+        .map(|list| list.get(1).unwrap().as_str());
+    let kinds: Option<BTreeSet<&str>> =
+        kinds.map(|list| list.split('`').skip(1).step_by(2).collect());
+    let model: BTreeSet<&str> = RunKind::ALL.iter().map(|kind| kind.as_str()).collect();
+    if kinds.as_ref() != Some(&model) || !when.contains("`gatesVex`") {
+        problems.insert(format!(
+            "{run_required}: its row must list the `kind` values {model:?} and name `gatesVex`"
+        ));
     }
     for named in family.find_iter(&contract) {
         if !known.contains(named.as_str()) {
@@ -730,6 +755,26 @@ fn test_bazel_contract_codes() {
         if documented.iter().filter(|other| *other == token).count() != 1 {
             problems.insert(format!("the token table lists `{token}` more than once"));
         }
+    }
+    // A token is reserved before the lane that reports it lands, and no
+    // module lists these yet: the table keeps the 68 tokens of design 6
+    // and the four that revision 3 added.
+    let revision_3 = [
+        "lock_not_in_root_package",
+        "managed_pnpm_unproven",
+        "cargo_config_undeclared",
+        "user_patch_hook",
+    ];
+    for token in revision_3 {
+        if !documented.contains(&token) {
+            problems.insert(format!("token `{token}` has no token-table row"));
+        }
+    }
+    if documented.len() < 72 {
+        let rows = documented.len();
+        problems.insert(format!(
+            "the token table has {rows} rows; design 6 reserves 72"
+        ));
     }
     // A doc comment may show a list or a field; only code declares one.
     let code_of = |text: &String| {
