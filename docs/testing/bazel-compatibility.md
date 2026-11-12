@@ -341,10 +341,14 @@ without the downloader rewrite.
   a request a tool sent straight to the loopback origin, which the log cannot
   name), else `none` beside an empty list. The field is private, so a test
   cannot write a list by hand, and the audit refuses any report whose list
-  names a host without that source.
+  names a host without that source. `hosts_from_renamed_log` takes the
+  server's own list with some entries renamed to `127.0.0.1` and panics on
+  anything else: a name the server did not log, or a logged name left out.
 - `lanes` names the lanes the test proves on its cell (`Report::proves("H-JS1")`).
   The claims audit matches a lane's claim against it, so a lane test that does
-  not call `proves` is evidence for nothing.
+  not call `proves` is evidence for nothing. Neither is one that never read
+  its fixture server's log: the audit refuses a `ran` report that names a
+  lane with `hosts_source` `none`, and does not count it for a claim.
 
 A test that fails leaves no report. It writes none, and because the file name
 is fixed per cell and the default directory persists, `Cell::open` removes the
@@ -374,15 +378,29 @@ one cell per (fixture group, Bazel, runner, test-name prefix), run with
 matrices list and no other. The toy group is all in one: its `core` cell
 also runs the guard tests that use the toy fixture
 (`core/guard/MATRIX.json`), which the `bazel_core_` row of `ci.yml` does not
-select. To add a cell, edit the `MATRIX.json` of your fixtures; nobody edits
-the workflow. A new `#[ignore]` test that no matrix lists fails `--check`: a
-`bazel_core_` test goes into `core/MATRIX.json`, any other test on the toy
-fixture into `core/guard/MATRIX.json` (or a file of the same shape with its
-own `filter`), and a ruleset's test under its fixture in the ruleset's file.
+select. In a ruleset group the `bazel_agent_` tests ride the `vendor` cell;
+there is no agent job. To add a cell, edit the `MATRIX.json` of your
+fixtures; nobody edits the workflow. A new `#[ignore]` test that no matrix
+lists fails `--check`: a `bazel_core_` test goes into `core/MATRIX.json`, any
+other test on the toy fixture into `core/guard/MATRIX.json` (or a file of the
+same shape with its own `filter`), and a ruleset's test under its fixture in
+the ruleset's file (`lanes`). The last works for a light ruleset only today:
+the heavy schema (`baseline_heavy.rs`) has no `lanes` field yet, so a heavy
+lane test cannot be listed until its owner adds one.
 
 ```sh
 python3 scripts/bazel-matrix.py --check                  # the rules below
 python3 scripts/bazel-matrix.py --event pull_request     # the plan, as JSON
+```
+
+Under `--exact` a path libtest does not know runs nothing and exits 0. The
+planner computes each path from the sources (the file's module, the inline
+`mod` blocks around the test, its name), and the workflow's `build` job holds
+the result to the binary:
+
+```sh
+target/bazel-bin/e2e_bazel_build --list --ignored > target/bazel-tests.txt
+python3 scripts/bazel-matrix.py --check --libtest-list target/bazel-tests.txt
 ```
 
 `--check` (also run by `scripts/tests/test_bazel_matrix.py`) fails when a
@@ -390,9 +408,12 @@ listed test is not an `#[ignore]` test of the suite or such a test is in no
 matrix, when a (Bazel, runner) has no pin, when a (fixture, Bazel) pair is not
 in the era table the script carries, when a rules_jvm_external entry of tier
 `pr` climbs above proof tier 0, when a Go or Rust entry is `pr` without a
-restored repository cache, or when a fixture whose packages a tool fetches
-(pip mode, crate_universe, an unpinned Coursier hub) does not say
-`"fetch": "tool"`. The light and heavy matrices name no runner: a nightly
+restored repository cache (`"cache": "restored"`, a key the suite's schema
+does not take yet, so such a cell is `nightly` for now), when a fixture whose
+packages a tool fetches (pip mode, crate_universe, an unpinned Coursier hub)
+does not say `"fetch": "tool"`, or when the `os` list of a toy test is not a
+list of runners its cells run on, with at least one for each of its Bazel
+releases. The light and heavy matrices name no runner: a nightly
 entry runs on ubuntu, and a lane test on 7.7.2, 8.8.2 or 9.3.2 also on macOS
 and Windows; `pr` moves the ubuntu cell into the pull-request tier.
 
@@ -405,16 +426,21 @@ python3 scripts/bazel-matrix-audit.py --reports <dir> --require hosts,wall_ms,re
     [--tiers pr|full [--cell <id>]] [--claims target/bazel-claims.json]
 ```
 
-It fails when a `ran` report lacks its hosts, their source or its wall time,
-when a resolved ruleset version differs from the pin in its `MATRIX.json`,
-when a test planned for the run (or the cell) has no `ran` report on its
-Bazel release and runner, and when a claim of `lanes::claims_json()` has no
-evidence. A claim is a lane on Bazel `lo` to `hi` under one dependency system.
-It is held to the pinned releases: `hi` must be one, every major the range
-spans must have one inside it, and the newest of each needs a `ran` report
-that names the lane, under that system, on each OS the claim lists (on any OS
-while it lists none). Over a whole run a record-only cell that did not run is
-listed and is not an error.
+It fails when a `ran` report lacks its hosts, their source, its wall time or
+its list of lanes, when a resolved ruleset version differs from the pin of
+the fixture that lists the test on the report's Bazel release, when a test
+planned for the run (or the cell) has no `ran` report on its Bazel release
+and runner, and when a claim of `lanes::claims_json()` has no evidence. A
+claim is a lane on Bazel `lo` to `hi` under one dependency system. It is held
+to the pinned releases and to the Bazel lines of the support table: the
+majors, except that under Bzlmod (and hybrid) 7.0 and 7.1 are each a line of
+their own beside 7.2 and later 7.x. `hi` must be a pinned release, every line
+the range reaches must have a pinned release inside the range, and the newest
+such release of each line needs a `ran` report that names the lane, under
+that system, with its hosts from the fixture server's log, on each OS the
+claim lists (on any OS while it lists none). So a Bzlmod claim from 7.0.0
+needs reports on 7.0.2 and 7.1.2 as well as on 7.7.2. Over a whole run a
+record-only cell that did not run is listed and is not an error.
 
 To check a local run against the plan of its cell (the cell ids are in the
 plan; a macOS cell is `nightly`, so `--tiers full`):

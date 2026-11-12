@@ -1267,10 +1267,57 @@ fn a_report_carries_the_fields_a_claim_is_audited_on() {
         report.hosts(),
         ["127.0.0.1", "bcr.bazel.build", "registry.npmjs.org"]
     );
-    let invented = [renamed, vec!["pypi.org".to_string()]].concat();
-    assert!(panics(&|| {
-        Report::new("x").hosts_from_renamed_log(&server, invented.clone())
-    }));
+    // The list is held to the log by name, not by length. Each of these is
+    // refused; the second and the third are as long as the log itself.
+    let names = |hosts: &[&str]| -> Vec<String> { hosts.iter().map(|h| h.to_string()).collect() };
+    let refused = [
+        // One name more than the log holds.
+        [renamed.clone(), names(&["pypi.org"])].concat(),
+        // A host nobody contacted in the place of the renamed one.
+        names(&["bcr.bazel.build", "pypi.org", "registry.npmjs.org"]),
+        // The same with the rename kept: still as long as the log.
+        names(&["127.0.0.1", "pypi.org", "registry.npmjs.org"]),
+        // A logged host left out, with nothing renamed.
+        names(&["bcr.bazel.build", "registry.npmjs.org"]),
+        // The loopback name beside the whole log: it stands for no entry.
+        [server.hosts(), names(&["127.0.0.1"])].concat(),
+    ];
+    for hosts in refused {
+        assert!(
+            panics(&|| Report::new("x").hosts_from_renamed_log(&server, hosts.clone())),
+            "{hosts:?} is not the server's log"
+        );
+    }
+    let logged = server.hosts();
+    let check = |reported: &[&str]| probe_report::renamed_log(&logged, &names(reported));
+    assert_eq!(
+        check(&["bcr.bazel.build", "maven2", "registry.npmjs.org"]),
+        Ok(())
+    );
+    // Two entries may merge into the one loopback name.
+    assert_eq!(check(&["127.0.0.1", "registry.npmjs.org"]), Ok(()));
+    let why = check(&["bcr.bazel.build", "pypi.org", "registry.npmjs.org"]).unwrap_err();
+    assert!(
+        why.contains(r#"names ["pypi.org"], which the fixture server did not log"#),
+        "{why}"
+    );
+    let why = check(&["bcr.bazel.build", "registry.npmjs.org"]).unwrap_err();
+    assert!(why.contains(r#"leaves out ["maven2"]"#), "{why}");
+    let why = check(&[
+        "127.0.0.1",
+        "bcr.bazel.build",
+        "maven2",
+        "registry.npmjs.org",
+    ])
+    .unwrap_err();
+    assert!(why.contains("stands for no host"), "{why}");
+    // A server that itself logged the loopback name reports it as it is.
+    let loopback = names(&["127.0.0.1", "maven2"]);
+    assert_eq!(probe_report::renamed_log(&loopback, &loopback), Ok(()));
+    assert_eq!(
+        probe_report::renamed_log(&loopback, &names(&["127.0.0.1"])),
+        Ok(())
+    );
     report.proves("H-JS1").proves("H-JS2").proves("H-JS1");
     report
         .resolved

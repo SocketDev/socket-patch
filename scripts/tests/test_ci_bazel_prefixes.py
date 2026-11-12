@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).parents[2]
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 COMPAT = ROOT / ".github" / "workflows" / "bazel-compatibility.yml"
+CLAIMS_SOURCE = "crates/socket-patch-core/tests/bazel_golden/claims.rs"
 SUITE = "e2e_bazel_build"
 PREFIXES = ("bazel_core_", "bazel_guard_", "bazel_agent_", "bazel_hosted_", "bazel_vendor_", "bazel_canary_")
 # The one required Bazel row of ci.yml (DESIGN 9.5).
@@ -110,12 +111,12 @@ class CiRow(unittest.TestCase):
         self.assertEqual(selected, set(core["tests"]))
         planned = next(c for c in matrix.plan(matrix.entries(), ("pr",), matrix.suite_tests())
                        if c["id"] == "core-9.3.2-ubuntu-core")
-        # The cell also holds the toy guard tests, which the row's prefix
-        # leaves to bazel-compatibility.yml.
-        in_row = {name for name in planned["tests"] if prefix in name}
-        self.assertTrue(in_row <= selected)
-        self.assertGreaterEqual(len(in_row), 9)
-        self.assertTrue(all(name.startswith("bazel_guard_") for name in set(planned["tests"]) - in_row))
+        # The row runs every `bazel_core_` test the cell plans. What else
+        # the cell holds (the toy fixture's tests of another prefix) is
+        # left to bazel-compatibility.yml.
+        in_cell = {name for name in planned["tests"] if name.startswith(core["filter"])}
+        self.assertGreaterEqual(len(in_cell), 9)
+        self.assertLessEqual(in_cell, selected)
 
     def test_the_install_steps_key_on_the_row(self):
         steps = dict(rows_mod.steps(CI_JOBS["e2e"]))
@@ -172,6 +173,16 @@ class CompatWorkflow(unittest.TestCase):
         build = "\n".join(COMPAT_JOBS["build"])
         self.assertIn(f"--test {SUITE} > target-build.json", build)
         self.assertIn(f"--dest target/bazel-bin --suites {SUITE}", build)
+        # The paths the cells filter on are held to the binary's own list,
+        # after the bundle and before it is uploaded for the cells.
+        steps = [name for name, _ in rows_mod.steps(COMPAT_JOBS["build"])]
+        listed = "Hold the cell filters to the tests the binary lists"
+        self.assertLess(steps.index("Bundle the binaries the cells run"), steps.index(listed))
+        self.assertEqual(steps[-1], "", "the upload is the last step")
+        check = dict(rows_mod.steps(COMPAT_JOBS["build"]))[listed]
+        self.assertIn(f'"target/bazel-bin/{SUITE}$exe" --list --ignored > target/bazel-tests.txt', check)
+        self.assertIn("scripts/bazel-matrix.py --check --libtest-list target/bazel-tests.txt", check)
+        self.assertIn("set -euo pipefail", check)
         # The matrices are generated: nothing is listed by hand.
         for job, output in (("cells", "cells"), ("extras", "extras")):
             text = "\n".join(COMPAT_JOBS[job])
@@ -191,12 +202,129 @@ class CompatWorkflow(unittest.TestCase):
         audit = dict(rows_mod.steps(COMPAT_JOBS["audit"]))["Audit the reports"]
         self.assertIn('args=(--reports target/bazel-reports --tiers "$TIERS" --require "hosts,wall_ms,resolved")', audit)
         self.assertIn('if [ -n "$CLAIMS" ]; then args+=(--claims "$CLAIMS"); fi', audit)
-        self.assertIn("if: always() && needs.plan.result == 'success'", "\n".join(COMPAT_JOBS["audit"]))
+        # After failed cells too, and not on a cancelled run: `always()`
+        # would start the audit of a superseded commit.
+        conditions = re.findall(r"^    if: (.*)$", "\n".join(COMPAT_JOBS["audit"]), re.M)
+        self.assertEqual(conditions, ["${{ !cancelled() && needs.plan.result == 'success' }}"])
+        self.assertNotIn("always()", conditions[0])
+        self.assertIn("cancel-in-progress: ${{ github.event_name == 'pull_request' }}", COMPAT_TEXT)
         # Every key a step reads from the matrix is one the planner emits.
         emitted = set(matrix.plan(matrix.entries(), matrix.TIERS, matrix.suite_tests())[0]) - {"tests"}
         for job in ("cells", "extras"):
             read = set(re.findall(r"matrix\.([a-z_]+)", "\n".join(COMPAT_JOBS[job])))
             self.assertLessEqual(read, emitted, job)
+
+    def test_the_repository_cache_is_one_rolling_cache_per_group_bazel_and_runner(self):
+        """The cells of one (group, Bazel, runner) differ by mode and share
+        a repository cache. A key is written once: under one key for all of
+        them the first cell to finish saved its own fetches and the others
+        never could. So each cell saves under a key of its own, and every
+        cell restores the newest one of the shared prefix."""
+        steps = dict(rows_mod.steps(COMPAT_JOBS["cells"]))
+        restore = steps["Restore the repository cache"]
+        key = re.search(r"^          key: (.*)$", restore, re.M).group(1)
+        shared = "bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-"
+        self.assertTrue(key.startswith(shared + "${{ hashFiles("), key)
+        # Unique per cell and run: never an exact hit, never a key already taken.
+        self.assertTrue(key.endswith("-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}"), key)
+        fallbacks = re.search(r"^          restore-keys: \|\n((?:            .*\n?)+)", restore, re.M).group(1)
+        fallbacks = [line.strip() for line in fallbacks.splitlines()]
+        self.assertEqual(len(fallbacks), 2, fallbacks)
+        # Each is a prefix of the key that stops before the mode, so it
+        # matches what any cell of the line saved: the same fixtures
+        # first, then any.
+        for prefix in fallbacks:
+            self.assertTrue(key.startswith(prefix) and prefix.endswith("-"), prefix)
+            self.assertNotIn("matrix.mode", prefix)
+            self.assertNotIn("github.run_id", prefix)
+        self.assertGreater(len(fallbacks[0]), len(fallbacks[1]))
+        self.assertEqual(fallbacks[1], shared)
+        self.assertIn("if: matrix.cache == 'restore'", restore)
+        # A cell saves when it fetched what the restored cache lacked,
+        # which the run step reports, and only from main.
+        run = steps["Run the cell"]
+        self.assertIn("        id: run\n", run)
+        for line in ('cached > "$RUNNER_TEMP/bazel-repos.before"', 'cached > "$RUNNER_TEMP/bazel-repos.after"',
+                     'comm -13 "$RUNNER_TEMP/bazel-repos.before" "$RUNNER_TEMP/bazel-repos.after"',
+                     'echo "repos_grew=true" >> "$GITHUB_OUTPUT"'):
+            self.assertIn(line, run)
+        self.assertLess(run.index("bazel-repos.before"), run.index(f"bazel-bin/{SUITE}$exe"))
+        self.assertLess(run.index("bazel-matrix-audit.py"), run.index("bazel-repos.after"))
+        save = steps["Save the repository cache"]
+        for condition in ("matrix.cache == 'restore'", "github.ref == 'refs/heads/main'",
+                          "steps.run.outputs.repos_grew == 'true'", "steps.repo-cache.outcome == 'success'"):
+            self.assertIn(condition, save)
+        self.assertNotIn("cache-hit", save)
+        self.assertIn("key: ${{ steps.repo-cache.outputs.cache-primary-key }}", save)
+        # The planner gives the cells that share a prefix different modes.
+        restoring = [c for c in matrix.plan(matrix.entries(), matrix.TIERS, matrix.suite_tests()) if c["cache"]]
+        self.assertTrue(restoring)
+        keys = [(c["group"], c["bazel"], c["os"], c["mode"]) for c in restoring]
+        self.assertEqual(len(keys), len(set(keys)))
+
+    def claims_step(self):
+        return dict(rows_mod.steps(COMPAT_JOBS["audit"]))["Dump the lane claims"]
+
+    def is_stub(self, text):
+        """The workflow's own test for "claims.rs holds no code", applied
+        to `text`: `grep -Evq PATTERN` finds a line that is neither blank
+        nor a comment."""
+        pattern = re.search(r"if ! grep -Evq '([^']+)' \"\$CLAIMS_SOURCE\"; then", self.claims_step()).group(1)
+        blank_or_comment = re.compile(pattern.replace("[[:space:]]", r"\s"))
+        return all(blank_or_comment.match(line) for line in text.splitlines())
+
+    def test_the_claims_dump_is_found_by_its_source_not_by_how_many_tests_ran(self):
+        """"0 passed" is what a stub prints, and also a `claims::dump` that
+        was renamed, moved or ignored. The step tells them apart by the
+        source: comments only is the stub; code means exactly one test
+        named `claims::dump` must run and leave the file."""
+        step = self.claims_step()
+        self.assertIn(f"CLAIMS_SOURCE: {CLAIMS_SOURCE}", step)
+        self.assertIn("if: needs.plan.outputs.tiers == 'full'", step)
+        self.assertIn("--test bazel_golden -- --exact claims::dump 2>&1 | tee claims.log", step)
+        stub_branch = step[step.index("if ! grep -Evq"):step.index("cargo test")]
+        self.assertIn("::notice::", stub_branch)
+        self.assertIn("exit 0", stub_branch)
+        after = step[step.index("cargo test"):]
+        self.assertNotIn("::notice::", after)
+        self.assertRegex(after, r'if \[ "\$\{ran:-0\}" != 1 \]; then\n\s+echo "::error::[^\n]*\n\s+exit 1\n')
+        self.assertRegex(after, r'if \[ ! -f target/bazel-claims\.json \]; then\n\s+echo "::error::[^\n]*\n\s+exit 1\n')
+        self.assertRegex(step, r'if \[ ! -f "\$CLAIMS_SOURCE" \]; then\n\s+echo "::error::[^\n]*\n\s+exit 1\n')
+        self.assertTrue(after.rstrip().endswith('echo "file=target/bazel-claims.json" >> "$GITHUB_OUTPUT"'))
+        # The stub test itself, on sources of both kinds.
+        self.assertTrue(self.is_stub("//! Goldens: writes the claims.\n//! Stub until the gate.\n\n  // fn dump\n"))
+        for code in ("//! Doc.\n\n#[test]\nfn dump() {}\n", "//! Doc.\nmod dump;\n", "use x::y;\n",
+                     "//! Doc.\n    #[test]\n    #[ignore]\n    fn dump_later() {}\n", "claims! { dump }\n"):
+            self.assertFalse(self.is_stub(code), code)
+
+    def test_the_claims_source_is_the_stub_or_declares_the_test_the_workflow_runs(self):
+        """Holds claims.rs to the name the audit job runs. Once the file
+        holds code it declares `#[test] fn dump()` at its top level (libtest:
+        `claims::dump`), not ignored; a rename fails here, in a required
+        unit test, instead of leaving the claims unaudited."""
+        path = ROOT / CLAIMS_SOURCE
+        self.assertTrue(path.is_file(), f"{CLAIMS_SOURCE} moved: the audit job reads the claims dump from it")
+        golden = (path.parent / "main.rs").read_text(encoding="utf-8")
+        self.assertIn("\nmod claims;\n", golden)
+
+        def problem(text):
+            if self.is_stub(text):
+                return None
+            other = r"((?:#\[[^\n]*\]\n|//[^\n]*\n)*)"
+            found = re.search("^" + other + r"#\[test\]\n" + other + r"fn dump\(\)", text, re.M)
+            if not found:
+                return "no top-level `#[test] fn dump()`"
+            return "`dump` is ignored" if "#[ignore" in found.group(1) + found.group(2) else None
+
+        self.assertIsNone(problem(path.read_text(encoding="utf-8")))
+        # The rule, on what the file may become.
+        self.assertIsNone(problem("//! Doc.\n\nuse x::y;\n\n/// Writes it.\n#[test]\nfn dump() {\n    y();\n}\n"))
+        self.assertEqual(problem("//! Doc.\n\n#[test]\nfn dump_claims() {}\n"), "no top-level `#[test] fn dump()`")
+        self.assertEqual(problem("//! Doc.\n\nmod inner {\n    #[test]\n    fn dump() {}\n}\n"),
+                         "no top-level `#[test] fn dump()`")
+        self.assertEqual(problem("//! Doc.\n\nfn dump() {}\n"), "no top-level `#[test] fn dump()`")
+        self.assertEqual(problem('#[test]\n#[ignore = "later"]\nfn dump() {}\n'), "`dump` is ignored")
+        self.assertEqual(problem("//! Doc.\n\n/// Writes it.\n#[ignore]\n#[test]\nfn dump() {}\n"), "`dump` is ignored")
 
     def test_every_action_is_pinned_to_a_commit_and_bazel_comes_from_the_installer(self):
         uses = re.findall(r"^\s*(?:- )?uses: (\S+)", COMPAT_TEXT, re.M)

@@ -112,18 +112,17 @@ impl Report {
 
     /// [`Report::hosts_from_log`] for a test that renames what the log
     /// cannot name: a request a tool sent straight to the loopback origin
-    /// has no host segment, and is reported as `127.0.0.1`. `hosts` is the
-    /// server's own list after that renaming, which can merge two entries
-    /// and never adds one.
+    /// has no host segment, and is reported as [`LOOPBACK`]. `hosts` is the
+    /// server's own list after that renaming and nothing else: every other
+    /// name is one the server logged, and every logged name is there unless
+    /// it was renamed ([`renamed_log`]). Anything else panics, so the
+    /// report cannot name a host no server logged, or leave one out.
     pub fn hosts_from_renamed_log(&mut self, server: &FixtureServer, mut hosts: Vec<String>) {
         hosts.sort();
         hosts.dedup();
-        let logged = server.hosts().len();
-        assert!(
-            hosts.len() <= logged,
-            "{}: {hosts:?} names more hosts than the fixture server logged ({logged})",
-            self.test
-        );
+        if let Err(why) = renamed_log(&server.hosts(), &hosts) {
+            panic!("{}: {why}", self.test);
+        }
         self.hosts = hosts;
         self.hosts_logged = true;
     }
@@ -213,6 +212,47 @@ impl Report {
         println!("probe report ({status:?}): {}", path.display());
         path
     }
+}
+
+/// How a report names the fixture server for a request that reached it
+/// with no host segment: a tool asked the loopback origin directly.
+pub const LOOPBACK: &str = "127.0.0.1";
+
+/// Whether `reported` is `logged` (a fixture server's own host list) with
+/// some entries renamed to [`LOOPBACK`] and no other change. `Err` says
+/// what differs: a name the server did not log, a logged name that is gone
+/// with nothing renamed, or [`LOOPBACK`] with no logged name it stands for.
+/// A count cannot tell these apart: a list of the same length may still
+/// swap a logged host for one nobody contacted.
+pub fn renamed_log(logged: &[String], reported: &[String]) -> Result<(), String> {
+    let is_loopback = |host: &&String| host.as_str() == LOOPBACK;
+    let invented: Vec<&String> = reported
+        .iter()
+        .filter(|host| !is_loopback(host) && !logged.contains(host))
+        .collect();
+    if !invented.is_empty() {
+        return Err(format!(
+            "the report names {invented:?}, which the fixture server did not log ({logged:?})"
+        ));
+    }
+    let renamed: Vec<&String> = logged
+        .iter()
+        .filter(|host| !reported.contains(host))
+        .collect();
+    let names_loopback = reported.iter().any(|host| is_loopback(&host));
+    if !renamed.is_empty() && !names_loopback {
+        return Err(format!(
+            "the report leaves out {renamed:?}, which the fixture server logged, and renames \
+             nothing to {LOOPBACK}"
+        ));
+    }
+    if renamed.is_empty() && names_loopback && !logged.iter().any(|host| is_loopback(&host)) {
+        return Err(format!(
+            "the report names {LOOPBACK}, which stands for no host the fixture server logged \
+             ({logged:?})"
+        ));
+    }
+    Ok(())
 }
 
 /// Where reports go: [`env::PROBE_DIR`], else `<target tmp>/bazel-probe`.

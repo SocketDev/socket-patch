@@ -9,11 +9,14 @@ when
 
   * a report is not a report (unreadable, no test, a status other than
     `ran` / `skipped`);
-  * a `ran` report lacks the hosts it contacted or its wall time, or its
-    hosts did not come from the fixture server's request log
-    (`hosts_source`; `none` only with an empty list);
-  * a `ran` report resolved a ruleset to another version than the
-    MATRIX.json of its fixture pins (a baseline must resolve every pin);
+  * a `ran` report lacks the hosts it contacted, its wall time or its list
+    of lanes, or its hosts did not come from the fixture server's request
+    log (`hosts_source`; `none` only with an empty list, and never in a
+    report that names a lane);
+  * a `ran` report resolved a ruleset to another version than its fixture
+    pins in MATRIX.json (a baseline must resolve every pin). The pins are
+    those of the fixture that lists the test on the report's Bazel release:
+    one test may be listed under two fixtures on different releases;
   * `--require a,b`: a `ran` report lacks one of those fields;
   * `--tiers pr|full`: a test the matrices plan for that run has no `ran`
     report on its Bazel release and runner (`--cell ID`: that cell alone).
@@ -22,11 +25,17 @@ when
 
 A claim is `{lane, mode, ruleset, tier, lo, hi, system, os}`: the lane runs
 on Bazel `lo` to `hi` under one dependency system. It is held to the pinned
-releases CI can run (scripts/bazel-pins.txt): `hi` must be one, every major
-the range spans must have one inside it, and the newest of each needs a
-`ran` report that names the lane (`lanes` in the report) under that system,
-on each OS the claim lists (on any OS while it lists none). A claim above
-its evidence, or over a line with no cell, fails.
+releases CI can run (scripts/bazel-pins.txt) and to the Bazel lines of
+DESIGN 8, which are the majors, except that under Bzlmod (and hybrid) 7.0
+and 7.1 are each a line of their own beside 7.2 - 7.x: their lock is of
+another family, and DESIGN 8 gives them their own cells (7.0.2 and 7.1.2).
+`hi` must be a pinned release, every line the range reaches must have a
+pinned release inside the range, and the newest such release of each line
+needs a `ran` report that names the lane (`lanes` in the report) under that
+system, with its hosts taken from the fixture server's log, on each OS the
+claim lists (on any OS while it lists none). A claim above its evidence, or
+over a line with no cell, fails. A release that is not the newest of its
+line inside the range needs no report: 8.4.2 is pinned for one ruleset.
 
   bazel-matrix-audit.py --reports DIR [--require hosts,wall_ms,resolved]
                         [--tiers pr|full [--cell ID]] [--claims FILE]
@@ -44,7 +53,13 @@ STATUSES = ("ran", "skipped")
 # The fields of a report (probe_report.rs `Report::to_json`).
 FIELDS = ("test", "status", "reason", "bazel", "os", "arch", "group", "system", "lanes", "hosts",
           "hosts_source", "direct_network", "wall_ms", "resolved", "details")
-HOSTS_SOURCES = ("fixture_server_log", "none")
+LOGGED = "fixture_server_log"
+HOSTS_SOURCES = (LOGGED, "none")
+# The (major, minor) at which a line of DESIGN 8 starts inside a major, per
+# dependency system: 7.0 - 7.1 Bzlmod is Beta on the family-A lock, with the
+# cells 7.0.2 and 7.1.2, and 7.2 - 7.7 is Supported. Section 8 splits no
+# WORKSPACE line below the major.
+LINE_STARTS = {"bzlmod": ((7, 1), (7, 2)), "hybrid": ((7, 1), (7, 2))}
 CLAIM_KEYS = ("lane", "mode", "ruleset", "tier", "lo", "hi", "system", "os")
 
 
@@ -89,16 +104,50 @@ def read_reports(directory):
     return reports, errors
 
 
-def pins_by_test(fixtures=None):
-    """{test: (pins, baseline?)} from the light and heavy matrices."""
+def pins_by_cell(fixtures=None):
+    """{(test, Bazel): (pins, baseline?)} from the light and heavy matrices,
+    keyed the way the planner keys an entry (bazel-matrix.py refuses a test
+    listed twice on one Bazel and runner, not one listed under two
+    fixtures): a lane test under an e9 and an e7 fixture is held to the
+    pins of the fixture whose cells name the report's Bazel release."""
     found = {}
     for _, doc in matrix.matrices(fixtures or matrix.FIXTURES):
         for fixture in doc.get("fixtures", []) if isinstance(doc, dict) else []:
             pins = fixture.get("pins", {})
-            found[fixture.get("test")] = (pins, True)
+            for cell in fixture.get("cells", []):
+                found[(fixture.get("test"), cell.get("bazel"))] = (pins, True)
             for lane in fixture.get("lanes", []):
-                found.setdefault(lane.get("test"), (pins, False))
+                for cell in lane.get("cells", []):
+                    found.setdefault((lane.get("test"), cell.get("bazel")), (pins, False))
     return found
+
+
+def pins_of(report, pins):
+    """((pins, baseline?), error) for a `ran` report: the pins of the
+    fixture that lists its test on its Bazel release. A test no fixture
+    lists (the toy, the harness) has none. A release no fixture lists the
+    test on (a local run off the matrix) is held to the pins all its
+    fixtures agree on; where they pin different versions nothing says
+    which fixture it built, and that is an error, not a pass."""
+    test, bazel = report["test"], report.get("bazel")
+    if (test, bazel) in pins:
+        return pins[(test, bazel)], None
+    others = [value for (name, _), value in pins.items() if name == test]
+    if not others:
+        return ({}, False), None
+    if all(pinned == others[0][0] for pinned, _ in others):
+        return (others[0][0], any(baseline for _, baseline in others)), None
+    listed = ", ".join(sorted(str(release) for name, release in pins if name == test))
+    return ({}, False), (f"ran {test} on Bazel {bazel}, where no MATRIX.json lists it (listed on "
+                         f"{listed}, under fixtures with different pins): its resolved versions "
+                         "can be held to no pin")
+
+
+def names_lane(report, lane):
+    """Whether the report's `lanes` holds exactly this lane id. A string
+    would also answer `in`, for any substring of it."""
+    lanes = report.get("lanes")
+    return isinstance(lanes, list) and lane in lanes
 
 
 def report_errors(report, required, pins):
@@ -107,12 +156,23 @@ def report_errors(report, required, pins):
     hosts = report.get("hosts")
     if not isinstance(hosts, list) or not all(isinstance(h, str) for h in hosts):
         errors.append(f"{name}: no `hosts` list: the report does not say what the cell contacted")
+    lanes = report.get("lanes")
+    if not isinstance(lanes, list) or not all(isinstance(lane, str) for lane in lanes):
+        errors.append(f"{name}: `lanes` is {lanes!r}, not a list of lane ids")
+        lanes = []
     source = report.get("hosts_source")
     if source not in HOSTS_SOURCES:
         errors.append(f"{name}: `hosts_source` is {source!r}: the hosts must come from the "
                       "fixture server's request log (Report::hosts_from_log)")
-    elif source == "none" and hosts:
-        errors.append(f"{name}: lists hosts {hosts} that no fixture server logged")
+    elif source != LOGGED:
+        if hosts:
+            errors.append(f"{name}: lists hosts {hosts} that no fixture server logged")
+        # A test that started no fixture server names no host and no lane.
+        # A lane test serves its packages, so its report reads the log.
+        if lanes:
+            errors.append(f"{name}: names the lanes {lanes} with `hosts_source` {source!r}: a "
+                          "report is evidence for a lane only with its hosts taken from the "
+                          "fixture server's request log (Report::hosts_from_log)")
     wall = report.get("wall_ms")
     if not isinstance(wall, int) or isinstance(wall, bool) or wall < 0:
         errors.append(f"{name}: no `wall_ms`")
@@ -124,7 +184,9 @@ def report_errors(report, required, pins):
         if report.get(field) is None:
             errors.append(f"{name}: no `{field}` field")
     resolved = report.get("resolved")
-    wanted, baseline = pins.get(report["test"], ({}, False))
+    (wanted, baseline), unpinned = pins_of(report, pins)
+    if unpinned:
+        errors.append(f"{name}: {unpinned}")
     if wanted and not isinstance(resolved, dict):
         errors.append(f"{name}: no `resolved` versions for a fixture that pins {wanted}")
     for ruleset, pin in (wanted.items() if isinstance(resolved, dict) else ()):
@@ -161,6 +223,32 @@ def planned_errors(reports, tiers, cell=None):
     return errors, notes
 
 
+def line_name(start, end):
+    (major, minor), (next_major, next_minor) = start, end
+    if (next_major, next_minor) == (major + 1, 0):
+        return f"{major}.x" if minor == 0 else f"{major}.{minor} - {major}.x"
+    if (next_major, next_minor) == (major, minor + 1):
+        return f"{major}.{minor}.x"
+    return f"{major}.{minor} - {next_major}.{next_minor - 1}.x"
+
+
+def lines_of(lo, hi, system):
+    """[(name, first, end)] of the Bazel lines of DESIGN 8 that a claim from
+    `lo` to `hi` (version keys) reaches under `system`, oldest first. A line
+    holds the versions from `first` up to, not including, `end`: a major,
+    or a part of one where `LINE_STARTS` splits it for the system."""
+    majors = range(lo[0], hi[0] + 2)
+    starts = sorted({(major, 0) for major in majors}
+                    | {start for start in LINE_STARTS.get(system, ()) if start[0] in majors})
+    found = []
+    for start, end in zip(starts, starts[1:]):
+        # Below every release and pre-release of that minor.
+        first, after = start + (0, 0, ()), end + (0, 0, ())
+        if lo < after and first <= hi:
+            found.append((line_name(start, end), first, after))
+    return found
+
+
 def claim_errors(doc, reports, pins):
     """What the claims document states without evidence."""
     if not isinstance(doc, dict) or doc.get("version") != 1 or not isinstance(doc.get("claims"), list):
@@ -184,27 +272,33 @@ def claim_errors(doc, reports, pins):
                           "the top of the claim")
             continue
         inside = [v for v in releases if lo <= version_key(v) <= hi]
-        for major in range(lo[0], hi[0] + 1):
-            line = [v for v in inside if version_key(v)[0] == major]
+        for name, first, after in lines_of(lo, hi, claim["system"]):
+            line = [v for v in inside if first <= version_key(v) < after]
             if not line:
-                errors.append(f"{what}: spans Bazel {major}.x, where no pinned release lies "
+                errors.append(f"{what}: spans Bazel {name}, where no pinned release lies "
                               "inside the range")
                 continue
             for os_name in claim["os"] or [None]:
-                proof = [r for r in reports if r["status"] == "ran"
-                         and claim["lane"] in (r.get("lanes") or [])
+                where = (f"on Bazel {line[-1]} under {claim['system']} on {os_name or 'any OS'}"
+                         f" (the newest pinned release of Bazel {name} inside the claim)")
+                named = [r for r in reports if r["status"] == "ran"
+                         and names_lane(r, claim["lane"])
                          and r.get("bazel") == line[-1] and r.get("system") == claim["system"]
                          and os_name in (None, r.get("os"))]
-                if not proof:
-                    errors.append(f"{what}: no `ran` report names the lane on Bazel {line[-1]}"
-                                  f" under {claim['system']} on {os_name or 'any OS'}")
+                if not named:
+                    errors.append(f"{what}: no `ran` report names the lane {where}")
+                elif not any(r.get("hosts_source") == LOGGED for r in named):
+                    files = ", ".join(sorted(r["_file"] for r in named))
+                    errors.append(f"{what}: no `ran` report with hosts from the fixture "
+                                  f"server's log names the lane {where}: {files} did not read "
+                                  "the log (`hosts_source`), so it proves nothing")
     return errors
 
 
 def audit(directory, required=(), tiers=None, cell=None, claims=None, fixtures=None):
     """(errors, notes, summary) for the reports under `directory`."""
     reports, errors = read_reports(directory)
-    pins = pins_by_test(fixtures)
+    pins = pins_by_cell(fixtures)
     ran = [r for r in reports if r["status"] == "ran"]
     for report in ran:
         errors += report_errors(report, required, pins)

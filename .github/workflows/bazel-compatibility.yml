@@ -12,7 +12,8 @@ name: Bazel patch compatibility
 # every test of one (fixture group, Bazel, runner, test-name prefix), run
 # with `--exact`: it runs the tests its matrices list and no other. The toy
 # group is all in one: its `core` cell also runs the guard tests that use
-# the toy fixture, which ci.yml's `bazel_core_` row does not select.
+# the toy fixture, which ci.yml's `bazel_core_` row does not select. In a
+# ruleset group the `bazel_agent_` tests ride the `vendor` cell.
 #
 # Tiers. A matrix entry is `pr` or `nightly`:
 #   * pull_request (the paths below): the `pr` entries.
@@ -28,7 +29,9 @@ name: Bazel patch compatibility
 # Jobs: plan -> build (the CLI and the suite, once per runner OS) ->
 # cells / extras -> audit. `extras` are the record-only cells (the
 # `bazel_canary_` tests, and any cell on a Bazel pre-release): their result
-# is recorded and gates nothing.
+# is recorded and gates nothing. `build` also holds the test paths the cells
+# filter on to the list the binary prints: under `--exact` a path libtest
+# does not know runs nothing and exits 0.
 #
 # Evidence. A test that printed SKIP still passes for libtest, so a green
 # test run proves nothing. Every test writes a JSON report
@@ -153,6 +156,20 @@ jobs:
           BUNDLE_OS: ${{ matrix.os }}
         run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/bazel-bin --suites e2e_bazel_build
 
+      - name: Hold the cell filters to the tests the binary lists
+        # scripts/bazel-matrix.py computes each test's libtest path from
+        # the sources (file, inline modules, name). Here the binary says
+        # what the paths are: the two sets must be equal, or no cell is
+        # built on this runner.
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          py=$(command -v python3 || command -v python)
+          "target/bazel-bin/e2e_bazel_build$exe" --list --ignored > target/bazel-tests.txt
+          "$py" scripts/bazel-matrix.py --check --libtest-list target/bazel-tests.txt
+
       - uses: ./.github/actions/upload-artifact
         with:
           name: bazel-bin-${{ matrix.os }}
@@ -234,6 +251,24 @@ jobs:
         # them once and its reports say `direct_network`. A canary cell
         # stays cold: on a warm cache it could not tell when a pinned URL
         # stops answering.
+        #
+        # One rolling cache per (group, Bazel, runner OS), shared by the
+        # cells of every mode. A cache key is written once. With one key
+        # for the guard, hosted and vendor cells of a line, the first cell
+        # to finish would save what it fetched and no cell could add to it
+        # afterwards. So the key ends in the mode and the run: it is never
+        # hit, the restore takes the newest cache of the prefix whichever
+        # cell saved it, and a cell that fetched what that cache lacked
+        # saves the two together under its own key (the last step). The
+        # cells of a line converge on the union of what they fetch, within
+        # one run on main per mode, and then save nothing.
+        #
+        # Not one cache per mode: the modes fetch the same rulesets and
+        # toolchains, so each could grow to the union, which is 383 MB at
+        # the fetch tier and about 1.1 GB with the tier-2 toolchains
+        # ([probe] T6, one Bazel line on macOS). Three of them for each of
+        # nine (Bazel, runner) pairs is up to 10 GB at the fetch tier
+        # alone: all a repository may cache, cargo's share included.
         id: repo-cache
         if: matrix.cache == 'restore'
         uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
@@ -241,13 +276,15 @@ jobs:
         continue-on-error: true
         with:
           path: ${{ runner.temp }}/bazel-repos
-          key: bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.group), 'crates/socket-patch-cli/tests/fixtures/bazel/registry/MANIFEST.json') }}
-          # The cache is content-addressed: an older one is still correct,
-          # only incomplete.
+          key: bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.group), 'crates/socket-patch-cli/tests/fixtures/bazel/registry/MANIFEST.json') }}-${{ matrix.mode }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # The cache is content-addressed: another mode's, or one saved
+          # for older fixtures, is still correct, only incomplete.
           restore-keys: |
+            bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.group), 'crates/socket-patch-cli/tests/fixtures/bazel/registry/MANIFEST.json') }}-
             bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-
 
       - name: Run the cell
+        id: run
         shell: bash
         env:
           # A missing Bazel or an unreachable origin fails instead of SKIP.
@@ -267,6 +304,12 @@ jobs:
           exe=''
           if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
           py=$(command -v python3 || command -v python)
+          # The files of the repository cache, before and after: a cell
+          # that fetched one the restored cache lacked saves the cache.
+          cached() {
+            if [ -d "$RUNNER_TEMP/bazel-repos" ]; then find "$RUNNER_TEMP/bazel-repos" -type f | LC_ALL=C sort; fi
+          }
+          cached > "$RUNNER_TEMP/bazel-repos.before"
           status=0
           (
             cd crates/socket-patch-cli
@@ -277,6 +320,9 @@ jobs:
           # A test that printed SKIP passed for libtest. Only a report of
           # status `ran` counts: each test planned for this cell needs one.
           "$py" scripts/bazel-matrix-audit.py --reports target/bazel-probe --tiers "$TIERS" --cell "$CELL_ID" --require hosts,wall_ms,resolved || status=1
+          cached > "$RUNNER_TEMP/bazel-repos.after"
+          fetched=$(LC_ALL=C comm -13 "$RUNNER_TEMP/bazel-repos.before" "$RUNNER_TEMP/bazel-repos.after" | wc -l)
+          if [ "$fetched" -gt 0 ]; then echo "repos_grew=true" >> "$GITHUB_OUTPUT"; fi
           exit "$status"
 
       - name: Upload the cell reports
@@ -289,10 +335,13 @@ jobs:
           retention-days: 30
 
       - name: Save the repository cache
+        # Only what a run on main fetched beyond the restored cache: then
+        # the next run restores this one, and a run that fetched nothing
+        # new saves nothing.
         if: >-
           matrix.cache == 'restore'
           && github.ref == 'refs/heads/main'
-          && steps.repo-cache.outputs.cache-hit != 'true'
+          && steps.run.outputs.repos_grew == 'true'
           && steps.repo-cache.outcome == 'success'
         uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
@@ -314,9 +363,12 @@ jobs:
 
   audit:
     # Runs when cells failed too: a failed cell left no report, which is
-    # what the audit is there to say. It never gates a merge or a release.
+    # what the audit is there to say. Not on a cancelled run (a push that
+    # supersedes this one): `always()` would start it on the old commit to
+    # fail on reports that were never written. It never gates a merge or a
+    # release.
     needs: [plan, cells, extras]
-    if: always() && needs.plan.result == 'success'
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
     timeout-minutes: 30
     env:
@@ -353,27 +405,45 @@ jobs:
           save-if: false
 
       - name: Dump the lane claims
-        # `claims::dump` writes what `lanes::claims_json()` renders. Until
-        # the gate lands the golden suite has no such test and every lane
-        # is a disabled stub, so there is nothing to claim. Once the test
-        # exists, a run that leaves no file is an error, not "no claims".
-        # Claims hold over the whole matrix, so only a full run audits them.
+        # `claims::dump` (bazel_golden) writes what `lanes::claims_json()`
+        # renders. Whether there is such a test is read from its source,
+        # not from the run. Until the gate lands, claims.rs is a stub of
+        # comment lines, every lane is a disabled stub, and there is
+        # nothing to claim. Once the file holds code, the run must execute
+        # exactly the test `claims::dump` and leave the file: a test that
+        # was renamed, moved or ignored also reports "0 passed", and the
+        # claims would go unaudited on a green run.
+        # scripts/tests/test_ci_bazel_prefixes.py holds claims.rs to that
+        # name. Claims hold over the whole matrix, so only a full run
+        # audits them.
         id: claims
         if: needs.plan.outputs.tiers == 'full'
         shell: bash
+        env:
+          CLAIMS_SOURCE: crates/socket-patch-core/tests/bazel_golden/claims.rs
         run: |
           set -euo pipefail
           rm -f target/bazel-claims.json
-          cargo test --locked -p socket-patch-core --test bazel_golden claims::dump 2>&1 | tee claims.log
+          if [ ! -f "$CLAIMS_SOURCE" ]; then
+            echo "::error::$CLAIMS_SOURCE is gone: the claims dump moved, and the claims would go unaudited"
+            exit 1
+          fi
+          # A line that is neither blank nor a comment is code.
+          if ! grep -Evq '^[[:space:]]*(//.*)?$' "$CLAIMS_SOURCE"; then
+            echo "::notice::$CLAIMS_SOURCE is still the stub (comments only): no lane is enabled, so no claim is audited."
+            exit 0
+          fi
+          cargo test --locked -p socket-patch-core --test bazel_golden -- --exact claims::dump 2>&1 | tee claims.log
           ran=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' claims.log | head -n 1)
-          if [ "${ran:-0}" = 0 ]; then
-            echo "::notice::bazel_golden has no claims::dump test yet: no lane is enabled, so no claim is audited."
-          elif [ ! -f target/bazel-claims.json ]; then
+          if [ "${ran:-0}" != 1 ]; then
+            echo "::error::$CLAIMS_SOURCE holds code, but the run executed ${ran:-0} test(s) named exactly claims::dump: the claims would go unaudited"
+            exit 1
+          fi
+          if [ ! -f target/bazel-claims.json ]; then
             echo "::error::claims::dump ran and wrote no target/bazel-claims.json"
             exit 1
-          else
-            echo "file=target/bazel-claims.json" >> "$GITHUB_OUTPUT"
           fi
+          echo "file=target/bazel-claims.json" >> "$GITHUB_OUTPUT"
 
       - name: Audit the reports
         shell: bash

@@ -15,10 +15,19 @@ parses each one strictly, so this script reads them as they are:
   light   {"group", "ruleset", "fixtures": [{"path", "test", "system",
           "pins", "fetch"?, "cells": [{"bazel", "proof", "tier"}],
           "lanes"?: [{"test", "cells"}]}]}
-  heavy   as light, with "fixture" (relative to fixtures/bazel) for "path"
+  heavy   {"group", "ruleset", "fixtures": [{"fixture" (relative to
+          fixtures/bazel), "test", "system", "pins", "fetch", "cells"}]}
 
 A file of another shape is refused: a matrix this script cannot read would
 otherwise plan nothing and look covered.
+
+Two keys are read here that the suite's schemas do not take yet: `lanes`
+under a heavy fixture (the heavy `Fixture` of baseline_heavy.rs has no such
+field, so a heavy lane test cannot be listed until it does) and `cache` in
+a cell (neither `CellSpec` has it). Both schemas refuse unknown keys, so no
+committed matrix can carry them today. scripts/tests/test_bazel_matrix.py
+holds every key this script reads to the fields of those structs and names
+these two as the open ones.
 
 An entry is one test on one Bazel release on one runner. Its tier is `pr`
 (the path-filtered pull-request run and every wider run) or `nightly`
@@ -28,15 +37,24 @@ and heavy matrices give one tier per (fixture, Bazel) and name no runner;
 
 A cell is one CI job: every entry of one (group, Bazel, runner, mode), where
 the mode is the test-name prefix (`bazel_core_`, `bazel_guard_`,
-`bazel_agent_`, `bazel_hosted_`, `bazel_vendor_`, `bazel_canary_`). The toy
-group is "all in one" (DESIGN 9.5): every gating test of it shares the
-`core` cell of its Bazel and runner, whatever its prefix. A cell's libtest
-filter is `--exact` with the full path of each test, so it runs the tests
-its matrices list and no other: a prefix would also run the nightly tests
-of the same mode in the pull-request tier.
+`bazel_agent_`, `bazel_hosted_`, `bazel_vendor_`, `bazel_canary_`), with
+two exceptions of DESIGN 9.5. The toy group is "all in one": every gating
+test of it shares the `core` cell of its Bazel and runner, whatever its
+prefix. And in a ruleset group a `bazel_agent_` test rides the `vendor`
+cell ("agent Go rides the vendor cell"): there is no agent job. A cell's
+libtest filter is `--exact` with the full path of each test, so it runs the
+tests its matrices list and no other: a prefix would also run the nightly
+tests of the same mode in the pull-request tier.
 
-  bazel-matrix.py --check
+`--exact` compares whole paths, so a path libtest does not know runs
+nothing and still exits 0. The paths are computed from the sources
+(`suite_tests`: file, inline `mod` blocks, name) and `--libtest-list`
+holds them to what the built binary lists.
+
+  bazel-matrix.py --check [--libtest-list FILE]
       Hold the matrices to the rules below and to the suite's sources.
+      With FILE, the output of `e2e_bazel_build --list --ignored`: fail
+      unless it names exactly the test paths the cells filter on.
   bazel-matrix.py --event E [--labels JSON] [--github-output FILE]
       Print the plan of the event as JSON; with --github-output write
       `cells`, `extras`, `build` and `tiers` for the workflow instead, and
@@ -48,7 +66,8 @@ has an entry; every (Bazel, runner) is pinned in scripts/bazel-pins.txt;
 every (fixture, Bazel) pair is in the era table; no rules_jvm_external
 entry is `pr` above proof tier 0; no Go or Rust entry is `pr` without a
 restored repository cache; a fixture whose packages a tool fetches says
-`"fetch": "tool"`.
+`"fetch": "tool"`; the `os` list of a core-shape test names runners its
+cells run on and leaves each of its releases at least one.
 """
 
 import argparse
@@ -246,7 +265,13 @@ def entry(matrix, group, ruleset, test, system, bazel, runner, tier, **more):
 
 def read_core(doc, matrix):
     """The entries of the core shape: a test runs on every runner of each
-    cell of a release it names, or on those of its own `os` list."""
+    cell of a release it names, or on those of its own `os` list.
+
+    That list is held, for every file of the shape, to the rule the suite
+    has for core/MATRIX.json alone (core.rs): it is a list of runners, each
+    one a runner of a cell of one of the test's releases, and it leaves
+    each release at least one runner. A misspelt runner would otherwise
+    drop the test from a cell, which then no longer asks for its report."""
     group, prefix = need(doc, "group", str, matrix), need(doc, "filter", str, matrix)
     cells = need(doc, "cells", list, matrix)
     out = []
@@ -254,14 +279,21 @@ def read_core(doc, matrix):
         where = f"{matrix}: {name}"
         if not name.startswith(prefix):
             raise MatrixError(f"{where}: not a `{prefix}` test")
-        scope = claim.get("os")
+        scope = need(claim, "os", list, where) if isinstance(claim, dict) and "os" in claim else None
+        if scope is not None and not (scope and all(isinstance(runner, str) and runner in RUNNERS
+                                                    for runner in scope)):
+            raise MatrixError(f"{where}: `os` is {scope!r}, not a list of runners "
+                              f"({', '.join(RUNNERS)})")
+        runs_on = set()
         for bazel in need(claim, "bazel", list, where):
             rows = [cell for cell in cells if cell.get("bazel") == bazel]
             if not rows:
                 raise MatrixError(f"{where}: no cell on Bazel {bazel}")
+            planned = 0
             for cell in rows:
                 tiers = need(cell, "tier", dict, f"{matrix}: cell {bazel}")
                 for runner in need(cell, "os", list, f"{matrix}: cell {bazel}"):
+                    runs_on.add(str(runner))
                     if scope is not None and runner not in scope:
                         continue
                     if runner not in tiers:
@@ -269,6 +301,14 @@ def read_core(doc, matrix):
                     out.append(entry(matrix, group, "", name, need(claim, "system", str, where),
                                      bazel, runner, tiers[runner],
                                      network=need(cell, "network", str, f"{matrix}: cell {bazel}")))
+                    planned += 1
+            if not planned:
+                raise MatrixError(f"{where}: the cells on Bazel {bazel} name no runner" if scope is None
+                                  else f"{where}: no cell on Bazel {bazel} runs on any of {', '.join(scope)}")
+        stray = [runner for runner in scope or () if runner not in runs_on]
+        if stray:
+            raise MatrixError(f"{where}: `os` names {', '.join(stray)}, where no cell of its "
+                              "Bazel releases runs")
     return out
 
 
@@ -337,7 +377,12 @@ def macro_tests(text):
     """The tests a `macro_rules!` of the suite declares: for each macro whose
     body holds `#[ignore` and `fn $name`, the names that start a line of its
     invocations (`name! {` up to the `}` at the same indentation)."""
-    lines, names = text.splitlines(), []
+    return [name for name, _ in macro_test_lines(text)]
+
+
+def macro_test_lines(text):
+    """[(name, line index)] of `macro_tests`."""
+    lines, names = text.split("\n"), []
     macros = set()
     for i, line in enumerate(lines):
         opened = re.match(r"^(\s*)macro_rules!\s*([A-Za-z_][A-Za-z0-9_]*)\s*\{", line)
@@ -354,29 +399,78 @@ def macro_tests(text):
         called = re.match(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)!\s*\{\s*$", line)
         if not called or called.group(2) not in macros:
             continue
-        for inner in lines[i + 1:]:
+        for at, inner in enumerate(lines[i + 1:], i + 1):
             if inner.startswith(called.group(1) + "}"):
                 break
             name = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\b", inner)
             if name:
-                names.append(name.group(1))
+                names.append((name.group(1), at))
     return names
+
+
+def ignored_test_lines(text):
+    """[(name, line index)] of the `#[ignore]` functions `text` spells out
+    (ci-e2e-bundle.py's reader, with where each name stands)."""
+    return [(found.group(1), text.count("\n", 0, found.start(1)))
+            for found in bundle.IGNORED_FN.finditer(text)]
+
+
+INLINE_MOD = re.compile(r"^(\s*)(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*\{\s*$")
+
+
+def inline_modules(text):
+    """Per line of `text`, the inline `mod name {` blocks around it,
+    outermost first. A block runs to the first line that starts with its
+    own indentation and `}`, as rustfmt writes it (the rule `macro_tests`
+    reads an invocation by). libtest names a test by these modules too:
+    a test in `mod inner` of lane.rs is `lane::inner::<name>`."""
+    stack, found = [], []
+    for line in text.split("\n"):
+        if stack and line.startswith(stack[-1][0] + "}"):
+            stack.pop()
+        found.append([name for _, name in stack])
+        opened = INLINE_MOD.match(line)
+        if opened:
+            stack.append(opened.group(1, 2))
+    return found
 
 
 def suite_tests(tests=TESTS):
     """{test name: its libtest path} for every `#[ignore]` test of the
-    suite, a macro's included. The path is `<module>::<name>`, which is what
-    `--exact` compares."""
+    suite, a macro's included. The path is what `--exact` compares: the
+    modules of the file, the inline `mod` blocks around the test (or around
+    the macro invocation that declares it), and the name. It is a model of
+    what rustc does; `libtest_errors` holds it to the binary."""
     found = {}
     for path in bundle.suite_files(SUITE, tests):
         text = path.read_text(encoding="utf-8")
         rel = path.relative_to(tests / SUITE).with_suffix("")
         parts = [p for p in rel.parts if p not in ("main", "mod")]
-        for name in bundle.ignored_tests(text) + macro_tests(text):
+        inside = inline_modules(text)
+        for name, line in ignored_test_lines(text) + macro_test_lines(text):
             if name in found:
                 raise MatrixError(f"{SUITE}: two tests are named {name}")
-            found[name] = "::".join(parts + [name])
+            found[name] = "::".join(parts + inside[line] + [name])
     return found
+
+
+def libtest_errors(listing, tests):
+    """What `<suite binary> --list --ignored` printed against the paths the
+    cells filter on (`tests`, from `suite_tests`). The two sets must be
+    equal. A path the binary does not list would run nothing under
+    `--exact`, with exit 0; a test the binary lists and no path names (in
+    a module this script cannot see: one a macro writes, or a file outside
+    the suite's directory) runs in no cell."""
+    listed = set(re.findall(r"^(\S+): test\r?$", listing, re.M))
+    if not listed:
+        return [f"{SUITE}: the listing names no test: it is not what `{SUITE} --list --ignored` prints"]
+    known = set(tests.values())
+    errors = [f"{SUITE}: a cell filters on `{path}`, which the binary does not list: under "
+              "`--exact` it would run nothing" for path in sorted(known - listed)]
+    errors += [f"{SUITE}: the binary lists the `#[ignore]` test `{path}`, which no cell can "
+               "select: the planner computes another path for it, or does not see it"
+               for path in sorted(listed - known)]
+    return errors
 
 
 def fetches_by_tool(ruleset, fixture):
@@ -429,7 +523,9 @@ def fixture_errors(fixtures=FIXTURES):
                     if ruleset in GO_RUST and cell.get("cache") != "restored":
                         errors.append(f"{at}: a Go or Rust cell is in the pull-request tier "
                                       'only with a restored repository cache (`"cache": '
-                                      '"restored"`)')
+                                      '"restored"`). The suite\'s `CellSpec` takes no `cache` '
+                                      "key yet (baseline_heavy.rs), so until it does the cell "
+                                      "is `nightly`")
     return errors
 
 
@@ -487,12 +583,18 @@ def tiers_of(event, labels=()):
 
 def cell_mode(e):
     """The cell an entry joins within its (group, Bazel, runner): its
-    test-name prefix, except that the toy group's gating tests all share
-    the `core` cell. A core-group guard test costs seconds on a fixture
-    with no ruleset, and a job of its own would spend most of its time on
-    setup; a canary keeps its own cell, because it is record-only."""
+    test-name prefix, with the two exceptions of DESIGN 9.5. The toy
+    group's gating tests all share the `core` cell: a core-group guard test
+    costs seconds on a fixture with no ruleset, and a job of its own would
+    spend most of its time on setup. In a ruleset group an agent test rides
+    the `vendor` cell (the nightly table has guard, hosted and vendor cells
+    and no agent one); the filter is `--exact`, so the shared cell still
+    runs the listed tests and no other. A canary keeps its own cell,
+    because it is record-only."""
     mode = mode_of(e["test"])
-    return "core" if e["group"] == "core" and mode not in RECORD_ONLY_MODES else mode
+    if e["group"] == "core":
+        return mode if mode in RECORD_ONLY_MODES else "core"
+    return "vendor" if mode == "agent" else mode
 
 
 def cell_id(e):
@@ -547,13 +649,29 @@ def main(argv=None):
     ap.add_argument("--event", help="pull_request, schedule or workflow_dispatch")
     ap.add_argument("--labels", default="[]", help="the pull request's label names, as a JSON list")
     ap.add_argument("--github-output", type=Path, help="append the workflow outputs to this file")
+    ap.add_argument("--libtest-list", type=Path,
+                    help=f"with --check: the output of `{SUITE} --list --ignored`, which must name "
+                         "exactly the test paths the cells filter on")
     args = ap.parse_args(argv)
+    if args.libtest_list is not None and not args.check:
+        ap.error("--libtest-list needs --check")
     errors = check()
     for error in errors:
         print(f"bazel-matrix: {error}", file=sys.stderr)
     if errors:
         return 1
     found, tests = entries(), suite_tests()
+    if args.libtest_list is not None:
+        try:
+            listing = args.libtest_list.read_text(encoding="utf-8")
+        except (OSError, ValueError) as e:
+            print(f"bazel-matrix: {args.libtest_list}: {e}", file=sys.stderr)
+            return 1
+        errors = libtest_errors(listing, tests)
+        for error in errors:
+            print(f"bazel-matrix: {error}", file=sys.stderr)
+        if errors:
+            return 1
     if args.check:
         full = plan(found, TIERS, tests)
         print(f"bazel-matrix: ok ({len(matrices())} matrices, {len(found)} entries, "
