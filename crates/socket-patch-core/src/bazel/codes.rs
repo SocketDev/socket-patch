@@ -64,11 +64,12 @@
 //! and v5.0 removed the `level` the Gradle discovery notes once carried.
 //! The contract section therefore documents the Level column as the
 //! human prefix, and gives the run-required advisory no `details` object:
-//! its detail text names the command and the platforms. Nothing is
-//! emitted yet, so the choice is open until the first code becomes
-//! `active`: either this stands, or the envelope gains optional `level`
-//! and `details` fields on `RunWarning` and the contract's envelope text
-//! changes with it.
+//! its detail text names the command and the platforms. The first codes
+//! became `active` with the early hazard fixes (the output-tree and
+//! `.bazelignore` guards), and they are emitted under this reading, which
+//! settles it: a run-level warning is `{code, detail}`. A code that needs
+//! structured fields later carries them in an event's `details`, as the
+//! run-required row of the contract says, and not on `RunWarning`.
 
 use std::fmt;
 

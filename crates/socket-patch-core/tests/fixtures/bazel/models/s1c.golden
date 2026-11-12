@@ -1,0 +1,216 @@
+## assigned-result
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes one string literal and an optional boolean dev_dependency, as a statement of its own
+
+## basename-dot-in-pkg
+file MODULE.bazel
+file .socket/bazel/.hidden.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/.hidden.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/.hidden.MODULE.bazel:3)
+
+## basename-dot-root
+file MODULE.bazel
+file .socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket-patch.MODULE.bazel:3)
+
+## basename-plain-MODULE.bazel
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## dev_dependency-False
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## dev_dependency-True
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3 dev
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") dev (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep dev (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## dev_dependency-True+ignore_dev
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3 dev
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") dev (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep dev (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## include-before-module
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:1
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## include-cycle-self
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:3)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:4)
+gap Everything .socket/bazel/socket-patch.MODULE.bazel:1: the file includes itself
+
+## include-in-nonroot-local-override
+file MODULE.bazel
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (MODULE.bazel:3)
+LocalPath override of segdep (MODULE.bazel:4)
+
+## include-twice-same
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:4
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## indented-include
+file MODULE.bazel
+gap Everything MODULE.bazel:3: a line indented differently from its block
+
+## keyword-label
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes one string literal and an optional boolean dev_dependency, as a statement of its own
+
+## label-@//
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## label-@@//
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## label-@s1//
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## label-bare-path
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## label-no-colon
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+gap Everything .socket/bazel/socket-patch.MODULE.bazel/socket-patch.MODULE.bazel:1: the included file does not exist (included at MODULE.bazel:3)
+
+## label-relative-colon
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## nested-include
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+file .socket/bazel/inner.MODULE.bazel <- .socket/bazel/socket-patch.MODULE.bazel:2
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/inner.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/inner.MODULE.bazel:3)
+
+## no-module-call
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:1
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## nonliteral-concat
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## nonliteral-variable
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:5: include() takes one string literal and an optional boolean dev_dependency, as a statement of its own
+
+## ok-baseline
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## segment-calls-module()
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:3)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:4)
+
+## segment-comment-only
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+
+## segment-empty-0-bytes
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+
+## segment-is-directory
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+gap Everything .socket/bazel/socket-patch.MODULE.bazel:1: the file cannot be read (included at MODULE.bazel:3)
+
+## segment-missing-file
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+gap Everything .socket/bazel/socket-patch.MODULE.bazel:1: the included file does not exist (included at MODULE.bazel:3)
+
+## single-quotes
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## suffix-.bzl
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## suffix-lowercase
+file MODULE.bazel
+module Some("s1") repo_name=None
+gap Everything MODULE.bazel:3: include() takes a label of the form //pkg:name.MODULE.bazel
+
+## target-with-subdir-name
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## trailing-comma-multiline
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+
+## trailing-comment
+file MODULE.bazel
+file .socket/bazel/socket-patch.MODULE.bazel <- MODULE.bazel:3
+module Some("s1") repo_name=None
+dep segdep@1.0 as Some("segdep") (.socket/bazel/socket-patch.MODULE.bazel:2)
+LocalPath override of segdep (.socket/bazel/socket-patch.MODULE.bazel:3)
+

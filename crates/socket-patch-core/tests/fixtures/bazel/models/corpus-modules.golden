@@ -1,0 +1,16 @@
+aspect_rules_py-2.0.0-alpha.11-uv-overrides-setup.MODULE.bazel	deps=0 proxies=1 tags=6 imports=1 rules=0 overrides=0 gaps=0
+bazelbuild-bazel-9.3.2.MODULE.bazel	deps=37 proxies=10 tags=4 imports=53 rules=9 overrides=8 gaps=1
+bcr-copybara-20250728.MODULE.bazel	deps=15 proxies=3 tags=2 imports=7 rules=0 overrides=1 gaps=0
+bcr-libsl3-1.2.53004.MODULE.bazel	deps=4 proxies=0 tags=0 imports=0 rules=0 overrides=0 gaps=0
+bcr-mcap-2.1.3.MODULE.bazel	deps=3 proxies=0 tags=0 imports=0 rules=0 overrides=0 gaps=0
+bcr-rules_pkl-0.18.0.MODULE.bazel	deps=12 proxies=7 tags=7 imports=21 rules=0 overrides=0 gaps=0
+bcr-trlc-3.1.1.MODULE.bazel	deps=4 proxies=3 tags=4 imports=4 rules=0 overrides=0 gaps=2
+gazelle-0.47.0-go_mod.MODULE.bazel	deps=10 proxies=3 tags=17 imports=19 rules=0 overrides=2 gaps=0
+rules_dotnet-0.22.2-examples.MODULE.bazel	deps=3 proxies=5 tags=1 imports=5 rules=0 overrides=1 gaps=0
+rules_js-3.6.0-npm_translate_lock.MODULE.bazel	deps=2 proxies=2 tags=2 imports=3 rules=0 overrides=1 gaps=0
+rules_jvm_external-6.7-bzlmod_lock_files.MODULE.bazel	deps=1 proxies=1 tags=1 imports=1 rules=0 overrides=1 gaps=0
+rules_pycross-2.0.1-build_setuptools.MODULE.bazel	deps=5 proxies=5 tags=10 imports=3 rules=0 overrides=1 gaps=5
+rules_pycross-2.0.1-openssl-repositories.MODULE.bazel	deps=1 proxies=0 tags=0 imports=0 rules=1 overrides=0 gaps=0
+rules_python-1.7.0-bzlmod.MODULE.bazel	deps=9 proxies=3 tags=14 imports=6 rules=0 overrides=3 gaps=0
+rules_ruby-0.29.0-gem.MODULE.bazel	deps=4 proxies=1 tags=2 imports=3 rules=0 overrides=1 gaps=0
+rules_rust-0.75.0-ext_annotations.MODULE.bazel	deps=3 proxies=3 tags=5 imports=3 rules=1 overrides=1 gaps=0

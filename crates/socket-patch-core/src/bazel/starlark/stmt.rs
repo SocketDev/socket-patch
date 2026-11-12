@@ -628,6 +628,32 @@ impl<'a> File<'a> {
         1 + self.src[..offset].iter().filter(|b| **b == b'\n').count()
     }
 
+    /// Every name written inside `span`, in source order and as often as
+    /// it is written: what [`File::uses`] counts as a name (no attribute
+    /// after a `.`, no keyword of an argument) and no reserved word. A
+    /// binding counts too. Evaluating the span can reach a function only
+    /// through one of these names, so a caller that knows each of them is
+    /// harmless knows the span declares nothing.
+    pub fn names_in(&self, span: Span) -> Vec<&'a str> {
+        let is_op = |at: Option<usize>, op: &[u8]| {
+            let token = at.and_then(|at| self.tokens.get(at));
+            token.is_some_and(|t| t.tok == Tok::Op && &self.src[t.start..t.end] == op)
+        };
+        let first = self.tokens.partition_point(|t| t.start < span.0);
+        let inside = self.tokens[first..].iter().take_while(|t| t.end <= span.1);
+        let mut names = Vec::new();
+        for (i, t) in (first..).zip(inside) {
+            let text = std::str::from_utf8(&self.src[t.start..t.end]).unwrap_or_default();
+            let reserved = KEYWORDS.contains(&text) || CONSTANTS.contains(&text);
+            let attribute = is_op(i.checked_sub(1), b".");
+            let keyword = t.depth > 0 && is_op(Some(i + 1), b"=");
+            if t.tok == Tok::Ident && !reserved && !attribute && !keyword {
+                names.push(text);
+            }
+        }
+        names
+    }
+
     /// Where `name` is written in the file, against its top-level
     /// statements.
     pub fn uses(&self, name: &str) -> Uses<'_> {
@@ -2287,6 +2313,35 @@ use_repo(ext, "r")
         ] {
             assert_eq!(handed(&src, dialect), [Why::PassedAsValue], "{src}");
         }
+    }
+
+    /// The WORKSPACE reader asks which names an expression can reach a
+    /// function through. An attribute, the keyword of an argument, a
+    /// reserved word and the text of a string or a comment are not names.
+    #[test]
+    fn the_names_in_a_span_are_the_ones_evaluating_it_can_reach() {
+        let src = "http_archive(\n    name = \"dep\",  # helper(x)\n    urls = [mirror(BASE) + \
+                   \"/{}.tgz\".format(VERSION) for mirror in MIRRORS if not None],\n    \
+                   build_file_content = \"\"\"cc_library(name = \"x\")\"\"\",\n)\nafter = other.attr\n";
+        let file = read(src.as_bytes(), Dialect::Workspace).unwrap();
+        let call = file.stmts[0].span;
+        assert_eq!(
+            file.names_in(call),
+            [
+                "http_archive",
+                "mirror",
+                "BASE",
+                "VERSION",
+                "mirror",
+                "MIRRORS"
+            ]
+        );
+        // A span is taken as given: the callee in front of it is out.
+        let args = (call.0 + "http_archive(".len(), call.1 - 1);
+        assert_eq!(file.names_in(args)[0], "mirror");
+        assert_eq!(file.names_in(file.stmts[1].span), ["after", "other"]);
+        assert_eq!(file.names_in((0, 0)), [""; 0]);
+        assert_eq!(file.names_in((src.len(), src.len())), [""; 0]);
     }
 
     #[test]

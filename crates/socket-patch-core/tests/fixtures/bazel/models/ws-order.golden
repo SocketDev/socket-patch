@@ -1,0 +1,20 @@
+c01	built=v2	query=v2	exact WORKSPACE:5 file:///WS/archives/dep-v2.tar.gz
+c02	built=v2	query=v2	exact WORKSPACE:12 file:///WS/archives/dep-v2.tar.gz
+c03	built=v1	query=v2	exact WORKSPACE:5 file:///WS/archives/dep-v1.tar.gz
+c04	built=v1	query=v1	exact WORKSPACE:6 file:///WS/archives/dep-v1.tar.gz
+c05	built=v2	query=v2	exact WORKSPACE:14 file:///WS/archives/dep-v2.tar.gz
+c06	built=v1	query=v2	exact WORKSPACE:6 maybe file:///WS/archives/dep-v1.tar.gz
+c07	built=v2	query=v2	exact WORKSPACE:8 file:///WS/archives/dep-v2.tar.gz
+c08	built=v1	query=v2	exact deps_plain.bzl:4 macro file:///WS/archives/dep-v1.tar.gz
+c09	built=v2	query=v1	exact WORKSPACE:5 file:///WS/archives/dep-v2.tar.gz
+c10	built=v1	query=v1	unknown ReplacedByMacro at line 13
+c11	built=v2	query=v2	exact WORKSPACE:6 file:///WS/archives/dep-v2.tar.gz
+c12	built=v2	query=v2	exact WORKSPACE:8 file:///WS/archives/dep-v2.tar.gz
+c13	built=v1	query=v2	exact deps_maybe.bzl:5 maybe macro file:///WS/archives/dep-v1.tar.gz
+c14	built=v2	query=v2	exact WORKSPACE:14 file:///WS/archives/dep-v2.tar.gz
+c15	built=v2	query=v2	exact WORKSPACE:5 file:///WS/archives/dep-v2.tar.gz
+r01	built=patched	query=patched	exact WORKSPACE:5 file:///WS/archives/dep-patched.tar.gz
+r02	built=patched	query=v2	exact WORKSPACE:6 maybe file:///WS/archives/dep-patched.tar.gz
+r03	built=v1	query=patched	exact WORKSPACE:5 file:///WS/archives/dep-v1.tar.gz
+r04	built=v1	query=v1	unknown ReplacedByMacro at line 13
+r05	built=patched	query=patched	exact deps_plain.bzl:4 macro file:///WS/archives/dep-patched.tar.gz

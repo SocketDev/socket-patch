@@ -1,0 +1,7 @@
+bazelbuild-bazel-6.5.0.WORKSPACE	chunks=16 loads=17 calls=97 inert=4 opaque=2 unread_macro_files=6
+rules_dotnet-0.13.0-examples.WORKSPACE	chunks=9 loads=8 calls=11 inert=0 opaque=0 unread_macro_files=3
+rules_go-0.41.0-basic-gazelle.WORKSPACE	chunks=2 loads=4 calls=6 inert=0 opaque=0 unread_macro_files=1
+rules_jvm_external-5.3-simple.WORKSPACE	chunks=5 loads=4 calls=6 inert=0 opaque=0 unread_macro_files=0
+rules_nodejs-5.8.5-bazel_managed_deps.WORKSPACE	chunks=4 loads=3 calls=4 inert=0 opaque=0 unread_macro_files=0
+rules_python-0.31.0-pip_parse.WORKSPACE	chunks=4 loads=3 calls=6 inert=0 opaque=0 unread_macro_files=0
+rules_ruby-0.29.0-gem.WORKSPACE	chunks=3 loads=2 calls=4 inert=0 opaque=0 unread_macro_files=0
