@@ -1,0 +1,435 @@
+[
+ {
+  "name": "bazel 7.7.2 http_file f408_then_ok (rc-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-37d71f10561fd1432ac2a5b5aa7c67be20581b2405e4280bf8d51763679443c9"
+ },
+ {
+  "name": "bazel 7.7.2 http_file tamper_then_ok (rc-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/tamper/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-3333-4333-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/tamper/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-3333-4333-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-a19966d39ce640c4a9d50bd4c05a77aa082c4580e80ed314f33b6f154ec69507"
+ },
+ {
+  "name": "bazel 7.7.2 http_file f410_then_ok (rc-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/410/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/410/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-c88c73c0ee3e33957096f6626f43337cbe9c2e989602918a2b9f44bb22a417a7"
+ },
+ {
+  "name": "bazel 7.7.2 http_file refused_then_ok (rc-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:1/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-4444-4444-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:1/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-4444-4444-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-e9dc3183805a9d41fcb0c2e18fecacf65e513f2d6b59df82a5e213152995962d"
+ },
+ {
+  "name": "bazel 7.7.2 http_file f403_then_ok (rc-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/403/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/403/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-ef1903b1919861713d2a5fd78b995ad44d03affddf86d9039ea62d58ece184e9"
+ },
+ {
+  "name": "bazel 7.7.2 http_file slow12 (rc-cold)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/slow/12/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/slow/12/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-dab7bf65408bbc1aca5c03d58a34dfb4bffdb9c43bfcbbb5975529a724074469"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f408_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-37d71f10561fd1432ac2a5b5aa7c67be20581b2405e4280bf8d51763679443c9"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f429_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/429/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/429/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-58fc8a34ebea0e68e3e98409ed4ff66e9dae73a2d901df8f67fb3fdc4d635e8d"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f404_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/404/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/404/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-5ffe5f79682e499506638dcbe0301afa1018cfb7d9049d81f5bb50a2c61867a9"
+ },
+ {
+  "name": "bazel 9.3.2 http_file flaky3_408 (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/flaky/3/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/flaky/3/408/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-7cad7b7dbf3d3ddfc9b3b1d5d01d9dee35ef5858ab28a284c1c8c2cf3bcfb16b"
+ },
+ {
+  "name": "bazel 9.3.2 http_file tamper_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/tamper/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-3333-4333-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/tamper/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-3333-4333-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-a19966d39ce640c4a9d50bd4c05a77aa082c4580e80ed314f33b6f154ec69507"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f500_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/500/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/500/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-ac67401f23a358f8de8e3d8e7ab304947c291fcd33f42d75715febe2663206f9"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f410_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/410/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/410/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-c88c73c0ee3e33957096f6626f43337cbe9c2e989602918a2b9f44bb22a417a7"
+ },
+ {
+  "name": "bazel 9.3.2 http_file refused_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:1/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-4444-4444-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:1/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-4444-4444-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-e9dc3183805a9d41fcb0c2e18fecacf65e513f2d6b59df82a5e213152995962d"
+ },
+ {
+  "name": "bazel 9.3.2 http_file f403_then_ok (rc-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/status/403/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/status/403/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz http://127.0.0.1:57431/patch/npm/minimist/1.2.2/11111111-2222-4222-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-ef1903b1919861713d2a5fd78b995ad44d03affddf86d9039ea62d58ece184e9"
+ },
+ {
+  "name": "bazel 9.3.2 http_file mode_file_flipped_pin (rc-warm-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/mode/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/mode/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-421bcfc5246fa8548671388c1437cac06525dfd80a631cb7dc238e4a25177ca3"
+ },
+ {
+  "name": "bazel 9.3.2 http_file slow12 (rc-cold)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/slow/12/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/slow/12/patch/npm/minimist/1.2.2/11111111-1111-4111-8111-111111111111/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-dab7bf65408bbc1aca5c03d58a34dfb4bffdb9c43bfcbbb5975529a724074469"
+ },
+ {
+  "name": "bazel 6.6.0 rctx.download(canonical_id = url) dl_cid step a (rc-workspace-6.6.0)",
+  "bazel": "6.6.0",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-b6671f9e49a19132064bbde8476d9f92c88958b652138bf33a2baaecb662bef6"
+ },
+ {
+  "name": "bazel 6.6.0 rctx.download(canonical_id = url) dl_cid step b (rc-workspace-6.6.0)",
+  "bazel": "6.6.0",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-223fb82da2b7a0f56bbcec1e2bb1792b2b900eeef6f2b1c89c15fede3f413495"
+ },
+ {
+  "name": "bazel 7.7.2 http_file hf step a (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-62c3b1cbb6b20e02cf1d38e4e1927b2835715dc9beffdf05a057adce4ce38baf"
+ },
+ {
+  "name": "bazel 7.7.2 rctx.download(canonical_id = url) dl_cid step a (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-b6671f9e49a19132064bbde8476d9f92c88958b652138bf33a2baaecb662bef6"
+ },
+ {
+  "name": "bazel 7.7.2 http_file hf step b (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-5f4c520fb14e210a0be323138e204b4d3e77f56b4132e87e94f2d6ce5d78353d"
+ },
+ {
+  "name": "bazel 7.7.2 rctx.download(canonical_id = url) dl_cid step b (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-223fb82da2b7a0f56bbcec1e2bb1792b2b900eeef6f2b1c89c15fede3f413495"
+ },
+ {
+  "name": "bazel 7.7.2 http_file hf_sri step a (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-abee7208de10b2ef436d39d38ff976a5eaec1264093c03e878f0f80ef8e6e69ed410229d35154acf62f6feb0bbc8cd441793a2c084b70b03989bbc42014d481c"
+ },
+ {
+  "name": "bazel 7.7.2 http_archive ha step a (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_archive",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-4750e59678e0f333e394e787f61475c0765d1d97ffd341076f375aa1fbfcf1e0a8126581b3551eed34adbce2c912b9777bb9e7ed6137a0db195af9ec63ecda39"
+ },
+ {
+  "name": "bazel 7.7.2 http_file hf_sri step b (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_file",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-5e2ff51b36d825bd0733f4f6bf08c10ee6c490ff5eaffc290c9bb4712a7c2377d4830071d07592a563d005c39d9245482feaaf7ef5ff578b149ce9843e898794"
+ },
+ {
+  "name": "bazel 7.7.2 http_archive ha step b (rc-module-7.7.2)",
+  "bazel": "7.7.2",
+  "rule": "http_archive",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-e187780eceed3a07969815c4f0c701b49d995c9ff905a122bc3e28c16f09136e4ffc3ead6f2a6f1636a547ff0aea0305a04c5c8799e5d814e653fb32798debe4"
+ },
+ {
+  "name": "bazel 9.3.2 http_file hf step a (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-62c3b1cbb6b20e02cf1d38e4e1927b2835715dc9beffdf05a057adce4ce38baf"
+ },
+ {
+  "name": "bazel 9.3.2 rctx.download(canonical_id = url) dl_cid step a (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-b6671f9e49a19132064bbde8476d9f92c88958b652138bf33a2baaecb662bef6"
+ },
+ {
+  "name": "bazel 9.3.2 http_file hf step b (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000001/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-5f4c520fb14e210a0be323138e204b4d3e77f56b4132e87e94f2d6ce5d78353d"
+ },
+ {
+  "name": "bazel 9.3.2 rctx.download(canonical_id = url) dl_cid step b (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "rctx.download(canonical_id = url)",
+  "checksum": "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000006/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha256/87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198",
+  "observed_id_marker": "id-223fb82da2b7a0f56bbcec1e2bb1792b2b900eeef6f2b1c89c15fede3f413495"
+ },
+ {
+  "name": "bazel 9.3.2 http_file hf_sri step a (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-abee7208de10b2ef436d39d38ff976a5eaec1264093c03e878f0f80ef8e6e69ed410229d35154acf62f6feb0bbc8cd441793a2c084b70b03989bbc42014d481c"
+ },
+ {
+  "name": "bazel 9.3.2 http_archive ha step a (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_archive",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/aaaaaaaa-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-4750e59678e0f333e394e787f61475c0765d1d97ffd341076f375aa1fbfcf1e0a8126581b3551eed34adbce2c912b9777bb9e7ed6137a0db195af9ec63ecda39"
+ },
+ {
+  "name": "bazel 9.3.2 http_file hf_sri step b (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_file",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000002/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-5e2ff51b36d825bd0733f4f6bf08c10ee6c490ff5eaffc290c9bb4712a7c2377d4830071d07592a563d005c39d9245482feaaf7ef5ff578b149ce9843e898794"
+ },
+ {
+  "name": "bazel 9.3.2 http_archive ha step b (rc-module-9.3.2)",
+  "bazel": "9.3.2",
+  "rule": "http_archive",
+  "checksum": "sha512-PB1QxhgSBu+E/+DYsxOEwKc+3wVwtJgrGiGadWXSKD3h0kcgVwbdUsfA5Rn4+S4qGK3recqJqqOTh4B2cilFRg==",
+  "urls": [
+   "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz"
+  ],
+  "canonical_id": "http://127.0.0.1:57431/patch/npm/minimist/1.2.2/bbbbbbbb-0000-4000-8000-000000000003/642d7f02-ebc1-4ab0-99e2-07f5dd8463cb/minimist-1.2.2.tgz",
+  "entry_dir": "content_addressable/sha512/3c1d50c6181206ef84ffe0d8b31384c0a73edf0570b4982b1a219a7565d2283de1d247205706dd52c7c0e519f8f92e2a18adeb79ca89aaa39387807672294546",
+  "observed_id_marker": "id-e187780eceed3a07969815c4f0c701b49d995c9ff905a122bc3e28c16f09136e4ffc3ead6f2a6f1636a547ff0aea0305a04c5c8799e5d814e653fb32798debe4"
+ }
+]

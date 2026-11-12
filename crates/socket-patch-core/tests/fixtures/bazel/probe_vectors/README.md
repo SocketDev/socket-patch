@@ -1,10 +1,12 @@
-# Bazel probe vectors (X2, X3, X4, and the lockfile group's L1 / L6)
+# Bazel probe vectors (X2, X3, X4, the lockfile group's L1 / L6, and the output-tree layouts)
 
 Evidence captured from real Bazel for the three probes the Bazel-support design adds (its
-section "Probes this design adds"), and the `MODULE.bazel.lock` vectors of the campaign's
-lockfile probe group that the same section names. Nothing here was written by socket-patch.
-The files are test inputs for the pure Bazel readers of `socket_patch_core::bazel`, and the
-record of why the design hypotheses stand or fall.
+section "Probes this design adds"), the `MODULE.bazel.lock` vectors of the campaign's
+lockfile probe group that the same section names, and the on-disk layouts of Bazel-owned
+trees that three other probe groups recorded (the design's section "Output-tree
+classifier"). Nothing here was written by socket-patch. The files are test inputs for the
+pure Bazel readers of `socket_patch_core::bazel`, and the record of why the design
+hypotheses stand or fall.
 
 - Captured 2026-11-11 / 2026-11-12 on one macOS arm64 machine (Darwin 27.0.0), bazelisk
   1.30.0, each cell from `env -i` with an empty `HOME`, `--nohome_rc --nosystem_rc`, and
@@ -18,14 +20,19 @@ record of why the design hypotheses stand or fall.
   due to an internal error` and exit 37; they are recorded here with exit 1, which is what
   a user sees. X2 and X4 ran both ways: nothing else differs, and the X4 locks are
   byte-identical (`x2/vectors.json` `environment`). A test that reruns a cell either keeps
-  `TEST_TMPDIR` out of Bazel's environment or sets both variables. The lockfile group ran
-  earlier on 2026-11-11, before the launcher exported the variable.
+  `TEST_TMPDIR` out of Bazel's environment or sets both variables. The lockfile group and
+  the three groups of the output-tree layouts ran earlier on 2026-11-11, before the
+  launcher exported the variable.
 - The driver scripts, the cell workspaces, every command's log and the full reports are in
   the campaign's probe directories, outside this repository: `design-x/RESULTS.md` for
-  X2 - X4, `lockfile/RESULTS.md` (rows L1.g and L6.a, sections L6 and 5) for `lockfile/`.
+  X2 - X4, `lockfile/RESULTS.md` (rows L1.g and L6.a, sections L6 and 5) for `lockfile/`,
+  and the `RESULTS.md` of `core-external-edits`, `core-output-base` and `platform-server`
+  (each one's section 5, "Test vectors written") for the output-tree layouts.
   `*/vectors.json` repeats each cell's exit codes and first error line.
 - Machine paths are replaced with `<PROBE>`, `<OUTPUT_BASE>` and `<CAMPAIGN>` in every
-  text that had one. The byte-real files had none.
+  text that had one. The byte-real files had none. The layout vectors also carried the
+  machine's host and user names in two file names, replaced with `host` and `user`
+  ("Output-tree layouts" below).
 - No file here has the literal name of a Bazel boundary file. A `MODULE.bazel`,
   `MODULE.bazel.lock`, `BUILD.bazel` or `WORKSPACE` of a probe workspace is committed with a
   prefix (`root.MODULE.bazel`, `9.3.2.MODULE.bazel.lock`, `sub-pkg.BUILD.bazel`), and the
@@ -41,8 +48,9 @@ Check the tree in this directory with
 `SHA256SUMS` lists every file here but itself. `check.py` (standard library, no Bazel)
 checks what the checksums cannot: that every file is listed, that every file a
 `vectors.json` names is there, that every workspace file a committed lock records (main
-repository and `othermod`) has its bytes committed, and that the locks still show each
-verdict below. `.gitattributes` marks the
+repository and `othermod`) has its bytes committed, that the locks still show each
+verdict below, and that every recorded layout still gives its recorded classification.
+`.gitattributes` marks the
 directory `-text`: the CRLF, BOM and no-final-newline inputs are the point, and a
 line-ending conversion on checkout would break both the digests in the locks and the
 checksum file.
@@ -55,6 +63,7 @@ checksum file.
 | X2 | Under Bzlmod a crate_universe hub exposes `BUILD.<name>-<version>.bazel`, so a spoke can be replaced with `override_repo` and nothing else | The hub file does not exist (rules_rust 0.75.0 on 7.7.2, 8.8.2, 9.3.2). `override_repo` itself leaves `cargo-bazel-lock.json` byte-identical and needs no repin. `MODULE.bazel.lock` is byte-identical too, but only because the `crate` extension has no entry in it: with `lockfile` and `cargo_lockfile` both set, as here, rules_rust reports the extension reproducible. For an extension that has an entry `override_repo` changes its `usagesDigest`, and `--lockfile_mode=error` fails until the lock is refreshed (campaign probe S10 and the starlark-include lock-touch table, toy extensions; not run here on a recorded hub). A substitute built from a copy of the spoke's BUILD file works for a crate with no crate dependency, fails for one that has any (unless the root module imports each dependency spoke), and breaks `bazel query 'deps(...)'`. A stale override after a version bump is a hard error |
 | X3 | The output base holds the result of a reproducible extension, and gazelle's lock facts name the selected Go module version | Bazel 8.8.2 and 9.3.2 keep `<output_base>/MODULE.bazel.lock` in the workspace lock's format; its `go_deps` entry names version, sum and replacement of the selected module. 7.7.2 has no such file and nothing else that names the version. gazelle's facts are not a selection proof: they list the Socket module at its pin while Bazel builds an unpatched higher version, and after the replace is removed. The recorded root `go.mod` / `go.sum` digests are not a sufficient freshness test for that entry: `hosted` and `skew` record the same two digests and select different versions (below) |
 | L1.g, L6.a (lockfile group) | A static reader that compares each recorded main-repository input with the SHA-256 of the file predicts Bazel's `error`-mode verdict | 34 of 34 vectors on 17 releases from 6.5.0 to 10.0.0rc3, fresh and stale. A CRLF copy of an input stales the entry (6.6.0, 7.0.2, 7.1.2, 7.7.2, 8.8.2, 9.3.2, 10.0.0rc3). A CRLF-encoded `MODULE.bazel.lock` is accepted in `error` mode and left CRLF by `update` on 7.7.2 and 9.3.2; the cells of the other five stopped early and recorded the acceptance only |
+| Output-tree layouts (`core-external-edits`, `core-output-base`, `platform-server` groups) | A tree Bazel owns is known by a marker Bazel writes and never by a name; a convenience link names its output base when its target is cut at the segment `execroot`; the path of a repository-cache entry and the name of its `id-` file follow from the checksum and the canonical id | The groups' prototypes agree with the real trees: 42 of 42 query paths over 10 layouts (5.4.1 to 10.0.0rc3), 24 of 24 links, 35 of 35 cache entries (6.6.0, 7.7.2, 9.3.2). These are recordings for the classifier's tests, not a run of socket-patch |
 
 ## X4: `x4/`
 
@@ -150,6 +159,76 @@ This directory alone has a byte-real lock for each of the nine lock versions the
 run here write (3, 6, 11, 13, 16, 18, 24, 26, 28). Versions 6, 11, 16, 18 and 24 are
 nowhere else in this tree; 6 and 18 are what Bazel 7.1.2 and 8.4.2 write.
 
+## Output-tree layouts: `core-external-edits/`, `core-output-base/`, `platform-server/`
+
+What real Bazel left on disk in the kinds of tree the output-tree classifier
+(`socket_patch_core::bazel::output_tree`) has to recognise: an output base, an entry of the
+repo contents cache, a vendor directory, the convenience links, and the repository cache.
+Three other probe groups of the campaign recorded them on 2026-11-11 on the same machine,
+each with its own harness, which its report describes (not the `env -i` cells above). The
+classifier's tests fabricate their trees; these files are the shapes Bazel itself made,
+for the tests that need no Bazel.
+
+Each file keeps its path under the campaign's probes directory, so a citation of the
+design names the file here. `import_layouts.py <probes directory>` wrote them. It pins
+the SHA-256 of each probe file and changes three things, all of which named the capture
+machine:
+
+- the campaign directory is `<CAMPAIGN>` (the two `detect` fields below, and every path
+  of `link_route.json`);
+- the log file of a Bazel server, `java.log.<host>.<user>.log.java.<time>.<pid>` in the
+  top level of each recorded output base, is `java.log.host.user.log.java.<time>.<pid>`;
+- the directory `_bazel_<user>` of an output user root is `_bazel_user` (twelve paths of
+  `link_route.json`).
+
+`repo_cache_vectors.json` had none of them and is the probe's file byte for byte.
+
+| Path | What |
+|---|---|
+| `core-external-edits/vectors/detect/<bazel>-<cfg>.json` | ten layouts of one fixture: an archive consumed as `dep_http` (`http_archive`) and as `dep_plain` (a repository rule that never enters the contents cache). `<cfg>` is `default` (5.4.1, 6.6.0, 7.7.2, 8.8.2: no flag), `cc` (8.3.1, 8.8.2, 9.3.2, 10.0.0rc3: `--repo_contents_cache=<CACHE>`) or `vendor` (7.7.2, 9.3.2: `bazel vendor` of both repositories, then a build with `--vendor_dir=vendor_src`) |
+| its `tree` | the entries a classifier can ask about, each with `path`, `type` (`file`, `dir`, `symlink`), `mode`, the `target` of a link, and the `content` of the files whose bytes matter: `DO_NOT_BUILD_HERE` (the workspace path), `<entry>.recorded_inputs`, `@<repo>.marker`, `VENDOR.bazel`. It covers the top level of the output base, `execroot/DO_NOT_BUILD_HERE`, every entry of `external/`, the two repositories in full wherever they live, the files in the root of the contents cache, the workspace's links and the vendor directory. A path can be listed twice, with the same entry |
+| its `expect` | four or five query paths (42 in all), each with `kinds`, the `canonical` path with every link followed, and the `output_base`, `cache_entry` and `vendor_dir` the markers name, or null |
+| `core-output-base/proto/vectors/link_route.json` | 24 convenience links in six sets of four (`out`, `bin`, `testlogs`, the workspace's name): the default prefix on 9.3.2 and on 7.7.2; `dist/` as the prefix (7.7.2); after an upgrade from 8.8.2 to 9.3.2, where the links name the 9.3.2 base under `$HOME/Library/Caches/bazel` while the 8.8.2 base of the same name was still on disk under another root; a `startup --output_base` shared by two workspaces (7.7.2); and `--output_base=<workspace>/out` (7.7.2), a base inside the checkout. Each row has the `workspace`, the `link` name under it with its `prefix`, the `readlink` `target`, the `expected_output_base`, and `marker`, the content of `DO_NOT_BUILD_HERE` in that base |
+| `platform-server/vectors/repo_cache_vectors.json` | 35 entries found in the repository caches Bazel 6.6.0, 7.7.2 and 9.3.2 wrote for downloads from a local fake server (the URLs carry made-up tokens). `entry_dir` is the entry under the cache root, `content_addressable/sha256/<64 hex>` (27) or `content_addressable/sha512/<128 hex>` (8, where `checksum` is an SRI `sha512-` string); the payload is the file named `file` in it, and `observed_id_marker` is the empty `id-<hex>` file beside it: the entry's own hash function over `canonical_id`, which in every row is the URL list joined by one space |
+
+Tokens in a `detect` vector: `<OB>` the output base, `<WS>` the workspace, `<CACHE>` the
+root of the repo contents cache, `<INSTALL>` the directory of install bases. A test picks
+a directory for each, in memory or on disk. `<CAMPAIGN>` appears in two fields that no
+rule reads: `workspace_path_hashed` and the `FILE:` line of a `.marker`. In
+`link_route.json` every path starts with `<CAMPAIGN>`.
+
+The `kinds` are the prototype's names for the classifier's classes, and a path can have
+several because it is judged as spelled and as resolved:
+
+| `kinds` value | Rule the prototype applied |
+|---|---|
+| `bazel_output_base` | an ancestor holds a regular file `DO_NOT_BUILD_HERE`, and the path is under its `external` or `execroot` |
+| `bazel_repo_contents_cache` | an ancestor `E` has a sibling file `E.recorded_inputs` whose first line is the 64-hex name of `E`'s parent directory. The entry is named by a UUID, or by a counter on 8.3.1 (`1`) |
+| `bazel_vendor_dir` | an ancestor holds a file `VENDOR.bazel` |
+| `via_link` | the path as spelled crosses a link: `bazel-bin` into the output base, `external/<repo>` out of it into the contents cache or the vendor directory |
+
+Limits of what was recorded:
+
+- `workspace_md5_is_output_base_name` is the MD5 of the path in `workspace_path_hashed` as
+  it was on the capture machine, and each base of `link_route.json` that is named by 32
+  hex digits is the MD5 of its `workspace` in the same way. The import checks both on the
+  probe files; the committed paths start with `<CAMPAIGN>` and no longer hash to them.
+- The prototype's fifth kind, `hardlinked` (a file with more than one link), is in no
+  vector: the trees record no link count.
+- Every `detect` layout is the state right after a build: `execroot/DO_NOT_BUILD_HERE` is
+  there. None is the state after `bazel clean` and a build, where only the marker of the
+  base remains, and none has a vendor directory that holds `.vendorignore` alone.
+- Every marker names its own workspace, the shared base of `link_route.json` included, and
+  every path is ASCII. A marker that names another workspace, and one whose bytes are not
+  the canonical path, are not recorded.
+- Every repository-cache entry here has an `id-` file, because the vectors were collected
+  from those files, and sits under `sha256` or `sha512`. The campaign also saw entries
+  with no `id-` file (5.4.1 and 6.6.0 caches unless a rule passes `canonical_id`:
+  `platform-server/RESULTS.md`, "Cache layout that explains it") and one entry under
+  `sha384` (`test-infra-offline/RESULTS.md` 2.6). Neither is recorded here, so a test of
+  the repository-cache rule fabricates those two shapes.
+- macOS arm64 only (`darwin_arm64-fastbuild`). No Windows junction and no Linux layout.
+
 ## Reruns from the committed files
 
 The X4 workspace (6.6.0, 7.1.2, 9.3.2, and 9.3.2 under each digest function), three
@@ -167,4 +246,8 @@ cannot be reproduced that way: gazelle's facts keep rows from the states that ca
   in every lock. The same holds for `lockfile/l6-crlf-pair/`.
 - Do not give a copy inside this repository the literal name `MODULE.bazel`, `BUILD.bazel`,
   `WORKSPACE` or `MODULE.bazel.lock`; rename only in a temporary directory.
+- A layout vector is a description, not a tree: put a directory in place of every token
+  (`<OB>`, `<WS>`, `<CACHE>`, `<INSTALL>`, `<CAMPAIGN>`) before a path is used, and build
+  the tree in memory or in a temporary directory, never here. Its `expect` rows are what
+  a prototype answered; the classifier's own classes and precedence are the design's.
 - A file added here needs its line in `SHA256SUMS`, and `check.py` must still pass.

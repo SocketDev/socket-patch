@@ -12,6 +12,10 @@ script checks what a test that reads the vectors relies on:
   `othermod` `go.mod` / `go.sum` row of the X3 locks has a fixture file with that SHA-256
   (files of other repositories, such as rules_go's, live in the output base);
 - the static reading of each lock agrees with what Bazel did (`expected.json`, the X4 rows);
+- each output-tree layout still gives what was recorded for it: the tree of a detect vector
+  alone yields every classification in its `expect`, each convenience link cut at
+  `execroot` names its output base, and each repository-cache entry and `id-` file follows
+  from the checksum and the canonical id;
 - each verdict that a design rule rests on is still what the files show: a byte-real lock
   for each lock version run, a lock written under a non-default digest function, the
   crate extension absent from the X2 lock, and the `hosted` / `skew` pair of X3 with equal
@@ -20,9 +24,11 @@ script checks what a test that reads the vectors relies on:
 Standard library only. Reads bytes, writes nothing, runs no Bazel. Prints one line per
 check and exits 1 if any failed.
 """
+import base64
 import hashlib
 import json
 import os
+import posixpath
 import re
 import sys
 
@@ -425,12 +431,130 @@ def check_lockfile():
     return versions
 
 
+# ------------------------------------------------------------------ output-tree layouts
+def classify(nodes, query):
+    """What the recorded tree alone says about `query`, by the rules of the detect prototype.
+
+    `nodes` maps a tokenized path to its tree entry. Returns the fields of an `expect` row:
+    the path with every recorded link followed, the kinds, and the directory each marker
+    names. A path is judged as spelled and as resolved, nearest ancestor first.
+    """
+    def is_file(path):
+        return nodes.get(path, {}).get("type") == "file"
+
+    todo, crossed = query.split("/"), False
+    real = todo.pop(0)
+    for _ in range(200):  # more components than any vector has; a link cycle ends here
+        if not todo:
+            break
+        real += "/" + todo.pop(0)
+        node = nodes.get(real, {})
+        if node.get("type") == "symlink":
+            target, crossed = node["target"], True
+            if not target.startswith("<"):
+                target = posixpath.dirname(real) + "/" + target
+            todo = target.split("/") + todo
+            real = todo.pop(0)
+
+    def ancestors(path):
+        child = None
+        while True:
+            yield path, child
+            if "/" not in path:
+                return
+            path, child = path.rsplit("/", 1)
+
+    base = cache = vendor = None
+    for spelling in (query, real):
+        for d, child in ancestors(spelling):
+            if base is None and child in ("external", "execroot") and is_file(d + "/DO_NOT_BUILD_HERE"):
+                base = d
+    for d, child in ancestors(real):
+        key = posixpath.basename(posixpath.dirname(d))
+        first = nodes.get(d + ".recorded_inputs", {}).get("content", "").split("\n")[0]
+        if cache is None and re.fullmatch(r"[0-9a-f]{64}", key) and is_file(d + ".recorded_inputs") and first == key:
+            cache = d
+        if vendor is None and child is not None and is_file(d + "/VENDOR.bazel"):
+            vendor = d
+    kinds = [name for name, hit in (("via_link", crossed), ("bazel_output_base", base),
+                                    ("bazel_repo_contents_cache", cache), ("bazel_vendor_dir", vendor)) if hit]
+    return {"canonical": real, "kinds": kinds, "output_base": base, "cache_entry": cache, "vendor_dir": vendor}
+
+
+def check_layouts():
+    detect = "core-external-edits/vectors/detect/"
+    problems, queries, seen = [], 0, set()
+    vectors = [f for f in all_files() if f.startswith(detect)]
+    for rel in vectors:
+        v = load(rel)
+        nodes = {}
+        for entry in v["tree"]:
+            if nodes.setdefault(entry["path"], entry) != entry:
+                problems.append(f"{rel}: two different entries for {entry['path']}")
+        if rel != f"{detect}{v['bazel']}-{v['cfg']}.json":
+            problems.append(f"{rel}: the name is not <bazel>-<cfg>")
+        if nodes.get("<OB>/DO_NOT_BUILD_HERE", {}).get("content") != "<WS>":
+            problems.append(f"{rel}: the output-base marker does not hold the workspace path")
+        if nodes.get("<OB>/execroot", {}).get("type") != "dir":
+            problems.append(f"{rel}: no execroot directory in the output base")
+        for row in v["expect"]:
+            queries += 1
+            got = classify(nodes, row["query"])
+            seen.update(got["kinds"])
+            want = {k: (sorted(row[k]) if k == "kinds" else row[k]) for k in got}
+            got["kinds"].sort()
+            if got != want:
+                problems.append(f"{rel}: {row['query']}: the tree gives {got}")
+    if (len(vectors), queries, len(seen)) != (10, 42, 4):
+        problems.append(f"{len(vectors)} layouts, {queries} queries, kinds {sorted(seen)}; want 10, 42, all four")
+    check("layouts: each of the 42 recorded classifications follows from its recorded tree (10 detect vectors)",
+          problems)
+
+    problems, prefixes, in_tree = [], {}, 0
+    links = load("core-output-base/proto/vectors/link_route.json")
+    for row in links:
+        where = f"{row['workspace_basename']} {row['link']}"
+        parts = row["target"].split("/")
+        base = "/".join(parts[:parts.index("execroot")]) if "execroot" in parts else None
+        if not (base == row["expected_output_base"] == row["find_output_base(canonical link target)"]):
+            problems.append(f"{where}: the target cut at `execroot` is {base}")
+        if not (row["classified"] and row["marker_names_this_workspace"] and row["marker"] == row["workspace"]):
+            problems.append(f"{where}: the marker does not name the workspace")
+        if not (row["link"].startswith(row["prefix"])
+                and posixpath.basename(row["workspace"]) == row["workspace_basename"]):
+            problems.append(f"{where}: link name, prefix or workspace basename")
+        prefixes[row["prefix"]] = prefixes.get(row["prefix"], 0) + 1
+        in_tree += (base or "").startswith(row["workspace"] + "/")
+    if (len(links), prefixes, in_tree) != (24, {"bazel-": 20, "dist/": 4}, 4):
+        problems.append(f"{len(links)} links, prefixes {prefixes}, {in_tree} with the base inside the workspace")
+    check("layouts: each of the 24 convenience links leads to its output base when cut at `execroot`", problems)
+
+    problems, lengths, bazels = [], {}, {}
+    rows = load("platform-server/vectors/repo_cache_vectors.json")
+    for row in rows:
+        kind, _, b64 = row["checksum"].rpartition("-")
+        digest = base64.b64decode(b64).hex() if kind else row["checksum"].lower()
+        kind = kind or "sha256"
+        marker = "id-" + hashlib.new(kind, row["canonical_id"].encode("utf-8")).hexdigest()
+        if row["entry_dir"] != f"content_addressable/{kind}/{digest}" or row["observed_id_marker"] != marker:
+            problems.append(f"{row['name']}: entry directory or id marker")
+        if len(digest) != 2 * hashlib.new(kind).digest_size or row["canonical_id"] != " ".join(row["urls"]):
+            problems.append(f"{row['name']}: digest length or canonical id")
+        lengths[kind] = lengths.get(kind, 0) + 1
+        bazels[row["bazel"]] = bazels.get(row["bazel"], 0) + 1
+    if (lengths, bazels) != ({"sha256": 27, "sha512": 8}, {"7.7.2": 14, "9.3.2": 19, "6.6.0": 2}):
+        problems.append(f"entries by algorithm {lengths}, by release {bazels}")
+    check("layouts: each of the 35 repository-cache entries and id markers follows from its checksum and canonical id",
+          problems)
+
+
 def main():
     check_tree()
     x4_versions = check_x4()
     check_x2()
     check_x3()
     lockfile_versions = check_lockfile()
+    check_layouts()
     check("a byte-real lock for each of the nine lock versions run (3 to 28)",
           [f"lockFileVersion {n}" for n in LOCK_VERSIONS if n not in (x4_versions | lockfile_versions)]
           + [f"lockfile/ alone lacks lockFileVersion {n}" for n in LOCK_VERSIONS if n not in lockfile_versions])
