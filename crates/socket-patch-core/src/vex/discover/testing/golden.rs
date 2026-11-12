@@ -443,8 +443,10 @@ fn corpus() -> Vec<CorpusEntry> {
         match name.as_str() {
             GOLDEN_DIR => {}
             // Tables and store listings, not projects (`sbt`: build-tool
-            // resolution records, read by the sbt evidence parser only).
-            "vlt" | "vlt-trees" | "vendor" | "sbt" => {}
+            // resolution records, read by the sbt evidence parser only;
+            // `bazel`: vectors captured from real Bazel, read by the pure
+            // readers of `crate::bazel` only).
+            "vlt" | "vlt-trees" | "vendor" | "sbt" | "bazel" => {}
             // Redirect cases: `<eco>/<flavor>/<case>/{input,expected}` —
             // each side is a project root (nested files included).
             "redirect" => {

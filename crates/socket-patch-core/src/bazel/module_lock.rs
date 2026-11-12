@@ -40,9 +40,10 @@
 //! Linux and Windows are unprobed.
 
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 
 use super::model::{FileText, FileView};
+use crate::formats::text::strip_bom_bytes;
+use crate::utils::digest::sha256_hex_of;
 
 /// The lock's path under a Bazel root.
 pub const MODULE_LOCK: &str = "MODULE.bazel.lock";
@@ -377,7 +378,7 @@ pub fn input_state(recorded: &str, file: &FileText) -> InputState {
 
 /// Lowercase hex SHA-256, the form Bazel records.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    hex::encode(Sha256::digest(bytes))
+    sha256_hex_of(bytes)
 }
 
 fn is_sha256(text: &str) -> bool {
@@ -402,7 +403,7 @@ impl ModuleLock {
     /// CRLF line ends and with or without a final newline, so all of them
     /// are accepted here.
     pub fn parse(bytes: &[u8]) -> Self {
-        let bytes = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        let bytes = strip_bom_bytes(bytes);
         let Ok(root) = serde_json::from_slice::<Value>(bytes) else {
             return Self::UnknownShape("the file is not JSON".to_string());
         };

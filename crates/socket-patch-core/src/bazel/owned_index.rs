@@ -23,6 +23,7 @@
 use serde_json::{Map, Value};
 
 use super::ignore::{IgnoreLine, BAZELIGNORE};
+use crate::formats::text::split_bom;
 use crate::patch::path_safety::{is_canonical_uuid, is_safe_multi_segment};
 use crate::utils::digest::is_hex64_lower;
 
@@ -323,7 +324,7 @@ pub fn parse(bytes: &[u8]) -> Parsed {
     let Ok(text) = std::str::from_utf8(bytes) else {
         return Parsed::Foreign;
     };
-    let unmarked = text.strip_prefix('\u{feff}').unwrap_or(text);
+    let (_, unmarked) = split_bom(text);
     let doc = match serde_json::from_str::<Value>(unmarked) {
         Ok(Value::Object(doc)) => doc,
         Ok(_) => return Parsed::Foreign,
@@ -353,7 +354,7 @@ pub fn parse(bytes: &[u8]) -> Parsed {
 /// Reads an object of any members: a missing one is a reason, never a
 /// panic.
 fn read(text: &str, doc: &Map<String, Value>) -> Result<Index, String> {
-    if text.starts_with('\u{feff}') {
+    if !split_bom(text).0.is_empty() {
         return Err("the file starts with a byte-order mark".to_string());
     }
     match doc.get("version").and_then(Value::as_u64) {
