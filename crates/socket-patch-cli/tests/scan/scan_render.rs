@@ -13,8 +13,6 @@
 //!      and the retained-wiring warning;
 //!   6. hosted mode's table, per-directory runs and corrupt `bun.lockb`.
 
-use std::path::Path;
-
 use wiremock::MockServer;
 
 use crate::scan_fixture::*;
@@ -1518,9 +1516,11 @@ async fn scan_hosted_paths_run_once_per_project_directory() {
 
     let (code, stdout, stderr) = run_scan_api(tmp.path(), &mock.uri(), &["apps/*"]);
     assert_eq!(code, 0, "stdout={stdout}; stderr={stderr}");
-    // glob rebuilds matches with the native separator (`apps\a` on Windows).
+    // Headings name the directory relative to --cwd with `/` separators on
+    // every OS (`shown_project_dir`), even though glob matches `apps\a` on
+    // Windows.
     for app in ["a", "b"] {
-        let header = format!("== {} ==", Path::new("apps").join(app).display());
+        let header = format!("== apps/{app} ==");
         assert!(stdout.contains(&header), "missing {header:?}: {stdout}");
     }
     assert_eq!(
