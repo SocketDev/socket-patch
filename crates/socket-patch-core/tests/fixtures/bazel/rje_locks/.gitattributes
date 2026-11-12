@@ -1,0 +1,3 @@
+# Byte-real locks and hash inputs: several are CRLF on purpose, one is a
+# tarball, and SHA256SUMS pins every byte. No conversion on checkout.
+* -text
