@@ -213,6 +213,7 @@ pub use crate::origin::{
     VendorRef,
 };
 
+pub(crate) mod bazel;
 pub(crate) mod bun;
 pub(crate) mod cargo;
 pub(crate) mod composer;

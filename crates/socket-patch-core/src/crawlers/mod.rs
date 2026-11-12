@@ -1,3 +1,7 @@
+pub mod bazel_evidence;
+pub mod bazel_output;
+pub mod bazel_root;
+pub mod bazel_workspace;
 pub mod cargo_crawler;
 pub mod composer_crawler;
 pub mod coursier_cache;
