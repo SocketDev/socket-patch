@@ -3092,3 +3092,189 @@ Coursier reads the module from the next repository, unpatched jar included) and
 `vendor_scala_cli_repository_shadowed`: an input declares a repository or a direct `url=`
 for the patched group, or Bloop evidence newer than every input and the wiring resolved
 the GAV outside the tree).
+
+## Bazel builds
+
+Bazel is not an ecosystem here. A Bazel ruleset (rules_js, rules_python,
+rules_jvm_external, gazelle, rules_rust and others) reads a lock file and fetches
+packages of the registry ecosystems, so there is no `bazel` value for `--ecosystems`,
+no new purl type and no new flag. A *hub* below is one declaration that makes a ruleset
+fetch registry packages for the build, together with the lock file it reads.
+
+This section lists every code and every `details.token` the Bazel checks report.
+Support lands in stages, so each code has a **status**:
+
+- `planned`: the name is reserved and this release never emits it. The check behind
+  it has not shipped, so in that respect socket-patch treats a Bazel workspace as
+  earlier releases did.
+- `active`: this release emits it as described.
+
+A code becomes `active` in the release that ships its behaviour. Every code is additive
+(MINOR). The strings are defined in one place (`socket_patch_core::bazel::codes`), and
+`test_bazel_contract_codes` (`tests/contract_gradle_codes.rs`) fails when a code or a
+token has no row here, when this document names a Bazel code that does not exist, or
+when a code string is spelled anywhere else in the source.
+
+Run-level codes and advisories are `warnings[]` entries with the additive `level`
+field (`info` or `warn`), as the Gradle discovery notes are: human mode prints `info`
+as `Note:` lines, which `--silent` suppresses. The level in a table is the lowest the
+code is reported at; a run raises an `info` to `warn` only where the row says so. A
+refusal writes nothing for the package: its detail ends with the remedy and "nothing
+was written", and never contains a grant token.
+
+### Run level
+
+| Code | Status | Level | When | Remedy |
+|---|---|---|---|---|
+| `bazel_workspace_detected` | planned | `info` | A Bazel workspace with at least one recognized ruleset. Names the root, the Bazel release line and its support tier, the dependency system (Bzlmod or WORKSPACE) and each governed ecosystem with its ruleset and lock. | - |
+| `bazel_workspace_out_of_scope` | planned | `info` | The workspace has Bazel modules, source archives or hand-written pins. Socket patches cover registry packages; these dependencies are counted and not examined. | - |
+| `bazel_workspace_unreadable` | planned | `warn` | A Bazel file exists and cannot be read or parsed. | Names the file and the construct to fix. |
+| `bazel_workspace_version_unsupported` | planned | `warn` | Bazel 4 or older, or Bazel 5 with Bzlmod. | Upgrade Bazel, or patch outside Bazel. |
+| `bazel_workspace_version_untested` | planned | `info` | The Bazel or ruleset version is floating, unknown or newer than the releases socket-patch was tested with. | Pin `.bazelversion` to a tested release. |
+| `bazel_workspace_above_repo` | planned | `warn` | A Bazel workspace file exists above the repository root, where socket-patch does not read. | Run from the repository that holds the Bazel root. |
+| `bazel_workspace_output_tree_skipped` | planned | `info` | A directory that is a Bazel output base, cache or vendor directory was left out of a walk. | - |
+| `bazel_workspace_inside_output_tree` | planned | `warn` | `apply` ran with its working directory inside a Bazel output tree (not given by `--cwd`). Nothing was patched; the exit code stays 0. | Run from the workspace root, or use hosted mode. |
+| `bazel_workspace_rc_unread` | planned | `info` | An rc file import could not be followed, or a `tools/bazel` wrapper exists, so flags may apply that socket-patch cannot see. Names the path. | - |
+| `bazel_workspace_ignore_line_added` | planned | `info` | A line was added to `.bazelignore` so that a `.socket` tree stays out of `//...`. | Commit `.bazelignore`. |
+| `bazel_workspace_ignore_line_needed` | planned | `warn` | A `.socket` tree is visible to `//...` and `.bazelignore` cannot be written. | Add the printed lines to the printed file. |
+| `bazel_workspace_prune_skipped` | planned | `warn` | `scan --prune` could not tell what a lock that Bazel reads resolves, so the records of that ecosystem were kept. | - |
+| `bazel_workspace_unsupported_in_memory` | planned | - | A warning of the in-memory hosted engine, which has no `level`: it met an ecosystem that a Bazel ruleset governs and left it alone. | Run `socket-patch scan --mode hosted` from a checkout. |
+
+### Agent mode
+
+| Code | Status | Kind | Level | When | Remedy |
+|---|---|---|---|---|---|
+| `bazel_agent_not_consumed` | planned | advisory | `warn` | An agent command, or `apply --check`, touched an ecosystem that a ruleset governs or may govern. The ruleset builds those packages from its lock, not from the installed tree, so the Bazel build does not get the patch. The installed tree is still patched and the exit code is unchanged. | `socket-patch scan --mode hosted` |
+| `bazel_agent_output_tree` | planned | refusal | - | `scan`, or any command with an explicit `--cwd` or `--global-prefix`, where the scope root or a package path is a Bazel output tree or a link into one. | Run from the workspace root, or use hosted mode. |
+| `bazel_agent_go_unsupported` | planned | refusal | - | A Go directory `replace` that this workspace cannot consume safely. `details.token` is the token the vendored refusal carries. | The remedy of the check that failed. |
+| `bazel_agent_coursier_pin_hazard` | planned | sidecar advisory | - | An agent-patched Coursier or `~/.m2` jar has a coordinate that a rules_jvm_external hub resolves: a later `@<hub>//:pin` would record the patched jar's digest in the lock. | Do not run `@<hub>//:pin` from this cache; use hosted mode. |
+
+### Hosted and vendored refusals
+
+Hosted and vendored mode refuse for the same reasons. The code is the mode's prefix
+plus the reason, and `details.token` (one of the [tokens](#tokens) below) names the
+case. A `-` means the mode has no such refusal.
+
+| Hosted code | Vendored code | Status | When | Remedy |
+|---|---|---|---|---|
+| `redirect_bazel_consumer_undetermined` | `vendor_bazel_consumer_undetermined` | planned | The ruleset is present and its hub or lock label is not a literal, or a file it needs cannot be read. | Names the statement and the argument to make literal. |
+| `redirect_bazel_mode_ambiguous` | `vendor_bazel_mode_ambiguous` | planned | Bzlmod and WORKSPACE may both be in effect, or the candidate declarations name different locks. | Names both declarations and the rc line. |
+| `redirect_bazel_declaration_inactive` | `vendor_bazel_declaration_inactive` | planned | The only declaration that names the lock is dead, shadowed, not imported or in another module, so Bazel does not read the lock through it. | `--enable_workspace` (Bazel 8) or a migration; the shadowing declaration; the missing `use_repo`. |
+| `redirect_bazel_ruleset_unsupported` | `vendor_bazel_ruleset_unsupported` | planned | socket-patch has no lane for this ruleset shape in this mode, or the lane is not enabled. | The mode that works, else the manual snippet. |
+| `redirect_bazel_ruleset_version_unsupported` | `vendor_bazel_ruleset_version_unsupported` | planned | A ruleset version requirement is not proven, or the Bazel release line is outside what the lane supports. | Commit `MODULE.bazel.lock`, raise the `bazel_dep`, or pin with `single_version_override`. Names the threshold and the evidence found. |
+| `redirect_bazel_lockfile_frozen` | `vendor_bazel_lockfile_frozen` | planned | The edit would make `MODULE.bazel.lock` stale while `--lockfile_mode=error` is set, which fails every build. | Names the rc line and `bazel mod deps --lockfile_mode=update`; followed by the manual snippet. |
+| `redirect_bazel_pin_bypassed` | `vendor_bazel_pin_bypassed` | planned | A repository override, a vendor directory, `--nofetch` or a replacement declaration makes Bazel take the package from where the pin does not reach. | Remove the override, or patch its target. |
+| `redirect_bazel_fetch_blocked` | - | planned | The downloader config or the Go proxy settings keep Bazel from the patch host. | Add `allow <patch host>` to the downloader config. |
+| `redirect_bazel_derived_unrepairable` | `vendor_bazel_derived_unrepairable` | planned | A value derived from the lock cannot be recomputed, or was already inconsistent before the edit. | Regenerate the file with the ruleset's own command, then run again. |
+| `redirect_bazel_lock_check_present` | - | planned | A lock check target (for example `compile_pip_requirements`) covers the file: its test would fail after the rewrite, and its update command would erase the pin. | The ordered steps printed with the refusal. |
+| `redirect_bazel_selection_unproven` | `vendor_bazel_selection_unproven` | planned | Go: nothing committed proves that Bazel selects the pinned module version. | The routes printed with the refusal. |
+| `redirect_bazel_lock_set_partial` | `vendor_bazel_lock_set_partial` | planned | One of several lock files of a hub, or one of several hubs that pin the package, cannot be rewritten. | Names the file. |
+| `redirect_bazel_owned_file_modified` | `vendor_bazel_owned_file_modified` | planned | `.socket/bazel/index.json` does not pass the strict parse. | Restore it from version control. |
+
+### Advisories
+
+| Code | Status | Level | When |
+|---|---|---|---|
+| `redirect_bazel_run_required` | planned | `info` | The pin is wired, and one named command must be run and its result committed; until then `vex` withholds the statement. With `gatesVex: false` it only notes lockfile facts that may be stale, and `vex` is not held back. Also reported after `rollback`, `remove`, `repair` or a takeover whose restoring edit leaves Bazel state stale: at `warn` when builds fail until the command has run. `details` carries `kind` (`lockfile`, `update_repos` or `repin`), `command`, `platforms` and `gatesVex`. |
+| `vendor_bazel_run_required` | planned | `info` | The same, in vendored mode. |
+| `redirect_bazel_withdrawn_pin_kept` | planned | `warn` | The pin of a withdrawn patch was kept, because restoring it under `--lockfile_mode=error` would fail every build. Names both steps to take. |
+| `redirect_bazel_fetch_dependency` | planned | `info` | Once per run: a pin makes cold repository fetches depend on the patch host beyond the package itself (the NuGet service index for a rules_dotnet pin, the registry `config.json` for a rules_rs pin). |
+| `redirect_bazel_manual_snippet` | planned | `info` | Follows a refusal that has a manual procedure. |
+| `redirect_bazel_token_surface` | planned | `info` | Once per run: the pinned URL, grant token included, is repeated outside the lock that was edited: in the `maven_url=` tags of the BUILD file rules_jvm_external generates, or in the refreshed `MODULE.bazel.lock` for a NuGet pin. |
+| `redirect_bazel_pin_erased` | planned | `warn` | A recorded pin is gone from its lock (a ruleset's pin or update command, or a package-manager install, rewrote it). Run `scan` again. |
+| `redirect_bazel_side_file_skipped` | planned | `info` | A lock of the same ecosystem that no hub reads (a `package-lock.json` or `yarn.lock` beside the governed `pnpm-lock.yaml`) was left as found, and no `.npmrc` was created. Names the file. |
+
+### Withheld VEX statements
+
+`vex` makes no statement for the package while the condition holds.
+
+| Code | Status | Withheld when |
+|---|---|---|
+| `vex_bazel_not_consumed` | planned | The patch rests on an installed tree, or on a lock that no live hub reads. |
+| `vex_bazel_consumer_undetermined` | planned | Which lock Bazel reads is undetermined or ambiguous, or a version requirement is no longer proven. |
+| `vex_bazel_pin_bypassed` | planned | An override or a replacement bypasses the pin now; or the user's own patch for the package exists on a hub whose patch hook runs the host `patch` tool (`user_patch_hook`). |
+| `vex_bazel_derived_stale` | planned | A value derived from the pin disagrees with it: a recorded hash, a checksum entry, a hash-file line, an index row, a pinned digest that is not the patch's, or a recorded lock entry that lacks the pin. |
+| `vex_bazel_run_pending` | planned | The command of a `*_bazel_run_required` advisory has not left its committed evidence. |
+| `vex_bazel_selection_unproven` | planned | A Go pin without proof that Bazel selects the pinned version. |
+| `vex_bazel_integrity_unanchored` | planned | No digest that the build enforces anchors the pin: a gem with neither a `gem_checksums` entry nor an enforced `CHECKSUMS` entry, or a Go pin while a tracked `repo_env` names a host module cache. |
+
+### Tokens
+
+`details.token` names the exact case behind a refusal, an undetermined answer or a
+bypass. A token is reported only with a code above, is in use once a code that carries
+it is `active`, and is as stable as a code.
+
+| Token | Case |
+|---|---|
+| `lane_not_enabled` | No lane for this ruleset shape and mode is enabled in this release. |
+| `bazel_line_unsupported` | The Bazel release line or the dependency system is outside what the lane supports. |
+| `bazel_line_unproven` | The lane has not been run on this Bazel release line and dependency system. |
+| `bazel_line_unknown` | No Bazel version is declared and the hub is declared only in WORKSPACE files; commit `.bazelversion`. |
+| `platform_unverified` | A lane that writes a directory tree has not been run on this operating system. |
+| `lock_path` | The lock a hub names has a file name the rewriter does not handle (for example `Cargo.Bazel.lock`). |
+| `label_not_literal` | A hub name, a lock label or a value to edit is computed, not a plain string literal. |
+| `rc_import_unreadable` | An rc file import could not be followed, so a flag that changes the answer may be set. |
+| `workspace_dead` | The declaration is in a WORKSPACE file that this Bazel configuration does not evaluate. |
+| `hub_shadowed` | Another declaration of the same repository name takes precedence. |
+| `hub_not_imported` | The hub is declared and no `use_repo` imports it. |
+| `hub_not_root_module` | The hub belongs to a module that is not the root module. |
+| `dev_dependency_dropped` | The hub is a dev dependency and `--ignore_dev_dependency` is or may be set. |
+| `nested_bazel_roots` | Several Bazel roots lie between the project and the repository root. |
+| `vendor_dir` | `--vendor_dir` is or may be in effect: a tracked rc flag, or a committed vendor directory. |
+| `nofetch` | `--nofetch` is or may be set, so Bazel keeps building a copy it already fetched. |
+| `repo_override` | A repository or module override flag, `override_repo` or `inject_repo` names the hub, one of its repositories or the ruleset, or a name that cannot be parsed. |
+| `user_override` | A replacement or override declaration for the package (for example `npm_replace_package`, `maven.override`, `uv.override_package`, `local_wheels`). |
+| `bazel_root_outside_repository` | A Bazel root above the repository root governs the build, and socket-patch does not read there. |
+| `downloader_config` | The tracked `--downloader_config` blocks or rewrites the patch host. |
+| `goproxy` | The tracked `GOPROXY`, `GONOPROXY` or `GOPRIVATE` settings keep `go mod download` from the patch host. |
+| `import_mode` | rules_js import mode (`npm_package_lock` or `yarn_lock`). |
+| `npmrc_unscoped_credential` | An npmrc that rules_js loads holds a credential with no registry scope, which would be sent to the patch host. |
+| `trust_lockfile_missing` | `update_pnpm_lock` with a Bazel-managed pnpm 11 or newer, which needs `pnpm-workspace.yaml` with `trustLockfile: true` among the rule's `data`. |
+| `data_label_missing` | Vendored mode with an `update_pnpm_lock` hash file: the vendored archive would have to be added to the rule's `data`. |
+| `spoke_imported` | The workspace refers directly to the package's own repository, which the pin renames or bypasses. |
+| `hash_file_mismatch` | The `update_pnpm_lock` hash file did not match its lock before the edit. |
+| `legacy_lock_absolute_path` | Vendored mode on a pnpm lock older than `lockfileVersion` 9.0. |
+| `derived_outside_project` | A derived value that must change with the pin lives outside the project root. |
+| `paired_manifest_mismatch` | The manifest the hub names (`Gemfile`, `pyproject.toml`) is not the one beside the lock that the rewriter edits. |
+| `no_local_wheel_form` | Vendored PyPI: a requirements file has no relative form for a local wheel. |
+| `uv_lock_requires_url` | Vendored PyPI: a hub that reads `uv.lock` needs a URL for each wheel. |
+| `workspace_pip_parse` | A WORKSPACE `pip_parse` hub that the lane does not cover. |
+| `legacy_pip_install` | Legacy `pip_install`. |
+| `no_binary_package` | The package is listed in uv's `no-binary-package`, so the build does not use a pinned wheel. |
+| `lock_not_watched` | aspect_rules_py `uv.lockfile` (1.7.0 to 1.8.4) does not watch its lock, so an edit never reaches an existing output base. |
+| `pycross_lock_kind` | rules_pycross over `pdm.lock` or `pylock.toml`. |
+| `generated_lock_bzl` | rules_pycross `lock_file.instantiate` or `pycross_lock_repo`: they read a generated `.bzl` file that a lock edit never reaches. |
+| `lock_format` | A lock format the lane cannot edit: `maven_install.json` v1 or unknown, the single `paket.bzl` and the tuple format of rules_dotnet. |
+| `classifier` | The `maven_install.json` entry has an artifact other than the plain jar (for example `sources`). |
+| `packaging` | The Maven artifact is not packaged as a jar. |
+| `m2local` | The Maven artifact is resolved from the local Maven repository. |
+| `same_gav` | The patch is served under the original Maven coordinates, which cannot be pinned fail-closed. |
+| `non_ascii` | `maven_install.json` v1, or a lock whose strings use `\u` escapes: its hash over non-ASCII text is not proven. |
+| `versioned_label_used` | A BUILD or `.bzl` file names the package's versioned alias, which the pin renames. |
+| `export_consumer` | The workspace calls `java_export`, `maven_export` or `pom_file`: a published POM would carry the patched version string. |
+| `unpinned_hub` | rules_jvm_external without a lock file. |
+| `no_committable_wiring` | Vendored Maven under rules_jvm_external: no wiring exists that could be committed. |
+| `workspace_go_repository` | Go under WORKSPACE `go_repository`: a directory `replace` has no build effect, or the module's rule cannot carry the pin. |
+| `workspace_definition_order` | Which WORKSPACE definition of the repository takes effect cannot be proven. |
+| `go_bazel_module_provided` | A Bazel module provides the Go module path, so a root `replace` is a no-op or an error. |
+| `lock_records_local_path` | The directory `replace` would make `MODULE.bazel.lock` record an absolute path of this machine. |
+| `go_work` | `go_deps.from_file(go_work = ...)`: no selection proof covers several `go.mod` files. |
+| `go_vendor_dir` | Bazel builds the module from a committed Go `vendor/` directory. |
+| `crate_universe_repin` | crate_universe with a `lockfile`: every effective edit needs a repin. |
+| `crates_repository_unpinned` | WORKSPACE `crates_repository` without a `lockfile`. |
+| `from_specs` | A `crate.from_specs` hub. |
+| `cargo_raze` | cargo-raze. |
+| `crates_vendor` | rules_rust `crates_vendor`, or a hub whose lock a `crates_vendor` target names. |
+| `crate_name_collision` | Vendored rules_rs: another source-less entry or `[patch]` path already exists for the crate name. |
+| `facts_cold` | Hosted rules_rs: the committed `MODULE.bazel.lock` does not hold the fact for the crate. |
+| `token_in_repo_name` | The pin would put the grant token in a Bazel repository name. |
+| `path_gem_not_fetched` | Vendored gems: `bundle_fetch` never fetches a `PATH` gem. |
+| `legacy_bundle_rule` | rules_ruby `rb_bundle` or bazelruby `ruby_bundle`. |
+| `nuget_folder_source` | Vendored NuGet: the ruleset cannot read a folder source. |
+| `nuget_config_undeclared` | `nuget.from_lock` does not name the `NuGet.Config` that the rewriter edits. |
+| `legacy_rules_nodejs` | rules_nodejs `npm_install` or `yarn_install`. |
+| `report_only` | A shape that is recognized only to be reported (rules_req_compile, rules_poetry, bazel-deps, hand-written pins). |
+| `lock_not_in_root_package` | Vendored rules_js below 2.1.1 with the pnpm lock outside the Bazel root package. |
+| `managed_pnpm_unproven` | `update_pnpm_lock` with a Bazel-managed pnpm that is version 8 or older, or unknown. |
+| `cargo_config_undeclared` | A crate_universe hub that does not name, as a literal `cargo_config` label, the config file the rewriter edits. |
+| `user_patch_hook` | The user's own patch for the package exists on a hub whose patch hook runs the host `patch` tool, which can reverse the fix. |
