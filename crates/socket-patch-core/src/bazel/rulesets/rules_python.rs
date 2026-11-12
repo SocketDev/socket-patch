@@ -27,11 +27,19 @@
 //! hybrid root the hub's rule comes from the Bzlmod module whenever the
 //! root module can see [`RulesPythonDetail::load_repo`] (design 2.8).
 //!
+//! A `WORKSPACE` file can declare a hub where this reader does not look:
+//! behind a macro whose body was not read, in a block, through an alias.
+//! Where the ruleset shows in the file and such a place exists, the
+//! recognizer says so with a signal, whatever hubs it did read
+//! ([`Ran::signals`]): the hubs that show do not vouch for the rest.
+//!
 //! This file also holds what the three Python recognizers share: the
 //! reading of a tag or rule call ([`Reading`]), one extension usage
-//! ([`Usage`]), the paired manifest of a uv or poetry lock and the fold
-//! of the root files into version evidence.
+//! ([`Usage`]), what a `WORKSPACE` file runs ([`Ran`]), the paired
+//! manifest of a uv or poetry lock and the fold of the root files into
+//! version evidence.
 
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 
 use super::pip_compile::{self, PipCompileDetail};
@@ -39,8 +47,8 @@ use super::{RecognizeInput, Recognized};
 use crate::bazel::derived::LockCheckKind;
 use crate::bazel::label::{Label, Repo};
 use crate::bazel::model::{
-    Bypass, DeclSystem, Declaration, DerivedState, FileView, Gap, Hub, HubShape, Liveness, LockRef,
-    LockRole, Ruleset, RulesetDetail, RulesetSignal, Site, UserDecl,
+    Bypass, DeclSystem, Declaration, DerivedState, FileText, FileView, Gap, Hub, HubShape,
+    Liveness, LockRef, LockRole, Ruleset, RulesetDetail, RulesetSignal, Site, UserDecl,
 };
 use crate::bazel::module_file::{
     At, BazelDep, GapScope, Host, ModuleGap, ModuleModel, ModuleOverride, OverrideKind as Declared,
@@ -52,7 +60,7 @@ use crate::bazel::ruleset_version::{
     self, Evidence, LineSpan, LockfileFlag, OverrideKind, Registries, RootDep, RootOverride,
     Unproven, VersionVerdict,
 };
-use crate::bazel::starlark::{Arg, ArgKind, Call, LoadSymbol, Value, ValueKind};
+use crate::bazel::starlark::{Arg, ArgKind, Call, Lookup, Span, Value, ValueKind};
 use crate::bazel::version::Tri;
 use crate::bazel::workspace_file::{
     Callee, WorkspaceModel, WsCall, WsFile, WsLoad, WsStmt, WsStmtKind,
@@ -79,7 +87,7 @@ pub const REPO_OVERRIDE: &str = TOKENS[2];
 pub const PAIRED_MANIFEST_MISMATCH: &str = TOKENS[3];
 
 /// The file the native rewriter edits together with a uv or poetry lock.
-const MANIFEST: &str = "pyproject.toml";
+pub(super) const MANIFEST: &str = "pyproject.toml";
 
 // ── What the three Python recognizers share ──────────────────────────
 
@@ -294,9 +302,11 @@ impl<'a> Reading<'a> {
     }
 
     /// The argument `name` after one level of constants; `Ok(None)` when
-    /// it is not written.
+    /// it is not written, and when it is `None`, which Bazel takes for an
+    /// attribute that is not set.
     pub fn value(&self, name: &str) -> Result<Option<&'a Value>, Computed> {
-        Ok(named(self.call, name)?.map(|value| self.resolve(value)))
+        let value = named(self.call, name)?.map(|value| self.resolve(value));
+        Ok(value.filter(|value| value.kind != ValueKind::None))
     }
 
     /// Notes that an argument could be anything. `problem` follows the
@@ -372,27 +382,44 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// The main-repository file `label` names, relative to the Bazel root.
-    fn path(&self, label: &str) -> Option<String> {
+    /// `label` parsed, when it names a file of the main repository.
+    fn main_label(&self, label: &str) -> Option<Label> {
         match self.scope {
             // A tag's label is relative to the root package, and the root
             // module's own name is the main repository too.
             Scope::Module(model, _) => {
                 let label = Label::parse(label, Some("")).ok()?;
-                matches!(model.host(&label), Host::Root).then(|| label.file())
+                matches!(model.host(&label), Host::Root).then_some(label)
             }
             // An attribute of a repository rule lives in `//external`,
             // so a relative label names no file of the workspace.
             Scope::Workspace(ws, _) => {
                 let label = Label::parse(label, None).ok()?;
-                let main = match &label.repo {
-                    Repo::Main => true,
-                    Repo::Apparent(name) => ws.name.as_deref() == Some(name.as_str()),
-                    Repo::Canonical(_) => false,
-                };
-                main.then(|| label.file())
+                main_repo(ws, &label).then_some(label)
             }
         }
+    }
+
+    /// The main-repository file `label` names, relative to the Bazel root.
+    fn path(&self, label: &str) -> Option<String> {
+        Some(self.main_label(label)?.file())
+    }
+
+    /// The file `name` in the package of the main-repository label
+    /// `label`, as a file the declaration reads that pins nothing. The
+    /// package of a label is not the directory of its file: `//:py/uv.lock`
+    /// is a file of the root package.
+    pub fn in_package_of(&self, label: &str, name: &str) -> Option<LockRef> {
+        let package = self.main_label(label)?.package;
+        let path = match package.as_str() {
+            "" => name.to_string(),
+            package => format!("{package}/{name}"),
+        };
+        Some(LockRef {
+            label: format!("//{package}:{name}"),
+            path: Some(path),
+            role: LockRole::Config,
+        })
     }
 
     /// Records every label of the argument `name` as a file of `role`,
@@ -789,16 +816,126 @@ pub(super) fn lock_checks(
     (scans, rows)
 }
 
+/// Whether `label` names a file of the main repository of `ws`: the
+/// workspace's own name is the main repository too.
+fn main_repo(ws: &WorkspaceModel, label: &Label) -> bool {
+    match &label.repo {
+        Repo::Main => true,
+        Repo::Apparent(name) => ws.name.as_deref() == Some(name.as_str()),
+        Repo::Canonical(_) => false,
+    }
+}
+
+/// Whether `call` is `maybe(...)` of
+/// `@bazel_tools//tools/build_defs/repo:utils.bzl`, which calls its first
+/// argument with the rest.
+fn is_maybe(file: &WsFile, call: &WsCall) -> bool {
+    let Callee::Loaded { load, symbol } = &call.callee else {
+        return false;
+    };
+    let label = file.loads.get(*load).and_then(|load| load.label.as_ref());
+    symbol == "maybe"
+        && label.is_some_and(|label| {
+            let bazel_tools = matches!(&label.repo, Repo::Apparent(repo) | Repo::Canonical(repo) if repo == "bazel_tools");
+            bazel_tools && label.package == "tools/build_defs/repo" && label.name == "utils.bzl"
+        })
+}
+
+/// Whether everything `call` runs is accounted for.
+///
+/// A function Bazel predeclares and a function of another repository are
+/// their owners': a ruleset's own macro declares that ruleset's
+/// repositories, and a hub rule is read as the hub it declares. A
+/// function of the main repository is the project's own and can call any
+/// rule, so it is followed only as a macro whose body the model linked,
+/// which it does for a top-level call alone: a macro that a macro calls
+/// is not read. A name that one `load` does not bind (an alias, a `def`
+/// of the same file, a parameter, a name loaded twice) is not known at
+/// all. `maybe` calls its first argument, which is judged the same way.
+fn followed(ws: &WorkspaceModel, file: &WsFile, call: &WsCall) -> bool {
+    let known = |callee: &Callee| match callee {
+        Callee::Builtin => true,
+        Callee::Unknown => false,
+        // The label of a relative `load` in a macro file is not parsed,
+        // and the file it names is one of the main repository.
+        Callee::Loaded { load, .. } => {
+            let label = file.loads.get(*load).and_then(|load| load.label.as_ref());
+            label.is_some_and(|label| !main_repo(ws, label))
+        }
+    };
+    let wrapped = call.passes.as_ref().filter(|_| is_maybe(file, call));
+    (known(&call.callee) || call.macro_def.is_some()) && wrapped.is_none_or(known)
+}
+
+/// Whether one of `names` is written in the bytes `span` of `src` as a
+/// whole word. A name inside a string counts too, which only refuses.
+fn written(src: &[u8], span: Span, names: &[&str]) -> bool {
+    let Some(text) = src.get(span.0..span.1) else {
+        return true;
+    };
+    let word = |byte: &u8| byte.is_ascii_alphanumeric() || *byte == b'_';
+    let mut words = text.split(|byte| !word(byte));
+    words.any(|found| names.iter().any(|name| name.as_bytes() == found))
+}
+
+/// Whether `value` hands one of `names` to the call it is an argument of:
+/// as a bare name, inside a list or a dict, or somewhere in a computed
+/// value, which `computed` answers for its span.
+fn hands_on(value: &Value, names: &[&str], computed: &dyn Fn(Span) -> bool) -> bool {
+    let inside = |value: &Value| hands_on(value, names, computed);
+    match &value.kind {
+        ValueKind::Ident(name) => names.contains(&name.as_str()),
+        ValueKind::List(items) => items.iter().any(inside),
+        ValueKind::Dict(entries) => entries.iter().any(|(k, v)| inside(k) || inside(v)),
+        ValueKind::Dynamic => computed(value.span),
+        _ => false,
+    }
+}
+
+/// How a ruleset shows in a `WORKSPACE` file.
+pub(super) struct WsSignature {
+    pub ruleset: Ruleset,
+    /// The name the ruleset's repository is declared and loaded by:
+    /// `http_archive(name = ...)`, `load("@<name>//...", ...)`.
+    pub repo: &'static str,
+    /// Whether a `load` gives a hub rule of the ruleset: the `load`, and
+    /// the name of one of its symbols in the loaded file.
+    pub hub_rule: fn(&WsLoad, &str) -> bool,
+}
+
+impl WsSignature {
+    /// The local names of the hub rules `load` binds.
+    fn rules<'f>(&self, load: &'f WsLoad) -> impl Iterator<Item = &'f str> + 'f {
+        let hub_rule = self.hub_rule;
+        let symbols = load.load.symbols.iter();
+        let rules = symbols.filter(move |symbol| hub_rule(load, &symbol.name));
+        rules.map(|symbol| symbol.local.as_str())
+    }
+
+    /// The local names of the hub rules `file` binds.
+    fn bound<'f>(&self, file: &'f WsFile) -> Vec<&'f str> {
+        let loads = file.loads.iter();
+        loads.flat_map(|load| self.rules(load)).collect()
+    }
+
+    /// Whether `load` takes a file of the ruleset's own repository.
+    fn fetched(&self, load: &WsLoad) -> bool {
+        let repo = load.label.as_ref().map(|label| &label.repo);
+        matches!(repo, Some(Repo::Apparent(name) | Repo::Canonical(name)) if name == self.repo)
+    }
+}
+
 /// What Bazel runs of a `WORKSPACE` file, as far as this reader follows
 /// it: the top-level statements, and the statements directly in the body
 /// of each main-repository macro one of them calls.
 pub(super) struct Ran<'a> {
     /// The rule calls that were read, each with the file it is in.
     pub calls: Vec<(&'a WsFile, &'a WsStmt, &'a WsCall)>,
-    /// The files with a statement that was not read (a comprehension, a
-    /// block of a macro body): a call of a rule the file loads may stand
-    /// there.
-    pub unread: Vec<&'a WsFile>,
+    /// The statements that were not followed, each with its file: one
+    /// that was not read (a comprehension, a block of a macro body), and
+    /// a call of a function whose body was not read ([`followed`]). A
+    /// call of any rule may stand behind each of them.
+    pub unread: Vec<(&'a WsFile, &'a WsStmt)>,
 }
 
 impl<'a> Ran<'a> {
@@ -812,7 +949,7 @@ impl<'a> Ran<'a> {
         };
         let mut bodies = BTreeSet::new();
         for stmt in &ws.stmts {
-            ran.take(root, stmt);
+            ran.take(ws, root, stmt);
             let WsStmtKind::Call(call) = &stmt.kind else {
                 continue;
             };
@@ -823,17 +960,126 @@ impl<'a> Ran<'a> {
             let Some(file) = ws.files.get(made_by.file) else {
                 continue;
             };
-            made_by.body.iter().for_each(|inner| ran.take(file, inner));
+            let body = made_by.body.iter();
+            body.for_each(|inner| ran.take(ws, file, inner));
         }
         ran
     }
 
-    fn take(&mut self, file: &'a WsFile, stmt: &'a WsStmt) {
+    fn take(&mut self, ws: &WorkspaceModel, file: &'a WsFile, stmt: &'a WsStmt) {
         match &stmt.kind {
-            WsStmtKind::Call(call) => self.calls.push((file, stmt, call)),
-            WsStmtKind::Opaque => self.unread.push(file),
+            WsStmtKind::Call(call) => {
+                if !followed(ws, file, call) {
+                    self.unread.push((file, stmt));
+                }
+                self.calls.push((file, stmt, call));
+            }
+            WsStmtKind::Opaque => self.unread.push((file, stmt)),
             WsStmtKind::Load(_) | WsStmtKind::Inert => {}
         }
+    }
+
+    /// The signals of the model `ws` for the ruleset of `signature`
+    /// (design 2.7, 2.9), one for each file to fix. `hubs` are the hubs
+    /// that were read from the model, and `vendored` is the `load` of a
+    /// checked-in copy of what a hub generates.
+    ///
+    /// Two things are signalled, whether or not another hub was read:
+    ///
+    /// - a file that loads a hub rule and shows no hub, and a checked-in
+    ///   copy with no hub at all: the rule is called where this reader
+    ///   did not look, or the copy is all the build has;
+    /// - the ruleset shows in the model, and a call of a hub rule may
+    ///   stand where the model was not followed. It shows by a `load`
+    ///   from its repository, a `load` of a hub rule, a rule call that
+    ///   names its repository, or the checked-in copy. Not followed is
+    ///   every statement of [`Ran::unread`], a call that hands a hub rule
+    ///   to another function (anywhere but as the rule of `maybe`), and a
+    ///   macro file that could not be read.
+    ///
+    /// Deviation from design 2.7, which signals on the ruleset's archive
+    /// alone: a model that shows the ruleset, was followed in full and
+    /// has no hub stays silent. Most roots that fetch rules_python do so
+    /// for its toolchains, and a signal there would refuse every
+    /// requirements file of a build that reads none of them.
+    ///
+    /// Two cases are governance's and not signalled here, because no one
+    /// ruleset can claim them: a `WORKSPACE` file that could not be read
+    /// ([`WorkspaceModel::unreadable`]), and a model that was not
+    /// followed in full while no ruleset shows in it
+    /// ([`WorkspaceModel::gaps`], [`Ran::unread`]).
+    pub fn signals(
+        &self,
+        ws: &WorkspaceModel,
+        files: &dyn FileView,
+        signature: &WsSignature,
+        hubs: &[Hub],
+        vendored: Option<&Site>,
+    ) -> Vec<RulesetSignal> {
+        let site = |file: &str, span: Span| Site {
+            file: file.to_string(),
+            span,
+            system: DeclSystem::Workspace,
+        };
+        let mut sites = Vec::new();
+        let mut shows = vendored.is_some();
+        for file in &ws.files {
+            let read = hubs.iter().any(|hub| hub.decl.site.file == file.path);
+            for load in &file.loads {
+                let rule = signature.rules(load).next().is_some();
+                shows |= rule || signature.fetched(load);
+                if rule && !read {
+                    sites.push(site(&file.path, load.span));
+                }
+            }
+        }
+        sites.extend(vendored.filter(|_| hubs.is_empty()).cloned());
+        let named = |file: &WsFile, call: &WsCall| match call.call.arg("name") {
+            Lookup::Found(name) => file.resolve(name).as_str() == Some(signature.repo),
+            _ => false,
+        };
+        shows |= self.calls.iter().any(|(file, _, call)| named(file, call));
+        if !shows {
+            return Vec::new();
+        }
+        let unread = self.unread.iter();
+        sites.extend(unread.map(|(file, stmt)| site(&file.path, stmt.span)));
+        // The hub rules of each file, and its bytes once they are asked
+        // for.
+        let bound = |file| signature.bound(file);
+        let rules: Vec<Vec<&str>> = ws.files.iter().map(bound).collect();
+        let sources: Vec<OnceCell<FileText>> = ws.files.iter().map(|_| OnceCell::new()).collect();
+        for (file, stmt, call) in &self.calls {
+            let index = ws.files.iter().position(|of| std::ptr::eq(of, *file));
+            let Some((rules, source)) = index.map(|at| (&rules[at], &sources[at])) else {
+                continue;
+            };
+            if rules.is_empty() {
+                continue;
+            }
+            // Only an argument that names more than constants can reach
+            // a rule; the file is read again to see which names it has,
+            // and one that cannot be read may have any.
+            let computed = |span: Span| {
+                call.impure
+                    && match source.get_or_init(|| files.read(&file.path)) {
+                        FileText::Bytes(src) => written(src, span, rules),
+                        FileText::Absent | FileText::Unreadable => true,
+                    }
+            };
+            // `maybe(rule, ...)` is read as the rule it declares.
+            let rule = usize::from(is_maybe(file, call) && call.passes.is_some());
+            let mut handed = call.call.args.iter().skip(rule);
+            if handed.any(|arg| hands_on(&arg.value, rules, &computed)) {
+                sites.push(site(&file.path, stmt.span));
+            }
+        }
+        sites.extend(ws.gaps.iter().map(|gap| site(&gap.file, (0, 0))));
+        let mut seen = BTreeSet::new();
+        sites.retain(|site| seen.insert(site.file.clone()));
+        let ruleset = signature.ruleset;
+        let signal = |site: Site| RulesetSignal { ruleset, site };
+        sites.into_iter().map(signal).collect()
     }
 }
 
@@ -848,15 +1094,11 @@ pub(super) fn called_rule<'a>(
         Callee::Loaded { load, symbol } => Some((file.loads.get(*load)?, symbol.as_str())),
         _ => None,
     };
-    let (load, symbol) = loaded(&call.callee)?;
-    let tools = load.label.as_ref().is_some_and(|label| {
-        let bazel_tools = matches!(&label.repo, Repo::Apparent(repo) | Repo::Canonical(repo) if repo == "bazel_tools");
-        bazel_tools && label.package == "tools/build_defs/repo" && label.name == "utils.bzl"
-    });
-    if symbol == "maybe" && tools {
+    if is_maybe(file, call) {
         let (load, symbol) = loaded(call.passes.as_ref()?)?;
         return Some((load, symbol, true));
     }
+    let (load, symbol) = loaded(&call.callee)?;
     Some((load, symbol, false))
 }
 
@@ -888,6 +1130,40 @@ const PIP_EXTENSION: [(&str, &str); 2] = [
 
 /// The file a `WORKSPACE` loads `pip_parse` from.
 const PIP_BZL: (&str, &str) = ("python", "pip.bzl");
+
+/// The `WORKSPACE` rules that declare a hub.
+const HUB_RULES: [&str; 3] = ["pip_parse", "multi_pip_parse", "pip_install"];
+
+/// The `multi_pip_parse` users write is loaded from `pip.bzl` in the root
+/// package of the repository `python_register_multi_toolchains` makes
+/// (`load("@python//:pip.bzl", "multi_pip_parse")`). That file is
+/// generated with the wrapper `multi_pip_parse(name, requirements_lock,
+/// **kwargs)`, which fills in the Python versions and calls the ruleset's
+/// own function, whose docstring starts "NOT INTENDED FOR DIRECT USE"
+/// (`rules_python@0.31.0:python/private/toolchains_repo.bzl:353-355` and
+/// `python/pip.bzl:226`; the same at 1.4.2 and 2.5.0-rc4). The repository
+/// has any name the user gave it, so the file is known by its place alone.
+fn toolchains_pip(load: &WsLoad) -> bool {
+    let label = load.label.as_ref();
+    label.is_some_and(|label| {
+        label.repo != Repo::Main && label.package.is_empty() && label.name == PIP_BZL.1
+    })
+}
+
+/// Whether `load` gives the hub rule `symbol`.
+fn pip_rule(load: &WsLoad, symbol: &str) -> bool {
+    let own = HUB_RULES.contains(&symbol) && ruleset_load(load, PIP_BZL.0, PIP_BZL.1).is_some();
+    own || (symbol == HUB_RULES[1] && toolchains_pip(load))
+}
+
+/// The checked-in copy's file name, and the function it defines.
+const VENDORED: (&str, &str) = ("requirements.bzl", "install_deps");
+
+const SIGNATURE: WsSignature = WsSignature {
+    ruleset: Ruleset::RulesPython,
+    repo: MODULES[0],
+    hub_rule: pip_rule,
+};
 
 /// The lock attributes that take one label (INDEX F58).
 const LOCK_ATTRIBUTES: [&str; 4] = [
@@ -973,6 +1249,12 @@ pub struct RulesPythonDetail {
     /// For a `WORKSPACE` hub: the repository name its rule's `load` uses.
     /// In a hybrid root, a name the root module can see makes the rule
     /// the Bzlmod module's (design 2.8).
+    ///
+    /// `None` also for a `multi_pip_parse` that is loaded from the
+    /// toolchains repository (`@python//:pip.bzl`): that name is the
+    /// user's own for the repository of generated files and not the
+    /// ruleset's, so the hybrid rule must bind it to no module, and the
+    /// version of such a hub stays unknown.
     pub load_repo: Option<String>,
     /// The scan of each package lock for lock checks.
     pub lock_checks: Vec<PipCompileDetail>,
@@ -1196,33 +1478,60 @@ fn finish(
     hub
 }
 
+/// The `load` of a checked-in copy of the file a hub generates: the
+/// row's target, and where the `load` is.
+///
+/// `pip_parse` writes `requirements.bzl` into the hub's repository, and a
+/// project that vendors it loads its own copy and calls `install_deps()`.
+/// The build then takes its requirement lines from the copy, so an edit
+/// of the lock reaches nothing until the copy is regenerated (INDEX F63).
+/// The copy is known by its file name, and under another name by the
+/// function it defines. It is looked for in every file of the model: a
+/// macro file loads it as the `WORKSPACE` file would. The label of a
+/// relative `load` in a macro file is not parsed, and it names a file of
+/// the main repository; the target is then the label as written.
+fn vendored_copy(ws: &WorkspaceModel) -> Option<(String, Site)> {
+    let (copy, installs) = VENDORED;
+    for file in &ws.files {
+        for load in &file.loads {
+            let written = load.load.module.as_str();
+            let (own, target) = match &load.label {
+                Some(label) => {
+                    let target = format!("//{}:{}", label.package, label.name);
+                    (main_repo(ws, label), target)
+                }
+                None => (true, written.to_string()),
+            };
+            let named = written.rsplit(['/', ':']).next() == Some(copy);
+            let defined = load.load.symbols.iter().any(|s| s.name == installs);
+            if own && (named || defined) {
+                let site = Site {
+                    file: file.path.clone(),
+                    span: load.span,
+                    system: DeclSystem::Workspace,
+                };
+                return Some((target, site));
+            }
+        }
+    }
+    None
+}
+
 fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recognized) {
-    let Some(root) = ws.files.first() else {
-        return;
-    };
-    // A `requirements.bzl` of the main repository that the `WORKSPACE`
-    // loads is a checked-in copy of what `pip_parse` generates: the build
-    // takes its requirement lines from that file, so an edit of the lock
-    // reaches nothing until the copy is regenerated (INDEX F63).
-    let vendored = root.loads.iter().find_map(|load| {
-        let label = load.label.as_ref()?;
-        let main = match &label.repo {
-            Repo::Main => true,
-            Repo::Apparent(name) => ws.name.as_deref() == Some(name.as_str()),
-            Repo::Canonical(_) => false,
-        };
-        let copy = label.name.rsplit('/').next() == Some("requirements.bzl");
-        (main && copy).then(|| format!("//{}:{}", label.package, label.name))
-    });
+    // A `WORKSPACE` file that could not be read is a model with no file
+    // and no statement: nothing below finds anything in it. What it
+    // declares is of no one ruleset, and governance makes every ecosystem
+    // undetermined then (`WorkspaceModel::unreadable`).
+    let vendored = vendored_copy(ws);
     let before = out.hubs.len();
     let ran = Ran::of(ws);
-    for (file, stmt, call) in ran.calls {
+    for &(file, stmt, call) in &ran.calls {
         let Some((load, rule, maybe)) = called_rule(file, call) else {
             continue;
         };
-        let Some(repo) = ruleset_load(load, PIP_BZL.0, PIP_BZL.1) else {
+        if !pip_rule(load, rule) {
             continue;
-        };
+        }
         let (api, shape, requirements) = match rule {
             "pip_parse" => (
                 PipApi::WorkspaceParse,
@@ -1264,51 +1573,36 @@ fn workspace(input: &RecognizeInput<'_>, ws: &WorkspaceModel, out: &mut Recogniz
             unified_hub: Vec::new(),
             spokes: Vec::new(),
             overrides: Vec::new(),
-            load_repo: Some(repo.to_string()),
+            // The toolchains repository of the wrapper is not the
+            // ruleset's (see the field).
+            load_repo: ruleset_load(load, PIP_BZL.0, PIP_BZL.1).map(str::to_string),
             lock_checks: Vec::new(),
         };
-        let written: Vec<String> = reading
-            .locks
-            .iter()
-            .filter(|lock| lock.role == LockRole::PackageLock)
-            .filter_map(|lock| lock.path.clone())
-            .collect();
         let version = VersionVerdict::unknown(Unproven::WorkspaceDefinition);
-        let mut hub = finish(input, reading, shape, detail, &version, out);
-        if let Some(target) = &vendored {
-            hub.derived
-                .extend(written.iter().map(|input| DerivedState::LockCheck {
-                    target: target.clone(),
-                    input: input.clone(),
-                    kind: LockCheckKind::RequirementsBzl,
-                }));
-        }
+        let hub = finish(input, reading, shape, detail, &version, out);
         out.hubs.push(hub);
     }
-    // A file loads a hub rule and a call of it may stand unread: no call
-    // was read at all, or a statement of that file was not (a
-    // comprehension, a block of a macro body). The hub such a call
-    // declares is unknown.
-    let rules = ["pip_parse", "multi_pip_parse", "pip_install"];
-    let no_hub = out.hubs.len() == before;
-    for file in &ws.files {
-        let hidden = no_hub || ran.unread.iter().any(|unread| std::ptr::eq(*unread, file));
-        for load in file.loads.iter().filter(|_| hidden) {
-            let rule = |symbol: &LoadSymbol| rules.contains(&symbol.name.as_str());
-            if load.load.symbols.iter().any(rule)
-                && ruleset_load(load, PIP_BZL.0, PIP_BZL.1).is_some()
-            {
-                out.signals.push(RulesetSignal {
-                    ruleset: Ruleset::RulesPython,
-                    site: Site {
-                        file: file.path.clone(),
-                        span: load.span,
-                        system: DeclSystem::Workspace,
-                    },
-                });
-            }
+    // Which hub the copy was generated from is not written anywhere, so
+    // it stands over every lock of every hub of the model: the row only
+    // refuses.
+    if let Some((target, _)) = &vendored {
+        for hub in &mut out.hubs[before..] {
+            let written = hub.locks.iter();
+            let written = written.filter(|lock| lock.role == LockRole::PackageLock);
+            let row = |input: String| DerivedState::LockCheck {
+                target: target.clone(),
+                input,
+                kind: LockCheckKind::RequirementsBzl,
+            };
+            let rows: Vec<_> = written
+                .filter_map(|lock| lock.path.clone().map(row))
+                .collect();
+            hub.derived.extend(rows);
         }
     }
+    let copy = vendored.as_ref().map(|(_, site)| site);
+    let signals = ran.signals(ws, input.files, &SIGNATURE, &out.hubs[before..], copy);
+    out.signals.extend(signals);
 }
 
 #[cfg(test)]
@@ -1533,8 +1827,9 @@ pub(super) mod tests {
         assert!(hub.derived.is_empty() && hub.bypasses.is_empty() && hub.user_decls.is_empty());
     }
 
-    /// `heavy/rules_python/bzlmod/e9-per-platform/MODULE.bazel`, the
-    /// baseline canary fixture of the CLI crate.
+    /// Trimmed from `heavy/rules_python/bzlmod/e9-per-platform/MODULE.bazel`,
+    /// the baseline canary fixture of the CLI crate: its statements
+    /// without its comments.
     const PER_PLATFORM: &str = "module(name = \"socket_fixture\", version = \"0.0.0\")\n\
         \n\
         bazel_dep(name = \"rules_python\", version = \"2.5.0-rc4\")\n\
@@ -1631,7 +1926,9 @@ pub(super) mod tests {
         assert_eq!(index("2.0.3", &computed), None);
     }
 
-    /// `heavy/rules_python_uv/bzlmod/e9-requirements/MODULE.bazel`.
+    /// Derived from the `pip.parse` tag of
+    /// `heavy/rules_python_uv/bzlmod/e9-requirements/MODULE.bazel`, with
+    /// the uv lock moved into a package of its own.
     const UV_AND_REQUIREMENTS: &str = "pip.parse(\n    hub_name = \"pypi\",\n    python_version = \"3.12\",\n    \
         requirements_lock = \"//:requirements.txt\",\n    uv_lock = \"//py:uv.lock\",\n)\nuse_repo(pip, \"pypi\")\n";
 
@@ -2041,8 +2338,9 @@ pub(super) mod tests {
         );
     }
 
-    /// `heavy/rules_python/workspace/e7/WORKSPACE`, with the lock label
-    /// spelled through the workspace's own name.
+    /// Derived from `heavy/rules_python/workspace/e7/WORKSPACE`: its
+    /// statements without its comments, and the lock label spelled
+    /// through the workspace's own name.
     const WORKSPACE: &str = "workspace(name = \"socket_fixture\")\n\
         \n\
         load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
@@ -2141,7 +2439,7 @@ pub(super) mod tests {
 
     #[test]
     fn workspace_hubs_are_found_under_maybe_in_macros_and_in_legacy_rules() {
-        let load = "load(\"@rules_python//python:pip.bzl\", \"multi_pip_parse\", \"pip_install\", \"pip_parse\")\n";
+        let load = "load(\"@rules_python//python:pip.bzl\", \"pip_install\", \"pip_parse\")\n";
         let hubs = |files: &[(&str, &str)]| Root::of(files).recognize(recognize);
 
         // `maybe(pip_parse, ...)`: the attributes are the keyword ones.
@@ -2175,12 +2473,15 @@ pub(super) mod tests {
             ("tools/deps.bzl", "pip")
         );
 
-        // `multi_pip_parse` names one lock per Python version, and
-        // `pip_install` is the legacy shape, whose lock is `requirements`.
+        // `multi_pip_parse` names one lock per Python version. Users load
+        // the wrapper that the toolchains repository generates, which
+        // fills in the Python versions; `pip_install` is the legacy
+        // shape, whose lock is `requirements`.
+        let versions = "python_interpreter_target = {\"3.10\": \"@python_3_10_host//:python\", \"3.11\": \"@python_3_11_host//:python\"},\n    \
+                        requirements_lock = {\"3.10\": \"//:requirements_3_10.txt\", \"3.11\": \"//:requirements_3_11.txt\"},\n";
         let legacy = format!(
-            "{load}multi_pip_parse(\n    name = \"pypi\",\n    default_version = \"3.11\",\n    \
-             python_interpreter_target = {{\"3.10\": \"@python_3_10_host//:python\", \"3.11\": \"@python_3_11_host//:python\"}},\n    \
-             requirements_lock = {{\"3.10\": \"//:requirements_3_10.txt\", \"3.11\": \"//:requirements_3_11.txt\"}},\n)\n\
+            "{load}load(\"@python//:pip.bzl\", \"multi_pip_parse\")\n\
+             multi_pip_parse(\n    name = \"pypi\",\n    default_version = \"3.11\",\n    {versions})\n\
              pip_install(name = \"old\", requirements = \"//:requirements.txt\")\n"
         );
         let found = hubs(&[("WORKSPACE", &legacy)]);
@@ -2192,20 +2493,137 @@ pub(super) mod tests {
             (multi.shape, detail(multi).api),
             (HubShape::PipParseWorkspace, PipApi::MultiParse)
         );
-        let paths: Vec<_> = multi
-            .locks
-            .iter()
-            .map(|lock| lock.path.as_deref())
-            .collect();
-        assert_eq!(
-            paths,
-            [Some("requirements_3_10.txt"), Some("requirements_3_11.txt")]
-        );
+        let paths = |hub: &Hub| -> Vec<Option<String>> {
+            hub.locks.iter().map(|lock| lock.path.clone()).collect()
+        };
+        let per_version = [
+            Some("requirements_3_10.txt".to_string()),
+            Some("requirements_3_11.txt".to_string()),
+        ];
+        assert_eq!(paths(multi), per_version);
+        // The wrapper's repository is the user's name for the generated
+        // toolchain files, not the ruleset's: no module is bound to it.
+        assert_eq!(detail(multi).load_repo, None);
         assert_eq!(
             (old.shape, detail(old).api),
             (HubShape::PipInstall, PipApi::LegacyInstall)
         );
         assert_eq!(old.locks[0].path.as_deref(), Some("requirements.txt"));
+        assert_eq!(detail(old).load_repo.as_deref(), Some("rules_python"));
+
+        // The function the wrapper calls is the ruleset's own, which
+        // takes the Python versions as an argument. It is read the same
+        // way, and its `load` does name the ruleset.
+        let direct = format!(
+            "load(\"@rules_python//python:pip.bzl\", \"multi_pip_parse\")\n\
+             multi_pip_parse(\n    name = \"pypi\",\n    default_version = \"3.11\",\n    \
+             python_versions = [\"3.10\", \"3.11\"],\n    {versions})\n"
+        );
+        let found = hubs(&[("WORKSPACE", &direct)]);
+        assert_eq!((&found.gaps, &found.signals), (&vec![], &vec![]));
+        let [multi] = &found.hubs[..] else {
+            panic!("one hub, found {:?}", found.hubs);
+        };
+        assert_eq!(
+            (detail(multi).api, paths(multi)),
+            (PipApi::MultiParse, per_version.to_vec())
+        );
+        assert_eq!(detail(multi).load_repo.as_deref(), Some("rules_python"));
+        // A `pip.bzl` in the root package of the main repository is the
+        // project's own file.
+        let own = legacy.replace("@python//:pip.bzl", "//:pip.bzl");
+        let found = hubs(&[("WORKSPACE", &own)]);
+        assert_eq!(found.hubs.len(), 1, "{:?}", found.hubs);
+    }
+
+    /// `rules_python@0.31.0:examples/multi_python_versions/WORKSPACE`,
+    /// byte for byte.
+    const MULTI_PYTHON_VERSIONS: &str = r#"workspace(name = "rules_python_multi_python_versions")
+
+local_repository(
+    name = "rules_python",
+    path = "../..",
+)
+
+load("@rules_python//python:repositories.bzl", "py_repositories", "python_register_multi_toolchains")
+
+py_repositories()
+
+load("@rules_python//python/pip_install:repositories.bzl", "pip_install_dependencies")
+
+pip_install_dependencies()
+
+default_python_version = "3.9"
+
+python_register_multi_toolchains(
+    name = "python",
+    default_version = default_python_version,
+    python_versions = [
+        "3.8",
+        "3.9",
+        "3.10",
+        "3.11",
+    ],
+    register_coverage_tool = True,
+)
+
+load("@python//:pip.bzl", "multi_pip_parse")
+
+multi_pip_parse(
+    name = "pypi",
+    default_version = default_python_version,
+    python_interpreter_target = {
+        "3.10": "@python_3_10_host//:python",
+        "3.11": "@python_3_11_host//:python",
+        "3.8": "@python_3_8_host//:python",
+        "3.9": "@python_3_9_host//:python",
+    },
+    requirements_lock = {
+        "3.10": "//requirements:requirements_lock_3_10.txt",
+        "3.11": "//requirements:requirements_lock_3_11.txt",
+        "3.8": "//requirements:requirements_lock_3_8.txt",
+        "3.9": "//requirements:requirements_lock_3_9.txt",
+    },
+)
+
+load("@pypi//:requirements.bzl", "install_deps")
+
+install_deps()
+"#;
+
+    #[test]
+    fn the_multi_python_versions_example_is_one_hub_over_a_lock_per_version() {
+        let found = Root::of(&[("WORKSPACE", MULTI_PYTHON_VERSIONS)]).recognize(recognize);
+        assert_eq!((&found.gaps, &found.signals), (&vec![], &vec![]));
+        let [hub] = &found.hubs[..] else {
+            panic!("one hub, found {:?}", found.hubs);
+        };
+        assert_eq!(
+            (hub.shape, detail(hub).api, detail(hub).hub_name.as_str()),
+            (HubShape::PipParseWorkspace, PipApi::MultiParse, "pypi")
+        );
+        assert!(hub.decl.literal);
+        let paths: Vec<_> = hub.locks.iter().map(|lock| lock.path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            [
+                Some("requirements/requirements_lock_3_10.txt"),
+                Some("requirements/requirements_lock_3_11.txt"),
+                Some("requirements/requirements_lock_3_8.txt"),
+                Some("requirements/requirements_lock_3_9.txt"),
+            ]
+        );
+        assert!(hub
+            .locks
+            .iter()
+            .all(|lock| lock.role == LockRole::PackageLock));
+        // `@python` is the toolchains repository, so nothing says which
+        // rules_python runs the rule.
+        assert_eq!(detail(hub).load_repo, None);
+        assert_eq!(
+            hub.ruleset_version,
+            VersionVerdict::unknown(Unproven::WorkspaceDefinition)
+        );
     }
 
     #[test]
@@ -2294,6 +2712,330 @@ pub(super) mod tests {
         assert_eq!(
             Root::of(&[("WORKSPACE", own)]).recognize(recognize),
             Recognized::default()
+        );
+    }
+
+    /// A `WORKSPACE` archive of the ruleset, and the `load` of its rule.
+    const ARCHIVE: &str = "load(\"@bazel_tools//tools/build_defs/repo:http.bzl\", \"http_archive\")\n\
+        http_archive(name = \"rules_python\", sha256 = \"00\", url = \"https://example.com/rules_python.tar.gz\")\n";
+    const PIP_LOAD: &str = "load(\"@rules_python//python:pip.bzl\", \"pip_parse\")\n";
+    /// A `WORKSPACE` that runs the macro `python_deps` of `tools/deps.bzl`.
+    const MACRO_CALL: &str = "load(\"//tools:deps.bzl\", \"python_deps\")\npython_deps()\n";
+
+    /// `pip_parse(name = "<name>", requirements_lock = "//:<name>.txt")`.
+    fn pip_parse(name: &str) -> String {
+        format!("pip_parse(name = \"{name}\", requirements_lock = \"//:{name}.txt\")\n")
+    }
+
+    /// The names of the hubs of a `WORKSPACE` root and the file of each
+    /// signal, which must be this ruleset's.
+    fn hubs_and_signals(files: &[(&str, &str)]) -> (Vec<String>, Vec<String>) {
+        let found = Root::of(files).recognize(recognize);
+        let own = |signal: &RulesetSignal| {
+            (signal.ruleset, signal.site.system) == (Ruleset::RulesPython, DeclSystem::Workspace)
+        };
+        assert!(found.signals.iter().all(own), "{:?}", found.signals);
+        let hubs = found.hubs.iter().map(|hub| hub.decl.apparent_name.clone());
+        let signals = found.signals.iter().map(|signal| signal.site.file.clone());
+        (hubs.collect(), signals.collect())
+    }
+
+    fn want(hubs: &[&str], signals: &[&str]) -> (Vec<String>, Vec<String>) {
+        let owned = |names: &[&str]| names.iter().map(|name| name.to_string()).collect();
+        (owned(hubs), owned(signals))
+    }
+
+    #[test]
+    fn a_macro_that_was_not_followed_is_a_signal_where_the_ruleset_shows() {
+        // A macro that calls a macro of another file: the model reads one
+        // level, so the `pip_parse` of the second file is not seen. The
+        // archive shows the ruleset, and the call that was not followed
+        // is the place to look.
+        let ws = format!("{ARCHIVE}load(\"//tools:deps.bzl\", \"deps\")\ndeps()\n");
+        let deps =
+            "load(\"//tools:python.bzl\", \"python_deps\")\ndef deps():\n    python_deps()\n";
+        let python = format!("{PIP_LOAD}def python_deps():\n    {}", pip_parse("pip"));
+        let files = [
+            ("WORKSPACE", &*ws),
+            ("tools/deps.bzl", deps),
+            ("tools/python.bzl", &*python),
+        ];
+        assert_eq!(hubs_and_signals(&files), want(&[], &["tools/deps.bzl"]));
+        // The macro file is missing, or is not Starlark this reader
+        // vouches for: the call in the `WORKSPACE` file and the file.
+        let unread = want(&[], &["WORKSPACE", "tools/deps.bzl"]);
+        assert_eq!(hubs_and_signals(&files[..1]), unread);
+        let tabbed = [files[0], ("tools/deps.bzl", "def deps():\n\tpass\n")];
+        assert_eq!(hubs_and_signals(&tabbed), unread);
+        // A `load` from the ruleset's repository shows it as the archive
+        // does, and so does a `local_repository` of its name.
+        for shown in [
+            "load(\"@rules_python//python:repositories.bzl\", \"py_repositories\")\npy_repositories()\n",
+            "local_repository(name = \"rules_python\", path = \"../rules_python\")\n",
+        ] {
+            let ws = ws.replace(ARCHIVE, shown);
+            assert_eq!(hubs_and_signals(&[("WORKSPACE", &ws)]), unread, "{shown}");
+        }
+
+        // With nothing of the ruleset in the files that were read, what
+        // was not followed is of no one ruleset: governance's to report.
+        let bare = ws.replace(ARCHIVE, "");
+        let files = [("WORKSPACE", &*bare), files[1], files[2]];
+        assert_eq!(hubs_and_signals(&files), want(&[], &[]));
+        assert_eq!(hubs_and_signals(&files[..1]), want(&[], &[]));
+        // The same for a macro file that loads the rule and cannot be
+        // read: no file of the model shows the ruleset.
+        let hidden = format!("{PIP_LOAD}def python_deps():\n\t{}", pip_parse("b"));
+        let files = [("WORKSPACE", MACRO_CALL), ("tools/deps.bzl", &*hidden)];
+        assert_eq!(hubs_and_signals(&files), want(&[], &[]));
+        let shown = format!("{ARCHIVE}{MACRO_CALL}");
+        let files = [("WORKSPACE", &*shown), files[1]];
+        assert_eq!(hubs_and_signals(&files), unread);
+
+        // The ruleset with every statement followed and no hub is a root
+        // that uses its toolchains: silent, also with a macro of the
+        // project that was read in full.
+        let toolchains = format!(
+            "{ARCHIVE}load(\"@rules_python//python:repositories.bzl\", \"py_repositories\")\n\
+             py_repositories()\nload(\"//tools:deps.bzl\", \"deps\")\ndeps()\n"
+        );
+        let flat =
+            "def deps():\n    native.local_repository(name = \"x\", path = \"third_party/x\")\n";
+        let root = Root::of(&[("WORKSPACE", &toolchains), ("tools/deps.bzl", flat)]);
+        assert_eq!(root.recognize(recognize), Recognized::default());
+        // A `WORKSPACE` file that cannot be read is governance's too.
+        let tab = format!("{PIP_LOAD}if True:\n\t{}", pip_parse("pip"));
+        let root = Root::of(&[("WORKSPACE", &tab)]);
+        assert_eq!(root.recognize(recognize), Recognized::default());
+
+        // What the rule costs, on Bazel's own 6.5.0 `WORKSPACE` (the
+        // Starlark corpus): it declares a mock `rules_python` for
+        // protobuf and no hub, and it calls macros of its own and runs
+        // comprehensions that this reader does not follow. A hub could
+        // stand behind any of them, so the ecosystem is not determined.
+        let path = fixtures().join("starlark/corpus/bazelbuild-bazel-6.5.0.WORKSPACE");
+        let text = std::fs::read_to_string(path).expect("the corpus file");
+        let (hubs, signals) = hubs_and_signals(&[("WORKSPACE", &text)]);
+        assert!(hubs.is_empty(), "{hubs:?}");
+        assert_eq!(signals.first().map(String::as_str), Some("WORKSPACE"));
+        assert!(signals.contains(&"distdir.bzl".to_string()), "{signals:?}");
+    }
+
+    #[test]
+    fn a_hub_that_was_read_does_not_vouch_for_one_that_may_stand_unread() {
+        let seen = format!("{PIP_LOAD}{}", pip_parse("a"));
+        let with_macro = format!("{seen}{MACRO_CALL}");
+        let behind = |macro_file: &str| {
+            hubs_and_signals(&[("WORKSPACE", &with_macro), ("tools/deps.bzl", macro_file)])
+        };
+        // The macro calls a `def` of its own file, which is not read.
+        let helper = format!(
+            "{PIP_LOAD}def _tools():\n    {}def python_deps():\n    _tools()\n",
+            pip_parse("b")
+        );
+        assert_eq!(behind(&helper), want(&["a"], &["tools/deps.bzl"]));
+        // The macro's name is bound twice, so its body is not read.
+        let twice = format!(
+            "{PIP_LOAD}def python_deps():\n    pass\ndef python_deps():\n    {}",
+            pip_parse("b")
+        );
+        assert_eq!(
+            behind(&twice),
+            want(&["a"], &["tools/deps.bzl", "WORKSPACE"])
+        );
+        // The macro file is not Starlark this reader vouches for.
+        let tabbed = format!("{PIP_LOAD}def python_deps():\n\t{}", pip_parse("b"));
+        assert_eq!(
+            behind(&tabbed),
+            want(&["a"], &["WORKSPACE", "tools/deps.bzl"])
+        );
+        // A macro that was read in full hides nothing.
+        let read = format!("{PIP_LOAD}def python_deps():\n    {}", pip_parse("b"));
+        assert_eq!(behind(&read), want(&["a", "b"], &[]));
+
+        // The rule is handed to a function, which can call it. `maybe` of
+        // `@bazel_tools` is the one function whose first argument is read
+        // as the rule it declares.
+        let one = |rest: &str| hubs_and_signals(&[("WORKSPACE", &format!("{seen}{rest}"))]);
+        let hidden = want(&["a"], &["WORKSPACE"]);
+        let wrap = "load(\"@my_rules//:wrap.bzl\", \"wrap\")\n";
+        let b = "name = \"b\", requirements_lock = \"//:b.txt\"";
+        assert_eq!(one(&format!("{wrap}wrap(pip_parse, {b})\n")), hidden);
+        assert_eq!(
+            one(&format!("{wrap}wrap(rules = [pip_parse], {b})\n")),
+            hidden
+        );
+        assert_eq!(one(&format!("{wrap}wrap({{\"b\": pip_parse}})\n")), hidden);
+        let maybe = "load(\"@bazel_tools//tools/build_defs/repo:utils.bzl\", \"maybe\")\n";
+        assert_eq!(
+            one(&format!("{maybe}maybe(repo_rule = pip_parse, {b})\n")),
+            hidden
+        );
+        assert_eq!(
+            one(&format!("{maybe}maybe(pip_parse, {b})\n")),
+            want(&["a", "b"], &[])
+        );
+        // The rule is called inside a computed argument, which is found
+        // by its name in the text; a computed argument that names other
+        // functions hands on no rule.
+        assert_eq!(one(&format!("print(pip_parse({b}))\n")), hidden);
+        let other = "load(\"@versions//:defs.bzl\", \"url_of\")\nlocal_repository(name = \"x\", path = url_of(\"x\"))\n";
+        assert_eq!(one(other), want(&["a"], &[]));
+        // A wrapper of the project that was read: its parameter is called
+        // in its body, which names the file to fix as well.
+        let own = format!("{seen}load(\"//tools:wrap.bzl\", \"wrap\")\nwrap(pip_parse, {b})\n");
+        let files = [
+            ("WORKSPACE", &*own),
+            (
+                "tools/wrap.bzl",
+                "def wrap(rule, **kwargs):\n    rule(**kwargs)\n",
+            ),
+        ];
+        assert_eq!(
+            hubs_and_signals(&files),
+            want(&["a"], &["tools/wrap.bzl", "WORKSPACE"])
+        );
+        // The rule under another name.
+        assert_eq!(one(&format!("parse = pip_parse\nparse({b})\n")), hidden);
+
+        // A rule that two `load` statements bind is not known to the
+        // reader of the file: neither call is read as a hub, and the hub
+        // of a macro beside them does not stand in for them.
+        let twice = format!(
+            "{seen}load(\"@a//:requirements.bzl\", \"install_deps\")\ninstall_deps()\n{PIP_LOAD}{}",
+            pip_parse("b")
+        );
+        assert_eq!(
+            hubs_and_signals(&[("WORKSPACE", &twice)]),
+            want(&[], &["WORKSPACE"])
+        );
+        let beside = format!("{twice}{MACRO_CALL}");
+        let read = format!("{PIP_LOAD}def python_deps():\n    {}", pip_parse("c"));
+        let files = [("WORKSPACE", &*beside), ("tools/deps.bzl", &*read)];
+        assert_eq!(hubs_and_signals(&files), want(&["c"], &["WORKSPACE"]));
+    }
+
+    #[test]
+    fn a_checked_in_requirements_bzl_stands_over_every_hub_of_the_model() {
+        let row = |target: &str| DerivedState::LockCheck {
+            target: target.to_string(),
+            input: "requirements.txt".to_string(),
+            kind: LockCheckKind::RequirementsBzl,
+        };
+        // A macro file loads the copy as the `WORKSPACE` file would. The
+        // hub gets the row, and the copy's function is one of the main
+        // repository that was not followed.
+        let ws = "load(\"//tools:deps.bzl\", \"deps\")\ndeps()\n";
+        let deps = format!(
+            "{PIP_LOAD}load(\"//:requirements.bzl\", \"install_deps\")\n\
+             def deps():\n    pip_parse(name = \"pip\", requirements_lock = \"//:requirements.txt\")\n    install_deps()\n"
+        );
+        let found = |deps: &str| {
+            let found =
+                Root::of(&[("WORKSPACE", ws), ("tools/deps.bzl", deps)]).recognize(recognize);
+            let [hub] = &found.hubs[..] else {
+                panic!("one hub, found {:?}", found.hubs);
+            };
+            assert_eq!(hub.decl.site.file, "tools/deps.bzl");
+            let signals = found.signals.iter().map(|signal| signal.site.file.clone());
+            (hub.derived.clone(), signals.collect::<Vec<_>>())
+        };
+        let unfollowed = vec!["tools/deps.bzl".to_string()];
+        assert_eq!(
+            found(&deps),
+            (vec![row("//:requirements.bzl")], unfollowed.clone())
+        );
+        // A relative label of a macro file is not parsed: the target is
+        // the label as written.
+        let relative = deps.replace("//:requirements.bzl", ":requirements.bzl");
+        assert_eq!(
+            found(&relative),
+            (vec![row(":requirements.bzl")], unfollowed.clone())
+        );
+        // Under another file name the copy is known by `install_deps`.
+        let renamed = deps.replace("//:requirements.bzl", "//third_party:pip_deps.bzl");
+        assert_eq!(
+            found(&renamed),
+            (vec![row("//third_party:pip_deps.bzl")], unfollowed)
+        );
+        // The file the hub's own repository generates is no copy.
+        let generated = deps.replace("//:requirements.bzl", "@pip//:requirements.bzl");
+        assert_eq!(found(&generated), (vec![], vec![]));
+
+        // Two hubs: the copy may be of either, so it stands over both.
+        let two = format!(
+            "{PIP_LOAD}{}{}load(\"//:requirements.bzl\", \"install_deps\")\ninstall_deps()\n",
+            pip_parse("a"),
+            pip_parse("b")
+        );
+        let both = Root::of(&[("WORKSPACE", &two)]).recognize(recognize);
+        let inputs: Vec<_> = both.hubs.iter().map(|hub| hub.derived.clone()).collect();
+        let over = |input: &str| {
+            vec![DerivedState::LockCheck {
+                target: "//:requirements.bzl".to_string(),
+                input: input.to_string(),
+                kind: LockCheckKind::RequirementsBzl,
+            }]
+        };
+        assert_eq!(inputs, [over("a.txt"), over("b.txt")]);
+
+        // The copy with no hub at all: the build takes its lines from a
+        // file no declaration ties to a lock. The `load` is the signal,
+        // with the copy absent, present, and beside the ruleset's archive.
+        let only = "load(\"//:requirements.bzl\", \"install_deps\")\ninstall_deps()\n";
+        let vendored = want(&[], &["WORKSPACE", "requirements.bzl"]);
+        assert_eq!(hubs_and_signals(&[("WORKSPACE", only)]), vendored);
+        let copy = "load(\"@rules_python//python/pip_install:pip_repository.bzl\", \"whl_library\")\n\
+                    _packages = [(\"pip_six\", \"six==1.16.0\")]\n\
+                    def install_deps(**whl_library_kwargs):\n    for name, requirement in _packages:\n        \
+                    whl_library(name = name, requirement = requirement)\n";
+        let files = [("WORKSPACE", only), ("requirements.bzl", copy)];
+        assert_eq!(hubs_and_signals(&files), vendored);
+        let archived = format!("{ARCHIVE}{only}");
+        let files = [("WORKSPACE", &*archived), files[1]];
+        assert_eq!(hubs_and_signals(&files), vendored);
+    }
+
+    #[test]
+    fn an_attribute_that_is_none_is_not_set() {
+        // Bazel takes `None` for an optional attribute as the attribute
+        // left out (rules_python 2.4.6 tags).
+        let hub = |attributes: &str| {
+            let tag = format!(
+                "pip.parse(hub_name = \"pip\", python_version = \"3.11\", {attributes})\nuse_repo(pip, \"pip\")\n"
+            );
+            let found = bzlmod("2.4.6", &tag);
+            assert_eq!(
+                (&found.gaps, &found.signals),
+                (&vec![], &vec![]),
+                "{attributes}"
+            );
+            let [hub] = &found.hubs[..] else {
+                panic!("one hub, found {:?}", found.hubs);
+            };
+            assert!(hub.decl.literal, "{attributes}");
+            assert_eq!(detail(hub).download_only, Some(false), "{attributes}");
+            let locks = hub.locks.iter().map(|lock| (lock.path.clone(), lock.role));
+            let manifest = detail(hub).manifest.clone();
+            (hub.shape, locks.collect::<Vec<_>>(), manifest)
+        };
+        let one = |path: &str| {
+            let lock = (Some(path.to_string()), LockRole::PackageLock);
+            (HubShape::PipParse, vec![lock], PairedManifest::None)
+        };
+        // No uv lock: the requirements file is the lock, not a file that
+        // pins nothing.
+        assert_eq!(
+            hub("requirements_lock = \"//:requirements.txt\", uv_lock = None"),
+            one("requirements.txt")
+        );
+        assert_eq!(
+            hub("requirements_lock = None, requirements_linux = \"//:requirements_linux.txt\""),
+            one("requirements_linux.txt")
+        );
+        assert_eq!(
+            hub("requirements_lock = \"//:requirements.txt\", requirements_darwin = None, download_only = None"),
+            one("requirements.txt")
         );
     }
 

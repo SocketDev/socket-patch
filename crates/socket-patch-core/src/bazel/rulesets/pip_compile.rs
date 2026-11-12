@@ -29,13 +29,21 @@
 //! has shown that the pin survives it.
 //!
 //! What cannot be read is not "no check": a BUILD file that cannot be
-//! parsed, a check macro used where the statement reader has no model and
-//! a computed lock argument are each reported as [`Unread`], and the
+//! parsed, a check macro used where the statement reader has no model, a
+//! computed lock argument and an argument passed by a position this
+//! reader has no parameter for are each reported as [`Unread`], and the
 //! recognizer turns them into gaps, which refuse.
+//!
+//! A label is matched against the lock more widely than a hub's own lock
+//! label is read. [`scan`] is not told the main repository's own name, so
+//! `@name//pkg:file` counts as the file `pkg/file` of this repository,
+//! and a diff test against `requirements.bzl` in the root package of any
+//! other repository counts as one over the file a hub generates. A match
+//! that is wrong only refuses.
 
 use super::rules_python::LABEL_NOT_LITERAL;
 use crate::bazel::derived::LockCheckKind;
-use crate::bazel::label::Label;
+use crate::bazel::label::{Label, Repo};
 use crate::bazel::model::{DerivedState, FileText, FileView, Gap};
 use crate::bazel::starlark::{self, Call, Dialect, File, Lookup, StmtKind, Value, ValueKind};
 use crate::bazel::version::Tri;
@@ -175,7 +183,18 @@ struct Macro {
 /// (`rules_uv@v0.90.0:uv/pip.bzl:54-55`); `lock(name, srcs, out)`
 /// (`rules_python@2.5.0-rc4:python/uv/private/lock.bzl:613`);
 /// `gazelle_python_manifest(name, requirements | lockfiles)`
-/// (`gazelle/manifest/defs.bzl:23`); bazel_skylib `diff_test(file1, file2)`.
+/// (`gazelle/manifest/defs.bzl:23`); bazel_skylib
+/// `diff_test(name, file1, file2, failure_message = None, **kwargs)`
+/// (`bazel_skylib@1.7.1:rules/diff_test.bzl:157`).
+///
+/// All but `lock`, whose parameters are keyword-only, are Starlark
+/// functions that take positional arguments. `name` comes first in each.
+/// What follows it keeps its place across releases in `diff_test` alone:
+/// `compile_pip_requirements` gained `srcs` before `src`
+/// (`rules_python@0.31.0:python/pip_install/requirements.bzl:20-22`
+/// against the 2.5.0-rc4 file above), and `gazelle_python_manifest`
+/// gained `lockfiles` in fourth place (`0.31.0` against `2.5.0-rc4`
+/// `gazelle/manifest/defs.bzl:23-27`).
 const MACROS: [Macro; 5] = [
     Macro {
         symbol: "compile_pip_requirements",
@@ -219,6 +238,24 @@ impl Macro {
         }
     }
 
+    /// The place a parameter keeps in every release of the macro, for an
+    /// argument that is passed without its name.
+    fn position(&self, parameter: &str) -> Option<usize> {
+        match (self.made, parameter) {
+            (_, "name") => Some(0),
+            (Made::DiffTest, "file1") => Some(1),
+            (Made::DiffTest, "file2") => Some(2),
+            _ => None,
+        }
+    }
+
+    /// Whether `call` passes an argument at a place this reader has no
+    /// parameter for: it may be the lock. The fourth parameter of
+    /// `diff_test` is its failure message.
+    fn unplaced(&self, call: &Call) -> bool {
+        self.made != Made::DiffTest && call.positional().count() > 1
+    }
+
     /// The file an absent argument stands for, relative to the Bazel root.
     fn default(&self, argument: &str, package: &str, name: Option<&str>) -> Option<String> {
         match (self.symbol, argument) {
@@ -246,10 +283,23 @@ impl Macro {
             Made::DiffTest => path.rsplit('/').next() == Some(REQUIREMENTS_BZL),
             _ => path == lock,
         };
-        let path = |label: &str| Label::parse(label, Some(package)).ok()?.path();
+        // An apparent repository name can be the main repository's own,
+        // which `scan` is not told: its file is compared like a file of
+        // this repository. A canonical name is another repository for
+        // certain, and counts for a diff test alone, as the
+        // `requirements.bzl` a hub generates in its root package: the
+        // other side of a check over a checked-in copy, under any name.
+        let path = |label: &str| {
+            let label = Label::parse(label, Some(package)).ok()?;
+            let generated = self.made == Made::DiffTest && label.package.is_empty();
+            match label.repo {
+                Repo::Main | Repo::Apparent(_) => Some(label.file()),
+                Repo::Canonical(_) => generated.then(|| label.file()),
+            }
+        };
         let (mut hit, mut unread) = (false, false);
         for argument in self.files {
-            match strings(file, call, argument) {
+            match strings(file, call, argument, self.position(argument)) {
                 Ok(Some(labels)) => {
                     let mut paths = labels.iter().filter_map(|label| path(label));
                     hit |= paths.any(|path| names(&path));
@@ -278,10 +328,27 @@ fn join(dir: &str, name: &str) -> String {
     }
 }
 
-/// The strings the argument `name` gives after one level of constants: a
+/// What `call` passes for the parameter `name`: by keyword, or as the
+/// positional argument at `position` when the parameter has a place.
+/// Both at once is a call Bazel rejects.
+fn passed<'f>(call: &'f Call, name: &str, position: Option<usize>) -> Lookup<'f> {
+    let placed = position.and_then(|at| call.positional().nth(at));
+    match (call.arg(name), placed) {
+        (Lookup::Absent, Some(value)) => Lookup::Found(value),
+        (Lookup::Found(_), Some(_)) => Lookup::Unknown,
+        (by_keyword, _) => by_keyword,
+    }
+}
+
+/// The strings the parameter `name` gets after one level of constants: a
 /// string, or the items of a list. `Ok(None)` when it is absent or `None`;
 /// `Err` when it is computed, or a `*` or `**` argument may supply it.
-fn strings<'f>(file: &'f File<'_>, call: &'f Call, name: &str) -> Result<Option<Vec<&'f str>>, ()> {
+fn strings<'f>(
+    file: &'f File<'_>,
+    call: &'f Call,
+    name: &str,
+    position: Option<usize>,
+) -> Result<Option<Vec<&'f str>>, ()> {
     let resolve = |value: &'f Value| match &value.kind {
         ValueKind::Ident(constant) => {
             let bound = file.constant(constant, value.span.0).exact().flatten();
@@ -289,7 +356,7 @@ fn strings<'f>(file: &'f File<'_>, call: &'f Call, name: &str) -> Result<Option<
         }
         _ => value,
     };
-    let value = match call.arg(name) {
+    let value = match passed(call, name, position) {
         Lookup::Absent => return Ok(None),
         Lookup::Found(value) => resolve(value),
         Lookup::Unknown => return Err(()),
@@ -420,15 +487,16 @@ fn build_file(package: &Package<'_>, src: &[u8], found: &mut PipCompileDetail) {
                     continue;
                 };
                 let line = file.line_of(stmt.span.0);
-                let name = match strings(&file, call, "name") {
+                let name = match strings(&file, call, "name", made.position("name")) {
                     Ok(Some(name)) if name.len() == 1 => Some(name[0]),
                     _ => None,
                 };
+                let unplaced = made.unplaced(call);
                 match (
                     made.covers(&file, call, package.dir, name, &found.lock),
                     name,
                 ) {
-                    (Some(false), _) => {}
+                    (Some(false), _) if !unplaced => {}
                     (Some(true), Some(name)) => found.add(LockCheck {
                         kind: made.kind(dot_test),
                         target: format!("//{}:{name}", package.dir),
@@ -437,6 +505,16 @@ fn build_file(package: &Package<'_>, src: &[u8], found: &mut PipCompileDetail) {
                             line,
                         },
                     }),
+                    // Which parameter a positional argument after the
+                    // name lands on depends on the release that defines
+                    // the macro.
+                    _ if unplaced => {
+                        let why = format!(
+                            "this `{}` call passes arguments by position; name every argument",
+                            symbol.local
+                        );
+                        found.unread(path, line, why);
+                    }
                     _ if doubted => {
                         let why = format!(
                             "an argument of this `{}` call is computed; write its name and \
@@ -633,13 +711,15 @@ mod tests {
 
     #[test]
     fn compile_pip_requirements_covers_its_named_and_default_files() {
-        // The fixture of the lock-check canary
-        // (`heavy/rules_python/bzlmod/e9-compile/BUILD.bazel`).
+        // Trimmed from the fixture of the lock-check canary
+        // (`heavy/rules_python/bzlmod/e9-compile/BUILD.bazel`): its
+        // `compile_pip_requirements` call, as written there.
         let build = "load(\"@rules_python//python:pip.bzl\", \"compile_pip_requirements\")\n\
                      \n\
                      compile_pip_requirements(\n    name = \"requirements\",\n    src = \"requirements.in\",\n    \
-                     extra_args = [\"--no-emit-index-url\"],\n    requirements_txt = \"requirements_lock.txt\",\n)\n";
-        let detail = checks(&[("BUILD.bazel", build)], "requirements_lock.txt");
+                     extra_args = [\n        \"--index-url=http://socket-fixture.invalid/pip-mode/simple\",\n        \
+                     \"--no-emit-index-url\",\n    ],\n    requirements_txt = \"requirements.txt\",\n)\n";
+        let detail = checks(&[("BUILD.bazel", build)], "requirements.txt");
         assert_eq!(
             detail.checks,
             [LockCheck {
@@ -653,7 +733,7 @@ mod tests {
         );
         // Another file of the package is not covered.
         assert_eq!(
-            found(&[("BUILD.bazel", build)], "requirements.txt"),
+            found(&[("BUILD.bazel", build)], "requirements_lock.txt"),
             (vec![], true)
         );
 
@@ -793,6 +873,132 @@ mod tests {
         let detail = checks(&beside, "requirements.txt");
         assert!(detail.checks.is_empty());
         assert_eq!(detail.unread.len(), 2, "{:?}", detail.unread);
+    }
+
+    #[test]
+    fn a_label_with_a_repository_name_is_matched_by_the_file_it_names() {
+        // `scan` is not told the main repository's own name, which a
+        // label may spell out: the file decides, in any repository an
+        // apparent name can stand for.
+        let load = "load(\"@rules_python//python:pip.bzl\", \"compile_pip_requirements\")\n";
+        let over = |label: &str| {
+            let build = format!(
+                "{load}compile_pip_requirements(name = \"requirements\", src = \"requirements.in\", \
+                 requirements_txt = \"{label}\")\n"
+            );
+            found(&[("BUILD.bazel", &build)], "requirements.txt")
+        };
+        for label in [
+            "requirements.txt",
+            "//:requirements.txt",
+            "@//:requirements.txt",
+            "@@//:requirements.txt",
+            "@root//:requirements.txt",
+        ] {
+            assert_eq!(
+                over(label),
+                one(pip_compile(Tri::Maybe), "//:requirements"),
+                "{label}"
+            );
+        }
+        // Another file is not the lock under any name, and a canonical
+        // name is never the main repository.
+        for label in [
+            "@root//:requirements_dev.txt",
+            "@other//py:requirements.txt",
+            "@@other+//:requirements.txt",
+        ] {
+            assert_eq!(over(label), (vec![], true), "{label}");
+        }
+
+        // A diff test against the `requirements.bzl` a hub generates is
+        // a check over the checked-in copy, whatever the copy is called
+        // (the names of `rules_python@0.31.0:examples/pip_parse_vendored`
+        // are `requirements.bzl` on both sides).
+        let diff = "load(\"@bazel_skylib//rules:diff_test.bzl\", \"diff_test\")\n\
+                    diff_test(name = \"test_vendored\", file1 = \"pip_deps.bzl\", file2 = \"@pip//:requirements.bzl\")\n";
+        let vendored = one(LockCheckKind::RequirementsBzl, "//:test_vendored");
+        let files = |build: &str| {
+            found(
+                &[("BUILD.bazel", build), ("pip_deps.bzl", "")],
+                "requirements.txt",
+            )
+        };
+        assert_eq!(files(diff), vendored);
+        assert_eq!(files(&diff.replace("@pip//", "@@pip+//")), vendored);
+        // The generated file is in the root package of its repository.
+        let nested = diff.replace("@pip//:", "@@pip+//sub:");
+        assert_eq!(files(&nested), (vec![], true));
+    }
+
+    #[test]
+    fn an_argument_passed_by_position_is_read_where_its_place_is_fixed() {
+        // bazel_skylib `diff_test(name, file1, file2, failure_message)`.
+        let diff = "load(\"@bazel_skylib//rules:diff_test.bzl\", \"diff_test\")\n\
+                    diff_test(\"check\", \"requirements.bzl\", \":gen\")\n";
+        let vendored = one(LockCheckKind::RequirementsBzl, "//:check");
+        assert_eq!(
+            found(&[("BUILD.bazel", diff)], "requirements.txt"),
+            vendored
+        );
+        let message = diff.replace("\":gen\")", "\":gen\", \"run //:vendor\")");
+        assert_eq!(
+            found(&[("BUILD.bazel", &message)], "requirements.txt"),
+            vendored
+        );
+        // A file given twice is a call Bazel rejects.
+        let twice = diff.replace("\":gen\")", "\":gen\", file1 = \"a.txt\")");
+        let files = [("BUILD.bazel", &*twice), ("requirements.bzl", "")];
+        assert_eq!(checks(&files, "requirements.txt").unread.len(), 1);
+
+        // The name comes first in every macro: with it alone the
+        // defaults are known.
+        let load = "load(\"@rules_python//python:pip.bzl\", \"compile_pip_requirements\")\n";
+        let named = format!("{load}compile_pip_requirements(\"requirements\")\n");
+        assert_eq!(
+            found(&[("BUILD.bazel", &named)], "requirements.txt"),
+            one(pip_compile(Tri::Maybe), "//:requirements")
+        );
+        assert_eq!(
+            found(&[("BUILD.bazel", &named)], "other.txt"),
+            (vec![], true)
+        );
+
+        // What follows the name changes its place between releases, so
+        // an argument there may be the lock: the call is not read.
+        let unread = |build: &str, lock: &str| {
+            let detail = checks(&[("BUILD.bazel", build)], lock);
+            assert!(detail.checks.is_empty(), "{build}");
+            let [unread] = &detail.unread[..] else {
+                panic!("one place, found {:?}", detail.unread);
+            };
+            assert_eq!((unread.file.as_str(), unread.line), ("BUILD.bazel", 2));
+            assert!(unread.why.contains("name every argument"), "{}", unread.why);
+        };
+        // rules_uv `pip_compile(name, requirements_in,
+        // requirements_overrides, requirements_txt)`.
+        unread(
+            "load(\"@rules_uv//uv:pip.bzl\", \"pip_compile\")\n\
+             pip_compile(\"gen\", \"requirements.in\", None, \"//:requirements_lock.txt\")\n",
+            "requirements_lock.txt",
+        );
+        unread(
+            "load(\"@rules_python_gazelle_plugin//manifest:defs.bzl\", \"gazelle_python_manifest\")\n\
+             gazelle_python_manifest(\"m\", \":modules_map\", \"//:requirements_lock.txt\")\n",
+            "requirements_lock.txt",
+        );
+        unread(
+            &format!("{load}compile_pip_requirements(\"requirements\", \"requirements.in\", None, \"locks.txt\")\n"),
+            "locks.txt",
+        );
+        // A keyword that names the lock is a check whatever else is
+        // passed by position.
+        let keyword = "load(\"@rules_uv//uv:pip.bzl\", \"pip_compile\")\n\
+                       pip_compile(\"gen\", \"requirements.in\", requirements_txt = \"//:requirements_lock.txt\")\n";
+        assert_eq!(
+            found(&[("BUILD.bazel", keyword)], "requirements_lock.txt"),
+            one(LockCheckKind::Erasing, "//:gen")
+        );
     }
 
     #[test]
