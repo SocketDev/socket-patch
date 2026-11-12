@@ -14,6 +14,7 @@ use socket_patch_core::api::client::{
 };
 use socket_patch_core::api::ranking::severity_order;
 use socket_patch_core::api::types::{BatchPackagePatches, BatchSearchResponse, PatchSearchResult};
+use socket_patch_core::bazel::codes::Code as BazelCode;
 use socket_patch_core::crawlers::ruby_crawler::{
     config_path_ignored_warning, stale_plugin_registration_warning,
 };
@@ -1307,12 +1308,66 @@ struct GradleScan {
     locked: Option<HashSet<String>>,
 }
 
+/// Run-level note: the search for project directories left out
+/// directories Bazel owns (design 3, HZ-02 and HZ-03).
+const BAZEL_TREE_SKIPPED: &str = BazelCode::WorkspaceOutputTreeSkipped.as_str();
+
+/// The [`BAZEL_TREE_SKIPPED`] detail: which directories below `--cwd`.
+fn bazel_trees_skipped_detail(trees: &[String]) -> String {
+    let named: Vec<&str> = trees
+        .iter()
+        .map(|tree| if tree.is_empty() { "." } else { tree })
+        .collect();
+    format!(
+        "{} below this one {} not searched for projects ({}): Bazel owns {} (an output \
+         base, a cache or a vendor directory), and nothing in one is a project to patch",
+        plural(trees.len(), "directory", "directories"),
+        if trees.len() == 1 { "was" } else { "were" },
+        named.join(", "),
+        if trees.len() == 1 { "it" } else { "them" },
+    )
+}
+
+/// Refuse a scan whose scope root (`--cwd`, or `--global-prefix`) is in a
+/// tree Bazel owns, before anything there is read or crawled (design 3,
+/// HZ-02): what a scan found in an output base it would report as
+/// installed and patch, and the next build would silently undo it. `None`
+/// when the scope is outside every such tree; else the exit code, after
+/// the coded error is printed.
+async fn refuse_bazel_tree_scope(args: &ScanArgs) -> Option<i32> {
+    use socket_patch_core::patch::shared_store::bazel_tree_of;
+    let common = &args.common;
+    let mut detail = None;
+    if let Some(prefix) = &common.global_prefix {
+        let tree = bazel_tree_of(prefix).await;
+        detail = tree.map(|tree| tree.scope_refusal("scan", "--global-prefix"));
+    }
+    if detail.is_none() {
+        let named_by = if common.cwd == Path::new(".") {
+            "the working directory"
+        } else {
+            "the directory to scan"
+        };
+        let tree = bazel_tree_of(&common.cwd).await;
+        detail = tree.map(|tree| tree.scope_refusal("scan", named_by));
+    }
+    let detail = detail?;
+    if common.json {
+        let code = BazelCode::AgentOutputTree.as_str();
+        emit_scan_error(common, EnvelopeError::new(code, detail));
+    } else {
+        eprintln!("Error: {detail}");
+    }
+    Some(1)
+}
+
 /// Whether a run-level warning code is an advisory that needs no action
-/// (the Gradle discovery notes), printed as `Note:` for humans.
+/// (the Gradle discovery notes, a Bazel tree left out of the project
+/// search), printed as `Note:` for humans.
 fn is_info_note(code: &str) -> bool {
     matches!(
         code,
-        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS
+        GRADLE_MAVEN_LOCAL_UNDETERMINED | GRADLE_USER_HOME_DIFFERS | BAZEL_TREE_SKIPPED
     )
 }
 
@@ -1865,6 +1920,9 @@ async fn scan_project(
         };
         return scan_usage_error(&args, code, &message);
     }
+    if let Some(code) = refuse_bazel_tree_scope(&args).await {
+        return code;
+    }
     // A bare scan keeps the mode the project already has (#1088): only an
     // explicit `--mode` converts a vendored or agent-mode project. The
     // hosted default above is the only one this replaces (a `--prune` or
@@ -1925,6 +1983,7 @@ async fn scan_project(
     // at or below `--cwd`. `--json` and `--vex` take one directory, so they
     // scan `--cwd` alone and say which projects were left.
     let mut unscanned_projects = None;
+    let mut bazel_trees_skipped = None;
     if discovers_projects(&args, invocation) {
         let found = crate::commands::projects_below::discovered(
             &args.common,
@@ -1945,10 +2004,18 @@ async fn scan_project(
                 eprintln!("{line}");
             }
         }
+        if !found.bazel_trees.is_empty() {
+            bazel_trees_skipped = Some(bazel_trees_skipped_detail(&found.bazel_trees));
+        }
         if !others.is_empty() {
             if args.common.json || args.vex.vex.is_some() {
                 unscanned_projects = Some(others);
             } else {
+                // Each directory's run reports its own; this one is the
+                // search's, so it is said once, here.
+                if let Some(detail) = bazel_trees_skipped.filter(|_| !args.common.silent) {
+                    eprintln!("Note: {detail}");
+                }
                 return Box::pin(run_project_dirs(
                     args,
                     invocation,
@@ -2097,6 +2164,9 @@ async fn scan_project(
             eprintln!("Warning: {detail}");
         }
         layout_refusals.push((render::PROJECTS_NOT_SCANNED.to_string(), detail));
+    }
+    if let Some(detail) = bazel_trees_skipped {
+        layout_refusals.push((BAZEL_TREE_SKIPPED.to_string(), detail));
     }
     // A token whose org could not be resolved put the whole run on the
     // public proxy (the client already warned on stderr): `--json`

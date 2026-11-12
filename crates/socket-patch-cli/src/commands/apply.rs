@@ -997,16 +997,23 @@ pub(crate) fn representative_file(
 /// `files` enumerates only the files that participated in the action —
 /// for `Applied`, the patched ones with their `applied_via` strategy;
 /// for `Verified`, every file the engine confirmed could be patched.
+/// The `errorCode` of a package whose apply failed with `error`: the
+/// refusal to write into a tree Bazel owns has its own (design 3, HZ-02),
+/// so a script can tell it from a patch that did not fit.
+fn failure_code(error: &str) -> &'static str {
+    use socket_patch_core::patch::shared_store::BAZEL_TREE_REFUSAL_MARKER;
+    if error.contains(BAZEL_TREE_REFUSAL_MARKER) {
+        socket_patch_core::bazel::codes::Code::AgentOutputTree.as_str()
+    } else {
+        "apply_failed"
+    }
+}
+
 pub(crate) fn result_to_event(result: &ApplyResult, dry_run: bool) -> PatchEvent {
     let purl = result.package_key.clone();
     if !result.success {
-        return PatchEvent::new(PatchAction::Failed, purl).with_error(
-            "apply_failed",
-            result
-                .error
-                .clone()
-                .unwrap_or_else(|| "unknown error".to_string()),
-        );
+        let error = result.error.as_deref().unwrap_or("unknown error");
+        return PatchEvent::new(PatchAction::Failed, purl).with_error(failure_code(error), error);
     }
 
     // A package managed by `socket-patch vendor` is skipped with its own
@@ -1178,6 +1185,68 @@ fn refuse_yarn_pnp_with_skips(args: &ApplyArgs, skipped: &[PatchEvent]) -> i32 {
     1
 }
 
+/// What `apply` does when the directory it would work in is in a tree
+/// Bazel owns (design 3, HZ-02): `None` to go on, else the exit code,
+/// after the warning or the coded error is printed. Nothing is crawled or
+/// written either way: Bazel replaces what is in such a tree, so a patch
+/// there would be recorded as applied and silently lost.
+///
+/// A working directory no flag named is a warning and exit 0. A legacy
+/// `npm_install` / `yarn_install` repository rule runs the project's
+/// lifecycle hooks inside `<output base>/external/<repo>`, a hook that
+/// runs `socket-patch apply` lands here, and a failure would fail the
+/// rule and every target behind it. `--cwd .` reads the same: it names the
+/// directory the process is already in.
+///
+/// A directory the caller chose (`--cwd`, `--global-prefix`, or their
+/// variables) is refused, exit 1. So is `--check` wherever it runs: it is
+/// an audit no hook calls, and passing would say the patches are in place
+/// in a tree nothing was checked in.
+async fn bazel_tree_preflight(args: &ApplyArgs) -> Option<i32> {
+    use socket_patch_core::bazel::codes::Code;
+    use socket_patch_core::patch::shared_store::bazel_tree_of;
+    let common = &args.common;
+    // The default: no flag and no variable moved the run.
+    let implicit_cwd = common.cwd == Path::new(".");
+    let cwd = if implicit_cwd {
+        "the working directory"
+    } else {
+        "--cwd"
+    };
+    let mut found = None;
+    if let Some(prefix) = &common.global_prefix {
+        let named = Some(("--global-prefix", false));
+        found = bazel_tree_of(prefix).await.zip(named);
+    }
+    if found.is_none() {
+        let named = Some((cwd, implicit_cwd));
+        found = bazel_tree_of(&common.cwd).await.zip(named);
+    }
+    let (tree, (named_by, implicit)) = found?;
+    let mut env = Envelope::new(Command::Apply);
+    env.dry_run = common.dry_run;
+    if implicit && !args.check {
+        let detail = tree.scope_warning();
+        if common.json {
+            env.warn(Code::WorkspaceInsideOutputTree.as_str(), detail);
+            println!("{}", env.to_pretty_json());
+        } else if !common.silent {
+            eprintln!("Warning: {detail}");
+        }
+        return Some(0);
+    }
+    let action = if args.check { "check" } else { "apply" };
+    let detail = tree.scope_refusal(action, named_by);
+    if common.json {
+        env.mark_error(EnvelopeError::new(Code::AgentOutputTree.as_str(), detail));
+        println!("{}", env.to_pretty_json());
+    } else {
+        // Errors print even under --silent.
+        eprintln!("Error: {detail}");
+    }
+    Some(1)
+}
+
 pub async fn run(args: ApplyArgs) -> i32 {
     apply_env_toggles(&args.common);
     // `--vex` attests the manifest's project but this run patches `--cwd`'s
@@ -1335,6 +1404,12 @@ pub async fn run(args: ApplyArgs) -> i32 {
         return i32::from(matches!(vex_result, Some(ManifestlessVex::Failed(_))));
     }
 
+    // Decided after the no-manifest exit above, which stays first and
+    // unchanged, and before anything is read, crawled, locked or written.
+    if let Some(code) = bazel_tree_preflight(&args).await {
+        return code;
+    }
+
     // Read-only Go `replace`-redirect verification for CI / GitHub-App auditing.
     // Branches BEFORE the lock (so concurrent builds don't contend) and
     // before any crawl/fetch; it reads only the manifest + committed copies +
@@ -1430,13 +1505,11 @@ fn collect_apply_failures(
         if failures.iter().any(|f| f.purl == r.package_key) {
             continue;
         }
+        let error = r.error.as_deref().unwrap_or("unknown error");
         failures.push(ApplyFailure {
             purl: r.package_key.clone(),
-            code: "apply_failed".to_string(),
-            error: r
-                .error
-                .clone()
-                .unwrap_or_else(|| "unknown error".to_string()),
+            code: failure_code(error).to_string(),
+            error: error.to_string(),
         });
     }
     if !failures.is_empty() {

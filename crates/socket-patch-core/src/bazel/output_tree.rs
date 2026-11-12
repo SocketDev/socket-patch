@@ -24,6 +24,7 @@
 //! to crawl.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 /// The file a Bazel server writes into its output base. It holds the
@@ -245,6 +246,46 @@ pub fn tree_at(fs: &dyn TreeFs, dir: &Path, vendor_dirs: &[PathBuf]) -> Found {
             root: dir.to_path_buf(),
         }),
     }
+}
+
+/// Whether an entry of this name can be one of the markers [`tree_at`]
+/// asks for, by the name alone and spelled as Bazel writes it.
+fn is_marker_name(name: &OsStr) -> bool {
+    let named = |marker: &str| name == OsStr::new(marker);
+    named(OUTPUT_BASE_MARKER)
+        || named(CAS_FILE)
+        || VENDOR_MARKERS.iter().any(|marker| named(marker))
+        || recorded_inputs_entry(name).is_some()
+}
+
+/// `<entry>` of a name spelled `<entry>.recorded_inputs`.
+fn recorded_inputs_entry(name: &OsStr) -> Option<&OsStr> {
+    let name = Path::new(name);
+    let suffix = RECORDED_INPUTS_SUFFIX.trim_start_matches('.');
+    (name.extension() == Some(OsStr::new(suffix))).then(|| name.file_stem())?
+}
+
+/// The directory that an entry called `name` in `dir` marks as the root
+/// of a tree, if the entry is the regular file [`tree_at`] asks for:
+/// `dir` itself for a marker a tree holds, and `dir/<entry>` for
+/// `<entry>.recorded_inputs`. `None` for every other name.
+///
+/// This is a filter in front of [`tree_at`], for a caller that already
+/// holds the names of a directory (a walker's listing, a path list): a
+/// directory no name points at holds no marker Bazel wrote, so it costs
+/// no `stat`. The answer proves nothing by itself; [`tree_at`] on the
+/// directory decides. A directory tracked rc files name with
+/// `--vendor_dir` carries no marker and is not found this way.
+pub fn marked_dir(dir: &Path, name: &OsStr) -> Option<PathBuf> {
+    if let Some(entry) = recorded_inputs_entry(name) {
+        return Some(dir.join(entry));
+    }
+    let own = if name == OsStr::new(CAS_FILE) {
+        is_cas_entry(dir)
+    } else {
+        is_marker_name(name)
+    };
+    own.then(|| dir.to_path_buf())
 }
 
 /// The nearest tree at or above `path`, by markers on the path as spelled.
@@ -1384,6 +1425,68 @@ mod tests {
         assert_eq!(listing.stat(Path::new("services/api/go.mod")), Entry::File);
         assert_eq!(listing.stat(Path::new("services/web")), Entry::Neither);
         assert_eq!(listing.read_link(Path::new("vendor_src")), None);
+    }
+
+    /// The name filter never hides a tree: over a whole path list, the
+    /// directories the marker names point at include every directory
+    /// `tree_at` finds a tree in. A name alone proves nothing the other
+    /// way, and the names are the ones Bazel writes, in its spelling.
+    #[test]
+    fn a_marker_name_points_at_the_directory_it_marks() {
+        let cas = format!("cache/content_addressable/sha256/{}", "ab".repeat(32));
+        let cas_file = format!("{cas}/file");
+        let files = [
+            "ws/MODULE.bazel",
+            "ws/pnpm-lock.yaml",
+            "ws/out/DO_NOT_BUILD_HERE",
+            "ws/out/external/rules_x+/package.json",
+            "ws/vendor_src/VENDOR.bazel",
+            "ws/vendor_src/+http+dep/package-lock.json",
+            "ws/third_party/.vendorignore",
+            "cache/contents/cd12/26ed/BUILD.bazel",
+            "cache/contents/cd12/26ed.recorded_inputs",
+            cas_file.as_str(),
+            // Named like a marker, and none: no directory of a base beside
+            // the first, the second outside a cache, the third beside no
+            // entry at all.
+            "ws/notes/DO_NOT_BUILD_HERE",
+            "ws/docs/file",
+            "ws/.recorded_inputs",
+        ];
+        let listing = Listing::new(files);
+        let mut pointed: Vec<PathBuf> = Vec::new();
+        for file in files.map(Path::new) {
+            let (dir, name) = (file.parent().unwrap(), file.file_name().unwrap());
+            let marked = marked_dir(dir, name);
+            assert!(marked.is_none() || is_marker_name(name), "{file:?}");
+            pointed.extend(marked);
+        }
+        pointed.sort();
+        let class = |dir: &PathBuf| tree_at(&listing, dir, &[]).tree.map(|tree| tree.class);
+        let mut trees: Vec<(PathBuf, PathClass)> = listing
+            .dirs
+            .iter()
+            .filter_map(|dir| Some((dir.clone(), class(dir)?)))
+            .collect();
+        trees.sort_by(|a, b| a.0.cmp(&b.0));
+        let want = [
+            (cas.as_str(), RepositoryCache),
+            ("cache/contents/cd12/26ed", RepoContentsCache),
+            ("ws/out", OutputBase),
+            ("ws/third_party", VendorDir),
+            ("ws/vendor_src", VendorDir),
+        ];
+        assert_eq!(trees, want.map(|(dir, class)| (PathBuf::from(dir), class)));
+        let not_trees: Vec<&PathBuf> = pointed.iter().filter(|dir| class(dir).is_none()).collect();
+        assert_eq!(not_trees, [Path::new("ws/notes")]);
+        assert_eq!(pointed.len(), trees.len() + 1, "{pointed:?}");
+
+        for name in ["do_not_build_here", "VENDOR.bazel.bak", "recorded_inputs"] {
+            assert!(!is_marker_name(OsStr::new(name)), "{name}");
+        }
+        // `file` is a marker only inside an entry of the repository cache.
+        assert!(is_marker_name(OsStr::new("file")));
+        assert_eq!(marked_dir(Path::new("ws/docs"), OsStr::new("file")), None);
     }
 
     // ── What real Bazel left on disk (probes C1, C3, C7, C8, C11, H1, H3) ──

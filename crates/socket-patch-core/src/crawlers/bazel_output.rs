@@ -13,7 +13,7 @@
 //! `--symlink_prefix`, `startup --output_base`) arrives from the caller,
 //! through [`Classifier::with_vendor_dirs`] and [`Candidates`].
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{ErrorKind, Read as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
@@ -191,6 +191,88 @@ impl Classifier {
                 root: dir,
             }),
         }
+    }
+
+    /// The trees the entries of `dir` give away, for a walker that holds
+    /// its listing: `dir` itself when it holds a marker, and each child
+    /// directory a marker beside it names (`<entry>.recorded_inputs`).
+    /// `names` are the entries of `dir` that are not directories.
+    ///
+    /// Each name is first asked whether it can be a marker at all
+    /// ([`output_tree::marked_dir`]), so a directory that holds none, which
+    /// is every directory outside a Bazel tree, costs no `stat`; the ones
+    /// a name points at are judged by [`Classifier::tree_at`]. The walker
+    /// neither enters a returned root nor looks at anything in it. A
+    /// directory only a tracked `--vendor_dir` names has no marker to list
+    /// and is not found here.
+    pub fn trees_marked_by<'a>(
+        &self,
+        dir: &Path,
+        names: impl IntoIterator<Item = &'a OsStr>,
+    ) -> Vec<Tree> {
+        let mut trees: Vec<Tree> = Vec::new();
+        for name in names {
+            let Some(marked) = output_tree::marked_dir(dir, name) else {
+                continue;
+            };
+            if trees.iter().any(|tree| tree.root == marked) {
+                continue;
+            }
+            // A link is judged by where it leads, and a walker follows
+            // none: only a tree rooted at the directory itself counts.
+            let own = self.tree_at(&marked).tree;
+            trees.extend(own.filter(|tree| tree.root == marked));
+        }
+        trees
+    }
+}
+
+/// What [`vendor_dirs_at`] found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VendorDirs {
+    /// The first-level entries of the root that are Bazel vendor
+    /// directories, sorted.
+    pub dirs: Vec<PathBuf>,
+    /// The root could not be listed to its end, or a marker test went
+    /// unanswered: the list may be short, and an empty one does not say
+    /// that the root holds no vendor directory.
+    pub cannot_tell: bool,
+}
+
+/// The first-level directories of the Bazel root `root` that are vendor
+/// directories by what `bazel vendor` wrote into them: `VENDOR.bazel`, or
+/// `.vendorignore` alone on 7.1.2, 7.2.0 and 7.2.1 (probe C11). A link to
+/// such a directory counts as one.
+///
+/// A committed vendor directory is evidence that some command line passes
+/// `--vendor_dir` even where no tracked rc file does (design 2.6): Bazel
+/// then builds from it and a pin in the lock is a silent no-op. The
+/// directory a tracked flag names needs no marker and is the caller's to
+/// add. Only the first level is listed: that is where the flag's
+/// customary values put it, and a deeper one is found by its marker when
+/// a path into it is classified.
+pub fn vendor_dirs_at(root: &Path) -> VendorDirs {
+    let classifier = Classifier::new();
+    let mut listed_all = true;
+    let mut dirs = Vec::new();
+    for entry in list(root, MAX_LISTED, &mut listed_all) {
+        // A regular file is no directory; a link may lead to one.
+        if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+            continue;
+        }
+        let found = classifier.tree_at(&entry.path());
+        listed_all &= !found.cannot_tell;
+        if found
+            .tree
+            .is_some_and(|tree| tree.class == PathClass::VendorDir)
+        {
+            dirs.push(entry.path());
+        }
+    }
+    dirs.sort();
+    VendorDirs {
+        dirs,
+        cannot_tell: !listed_all,
     }
 }
 
@@ -858,6 +940,117 @@ mod tests {
         // One classifier serves every task of a run.
         fn shared<T: Send + Sync>(_: &T) {}
         shared(&classifier);
+    }
+
+    /// The names of the entries of `dir` that are not directories: what a
+    /// walker hands to `trees_marked_by`.
+    fn file_names(dir: &Path) -> Vec<OsString> {
+        let entries = fs::read_dir(dir).unwrap().map(Result::unwrap);
+        let files = entries.filter(|entry| !entry.file_type().unwrap().is_dir());
+        files.map(|entry| entry.file_name()).collect()
+    }
+
+    #[test]
+    fn a_listing_names_the_trees_a_walker_must_not_enter() {
+        let disk = Scratch::new();
+        let sha256 = "87d8263a29f202dab6acea9f28262585d34aa0d6fc45683d74d929ffa339a198";
+        let cas = format!("ws/.cache/content_addressable/sha256/{sha256}");
+        // The last two are named like markers and mark nothing: no
+        // directory of a base beside the first, and the second is outside
+        // a cache entry.
+        let more = format!(
+            "{{ws}}/package.json
+             {{ws}}/vendor_src/VENDOR.bazel
+             {{ws}}/third_party/.vendorignore
+             {{ws}}/.cache/content_addressable/sha256/{sha256}/file
+             {{ws}}/.cache/contents/cd12/1/BUILD.bazel
+             {{ws}}/.cache/contents/cd12/1.recorded_inputs
+             {{ws}}/.cache/contents/cd12/2/BUILD.bazel
+             {{ws}}/notes/DO_NOT_BUILD_HERE
+             {{ws}}/docs/file"
+        );
+        disk.lay("ws", "ws/out", &[BASE, &more].join("\n"));
+        let classifier = Classifier::new();
+        let marked = |dir: &str, names: &[OsString]| {
+            let names = names.iter().map(OsString::as_os_str);
+            classifier.trees_marked_by(&disk.at(dir), names)
+        };
+        for (dir, want) in [
+            ("ws/out", vec![(OutputBase, "ws/out")]),
+            ("ws/vendor_src", vec![(VendorDir, "ws/vendor_src")]),
+            ("ws/third_party", vec![(VendorDir, "ws/third_party")]),
+            (cas.as_str(), vec![(RepositoryCache, cas.as_str())]),
+            // The marker of a contents-cache entry lies beside it, so its
+            // parent's listing is what names it, and only it.
+            (
+                "ws/.cache/contents/cd12",
+                vec![(RepoContentsCache, "ws/.cache/contents/cd12/1")],
+            ),
+            ("ws/.cache/contents/cd12/1", vec![]),
+            ("ws", vec![]),
+            ("ws/notes", vec![]),
+            ("ws/docs", vec![]),
+        ] {
+            let want: Vec<Tree> = want
+                .into_iter()
+                .filter_map(|(class, root)| tree(class, disk.at(root)))
+                .collect();
+            assert_eq!(marked(dir, &file_names(&disk.at(dir))), want, "{dir}");
+        }
+        // The names decide what is asked: a marker the listing does not
+        // name is never looked for.
+        assert_eq!(marked("ws/out", &[]), vec![]);
+        assert_eq!(marked("ws/out", &["README".into()]), vec![]);
+    }
+
+    #[test]
+    fn the_vendor_directories_of_a_root_are_its_marked_first_level_entries() {
+        let disk = Scratch::new();
+        // Bazel 7.3 and later write `VENDOR.bazel`; 7.1.2, 7.2.0 and 7.2.1
+        // only `.vendorignore` (probe C11). Not vendor directories: an
+        // in-tree output base, a directory below the first level, a file,
+        // and the root's own stray marker.
+        let more = "
+            {ws}/MODULE.bazel
+            {ws}/VENDOR.bazel
+            {ws}/notes
+            {ws}/src/package.json
+            {ws}/vendor_src/VENDOR.bazel
+            {ws}/vendor_src/+http+dep/package-lock.json
+            {ws}/third_party/.vendorignore
+            {ws}/tools/deps/VENDOR.bazel";
+        disk.lay("ws", "ws/out", &[BASE, more].join("\n"));
+        let found = vendor_dirs_at(&disk.at("ws"));
+        let want = vec![disk.at("ws/third_party"), disk.at("ws/vendor_src")];
+        assert_eq!((found.dirs, found.cannot_tell), (want, false));
+
+        assert_eq!(vendor_dirs_at(&disk.at("ws/src")), VendorDirs::default());
+        // A root that is not there holds none, and that is known.
+        assert_eq!(vendor_dirs_at(&disk.at("gone")), VendorDirs::default());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_vendor_directory_counts_and_an_unread_root_is_not_empty() {
+        let disk = Scratch::new();
+        let layout = "
+            shared/vendor/VENDOR.bazel
+            shared/vendor/+http+dep/go.mod
+            {ws}/deps -> shared/vendor
+            {ws}/one -> shared/vendor/+http+dep
+            {ws}/bazel-bin -> {base}/execroot/_main/bazel-out/k8/bin
+            {ws}/stale -> nowhere";
+        disk.lay("ws", "root/_bazel_u/6d82", &[BASE, layout].join("\n"));
+        let found = vendor_dirs_at(&disk.at("ws"));
+        // Both lead into the vendor directory; the convenience link leads
+        // into an output base, which is another kind of tree.
+        let want = vec![disk.at("ws/deps"), disk.at("ws/one")];
+        assert_eq!((found.dirs, found.cannot_tell), (want, false));
+
+        let unread = while_locked(&disk.at("ws"), || vendor_dirs_at(&disk.at("ws")));
+        if let Some(unread) = unread {
+            assert_eq!((unread.dirs, unread.cannot_tell), (vec![], true));
+        }
     }
 
     #[cfg(unix)]
