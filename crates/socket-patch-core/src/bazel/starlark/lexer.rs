@@ -23,6 +23,7 @@
 //!   has one length in `MODULE.bazel` up to Bazel 7 and another elsewhere.
 
 use super::MAX_FILE_BYTES;
+use crate::formats::text::strip_bom_bytes;
 
 /// A byte range `[start, end)` of the file.
 pub type Span = (usize, usize);
@@ -161,8 +162,12 @@ pub fn lex(src: &[u8]) -> Result<Lexed, Unreadable> {
     if src.len() > MAX_FILE_BYTES {
         return fail(UnreadableKind::TooLarge, MAX_FILE_BYTES);
     }
-    let boms: [&[u8]; 3] = [&[0xEF, 0xBB, 0xBF], &[0xFF, 0xFE], &[0xFE, 0xFF]];
-    if boms.iter().any(|bom| src.starts_with(bom)) {
+    // What a UTF-8 mark is belongs to the shared helper (#905); here it is
+    // not stripped, since Bazel rejects the file. The UTF-16 marks are
+    // this reader's own.
+    let utf8_bom = strip_bom_bytes(src).len() != src.len();
+    let utf16_boms: [&[u8]; 2] = [&[0xFF, 0xFE], &[0xFE, 0xFF]];
+    if utf8_bom || utf16_boms.iter().any(|bom| src.starts_with(bom)) {
         return fail(UnreadableKind::Bom, 0);
     }
     let mut lexer = Lexer {

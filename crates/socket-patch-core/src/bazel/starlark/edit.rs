@@ -69,17 +69,34 @@ pub fn replace_string_inner(
         return Err(EditError::UnsafeText);
     }
     let out = [&file.src[..inner.0], new.as_bytes(), &file.src[inner.1..]].concat();
+    // A file the edit grows past the size cap does not read back.
+    let reread = read(&out, file.dialect).map_err(|_| EditError::RereadMismatch)?;
+    let same = reads_as_edited(file, &reread, edited, inner, new.len());
+    same.then_some(out).ok_or(EditError::RereadMismatch)
+}
 
+/// Whether `reread` is `file` with one string changed and nothing else:
+/// the string at token `edited`, whose contents `inner` are now `new_len`
+/// bytes long. That is the same kind of line end, as many comments and
+/// statements, and the same tokens, each one past the string moved by the
+/// change in length.
+fn reads_as_edited(
+    file: &File<'_>,
+    reread: &File<'_>,
+    edited: usize,
+    inner: Span,
+    new_len: usize,
+) -> bool {
     // Every offset at or past the end of the old text moves by the change
     // in length; the edited token is the only one that straddles it.
     let moved = |at: usize| match at >= inner.1 {
-        true => at - (inner.1 - inner.0) + new.len(),
+        true => at - (inner.1 - inner.0) + new_len,
         false => at,
     };
     let expected = |(i, t): (usize, &Token)| Token {
         tok: match t.tok {
             Tok::Str { plain, .. } if i == edited => Tok::Str {
-                inner: (inner.0, inner.0 + new.len()),
+                inner: (inner.0, inner.0 + new_len),
                 plain,
             },
             Tok::Str { inner, plain } => Tok::Str {
@@ -92,18 +109,17 @@ pub fn replace_string_inner(
         end: moved(t.end),
         depth: t.depth,
     };
-    let reread = read(&out, file.dialect).map_err(|_| EditError::RereadMismatch)?;
     let tokens = file.tokens.iter().enumerate().map(expected);
-    let same = reread.eol == file.eol
+    reread.eol == file.eol
         && reread.comments.len() == file.comments.len()
         && reread.stmts.len() == file.stmts.len()
-        && reread.tokens.iter().copied().eq(tokens);
-    same.then_some(out).ok_or(EditError::RereadMismatch)
+        && reread.tokens.iter().copied().eq(tokens)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::stmt::{Dialect, Lookup, StmtKind, ValueKind};
+    use super::super::MAX_FILE_BYTES;
     use super::*;
 
     const MODULE: &str = "module(name = \"m\")\n\n# The pin.\nbazel_dep(\n    name = 'rules_go',  # keep\n    version = \"0.50.1\",\n)\nruby.bundle_fetch(gem_checksums = {\"rack-3.0.8\": \"sha256-old\"})";
@@ -223,6 +239,62 @@ mod tests {
             let refused = replace_string_inner(&file, inner.unwrap(), old, "b");
             assert_eq!(refused, Err(EditError::NotPlainString), "{literal}");
         }
+
+        // An edit that grows a file past the size the reader takes is
+        // refused: its result would not read back. One that keeps the size
+        // of the same file is made.
+        let mut full = String::from("x = \"a\"\n# ");
+        full.push_str(&"c".repeat(MAX_FILE_BYTES - full.len() - 1));
+        full.push('\n');
+        assert_eq!(full.len(), MAX_FILE_BYTES);
+        let at_cap = read(full.as_bytes(), Dialect::Module).unwrap();
+        let grow = replace_string_inner(&at_cap, (5, 6), "a", "ab");
+        assert_eq!(grow, Err(EditError::RereadMismatch));
+        let keep = replace_string_inner(&at_cap, (5, 6), "a", "b").unwrap();
+        assert_eq!(keep, full.replacen("\"a\"", "\"b\"", 1).into_bytes());
+    }
+
+    /// The re-read guard of design 5.1, on its own. No edit that passes
+    /// the checks before it reads back as anything but the file with that
+    /// string changed, so the guard is given re-reads that are something
+    /// else: each differs from the file in one of the things it compares.
+    #[test]
+    fn a_reread_is_the_file_with_one_string_changed_or_a_mismatch() {
+        const OLD: &str = "V = \"old\" \na()\nb()  # c\n";
+        let file = read(OLD.as_bytes(), Dialect::Module).unwrap();
+        let (edited, inner) = (2, (5, 8));
+        assert_eq!(file.tokens[edited].tok, Tok::Str { inner, plain: true });
+        let same = |text: &str, new_len: usize| {
+            let reread = read(text.as_bytes(), Dialect::Module).unwrap();
+            reads_as_edited(&file, &reread, edited, inner, new_len)
+        };
+        let new = OLD.replace("old", "new");
+        assert!(same(&new, 3));
+        // Each replacement keeps every byte offset, so nothing else moves.
+        for (what, from, to) in [
+            ("the kind of line end", "\" \n", "\"\r\n"),
+            ("a comment", "# c", "   "),
+            ("a statement", "a()\nb()", "a() b()"),
+            ("the kind of a token", "a()", "1()"),
+            ("a token", "b()  #", "b(); #"),
+        ] {
+            assert!(new.contains(from), "{what}");
+            assert!(!same(&new.replace(from, to), 3), "{what}");
+        }
+        // A string of another length moves every token after it by the
+        // difference, and by nothing else.
+        let longer = OLD.replace("old", "longer");
+        assert!(same(&longer, 6));
+        assert!(!same(&longer, 3) && !same(&longer, 7) && !same(&new, 6));
+
+        // An empty string starts where it ends, and still does not move.
+        let empty = read(b"V = ''\nf()\n", Dialect::Module).unwrap();
+        let filled = replace_string_inner(&empty, (5, 5), "", "ab").unwrap();
+        assert_eq!(filled, b"V = 'ab'\nf()\n");
+        let again = read(&filled, Dialect::Module).unwrap();
+        assert!(reads_as_edited(&empty, &again, 2, (5, 5), 2));
+        let back = replace_string_inner(&again, (5, 7), "ab", "");
+        assert_eq!(back.as_deref(), Ok(&b"V = ''\nf()\n"[..]));
     }
 
     /// Renaming what a `load` binds would change the meaning of every use

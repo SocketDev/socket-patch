@@ -440,5 +440,76 @@ mod tests {
             .collect();
         let file = read(defs.as_bytes(), Dialect::Bzl).unwrap();
         assert_eq!(file.stmts.len(), 1);
+        // A target nests like a value, and its brackets are walked once.
+        let pattern = format!("{}a{} = 1\n", "(".repeat(deep), ")".repeat(deep));
+        let file = read(pattern.as_bytes(), Dialect::Bzl).unwrap();
+        assert_eq!(file.bindings.len(), 1);
+        let index = format!("a{}[b]{} = 1\n", "[".repeat(deep), "]".repeat(deep));
+        let file = read(index.as_bytes(), Dialect::Bzl).unwrap();
+        assert_eq!((file.bindings.len(), file.uses("b").other.len()), (0, 1));
+    }
+
+    /// A query costs what the uses of its name cost, and not the size of
+    /// the file: a caller asks about every proxy and every constant of a
+    /// file, and a file may be [`MAX_FILE_BYTES`] of them. Each file here
+    /// is at that size. The test takes seconds; with one pass over the
+    /// file, its bindings or its statements for each query or each use it
+    /// took over six minutes in a release build, so the bound is far from
+    /// both.
+    #[test]
+    fn a_query_costs_what_its_name_costs_at_the_size_cap() {
+        fn module(src: &str) -> (File<'_>, usize) {
+            assert!(src.len() <= MAX_FILE_BYTES && src.len() > MAX_FILE_BYTES * 9 / 10);
+            let file = read(src.as_bytes(), Dialect::Module).expect("a file at the cap reads");
+            (file, src.len())
+        }
+        const EXT: &str = "m = use_extension(\"//:e.bzl\", \"e\")\n";
+        let started = std::time::Instant::now();
+
+        // One proxy with a tag on most lines, and one name bound on the
+        // others.
+        let src = format!(
+            "{EXT}{}{}",
+            "a=1\n".repeat(124_993),
+            "m.x()\n".repeat(91_428)
+        );
+        let (file, end) = module(&src);
+        assert_eq!(file.tags("m").exact().unwrap().len(), 91_428);
+        assert_eq!(file.constant("a", end).reasons().len(), 124_993);
+        assert_eq!(file.calls("a").reasons().len(), 124_993);
+
+        // A proxy on every line, and every query about each.
+        let proxy = |n: usize| format!("p{n} = use_extension(\"//:e.bzl\", \"e\")\n");
+        let src: String = (0..26_000).map(proxy).collect();
+        let (file, end) = module(&src);
+        for n in 0..26_000 {
+            let name = format!("p{n}");
+            assert_eq!(file.tags(&name).exact(), Some(vec![]), "{name}");
+            assert_eq!(file.calls(&name).exact(), Some(vec![]), "{name}");
+            let value = file.constant(&name, end);
+            assert_eq!(value.reasons().len(), 1, "{name}");
+        }
+
+        // A constant on every line.
+        let constant = |n: usize| format!("c{n} = [{n}]\n");
+        let src: String = (0..60_000).map(constant).collect();
+        let (file, end) = module(&src);
+        for n in 0..60_000 {
+            let value = file.constant(&format!("c{n}"), end);
+            assert!(value.exact().flatten().is_some(), "c{n}");
+        }
+
+        // One call that is handed a name on every argument, and a tag on
+        // every line that is handed a list.
+        let handed = format!("f({})\n", "m, ".repeat(150_000));
+        let src = format!("{EXT}L = []\n{handed}{}", "m.x(L)\n".repeat(80_000));
+        let (file, end) = module(&src);
+        let tags = file.tags("m");
+        assert_eq!((tags.seen().len(), tags.reasons().len()), (80_000, 150_000));
+        assert!(file.constant("L", end).exact().is_some());
+        assert_eq!(file.calls("f").exact().unwrap().len(), 1);
+
+        let took = started.elapsed();
+        assert!(took.as_secs() < 120, "the queries took {took:?}");
     }
 }
