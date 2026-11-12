@@ -1,0 +1,8 @@
+# The toy core fixture, hybrid: this file and WORKSPACE both declare a hub
+# named `toy`, each from its own lock.
+
+module(name = "toy_core")
+
+toy = use_extension("//:toy.bzl", "toy")
+toy.lock(file = "//:toy.lock.json")
+use_repo(toy, "toy")

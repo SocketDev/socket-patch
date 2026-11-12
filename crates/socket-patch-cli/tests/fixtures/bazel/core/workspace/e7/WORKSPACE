@@ -1,0 +1,14 @@
+# The toy core fixture, WORKSPACE: no external ruleset, one hub read from a JSON lock.
+
+workspace(name = "toy_core")
+
+load("//:toy.bzl", "toy_lock")
+
+toy_lock(
+    name = "toy",
+    lock = "//:toy.lock.json",
+)
+
+load("@toy//:repos.bzl", "toy_repos")
+
+toy_repos()

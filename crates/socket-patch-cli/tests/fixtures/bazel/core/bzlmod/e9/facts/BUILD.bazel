@@ -1,0 +1,6 @@
+load("//:probe.bzl", "socket_probe")
+
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@toy_facts//:indexed"],
+)

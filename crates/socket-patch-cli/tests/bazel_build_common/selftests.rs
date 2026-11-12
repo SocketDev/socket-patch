@@ -17,6 +17,7 @@ use super::isolation::{self, OutsideState, Scratch};
 use super::probe_report::{self, Report, Status};
 use super::proof::{parse_locations, Anchor, SourceFile};
 use super::server::{self, Cell, Limiter};
+use super::toy;
 use super::workspace;
 use crate::common::hermetic;
 
@@ -344,6 +345,40 @@ fn command_options_follow_the_bazel_line() {
     assert!(
         !plain.iter().any(|a| a.starts_with("--lockfile_mode")),
         "5.x has no lockfile"
+    );
+}
+
+/// What makes a toy cell need no network: the committed registry as a
+/// `file://` URL where that form is known to work, the committed archives
+/// as a distdir, and a hand pin that only an upstream lock takes.
+#[test]
+fn a_toy_cell_reads_the_committed_registry_and_archives() {
+    let scratch = Scratch::cold();
+    let distdir = workspace::fixtures_root().join("registry/distdir/9.3.2");
+    assert!(distdir.is_dir(), "{}", distdir.display());
+    let options = Options {
+        registry: Some("file:///srv/registry".into()),
+        distdir: Some(distdir.clone()),
+        ..Options::default()
+    };
+    let args = strings(&options.args(&bazel("9.3.2", false), &scratch).unwrap());
+    assert!(args.contains(&"--registry=file:///srv/registry".to_string()));
+    assert!(args.contains(&format!("--distdir={}", distdir.display())));
+
+    // Off Unix, for a path a URL would have to escape, and for a relative
+    // one, there is no URL: the fixture server plays the registry instead.
+    let url = cfg!(unix).then(|| "file:///srv/registry".to_string());
+    assert_eq!(toy::file_url(Path::new("/srv/registry")), url);
+    assert_eq!(toy::file_url(Path::new("/srv/my registry")), None);
+    assert_eq!(toy::file_url(Path::new("registry")), None);
+
+    let lock = workspace::fixtures_root().join("core/bzlmod/e9/toy.lock.json");
+    let lock = std::fs::read_to_string(lock).expect("read the toy lock");
+    let pinned = toy::pin(&lock, toy::DEP);
+    assert!(pinned.contains(&toy::DEP.hosted_url()) && !pinned.contains(toy::REGISTRY));
+    assert!(
+        panics(&|| drop(toy::pin(&pinned, toy::DEP))),
+        "a lock already pinned takes no second pin"
     );
 }
 

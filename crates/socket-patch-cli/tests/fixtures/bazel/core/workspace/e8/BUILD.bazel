@@ -1,0 +1,14 @@
+load("//:probe.bzl", "socket_probe")
+load("//:toy.bzl", "toy_consumer")
+
+# Proof tiers 0 and 1: the package file Bazel fetched for the hub.
+socket_probe(
+    name = "socket_probe",
+    srcs = ["@toy//:dep"],
+)
+
+# Proof tier 2: the package is a script; running it prints which bytes were built.
+toy_consumer(
+    name = "consumer",
+    src = "@toy//:dep",
+)

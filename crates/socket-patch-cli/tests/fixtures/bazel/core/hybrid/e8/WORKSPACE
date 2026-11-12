@@ -1,0 +1,26 @@
+# The toy core fixture, hybrid: MODULE.bazel and this file both declare a hub
+# named `toy`, each from its own lock, and this file alone declares `toy_ws`.
+
+workspace(name = "toy_core")
+
+load("//:toy.bzl", "toy_lock")
+
+# Shadowed by the Bzlmod hub of the same name wherever Bzlmod is on.
+toy_lock(
+    name = "toy",
+    lock = "//ws:toy.lock.json",
+)
+
+load("@toy//:repos.bzl", "toy_repos")
+
+toy_repos()
+
+# Visible only while Bazel reads this file.
+toy_lock(
+    name = "toy_ws",
+    lock = "//ws:toy.lock.json",
+)
+
+load("@toy_ws//:repos.bzl", toy_ws_repos = "toy_repos")
+
+toy_ws_repos()

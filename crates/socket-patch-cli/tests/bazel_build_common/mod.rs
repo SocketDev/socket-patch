@@ -16,6 +16,8 @@
 //! - [`fixture_server`] and [`registry`]: the loopback server that plays
 //!   every upstream host.
 //! - [`proof`]: the proof ladder, tiers 0 to 2.
+//! - [`toy`]: the core fixture (`fixtures/bazel/core`) and the committed
+//!   registry subset that lets a cell on it run with no network.
 //! - [`probe_report`]: the per-cell JSON a claim rests on.
 //!
 //! Socket-patch itself never runs Bazel; only this harness does. Every
@@ -34,6 +36,7 @@ pub mod probe_report;
 pub mod proof;
 pub mod registry;
 pub mod server;
+pub mod toy;
 pub mod workspace;
 
 mod selftests;

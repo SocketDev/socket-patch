@@ -1,0 +1,83 @@
+{
+  "registry": "https://bcr.bazel.build/",
+  "versions": {
+    "7.7.2": {
+      "archives": [
+        {
+          "bytes": 7680,
+          "file": "platforms-0.0.10.tar.gz",
+          "module": "platforms@0.0.10",
+          "sha256": "218efe8ee736d26a3572663b374a253c012b716d8af0c07e842e82f238a0a7ee"
+        }
+      ],
+      "distdir": true,
+      "lock": "core/bzlmod/e7/locks/v13/MODULE.bazel.lock"
+    },
+    "8.8.2": {
+      "archives": [
+        {
+          "bytes": 16826,
+          "file": "bazel_features-v1.30.0.tar.gz",
+          "module": "bazel_features@1.30.0",
+          "sha256": "a660027f5a87f13224ab54b8dc6e191693c554f2692fcca46e8e29ee7dabc43b"
+        },
+        {
+          "bytes": 43566,
+          "file": "bazel-skylib-1.7.1.tar.gz",
+          "module": "bazel_skylib@1.7.1",
+          "sha256": "bc283cdfcd526a52c3201279cda4bc298652efa898b10b4db0837dc51652756f"
+        },
+        {
+          "bytes": 7882,
+          "file": "platforms-0.0.11.tar.gz",
+          "module": "platforms@0.0.11",
+          "sha256": "29742e87275809b5e598dc2f04d86960cc7a55b3067d97221c9abbc9926bff0f"
+        },
+        {
+          "bytes": 11145938,
+          "file": "protobuf-29.0.zip",
+          "module": "protobuf@29.0",
+          "sha256": "2e442d21839ec9dbafda4cc9083239aa04e78fc9c27dfa59b5374e968050cd22"
+        },
+        {
+          "bytes": 181594,
+          "file": "rules_cc-0.1.1.tar.gz",
+          "module": "rules_cc@0.1.1",
+          "sha256": "712d77868b3152dd618c4d64faaddefcc5965f90f5de6e6dd1d5ddcd0be82d42"
+        },
+        {
+          "bytes": 112382,
+          "file": "rules_java-8.14.0.tar.gz",
+          "module": "rules_java@8.14.0",
+          "sha256": "bbe7d94360cc9ed4607ec5fd94995fd1ec41e84257020b6f09e64055281ecb12"
+        },
+        {
+          "bytes": 873165,
+          "file": "rules_python-0.40.0.tar.gz",
+          "module": "rules_python@0.40.0",
+          "sha256": "690e0141724abb568267e003c7b6d9a54925df40c275a870a4d934161dc9dd53"
+        },
+        {
+          "bytes": 14070,
+          "file": "rules_shell-v0.2.0.tar.gz",
+          "module": "rules_shell@0.2.0",
+          "sha256": "410e8ff32e018b9efd2743507e7595c26e2628567c42224411ff533b57d27c28"
+        }
+      ],
+      "distdir": false,
+      "lock": "core/bzlmod/e8/locks/v28/MODULE.bazel.lock"
+    },
+    "9.3.2": {
+      "archives": [
+        {
+          "bytes": 7879,
+          "file": "platforms-1.0.0.tar.gz",
+          "module": "platforms@1.0.0",
+          "sha256": "3384eb1c30762704fbe38e440204e114154086c8fc8a8c2e3e28441028c019a8"
+        }
+      ],
+      "distdir": true,
+      "lock": "core/bzlmod/e9/locks/v28/MODULE.bazel.lock"
+    }
+  }
+}

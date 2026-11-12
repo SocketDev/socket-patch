@@ -1,0 +1,11 @@
+{
+  "lockVersion": 1,
+  "packages": {
+    "indexed": {
+      "version": "1.0.0",
+      "url": "https://registry.toy.invalid/indexed/-/indexed-1.0.0.sh",
+      "sha256": "ee52a31b96c34e703cc445ba5fd8c7e16192f925b21d327e5185efe5e62356f5"
+    }
+  },
+  "pinsHash": 964847832
+}
