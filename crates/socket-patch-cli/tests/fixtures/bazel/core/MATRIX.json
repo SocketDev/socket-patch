@@ -47,6 +47,7 @@
     "bazel_core_zero_network": {"system": "bzlmod", "bazel": ["7.7.2", "9.3.2"]},
     "bazel_core_hybrid_hub_names_resolve_per_system": {"system": "hybrid", "bazel": ["7.7.2", "8.8.2"]},
     "bazel_core_workspace_only_gets_a_placeholder_module_file": {"system": "workspace", "bazel": ["7.7.2", "8.8.2"]},
-    "bazel_core_toy_facts_go_stale": {"system": "bzlmod", "bazel": ["8.8.2", "9.3.2"]}
+    "bazel_core_toy_facts_go_stale": {"system": "bzlmod", "bazel": ["8.8.2", "9.3.2"]},
+    "bazel_core_probe_rule_takes_a_tree_artifact": {"system": "bzlmod", "bazel": ["7.7.2", "8.8.2", "9.3.2"], "os": ["ubuntu-latest", "macos-latest"]}
   }
 }

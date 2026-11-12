@@ -18,6 +18,7 @@ use super::env::{self, Group, System};
 use super::invoke::{Bazel, Options, Run};
 use super::isolation::Scratch;
 use super::probe_report::{self, Report};
+use super::workspace;
 
 /// How many servers may run at once: two fit a 4-vCPU runner (about
 /// 300 MB each, and a concurrent cold pair costs a quarter more wall time
@@ -205,7 +206,14 @@ impl Cell {
 
     /// The command [`Cell::bazel_with`] runs, not yet spawned: for a test
     /// that asserts on the environment or the options a command gets.
+    /// Panics on a `mod` command that breaks lock rule 3
+    /// ([`workspace::check_mod_command`]), whichever helper it came through.
     pub fn command_with(&self, options: &Options, command: &str, args: &[&str]) -> Command {
+        if command == "mod" && self.bazel.version.has_lockfile_mode() {
+            if let Err(why) = workspace::check_mod_command(args, options.lockfile_mode) {
+                panic!("{}: {why}", self.test);
+            }
+        }
         let mut cmd = self.bazel.command(&self.scratch, command);
         let flags = options
             .args(&self.bazel, &self.scratch)

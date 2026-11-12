@@ -233,10 +233,18 @@ Bazel owns this file, and a live server keeps its own view of it.
    `--lockfile_mode=off` (`Cell::mod_oracle`). The stale-lock oracle is an
    `error`-mode build of a target that consumes the hub
    (`Cell::error_mode_build`), never `bazel mod deps --lockfile_mode=error`.
+   A cell refuses both mistakes on every `mod` command it builds: `deps` in
+   `error` mode, and any subcommand that only asks (`graph`, `show_repo`,
+   `show_extension`, `all_paths`, `path`, `explain`, `dump_repo_mapping`) in
+   a mode other than `off`.
 4. The repository cache lies outside the workspace copy (9.3.2 exits 2
    otherwise).
 5. A cell that expects a fetch to fail runs one command with
    `--experimental_repository_downloader_retries=0` (`Cell::failing_fetch`).
+
+Rule 2 is the one rule no helper enforces: to the harness a restored snapshot
+and a hand edit are the same bytes. There is no restore helper; a saved tree
+goes into a new cell.
 
 `Cell::write` refuses `MODULE.bazel.lock` (and a path that leaves the
 workspace copy), so rule 1 cannot be skipped by accident.
@@ -248,7 +256,8 @@ only `info` and `shutdown`.
 test takes its snapshot. Tree comparisons after Bazel ran leave out what Bazel
 owns (`bazel_common::assert_same_tree_but_bazel_owned`), and lock equality
 after a rollback is asserted only after `bazel shutdown` and a second
-baseline.
+baseline: `Cell::lock_after_rebaseline` does both and returns the lock to
+compare with the one step 1 left.
 
 ## Proof ladder
 
@@ -271,11 +280,21 @@ a directory input on a 5.x line.
 | 1 | `bazel build //:socket_probe` and `cquery --output=files`, on a warm server and after `bazel shutdown` | An action input is the patched file. |
 | 2 | `bazel run //:consumer` printing a marker from patched code | The language rule consumes it. |
 
-`bazel_canary_probe_rule_tree_artifact` builds the rule over a file and a
-tree artifact on the selected Bazel. Before Bazel 6 it builds the file input
-alone and records `"tree_artifact": "unsupported before Bazel 6"` in the
-report's details. It is record-only and uses the network on a Bzlmod line
-(Bazel resolves its builtin modules from the registry).
+Two tests build the rule over a file and a tree artifact (the shape rules_js
+hands it), on a warm and on a restarted server:
+
+- `bazel_core_probe_rule_takes_a_tree_artifact` runs on the toy cell, so
+  nothing leaves the machine where the line's module archives are committed
+  (7.7.2 and 9.3.2). It also checks that a restarted server writes the same
+  `MODULE.bazel.lock` for the baseline commands
+  (`Cell::lock_after_rebaseline`). The tree is made with `/bin/cp`: `SKIP
+  (n/a)` on Windows.
+- `bazel_canary_probe_rule_tree_artifact` runs on any selected Bazel, with no
+  fixture. Before Bazel 6 it builds the file input alone and records
+  `"tree_artifact": "unsupported before Bazel 6"` in the report's details. It
+  is record-only and uses the network on a Bzlmod line (Bazel resolves its
+  builtin modules from the registry), so it prints `SKIP (n/a)` in the
+  offline phase.
 
 ## Reports
 
