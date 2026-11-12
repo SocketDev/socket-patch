@@ -755,7 +755,8 @@ pub(crate) fn baseline(test: &str, ruleset: &str, path: &str) {
         maven::ROOT => "127.0.0.1".to_string(),
         _ => host,
     };
-    cell.report.hosts = server.hosts().into_iter().map(host).collect();
+    let hosts = server.hosts().into_iter().map(host).collect();
+    cell.report.hosts_from_renamed_log(&server, hosts);
     cell.report.direct_network = true;
     cell.report.resolved = resolved;
     cell.report

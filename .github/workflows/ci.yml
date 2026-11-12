@@ -293,7 +293,9 @@ jobs:
           done
 
       - name: Shell — shellcheck the release scripts
-        run: shellcheck scripts/version-sync.sh scripts/release-lint.sh scripts/dispatch-publish.sh
+        # And the Bazel installer the real-Bazel legs run (pinned digests,
+        # fails closed: scripts/tests/test_install_bazelisk.py).
+        run: shellcheck scripts/version-sync.sh scripts/release-lint.sh scripts/dispatch-publish.sh scripts/install-bazelisk.sh
 
   # Release-readiness gate (scripts/release-lint.sh — the same checks the
   # Release workflow's `version` job runs before publishing anything):
@@ -1518,6 +1520,18 @@ jobs:
           # (socket-patch-vendor.sbt) capstones on the current 1.x line. The
           # other sbt lines, JDK 21, the agent cells beyond coverage-docker's,
           # Mill, scala-cli and macOS / Windows are sbt-compatibility.yml.
+          # Real Bazel, the core row: every `bazel_core_` test of
+          # e2e_bazel_build on Bazel 9.3.2, against the toy fixture
+          # (tests/fixtures/bazel/core: no external ruleset). No network by
+          # design: the registry files and the one module archive a build
+          # fetches are committed, and the packages come from the suite's
+          # loopback fixture server. `bazel:` installs that exact release
+          # below (pinned sha256, scripts/bazel-pins.txt) and makes the leg
+          # fail instead of skip when Bazel is missing. Claimed on 9.3.2
+          # only. Every other Bazel line, fixture group, OS and the report
+          # audit run in bazel-compatibility.yml, whose cells come from the
+          # fixtures' MATRIX.json files (scripts/bazel-matrix.py).
+          - {os: ubuntu-latest, suite: e2e_bazel_build, bazel: '9.3.2', test_filter: '--ignored bazel_core_'}
     runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
     # The real-toolchain capstones loop several releases per leg (pip,
     # pipenv) or bootstrap a tool from PyPI before the suite (poetry, pdm,
@@ -1886,6 +1900,50 @@ jobs:
         with:
           path: ${{ runner.temp }}/gradle-${{ matrix.gradle }}-bin.zip
           key: ${{ steps.gradle-dist-cache.outputs.cache-primary-key }}
+
+      - name: Restore the Bazel ${{ matrix.bazel }} binaries
+        # The pinned bazelisk and Bazel release binary, both served by
+        # github.com releases (the outage the Gradle step above describes).
+        # install-bazelisk.sh checks a restored file against its pin too,
+        # so a miss or a stale entry only means a download. Saved from
+        # main only; bazel-compatibility.yml shares the key.
+        id: bazel-dist-cache
+        if: matrix.bazel != ''
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: bazel-dist-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles('scripts/bazel-pins.txt', 'scripts/install-bazelisk.sh') }}
+
+      - name: Install Bazel ${{ matrix.bazel }}
+        if: matrix.bazel != ''
+        shell: bash
+        env:
+          BAZEL_VERSION: ${{ matrix.bazel }}
+        # The script prints SOCKET_PATCH_BAZEL_E2E_BAZEL, _BINARY, _BAZELISK
+        # and _VERSION: the suite drives that verified binary and asserts
+        # its version. _REQUIRED turns "no Bazel" from SKIP into a failure,
+        # so the leg cannot pass on an unexercised toolchain; _GROUP is the
+        # fixture group of the one Bazel row here (the toy `core`).
+        run: |
+          set -euo pipefail
+          scripts/install-bazelisk.sh "$BAZEL_VERSION" "$RUNNER_TEMP/bazel-dist" >> "$GITHUB_ENV"
+          {
+            echo "SOCKET_PATCH_BAZEL_E2E_REQUIRED=1"
+            echo "SOCKET_PATCH_BAZEL_E2E_GROUP=core"
+          } >> "$GITHUB_ENV"
+
+      - name: Save the Bazel ${{ matrix.bazel }} binaries
+        if: >-
+          matrix.bazel != ''
+          && github.ref == 'refs/heads/main'
+          && steps.bazel-dist-cache.outputs.cache-hit != 'true'
+          && steps.bazel-dist-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: ${{ steps.bazel-dist-cache.outputs.cache-primary-key }}
 
       - name: Setup .NET SDK
         if: matrix.dotnet != ''

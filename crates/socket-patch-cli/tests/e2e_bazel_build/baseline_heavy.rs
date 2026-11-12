@@ -822,7 +822,8 @@ fn baseline(test: &str) {
     let requests = server.requests().len();
     let asked = |url: &String| !server.requests_for(url).is_empty();
     let fetched_cold = levers.packages.iter().any(asked);
-    cell.report.hosts = reported_hosts(server.hosts());
+    cell.report
+        .hosts_from_renamed_log(&server, reported_hosts(server.hosts()));
     cell.report.direct_network = true;
     cell.report.resolved = resolved;
     cell.report

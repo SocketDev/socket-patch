@@ -29,6 +29,7 @@ setting when that toolchain is required for the check.
 | Python | [uv](uv-compatibility.md), [Poetry](poetry-compatibility.md), [PDM](pdm-compatibility.md), [Pipenv](pipenv-compatibility.md), [Hatch](hatch.md) |
 | PHP | [Composer](composer-compatibility.md) |
 | JVM | [Maven reactor and Gradle vendoring](../design/maven-vendoring.md#validation-and-remaining-scope), [Gradle in every mode](#gradle), [sbt, Mill and scala-cli](sbt-compatibility.md) |
+| Bazel (a build shape of the ecosystems above, not one of its own) | [Bazel](bazel-compatibility.md): the real-Bazel suite, its pinned releases, the generated CI matrix and the report audit |
 
 Other ecosystems have Rust and container suites listed in
 [ecosystem support](../ecosystems.md) and the Docker guide.

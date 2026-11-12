@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256, Sha512};
 
 use super::env::{self, Group, System, Version};
-use super::fixture_server::FixtureServer;
+use super::fixture_server::{Fetcher, FixtureServer, HOSTED_ORIGIN};
 use super::invoke::{absolute_program, named_bazelisk, Bazel, Options};
 use super::isolation::{self, OutsideState, Scratch};
 use super::probe_report::{self, Report, Status};
@@ -1021,6 +1021,25 @@ fn the_offline_assertion_has_no_minimum_and_a_cold_one_needs_the_artifact() {
     assert!(panics(&no_credential), "a credential went to the registry");
 }
 
+/// A hosted reference keeps the production origin wherever Bazel's
+/// downloader fetches it, and gets the loopback one only for a tool the
+/// rewrite cannot reach. A matrix names the fetcher; an unknown name is
+/// not the downloader.
+#[test]
+fn the_hosted_origin_follows_who_fetches() {
+    let server = FixtureServer::start();
+    assert_eq!(server.hosted_origin(Fetcher::Downloader), HOSTED_ORIGIN);
+    assert_eq!(HOSTED_ORIGIN, "https://patch.socket.dev");
+    let loopback = server.hosted_origin(Fetcher::Tool);
+    assert_eq!(loopback, format!("http://127.0.0.1:{}", server.port()));
+    assert_eq!(loopback, server.loopback_origin());
+    assert_eq!(Fetcher::parse("downloader"), Some(Fetcher::Downloader));
+    assert_eq!(Fetcher::parse("tool"), Some(Fetcher::Tool));
+    for unknown in ["", "pip", "Downloader", "tool "] {
+        assert_eq!(Fetcher::parse(unknown), None, "{unknown:?}");
+    }
+}
+
 #[test]
 fn fixture_server_states_the_content_type_a_route_was_given() {
     let server = FixtureServer::start();
@@ -1207,7 +1226,52 @@ fn a_report_carries_the_fields_a_claim_is_audited_on() {
     let mut report = Report::new("bazel_core_launch_isolated");
     report.bazel = Some("9.3.2".into());
     report.system = Some(System::Bzlmod);
-    report.hosts = vec!["bcr.bazel.build".into()];
+    // Until a fixture server's log is read the report names no host and
+    // says so: the field is private, so no test can write a list by hand.
+    let unlogged = report.to_json(Status::Ran, None);
+    assert_eq!(unlogged["hosts_source"], "none");
+    assert!(unlogged["hosts"].as_array().unwrap().is_empty() && report.hosts().is_empty());
+    let server = FixtureServer::start();
+    // A server that was asked nothing is still a source: the list is the
+    // log's, and it is empty.
+    report.hosts_from_log(&server);
+    let idle = report.to_json(Status::Ran, None);
+    assert_eq!(idle["hosts_source"], "fixture_server_log");
+    assert!(idle["hosts"].as_array().unwrap().is_empty());
+    server.serve("https://registry.npmjs.org/a/-/a-1.0.0.tgz", "a");
+    http(&server, "GET", "/registry.npmjs.org/a/-/a-1.0.0.tgz", "");
+    http(
+        &server,
+        "GET",
+        "/bcr.bazel.build/modules/x/1.0/MODULE.bazel",
+        "",
+    );
+    http(&server, "GET", "/maven2/org/x/x-1.0.jar", "");
+    report.hosts_from_log(&server);
+    assert_eq!(
+        report.hosts(),
+        ["bcr.bazel.build", "maven2", "registry.npmjs.org"]
+    );
+    // A request a tool sent straight to the loopback origin has no host
+    // segment; the test names it, and may merge entries but never add one.
+    let rename = |host: String| {
+        if host == "maven2" {
+            "127.0.0.1".to_string()
+        } else {
+            host
+        }
+    };
+    let renamed: Vec<String> = server.hosts().into_iter().map(rename).collect();
+    report.hosts_from_renamed_log(&server, renamed.clone());
+    assert_eq!(
+        report.hosts(),
+        ["127.0.0.1", "bcr.bazel.build", "registry.npmjs.org"]
+    );
+    let invented = [renamed, vec!["pypi.org".to_string()]].concat();
+    assert!(panics(&|| {
+        Report::new("x").hosts_from_renamed_log(&server, invented.clone())
+    }));
+    report.proves("H-JS1").proves("H-JS2").proves("H-JS1");
     report
         .resolved
         .insert("aspect_rules_js".into(), "3.6.0".into());
@@ -1216,7 +1280,12 @@ fn a_report_carries_the_fields_a_claim_is_audited_on() {
     assert_eq!(ran["status"], "ran");
     assert_eq!(ran["bazel"], "9.3.2");
     assert_eq!(ran["system"], "bzlmod");
-    assert_eq!(ran["hosts"], serde_json::json!(["bcr.bazel.build"]));
+    assert_eq!(
+        ran["hosts"],
+        serde_json::json!(["127.0.0.1", "bcr.bazel.build", "registry.npmjs.org"])
+    );
+    assert_eq!(ran["hosts_source"], "fixture_server_log");
+    assert_eq!(ran["lanes"], serde_json::json!(["H-JS1", "H-JS2"]));
     assert_eq!(ran["resolved"]["aspect_rules_js"], "3.6.0");
     assert_eq!(ran["details"]["tier"], 1);
     assert_eq!(ran["direct_network"], false);
@@ -1226,6 +1295,8 @@ fn a_report_carries_the_fields_a_claim_is_audited_on() {
     assert_eq!(skipped["status"], "skipped");
     assert_eq!(skipped["reason"], "no Bazel");
     assert!(skipped["bazel"].is_null() && skipped["hosts"].as_array().unwrap().is_empty());
+    assert_eq!(skipped["hosts_source"], "none");
+    assert!(skipped["lanes"].as_array().unwrap().is_empty());
 
     // One file per (test, version, system, OS): matrix cells never collide.
     let name = report

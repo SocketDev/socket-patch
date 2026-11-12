@@ -31,6 +31,31 @@ use std::time::Duration;
 /// port recorded in `MODULE.bazel.lock` facts fails the next run.
 pub const HOSTED_ORIGIN: &str = "https://patch.socket.dev";
 
+/// Who fetches a fixture's packages: the `fetch` (and `hosted_fetch`) value
+/// of a `MATRIX.json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fetcher {
+    /// Bazel's downloader, which the rewrite of the downloader config
+    /// reaches.
+    Downloader,
+    /// A program Bazel runs (pip, cargo under crate_universe, Coursier in
+    /// an unpinned hub, a legacy package manager): it never sees the
+    /// downloader config.
+    Tool,
+}
+
+impl Fetcher {
+    /// `None` for anything but the two names a matrix may state: an
+    /// unknown fetcher must not be read as the downloader.
+    pub fn parse(text: &str) -> Option<Fetcher> {
+        match text {
+            "downloader" => Some(Fetcher::Downloader),
+            "tool" => Some(Fetcher::Tool),
+            _ => None,
+        }
+    }
+}
+
 /// The `Content-Type` of [`FixtureServer::serve`]: Bazel's downloader and
 /// the package managers that fetch an artifact ignore it.
 pub const OCTET_STREAM: &str = "application/octet-stream";
@@ -111,6 +136,19 @@ impl FixtureServer {
     /// [`HOSTED_ORIGIN`] instead.
     pub fn loopback_origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// The origin a fake Socket API advertises for a patched artifact
+    /// that `fetcher` will fetch: [`HOSTED_ORIGIN`] for Bazel's
+    /// downloader, so that everything socket-patch writes is
+    /// production-shaped and arrives here through the rewrite, and
+    /// [`FixtureServer::loopback_origin`] for a tool, which the rewrite
+    /// does not reach. The one place that rule is decided.
+    pub fn hosted_origin(&self, fetcher: Fetcher) -> String {
+        match fetcher {
+            Fetcher::Downloader => HOSTED_ORIGIN.to_string(),
+            Fetcher::Tool => self.loopback_origin(),
+        }
     }
 
     /// Serve `bytes` for `url`, written as the lock writes it

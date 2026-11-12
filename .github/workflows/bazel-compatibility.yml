@@ -1,0 +1,397 @@
+name: Bazel patch compatibility
+
+# The real-Bazel matrix: the `#[ignore]` tests of e2e_bazel_build (the one
+# suite that runs Bazel; socket-patch itself never does) on pinned Bazel
+# releases, per runner. ci.yml's `e2e` job keeps one required row, the toy
+# fixture on 9.3.2 with no network (`--ignored bazel_core_`).
+#
+# The matrix is generated. `plan` runs scripts/bazel-matrix.py, which reads
+# every crates/socket-patch-cli/tests/fixtures/bazel/**/MATRIX.json and
+# prints the cells of the event, so a package adds a cell by editing the
+# MATRIX.json of its own fixtures and nobody edits this file. A cell is
+# every test of one (fixture group, Bazel, runner, test-name prefix), run
+# with `--exact`: it runs the tests its matrices list and no other.
+#
+# Tiers. A matrix entry is `pr` or `nightly`:
+#   * pull_request (the paths below): the `pr` entries.
+#   * schedule, workflow_dispatch: every entry.
+#   * a pull request labelled `bazel-matrix`: every entry. `schedule` and
+#     `workflow_dispatch` exist only for a workflow file on the default
+#     branch, so until this file is on main the label stands in for a
+#     dispatch. GitHub applies `paths` to a `labeled` event too: the label
+#     widens a run that the paths select, it does not start one.
+# Not triggered by `merge_group` and not part of ci.yml's `ci-ok`: nothing
+# here blocks a merge or a release.
+#
+# Jobs: plan -> build (the CLI and the suite, once per runner OS) ->
+# cells / extras -> audit. `extras` are the record-only cells (the
+# `bazel_canary_` tests, and any cell on a Bazel pre-release): their result
+# is recorded and gates nothing.
+#
+# Evidence. A test that printed SKIP still passes for libtest, so a green
+# test run proves nothing. Every test writes a JSON report
+# (bazel_build_common::probe_report), and each cell ends with
+# scripts/bazel-matrix-audit.py: every test planned for the cell needs a
+# report of status `ran`, with the hosts it contacted (from the fixture
+# server's log) and its wall time, and with ruleset versions that equal the
+# pins of its MATRIX.json. `audit` repeats that over the whole run and, on
+# a full run, holds the lane claims (`lanes::claims_json()`) to the reports:
+# a lane may name a Bazel line, a dependency system or an OS only with a
+# `ran` report for it. A red audit blocks promoting a lane, never a release.
+#
+# Bazel comes from scripts/install-bazelisk.sh (pinned sha256 per platform
+# in scripts/bazel-pins.txt; no setup-bazel, which rewrites ~/.bazelrc and
+# verifies no digest). Every pinned action is a 40-hex commit.
+#
+# Nothing here has run on Linux x86_64 or Windows yet: every probe and every
+# local cell ran on macOS arm64 (five probe groups added Linux arm64
+# containers). A cell that disagrees with a probe refutes it.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled]
+    # In a GitHub filter `*` does not cross `/`: the first pattern alone
+    # misses crates/socket-patch-core/src/bazel/lanes/rules_js.rs.
+    paths:
+      - '**/*bazel*'
+      - '**/*bazel*/**'
+      - 'scripts/install-bazelisk.sh'
+      - 'scripts/bazel-*.py'
+      - 'scripts/bazel-pins.txt'
+      - '.github/workflows/bazel-compatibility.yml'
+  schedule:
+    # Nightly, off the other compatibility workflows' 04:17 and ci.yml's 05:41.
+    - cron: '53 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A label other than `bazel-matrix` starts a run that plans nothing; it
+  # gets a group of its own so it cannot cancel the matrix in progress.
+  group: bazel-compat-${{ github.event.pull_request.number || github.ref }}${{ github.event_name == 'schedule' && '-nightly' || '' }}${{ github.event.action == 'labeled' && github.event.label.name != 'bazel-matrix' && format('-label-{0}', github.run_id) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  SOCKET_NO_CONFIG: '1'
+  SOCKET_NO_UPDATE_CHECK: '1'
+  SOCKET_TELEMETRY_DISABLED: '1'
+
+jobs:
+  plan:
+    if: github.event.pull_request.draft != true && (github.event.action != 'labeled' || github.event.label.name == 'bazel-matrix')
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 5
+    outputs:
+      tiers: ${{ steps.plan.outputs.tiers }}
+      cells: ${{ steps.plan.outputs.cells }}
+      extras: ${{ steps.plan.outputs.extras }}
+      build: ${{ steps.plan.outputs.build }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Check the test-name prefixes and the matrices
+        run: |
+          python3 scripts/ci-e2e-bundle.py --check
+          python3 scripts/bazel-matrix.py --check
+
+      - name: Plan the cells
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # `null` off pull_request, which the script reads as no label.
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: python3 scripts/bazel-matrix.py --event "$EVENT_NAME" --labels "$LABELS" --github-output "$GITHUB_OUTPUT"
+
+  build:
+    name: build ${{ matrix.os }}
+    needs: [plan]
+    if: needs.plan.outputs.build != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(needs.plan.outputs.build) }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          shared-key: e2e-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Compile the CLI and the real-Bazel suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p socket-patch-cli --bin socket-patch
+          cargo test --locked -p socket-patch-cli --no-run --message-format=json-render-diagnostics --test e2e_bazel_build > target-build.json
+
+      - name: Bundle the binaries the cells run
+        shell: bash
+        env:
+          BUNDLE_OS: ${{ matrix.os }}
+        run: python3 scripts/ci-e2e-bundle.py --os "$BUNDLE_OS" --cargo-json target-build.json --dest target/bazel-bin --suites e2e_bazel_build
+
+      - uses: ./.github/actions/upload-artifact
+        with:
+          name: bazel-bin-${{ matrix.os }}
+          path: target/bazel-bin/
+          if-no-files-found: error
+          retention-days: 3
+
+  cells:
+    name: ${{ matrix.name }}
+    needs: [plan, build]
+    if: needs.plan.outputs.cells != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.cells) }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    continue-on-error: ${{ matrix.record_only == 'true' }}
+    steps: &cell-steps
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the real-Bazel suite
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bazel-bin-${{ matrix.os }}*
+          merge-multiple: true
+          path: target/bazel-bin
+
+      - name: Stage the CLI where the test binary expects it
+        # `CARGO_BIN_EXE_socket-patch` was baked in at compile time as
+        # <checkout>/target/debug/socket-patch; CARGO_TARGET_TMPDIR likewise.
+        shell: bash
+        run: |
+          set -euo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          chmod +x target/bazel-bin/* || true
+          mkdir -p target/debug target/tmp target/bazel-probe
+          cp "target/bazel-bin/socket-patch$exe" "target/debug/socket-patch$exe"
+
+      - name: Restore the Bazel ${{ matrix.bazel }} binaries
+        # The pinned bazelisk and Bazel release, both from github.com
+        # releases (releases.bazel.build second for Bazel). The installer
+        # checks a restored file against its pin too, so a miss or a stale
+        # entry only means a download. Saved from main; ci.yml's row shares
+        # the key.
+        id: bazel-dist-cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: bazel-dist-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles('scripts/bazel-pins.txt', 'scripts/install-bazelisk.sh') }}
+
+      - name: Install Bazel ${{ matrix.bazel }}
+        shell: bash
+        env:
+          BAZEL_VERSION: ${{ matrix.bazel }}
+        # Prints SOCKET_PATCH_BAZEL_E2E_BAZEL, _BINARY, _BAZELISK and _VERSION.
+        run: scripts/install-bazelisk.sh "$BAZEL_VERSION" "$RUNNER_TEMP/bazel-dist" >> "$GITHUB_ENV"
+
+      - name: Save the Bazel ${{ matrix.bazel }} binaries
+        if: >-
+          github.ref == 'refs/heads/main'
+          && steps.bazel-dist-cache.outputs.cache-hit != 'true'
+          && steps.bazel-dist-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-dist
+          key: ${{ steps.bazel-dist-cache.outputs.cache-primary-key }}
+
+      - name: Restore the repository cache
+        # For a cell whose archives are not committed (Bazel 8.8.2 fetches
+        # 12.4 MB of its own modules' archives even for a `filegroup`) and
+        # for the lane cells of a ruleset. Without it such a cell downloads
+        # them once and its reports say `direct_network`. A canary cell
+        # stays cold: on a warm cache it could not tell when a pinned URL
+        # stops answering.
+        id: repo-cache
+        if: matrix.cache == 'restore'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/bazel-repos
+          key: bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-${{ hashFiles(format('crates/socket-patch-cli/tests/fixtures/bazel/{0}/**', matrix.group), 'crates/socket-patch-cli/tests/fixtures/bazel/registry/MANIFEST.json') }}
+          # The cache is content-addressed: an older one is still correct,
+          # only incomplete.
+          restore-keys: |
+            bazel-repos-${{ matrix.group }}-${{ matrix.bazel }}-${{ runner.os }}-
+
+      - name: Run the cell
+        shell: bash
+        env:
+          # A missing Bazel or an unreachable origin fails instead of SKIP.
+          SOCKET_PATCH_BAZEL_E2E_REQUIRED: '1'
+          SOCKET_PATCH_BAZEL_E2E_GROUP: ${{ matrix.group }}
+          SOCKET_PATCH_BAZEL_E2E_PROBE_DIR: ${{ github.workspace }}/target/bazel-probe
+          SOCKET_PATCH_BAZEL_E2E_CACHE_ROOT: ${{ matrix.cache == 'restore' && format('{0}/bazel-repos', runner.temp) || '' }}
+          # Output bases under a short root: Windows path limits.
+          SOCKET_PATCH_BAZEL_E2E_OUTPUT_ROOT: ${{ runner.os == 'Windows' && 'C:/b' || '' }}
+          CELL_ID: ${{ matrix.id }}
+          CELL_FILTER: ${{ matrix.filter }}
+          TIERS: ${{ needs.plan.outputs.tiers }}
+        # Two tests at a time: each starts a Bazel server (200 to 500 MB),
+        # and the harness admits two servers per process anyway.
+        run: |
+          set -uo pipefail
+          exe=''
+          if [ "$RUNNER_OS" = Windows ]; then exe=.exe; fi
+          py=$(command -v python3 || command -v python)
+          status=0
+          (
+            cd crates/socket-patch-cli
+            export CARGO_MANIFEST_DIR="$PWD"
+            # shellcheck disable=SC2086 # the filter is several libtest arguments
+            "../../target/bazel-bin/e2e_bazel_build$exe" --ignored --nocapture --test-threads=2 $CELL_FILTER
+          ) || status=1
+          # A test that printed SKIP passed for libtest. Only a report of
+          # status `ran` counts: each test planned for this cell needs one.
+          "$py" scripts/bazel-matrix-audit.py --reports target/bazel-probe --tiers "$TIERS" --cell "$CELL_ID" --require hosts,wall_ms,resolved || status=1
+          exit "$status"
+
+      - name: Upload the cell reports
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: bazel-probe-${{ matrix.id }}
+          path: target/bazel-probe/
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Save the repository cache
+        if: >-
+          matrix.cache == 'restore'
+          && github.ref == 'refs/heads/main'
+          && steps.repo-cache.outputs.cache-hit != 'true'
+          && steps.repo-cache.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ runner.temp }}/bazel-repos
+          key: ${{ steps.repo-cache.outputs.cache-primary-key }}
+
+  extras:
+    name: ${{ matrix.name }} (record-only)
+    needs: [plan, build]
+    if: needs.plan.outputs.extras != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.extras) }}
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS != 'true' && (matrix.os == 'ubuntu-latest' && 'depot-ubuntu-24.04-4' || matrix.os == 'ubuntu-22.04' && 'depot-ubuntu-22.04-4') || matrix.os }}
+    timeout-minutes: ${{ matrix.timeout }}
+    continue-on-error: ${{ matrix.record_only == 'true' }}
+    steps: *cell-steps
+
+  audit:
+    # Runs when cells failed too: a failed cell left no report, which is
+    # what the audit is there to say. It never gates a merge or a release.
+    needs: [plan, cells, extras]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ${{ vars.DISABLE_DEPOT_RUNNERS == 'true' && 'ubuntu-latest' || 'depot-ubuntu-24.04-4' }}
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the cell reports
+        # A run whose cells all failed uploaded none. The audit below then
+        # says which reports are missing; it does not pass on an empty set.
+        continue-on-error: true
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: bazel-probe-*
+          merge-multiple: true
+          path: target/bazel-reports
+
+      - name: Install Rust
+        if: needs.plan.outputs.tiers == 'full'
+        shell: bash
+        run: scripts/rustup-retry.sh toolchain install
+
+      - name: Cache cargo
+        if: needs.plan.outputs.tiers == 'full'
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        timeout-minutes: 5
+        continue-on-error: true
+        with:
+          shared-key: e2e-ubuntu-latest
+          save-if: false
+
+      - name: Dump the lane claims
+        # `claims::dump` writes what `lanes::claims_json()` renders. Until
+        # the gate lands the golden suite has no such test and every lane
+        # is a disabled stub, so there is nothing to claim. Once the test
+        # exists, a run that leaves no file is an error, not "no claims".
+        # Claims hold over the whole matrix, so only a full run audits them.
+        id: claims
+        if: needs.plan.outputs.tiers == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f target/bazel-claims.json
+          cargo test --locked -p socket-patch-core --test bazel_golden claims::dump 2>&1 | tee claims.log
+          ran=$(sed -n 's/^test result: .* \([0-9][0-9]*\) passed;.*/\1/p' claims.log | head -n 1)
+          if [ "${ran:-0}" = 0 ]; then
+            echo "::notice::bazel_golden has no claims::dump test yet: no lane is enabled, so no claim is audited."
+          elif [ ! -f target/bazel-claims.json ]; then
+            echo "::error::claims::dump ran and wrote no target/bazel-claims.json"
+            exit 1
+          else
+            echo "file=target/bazel-claims.json" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Audit the reports
+        shell: bash
+        env:
+          TIERS: ${{ needs.plan.outputs.tiers }}
+          CLAIMS: ${{ steps.claims.outputs.file }}
+        run: |
+          set -euo pipefail
+          mkdir -p target/bazel-reports
+          args=(--reports target/bazel-reports --tiers "$TIERS" --require "hosts,wall_ms,resolved")
+          if [ -n "$CLAIMS" ]; then args+=(--claims "$CLAIMS"); fi
+          python3 scripts/bazel-matrix-audit.py "${args[@]}"
+
+      - name: Upload every report of the run
+        if: always()
+        uses: ./.github/actions/upload-artifact
+        with:
+          name: bazel-reports
+          path: |
+            target/bazel-reports/
+            target/bazel-claims.json
+          if-no-files-found: ignore
+          retention-days: 30

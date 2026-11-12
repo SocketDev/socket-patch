@@ -8,7 +8,8 @@ cargo-vex-matrix leg runs, so the legs download them instead of compiling.
 A row's `suite` may list several binaries (space-separated); a row marked
 `allow_empty: 'true'` names suites that have not landed yet, which are
 skipped until their test file exists. `--suites` bundles an explicit list
-instead (gradle-compatibility.yml's own build).
+instead (the own builds of gradle-compatibility.yml and
+bazel-compatibility.yml).
 
 Every run also enforces the per-suite test-name prefix contract
 (`PREFIX_GUARDS`): each `#[ignore]` test of a guarded suite must start with
@@ -55,11 +56,22 @@ GRADLE_SUITE_PREFIXES = {
 GRADLE_SUITES = tuple(GRADLE_SUITE_PREFIXES)
 
 
+# The real-Bazel suite is one binary, and the rows and generated cells that
+# run it (ci.yml's `bazel_core_` row, bazel-compatibility.yml) select its
+# tests by these six prefixes. scripts/bazel-matrix.py holds each test to a
+# cell; a test a `macro_rules!` declares is checked there, not here.
+BAZEL_SUITE_PREFIXES = {
+    "e2e_bazel_build": ("bazel_core_", "bazel_guard_", "bazel_agent_", "bazel_hosted_",
+                        "bazel_vendor_", "bazel_canary_"),
+}
+
+
 def prefix_pattern(prefixes):
     return re.compile("^(?:" + "|".join(re.escape(p) for p in prefixes) + ")")
 
 
-PREFIX_GUARDS = {suite: prefix_pattern(prefixes) for suite, prefixes in GRADLE_SUITE_PREFIXES.items()}
+PREFIX_GUARDS = {suite: prefix_pattern(prefixes)
+                 for suite, prefixes in {**GRADLE_SUITE_PREFIXES, **BAZEL_SUITE_PREFIXES}.items()}
 
 IGNORED_FN = re.compile(
     r"#\[\s*ignore\b(?:\s*=\s*\"(?:[^\"\\]|\\.)*\")?\s*\]"
